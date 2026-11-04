@@ -389,11 +389,11 @@ at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says
 field puts the default back.
 
 **`admission` is pinned the same way.** On every tick the dispatcher reads `kanban.admission` from
-the managed scope and counts the container's cgroup memory usage against a budget. Past it the
-dispatcher refuses a card rather than spawn a worker: the card is blocked with kind `capacity` and a
-reason that names the figures, so the thread that filed it is told it is throttled. The budget is
-the request, not the limit, because the kubelet evicts the pod under node pressure once its usage
-passes the request. Under GKE Sandbox the limit the container can read is the sandbox's, not the
+the managed scope and counts the container's working set, its cgroup memory usage less the inactive
+file cache, against a budget. Past it the dispatcher refuses a card rather than spawn a worker: the
+card is blocked with kind `capacity` and a reason that names the figures, so the thread that filed
+it is told it is throttled. The budget is the request, not the limit, because the kubelet evicts the
+pod under node pressure once its working set passes the request. Under GKE Sandbox the limit the container can read is the sandbox's, not the
 cgroup's, so Hermes' own `/proc/meminfo` guard never fires there.
 
 Unset, `memoryBudgetMiB` is the agent container's memory request in MiB (`spec.deployment.resources`,
@@ -498,6 +498,13 @@ should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the
 a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
 that quota is the other shared resource, and for most deployments it binds before memory does.
 
+At the operator's defaults the admission budget binds before this cap does. The budget is the
+container's memory request, 2Gi unless `spec.deployment.resources` raises it. A tick admits one new
+worker per 512 MiB of headroom under the budget: two from the idle set, one above about 1.7 GiB in
+use, none above about 1.9 GiB, whatever `maxInProgress` says. Six workers at 430 MiB are about
+2.6 GiB, so a board meant to run six at once needs a request of about 4Gi. The request is the figure
+to raise: the kubelet evicts the pod once its working set passes it ([`admission`](#specharnesstuning)).
+
 [`docs/designs/safe-throttling.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/safe-throttling.md)
 is the design for admission by memory beside this count: a pressure guard on the container's own
 memory counters, a resident cap per worker, and a `capacity` refusal that names the alternatives.
@@ -538,6 +545,11 @@ waits, because every slot is busy or the only free one is triage's, gets one lin
 part of a request already running (a worker's child, or a card with a parent link) waits without
 one.
 
+The wait is bounded. A card that memory pressure or a full board has held past
+`tuning.admission.queueBoundSeconds` (120 s by default) is blocked with kind `capacity`. The queued
+line settles as stopped, and the Planning Agent answers the thread with the reason and the
+alternatives ([`admission`](#specharnesstuning)).
+
 A full board is logged as what it is. When every slot is busy for six ticks in a row the gateway
 logs, at most every five minutes:
 
@@ -562,7 +574,9 @@ The arithmetic behind `6`:
   two Node MCP proxies about 100 MiB each, a supervisor and an ssh. Six of them are about 2.6 GiB
   over the gateway's 1.8 GiB idle set, about 4.4 GiB under the container's 8Gi limit. A coordinator
   waiting on its own children gives its slot back but stays resident, so the process count can sit
-  above six; the 8Gi limit leaves room for about fourteen workers at that size.
+  above six; the 8Gi limit leaves room for about fourteen workers at that size. That is the limit's
+  room; the room a default install uses is the request's, because the admission budget follows the
+  request (above).
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
   request only when its children fit the proxy's memory limit: 176 MiB per request after 320 MiB of
   fixed reserves. At its default 2Gi limit that is 9 at once
@@ -616,8 +630,9 @@ Three things change while it is on:
 - `profile-platform.overlay.yaml` gains the three profile-shaped things only the `default` profile
   carried before: the toolsets each chat platform key resolves, the ingress plugins, and the
   `kanban` block. The adapters themselves are not copied — the managed scope at `/etc/hermes` is
-  machine-global, so `platforms.*`, `display.platforms` and the board's worker cap
-  ([`tuning.maxInProgress`](#specharnesstuning)) already land on this profile. The rest of `kanban`
+  machine-global, so `platforms.*`, `display.platforms`, the board's worker cap
+  ([`tuning.maxInProgress`](#specharnesstuning)) and the dispatcher's memory admission
+  ([`tuning.admission`](#specharnesstuning)) already land on this profile. The rest of `kanban`
   does have to follow the gateway, because the dispatcher and the notifier run in the gateway
   process and read their settings from its own home. The board itself does not move — Hermes
   anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
@@ -765,7 +780,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper. A sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it. The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
-- `resources` — requests and limits for the agent container, replacing the operator's defaults as a block.
+- `resources` — requests and limits for the agent container, replacing the operator's defaults as a block. The memory request is also the dispatcher's default admission budget ([`tuning.admission`](#specharnesstuning)), so raising it admits more workers at once.
 - `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`; [`spec.deployment.credentialProxy.resources`](#specdeploymentcredentialproxyresources) has the defaults it keeps, what the operator refuses, and what admission warns about.
 - `agentAPIAuth.resources` — requests and limits for the `agent-api-auth` sidecar in the gateway pod, the native container that authenticates the agent's API-server calls and also runs the event watcher and the drift detector. Merged over the operator's defaults per key, like `credentialProxy.resources`: a CR that sets only `limits.memory` keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and 2Gi ephemeral-storage limit.
 
@@ -1640,6 +1655,9 @@ _and_ beyond the agent's own repair:
 - `model.*`, `platforms.*`, `approvals.cron_mode` and `display.platforms`;
 - `kanban.max_in_progress`: the board is shared by every profile, and a burst of workers past it is
   lost to the OOM killer without a restart or an event;
+- `kanban.admission`: the dispatcher's memory budget, worker cap, queue bound and fail-closed
+  switch, from `spec.harness.tuning.admission`; the board is shared and an eviction is pod-wide, so
+  no profile may admit past the pod's request;
 - `terminal.*`: where the shell runs, one sandbox per Pod, reached the same way by every profile;
 - `database.journal_mode`, when the agent Pod has a runtime class: one data volume per Pod, and a
   corrupted database is found only after the sessions in it are unreadable;

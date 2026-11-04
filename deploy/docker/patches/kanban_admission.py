@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
@@ -84,6 +83,15 @@ CAPACITY_KIND = "capacity"
 #: own process tree is the fallback when neither is mounted.
 CGROUP_V1_USAGE_PATH = "/sys/fs/cgroup/memory/memory.usage_in_bytes"
 CGROUP_V2_USAGE_PATH = "/sys/fs/cgroup/memory.current"
+#: Beside each usage counter, the cgroup's ``memory.stat``. A usage counter
+#: includes the file cache, which reclaim frees before anything is evicted;
+#: the kubelet evicts on the working set, usage less the inactive file cache,
+#: so the sampler subtracts the same key and reads as the kubelet does. A
+#: missing file or key subtracts nothing.
+CGROUP_V1_STAT_PATH = "/sys/fs/cgroup/memory/memory.stat"
+CGROUP_V2_STAT_PATH = "/sys/fs/cgroup/memory.stat"
+CGROUP_V1_INACTIVE_FILE_KEY = "total_inactive_file"
+CGROUP_V2_INACTIVE_FILE_KEY = "inactive_file"
 PROC_ROOT = "/proc"
 SOURCE_CGROUP_V1 = "cgroup-v1"
 SOURCE_CGROUP_V2 = "cgroup-v2"
@@ -92,11 +100,13 @@ SOURCE_UPSTREAM = "meminfo"
 
 #: ``/proc/<pid>/status`` carries the resident set as ``VmRSS:  <n> kB``.
 #: ``/proc/<pid>/stat`` carries, after the parenthesised command, the state,
-#: then the parent pid (the file's field 4) and the start time (field 22).
+#: then the parent pid (the file's field 4), the process group (field 5) and
+#: the start time (field 22).
 PROC_STATUS_FILE = "status"
 PROC_STAT_FILE = "stat"
 VMRSS_FIELD = "VmRSS:"
 STAT_PPID_INDEX = 1
+STAT_PGRP_INDEX = 2
 STAT_STARTTIME_INDEX = 19
 
 BYTES_PER_KIB = 1024
@@ -107,6 +117,7 @@ KIB_PER_MIB = 1024
 TOTAL_KEY = "mem_total_kib"
 AVAILABLE_KEY = "mem_available_kib"
 USAGE_KEY = "usage_kib"
+INACTIVE_FILE_KEY = "inactive_file_kib"
 SOURCE_KEY = "source"
 
 #: Upstream's levels (``gateway.memory_status.classify_pressure``).
@@ -138,8 +149,12 @@ WORKER_RESERVE_MIB = 512
 #: whose first element is the id (upstream's ``respawn_guarded``,
 #: ``skipped_per_profile_capped`` and ``spawned`` shapes). The lists only name
 #: the rows the ready loop reached, so a row behind an exhausted budget is
-#: asked the same questions again before it is refused.
-EXCLUDED_ID_FIELDS = ("skipped_unassigned", "skipped_nonspawnable")
+#: asked the same questions again before it is refused. ``queued_noticed`` is
+#: the sibling kanban_priority patch's list of the cards it told they are
+#: queued this tick: at the end of a tick that notice has already been posted,
+#: so a card on it is refused no earlier than the next limited tick and its
+#: thread reads the queued line before the refusal.
+EXCLUDED_ID_FIELDS = ("skipped_unassigned", "skipped_nonspawnable", "queued_noticed")
 EXCLUDED_TUPLE_FIELDS = ("respawn_guarded", "skipped_per_profile_capped", "spawned")
 #: The lane the respawn guard is asked about.
 READY_LANE = "ready"
@@ -157,9 +172,14 @@ REASON_OPTIONS = (
     f"{SCOPE_CLUSTERS} clusters), or use the scheduled report."
 )
 
-#: Events that return a card to the ready lane without closing a run. With the
-#: card's creation and its last run's end, they bound how long it has waited.
-READY_ENTRY_EVENT_KINDS = ("promoted", "promoted_manual", "unblocked", "assigned", "reassigned")
+#: Events that return a card to the ready lane without closing a run: a
+#: promotion, an unblock, an assignment, a reviewer's changes request, a review
+#: reopened, a manual status change and a reclaim. With the card's creation and
+#: its last run's end, they bound how long it has waited.
+READY_ENTRY_EVENT_KINDS = (
+    "promoted", "promoted_manual", "unblocked", "assigned", "reassigned",
+    "changes_requested", "review_reopened", "status", "reclaimed",
+)
 
 _READY_ENTRY_PLACEHOLDERS = ", ".join("?" for _ in READY_ENTRY_EVENT_KINDS)
 
@@ -217,17 +237,18 @@ class _HermesEngine:
     def host_prefix(self) -> str:
         return self.db._host_prefix()
 
-    def pid_alive(self, pid: int) -> bool:
-        return bool(self.dispatch._pid_alive(pid))
-
     def kill_fn(self, signal_fn) -> Optional[Callable[[int, int], None]]:
         return self.dispatch._kill_fn(signal_fn)
 
-    def poll_worker_exit(self, pid: int) -> bool:
-        return bool(self.dispatch._poll_worker_exit(pid))
-
     def sigkill(self, kill, pid: int) -> bool:
         return bool(self.dispatch._sigkill(kill, pid))
+
+    def terminate(self, pid: int, claim_lock: str, signal_fn) -> dict:
+        """Upstream's kill ladder: SIGTERM, a short grace, SIGKILL; ``terminated`` says whether it worked."""
+        return dict(self.dispatch._terminate_reclaimed_worker(pid, claim_lock, signal_fn=signal_fn))
+
+    def survived(self, termination: Mapping[str, Any]) -> bool:
+        return bool(self.dispatch._worker_survived_termination(termination))
 
     def block_task(self, conn, task_id: str, *, reason: str, kind: str, expected_run_id=None) -> bool:
         return bool(
@@ -342,6 +363,19 @@ def _read_int_file(path: str) -> Optional[int]:
         return None
 
 
+def _read_stat_key(path: str, key: str) -> Optional[int]:
+    """The value of ``key`` in a ``<key> <value>`` file such as ``memory.stat``."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                name, _, value = line.partition(" ")
+                if name == key:
+                    return int(value.strip())
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def _proc_path(proc_root: str, pid: int, name: str) -> str:
     return os.path.join(proc_root, str(int(pid)), name)
 
@@ -427,22 +461,35 @@ def container_memory_sample(
     *,
     cgroup_v1_path: str = CGROUP_V1_USAGE_PATH,
     cgroup_v2_path: str = CGROUP_V2_USAGE_PATH,
+    cgroup_v1_stat_path: str = CGROUP_V1_STAT_PATH,
+    cgroup_v2_stat_path: str = CGROUP_V2_STAT_PATH,
     proc_root: str = PROC_ROOT,
     own_pid: Optional[int] = None,
 ) -> Optional[dict]:
     """The container's memory in upstream's sample shape, against ``budget_mib``.
 
     ``mem_total_kib`` is the budget and ``mem_available_kib`` the budget less
-    what the container uses, so ``classify_pressure`` reads the budget the way
-    it reads a host's ``MemTotal``. ``None`` when no counter can be read.
+    the container's working set, so ``classify_pressure`` reads the budget the
+    way it reads a host's ``MemTotal``. The working set is the cgroup's usage
+    less its inactive file cache, the kubelet's eviction figure; a process
+    tree's resident set has no cache to subtract. ``None`` when no counter can
+    be read.
     """
     budget_kib = int(budget_mib) * KIB_PER_MIB
     usage_kib = None
+    inactive_file_kib = 0
     source = None
-    for path, name in ((cgroup_v1_path, SOURCE_CGROUP_V1), (cgroup_v2_path, SOURCE_CGROUP_V2)):
+    counters = (
+        (cgroup_v1_path, cgroup_v1_stat_path, CGROUP_V1_INACTIVE_FILE_KEY, SOURCE_CGROUP_V1),
+        (cgroup_v2_path, cgroup_v2_stat_path, CGROUP_V2_INACTIVE_FILE_KEY, SOURCE_CGROUP_V2),
+    )
+    for path, stat_path, inactive_key, name in counters:
         usage = _read_int_file(path)
         if usage is not None and usage >= 0:
-            usage_kib, source = usage // BYTES_PER_KIB, name
+            inactive_file = _read_stat_key(stat_path, inactive_key) or 0
+            inactive_file_kib = max(0, inactive_file) // BYTES_PER_KIB
+            usage_kib = max(0, usage // BYTES_PER_KIB - inactive_file_kib)
+            source = name
             break
     if usage_kib is None:
         usage_kib = process_tree_rss_kib(os.getpid() if own_pid is None else own_pid, proc_root=proc_root)
@@ -453,6 +500,7 @@ def container_memory_sample(
         TOTAL_KEY: budget_kib,
         AVAILABLE_KEY: max(0, budget_kib - usage_kib),
         USAGE_KEY: usage_kib,
+        INACTIVE_FILE_KEY: inactive_file_kib,
         SOURCE_KEY: source,
     }
 
@@ -693,28 +741,57 @@ def _descendant_identities(pid: int, *, proc_root: str) -> list:
     ]
 
 
-def _stop_worker(engine, pid: int, signal_fn, *, proc_root: str) -> dict:
-    """SIGTERM, a short grace, SIGKILL if it stays, then the descendants that outlived it.
+def _group_members(pid: int, *, proc_root: str) -> list:
+    """Every other process in ``pid``'s process group that exists now.
 
-    Upstream's ``enforce_max_runtime`` sequence, plus the orphans: a worker's
-    tool subprocesses hold the memory as much as the worker does.
+    The dispatcher starts a worker as a session leader, so its group id is
+    its pid, and what the worker forks without a session of its own, the ssh
+    client of a terminal command among them, stays in the group.
     """
-    outcome = {"pid": int(pid), "sigterm": False, "sigkill": False, "orphans_killed": []}
+    members: list = []
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return members
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == int(pid):
+            continue
+        if _stat_field(proc_root, int(entry), STAT_PGRP_INDEX) == str(int(pid)):
+            members.append(int(entry))
+    return members
+
+
+def _stop_worker(engine, pid: int, claim_lock: str, signal_fn, *, proc_root: str) -> dict:
+    """Upstream's kill ladder on the worker, then whatever of its tree outlived it.
+
+    ``_terminate_reclaimed_worker`` sends SIGTERM, waits a short grace and
+    sends SIGKILL if the worker stays; ``terminated`` in its result says
+    whether the worker is gone. Then two sweeps, because a worker's tool
+    subprocesses hold the memory as much as the worker does: the descendants
+    snapshotted before the SIGTERM, each checked by start time so a reused pid
+    is not mistaken for one, and the live members of the worker's process
+    group, which catches a child forked during the grace window.
+    """
+    descendants = _descendant_identities(pid, proc_root=proc_root)
+    termination = engine.terminate(int(pid), claim_lock, signal_fn)
+    outcome = {
+        "pid": int(pid),
+        "terminated": bool(termination.get("terminated")),
+        "sigkill": bool(termination.get("sigkill")),
+        "orphans_killed": [],
+        "group_killed": [],
+        "termination": termination,
+    }
     kill = engine.kill_fn(signal_fn)
     if kill is None:
         return outcome
-    descendants = _descendant_identities(pid, proc_root=proc_root)
-    try:
-        kill(int(pid), signal.SIGTERM)
-        outcome["sigterm"] = True
-    except (ProcessLookupError, OSError):
-        pass
-    if not engine.poll_worker_exit(pid) and engine.pid_alive(pid):
-        outcome["sigkill"] = engine.sigkill(kill, pid)
     for member, started in descendants:
         if started is not None and _stat_field(proc_root, member, STAT_STARTTIME_INDEX) == started:
             if engine.sigkill(kill, member):
                 outcome["orphans_killed"].append(member)
+    for member in _group_members(pid, proc_root=proc_root):
+        if member not in outcome["orphans_killed"] and engine.sigkill(kill, member):
+            outcome["group_killed"].append(member)
     return outcome
 
 
@@ -724,8 +801,10 @@ def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[Admissio
 
     Mirrors ``enforce_max_runtime``: host-local claims only, kill with grace,
     then the card leaves ``running``, here through ``block_task`` with kind
-    ``capacity`` and the figures in the reason. ``signal_fn`` and ``rss_fn``
-    are test hooks. Returns the ids blocked.
+    ``capacity`` and the figures in the reason. A worker that survives the
+    ladder keeps its card, so a card is never blocked under a live worker; the
+    next tick measures it again. ``signal_fn`` and ``rss_fn`` are test hooks.
+    Returns the ids blocked.
     """
     engine = engine or _ENGINE
     stopped: list = []
@@ -745,7 +824,14 @@ def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[Admissio
             rss_kib = rss_fn(pid) if rss_fn is not None else process_tree_rss_kib(pid, proc_root=proc_root)
             if rss_kib is None or rss_kib <= cap_kib:
                 continue
-            outcome = _stop_worker(engine, pid, signal_fn, proc_root=proc_root)
+            outcome = _stop_worker(engine, pid, lock, signal_fn, proc_root=proc_root)
+            if engine.survived(outcome["termination"]):
+                logger.warning(
+                    "%s worker %s of %s is over the cap and survived termination (%s); "
+                    "the card stays running and the next tick tries again",
+                    LOG_PREFIX, pid, task_id, outcome,
+                )
+                continue
             reason = capacity_reason(
                 f"the worker used {rss_kib // KIB_PER_MIB:,} MiB against the {cap_mib:,} MiB cap"
             )

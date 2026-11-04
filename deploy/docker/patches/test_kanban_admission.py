@@ -171,6 +171,8 @@ class FakeEngine:
         self._guarded = guarded or {}
         #: Pids that exit on SIGTERM; the others need SIGKILL.
         self.dies_on_term = set()
+        #: Pids that survive SIGKILL too (a worker in uninterruptible sleep).
+        self.immortal = set()
         #: Called as ``on_kill(pid, sig)`` after a signal lands, for a test
         #: that changes the world while the worker dies.
         self.on_kill = None
@@ -188,7 +190,7 @@ class FakeEngine:
         if pid not in self.alive:
             raise ProcessLookupError(pid)
         self.kills.append((pid, sig))
-        if sig == signal.SIGKILL or pid in self.dies_on_term:
+        if (sig == signal.SIGKILL and pid not in self.immortal) or pid in self.dies_on_term:
             self.alive.discard(pid)
         if self.on_kill is not None:
             self.on_kill(pid, sig)
@@ -202,6 +204,40 @@ class FakeEngine:
         except (ProcessLookupError, OSError):
             return False
         return True
+
+    def terminate(self, pid, claim_lock, signal_fn):
+        """Upstream's ``_terminate_reclaimed_worker`` over the fake kill."""
+        info = {"prev_pid": pid, "host_local": False, "termination_attempted": False,
+                "terminated": False, "sigkill": False}
+        if not str(claim_lock).startswith(self.host_prefix()):
+            return info
+        info["host_local"] = True
+        kill = self.kill_fn(signal_fn)
+        info["termination_attempted"] = True
+        try:
+            kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            info["terminated"] = True
+            return info
+        except OSError:
+            return info
+        if self.poll_worker_exit(pid):
+            info["terminated"] = True
+            return info
+        if self.pid_alive(pid):
+            if not self.sigkill(kill, pid):
+                return info
+            info["sigkill"] = True
+        info["terminated"] = not self.pid_alive(pid)
+        return info
+
+    @staticmethod
+    def survived(termination):
+        return bool(
+            termination.get("termination_attempted")
+            and termination.get("host_local")
+            and not termination.get("terminated")
+        )
 
     def block_task(self, conn, task_id, *, reason, kind, expected_run_id=None):
         if kind not in self.VALID_KINDS:
@@ -274,16 +310,18 @@ class FakeTree:
         self.proc.mkdir()
         self.v1 = str(self.root / "memory.usage_in_bytes")
         self.v2 = str(self.root / "memory.current")
+        self.v1_stat = str(self.root / "memory.stat.v1")
+        self.v2_stat = str(self.root / "memory.stat.v2")
 
     def close(self):
         self.tmp.cleanup()
 
-    def process(self, pid, *, ppid, rss_kib=None, starttime=1000, comm="python3"):
+    def process(self, pid, *, ppid, rss_kib=None, starttime=1000, comm="python3", pgrp=0):
         here = self.proc / str(pid)
         here.mkdir()
         # pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt
         # utime stime cutime cstime priority nice threads itrealvalue starttime ...
-        tail = ["S", str(ppid)] + ["0"] * 17 + [str(starttime), "0", "0"]
+        tail = ["S", str(ppid), str(pgrp)] + ["0"] * 16 + [str(starttime), "0", "0"]
         (here / "stat").write_text(f"{pid} ({comm}) " + " ".join(tail) + "\n")
         lines = [f"Name:\t{comm}", "State:\tS (sleeping)", f"Pid:\t{pid}", f"PPid:\t{ppid}"]
         if rss_kib is not None:
@@ -302,6 +340,12 @@ class FakeTree:
 
     def cgroup_v2(self, text):
         Path(self.v2).write_text(text)
+
+    def cgroup_v1_stat(self, text):
+        Path(self.v1_stat).write_text(text)
+
+    def cgroup_v2_stat(self, text):
+        Path(self.v2_stat).write_text(text)
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +468,7 @@ class SampleTest(unittest.TestCase):
     def take(self, budget_mib=2048):
         return admission.container_memory_sample(
             budget_mib, cgroup_v1_path=self.tree.v1, cgroup_v2_path=self.tree.v2,
+            cgroup_v1_stat_path=self.tree.v1_stat, cgroup_v2_stat_path=self.tree.v2_stat,
             proc_root=str(self.tree.proc), own_pid=100,
         )
 
@@ -435,6 +480,42 @@ class SampleTest(unittest.TestCase):
         self.assertEqual(got["usage_kib"], 836599808 // 1024)
         self.assertEqual(got["mem_total_kib"], 2048 * MIB)
         self.assertEqual(got["mem_available_kib"], 2048 * MIB - 836599808 // 1024)
+        # No memory.stat beside it: nothing is subtracted, the raw counter stands.
+        self.assertEqual(got["inactive_file_kib"], 0)
+
+    def test_the_inactive_file_cache_is_not_held_memory(self):
+        """A warm file cache is reclaimed before anything is evicted; the kubelet's
+        working set leaves it out, and so does the sampler."""
+        self.tree.cgroup_v2(f"{1800 * MIB * 1024}\n")
+        self.tree.cgroup_v2_stat(
+            f"anon {850 * MIB * 1024}\nfile {950 * MIB * 1024}\n"
+            f"active_file {50 * MIB * 1024}\ninactive_file {900 * MIB * 1024}\nslab_reclaimable 1024\n"
+        )
+        got = self.take()
+        self.assertEqual(got["source"], "cgroup-v2")
+        self.assertEqual(got["inactive_file_kib"], 900 * MIB)
+        self.assertEqual(got["usage_kib"], 900 * MIB)
+        self.assertEqual(got["mem_available_kib"], (2048 - 900) * MIB)
+
+    def test_cgroup_v1_subtracts_the_hierarchy_total_only(self):
+        self.tree.cgroup_v1(f"{1000 * MIB * 1024}\n")
+        self.tree.cgroup_v1_stat(
+            f"cache {400 * MIB * 1024}\ninactive_file {100 * MIB * 1024}\n"
+            f"total_inactive_file {300 * MIB * 1024}\n"
+        )
+        got = self.take()
+        self.assertEqual((got["source"], got["usage_kib"], got["inactive_file_kib"]),
+                         ("cgroup-v1", 700 * MIB, 300 * MIB))
+
+    def test_a_cache_larger_than_the_counter_leaves_zero_not_a_negative(self):
+        self.tree.cgroup_v2(f"{100 * MIB * 1024}\n")
+        self.tree.cgroup_v2_stat(f"inactive_file {200 * MIB * 1024}\n")
+        self.assertEqual(self.take()["usage_kib"], 0)
+
+    def test_a_malformed_stat_value_subtracts_nothing(self):
+        self.tree.cgroup_v2(f"{1024 * MIB * 1024}\n")
+        self.tree.cgroup_v2_stat("inactive_file lots\n")
+        self.assertEqual(self.take()["usage_kib"], 1024 * MIB)
 
     def test_cgroup_v2_when_v1_is_absent(self):
         self.tree.cgroup_v2(f"{1024 * 1024 * 1024}\n")
@@ -740,6 +821,40 @@ class RssCapTest(unittest.TestCase):
         self.assertEqual(got, ["t_sum"])
         self.assertIn("2,000 MiB against the 1,536 MiB cap", engine.blocks[0][2])
 
+    def test_a_worker_that_survives_the_ladder_keeps_its_card_this_tick(self):
+        """SIGKILL did not take (uninterruptible sleep): the card is not blocked
+        under a live worker; the next tick measures and tries again."""
+        conn = board()
+        running(conn, "t_immortal", pid=33)
+        engine = FakeEngine(alive={33})
+        engine.immortal = {33}
+        with self.assertLogs(admission.logger, level="WARNING") as logs:
+            got = self.enforce(conn, engine, {33: 4000})
+        self.assertEqual(got, [])
+        self.assertEqual(engine.kills, [(33, signal.SIGTERM), (33, signal.SIGKILL)])
+        self.assertEqual((status(conn, "t_immortal"), engine.blocks), ("running", []))
+        self.assertTrue(any("survived termination" in line for line in logs.output))
+
+    def test_the_workers_process_group_is_swept_for_a_child_forked_in_the_grace(self):
+        """A child forked after the descendants snapshot is reparented when the
+        worker dies, so the parent-field walk no longer finds it; its process
+        group still names the worker, and that pass kills it."""
+        tree = FakeTree()
+        self.addCleanup(tree.close)
+        tree.process(1, ppid=0, rss_kib=1)
+        tree.process(700, ppid=1, rss_kib=2000 * MIB, pgrp=700)
+        tree.process(701, ppid=1, rss_kib=100 * MIB, pgrp=700)
+        tree.process(702, ppid=1, rss_kib=100 * MIB, pgrp=702)
+        conn = board()
+        running(conn, "t_grp", pid=700)
+        engine = FakeEngine(alive={700, 701, 702})
+        engine.dies_on_term = {700}
+        got = admission.enforce_worker_rss_caps(
+            conn, settings=settings(worker_rss_cap_mib=1536), engine=engine, proc_root=str(tree.proc),
+        )
+        self.assertEqual(got, ["t_grp"])
+        self.assertEqual(engine.kills, [(700, signal.SIGTERM), (701, signal.SIGKILL)])
+
     def test_a_failing_block_never_raises_into_the_tick(self):
         conn = board()
         running(conn, "t_a", pid=21)
@@ -856,6 +971,38 @@ class OverdueTest(unittest.TestCase):
         self.assertEqual(sorted(got), ["t_noise", "t_promoted"])
         self.assertIn("waited 200 s", blocks(conn, "t_promoted")[0]["reason"])
         self.assertEqual((status(conn, "t_retry"), status(conn, "t_unblocked")), ("ready", "ready"))
+
+    def test_a_review_sent_back_or_reopened_waits_from_that_event(self):
+        """Upstream's ``request_changes``, ``reopen_review_task``, a manual
+        status change and a reclaim return a card to ready with an event and
+        no new run, so the wait starts at the event, not at the old run's end."""
+        conn = board()
+        for tid, kind in (
+            ("t_changes", "changes_requested"), ("t_reopened", "review_reopened"),
+            ("t_status", "status"), ("t_reclaimed", "reclaimed"),
+        ):
+            ready(conn, tid, age=90000)
+            ended_run(conn, tid, NOW - 21600)
+            event(conn, tid, kind, NOW - 30)
+        ready(conn, "t_reopened_old", age=90000)
+        ended_run(conn, "t_reopened_old", NOW - 21600)
+        event(conn, "t_reopened_old", "review_reopened", NOW - 200)
+        got = self.refuse(conn)
+        self.assertEqual(got, ["t_reopened_old"])
+        self.assertIn("waited 200 s", blocks(conn, "t_reopened_old")[0]["reason"])
+        for tid in ("t_changes", "t_reopened", "t_status", "t_reclaimed"):
+            with self.subTest(tid=tid):
+                self.assertEqual(status(conn, tid), "ready")
+
+    def test_a_card_told_it_is_queued_this_tick_is_refused_no_earlier_than_the_next(self):
+        """At the end of a tick the sibling patch has already posted the queued
+        line; the refusal waits for the next limited tick so the thread reads
+        them in that order."""
+        conn = board()
+        ready(conn, "t_noticed", age=600)
+        self.assertEqual(self.refuse(conn, result(queued_noticed=["t_noticed"])), [])
+        self.assertEqual(status(conn, "t_noticed"), "ready")
+        self.assertEqual(self.refuse(conn, result(queued_noticed=[])), ["t_noticed"])
 
     def test_claimed_running_and_blocked_rows_are_never_candidates(self):
         conn = board()

@@ -344,6 +344,58 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return _kb._pid_alive(pid)
 
 
+def _terminate_reclaimed_worker(
+    pid: Optional[int],
+    claim_lock: Optional[str],
+    *,
+    signal_fn=None,
+) -> dict[str, Any]:
+    """Best-effort host-local worker termination for reclaim paths."""
+    info: dict[str, Any] = {
+        "prev_pid": int(pid) if pid else None,
+        "host_local": False,
+        "termination_attempted": False,
+        "terminated": False,
+        "sigkill": False,
+    }
+    if not pid or pid <= 0 or not claim_lock:
+        return info
+    if not str(claim_lock).startswith(_kb._host_prefix()):
+        return info
+    info["host_local"] = True
+
+    kill = _kill_fn(signal_fn)
+    if kill is None:
+        return info
+
+    info["termination_attempted"] = True
+    try:
+        kill(int(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        info["terminated"] = True
+        return info
+    except OSError:
+        return info
+
+    if _poll_worker_exit(pid):
+        info["terminated"] = True
+        return info
+    if _kb._pid_alive(pid):
+        if not _sigkill(kill, pid):
+            return info
+        info["sigkill"] = True
+    info["terminated"] = not _kb._pid_alive(pid)
+    return info
+
+
+def _worker_survived_termination(termination: dict) -> bool:
+    return bool(
+        termination.get("termination_attempted")
+        and termination.get("host_local")
+        and not termination.get("terminated")
+    )
+
+
 def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
     return []
 

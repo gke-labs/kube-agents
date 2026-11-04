@@ -14,20 +14,22 @@ times in four days on the development install.
 Safe throttling has three goals. Never crash a container. Never starve one class of work. Tell a
 requester that it is throttled, with a reason and the alternatives.
 
-The first pull request adds four mechanisms to the dispatcher. It reads the container's own memory
-use and starts no worker when memory is short. It stops a worker whose processes grow past a cap.
-It refuses a card that waited too long for a slot. Each refusal blocks the card with the new kind
+The first change adds four mechanisms to the dispatcher. It reads the container's own memory use
+and starts no worker when memory is short. It stops a worker whose processes grow past a cap. It
+refuses a card that waited too long for a slot. Each refusal blocks the card with the new kind
 `capacity` and a reason the requester can act on. When the dispatcher cannot read memory, it starts
 nothing and logs why. Four settings on the `PlatformAgent` resource tune the mechanisms. Each
-setting has a default. Later pull requests add a budget per class of work, a cost estimate before a
+setting has a default. Later changes add a budget per class of work, a cost estimate before a
 request starts, the same refusal in the credential proxy, and metrics.
 
 ## Status
 
-Design, 2026-11-04. Nothing in this document is on `main`. The first pull request (PR 1 below)
-carries the dispatcher patch, the operator's fields and this document; it changes nothing an agent
-says or decides. The tracker entries, the measurements and the sibling changes are listed under
-References.
+**Status:** design of record, written 2026-11-04 with the first change, which is built: the
+container sampler, the pressure guard that fails closed, the headroom cap on a tick's spawns, the
+resident cap per worker, the refusal by queue age, the `capacity` block kind and the four
+`spec.harness.tuning.admission` fields. Not built: the rest of Stage 1 (the front door's reply for
+`capacity`, the cost estimate, hysteresis) and Stage 2. The first change edits no SOUL, prompt or
+SOP. The tracker entries, the measurements and the sibling changes are listed under References.
 
 ## Goals
 
@@ -43,9 +45,9 @@ References.
 
 - Sizing the container. The raise of the memory request from 2 GiB to 4 GiB is a separate change;
   this design takes the resolved request as given and derives its budget from it.
-- A change to what an agent says or decides. PR 1 edits no SOUL, prompt or SOP. The front door
-  answers a `capacity` block with the rule it already has for a blocked card; the reply written for
-  `capacity` is the next change in Stage 1.
+- A change to what an agent says or decides. The first change edits no SOUL, prompt or SOP. The
+  front door answers a `capacity` block with the rule it already has for a blocked card; the reply
+  written for `capacity` is the next change in Stage 1.
 - Admission inside the credential proxy. The broker has its slot cap, its child memory budget and
   its resource watermark gate
   ([`credential-proxy-child-memory-budget.md`](credential-proxy-child-memory-budget.md),
@@ -98,14 +100,14 @@ Non-functional:
 
 Where each lands:
 
-| Stage               | Requirements                                                                                 | Shape                                                    |
-| ------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Stage 0             | R9, the restart alert, the request raise                                                     | no new machinery; separate changes                       |
-| Stage 1, PR 1       | R1, R2, R4, R8, N1; the one-tick hold of N3; the `capacity` kind and the reason R6 relies on | the dispatcher patch, the operator fields, this document |
-| Stage 1, after PR 1 | R3, the front door's reply of R6, hysteresis (N3), the cases of N4                           | a SOUL rule, the estimate, eval cases                    |
-| Stage 2             | R5, R7, N2, the soak                                                                         | class budgets, the proxy's refusal, metrics              |
+| Stage                  | Requirements                                                                                 | Shape                                                    |
+| ---------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| Stage 0                | R9, the restart alert, the request raise                                                     | no new machinery; separate changes                       |
+| Stage 1, first change  | R1, R2, R4, R8, N1; the one-tick hold of N3; the `capacity` kind and the reason R6 relies on | the dispatcher patch, the operator fields, this document |
+| Stage 1, later changes | R3, the front door's reply of R6, hysteresis (N3), the cases of N4                           | a SOUL rule, the estimate, eval cases                    |
+| Stage 2                | R5, R7, N2, the soak                                                                         | class budgets, the proxy's refusal, metrics              |
 
-## What is true on `main` today
+## The state before the first change
 
 ### The container's counters under GKE Sandbox
 
@@ -176,7 +178,7 @@ eviction fires at the request.
 In the dispatcher, none of these reads the container's memory, none refuses a card with a reason
 the requester can act on, and none keeps one class of work from taking another class's memory.
 
-## The mechanism, by layer, in PR 1
+## The mechanism, by layer, in the first change
 
 Every mechanism lands in one patch under `deploy/docker/patches/`, beside the scheduling patch,
 anchored on the upstream functions named below, and in the operator's rendering of the managed
@@ -194,6 +196,15 @@ The dispatcher's guard gets a sampler of its own. It reads usage from the first 
    per process and counts no page cache, and it misses a process outside the tree, so it is the
    floor of the chain, not a peer of the two cgroup files; the readings step under Verification
    holds it to within 10% of the kubelet's view before the fallback is relied on.
+
+From a cgroup counter the sampler subtracts the inactive file cache the same cgroup's `memory.stat`
+reports (`total_inactive_file` under v1, `inactive_file` under v2). A usage counter includes the
+file cache, which reclaim frees before anything is evicted; the kubelet evicts on the working set,
+usage less that cache, so the sampler reads the figure the eviction reads, and a warm cache of
+clones and binaries is not pressure. A missing file or key subtracts nothing. The sibling cgroup v2
+patch subtracts both file lists and reclaimable slab for upstream's node-level thresholds; the
+dispatcher's sampler subtracts exactly what the kubelet does, because the request is where the
+kubelet acts.
 
 The sampler hands `classify_pressure` two numbers: `total = memory_budget_mib` and
 `available = memory_budget_mib - usage`. The classifier and its thresholds stay as upstream ships
@@ -217,8 +228,8 @@ that describes the sandbox's memory is a smaller problem and a separate change.
 `_tick_spawn_budget()` keeps its shape: `critical` spawns nothing this tick and the cards wait;
 `elevated` spawns at most one. What changes is `unknown`. With `fail_closed: true`, the default, a
 tick whose sampler read no source spawns nothing and logs
-`kanban admission: memory counters unreadable (<cause>); spawning nothing this tick`, once per
-tick. With `fail_closed: false` the tick behaves as upstream's: no restriction.
+`kanban admission: memory pressure is unknown (<cause>); fail_closed is on, so this tick spawns nothing`,
+once per tick. With `fail_closed: false` the tick behaves as upstream's: no restriction.
 
 The reason to close: the dispatcher that cannot see memory and spawns anyway is the dispatcher that
 evicted the pod. The chain of sources ends at `/proc/self/status`, readable wherever the dispatcher
@@ -234,14 +245,20 @@ worker reading a readiness report over the whole scope grows past 3 GiB, and not
 stops it. The cap is what stops a single runaway in flight.
 
 Each tick, in the reclaim phase after `enforce_max_runtime()`, the dispatcher sums `VmRSS` over
-each running worker's pid and its descendants, found through `/proc/<pid>/task/<tid>/children`
-where the kernel exposes it and through the parent field of `/proc/*/stat` otherwise, and compares
-the sum with `worker_rss_cap_mib`. A worker over the cap is stopped the way `enforce_max_runtime()`
-stops one: SIGTERM, `_poll_worker_exit`, `_sigkill`. Then, in one write transaction, its card is
-blocked with `block_task(..., kind="capacity")` and its run ended as `blocked`. Not `timed_out`: a
-timed-out card is returned to its source phase for the next tick to spawn again, into the same
-wall. The scope is the claims this host made, by the `claim_lock` prefix, as `enforce_max_runtime()`
-scopes itself.
+each running worker's pid and its descendants, found through the parent field of `/proc/*/stat`
+(gVisor does not expose `/proc/<pid>/task/<tid>/children`, and one walk that reads on both runtimes
+beats two), and compares the sum with `worker_rss_cap_mib`. A worker over the cap is stopped the way
+a reclaim stops one, through upstream's `_terminate_reclaimed_worker`: SIGTERM, a short grace,
+SIGKILL if it stays, and a result that says whether the worker is gone. Then two sweeps, because a
+worker's tool subprocesses hold the memory as much as the worker does: the descendants snapshotted
+before the SIGTERM, each checked by start time so a reused pid is not mistaken for one, and the live
+members of the worker's process group, which is how a child forked during the grace is caught (the
+dispatcher starts a worker as a session leader, so the group is its pid). A worker that survives the
+ladder keeps its card and is measured again next tick, so a card is never blocked under a live
+worker. Then, in one write transaction, its card is blocked with `block_task(..., kind="capacity")`
+and its run ended as `blocked`. Not `timed_out`: a timed-out card is returned to its source phase
+for the next tick to spawn again, into the same wall. The scope is the claims this host made, by the
+`claim_lock` prefix, as `enforce_max_runtime()` scopes itself.
 
 The reason reads, for example: `capacity: the worker used 1,612 MiB against the 1,536 MiB cap; the install cannot take this now. Options: wait for the queue to drain, ask for a smaller scope (at most 10 clusters), or use the scheduled report.`
 
@@ -254,22 +271,31 @@ its children are workers of their own, spawned by the dispatcher, not descendant
 ### 4. The refusal by queue age
 
 A card that waits for a slot costs nothing while it waits, and it starts eventually. What it costs
-is the user's time. The chat band for a delegated answer is three minutes; a card still queued at
-two minutes cannot meet it, and a strategy change, the scheduled report or a smaller scope, serves
-the user better than an answer twenty minutes later.
+is the user's time. The success criteria ask for a simple question answered under one minute and
+a first acknowledgement within ten seconds
+([`kube-agents-success-criteria.md`](../kube-agents-success-criteria.md), SC3 and SC4), and a
+delegated answer spends about forty seconds in worker start and model turns after its card is
+spawned (the per-phase breakdown there). A card still queued at two minutes is past any answer the
+user is waiting for, and a strategy change, the scheduled report or a smaller scope, serves the
+user better than an answer twenty minutes later. Two minutes is 24 ticks at the 5 s dispatch
+interval: 24 chances to spawn before the refusal.
 
 After the ready and review loops, before the tick returns, the dispatcher walks the ready rows it
 did not spawn and blocks, with kind `capacity`, each one older than `queue_bound_seconds` whose
-reason for waiting was memory pressure (the tick's early return) or an exhausted slot budget (the
-loop's break). It never refuses a card it skipped as unassigned, non-spawnable, respawn-guarded or
+reason for waiting was memory (the tick's early return, or the headroom cap on its spawns), an
+exhausted slot budget (the loop's break) or the scheduling patch's per-class reservation holding it
+back. It never refuses a card it skipped as unassigned, non-spawnable, respawn-guarded or
 per-profile capped: those are routing and quota states, and a `capacity` reason would name the
-wrong cause and send the user the wrong alternatives. The age is the time since the card became
-ready: its creation for a card created ready, the promotion that moved it out of `todo` otherwise.
-The reason follows the same shape: `capacity: this request waited 2 minutes for a worker slot; the install cannot take it now. Options: ...`.
+wrong cause and send the user the wrong alternatives. The age is the time since the card last
+entered the ready lane: the latest of its creation, the end of its last run, and the event that
+returned it to the lane (a promotion, an unblock, an assignment, a reviewer's changes request, a
+review reopened, a manual status change, a reclaim). The reason follows the same shape:
+`capacity: the card waited 300 s for a worker slot against the 120 s bound; the install cannot take this now. Options: ...`.
 
 A card refused this way is not retried on its own. `kanban_unblock` returns it to `ready` and its
 wait starts again. The `⏳ Queued` line of the scheduling patch is the first thing a waiting user
-card's thread shows; the refusal is the second, two minutes later.
+card's thread shows; a card told it is queued in a tick is not refused in that tick, so the refusal
+is a later line, at the bound or the first limited tick after it.
 
 ### 5. The `capacity` kind and its reason
 
@@ -278,7 +304,7 @@ card's thread shows; the refusal is the second, two minutes later.
 recurrence count, and a second block of the same kind after an unblock reaches
 `BLOCK_RECURRENCE_LIMIT` (2) and routes the card to `triage` for a human.
 
-The reason is one sentence of fact and one of options, in the requester's terms: MiB, minutes,
+The reason is one sentence of fact and one of options, in the requester's terms: MiB, seconds,
 clusters. No process id, file name or setting key, because the front door relays it in its own
 voice and must not have to translate it. The notifier's blocked wake carries it to the front door
 unchanged, and the front door's existing rule for a blocked card produces a reply from it with no
@@ -293,7 +319,9 @@ reads `kanban.max_in_progress`. The operator pins them in the managed scope: the
 `platform-agent-config` ConfigMap's `managed-config.yaml` key, mounted at `/etc/hermes`, rendered
 in [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go)
 beside `max_in_progress`. The operator always renders the block with all four keys, defaults
-applied in Go, so the dispatcher never defaults them and one file states the numbers in force.
+applied in Go, so the numbers in force are the operator's. The patch keeps a copy of the three
+constants for a key that is missing or malformed, held equal to the operator's by
+[`tests/test_kanban_admission_defaults_parity.py`](../../tests/test_kanban_admission_defaults_parity.py).
 
 The CR carries them as `spec.harness.tuning.admission`, type `AdmissionSpec`, four optional
 pointers beside `maxInProgress` in `TuningSpec`
@@ -311,7 +339,7 @@ spec:
         failClosed: true
 ```
 
-### 7. The tick after PR 1
+### 7. The tick after the first change
 
 1. The reclaim phase: zombies, stale claims, orphans, crashed workers, `enforce_max_runtime()`, the
    per-worker cap, then `recompute_ready`. The cap runs before promotion so that a card it blocks is
@@ -327,7 +355,7 @@ spec:
 | ---------------------------- | ------------------- | ----------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `memory_budget_mib`          | `memoryBudgetMiB`   | the agent container's resolved memory request in MiB; 2,048 today | 512 to 65,536 | on Autopilot the request is where the eviction fires, and a budget at the limit admits 8 GiB of work into a pod evicted at 2; following the resolved request means a raise of it, through `spec.deployment.resources` or a new operator default, moves the budget with it; the floor keeps a mistyped value from closing admission, and the ceiling is above any node the install runs on              |
 | `worker_rss_cap_mib`         | `workerRssCapMiB`   | 1,536                                                             | 256 to 65,536 | an idle worker is about 430 MiB and a long poll loop grows past 1 GiB; 1.5 GiB leaves a fleet-sized card room and stops a runaway before it alone carries the pod from its 1.8 GiB idle set past a 4 GiB request; under a 2 GiB request the pressure guard acts first; the floor is below an idle worker on purpose, for a test install, and a value under 430 stops every worker as its proxies start |
-| `queue_bound_seconds`        | `queueBoundSeconds` | 120                                                               | 10 to 3,600   | the chat band is a delegated answer under three minutes, and a card still queued at two cannot meet it; the floor is two ticks, so no card is refused before the dispatcher has tried twice; the ceiling is an hour, past which a refusal tells the user nothing                                                                                                                                       |
+| `queue_bound_seconds`        | `queueBoundSeconds` | 120                                                               | 10 to 3,600   | two minutes is 24 ticks at the 5 s dispatch interval, and a card still queued then is past the one-minute answer the success criteria set for a simple question, so a strategy change serves the user better; the floor is two ticks, so no card is refused before the dispatcher has tried twice; the ceiling is an hour, past which a refusal tells the user nothing                                 |
 | `fail_closed`                | `failClosed`        | `true`                                                            |               | a dispatcher that cannot read memory and spawns anyway is the one that evicted the pod; the chain of sources ends at `/proc/self/status`, so the closed state marks a real fault, which the log names; `false` is the way out where the fault is permanent and accepted                                                                                                                                |
 
 ## What later stages add
@@ -387,38 +415,46 @@ the foreground run cut by the tool-call guard killed with its process tree (R9).
    and leaves the tree: an undercount, and the pressure guard, which reads the whole container,
    still holds. A page shared between a worker's processes is counted once per process: an
    overcount, and the worker is stopped a little early.
-6. gVisor does not expose `/proc/<pid>/task/<tid>/children`. The walk falls back to the parent
-   field of `/proc/*/stat`. If neither answers, the tree is the worker pid alone, about half of the
-   worker's footprint (`hermes chat` is 207 of the 430 MiB), and the sampler logs that at startup.
+6. gVisor does not expose `/proc/<pid>/task/<tid>/children`, so the walk reads the parent field of
+   `/proc/*/stat`, on both runtimes. Where `/proc` itself is unreadable the tree is the worker pid
+   alone, about half of the worker's footprint (`hermes chat` is 207 of the 430 MiB), and the sum is
+   a floor; the pressure guard, which reads the whole container, still holds.
 7. The refused card comes back. The front door's current rule ends on a retry question; a user who
    says yes refiles the request, which waits two minutes and is refused again. A card unblocked and
    refused again, rather than refiled, reaches the recurrence limit and routes to `triage`. Both
    are the state until the `capacity` reply rule lands, and both tell the user why each time.
-8. The front door's reply. PR 1 relies on the generic blocked-card rule; the reason text carries the
+8. The front door's reply. The first change relies on the generic blocked-card rule; the reason text carries the
    options so that the reply names them; the rule itself is not written for `capacity` until the
    next change.
 9. The dashboard's memory banner. It keeps reading `/proc/meminfo` through `sample_memory()` and
    describes the sandbox's 10.25 GiB, not the container; the banner is wrong today and stays wrong
-   after PR 1 (open question 9).
+   after the first change (open question 9).
 
 ## Verification
 
-### What PR 1 carries
+### What the first change carries
 
 Tests, in the sense of [`AGENTS.md`](../../AGENTS.md) "Where Tests Go": no model in the loop, run
 on every pull request.
 
 - Beside the patch: the sampler against fixture directories for cgroup v1, cgroup v2 and the
-  `/proc` sum, in that order of preference; the classification arithmetic at 2,048 and 4,096 MiB;
-  the RSS walk over a fixture `/proc` tree with a reparented child; the four exclusions of the pass
-  by queue age; `fail_closed` on and off; the reason text's shape; the `capacity` kind through
-  `block_task` and `_route_block`.
+  `/proc` sum, in that order of preference, with and without a `memory.stat` to subtract; the
+  classification arithmetic at 2,048 and 4,096 MiB; the headroom cap; the RSS walk over a fixture
+  `/proc` tree with a reparented child, a reused pid and a child left in the process group; a
+  worker that survives the ladder; the exclusions of the pass by queue age and its clock over every
+  lane-entry event; `fail_closed` on and off; the reason text's shape; the `capacity` kind through
+  `block_task` and `_route_block`; and the verifier's drive of the patched dispatcher over a fixture
+  tree, run again against the image's tree in the build.
 - In the operator: the four keys always rendered with their defaults, the budget following a CR
-  `resources` override, the CRD's bounds, the chart's CRD copy in step (`make chart-check`).
-- The red-to-green loop of
-  [`eval_driven_development.md`](../../.agents/rules/eval_driven_development.md) for the runtime
-  path PR 1 changes: the runaway worker (item 3 below), red on `main` with the pod evicted or the
-  worker run to the end, green three times with a `capacity` block inside the bound and no restart.
+  `resources` override, the CRD's bounds, the chart's CRD copy in step (`make chart-check`), and
+  the patch's copies of the defaults held to the operator's.
+- Under the eval rule
+  ([`eval_driven_development.md`](../../.agents/rules/eval_driven_development.md)) the first change
+  is a deterministic guard: no model call is in its path, and the text it emits is the reason,
+  which the front door reads under its existing blocked-card rule as it reads a `transient`
+  block's. The unit tests cover each input class it acts on and the pass-through. The cases with a
+  model in the loop are item 3 below; they land with the `capacity` reply rule, the first change to
+  what an agent says, and are graded against a worker the case can grow (open question 5).
 
 ### The plan, from the requirements
 
@@ -434,8 +470,9 @@ on every pull request.
 3. Fault injection, each a nightly eval case: one worker growing without bound; a burst of three
    fleet-wide requests over a 49-cluster scope; a cost estimate wrong by 3×; counters frozen; a user
    question every minute during a saturated sweep; a pod restarted by hand mid-sweep. Pass: zero
-   restarts or evictions, refusals within two minutes with the hint, the chat question inside its
-   band (in-turn under 20 s, delegated under 3 minutes), one report process per request. The cases
+   restarts or evictions, refusals within two minutes with the hint, the chat question inside the
+   success criteria's bands (a simple question under one minute, the acknowledgement within ten
+   seconds), one report process per request. The cases
    register in `hack/eval/nightly-cases.txt` under a domain row of their own in
    [`domains.yaml`](domains.yaml); the existing `capacity` domain grades node pools, not the
    install.
@@ -447,12 +484,14 @@ on every pull request.
 
 ## Open questions
 
-1. The age clock of the pass by queue age: this document counts from the card's entry to `ready`.
-   The implementer confirms which column or event carries that time on the pinned release.
+1. Settled in the first change: the age clock of the pass by queue age is the latest of the card's
+   creation, its last run's end and its last lane-entry event (`promoted`, `promoted_manual`,
+   `unblocked`, `assigned`, `reassigned`, `changes_requested`, `review_reopened`, `status`,
+   `reclaimed`), the events the pinned release writes when a card returns to `ready` without a run.
 2. A setting outside the sane range relative to the resolved resources (a budget above the limit,
    a cap above the budget): clamp in the operator, warn in the CR's status, or accept and log in the
    dispatcher. The bounds in the schema are absolute and cannot express the relation.
-3. Settled in PR 1: a tick's spawns under `ok` are bounded by the headroom divided by 512 MiB
+3. Settled in the first change: a tick's spawns under `ok` are bounded by the headroom divided by 512 MiB
    (upstream's `MEMORY_GUARD_MB_PER_WORKER`, the footprint its derived cap assumes per worker).
    Whether the reserve should follow the measured per-worker size instead of a constant is for
    the cost estimate.
@@ -467,8 +506,8 @@ on every pull request.
    the triage column.
 7. The coordinator's residency: discounted from the slot count, counted by the budget. Whether the
    class budgets should charge it to the class of its children.
-8. gVisor and `/proc/<pid>/task/<tid>/children`: to verify on the development install; the
-   parent-field walk is the fallback either way.
+8. Settled in the first change: the walk reads the parent field of `/proc/*/stat` on both
+   runtimes, and the process-group pass catches what that walk misses after a reparent.
 9. The dashboard's memory banner and the OOM heuristics still read the sandbox's `/proc/meminfo`.
    Switch them to the same sampler, or leave them.
 
@@ -476,7 +515,8 @@ on every pull request.
 
 - Trackers: #4760 (safe-throttling: the requirements and the stages); #4354 (the gap, graded
   Blocking, and the measurements); #3753 (the sizing data and the scale runner); #4758 (the memory
-  request raise and the restart alert); #3254 (the cgroup v2 sample patch).
+  request raise and the restart alert); #3254 (the cgroup v2 sample patch); #4729 (the credential
+  broker's admission control, the design Stage 2's R7 joins).
 - Upstream Hermes v2026.9.14: `hermes_cli/kanban_db_dispatch.py` (`_tick_spawn_budget`,
   `_memory_pressure_level`, `_system_memory_sample`, `enforce_max_runtime`, `_run_reclaim_phase`,
   `_dispatch_once_locked`); `hermes_cli/kanban_db.py` (`VALID_BLOCK_KINDS`, `block_task`,

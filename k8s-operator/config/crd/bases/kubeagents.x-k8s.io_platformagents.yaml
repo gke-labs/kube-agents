@@ -5371,9 +5371,10 @@ spec:
                         to the generated Pod template.
                       type: object
                     resources:
-                      description:
-                        Resources specifies resource requests and limits
-                        for the main container.
+                      description: |-
+                        Resources specifies resource requests and limits for the main container.
+                        The memory request is also the dispatcher's default admission budget
+                        (spec.harness.tuning.admission.memoryBudgetMiB).
                       properties:
                         claims:
                           description: |-

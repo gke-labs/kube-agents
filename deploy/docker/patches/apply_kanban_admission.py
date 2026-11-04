@@ -25,8 +25,11 @@ leave in place. Why the change is needed is in the module docstring of
        capacity-limited by construction) and the final ``return result``
        (limited when memory, the slot budget or the sibling reservation held
        a ready row back): the ready cards past the queue bound are refused.
-       The early-return insert lands ahead of the kanban-scheduling patch's
-       ``queued`` notice so a refused card is not told it is queued first.
+       On the early return the insert lands ahead of the kanban-scheduling
+       patch's ``queued`` notice; on the final return that notice has already
+       run, so the refusal leaves out the cards it noticed this tick
+       (``result.queued_noticed``) and a thread reads the queued line at
+       least one tick before the refusal.
 
 ``hermes_cli/kanban_db.py``
 

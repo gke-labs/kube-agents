@@ -1312,6 +1312,8 @@ type DeploymentSpec struct {
 	Availability *AvailabilitySpec `json:"availability,omitempty"`
 
 	// Resources specifies resource requests and limits for the main container.
+	// The memory request is also the dispatcher's default admission budget
+	// (spec.harness.tuning.admission.memoryBudgetMiB).
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 

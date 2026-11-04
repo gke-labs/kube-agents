@@ -69,6 +69,10 @@ set every key you want to keep. Set it on the CR with `kubectl edit`; a later `h
 leaves it alone, because Helm patches only the fields its render changes. The
 [CRD page](/kube-agents/operator/platformagent-crd/#specdeployment) describes the field.
 
+The memory request is also the dispatcher's admission budget, so the row's 6 GiB admits workers
+up to about 6 GiB of container memory
+([`tuning.admission`](/kube-agents/operator/platformagent-crd/#specharnesstuning)).
+
 The shell sandbox's 2 vCPU and 2 GiB limits are the operator's defaults.
 [`shellSandbox.resources`](/kube-agents/operator/platformagent-crd/#shellsandbox) raises them one
 key at a time; the example leaves them, so a fleet audit that needs more memory in the sandbox is
