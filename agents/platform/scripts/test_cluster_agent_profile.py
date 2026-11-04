@@ -306,6 +306,13 @@ class DeleteProfileTest(unittest.TestCase):
         self.assertIn("could not take the profile lock", str(refused.exception))
         self.assertEqual(entered, [])
 
+    def test_an_unopenable_lock_is_logged_with_what_each_caller_does(self):
+        (self.home_root / cap.PROFILE_LOCKS_DIRNAME).write_text("a file where the lock dir goes")
+        with redirect_stderr(io.StringIO()) as err:
+            cap.delete_profile(self.NAME)
+        self.assertIn("could not open the profile lock", err.getvalue())
+        self.assertIn("a create refuses, a delete leaves the sandbox home", err.getvalue())
+
     def test_other_names_do_not_wait(self):
         with cap._profile_lock("cluster-two"):
             worker = threading.Thread(target=self.delete)
@@ -1178,6 +1185,20 @@ class ListReadyProfilesTest(unittest.TestCase):
         cap.cmd_stamp_soul(args)
         cli_stamped = (p / "SOUL.md").read_text(encoding="utf-8")
         self.assertIn("- project: proj-cli\n- cluster: clus-cli\n- location: us-east1\n", cli_stamped)
+
+    def test_stamp_soul_exits_non_zero_when_the_config_has_no_identity(self):
+        # The entrypoint has already replaced SOUL.md with the blank template when it
+        # calls this, and stamps the profile as refreshed only when every step exited
+        # zero; a quiet return here would leave the blank persona stamped as current.
+        p = self.tmp / "cluster-no-identity"
+        p.mkdir()
+        (p / "SOUL.md").write_text("# SOUL.md\n", encoding="utf-8")
+        (p / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+        args = cap.build_parser().parse_args(["stamp-soul", "--profile-dir", str(p)])
+        with self.assertRaises(SystemExit) as raised:
+            cap.cmd_stamp_soul(args)
+        self.assertIn("no readable cluster_identity", str(raised.exception.code))
+        self.assertEqual((p / "SOUL.md").read_text(encoding="utf-8"), "# SOUL.md\n")
 
     def test_list_profiles_excludes_reserved_tse_and_dot_deleted(self):
         for name in ("default", "platform", "tse", "cluster-demo", ".deleted"):

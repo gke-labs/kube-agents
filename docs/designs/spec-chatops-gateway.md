@@ -1627,14 +1627,23 @@ Slack Connect, not archived, the app a member) and written once (`slack`, `slack
 `slack.setAt`, `writer`; `slack.refused` cleared), and one line in the learning thread names the
 channel; the gateway's own home posts follow within one kubelet sync, about a minute, during which a
 home post is refused as having no home. A candidate the check refuses is written to `slack.refused`
-as one of the four words the operator matches, `shared`, `archived`, `not-member` or `malformed`,
+as one of the words the operator matches, `shared`, `archived`, `not-member` or `malformed` (the
+post-time check also writes `direct-message` for a hand-edited group DM id, which an operator without
+that word renders as a reason it does not know),
 while the record names no channel and does not name that reason already (a write that fails is tried
 again at the next refusal; while a channel is recorded, a refusal beside it is the post-time check's
 or an older gateway's, and a learn that adopts or replaces the channel clears it) and the next
 mention may learn; a record another writer filled first, or the record of a learn the file has not
 caught up with, is adopted after the same check with no line posted, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a
-candidate. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
+candidate. The second writer is the Home tab's channel picker (`a2a/gateway/slack_home_pick.go`): a
+`conversations_select` on the admitted Home view, deduped on the member and `action_ts`, admitted by
+`homeAdmitted` after the other-workspace check and a `users.info` guest check (a guest account of the
+workspace never moves it, listed or not, and a lookup that fails refuses), checked as a mention is, then one merge patch under the
+read `resourceVersion`, retried once when a 409 came from a writer of a sibling key (`moveHome`; a 409
+that moved the home names the winner); the member's view shows the
+move over the projected file for at most two minutes, one line in the new channel names who moved it
+and one in the old says it moved. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
 nothing without the operator's projection. `patch` on the object is the RBAC bound; data-only merge
 patches with the read `resourceVersion` as the precondition are the gateway's contract.
 
@@ -2238,7 +2247,8 @@ of changes: a card's plan moving or a mark changing reads the board again, a que
 answered recomputes who is waiting and reads the board only once the snapshot has aged out. At
 most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
 when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
-A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
+A board that cannot be read draws Fleet with a line saying so, never an empty fleet. Under the dashboard, the Home channel panel names where alerts and reports post and carries the picker
+that moves it (`slack_home_pick.go`; the record paragraph above says what a pick writes).
 
 **The board-health card's buttons.** The `kanban-board-health` job's stuck tasks reach Slack as a
 chat message whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it

@@ -1159,3 +1159,20 @@ func TestConfigHomeLearnArmed(t *testing.T) {
 		})
 	}
 }
+
+func TestPeopleSeenOffIsReadFromItsEnv(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		off   bool
+	}{{"", false}, {"true", false}, {"false", true}, {" false ", true}} {
+		setBaseEnv(t)
+		t.Setenv(envPeopleSeen, tc.value)
+		cfg, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.PeopleSeenOff != tc.off {
+			t.Errorf("%q: PeopleSeenOff=%v, want %v", tc.value, cfg.PeopleSeenOff, tc.off)
+		}
+	}
+}

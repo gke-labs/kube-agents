@@ -80,6 +80,8 @@ _SHELL_WORKLOAD = "platformagent-shell"
 _SHELL_CONTAINER = "shell"
 _CRED_PROXY_WORKLOAD = "platformagent-credential-proxy"
 _CRED_PROXY_CONTAINER = "envoy-credential-proxy"
+_KUBE_PROXY_WORKLOAD = "platformagent-kube-proxy"
+_KUBE_PROXY_CONTAINER = "kube-proxy"
 _GATEWAY_WORKLOAD = "platformagent-gateway"
 _AGENT_CONTAINER = "platform-agent"
 _DASHBOARD_CONTAINER = "platform-agent-dashboard"
@@ -214,6 +216,7 @@ _BASE = "base"
 _DASHBOARD = "dashboard"
 _SHELL_SANDBOX = "shellSandbox"
 _CREDENTIAL_PROXY = "credentialProxy"
+_KUBE_PROXY = "kubeProxy"
 _STORAGE_SECTION = "storage"
 _PERSISTENT_VOLUME_CLAIMS = "persistentVolumeClaims"
 _STORAGE_REQUEST = "storageRequest"
@@ -243,6 +246,7 @@ def _container_key(workload_key: str, container: str) -> str:
 
 _SHELL_WORKLOAD_KEY = _workload_key(_KIND_STATEFULSET, _SHELL_WORKLOAD)
 _CRED_PROXY_WORKLOAD_KEY = _workload_key(_KIND_DEPLOYMENT, _CRED_PROXY_WORKLOAD)
+_KUBE_PROXY_WORKLOAD_KEY = _workload_key(_KIND_DEPLOYMENT, _KUBE_PROXY_WORKLOAD)
 _GATEWAY_WORKLOAD_KEY = _workload_key(_KIND_DEPLOYMENT, _GATEWAY_WORKLOAD)
 
 # Pod-bearing workloads the footprint deliberately leaves out, and why. Empty today: every
@@ -571,10 +575,12 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
 
     shell_containers = {}
     cred_proxy_containers = {}
+    kube_proxy_containers = {}
     gateway_containers = {}
     gateway_init_containers = {}
     shell_replicas = 1
     cred_proxy_replicas = 1
+    kube_proxy_replicas = 1
     gateway_replicas = 1
     # Every pod-bearing document, summed or not, for _check_completeness below.
     pod_workloads = {}
@@ -637,6 +643,11 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])
             }
             cred_proxy_replicas = _replicas(doc)
+        elif kind == _KIND_DEPLOYMENT and name == _KUBE_PROXY_WORKLOAD:
+            kube_proxy_containers = {
+                c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])
+            }
+            kube_proxy_replicas = _replicas(doc)
         elif kind == _KIND_DEPLOYMENT and name == _GATEWAY_WORKLOAD:
             gateway_containers = {
                 c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])
@@ -665,6 +676,7 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
     required = [
         (shell_containers, _SHELL_CONTAINER, _SHELL_WORKLOAD),
         (cred_proxy_containers, _CRED_PROXY_CONTAINER, _CRED_PROXY_WORKLOAD),
+        (kube_proxy_containers, _KUBE_PROXY_CONTAINER, _KUBE_PROXY_WORKLOAD),
         (gateway_containers, _AGENT_CONTAINER, _GATEWAY_WORKLOAD),
         (gateway_containers, _DASHBOARD_CONTAINER, _GATEWAY_WORKLOAD),
         (gateway_containers, _FLUENT_BIT_CONTAINER, _GATEWAY_WORKLOAD),
@@ -706,6 +718,7 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
     summed_containers = {
         _container_key(_SHELL_WORKLOAD_KEY, _SHELL_CONTAINER),
         _container_key(_CRED_PROXY_WORKLOAD_KEY, _CRED_PROXY_CONTAINER),
+        _container_key(_KUBE_PROXY_WORKLOAD_KEY, _KUBE_PROXY_CONTAINER),
         _container_key(_GATEWAY_WORKLOAD_KEY, _AGENT_CONTAINER),
         _container_key(_GATEWAY_WORKLOAD_KEY, _DASHBOARD_CONTAINER),
         _container_key(_GATEWAY_WORKLOAD_KEY, _FLUENT_BIT_CONTAINER),
@@ -765,6 +778,11 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 [cred_proxy_containers[_CRED_PROXY_CONTAINER]],
                 pods=1,
                 replicas=cred_proxy_replicas,
+            ),
+            _KUBE_PROXY: _workload_entry(
+                [kube_proxy_containers[_KUBE_PROXY_CONTAINER]],
+                pods=1,
+                replicas=kube_proxy_replicas,
             ),
             # Claims are release-scoped rather than per-agent-replica: scaling the agent does
             # not create more of them, so the preflight must not multiply these.

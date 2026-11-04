@@ -214,33 +214,70 @@ readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
 readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-20}"
 
-# The credential-proxy container's memory limit on the eval install. The broker
-# admits a request only while its child memory reservation fits the budget it
-# derives from this limit (agents/platform/scripts/credential_proxy.py,
-# docs/designs/credential-proxy-child-memory-budget.md): at the operator's 1Gi
-# default that is four requests at once, under its slot cap of eight. The eval
-# runs EVAL_TASK_PARALLELISM lanes of Platform Agents, each fanning Cluster
-# Agents out over the seeded fleet, and on the default the queue behind those
-# four reached p50 waits of 8-22s and a longest wait of 56.7s against the
-# broker's 60s refusal: Cluster Agents' commands timed out and the judge graded
-# the answers as regressions on pull requests that never touched the path
-# (#2632). At 2Gi the budget admits nine, so the slot cap is the binding bound
-# again and the queue is the one the broker had before the budget existed,
-# with the OOM the budget exists to prevent still held off by the budget
-# (#2455's live test ran this figure: the broker's startup line read "admits 9
-# requests at once beside the slot cap of 8"). Set on this install only, through
-# spec.deployment.credentialProxy.resources, so the production default stays
-# where the CRD reference argues it should and an install that outgrows it
-# raises the same field. A string, because the CRD's quantity is int-or-string.
+# The credential-proxy container's memory limit on the eval install, pinned.
+# The broker admits a request only while its child memory reservation fits the
+# budget it derives from this limit (agents/platform/scripts/credential_proxy.py,
+# docs/designs/credential-proxy-child-memory-budget.md): at 2Gi the budget
+# admits nine, so the slot cap of eight is the binding bound. The operator's
+# default limit is 2Gi as well, and so is its default memory request on GKE
+# Autopilot, so today this override changes nothing. It stays as a pin: if the
+# operator default moves, the eval install keeps the budget its cases were
+# measured at. The cost is that the eval does not run the operator default;
+# to run it there, drop this constant, its echo and --set-string below, and the
+# three limit tests in tests/test_ci_deploy_credential_proxy_limit.py (that
+# file's CRD-order test guards step 5b' and stays).
+# The figure comes from #2632: at the 1Gi limit the operator defaulted to then,
+# the budget admitted four, and the eval's EVAL_TASK_PARALLELISM lanes of
+# Platform Agents, each fanning Cluster Agents out over the seeded fleet, queued
+# behind those four at p50 waits of 8-22s and a longest wait of 56.7s against
+# the broker's 60s refusal: Cluster Agents' commands timed out and the judge
+# graded the answers as regressions on pull requests that never touched the
+# path. #2455's live test ran this figure: the broker's startup line read
+# "admits 9 requests at once beside the slot cap of 8". Set on this install
+# only, through spec.deployment.credentialProxy.resources. A string, because
+# the CRD's quantity is int-or-string.
 # Limits only: the pool's host clusters are Autopilot with bursting, where a
 # limit above its request stands (the #2454 presubmit's proxy pod rendered
 # limits.memory 1Gi over a 512Mi request, QoS Burstable, and its broker read
 # the 1Gi), so requests.memory stays at the operator's default. On an Autopilot
-# cluster without bursting this override would be inert, as the CRD field doc
-# says, and requests.memory is the figure to raise there.
+# cluster without bursting the limit equals the request, and requests.memory is
+# the figure to set there.
 # tests/test_ci_deploy_credential_proxy_limit.py pins the flag, that the limit
 # admits at least the slot cap, and the chart rendering it onto the CR.
 readonly EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT="2Gi"
+
+# The gateway's session-affinity hook (litellm.vertex.sessionAffinity) routes
+# each Gemini conversation to one of a few replicas per prompt, so a worker's
+# first turn can read the system prompt and tools another worker warmed. It
+# takes effect only on a project with Vertex's LLM_SESSION_ID label, which is
+# granted outside this repository (docs/ci-pool-projects.md, section 1.1); on
+# one without it Vertex ignores the field and the run routes as before.
+# Override with EVAL_LITELLM_SESSION_AFFINITY=false to compare a run without it.
+readonly EVAL_LITELLM_SESSION_AFFINITY="${EVAL_LITELLM_SESSION_AFFINITY:-true}"
+# One id per prompt, not the chart's two: a profile's sessions start every few
+# minutes, about as long as a replica keeps the prompt, so splitting them over
+# two ids lets more of them land on a replica that has already dropped it.
+readonly EVAL_LITELLM_SESSION_AFFINITY_SLOTS="${EVAL_LITELLM_SESSION_AFFINITY_SLOTS:-1}"
+# Both reach `helm --set` and the chart's schema, which refuses anything but a
+# boolean and a positive integer only at step 5c, after the image build. This
+# check is stricter than Helm: lowercase true/false, at most three digits.
+# Checked here, before anything runs, the way EVAL_TASK_PARALLELISM is below.
+check_session_affinity_settings() {
+  case "${EVAL_LITELLM_SESSION_AFFINITY}" in
+  true | false) ;;
+  *)
+    echo "ERROR: EVAL_LITELLM_SESSION_AFFINITY='${EVAL_LITELLM_SESSION_AFFINITY}' must be true or false." >&2
+    return 1
+    ;;
+  esac
+  case "${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}" in
+  '' | *[!0-9]* | 0* | ????*)
+    echo "ERROR: EVAL_LITELLM_SESSION_AFFINITY_SLOTS='${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}' must be a positive integer of at most three digits, without leading zeros." >&2
+    return 1
+    ;;
+  esac
+}
+check_session_affinity_settings
 
 # The release step 5 installs, and — for the poisoned-record guard (#1172) —
 # the label pair Helm stamps on every release-record Secret it writes
@@ -357,7 +394,7 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next post-kube-agents-eval-rc"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-nightly-ghes-next ci-kube-agents-eval-nightly-gitlab-ce-next post-kube-agents-eval-rc"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -1698,7 +1735,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -1947,6 +1984,8 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
     --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+    --set "litellm.vertex.sessionAffinity.enabled=${EVAL_LITELLM_SESSION_AFFINITY}" \
+    --set "litellm.vertex.sessionAffinity.slots=${EVAL_LITELLM_SESSION_AFFINITY_SLOTS}" \
     --set "platformAgent.deployment.availability.runtimeClassName=" \
     --set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX_IN_PROGRESS}" \
     --set-string "platformAgent.deployment.credentialProxy.resources.limits.memory=${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT}" \

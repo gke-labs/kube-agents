@@ -182,7 +182,10 @@ clone that pip does not retry, and `tests/test_bench_deps_install_retry.py` runs
 stub pip. The artifact download in `python-tests.yml`'s join gets a second attempt a minute after a
 failed first one, because the action's own retries ran out twice with every shard uploaded;
 `test_the_join_downloads_the_shards_coverage_twice` in `scripts/test_integration_contracts.py` holds
-that shape.
+that shape. Every workflow that restores an Actions cache caps `@actions/cache`'s wait on one
+segment at a minute (`SEGMENT_DOWNLOAD_TIMEOUT_MINS`), so a restore the service refuses under the
+account's egress limit falls through to a cold install instead of holding the step for ten;
+`.agents/rules/github_actions.md` has the rule and `tests/test_cache_segment_timeout.py` holds it.
 
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
@@ -717,8 +720,6 @@ statuses on the head when an input changes — a push, a label, a new smoke stat
 green, so a gate missing from the head has not passed yet. Its `merge_group` jobs decide the same
 two again on the queue commit, and the enqueue sweep re-posts the head statuses of approved pull
 requests on its schedule. `scripts/merge_gate.py` is the reference for what each one reads.
-[`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) still re-pins a green's
-`BaseSHA:` suffix to the new head of `main`, which only Tide read.
 
 A push starts a fresh smoke run.
 [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0, makes some runs cheap: before
