@@ -582,35 +582,45 @@ func TestActivityStatus(t *testing.T) {
 	}
 }
 
-// concurrentStubSleep is how long each stub in the concurrency test sleeps
-// between its two calls. Run together, both terminals land inside twice
-// it; run one after the other they cannot, which is what makes "at once" a
-// tested claim. It is also the margin for everything else in the run (two
-// stub starts, four deliveries, two terminals): under the race detector on
-// a loaded runner that overhead reached 1.6 s, which 1.5 s did not cover.
-const concurrentStubSleep = 3 * time.Second
+// concurrentBarrierWait is how long each stub in the concurrency test waits
+// at the barrier for the other stub. It is under the task deadline, so a
+// stub that waits in vain exits on its own and its task ends failed.
+const concurrentBarrierWait = 10 * time.Second
 
 // Two tasks at once: each delivery lands on the task whose key signed it,
-// never on the other. The stubs overlap by sleeping after their calls.
+// never on the other. The stubs meet at a barrier between their two calls:
+// each writes its marker after its first call and waits for the other's, so
+// both tasks complete only when both stubs run at the same time. The test
+// used to time the two terminals against twice a stub's sleep, which a
+// loaded runner crossed with the tasks running at once.
 func TestActivity_ConcurrentTasksKeepTheirOwnTraces(t *testing.T) {
 	_, url := startServer(t)
+	barrier := t.TempDir()
 	startBridgeCfg(t, url, hermesStub(t, fmt.Sprintf(`
 prompt = sys.argv[-1]
 tool = "tool-for-" + prompt
 call(tool, {"which": ord(prompt)}, "call-" + prompt)
-time.sleep(%g)
+barrier = %q
+open(os.path.join(barrier, prompt), "w").close()
+give_up = time.monotonic() + %g
+while not all(os.path.exists(os.path.join(barrier, p)) for p in ("A", "B")):
+    if time.monotonic() > give_up:
+        sys.exit("the other task's stub never started: the two tasks did not run at once")
+    time.sleep(0.05)
 call(tool + "-again", {"which": ord(prompt)}, "call2-" + prompt)
 print("answer for " + prompt)
-`, concurrentStubSleep.Seconds())), func(c *Config) { c.Concurrency = 2 })
+`, barrier, concurrentBarrierWait.Seconds())), func(c *Config) { c.Concurrency = 2 })
 	c := gatewayClient(t, url)
 
-	started := time.Now()
 	submit(t, c, "task-a", "A")
 	submit(t, c, "task-b", "B")
 	ta := waitTerminal(t, c, "task-a")
 	tb := waitTerminal(t, c, "task-b")
-	if elapsed := time.Since(started); elapsed > 2*concurrentStubSleep {
-		t.Fatalf("the two tasks did not overlap: both terminals took %s, serial runs would", elapsed)
+	for _, task := range []*lib.Task{ta, tb} {
+		if task.State != lib.StateCompleted {
+			t.Fatalf("task %s: state = %s (%v), want completed: the two tasks did not run at once",
+				task.ID, task.State, task.FinalMessage)
+		}
 	}
 	// The input carries the prompt as a number, since no string value rides
 	// the trace: "A" is 65, "B" is 66.
