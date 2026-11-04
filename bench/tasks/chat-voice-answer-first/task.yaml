@@ -19,6 +19,13 @@
 # platform-agent-host is the agent's own host cluster on every install the
 # presubmit and a dev project run (hack/ci-env.sh HOST_CLUSTER_NAME).
 #
+# The check measures the whole delivered result, the sections kanban_complete's
+# gates add below the worker's text included (the verified-claims evidence,
+# the rightsizing checks): they are what the user reads, so a worker that
+# submits claims on a plain question is red here. The one thing it does not
+# count is the `[next: ...]` step lines that end the answer: plumbing the
+# presenters draw as a button and show as no text (an exact-line read).
+#
 # The worker's summary line is the other copy of the verdict a user could
 # see; the notifier drops it when a result is delivered. It never reaches
 # final_message, so this case cannot see it;

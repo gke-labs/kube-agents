@@ -1521,6 +1521,10 @@ _BOLD_SECTION = re.compile(r"\*\*[^*\n]+?(?<![.!?])\*\*[ \t]*(?:[:\u2014\u2013]|
 _ANSWER_LINK = re.compile(r"\[([^\]]*)\]\([^)\s]*\)")
 # Bold and code markers, which chat renders rather than shows.
 _UNSHOWN_MARKUP = re.compile(r"\*\*|`")
+# A ``[next: ...]`` step line (``slack_moments.NEXT_STEP_LINE``): plumbing the presenters draw
+# as a button and no surface shows as text, so the step lines that end a result are taken off
+# before it is measured, as ``slack_moments.visible_text`` takes them off.
+_STEP_LINE = re.compile(r"\[next:[^\]\n]*\]", re.IGNORECASE)
 
 
 def _delivered_results(final_message: str) -> list[str]:
@@ -1533,6 +1537,15 @@ def _delivered_results(final_message: str) -> list[str]:
         end = headers[i + 1].start() if i + 1 < len(headers) else len(final_message)
         results.append(final_message[header.end() : end].strip())
     return results
+
+
+def _visible(result: str) -> str:
+    """``result`` as chat shows it: every step-shaped line at its end taken off."""
+    lines = result.rstrip().split("\n")
+    end = len(lines)
+    while end and (not lines[end - 1].strip() or _STEP_LINE.fullmatch(lines[end - 1].strip())):
+        end -= 1
+    return "\n".join(lines[:end]).rstrip()
 
 
 def _unabbreviate(text: str) -> str:
@@ -1560,7 +1573,9 @@ class AnswerFirstVerifier(BaseVerifier):
     Every delivered result must pass: the lead is a bold span opening the
     result and holding one whole sentence; no ATX heading anywhere; at most
     ``max_chars`` characters as chat shows them, a markdown link counting as
-    its text and bold and code markers not at all, and ``max_sentences`` sentences, a bullet counting as one and a
+    its text, bold and code markers not at all, and the ``[next: ...]`` step
+    lines that end the result not at all (the presenters draw them as a
+    button), and ``max_sentences`` sentences, a bullet counting as one and a
     soft-wrapped sentence as one; and no sentence
     after the lead matching any of ``recap_patterns``, regexes searched in each
     later sentence's normalized text, which name the ways a restated verdict
@@ -1594,6 +1609,7 @@ class AnswerFirstVerifier(BaseVerifier):
         """The result's defects, and its lead's normalized text (``""`` without one)."""
         defects = []
         lead_text = ""
+        result = _visible(result)
         lead = _BOLD_LEAD.match(result)
         if lead is None:
             defects.append("does not open with a bold sentence")
