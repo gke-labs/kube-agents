@@ -6,16 +6,19 @@ broker's ``proposal-create`` verb: the sandbox's ``/v1/exec`` runs neither
 fleet audit) reaches the broker through ``vcs_client.call``. When the broker
 answers with a new proposal, ``call`` writes one JSON line to stderr naming it
 (``vcs_client.PROPOSAL_OPENED_KEY``), with the one-time claim token the broker
-minted for that answer in its ``claim`` field. That line comes back as part of
-the terminal output of the process that ran the command.
+minted for that answer in its ``claim`` field and the managed repository the
+broker resolved in its ``repo`` field. That line comes back as part of the
+terminal output of the process that ran the command.
 
 This hook sees that output before the model does. A line that has the record's
 shape is not proof by itself: terminal output also carries text nobody here
 wrote (a commit message, a file, a pod's log, another session's record). So each
 record's token is presented to the broker's ``proposal-claim`` verb
-(:func:`claim`), which burns it, checks with the forge that the proposal the
-token was minted for is open, recent and authored by the broker's own account,
-and answers the forge's ``url``, ``number`` and ``title``. Only a claimed
+(:func:`claim`), addressed to the record's ``repo`` whatever shape the forge
+gives its url (``…/pull/7``, ``…/pulls/7``, ``…/pull-requests/7``,
+``…/-/merge_requests/7``). The broker burns the token, checks with the forge
+that the proposal the token was minted for is open, recent and authored by the
+broker's own account, and answers the forge's ``url``, ``number`` and ``title``. Only a claimed
 proposal counts: it is written to the Session KV ledger
 (``POST /v1/proposals/opened``) with the origin of this process
 (:func:`resolve_origin`), and in a kanban worker it is also appended to the card
@@ -29,7 +32,9 @@ At most :data:`RECORDS_CHECKED_MAX` distinct urls in one output are claimed,
 and none once :data:`CLAIMS_BUDGET_SECONDS` have passed since the hook began on
 that output: Hermes skips a ``transform_terminal_output`` hook that runs past
 its 30 s callback timeout and hands the model the original output, tokens
-included. Every record line the hook does not claim (past the cap or the
+included. A record with no ``repo`` and a url :data:`PROPOSAL_URL` cannot read
+names no repository to send the claim to and takes none of those slots. Every
+record line the hook does not claim (no repository, past the cap or the
 budget, a repeated url, a refused claim, a broker hop that is down) keeps its
 text but loses its ``claim`` field, so no live token reaches what the model
 reads, unless one claim alone outlasts Hermes' timeout. The claim is one broker
@@ -79,11 +84,16 @@ logger = logging.getLogger(__name__)
 #: path. ``test_pr_opened.py`` fails when the two drift.
 PROPOSAL_OPENED_KEY = "kube-agents.event"
 PROPOSAL_OPENED_EVENT = "proposal-opened"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title", "claim")
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", "claim", "repo")
 
 #: The record's field that holds the broker's one-time claim token
 #: (``vcs_client.CLAIM_TOKEN_FIELD``).
 CLAIM_FIELD = "claim"
+
+#: The record's field that names the managed repository the broker resolved for
+#: the create (``vcs_client.REPO_FIELD``). The claim is sent to it; the broker
+#: checks what it kept with the token, never this.
+REPO_FIELD = "repo"
 
 #: ``kanban_progress_lines.PR_OPENED_KIND``: the event kind the notifier claims for it.
 PR_OPENED_KIND = "pr_opened"
@@ -138,8 +148,11 @@ RECORD_SEPARATORS = (",", ":")
 #: staged, as ``vcs_client`` finds its siblings there.
 SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 
-#: A pull request url on any forge (``…/pull/<n>``) or a merge request url
+#: A GitHub-shaped pull request url (``…/pull/<n>``) or a merge request url
 #: (``…/-/merge_requests/<n>``): the repository url before it, and the number.
+#: Read only for a record with no ``repo`` (one an older client wrote), and for
+#: the card event's number when the broker's answer has none. The Session KV
+#: server pins its own pattern equal to this one.
 PROPOSAL_URL = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
 
 #: A ``"claim": "<token>"`` member wherever it sits on a line, for a record that
@@ -209,9 +222,10 @@ def _record_of(line):
 
 
 def opened(line):
-    """The ``{url, number, title, claim}`` a proposal-opened record on ``line`` names, else None.
+    """The ``{url, number, title, claim, repo}`` a proposal-opened record on ``line`` names, else None.
 
-    ``claim`` is None when the line carries no token (a broker older than the token).
+    ``claim`` is None when the line carries no token (a broker older than the
+    token); ``repo`` is None when the line names no repository (an older client).
     """
     record = _record_of(line)
     if record is None:
@@ -263,6 +277,26 @@ def _forge():
     return forge
 
 
+def claim_repository(record):
+    """The repository a claim for ``record`` is sent to, else None.
+
+    The record's ``repo``, whatever the url looks like; for a record with none
+    (an older client), the repository url :data:`PROPOSAL_URL` reads off its url.
+    A record with neither takes no claim.
+    """
+    repo = record.get(REPO_FIELD)
+    if isinstance(repo, str) and repo:
+        return repo
+    match = PROPOSAL_URL.match(record.get("url") or "")
+    return match.group(1) if match else None
+
+
+def claimable(record):
+    """True when ``record`` carries a token and names a repository to send its claim to."""
+    token = record.get(CLAIM_FIELD)
+    return isinstance(token, str) and bool(token) and claim_repository(record) is not None
+
+
 class ClaimUnanswered(Exception):
     """The claim did not reach the broker: no forge module here, or the hop is down."""
 
@@ -277,9 +311,7 @@ def claim(record):
     alone, never with the token or the url. Raises :class:`ClaimUnanswered` when
     the broker could not be asked.
     """
-    token = record.get(CLAIM_FIELD)
-    match = PROPOSAL_URL.match(record["url"])
-    if not isinstance(token, str) or not token or match is None:
+    if not claimable(record):
         return None
     try:
         forge = _forge()
@@ -287,7 +319,10 @@ def claim(record):
         raise ClaimUnanswered(type(exc).__name__) from None
     try:
         answer = forge.call(
-            PROPOSAL_CLAIM_VERB, {CLAIM_FIELD: token, "url": record["url"]}, match.group(1), retry_transient=False
+            PROPOSAL_CLAIM_VERB,
+            {CLAIM_FIELD: record[CLAIM_FIELD], "url": record["url"]},
+            claim_repository(record),
+            retry_transient=False,
         )
     except Exception as exc:  # noqa: BLE001 — sorted into a refusal or an unanswered hop below
         reason = getattr(exc, "reason", None)
@@ -298,7 +333,11 @@ def claim(record):
     if not isinstance(answer, dict) or not isinstance(answer.get("url"), str) or not answer["url"]:
         logger.warning("pr_opened: %s answered without a url", PROPOSAL_CLAIM_VERB)
         return None
-    return {"url": answer["url"], "number": answer.get("number"), "title": str(answer.get("title") or "")[:TITLE_MAX]}
+    number = answer.get("number")
+    if number is None:
+        match = PROPOSAL_URL.match(answer["url"])
+        number = int(match.group(2)) if match else None
+    return {"url": answer["url"], "number": number, "title": str(answer.get("title") or "")[:TITLE_MAX]}
 
 
 def _first_module(names):
@@ -424,8 +463,7 @@ def _claim_output(output):
             continue
         if (
             proposal is not None
-            and proposal.get(CLAIM_FIELD)
-            and PROPOSAL_URL.match(proposal["url"])
+            and claimable(proposal)
             and proposal["url"] not in asked
             and len(asked) < RECORDS_CHECKED_MAX
             and not unanswered

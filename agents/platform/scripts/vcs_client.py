@@ -200,7 +200,12 @@ PROPOSAL_OPENED_EVENT = "proposal-opened"
 #: The top-level key of a `proposal-create` answer that holds the claim token
 #: (credential_proxy.py `CLAIM_TOKEN_FIELD`), and its field on the record.
 CLAIM_TOKEN_FIELD = "claim"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title", CLAIM_TOKEN_FIELD)
+#: The top-level key of a `proposal-create` answer that names the managed
+#: repository as the broker resolved it (`vcs_broker.Binding.stamp`), and its
+#: field on the record. The hook sends it back with the claim, so it needs no
+#: per-forge grammar for the proposal's url.
+REPO_FIELD = "repo"
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", CLAIM_TOKEN_FIELD, REPO_FIELD)
 
 
 @functools.lru_cache(maxsize=1)
@@ -257,7 +262,9 @@ def _say_opened(answer: object, claim: object = None) -> None:
 
     `claim` is the token `call()` took from the answer's top level. An answer
     with none -- a broker older than the token -- still records the proposal,
-    with the `claim` field absent rather than null.
+    with the `claim` field absent rather than null. `repo` comes from the
+    answer's top level too (`REPO_FIELD`), and is absent when the answer has
+    no such string.
 
     Never raises: the proposal is open whatever happens to this line, and a
     caller told otherwise would try to open it again.
@@ -265,9 +272,16 @@ def _say_opened(answer: object, claim: object = None) -> None:
     proposal = answer.get("proposal") if isinstance(answer, dict) else None
     if not isinstance(proposal, dict) or not proposal.get("url"):
         return
-    fields = {field: proposal.get(field) for field in PROPOSAL_OPENED_FIELDS if field != CLAIM_TOKEN_FIELD}
+    fields = {
+        field: proposal.get(field)
+        for field in PROPOSAL_OPENED_FIELDS
+        if field not in (CLAIM_TOKEN_FIELD, REPO_FIELD)
+    }
     if claim is not None:
         fields[CLAIM_TOKEN_FIELD] = claim
+    repo = answer.get(REPO_FIELD)
+    if isinstance(repo, str) and repo:
+        fields[REPO_FIELD] = repo
     record = {PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT, "proposal": fields}
     # A process started with fd 2 closed has no `sys.stderr`, and `print` would then
     # write to stdout, ahead of the one JSON document the callers print there.

@@ -28,16 +28,23 @@ _spec.loader.exec_module(plugin)
 
 URL = "https://github.com/acme/fleet-config/pull/99"
 REPOSITORY = "https://github.com/acme/fleet-config"
+#: The repository as the broker resolves it and stamps it on a ``proposal-create`` answer.
+REPO_NAME = "acme/fleet-config"
 TASK = "t_9f2a"
 TITLE = "Raise the checkout memory limit"
 
 
-def _vcs_record(url=URL, number=99, title=TITLE, claim=None):
-    """The stderr line ``vcs_client.call`` writes for a proposal it opened, with ``claim`` as its token."""
+def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None):
+    """The stderr line ``vcs_client.call`` writes for a proposal it opened, with ``claim`` as its token.
+
+    ``repo`` is the answer's top-level repository; None writes the line an older client wrote.
+    """
     stderr = io.StringIO()
     answer = {"proposal": {"url": url, "number": number, "title": title, "state": "open"}}
     if claim is not None:
         answer["claim"] = claim
+    if repo is not None:
+        answer["repo"] = repo
     with mock.patch.object(vcs_client, "_call", lambda verb, payload: answer), mock.patch("sys.stderr", stderr):
         vcs_client.call("proposal-create", {})
     return stderr.getvalue()
@@ -99,8 +106,8 @@ class _Broker:
         self.live[token] = url
         return token
 
-    def line(self, url=URL, number=99, title=TITLE):
-        return _vcs_record(url=url, number=number, title=title, claim=self.mint(url))
+    def line(self, url=URL, number=99, title=TITLE, repo=REPO_NAME):
+        return _vcs_record(url=url, number=number, title=title, claim=self.mint(url), repo=repo)
 
     def module(self):
         forge = types.ModuleType("forge")
@@ -152,7 +159,7 @@ class PrOpenedTest(unittest.TestCase):
         line = broker.line()
         token = _tokens(line)[0]
         self.run_hook(line, _Kanban(), broker=broker)
-        self.assertEqual(broker.asked, [("proposal-claim", REPOSITORY, {"claim": token, "url": URL}, False)])
+        self.assertEqual(broker.asked, [("proposal-claim", REPO_NAME, {"claim": token, "url": URL}, False)])
 
     def test_a_claimed_record_is_written_to_the_ledger_with_the_origin(self):
         broker = _Broker()
@@ -191,14 +198,14 @@ class PrOpenedTest(unittest.TestCase):
         for task in (TASK, ""):
             kanban, broker = _Kanban(), _Broker()
             first = broker.line(url=urls[0], number=0)
-            flood = broker.line(url=issue, number=3) + first * 3 + "".join(
+            flood = broker.line(url=issue, number=3, repo=None) + first * 3 + "".join(
                 broker.line(url=url, number=n) for n, url in enumerate(urls[1:], 1)
             )
             with self.subTest(worker=bool(task)):
                 out = self.run_hook(flood, kanban, task=task, broker=broker)
                 self.assertEqual(
                     [payload["url"] for _, _, payload, _ in broker.asked], urls[:cap],
-                    "one claim per distinct url, up to the cap; a url that names no proposal takes no slot",
+                    "one claim per distinct url, up to the cap; a record with no repo and no proposal url takes no slot",
                 )
                 self.assertEqual(_tokens(out), [], "no token survives, claimed or not")
                 kept = [plugin.opened(line)["url"] for line in out.splitlines()]
@@ -366,12 +373,68 @@ class PrOpenedTest(unittest.TestCase):
         self.assertEqual(plugin.PROPOSAL_OPENED_FIELDS, vcs_client.PROPOSAL_OPENED_FIELDS)
         self.assertEqual(plugin.CLAIM_FIELD, vcs_client.CLAIM_TOKEN_FIELD)
 
-    def test_a_gitlab_merge_request_is_recorded_the_same_way(self):
-        kanban, broker = _Kanban(), _Broker(title="Bump")
-        mr = "https://gitlab.com/acme/infra/-/merge_requests/12"
-        self.assertEqual(self.run_hook(broker.line(url=mr, number=12, title="Bump"), kanban, broker=broker), "")
-        self.assertEqual(broker.asked[0][1], "https://gitlab.com/acme/infra")
-        self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": mr, "number": 12, "title": "Bump"}, 7)])
+    def test_a_record_with_no_repo_is_claimed_at_the_repository_its_url_names(self):
+        # A line an older client wrote: the url's repository stands in for the record's ``repo``.
+        for url, repository in (
+            (URL, REPOSITORY),
+            ("https://gitlab.com/acme/infra/-/merge_requests/12", "https://gitlab.com/acme/infra"),
+        ):
+            kanban, broker = _Kanban(), _Broker(title="Bump")
+            number = int(url.rsplit("/", 1)[-1])
+            with self.subTest(url=url):
+                out = self.run_hook(broker.line(url=url, number=number, title="Bump", repo=None), kanban, broker=broker)
+                self.assertEqual(out, "")
+                self.assertEqual(broker.asked[0][1], repository)
+                self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": url, "number": number, "title": "Bump"}, 7)])
+
+    #: What each forge's ``proposal-create`` answers as the url, and the repository the broker resolves.
+    FORGE_URLS = (
+        ("gitea", "https://gitea.example.com/acme/infra/pulls/7", "acme/infra"),
+        ("bitbucket", "https://bitbucket.org/acme/infra/pull-requests/7", "acme/infra"),
+        ("bitbucket-datacenter", "https://bitbucket.example.com/projects/K/repos/s/pull-requests/7", "K/s"),
+    )
+
+    def test_every_forges_url_shape_is_claimed_counted_and_recorded(self):
+        for forge, url, repo in self.FORGE_URLS:
+            self.assertIsNone(plugin.PROPOSAL_URL.match(url), "the url parse alone would not claim it")
+            for task in (TASK, ""):
+                self.ledger.clear()
+                kanban, broker = _Kanban(), _Broker()
+                line = broker.line(url=url, number=7, repo=repo)
+                token = _tokens(line)[0]
+                stdout = json.dumps({"proposal": {"url": url, "number": 7}}) + "\n"
+                with self.subTest(forge=forge, worker=bool(task)):
+                    out = self.run_hook(line + stdout, kanban, task=task, broker=broker)
+                    self.assertEqual(broker.asked, [("proposal-claim", repo, {"claim": token, "url": url}, False)])
+                    self.assertEqual([payload["url"] for _, payload in self.ledger], [url])
+                    self.assertEqual(_tokens(out), [])
+                    if task:
+                        self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": url, "number": 7, "title": TITLE}, 7)])
+                        self.assertEqual(out, stdout, "the record line leaves a worker's output")
+                    else:
+                        self.assertEqual(kanban.events, [])
+                        self.assertEqual(plugin.opened(out.splitlines()[0])["url"], url)
+
+    def test_a_record_with_neither_a_repo_nor_a_proposal_url_is_stripped_unclaimed(self):
+        for _, url, _ in self.FORGE_URLS:
+            for repo in (None, ""):
+                kanban, broker = _Kanban(), _Broker()
+                line = broker.line(url=url, number=7, repo=repo)
+                token = _tokens(line)[0]
+                with self.subTest(url=url, repo=repo):
+                    out = self.run_hook(line, kanban, broker=broker)
+                    self.assertNotIn(token, out)
+                    self.assertEqual(plugin.opened(out)["url"], url)
+                    self.assertEqual((broker.asked, kanban.events, self.ledger), ([], [], []))
+
+    def test_a_missing_number_on_the_brokers_answer_is_read_off_the_url(self):
+        kanban, broker = _Kanban(), _Broker()
+        forge = broker.module()
+        answered = forge.call
+        forge.call = lambda *args, **kwargs: {**answered(*args, **kwargs), "number": None}
+        with mock.patch.object(plugin, "_forge", lambda: forge):
+            self.run_hook(broker.line(), kanban, broker=broker)
+        self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": URL, "number": 99, "title": TITLE}, 7)])
 
     def test_the_brokers_fields_are_recorded_not_the_lines(self):
         kanban, broker = _Kanban(), _Broker(title="Raise replicas")
@@ -599,8 +662,8 @@ class RealForgeTest(unittest.TestCase):
         with mock.patch.object(vcs_client, "_call", call), \
                 mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
                 mock.patch.dict(sys.modules, {"forge": forge}):
-            verdict = plugin.claim({"url": URL, "number": 99, "title": "t", "claim": "tok"})
-        self.assertEqual(asked, [("proposal-claim", {"claim": "tok", "url": URL, "repository": REPOSITORY})])
+            verdict = plugin.claim({"url": URL, "number": 99, "title": "t", "claim": "tok", "repo": REPO_NAME})
+        self.assertEqual(asked, [("proposal-claim", {"claim": "tok", "url": URL, "repository": REPO_NAME})])
         return verdict
 
     def test_the_brokers_answer_is_the_verdict_and_a_refusal_is_none(self):

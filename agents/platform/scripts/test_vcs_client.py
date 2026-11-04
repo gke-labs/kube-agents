@@ -431,8 +431,25 @@ class ProposalOpenedRecordTest(unittest.TestCase):
         self.assertEqual(
             [json.loads(line) for line in stderr.getvalue().splitlines()],
             [{"kube-agents.event": "proposal-opened",
-              "proposal": {"url": self.URL, "number": 4, "title": "Raise replicas", "claim": self.CLAIM}}],
+              "proposal": {"url": self.URL, "number": 4, "title": "Raise replicas", "claim": self.CLAIM,
+                           "repo": "acme/infra"}}],
         )
+
+    def test_the_record_line_carries_the_repository_the_broker_resolved(self):
+        for repo, expected in (("acme/infra", {"repo": "acme/infra"}), ("", {}), (None, {}), (7, {})):
+            with self.subTest(repo=repo):
+                answer = {**self.OPENED, "claim": self.CLAIM}
+                if repo is not None:
+                    answer["repo"] = repo
+                stderr = io.StringIO()
+                with mock.patch.object(vcs_client, "_call", lambda v, p: dict(answer)), \
+                        mock.patch("sys.stderr", stderr):
+                    vcs_client.call("proposal-create", {})
+                [record] = [json.loads(line) for line in stderr.getvalue().splitlines()]
+                self.assertEqual(
+                    record["proposal"],
+                    {"url": self.URL, "number": 4, "title": "Raise replicas", "claim": self.CLAIM, **expected},
+                )
 
     def test_the_returned_answer_has_no_claim_field(self):
         with mock.patch.object(vcs_client, "_call", lambda v, p: dict(self.CLAIMED)), \
