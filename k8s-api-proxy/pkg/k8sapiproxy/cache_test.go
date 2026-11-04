@@ -10,8 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1348,25 +1346,15 @@ func TestHandlerCacheFlightCancelTimeoutAndTooLargeCleanup(t *testing.T) {
 	}
 }
 
-func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing.T) {
-	store := &countingGetStore{
-		MemoryCacheStore: NewMemoryCacheStore(DefaultCacheMaxBytes),
-		allSeen:          make(chan struct{}),
-		target:           1,
-	}
+func TestHandlerCacheConditionalRequestBypassesFlightWithHeadersIntact(t *testing.T) {
 	leaderArrived := make(chan struct{})
-	releaseUpstream := make(chan struct{})
-	var sawConditional atomic.Bool
+	releaseLeader := make(chan struct{})
 	var upstreamCalls atomic.Int32
 
 	upstream := &fakeUpstream{
 		handler: func(_ string, req *http.Request) (*http.Response, error) {
-			if upstreamCalls.Add(1) == 1 {
-				close(leaderArrived)
-			}
-			<-releaseUpstream
-			if req.Header.Get(headerIfNoneMatch) != "" || req.Header.Get(headerIfModifiedSince) != "" {
-				sawConditional.Store(true)
+			upstreamCalls.Add(1)
+			if req.Header.Get(headerIfNoneMatch) != "" {
 				return &http.Response{
 					StatusCode: http.StatusNotModified,
 					Header:     http.Header{"Etag": []string{`"v1"`}},
@@ -1374,6 +1362,8 @@ func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing
 					Request:    req,
 				}, nil
 			}
+			close(leaderArrived)
+			<-releaseLeader
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{headerContentType: []string{contentTypeJSON}, "Etag": []string{`"v1"`}},
@@ -1382,56 +1372,37 @@ func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing
 			}, nil
 		},
 	}
+	h, _ := newTestHandler(t, Config{Upstream: upstream, Cache: &CacheConfig{}})
 
-	h, _ := newTestHandler(t, Config{
-		Upstream: upstream,
-		Cache:    &CacheConfig{Store: store},
-	})
-
-	reqCond := httptest.NewRequest(http.MethodGet, "/openapi/v2", nil)
-	reqCond.Header.Set(headerIfNoneMatch, `"v1"`)
-	reqCond.Header.Set(headerIfModifiedSince, "Wed, 21 Oct 2015 07:28:00 GMT")
-	reqUncond := httptest.NewRequest(http.MethodGet, "/openapi/v2", nil)
-
-	// The conditional request leads the flight: it is the one whose headers
-	// reach the upstream, so a missing strip would return 304 to both callers.
-	var recCond, recUncond *httptest.ResponseRecorder
-	var wg sync.WaitGroup
-	wg.Add(2)
+	var recUncond *httptest.ResponseRecorder
+	done := make(chan struct{})
 	go func() {
-		defer wg.Done()
-		recCond = serve(h, reqCond)
+		defer close(done)
+		recUncond = serve(h, httptest.NewRequest(http.MethodGet, "/openapi/v2", nil))
 	}()
 	<-leaderArrived
-	go func() {
-		defer wg.Done()
-		recUncond = serve(h, reqUncond)
-	}()
 
-	<-store.allSeen
-	time.Sleep(15 * time.Millisecond)
-	close(releaseUpstream)
-	wg.Wait()
+	// A conditional request arriving mid-flight neither joins it nor waits on it:
+	// it reaches the upstream with its validator and gets the 304 meant for it.
+	reqCond := httptest.NewRequest(http.MethodGet, "/openapi/v2", nil)
+	reqCond.Header.Set(headerIfNoneMatch, `"v1"`)
+	recCond := serve(h, reqCond)
+	close(releaseLeader)
+	<-done
 
-	if sawConditional.Load() {
-		t.Errorf("upstream received conditional headers from cacheable fetch")
+	if recCond.Code != http.StatusNotModified || recCond.Header().Get(headerCacheStatus) != cacheStatusBypass {
+		t.Errorf("conditional caller got %d %q, want 304 bypass", recCond.Code, recCond.Header().Get(headerCacheStatus))
 	}
-	if n := upstreamCalls.Load(); n != 1 {
-		t.Errorf("upstream calls = %d, want 1 (the follower coalesces onto the conditional leader)", n)
+	if recUncond.Code != http.StatusOK || recUncond.Body.String() != `{"swagger":"2.0"}` || recUncond.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Errorf("unconditional caller got %d %q %q, want 200, the full body and miss",
+			recUncond.Code, recUncond.Body.String(), recUncond.Header().Get(headerCacheStatus))
 	}
-	for name, rec := range map[string]*httptest.ResponseRecorder{"conditional": recCond, "unconditional": recUncond} {
-		if rec.Code != http.StatusOK || rec.Body.String() != `{"swagger":"2.0"}` {
-			t.Errorf("%s caller got code=%d body=%q, want 200 and full body", name, rec.Code, rec.Body.String())
-		}
-	}
-	statuses := []string{recCond.Header().Get(headerCacheStatus), recUncond.Header().Get(headerCacheStatus)}
-	sort.Strings(statuses)
-	if want := []string{cacheStatusCoalesced, cacheStatusMiss}; !reflect.DeepEqual(statuses, want) {
-		t.Errorf("Cache-Status = %q, want one miss and one coalesced", statuses)
+	if n := upstreamCalls.Load(); n != 2 {
+		t.Errorf("upstream calls = %d, want 2", n)
 	}
 }
 
-func TestHandlerCacheConditionalRequestRevalidatesDiscovery(t *testing.T) {
+func TestHandlerCacheConditionalRequestReachesUpstreamPastStoredDiscovery(t *testing.T) {
 	var gen atomic.Int32
 	gen.Store(1)
 	var upstreamCalls atomic.Int32
@@ -1448,31 +1419,139 @@ func TestHandlerCacheConditionalRequestRevalidatesDiscovery(t *testing.T) {
 	}
 	h, _ := newTestHandler(t, Config{Upstream: upstream, Cache: &CacheConfig{}})
 
-	get := func(conditional bool) *httptest.ResponseRecorder {
+	get := func(header, value string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/apis", nil)
-		if conditional {
-			req.Header.Set(headerIfNoneMatch, `"gen1"`)
+		if header != "" {
+			req.Header.Set(header, value)
 		}
 		return serve(h, req)
 	}
 
-	if rec := get(false); rec.Body.String() != `{"gen":1}` || rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := get("", ""); rec.Body.String() != `{"gen":1}` || rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("cold fetch = %q %q", rec.Body.String(), rec.Header().Get(headerCacheStatus))
 	}
 	gen.Store(2)
-	if rec := get(false); rec.Body.String() != `{"gen":1}` || rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+	if rec := get("", ""); rec.Body.String() != `{"gen":1}` || rec.Header().Get(headerCacheStatus) != cacheStatusHit {
 		t.Fatalf("warm fetch = %q %q, want the stored gen 1", rec.Body.String(), rec.Header().Get(headerCacheStatus))
 	}
-	// kubectl refetches discovery with If-None-Match when a resource type is unknown.
-	rec := get(true)
-	if rec.Code != http.StatusOK || rec.Body.String() != `{"gen":2}` || rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
-		t.Fatalf("conditional fetch = %d %q %q, want 200 gen 2 miss", rec.Code, rec.Body.String(), rec.Header().Get(headerCacheStatus))
+	// kubectl refetches discovery with a validator after a resource type misses.
+	for _, hdr := range []struct{ name, value string }{
+		{headerIfNoneMatch, `"gen1"`},
+		{headerIfModifiedSince, "Wed, 21 Oct 2015 07:28:00 GMT"},
+	} {
+		rec := get(hdr.name, hdr.value)
+		if rec.Code != http.StatusOK || rec.Body.String() != `{"gen":2}` || rec.Header().Get(headerCacheStatus) != cacheStatusBypass {
+			t.Errorf("%s fetch = %d %q %q, want 200 gen 2 bypass", hdr.name, rec.Code, rec.Body.String(), rec.Header().Get(headerCacheStatus))
+		}
 	}
-	if rec := get(false); rec.Body.String() != `{"gen":2}` || rec.Header().Get(headerCacheStatus) != cacheStatusHit {
-		t.Errorf("fetch after revalidation = %q %q, want the refreshed gen 2", rec.Body.String(), rec.Header().Get(headerCacheStatus))
+	if n := upstreamCalls.Load(); n != 3 {
+		t.Errorf("upstream calls = %d, want 3", n)
 	}
-	if n := upstreamCalls.Load(); n != 2 {
-		t.Errorf("upstream calls = %d, want 2", n)
+}
+
+type switchAuthenticator struct{ reject atomic.Bool }
+
+func (a *switchAuthenticator) AuthenticateRequest(r *http.Request) (*CallerIdentity, error) {
+	if a.reject.Load() {
+		return nil, errors.New("token expired")
+	}
+	return shellCaller.AuthenticateRequest(r)
+}
+
+func TestHandlerCacheServesNothingBeforeAuthentication(t *testing.T) {
+	auth := &switchAuthenticator{}
+	h, upstream := newTestHandler(t, Config{
+		Authenticator: auth,
+		Cache:         &CacheConfig{DefaultResourceTTL: time.Minute},
+	})
+	const target = "/api/v1/namespaces/default/pods"
+
+	for i, want := range []string{cacheStatusMiss, cacheStatusHit} {
+		if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != want {
+			t.Fatalf("warm-up %d Cache-Status = %q, want %q", i, rec.Header().Get(headerCacheStatus), want)
+		}
+	}
+
+	auth.reject.Store(true)
+	rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code = %d with a warm entry, want 401", rec.Code)
+	}
+	if cs := rec.Header().Get(headerCacheStatus); cs != "" {
+		t.Errorf("Cache-Status = %q on a refusal, want none", cs)
+	}
+	if upstream.calls != 1 {
+		t.Errorf("upstream calls = %d, want 1 (the warm-up miss)", upstream.calls)
+	}
+}
+
+func TestHandlerCacheReadAfterWriteDoesNotJoinOlderFlight(t *testing.T) {
+	var gen atomic.Int32
+	gen.Store(1)
+	var listCalls atomic.Int32
+	firstArrived := make(chan struct{})
+	releaseFirst := make(chan struct{})
+
+	upstream := &fakeUpstream{
+		handler: func(_ string, req *http.Request) (*http.Response, error) {
+			if req.Method == http.MethodPatch {
+				gen.Add(1)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{headerContentType: []string{contentTypeJSON}},
+					Body:       io.NopCloser(strings.NewReader(`{}`)),
+					Request:    req,
+				}, nil
+			}
+			body := fmt.Sprintf(`{"gen":%d}`, gen.Load())
+			if listCalls.Add(1) == 1 {
+				close(firstArrived)
+				<-releaseFirst
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{headerContentType: []string{contentTypeJSON}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    req,
+			}, nil
+		},
+	}
+	h, _ := newTestHandler(t, Config{
+		Upstream: upstream,
+		Policy:   Policy{Mode: ModeReadWrite, RedactSecrets: true},
+		Cache:    &CacheConfig{DefaultResourceTTL: time.Minute},
+	})
+	const target = "/api/v1/namespaces/default/pods"
+
+	var recOld *httptest.ResponseRecorder
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		recOld = serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+	}()
+	<-firstArrived
+
+	patch := httptest.NewRequest(http.MethodPatch, target+"/p", strings.NewReader(`{}`))
+	patch.Header.Set(headerContentType, "application/merge-patch+json")
+	if rec := serve(h, patch); rec.Code != http.StatusOK {
+		t.Fatalf("patch code = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The read after the write starts its own flight rather than taking the
+	// pre-write result of the one still running.
+	if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Body.String() != `{"gen":2}` {
+		t.Fatalf("read after write = %q %q, want gen 2", rec.Body.String(), rec.Header().Get(headerCacheStatus))
+	}
+	close(releaseFirst)
+	<-done
+	if recOld.Body.String() != `{"gen":1}` {
+		t.Errorf("read before write = %q, want gen 1", recOld.Body.String())
+	}
+
+	// The older flight finished after the write, so its result was not stored.
+	rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+	if rec.Body.String() != `{"gen":2}` || rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+		t.Errorf("next read = %q %q, want the stored gen 2", rec.Body.String(), rec.Header().Get(headerCacheStatus))
 	}
 }
 

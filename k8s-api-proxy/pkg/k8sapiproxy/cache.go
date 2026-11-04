@@ -30,7 +30,7 @@ const (
 	// DefaultResourceCacheTTL is the default TTL for cached resource get and list responses.
 	// It defaults to 0 so per-pod MemoryCacheStore replicas never return non-monotonic state across consecutive kubectl get calls.
 	// The proxy still coalesces concurrent in-flight GET and LIST requests when the TTL is 0.
-	// Set --cache-resource-ttl (KUBE_PROXY_CACHE_RESOURCE_TTL) or CacheConfig.DefaultResourceTTL with a shared CacheStore or sessionAffinity to cache resource responses after a flight.
+	// Set --cache-resource-ttl (KUBE_PROXY_CACHE_RESOURCE_TTL) or CacheConfig.DefaultResourceTTL to cache resource responses after a flight only when callers stick to one replica (sessionAffinity): invalidation is per replica.
 	DefaultResourceCacheTTL time.Duration = 0
 	// DefaultDiscoveryCacheTTL is the default TTL for cached discovery responses.
 	// It is short because nothing the proxy sees invalidates discovery: a CRD or
@@ -349,6 +349,8 @@ type cacheRequestMeta struct {
 type inflightCall struct {
 	done   chan struct{}
 	cancel context.CancelFunc
+	// epoch is responseCache.epoch when the flight started.
+	epoch uint64
 
 	val *sfResult
 	err error
@@ -370,6 +372,10 @@ type responseCache struct {
 
 	flightMu sync.Mutex
 	flights  map[string]*inflightCall
+	// epoch counts invalidations. A flight started before one may carry
+	// pre-write state, so a later request does not join it and its result
+	// is not stored.
+	epoch atomic.Uint64
 
 	scopeMu   sync.Mutex
 	scopeKeys map[string]map[string]time.Time
@@ -482,7 +488,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 
 	verbLabel, resLabel, _ := ClassifyRequestLabels(req, info)
 	reqCC := parseRequestCacheControl(req.Header)
-	if reqCC.noStore {
+	if reqCC.noStore || isConditionalRequest(req.Header) {
 		c.metrics.recordCacheRequest(CacheResultBypass, verbLabel, resLabel)
 		resp, err := next(req)
 		if err == nil && resp != nil {
@@ -497,7 +503,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	key := buildCacheKey(ev.ClusterID, req, meta.callerAccept)
 	now := c.now()
 
-	if !reqCC.noCache && !reqCC.zeroMaxAge && !isConditionalRequest(req.Header) {
+	if !reqCC.noCache && !reqCC.zeroMaxAge {
 		if raw, ok, err := c.store.Get(req.Context(), key); err == nil && ok {
 			if entry, err := decodeCachedResponse(raw); err == nil && isEntryFreshForRequest(entry, reqCC, now) {
 				c.metrics.recordCacheRequest(CacheResultHit, verbLabel, resLabel)
@@ -574,7 +580,8 @@ func (c *responseCache) acquireFlight(
 	next func(*http.Request) (*http.Response, error),
 ) *inflightCall {
 	c.flightMu.Lock()
-	if call, ok := c.flights[key]; ok {
+	epoch := c.epoch.Load()
+	if call, ok := c.flights[key]; ok && call.epoch == epoch {
 		call.waiters++
 		call.shared = true
 		c.flightMu.Unlock()
@@ -588,6 +595,7 @@ func (c *responseCache) acquireFlight(
 	call := &inflightCall{
 		done:    make(chan struct{}),
 		cancel:  cancel,
+		epoch:   epoch,
 		waiters: 1,
 	}
 	c.flights[key] = call
@@ -609,7 +617,7 @@ func (c *responseCache) runFlight(
 ) {
 	sfEv := &AuditEvent{ClusterID: clusterID}
 	sfReq := req.WithContext(context.WithValue(fetchCtx, auditEventKey{}, sfEv))
-	val, err := c.fetchAndPopulate(sfReq, sfEv, key, clusterID, info, isDiscovery, next, call.cancel)
+	val, err := c.fetchAndPopulate(sfReq, sfEv, key, clusterID, info, isDiscovery, next, call.cancel, call.epoch)
 
 	var closeUnclaimed io.Closer
 	c.flightMu.Lock()
@@ -671,6 +679,7 @@ func (c *responseCache) fetchAndPopulate(
 	isDiscovery bool,
 	next func(*http.Request) (*http.Response, error),
 	cancelFetch context.CancelFunc,
+	epoch uint64,
 ) (*sfResult, error) {
 	resp, err := next(req)
 	if err != nil {
@@ -736,7 +745,7 @@ func (c *responseCache) fetchAndPopulate(
 	}
 
 	cleanHeaders := sanitizeCachedHeaders(resp.Header)
-	if storeTTL > 0 && freshTTL > 0 {
+	if storeTTL > 0 && freshTTL > 0 && c.epoch.Load() == epoch {
 		now := c.now()
 		encoded, err := encodeCachedResponse(cachedResponseMeta{
 			StatusCode: resp.StatusCode,
@@ -778,11 +787,6 @@ func (c *responseCache) evictKey(ctx context.Context, key string) {
 
 func prepareCacheableUpstreamRequest(req *http.Request) *http.Request {
 	upReq := req.Clone(req.Context())
-	upReq.Header.Del(headerIfNoneMatch)
-	upReq.Header.Del(headerIfModifiedSince)
-	upReq.Header.Del(headerIfMatch)
-	upReq.Header.Del(headerIfUnmodifiedSince)
-	upReq.Header.Del(headerIfRange)
 	if normalizeAcceptEncoding(upReq.Header) == encodingGzip {
 		upReq.Header.Set(headerAcceptEncoding, encodingGzip)
 	} else {
@@ -792,10 +796,17 @@ func prepareCacheableUpstreamRequest(req *http.Request) *http.Request {
 }
 
 // isConditionalRequest reports whether the caller is revalidating its own copy.
-// kubectl revalidates discovery with If-None-Match after a resource type misses,
-// so answering from the store would hand its refetch the same stale document.
+// kubectl's disk cache sends If-None-Match on every discovery refetch, including
+// the one after a resource type misses. Such a request bypasses the cache with
+// its headers intact: the API server answers 304 or the current document, and a
+// stored copy is never handed to it, nor its 304 to a coalesced caller.
 func isConditionalRequest(h http.Header) bool {
-	return h.Get(headerIfNoneMatch) != "" || h.Get(headerIfModifiedSince) != ""
+	for _, name := range []string{headerIfNoneMatch, headerIfModifiedSince, headerIfMatch, headerIfUnmodifiedSince, headerIfRange} {
+		if h.Get(name) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func isCacheableRequest(req *http.Request, info *request.RequestInfo, dryRun bool) (cacheable bool, isDiscovery bool) {
@@ -887,6 +898,9 @@ func (c *responseCache) pruneExpiredScopeKeysLocked(now time.Time) {
 }
 
 func (c *responseCache) invalidateResourceScope(ctx context.Context, clusterID string, info *request.RequestInfo) {
+	c.epoch.Add(1)
+	// A caller that disconnects must not leave a deleted-from-index entry in the store.
+	ctx = context.WithoutCancel(ctx)
 	now := c.now()
 	c.scopeMu.Lock()
 	c.pruneExpiredScopeKeysLocked(now)

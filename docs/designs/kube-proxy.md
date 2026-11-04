@@ -132,7 +132,7 @@ k8s-api-proxy/
     │   ├── handler.go            # Core http.Handler: auth -> route -> RequestInfo -> policy -> proxy
     │   ├── policy.go             # Verb allowlist, subresource denylist, dryRun=All check
     │   ├── secrets.go            # PartialObjectMetadata rewrite + Secret response redaction
-    │   ├── cache.go              # Pluggable CacheStore, MemoryCacheStore, singleflight coalescing, and RFC 9111/9211 cache
+    │   ├── cache.go              # Pluggable CacheStore, MemoryCacheStore, in-flight request coalescing, and RFC 9111/9211 cache
     │   ├── headers.go            # Strip Authorization, Impersonate-*, X-Remote-*, unsafe Upgrade headers
     │   ├── auth.go               # CallerAuthenticator interface + TokenReview authenticator with TTL cache
     │   ├── audit.go              # AuditSink interface, AuditEvent struct, and slog audit sink
@@ -365,13 +365,13 @@ For allowed streaming requests (`kubectl logs -f` and `kubectl get -w`), `httput
 
 ### 8a. HTTP response cache and in-flight coalescing (`pkg/k8sapiproxy/cache.go`)
 
-When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTES > 0`), `pkg/k8sapiproxy` wraps the upstream transport with a response cache and `singleflight` request coalescer:
+When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTES > 0`), `pkg/k8sapiproxy` wraps the upstream transport with a response cache and an in-flight request coalescer:
 
 1. **Pluggable `CacheStore` and default `MemoryCacheStore`**:
    - `CacheStore` defines `Get(ctx, key)`, `Set(ctx, key, value, ttl)`, and `Delete(ctx, key)`. Optional `CacheStatsProvider` exposes `Stats() CacheStats` (`Bytes`, `Entries`, `CapacityEvicted`, `ExpiredEvicted`). Any store error fails open and forwards the request to the upstream cluster.
    - When `CacheConfig.Store` is nil, `NewMemoryCacheStore` provides an in-memory store bounded to `DefaultCacheMaxBytes` (`64 MiB`) with `DefaultCacheMaxEntryBytes` (`2 MiB`, configured via `--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`). It evicts expired entries first and uses second-chance frequency decay with LRU ordering so one-time list scans do not evict hot entries.
 2. **Cache eligibility and default TTLs**:
-   - Resource `get` and `list` requests (`GET`, no subresource, no `watch=`, and no `dryRun`) use `DefaultResourceCacheTTL` (`0s` by default). With `0s`, the proxy coalesces concurrent in-flight requests without post-flight storage across per-pod `MemoryCacheStore` replicas. Operators and embedders can enable post-flight resource storage via `--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL` or `CacheConfig.DefaultResourceTTL` with a shared `CacheStore` or `sessionAffinity`.
+   - Resource `get` and `list` requests (`GET`, no subresource, no `watch=`, and no `dryRun`) use `DefaultResourceCacheTTL` (`0s` by default). With `0s`, the proxy coalesces concurrent in-flight requests without post-flight storage across per-pod `MemoryCacheStore` replicas. Operators and embedders can enable post-flight resource storage via `--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL` or `CacheConfig.DefaultResourceTTL` when callers stick to one replica (`sessionAffinity`).
    - Discovery `GET` requests use `DefaultDiscoveryCacheTTL` (`30s`, configured via `--cache-discovery-ttl` / `KUBE_PROXY_CACHE_DISCOVERY_TTL`). Nothing the proxy forwards invalidates discovery, so a CRD or APIService installed out of band reaches kubectl within one TTL. Health and metrics paths in `nonCachedDiscoveryPaths` (`/healthz`, `/livez`, `/readyz`, `/metrics`) are never cached.
    - Responses larger than `MaxEntryBytes` bypass the cache (`Cache-Status: k8s-api-proxy; bypass`) and stream directly to the caller without full buffering.
 3. **Cache key isolation and `Secret` redaction before storage**:
@@ -379,10 +379,13 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - `baseRoundTrip` executes `redactSecretResponse` before returning the response to `responseCache`, so raw `core/v1` `Secret` values never enter `CacheStore`.
 4. **Coalescing, RFC 9111 `Cache-Control`, and RFC 9211 `Cache-Status` / `Age`**:
    - Concurrent cache misses for the same key coalesce into one upstream call.
-   - The proxy honors request `Cache-Control` directives (`no-store`, `no-cache`, `max-age=0`, `max-age=<seconds>`, `max-stale`) and upstream response `Cache-Control` (`no-store`, `max-age=0`, `max-age=<seconds>`), while caching `kube-apiserver`'s default `no-cache, private` responses under the configured TTL. That deviates from RFC 9111, which requires revalidating a `no-cache` response before reuse. A conditional request (`If-None-Match` or `If-Modified-Since`) is treated as a revalidation: the proxy fetches upstream rather than answering from the store, so kubectl's discovery refetch after an unknown resource type sees the current document.
+   - The proxy honors request `Cache-Control` directives (`no-store`, `no-cache`, `max-age=0`, `max-age=<seconds>`, `max-stale`) and upstream response `Cache-Control` (`no-store`, `max-age=0`, `max-age=<seconds>`), while caching `kube-apiserver`'s default `no-cache, private` responses under the configured TTL. That deviates from RFC 9111, which requires revalidating a `no-cache` response before reuse. A conditional request (`If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since`, or `If-Range`) bypasses the cache with its headers intact, so kubectl's disk cache gets the API server's `304` or the current document, and its discovery refetch after an unknown resource type is never answered from the store.
+   - A coalesced fetch, including the streamed body of a response over `MaxEntryBytes`, is bounded by a 60-second upstream deadline independent of any one caller.
    - Responses set `Cache-Status` (`k8s-api-proxy; hit`, `k8s-api-proxy; hit; coalesced`, `k8s-api-proxy; miss`, or `k8s-api-proxy; bypass`) and `Age`.
 5. **Write and auth-failure scope invalidation**:
    - Non-dry-run mutating requests (`create`, `update`, `patch`, `delete`, `deletecollection`) that return `2xx` or `401`/`403`, and read requests that return `401`/`403`, invalidate cached entries for that cluster, API group/version/resource, and namespace (plus cluster-wide list entries).
+   - A request arriving after an invalidation never joins a fetch that started before it, and such a fetch does not store its result.
+   - Invalidation is per replica: the scope index lives in the process, and `CacheStore` has no prefix delete. A shared `CacheStore` across replicas keeps entries another replica stored after a write it did not see, so resource TTLs above `0s` stay correct only with `sessionAffinity` routing a caller to one replica.
 
 ### 9. Pluggable GKE HTTPS transport (`pkg/upstream`)
 

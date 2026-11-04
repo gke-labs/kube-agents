@@ -68,8 +68,8 @@ responses (`DefaultDiscoveryCacheTTL`, configured via `--cache-discovery-ttl` /
 `KUBE_PROXY_CACHE_DISCOVERY_TTL`). With the `0s` default resource TTL, the proxy coalesces concurrent
 in-flight resource `GET` and `LIST` requests without post-flight storage across per-pod
 `MemoryCacheStore` replicas. Operators and embedders can set `--cache-resource-ttl` /
-`KUBE_PROXY_CACHE_RESOURCE_TTL` or `CacheConfig.DefaultResourceTTL` when they use a shared
-`CacheStore` or `sessionAffinity`.
+`KUBE_PROXY_CACHE_RESOURCE_TTL` or `CacheConfig.DefaultResourceTTL` when callers stick to one replica
+(`sessionAffinity`); invalidation is per replica, so a shared `CacheStore` alone keeps stale entries.
 Health and metrics discovery paths (`/healthz`, `/livez`, `/readyz`, `/metrics`), watches,
 subresources, and dry-run writes are never cached. Concurrent cache misses coalesce into one
 upstream request, `Secret` payloads are redacted before cache storage, non-dry-run mutations and
