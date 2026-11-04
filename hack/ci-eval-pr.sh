@@ -2945,8 +2945,9 @@ fi
 # HEAD and is not held to that order.
 #
 # An edit that would take the pin out is caught by review: this script takes
-# the root approvers. bench/tests/test_grader_pin.py catches an accidental
-# removal, not a deliberate one, since the same change can edit the test.
+# the root approvers like any file, so a root approver's own edit waits on one
+# lgtm from anyone OWNERS lists. bench/tests/test_grader_pin.py catches an
+# accidental removal, not a deliberate one, since the same change can edit it.
 # EVAL_GRADER_SHA names the commit
 # that graded the run; `bench-gate suite` writes it into eval-verdict.json
 # and the verdict markdown, and a grader that predates it ignores the

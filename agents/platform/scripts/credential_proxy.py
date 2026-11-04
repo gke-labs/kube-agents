@@ -89,7 +89,12 @@ from credential_proxy_client import (  # noqa: F401  (re-export)
     ADMISSION_BOUND_BACKGROUND,
     ADMISSION_BOUND_DRAINING,
     API_RELAY_PREFIX,
+    AUDIT_BROKER_POD,
+    AUDIT_BROKER_TIER,
+    AUDIT_CLASS,
     BACKGROUND_NICE,
+    BROKER_TIER_EXEC,
+    BROKER_TIER_STATEFUL,
     BUSY_BOUND_KEY,
     CLASS_BACKGROUND,
     CLASS_INTERACTIVE,
@@ -11547,6 +11552,18 @@ class JsonLineFormatter(logging.Formatter):
         return json.dumps(payload, default=str, separators=(",", ":"))
 
 
+def broker_tier_of(role: str) -> str:
+    """The `broker_tier` audit field of a broker process in ``role``."""
+    return BROKER_TIER_EXEC if role == EXEC_ROLE else BROKER_TIER_STATEFUL
+
+
+@functools.lru_cache(maxsize=None)
+def _broker_pod() -> str:
+    """This broker's pod name, for the `broker_pod` audit field. Kubernetes
+    sets a pod's hostname to its name. Read once for the life of the process."""
+    return socket.gethostname()
+
+
 def _tool_audit(
     status: str,
     request_id: str,
@@ -11558,12 +11575,15 @@ def _tool_audit(
     duration_ms: int | None = None,
     rule: str | None = None,
     pod: str = "",
+    broker_tier: str,
+    klass: str,
 ) -> dict[str, Any]:
     """The `audit` mapping of one tool-execution record.
 
     Only identifiers and outcomes: the request id, the verified principal, the
     tool and subcommand as the metrics label them (a closed vocabulary, never the
-    argv), the outcome and, where there is one, the exit code, the duration and
+    argv), the outcome, the broker's tier (`broker_tier_of`), the admission class,
+    this broker's pod and, where there is one, the exit code, the duration and
     the policy rule. No argument, path, stdin or output is ever here, so there is
     nothing in the record for a `--token` to leak through.
     """
@@ -11574,6 +11594,9 @@ def _tool_audit(
         "tool": tool,
         "subcommand": subcommand,
         "status": status,
+        AUDIT_BROKER_TIER: broker_tier,
+        AUDIT_CLASS: klass,
+        AUDIT_BROKER_POD: _broker_pod(),
     }
     if pod:
         # The caller's pod, from the TokenReview's pod-name extra: every
@@ -12708,7 +12731,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
-            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod, **fields)}
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod,
+                    broker_tier=broker_tier_of(self.broker_role), klass=admission_class(principal.role), **fields,
+                )
+            }
 
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
@@ -14299,8 +14327,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         def audit(status: str) -> dict[str, Any]:
             return {
+                # Interactive: the class of the request slot below.
                 AUDIT_EXTRA_KEY: _tool_audit(
-                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND
+                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND,
+                    broker_tier=broker_tier_of(self.broker_role), klass=CLASS_INTERACTIVE,
                 )
             }
 

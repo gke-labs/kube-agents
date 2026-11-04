@@ -6,19 +6,28 @@
 # hack/eval/inject-lane-exclusions.txt takes a case out of every pull
 # request's matrix and, for a roster case, out of what can red one, and
 # hack/eval/inject-lane-safeguards.yaml adds a rung 1 check to every case
-# there. Everything else under hack/ -- hack/eval/nightly-cases.txt,
-# ci-eval-pr.sh and the scripts it runs, the subprocess helpers that reset the
+# there. replay-proxy/ joins them because its normalizer decides which
+# requests match a recorded answer, so whoever changes it controls what replay
+# serves (eval-design.md in examples/inference-replay/, "The proxy can't come
+# from the pull request"). Everything else under hack/ --
+# hack/eval/nightly-cases.txt, ci-eval-pr.sh and the scripts it runs, the
+# subprocess helpers that reset the
 # environment or mint tokens -- matches no filter and falls through to the
 # root OWNERS, so a new case lands in the nightly with the normal approvers
 # (#1546, decided 2026-09-15). ci-eval-pr.sh pins the grader every pull
-# request is graded by; root-approver review guards that step, and
-# bench/tests/test_grader_pin.py catches an accidental removal.
+# request is graded by. A change to it needs what any change needs: a root
+# approver's approval (self-approval on their own change) and one lgtm from
+# anyone OWNERS lists. bench/tests/test_grader_pin.py catches an accidental
+# removal of the pin, not a deliberate one.
 # docs/eval-gate-roster.md states the rule.
 filters:
   'eval/(presubmit-cases|blocking-roster|inject-lane-exclusions)\.txt$':
     approvers:
     - eval-crew
   'eval/inject-lane-safeguards\.yaml$':
+    approvers:
+    - eval-crew
+  '^replay-proxy/':
     approvers:
     - eval-crew
 options:
