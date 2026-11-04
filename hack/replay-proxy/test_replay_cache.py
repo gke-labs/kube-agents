@@ -128,3 +128,19 @@ class ServedBodyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SimilarityTest(unittest.TestCase):
+    def test_json_messages_are_compared_by_their_words(self):
+        # Same pods in another order: identical words, though raw JSON glues each line to the next.
+        def tool(text):
+            return json.dumps({"content": text, "role": "tool"})
+        current = tool("web-a 1/1\nweb-b 2/2\nweb-c 1/1")
+        reordered = tool("web-c 1/1\nweb-a 1/1\nweb-b 2/2")
+        other = tool("web-a 1/1\nweb-b 2/2\napi-x 0/3")
+        self.assertGreater(replay_cache.similarity(reordered, current), replay_cache.similarity(other, current))
+
+    def test_tool_call_arguments_count(self):
+        message = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "kubectl", "arguments": "get pods"}}]})
+        self.assertEqual(replay_cache.message_text(message), "kubectl\nget pods")
+

@@ -28,6 +28,12 @@ JSON_SUFFIX = ".json"
 TMP_SUFFIX = ".tmp"
 TEXT_ENCODING = "utf-8"
 TOOL_CALLS_KEY = "tool_calls"
+# The parts of a message whose words a miss is ranked by.
+CONTENT_KEY = "content"
+TEXT_KEY = "text"
+FUNCTION_KEY = "function"
+NAME_KEY = "name"
+ARGUMENTS_KEY = "arguments"
 
 # Fields of a saved entry.
 ENTRY_FINGERPRINT = "fingerprint"
@@ -185,9 +191,35 @@ class PrefixIndex:
         return (found[0] if found else None), matched
 
 
+def message_text(text: str) -> str:
+    """A saved message's words: its content and tool calls, without the JSON around them.
+
+    Saved and current messages are JSON; split raw, a line's last word glues onto
+    the next line's first, which under-scores line-per-row tool output.
+    """
+    try:
+        message = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(message, dict):
+        return text
+    parts: List[str] = []
+    content = message.get(CONTENT_KEY)
+    if isinstance(content, str):
+        parts.append(content)
+    elif isinstance(content, list):
+        parts.extend(str(part.get(TEXT_KEY, "")) if isinstance(part, dict) else str(part) for part in content)
+    for call in message.get(TOOL_CALLS_KEY) or []:
+        function = call.get(FUNCTION_KEY) if isinstance(call, dict) else None
+        if isinstance(function, dict):
+            parts.extend((str(function.get(NAME_KEY, "")), str(function.get(ARGUMENTS_KEY, ""))))
+    return "\n".join(parts)
+
+
 def similarity(saved: str, current: str) -> float:
-    """How alike two messages are, by the words they share (order ignored, so it is linear in their size)."""
-    return difflib.SequenceMatcher(None, saved.split(), current.split(), autojunk=False).quick_ratio()
+    """How alike two messages are by the words they share, relative to both lengths (order ignored)."""
+    a, b = message_text(saved).split(), message_text(current).split()
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).quick_ratio()
 
 
 def served_id(fingerprint: str) -> str:
