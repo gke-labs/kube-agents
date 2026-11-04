@@ -833,7 +833,7 @@ class ProfileRouteTest(unittest.TestCase):
         shell = credential_proxy.Principal(workload="system:serviceaccount:ns:shell", role=credential_proxy.CALLER_ROLE_SHELL)
         CredentialProxyHandler.authenticator = _StubAuthenticator(shell)
         self.set_gate(trusted=[DOC["untrusted"]])
-        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        status, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(200, status, body)
         (_, kwargs), = self.executor.calls
         self.assertIsNone(kwargs["kubeconfig_context"])
@@ -1333,20 +1333,23 @@ class ConfinedExecutionTest(unittest.TestCase):
 class ProfileSlotShareTest(unittest.TestCase):
     """Profile work holds a bounded share of the pool, and the shell keeps a slot."""
 
-    def test_the_share_is_named_defaulted_and_clamped_below_the_pool(self):
+    def test_the_share_is_named_defaulted_and_clamped_to_the_background_cap(self):
         with mock.patch.dict(os.environ, {credential_proxy.ENV_PROFILE_SLOTS: ""}):
-            self.assertEqual(4, credential_proxy.profile_slot_limit_from_env(8, 2))
-        for raw, pool, session, want, warns in (
-            ("3", 8, 2, 3, False),
-            ("10", 8, 2, 5, True),  # clamped: 8 - 2 - 1, so the shell keeps a slot
-            ("x", 8, 2, 4, True),
-            ("0", 8, 2, 4, True),
-            ("4", 3, 2, 1, True),  # a pool too small to share still serves one
+            self.assertEqual(4, credential_proxy.profile_slot_limit_from_env(6))
+            # The default clamped on a small pod is expected, so it is quiet.
+            with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertEqual(2, credential_proxy.profile_slot_limit_from_env(2))
+        for raw, background_cap, want, warns in (
+            ("3", 6, 3, False),
+            ("10", 6, 6, True),  # P = min(P, B): the interactive reserve stays free
+            ("x", 6, 4, True),
+            ("0", 6, 4, True),
+            ("4", 2, 2, True),  # a budget-bound pod (admitted 4, B 2)
         ):
-            with self.subTest(raw=raw, pool=pool):
+            with self.subTest(raw=raw, background_cap=background_cap):
                 with mock.patch.dict(os.environ, {credential_proxy.ENV_PROFILE_SLOTS: raw}):
                     with self.assertLogs(credential_proxy.LOGGER, level="WARNING") if warns else contextlib.nullcontext():
-                        self.assertEqual(want, credential_proxy.profile_slot_limit_from_env(pool, session))
+                        self.assertEqual(want, credential_proxy.profile_slot_limit_from_env(background_cap))
 
     def test_a_profile_past_its_share_is_busy_and_the_shell_is_not(self):
         slots = credential_proxy.SessionSlots(

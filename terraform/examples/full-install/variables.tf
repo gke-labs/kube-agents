@@ -96,6 +96,12 @@ variable "namespace" {
   default     = "kubeagents-system"
 }
 
+variable "helm_upgrade_install" {
+  description = "Install the kube-agents release with `helm upgrade --install` semantics (opt-in), so an apply whose state lost a live release adopts it instead of failing with \"cannot re-use a name that is still in use\" (#4108). It also silently takes over a release of the same name that another Terraform state or a manual `helm install` owns in the namespace, so set it only on a long-lived environment whose own state owns the release."
+  type        = bool
+  default     = false
+}
+
 # With one bundle left, this no longer selects between bundles: `read-only` takes
 # local.read_only_roles and `custom` requires project_roles, which wins on its own.
 # It stays because it is still load-bearing in two places — installer_common.sh
@@ -622,7 +628,7 @@ variable "slack_home_channel_name" {
 }
 
 variable "slack_home_channel_policy" {
-  description = "\"auto\" (also empty) or \"manual\". Accepted and recorded in this release but with no effect yet: the A2A gateway does not learn a home channel, so slack_home_channel alone decides. Only used when enable_slack is true."
+  description = "\"auto\" (also empty) or \"manual\". Under platform_agent_mode next with Slack on the gateway (Google Chat not enabled) and slack_home_channel empty, \"auto\" lets the A2A gateway make the channel of the first top-level mention of the agent the home channel; \"manual\" leaves slack_home_channel alone to decide. A set slack_home_channel wins under either. Only used when enable_slack is true."
   type        = string
   default     = ""
   validation {

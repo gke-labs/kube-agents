@@ -34,6 +34,11 @@ const (
 	gchatChatFunction    = "kage.choice"
 	gchatChatParamReply  = "reply"
 	gchatChatParamChoice = "choice"
+	// gchatChatParamHome marks a home post's choice buttons. The click's
+	// binding does not read it; new cards keep carrying it so an older
+	// gateway still binds them.
+	gchatChatParamHome      = "home"
+	gchatChatParamHomeValue = "1"
 	// gchatChatButtonFilled draws the one primary button filled, Chat's
 	// emphasised button; the rest take Chat's default.
 	gchatChatButtonFilled = "FILLED"
@@ -276,6 +281,25 @@ func gchatChatWidgets(choices []chatmsg.Choice, links []chatmsg.Link) []map[stri
 		return nil
 	}
 	return []map[string]any{{"buttonList": map[string]any{"buttons": buttons}}}
+}
+
+// gchatHomeButtons marks each choice button of a home post's layout with
+// the home parameter (gchatChatParamHome).
+func gchatHomeButtons(layout gchatChatLayout) gchatChatLayout {
+	for _, w := range layout.Widgets {
+		list, _ := w["buttonList"].(map[string]any)
+		buttons, _ := list["buttons"].([]map[string]any)
+		for _, b := range buttons {
+			click, _ := b["onClick"].(map[string]any)
+			action, _ := click["action"].(map[string]any)
+			params, ok := action["parameters"].([]map[string]any)
+			if !ok {
+				continue
+			}
+			action["parameters"] = append(params, map[string]any{"key": gchatChatParamHome, "value": gchatChatParamHomeValue})
+		}
+	}
+	return layout
 }
 
 // gchatOneLine flattens a plain field the schema caps but does not hold to

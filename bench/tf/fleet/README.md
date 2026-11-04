@@ -84,22 +84,33 @@ project in the #1278 retest sweep); a role still drifted at the deadline gets a
 observed, so the operator knows whether it is a `tofu apply` or a node.
 
 The reconcile is load-bearing for `seeded-b` in particular, and it does two distinct
-things there. First, it **carries the control plane forward**: `min_master_version` is
+things there. First, it **moves the control plane at a minor roll**: `min_master_version` is
 not a creation-time floor — the field is neither `ForceNew` nor ignored, and the
 provider answers a raised value with an operator-initiated `clusters.update` carrying
 `desiredMasterVersion` (it upgrades only when the recorded master is lower, never
-down). That is what keeps the pin from rotting: a new patch inside the held minor moves
-the master onto it, and the day the REGULAR default rolls a minor, the derived pin
-recomputes and the next apply walks the master to the new default-minus-one, so the lag
-stays one minor without anyone touching the file, a hold excepted. The pin is drawn from
+down). That is what keeps the pin from rotting: the day the REGULAR default rolls a
+minor, the derived pin recomputes and the next apply walks the master to the new
+default-minus-one, so the lag stays one minor without anyone touching the file, a hold
+excepted. Inside the lag minor the pin is the running version, listed by REGULAR or
+not: a pin at REGULAR's newest patch of the minor moved the master onto the channel's
+list on every apply, and the upgrades cases that read `seeded-b` for a patch REGULAR
+has moved past (`upgrades-readiness-target-patch-valid`,
+`upgrades-master-behind-offered-elsewhere`) never found one for longer than the hours
+between a channel roll and the next reconcile. GKE's own patch auto-upgrade, which the
+exclusion lets through, can still move the master within the minor in a maintenance
+window once the channel's upgrade target passes it. The pin is drawn from
 REGULAR's own version list by `seeded_b_pin.py` (the stack's `external` data source),
 never from the provider's all-channel list: GKE lets a cluster running a patch its
 channel does not carry upgrade only within that minor, so a pin from a newer channel
 turns the next minor roll into a refused apply on every project. When `seeded-b` is
-found on such a patch, the script holds the pin instead, at the newest REGULAR patch of
-that minor above the running one if there is one, else at the running version, and the
-apply after that step does the minor bump, one minor per apply (GKE's control-plane
-rule), so a master the hold left two minors behind reaches the target over two applies.
+found below the lag minor on such a patch, the script steps it first, to the newest
+REGULAR patch of that minor above the running one if there is one, else holds it at the
+running version, and the apply after that step does the minor bump, one minor per apply
+(GKE's control-plane rule), so a master the hold left two minors behind reaches the
+target over two applies. That is also the ordinary path at a REGULAR minor roll when
+`seeded-b` sits on a patch REGULAR has dropped: the roll takes two reconciles, the step
+and then the bump, and `minor_behind_channel_default` reads `version-laggard` as drifted
+for the day between them.
 While a hold lasts the master may run a patch newer than any REGULAR patch of its minor,
 and after a minor roll the lag is two minors, not one: `hack/fleet-fixture-state.py` reads
 `version-laggard` as drifted on either (`not_ahead_of_channel`,
@@ -184,12 +195,12 @@ is not fully assertable on the day it is applied. Recreating a fixture restarts 
 clock — `creationTimestamp` is server-set and immutable, so backdating is impossible;
 do not try.
 
-| Day  | What becomes detectable                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D0   | RBAC over-grant, missing PDB, OOM crashloop, stockout, version lag, deprecated-API caller (its first-run Job completes inside the apply, so the audit trail starts on apply day), the four upgrade-readiness drain defects, the eleven upgrade-failure shapes (ten in `seeded-shapes`, one in `seeded-defaults`), the three zonal-skew fixtures, the `startup-fail` VM (its script fails on every boot, from the first), the world-open firewall rule |
-| D+1  | The drift outlier. The drift SOP excludes a cluster whose `createTime` is under 24 hours old "from every cohort" (§1), so on apply day the `(standard, seeded)` cohort has zero members, and §2.4's floor ("a cohort of fewer than **3** clusters produces no findings, ever") would floor it out with any two of the four still new                                                                                                                  |
-| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                                                                                                                                                                                                                                                                                                                                                    |
-| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                                                                                                                                                                                                                                                                                                                                                           |
+| Day  | What becomes detectable                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D0   | RBAC over-grant, missing PDB, OOM crashloop, stockout, version lag, deprecated-API caller (its first-run Job completes inside the apply, so the audit trail starts on apply day), the four upgrade-readiness drain defects, the eleven upgrade-failure shapes (ten in `seeded-shapes`, one in `seeded-defaults`), the three zonal-skew fixtures, the `startup-fail` VM (its script fails on every boot, from the first), the world-open firewall rule                                          |
+| D+1  | The drift outlier, and the hourly scan's hold on the pool-level outlier (`drift-pool-outlier`), which no facet reads until the `boot-disk` and `kubelet-config` facets land. The drift SOP excludes a cluster whose `createTime` is under 24 hours old "from every cohort" (§1), so on apply day the `(standard, seeded)` cohort has zero members, and §2.4's floor ("a cohort of fewer than **3** clusters produces no findings, ever") would floor it out with any two of the four still new |
+| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                                                                                                                                                                                                                                                                                                                                                                                             |
+| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 So `consistency-drift-outlier` must stay dormant until D+1, and `fleet-cost-idle-pool`
 until D+30, when both of its fixtures are visible.
@@ -237,6 +248,7 @@ The scenario ids below are the contract of the in-flight Phase 2 scenario branch
 | `startup-fail-<prefix>`, a standalone e2-micro whose startup script exits 1 on every boot                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | project, `var.zone`                  | — (GCE-level)                   | `gce-startup-script-failure`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | Control plane one minor behind REGULAR default, held by the `hold-the-minor-lag` NO_MINOR_UPGRADES exclusion, whose end time every apply re-stamps                                                                                                                                                                                                                                                                                                                                                                                                                                               | `seeded-b`                           | `version-laggard`               | `upgrade-readiness-lagging-cluster`, `upgrades-lagging-master-probe`, `upgrades-fleet-version-table`, `upgrades-fleet-rollout-stall`, `upgrades-fleet-readiness-exclusion`, `upgrades-master-behind-offered-elsewhere`, `upgrades-audit-reports-upgrade-blocked`, `upgrades-fleet-readiness-failclosed-webhook`, `upgrades-exclusion-end-date-named`, `upgrades-removed-api-callers-distinguished` (slot presence only), `upgrades-network-policy-enforcement-stated` (slot presence only), `upgrades-zonal-control-plane-outage-warned` (slot presence only) |
 | Master authorized networks absent, normalized to OFF (peers run it ON with an open block, whose contents the drift SOP never compares); every cluster in this stack carries `environment=seeded` so the drift cohort is exactly this fleet; seeded-d joins it as a fourth voter, which moves the agreement ratio from 2/3 to 3/4 and leaves the severity unchanged — main.tf's `seeded_d` block works the arithmetic                                                                                                                                                                             | `seeded-c`                           | `drift-outlier`                 | `consistency-drift-outlier`, `upgrades-removed-api-callers-distinguished` (slot presence only), `upgrades-network-policy-enforcement-stated` (slot presence only), `upgrades-zonal-control-plane-outage-warned` (slot presence only)                                                                                                                                                                                                                                                                                                                          |
+| `default-pool` on a 50 GB boot disk with `kubeletConfig.cpuCfsQuota` false, where every other pool in the stack runs a 20 GB disk of the default type and no kubelet block; the pool-level outlier the drift SOP's `boot-disk` and `kubelet-config` facets will read, planted ahead of them so their case can go red; both fields update in place, so no `reconcile-allow.json` entry                                                                                                                                                                                                            | `seeded-c` / `default-pool`          | `drift-pool-outlier`            | none yet: the facets' case is the follow-up                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `legacy-endpoints-writer` CronJob patches Endpoints v1 (`legacy-endpoints-lane`) every ten minutes: deprecated and still served, so every write is audit-stamped `k8s.io/deprecated=true`, with no `k8s.io/removed-release` and no Recommender insight                                                                                                                                                                                                                                                                                                                                           | `seeded-a` / ns `seeded-deprecation` | `deprecated-api-caller`         | `upgrades-removed-api-callers-distinguished`, `upgrades-readiness-deprecated-api-callers`                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `no-surge-pool`, `maxSurge 0` with `maxUnavailable 1`, so an upgrade takes its only node away rather than adding a replacement first (tainted so only the pinned workload lands there)                                                                                                                                                                                                                                                                                                                                                                                                           | `seeded-b`                           | `readiness-surge-blocked`       | `upgrades-no-surge-pool-recreate-warned`, `upgrades-readiness-surge-capacity`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `pinned-batch-runner`, one replica with a nodeSelector onto that pool, so a drain evicts it into Pending until the node is recreated (requests 250m / 256Mi, above the cost audit's 15% idle floor, so the pool is not an `idle-nodepool` finding)                                                                                                                                                                                                                                                                                                                                               | `seeded-b`                           | `readiness-pinned-workload`     | `upgrades-audit-reports-upgrade-blocked`, `upgrades-drain-blocking-budget-named`, `upgrades-no-surge-pool-recreate-warned`, `upgrades-readiness-surge-capacity`                                                                                                                                                                                                                                                                                                                                                                                               |
@@ -278,9 +290,9 @@ so the regular family's rollout never waits on the lag. The key is on every clus
 this stack because the drift audit's label-keys facet compares label keys across the
 cohort: a key on three clusters and not the fourth would be a drift finding.
 
-`seeded-b`'s lag is derived at apply time (the newest patch REGULAR itself offers one
-minor behind its default, read by `seeded_b_pin.py`), so the pin re-computes each
-reconcile instead of rotting — and `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
+`seeded-b`'s lag is derived at apply time (on a create, the newest patch REGULAR itself
+offers one minor behind its default, read by `seeded_b_pin.py`; afterwards the running
+version inside that minor), so the pin re-computes each reconcile instead of rotting. `seeded-b` is enrolled in the REGULAR channel on purpose: the upgrade
 SOP's master-behind check compares a cluster's master minor against its own channel's
 default, so a channel-less cluster falls out of that comparison entirely and the lag
 would be invisible to the audit it was planted for. The maintenance exclusion above is
@@ -373,8 +385,8 @@ the entries are project-level and the stack's teardown removes only its fixture
 resource — but two consequences are standing state this README must own: the agent
 under test is pointed at slot c by name for the length of the eval, and any future
 scenario that reads slot c's Cloud Logging history (a `consistency-drift-outlier`
-investigation, say) will find those fixture entries attributed to it. Slot c carries
-the fleet's only defect that is invisible to a log-analysis task, which is why it is
+investigation, say) will find those fixture entries attributed to it. Slot c's
+defects are the only ones in the fleet invisible to a log-analysis task, which is why it is
 the only slot the presubmit may reuse; when it is absent or mid-maintenance, the
 presubmit provisions its own cluster rather than borrowing slot a or b.
 
@@ -425,7 +437,7 @@ is checkable rather than asserted:
 The stack also grants `var.pool_state_readers` (default: the bot) the roles in
 `local.pool_state_reader_roles` for its hourly pool-state scan
 ([`docs/ci-health.md`](../../../docs/ci-health.md), "The pool-state scan"); a project
-applied before that default scans as "not checked".
+applied before that default, or before a role joined the list, scans as "not checked".
 
 Three things about this are worth stating rather than assuming:
 
@@ -546,7 +558,7 @@ decision recorded with the scenario drafts. The silence case in particular must
 tolerate the declared background rows above.
 
 Rough standing cost: about $340 per month — the GKE management fee (three zonal
-clusters) is most of it, the six nodes (20 GB disks), two 10 GB orphan disks and the
+clusters) is most of it, the six nodes (20 GB disks, bar `seeded-c`'s at 50 GB), two 10 GB orphan disks and the
 `startup-fail` e2-micro the rest. The no-surge pool on `seeded-b` adds a seventh node, a fifth e2-small, and
 seeded-d adds a fourth management fee, an e2-small and an e2-standard-2, so a project carrying
 the whole stack costs roughly $490 per month — the fee, not the nodes, is the larger

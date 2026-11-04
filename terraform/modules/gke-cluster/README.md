@@ -22,11 +22,17 @@ The default is `false`, which is GKE's own default and therefore the value every
 The `cluster_endpoint` output is whichever endpoint GKE publishes for the cluster, and on one whose IP endpoints are disabled that is the DNS hostname, not an address. `cluster_endpoint_is_dns` reports which of the two it is, because they need different trust anchors: the DNS endpoint terminates at a Google Front End holding a publicly signed certificate, while `cluster_ca_certificate` signs only the IP endpoints. A consumer that pins the cluster CA while dialling the DNS endpoint fails the handshake with `x509: certificate signed by unknown authority`; it should fall back to the system trust store instead.
 
 > **KMS resources cannot be deleted.** Cloud KMS key rings and keys are never actually
-> destroyed — `terraform destroy` only removes them from state, and a subsequent apply
-> with the same names fails with a 409. Recover by importing the existing resources back
-> into state (`terraform import module.<name>.google_kms_key_ring.gke_keyring[0] ...`) or by
-> choosing new `kms_keyring_name`/`kms_key_name` values. The full-install composition's
-> `lifecycle.sh` automates both directions.
+> deleted, and a raw `terraform destroy` does not leave the key usable: destroying the
+> crypto key schedules every version of it for destruction, so the key can no longer
+> encrypt: a cluster created again on it fails to start, and other clusters that share
+> the key lose it. Run `terraform state rm` on the key ring, the key and the key's grant
+> to the GKE service agent (`gke_kms_binding`, which the other clusters need) before a
+> raw destroy. A later apply with the same names fails with a 409 until you import the
+> existing resources back into state
+> (`terraform import module.<name>.google_kms_key_ring.gke_keyring[0] ...`) or choose new
+> `kms_keyring_name`/`kms_key_name` values. The full-install composition's `lifecycle.sh`
+> does both for you; its README's [Teardown and re-apply](../../examples/full-install/README.md#teardown-and-re-apply) section says how, including how to restore
+> versions a raw destroy scheduled.
 
 ## Usage
 

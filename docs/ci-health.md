@@ -48,7 +48,8 @@ still running or cut short, the night counts as cut short when its main or
 main-b part is, and a night without its main or main-b part gives no verdict on
 what is newly failing. `scripts/eval_dashboard/nightly.py` derives that line
 and the report from the same nightly runs. After it, the digest carries one
-line per domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)).
+line while nightly bug filing has been held for about two hours ([Nightly bugs](#nightly-bugs)),
+then one line per domain with no blocking presubmit seat ([Coverage gaps](#coverage-gaps)).
 The same tick reads the eval evidence store (`gs://kube-agents-evals-bench/evidence`,
 the records the nightly appends; `scripts/eval_dashboard/store.py`, best-effort
 and incremental) and renders the dashboard's Trend page (`trend.html`,
@@ -205,7 +206,8 @@ recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
-PR-caused reds (by rule 4's test, below) and infra reds (setup deaths, lost
+PR-caused reds (by rule 4's test, below, less its storm silence: a two-hour
+storm cannot blank a 24-hour count) and infra reds (setup deaths, lost
 pods and deadline kills that graded nothing are folded into the infra count),
 the typical run length and the typical wait before a run starts,
 and the delegation-ceiling repetitions on a day that had any. `health.json`'s
@@ -218,7 +220,13 @@ moves no state; the message lists it as "PR-caused" when the evidence rules out
 a flake and a moving main: the case passed on another pull request's run built
 on the same main commit, or it failed on two or more of that pull request's
 runs (a retest counts) while passing on another pull request. One red run with
-no same-base pass gets no line.
+no same-base pass gets no line. "Failing" means a record with at least two
+graded repetitions, all failed: one graded repetition beside two infra ones is
+a throttled run, not a collapse the pull request owns. While a storm's
+repetitions are firing, confirmed or not, no collapse the storm's reach covers
+(from three hours before its first hit run finished) is PR-caused: a thin
+record on one pull request is the storm's own symptom. A collapse that
+finished before the storm is named as usual.
 
 Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
@@ -230,7 +238,7 @@ forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only 
 nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
 section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
 lane" section with its own counts and links, and in no gate number, case
-history or digest line. The GHES lane (`pull-kube-agents-smoke-test-ghes`, its two nightlies; `docs/ci-pool-projects.md` 5.8) is not collected yet: its runs show in Prow only until the dashboard reads a lane per forge.
+history or digest line. The GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, their two nightlies each; `docs/ci-pool-projects.md` 5.8) are not collected yet: their runs show in Prow only until the dashboard reads a lane per forge.
 
 ## Hysteresis
 
@@ -484,7 +492,7 @@ wait is a fixed 24-hour figure that is not in the run data.
 
 Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
-(the GitOps stale-pull-request sweep, every ten minutes) and the seeded-fleet
+(the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
 daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
@@ -508,13 +516,13 @@ names none.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
-every ten minutes and this tick reads its latest finished build every fifteen,
-so the unit is the check, not the build (one sweep build in three is never
-read), and one failed check followed by a clean one is a flap. The sweep's note
-waits until two consecutive checks have failed; the reconciles' first failed
-build is the news. Any project's failure fails a sweep run, so a per-project
-threshold could never fire before the run's; the per-project counts name, in
-the message, the projects that failed in this check and the ones before it.
+hourly and this tick reads its latest finished build every fifteen minutes, so
+every build is read and counted once, and one failed build followed by a clean
+one is a flap. The sweep's note waits until two consecutive checks have failed;
+the reconciles' first failed build is the news. Any project's failure fails a
+sweep run, so a per-project threshold could never fire before the run's; the
+per-project counts name, in the message, the projects that failed in this check
+and the ones before it.
 The counts are `periodics_streaks` in `health.json`, advanced once per newly
 read build and carried across ticks; a failed build that did not reach a
 project (busy) keeps its count, and a clean build clears every count. A tick
@@ -522,7 +530,7 @@ that could not fetch the previous `health.json` has no counts to carry, so it
 notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
-build is older than its stale window (an hour for the sweep, 36 hours for the
+build is older than its stale window (two hours for the sweep, 36 hours for the
 daily reconcile; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
@@ -848,7 +856,15 @@ lacks, counts more of them than the listing holds, or cannot be read. The REST
 listing, and GitHub's issue search with it, have answered with no issues while
 the issues existed, and a dedupe that reads an empty list files every case
 again. The step reads both listings again, up to 4 times in one pass, and
-when none agrees it logs why, writes nothing, and the next tick retries. When a comment read
+when none agrees it logs why, writes nothing, and the next tick retries. When
+the armed step has held 8 ticks in a row (about two hours), the 11 AM digest
+carries one line, "Nightly bug filing held since <time>", with the last
+reason; the first trusted tick clears it. The count lives in
+`nightly-bugs-state.json` beside `health.json`; a dry run records no hold, and
+a count the step has not rewritten in the last hour is not reported and
+starts over at the next held tick. A pass that cannot read the listings at
+all keeps an open hold's count as it is, refreshing its time. A failed read of the object, other than
+its absence, leaves the count as it was; on the digest tick it costs that day's line. When a comment read
 returns fewer comments than the issue listing counts, the step skips that
 issue for the tick, so a recovery or night comment is not posted twice. When a case with an open issue passes every graded
 repetition on a graded night after its last failing one, and that night
@@ -1075,6 +1091,31 @@ It opens no roster pull request: the job holds no branch write path, and the
 eval crew approves every roster line. Locally,
 `python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
 is a dry run; `--live` writes.
+
+## The domain scorecard
+
+`scripts/eval_dashboard/understudies.py` writes one row per domain in
+`domains.yaml`, covered or not, for the dashboard's domain view
+(`cases.html#view=domains`): the roster cases that cover it; for an uncovered
+domain, the days since its allowlist entry began, the entry's issue, its
+held-out case and how long ago its exception expired, read as [Coverage
+gaps](#coverage-gaps) reads them; the open `nightly-red` issues labelled
+`domain:<slug>` and the age of the oldest; and its understudies, the best two
+of the candidates Coverage gaps ranks, with their nightly record and the
+store's verdict. An understudy is **ready** when the evidence store reads it
+`would-admit`; without a store read that column says the store was not read,
+and without a trusted `nightly-red` listing (the read [Nightly
+bugs](#nightly-bugs) uses) the count says not read rather than zero. Ready is
+the record bar only: the rest of the seat bar is checked at admission
+([`eval-gate-roster.md`](eval-gate-roster.md#the-admission-bar-and-who-clears-it)).
+
+It runs every tick before the render, capped at 2 minutes, writes
+`work/scorecard.json` for `render.py --scorecard`, and writes nothing to
+GitHub. It stops without a file on the same untrusted reads that stop Coverage
+gaps, and the view then says the scorecard was not computed. It adds no digest
+line: the coverage-gap line already covers an uncovered domain. Locally,
+`python3 scripts/eval_dashboard/understudies.py --data data.json [--store store.json] --out scorecard.json`
+(`--no-github` skips the issue read).
 
 ## The weekly health email
 
@@ -1387,8 +1428,9 @@ or more calls; `reason` says which.
 
 **The identity and the grant.** Every read runs as the bot itself,
 `eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,
-`roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`
-and `roles/storage.bucketViewer` on each project (`POOL_STATE_READER_ROLES` in the
+`roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`,
+`roles/storage.bucketViewer`, `roles/compute.networkViewer` and `roles/dns.reader` on each
+project (`POOL_STATE_READER_ROLES` in the
 verifier; together they cover every read the scan's checks make, and none writes;
 the one read outside the project, the warm-cache repository's policy in the Prow
 project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
@@ -1396,21 +1438,23 @@ grants them (`pool_state_readers`), so a project gets them from its fleet apply 
 the verifier fails one that lacks them (`--report` carries the binding). Grant them
 on the project: the check reads the project's own policy, so a grant on a folder or
 the organisation, or through a group, is not seen and reads as missing on every
-project. Projects applied before that default are one loop, run once by a project
-owner:
+project. Projects applied before that default, or before a role joined the list, are one
+loop, run once by a project owner:
 
 ```bash
 BOT=eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
 for p in $(sed -n '/^gitops_repo_for_project() {/,/^}/p' hack/ci-deploy.sh \
           | sed -n 's/^[[:space:]]*\(kube-agents-evals[-0-9]*\)).*/\1/p'); do
   for role in roles/iam.securityReviewer roles/container.clusterViewer \
-              roles/artifactregistry.reader roles/cloudkms.viewer roles/storage.bucketViewer; do
+              roles/artifactregistry.reader roles/cloudkms.viewer roles/storage.bucketViewer \
+              roles/compute.networkViewer roles/dns.reader; do
     gcloud projects add-iam-policy-binding "$p" --member "serviceAccount:${BOT}" --role "$role" --quiet >/dev/null
   done
 done
 ```
 
-Until then every check on the project records `not_checked` with gcloud's words.
+Until then the checks whose reads the missing roles cover record `not_checked` with
+gcloud's words (every check, on a project with none of the roles).
 
 **The condition.** `health.py`'s `pool_drift` is the fleet scan's rule over this
 document: the same finding on the same project in two consecutive scans, or on

@@ -55,7 +55,7 @@ pod at a time.** Concretely:
   `Create`, compare-and-swap semantics), so that two replicas or a rehydrate racing
   first contact cannot fork a conversation - the loser reads and adopts the winner's
   value. The stage 1 gateway runs a single replica and serializes per conversation
-  in-process, and minting is the KV `Create` this rule requires - the loser of a mint
+  in-process (running more than one is planned in [gateway-replicas.md](gateway-replicas.md)), and minting is the KV `Create` this rule requires - the loser of a mint
   race re-reads and adopts the winner's record before the contextId reaches any
   envelope.
 - The pod is an incarnation, not the identity. Reaping and respawning changes the pod
@@ -606,7 +606,7 @@ with a note and `/session <text>` is `<text>`, the ordinary turn; `/session <tex
 refuses a command it has not registered, so there the form is `@<bot> /session`: the mention is
 stripped before the gateway reads the text, and in a channel thread the next message needs the
 mention too: the adapter forwards an unmentioned reply only once a task has started there (or under the bot's own post), and
-the ack says so. In a Slack DM the next message has to be in the same thread (the Slack
+the ack says so. In a Slack or Google Chat DM the next message has to be in the same thread (the
 adapter's conversation keys), and the ack says that instead. The way back is answered even on an install whose spawner has since been disarmed, so a
 record left session-routed by a rollback can always re-home. It is a debugging and opt-in door for the transition,
 not the taught interface. The default flips when the delegation primitive lands: the session's request to
@@ -720,8 +720,8 @@ come out of the grace) is closed by the gateway as its supervisor
 (`failed`, on the `…supervisor` subject, unless a final is already on the stream) and the pod is
 deleted. A pod without room left in its lifetime for a whole task is not handed one, so the
 lifetime and that check never fire together. The pod's bus credential still lapses with its
-connection's grant TTL (an hour less jitter) and is renewed by the client's reconnect, which
-re-reads the pod-bound token. Two ends still have
+connection's grant TTL (an hour less jitter) and is renewed by the reconnect of each of the
+pod's two connections, which re-reads the pod-bound token. Two ends still have
 no terminal to wait for, and the record carries an independent bound for each rather
 than a justification that assumes a terminal that may not come. The `ask` copy is
 cleared by the reap scan once it is `A2A_ASK_TTL` old (24 hours by default,
@@ -1084,7 +1084,7 @@ not be silent about it.
   a Discord message - the text is routed the way any text is, the gateway's literal affordances
   included, so a prompt whose first word is `delegate` or `stop` reaches those paths rather than
   the persona. The harness sends none of them as a prompt, and a case whose prompt opens with
-  one is the case's defect; a stopped ask's `stop`, sent after the opening turn, is the one it
+  one is the case's defect; a stopped ask's `stop`, sent during or after the opening turn, is the one it
   sends itself. The reply carries the task id, so the caller can await a named task rather
   than guessing which post belongs to its submission, and the gateway's first-event grace, so the
   caller can set its own deadline above the window the gateway already owns.
@@ -1458,21 +1458,21 @@ and drops; in a DM (measured) it equals `text` with nothing stripped and no ment
 annotation — a typed `@app` there is plain text to Chat, and is delivered verbatim.
 
 **Conversation keys.** `gchat:spaces/AAA/threads/BBB` for a message in a threaded
-space — the canonical example above. In a DM space, top-level messages share one conversation,
-`gchat:dm/spaces/AAA`, answered top-level, and a message typed inside an existing thread is
-a side thread, its own conversation `gchat:dm/spaces/AAA/threads/BBB`, answered in that
-thread. This is the main-flow and side-thread rule of the Hermes Google Chat adapter that
-`today` runs.
-Chat attaches a thread to every DM message, the one it auto-created for a top-level message
-included, so the thread name cannot tell them apart; Chat's `message.threadReply` flag does
-(true only for a reply in a thread, per the Chat API `Message` resource; measured: the
-captured in-thread DM reply carries it and the top-level DMs omit it). Hermes infers the
-split from a persisted per-thread inbound count instead, and the gateway keeps no count.
-The two differ on one case: the first reply into a thread Hermes has counted no inbound
-message in, such as the thread under a bot-posted report, is main flow to Hermes
-(`cron-report-relay.md`, "The first reply into a report's thread") and a side thread here. A record minted under the thread-less key before side threads existed still
-parses and posts top-level, and `openDirect` returns that key, so an unsolicited post to a
-DM lands top-level. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
+space — the canonical example above. In a DM space every message a user sends keys the
+thread Chat attached to it, `gchat:dm/spaces/AAA/threads/BBB`, top-level or reply, and is answered in that thread. A reply
+typed in the thread continues it, and two top-level asks are two conversations: the DM rule of
+[the Slack adapter](#the-slack-adapter-added-94). Chat attaches a thread to every DM message,
+the one it auto-created for a top-level message included, so the thread name cannot tell a
+top-level ask from a reply; Chat's `message.threadReply` flag does (true only for a reply in a
+thread, per the Chat API `Message` resource; measured: the captured in-thread DM reply carries
+it and the top-level DMs omit it). The adapter reads it to mark a top-level ask
+`InboundMessage.TopLevel`, and it decides nothing about the key. The Hermes Google Chat adapter
+that `today` runs keeps its main-flow and side-thread rule, inferred from a persisted per-thread
+inbound count (`cron-report-relay.md`, "The first reply into a report's thread"), so the two
+modes differ on every top-level DM. The design is
+[`gchat-dm-thread-per-ask.md`](gchat-dm-thread-per-ask.md). A record minted under the
+thread-less key `gchat:dm/spaces/AAA` still parses and posts top-level, and `openDirect`
+returns that key, so an unsolicited post to a DM lands top-level. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
 `GROUP_CHAT`, binds the whole space as one conversation, `gchat:space/spaces/AAA`;
 anything that is not positively a DM is read as a group, since a space misread as a DM
 would bind every thread in it to one session — the honest reading of "a space is
@@ -1547,7 +1547,8 @@ works and until the parent's own answer has been delivered on that thread, then 
 cursor moved past it, and posted after all if the parent ends blocked, its subscription is gone,
 or the hold passes two hours (then led "Interim result from <card title> …"). One that arrives after
 the parent's answer has posted opens with "Late result from <card title>:". On Slack with
-`KAGE_SLACK_UX` on, a child whose parent still works is not held: its `completed` delivers, and
+`KAGE_SLACK_UX` on, and on Google Chat under `next`, where the gateway lays the plan out, a
+child whose parent still works is not held: its `completed` delivers, and
 `kanban_progress_lines` settles its plan row and posts nothing, as under `today`. Its other events (blocked, gave up, progress) post as before. A route probe (an empty notify, which an armed gateway refuses at once) tells the
 notifier when the route is unavailable (the gateway restarting), and it holds deliveries
 unclaimed then; only a send that meets the outage before the next probe spends one unit of
@@ -1591,13 +1592,20 @@ one platform is ever routed.
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
 The gateway Role reaches that one name with `get` and `patch`. `spec.integration.slack.homeChannelPolicy`
 (`auto`, also absent, or `manual`) is rendered to the gateway as `A2A_SLACK_HOME_POLICY`, with the
-record's name as `A2A_HOME_CHANNEL_RECORD` and the gateway's own image as `A2A_SELF_IMAGE`. In this
-release the agent's env and the `HomeChannelUnset` condition follow `homeChannel` alone. The change
-that makes the operator render the agent's `SLACK_HOME_CHANNEL` and `A2A_NOTIFY_PLATFORM` from "the
-CR, else the record" and the switch that arms the gateway's learn ship as one, so no release holds a
-signal nothing answers. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
-switch, `A2A_HOME_CHANNEL_LEARN=true`, which only the operator change that admits the record renders;
-that change merges after the gateway code, never before it. The gateway keeps no copy of the home
+record's name as `A2A_HOME_CHANNEL_RECORD`, the gateway's own image as `A2A_SELF_IMAGE` and the switch
+that arms the gateway's learn, `A2A_HOME_CHANNEL_LEARN=true`, whenever Slack is on the gateway. The
+operator reads the record once per reconcile and projects the home channel it stands behind, "the CR,
+else the admitted record", into a second ConfigMap it owns, `<agent>-chat-home`, one key `slack_home`
+always present, mounted as a read-only directory (Optional, no subPath, out of every pod-template hash)
+in the agent pod at `/etc/kube-agents/chat-home` and in the gateway pod at `/etc/a2a/chat-home`; the
+kubelet refreshes the file in place within about a minute, so a learned channel reaches both pods with
+no pod replaced and no copy to drift, and the `HomeChannelUnset` condition comes from the same read.
+The agent's env carries the CR field only, as any CR edit does. The operator admits a recorded channel
+only under policy `auto`, when the value is a channel id of at most 32 runes and no `slack.refused`
+stands beside it; a hand edit of the record carries the trust of the CR field, and the gateway checks a
+file-sourced home before each post (below), never the CR field. The projection joins the stack's teardown list, and a hand edit of it is
+rewritten on the next pass. The gateway's half (`a2a/gateway/slack_home_channel.go`) sits behind that
+switch, `A2A_HOME_CHANNEL_LEARN=true`. The gateway keeps no copy of the home
 channel. It reads one file, `/etc/a2a/chat-home/slack_home`: the projection of the home channel the
 operator admits (the CR field, else the record), which the operator change that admits the record
 mounts as a directory in the gateway pod; the notify route reads that file once per request, in
@@ -1619,14 +1627,23 @@ Slack Connect, not archived, the app a member) and written once (`slack`, `slack
 `slack.setAt`, `writer`; `slack.refused` cleared), and one line in the learning thread names the
 channel; the gateway's own home posts follow within one kubelet sync, about a minute, during which a
 home post is refused as having no home. A candidate the check refuses is written to `slack.refused`
-as one of the four words the operator matches, `shared`, `archived`, `not-member` or `malformed`,
+as one of the words the operator matches, `shared`, `archived`, `not-member` or `malformed` (the
+post-time check also writes `direct-message` for a hand-edited group DM id, which an operator without
+that word renders as a reason it does not know),
 while the record names no channel and does not name that reason already (a write that fails is tried
 again at the next refusal; while a channel is recorded, a refusal beside it is the post-time check's
 or an older gateway's, and a learn that adopts or replaces the channel clears it) and the next
 mention may learn; a record another writer filled first, or the record of a learn the file has not
 caught up with, is adopted after the same check with no line posted, or replaced when that check
 refuses it; a group direct message is refused without a call and a direct message is never a
-candidate. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
+candidate. The second writer is the Home tab's channel picker (`a2a/gateway/slack_home_pick.go`): a
+`conversations_select` on the admitted Home view, deduped on the member and `action_ts`, admitted by
+`homeAdmitted` after the other-workspace check and a `users.info` guest check (a guest account of the
+workspace never moves it, listed or not, and a lookup that fails refuses), checked as a mention is, then one merge patch under the
+read `resourceVersion`, retried once when a 409 came from a writer of a sibling key (`moveHome`; a 409
+that moved the home names the winner); the member's view shows the
+move over the projected file for at most two minutes, one line in the new channel names who moved it
+and one in the old says it moved. The hand-reachable state, `kubectl set env` of the switch on the gateway Deployment, learns
 nothing without the operator's projection. `patch` on the object is the RBAC bound; data-only merge
 patches with the read `resourceVersion` as the precondition are the gateway's contract.
 
@@ -1638,8 +1655,19 @@ card filed under `today` in a DM or another channel and delivered after the swit
 refused rather than reported into home; a Slack subscription with no channel is not sent. Slack
 lays out a home-channel request's `chat` message as it lays out a conversation's (the fleet
 audit's report card, `a2a notify --chat-file`): one that breaks a rule, or that Slack refuses,
-is dropped and its `text` posted, and the request's `update` and `mark` are not read. Chat posts
-the `text`. Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
+is dropped and its `text` posted. The `mark` is not read on a home post (it is drawn on an ask's
+plan, which a home thread has none of); the `update` key is kept per home thread as it is per
+conversation, in the same table and under the same bounds (16 keys a thread, 1,024 threads and
+conversations together, the least recently used forgotten first): a later request with the key on
+that thread edits the message, laid out or as text; one that finds no message there (another
+thread's, one forgotten, one lost to a restart) or a message that can no longer be edited posts
+anew; and a laid-out edit that fails otherwise is retried once and then left as it was, as a
+conversation's is ("Chat messages" below). A keyed message is one message, so its text is posted or
+edited as text only when it fits one chunk; a keyed request whose text is longer and whose layout
+does not land is posted in chunks and unkeyed, as before. A keyed request with no thread starts one
+and binds its key to it, which is how the event watcher's alert, posted under `alert-<session>`, is
+edited into its triage. Google Chat under `next` lays a home-channel `chat` message out and edits it
+the same way ("Chat messages on Google Chat"). Slack also takes Block Kit: a request may carry `blocks`, a JSON array posted as one message with
 `text` as its notification and fallback (`a2a notify --blocks-file`). A backend without blocks, Chat today, refuses such a request
 rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back as the
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
@@ -1737,8 +1765,11 @@ redelivered click is a duplicate like a redelivered message, and a click or repl
 sender the gateway drops changes
 nothing. A remembered question binds its click to the conversation it was posted in; the
 event's surface binds only a click on one the adapter does not remember. A question posted
-to the home channel (chat.notify) has no conversation at post time, so its click is bound by
-the event and a typed reply in its thread does not answer it; its buttons do. A
+to the home channel (chat.notify) has no conversation at post time, so its click binds by the
+same surface rule as a typed message, to the thread the event names, in the kind the event
+names, or, where the adapter clears the thread (an unthreaded space, a click event with no
+thread name), to the shared space, as a typed message there does, so the binding survives a restart without any mark, and a typed reply in its thread
+does not answer it; its buttons do. A
 rewrite that fails posts the line in the conversation instead. The questions and answers
 are held in the process: after a restart a question keeps its buttons until clicked, the click
 is still a turn, and the rewrite reads the message the event carries, its text, its link
@@ -1821,8 +1852,8 @@ thread is the session in a DM as in a channel. So `stop`, a status question and
 `/session` act on the thread they are typed in. A `stop` or a status question typed at
 the top of the DM is a conversation with nothing running in it, so it starts no task
 and its reply says to send it in the question's thread instead; the adapter marks such
-a message top-level (`InboundMessage.TopLevel`, set only for a top-level DM), and the
-gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
+a message top-level (`InboundMessage.TopLevel`, set for a top-level Slack or Google Chat
+DM), and the gateway keys the where-to-send-it reply on that mark. A `stop` in a thread with
 nothing running gets "nothing is running": the plain reply when the conversation has
 never run a task (a question refused at the session cap, say), and otherwise one that
 adds that if the agent filed a card, that card keeps working until it finishes, since
@@ -2187,8 +2218,8 @@ Chat and posted as the text elsewhere. The first request with an `update` key po
 chunk since an edit reaches only one message, and a later request with the same key in the same
 conversation edits it, laid out or as text, on Google Chat too. A key with no message here
 (another conversation's, one forgotten, one lost to a restart) or a message the backend says can no longer be edited posts anew. A laid-out edit that fails otherwise (a rate limit, an outage) is tried once more, laid out, and failing again leaves the message as it was and answers the request with the error: a text edit would strip the card and close an open question.
-A conversation keeps 16 keys and the gateway keys for 1,024 conversations, the least recently used
-forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
+A conversation or home thread keeps 16 keys and the gateway keys for 1,024 of them together, the
+least recently used forgotten first, so a plan edited all along outlives the questions filed after it. A notify's
 `mark` is drawn once its post lands, on the ask of the chain its `update` key is bound to
 (spec-a2a-payloads.md, "Card work after the task ends"): the first keyed `mark` binds the key
 to the conversation's latest chain, recorded on that chain's root history entry beside its
@@ -2217,7 +2248,8 @@ of changes: a card's plan moving or a mark changing reads the board again, a que
 answered recomputes who is waiting and reads the board only once the snapshot has aged out. At
 most 50 members are republished to. Admission is the inbound allowlist (`slackPrincipal`) and,
 when allow-all is what admits the member, their `users.info` team being the bot's (a failed lookup publishes nothing; a republish goes only to members admitted when they opened the tab and looks nothing up again); anyone else gets one line and no read of the board.
-A board that cannot be read draws Fleet with a line saying so, never an empty fleet.
+A board that cannot be read draws Fleet with a line saying so, never an empty fleet. Under the dashboard, the Home channel panel names where alerts and reports post and carries the picker
+that moves it (`slack_home_pick.go`; the record paragraph above says what a pick writes).
 
 **The board-health card's buttons.** The `kanban-board-health` job's stuck tasks reach Slack as a
 chat message whose rows carry the cards each stands for (`tasks`) and the buttons to draw under it

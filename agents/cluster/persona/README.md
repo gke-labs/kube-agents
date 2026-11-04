@@ -5,11 +5,18 @@ a read-only SRE for one GKE cluster, which each task names through the
 `project`, `cluster` and `location` parameters. It is the example persona for
 #3656, for the profile dispatcher (#3655) to run.
 
-Today's install does not run it. The image builds it into
-`/opt/cluster-template/persona` with the rest of `agents/cluster/`, but it is
-not scaffolded: `OVERLAY_ITEMS` in `agents/platform/scripts/cluster_agent_profile.py`
-leaves it out, so the Hermes cluster profiles still come from `agents/cluster/`
-(`SOUL.md`, `AGENTS.md`, `config.yaml`, `skills/`). This directory is the
+It ships as its own image, `persona-cluster` (`a2a/Dockerfile.persona-cluster`,
+with this directory under `/files`), and the chart's `profiles.cluster.enabled`
+renders the generic `cluster` AgentProfile that runs it (#3658). A profile
+worker pod mounts the image at `/persona`. No pod runs it until the profile
+dispatcher, worker and pool land (#4148, #4483, #4484) and the operator runs
+them.
+
+The Hermes cluster profiles don't use it. The platform-agent image also builds
+it into `/opt/cluster-template/persona` with the rest of `agents/cluster/`, but
+`OVERLAY_ITEMS` in `agents/platform/scripts/cluster_agent_profile.py` leaves it
+out, so those profiles still come from `agents/cluster/` (`SOUL.md`,
+`AGENTS.md`, `config.yaml`, `skills/`). This directory is the
 generic version of the same agent, with the kanban loop, the per-cluster
 stamping and the pinned kubeconfig taken out: credentials for the task's target
 come from the credential proxy under the task's grant.

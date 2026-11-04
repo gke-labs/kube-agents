@@ -77,10 +77,25 @@ STOP_MARKER_RE = re.compile(r"clean[\W_]*audit[\W_]*stop", re.IGNORECASE)
 # kubectl phases (CRD discovery, then per-kind listings) one shared 170 s wall-clock budget so
 # the script prints CLEAN_AUDIT_STOP: NO instead of being killed silent at 180 s.
 COLLECTOR_BUDGET_SECONDS = 170
-# Per-call kubectl cap within COLLECTOR_BUDGET_SECONDS: 60 s broker admission wait + 60 s broker
-# kubectl run cap + 5 s margin, matching cluster_preflight.sh so queued calls on the shared
-# 8-slot sandbox pool do not time out locally. Each phase gets min(KUBECTL_TIMEOUT_SECONDS, remaining).
-KUBECTL_TIMEOUT_SECONDS = 125
+# Per-call kubectl cap within COLLECTOR_BUDGET_SECONDS: one broker admission wait, one broker
+# kubectl run and a margin, the sizing cluster_preflight.sh gives its own calls, so queued calls
+# on the shared sandbox pool do not time out locally. Each phase gets min(KUBECTL_TIMEOUT_SECONDS,
+# remaining).
+BROKER_ADMISSION_WAIT_SECONDS = 60
+BROKER_KUBECTL_RUN_SECONDS = 60
+KUBECTL_CAP_MARGIN_SECONDS = 5
+KUBECTL_TIMEOUT_SECONDS = BROKER_ADMISSION_WAIT_SECONDS + BROKER_KUBECTL_RUN_SECONDS + KUBECTL_CAP_MARGIN_SECONDS
+# The shim retries a broker refusal on its own (credential_proxy_client.py), keeping a retry's
+# admission wait, not the command's run, inside a deadline the caller may shorten through this
+# variable (the shim's RETRY_DEADLINE_ENV; test_domain_auditors.py holds the two equal). The cap
+# above has room for one admission wait and one run, so a retry admitted late would carry past
+# it, where the local timeout's text stands in for the broker's reason. Every call therefore
+# tells the shim the cap less the margin and the run bound, under which no retry fits, and a
+# refused call records that refusal's text at once, as cluster_preflight.sh's calls do. A phase
+# run under less than the cap, on what the budget has left, keeps the same deadline: shorter
+# still admits nothing.
+SHIM_RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
+SHIM_RETRY_DEADLINE_SECONDS = KUBECTL_TIMEOUT_SECONDS - KUBECTL_CAP_MARGIN_SECONDS - BROKER_KUBECTL_RUN_SECONDS
 BUDGET_EXHAUSTED_ERROR = (
     f"collector {COLLECTOR_BUDGET_SECONDS}s wall-clock budget exhausted before kubectl completed"
 )
@@ -234,6 +249,7 @@ def audit_certificates(
     env = os.environ.copy()
     if CREDENTIAL_PROXY_BIN not in env.get("PATH", ""):
         env["PATH"] = f"{CREDENTIAL_PROXY_BIN}:" + env.get("PATH", "")
+    env[SHIM_RETRY_DEADLINE_ENV] = str(SHIM_RETRY_DEADLINE_SECONDS)
     if kubeconfig:
         env["KUBECONFIG"] = kubeconfig
 

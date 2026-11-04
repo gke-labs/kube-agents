@@ -1356,6 +1356,68 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             combined = proc.stdout + proc.stderr
             self.assertIn("not a regular file", combined)
 
+    def test_print_minter_restore_advice_names_the_restore_for_scheduled_versions(self):
+        """A minter key whose versions a destroy scheduled needs a restore, not a
+        re-import: the helper names gcloud's restore and enable and returns 0."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "kms_key_scheduled_version() { echo 3; }; "
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        out = proc.stdout + proc.stderr
+        self.assertIn("rc=0", proc.stdout, out)
+        self.assertIn("Its versions are scheduled for destruction, as a destroy of the key leaves them.", out)
+        # gcloud's restore works in or out of Terraform state; adopt-kms would
+        # need a checkout and state backend the installers do not have here.
+        self.assertNotIn("adopt-kms", out)
+        self.assertIn(
+            "gcloud kms keys versions restore <version> --key minter-key --keyring minter-ring --location us-central1 --project p1",
+            out,
+        )
+
+    def test_print_minter_restore_advice_is_silent_with_nothing_scheduled(self):
+        """A key never imported, or a failed query, has nothing to restore: the
+        helper prints nothing and returns 1, so the caller's import advice stands."""
+        cmd = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'kms_key_scheduled_version() { echo ""; }; '
+            'if print_minter_restore_advice "minter-key" "minter-ring" "us-central1" "p1"; then echo rc=0; else echo rc=1; fi'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("scheduled for destruction", proc.stdout + proc.stderr)
+
+    def test_kms_key_scheduled_version_asks_for_destroy_scheduled_versions(self):
+        """The query filters on DESTROY_SCHEDULED, and a failing gcloud reads as none."""
+        asks = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            'gcloud() { case "$*" in *"state=DESTROY_SCHEDULED"*) echo 3 ;; *) echo wrong ;; esac; }; '
+            'echo "v=[$(kms_key_scheduled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[3]", self._run_install_func(asks).stdout)
+        fails = (
+            f"{_SOURCE_INSTALLER_COMMON}"
+            "gcloud() { return 1; }; "
+            'echo "v=[$(kms_key_scheduled_version minter-key minter-ring us-central1 p1)]"'
+        )
+        self.assertIn("v=[]", self._run_install_func(fails).stdout)
+
+    def test_both_installers_name_the_restore_before_their_import_advice(self):
+        """install.sh and upgrade.sh refuse a minter key with no ENABLED version; the
+        restore advice comes first, and their own import advice only when it returns 1."""
+        for script, advice in (
+            (_INSTALL_SH, 'print_info "Fix the App key import'),
+            (_REPO_ROOT / "upgrade.sh", 'print_info "Import the App key with install.sh'),
+        ):
+            with self.subTest(script=script.name):
+                text = script.read_text()
+                call = text.index("print_minter_restore_advice ")
+                self.assertLess(call, text.index(advice))
+                self.assertIn(" ||\n", text[call : text.index(advice)])
+        # upgrade.sh sources the target tree's helpers, which may predate this one.
+        self.assertIn("declare -F print_minter_restore_advice", (_REPO_ROOT / "upgrade.sh").read_text())
+
     def test_validate_non_interactive_minter_config(self):
         """validate_non_interactive_minter_config enforces intent-driven validation."""
         # 1. No App ID and no PEM path -> succeeds (optional feature omitted)
@@ -1384,6 +1446,20 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc4 = self._run_install_func(cmd4)
         self.assertEqual(proc4.returncode, 1, proc4.stderr)
         self.assertIn("provided in non-interactive mode, but no ENABLED KMS key exists", proc4.stdout + proc4.stderr)
+
+        # 4b. The same, but the key's versions are scheduled for destruction -> the
+        # restore is named instead of the import, and the run still stops.
+        cmd4b = (
+            f'{_SOURCE_INSTALLER_COMMON}'
+            'kms_key_enabled_version() { echo ""; }; '
+            'kms_key_scheduled_version() { echo 2; }; '
+            'rc=0; validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org" || rc=$?; echo "rc=$rc"'
+        )
+        proc4b = self._run_install_func(cmd4b)
+        out4b = proc4b.stdout + proc4b.stderr
+        self.assertIn("rc=1", proc4b.stdout, out4b)
+        self.assertIn("Its versions are scheduled for destruction", out4b)
+        self.assertNotIn("for automated import, or pre-import", out4b)
 
         # 5. App ID provided with org and existing KMS key version (AOT path) -> succeeds
         cmd5 = (
@@ -4985,6 +5061,18 @@ class MissingPemAgainstKmsTest(unittest.TestCase):
         self.assertIn("has no ENABLED version, so the import still needs that file", combined)
         self.assertIn("PEM=[/tmp/never-existed-12345.pem] RC=1", proc.stdout)
 
+    def test_a_missing_pem_names_the_restore_when_the_key_versions_are_scheduled(self):
+        """A key whose versions a destroy scheduled needs a restore, not the PEM again."""
+        proc = self._resolve(
+            "/tmp/never-existed-12345.pem", "",
+            overrides='kms_key_scheduled_version() { echo 2; }; ',
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        combined = proc.stdout + proc.stderr
+        self.assertIn("Its versions are scheduled for destruction", combined)
+        self.assertIn("gcloud kms keys versions restore <version> --key github-token-minter-key", combined)
+        self.assertNotIn("the import still needs that file", combined)
+
     def test_an_overridden_keyring_and_key_are_what_kms_is_asked_about(self):
         """--kms-keyring/--kms-key must reach the probe, or the fallback checks the wrong key."""
         proc = self._resolve(
@@ -5849,6 +5937,26 @@ class ServiceAccountOwnershipIsCheckedOnEveryApplyDoorTest(unittest.TestCase):
         apply = self.source.index("run_lifecycle_apply", menu_generator)
         self.assertLess(menu_generator, check)
         self.assertLess(check, apply)
+
+
+class FootprintSummaryIsPrintedInTheStepElevenSummaryTest(unittest.TestCase):
+    """The footprint and modeled-cost block is part of the step 11 summary: after the
+    generator wrote the tfvars it reads, inside the summary, and before the dry-run exit
+    and the confirmation, so the dry run and the real run both show it."""
+
+    def setUp(self):
+        self.source = _INSTALL_SH.read_text()
+
+    def test_the_block_sits_between_the_summary_heading_and_the_dry_run_exit(self):
+        generator = self.source.index('write_tfvars_from_state "$tfvars_file" "$image_tag"')
+        summary = self.source.index('print_step "11. Pre-Flight Configuration Summary"', generator)
+        call = self.source.index('print_footprint_summary "$repo_dir" "$tfvars_file"', summary)
+        dry_run = self.source.index('if [ "$PARAM_DRY_RUN" = "true" ]; then', summary)
+        confirm = self.source.index("Proceed with automated GKE cluster & Platform Agent provisioning?", summary)
+        self.assertLess(summary, call)
+        self.assertLess(call, dry_run)
+        self.assertLess(dry_run, confirm)
+        self.assertEqual(self.source.count("print_footprint_summary "), 1)
 
 
 class FailedInitialReleaseIsClearedBeforeTheApplyTest(unittest.TestCase):

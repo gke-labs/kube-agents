@@ -119,6 +119,7 @@ version-control abstraction lands.
 | The shims themselves           | [`deploy/docker/Dockerfile`](../../deploy/docker/Dockerfile) — symlinks under `/opt/credential-proxy/bin`                                                                                                                                                                             |
 | Its command policy             | `/etc/credential-proxy/policy.json`, from `CREDENTIAL_PROXY_POLICY`                                                                                                                                                                                                                   |
 | Proxy placement and federation | [`credential_proxy_manifests.go`](../../k8s-operator/internal/controller/credential_proxy_manifests.go), `buildCredentialProxyEnv` in [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go)                                               |
+| The Kubernetes API proxy       | [`kube-proxy.md`](kube-proxy.md) — [`k8s-api-proxy/`](../../k8s-api-proxy/) and [`kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)                                                                                                           |
 | The STS credential file        | [`agents/platform/scripts/wif_credentials.py`](../../agents/platform/scripts/wif_credentials.py)                                                                                                                                                                                      |
 | The isolation contract         | [`docs/credential-isolation-design.md`](../credential-isolation-design.md)                                                                                                                                                                                                            |
 | The Session KV store           | [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py), SQLite under `/var/lib/kube-agents/session/`                                                                                                                                    |
@@ -355,6 +356,19 @@ a closed stdout drops the printf) gets a
 connection was closed under the command or never opened, and that it may have
 run. A per-environment `ControlPath` would remove the sharing itself and is
 upstream's to make.
+
+The sharing also puts a ceiling on fan-out. Every concurrent command is a session on the
+one master, and `sshd` caps sessions per connection at `MaxSessions`, 10 by default: the
+eleventh concurrent command is refused by the master and the client exits 255 with
+nothing on stderr, the same shape as the teardown above. A sweep that delegates a card
+per cluster hit it on a large fleet. `deploy/sandbox/sshd_config` sets `MaxSessions 128`,
+and raises `MaxStartups` to `64:30:256` for the moment several agent processes open a
+master at once after a sandbox restart; the image's smoke test opens one master and runs
+64 sessions over it. More sessions mean more shells in the one pod, so the container's
+memory is the counterpart: `spec.harness.experimental.shellSandbox.resources` sizes the
+shell container, and the
+[CRD reference](../site/src/content/docs/operator/platformagent-crd.md#shellsandbox) owns
+its defaults, merge rule and refusals.
 
 ### What the credential proxy is for
 
@@ -1386,7 +1400,11 @@ scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart 
 directories. The scaffold passes `--profile <name>` and pushes that home plus the machine
 home and `profiles/platform`, the two roots the sandbox creates bare; the start pushes
 every home. Re-sending every home on every scaffold made onboarding N clusters
-cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: the Deployment and
+cost O(N²) (#3701). A profile delete runs it the other way: `--remove-profile <name>`
+removes that home from the sandbox once the agent pod's copy is gone, over the same
+SSH hop, and refuses a name that still has anything under the agent pod's `profiles/`.
+Create and delete hold a per-profile lock, so a delete cannot remove the sandbox home a
+concurrent scaffold of the same name has just pushed (#4389). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
@@ -1652,8 +1670,8 @@ worker on the default profile sends and is silent — the root is matched by val
 a data root with a `profiles` component in its own path is not read as a profile; a name
 that is not one component is refused with a line on stderr; a well-formed name with no
 home here is a profile the mirror has not
-delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` runs
-on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
+delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` pushes
+the layout on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
 that window would otherwise fail the same way with nothing beside the failure to say why.
 Nothing evaluates the value; every use is a quoted expansion.
 
@@ -2158,8 +2176,11 @@ from the test fleet now that cron runs have a working directory of their own. A 
 is listed before the pod's profile list is read, so a profile scaffolded between the two
 reads is never taken for stale; only cluster-prefixed names go, only when the pod lists the
 platform profile, and only under a profiles root that `find -P` reports as a real directory,
-by one `rm` per home as the model's account, which owns the homes; a home whose `rm` fails
-is named in one chat bullet each night until it goes. The listing runs as
+by one `rm` per home as the model's account, which owns the homes, each under that
+profile's lock, the one `create_profile` and `delete_profile` hold (#4389): taken without
+blocking, from the pod's last-moment recheck through the `rm`, so a name being scaffolded
+right then is left for the next night. A home whose `rm` fails is named in one chat bullet
+each night until it goes. The listing runs as
 `hermes`, the default principal, because its output is believed, under the sandbox's own
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
@@ -2522,18 +2543,21 @@ ReadWriteOnce data PVC that only the gateway pod mounts.
 
 So `CREDENTIAL_PROXY_ROLE` selects which services a container starts:
 
-| Role        | Starts                                               | Runs in                              |
-| ----------- | ---------------------------------------------------- | ------------------------------------ |
-| `broker`    | credential exec broker, Google Chat and Slack relays | the `<agent>-credential-proxy` pod   |
-| `api-proxy` | API authenticator, k8s-event-watcher, drift-detector | the gateway pod, as `agent-api-auth` |
-| `combined`  | all of them                                          | nothing, now — the default           |
+| Role        | Starts                                                                       | Runs in                                                                       |
+| ----------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `broker`    | credential exec broker, Google Chat and Slack relays                         | the `<agent>-credential-proxy` pod                                            |
+| `api-proxy` | API authenticator, k8s-event-watcher, drift-detector                         | the gateway pod, as `agent-api-auth`                                          |
+| `combined`  | all of them                                                                  | nothing, now — the default                                                    |
+| `exec`      | credential exec broker, without the event relays (the Cloud API relay stays) | the `<agent>-credential-proxy-exec-tier` pods, once the operator renders them |
 
 `combined` is the default, so an image paired with an operator that does not set the
 variable starts every service; `start-services.sh` refuses any other value rather than
-falling back to it. The `api-proxy` container loads no policy and builds no
-`CommandExecutor`: it compares one key and forwards, holding no credential path. It is
-called `agent-api-auth`, and `envoy-credential-proxy` names the `broker` container — the
-one that does proxy credentials.
+falling back to it. An `exec` pod serves only the exec routes that
+[`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §12 lists. The
+`api-proxy` container loads no policy and builds no `CommandExecutor`: it compares one key
+and forwards, holding no credential path. It is called `agent-api-auth`, and
+`envoy-credential-proxy` names the `broker` container — the one that does proxy
+credentials.
 
 ### How the proxy gets a token
 
@@ -2666,12 +2690,12 @@ role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
 apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
-minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session, profile)`
-(the sixth role, `profile`, is below), and
+minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
+(the `profile` and `scope` roles, below, reach it too), and
 within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. One path
 under it is the shell's alone: `/v1/exec/admission`, the read-only report of how many commands
 the broker admits at once, which the shell's fleet sweeps size their pools by
-(`broker_admission.py`); the session and profile roles don't reach it, and a sweep run under
+(`broker_admission.py`); the session, profile and scope roles don't reach it, and a sweep run under
 either falls back to four. Because a
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
@@ -2696,6 +2720,15 @@ credential's cluster and project. Profile calls together hold at most
 ([spec-subagent-profiles.md](spec-subagent-profiles.md) owns the detail). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
+
+The scope publisher Job under `mode: next` has a role of its own, `scope`:
+its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its callers through
+`CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
+`ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token
+for token, each on an argument the `scope.json` at `CREDENTIAL_PROXY_SCOPE_FILE` declares or
+that an earlier lookup returned to the role within five hours. That record of returned members is
+memory in the one broker process, so the role stays on the single broker pod
+([credential-proxy-single-pod.md](credential-proxy-single-pod.md#2-state-that-lives-in-the-pod)).
 
 Be precise about what the token buys: it is a **multi-tenancy control** that stops another
 workload in the cluster borrowing the agent's credentials, and not an agent-containment
@@ -2836,13 +2869,13 @@ bounds what stays on the volume, not what a clone transiently writes.
 
 The agent-facing surface for all of it is the `inspect-repository` skill, which is the thing a
 list of protocol verbs does not give you: without a skill naming the capability, the agent has
-no way to know that reading somebody else's code is still possible. Its `clone` subcommand
-pages the listing, batches the reads and writes the files into a scratch directory; what lands
-is source with no repository around it, which is the same property the write path has for the
-same reason. Its `open`/`grep`/`fetch`/`close` sequence is for repositories too large to copy,
-and the handle rather than a directory is what travels between the agent's turns. On a broker
-that has not been armed, `clone` falls back to the leased checkout and says `"mode":
-"directory"`; the handle subcommands say they cannot serve the request instead of pretending.
+no way to know that reading somebody else's code is still possible. Its `clone` command takes
+one revision through the broker's stateless `snapshot` verb (`/v1/vcs/snapshot`) and unpacks it
+into a scratch directory; what lands is source with no repository around it, which is the same
+property the write path has for the same reason. A repository over the snapshot ceiling is
+refused whole, and `--prefix` takes part of it. With no broker, `clone` falls back to
+the leased checkout and says `"mode": "directory"`. A broker older than the verb is an error that
+names the image to roll forward, because the sandbox's `git` has no transport for that checkout.
 
 What content-passing does not remove is the volume itself. The clone path still needs it, so
 the mount stays until the last skill has migrated and directory mode is deleted; the

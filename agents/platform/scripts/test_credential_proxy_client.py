@@ -9,20 +9,27 @@ Run:  python3 agents/platform/scripts/test_credential_proxy_client.py
 
 import base64
 import http.client
+import http.server
 import io
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import command_policy
+import credential_proxy
 import credential_proxy_client
 
 try:
@@ -436,6 +443,83 @@ class TestGetCredentialsWithFlagsBetweenItsWords(ContextLessTestCase):
         for argv, want in cases:
             with self.subTest(argv=argv):
                 self.assertEqual(want, credential_proxy_client.is_get_credentials(argv))
+
+
+class TestTheShimAndTheBrokerAgreeOnGetCredentials(unittest.TestCase):
+    """The shim's get-credentials walk reads argv as the broker's does.
+
+    The shim can't import `command_policy` in the sandbox, so it keeps its own
+    walk. This holds the two to one table of spellings, and holds the shim's
+    short valued flags to the policy's, so a short valued flag added to the
+    policy fails here until the shim learns it too.
+    """
+
+    GC = ["gcloud", "container", "clusters"]
+
+    AGREED = [
+        (GC + ["get-credentials", "c"], True),
+        (GC + ["--location=l", "get-credentials", "c"], True),
+        (GC + ["--location", "l", "get-credentials", "c"], True),
+        (GC + ["--zone", "l", "get-credentials", "c"], True),
+        (GC + ["-z", "l", "get-credentials", "c"], True),
+        (GC + ["-z=l", "get-credentials", "c"], True),
+        (["gcloud", "container", "-z", "l", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "-z", "l", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--project=p", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--project", "p", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "--project", "p", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "--project=p", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "container", "--quiet", "clusters", "--zone", "l", "get-credentials", "c"], True),
+        (["gcloud", "alpha", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "beta", "container", "clusters", "get-credentials", "c"], True),
+        (["gcloud", "beta", "container", "clusters", "-z", "l", "get-credentials", "c"], True),
+        (GC + ["describe", "get-credentials"], False),
+        (GC + ["list", "--location", "l"], False),
+        (GC + ["-z", "l", "list"], False),
+        (GC + ["describe", "c", "-z", "l"], False),
+        (["gcloud", "projects", "list"], False),
+        (["gcloud", "compute", "instances", "list", "--format=json"], False),
+        (GC, False),
+        (["kubectl", "container", "clusters", "get-credentials"], False),
+        (["kubectl", "get", "pods", "-n", "default"], False),
+        ([], False),
+    ]
+
+    # Known and harmless: the shim never lets a bare `--flag` take one of the
+    # three command words as its value, so it reads `get-credentials` here as
+    # the verb where the broker reads it as `--format`'s value. The shim asks
+    # for a file the broker doesn't send, and nothing lands. (argv, shim, broker)
+    KNOWN_DISAGREEMENTS = [
+        (GC + ["--format", "get-credentials", "list"], True, False),
+        # Malformed argv the read-only policy refuses before routing: the broker
+        # can't read them and falls back to "carries the verb", the shim reads
+        # them its own way. Pinned so any other disagreement fails.
+        (["gcloud", "--", "container", "clusters", "get-credentials", "c"], False, True),
+        (GC + ["-qz", "l", "get-credentials", "c"], False, True),
+        (GC + ["--format", "-z", "get-credentials", "c"], False, True),
+    ]
+
+    def test_the_release_tracks_are_the_policys(self):
+        self.assertEqual(command_policy._GCLOUD_RELEASE_TRACKS, credential_proxy_client._GCLOUD_RELEASE_TRACKS)
+
+    def test_both_read_every_spelling_the_same(self):
+        for argv, want in self.AGREED:
+            with self.subTest(argv=argv):
+                self.assertEqual(want, credential_proxy._is_get_credentials(argv))
+                self.assertEqual(want, credential_proxy_client.is_get_credentials(argv))
+
+    def test_the_known_disagreements_are_the_only_ones(self):
+        for argv, shim, broker in self.KNOWN_DISAGREEMENTS:
+            with self.subTest(argv=argv):
+                self.assertEqual(shim, credential_proxy_client.is_get_credentials(argv))
+                self.assertEqual(broker, credential_proxy._is_get_credentials(argv))
+
+    def test_the_shim_knows_every_short_valued_flag_the_policy_does(self):
+        policy_short = {
+            flag for flag in command_policy._GCLOUD_FLAGS_WITH_VALUE
+            if flag.startswith("-") and not flag.startswith("--")
+        }
+        self.assertEqual(policy_short, set(credential_proxy_client._GCLOUD_SHORT_FLAGS_WITH_VALUE))
 
 
 class TestAShellFollowsItsOwnGetCredentials(ContextLessTestCase):
@@ -1710,6 +1794,509 @@ class ApiSessionTest(unittest.TestCase):
         self.assertEqual("http://b/v1/gcp/h/p", completed.stdout.strip())
 
 
+def busy_error(bound, url="http://broker/v1/exec"):
+    """A 503 CREDENTIAL_PROXY_BUSY refusal as the broker sends it, `bound` omitted when None."""
+    reply = {"status": "busy", "code": credential_proxy_client.BUSY_CODE, "error": f"busy at {bound}"}
+    if bound is not None:
+        reply[credential_proxy_client.BUSY_BOUND_KEY] = bound
+    return urllib.error.HTTPError(
+        url=url, code=503, msg="Service Unavailable", hdrs=http.client.HTTPMessage(),
+        fp=io.BytesIO(json.dumps(reply).encode("utf-8")),
+    )
+
+
+def unreachable():
+    """What the opener raises when no connection to the broker could be made."""
+    return urllib.error.URLError(credential_proxy_client.BrokerUnreachable("[Errno 111] Connection refused"))
+
+
+class TestExecTierRouting(unittest.TestCase):
+    """Exec-role calls go to the exec tier, fall back when it cannot be reached,
+    and retry a refusal at admission on the shim's schedule, with or without
+    exec routing. docs/designs/credential-broker-exec-tier.md §3.2, §4.3 and §12.
+    The schedule itself (waits, deadline, Retry-After) is RetriesAdmissionRefusalsTest's."""
+
+    EXEC = "http://agent-credential-proxy-exec-tier.kubeagents-system.svc.cluster.local:8765"
+    STATEFUL = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+    OK = {"exitCode": 0, "stdout": "pods\n"}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "token").write_text("caller-token\n", encoding="utf-8")
+        self.environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.tmp / "token"),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+        }
+        self.sleeps = []
+
+    def run_shim(self, answers, endpoint=EXEC, fallback=STATEFUL):
+        """Send one kubectl through `execute`, answering each call from `answers` in turn."""
+        calls = []
+        answers = list(answers)
+
+        def fake_open(request, *args, **kwargs):
+            calls.append((request.full_url, json.loads(request.data)["requestId"]))
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return RecordingResponse(json.dumps(answer).encode("utf-8"))
+
+        stderr = io.StringIO()
+        with patch.dict("os.environ", self.environ, clear=False), \
+                patch.object(credential_proxy_client, "open_broker_request", fake_open), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+            code = credential_proxy_client.execute(
+                endpoint, ["kubectl", "get", "pods"], fallback=fallback, sleep_fn=self.sleeps.append
+            )
+        self.assertEqual([], answers, "every planned answer is used")
+        return code, calls, stderr.getvalue()
+
+    def test_the_exec_tier_is_the_target_when_its_url_is_set(self):
+        cases = {
+            "both": ({"CREDENTIAL_PROXY_EXEC_URL": self.EXEC, "CREDENTIAL_PROXY_URL": self.STATEFUL}, (self.EXEC, self.STATEFUL)),
+            "stateful only": ({"CREDENTIAL_PROXY_EXEC_URL": "", "CREDENTIAL_PROXY_URL": self.STATEFUL}, (self.STATEFUL, None)),
+            "blank exec": ({"CREDENTIAL_PROXY_EXEC_URL": "  ", "CREDENTIAL_PROXY_URL": self.STATEFUL}, (self.STATEFUL, None)),
+            "exec only": ({"CREDENTIAL_PROXY_EXEC_URL": self.EXEC}, (self.EXEC, None)),
+        }
+        for name, (environ, expected) in cases.items():
+            with self.subTest(name), patch.dict("os.environ", environ, clear=False):
+                if "CREDENTIAL_PROXY_URL" not in environ:
+                    os.environ.pop("CREDENTIAL_PROXY_URL", None)
+                self.assertEqual(expected, credential_proxy_client.exec_endpoints())
+
+    def test_an_unreachable_exec_tier_falls_back_with_one_line_and_the_same_request(self):
+        code, calls, stderr = self.run_shim([unreachable(), self.OK])
+        self.assertEqual(0, code)
+        self.assertEqual([self.EXEC + "/v1/exec", self.STATEFUL + "/v1/exec"], [url for url, _ in calls])
+        self.assertEqual(1, len({request_id for _, request_id in calls}), "the fallback is the same request")
+        self.assertEqual(1, stderr.count(credential_proxy_client.EXEC_FALLBACK_NOTICE), stderr)
+
+    def test_with_no_fallback_an_unreachable_broker_is_reported_as_before(self):
+        code, calls, stderr = self.run_shim([unreachable()], fallback=None)
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("credential proxy unavailable", stderr)
+
+    def test_a_failure_after_the_connection_is_made_does_not_fall_back(self):
+        """A send that fails part way may have reached the broker."""
+        code, calls, stderr = self.run_shim([urllib.error.URLError(BrokenPipeError("broken pipe"))])
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("credential proxy unavailable", stderr)
+
+    def test_each_retryable_bound_is_retried_on_a_new_connection_after_a_wait(self):
+        for bound in sorted(credential_proxy_client.RETRYABLE_BUSY_BOUNDS):
+            with self.subTest(bound=bound):
+                self.sleeps.clear()
+                code, calls, _ = self.run_shim([busy_error(bound), self.OK])
+                self.assertEqual(0, code)
+                self.assertEqual([self.EXEC + "/v1/exec"] * 2, [url for url, _ in calls])
+                self.assertEqual(1, len({request_id for _, request_id in calls}))
+                self.assertEqual(1, len(self.sleeps), "one jittered wait before the retry")
+
+    def test_a_refusal_under_any_other_bound_is_not_retried(self):
+        """A reply with no bound is an older broker's and is retried
+        (RetriesAdmissionRefusalsTest); a bound the shim does not know, or one
+        that is not a string, is reported."""
+        for bound in ("session", "refresh-lock", "other", "scope", ["slot"], {"slot": 1}):
+            with self.subTest(bound=bound):
+                code, calls, stderr = self.run_shim([busy_error(bound)])
+                self.assertEqual(1, code)
+                self.assertEqual(1, len(calls))
+                self.assertIn(f"busy at {bound}", stderr)
+                self.assertEqual([], self.sleeps)
+
+    def test_without_exec_routing_a_busy_refusal_is_retried_on_the_same_schedule(self):
+        """With no exec tier, or a named endpoint, there is one stateful pod:
+        the wait is what lets it admit the command once a slot frees."""
+        code, calls, stderr = self.run_shim([busy_error("slot"), self.OK], endpoint=self.STATEFUL, fallback=None)
+        self.assertEqual(0, code, stderr)
+        self.assertEqual([self.STATEFUL + "/v1/exec"] * 2, [url for url, _ in calls])
+        self.assertEqual(1, len(self.sleeps))
+        self.assertIn("credential proxy busy (HTTP 503): busy at slot; retrying in", stderr)
+
+    def test_a_drop_while_the_refusal_is_read_is_reported_not_raised(self):
+        class TornBody(io.BytesIO):
+            def read(self, *args):
+                raise http.client.IncompleteRead(b'{"status": "bu')
+
+        torn = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=503, msg="Service Unavailable",
+            hdrs=http.client.HTTPMessage(), fp=TornBody(),
+        )
+        code, calls, stderr = self.run_shim([torn])
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("the connection dropped while the refusal was read", stderr)
+
+    def test_a_second_refusal_is_retried_again_until_the_count_is_spent(self):
+        code, calls, stderr = self.run_shim([busy_error("slot"), busy_error("slot"), self.OK])
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(3, len(calls))
+        self.assertEqual(2, len(self.sleeps))
+        self.sleeps.clear()
+        refusals = [busy_error("slot") for _ in range(credential_proxy_client.CREDENTIAL_PROXY_CLIENT_MAX_RETRIES + 1)]
+        code, calls, stderr = self.run_shim(refusals)
+        self.assertEqual(1, code)
+        self.assertEqual(len(refusals), len(calls))
+        self.assertEqual(credential_proxy_client.CREDENTIAL_PROXY_CLIENT_MAX_RETRIES, len(self.sleeps))
+        self.assertIn(f"credential proxy throttled: gave up after {len(refusals)} attempts (HTTP 503): busy at slot", stderr)
+
+    def test_a_fallback_is_not_a_retry_and_does_not_count_against_the_schedule(self):
+        code, calls, stderr = self.run_shim([unreachable(), busy_error("slot"), self.OK])
+        self.assertEqual(0, code)
+        self.assertEqual(
+            [self.EXEC + "/v1/exec", self.STATEFUL + "/v1/exec", self.STATEFUL + "/v1/exec"],
+            [url for url, _ in calls],
+        )
+        self.assertEqual(1, len(self.sleeps), "the fallback waits for nothing; the retry does")
+        self.assertIn("(attempt 2)", stderr, "the fallback is not an attempt")
+        self.sleeps.clear()
+        code, calls, _ = self.run_shim([busy_error("slot"), unreachable(), self.OK])
+        self.assertEqual(0, code, "the retry may still fall back: nothing ran")
+        self.assertEqual(3, len(calls))
+        self.assertEqual(1, len(self.sleeps))
+        self.sleeps.clear()
+        refusals = [busy_error("budget") for _ in range(credential_proxy_client.CREDENTIAL_PROXY_CLIENT_MAX_RETRIES + 1)]
+        code, calls, stderr = self.run_shim([unreachable(), *refusals])
+        self.assertEqual(1, code)
+        self.assertEqual(len(refusals) + 1, len(calls))
+        self.assertIn(f"gave up after {len(refusals)} attempts", stderr)
+
+    def test_a_503_that_is_not_the_brokers_is_not_retried(self):
+        envoy = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=503, msg="Service Unavailable",
+            hdrs=http.client.HTTPMessage(), fp=io.BytesIO(b"<html>upstream connect error</html>"),
+        )
+        code, calls, stderr = self.run_shim([envoy])
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("non-JSON response", stderr)
+
+    def test_a_policy_block_still_exits_77(self):
+        refusal = {"code": "SECURITY_POLICY_BLOCKED", "message": "no", "rule": "kubernetes.read-only"}
+        blocked = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=403, msg="Forbidden", hdrs=http.client.HTTPMessage(),
+            fp=io.BytesIO(json.dumps(refusal).encode("utf-8")),
+        )
+        code, calls, stderr = self.run_shim([blocked])
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("policy rule: kubernetes.read-only", stderr)
+
+    def test_a_busy_body_on_another_status_is_not_retried(self):
+        """Only the broker's admission refusal, a 503, is known not to have run."""
+        reply = {"status": "busy", "code": credential_proxy_client.BUSY_CODE, "bound": "slot", "error": "odd"}
+        odd = urllib.error.HTTPError(
+            url="http://broker/v1/exec", code=500, msg="Internal Server Error", hdrs=http.client.HTTPMessage(),
+            fp=io.BytesIO(json.dumps(reply).encode("utf-8")),
+        )
+        code, calls, stderr = self.run_shim([odd])
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(calls))
+        self.assertIn("odd", stderr)
+
+    def test_the_two_new_lines_keep_kubectls_failure_classifiers_right(self):
+        """A fallback line must not hide a real cluster connection failure that
+        follows it, nor look like one; a dropped connection is the shim's own."""
+        import cluster_agent_profile
+
+        notice = credential_proxy_client.EXEC_FALLBACK_NOTICE
+        self.assertIsNone(cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE.search(notice))
+        self.assertIsNone(cluster_agent_profile.CONNECTIVITY_FAILURE_RE.search(notice))
+        _, _, stderr = self.run_shim([ConnectionResetError(104, "Connection reset by peer")])
+        self.assertIsNotNone(cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE.search(stderr), stderr)
+
+    def test_a_connection_dropped_after_the_request_was_sent_is_never_sent_again(self):
+        """The command may have run: no retry, and no fallback, whichever broker it was."""
+        drops = (
+            http.client.RemoteDisconnected("Remote end closed connection without response"),
+            http.client.IncompleteRead(b"{"),
+            ConnectionResetError(104, "Connection reset by peer"),
+        )
+        for drop in drops:
+            with self.subTest(drop=type(drop).__name__):
+                code, calls, stderr = self.run_shim([drop])
+                self.assertEqual(1, code)
+                self.assertEqual(1, len(calls))
+                self.assertIn("the command may have run", stderr)
+
+    def test_a_malformed_url_is_reported_not_raised_and_not_as_a_drop(self):
+        """A bad port is raised bare by urllib, before a socket opens, and a URL
+        with no scheme fails while the request is built: nothing was sent."""
+        for url in ("http://broker:abc", "agent-credential-proxy-exec-tier"):
+            with self.subTest(url=url):
+                stderr = io.StringIO()
+                with patch.dict("os.environ", self.environ, clear=False), \
+                        patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+                    code = credential_proxy_client.execute(url, ["kubectl", "get", "pods"], fallback=self.STATEFUL)
+                self.assertEqual(1, code)
+                self.assertIn("credential proxy unavailable", stderr.getvalue())
+                self.assertNotIn("may have run", stderr.getvalue())
+
+
+class TestBrokerUnreachable(unittest.TestCase):
+    """The one exact signal that no request reached the broker."""
+
+    def test_a_failed_connect_raises_it_with_the_same_message(self):
+        def refuse(self):
+            raise ConnectionRefusedError(111, "Connection refused")
+
+        connection = credential_proxy_client.BrokerConnection("broker", 8765)
+        with patch.object(credential_proxy_client.http.client.HTTPConnection, "connect", refuse):
+            with self.assertRaises(credential_proxy_client.BrokerUnreachable) as caught:
+                connection.connect()
+        self.assertIsInstance(caught.exception, OSError)
+        self.assertIn("Connection refused", str(caught.exception))
+
+    def test_the_opener_wraps_it_in_a_url_error_as_before(self):
+        """A caller that reads only the URLError (vcs, workspaces) sees no change."""
+        import socket
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        request = urllib.request.Request(f"http://127.0.0.1:{port}/v1/exec", data=b"{}", method="POST")
+        with self.assertRaises(urllib.error.URLError) as caught:
+            credential_proxy_client.open_broker_request(request)
+        self.assertIsInstance(caught.exception.reason, credential_proxy_client.BrokerUnreachable)
+
+
+class TestApiSessionExecTier(unittest.TestCase):
+    """The Cloud API relay is an exec-tier route; its GETs fall back on the stateful broker."""
+
+    EXEC = "http://exec-tier:8765"
+    STATEFUL = "http://stateful:8765"
+    URL = "https://container.googleapis.com/v1/projects/p/locations/-/clusters"
+
+    class FlakyHttp:
+        def __init__(self, unreachable_hosts=()):
+            self.calls = []
+            self.unreachable_hosts = set(unreachable_hosts)
+
+        def get(self, url, *, params=None, headers=None, timeout=None):
+            self.calls.append(url)
+            if urllib.parse.urlsplit(url).netloc in self.unreachable_hosts:
+                raise ConnectionError(f"cannot connect to {url}")
+            return "upstream-response"
+
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        (directory / "token").write_text("caller-token\n", encoding="utf-8")
+        patcher = patch.dict(os.environ, {
+            "CREDENTIAL_PROXY_URL": self.STATEFUL,
+            "CREDENTIAL_PROXY_EXEC_URL": self.EXEC,
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(directory / "token"),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_exec_tier_serves_the_relay_when_its_url_is_set(self):
+        http_ = self.FlakyHttp()
+        credential_proxy_client.ApiSession(http=http_).get(self.URL)
+        self.assertTrue(http_.calls[0].startswith(self.EXEC + credential_proxy_client.API_RELAY_PREFIX))
+
+    def test_an_unreachable_exec_tier_falls_back_once_and_stays_there(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        session = credential_proxy_client.ApiSession(http=http_)
+        stderr = io.StringIO()
+        with patch("sys.stderr", new=stderr):
+            self.assertEqual("upstream-response", session.get(self.URL))
+            self.assertEqual("upstream-response", session.get(self.URL))
+        self.assertEqual(
+            ["exec-tier:8765", "stateful:8765", "stateful:8765"],
+            [urllib.parse.urlsplit(url).netloc for url in http_.calls],
+        )
+        self.assertEqual(1, stderr.getvalue().count(credential_proxy_client.EXEC_FALLBACK_NOTICE))
+
+    def test_the_exec_attempt_gets_the_shims_connect_bound_and_the_callers_read_timeout(self):
+        seen = []
+
+        class Recording(self.FlakyHttp):
+            def get(inner, url, *, params=None, headers=None, timeout=None):
+                seen.append((urllib.parse.urlsplit(url).netloc, timeout))
+                return super().get(url, params=params, headers=headers, timeout=timeout)
+
+        bound = credential_proxy_client.BROKER_CONNECT_TIMEOUT_SECONDS
+        http_ = Recording(unreachable_hosts={"exec-tier:8765"})
+        session = credential_proxy_client.ApiSession(http=http_)
+        with patch("sys.stderr", new=io.StringIO()):
+            session.get(self.URL, timeout=120)
+        self.assertEqual(("exec-tier:8765", (bound, 120)), seen[0])
+        self.assertEqual("stateful:8765", seen[1][0])
+        self.assertTrue(119 < seen[1][1] <= 120, "the fallback gets what the exec attempt left")
+        self.assertEqual((bound, None), credential_proxy_client._exec_connect_bound(None))
+        self.assertEqual((3, 50), credential_proxy_client._exec_connect_bound((3, 50)))
+
+    def test_readers_sharing_a_session_all_fall_back_when_the_exec_tier_is_down(self):
+        """Fleet collectors share one session across a thread pool: every reader
+        must land on the stateful broker, and the session must stay usable."""
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        barrier = threading.Barrier(8)
+
+        class Racing(self.FlakyHttp):
+            def get(inner, url, *, params=None, headers=None, timeout=None):
+                if urllib.parse.urlsplit(url).netloc == "exec-tier:8765":
+                    barrier.wait(timeout=10)
+                return super().get(url, params=params, headers=headers, timeout=timeout)
+
+        for _ in range(20):
+            barrier.reset()
+            http_ = Racing(unreachable_hosts={"exec-tier:8765"})
+            session = credential_proxy_client.ApiSession(http=http_)
+            with patch("sys.stderr", new=io.StringIO()) as stderr, ThreadPoolExecutor(8) as pool:
+                results = list(pool.map(lambda _: session.get(self.URL), range(8)))
+            self.assertEqual(["upstream-response"] * 8, results)
+            self.assertEqual(1, stderr.getvalue().count(credential_proxy_client.EXEC_FALLBACK_NOTICE))
+            self.assertEqual("upstream-response", session.get(self.URL))
+
+    def test_a_requests_connection_error_falls_back(self):
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests is not installed here; the sandbox image has it")
+
+        class RequestsLike(self.FlakyHttp):
+            def get(inner, url, *, params=None, headers=None, timeout=None):
+                inner.calls.append(url)
+                if urllib.parse.urlsplit(url).netloc == "exec-tier:8765":
+                    raise requests.exceptions.ConnectionError("Max retries exceeded")
+                return "upstream-response"
+
+        session = credential_proxy_client.ApiSession(http=RequestsLike())
+        with patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual("upstream-response", session.get(self.URL))
+
+    def test_the_fallback_gets_only_the_time_the_exec_attempt_left(self):
+        left = credential_proxy_client._time_left
+        self.assertIsNone(left(None, 5.0))
+        self.assertEqual(15.0, left(25.0, 10.0))
+        self.assertEqual((10, 5.0), left((10, 15), 10.0))
+        self.assertEqual((10, None), left((10, None), 10.0))
+        self.assertIs(False, left(25.0, 24.5))
+        self.assertIs(False, left((10, 15), 14.5))
+
+    def test_a_fallback_with_no_time_left_raises_the_error(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        session = credential_proxy_client.ApiSession(http=http_)
+        clock = iter([100.0, 130.0])
+        with patch.object(credential_proxy_client.time, "monotonic", lambda: next(clock)), \
+                patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(ConnectionError):
+                session.get(self.URL, timeout=25)
+        self.assertEqual(1, len(http_.calls))
+
+    def test_the_built_session_ignores_a_proxy_from_the_environment(self):
+        try:
+            import requests  # noqa: F401
+        except ImportError:
+            self.skipTest("requests is not installed here; the sandbox image has it")
+        self.assertFalse(credential_proxy_client.ApiSession()._http.trust_env)
+
+    def test_a_named_endpoint_has_no_fallback(self):
+        http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})
+        session = credential_proxy_client.ApiSession(self.EXEC, http=http_)
+        with self.assertRaises(ConnectionError):
+            session.get(self.URL)
+        self.assertEqual(1, len(http_.calls))
+
+
+class TestShimEntryRouting(unittest.TestCase):
+    """The shim run as `kubectl`, and with `--endpoint`, against brokers on loopback."""
+
+    @classmethod
+    def setUpClass(cls):
+        import http.server
+        import threading
+
+        cls.answers = []
+        cls.requests = []
+
+        class Broker(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                cls.requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                status, body = cls.answers.pop(0) if cls.answers else (200, {"exitCode": 0, "stdout": "ok\n"})
+                data = json.dumps(body).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Broker)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        import socket
+
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.shim = self.root / "credential-proxy-exec"
+        shutil.copy(credential_proxy_client.__file__, self.shim)
+        (self.root / "kubectl").symlink_to(self.shim)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.closed = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        self.live = f"http://127.0.0.1:{self.server.server_address[1]}"
+        type(self).answers.clear()
+        type(self).requests.clear()
+
+    def run_shim(self, args, environ):
+        env = {"PATH": os.environ["PATH"], "HERMES_HOME": str(self.root / "home"), **environ}
+        return subprocess.run(
+            [sys.executable, *args], env=env, capture_output=True, text=True, timeout=60
+        )
+
+    def test_kubectl_falls_back_from_an_unreachable_exec_tier_and_retries_a_busy_slot(self):
+        type(self).answers.append((503, {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "bound": "slot", "error": "busy"}))
+        completed = self.run_shim(
+            [str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_EXEC_URL": self.closed, "CREDENTIAL_PROXY_URL": self.live},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("ok\n", completed.stdout)
+        self.assertEqual(1, completed.stderr.count(credential_proxy_client.EXEC_FALLBACK_NOTICE), completed.stderr)
+        self.assertEqual(2, len(self.requests), "the busy slot was retried once")
+        self.assertEqual(1, len({r["requestId"] for r in self.requests}))
+
+    def test_a_proxy_in_the_environment_is_not_used_to_reach_the_broker(self):
+        """A proxy in between would accept every connect, so an unreachable broker
+        could not be told apart from one that dropped the request."""
+        completed = self.run_shim(
+            [str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "http_proxy": self.closed, "HTTP_PROXY": self.closed},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual(1, len(self.requests))
+
+    def test_a_named_endpoint_wins_over_the_exec_tier(self):
+        completed = self.run_shim(
+            [str(self.shim), "--endpoint", self.live, "kubectl", "get", "pods"],
+            {"CREDENTIAL_PROXY_EXEC_URL": self.closed},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertNotIn("exec tier", completed.stderr)
+        named = self.run_shim(
+            [str(self.shim), "--endpoint", self.closed, "kubectl", "get", "pods"],
+            {"CREDENTIAL_PROXY_EXEC_URL": self.closed, "CREDENTIAL_PROXY_URL": self.live},
+        )
+        self.assertEqual(1, named.returncode)
+        self.assertIn("credential proxy unavailable", named.stderr, "no fallback for a named endpoint")
+
+
 @unittest.skipUnless(Path("/proc/self/stat").exists() and shutil.which("bash"), "needs /proc and bash")
 class TestRealShellCommandLines(unittest.TestCase):
     """The shell pin through real processes, not a patched ancestry.
@@ -1903,6 +2490,538 @@ class TestRealShellCommandLines(unittest.TestCase):
             self.line("FETCH seeded-a && kubectl get pods m")
         shells = self.home / ".kubeconfigs" / "shells"
         self.assertLessEqual(len(list(shells.iterdir())), 1)
+
+
+class ScriptedBroker:
+    """A local HTTP server that answers `/v1/exec` from a script, in order.
+
+    Each entry is `(status, headers, body)`; a body that is a dict is sent as
+    JSON. The last entry repeats once the script runs out, so a test that
+    expects five refusals scripts one. Every request's body is kept, so a test
+    can check the retried request is the same one. Real sockets rather than a
+    patched opener: the retry has to work through `open_broker_request`'s own
+    opener and a new connection per attempt, which is what a replica switch
+    depends on.
+    """
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.requests = []
+        self.disconnect_after_send = False
+        server = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                server.requests.append(json.loads(self.rfile.read(length).decode("utf-8")))
+                if server.disconnect_after_send:
+                    # The request was on the wire and read; the answer never comes.
+                    self.close_connection = True
+                    self.wfile.close()
+                    return
+                index = min(len(server.requests) - 1, len(server.script) - 1)
+                status, headers, body = server.script[index]
+                data = json.dumps(body).encode("utf-8") if isinstance(body, dict) else body.encode("utf-8")
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                if isinstance(body, dict):
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.endpoint = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+BUSY_SLOT = {
+    "status": "busy",
+    "code": "CREDENTIAL_PROXY_BUSY",
+    "bound": "slot",
+    "error": "the credential proxy is at its limit of 8 concurrent commands",
+}
+BUSY_SESSION = {
+    "status": "busy",
+    "code": "CREDENTIAL_PROXY_BUSY",
+    "bound": "session",
+    "error": "the session role is limited to 2 concurrent command(s) through the credential proxy",
+}
+BUSY_UNBOUNDED = {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": "busy, from an older broker"}
+PRESSURE = {"code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE", "error": "the credential proxy is under memory pressure"}
+OK = {"exitCode": 0, "stdout": "NAME   STATUS\ndefault   Active\n", "stderr": ""}
+
+
+class RetriesAdmissionRefusalsTest(unittest.TestCase):
+    """The shim waits out the broker's admission refusals instead of failing at once."""
+
+    def setUp(self):
+        patcher = patch.dict("os.environ", {"CREDENTIAL_PROXY_TOKEN_FILE": "", "KUBECONFIG": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sleeps = []
+        self.rng = random.Random(7)
+
+    def broker(self, script):
+        broker = ScriptedBroker(script)
+        self.addCleanup(broker.close)
+        return broker
+
+    def run_shim(self, broker, argv=("kubectl", "get", "ns")):
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                broker.endpoint, list(argv), sleep_fn=self.sleeps.append, rng=self.rng
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_429_then_a_busy_503_then_a_200_runs_the_command(self):
+        broker = self.broker([(429, {"Retry-After": "4"}, PRESSURE), (503, {}, BUSY_SLOT), (200, {}, OK)])
+        code, out, err = self.run_shim(broker)
+        self.assertEqual(0, code, err)
+        self.assertEqual(OK["stdout"], out)
+        self.assertEqual(3, len(broker.requests))
+        # Two sleeps: Retry-After 4 gives [2, 4]; the second retry's base is 4 s, [2, 4] too.
+        self.assertEqual(2, len(self.sleeps))
+        for delay in self.sleeps:
+            self.assertGreaterEqual(delay, 2.0)
+            self.assertLessEqual(delay, 4.0)
+        # One line per wait, naming the broker's reason and the attempt.
+        lines = err.strip().splitlines()
+        self.assertEqual(2, len(lines), err)
+        self.assertIn("credential proxy busy (HTTP 429): the credential proxy is under memory pressure", lines[0])
+        self.assertIn("(attempt 2)", lines[0])
+        self.assertIn("credential proxy busy (HTTP 503): the credential proxy is at its limit", lines[1])
+        self.assertIn("(attempt 3)", lines[1])
+
+    def test_the_retried_request_is_the_same_request(self):
+        broker = self.broker([(503, {}, BUSY_SLOT), (200, {}, OK)])
+        self.run_shim(broker)
+        self.assertEqual(2, len(broker.requests))
+        self.assertEqual(broker.requests[0], broker.requests[1])
+        self.assertEqual(broker.requests[0]["requestId"], broker.requests[1]["requestId"])
+
+    def test_five_refusals_give_up_with_a_throttling_line(self):
+        broker = self.broker([(429, {}, PRESSURE)])
+        code, out, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual("", out)
+        self.assertEqual(5, len(broker.requests))
+        self.assertEqual(4, len(self.sleeps))
+        self.assertIn(
+            "credential proxy throttled: gave up after 5 attempts (HTTP 429): "
+            "the credential proxy is under memory pressure",
+            err.strip().splitlines()[-1],
+        )
+
+    def test_a_retry_that_could_outlast_the_deadline_is_not_started(self):
+        # Two refusals the broker held for its full admission wait: the clock
+        # reads 0 at the first send, 60.5 s at the first refusal and 122.5 s at
+        # the second. A third attempt could end past 170 s, inside the terminal
+        # tool's 180 s kill, so the shim gives up there with the reason instead.
+        readings = iter([0.0, 60.5, 122.5])
+        broker = self.broker([(503, {}, BUSY_SLOT)])
+        out, err = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                broker.endpoint, ["kubectl", "get", "ns"],
+                sleep_fn=self.sleeps.append, rng=self.rng, clock=lambda: next(readings),
+            )
+        self.assertEqual(1, code)
+        self.assertEqual(2, len(broker.requests))
+        self.assertEqual(1, len(self.sleeps))
+        lines = err.getvalue().strip().splitlines()
+        self.assertEqual(2, len(lines), err.getvalue())
+        self.assertIn("(attempt 2)", lines[0])
+        self.assertIn(
+            f"credential proxy throttled: gave up after 2 attempts (HTTP 503): {BUSY_SLOT['error']}", lines[1]
+        )
+
+    def test_a_caller_s_deadline_with_no_room_for_a_retry_stops_the_shim_at_the_first_refusal(self):
+        # The Cluster Agent preflight kills one brokered call at 125 s, which
+        # holds one admission wait and one command run, and tells the shim
+        # 60 s: not even a refusal answered at once is retried, since the
+        # retry's admission wait alone would reach the deadline, so the
+        # broker's reason, not the kill, is the output.
+        readings = iter([0.0, 0.5])
+        broker = self.broker([(503, {}, BUSY_SLOT)])
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict("os.environ", {credential_proxy_client.RETRY_DEADLINE_ENV: "60"}), \
+                patch("sys.stdout", new=out), patch("sys.stderr", new=err):
+            code = credential_proxy_client.execute(
+                broker.endpoint, ["kubectl", "get", "ns"],
+                sleep_fn=self.sleeps.append, rng=self.rng, clock=lambda: next(readings),
+            )
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertEqual(
+            [f"credential proxy throttled: gave up after 1 attempt (HTTP 503): {BUSY_SLOT['error']}"],
+            err.getvalue().strip().splitlines(),
+        )
+
+    def test_the_admission_wait_the_deadline_allows_for_is_the_brokers(self):
+        self.assertEqual(
+            credential_proxy.COMMAND_SLOT_WAIT_SECONDS, credential_proxy_client.BROKER_ADMISSION_WAIT_SECONDS
+        )
+        # Two waited attempts fit the deadline; a third never starts.
+        two = 2 * credential_proxy_client.BROKER_ADMISSION_WAIT_SECONDS
+        self.assertLess(two + credential_proxy_client.RETRY_BACKOFF_BASE_SECONDS, credential_proxy_client.RETRY_DEADLINE_SECONDS)
+        self.assertGreater(two + credential_proxy_client.BROKER_ADMISSION_WAIT_SECONDS, credential_proxy_client.RETRY_DEADLINE_SECONDS)
+
+    def test_the_exponential_waits_are_jittered_and_capped_at_16(self):
+        broker = self.broker([(503, {}, BUSY_SLOT)])
+        self.run_shim(broker)
+        bounds = [(1.0, 2.0), (2.0, 4.0), (4.0, 8.0), (8.0, 16.0)]
+        self.assertEqual(len(bounds), len(self.sleeps))
+        for delay, (low, high) in zip(self.sleeps, bounds):
+            self.assertGreaterEqual(delay, low)
+            self.assertLessEqual(delay, high)
+        self.assertLessEqual(sum(self.sleeps), 30.0)
+
+    def test_retry_after_is_honoured_and_clamped_at_30(self):
+        broker = self.broker([(429, {"Retry-After": "120"}, PRESSURE), (200, {}, OK)])
+        code, _, _ = self.run_shim(broker)
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(self.sleeps))
+        self.assertGreaterEqual(self.sleeps[0], 15.0)
+        self.assertLessEqual(self.sleeps[0], 30.0)
+
+    def test_a_retry_after_of_zero_still_waits_between_the_retries(self):
+        # Five 429s each carrying `Retry-After: 0`: four waits, every one inside
+        # the floored window [1, 2], none of them zero.
+        broker = self.broker([(429, {"Retry-After": "0"}, PRESSURE)])
+        code, _, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual(5, len(broker.requests))
+        self.assertEqual(4, len(self.sleeps), err)
+        for delay in self.sleeps:
+            self.assertGreaterEqual(delay, 1.0)
+            self.assertLessEqual(delay, 2.0)
+
+    def test_a_retry_after_date_falls_back_to_the_exponential(self):
+        broker = self.broker([(429, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}, PRESSURE), (200, {}, OK)])
+        self.run_shim(broker)
+        self.assertEqual(1, len(self.sleeps))
+        self.assertGreaterEqual(self.sleeps[0], 1.0)
+        self.assertLessEqual(self.sleeps[0], 2.0)
+
+    def test_a_session_cap_refusal_is_reported_and_not_retried(self):
+        broker = self.broker([(503, {}, BUSY_SESSION), (200, {}, OK)])
+        code, _, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertIn(BUSY_SESSION["error"], err)
+        self.assertNotIn("retrying", err)
+
+    def test_a_busy_reply_whose_bound_is_not_a_string_is_reported_and_not_retried(self):
+        # A broker of another version, or something between, writing `bound`
+        # as a list: the shim prints the refusal, as it does for a bound it
+        # does not know, rather than crash on the lookup.
+        broker = self.broker([(503, {}, {**BUSY_SLOT, "bound": ["slot"]}), (200, {}, OK)])
+        code, _, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertEqual(BUSY_SLOT["error"], err.strip())
+
+    def test_a_busy_reply_with_no_bound_is_retried(self):
+        broker = self.broker([(503, {}, BUSY_UNBOUNDED), (200, {}, OK)])
+        code, _, _ = self.run_shim(broker)
+        self.assertEqual(0, code)
+        self.assertEqual(2, len(broker.requests))
+
+    def test_a_bare_non_json_503_is_not_retried(self):
+        broker = self.broker([(503, {"Content-Type": "text/html"}, "<html>upstream connect error</html>"), (200, {}, OK)])
+        code, _, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertIn("credential proxy error (HTTP 503): non-JSON response", err)
+
+    def test_an_envoy_overloaded_503_is_retried(self):
+        broker = self.broker([
+            (503, {"Content-Type": "text/plain", "x-envoy-overloaded": "true"}, "envoy overloaded"),
+            (200, {}, OK),
+        ])
+        code, _, err = self.run_shim(broker)
+        self.assertEqual(0, code, err)
+        self.assertEqual(2, len(broker.requests))
+        self.assertIn("credential proxy busy (HTTP 503): non-JSON response; retrying", err)
+
+    def test_a_disconnect_after_the_send_is_not_retried(self):
+        broker = self.broker([(200, {}, OK)])
+        broker.disconnect_after_send = True
+        code, _, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertIn("the command may have run", err)
+        self.assertNotIn("retrying", err)
+
+    def test_a_policy_block_still_exits_77_at_once(self):
+        blocked = {"code": "SECURITY_POLICY_BLOCKED", "message": "Command blocked.", "rule": "no-delete"}
+        broker = self.broker([(403, {}, blocked), (200, {}, OK)])
+        code, _, err = self.run_shim(broker, ("kubectl", "delete", "ns", "x"))
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+        self.assertIn("policy rule: no-delete", err)
+
+    def test_a_plain_200_is_unchanged(self):
+        broker = self.broker([(200, {}, OK)])
+        code, out, err = self.run_shim(broker)
+        self.assertEqual((0, OK["stdout"], ""), (code, out, err))
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual([], self.sleeps)
+
+    def test_any_other_json_error_is_printed_once(self):
+        broker = self.broker([(400, {}, {"error": "argv is required"}), (200, {}, OK)])
+        code, _, err = self.run_shim(broker)
+        self.assertEqual(1, code)
+        self.assertEqual(1, len(broker.requests))
+        self.assertEqual("argv is required", err.strip())
+
+
+class RetryScheduleTest(unittest.TestCase):
+    """The delay and the refusal filter, without a server."""
+
+    class Pinned:
+        def __init__(self):
+            self.draws = []
+
+        def uniform(self, low, high):
+            self.draws.append((low, high))
+            return high
+
+    def test_the_exponential_bases_are_2_4_8_16(self):
+        rng = self.Pinned()
+        delays = [credential_proxy_client.retry_delay_seconds(k, None, rng) for k in range(4)]
+        self.assertEqual([2.0, 4.0, 8.0, 16.0], delays)
+        self.assertEqual([(1.0, 2.0), (2.0, 4.0), (4.0, 8.0), (8.0, 16.0)], rng.draws)
+        self.assertEqual(16.0, credential_proxy_client.retry_delay_seconds(9, None, rng))
+
+    def test_retry_after_is_the_base_held_between_2_and_30(self):
+        rng = self.Pinned()
+        self.assertEqual(4.0, credential_proxy_client.retry_delay_seconds(0, "4", rng))
+        self.assertEqual((2.0, 4.0), rng.draws[-1])
+        self.assertEqual(30.0, credential_proxy_client.retry_delay_seconds(0, "45", rng))
+        self.assertEqual(2.5, credential_proxy_client.retry_delay_seconds(3, " 2.5 ", rng))
+        # A header under the backoff floor, 0 or negative included, still waits
+        # the floor, jittered: a zero base would make the retries a burst.
+        for header in ("1.5", "0", "-3"):
+            self.assertEqual(2.0, credential_proxy_client.retry_delay_seconds(0, header, rng), header)
+            self.assertEqual((1.0, 2.0), rng.draws[-1], header)
+
+    def test_an_unreadable_retry_after_falls_back(self):
+        rng = self.Pinned()
+        for header in ("Wed, 21 Oct 2026 07:28:00 GMT", "", "nan", "inf", "soon"):
+            self.assertEqual(8.0, credential_proxy_client.retry_delay_seconds(2, header, rng), header)
+
+    def test_retry_wait_is_spent_by_count_or_by_deadline(self):
+        rng = self.Pinned()
+        wait = credential_proxy_client.retry_wait
+        # Immediate refusals: four waits, then None.
+        self.assertEqual(2.0, wait(1, 0.0, None, rng, lambda: 0.0))
+        self.assertEqual(16.0, wait(4, 0.0, None, rng, lambda: 0.0))
+        self.assertIsNone(wait(5, 0.0, None, rng, lambda: 0.0))
+        # A waited refusal: 60.5 s elapsed, 2 s of sleep and a 60 s admission wait still fit 170 s.
+        self.assertEqual(2.0, wait(1, 0.0, None, rng, lambda: 60.5))
+        # 122.5 s elapsed: another admission wait would end past the deadline.
+        self.assertIsNone(wait(2, 0.0, None, rng, lambda: 122.5))
+        # A long Retry-After counts against the deadline too.
+        self.assertIsNone(wait(1, 0.0, "30", rng, lambda: 81.0))
+        self.assertEqual(30.0, wait(1, 0.0, "30", rng, lambda: 79.0))
+        # A caller's shorter deadline: one waited attempt fits 120 s, a second does not.
+        self.assertIsNone(wait(1, 0.0, None, rng, lambda: 60.5, deadline=120.0))
+        self.assertEqual(2.0, wait(1, 0.0, None, rng, lambda: 0.5, deadline=120.0))
+        # The preflight's 60 s: a retry's admission wait alone reaches it, so
+        # not even a refusal answered at once is retried.
+        self.assertIsNone(wait(1, 0.0, None, rng, lambda: 0.0, deadline=60.0))
+
+    def test_the_callers_deadline_only_shortens_the_shims(self):
+        read = credential_proxy_client.retry_deadline_seconds
+        default = credential_proxy_client.RETRY_DEADLINE_SECONDS
+        name = credential_proxy_client.RETRY_DEADLINE_ENV
+        self.assertEqual(default, read({}))
+        self.assertEqual(120.0, read({name: "120"}))
+        self.assertEqual(120.0, read({name: " 120 "}))
+        self.assertEqual(0.0, read({name: "0"}))
+        self.assertEqual(default, read({name: "500"}))
+        for bad in ("", "soon", "-1", "inf", "nan"):
+            self.assertEqual(default, read({name: bad}), bad)
+
+    def test_the_default_rng_jitters_inside_the_window(self):
+        for _ in range(50):
+            delay = credential_proxy_client.retry_delay_seconds(1, None)
+            self.assertGreaterEqual(delay, 2.0)
+            self.assertLessEqual(delay, 4.0)
+
+    def test_which_busy_replies_are_retried(self):
+        retryable = credential_proxy_client.busy_reply_retryable
+        for bound in sorted(credential_proxy_client.RETRYABLE_BUSY_BOUNDS):
+            self.assertTrue(retryable({"code": "CREDENTIAL_PROXY_BUSY", "bound": bound}), bound)
+        self.assertTrue(retryable({"code": "CREDENTIAL_PROXY_BUSY"}))
+        self.assertTrue(retryable({"code": "CREDENTIAL_PROXY_RESOURCE_PRESSURE"}))
+        for bound in ("session", "scope", "refresh-lock", "other"):
+            self.assertFalse(retryable({"code": "CREDENTIAL_PROXY_BUSY", "bound": bound}), bound)
+        # A bound that is not a string is not one the shim knows, and must not
+        # raise out of the lookup.
+        for bound in (["slot"], {"slot": True}, 1, 0.5, True):
+            self.assertFalse(retryable({"code": "CREDENTIAL_PROXY_BUSY", "bound": bound}), repr(bound))
+        self.assertFalse(retryable({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}}))
+        self.assertFalse(retryable({"code": "SECURITY_POLICY_BLOCKED"}))
+        self.assertFalse(retryable(None))
+        self.assertFalse(retryable(["CREDENTIAL_PROXY_BUSY"]))
+
+    def test_which_exec_answers_are_retried(self):
+        retryable = credential_proxy_client.exec_refusal_retryable
+        overloaded = {"x-envoy-overloaded": "true"}
+        self.assertTrue(retryable(429, {}, None))
+        self.assertTrue(retryable(429, {}, {"error": "anything"}))
+        self.assertTrue(retryable(503, {}, {"code": "CREDENTIAL_PROXY_BUSY", "bound": "slot"}))
+        self.assertTrue(retryable(503, overloaded, None))
+        self.assertFalse(retryable(503, {}, None))
+        self.assertFalse(retryable(503, overloaded, {"code": "CREDENTIAL_PROXY_BUSY", "bound": "session"}))
+        self.assertFalse(retryable(503, {}, {"error": "a plain failure"}))
+        self.assertFalse(retryable(500, overloaded, None))
+        self.assertFalse(retryable(403, {}, {"code": "SECURITY_POLICY_BLOCKED"}))
+
+    def test_the_envoy_header_is_read_case_insensitively(self):
+        headers = http.client.HTTPMessage()
+        headers["X-Envoy-Overloaded"] = "true"
+        self.assertTrue(credential_proxy_client.exec_refusal_retryable(503, headers, None))
+
+
+class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
+    """The relay waits out the broker's own refusal and hands an upstream one back."""
+
+    ENDPOINT = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+    URL = "https://monitoring.googleapis.com/v3/projects/kagents-dev/timeSeries"
+
+    class Response:
+        def __init__(self, status_code, body, headers=None):
+            self.status_code = status_code
+            self._body = body
+            self.headers = headers or {}
+
+        def json(self):
+            if isinstance(self._body, (dict, list)):
+                return self._body
+            raise ValueError("not JSON")
+
+    class ScriptedHttp:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.calls = []
+
+        def get(self, url, *, params=None, headers=None, timeout=None):
+            self.calls.append({"url": url, "params": params, "headers": headers, "timeout": timeout})
+            return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        token_file = directory / "token"
+        token_file.write_text("caller-token\n", encoding="utf-8")
+        patcher = patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": self.ENDPOINT, "CREDENTIAL_PROXY_TOKEN_FILE": str(token_file)}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.sleeps = []
+
+    def session(self, responses):
+        http_ = self.ScriptedHttp(responses)
+        return http_, credential_proxy_client.ApiSession(
+            http=http_, sleep_fn=self.sleeps.append, rng=random.Random(3)
+        )
+
+    def test_a_broker_busy_then_a_200_is_one_answer(self):
+        ok = self.Response(200, {"timeSeries": []})
+        http_, session = self.session([
+            self.Response(503, BUSY_SLOT, {"Retry-After": "4"}),
+            self.Response(429, PRESSURE),
+            ok,
+        ])
+        with patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertIs(ok, session.get(self.URL, params={"pageSize": 1}, timeout=30))
+        self.assertEqual(3, len(http_.calls))
+        self.assertEqual({call["url"] for call in http_.calls}, {http_.calls[0]["url"]})
+        self.assertEqual([{"pageSize": 1}] * 3, [call["params"] for call in http_.calls])
+        self.assertEqual([30] * 3, [call["timeout"] for call in http_.calls])
+        self.assertEqual(2, len(self.sleeps))
+        self.assertGreaterEqual(self.sleeps[0], 2.0)
+        self.assertLessEqual(self.sleeps[0], 4.0)
+        self.assertEqual(2, len(err.getvalue().strip().splitlines()))
+
+    def test_a_broker_that_stays_busy_hands_back_its_last_answer(self):
+        busy = self.Response(503, BUSY_SLOT)
+        http_, session = self.session([busy])
+        with patch("sys.stderr", new=io.StringIO()):
+            self.assertIs(busy, session.get(self.URL))
+        self.assertEqual(5, len(http_.calls))
+        self.assertEqual(4, len(self.sleeps))
+
+    def test_the_relay_stops_at_the_deadline_too(self):
+        readings = iter([0.0, 60.5, 122.5])
+        busy = self.Response(503, BUSY_SLOT)
+        http_ = self.ScriptedHttp([busy])
+        session = credential_proxy_client.ApiSession(
+            http=http_, sleep_fn=self.sleeps.append, rng=random.Random(3), clock=lambda: next(readings)
+        )
+        with patch("sys.stderr", new=io.StringIO()):
+            self.assertIs(busy, session.get(self.URL))
+        self.assertEqual(2, len(http_.calls))
+        self.assertEqual(1, len(self.sleeps))
+
+    def test_the_relay_keeps_to_a_caller_s_shorter_deadline_too(self):
+        readings = iter([0.0, 60.5])
+        busy = self.Response(503, BUSY_SLOT)
+        http_ = self.ScriptedHttp([busy])
+        session = credential_proxy_client.ApiSession(
+            http=http_, sleep_fn=self.sleeps.append, rng=random.Random(3), clock=lambda: next(readings)
+        )
+        with patch.dict("os.environ", {credential_proxy_client.RETRY_DEADLINE_ENV: "120"}), \
+                patch("sys.stderr", new=io.StringIO()):
+            self.assertIs(busy, session.get(self.URL))
+        self.assertEqual(1, len(http_.calls))
+        self.assertEqual([], self.sleeps)
+
+    def test_an_upstream_429_passes_through_at_once(self):
+        quota = self.Response(429, {"error": {"code": 429, "message": "Quota exceeded", "status": "RESOURCE_EXHAUSTED"}})
+        http_, session = self.session([quota, self.Response(200, {})])
+        self.assertIs(quota, session.get(self.URL))
+        self.assertEqual(1, len(http_.calls))
+        self.assertEqual([], self.sleeps)
+
+    def test_an_upstream_503_and_a_session_cap_pass_through(self):
+        for refused in (
+            self.Response(503, {"error": {"code": 503, "status": "UNAVAILABLE"}}),
+            self.Response(503, "<html>upstream</html>"),
+            self.Response(503, BUSY_SESSION),
+        ):
+            http_, session = self.session([refused, self.Response(200, {})])
+            self.assertIs(refused, session.get(self.URL))
+            self.assertEqual(1, len(http_.calls))
+        self.assertEqual([], self.sleeps)
+
+    def test_a_transport_that_returns_no_status_is_handed_back(self):
+        http_, session = self.session(["upstream-response"])
+        self.assertEqual("upstream-response", session.get(self.URL))
+        self.assertEqual([], self.sleeps)
 
 
 if __name__ == "__main__":

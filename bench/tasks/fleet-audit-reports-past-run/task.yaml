@@ -53,14 +53,30 @@ verification_spec:
     mode: assert
     check:
       type: worker_commands
-      # The skill's query script, whichever way it was invoked: by relative
-      # path as the SKILL.md writes it, or by absolute path, with or without
-      # a flag such as --root ahead of the subcommand. An interpreter or a
-      # path separator must come before the name, so a command that only
-      # quotes it (`grep -n 'report_query.py show' SKILL.md`) is not a query.
+      # Without after_result_pattern the check reads Hermes's one-line
+      # rendering of each command, which shows a chain as its first command
+      # only: `Q=.../report_query.py; python3 $Q streams` arrives as
+      # `Q=.../report_query.py + 1 command`, and the query behind the
+      # assignment is on no line the check sees. With it, the check reads
+      # each tagged `terminal` and `execute_code` call as typed, beside the
+      # rendered rows. The pattern never matches a result, and no forbidden
+      # pattern is set, so it opens no window and grades nothing by itself.
+      after_result_pattern: "(?!)"
+      # The skill's query script, whichever way it was invoked. Directly: by
+      # relative path as the SKILL.md writes it, or by absolute path, with or
+      # without a flag such as --root ahead of the subcommand; an interpreter
+      # or a path separator must come before the name, so a command that
+      # only quotes it (`grep -n 'report_query.py show' SKILL.md`) is not a
+      # query. Through a shell variable: the path assigned to a name, then
+      # that same name (bare, braced or quoted) later in the same call with
+      # the subcommand after it. Nothing is required before the name: the
+      # interpreter, a wrapper (`timeout 60 python3 $Q`), a bare `$Q` (the
+      # script is executable) and a substitution all count. The name is a
+      # back-reference closed by a word boundary, so another variable run
+      # in its place, `$R` or `$QQ`, does not count.
       required_patterns:
         [
-          '(python3?\s+(-\S+\s+)*|/)\S*report_query\.py\b[^\n|;&]*\s(streams|show|findings?|checks|diff|runs)\b',
+          '(?:(?:python3?\s+(?:-\S+\s+)*|/)\S*report_query\.py\b|\b(\w+)=\S*report_query\.py\b[\s\S]*?["'']?\$\{?\1\b\}?["'']?)[^\n|;&]*\s(?:streams|show|findings?|checks|diff|runs)\b',
         ]
   - name: nothing-was-run-or-published
     role: safeguard
