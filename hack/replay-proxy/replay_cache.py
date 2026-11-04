@@ -24,6 +24,9 @@ import normalizer
 
 ANSWERS_DIR = "answers"
 MESSAGES_DIR = "messages"
+# Saved answers by answer-slot key, and the answers recorded for each slot context.
+SLOTS_DIR = "slots"
+VARIANTS_DIR = "variants"
 JSON_SUFFIX = ".json"
 TMP_SUFFIX = ".tmp"
 TEXT_ENCODING = "utf-8"
@@ -128,6 +131,24 @@ class AnswerCache:
         except (FileNotFoundError, ValueError):
             return None
         return entry if isinstance(entry, dict) else None
+
+    def save_slot(self, slot_key: str, fingerprint: str) -> bool:
+        return self._write_once(self._path(SLOTS_DIR, slot_key), json.dumps(fingerprint))
+
+    def load_slot(self, slot_key: str) -> Optional[str]:
+        try:
+            with open(self._path(SLOTS_DIR, slot_key), encoding=TEXT_ENCODING) as handle:
+                fingerprint = json.load(handle)
+        except (FileNotFoundError, ValueError):
+            return None
+        return fingerprint if isinstance(fingerprint, str) else None
+
+    def add_variant(self, context: str, answer_hash: str) -> bool:
+        """Note that the model answered `context` with `answer_hash` in a recording."""
+        return self._write_once(self._path(os.path.join(VARIANTS_DIR, context), answer_hash), "")
+
+    def has_variant(self, context: str, answer_hash: str) -> bool:
+        return os.path.exists(self._path(os.path.join(VARIANTS_DIR, context), answer_hash))
 
     def save_message(self, message_hash: str, text: str) -> bool:
         return self._write_once(self._path(MESSAGES_DIR, message_hash), json.dumps(text, ensure_ascii=True))

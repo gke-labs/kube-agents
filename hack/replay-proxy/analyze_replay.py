@@ -53,6 +53,7 @@ class Line:
     chain: List[str]
     miss: Dict[str, Any]
     served_from_build: Optional[str]
+    served_via: str
 
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
@@ -68,6 +69,7 @@ class Line:
             scope=(str(job.get(F.JOB_KIND) or ""), str(job.get(F.JOB_PROJECT) or ""), str(job.get(F.JOB_BUILD) or "")),
             build=str(job.get(F.JOB_BUILD) or ""),
             served=bool(entry.get(F.SERVED)),
+            served_via=str(entry.get(F.SERVED_VIA) or ""),
             prompt_tokens=int(entry.get(F.PROMPT_TOKENS) or 0),
             chain=chain,
             miss=entry.get(F.MISS) or {},
@@ -151,6 +153,7 @@ def summarize(lines: List[Line], verdicts: Optional[Dict[str, str]] = None, top:
     convs = conversations(lines)
     total = sum(line.prompt_tokens for line in lines)
     served = sum(line.prompt_tokens for line in lines if line.served)
+    via_slots = sum(line.prompt_tokens for line in lines if line.served and line.served_via == F.VIA_ANSWER_SLOTS)
     before = sum(conv.served_before_first_miss()[1] for conv in convs)
     by_role: Dict[str, int] = {}
     by_signature: Dict[Tuple[str, str], int] = {}
@@ -181,6 +184,7 @@ def summarize(lines: List[Line], verdicts: Optional[Dict[str, str]] = None, top:
         "conversations": len(convs),
         "prompt_tokens": total,
         "served_token_percent": percent(served, total),
+        "served_via_answer_slots_token_percent": percent(via_slots, total),
         "served_before_first_miss_token_percent": percent(before, total),
         "first_miss_tokens_lost_by_role": dict(sorted(by_role.items(), key=lambda kv: -kv[1])),
         "first_miss_tokens_lost_by_signature": [
@@ -198,7 +202,8 @@ def render(report: Dict[str, Any]) -> str:
     lines = [
         f"requests: {report['requests']} in {report['conversations']} conversations; prompt tokens {report['prompt_tokens']}",
         f"served: {report['served_token_percent']}% of prompt tokens"
-        f" ({report['served_before_first_miss_token_percent']}% before each conversation's first miss)",
+        f" ({report['served_before_first_miss_token_percent']}% before each conversation's first miss;"
+        f" {report['served_via_answer_slots_token_percent']}% through answer slots)",
         f"first-miss tokens lost by role: {report['first_miss_tokens_lost_by_role']}",
         "first-miss signatures (tokens lost, role, signature):",
     ]

@@ -1,12 +1,17 @@
 """Record and replay modes end to end against the fake LiteLLM, and the guard on serving."""
 
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
+import normalizer
 import replay_cache
 import replay_proxy
 from test_replay_proxy import TOKEN, FakeLiteLLM, ProxyTestCase, chat
@@ -54,6 +59,59 @@ class GuardTest(unittest.TestCase):
             self.assertEqual(config.allow_serve, allowed, value)
         config = replay_proxy.Config.from_env({"REPLAY_CACHE_DIR": "/c"})
         self.assertEqual((config.mode, config.cache_dir), ("shadow", "/c"))
+
+
+class AnswerSlotGuardTest(unittest.TestCase):
+    """A saved answer is served through a slot only if every value it names is bound outside the answers."""
+
+    def setUp(self):
+        self.cache_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cache_dir, ignore_errors=True)
+
+    def proxy(self):
+        config = replay_proxy.Config(mode="replay", allow_serve=True, cache_dir=self.cache_dir,
+                                     litellm_config_checksum="abc", litellm_image="img")
+        proxy = replay_proxy.ShadowProxy(config, out=io.StringIO())
+        self.addCleanup(proxy.close)
+        return proxy
+
+    @staticmethod
+    def body(said, ticket="ticket Latte"):
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "work kanban task t_bbbbbbbb"},
+            {"role": "assistant", "content": said},
+            {"role": "user", "content": ticket},
+        ]}
+
+    def record(self, body, answer, others=()):
+        """Save `answer` for `body` as record mode would, and note `others` as recorded answers too."""
+        context = normalizer.KeyContext("abc", "img")
+        cache = replay_cache.AnswerCache(self.cache_dir)
+        normalized = normalizer.normalize_request(body, time.time())
+        fingerprint = normalizer.fingerprint(normalized, context)
+        cache.save(fingerprint, {"fingerprint": fingerprint, "answer": replay_cache.normalize_answer(answer, normalized.mapping)})
+        slot_key, slots = normalizer.answer_slots(normalized, context)
+        cache.save_slot(slot_key, fingerprint)
+        for other in (body, *others):
+            for c, a in normalizer.answer_slots(normalizer.normalize_request(other, time.time()), context)[1]:
+                cache.add_variant(c, a)
+
+    def test_a_value_only_an_answer_named_is_not_served_through_a_slot(self):
+        # Bob named his own pod in his yes; Alice's recorded yes named another.
+        bob = self.body("Yes, web-7d4b9c8f6d-x2k9p.")
+        alice_yes = self.body("Yes please, web-5f6c7d8b9c-m8n7q.")
+        self.record(bob, {"role": "assistant", "content": "restart web-7d4b9c8f6d-x2k9p"}, others=[alice_yes])
+        self.assertIsNone(self.proxy().lookup(alice_yes, time.time()),
+                          "Bob's answer would restart the pod Alice's yes named")
+
+    def test_a_value_bound_by_the_tool_output_is_served(self):
+        bob = self.body("Yes.", ticket="ticket Latte for web-7d4b9c8f6d-x2k9p")
+        alice_yes = self.body("Yes please.", ticket="ticket Latte for web-5f6c7d8b9c-m8n7q")
+        self.record(bob, {"role": "assistant", "content": "restart web-7d4b9c8f6d-x2k9p"}, others=[alice_yes])
+        hit = self.proxy().lookup(alice_yes, time.time())
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0]["content"], "restart web-5f6c7d8b9c-m8n7q")
+        self.assertEqual(hit[3], "answer_slots")
 
 
 class RecordTest(ProxyTestCase):
@@ -152,6 +210,57 @@ class ReplayTest(ProxyTestCase):
         self.assertEqual(body["choices"][0]["message"]["content"], "answer 1 for t_22222222")
         self.assertEqual(body["usage"]["prompt_tokens"], 1000)
         self.assertTrue(self.lines(1, out)[0]["served"])
+
+    @staticmethod
+    def pickup(task, said, ticket):
+        """A worker's second request: the opening, its answer to it, and what the tool showed."""
+        return {"model": "model-default", "stream": False, "messages": [
+            {"role": "system", "content": "You are the platform agent."},
+            {"role": "user", "content": f"work kanban task {task}"},
+            {"role": "assistant", "content": said},
+            {"role": "user", "content": f"ticket {ticket}"},
+        ]}
+
+    def record_two_pickups(self):
+        # Alice and Bob were asked the same thing and said yes in different words.
+        self.record(self.pickup("t_aaaaaaaa", "Yes please.", "Tea"), self.pickup("t_bbbbbbbb", "Yes.", "Latte"))
+        return {line["message_hashes"][-1]: line for line in self.lines(2, self.record_out)}
+
+    def test_another_recorded_answer_to_the_same_request_still_matches(self):
+        self.record_two_pickups()
+        _, port, out = self.replay()
+        calls = len(FakeLiteLLM.calls)
+        # Bob again, but served Alice's "Yes please." at the fork.
+        status, headers, payload = self.request("POST", COMPLETIONS, self.pickup("t_cccccccc", "Yes please.", "Latte"),
+                                                port=port)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(FakeLiteLLM.calls), calls, "served without calling the model")
+        self.assertEqual(headers["x-replay-served"], "true")
+        self.assertEqual(json.loads(payload)["choices"][0]["message"]["content"], "answer 2 for Latte")
+        line = self.lines(1, out)[0]
+        self.assertEqual((line["served"], line["served_via"]), (True, "answer_slots"))
+
+    def test_an_answer_never_recorded_for_that_request_misses(self):
+        self.record_two_pickups()
+        _, port, out = self.replay()
+        calls = len(FakeLiteLLM.calls)
+        self.request("POST", COMPLETIONS, self.pickup("t_cccccccc", "No, cancel it.", "Latte"), port=port)
+        self.assertEqual(len(FakeLiteLLM.calls), calls + 1)
+        self.assertFalse(self.lines(1, out)[0]["served"])
+
+    def test_what_the_tool_showed_still_has_to_match(self):
+        self.record_two_pickups()
+        _, port, out = self.replay()
+        calls = len(FakeLiteLLM.calls)
+        self.request("POST", COMPLETIONS, self.pickup("t_cccccccc", "Yes please.", "Mocha"), port=port)
+        self.assertEqual(len(FakeLiteLLM.calls), calls + 1)
+        self.assertFalse(self.lines(1, out)[0]["served"])
+
+    def test_an_exact_match_says_so(self):
+        self.record_two_pickups()
+        _, port, out = self.replay()
+        self.request("POST", COMPLETIONS, self.pickup("t_cccccccc", "Yes.", "Latte"), port=port)
+        self.assertEqual(self.lines(1, out)[0]["served_via"], "exact")
 
     def test_a_miss_is_compared_with_the_most_alike_of_conversations_sharing_its_opening(self):
         # Every worker conversation opens the same way, so the miss must be shown

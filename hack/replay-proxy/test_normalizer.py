@@ -163,6 +163,31 @@ class StderrOrderTest(unittest.TestCase):
         self.assertEqual(norm(warning), warning)
 
 
+class AnswerSlotTest(unittest.TestCase):
+    CONTEXT = normalizer.KeyContext("c", "i")
+
+    @staticmethod
+    def convo(said, shown, task="t_aaaaaaaa"):
+        return normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "user", "content": f"work kanban task {task}"},
+            {"role": "assistant", "content": said},
+            {"role": "user", "content": shown},
+        ]}, NOW)
+
+    def test_the_slot_key_ignores_which_answer_and_keeps_what_followed(self):
+        a, a_slots = normalizer.answer_slots(self.convo("Yes please.", "ticket Tea"), self.CONTEXT)
+        b, b_slots = normalizer.answer_slots(self.convo("Yes.", "ticket Tea", task="t_bbbbbbbb"), self.CONTEXT)
+        c, _ = normalizer.answer_slots(self.convo("Yes.", "ticket Latte"), self.CONTEXT)
+        self.assertEqual(a, b)
+        self.assertNotEqual(a, c)
+        self.assertEqual(a_slots[0][0], b_slots[0][0], "both answers fill the same context")
+        self.assertNotEqual(a_slots[0][1], b_slots[0][1])
+
+    def test_placeholders_outside_answers(self):
+        n = self.convo("I'll look at web-7d4b9c8f6d-x2k9p", "ticket for web-5f6c7d8b9c-m8n7q")
+        self.assertEqual(normalizer.placeholders_outside_answers(n), {"⟦TASK_1⟧", "⟦POD_2⟧"})
+
+
 class TimeTest(unittest.TestCase):
     def test_iso_buckets(self):
         self.assertEqual(norm("2026-11-03T11:58:00Z"), "⟦TIME_past_within_hour⟧")

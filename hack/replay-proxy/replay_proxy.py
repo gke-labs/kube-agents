@@ -474,17 +474,30 @@ class ShadowProxy:
         self._worker = threading.Thread(target=self._work, name="replay-shadow-analysis", daemon=True)
         self._worker.start()
 
-    def lookup(self, body: Dict[str, Any], received: float) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], str]]:
-        """Replay mode: (restored answer, saved entry, fingerprint) on a servable hit, else None."""
+    def lookup(self, body: Dict[str, Any], received: float) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], str, str]]:
+        """Replay mode: (restored answer, saved entry, fingerprint, how it matched) on a servable hit, else None."""
         normalized = normalizer.normalize_request(body, received)
         fingerprint = normalizer.fingerprint(normalized, self.key_context)
+        via = F.VIA_EXACT
         entry = self.cache.load(fingerprint)
+        if entry is None:
+            # The same conversation recorded after a different answer the model
+            # gave to the same context: every answer here must be a recorded one.
+            slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
+            recorded = self.cache.load_slot(slot_key) if slots else None
+            if recorded is None or not all(self.cache.has_variant(c, a) for c, a in slots):
+                return None
+            fingerprint, via, entry = recorded, F.VIA_ANSWER_SLOTS, self.cache.load(recorded)
         if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
             return None
+        if via == F.VIA_ANSWER_SLOTS:
+            named = set(normalizer.PLACEHOLDER_RE.findall(json.dumps(entry[replay_cache.ENTRY_ANSWER], ensure_ascii=False)))
+            if not named <= normalizer.placeholders_outside_answers(normalized):
+                return None  # a value only an answer named could carry another number here
         answer, missing = replay_cache.restore_answer(entry[replay_cache.ENTRY_ANSWER], normalized.mapping)
         if missing:
             return None  # the answer names a value this request does not bind
-        return answer, entry, fingerprint
+        return answer, entry, fingerprint, via
 
     def submit(
         self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int,
@@ -538,12 +551,19 @@ class ShadowProxy:
             return None
 
     def record(
-        self, entry: Dict[str, Any], upstream: Dict[str, Any], mapping: normalizer.Mapping,
+        self, entry: Dict[str, Any], upstream: Dict[str, Any], normalized: normalizer.NormalizedRequest,
         diag_walked: List[Any], received: float,
     ) -> bool:
         """Record mode: save a storable answer under its fingerprint; True when this call saved it."""
+        mapping = normalized.mapping
+        slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
+        # Every answer in the history is one the model gave to what preceded it.
+        for context, answer_hash in slots:
+            self.cache.add_variant(context, answer_hash)
         if entry[F.UNSTORABLE]:
             return False
+        if slots:
+            self.cache.save_slot(slot_key, entry[F.FINGERPRINT])
         saved = self.cache.save(entry[F.FINGERPRINT], {
             replay_cache.ENTRY_FINGERPRINT: entry[F.FINGERPRINT],
             replay_cache.ENTRY_ANSWER: replay_cache.normalize_answer(upstream["message"], mapping),
@@ -658,6 +678,7 @@ class ShadowProxy:
         }
         if served is not None:
             entry[F.SERVED_FROM] = served.get(replay_cache.ENTRY_RECORDED_BY)
+            entry[F.SERVED_VIA] = upstream.get("served_via")
         entry.update(usage_tokens(upstream["usage"]))
         entry[F.TOKENS_ESTIMATED] = entry[F.PROMPT_TOKENS] is None
         if entry[F.TOKENS_ESTIMATED]:
@@ -686,7 +707,7 @@ class ShadowProxy:
         entry[F.DIAG_MESSAGE_HASHES] = diag_hashes
         entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
         if self.config.mode == F.MODE_RECORD:
-            entry[F.RECORDED] = self.record(entry, upstream, normalized.mapping, diag_walked, received)
+            entry[F.RECORDED] = self.record(entry, upstream, normalized, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, diag_walked)
         entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
@@ -787,8 +808,10 @@ class Handler(BaseHTTPRequestHandler):
             if hit is not None:
                 self.proxy.metrics.add("completions")
                 self.proxy.metrics.add("served")
-                upstream = self._serve(body, *hit)
-                self.proxy.submit(body, received, upstream, len(raw), served=hit[1])
+                answer, saved, fingerprint, via = hit
+                upstream = self._serve(body, answer, saved, fingerprint)
+                upstream["served_via"] = via
+                self.proxy.submit(body, received, upstream, len(raw), served=saved)
                 return
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))
         if body is None:

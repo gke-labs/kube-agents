@@ -87,6 +87,10 @@ MODE = "mode"
 SERVED = "served"
 # On a served line: the job that recorded the answer (its `job` block).
 SERVED_FROM = "served_from"
+# How a served answer matched: the exact key, or the answer-slot key.
+SERVED_VIA = "served_via"
+VIA_EXACT = "exact"
+VIA_ANSWER_SLOTS = "answer_slots"
 # In record mode: whether this request's answer was saved (false when the key
 # was already there, or the answer was unstorable).
 RECORDED = "recorded"

@@ -99,6 +99,13 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(report["served_token_percent"], 50.0)
         self.assertEqual(report["served_before_first_miss_token_percent"], 0.0)
 
+    def test_served_through_answer_slots_is_reported_apart(self):
+        lines = [line("x1", 1, ["m1"], True, tokens=300), line("x2", 2, ["m1", "m2"], True, tokens=100)]
+        lines[0]["served_via"], lines[1]["served_via"] = "exact", "answer_slots"
+        report = analyze_replay.summarize(analyze_replay.load([write(lines)]))
+        self.assertEqual(report["served_token_percent"], 100.0)
+        self.assertEqual(report["served_via_answer_slots_token_percent"], 25.0)
+
     def test_verdict_join(self):
         verdicts = {"b1": "pass", "rec-1": "pass", "rec-2": "fail"}
         report = analyze_replay.summarize(analyze_replay.load([write(entries())]), verdicts)

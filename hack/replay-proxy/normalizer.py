@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Hex digits of the normalizer source hash kept in NORMALIZER_VERSION.
 NORMALIZER_VERSION_HEX_CHARS = 16
@@ -32,6 +32,10 @@ NORMALIZER_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:NO
 # collision across a week of logs negligible, short enough to keep a log line
 # with a few hundred messages small.
 MESSAGE_HASH_HEX_CHARS = 16
+# Replay keys a request a second way, each assistant message as a slot any
+# recorded answer to that same context fills (answer_slots).
+ASSISTANT_ROLE = "assistant"
+ANSWER_SLOT = "recorded-answer"
 
 # Request fields that change how the answer is delivered or who asked, never
 # what the model sees. Everything else is in the key.
@@ -634,3 +638,41 @@ def fingerprint(normalized: NormalizedRequest, context: KeyContext) -> str:
 def settings_hash(normalized: NormalizedRequest, context: KeyContext) -> str:
     """The key without the messages: the root of every per-message prefix chain."""
     return stable_hash({"settings": normalized.settings, "context": context.as_dict()})
+
+
+def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[str, List[Tuple[str, str]]]:
+    """The request's key with each assistant message as a slot, and each slot's (context, answer).
+
+    The model can answer one request in different words that do the same thing
+    (a card lookup with or without the task id), and a conversation recorded
+    after one answer then never matches a replay that was served the other.
+    Keyed this way, it matches as long as each answer it holds is one the model
+    gave to that same context in a recording, which the caller checks per slot.
+    A slot's context is the chain of everything before it, earlier answers as
+    slots too, so the tool results that followed an answer still have to match.
+    """
+    current = settings_hash(normalized, context)
+    slots: List[Tuple[str, str]] = []
+    for message_hash, role in zip(normalized.message_hashes, normalized.roles()):
+        if role == ASSISTANT_ROLE:
+            slots.append((current, message_hash))
+            part = ANSWER_SLOT
+        else:
+            part = message_hash
+        current = stable_hash({"prefix": current, "message": part})
+    return current, slots
+
+
+def placeholders_outside_answers(normalized: NormalizedRequest) -> Set[str]:
+    """The placeholders the request's non-assistant messages hold.
+
+    Served through a slot, a saved answer's placeholder is safe only if one of
+    these binds it: a value only an assistant message named can carry a
+    different number when the answers differ.
+    """
+    found: Set[str] = set()
+    for message, role in zip(normalized.messages, normalized.roles()):
+        if role != ASSISTANT_ROLE:
+            found.update(PLACEHOLDER_RE.findall(json.dumps(message, ensure_ascii=False)))
+    return found
+
