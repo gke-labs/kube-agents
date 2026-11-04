@@ -30,6 +30,8 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 import command_policy
 import credential_proxy
 import scoped_sa_pool
@@ -1622,11 +1624,15 @@ class OperatorContractTest(unittest.TestCase):
         # args.port has to be the port Envoy binds in front of the socket. The
         # operator sets it from credentialProxyPort, Envoy's config carries the
         # literal, and the runtime's default is the fallback for a hand run:
-        # one number, or the refusal guards the wrong port.
+        # one number, or the refusal guards the wrong port. The config has two
+        # listeners, so the number is read off the credentialed one by name
+        # rather than off whichever port_value comes first.
         manifests = _OPERATOR_MANIFESTS.read_text()
         self.assertRegex(manifests, r'credentialProxyPortEnv\s*=\s*"CREDENTIAL_PROXY_PORT"')
         operator_port = int(re.search(r"^\s*credentialProxyPort\s*=\s*(\d+)", manifests, re.MULTILINE).group(1))
-        envoy_port = int(re.search(r"port_value:\s*(\d+)", _ENVOY_CONFIG.read_text()).group(1))
+        listeners = yaml.safe_load(_ENVOY_CONFIG.read_text())["static_resources"]["listeners"]
+        credentialed = next(listener for listener in listeners if listener["name"] == "credential_proxy")
+        envoy_port = int(credentialed["address"]["socket_address"]["port_value"])
         with mock.patch.object(sys, "argv", ["credential_proxy.py"]), mock.patch.dict(os.environ):
             os.environ.pop("CREDENTIAL_PROXY_PORT", None)
             runtime_default = credential_proxy.parse_args().port

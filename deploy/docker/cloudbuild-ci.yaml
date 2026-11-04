@@ -166,6 +166,23 @@ steps:
       - "k8s-operator/Dockerfile"
       - "k8s-operator"
 
+  # deploy/kube-proxy/Dockerfile shares no stage with the agent images, so it
+  # starts immediately alongside sandbox and operator.
+  - id: kube-proxy
+    name: "gcr.io/cloud-builders/docker"
+    waitFor: ["-"]
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "build"
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_KUBE_PROXY_URI"
+      - "-f"
+      - "deploy/kube-proxy/Dockerfile"
+      - "."
+
   # The two AgentPlugin images the presubmit deploys so the Pub/Sub platform
   # adapter and the stockout investigator run from this tree: a busybox layer
   # carrying the plugin's files each, seconds to build. Empty URIs make the
@@ -282,6 +299,7 @@ images:
   - "$_PROXY_URI"
   - "$_SANDBOX_URI"
   - "$_OPERATOR_URI"
+  - "$_KUBE_PROXY_URI"
 
 # No `options.machineType` here on purpose. The operator step only genuinely
 # overlaps the agent builds if the worker has cores to spare, but a private
@@ -300,6 +318,7 @@ substitutions:
   _PROXY_URI: ""
   _SANDBOX_URI: ""
   _OPERATOR_URI: ""
+  _KUBE_PROXY_URI: ""
   _CACHE_IMAGE: ""
   _BUILDCACHE_IMAGE: ""
   _PROXY_BUILDCACHE_IMAGE: ""

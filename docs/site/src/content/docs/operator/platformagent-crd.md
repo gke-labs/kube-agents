@@ -716,7 +716,7 @@ The credential broker is a Deployment of its own, never a container of this Pod,
 Abstracts the pod/deployment configuration. The controller synthesises a `Deployment` from these plus the workspace ConfigMaps. Available fields:
 
 - `image` — container image repository.
-- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's default platform-agent version applies instead.
+- `tag` — image tag. Applies only when `image` is set without a tag or digest, falling back to `latest` there; when `image` is omitted, the operator's default platform-agent version applies instead. The credential broker's image is derived from the same repository and tag, and a pinned one must be at least as new as the operator. The operator reads the broker's readiness on a health listener (port 8768) that older broker images do not open, so a broker Pod running one never becomes Ready.
 - `imagePullPolicy` — one of `Always`, `Never`, `IfNotPresent`. Default `IfNotPresent`.
 - `imagePullSecrets` — Secrets in the agent's namespace holding registry credentials, as
   `- name: <secret>` entries. Referenced, not created: each must exist before the pod is
@@ -902,7 +902,7 @@ spec:
 - `sharedVpcHosts` and `metricsScopes` — project IDs of Shared VPC host projects, and of the scoping projects of Cloud Monitoring Metrics Scopes. Neither is a Resource Manager container: each is resolved on every run to the projects it reaches, and those projects then take the `projects` path above. [`spec.scope.sharedVpcHosts` and `spec.scope.metricsScopes`](#specscopesharedvpchosts-and-specscopemetricsscopes) has the lookups, the roles they need, and how a monitored project the scope names by number reads.
 - `maxProjects` — the most projects the reconcile lists per run, the management project included, 1 to 5000, 100 by default: explicit projects, selector members and container members fill it in that fixed order, and a project past it reads `over-cap` (profiles kept, nothing created).
 
-  The reconcile lists with four workers at every cap and sizes its listing budget from it, 300 seconds per default cap's worth of projects, and the bootstrap gate's ceiling on the reconcile follows the budget, so an estate of a few hundred projects declares the number it has rather than reading half of itself `over-cap`; the snapshot records the cap in force under `maxProjects`.
+  The reconcile lists with four workers at every cap and sizes its listing budget from it, 300 seconds per default cap's worth of projects, and the bootstrap gate's ceiling on the reconcile follows the budget, so an estate of a few hundred projects declares the number it has rather than reading half of itself `over-cap`; the snapshot records the cap in force under `maxProjects`. Each run creates at most 100 profiles and leaves the rest to the next run, so a wide scope onboards in batches a run apart rather than against that ceiling; `BOOTSTRAP_MAX_CREATES_PER_TICK` under [`spec.deployment.env`](#specdeployment) sets the number.
 
   The Terraform composition refuses a plan whose explicit projects and selector members exceed it, while a selector is declared or the cap is below its default, and renders the same value here from its `scope.max_projects` (`SCOPE_MAX_PROJECTS` in `install.env`). A CR edited by hand takes the value directly. The 100-entry cap on each declared list is unchanged: a hand-written list past a hundred entries is the shape folders exist for.
 
@@ -1735,21 +1735,32 @@ force-syncs either way.
 A `cluster-*` profile's `config.yaml` is never force-synced: it carries the `cluster_identity`
 stamp the cluster reconciler matches the profile to its cluster by, and an overwrite would strip
 it. It is back-filled from the cluster template instead, on the same fill-only terms — keys the
-template declares and the live file has lost are restored at the next start, and `cluster_identity`
+template declares and the live file has lost are restored on a pass, and `cluster_identity`
 and every value the file already holds are left alone, except the retired `memory.provider` key,
-which the entrypoint drops. The persona files and `skills/` beside it still force-sync.
+which the entrypoint drops.
+
+A cluster profile takes these steps, the persona copy, the `skills/` replace, the shared plugin
+refresh, the back-fill and the repairs below, on a pass. A pass runs only when the profile's
+`.scaffold-stamp` does not match the image: the first start on a new image, a start after a pass
+that warned, or one after the stamp was deleted.
+
+The entrypoint hashes what a pass reads from the image once per start and stamps each cluster
+profile it refreshed without a warning. On a same-image restart a stamped profile is left as it
+is, hand edits included. Delete `profiles/cluster-*/.scaffold-stamp` to send a profile through
+the pass on the next start. Without the stamp script every profile is refreshed and none is
+stamped.
 
 The remote MCP server entries inside both of these files do follow the image (see
 [the config reference](/kube-agents/reference/config/)). The back-fill recurses only through
 mappings and a server's `args` is a list, so it would otherwise stay as the image that scaffolded
 the profile spelled it for the life of the volume.
 
-At every start the entrypoint repairs it in each cluster profile's `config.yaml`, and in the
-platform profile's when it is the front door: for a server the template routes through the
-credential proxy's MCP relay (`gke` and `developer_knowledge`), the whole `args` list and the
-`MCP_REMOTE_BEARER_FILE` entry in its `env` become the template's, so a hand edit to either is
-reverted at the next start; for any other remote server the image ships, only the `User-Agent`
-header value is set. Nothing else in the file is changed.
+The entrypoint repairs it in each cluster profile's `config.yaml` on a pass through the profile,
+and in the platform profile's at every start when it is the front door: for a server the template
+routes through the credential proxy's MCP relay (`gke` and `developer_knowledge`), the whole
+`args` list and the `MCP_REMOTE_BEARER_FILE` entry in its `env` become the template's, so a hand
+edit to either is reverted at the next pass or start; for any other remote server the image
+ships, only the `User-Agent` header value is set. Nothing else in the file is changed.
 
 The `plugins.enabled` list follows the image for the same reason: it is a list, so the back-fill
 never enters it. In the `default`, `platform` and every cluster profile it gains the names the

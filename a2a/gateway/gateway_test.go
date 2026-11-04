@@ -1483,6 +1483,13 @@ func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) 
 // by wrap, as startRigWithSpawnerAdapter chooses the first's.
 func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, whileDown ...func()) (*rig, *fakeSpawner) {
 	t.Helper()
+	return restartRigWith(t, r, wrap, RunOptions{}, whileDown...)
+}
+
+// restartRigWith is restartRigWrapped with the second gateway run under opts,
+// as an elected gateway runs (RunWith).
+func restartRigWith(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, opts RunOptions, whileDown ...func()) (*rig, *fakeSpawner) {
+	t.Helper()
 	r.stop()
 	select {
 	case <-r.ran:
@@ -1515,7 +1522,7 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 		t.Fatalf("New: %v", err)
 	}
 	ran := make(chan struct{})
-	go func() { _ = g.Run(ctx); close(ran) }()
+	go func() { _ = g.RunWith(ctx, opts); close(ran) }()
 	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel, ran: ran}, spawn
 }
 

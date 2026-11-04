@@ -1,24 +1,27 @@
 # k8s-api-proxy
 
-The home of a Kubernetes API proxy for the agent sandbox, which is being written. The plan is
-that the sandbox's `kubectl` talks to it, and the proxy authenticates the caller, applies a
-per-request policy, redacts Secret values, and forwards the request to the cluster's API server
-with credentials the sandbox never holds. So far it has the policy (`pkg/k8sapiproxy/policy.go`)
-and the HTTP handler around it (`handler.go`), which authenticates through a pluggable
-`CallerAuthenticator`, removes the caller's credentials (including a bearer token in
-`Sec-WebSocket-Protocol`), impersonation, `Audit-ID` and `Connection`-named headers, and forwards
-through a pluggable `UpstreamTransport`. `NewTokenReviewAuthenticator` (`auth.go`) is the
-`CallerAuthenticator`: it accepts a bearer token that a TokenReview on the host cluster finds
-valid for the configured audience, from a username on an allowlist, and caches each acceptance
-or refusal for ten seconds by default. The audience should be one the API server does not accept,
-so a token sent to the proxy cannot be used against the API server directly; the operator picks
-it. A review that fails is a 503 rather than a 401. `pkg/upstream` implements the transport, and
-nothing serves or deploys the handler yet.
+The Kubernetes API proxy for the agent sandbox (`<agent>-kube-proxy` deployment). The sandbox's
+`kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
+authenticates the caller (`pkg/k8sapiproxy/auth.go`), applies a per-request policy
+(`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
+caller's credentials (including a bearer token in `Sec-WebSocket-Protocol`), impersonation,
+`Audit-ID` and `Connection`-named headers (`pkg/k8sapiproxy/headers.go`), forwards the request to
+the cluster's API server through `pkg/upstream` with credentials the sandbox never holds, and emits
+structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
+(`pkg/k8sapiproxy/metrics.go`), and OpenTelemetry spans (`pkg/k8sapiproxy/telemetry.go`).
+`cmd/k8s-api-proxy` builds the production server binary.
+
+`NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
+that a TokenReview on the host cluster finds valid for the configured audience, from a username on
+an allowlist, and caches each acceptance or refusal for ten seconds by default. The audience should
+be one the API server does not accept, so a token sent to the proxy cannot be used against the API
+server directly; the operator picks it. A review that fails is a 503 rather than a 401.
 
 `pkg/upstream` sends `in-cluster`, and the proxy's own cluster when it is given that cluster's
-`gke_` ID, to the API server through the pod's service account. Any other `gke_` cluster is reached
-with the proxy's Application Default Credentials: it describes the cluster through the Container
-API and picks its endpoint by rules 1, 2 and 4 of
+`gke_` ID via `--host-cluster-id`, to the API server through the pod's service account. Any other
+`gke_` cluster is reached with the proxy's Google credentials (Workload Identity Federation or
+Application Default Credentials): it describes the cluster through the Container API and picks its
+endpoint by rules 1, 2 and 4 of
 [`private-endpoint-selection.md`](../docs/designs/private-endpoint-selection.md) (the private
 endpoint of rule 3 is not chosen yet). A resolved endpoint is reused for ten minutes and a failed
 resolution for ten seconds; an endpoint that cannot be dialled is described again after ten
@@ -39,7 +42,7 @@ the error and the handler's 502 as the status (on a watch, the stream's 200). Th
 writes each event as one `slog` record, and the reverse proxy's own errors go to the same logger.
 
 The policy has three modes. `read-only` permits `get`, `list` and `watch` and the discovery
-paths. `read-only-dry-run`, the default and the mode kube-agents will run, also permits `create`,
+paths. `read-only-dry-run`, the default and the mode kube-agents runs, also permits `create`,
 `update` and `patch` carrying `dryRun=All`. `read-write` permits writes. Every mode refuses
 stream upgrades (`exec`, `attach`, `portforward`, `proxy`; `read-write` can opt in),
 credential minting, assigning pods to nodes, and the token and access review APIs. With Secret
@@ -55,8 +58,7 @@ it cannot tell an empty one from a set one: `kubectl describe secret` prints eve
 the placeholder's size, and an empty key looks the same as a populated one. A response the handler
 cannot redact becomes a 502, or on a watch ends the stream with an `ERROR` event.
 
-It is a self-contained Go module, and nothing outside this directory builds it. Run its checks
-from this directory:
+It is a self-contained Go module. Run its checks from this directory:
 
 ```bash
 gofmt -l .
