@@ -878,14 +878,16 @@ KEEPALIVE_IDLE_SECONDS = 60
 # reads the TimeoutError it passes rather than this text, which the tests
 # pin as never reaching the log.
 IDLE_CLOSE_LOG_PREFIX = "Request timed out"
-# The most connections the credentialed listeners (the Unix socket or TCP
-# port behind Envoy, and the agent API door) hold a thread for at once. The
+# The most connections a credentialed listener (the Unix socket or TCP port
+# behind Envoy, and the agent API door) holds a thread for at once. The
 # stdlib server starts one OS thread per accepted connection with no cap; one
-# past this is answered THREAD_CAP_REFUSAL on the accept loop's thread and
-# closed, with no thread spent. Unless MAX_THREADS_ENV names a cap, it is
-# derived from Envoy's config (default_max_threads): the sum, over the static
-# clusters that forward to the broker's socket, of each cluster's
-# circuit-breaker max_connections, Envoy's own default of
+# past this is answered THREAD_CAP_REFUSAL on a short-lived refusal thread of
+# its own (THREAD_CAP_REFUSAL_SECONDS, below) and closed, with no handler
+# thread spent. MAX_THREADS_ENV names the cap for both listeners. Unset, the
+# listener behind Envoy takes a cap derived from Envoy's config
+# (default_max_threads): the sum, over the static clusters that forward to
+# the broker's socket, of each cluster's circuit-breaker max_connections,
+# Envoy's own default of
 # ENVOY_DEFAULT_MAX_CONNECTIONS for a cluster that sets none. Derived rather
 # than pinned so that Envoy's breaker refuses before the cap does whatever a
 # config raises it to, and so that a second cluster to the socket (a health
@@ -897,7 +899,9 @@ IDLE_CLOSE_LOG_PREFIX = "Request timed out"
 # running from source; the shipped config declares 4096 on the credentialed
 # route's cluster and 64 on the readiness probe's, so the derived cap is 4160
 # there. With neither readable, the fallback is Envoy's default for one
-# cluster.
+# cluster. The agent API door derives nothing: no Envoy fronts it, its peers
+# are the pods of its namespace, and the argument above does not hold there,
+# so unset it takes FALLBACK_MAX_THREADS (door_thread_cap_from_env).
 MAX_THREADS_ENV = "CREDENTIAL_PROXY_MAX_THREADS"
 ENVOY_CONFIG_PATH = Path("/etc/envoy/envoy-credential-proxy.yaml")
 # This file sits three directories under the repository root
@@ -922,8 +926,12 @@ ENVOY_DEFAULT_MAX_CONNECTIONS = 1024
 # The routing priority a route runs at unless it names another, and the one
 # a circuit-breaker threshold applies to when it names none. Envoy keeps a
 # breaker per priority; the shipped routes set none, so DEFAULT's is the
-# ceiling in force, whatever a HIGH threshold beside it says.
+# ceiling in force, whatever a HIGH threshold beside it says. Envoy reads the
+# config through proto-JSON, which takes an enum by its name or its number,
+# so a threshold's priority is one of these four spellings or the config is
+# one Envoy would not load (_routing_priority).
 ENVOY_DEFAULT_PRIORITY = "DEFAULT"
+ENVOY_ROUTING_PRIORITIES: Mapping[str, int] = {ENVOY_DEFAULT_PRIORITY: 0, "HIGH": 1}
 FALLBACK_MAX_THREADS = ENVOY_DEFAULT_MAX_CONNECTIONS
 # The 503 a connection past the thread cap is written before it is closed: a
 # whole HTTP/1.1 response with an empty body, so a client that already sent
@@ -1409,17 +1417,24 @@ class ThreadCap(ConnectionCap):
     bare close would be a reset. The write and the drain behind it run on a
     short-lived thread, one per refusal and at most
     THREAD_CAP_REFUSAL_THREADS at once, so a peer that holds its refused
-    connection open never holds the accept loop. The cap is MAX_THREADS_ENV,
-    read once by serve(); a test passes ``max_threads`` directly. The log carries one
+    connection open never holds the accept loop; past
+    THREAD_CAP_REFUSAL_THREADS such peers a refused connection is closed at
+    once, unanswered. The cap is serve()'s to set: MAX_THREADS_ENV or Envoy's
+    config for the listener behind Envoy (thread_cap_from_env), MAX_THREADS_ENV
+    or the fallback for the door (door_thread_cap_from_env); a test passes
+    ``max_threads`` directly. The log carries one
     ALERT when the cap is first reached, at most one line per
     THREAD_CAP_LOG_INTERVAL_SECONDS while it keeps being reached, and one
-    when an interval has passed without a refusal; never one per refused
+    when an interval has passed without a refusal, each with the count
+    refused since the last line and how many of those were closed
+    unanswered; never one per refused
     connection or per freed slot, so a saturated hour cannot fill the log.
     """
 
-    # The cap every credentialed listener is built with unless told otherwise;
+    # The cap a credentialed listener is built with unless told otherwise;
     # serve() sets it from MAX_THREADS_ENV, or Envoy's config, before building
-    # any (thread_cap_from_env).
+    # the listener behind Envoy (thread_cap_from_env), and builds the door
+    # with its own (door_thread_cap_from_env).
     max_threads: int = FALLBACK_MAX_THREADS
 
     def __init__(self, *args: Any, max_threads: int | None = None, **kwargs: Any) -> None:
@@ -1427,6 +1442,7 @@ class ThreadCap(ConnectionCap):
         # outside an episode) and when the last refusal happened; see
         # THREAD_CAP_LOG_INTERVAL_SECONDS.
         self._refused = 0
+        self._refused_unanswered = 0
         self._refused_logged_at: float | None = None
         self._last_refusal_at = 0.0
         self._refused_lock = threading.Lock()
@@ -1435,26 +1451,38 @@ class ThreadCap(ConnectionCap):
         super().__init__(*args, cap=cap, **kwargs)
 
     def refuse_connection(self, request: Any) -> None:
+        # The refusal thread's slot is taken before the count, so the line
+        # written below says how this refusal ends: answered on a thread of
+        # its own, or closed unanswered because THREAD_CAP_REFUSAL_THREADS
+        # refusals are already waiting on their peers.
+        answered = self._refusal_slots.acquire(blocking=False)
         now = time.monotonic()
         with self._refused_lock:
             self._refused += 1
+            if not answered:
+                self._refused_unanswered += 1
             self._last_refusal_at = now
             due = (
                 self._refused_logged_at is None
                 or now - self._refused_logged_at >= THREAD_CAP_LOG_INTERVAL_SECONDS
             )
             if due:
-                refused, self._refused = self._refused, 0
+                refused, unanswered = self._refused, self._refused_unanswered
+                self._refused = self._refused_unanswered = 0
                 self._refused_logged_at = now
         if due:
             LOGGER.warning(
                 "ALERT connection refused: %d connections hold a thread (%s); %d refused since "
-                "the last line, each answered 503 with Retry-After",
+                "the last line, %d answered 503 with Retry-After on a refusal thread and %d closed "
+                "unanswered with %d refusals already waiting on their peers",
                 self.connection_cap,
                 MAX_THREADS_ENV,
                 refused,
+                refused - unanswered,
+                unanswered,
+                THREAD_CAP_REFUSAL_THREADS,
             )
-        if not self._refusal_slots.acquire(blocking=False):
+        if not answered:
             LOGGER.debug(
                 "thread cap refusal closed unanswered: %d refusals already waiting on their peers",
                 THREAD_CAP_REFUSAL_THREADS,
@@ -1466,7 +1494,11 @@ class ThreadCap(ConnectionCap):
                 target=self._deliver_refusal, args=(request,), daemon=True, name="thread-cap-refusal"
             ).start()
         except RuntimeError as exc:
+            # Counted as unanswered on the next line: the slot was taken and
+            # the answer not written.
             self._refusal_slots.release()
+            with self._refused_lock:
+                self._refused_unanswered += 1
             LOGGER.debug("thread cap refusal closed unanswered type=%s", type(exc).__name__)
             self.shutdown_request(request)
 
@@ -1499,12 +1531,16 @@ class ThreadCap(ConnectionCap):
                 return
             if time.monotonic() - self._last_refusal_at < THREAD_CAP_LOG_INTERVAL_SECONDS:
                 return
-            refused, self._refused = self._refused, 0
+            refused, unanswered = self._refused, self._refused_unanswered
+            self._refused = self._refused_unanswered = 0
             self._refused_logged_at = None
         LOGGER.warning(
-            "thread cap released: no connection refused for %ds, %d refused since the last line",
+            "thread cap released: no connection refused for %ds, %d refused since the last line, "
+            "%d answered 503 with Retry-After and %d closed unanswered",
             THREAD_CAP_LOG_INTERVAL_SECONDS,
             refused,
+            refused - unanswered,
+            unanswered,
         )
 
 
@@ -1524,6 +1560,19 @@ def thread_cap_from_env() -> int:
     if pinned > 0:
         return pinned
     return session_slot_limit_from_env(MAX_THREADS_ENV, default_max_threads())
+
+
+def door_thread_cap_from_env() -> int:
+    """The agent API door's cap: MAX_THREADS_ENV as a positive integer, else FALLBACK_MAX_THREADS.
+
+    Nothing is derived for the door. The derivation (default_max_threads)
+    sums Envoy's connection ceilings to the broker's socket so that Envoy's
+    breaker refuses before the cap, and no Envoy fronts the door: its peers
+    are the pods of its namespace, with no breaker between them and it, so a
+    cap read off the broker's config would bound it by a file no proxy in its
+    pod reads. The same grammar as thread_cap_from_env for the environment.
+    """
+    return session_slot_limit_from_env(MAX_THREADS_ENV, FALLBACK_MAX_THREADS)
 
 
 def default_max_threads(paths: Sequence[Path] | None = None) -> int:
@@ -1600,52 +1649,106 @@ def envoy_broker_connection_ceiling(config: Any) -> int | None:
     cluster with no such threshold, or a threshold that sets no count, since
     Envoy applies its default to a priority no threshold names. A threshold
     at another priority is not read: the shipped routes run at DEFAULT, and
-    a route that named HIGH would draw on a pool this does not count. None
+    a route that named HIGH would draw on a pool this does not count. The
+    priority and the count are read as Envoy's proto-JSON reads them
+    (_routing_priority, _connection_count), and a value neither reads, a
+    priority that is not a RoutingPriority or a max_connections that is not
+    a count, is a WARNING naming the cluster, so a reading that diverges from
+    Envoy's is visible at startup rather than silent. None
     when no cluster forwards to the socket, or the sum is zero, so the
     caller can say so rather than cap at nothing.
     """
     clusters = _mapping(_mapping(config).get("static_resources")).get("clusters")
     total = 0
     found = False
+    default_priority = ENVOY_ROUTING_PRIORITIES[ENVOY_DEFAULT_PRIORITY]
     for cluster in clusters if isinstance(clusters, list) else ():
         cluster = _mapping(cluster)
         if not _cluster_forwards_to_broker(cluster):
             continue
         found = True
+        name = cluster.get("name")
         thresholds = _mapping(cluster.get("circuit_breakers")).get("thresholds")
         ceiling = ENVOY_DEFAULT_MAX_CONNECTIONS
         for threshold in (thresholds if isinstance(thresholds, list) else ()):
             threshold = _mapping(threshold)
-            if threshold.get("priority", ENVOY_DEFAULT_PRIORITY) == ENVOY_DEFAULT_PRIORITY:
-                ceiling = _connection_count(threshold.get("max_connections"))
-                break
+            priority = _routing_priority(threshold.get("priority"))
+            if priority is None:
+                LOGGER.warning(
+                    "Envoy cluster %s: threshold priority %r is not a RoutingPriority Envoy would read; "
+                    "the threshold is not read for the thread cap",
+                    name, threshold.get("priority"),
+                )
+                continue
+            if priority != default_priority:
+                continue
+            declared = threshold.get("max_connections")
+            count = _connection_count(declared)
+            if count is None:
+                if declared is not None:
+                    LOGGER.warning(
+                        "Envoy cluster %s: max_connections %r is not a count Envoy would read; "
+                        "Envoy's default of %d is read for the thread cap",
+                        name, declared, ENVOY_DEFAULT_MAX_CONNECTIONS,
+                    )
+                count = ENVOY_DEFAULT_MAX_CONNECTIONS
+            ceiling = count
+            break
         total += ceiling
     return total if found and total > 0 else None
 
 
 def _cluster_forwards_to_broker(cluster: Mapping[str, Any]) -> bool:
-    """Whether any endpoint of a parsed Envoy cluster is the broker's socket."""
+    """Whether any endpoint of a parsed Envoy cluster is the broker's socket.
+
+    The pipe's path is compared normalised: a doubled slash or a ``.``
+    segment names the same socket to the kernel, and so to Envoy.
+    """
     endpoints = _mapping(cluster.get("load_assignment")).get("endpoints")
     for locality in endpoints if isinstance(endpoints, list) else ():
         lb_endpoints = _mapping(locality).get("lb_endpoints")
         for lb_endpoint in lb_endpoints if isinstance(lb_endpoints, list) else ():
             address = _mapping(_mapping(_mapping(lb_endpoint).get("endpoint")).get("address"))
-            if _mapping(address.get("pipe")).get("path") == ENVOY_BROKER_SOCKET_PATH:
+            path = _mapping(address.get("pipe")).get("path")
+            if isinstance(path, str) and os.path.normpath(path) == ENVOY_BROKER_SOCKET_PATH:
                 return True
     return False
 
 
-def _connection_count(value: Any) -> int:
-    """A threshold's max_connections, or Envoy's default when it is unset or not a count.
+def _routing_priority(value: Any) -> int | None:
+    """A threshold's priority as Envoy reads it: the RoutingPriority's number, or None for a value it would not load.
 
-    A quoted count (``"4096"``) is a count: Envoy's proto-JSON reading of a
-    UInt32Value accepts a digit string, so the breaker runs at it. Decimal
-    digits only: ``str.isdigit`` admits a superscript, which ``int`` refuses.
+    Absent or null is DEFAULT. proto-JSON reads an enum by its name or its
+    number, so ``DEFAULT`` and ``0`` are one priority and ``HIGH`` and ``1``
+    the other (ENVOY_ROUTING_PRIORITIES). A bool is not a number here (pyyaml
+    reads ``true`` as one), a lower-case name is not the name, and a float is
+    neither; Envoy loads none of them.
+    """
+    if value is None:
+        return ENVOY_ROUTING_PRIORITIES[ENVOY_DEFAULT_PRIORITY]
+    if isinstance(value, str):
+        return ENVOY_ROUTING_PRIORITIES.get(value)
+    if isinstance(value, int) and not isinstance(value, bool) and value in ENVOY_ROUTING_PRIORITIES.values():
+        return value
+    return None
+
+
+def _connection_count(value: Any) -> int | None:
+    """A threshold's max_connections as Envoy reads it, or None when it is not a count.
+
+    Envoy's proto-JSON reading of a UInt32Value takes a digit string
+    (``"4096"``) and a float with no fractional part (``4096.0``) as the
+    integer, so the breaker runs at either; both are counts here. Decimal
+    digits only for the string: ``str.isdigit`` admits a superscript, which
+    ``int`` refuses. A bool, a negative, a fraction, a word and an unset
+    value are None, and the caller reads Envoy's default for each.
     """
     if isinstance(value, str) and value.isdecimal():
         value = int(value)
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return ENVOY_DEFAULT_MAX_CONNECTIONS
+        return None
     return value
 
 
@@ -15777,8 +15880,11 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         )
 
 
-def start_agent_api_proxy() -> ThreadingHTTPServer:
+def start_agent_api_proxy(max_threads: int | None = None) -> ThreadingHTTPServer:
     """Bind the authenticated front door for the agent's own API.
+
+    ``max_threads`` is the door's connection cap (door_thread_cap_from_env;
+    the class attribute when None, as a test sets it).
 
     This runs wherever the agent's API server is reachable on loopback. In the
     sidecar deployment that is this same container; when the broker is split
@@ -15799,8 +15905,12 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
         or "/opt/data"
     )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
-    server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
-    LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
+    cap = ThreadCap.max_threads if max_threads is None else max_threads
+    server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler, max_threads=cap)
+    LOGGER.info(
+        "authenticated PlatformAgent API proxy listening on port %d, %d connections at once (%s)",
+        port, cap, MAX_THREADS_ENV,
+    )
     return server
 
 
@@ -16104,11 +16214,13 @@ def serve(args: argparse.Namespace) -> None:
     # raises RecursionError on the default stack overflows the smaller one
     # and takes the process down with it; the default's size is address
     # space, not memory.
-    ThreadCap.max_threads = thread_cap_from_env()
     role = resolve_role()
     if role == ROLE_API_PROXY:
-        start_agent_api_proxy().serve_forever()
+        # The door alone: its cap is the environment's or the fallback, and
+        # no Envoy config is read, since none fronts it (MAX_THREADS_ENV).
+        start_agent_api_proxy(max_threads=door_thread_cap_from_env()).serve_forever()
         return
+    ThreadCap.max_threads = thread_cap_from_env()
 
     CredentialProxyHandler.broker_role = role
     # Decided before anything credentialed starts, so a misconfigured
@@ -16307,7 +16419,7 @@ def serve(args: argparse.Namespace) -> None:
                 teams_tenant_id or "common",
             )
     if role == ROLE_COMBINED:
-        api_server = start_agent_api_proxy()
+        api_server = start_agent_api_proxy(max_threads=door_thread_cap_from_env())
         threading.Thread(target=api_server.serve_forever, daemon=True).start()
     if args.unix_socket:
         socket_path = Path(args.unix_socket)

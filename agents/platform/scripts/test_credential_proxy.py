@@ -11086,6 +11086,47 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         proxy.serve_forever.assert_called_once_with()
         start.assert_not_called()
 
+    def test_the_door_takes_the_environments_cap_or_the_fallback_and_derives_none(self):
+        # No Envoy fronts the agent API door, so the derivation's argument
+        # (Envoy's breaker refuses before the cap) does not hold there: the
+        # door is built with MAX_THREADS_ENV, else 1024, and the Envoy config
+        # is not read in the api-proxy role. In the combined role the
+        # listener behind Envoy takes the derived cap and the door its own.
+        not_derived = mock.patch.object(
+            credential_proxy, "default_max_threads", side_effect=AssertionError("the Envoy config was read for the door")
+        )
+        for value, expected in ((None, 1024), ("12", 12), ("many", 1024), ("0", 1024)):
+            proxy = mock.MagicMock()
+            with self.subTest(value=value), not_derived, mock.patch.dict(os.environ), \
+                    mock.patch.object(credential_proxy, "resolve_role", return_value="api-proxy"), \
+                    mock.patch.object(credential_proxy, "start_agent_api_proxy", return_value=proxy) as started:
+                os.environ.pop(credential_proxy.MAX_THREADS_ENV, None)
+                if value is not None:
+                    os.environ[credential_proxy.MAX_THREADS_ENV] = value
+                credential_proxy.serve(types.SimpleNamespace())
+                started.assert_called_once_with(max_threads=expected)
+                proxy.serve_forever.assert_called_once_with()
+        self.assertEqual(credential_proxy.FALLBACK_MAX_THREADS, credential_proxy.door_thread_cap_from_env())
+        self.addCleanup(setattr, credential_proxy.ThreadCap, "max_threads", credential_proxy.ThreadCap.max_threads)
+        with mock.patch.object(credential_proxy, "resolve_role", return_value="combined"), \
+                mock.patch.object(credential_proxy, "thread_cap_from_env", return_value=4160), \
+                mock.patch.object(credential_proxy, "start_agent_api_proxy", mock.MagicMock()) as started:
+            self._serve_with(None)
+        started.assert_called_once_with(max_threads=1024)
+        self.assertEqual(4160, credential_proxy.ThreadCap.max_threads)
+
+    def test_the_door_is_built_with_the_cap_it_is_given(self):
+        names = ("external_key", "upstream_key", "workspace_root")
+        for name in names:
+            self.addCleanup(setattr, AgentAPIProxyHandler, name, AgentAPIProxyHandler.__dict__.get(name))
+        with mock.patch.dict(os.environ, {"API_SERVER_EXTERNAL_KEY": "external", "AGENT_API_PROXY_PORT": "0"}), \
+                self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            server = credential_proxy.start_agent_api_proxy(max_threads=3)
+        self.addCleanup(server.server_close)
+        self.assertIsInstance(server, credential_proxy.ThreadingTCPHTTPServer)
+        self.assertEqual(3, server.connection_cap)
+        self.assertTrue(any("3 connections at once" in line and credential_proxy.MAX_THREADS_ENV in line for line in logs.output), logs.output)
+
     def test_the_sweep_env_turns_it_off_and_nothing_else_does(self):
         # Installs sharing one App installation (the eval lanes, #4611) turn
         # the sweep off, in any of the spellings the broker's other switches
@@ -15490,7 +15531,7 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
             pass
 
         class FakeServer:
-            def __init__(self, address, handler):
+            def __init__(self, address, handler, max_threads=None):
                 self.address = address
 
             def serve_forever(self):
@@ -16333,6 +16374,48 @@ class ThreadCapTest(_CredentialedUnixServer):
             time.sleep(_RESET_SETTLE_SECONDS)
             self.assertEqual(503, self._refused()[0])
 
+    def test_the_line_counts_the_refusals_closed_unanswered(self):
+        # The line says how the refusals since the last one ended: answered
+        # 503 on a refusal thread, or closed unanswered because
+        # THREAD_CAP_REFUSAL_THREADS refusals were already waiting on their
+        # peers. Driven on the server directly over socket pairs, with all
+        # but one refusal slot held by the test and the drain held open by a
+        # peer that neither reads nor closes: the first refusal is answered,
+        # the two behind it find no slot, and with the interval at zero every
+        # refusal writes its own line, so each line counts one.
+        server = self.server
+        pairs = [socket.socketpair() for _ in range(3)]
+        for ours, peer in pairs:
+            self.addCleanup(peer.close)
+            self.addCleanup(ours.close)
+        for _ in range(credential_proxy.THREAD_CAP_REFUSAL_THREADS - 1):
+            self.assertTrue(server._refusal_slots.acquire(blocking=False))
+            self.addCleanup(server._refusal_slots.release)
+        with mock.patch.object(credential_proxy, "THREAD_CAP_REFUSAL_SECONDS", _LONG_REFUSAL_DRAIN_SECONDS), \
+                mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", 0):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                for ours, _ in pairs:
+                    server.refuse_connection(ours)
+                server.connection_released()
+            pairs[0][1].settimeout(_CLOSE_WAIT_SECONDS)
+            self.assertTrue(pairs[0][1].recv(len(credential_proxy.THREAD_CAP_REFUSAL)).startswith(b"HTTP/1.1 503 "))
+            for _, peer in pairs[1:]:
+                peer.settimeout(_CLOSE_WAIT_SECONDS)
+                self.assertEqual(b"", peer.recv(1), "an unanswered refusal is closed at once")
+        alerts = [line for line in logs.output if "ALERT connection refused" in line]
+        self.assertEqual(3, len(alerts), logs.output)
+        self.assertIn("1 refused since the last line, 1 answered 503 with Retry-After on a refusal thread and 0 closed unanswered", alerts[0])
+        for line in alerts[1:]:
+            self.assertIn(
+                "1 refused since the last line, 0 answered 503 with Retry-After on a refusal thread and 1 closed unanswered "
+                f"with {credential_proxy.THREAD_CAP_REFUSAL_THREADS} refusals already waiting on their peers",
+                line,
+            )
+        released = [line for line in logs.output if "thread cap released" in line]
+        self.assertEqual(1, len(released), logs.output)
+        self.assertIn("0 refused since the last line, 0 answered 503 with Retry-After and 0 closed unanswered", released[0])
+        pairs[0][1].close()  # the parked drain reads EOF and gives its slot back
+
     def test_a_slot_is_given_back_when_the_handler_thread_fails_to_start(self):
         # The slot is taken on the accept loop before the handler thread is
         # started; a start that fails (RuntimeError: can't start new thread)
@@ -16451,23 +16534,42 @@ static_resources:
 _TWO_CLUSTER_CEILING = 4096 + 64
 
 
+def yaml_value(text):
+    """The Python value pyyaml reads a scalar as, so a test says what the walk was handed."""
+    return yaml.safe_load(text)
+
+
 def _ceiling_summed_by_hand(config):
-    """The rule the broker derives its cap by, written out: per cluster to the
-    broker's socket, the max_connections of the first threshold at the DEFAULT
-    priority (the one a threshold that names none is at), 1024 for a cluster
-    with no such threshold or a threshold that sets no count; summed."""
+    """The rule the broker derives its cap by, written out: per cluster whose
+    pipe is the broker's socket (the path normalised, as the kernel reads
+    it), the max_connections of the first threshold at the DEFAULT priority
+    (spelt DEFAULT or 0, as proto-JSON reads an enum, or left out or null),
+    a quoted digit string or a whole-number float read as the integer, 1024
+    for a cluster with no such threshold or a threshold that sets no count
+    or one that is not a count; summed."""
     total = 0
     for cluster in config["static_resources"]["clusters"]:
         paths = [
-            endpoint["endpoint"]["address"].get("pipe", {}).get("path")
+            os.path.normpath(str(endpoint["endpoint"]["address"].get("pipe", {}).get("path")))
             for locality in cluster["load_assignment"]["endpoints"]
             for endpoint in locality["lb_endpoints"]
         ]
         if "/var/run/credential-proxy/backend.sock" not in paths:
             continue
         thresholds = cluster.get("circuit_breakers", {}).get("thresholds") or []
-        at_default = [t for t in thresholds if t.get("priority", "DEFAULT") == "DEFAULT"] or [{}]
-        total += int(at_default[0].get("max_connections", 1024))
+        at_default = [
+            t for t in thresholds
+            if t.get("priority") is None or t.get("priority") == "DEFAULT"
+            or (type(t.get("priority")) is int and t.get("priority") == 0)
+        ] or [{}]
+        count = at_default[0].get("max_connections", 1024)
+        if isinstance(count, str) and count.isdecimal():
+            count = int(count)
+        if isinstance(count, float) and count.is_integer():
+            count = int(count)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            count = 1024
+        total += count
     return total
 
 
@@ -16622,7 +16724,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
                 self.assertEqual(expected, credential_proxy.thread_cap_from_env())
         superscript = "\u00b2"
         self.assertTrue(superscript.isdigit() and not superscript.isdecimal())
-        self.assertEqual(credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS, credential_proxy._connection_count(superscript))
+        self.assertIsNone(credential_proxy._connection_count(superscript))
         text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f'            max_connections: "{superscript}"\n', 1)
         path, derived, config = self._derived(text)
         self.assertEqual(credential_proxy.ENVOY_DEFAULT_MAX_CONNECTIONS + 64, derived)
@@ -16669,6 +16771,95 @@ class ThreadCapDefaultTest(unittest.TestCase):
                 text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
                 path, derived, config = self._derived(text)
                 self.assertEqual(expected + 64, derived)
+
+    def test_a_numeric_or_null_priority_is_the_priority_envoy_reads(self):
+        # proto-JSON, which Envoy reads the config through, takes an enum by
+        # its name or its number: `priority: 0` is DEFAULT and `priority: 1`
+        # is HIGH, and an explicit null is the unset field, DEFAULT. So the
+        # runtime threshold spelt either way is the ceiling Envoy runs at,
+        # and the cap has to read it as such rather than fall to 1024 and
+        # refuse connections Envoy's breaker would have carried.
+        runtime_default = "          - priority: DEFAULT\n            max_connections: 4096\n"
+        self.assertIn(runtime_default, _TWO_CLUSTER_ENVOY_CONFIG)
+        cases = {
+            "          - priority: 0\n            max_connections: 4096\n": 4096,
+            "          - priority: null\n            max_connections: 4096\n": 4096,
+            "          - priority: ~\n            max_connections: 4096\n": 4096,
+            "          - priority: 1\n            max_connections: 4096\n": 1024,
+            "          - priority: 1\n            max_connections: 8192\n          - priority: 0\n            max_connections: 2048\n": 2048,
+        }
+        for threshold, runtime_ceiling in cases.items():
+            with self.subTest(threshold=threshold):
+                path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_default, threshold))
+                self.assertEqual(runtime_ceiling + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        for value in (None, "DEFAULT", 0):
+            self.assertEqual(0, credential_proxy._routing_priority(value), value)
+        for value in ("HIGH", 1):
+            self.assertEqual(1, credential_proxy._routing_priority(value), value)
+
+    def test_a_priority_or_a_count_envoy_would_not_read_is_a_warning_naming_the_cluster(self):
+        # A spelling that is neither a RoutingPriority's name nor its number
+        # (a lower-case name, a bool, a float, a number past the enum) is a
+        # config Envoy would not load; the threshold is passed over with a
+        # WARNING rather than silently, as is a max_connections that is not
+        # a count. The warning names the cluster and the value, so the
+        # divergence from Envoy's reading is visible at startup.
+        runtime_default = "          - priority: DEFAULT\n            max_connections: 4096\n"
+        for priority in ("default", "true", "0.0", "2"):
+            with self.subTest(priority=priority), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace(runtime_default, f"          - priority: {priority}\n            max_connections: 4096\n")
+                path, derived, config = self._derived(text)
+                self.assertEqual(1024 + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            self.assertTrue(
+                any("credential_runtime" in line and "priority" in line and "not read for the thread cap" in line for line in logs.output),
+                logs.output,
+            )
+            self.assertIsNone(credential_proxy._routing_priority(yaml_value(priority)))
+        for count in ("lots", "4096.5", "true", "-1", '"-1"'):
+            with self.subTest(count=count), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {count}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(1024 + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+            self.assertTrue(
+                any("credential_runtime" in line and "max_connections" in line and "not a count" in line for line in logs.output),
+                logs.output,
+            )
+        # A threshold that sets no count is Envoy's default without a
+        # warning: that is a config Envoy loads, and the reading agrees.
+        with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            path, derived, config = self._derived(_TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", ""))
+        self.assertEqual(1024 + 64, derived)
+
+    def test_a_whole_number_float_count_is_the_count_envoy_reads(self):
+        # proto-JSON reads 4096.0 into a UInt32Value as 4096, so the breaker
+        # runs at it; the cap reads it the same way, and a fraction is not a count.
+        for value, expected in (("4096.0", 4096), ("64.0", 64), ("4096.5", 1024)):
+            with self.subTest(value=value):
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("            max_connections: 4096\n", f"            max_connections: {value}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(expected + 64, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertEqual(4096, credential_proxy._connection_count(4096.0))
+        for value in (4096.5, float("inf"), float("nan"), -1.0, True):
+            self.assertIsNone(credential_proxy._connection_count(value), value)
+
+    def test_the_brokers_socket_path_is_compared_normalised(self):
+        # A doubled slash or a `.` segment names the same socket to the
+        # kernel, so Envoy connects to the broker through it; the cluster
+        # counts, where a string comparison would read 1024 for the runtime
+        # cluster against a breaker of 4096.
+        for spelling in ("/var/run/credential-proxy//backend.sock", "/var/run/credential-proxy/./backend.sock"):
+            with self.subTest(spelling=spelling):
+                text = _TWO_CLUSTER_ENVOY_CONFIG.replace("path: /var/run/credential-proxy/backend.sock\n", f"path: {spelling}\n", 1)
+                path, derived, config = self._derived(text)
+                self.assertEqual(_TWO_CLUSTER_CEILING, derived)
+                self.assertEqual(_ceiling_summed_by_hand(config), derived)
+        self.assertFalse(credential_proxy._cluster_forwards_to_broker(
+            {"load_assignment": {"endpoints": [{"lb_endpoints": [{"endpoint": {"address": {"pipe": {"path": "/var/run/credential-proxy/other.sock"}}}}]}]}}
+        ))
 
     def test_a_pinned_cap_reads_no_config_and_logs_no_derivation(self):
         # The environment is read first: a pinned cap derives nothing, so an
