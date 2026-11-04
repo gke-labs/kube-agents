@@ -24,9 +24,22 @@ MAX_CELL_CHARS = 200
 REDACTED_STOP_MARKER = "[REDACTED_STOP_MARKER]"
 ANSI_ESCAPE_RE = re.compile(r"(?:\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x9B[0-?]*[ -/]*[@-~])")
 STOP_MARKER_RE = re.compile(r"clean[\W_]*audit[\W_]*stop", re.IGNORECASE)
-# Per-call kubectl deadline: 60 s broker admission wait + 60 s broker kubectl run cap + 5 s margin,
-# matching cluster_preflight.sh so queued calls on the shared 8-slot sandbox pool do not time out locally.
-KUBECTL_TIMEOUT_SECONDS = 125
+# Per-call kubectl deadline: one broker admission wait, one broker kubectl run and a margin, the
+# sizing cluster_preflight.sh gives its own calls, so queued calls on the shared sandbox pool do
+# not time out locally.
+BROKER_ADMISSION_WAIT_SECONDS = 60
+BROKER_KUBECTL_RUN_SECONDS = 60
+KUBECTL_CAP_MARGIN_SECONDS = 5
+KUBECTL_TIMEOUT_SECONDS = BROKER_ADMISSION_WAIT_SECONDS + BROKER_KUBECTL_RUN_SECONDS + KUBECTL_CAP_MARGIN_SECONDS
+# The shim retries a broker refusal on its own (credential_proxy_client.py), keeping a retry's
+# admission wait, not the command's run, inside a deadline the caller may shorten through this
+# variable (the shim's RETRY_DEADLINE_ENV; test_domain_auditors.py holds the two equal). The cap
+# above has room for one admission wait and one run, so a retry admitted late would carry past
+# it, where the local timeout's text stands in for the broker's reason. Every call therefore
+# tells the shim the cap less the margin and the run bound, under which no retry fits, and a
+# refused call records that refusal's text at once, as cluster_preflight.sh's calls do.
+SHIM_RETRY_DEADLINE_ENV = "CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS"
+SHIM_RETRY_DEADLINE_SECONDS = KUBECTL_TIMEOUT_SECONDS - KUBECTL_CAP_MARGIN_SECONDS - BROKER_KUBECTL_RUN_SECONDS
 # The sandbox's kubectl wrapper that forwards calls through the credential proxy.
 CREDENTIAL_PROXY_BIN = "/opt/credential-proxy/bin"
 # Marker emitted on stderr when the credential proxy cuts output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES.
@@ -160,6 +173,7 @@ def audit_networking(kubeconfig: str | None = None) -> int:
     env = os.environ.copy()
     if CREDENTIAL_PROXY_BIN not in env.get("PATH", ""):
         env["PATH"] = f"{CREDENTIAL_PROXY_BIN}:" + env.get("PATH", "")
+    env[SHIM_RETRY_DEADLINE_ENV] = str(SHIM_RETRY_DEADLINE_SECONDS)
     if kubeconfig:
         env["KUBECONFIG"] = kubeconfig
 

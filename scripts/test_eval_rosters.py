@@ -245,6 +245,8 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("consistency-drift-outlier", "cost-idle-pool-probe"),
     # 2026-11-02 (#2013 step 4, #4094): 36/36 on the twelve graded main nightlies 10-20 to 11-02, 15/15 at the gemini-4-argon next key (the store at collecting), 1068/1117 graded presubmit repetitions 10-27 to 11-02 with no all-reps collapse.
     ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),
+    # 2026-11-02 (#4095): 21/21 on the seven main-b nightlies 10-27 to 11-02, every one under spec.mode next (15/15 at the gemini-4-argon key of 10-29), the store at collecting.
+    ("monitoring-alert-policy-read", "incident-triage-oom-event-probe"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -255,6 +257,7 @@ PROMOTED_AFTER_THE_SPLIT = [
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat; again 2026-10-26, from the nightly file (#3120)
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),  # 2026-10-23, from the nightly file's frozen part
     ("consistency-drift-outlier", "cost-idle-pool-probe"),  # 2026-10-26, from the nightly file's frozen part
+    ("monitoring-alert-policy-read", "incident-triage-oom-event-probe"),  # 2026-11-02 (#4095), from the nightly file's sorted section, which pins no history
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
@@ -891,6 +894,10 @@ INJECT_LANE_REQUESTING = [
     # the change as a pull request; its objective's pull_request_opened leaf
     # allows one.
     "scale-request-proposes-pr",
+    # stop-on-permission-refusal: refused or declined the kubectl scale the
+    # user asked for, it may propose the change as a pull request (#4224);
+    # its objective's pull_request_opened leaf allows one.
+    "stop-on-permission-refusal",
     "vcs-review-feedback-read-back",
     # Also listed in `requesting:`, for the pull request it opens and closes
     # beside the one its check grades.

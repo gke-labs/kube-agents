@@ -425,6 +425,25 @@ litellm:
     projectSecretRef:
       name: ""
       key: ""
+    # Sends each Gemini conversation a Vertex session_id, the same on every
+    # turn, so a new conversation lands on a serving replica that another
+    # conversation with the same prompt warmed and turn 1 reads its prefix
+    # from cache. Needs Vertex's LLM_SESSION_ID label on the serving project;
+    # without it Vertex ignores the field. slots is how many session ids one
+    # prompt is spread across: 1 puts every concurrent
+    # conversation of a profile on one replica, which queues; more spread
+    # them but reuse each less often. With litellm.redaction on, the id is
+    # hashed from redacted text, so SESSION_KV_SALT must be set for it to
+    # match on every gateway replica.
+    # Unsupported: the LLM_SESSION_ID label is granted per project by Vertex
+    # on request, with no documented customer process, and nothing here can
+    # check it; the gateway logs "sending session_id" either way. No
+    # compatibility promise: this value may change meaning, change default,
+    # or be removed between releases, and an install that sets it is expected
+    # to re-check it at every upgrade.
+    sessionAffinity:
+      enabled: false
+      slots: 2
   # modelProvider: openai_compatible only: any server speaking the OpenAI
   # chat-completions API (vLLM, TGI, an internal gateway), self-hosted or
   # private. Nothing here has a default, and modelDefaultName is required too:
@@ -1184,6 +1203,34 @@ platformAgent:
     # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
     # buckets and a sizing method.
     alertDailyLimits: {}
+    # The event watcher's tuning settings. Each key that you set becomes one
+    # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to
+    # the agent-api-auth container, which runs the watcher. A key that you do
+    # not set keeps the watcher's default (in brackets below). An entry with the
+    # same name in env above wins over the key, a valueFrom entry included.
+    #
+    #   eventWatcher:
+    #     dedupWindow: 24h                # WATCHER_DEDUP_WINDOW [24h]
+    #     backoffMinCount: 3              # WATCHER_BACKOFF_MIN_COUNT [3]
+    #     imagePullTransientMinCount: 3   # WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT [3]
+    #     failedSchedulingMinCount: 5     # WATCHER_FAILEDSCHEDULING_MIN_COUNT [5]
+    #     failedSchedulingMinSpan: 2m     # WATCHER_FAILEDSCHEDULING_MIN_SPAN [2m]
+    #     scaleUpHold: 15m                # WATCHER_SCALEUP_HOLD [15m]
+    #     settle: 2m                      # WATCHER_SETTLE [2m]
+    #     quietAfter: 15m                 # WATCHER_QUIET_AFTER [15m]
+    #     autopilotScaleToZeroHold: true  # WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD [true]
+    #
+    # A duration is a Go duration such as 90s, 2m or 1h30m, up to 1000000h.
+    # "0" turns off failedSchedulingMinSpan, settle and quietAfter.
+    # dedupWindow and scaleUpHold must be above zero, and a count at least 1.
+    # A count of 1 fires on the first event only with its gate off:
+    # failedSchedulingMinSpan "0" for failedSchedulingMinCount, and settle "0"
+    # for backoffMinCount. The watcher README
+    # (k8s-operator/cmd/k8s-event-watcher/README.md, the flag table) says what
+    # each setting does. A duration that the watcher cannot read keeps its
+    # default, and the container log names it. A change rolls the agent pod
+    # and the credential-proxy pod, which also gets spec.deployment.env.
+    eventWatcher: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests, or 2 CPU

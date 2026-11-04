@@ -83,6 +83,12 @@ const PAGE = {
   // The lede prints it verbatim, so it is shape-checked and not only typed.
   poolDayRe: /^\d{4}-\d{2}-\d{2}$/,
   spyglass: "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents",
+  // Where a run that records its build directory (gcs_base) links: the smoke
+  // lanes' bucket is not Deck-readable, so Spyglass shows nothing for it,
+  // while a project reader opens the directory in the Console's bucket
+  // browser and a transcript as an object.
+  gcsBrowser: "https://console.cloud.google.com/storage/browser/",
+  gcsObject: "https://storage.cloud.google.com/",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
@@ -464,10 +470,15 @@ const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 const prText = (pr) => (pr == null ? "no PR" : `PR #${pr}`);
 const prLink = (pr) => (pr == null ? prText(pr) : `<a href="${PAGE.prUrl}/${esc(pr)}">${esc(prText(pr))}</a>`);
-const buildUrl = (run) => (run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
+// A run that records where it lives (gcs_base) links there; a record from
+// before the field keeps the Spyglass link under the old bucket.
+const gcsPath = (base) => String(base).replace(/^gs:\/\//, "").replace(/\/+$/, "");
+const buildUrl = (run) => (run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
 const transcriptUrl = (run, kase, n = 1) => {
+  const rel = `artifacts/eval_${enc(kase)}_rep${enc(n)}.log`;
+  if (run.gcs_base) return `${PAGE.gcsObject}${gcsPath(run.gcs_base)}/${rel}`;
   const base = buildUrl(run);
-  return base ? `${base}/artifacts/eval_${enc(kase)}_rep${enc(n)}.log` : null;
+  return base ? `${base}/${rel}` : null;
 };
 // The repetition whose reason and quote a case row shows (classify.py's
 // rep_n); rep 1, as the pages always linked, when the row names none.
@@ -1008,8 +1019,9 @@ function releasesHtml() {
 /* ---- the GitLab lane (SCHEMA.md: brief.json's gitlab block) ---- */
 // The lane's runs are nobody's gate verdict: tier gitlab (tiers.py) keeps
 // them out of every count above, so this section is the only place they
-// show. Each row links Spyglass under the lane's own job name.
-const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
+// show. Each row links the build where it lives (log_url for a night,
+// gcs_base for a run that records it), else Spyglass under the lane's own job name.
+const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
 function laneRow(run) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);

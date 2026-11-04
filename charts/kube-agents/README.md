@@ -353,6 +353,11 @@ resolves to that GSA:
 instantiation creates the identity and roles, and the chart values above carry
 the annotated KSA.
 
+`litellm.vertex.sessionAffinity` (off by default) sends each Gemini
+conversation a Vertex `session_id` so a new conversation's first turn can read
+a prompt another conversation warmed:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#prompt-caching).
+
 #### OpenAI-compatible endpoints (`litellm.modelProvider=openai_compatible`)
 
 `openai_compatible` routes `model-default` to any server that speaks the OpenAI
@@ -626,9 +631,9 @@ On clusters enforcing NetworkPolicy, scrapes are dropped unless admitted: set `p
 When deploying via GitOps tools like ArgoCD, `helm template` passes the destination cluster's discovered API versions by default when connected to the target cluster. If default detection does not pick up your CRDs or if running disconnected templates, explicitly set `platformAgent.serviceMonitor: true` or `platformAgent.vmPodScrape: true` in your Helm values.
 
 `operator.metrics` is the operator's own listener: the manager serves controller-runtime's
-series and every `PlatformAgent`'s `status.usage` and `status.phase` as gauges
+series and every `PlatformAgent`'s `status.usage`, `status.phase` and `status.inference` as gauges
 (`kubeagents_platformagent_usage`, `kubeagents_platformagent_usage_time_seconds`,
-`kubeagents_platformagent_phase`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
+`kubeagents_platformagent_phase`, `kubeagents_platformagent_model`; [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#prometheus-metrics))
 on port `8080` (container port `metrics`), plain HTTP on the pod network.
 `operator.metrics.podMonitoring` renders `<release>-operator-monitoring` over the operator's
 pods, the same tri-state as `platformAgent.podMonitoring`. `operator.metrics.enabled: false`
@@ -928,6 +933,19 @@ lost. Move them to `platformAgent.deployment.env` first. A re-tag to a chart wit
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives
 the buckets, the defaults and a sizing method.
 
+`platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
+`backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,
+`failedSchedulingMinSpan`, `scaleUpHold`, `settle`, `quietAfter` and `autopilotScaleToZeroHold`.
+Each key that is set becomes a `WATCHER_<NAME>` entry in the CR's `spec.deployment.env`, for example
+`failedSchedulingMinSpan` becomes `WATCHER_FAILEDSCHEDULING_MIN_SPAN`. The operator passes it to the
+`agent-api-auth` container, which runs the watcher. A key that is not set keeps the watcher's
+default. The schema checks the shape of each value: a Go duration, a count of at least 1 or a
+boolean. A duration that the watcher cannot read keeps its default, and the container log names it.
+An entry with the same name in `platformAgent.deployment.env` wins over the key, a `valueFrom`
+entry included. A change rolls the agent pod and the credential-proxy pod. The
+[watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
+gives each setting's meaning and default.
+
 #### PlatformAgent annotations
 
 `platformAgent.annotations` is copied onto the CR's `metadata.annotations`, and
@@ -1165,6 +1183,19 @@ declare it (or a `LimitRange` to default it), and will reject the pod if omitted
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
 records how many claims follow it (`dataClaims`) and their default size, and each one moves by
 the difference, so a raise of 30Gi adds 60Gi to `requests.storage`.
+With `platformAgent.mode: next` it also counts what that mode adds, from footprint.yaml's
+`nextMode`: NATS and its 40Gi JetStream claim, the two auth callouts, the two capability
+verifiers, the console, the A2A gateway, the provisioning Job (counted although it runs to
+completion, because the operator runs it again whenever its spec changes and about daily once
+its TTL removes it, with the rest of the release standing), and the
+`hermes-bridge` container in each agent pod: at the `api` default, or, when `operator.extraEnv`
+sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less than the agent
+container's size (the operator's fallback under `cli`), raised per key by any readable figure
+in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
+rather than re-implementing it, so it can over-count; it never fails the render on them. The mode is read from the values, so a mode set
+on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
+The session pods a next install spawns on demand are not counted; the operator caps those with
+a `ResourceQuota` of its own.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.
@@ -1176,7 +1207,10 @@ CPU, memory and ephemeral-storage (requests and limits), `pods` (`count/pods`),
 keys, including `services`, `secrets` and other `count/<resource>` entries, are not
 modelled and are skipped rather than guessed at. **Scoped quotas are skipped entirely** —
 a quota with `scopes` or a `scopeSelector` applies to a subset of pods the template cannot
-identify, so comparing the whole release against it would be wrong either way. Every quota
+identify, so comparing the whole release against it would be wrong either way. So is a quota
+a `PlatformAgent` owns: the operator's next-mode session-pod quota (`pods` of `maxSessions`
+plus a headroom), which it puts back on every reconcile, so a printed patch would not stick;
+raise `spec.harness.tuning.maxSessions` instead. Every quota
 that falls short is reported in one failure, so a namespace with two of them takes one
 patch rather than two rounds.
 
@@ -1424,8 +1458,9 @@ helm uninstall kube-agents -n kubeagents-system
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
-  the operator's **golden manifest**
-  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`),
+  the operator's **golden manifests**
+  (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and
+  `platformagent-next.yaml` for its `nextMode` section),
   not from `k8s-operator/config/` and not from a live render. Changing the operator's
   resources therefore takes two steps in order — re-bless the goldens
   (`cd k8s-operator && go test ./internal/testing/... -update`), then `make chart-sync`.
