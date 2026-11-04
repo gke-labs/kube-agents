@@ -938,10 +938,11 @@ the buckets, the defaults and a sizing method.
 `failedSchedulingMinSpan`, `scaleUpHold`, `settle`, `quietAfter` and `autopilotScaleToZeroHold`.
 Each key that is set becomes a `WATCHER_<NAME>` entry in the CR's `spec.deployment.env`, for example
 `failedSchedulingMinSpan` becomes `WATCHER_FAILEDSCHEDULING_MIN_SPAN`. The operator passes it to the
-container that runs the watcher. A key that is not set keeps the watcher's default. The schema checks
-the shape of each value: a Go duration, a count or a boolean. A value that the watcher cannot read
-keeps its default, and the container log names it. The conflict rules are the same as for
-`alertDailyLimits`. The
+`agent-api-auth` container, which runs the watcher. A key that is not set keeps the watcher's
+default. The schema checks the shape of each value: a Go duration, a count of at least 1 or a
+boolean. A duration that the watcher cannot read keeps its default, and the container log names it.
+An entry with the same name in `platformAgent.deployment.env` wins over the key, a `valueFrom`
+entry included. A change rolls the agent pod and the credential-proxy pod. The
 [watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
 gives each setting's meaning and default.
 

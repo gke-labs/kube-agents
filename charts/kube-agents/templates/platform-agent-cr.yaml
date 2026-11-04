@@ -347,11 +347,13 @@ spec:
     {{- end }}
     {{- /*
       The event watcher's settings in deployment.eventWatcher come next, as
-      WATCHER_<NAME>, with the same rules as the alert ceilings above. The
-      operator merges spec.deployment.env into the agent-api-auth container,
-      where deploy/shared/start-services.sh reads each variable and passes it
-      to the watcher as a flag. A number goes through int64 for the reason
-      above; a duration string and a boolean go through toString.
+      WATCHER_<NAME>. A name that deployment.env also lists is skipped, so the
+      explicit entry wins, a valueFrom entry included: the operator forwards
+      valueFrom to the agent-api-auth container, unlike to the agent container
+      the alert ceilings go to. There deploy/shared/start-services.sh reads
+      each variable and passes it to the watcher as a flag. A number goes
+      through int64 for the reason above; a duration string and a boolean go
+      through toString.
     */}}
     {{- $eventWatcher := .Values.platformAgent.deployment.eventWatcher | default dict }}
     {{- range $setting := list
@@ -367,9 +369,6 @@ spec:
     {{- $key := index $setting 0 }}
     {{- $name := index $setting 1 }}
     {{- $setValue := index $eventWatcher $key }}
-    {{- if and (not (kindIs "invalid" $setValue)) (hasKey $userValueFromNames $name) }}
-    {{- fail (printf "platformAgent.deployment.eventWatcher.%s is set, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and the watcher keeps its default. Remove the valueFrom entry or the key." $key $name) }}
-    {{- end }}
     {{- if and (not (kindIs "invalid" $setValue)) (not (hasKey $userEnvNames $name)) }}
     {{- if or (kindIs "float64" $setValue) (kindIs "int" $setValue) (kindIs "int64" $setValue) }}
     {{- $setValue = $setValue | int64 }}

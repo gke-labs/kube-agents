@@ -2,11 +2,11 @@
 
 Each key that is set becomes one `WATCHER_<NAME>` entry in `spec.deployment.env`, with a
 string value, after the alert ceilings and before `platformAgent.deployment.env`. A default
-render has no env. An entry with the same name in `platformAgent.deployment.env` wins, so the
-name occurs one time only. A `valueFrom` entry for a name whose key is set fails the render,
-because the operator forwards only literal values. The schema refuses a value that is not a
-Go duration, a count or a boolean as the key needs, a zero dedup window, and an unknown key.
-Every name the chart renders is one that `deploy/shared/start-services.sh` reads and checks.
+render has no env. An entry with the same name in `platformAgent.deployment.env` wins, a
+`valueFrom` entry included, so the name occurs one time only. The schema refuses a value that
+is not a Go duration, a count of at least 1 or a boolean as the key needs, a zero dedup window
+or scale-up hold, and an unknown key. Every name the chart renders is one that
+`deploy/shared/start-services.sh` reads and checks.
 
 Run: python3 -m unittest discover -s tests -p 'test_chart_event_watcher_settings.py' -v
 """
@@ -79,7 +79,7 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
         # passes it to the watcher. A name it does not read would do nothing.
         text = _ENTRYPOINT.read_text()
         checked = set(re.findall(r"^normalize_(?:duration|count|boolean) (WATCHER_[A-Z_]+) ", text, re.M))
-        self.assertEqual(checked, {name for name, _ in _SETTINGS.values()})
+        self.assertLessEqual({name for name, _ in _SETTINGS.values()}, checked)
 
     def test_the_template_names_every_setting(self):
         template = (_CHART / _CR_TEMPLATE).read_text()
@@ -168,15 +168,14 @@ class EventWatcherSettingsRenderTest(unittest.TestCase):
         ))
         self.assertEqual(deployment["env"], [{"name": "WATCHER_FAILEDSCHEDULING_MIN_SPAN", "value": "5m"}])
 
-    def test_a_value_from_entry_for_a_set_key_fails_the_render(self):
-        res = self._render(_values(
+    def test_a_value_from_entry_wins_over_the_key(self):
+        # The operator forwards valueFrom to the agent-api-auth container, so the
+        # explicit entry is the one the watcher reads, as for a literal entry.
+        deployment = self._deployment(_values(
             {"failedSchedulingMinSpan": "7m"},
             [{"name": "WATCHER_FAILEDSCHEDULING_MIN_SPAN", "valueFrom": _VALUE_FROM}],
         ))
-        self.assertNotEqual(res.returncode, 0, res.stdout)
-        self.assertIn("platformAgent.deployment.eventWatcher.failedSchedulingMinSpan", res.stderr)
-        self.assertIn("WATCHER_FAILEDSCHEDULING_MIN_SPAN", res.stderr)
-        self.assertIn("forwards only literal values", res.stderr)
+        self.assertEqual(deployment["env"], [{"name": "WATCHER_FAILEDSCHEDULING_MIN_SPAN", "valueFrom": _VALUE_FROM}])
 
     def test_a_value_from_entry_for_an_unset_key_renders_unchanged(self):
         deployment = self._deployment(_values(
@@ -191,6 +190,8 @@ class EventWatcherSettingsRenderTest(unittest.TestCase):
     def test_the_schema_refuses_a_bad_value(self):
         for settings in (
             {"dedupWindow": "0"}, {"dedupWindow": "0s"}, {"dedupWindow": 0},
+            {"scaleUpHold": "0"}, {"scaleUpHold": 0},
+            {"backoffMinCount": 0}, {"failedSchedulingMinCount": 0}, {"imagePullTransientMinCount": 0},
             {"settle": "5x"}, {"settle": "2 m"}, {"settle": 30}, {"settle": True},
             {"backoffMinCount": -1}, {"backoffMinCount": 2.5}, {"backoffMinCount": "3"},
             {"autopilotScaleToZeroHold": "false"},

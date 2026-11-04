@@ -1205,10 +1205,9 @@ platformAgent:
     alertDailyLimits: {}
     # The event watcher's tuning settings. Each key that you set becomes one
     # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to
-    # the container that runs the watcher. A key that you do not set keeps the
-    # watcher's default (in brackets below). The same rules as alertDailyLimits
-    # apply: an entry with the same name in env above wins over the key, and a
-    # valueFrom entry for a key that is set fails the render.
+    # the agent-api-auth container, which runs the watcher. A key that you do
+    # not set keeps the watcher's default (in brackets below). An entry with the
+    # same name in env above wins over the key, a valueFrom entry included.
     #
     #   eventWatcher:
     #     dedupWindow: 24h                # WATCHER_DEDUP_WINDOW [24h]
@@ -1223,12 +1222,12 @@ platformAgent:
     #
     # A duration is a Go duration such as 90s, 2m or 1h30m, up to 1000000h.
     # "0" turns off failedSchedulingMinSpan, settle and quietAfter.
-    # dedupWindow must be above zero. A count of 1 fires on the first event.
-    # The watcher README (k8s-operator/cmd/k8s-event-watcher/README.md, the
-    # flag table) says what each setting does. A value that the watcher cannot
-    # read keeps its default, and the container log names it. A change rolls
-    # the gateway pod. To exclude namespaces or event reasons from alerts, see
-    # harness.eventWatcher.alertExclude, not this block.
+    # dedupWindow and scaleUpHold must be above zero, and a count at least 1.
+    # A count of 1 fires on the first event. The watcher README
+    # (k8s-operator/cmd/k8s-event-watcher/README.md, the flag table) says what
+    # each setting does. A duration that the watcher cannot read keeps its
+    # default, and the container log names it. A change rolls the agent pod
+    # and the credential-proxy pod, which also gets spec.deployment.env.
     eventWatcher: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
