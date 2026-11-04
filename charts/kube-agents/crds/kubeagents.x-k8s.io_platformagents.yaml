@@ -11746,6 +11746,16 @@ spec:
                       maxLength: 2048
                       pattern: ^$|^https?://[^\s]+$
                       type: string
+                    peopleSeen:
+                      default: true
+                      description: |-
+                        PeopleSeen keeps one hashed key and a last-active time per verified
+                        chat person in the gateway's people bucket, for 30 days after their
+                        last turn, and serves the people seen in the last 7 and 30 days as
+                        kubeagents_a2a_gateway_people_seen. Next mode only. False writes no
+                        key, deletes every key the bucket holds at the gateway's next start,
+                        and serves no sample.
+                      type: boolean
                   type: object
               required:
                 - harness
@@ -12029,6 +12039,21 @@ spec:
                         else moves.
                       format: int64
                       type: integer
+                    chatSessionsTotal:
+                      description: |-
+                        ChatSessionsTotal is the chat half of SessionsTotal: the chat
+                        conversations the gateway opened a session for (the session_store
+                        plugin's kubeagents_chat_sessions_total on a today install, that plus
+                        the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
+                        install), without the event watcher's triage sessions. A re-seed from
+                        a status that carries no chatSessionsTotal (an install with triage
+                        sessions and no chat yet, or a served CRD that holds the field back)
+                        seeds those triage sessions into the chat half, and the counter keeps
+                        them. Read every five minutes and kept monotonic the same way as
+                        ToolExecutionsTotal. Moves LastActiveTime, as SessionsTotal does; does
+                        not move LastHumanActiveTime. Absent while the served CRD predates it.
+                      format: int64
+                      type: integer
                     chatTurnsErroredTotal:
                       description: |-
                         ChatTurnsErroredTotal is the cumulative count of synchronous chat turns
@@ -12240,8 +12265,8 @@ spec:
                         delivered (its k8s_event_watcher_triage_sessions_total; a session
                         whose inject was filtered, suppressed or failed is not counted) plus
                         the chat conversations the gateway opened a session for (the session_store
-                        plugin's kubeagents_chat_sessions_total on a today install, the A2A
-                        gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+                        plugin's kubeagents_chat_sessions_total on a today install, that plus the
+                        A2A gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
                         chat conversation that resumes after the session store's retention
                         window (seven days by default) counts again. Read every five minutes
                         and kept monotonic across restarts, like toolExecutionsTotal.
