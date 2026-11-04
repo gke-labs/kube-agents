@@ -461,6 +461,10 @@ _EXEC_TIMEOUT = 60.0
 # ``_EXEC_TIMEOUT`` because the run waits on it before the agent is invoked.
 _POD_CLOCK_SCRIPT = "date +%s"
 _POD_CLOCK_TIMEOUT_SECONDS = 15.0
+# How long the purge's shell fallback (clearing the run's files when the script
+# never sorted them) may take. Short: it is ``rm`` alone, and on a pod the
+# purge could not reach at all it would otherwise cost a second full timeout.
+_FALLBACK_CLEAR_TIMEOUT_SECONDS = 15.0
 
 _PF_LOCK = threading.Lock()  # guards the three registries below
 _PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
@@ -656,9 +660,10 @@ def _agent_shell(script: str, timeout: float) -> str:
 def _pod_clock() -> int | None:
     """The agent pod's clock in epoch seconds, or ``None`` when it could not be read.
 
-    Read before the agent is invoked and passed to every purge as its floor: a
-    top-level card whose ``tasks.created_at`` is earlier was not filed by this
-    run, whatever its ``kanban_create`` result said (:data:`_PURGE_ROWS_SCRIPT`).
+    Read before the agent is invoked and passed to the stall archive and every
+    purge as their floor: a top-level card whose ``tasks.created_at`` is earlier
+    was not filed by this run, whatever its ``kanban_create`` result said
+    (:data:`_PURGE_ROWS_SCRIPT`, :func:`_archive_stalled_cards`).
     The pod's clock, not the runner's, because hermes stamps ``created_at``
     from it.
     """
@@ -666,8 +671,9 @@ def _pod_clock() -> int | None:
     if out.isascii() and out.isdigit():
         return int(out)
     _log.warning(
-        "could not read the agent pod's clock (%s); the purge will take every card the front "
-        "door's kanban_create returned as the run's own", out[:_LOG_EXCERPT_CHARS] or "no output",
+        "could not read the agent pod's clock (%s); the stall archive and the purge will take "
+        "every card the front door's kanban_create returned as the run's own",
+        out[:_LOG_EXCERPT_CHARS] or "no output",
     )
     return None
 
@@ -1263,22 +1269,23 @@ _MAX_ARCHIVED_DESCENDANTS = 32
 _CARD_ID = re.compile(r"t_[0-9a-f]+")
 
 # Prints each given card whose ``tasks.created_at`` is earlier than the floor,
-# then ``listed``; read-only. The stall archive asks it before it archives, so
+# then :data:`_CREATED_BEFORE_DONE_MARKER`; read-only. The stall archive asks it before it archives, so
 # a card the front door's create handed back that predates the run keeps its
 # worker, as the purge keeps its rows (:data:`_PURGE_ROWS_SCRIPT`).
 _CREATED_BEFORE_SCRIPT = r"""
 import sqlite3, sys
-ROOT, FLOOR = sys.argv[1], int(sys.argv[2])
+ROOT, FLOOR, BUSY, DONE = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
 try:
-    kb = sqlite3.connect("file:%s/kanban.db?mode=ro" % ROOT, uri=True, timeout=10)
-    for tid in sys.argv[3:]:
+    kb = sqlite3.connect("file:%s/kanban.db?mode=ro" % ROOT, uri=True, timeout=BUSY)
+    for tid in sys.argv[5:]:
         r = kb.execute("SELECT created_at FROM tasks WHERE id = ?", (tid,)).fetchone()
         if r is not None and r[0] is not None and int(r[0]) < FLOOR:
             print(tid)
-    print("listed")
+    print(DONE)
 except sqlite3.Error as exc:
     print("unread: %s" % exc)
 """
+_CREATED_BEFORE_DONE_MARKER = "listed"
 
 
 def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
@@ -1310,7 +1317,13 @@ def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
 
 def _created_before(ids: Sequence[str], floor: int, timeout: float) -> set[str] | None:
     """Which of ``ids`` were created before ``floor``; ``None`` when the board could not be read."""
-    args = " ".join(_shell_quote(a) for a in [worker_trajectory.DATA_ROOT, str(floor), *ids])
+    args = " ".join(
+        _shell_quote(a)
+        for a in [
+            worker_trajectory.DATA_ROOT, str(floor), str(_PURGE_BUSY_TIMEOUT_SECONDS),
+            _CREATED_BEFORE_DONE_MARKER, *ids,
+        ]
+    )
     out = _agent_shell(
         f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
         f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
@@ -1318,13 +1331,18 @@ def _created_before(ids: Sequence[str], floor: int, timeout: float) -> set[str] 
         timeout,
     )
     lines = [line.strip() for line in out.splitlines()]
-    if "listed" not in lines:
+    if _CREATED_BEFORE_DONE_MARKER not in lines:
         return None
     return {line for line in lines if line in ids}
 
 
 def _archive_stalled_cards(stalled: Sequence[str], timeout: float, floor: int | None = None) -> None:
     """Archive the cards that ran to the ceiling, and the cards they fanned out.
+
+    With ``floor`` (the run's :func:`_pod_clock`), a stalled card created
+    before it is left running, and so is its fan-out: the front door's create
+    handed it back by its key, so it is not the run's. When the board cannot be
+    read to tell, every stalled card is archived, as without a floor.
 
     The unit has given up on them: its record is written and their files are
     about to be deleted. Left alone, a worker that still heartbeats keeps its
@@ -1420,7 +1438,10 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # cards' files go before the board step, so they still go when it fails; with
 # a floor but no board read to check it against, every root's files go too: a
 # stranger's card losing its files is rarer, and cheaper, than the run's own
-# report outliving it.
+# report outliving it. Once the roots are sorted it leaves the ``SORTED``
+# marker until it exits: the harness clears every root's files from the shell
+# only when the script printed nothing and no marker is there, so a script cut
+# off mid-board-step does not cost a pre-run card its files after all.
 # A fan-out card after them is taken only when its ``created`` event names a
 # card already taken as its ``creator_task_id``: hermes writes that event only
 # for a create that made the card, so a card a worker's ``kanban_create``
@@ -1441,16 +1462,24 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 _PURGE_ROWS_SCRIPT = r"""
 import json, os, shutil, sqlite3, sys
 ROOT, BUSY = sys.argv[1], float(sys.argv[2])
-KEPT, FOREIGN, DONE, ATTACHMENTS, LOGS = sys.argv[3:8]
-FLOOR = int(sys.argv[8]) if sys.argv[8] else None
-rest = [a for a in sys.argv[10:] if a]
-roots, fanned = rest[:int(sys.argv[9])], rest[int(sys.argv[9]):]
+KEPT, FOREIGN, DONE, ATTACHMENTS, LOGS, SORTED = sys.argv[3:9]
+FLOOR = int(sys.argv[9]) if sys.argv[9] else None
+rest = [a for a in sys.argv[11:] if a]
+roots, fanned = rest[:int(sys.argv[10])], rest[int(sys.argv[10]):]
 BY_TASK = ("task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")
 LIVE = ("todo", "scheduled", "ready", "running")
 def unlink(tid):
     shutil.rmtree(os.path.join(ATTACHMENTS, tid), ignore_errors=True)
     try:
         os.remove(os.path.join(LOGS, tid + ".log"))
+    except OSError:
+        pass
+def mark_sorted(on):
+    try:
+        if on:
+            open(SORTED, "w").close()
+        else:
+            os.remove(SORTED)
     except OSError:
         pass
 kb, older, failed = None, set(), None
@@ -1468,7 +1497,9 @@ for tid in roots:
         print("%s %s" % (FOREIGN, tid))
     else:
         unlink(tid)
+mark_sorted(True)
 if failed is not None:
+    mark_sorted(False)
     print("rows kept: %s" % failed)
     sys.exit(0)
 roots = [t for t in roots if t not in older]
@@ -1529,6 +1560,7 @@ try:
     print(DONE)
 except sqlite3.Error as exc:
     print("rows kept: %s" % exc)
+mark_sorted(False)
 """
 # How long the purge waits on hermes' write lock, as the capture's read does
 # (``worker_trajectory`` ``SQLITE_BUSY_TIMEOUT``).
@@ -1538,6 +1570,9 @@ _PURGE_BUSY_TIMEOUT_SECONDS = 10
 _PURGE_KEPT_MARKER = "kept"
 _PURGE_FOREIGN_MARKER = "foreign"
 _PURGE_DONE_MARKER = "purged"
+# The file the purge script leaves in the logs directory, named for the run's
+# first card, while it has sorted the roots and not yet exited.
+_PURGE_SORTED_PREFIX = ".purge-sorted-"
 
 
 def _purge_argv(
@@ -1552,11 +1587,17 @@ def _purge_argv(
         _PURGE_DONE_MARKER,
         _ATTACHMENTS_DIR,
         _LOGS_DIR,
+        _purge_sorted_marker(task_ids),
         "" if floor is None else str(floor),
         str(len(task_ids)),
         *task_ids,
         *fanned_out,
     ]
+
+
+def _purge_sorted_marker(task_ids: list[str]) -> str:
+    """The purge script's sorted marker for this run (:data:`_PURGE_SORTED_PREFIX`)."""
+    return f"{_LOGS_DIR}/{_PURGE_SORTED_PREFIX}{task_ids[0]}" if task_ids else ""
 
 
 def _purge_card_state(
@@ -1571,7 +1612,9 @@ def _purge_card_state(
     the harness's own, unless one was created before ``floor`` (the pod's
     clock at the run's start, :func:`_pod_clock`; ``None`` takes them all), and
     a card in ``fanned_out`` (in walk order, creators first) goes only when
-    hermes recorded one of them as its creator.
+    hermes recorded one of them as its creator. With a floor but no board to
+    check it against, or a script that never sorted the roots, every root's
+    files go: the run's own report must not outlive it.
 
     The board rows go too (:data:`_PURGE_ROWS_SCRIPT`): every card view ends
     with a "Recent work by @<assignee>" digest of that profile's last completed
@@ -1599,9 +1642,13 @@ def _purge_card_state(
     )
     out = _agent_shell(script, timeout)
     if floor is not None and not out.strip():
-        # No python, or the exec timed out: nothing sorted the roots, and the
+        # No output: no python, or the exec failed or timed out. The marker says
+        # whether the script got as far as sorting the roots; without it the
         # run's own reports must not outlive it.
-        _agent_shell(clear_roots, timeout)
+        marker = _shell_quote(_purge_sorted_marker(task_ids))
+        _agent_shell(
+            f"if [ -e {marker} ]; then rm -f {marker}; else {clear_roots}fi", _FALLBACK_CLEAR_TIMEOUT_SECONDS
+        )
     lines = out.splitlines()
 
     def marked(marker: str) -> list[str]:

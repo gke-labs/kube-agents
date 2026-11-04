@@ -3882,6 +3882,7 @@ def _run_purge(
     paths = [worker_trajectory.DATA_ROOT, harness._ATTACHMENTS_DIR, harness._LOGS_DIR]
     local = [str(root), str(root / "attachments"), str(root / "logs")]
     argv = [local[paths.index(a)] if a in paths else a for a in argv]
+    argv = [str(root / "logs") + a[len(harness._LOGS_DIR):] if a.startswith(harness._LOGS_DIR + "/") else a for a in argv]
     if busy:
         argv[1] = busy
     proc = subprocess.run(
@@ -4055,7 +4056,8 @@ def test_a_floored_purge_whose_script_never_ran_clears_the_roots_files_from_the_
 
     harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
     assert len(scripts) == 2 and _is_purge(scripts[0])
-    assert scripts[1].startswith("for t in 't_1'") and f"rm -rf {harness._ATTACHMENTS_DIR}" in scripts[1]
+    marker = harness._shell_quote(harness._purge_sorted_marker(["t_1"]))
+    assert scripts[1].startswith(f"if [ -e {marker} ]") and f"rm -rf {harness._ATTACHMENTS_DIR}" in scripts[1]
 
     # A script that ran sorted the roots itself: no second exec.
     harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
@@ -5896,10 +5898,14 @@ def test_the_created_before_script_reads_the_board(tmp_path: Path) -> None:
     kb.executemany("INSERT INTO tasks VALUES (?, ?)", [("t_old", _FLOOR - 1), ("t_same", _FLOOR), ("t_new", _FLOOR + 5)])
     kb.commit()
     proc = subprocess.run(
-        [sys.executable, "-c", harness._CREATED_BEFORE_SCRIPT, str(tmp_path), str(_FLOOR), "t_old", "t_same", "t_new", "t_gone"],
+        [
+            sys.executable, "-c", harness._CREATED_BEFORE_SCRIPT, str(tmp_path), str(_FLOOR),
+            str(harness._PURGE_BUSY_TIMEOUT_SECONDS), harness._CREATED_BEFORE_DONE_MARKER,
+            "t_old", "t_same", "t_new", "t_gone",
+        ],
         capture_output=True, text=True, check=True,
     )
-    assert proc.stdout.splitlines() == ["t_old", "listed"]
+    assert proc.stdout.splitlines() == ["t_old", harness._CREATED_BEFORE_DONE_MARKER]
 
 
 def test_settle_floors_its_stall_archive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5933,3 +5939,53 @@ def test_a_card_already_done_on_the_first_read_floors_its_purge(
 
     (purge,) = [s for s in scripts if _is_purge(s)]
     assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([_TASK_ID], floor=_FLOOR)))
+
+
+def test_a_completed_purge_leaves_no_sorted_marker(tmp_path: Path) -> None:
+    kb = _purge_board(tmp_path)
+    _stamp(kb, {"t_done": _FLOOR})
+    _card_files(tmp_path, "t_done")
+    _run_purge(tmp_path, ["t_done"], floor=_FLOOR)
+    assert not list((tmp_path / "logs").glob(harness._PURGE_SORTED_PREFIX + "*"))
+
+
+def test_a_purge_cut_off_mid_board_step_leaves_the_sorted_marker(tmp_path: Path) -> None:
+    """The exec times out after the roots were sorted: the marker stops the shell fallback undoing that."""
+    kb = _purge_board(tmp_path)
+    _purge_card(kb, "t_old", "done")
+    _purge_card(kb, "t_mine", "done")
+    _stamp(kb, {"t_old": _FLOOR - 1, "t_mine": _FLOOR})
+    _card_files(tmp_path, "t_mine", "t_old")
+    argv = harness._purge_argv(["t_mine", "t_old"], floor=_FLOOR)
+    argv[0], argv[5], argv[6] = str(tmp_path), str(tmp_path / "attachments"), str(tmp_path / "logs")
+    marker = tmp_path / "logs" / (harness._PURGE_SORTED_PREFIX + "t_mine")
+    argv[7] = str(marker)
+    holder = sqlite3.connect(tmp_path / "kanban.db", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            subprocess.run([sys.executable, "-c", harness._PURGE_ROWS_SCRIPT, *argv], capture_output=True, timeout=3)
+    finally:
+        holder.execute("ROLLBACK")
+    assert marker.exists()
+    assert not _has_files(tmp_path, "t_mine") and _has_files(tmp_path, "t_old")
+
+
+def test_the_shell_fallback_clears_the_roots_only_without_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harness, "_ATTACHMENTS_DIR", str(tmp_path / "attachments"))
+    monkeypatch.setattr(harness, "_LOGS_DIR", str(tmp_path / "logs"))
+    scripts: list[str] = []
+    monkeypatch.setattr(harness, "_agent_shell", lambda script, timeout: scripts.append(script) or "")
+    harness._purge_card_state(["t_1"], 5.0, floor=_FLOOR)
+    fallback = scripts[1]
+    marker = tmp_path / "logs" / (harness._PURGE_SORTED_PREFIX + "t_1")
+
+    _card_files(tmp_path, "t_1")
+    marker.write_text("")
+    subprocess.run(["sh", "-c", fallback], check=True)
+    assert _has_files(tmp_path, "t_1") and not marker.exists()
+
+    subprocess.run(["sh", "-c", fallback], check=True)
+    assert not _has_files(tmp_path, "t_1")

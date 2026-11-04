@@ -65,7 +65,8 @@ this one's summary. A worker's card counts only when Hermes recorded the run as 
 card a worker's create handed back by an existing idempotency key stays, files included. Likewise
 a card the front door's create returned that was created before the run started, by the agent pod's
 clock read before the agent is invoked, is not this run's and stays, files included; this holds on
-both waits below. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
+both waits below. When the clock or the board cannot be read, such a card is taken like the run's
+own. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
 other than a follow-up linked to its creator. A card still running when the wait ran out is archived
 first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
