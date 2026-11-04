@@ -61,6 +61,15 @@ CR = {
             "proposalHumanTouches": 5,
             "peopleSeen7d": 3,
             "peopleSeen30d": 11,
+            "proposalsFromChat": 3,
+            "proposalsFromConsole": 0,
+            "proposalsFromApi": 0,
+            "proposalsFromEvent": 0,
+            "proposalsFromDrift": 1,
+            "proposalsFromAudit": 0,
+            "proposalsFromScheduled": 0,
+            "proposalsFromIssue": 0,
+            "proposalsFromOther": 0,
             "lastActiveTime": "2026-10-20T17:34:06Z",
             "lastHumanActiveTime": "2026-10-20T16:10:00Z",
             "activeInterfaces": ["googlechat"],
@@ -190,6 +199,9 @@ class RenderTest(unittest.TestCase):
         self.assertTrue(lines[0].startswith("```"))
         self.assertEqual(lines[-1], "```")
         self.assertLessEqual(len(lines), fs.SUMMARY_MAX_LINES)
+        # The full fixture fills the block: a new line moves the cap with it.
+        self.assertEqual(len(lines), fs.SUMMARY_MAX_LINES)
+        self.assertIn("  peopleSeen30d: 11 (as the gateway reports)\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n", text)
         self.assertIn("mode: today", text)
         self.assertIn(f"version: {TAG}", text)
         self.assertIn("model: vertex_ai/claude-opus-5", text)
@@ -425,6 +437,35 @@ class RenderTest(unittest.TestCase):
             self.assertIn(f"  {counter}: 0\n", text)
         self.assertNotIn("remediationsAppliedTotal", fs.USAGE_COUNTERS)
         self.assertEqual(fs.audit(text, full_snapshot(cr=cr).identifiers), [])
+
+    def test_the_origin_line_lists_non_zero_origins_in_the_table_order(self):
+        cr = json.loads(json.dumps(CR))
+        usage = cr["status"]["usage"]
+        usage.update({field: 0 for field in fs.USAGE_ORIGIN_FIELDS})
+        usage.update({"proposalsFromOther": 4, "proposalsFromChat": 3, "proposalsFromEvent": 1, "proposalsFromAudit": 2})
+        text = fs.render(full_snapshot(cr=cr))
+        self.assertIn("\n  proposals by origin: chat 3, event 1, audit 2, other 4 (as the agent reports)\n", text)
+        self.assertEqual(text.count(fs.ORIGIN_LINE_PREFIX), 1)
+
+    def test_the_origin_line_prints_none_when_every_origin_reads_zero(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["usage"].update({field: 0 for field in fs.USAGE_ORIGIN_FIELDS})
+        text = fs.render(full_snapshot(cr=cr))
+        self.assertIn("\n  proposals by origin: none (as the agent reports)\n", text)
+
+    def test_the_origin_line_prints_no_reading_when_the_origins_are_absent(self):
+        cr = json.loads(json.dumps(CR))
+        for field in fs.USAGE_ORIGIN_FIELDS:
+            cr["status"]["usage"].pop(field, None)
+        text = fs.render(full_snapshot(cr=cr))
+        self.assertIn("\n  proposals by origin: no reading (as the agent reports)\n", text)
+        self.assertIn("\n  proposals by origin: no reading (as the agent reports)\n", fs.render(full_snapshot(cr={})))
+
+    def test_the_origin_fields_are_the_nine_status_fields_in_the_table_order(self):
+        self.assertEqual(
+            list(fs.USAGE_ORIGIN_FIELDS),
+            [f"proposalsFrom{origin}" for origin in ("Chat", "Console", "Api", "Event", "Drift", "Audit", "Scheduled", "Issue", "Other")],
+        )
 
     def test_next_mode_and_interfaces_are_printed_as_enums(self):
         cr = json.loads(json.dumps(CR))
@@ -788,7 +829,7 @@ class MainTest(unittest.TestCase):
         text = fs.render(snapshot)
         self.assertIn(f"\n  model: hosted_vllm/{CLUSTER}/llama-8b\n", text)
         self.assertEqual(fs.audit(text, snapshot.identifiers), [CLUSTER])
-        self.assertEqual(fs.audit(fs._without_model_line(text), snapshot.identifiers), [])
+        self.assertEqual(fs.audit(fs._without_fixed_lines(text), snapshot.identifiers), [])
         out = io.StringIO()
         with mock.patch.object(fs, "collect", return_value=snapshot):
             self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=out, stderr=io.StringIO()), fs.EXIT_OK)
@@ -796,7 +837,7 @@ class MainTest(unittest.TestCase):
 
     def test_the_audit_skips_the_model_line_and_nothing_else(self):
         text = f"```\n  mode: today\n  model: x/{CLUSTER}\n  kubernetes: {CLUSTER}\n```"
-        stripped = fs._without_model_line(text)
+        stripped = fs._without_fixed_lines(text)
         self.assertNotIn("model:", stripped)
         self.assertIn(f"  kubernetes: {CLUSTER}", stripped)
         self.assertEqual(len(stripped.splitlines()), len(text.splitlines()) - 1)
@@ -805,6 +846,33 @@ class MainTest(unittest.TestCase):
         with mock.patch.object(fs, "collect", return_value=snapshot), mock.patch.object(fs, "render", return_value=text):
             self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err), fs.EXIT_LEAK)
 
+
+    def test_the_audit_skips_the_origin_line_and_nothing_else(self):
+        text = f"```\n  model: x/y\n  proposals by origin: chat 3 (as the agent reports)\n  kubernetes: {CLUSTER}\n```"
+        stripped = fs._without_fixed_lines(text)
+        self.assertNotIn("model:", stripped)
+        self.assertNotIn(fs.ORIGIN_LINE_PREFIX, stripped)
+        self.assertEqual(len(stripped.splitlines()), len(text.splitlines()) - 2)
+        self.assertEqual(fs.audit(stripped, [CLUSTER]), [CLUSTER])
+
+    def test_a_cluster_named_chat_is_not_refused_for_the_origin_line_but_is_elsewhere(self):
+        cr = json.loads(json.dumps(CR))
+        cr["spec"]["scope"]["exclude"]["clusters"] = ["chat"]
+        snapshot = full_snapshot(cr=cr)
+        self.assertIn("chat", snapshot.identifiers)
+        text = fs.render(snapshot)
+        self.assertIn("\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n", text)
+        self.assertEqual(fs.audit(text, snapshot.identifiers), ["chat"])
+        self.assertEqual(fs.audit(fs._without_fixed_lines(text), snapshot.identifiers), [])
+        out = io.StringIO()
+        with mock.patch.object(fs, "collect", return_value=snapshot):
+            self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=out, stderr=io.StringIO()), fs.EXIT_OK)
+        self.assertIn("proposals by origin: chat 3", out.getvalue())
+        leaked = text.replace("  lastActive:", "  cluster: chat\n  lastActive:")
+        err = io.StringIO()
+        with mock.patch.object(fs, "collect", return_value=snapshot), mock.patch.object(fs, "render", return_value=leaked):
+            self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err), fs.EXIT_LEAK)
+        self.assertIn("chat", err.getvalue())
 
 
 class GatewayCopyTest(unittest.TestCase):
@@ -821,6 +889,9 @@ class GatewayCopyTest(unittest.TestCase):
     def test_the_gateway_prints_the_same_counters_and_readings(self):
         self.assertEqual(list(fs.USAGE_COUNTERS), self._go_strings("usageSummaryCounters"))
         self.assertEqual(sorted(fs.USAGE_READINGS), sorted(self._go_strings("usageSummaryReadings")))
+
+    def test_the_gateway_prints_the_same_origin_fields(self):
+        self.assertEqual(list(fs.USAGE_ORIGIN_FIELDS), self._go_strings("usageSummaryOriginFields"))
 
     def test_the_gateway_prints_the_same_environment_lines(self):
         self.assertEqual(list(fs.ENVIRONMENT_KEYS), self._go_strings("usageSummaryEnvironmentKeys"))

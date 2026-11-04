@@ -28,7 +28,8 @@ import (
 // Role) and its own task records, which count chat turns, not the kanban
 // cards the script's tasks line counts; the line is labelled for that. No model is in the loop, and the block
 // names no cluster, project, namespace, task or person: the audit below
-// refuses a block that does, outside the model line, which is printed by design.
+// refuses a block that does, outside the model line and the proposals-by-origin
+// line, which are printed by design.
 
 const (
 	usageSummaryTitle = "kube-agents usage & feedback summary"
@@ -87,8 +88,13 @@ const (
 	//: a2aGatewayName); the resource name is what precedes the suffix.
 	a2aGatewayNameSuffix = "-a2a-gateway"
 	platformAgentNameEnv = "PLATFORM_AGENT_NAME"
-	//: The model line's start: the audit runs over the block without this one line.
+	//: The model line's start: the audit runs over the block without this line.
 	usageSummaryModelLinePrefix = "  model: "
+	//: The origin line's start: the audit runs over the block without this
+	//: line, which carries only fixed words and digits.
+	usageSummaryOriginLinePrefix = "  proposals by origin: "
+	//: What precedes the origin's name in its field.
+	usageSummaryOriginFieldPrefix = "proposalsFrom"
 	//: status.inference, the operator's reading of the install's default model.
 	inferenceStatusKey        = "inference"
 	inferenceProviderField    = "provider"
@@ -97,6 +103,7 @@ const (
 	usageNoReading            = "no reading"
 	usageForgeReadingSuffix   = " (as the forge reports)"
 	usageGatewayReadingSuffix = " (as the gateway reports)"
+	usageAgentReadingSuffix   = " (as the agent reports)"
 	//: status.usage.topTools: the operator's reading of the broker's five
 	//: most-invoked tool and subcommand pairs since the broker pod started,
 	//: and the row fields it carries. The script's TOP_TOOLS_* names.
@@ -195,6 +202,17 @@ var usageSummaryReadings = map[string]string{
 	"peopleSeen7d":                    usageGatewayReadingSuffix,
 	"peopleSeen30d":                   usageGatewayReadingSuffix,
 }
+
+// : The nine status.usage proposal-origin readings, in the origin table's order
+// : (docs/designs/proposal-origin.md); the block prints them as one line. The
+// : script's USAGE_ORIGIN_FIELDS verbatim.
+var usageSummaryOriginFields = []string{
+	"proposalsFromChat", "proposalsFromConsole", "proposalsFromApi", "proposalsFromEvent", "proposalsFromDrift",
+	"proposalsFromAudit", "proposalsFromScheduled", "proposalsFromIssue", "proposalsFromOther",
+}
+
+// : The lines printed by design, each removed (its first occurrence) before the audit.
+var usageSummaryFixedLinePrefixes = []string{usageSummaryModelLinePrefix, usageSummaryOriginLinePrefix}
 
 // : The environment lines, in the order the block prints them: the script's
 // : ENVIRONMENT_KEYS verbatim.
@@ -442,6 +460,32 @@ func inferenceModelLine(cr map[string]any) string {
 	return provider + inferenceSeparator + model
 }
 
+// usageSummaryOriginLine lists the origins whose reading is above zero in the
+// table's order, "none" when every reading is zero, and "no reading" when the
+// readings are absent.
+func usageSummaryOriginLine(usage map[string]any) string {
+	var parts []string
+	present := false
+	for _, field := range usageSummaryOriginFields {
+		value, ok := usage[field]
+		if !ok || value == nil {
+			continue
+		}
+		present = true
+		if n := asInt(value); n != 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", strings.ToLower(strings.TrimPrefix(field, usageSummaryOriginFieldPrefix)), n))
+		}
+	}
+	shown := strings.Join(parts, ", ")
+	switch {
+	case !present:
+		shown = usageNoReading
+	case shown == "":
+		shown = usageSummaryNone
+	}
+	return usageSummaryOriginLinePrefix + shown + usageAgentReadingSuffix
+}
+
 // renderUsageSummary is the block: the script's shape, from what the gateway sees.
 func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, window time.Duration, tasks taskRollup, haveTasks bool) string {
 	usage, _ := nested(cr, "status", "usage").(map[string]any)
@@ -493,6 +537,7 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		}
 		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, suffix))
 	}
+	lines = append(lines, usageSummaryOriginLine(usage))
 	last := asString(usage["lastActiveTime"])
 	if last == "" {
 		last = usageSummaryNever
@@ -608,18 +653,22 @@ func usageIdentifiers(cr map[string]any) []string {
 	return ids
 }
 
-// usageSummaryWithoutModelLine is the block less its first model line, the one
-// line printed by design: a deployment name can carry a spec identifier as a
-// segment, and the line is never the reason a block is refused. Every other
-// line stays audited.
-func usageSummaryWithoutModelLine(text string) string {
+// usageSummaryWithoutFixedLines is the block less its first model line and its
+// first origin line, the lines printed by design: a deployment name can carry
+// a spec identifier as a segment, and the origin line prints origin words a
+// cluster may be named ("chat", "drift"). Neither line is the reason a block
+// is refused; every other line stays audited.
+func usageSummaryWithoutFixedLines(text string) string {
 	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		if strings.HasPrefix(line, usageSummaryModelLinePrefix) {
-			return strings.Join(append(lines[:i:i], lines[i+1:]...), "\n")
+	for _, prefix := range usageSummaryFixedLinePrefixes {
+		for i, line := range lines {
+			if strings.HasPrefix(line, prefix) {
+				lines = append(lines[:i:i], lines[i+1:]...)
+				break
+			}
 		}
 	}
-	return text
+	return strings.Join(lines, "\n")
 }
 
 // auditUsageSummary returns the identifiers that appear in text as whole
@@ -667,7 +716,7 @@ func (g *Gateway) feedbackSummary(ctx context.Context, rec *SessionRecord) {
 		g.log.Warn("feedback summary: task records unavailable", "err", err)
 	}
 	text := renderUsageSummary(now, cr, version, window, tasks, haveTasks)
-	if leaked := auditUsageSummary(usageSummaryWithoutModelLine(text), usageIdentifiers(cr)); len(leaked) > 0 {
+	if leaked := auditUsageSummary(usageSummaryWithoutFixedLines(text), usageIdentifiers(cr)); len(leaked) > 0 {
 		g.log.Warn("feedback summary refused: the block named identifiers of the install", "conversation", rec.Key, "count", len(leaked))
 		g.post(rec.Key, usageSummaryRefusedNotice)
 		return

@@ -27,9 +27,10 @@ The block carries static enums, version strings, integer counters and durations.
 No cluster name, project id, namespace, task title, summary, result or error text
 reaches it: the task roll-up reads status and timestamps only, and ``main`` refuses
 to print a block in which any identifier read from the resource appears outside
-the ``model:`` line, which is printed by design. Every optional source that fails
-prints as ``unavailable`` (the cluster ``scale`` line is omitted when unread); the
-block never exceeds SUMMARY_MAX_LINES so a reader can check all of it before pasting.
+the ``model:`` line and the ``proposals by origin:`` line, which are printed by
+design. Every optional source that fails prints as ``unavailable`` (the cluster
+``scale`` line is omitted when unread); the block never exceeds SUMMARY_MAX_LINES
+so a reader can check all of it before pasting.
 
 Run from a workstation::
 
@@ -156,6 +157,7 @@ USAGE_COUNTERS: Tuple[str, ...] = (
 USAGE_NO_READING = "no reading"
 USAGE_FORGE_READING_SUFFIX = " (as the forge reports)"
 USAGE_GATEWAY_READING_SUFFIX = " (as the gateway reports)"
+USAGE_AGENT_READING_SUFFIX = " (as the agent reports)"
 #: The fields read off a source rather than counted, each to the suffix naming
 #: that source: absent means no reading yet, which is not 0. The broker reads
 #: the six off the forge; the operator reads the two people readings off the
@@ -225,6 +227,25 @@ TEMPLATE_EXTRA_TOKENS = (
     | frozenset(TOOL_STATUS_ORDER)
     | {"tools", "top", "since", "broker", "start", "scale", "namespaces", "deployments", "pods", "nodes", "crds", "kcc", NONE, OTHER_BUCKET}
 )
+#: The nine ``status.usage`` proposal-origin readings, in the origin table's
+#: order (docs/designs/proposal-origin.md); the block prints them as one line.
+#: The gateway's usageSummaryOriginFields verbatim.
+USAGE_ORIGIN_FIELDS: Tuple[str, ...] = (
+    "proposalsFromChat",
+    "proposalsFromConsole",
+    "proposalsFromApi",
+    "proposalsFromEvent",
+    "proposalsFromDrift",
+    "proposalsFromAudit",
+    "proposalsFromScheduled",
+    "proposalsFromIssue",
+    "proposalsFromOther",
+)
+#: What precedes the origin's name in its field.
+ORIGIN_FIELD_PREFIX = "proposalsFrom"
+#: The origin line's start; the audit runs over the block without this line,
+#: which carries only fixed words and digits.
+ORIGIN_LINE_PREFIX = "  proposals by origin: "
 #: Kanban statuses folded into the roll-up's buckets; anything else is "other".
 STATUS_BUCKETS: Mapping[str, str] = {
     "done": "done",
@@ -262,8 +283,10 @@ ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "kubernetes", "
 INFERENCE_STATUS_KEY = "inference"
 INFERENCE_PROVIDER_FIELD = "provider"
 INFERENCE_MODEL_FIELD = "model"
-#: The model line's start; the audit runs over the block without this one line.
+#: The model line's start; the audit runs over the block without this line.
 MODEL_LINE_PREFIX = "  model: "
+#: The lines printed by design, each removed (its first occurrence) before the audit.
+FIXED_LINE_PREFIXES: Tuple[str, ...] = (MODEL_LINE_PREFIX, ORIGIN_LINE_PREFIX)
 #: The model_list entry whose model is the install's default (the operator's agentModelName).
 LITELLM_DEFAULT_MODEL_ALIAS = "model-default"
 #: The ``model_name: model-default`` line, quoted or bare, at any indent.
@@ -729,19 +752,33 @@ def audit(text: str, identifiers: Iterable[str]) -> List[str]:
     return leaked
 
 
-def _without_model_line(text: str) -> str:
-    """The block less its first ``model:`` line, the one line printed by design.
+def _without_fixed_lines(text: str) -> str:
+    """The block less its first ``model:`` line and its first origin line, the lines printed by design.
 
     A deployment name can carry a spec identifier as a segment
-    (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``); the line is
-    never the reason a block is refused, and every other line stays audited.
+    (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``), and the
+    origin line prints origin words a cluster may be named (``chat``,
+    ``drift``); neither line is the reason a block is refused, and every
+    other line stays audited.
     """
     lines = text.split("\n")
-    for index, line in enumerate(lines):
-        if line.startswith(MODEL_LINE_PREFIX):
-            del lines[index]
-            break
+    for prefix in FIXED_LINE_PREFIXES:
+        for index, line in enumerate(lines):
+            if line.startswith(prefix):
+                del lines[index]
+                break
     return "\n".join(lines)
+
+
+def _origin_line(usage: Mapping[str, Any]) -> str:
+    """The origins whose reading is above zero, in order; ``none`` when all read zero; ``no reading`` when absent."""
+    readings = [(field, usage.get(field)) for field in USAGE_ORIGIN_FIELDS]
+    present = [(field, int(value)) for field, value in readings if value is not None]
+    if not present:
+        shown = USAGE_NO_READING
+    else:
+        shown = ", ".join(f"{field[len(ORIGIN_FIELD_PREFIX):].lower()} {value}" for field, value in present if value) or NONE
+    return f"{ORIGIN_LINE_PREFIX}{shown}{USAGE_AGENT_READING_SUFFIX}"
 
 
 # --- rendering ------------------------------------------------------------------
@@ -822,6 +859,7 @@ def render(snapshot: Snapshot) -> str:
             lines.append(f"  {counter}: {shown}{suffix}")
         else:
             lines.append(f"  {counter}: {int(value or 0)}")
+    lines.append(_origin_line(usage))
     lines.append(f"  lastActive: {usage.get('lastActiveTime') or NEVER}")
     lines.append(f"  lastHumanActive: {usage.get('lastHumanActiveTime') or NEVER}")
     # The broker's own text first; the operator's reading of it in the status
@@ -1096,7 +1134,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     if missing and options.in_pod:
         detail = "; ".join(f"{name}: {snapshot.source_reasons.get(name, REASON_EXEC)}" for name in missing)
         print(f"feedback-summary: could not be read: {detail}", file=stderr)
-    leaked = audit(_without_model_line(text), snapshot.identifiers)
+    leaked = audit(_without_fixed_lines(text), snapshot.identifiers)
     if leaked:
         print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)
         return EXIT_LEAK
