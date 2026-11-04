@@ -1406,15 +1406,22 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
     def test_both_installers_name_the_restore_before_their_import_advice(self):
         """install.sh and upgrade.sh refuse a minter key with no ENABLED version; the
         restore advice comes first, and their own import advice only when it returns 1."""
-        for script, advice in (
-            (_INSTALL_SH, 'print_info "Fix the App key import'),
-            (_REPO_ROOT / "upgrade.sh", 'print_info "Import the App key with install.sh'),
+        for script, refusal, advice in (
+            (_INSTALL_SH, "but its KMS signing key still has no ENABLED version", 'print_info "Fix the App key import'),
+            (_REPO_ROOT / "upgrade.sh", "but its KMS signing key has no ENABLED version", 'print_info "Import the App key with install.sh'),
         ):
             with self.subTest(script=script.name):
                 text = script.read_text()
-                call = text.index("print_minter_restore_advice ")
-                self.assertLess(call, text.index(advice))
-                self.assertIn(" ||\n", text[call : text.index(advice)])
+                # Anchor on the final refusal's own print_error, not the first
+                # restore-advice call in the file: the helper runs three times
+                # since #4570, and anchoring on the first left the final refusal
+                # free to drop its advice with the test still green.
+                start = text.index(refusal)
+                window = text[start : text.index(advice, start)]
+                # The opening quote matches the call, not upgrade.sh's
+                # `declare -F print_minter_restore_advice` guard line.
+                self.assertIn('print_minter_restore_advice "', window)
+                self.assertIn(" ||\n", window)
         # upgrade.sh sources the target tree's helpers, which may predate this one.
         self.assertIn("declare -F print_minter_restore_advice", (_REPO_ROOT / "upgrade.sh").read_text())
 
