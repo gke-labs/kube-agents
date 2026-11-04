@@ -28,6 +28,14 @@ run twice writes nothing. An issue a person closed while the pipeline was
 still red stays closed for the runs it names; the next failing run opens a
 fresh one.
 
+The promotion pipeline has a second issue of its own. A night red on the
+eval's RED verdict alone is no stage failure, but `STALL_NIGHTS` of them in
+a row cut no staging tag and stall the release chain; that opens one
+`ci:release-stalled` issue with a row per night (the run, the candidate
+commit, the eval build the step-5 log links), adds a row each later RED
+night, and closes on the next run whose eval passed. A stage-failure night
+leaves it alone.
+
 Two bounds on what a green run may close. A run being re-run leaves
 `status=completed`, so the newest run by number is read whatever its status,
 and while it is queued or in progress nothing is decided: the earlier green
@@ -297,6 +305,49 @@ RECOVERED_PASSED = "passed on candidate {candidate}"
 RECOVERED_RED_VERDICT = "ran every stage before the release-candidate eval and was rejected by its RED verdict on candidate {candidate}, a judgement on the candidate and not a stage failure"
 NOT_CONFIGURED = "chat not configured: set CI_HEALTH_CHAT_SPACE and CI_HEALTH_CHAT_TOKEN; nothing posted"
 
+# The stalled release chain (gke-labs/kube-agents#4761). A RED night is no
+# stage failure, so the stage issue stays shut, and night after night of them
+# cuts no staging tag and leaves the GA scheduler nothing to publish. This
+# many settled-RED nights of `EVAL_PIPELINE` in a row, with no green run and
+# no stage failure between, open one issue; each later RED night adds its
+# row; the next run that passes the eval closes it. A stage-failure night
+# leaves it alone: the stage issue covers that night.
+STALL_NIGHTS = 2
+STALL_LABEL = "ci:release-stalled"
+STALL_LABEL_COLOR = "b60205"
+STALL_LABEL_DESCRIPTION = "The release-candidate eval has rejected every candidate for several nights"
+TRIAGE_LABEL = "needs-triage"
+# Its own marker kind, so it never collides with the stage issue on the same
+# workflow; the stamp lists the RED runs the body has rows for, newest first.
+STALL_MARKER = "<!-- release-stalled workflow={workflow_id} -->"
+STALL_STAMP = "<!-- release-stalled runs={run_ids} -->"
+_STALL_STAMP_RE = re.compile(r"<!-- release-stalled runs=((?:\d+(?::\d+)?(?:,\d+(?::\d+)?)*)?) -->")
+STALL_TITLE = "🔴 release chain stalled: the RC eval has rejected {n} candidates in a row"
+STALL_LEAD = "The promotion pipeline has cut no staging tag because the release-candidate eval verdict was RED on each of these nights."
+STALL_TABLE_HEADER = "| Night (UTC) | Promotion run | Candidate | Eval build |"
+STALL_TABLE_RULE = "| --- | --- | --- | --- |"
+STALL_ROW = "| {night} | {run} | {candidate} | {build} |"
+STALL_FOOTER = "The failing cases are in each eval build's verdict; this issue names the nights, not the cases."
+STALL_COMMENT = "Rejected again: {runs}. The RC eval has now rejected {n} candidates in a row."
+STALL_CLOSED_COMMENT = "{run} ({when}) passed the release-candidate eval; the release chain is moving again. Closing."
+CHAT_STALLED = STALL_TITLE + " — {url}"
+CHAT_MOVING = "✅ release chain moving again: run #{run_number} passed the gate — closed {url}"
+EVAL_LINK_UNAVAILABLE = "(eval link unavailable)"
+# A night is the UTC date the run was created: `2026-11-04`.
+NIGHT_LENGTH = len("2026-11-04")
+COMMIT_URL = "https://github.com/{repo}/commit/{sha}"
+ISSUE_URL = "https://github.com/{repo}/issues/{number}"
+# What `poll_rc_eval_verdict.py` prints into the step-5 log once it has a
+# settled RED: the Prow build id and its Spyglass link. An empty build id
+# prints no link, and reads as unavailable.
+_RED_VERDICT_LINE_RE = re.compile(r"^verdict=red settled=true build_id=(\S+) (\S+)$")
+JOB_PASSED = "success"
+# The outcome word of the stalled-chain half of a reconcile, and how it is
+# joined to the stage half's when both wrote.
+STALL_OUTCOME = "stall-{outcome}"
+OUTCOME_SEPARATOR = ", "
+NOTHING = "nothing"
+
 
 # --------------------------------------------------------------------------- #
 # Reading a run
@@ -396,6 +447,11 @@ def red_verdict_night(jobs: list) -> bool:
         and ROLLBACK_LEG_MARKER not in (job.get("name") or "")
         for job in jobs
     )
+
+
+def eval_passed(jobs: list) -> bool:
+    """True when the eval wait ran and passed: the verdict was GREEN."""
+    return any(is_eval_wait(job) and job.get("conclusion") == JOB_PASSED for job in jobs)
 
 
 def failing_job(jobs: list) -> dict | None:
@@ -526,10 +582,10 @@ def marker(workflow_id: int) -> str:
     return MARKER.format(workflow_id=workflow_id)
 
 
-def stamped_attempts(body: str | None) -> set:
+def stamped_attempts(body: str | None, pattern: re.Pattern = _STAMP_RE) -> set:
     """The `(run id, attempt)` pairs the body records; a bare id is its
-    first attempt."""
-    match = _STAMP_RE.search(body or "")
+    first attempt. `pattern` picks the stage stamp or the stall stamp."""
+    match = pattern.search(body or "")
     if not match or not match.group(1):
         return set()
     found = set()
@@ -627,6 +683,80 @@ def render_body(workflow_name: str, workflow_id: int, details: dict, streak: lis
     return "\n".join(lines)
 
 
+def stall_marker(workflow_id: int) -> str:
+    return STALL_MARKER.format(workflow_id=workflow_id)
+
+
+def stamp_entry(run: dict) -> str:
+    run_id, attempt = attempt_of(run)
+    return f"{run_id}{STAMP_ATTEMPT_SEPARATOR}{attempt}"
+
+
+def stall_stamp_entries(body: str | None) -> list:
+    """The stall stamp's `<id>:<attempt>` entries in their order, newest
+    first; a stamp that does not fit the shape reads as none."""
+    match = _STALL_STAMP_RE.search(body or "")
+    return [entry for entry in match.group(1).split(",") if entry] if match else []
+
+
+def extract_red_verdict_build(log_text: str) -> tuple | None:
+    """`(build id, Spyglass link)` from the poller's settled-RED line, or None."""
+    for raw in log_text.splitlines():
+        match = _RED_VERDICT_LINE_RE.match(clean_log_line(raw).strip())
+        if match:
+            return match.group(1), match.group(2)
+    return None
+
+
+def stall_row(repo: str, row: dict) -> str:
+    """One night of the stall table: the night, the run, the candidate
+    commit and the eval build, each a link where the logs gave one."""
+    run, sha, build = row["run"], row["candidate"].get("sha"), row["build"]
+    created = run.get("created_at") or ""
+    return STALL_ROW.format(
+        night=created[:NIGHT_LENGTH] if created else WHEN_UNKNOWN,
+        run=run_link(run),
+        candidate=f"[`{sha[:SHORT_SHA]}`]({COMMIT_URL.format(repo=repo, sha=sha)})" if sha else CANDIDATE_UNKNOWN,
+        build=f"[{build[0]}]({build[1]})" if build else EVAL_LINK_UNAVAILABLE,
+    )
+
+
+def stall_rows_in(body: str | None) -> list:
+    """The table rows an earlier render wrote, newest first, so a rewrite
+    keeps the nights it no longer reads the logs of."""
+    lines = (body or "").splitlines()
+    if STALL_TABLE_RULE not in lines:
+        return []
+    rows = []
+    for line in lines[lines.index(STALL_TABLE_RULE) + 1 :]:
+        if not line.startswith("|"):
+            break
+        rows.append(line)
+    return rows
+
+
+def render_stall_title(nights: int) -> str:
+    return STALL_TITLE.format(n=nights)
+
+
+def render_stall_body(workflow_id: int, stamped: list, rows: list) -> str:
+    """The stalled-chain issue: `stamped` and `rows` newest first."""
+    return "\n".join(
+        [
+            stall_marker(workflow_id),
+            STALL_STAMP.format(run_ids=",".join(stamped)),
+            "",
+            STALL_LEAD,
+            "",
+            STALL_TABLE_HEADER,
+            STALL_TABLE_RULE,
+            *rows,
+            "",
+            STALL_FOOTER,
+        ]
+    )
+
+
 def render_still_failing(details: dict) -> str:
     run = details["run"]
     return (
@@ -709,36 +839,37 @@ class GitHubAPI(FlakyGitHubAPI):
     def jobs(self, run_id: int) -> list:
         return self.get_object_pages(f"/repos/{self.repo}/actions/runs/{run_id}/jobs", "jobs")
 
-    def issues_for_workflow(self, workflow_id: int, state: str) -> list:
-        """The labelled issues in `state` that carry this workflow's marker,
+    def issues_for_workflow(self, workflow_id: int, state: str, label: str = LABEL, marker_for=marker) -> list:
+        """The issues labelled `label` in `state` that carry this workflow's
+        marker (the stage issue's, or the one `marker_for` renders),
         newest-updated first; pull requests, which the endpoint lists too,
         dropped."""
         query = urllib.parse.urlencode(
-            {"labels": LABEL, "state": state, "sort": "updated", "direction": "desc", "per_page": ISSUE_PAGE}
+            {"labels": label, "state": state, "sort": "updated", "direction": "desc", "per_page": ISSUE_PAGE}
         )
         issues = self.get(f"/repos/{self.repo}/issues?{query}") or []
         return [
             issue
             for issue in issues
-            if "pull_request" not in issue and marker(workflow_id) in (issue.get("body") or "")
+            if "pull_request" not in issue and marker_for(workflow_id) in (issue.get("body") or "")
         ]
 
-    def ensure_label(self) -> None:
+    def ensure_label(self, name: str = LABEL, color: str = LABEL_COLOR, description: str = LABEL_DESCRIPTION) -> None:
         if self.dry_run:
-            log(f"dry-run: would ensure label {LABEL}")
+            log(f"dry-run: would ensure label {name}")
             return
         self.request(
             "POST",
             f"/repos/{self.repo}/labels",
-            {"name": LABEL, "color": LABEL_COLOR, "description": LABEL_DESCRIPTION},
+            {"name": name, "color": color, "description": description},
             tolerate=(LABEL_EXISTS,),
         )
 
-    def create_issue(self, title: str, body: str) -> dict:
+    def create_issue(self, title: str, body: str, labels: tuple = (LABEL,)) -> dict:
         if self.dry_run:
-            log(f"dry-run: would open an issue titled {title!r}:\n{body}")
+            log(f"dry-run: would open an issue titled {title!r} labelled {', '.join(labels)}:\n{body}")
             return {"number": DRY_RUN_ISSUE_NUMBER}
-        return self.request("POST", f"/repos/{self.repo}/issues", {"title": title, "body": body, "labels": [LABEL]})
+        return self.request("POST", f"/repos/{self.repo}/issues", {"title": title, "body": body, "labels": list(labels)})
 
     def update_issue(self, number: int, **fields) -> None:
         if self.dry_run:
@@ -844,13 +975,36 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
         log(f"{name}: no completed run has said anything yet")
         return "nothing"
     decision = decide(current, reporting_history(runs, current))
+    # Each run's jobs are read at most once per reconcile, whichever of the
+    # stage issue and the stalled-chain issue asks first.
+    cache: dict = {}
+
+    def jobs_for(run: dict) -> list:
+        if run["id"] not in cache:
+            cache[run["id"]] = api.jobs(run["id"])
+        return cache[run["id"]]
+
+    outcome = reconcile_stage(api, workflow, current, decision, jobs_for, cache, sender, dry_run, environ)
+    if name != EVAL_PIPELINE:
+        return outcome
+    stall = reconcile_stall(api, workflow, runs, current, decision, jobs_for, sender, dry_run, environ)
+    if stall == NOTHING:
+        return outcome
+    stall = STALL_OUTCOME.format(outcome=stall)
+    return stall if outcome == NOTHING else f"{outcome}{OUTCOME_SEPARATOR}{stall}"
+
+
+def reconcile_stage(api: GitHubAPI, workflow: dict, current: dict, decision: dict, jobs_for, cache: dict, sender: Sender, dry_run: bool, environ=os.environ) -> str:
+    """Bring the workflow's stage issue into line with its newest reporting
+    run. `cache` holds the jobs `jobs_for` has read, by run id."""
+    name, workflow_id = workflow["name"], workflow["id"]
     open_issues = api.issues_for_workflow(workflow_id, ISSUE_OPEN)
     issue = open_issues[0] if open_issues else None
 
     # The promotion pipeline's red run has its jobs read once here, for the
     # RED-verdict question and then for the issue. Every other red run's are
     # read when the issue needs them; a green run's only when one is open.
-    jobs = api.jobs(current["id"]) if decision["kind"] != "green" and name == EVAL_PIPELINE else None
+    jobs = jobs_for(current) if decision["kind"] != "green" and name == EVAL_PIPELINE else None
     red_verdict = jobs is not None and red_verdict_night(jobs)
     if red_verdict:
         log(f"{name}: run #{current['run_number']} is red on the eval's RED verdict alone; the gate rejected the candidate, which is no stage failure")
@@ -862,9 +1016,10 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
         if issue.get("state_reason") == REOPENED:
             log(f"{name}: green (run #{current['run_number']}), but a person reopened #{issue['number']}; leaving it open")
             return "nothing"
-        jobs, note = recovery_jobs(api, name, current, issue, jobs)
+        jobs, note = recovery_jobs(api, name, current, issue, jobs if jobs is not None else cache.get(current["id"]))
         if jobs is None:
             return "nothing"
+        cache[current["id"]] = jobs
         details = run_details(api, current, with_failure=False, jobs=jobs)
         api.comment(issue["number"], render_recovered(details, note, RECOVERED_RED_VERDICT if red_verdict else RECOVERED_PASSED))
         api.update_issue(issue["number"], state=ISSUE_CLOSED)
@@ -895,6 +1050,107 @@ def reconcile(api: GitHubAPI, workflow: dict, sender: Sender, dry_run: bool, env
     created = api.create_issue(render_title(name), render_body(name, workflow_id, details, streak))
     log(f"{name}: run #{current['run_number']} failed; opened #{created['number']}")
     post(sender, render_chat_broken(name, details, created["number"]), dry_run, environ)
+    return "opened"
+
+
+def stall_details(api: GitHubAPI, run: dict, jobs: list) -> dict:
+    """One RED night's row: the candidate from the first jobs' logs, and
+    the eval build from the step-5 log's verdict line. A log that cannot be
+    read leaves its cell saying so; the issue still files."""
+    candidate = run_details(api, run, with_failure=False, jobs=jobs)["candidate"]
+    wait = next((job for job in jobs if is_eval_wait(job)), None)
+    text = api.job_log(wait["id"]) if wait is not None else None
+    return {"run": run, "candidate": candidate, "build": extract_red_verdict_build(text) if text else None}
+
+
+def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, decision: dict, jobs_for, sender: Sender, dry_run: bool, environ=os.environ) -> str:
+    """Bring the promotion pipeline's stalled-chain issue into line with
+    its newest reporting run. Returns `nothing`, `opened`, `updated` or
+    `closed`.
+
+    A settled-RED night counts the RED nights in a row behind it, newest
+    first, and stops at the first run that is not one (green, or red on a
+    stage) or that the open issue already stamps; jobs are read only that
+    far. A run whose eval passed closes the issue, whatever happened to the
+    run after the gate. A stage-failure night leaves it alone.
+    """
+    name, workflow_id = workflow["name"], workflow["id"]
+    if decision["kind"] == "green":
+        red_night, passed = False, None
+    else:
+        jobs = jobs_for(current)
+        red_night, passed = red_verdict_night(jobs), eval_passed(jobs)
+        if not red_night and not passed:
+            log(f"{name}: run #{current['run_number']} failed on a stage, not on the verdict; the stalled-chain issue is left as it is")
+            return NOTHING
+    open_issues = api.issues_for_workflow(workflow_id, ISSUE_OPEN, STALL_LABEL, stall_marker)
+    issue = open_issues[0] if open_issues else None
+    stamped = stamped_attempts(issue.get("body"), _STALL_STAMP_RE) if issue else set()
+
+    if not red_night:
+        if issue is None:
+            return NOTHING
+        if issue.get("state_reason") == REOPENED:
+            log(f"{name}: run #{current['run_number']} is no RED night, but a person reopened #{issue['number']}; leaving it open")
+            return NOTHING
+        if stamped and current["id"] < max(run_id for run_id, _ in stamped):
+            log(f"{name}: run #{current['run_number']} is older than the RED nights #{issue['number']} records; nothing")
+            return NOTHING
+        if passed is None:
+            passed = eval_passed(jobs_for(current))
+        if not passed:
+            log(f"{name}: run #{current['run_number']} did not pass the release-candidate eval (it did not run); #{issue['number']} stays open")
+            return NOTHING
+        api.comment(issue["number"], STALL_CLOSED_COMMENT.format(run=run_link(current), when=run_when(current)))
+        api.update_issue(issue["number"], state=ISSUE_CLOSED)
+        log(f"{name}: run #{current['run_number']} passed the eval; closed stalled-chain #{issue['number']}")
+        post(sender, CHAT_MOVING.format(run_number=current["run_number"], url=ISSUE_URL.format(repo=api.repo, number=issue["number"])), dry_run, environ)
+        return "closed"
+
+    stamped_ids = {run_id for run_id, _ in stamped}
+    new = []
+    for run in [current, *reporting_history(runs, current)]:
+        if run["id"] in stamped_ids or run["conclusion"] not in FAILING_CONCLUSIONS:
+            break
+        jobs = jobs_for(run)
+        if not red_verdict_night(jobs):
+            break
+        new.append((run, jobs))
+
+    if issue is not None:
+        if not new:
+            log(f"{name}: stalled-chain #{issue['number']} already records run #{current['run_number']}")
+            return NOTHING
+        rows = [stall_row(api.repo, stall_details(api, run, jobs)) for run, jobs in new]
+        entries = [stamp_entry(run) for run, _ in new]
+        old_entries = stall_stamp_entries(issue.get("body"))
+        nights = len(entries) + len(old_entries)
+        # Comment first, as on the stage issue: the rewrite stamps the run.
+        api.comment(issue["number"], STALL_COMMENT.format(runs=", ".join(run_link(run) for run, _ in new), n=nights))
+        api.update_issue(
+            issue["number"],
+            title=render_stall_title(nights),
+            body=render_stall_body(workflow_id, entries + old_entries, rows + stall_rows_in(issue.get("body"))),
+        )
+        log(f"{name}: run #{current['run_number']} rejected again; stalled-chain #{issue['number']} now counts {nights}")
+        return "updated"
+
+    if len(new) < STALL_NIGHTS:
+        log(f"{name}: {len(new)} settled-RED night{'' if len(new) == 1 else 's'} in a row; {STALL_NIGHTS} open the stalled-chain issue")
+        return NOTHING
+    for closed in api.issues_for_workflow(workflow_id, ISSUE_CLOSED, STALL_LABEL, stall_marker):
+        if attempt_of(current) in stamped_attempts(closed.get("body"), _STALL_STAMP_RE):
+            log(f"{name}: run #{current['run_number']} is recorded on closed #{closed['number']}; someone dealt with it")
+            return NOTHING
+    rows = [stall_row(api.repo, stall_details(api, run, jobs)) for run, jobs in new]
+    api.ensure_label(STALL_LABEL, STALL_LABEL_COLOR, STALL_LABEL_DESCRIPTION)
+    created = api.create_issue(
+        render_stall_title(len(new)),
+        render_stall_body(workflow_id, [stamp_entry(run) for run, _ in new], rows),
+        (STALL_LABEL, TRIAGE_LABEL),
+    )
+    log(f"{name}: {len(new)} settled-RED nights in a row; opened stalled-chain #{created['number']}")
+    post(sender, CHAT_STALLED.format(n=len(new), url=ISSUE_URL.format(repo=api.repo, number=created["number"])), dry_run, environ)
     return "opened"
 
 

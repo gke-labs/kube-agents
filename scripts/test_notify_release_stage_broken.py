@@ -174,6 +174,10 @@ def issues_path(state):
     return f"/repos/{REPO}/issues?labels=ci%3Arelease-stage-broken&state={state}&sort=updated&direction=desc&per_page={notifier.ISSUE_PAGE}"
 
 
+def stall_issues_path(state):
+    return f"/repos/{REPO}/issues?labels=ci%3Arelease-stalled&state={state}&sort=updated&direction=desc&per_page={notifier.ISSUE_PAGE}"
+
+
 def issue(number, body, state="open"):
     return {"number": number, "body": body, "state": state, "html_url": f"https://github.com/{REPO}/issues/{number}"}
 
@@ -191,6 +195,8 @@ def staging_github(runs=STAGING_RUNS, open_issues=(), closed_issues=(), logs=Non
         jobs_path(RUN_30["id"]): STAGING_JOBS,
         issues_path("open"): list(open_issues),
         issues_path("closed"): list(closed_issues),
+        stall_issues_path("open"): [],
+        stall_issues_path("closed"): [],
     }
     default_logs = {STEP1_JOB: fixture("staging-30-step1.log"), E2E_JOB: fixture("staging-30-e2e.log")}
     return FakeGitHub(responses, logs if logs is not None else default_logs)
@@ -611,15 +617,20 @@ class ReconcileTest(unittest.TestCase):
     def test_a_red_verdict_night_opens_nothing_and_posts_nothing(self):
         """Step 5 failed and step 5b was skipped: the eval answered RED. The
         gate rejected the candidate, which is no stage failure, so the night
-        reads as green: no issue, no Chat post. The rollback leg that failed
-        beside it counts for nothing, as on a green night."""
+        reads as green: no stage issue, no Chat post. The rollback leg that
+        failed beside it counts for nothing, as on a green night. One RED
+        night after a green one is short of `STALL_NIGHTS`, so it opens no
+        stalled-chain issue either."""
+        self.assertGreater(notifier.STALL_NIGHTS, 1)
         run_31 = run_like(31, 39600000000, conclusion="failure")
         github = staging_github(runs=runs_list(run_31, *STAGING_RUNS["workflow_runs"][2:]))
         github.responses[jobs_path(run_31["id"])] = jobs_with(STAGING_26_JOBS, **{EVAL_STAGE: "failure"})
         chat = FakeChat()
-        self.assertEqual(reconcile(github, chat)[0], "nothing")
+        outcome, err = reconcile(github, chat)
+        self.assertEqual(outcome, "nothing")
         self.assertEqual(github.writes, [])
         self.assertEqual(chat.posted, [])
+        self.assertIn(f"1 settled-RED night in a row; {notifier.STALL_NIGHTS} open the stalled-chain issue", err)
 
     def test_a_red_verdict_night_closes_an_issue_whose_stage_ran_and_says_what_the_run_was_red_on(self):
         run_31 = run_like(31, 39600000000, conclusion="failure")
@@ -905,6 +916,231 @@ class ReconcileTest(unittest.TestCase):
             code = notifier.main(["--sweep"], environ={}, api=github.api())
         self.assertEqual(code, 1)
         self.assertEqual(github.writes, [])
+
+
+# The step-5 log's build id; each night in the stall tests gets its own by
+# replacing the last two digits with the run number.
+STEP5_BUILD = "1985733102944374784"
+SPYGLASS = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/"
+SHA_31 = "e1ab9e5" + "1" * 33
+SHA_32 = "0cc8ee5" + "2" * 33
+SHA_33 = "3a8ba90" + "3" * 33
+STALL_TITLE_2 = "🔴 release chain stalled: the RC eval has rejected 2 candidates in a row"
+STALL_TITLE_3 = "🔴 release chain stalled: the RC eval has rejected 3 candidates in a row"
+STALL_FOOTER = "The failing cases are in each eval build's verdict; this issue names the nights, not the cases."
+E2E_SHORT = "Step 3 - Run Nightly E2E Matrix / Run E2E (rc)"
+STAGING_TAG_STAGE = "Step 6 - Create Staging Tag"
+
+
+def build_of(number):
+    return STEP5_BUILD[:-2] + f"{number:02d}"
+
+
+def night_run_id(number):
+    return 41000000000 + number
+
+
+def night(number, day, sha, eval_log=True, run_conclusion="failure", **conclusions):
+    """`(run, jobs, logs)` for one promotion night: by default a settled RED
+    (step 5 failed, step 5b skipped, the rollback leg failed as it does on
+    green nights), its step-1 log naming `sha`, its step-5 log carrying the
+    poller's verdict line. Job ids are the run's own, so two nights never
+    share a log."""
+    run_id = night_run_id(number)
+    run = dict(run_like(number, run_id, conclusion=run_conclusion), created_at=f"2026-11-{day:02d}T02:36:58Z")
+    jobs = jobs_with(STAGING_26_JOBS, **(conclusions or {EVAL_STAGE: "failure"}))
+    for index, job in enumerate(jobs["jobs"]):
+        job["id"] = run_id * 100 + index
+    by_name = {job["name"]: job["id"] for job in jobs["jobs"]}
+    logs = {by_name["Step 1 - Resolve Promotion Candidate"]: f"2026-11-{day:02d}T02:37:11.0000000Z Commit SHA:         {sha}\n"}
+    if eval_log:
+        logs[by_name[EVAL_STAGE]] = fixture("staging-red-step5.log").replace(STEP5_BUILD, build_of(number))
+    return run, jobs, logs
+
+
+def eval_job_id(number):
+    return night_run_id(number) * 100 + [job["name"] for job in STAGING_26_JOBS["jobs"]].index(EVAL_STAGE)
+
+
+def stalled_github(*nights, open_stall=(), closed_stall=()):
+    """The promotion pipeline with `nights` (oldest first) on top of a green
+    history."""
+    github = staging_github(runs=runs_list(*[each[0] for each in reversed(nights)], *STAGING_RUNS["workflow_runs"][2:]), logs={})
+    for run, jobs, logs in nights:
+        github.responses[jobs_path(run["id"])] = jobs
+        github.logs.update(logs)
+    github.responses[stall_issues_path("open")] = list(open_stall)
+    github.responses[stall_issues_path("closed")] = list(closed_stall)
+    return github
+
+
+def rows_of(body):
+    return [line for line in body.splitlines() if line.startswith("| 2026-")]
+
+
+class StalledChainTest(unittest.TestCase):
+    """The RC eval rejecting candidate after candidate: no stage failed, and
+    no staging tag is cut. `STALL_NIGHTS` settled-RED nights in a row open
+    one issue; each later RED night adds a row; the next pass of the gate
+    closes it."""
+
+    def _opened(self, chat=None):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32))
+        outcome, err = reconcile(github, chat or FakeChat())
+        self.assertEqual(outcome, "stall-opened", err)
+        return github
+
+    def _open_issue(self, number=4001, state="open"):
+        body = self._opened().writes[1][2]["body"]
+        return dict(issue(number, body, state=state), title=STALL_TITLE_2)
+
+    def test_two_red_verdict_nights_open_the_stalled_issue_with_its_label_marker_rows_and_a_chat_line(self):
+        chat = FakeChat()
+        github = self._opened(chat)
+        self.assertEqual(len(github.writes), 2)
+        method, path, payload = github.writes[0]
+        self.assertEqual((method, path), ("POST", f"/repos/{REPO}/labels"))
+        self.assertEqual(payload["name"], "ci:release-stalled")
+        self.assertEqual(payload["description"], "The release-candidate eval has rejected every candidate for several nights")
+        method, path, payload = github.writes[1]
+        self.assertEqual((method, path), ("POST", f"/repos/{REPO}/issues"))
+        self.assertEqual(payload["title"], STALL_TITLE_2)
+        self.assertEqual(payload["labels"], ["ci:release-stalled", "needs-triage"])
+        self.assertNotIn("assignees", payload)
+        body = payload["body"]
+        self.assertIn(f"<!-- release-stalled workflow={STAGING['id']} -->", body)
+        self.assertIn(f"<!-- release-stalled runs={night_run_id(32)}:1,{night_run_id(31)}:1 -->", body)
+        self.assertNotIn("release-stage-broken", body)
+        self.assertIn("The promotion pipeline has cut no staging tag because the release-candidate eval verdict was RED on each of these nights.", body)
+        self.assertEqual(
+            rows_of(body),
+            [
+                f"| 2026-11-02 | [#32](https://github.com/{REPO}/actions/runs/{night_run_id(32)}) | [`0cc8ee5`](https://github.com/{REPO}/commit/{SHA_32}) | [{build_of(32)}]({SPYGLASS}{build_of(32)}) |",
+                f"| 2026-11-01 | [#31](https://github.com/{REPO}/actions/runs/{night_run_id(31)}) | [`e1ab9e5`](https://github.com/{REPO}/commit/{SHA_31}) | [{build_of(31)}]({SPYGLASS}{build_of(31)}) |",
+            ],
+        )
+        self.assertTrue(body.endswith(STALL_FOOTER), body)
+        self.assertEqual(chat.posted, [f"{STALL_TITLE_2} — https://github.com/{REPO}/issues/4001"])
+
+    def test_a_third_red_verdict_night_comments_adds_a_row_and_rewrites_the_title(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), night(33, 3, SHA_33), open_stall=[self._open_issue()])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-updated")
+        # Comment first, as on the stage issue: the rewrite stamps the run.
+        self.assertEqual([(w[0], w[1]) for w in github.writes], [("POST", f"/repos/{REPO}/issues/4001/comments"), ("PATCH", f"/repos/{REPO}/issues/4001")])
+        comment = github.writes[0][2]["body"]
+        self.assertEqual(len(comment.splitlines()), 1)
+        self.assertIn(f"[#33](https://github.com/{REPO}/actions/runs/{night_run_id(33)})", comment)
+        patch = github.writes[1][2]
+        self.assertEqual(patch["title"], STALL_TITLE_3)
+        self.assertIn(f"<!-- release-stalled runs={night_run_id(33)}:1,{night_run_id(32)}:1,{night_run_id(31)}:1 -->", patch["body"])
+        rows = rows_of(patch["body"])
+        self.assertEqual([row[:12] for row in rows], ["| 2026-11-03", "| 2026-11-02", "| 2026-11-01"])
+        self.assertIn(build_of(33), rows[0])
+        self.assertTrue(patch["body"].endswith(STALL_FOOTER))
+        self.assertEqual(chat.posted, [])
+
+    def test_a_red_verdict_night_already_stamped_is_not_added_twice(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), open_stall=[self._open_issue()])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+
+    def test_a_green_run_closes_the_stalled_issue_with_a_comment_and_a_chat_line(self):
+        green = night(33, 3, SHA_33, eval_log=False, run_conclusion="success", **{ROLLBACK_LEG: "failure"})
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), green, open_stall=[self._open_issue()])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "stall-closed")
+        self.assertEqual([(w[0], w[1]) for w in github.writes], [("POST", f"/repos/{REPO}/issues/4001/comments"), ("PATCH", f"/repos/{REPO}/issues/4001")])
+        self.assertIn(f"[#33](https://github.com/{REPO}/actions/runs/{night_run_id(33)})", github.writes[0][2]["body"])
+        self.assertEqual(github.writes[1][2], {"state": "closed"})
+        self.assertEqual(chat.posted, [f"✅ release chain moving again: run #33 passed the gate — closed https://github.com/{REPO}/issues/4001"])
+
+    def test_a_green_verdict_on_a_night_that_then_fails_a_stage_closes_the_stalled_issue(self):
+        """Step 5 passed and step 6 failed: the gate passed the candidate,
+        so the chain is moving; the stage issue covers the step-6 failure."""
+        tag_failed = night(33, 3, SHA_33, eval_log=False, **{STAGING_TAG_STAGE: "failure"})
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), tag_failed, open_stall=[self._open_issue()])
+        chat = FakeChat()
+        self.assertEqual(reconcile(github, chat)[0], "opened, stall-closed")
+        self.assertIn(("PATCH", f"/repos/{REPO}/issues/4001", {"state": "closed"}), github.writes)
+        self.assertEqual(len(chat.posted), 2)
+        self.assertTrue(chat.posted[1].startswith("✅ release chain moving again: run #33 passed the gate"), chat.posted)
+
+    def test_a_green_run_whose_eval_did_not_run_leaves_the_stalled_issue_open(self):
+        """A promotion run with `skip_pipeline` concludes success with step 5
+        skipped: no candidate passed the gate, so nothing moved."""
+        skipped = night(33, 3, SHA_33, eval_log=False, run_conclusion="success", **{EVAL_STAGE: "skipped", ROLLBACK_LEG: "success"})
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), skipped, open_stall=[self._open_issue()])
+        outcome, err = reconcile(github)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertIn("did not pass the release-candidate eval", err)
+
+    def test_a_stage_broken_night_between_two_red_nights_neither_opens_nor_counts(self):
+        broken = night(32, 2, SHA_32, eval_log=False, **{E2E_SHORT: "failure", EVAL_STAGE: "skipped"})
+        github = stalled_github(night(31, 1, SHA_31), broken, night(33, 3, SHA_33))
+        chat = FakeChat()
+        outcome, err = reconcile(github, chat)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn("1 settled-RED night in a row", err)
+
+    def test_a_stage_broken_night_leaves_an_open_stalled_issue_alone(self):
+        broken = night(33, 3, SHA_33, eval_log=False, **{E2E_SHORT: "failure", EVAL_STAGE: "skipped"})
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), broken, open_stall=[self._open_issue()])
+        self.assertEqual(reconcile(github)[0], "opened")
+        self.assertFalse([w for w in github.writes if "/issues/4001" in w[1]])
+        self.assertEqual(github.writes[1][2]["labels"], [notifier.LABEL])
+
+    def test_a_red_verdict_night_after_a_stage_broken_one_adds_to_the_open_stalled_issue(self):
+        """The streak that opened the issue stands until a green run; a stage
+        night between does not end it."""
+        broken = night(33, 3, SHA_33, eval_log=False, **{E2E_SHORT: "failure", EVAL_STAGE: "skipped"})
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), broken, night(34, 4, SHA_33), open_stall=[self._open_issue()])
+        self.assertEqual(reconcile(github)[0], "stall-updated")
+        patch = github.writes[1][2]
+        self.assertEqual(patch["title"], STALL_TITLE_3)
+        self.assertEqual([row[:12] for row in rows_of(patch["body"])], ["| 2026-11-04", "| 2026-11-02", "| 2026-11-01"])
+
+    def test_a_red_night_whose_step_5_log_has_no_verdict_line_still_files_with_the_link_unavailable(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, eval_log=False))
+        github.logs[eval_job_id(31)] = "2026-11-01T07:48:02.0Z ##[error]Process completed with exit code 1.\n"
+        self.assertEqual(reconcile(github)[0], "stall-opened")
+        rows = rows_of(github.writes[1][2]["body"])
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertTrue(row.endswith("| (eval link unavailable) |"), row)
+
+    def test_a_dry_run_of_a_stall_writes_and_posts_nothing(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32))
+        chat = FakeChat()
+        outcome, err = reconcile(github, chat, dry_run=True)
+        self.assertEqual(outcome, "stall-opened")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn(f"would open an issue titled {STALL_TITLE_2!r}", err)
+        self.assertIn("would ensure label ci:release-stalled", err)
+        self.assertIn("would post to chat", err)
+
+    def test_a_closed_stalled_issue_stamping_the_newest_run_is_not_reopened(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32), closed_stall=[self._open_issue(3999, state="closed")])
+        chat = FakeChat()
+        outcome, err = reconcile(github, chat)
+        self.assertEqual(outcome, "nothing")
+        self.assertEqual(github.writes, [])
+        self.assertEqual(chat.posted, [])
+        self.assertIn("closed #3999", err)
+
+    def test_a_stalled_issue_is_never_mistaken_for_the_stage_issue(self):
+        """Its own label and marker kind: the stage issue's listing does not
+        see it, and its stamp is not read as the stage stamp."""
+        body = self._open_issue()["body"]
+        self.assertNotIn(notifier.marker(STAGING["id"]), body)
+        self.assertEqual(notifier.stamped_attempts(body), set())
+        self.assertEqual(notifier.stamped_attempts(body, notifier._STALL_STAMP_RE), {(night_run_id(32), 1), (night_run_id(31), 1)})
 
 
 class MainTest(unittest.TestCase):

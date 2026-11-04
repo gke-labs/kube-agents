@@ -1581,7 +1581,9 @@ section](#the-nightly-section)).
 The release-stage notifier (`.github/workflows/release-stage-broken-notify.yml`,
 `scripts/release/notify_release_stage_broken.py`) posts to the same space with
 the same app identity and variables when it opens or closes a
-`ci:release-stage-broken` issue for a failed run of a release pipeline
+`ci:release-stage-broken` issue for a failed run of a release pipeline, or a
+`ci:release-stalled` issue when the release-candidate eval has rejected two
+candidates in a row
 ([`scripts/release/README.md`](../scripts/release/README.md), "Pipeline Cadence &
 Execution Flow", the "When a stage fails" bullet). The workflow mints the app
 token and reads no webhook URL. `CI_HEALTH_MUTE=true` silences it too, and its
