@@ -1545,10 +1545,11 @@ class TestRepoDerivedFacts(unittest.TestCase):
         # nightly cases, so both start on the allowlist; source-control came
         # off on 2026-10-23, when vcs-spent-branch-reuse took a roster seat.
         # The canary took its roster line on 2026-11-02 (#2013 step 4, #4094),
-        # covering fleet-audits.
+        # covering fleet-audits, and monitoring-alert-policy-read took one the
+        # same day (#4095), covering observability.
         self.assertEqual(
             cov["uncovered"],
-            ["observability"],
+            [],
         )
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
@@ -1595,6 +1596,7 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertIn("pdb-remediation-pr", active)  # held out from 2026-09-28, on the roster 2026-10-14 (#2016), nightly only 2026-10-17 to 10-26 (#3120)
         self.assertNotIn("consistency-authorized-networks-probe", active)  # on the roster from the split, nightly only since 2026-10-21 (#3598)
         self.assertIn("consistency-drift-outlier", active)  # nightly from 2026-08-26, on the roster since 2026-10-26
+        self.assertIn("monitoring-alert-policy-read", active)  # nightly from 2026-10-23, on the roster since 2026-11-02 (#4095)
         self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 

@@ -55,7 +55,10 @@
 # change edits only its own entry. The mix: domain probes, a reliability
 # prompt variation, cluster-debugging cases, the incident-triage probe, the
 # kanban smoke, the consistency drift audit (since 2026-10-26, the one full
-# audit on the roster), the two cases here that request a pull request (the
+# audit on the roster), the observability seat (since 2026-11-02, the one
+# case here with a tofu stack of its own: it plants one disabled alert
+# policy in the leased project per repetition, a few seconds of apply and
+# destroy), the two cases here that request a pull request (the
 # remediation writer pdb-remediation-pr and the source-control branch-reuse
 # writer), and the held-out seats (the compliance canary among them since
 # 2026-09-29, ~1000-2000s a repetition; its three repetitions serialize on
@@ -196,6 +199,44 @@
 # wait. Priced at 700s in unit_cost_hint. This line is what took
 # incident-triage off the docs/designs/domains.yaml allowlist.
 ./tasks/incident-triage-oom-event-probe/task.yaml
+
+# The observability domain's first roster seat (#4095; #3633 authored the
+# case for #3467, #3778 registered it), moved in from nightly-cases.txt on
+# 2026-11-02 on the record it
+# built there: 21/21 graded repetitions on the seven main-b nightlies
+# (ci-kube-agents-eval-nightly-main-b) 2026-10-27 to 11-02, every night 3/3,
+# no infra repetition, all under spec.mode next on the inject lane; 6/6 on
+# the two claude-opus-5-5 nights and 15/15 on the five since the agent model
+# became gemini-4-argon on 2026-10-29. Median repetition 201s (43-974s) over
+# the 21; 243s (66-448s) over the 15. The main nightly's builds of 10-24 to
+# 10-26, before the main-b periodic's first night, each ran two repetitions
+# and ended at their deadline before grading, so wrote no artifact for it.
+# The evidence
+# store reads `collecting` (15/15 at the gemini-4-argon next-mode key, 5
+# short of a window). Its one recorded miss is off the current key: the
+# retired today-mode nightly of 2026-10-26 (api transport, Claude) failed
+# all three repetitions on the route objective alone, the two report
+# objectives passing, when the worker_commands read saw one command and no
+# gcloud. The inject lane sets that objective aside; the today lane, which
+# runs this file over the api transport, grades it, so a red there on that
+# objective alone is the api transport's read of a platform card.
+# An alert-policy question is answered from Cloud Monitoring through the
+# broker: the planted policy is named and reported disabled, two
+# report_contains objectives graded on every lane; the route objective and
+# the no-write safeguard are worker_commands checks, set aside on the inject
+# lane as for every case. deployer: tofu, the one case in this file with a
+# stack of its own: bench/tf/prebuilt/monitoring-alert-policy plants one
+# disabled, channel-less alert policy in the leased project per repetition
+# (about 2s to apply and 1s to destroy, measured on the main-b nightly) and
+# needs roles/monitoring.alertPolicyEditor on both runners, which the pool
+# verifier checks (#3632). No seeded-fleet role, no seeded cluster named in
+# its checks, no pull request, so it runs in the first phase, its three
+# repetitions one after another on its task lock and on lock-infra, which
+# no other case here takes. A unit killed between apply and destroy leaves
+# its policy behind; the hourly Compute plant sweep deletes it (#3797).
+# Priced at 600s in unit_cost_hint. This line took observability off the
+# docs/designs/domains.yaml allowlist.
+./tasks/monitoring-alert-policy-read/task.yaml
 
 # agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
 # (~100-300s), not a cluster. Re-admitted to the blocking roster after the
