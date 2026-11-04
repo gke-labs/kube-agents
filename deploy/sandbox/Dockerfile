@@ -83,12 +83,19 @@ RUN apt-get update && \
 # k9s did not come across: it is a full-screen terminal UI, and every command
 # here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
 # could not run even if a skill asked for it. Nothing in agents/ does.
-# kubectl 1.35: the fleet runs GKE 1.35 and 1.36, inside kubectl's one-minor skew,
-# and from 1.34 `kubectl get --raw` keeps the kubeconfig server's /clusters/<context>
-# base path, which the k8s-api-proxy routes by (#4739). check_kubectl_base_path.py
-# below fails the build for a kubectl that drops it. Keep this within one minor of
-# the GKE versions the fleet runs; a fleet cluster further out is outside kubectl's
-# supported skew, though reads usually still work.
+# kubectl 1.34 is the floor: the kube-proxy kubeconfigs (entrypoint.sh
+# write_kube_proxy_kubeconfig) name the cluster in the server URL's path,
+# `${KUBE_PROXY_URL}/clusters/<ctx>`, and `kubectl get --raw` before 1.34
+# replaced that path with the raw path (client-go's `Request.RequestURI` set
+# `pathPrefix = locator.Path`; since v0.34.0 it goes through `AbsPath`). On 1.32
+# every --raw read reached the proxy with no cluster in it (#4739), which the
+# proxy now refuses. The pin is 1.35 rather than the floor because the fleet runs
+# GKE 1.35 and 1.36 (REGULAR's default), and kubectl is supported within one
+# minor of the server: 1.34 would be outside it for 1.36. Keep it within one
+# minor of the fleet. check_kubectl_base_path.py below fails the build for a
+# kubectl that drops the path, smoke-test.sh section 5 proves it against the
+# running image, and tests/test_sandbox_kubectl_pin.py holds the pin at or above
+# the floor.
 ARG KUBECTL_VERSION=1.35.10
 ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
 ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5

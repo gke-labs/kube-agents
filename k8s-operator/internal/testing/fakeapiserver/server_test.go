@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -491,14 +492,7 @@ func TestReflector_SyncsAndRecoversFromExpiry(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.ThrottleFirst(1, time.Second)
-	lw := cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
-		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (k8sruntime.Object, error) {
-			return client.CoreV1().Events(metav1.NamespaceAll).List(ctx, opts)
-		},
-		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-			return client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
-		},
-	}, client)
+	lw := cache.ToListWatcherWithWatchListSemantics(eventsListWatch(client), client)
 	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
 	reflector := cache.NewReflector(lw, &corev1.Event{}, store, 0)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -531,14 +525,7 @@ func TestReflector_SyncsAndRecoversFromExpiry(t *testing.T) {
 func TestReflector_ClassicListPaginates(t *testing.T) {
 	s := startSmall(t, 6)
 	client := clientFor(t, s, k8sruntime.ContentTypeJSON)
-	lw := classicListWatch{&cache.ListWatch{
-		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (k8sruntime.Object, error) {
-			return client.CoreV1().Events(metav1.NamespaceAll).List(ctx, opts)
-		},
-		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-			return client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
-		},
-	}}
+	lw := classicListWatch{eventsListWatch(client)}
 	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
 	reflector := cache.NewReflector(lw, &corev1.Event{}, store, 0)
 	reflector.WatchListPageSize = 25
@@ -561,6 +548,19 @@ func TestReflector_ClassicListPaginates(t *testing.T) {
 type classicListWatch struct{ *cache.ListWatch }
 
 func (classicListWatch) IsWatchListSemanticsUnSupported() bool { return true }
+
+// eventsListWatch is the reflector's view of a client's Events: the one
+// list-and-watch pair every reflector test here builds.
+func eventsListWatch(client kubernetes.Interface) *cache.ListWatch {
+	return &cache.ListWatch{
+		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (k8sruntime.Object, error) {
+			return client.CoreV1().Events(metav1.NamespaceAll).List(ctx, opts)
+		},
+		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+			return client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
+		},
+	}
+}
 
 // Two servers with one seed hold the same objects, byte for byte on the
 // wire; a different seed holds different ones.
@@ -795,4 +795,91 @@ func mustRequest(t *testing.T, method, url, body string) *http.Request {
 	}
 	req.Header.Set(contentTypeHeader, k8sruntime.ContentTypeJSON)
 	return req
+}
+
+// A server without the WatchList gate refuses sendInitialEvents the way the
+// API server does, with a 422 Invalid, and a client-go reflector that asked
+// for watch-list falls back to a paged list against it.
+func TestWatchListUnsupported_RefusedAndTheReflectorFallsBackToPages(t *testing.T) {
+	s := Start(Options{Seed: 1, Sizes: small, WatchListUnsupported: true})
+	t.Cleanup(s.Close)
+	client := clientFor(t, s, k8sruntime.ContentTypeProtobuf)
+	ctx := context.Background()
+	_, err := client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, metav1.ListOptions{
+		SendInitialEvents:    ptr.To(true),
+		AllowWatchBookmarks:  true,
+		ResourceVersionMatch: metav1.ResourceVersionMatchNotOlderThan,
+	})
+	if !apierrors.IsInvalid(err) {
+		t.Fatalf("watch with sendInitialEvents: %v, want 422 Invalid", err)
+	}
+	if c := s.Counts(); c.WatchLists != 0 {
+		t.Errorf("counts after the refusal = %+v; want no watch-list stream counted", c)
+	}
+
+	lw := eventsListWatch(client)
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	reflector := cache.NewReflector(lw, &corev1.Event{}, store, 0)
+	reflector.WatchListPageSize = 25
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go reflector.RunWithContext(rctx)
+	eventually(t, 20*time.Second, func() bool { return len(store.List()) == small.Events }, "the reflector's sync through the fallback list")
+	if c := s.Counts(); c.WatchLists != 0 || c.WatchListsRefused < 2 || c.Lists < 3 {
+		t.Errorf("counts = %+v; want no watch-list stream, a refused stream for the direct watch and for the reflector's attempt, and at least three list pages", c)
+	}
+}
+
+// The one field selector the fake honours, reason=<value> on Events, pages
+// the matches at the limit with a continue token and no remainingItemCount,
+// and a selector on any other field is refused as the API server refuses an
+// unsupported field label.
+func TestList_FieldSelectorReasonPagesTheMatches(t *testing.T) {
+	s := startSmall(t, 1)
+	client := clientFor(t, s, k8sruntime.ContentTypeJSON)
+	ctx := context.Background()
+	const reason = "TriggeredScaleUp"
+	for i := 0; i < 3; i++ {
+		s.AddEvent(corev1.Event{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("mark-%d", i), Namespace: "team-0"}, Reason: reason})
+	}
+	events := client.CoreV1().Events(metav1.NamespaceAll)
+	var got []string
+	var pages int
+	opts := metav1.ListOptions{FieldSelector: "reason=" + reason, Limit: 2}
+	for {
+		list, err := events.List(ctx, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages++
+		if list.RemainingItemCount != nil {
+			t.Errorf("page %d carries remainingItemCount %d; a filtered list omits it", pages, *list.RemainingItemCount)
+		}
+		for _, ev := range list.Items {
+			if ev.Reason != reason {
+				t.Errorf("page %d holds %s with reason %q", pages, ev.Name, ev.Reason)
+			}
+			got = append(got, ev.Name)
+		}
+		if list.Continue == "" {
+			break
+		}
+		opts.Continue = list.Continue
+	}
+	if len(got) != 3 || pages < 2 {
+		t.Errorf("selected %v over %d pages; want the three marks over at least two pages", got, pages)
+	}
+	served := s.Counts().Lists
+	for _, selector := range []string{"involvedObject.kind=Pod", "reason!=" + reason, "reason=" + reason + ",involvedObject.kind=Pod", "reason"} {
+		if _, err := events.List(ctx, metav1.ListOptions{FieldSelector: selector}); !apierrors.IsBadRequest(err) {
+			t.Errorf("selector %q: %v, want 400", selector, err)
+		}
+	}
+	if got := s.Counts().Lists; got != served {
+		t.Errorf("Counts.Lists moved from %d to %d across four refused selectors; a refusal serves no page", served, got)
+	}
+	double, err := events.List(ctx, metav1.ListOptions{FieldSelector: "reason==" + reason})
+	if err != nil || len(double.Items) != 3 {
+		t.Errorf("reason== selector: %d items, %v; want the three marks, as the API server treats == as =", len(double.Items), err)
+	}
 }

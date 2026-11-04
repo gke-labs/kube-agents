@@ -350,7 +350,7 @@ the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
-the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` and `execute_code` entries
+the kanban worker logs by card id (for the required checks, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
 the harness appends to the trajectory from the workers' sessions as well, present when the
 wait found the cards and the door showed the trace); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
@@ -484,12 +484,13 @@ lane what names a write is the reply and the workers' calls the harness reads ba
 once the delegation wait has found the cards; a write neither names is recorded as unattributed
 and charged to nobody. The wait holds a case until the cards it filed are terminal, so a pull
 request the card's worker opens lands in its own case's window. What the wait does not follow is
-a worker's own fan-out, the child cards a worker files, nor a card still running when the case
-reaches the delegation ceiling or when the wait falls back. A write from one of those that lands
-in a later first-phase unit's window is unattributed there; one that lands in a requesting
-case's window, which runs alone and is marked exclusive, is charged to that case, so read a block
-on a requesting case's later repetitions as transport when the earlier case fanned out or ended
-at the ceiling. Parity in
+a worker's own fan-out, the child cards a worker files, a card still running when the case
+reaches the delegation ceiling or when the wait falls back, nor a card whose exchange the
+transport cut before the wait began. A write from one of those that lands in a later first-phase
+unit's window is unattributed there. A second-phase unit (a requesting case, a stopped ask, a
+`writes_alone` case) runs alone and its window is marked exclusive, so the CI script archives
+every card still live before each such unit, then settles. A fence that could not run is a
+`Card fence` warning in the run log; read a block on that unit after one as transport. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation

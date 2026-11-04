@@ -11,6 +11,16 @@ Both channels terminate at the **Planning Agent** — the `default` Hermes profi
 
 The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
+On a large fleet the roster counts the Cluster Agents by project and location instead of naming each, and the Planning Agent looks a named cluster's agent up with `list_agents` before it files the card. The switch is the number of Cluster Agents, above `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`, 20 unless set. A fleet of four Cluster Agents never reaches it. Set the variable in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages; a value that is not a whole number keeps the default, and changing it rolls the agent pod.
+
+```yaml
+platformAgent:
+  deployment:
+    env:
+      - name: KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD
+        value: "100"
+```
+
 Under `spec.mode: next`, Google Chat terminates at the A2A gateway instead: the same Chat app, topic and subscription, pulled through the credential broker by the gateway rather than by the Planning Agent, with the same `allowedUsers` list deciding who is answered. The Planning Agent's Google Chat platform is off on such an install, so proactive alerts and scheduled reports reach the [home channel](#home-channel) through the gateway instead. The gateway posts them there as new threads or as replies in those threads. A reply a person types in one of those threads starts a new conversation rather than continuing the investigation that raised the alert.
 
 The reports of the cards a triage files reach the alert's thread the same way, and so do the answers of the cards the agent files for a question you asked it in chat. They post in the thread or DM you asked in, whether or not a home channel is configured (a home channel that is set but is not a space name turns this off too). Either way there are two differences from the Planning Agent's own delivery. A card's progress is one plan message the gateway edits in place with `KAGE_SLACK_UX` on, and a message per note with it off. A file the card produced is not attached. The design of record is [`docs/designs/spec-chatops-gateway.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-chatops-gateway.md).

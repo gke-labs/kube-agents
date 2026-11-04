@@ -587,6 +587,16 @@ func (in *AgentUsageStatus) DeepCopyInto(out *AgentUsageStatus) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.PeopleSeen7d != nil {
+		in, out := &in.PeopleSeen7d, &out.PeopleSeen7d
+		*out = new(int64)
+		**out = **in
+	}
+	if in.PeopleSeen30d != nil {
+		in, out := &in.PeopleSeen30d, &out.PeopleSeen30d
+		*out = new(int64)
+		**out = **in
+	}
 	if in.ClustersRegistered != nil {
 		in, out := &in.ClustersRegistered, &out.ClustersRegistered
 		*out = new(int64)

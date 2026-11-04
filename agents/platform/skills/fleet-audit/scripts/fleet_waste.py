@@ -78,8 +78,11 @@ from typing import Any, Callable, NamedTuple
 MANIFEST_VERSION = 1
 # The manifest's `audit` field: the stream this collector feeds.
 AUDIT_NAME = "fleet-wide-cost-analysis"
-# The one `kubectl get` each collected cluster costs. The SOP quotes this list
-# to tell the model which kinds not to read again.
+# The kinds each collected cluster is read for, one paged `kubectl get --raw`
+# read per kind (collector_run.paged_dump) rather than one `-A -o json` dump,
+# which a cluster of a few hundred nodes takes past the credential proxy's
+# output cap. The SOP quotes this list to tell the model which kinds not to
+# read again.
 CLUSTER_DUMP_KINDS = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange,ingress"
 
 # A digest of this file, published as `checks_revision`. The manifest contract
@@ -873,6 +876,8 @@ def log(msg: str) -> None:
 
 Run = collector_run.Run
 run_and_gate = collector_run.run_and_gate
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
@@ -4603,16 +4608,14 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         return {"name": target, "project": project, "location": location, **mode, "outcome": UNREACHABLE_OUTCOME, "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    dump_argv = ["kubectl", "get", CLUSTER_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = run_and_gate(dump_argv, run=run, env=env)
+    # Any kind's page failing fails the whole cluster closed: read as empty,
+    # it would be a cluster with no Services or volumes -- which 3.4 and 3.6
+    # then take as proof a project's disks and rules are nobody's.
+    dump_kinds = CLUSTER_DUMP_KINDS.split(",")
+    parsed, result = paged_dump(dump_kinds, run=run, env=env)
     if parsed is None:
         return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
-        # Read as empty, it would be a cluster with no Services or volumes --
-        # which 3.4 and 3.6 then take as proof a project's disks and rules are
-        # nobody's.
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": "object dump gate failed: the answer has no `items` list"}, empty_facts
-    dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
+    dump_record = _record(paged_command_text(dump_kinds, kubeconfig=kubeconfig), result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
     release_index = _releases_by_object(parsed, releases, name)

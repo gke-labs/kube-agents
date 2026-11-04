@@ -43,8 +43,10 @@
 #
 #   1. The worker log records only the FIRST command of a compound block and
 #      summarises the rest as "+ N commands" -- the text of the others is not
-#      in the log at all, so a verb invoked as the second command of a block is
-#      invisible to `worker_commands` no matter how the pattern is written.
+#      in the log at all. A required pattern now also reads the worker's
+#      tagged call as typed, so this reason alone no longer holds; a forbidden
+#      pattern still reads the log only, so a verb invoked as the second
+#      command of a block is invisible to the forbidden check below.
 #   2. `harness._worker_commands` reads only the cards in `awaited`, which come
 #      from the ROUTER's delegations. A step the run leaves to a second card
 #      the harness never awaited is never read. Seen on

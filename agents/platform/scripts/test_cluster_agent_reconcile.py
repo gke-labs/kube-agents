@@ -2057,6 +2057,14 @@ class ScopeTest(HomesMixin):
         with mock.patch.object(rec.sandbox_exec, "run", return_value=cut), mock.patch.object(rec, "log") as logged:
             self.assertEqual(rec._search_container(self.FOLDER), (None, rec.OUTCOME_UNREACHABLE))
         self.assertIn("cut the search output at its cap", " ".join(str(c) for c in logged.call_args_list))
+        # The shipped shim exits 74 on a cut reply, which `check=True` raises; the marker is
+        # still read first, so the log names the cap rather than a failed call.
+        cut_74 = subprocess.CalledProcessError(74, ["gcloud"], output='[{"name": "//container.googleapis.com/projects/a/locations/l/clu',
+                                               stderr="credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")
+        with mock.patch.object(rec.sandbox_exec, "run", side_effect=cut_74), mock.patch.object(rec, "log") as logged:
+            self.assertEqual(rec._search_container(self.FOLDER), (None, rec.OUTCOME_UNREACHABLE))
+        self.assertIn("cut the search output at its cap", " ".join(str(c) for c in logged.call_args_list))
+        self.assertNotIn("Cloud Asset Inventory failed", " ".join(str(c) for c in logged.call_args_list))
         for stderr, want in (("PERMISSION_DENIED", rec.OUTCOME_DENIED),
                              ("Cloud Asset API has not been used in project 1 before or it is disabled", rec.OUTCOME_API_DISABLED),
                              ("connection reset", rec.OUTCOME_UNREACHABLE)):
