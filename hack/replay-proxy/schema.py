@@ -1,7 +1,8 @@
 """The shadow proxy's log line: event names, field names and unstorable reasons.
 
-replay_proxy.py writes these lines and analyze_shadow.py reads them; both use
-the names here, so a renamed field breaks the tests instead of the analysis.
+replay_proxy.py writes these lines and analyze_shadow.py and analyze_replay.py
+read them; all use the names here, so a renamed field breaks the tests instead
+of the analysis.
 """
 
 LOG_SCHEMA_VERSION = 1
@@ -73,3 +74,35 @@ UNSTORABLE_REPEATS_NUMBER = "repeats_swapped_number"
 UNSTORABLE_SCRUB_MASKS_CREDENTIAL = "scrub_masks_credential"
 UNSTORABLE_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
 UNSTORABLE_SCRUB_FAILED = "scrub_failed"
+
+# Proxy modes (REPLAY_MODE). Shadow and record never serve a saved answer.
+MODE_SHADOW = "shadow"
+MODE_RECORD = "record"
+MODE_REPLAY = "replay"
+MODES = (MODE_SHADOW, MODE_RECORD, MODE_REPLAY)
+
+# Fields every request line carries in every mode.
+MODE = "mode"
+# True when replay mode served a saved answer and the model was not called.
+SERVED = "served"
+# On a served line: the job that recorded the answer (its `job` block).
+SERVED_FROM = "served_from"
+# In record mode: whether this request's answer was saved (false when the key
+# was already there, or the answer was unstorable).
+RECORDED = "recorded"
+# On a replay miss: the closest saved request and where this one differed.
+MISS = "miss"
+MISS_CLOSEST_FINGERPRINT = "closest_fingerprint"
+MISS_MATCHED_MESSAGES = "matched_messages"
+MISS_INDEX = "index"
+MISS_ROLE = "role"
+# The normalized, scrubbed text of the differing message on each side, cut to
+# a short window around the first difference.
+MISS_SAVED_SNIPPET = "saved_snippet"
+MISS_CURRENT_SNIPPET = "current_snippet"
+# The two windows with digit and hex runs collapsed, for grouping misses.
+MISS_SIGNATURE = "signature"
+# Where the first difference is when it is not a message.
+MISS_ROLE_SETTINGS = "settings"
+MISS_ROLE_NONE = "none"
+MISS_ROLE_NO_CACHE = "no_saved_request"

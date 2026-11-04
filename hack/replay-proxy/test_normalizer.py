@@ -380,6 +380,23 @@ class AnswerMappingTest(unittest.TestCase):
         self.assertTrue(mapping.answer_repeats_bare_number("kill 9921"))
         self.assertFalse(mapping.answer_repeats_bare_number("kill 99210"))
 
+    def test_answer_swaps_a_pod_or_node_tail_after_its_dash(self):
+        mapping = normalizer.normalize_request(
+            request("pod web-7d4b9c8f6d-x2k9p on gke-seeded-a-default-pool-1a2b3c4d-wxyz"), NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("describe web-7d4b9c8f6d-x2k9p"), "describe web-⟦POD_1⟧")
+        self.assertEqual(mapping.apply_to_answer("drain gke-seeded-a-default-pool-1a2b3c4d-wxyz"),
+                         "drain gke-seeded-a-default-pool-⟦NODE_1⟧")
+        self.assertEqual(mapping.apply_to_answer("x7d4b9c8f6d-x2k9p"), "x7d4b9c8f6d-x2k9p")
+
+    def test_restore_puts_this_requests_values_back(self):
+        mapping = normalizer.normalize_request(request("task t_11111111 pod web-7d4b9c8f6d-x2k9p age: 5m"), NOW).mapping
+        self.assertEqual(mapping.to_value["⟦TASK_1⟧"], "t_11111111")
+        restored, missing = mapping.restore("kanban_show(⟦TASK_1⟧) on web-⟦POD_1⟧, ⟦AGEm_1⟧ old")
+        self.assertEqual(restored, "kanban_show(t_11111111) on web-7d4b9c8f6d-x2k9p, 5m old")
+        self.assertEqual(missing, [])
+        _, missing = mapping.restore("and ⟦TASK_2⟧")
+        self.assertEqual(missing, ["⟦TASK_2⟧"])
+
     def test_repeated_number_uses_token_boundaries(self):
         mapping = normalizer.normalize_request(request("resourceVersion: 4821"), NOW).mapping
         for answer in ("upgrade to 4821.31", "use model-4821-pro", "pool node-pool-4821", "api v4821", "--offset=-4821"):

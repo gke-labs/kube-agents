@@ -39,6 +39,8 @@ KEY_DROP_FIELDS = ("stream", "user", "metadata")
 MESSAGES_FIELD = "messages"
 
 OPEN, CLOSE = "⟦", "⟧"
+# A placeholder in a saved answer, for restoring it with the current request's values.
+PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" + re.escape(CLOSE))
 
 # Opaque fields. LiteLLM embeds Gemini's thought signature in tool-call ids
 # (`call_…__thought__<base64>`), so no rule ever edits inside one: the whole
@@ -205,6 +207,11 @@ ENCODING_ERRORS = "surrogatepass"
 # characters that may border a token are excluded on each side.
 TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=_-])"
 TOKEN_AFTER = r"(?![A-Za-z0-9+/=_-])"
+# Classes whose value is the tail of a longer name (`web-` + the pod's hash
+# suffix, `gke-…-` + the node's): in an answer that tail follows a `-` or `_`,
+# so those may border it on the left.
+SUFFIX_CLASSES = ("POD", "NODE", "SCRATCH", "TERMOUT")
+SUFFIX_TOKEN_BEFORE = r"(?<![A-Za-z0-9+/=])"
 # A bare number is a token when no word character, `.` or `-` precedes it and
 # no word character or `.`+digit follows it: `1` in `1.31`, `node-pool-1` or
 # `--replicas=-1` is not the number 1, but in `generation is 1.` it is.
@@ -242,6 +249,8 @@ class Mapping:
     """Value <-> placeholder, numbered per class by first appearance."""
 
     to_placeholder: Dict[str, str] = field(default_factory=dict)
+    # The reverse, placeholder -> value, which replay mode restores answers with.
+    to_value: Dict[str, str] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
     # Values swapped that can never be put back in an answer: bare numbers
     # (keyed numbers) and epoch timestamps, which become an unnumbered
@@ -255,6 +264,7 @@ class Mapping:
             self.counts[cls] = number
             token = f"{OPEN}{cls}_{number}{CLOSE}"
             self.to_placeholder[key] = token
+            self.to_value[token] = value
         if cls == NUMBER_CLASS:
             self.bare_numbers.add(value)
         return self.to_placeholder[key]
@@ -274,10 +284,28 @@ class Mapping:
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
             if value not in text:
                 continue
-            before = TOKEN_BEFORE if value[0].isalnum() else ""
+            suffix = token[len(OPEN):].rsplit("_", 1)[0] in SUFFIX_CLASSES
+            before = (SUFFIX_TOKEN_BEFORE if suffix else TOKEN_BEFORE) if value[0].isalnum() else ""
             after = TOKEN_AFTER if value[-1].isalnum() else ""
             text = re.sub(before + re.escape(value) + after, lambda _m, t=token: t, text)
         return text
+
+    def restore(self, text: str) -> Tuple[str, List[str]]:
+        """Put this request's values back for the placeholders in `text`.
+
+        Returns the restored text and the placeholders this request does not
+        bind; a non-empty list means the answer must not be served.
+        """
+        missing: List[str] = []
+
+        def sub(match: "re.Match[str]") -> str:
+            token = match.group(0)
+            if token not in self.to_value:
+                missing.append(token)
+                return token
+            return self.to_value[token]
+
+        return PLACEHOLDER_RE.sub(sub, text), missing
 
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""

@@ -24,7 +24,7 @@ import hashlib
 import json
 import threading
 from collections import OrderedDict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import normalizer
 
@@ -67,11 +67,17 @@ class DiagnosisHasher:
         return normalizer.stable_hash({"settings": settings, "context": context})
 
     def hashes(self, messages: List[Any], now: float) -> List[str]:
+        return self.normalized(messages, now)[0]
+
+    def normalized(self, messages: List[Any], now: float) -> Tuple[List[str], List[Any]]:
+        """The diagnosis hashes and the normalized messages they are hashes of."""
         norm = normalizer.Normalizer(now, keep_ips=False)
-        out = []
+        hashes, walked = [], []
         for message in messages:
             raw = json.dumps(message, sort_keys=True, ensure_ascii=False)
             norm.now = self._first_seen(raw, now)
             norm.keep_ips = norm.keep_ips or normalizer.CIDR_RE.search(raw) is not None
-            out.append(normalizer.stable_hash(norm.walk(message))[: normalizer.MESSAGE_HASH_HEX_CHARS])
-        return out
+            value = norm.walk(message)
+            walked.append(value)
+            hashes.append(normalizer.stable_hash(value)[: normalizer.MESSAGE_HASH_HEX_CHARS])
+        return hashes, walked

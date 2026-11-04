@@ -1,8 +1,12 @@
-"""Shadow-mode inference replay proxy: logs what replay would have keyed on, replays nothing.
+"""Inference replay proxy for evals: shadow (default), record and replay modes.
 
 Sits in front of LiteLLM (examples/inference-replay/eval-design.md, Rollout
-step 1). Every request is forwarded upstream with its body unchanged and every
-response is streamed back unchanged; no saved answer is ever served. For each
+steps 1 and 2). In shadow and record mode every request is forwarded upstream
+with its body unchanged and every response is streamed back unchanged; no saved
+answer is ever served. Record mode also saves each storable answer under its
+fingerprint (replay_cache.py). Replay mode serves a saved answer on a hit,
+restored with the current request's values, and forwards live on a miss; it
+refuses to start unless REPLAY_ALLOW_SERVE=yes. For each
 `/v1/chat/completions` request, once the response has gone back to the
 client, the proxy:
 
@@ -33,16 +37,18 @@ import http.client
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import diagnosis
 import normalizer
+import replay_cache
 import request_store
 import schema as F
 
@@ -81,6 +87,23 @@ DEFAULT_UPSTREAM_PORT = 80
 # cut real turns off. This bounds each socket read, not the whole response.
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 1800
 DEFAULT_STORE_DIR = "/data/shadow"
+DEFAULT_CACHE_DIR = "/data/replay-cache"
+# The only value of REPLAY_ALLOW_SERVE that lets replay mode start.
+ALLOW_SERVE_VALUE = "yes"
+EXIT_BAD_CONFIG = 2
+SERVED_HEADER = "X-Replay-Served"
+SERVED_HEADER_VALUE = "true"
+EVENT_STREAM_CONTENT_TYPE = "text/event-stream"
+# A replay miss's snippets: characters kept before the first difference, and
+# the most kept on each side.
+MISS_CONTEXT_CHARS = 40
+MISS_SNIPPET_CHARS = 160
+# The narrower windows a miss signature is built from, digit and hex runs collapsed.
+SIGNATURE_BEFORE_CHARS = 16
+SIGNATURE_AFTER_CHARS = 32
+SIGNATURE_COLLAPSE_RE = re.compile(r"[0-9a-f]{6,}|\d+")
+SIGNATURE_DIGITS = "#"
+SIGNATURE_SEPARATOR = " -> "
 DEFAULT_REDACTOR_PATH = "/app/scrubbers/redactor.py"
 DEFAULT_TRANSCRIPT_RULES_PATH = "/app/scrubbers/worker_transcript.py"
 UNSET = ""
@@ -141,6 +164,10 @@ class Config:
     job_project: str = UNSET
     job_build: str = UNSET
     job_pr: str = UNSET
+    mode: str = F.MODE_SHADOW
+    cache_dir: str = DEFAULT_CACHE_DIR
+    # Replay mode refuses to start unless this is set (REPLAY_ALLOW_SERVE=yes).
+    allow_serve: bool = False
 
     @classmethod
     def from_env(cls, env: Dict[str, str]) -> "Config":
@@ -158,6 +185,9 @@ class Config:
             job_project=env.get("REPLAY_JOB_PROJECT", UNSET),
             job_build=env.get("REPLAY_JOB_BUILD", UNSET),
             job_pr=env.get("REPLAY_JOB_PR", UNSET),
+            mode=env.get("REPLAY_MODE", F.MODE_SHADOW),
+            cache_dir=env.get("REPLAY_CACHE_DIR", DEFAULT_CACHE_DIR),
+            allow_serve=env.get("REPLAY_ALLOW_SERVE", UNSET) == ALLOW_SERVE_VALUE,
         )
 
 
@@ -173,6 +203,8 @@ class Metrics:
         "store_skipped": "replay_shadow_requests_store_skipped_total",
         "prompt_tokens": "replay_shadow_prompt_tokens_total",
         "analysis_dropped": "replay_shadow_analysis_dropped_total",
+        "served": "replay_shadow_served_total",
+        "recorded": "replay_shadow_recorded_total",
     }
 
     def __init__(self, scrubbers_loaded: bool):
@@ -257,6 +289,7 @@ class ResponseObserver:
         self.body = bytearray()
         self.message: Dict[str, Any] = {}
         self.usage: Optional[Dict[str, Any]] = None
+        self.finish_reason: Optional[str] = None
 
     def feed(self, data: bytes) -> None:
         self.seen += len(data)
@@ -296,6 +329,8 @@ class ResponseObserver:
         for choice in choices:
             if isinstance(choice, dict):
                 merge_delta(self.message, choice.get("delta") or {})
+                if choice.get("finish_reason"):
+                    self.finish_reason = choice["finish_reason"]
 
     def finish(self) -> None:
         if self.streaming:
@@ -311,6 +346,7 @@ class ResponseObserver:
         choices = out.get("choices") or []
         if choices and isinstance(choices[0], dict):
             self.message = choices[0].get("message") or {}
+            self.finish_reason = choices[0].get("finish_reason")
 
 
 def usage_tokens(usage: Optional[Dict[str, Any]]) -> Dict[str, Optional[int]]:
@@ -388,6 +424,23 @@ def unstorable_reasons(
     return reasons
 
 
+def diff_snippets(saved: Optional[str], current: str) -> Dict[str, Any]:
+    """Short windows of two normalized messages around their first difference, and a signature."""
+    other = saved or ""
+    first = next((i for i, (a, b) in enumerate(zip(other, current)) if a != b), min(len(other), len(current)))
+    start = max(0, first - MISS_CONTEXT_CHARS)
+
+    def narrow(text: str) -> str:
+        window = text[max(0, first - SIGNATURE_BEFORE_CHARS): first + SIGNATURE_AFTER_CHARS]
+        return SIGNATURE_COLLAPSE_RE.sub(SIGNATURE_DIGITS, window)
+
+    return {
+        F.MISS_SAVED_SNIPPET: saved[start: start + MISS_SNIPPET_CHARS] if saved is not None else None,
+        F.MISS_CURRENT_SNIPPET: current[start: start + MISS_SNIPPET_CHARS],
+        F.MISS_SIGNATURE: narrow(other) + SIGNATURE_SEPARATOR + narrow(current),
+    }
+
+
 # Tells the analysis worker to stop.
 _STOP = object()
 
@@ -396,7 +449,18 @@ class ShadowProxy:
     """Shared state for the handlers: configuration, scrubbers, store, metrics."""
 
     def __init__(self, config: Config, out=None):
+        if config.mode not in F.MODES:
+            raise ValueError(f"REPLAY_MODE must be one of {', '.join(F.MODES)}, not {config.mode!r}")
+        if config.mode == F.MODE_REPLAY and not config.allow_serve:
+            raise ValueError(
+                "replay mode serves saved answers instead of calling the model; "
+                f"it starts only with REPLAY_ALLOW_SERVE={ALLOW_SERVE_VALUE}"
+            )
         self.config = config
+        self.cache = replay_cache.AnswerCache(config.cache_dir) if config.mode != F.MODE_SHADOW else None
+        # Replay reads a cache another job recorded; its index is built once, at start.
+        self.index = replay_cache.PrefixIndex(self.cache.entries()) if config.mode == F.MODE_REPLAY else None
+        self.index_empty = not (self.index and self.index.by_prefix)
         self.key_context = normalizer.KeyContext(config.litellm_config_checksum, config.litellm_image)
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
         self.store = request_store.RequestStore(config.store_dir, self.scrubber)
@@ -408,10 +472,25 @@ class ShadowProxy:
         self._worker = threading.Thread(target=self._work, name="replay-shadow-analysis", daemon=True)
         self._worker.start()
 
-    def submit(self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int) -> None:
+    def lookup(self, body: Dict[str, Any], received: float) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], str]]:
+        """Replay mode: (restored answer, saved entry, fingerprint) on a servable hit, else None."""
+        normalized = normalizer.normalize_request(body, received)
+        fingerprint = normalizer.fingerprint(normalized, self.key_context)
+        entry = self.cache.load(fingerprint)
+        if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
+            return None
+        answer, missing = replay_cache.restore_answer(entry[replay_cache.ENTRY_ANSWER], normalized.mapping)
+        if missing:
+            return None  # the answer names a value this request does not bind
+        return answer, entry, fingerprint
+
+    def submit(
+        self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int,
+        served: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Queue one request's analysis; never waits. A full queue drops it and logs that."""
         try:
-            self._queue.put_nowait((body, received, upstream, request_bytes))
+            self._queue.put_nowait((body, received, upstream, request_bytes, served))
         except queue.Full:
             self.metrics.add("analysis_dropped")
             self.log({F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
@@ -432,10 +511,10 @@ class ShadowProxy:
             if item is _STOP:
                 self._queue.task_done()
                 return
-            body, received, upstream, request_bytes = item
+            body, received, upstream, request_bytes, served = item
             try:
                 try:
-                    entry = self.analyze(body, received, upstream, request_bytes)
+                    entry = self.analyze(body, received, upstream, request_bytes, served)
                 except Exception as exc:  # one bad request never stops the worker
                     self.metrics.add("analysis_errors")
                     # The type name only: an exception's message can quote request text.
@@ -446,6 +525,68 @@ class ShadowProxy:
                 self.metrics.add("analysis_errors")
             finally:
                 self._queue.task_done()
+
+    def _scrubbed_message(self, walked: Any) -> Optional[str]:
+        """A normalized message as scrubbed text, or None when it cannot be scrubbed."""
+        if not self.scrubber.available:
+            return None
+        try:
+            return self.scrubber.text(request_store.KIND_TOOL_RESULT, json.dumps(walked, sort_keys=True, ensure_ascii=False))
+        except Exception:
+            return None
+
+    def record(
+        self, entry: Dict[str, Any], upstream: Dict[str, Any], mapping: normalizer.Mapping,
+        diag_walked: List[Any], received: float,
+    ) -> bool:
+        """Record mode: save a storable answer under its fingerprint; True when this call saved it."""
+        if entry[F.UNSTORABLE]:
+            return False
+        saved = self.cache.save(entry[F.FINGERPRINT], {
+            replay_cache.ENTRY_FINGERPRINT: entry[F.FINGERPRINT],
+            replay_cache.ENTRY_ANSWER: replay_cache.normalize_answer(upstream["message"], mapping),
+            replay_cache.ENTRY_FINISH_REASON: upstream.get("finish_reason"),
+            replay_cache.ENTRY_USAGE: upstream["usage"],
+            replay_cache.ENTRY_MESSAGE_HASHES: entry[F.MESSAGE_HASHES],
+            replay_cache.ENTRY_DIAG_MESSAGE_HASHES: entry[F.DIAG_MESSAGE_HASHES],
+            replay_cache.ENTRY_DIAG_SETTINGS_HASH: entry[F.DIAG_SETTINGS_HASH],
+            replay_cache.ENTRY_RECORDED_BY: entry[F.JOB],
+            replay_cache.ENTRY_RECORDED_AT: received,
+            replay_cache.ENTRY_NORMALIZER_VERSION: self.key_context.normalizer_version,
+        })
+        # Each distinct message once, normalized and scrubbed, for a later miss's snippet.
+        for message_hash, walked in zip(entry[F.DIAG_MESSAGE_HASHES], diag_walked):
+            text = self._scrubbed_message(walked)
+            if text is not None:
+                self.cache.save_message(message_hash, text)
+        if saved:
+            self.metrics.add("recorded")
+        return saved
+
+    def miss_block(self, entry: Dict[str, Any], diag_walked: List[Any]) -> Dict[str, Any]:
+        """Replay mode, on a miss: the closest saved request and where this one first differs."""
+        if self.index_empty:
+            return {F.MISS_ROLE: F.MISS_ROLE_NO_CACHE}
+        hashes = entry[F.DIAG_MESSAGE_HASHES]
+        closest, matched = self.index.closest(entry[F.DIAG_SETTINGS_HASH], hashes)
+        if closest is None:
+            return {F.MISS_ROLE: F.MISS_ROLE_SETTINGS, F.MISS_MATCHED_MESSAGES: 0}
+        block: Dict[str, Any] = {
+            F.MISS_CLOSEST_FINGERPRINT: closest.get(replay_cache.ENTRY_FINGERPRINT),
+            F.MISS_MATCHED_MESSAGES: matched,
+        }
+        if matched >= len(hashes):
+            block[F.MISS_ROLE] = F.MISS_ROLE_NONE
+            return block
+        roles = entry[F.ROLES]
+        block[F.MISS_INDEX] = matched
+        block[F.MISS_ROLE] = roles[matched] if matched < len(roles) else ""
+        current = self._scrubbed_message(diag_walked[matched])
+        saved_hashes = closest.get(replay_cache.ENTRY_DIAG_MESSAGE_HASHES) or []
+        saved = self.cache.load_message(saved_hashes[matched]) if matched < len(saved_hashes) else None
+        if current is not None:
+            block.update(diff_snippets(saved, current))
+        return block
 
     def log(self, entry: Dict[str, Any]) -> None:
         line = json.dumps(entry, sort_keys=True, separators=(",", ":"))
@@ -471,10 +612,12 @@ class ShadowProxy:
             F.LITELLM_IMAGE: self.config.litellm_image,
             F.SCRUBBERS_LOADED: self.scrubber.available,
             F.SCRUBBERS_ERROR: self.scrubber.error,
+            F.MODE: self.config.mode,
         }
 
     def analyze(
-        self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int = 0
+        self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int = 0,
+        served: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """The log line for one completed chat request; stores its scrubbed text as a side effect."""
         request_id = uuid.uuid4().hex
@@ -496,7 +639,11 @@ class ShadowProxy:
             F.OBSERVE_FAILED: upstream["observe_failed"],
             F.LITELLM_MODEL_GROUP: upstream["headers"].get(MODEL_GROUP_HEADER),
             F.LITELLM_ATTEMPTED_FALLBACKS: upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
+            F.MODE: self.config.mode,
+            F.SERVED: served is not None,
         }
+        if served is not None:
+            entry[F.SERVED_FROM] = served.get(replay_cache.ENTRY_RECORDED_BY)
         entry.update(usage_tokens(upstream["usage"]))
         entry[F.TOKENS_ESTIMATED] = entry[F.PROMPT_TOKENS] is None
         if entry[F.TOKENS_ESTIMATED]:
@@ -521,8 +668,13 @@ class ShadowProxy:
         # eval-only bucket, never to Prow artifacts.
         entry[F.MESSAGE_HASHES] = normalized.message_hashes
         messages = body.get(request_store.MESSAGES_KEY)
-        entry[F.DIAG_MESSAGE_HASHES] = self.diagnosis.hashes(messages if isinstance(messages, list) else [], received)
+        diag_hashes, diag_walked = self.diagnosis.normalized(messages if isinstance(messages, list) else [], received)
+        entry[F.DIAG_MESSAGE_HASHES] = diag_hashes
         entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
+        if self.config.mode == F.MODE_RECORD:
+            entry[F.RECORDED] = self.record(entry, upstream, normalized.mapping, diag_walked, received)
+        if self.config.mode == F.MODE_REPLAY and served is None:
+            entry[F.MISS] = self.miss_block(entry, diag_walked)
         entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
         skipped = self.store.store(request_id, fingerprint, body)
         entry[F.STORED] = skipped is None
@@ -612,6 +764,18 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, RecursionError):
                 body = None
         received = time.time()
+        if body is not None and self.proxy.config.mode == F.MODE_REPLAY:
+            try:
+                hit = self.proxy.lookup(body, received)
+            except Exception:  # a cache that cannot be read is a miss, never a failed request
+                self.proxy.metrics.add("analysis_errors")
+                hit = None
+            if hit is not None:
+                self.proxy.metrics.add("completions")
+                self.proxy.metrics.add("served")
+                upstream = self._serve(body, *hit)
+                self.proxy.submit(body, received, upstream, len(raw), served=hit[1])
+                return
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))
         if body is None:
             return
@@ -698,6 +862,39 @@ class Handler(BaseHTTPRequestHandler):
         if observer is not None and resp.status == HTTP_OK and not cut_short:
             result["usage"] = observer.usage if isinstance(observer.usage, dict) else None
             result["message"] = observer.message if isinstance(observer.message, dict) else {}
+            result["finish_reason"] = observer.finish_reason
+        return result
+
+    def _serve(self, body: Dict[str, Any], answer: Dict[str, Any], entry: Dict[str, Any], fingerprint: str) -> Dict[str, Any]:
+        """Replay mode: answer from the cache, streamed or not as the request asked. The model is not called."""
+        started = time.monotonic()
+        model = str(body.get(F.MODEL) or "")
+        result: Dict[str, Any] = {"status": HTTP_OK, "headers": {}, "usage": entry.get(replay_cache.ENTRY_USAGE),
+                                  "message": answer, "finish_reason": entry.get(replay_cache.ENTRY_FINISH_REASON),
+                                  "latency_ms": None, "client_disconnected": False, "upstream_incomplete": False,
+                                  "observe_failed": False, "observe_too_large": False}
+        try:
+            self.send_response(HTTP_OK)
+            self.send_header(SERVED_HEADER, SERVED_HEADER_VALUE)
+            if body.get(F.STREAM):
+                self.send_header(CONTENT_TYPE_HEADER, EVENT_STREAM_CONTENT_TYPE)
+                self.send_header(TRANSFER_ENCODING_HEADER, CHUNKED)
+                self.end_headers()
+                for event in replay_cache.stream_events(answer, entry, model, fingerprint) + [b""]:
+                    if not self._send_client(True, event):
+                        result["client_disconnected"] = True
+                        break
+            else:
+                payload = replay_cache.completion_body(answer, entry, model, fingerprint)
+                self.send_header(CONTENT_TYPE_HEADER, JSON_CONTENT_TYPE)
+                self.send_header(CONTENT_LENGTH_HEADER, str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                self.wfile.flush()
+        except OSError:
+            self.close_connection = True
+            result["client_disconnected"] = True
+        result["latency_ms"] = int((time.monotonic() - started) * MS_PER_SECOND)
         return result
 
     def _observe(self, observer: "ResponseObserver", result: Dict[str, Any], data: Optional[bytes]):
@@ -759,7 +956,11 @@ def make_server(config: Config, host: str = DEFAULT_BIND_HOST, out=None) -> Thre
 
 def main() -> None:
     config = Config.from_env(dict(os.environ))
-    server = make_server(config)
+    try:
+        server = make_server(config)
+    except ValueError as exc:
+        print(f"replay proxy: {exc}", file=sys.stderr)
+        sys.exit(EXIT_BAD_CONFIG)
     proxy = server.proxy  # type: ignore[attr-defined]
     proxy.log(proxy.startup_line())
     server.serve_forever()

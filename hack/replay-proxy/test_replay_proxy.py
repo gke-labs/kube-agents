@@ -178,6 +178,30 @@ class ProxyTestCase(unittest.TestCase):
     redactor_path = REDACTOR
     upstream_timeout = replay_proxy.DEFAULT_UPSTREAM_TIMEOUT_SECONDS
     store_is_file = False
+    mode = "shadow"
+    allow_serve = False
+
+    def config(self, **overrides):
+        values = dict(
+            listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
+            store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
+            upstream_timeout_seconds=self.upstream_timeout,
+            litellm_config_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
+            job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
+            mode=self.mode, cache_dir=self.cache_dir, allow_serve=self.allow_serve,
+        )
+        values.update(overrides)
+        return replay_proxy.Config(**values)
+
+    def start_proxy(self, **overrides):
+        """Another proxy on the same upstream; returns (proxy, port, output)."""
+        out = io.StringIO()
+        server = replay_proxy.make_server(self.config(**overrides), host="127.0.0.1", out=out)
+        self.addCleanup(server.proxy.close)
+        threading.Thread(target=server.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.proxy, server.server_address[1], out
 
     def setUp(self):
         FakeLiteLLM.calls = []
@@ -194,15 +218,9 @@ class ProxyTestCase(unittest.TestCase):
             self.store = os.path.join(temp, "a-file")  # no directory can be made under a file
             with open(self.store, "w"):
                 pass
+        self.cache_dir = os.path.join(temp, "cache")
         self.out = io.StringIO()
-        config = replay_proxy.Config(
-            listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
-            store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
-            upstream_timeout_seconds=self.upstream_timeout,
-            litellm_config_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
-            job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
-        )
-        self.server = replay_proxy.make_server(config, host="127.0.0.1", out=self.out)
+        self.server = replay_proxy.make_server(self.config(), host="127.0.0.1", out=self.out)
         self.proxy = self.server.proxy
         # Registered first, so it runs last: after a test's own cleanups have
         # released anything holding the worker.
@@ -216,8 +234,8 @@ class ProxyTestCase(unittest.TestCase):
         self.server.server_close()
         self.upstream.server_close()
 
-    def request(self, method, path, body=None):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=LOG_WAIT_SECONDS)
+    def request(self, method, path, body=None, port=None):
+        conn = http.client.HTTPConnection("127.0.0.1", port or self.port, timeout=LOG_WAIT_SECONDS)
         data = json.dumps(body).encode() if isinstance(body, dict) else body
         conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
         resp = conn.getresponse()
@@ -229,14 +247,15 @@ class ProxyTestCase(unittest.TestCase):
         conn.close()
         return resp.status, headers, payload
 
-    def lines(self, count):
+    def lines(self, count, out=None):
+        out = out or self.out
         deadline = time.monotonic() + LOG_WAIT_SECONDS
         while time.monotonic() < deadline:
-            lines = [json.loads(l) for l in self.out.getvalue().splitlines() if l]
+            lines = [json.loads(l) for l in out.getvalue().splitlines() if l]
             if len(lines) >= count:
                 return lines
             time.sleep(POLL_SECONDS)
-        self.fail(f"expected {count} log lines, got: {self.out.getvalue()!r}")
+        self.fail(f"expected {count} log lines, got: {out.getvalue()!r}")
 
 
 class PassThroughTest(ProxyTestCase):
