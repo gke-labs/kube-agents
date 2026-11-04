@@ -289,9 +289,12 @@ is a ceiling rather than the only bound (#4615): before each proposal's step-2 r
 consults the quota the forge last reported in its response headers (GitHub's `core`
 `x-ratelimit-*`, GitLab's `ratelimit-*`; Gitea and Bitbucket report none this code reads, and the
 budget alone applies there). At or under `VCS_READINGS_QUOTA_FLOOR` (300) or a tenth of the
-reported limit, whichever is larger, step 2 stops for that forge host until the reported reset,
-and each repository it leaves unread records `reason="quota_floor"`; a rate-limited step-2 call
-whose answer reports the quota spent pauses the host the same way. The details reading is taken only
+reported limit, whichever is larger, step 2 stops until the reported reset for every repository
+that spends that quota, and each repository it leaves unread records `reason="quota_floor"`; a
+rate-limited step-2 call whose answer reports the quota spent pauses the quota the same way. On
+GitHub a quota is one owner's on one host, since the sweep token is minted per owner from that
+owner's App installation, so one owner's drained quota pauses no other owner's reads; on GitLab it
+is the whole host, which one static token reads. The details reading is taken only
 once every listed proposal is current in the cache; until then its series keep their previous
 values, or stay absent after a restart, with `reason="warming"` on the failure counter, while
 the outcomes reading is taken from the first complete listing. The cache's eviction rule is one
