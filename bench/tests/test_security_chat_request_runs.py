@@ -149,6 +149,9 @@ def test_collector_run_is_credited(command):
         f"python3 {COLLECT} compliance-audit > out.json &",
         # Inverted exit via ! or detaching wrappers are not credited under succeeded: true.
         f"time ! {COLLECT} compliance-audit",
+        f"time python3 {COLLECT} compliance-audit",
+        f"time -p python3 {COLLECT} compliance-audit",
+        f"/usr/bin/time python3 {COLLECT} compliance-audit",
         f"! (python3 {COLLECT} compliance-audit)",
         f"! cat scope.json | python3 {COLLECT} compliance-audit",
         f"! cat scope.json |& python3 {COLLECT} compliance-audit",
