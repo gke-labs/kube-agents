@@ -43,8 +43,11 @@ In this order, the first that applies:
    the card the worker runs, as ``creator_task_id``; an auto-decomposed child
    passes its root. The child gets that card's stamp, or none when it has none.
 2. **A trusted writer's stamp ticket** (:func:`writer_ticket`). See below.
-3. **The creating turn's origin** (:func:`turn_origin`): a tick-started cron
-   run's context (``tools.cron_run_scope.current_cron_origin``, when that
+3. **The creating turn's origin** (:func:`turn_origin`): for a dispatcher
+   worker, the stamp of the card it runs (``HERMES_KANBAN_TASK``), read from
+   the board on every call and never memoised, since one process can serve
+   more than one card; an unstamped card falls through to the rest. Then a
+   tick-started cron run's context (``tools.cron_run_scope.current_cron_origin``, when that
    Hermes has it); else the session record of the turn's trusted session id
    (``kanban_priority.trusted_origin_session``), read from the Session KV
    server's ``GET /v1/sessions/{id}/origin``, which follows a session id that
@@ -181,6 +184,9 @@ ORIGIN_CACHE_TTL_SECONDS = 30
 #: Minting and redeeming a ticket each wait at most this long, on loopback.
 STAMP_TICKET_TIMEOUT_SECONDS = 2.0
 
+#: The card a dispatcher-spawned worker runs, as the dispatcher sets it.
+WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
+
 #: Where Hermes installs the patched modules this one reads, and the name a
 #: test loads them under.
 CRON_SCOPE_MODULES = ("tools.cron_run_scope", "cron_run_scope")
@@ -249,6 +255,23 @@ def _first_module(names: tuple[str, ...]) -> Any:
         except ImportError:
             continue
     return None
+
+
+def card_origin() -> Optional[tuple[str, str]]:
+    """The stamp of the card this process runs as a dispatcher worker; None outside one or unstamped.
+
+    Read from the board the worker already opens (``connect_closing``) on every
+    call, so a process that runs a second card never reads the first one's
+    stamp. Raises when the board cannot be read; :func:`turn_origin` guards it.
+    """
+    task_id = os.environ.get(WORKER_TASK_ENV, "").strip()
+    if not task_id:
+        return None
+    from hermes_cli.kanban_db_connect import connect_closing
+
+    with connect_closing() as conn:
+        found = tuple(origin_of(conn, task_id))
+    return None if found == NO_ORIGIN else found
 
 
 def _cron_origin() -> Optional[tuple[str, str]]:
@@ -336,11 +359,15 @@ def _cached_record_origin(session_id: str) -> Optional[tuple[str, str]]:
 def turn_origin() -> tuple[str, str]:
     """The creating turn's ``(origin, platform)``; ``("other", "")`` when unresolved.
 
-    The cron run's context; else the session record for the trusted session id
+    The worker's card stamp (:func:`card_origin`, never memoised); else the
+    cron run's context; else the session record for the trusted session id
     (memoised per session id, :func:`_cached_record_origin`); else ``console``
     by the console id convention; else ``other``. Never raises.
     Each step is guarded on its own, so a failure in one never skips the next.
     """
+    card = _step(card_origin, None, "the worker's card")
+    if card:
+        return card
     cron = _step(_cron_origin, None, "the cron run's origin")
     if cron:
         return cron

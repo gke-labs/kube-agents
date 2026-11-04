@@ -349,33 +349,17 @@ def _first_module(names):
     return None
 
 
-def _card_stamp(origins, task_id):
-    """The card's ``(origin, platform)`` stamp from the board, ``NO_ORIGIN`` when it has none."""
-    from hermes_cli.kanban_db_connect import connect_closing
-
-    with connect_closing() as conn:
-        return tuple(origins.origin_of(conn, task_id))
-
-
 def resolve_origin():
     """This process's ``(origin, platform)``; ``("other", "")`` when nothing resolves one. Never raises.
 
-    The card's stamp, for a worker; then ``kanban_origin.turn_origin``, which
-    reads the tick-started run's context, then the session record for the
-    trusted Hermes session id, then the console id convention on that id.
+    ``kanban_origin.turn_origin``, the one resolver the board and the cron
+    patches share: the worker's card stamp, then the tick-started run's
+    context, then the session record for the trusted Hermes session id, then
+    the console id convention on that id.
     """
     origins = _first_module(KANBAN_ORIGIN_MODULES)
     if origins is None:
         return NO_ORIGIN
-    task_id = os.environ.get(TASK_ENV, "").strip()
-    if task_id:
-        try:
-            stamped = _card_stamp(origins, task_id)
-        except Exception as exc:  # noqa: BLE001 — an unreadable board is no stamp
-            logger.warning("pr_opened: card %s's origin is unreadable: %r", task_id, exc)
-            stamped = NO_ORIGIN
-        if stamped and stamped[0] != NO_ORIGIN[0]:
-            return stamped
     try:
         found = origins.turn_origin()
         return tuple(found) if found else NO_ORIGIN

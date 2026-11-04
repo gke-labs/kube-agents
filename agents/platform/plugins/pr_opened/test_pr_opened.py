@@ -165,7 +165,7 @@ class PrOpenedTest(unittest.TestCase):
         broker = _Broker()
         origins = types.ModuleType("kanban_origin")
         origins.origin_of = lambda conn, task_id: ("audit", "")
-        origins.turn_origin = lambda: ("chat", "slack")
+        origins.turn_origin = lambda: ("audit", "") if os.environ.get(plugin.TASK_ENV) else ("chat", "slack")
         self.run_hook(broker.line(), _Kanban(), broker=broker, origins=origins)
         self.assertEqual(self.ledger, [("/v1/proposals/opened", {"url": URL, "origin": "audit", "platform": ""})])
         self.ledger.clear()

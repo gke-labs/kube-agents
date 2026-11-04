@@ -154,7 +154,7 @@ def run_origin(job: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def _turn_origin() -> tuple[str, str]:
-    """The creating turn's origin (``kanban_origin.turn_origin``), or ``other`` without it."""
+    """The creating turn's origin (``kanban_origin.turn_origin``, a worker's card first), or ``other`` without it."""
     for name in KANBAN_ORIGIN_MODULES:
         try:
             return importlib.import_module(name).turn_origin()

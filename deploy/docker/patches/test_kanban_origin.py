@@ -14,6 +14,7 @@ Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_kanban_origi
 from __future__ import annotations
 
 import ast
+import contextlib
 import json
 import os
 import re
@@ -576,6 +577,69 @@ class ContractTest(Hermes):
     def test_a_stamp_outside_the_vocabulary_is_refused(self):
         with self.conn() as conn, self.assertRaises(ValueError):
             self.ko.stamp(conn, "t_x", "eval")
+
+
+class WorkerCardTest(unittest.TestCase):
+    """A dispatcher worker's turn resolves as its card's stamp, read from the board every call."""
+
+    def setUp(self):
+        kanban_origin._ORIGIN_CACHE.clear()
+        self.addCleanup(kanban_origin._ORIGIN_CACHE.clear)
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        self.board = root / "kanban.db"
+        with closing(sqlite3.connect(self.board)) as conn:
+            kanban_origin.stamp(conn, "t_slack", "chat", "slack")
+            kanban_origin.stamp(conn, "t_drift", "drift", "")
+            conn.commit()
+        board_path = self.board
+        connect = SimpleNamespace()
+
+        @contextlib.contextmanager
+        def connect_closing(db_path=None, *, board=None):
+            with closing(sqlite3.connect(board_path)) as conn:
+                yield conn
+
+        connect.connect_closing = connect_closing
+        package = SimpleNamespace(kanban_db_connect=connect)
+        for patcher in (
+            mock.patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db_connect": connect}),
+            mock.patch.object(kanban_origin, "_session_id", return_value=CHAT_SESSION),
+            mock.patch.object(kanban_origin, "_cron_origin", return_value=("scheduled", "")),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.fetch = mock.patch.object(kanban_origin, "_fetch_session_origin", return_value={"origin": "api"}).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def worker(self, task_id):
+        return mock.patch.dict(os.environ, {kanban_origin.WORKER_TASK_ENV: task_id})
+
+    def test_the_card_comes_first_and_an_unstamped_card_falls_through(self):
+        with self.worker("t_slack"):
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", "slack"), "the card beats the run and the record")
+        with self.worker("t_unstamped"):
+            self.assertEqual(kanban_origin.turn_origin(), ("scheduled", ""), "an unstamped card is the turn's own")
+        with self.worker(""):
+            self.assertEqual(kanban_origin.turn_origin(), ("scheduled", ""), "not a worker")
+
+    def test_two_cards_in_one_process_each_read_their_own_stamp(self):
+        kanban_origin._cron_origin.return_value = None
+        with self.worker("t_slack"):
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", "slack"))
+        with self.worker("t_drift"):
+            self.assertEqual(kanban_origin.turn_origin(), ("drift", ""))
+        with self.worker("t_slack"):
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", "slack"))
+        with self.worker("t_unstamped"):
+            self.assertEqual(kanban_origin.turn_origin(), ("api", ""), "the session record, below the card")
+        self.assertEqual(self.fetch.call_count, 1, "the card step never fills or reads the session cache")
+
+    def test_an_unreadable_board_falls_through_and_is_logged(self):
+        sys.modules["hermes_cli.kanban_db_connect"].connect_closing = mock.Mock(side_effect=sqlite3.OperationalError("locked"))
+        with self.worker("t_slack"), self.assertLogs(kanban_origin.logger, "WARNING") as logs:
+            self.assertEqual(kanban_origin.turn_origin(), ("scheduled", ""))
+        self.assertIn("the worker's card", "\n".join(logs.output))
 
 
 class SessionRecordTest(unittest.TestCase):

@@ -213,8 +213,9 @@ def cron_direct_origin_scope(origin: tuple) -> Iterator[None]:
 def direct_run_origin() -> tuple:
     """The current turn's ``(origin, platform)``, or ``("other", "")``. Never raises.
 
-    ``kanban_origin.turn_origin``: a cron run's origin when this turn is one,
-    else the trusted session's record, else the console id convention.
+    ``kanban_origin.turn_origin``: a kanban worker's card stamp, else a cron
+    run's origin when this turn is one, else the trusted session's record,
+    else the console id convention.
     """
     for name in KANBAN_ORIGIN_MODULES:
         try:

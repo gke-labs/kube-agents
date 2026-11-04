@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import sqlite3
+import sys
 import tempfile
 import threading
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -193,6 +197,38 @@ class RunOriginTest(unittest.TestCase):
         with mock.patch.object(cron_job_template, "SESSION_KV_URL", "http://127.0.0.1:9"):
             self.assertEqual(cron_job_template.run_origin(job), ("other", ""))
             self.assertFalse(self._record_as("a1b2c3", ("chat", "slack")))
+
+
+    def test_a_job_a_kanban_worker_creates_records_its_cards_origin(self):
+        # A chat ask routed through a card: the worker's turn has no session
+        # record and no cron context, so only the card says where it came from.
+        import kanban_origin
+
+        board = self.tmp / "kanban.db"
+        with contextlib.closing(sqlite3.connect(board)) as conn:
+            kanban_origin.stamp(conn, "t_9c53a768", "chat", "slack")
+            conn.commit()
+
+        board_path = board
+
+        @contextlib.contextmanager
+        def connect_closing(db_path=None, *, board=None):
+            with contextlib.closing(sqlite3.connect(board_path)) as conn:
+                yield conn
+
+        connect = types.SimpleNamespace(connect_closing=connect_closing)
+        modules = {"hermes_cli": types.SimpleNamespace(kanban_db_connect=connect), "hermes_cli.kanban_db_connect": connect}
+        with mock.patch.dict(sys.modules, modules), \
+                mock.patch.object(kanban_origin, "_cron_origin", return_value=None), \
+                mock.patch.object(kanban_origin, "_session_id", return_value=""):
+            for task_id, job_id, want in (
+                ("t_9c53a768", "w-stamped", {"origin": "chat", "platform": "slack"}),
+                ("t_unstamped", "w-unstamped", {"origin": "other", "platform": ""}),
+                ("", "not-a-worker", {"origin": "other", "platform": ""}),
+            ):
+                with self.subTest(task=task_id), mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": task_id}):
+                    self.assertTrue(cron_job_template.record_job_origin(job_id))
+                    self.assertEqual(self.kv.records[job_id], want)
 
 
 class PinTest(unittest.TestCase):
