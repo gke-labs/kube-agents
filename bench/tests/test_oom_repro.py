@@ -98,7 +98,7 @@ def test_kills_reads_oomkilled_from_init_sidecars_and_containers():
     p = pod("gw", init=[{"name": "agent-api-auth", "restartCount": 1, "lastState": {"terminated": oom}}],
             containers=[{"name": "platform-agent", "restartCount": 0, "lastState": {}},
                         {"name": "fluent-bit", "restartCount": 2, "lastState": {"terminated": {"reason": "Error"}}}])
-    assert capture.kills(p) == [{"pod": "gw", "container": "agent-api-auth", "restarts": 1, "exit_code": 137,
+    assert capture.kills(p) == [{"pod": "gw", "uid": None, "container": "agent-api-auth", "restarts": 1, "exit_code": 137,
                                  "finished": "2026-11-03T18:04:12Z"}]
 
 
@@ -262,7 +262,7 @@ def test_restore_patch_puts_back_resources_and_runtime_class_or_removes_what_was
         {"op": "add", "path": "/spec/harness/experimental/shellSandbox/resources", "value": {"limits": {"memory": "8G"}}}]
 
 
-def test_proxy_watches_the_shell_by_default_and_sets_its_limits(tmp_path):
+def test_proxy_watches_the_shell_by_default(tmp_path):
     assert cli.parse(["--host-context", "c", "--out", str(tmp_path), "proxy"]).watch == "shell"
     selector, container, field, python = cli.WATCH_TARGETS["shell"]
     assert (selector, container, field) == ("app=platform-agent-shell", "shell", "shellSandbox")
@@ -409,6 +409,7 @@ def test_fleet_delete_only_takes_subnets_of_the_harness_shape(monkeypatch, tmp_p
 def test_quantity_reads_the_full_kubernetes_grammar():
     assert cli.quantity("2e9") == 2e9 and cli.quantity("1E3") == 1e3
     assert cli.quantity("1Pi") == 2**50 and cli.quantity("1E") == 1e18 and cli.quantity(".5") == 0.5
+    assert cli.quantity("500000u") == 0.5 and cli.quantity("5n") == 5e-9
 
 
 def test_process_class_uses_argv_so_spaced_arguments_stay_one_word():
@@ -425,6 +426,45 @@ def test_kubectl_class_skips_value_flags_and_reads_booleans_as_kubectl_does():
     assert capture.process_class("kubectl get pods --all-namespaces=F") == "kubectl get pods"
     assert capture.process_class("kubectl --timeout 30s get pods") == "kubectl get pods"
     assert capture.process_class("kubectl --weird") == "kubectl ?"
+    assert capture.process_class("kubectl get pods --show-kind -A") == "kubectl get pods -A"
+    assert capture.process_class("kubectl get --output-watch-events pods -A") == "kubectl get pods -A"
+
+
+def test_a_replaced_pod_with_the_same_name_has_its_kill_recorded(tmp_path):
+    oom = {"reason": "OOMKilled", "exitCode": 137, "finishedAt": "2026-11-03T18:04:12Z"}
+
+    def shell(uid):
+        p = pod("platform-agent-shell-0", containers=[{"name": "shell", "restartCount": 1,
+                                                        "lastState": {"terminated": oom}}])
+        p["metadata"]["uid"] = uid
+        return p
+
+    class Host:
+        listings = [[shell("old")], [shell("new")]]
+
+        def pods(self, selector):
+            return self.listings.pop(0)
+
+        def kubectl(self, *args, check=True):
+            recorder.stop.set()
+            return ""
+
+    recorder = cli.Recorder(Host(), tmp_path, "app=platform-agent-shell", "shell")
+    for p in Host.listings[0]:
+        for kill in capture.kills(p):
+            recorder.seen[(kill["pod"], kill["uid"])] = kill["restarts"]
+    Host.listings.pop(0)
+    recorder.poll()
+    assert [k["uid"] for k in recorder.events] == ["new"]
+
+
+def test_a_failed_lease_release_is_reported(monkeypatch, capsys):
+    import subprocess as sp
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k: sp.CompletedProcess(
+        argv, 1 if "release" in argv else 0, "", "not yours to release"))
+    with cli.lease(FakeHost(), "note"):
+        pass
+    assert "not yours to release" in capsys.readouterr().out
 
 
 def test_render_report_survives_a_sample_with_no_cgroup_figure():

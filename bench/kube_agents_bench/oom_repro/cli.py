@@ -166,7 +166,7 @@ ERROR_TAIL_CHARS = 600
 # Quantities, for comparing a request with a limit.
 # Kubernetes' quantity grammar: a decimal number with an optional exponent, then a suffix.
 QUANTITY = re.compile(r"^([+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)([A-Za-z]*)$")
-QUANTITY_SUFFIXES = {"": 1, "m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15, "E": 1e18,
+QUANTITY_SUFFIXES = {"": 1, "n": 1e-9, "u": 1e-6, "m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15, "E": 1e18,
                      "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40, "Pi": 2**50, "Ei": 2**60}
 # The repository's live-test lease (scripts/live_test_lease.py, docs/designs/live-test-lease.md).
 LEASE_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "live_test_lease.py"
@@ -598,7 +598,10 @@ def lease(host: Host, note: str):
             yield lost
         finally:
             stop.set()
-            call("release")
+            released = call("release")
+            if released.returncode:
+                print(f"could not release the live-test lease; it lapses within {LEASE_TTL_MINUTES} minutes: "
+                      f"{released.stdout}{released.stderr}", flush=True)
 
 
 class Recorder:
@@ -607,7 +610,8 @@ class Recorder:
     def __init__(self, host: Host, out: Path, selector: str, container: str, python: str = CONTAINER_PYTHON) -> None:
         self.host, self.out, self.selector, self.container, self.python = host, out, selector, container, python
         self.stop = threading.Event()
-        self.seen: dict[str, int] = {}
+        # Keyed by pod name and uid: a StatefulSet pod keeps its name across a rollout and restarts from 0.
+        self.seen: dict[tuple[str, str | None], int] = {}
         self.events: list[dict] = []
 
     def sample(self) -> None:
@@ -619,7 +623,7 @@ class Recorder:
                     proc = subprocess.Popen(["kubectl", "--context", self.host.context, "-n", self.host.namespace,
                                              "exec", pod, "-c", self.container, "--", self.python, "-u", "-c",
                                              capture.SAMPLER_SCRIPT], stdout=subprocess.PIPE,
-                                            stderr=subprocess.DEVNULL, text=True)
+                                            stderr=subprocess.PIPE, text=True)
                     with path.open("a") as f:
                         for line in proc.stdout:
                             try:
@@ -630,6 +634,9 @@ class Recorder:
                             if self.stop.is_set():
                                 proc.terminate()
                                 break
+                    if proc.wait() and not self.stop.is_set():
+                        print(f"sampler: exec exited {proc.returncode}: "
+                              f"{proc.stderr.read()[-ERROR_TAIL_CHARS:].strip()}; retrying", flush=True)
             except (SystemExit, OSError) as exc:
                 print(f"sampler: {exc}; retrying", flush=True)
             self.stop.wait(capture.SAMPLE_SECONDS)
@@ -638,9 +645,10 @@ class Recorder:
         while not self.stop.is_set():
             for pod in self.host.pods(self.selector):
                 for kill in capture.kills(pod):
-                    if kill["container"] != self.container or self.seen.get(kill["pod"]) == kill["restarts"]:
+                    key = (kill["pod"], kill["uid"])
+                    if kill["container"] != self.container or self.seen.get(key) == kill["restarts"]:
                         continue
-                    self.seen[kill["pod"]] = kill["restarts"]
+                    self.seen[key] = kill["restarts"]
                     log = self.host.kubectl("logs", kill["pod"], "-c", kill["container"], "--previous",
                                             "--timestamps", check=False)
                     (self.out / PREVIOUS_LOG_FILE.format(**kill)).write_text(log)
@@ -653,7 +661,7 @@ class Recorder:
         for pod in self.host.pods(self.selector):
             for kill in capture.kills(pod):
                 if kill["container"] == self.container:
-                    self.seen[kill["pod"]] = kill["restarts"]
+                    self.seen[(kill["pod"], kill["uid"])] = kill["restarts"]
         for target in (self.sample, self.poll):
             threading.Thread(target=target, daemon=True).start()
         return self

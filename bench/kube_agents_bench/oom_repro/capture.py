@@ -63,7 +63,7 @@ KUBECTL_VALUE_FLAGS = ("-n", "--namespace", "--context", "--kubeconfig", "-l", "
                        "--template", "--as", "--as-group", "--as-uid", "--cache-dir", "--certificate-authority",
                        "--client-certificate", "--client-key", "--tls-server-name", "--username", "--password",
                        "--profile", "--profile-output", "-v", "--v", "--raw", "--subresource", "--timeout", "--since",
-                       "--tail", "--max-log-requests", "--output-watch-events", "--show-kind")
+                       "--tail", "--max-log-requests")
 ALL_NAMESPACES_FLAGS = ("-A", "--all-namespaces")
 HERMES_EXECUTABLE = "/bin/hermes"
 # A Python process is named for the script it runs: collect.py, fleet_upgrade_report.py.
@@ -129,7 +129,8 @@ def kills(pod: dict) -> list[dict]:
     for s in statuses.get("containerStatuses", []) + statuses.get("initContainerStatuses", []):
         last = s.get("lastState", {}).get("terminated", {})
         if last.get("reason") == OOM_REASON:
-            out.append({"pod": pod["metadata"]["name"], "container": s["name"], "restarts": s.get("restartCount", 0),
+            out.append({"pod": pod["metadata"]["name"], "uid": pod["metadata"].get("uid"), "container": s["name"],
+                        "restarts": s.get("restartCount", 0),
                         "exit_code": last.get("exitCode"), "finished": last.get("finishedAt")})
     return out
 
