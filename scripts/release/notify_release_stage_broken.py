@@ -34,8 +34,9 @@ a row cut no staging tag and stall the release chain; that opens one
 `ci:release-stalled` issue with a row per night (the run, the candidate
 commit, the eval build the step-5 log links), adds a row each later RED
 night, and closes on the next run whose eval passed. A night that fails on a
-stage before the eval passes leaves it alone, and a `skip_promotion` night,
-which skips the eval, neither counts nor ends the streak.
+stage before the eval passes leaves it alone, and a night that skips the
+eval step (`skip_promotion`, or a hand-dispatched `skip_pipeline`) neither
+counts nor ends the streak.
 
 Two bounds on what a green run may close. A run being re-run leaves
 `status=completed`, so the newest run by number is read whatever its status,
@@ -110,7 +111,7 @@ from eval_dashboard.post_health import SPACE_ENV, TOKEN_ENV, Sender  # noqa: E40
 from github_api import is_refusal, log  # noqa: E402
 from notify_broken_main import FAILING_CONCLUSIONS, decide, newest_reporting_run, reporting_history  # noqa: E402
 from notify_flaky_check import GitHubAPI as FlakyGitHubAPI  # noqa: E402
-from poll_rc_eval_verdict import VERDICT_LINE_FORMAT, VERDICT_RED  # noqa: E402
+from poll_rc_eval_verdict import SETTLED_TRUE, VERDICT_LINE_FORMAT, VERDICT_RED  # noqa: E402
 
 # The release workflows, by the `name:` each declares, which is how the
 # Actions API lists them. `test_notify_release_stage_broken.py` holds this
@@ -316,6 +317,9 @@ NOT_CONFIGURED = "chat not configured: set CI_HEALTH_CHAT_SPACE and CI_HEALTH_CH
 # stage before the eval passes leaves it alone: the stage issue covers that
 # night.
 STALL_NIGHTS = 2
+# A week of skip nights is the most the walk looks past before it treats
+# the streak as broken; each one passed over costs a jobs read per sweep.
+STALL_SKIP_NIGHTS_MAX = 7
 STALL_LABEL = "ci:release-stalled"
 STALL_LABEL_COLOR = "b60205"
 STALL_LABEL_DESCRIPTION = "The release-candidate eval has rejected every candidate for several nights"
@@ -325,13 +329,13 @@ TRIAGE_LABEL = "needs-triage"
 STALL_MARKER = "<!-- release-stalled workflow={workflow_id} -->"
 STALL_STAMP = "<!-- release-stalled runs={run_ids} -->"
 _STALL_STAMP_RE = re.compile(r"<!-- release-stalled runs=((?:\d+(?::\d+)?(?:,\d+(?::\d+)?)*)?) -->")
-STALL_TITLE = "🔴 release chain stalled: the RC eval has rejected {n} candidates in a row"
+STALL_TITLE = "🔴 release chain stalled: the RC eval has returned RED {n} nights in a row"
 STALL_LEAD = "The promotion pipeline has cut no staging tag because the release-candidate eval verdict was RED on each of these nights."
 STALL_TABLE_HEADER = "| Night (UTC) | Promotion run | Candidate | Eval build |"
 STALL_TABLE_RULE = "| --- | --- | --- | --- |"
 STALL_ROW = "| {night} | {run} | {candidate} | {build} |"
 STALL_FOOTER = "The failing cases are in each eval build's verdict; this issue names the nights, not the cases."
-STALL_COMMENT = "Rejected again: {runs}. The RC eval has now rejected {n} candidates in a row."
+STALL_COMMENT = "Rejected again: {runs}. The RC eval has now returned RED {n} nights in a row."
 STALL_CLOSED_COMMENT = "{run} ({when}) passed the release-candidate eval; the release chain is moving again. Closing."
 CHAT_STALLED = STALL_TITLE + " — {url}"
 CHAT_MOVING = "✅ release chain moving again: run #{run_number} passed the gate — closed {url}"
@@ -345,12 +349,11 @@ ISSUE_URL = "https://github.com/{repo}/issues/{number}"
 # prints no link, and reads as unavailable.
 # The pattern is built from the poller's own format, so a change to the line
 # there changes what is read here.
-VERDICT_SETTLED = "true"
 _LINE_FIELD = "FIELDPLACEHOLDER"
 _LINE_FIELD_RE = r"(\S+)"
 _RED_VERDICT_LINE_RE = re.compile(
     "^"
-    + re.escape(VERDICT_LINE_FORMAT.format(verdict=VERDICT_RED, settled=VERDICT_SETTLED, build_id=_LINE_FIELD, url=_LINE_FIELD)).replace(_LINE_FIELD, _LINE_FIELD_RE)
+    + re.escape(VERDICT_LINE_FORMAT.format(verdict=VERDICT_RED, settled=SETTLED_TRUE, build_id=_LINE_FIELD, url=_LINE_FIELD)).replace(_LINE_FIELD, _LINE_FIELD_RE)
     + "$"
 )
 JOB_PASSED = "success"
@@ -1086,7 +1089,8 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
     `closed`.
 
     A settled-RED night counts the RED nights in a row behind it, newest
-    first, passing over a `skip_promotion` night (green, step 5 skipped),
+    first, passing over a night that skips the eval step (`skip_promotion`,
+    or a hand-dispatched `skip_pipeline`: green, step 5 skipped),
     and stops at the first run that is not one (green, or red on a stage)
     or that the open issue already stamps; jobs are read only that far. A
     run whose eval passed closes the issue, whatever happened to the run
@@ -1136,15 +1140,17 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
 
     stamped_ids = {run_id for run_id, _ in stamped}
     new = []
+    skipped = 0
     for run in [current, *reporting_history(runs, current)]:
         if run["id"] in stamped_ids:
             break
         jobs = jobs_for(run)
-        # A `skip_promotion` night re-tests a candidate already through the
-        # promotion path and skips step 5: it says nothing about the gate,
-        # so it neither counts nor ends the streak.
+        # A night that skips the eval step (`skip_promotion`, or a
+        # hand-dispatched `skip_pipeline`) says nothing about the gate, so it
+        # neither counts nor ends the streak.
         if run["conclusion"] not in FAILING_CONCLUSIONS:
-            if eval_skipped(jobs):
+            if eval_skipped(jobs) and skipped < STALL_SKIP_NIGHTS_MAX:
+                skipped += 1
                 continue
             break
         if not red_verdict_night(jobs):

@@ -37,6 +37,7 @@ for path in (str(_HERE), str(_RELEASE)):
         sys.path.insert(0, path)
 
 import notify_release_stage_broken as notifier  # noqa: E402
+import poll_rc_eval_verdict as poller  # noqa: E402
 from github_api import API_ROOT  # noqa: E402
 
 FIXTURES = _HERE / "testdata" / "release_stage_broken"
@@ -930,8 +931,8 @@ SPYGLASS = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents
 SHA_31 = "e1ab9e5" + "1" * 33
 SHA_32 = "0cc8ee5" + "2" * 33
 SHA_33 = "3a8ba90" + "3" * 33
-STALL_TITLE_2 = "🔴 release chain stalled: the RC eval has rejected 2 candidates in a row"
-STALL_TITLE_3 = "🔴 release chain stalled: the RC eval has rejected 3 candidates in a row"
+STALL_TITLE_2 = "🔴 release chain stalled: the RC eval has returned RED 2 nights in a row"
+STALL_TITLE_3 = "🔴 release chain stalled: the RC eval has returned RED 3 nights in a row"
 STALL_FOOTER = "The failing cases are in each eval build's verdict; this issue names the nights, not the cases."
 E2E_SHORT = "Step 3 - Run Nightly E2E Matrix / Run E2E (rc)"
 STAGING_TAG_STAGE = "Step 6 - Create Staging Tag"
@@ -1157,6 +1158,16 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(chat.posted, [])
         self.assertIn("closed #3999", err)
 
+    def test_more_skip_nights_than_the_ceiling_break_the_streak_and_fewer_do_not(self):
+        """`STALL_SKIP_NIGHTS_MAX` bounds the jobs reads one sweep spends on
+        skip nights: past it, the walk treats the streak as broken."""
+        self.assertEqual(notifier.STALL_SKIP_NIGHTS_MAX, 7)
+        for skips, outcome in ((8, "nothing"), (6, "stall-opened")):
+            with self.subTest(skips=skips):
+                gap = [skip_promotion_night(40 + index, 2 + index, SHA_32) for index in range(skips)]
+                github = stalled_github(night(31, 1, SHA_31), *gap, night(60, 20, SHA_33))
+                self.assertEqual(reconcile(github)[0], outcome)
+
     def test_a_closed_stalled_issue_stamping_attempt_1_is_not_filed_again_for_a_red_attempt_2(self):
         """The closed-issue guard matches the run, as the open path does: a
         re-run of a night someone already dealt with is the same night."""
@@ -1171,9 +1182,9 @@ class StalledChainTest(unittest.TestCase):
         self.assertIn("closed #3999", err)
 
     def test_the_poller_verdict_line_format_is_what_the_notifier_parses(self):
-        line = notifier.VERDICT_LINE_FORMAT.format(verdict="red", settled="true", build_id=build_of(40), url=SPYGLASS + build_of(40))
+        line = poller.VERDICT_LINE_FORMAT.format(verdict=poller.VERDICT_RED, settled=poller.SETTLED_TRUE, build_id=build_of(40), url=SPYGLASS + build_of(40))
         self.assertEqual(notifier.extract_red_verdict_build(f"2026-11-04T07:48:02.0Z {line}\n"), (build_of(40), SPYGLASS + build_of(40)))
-        green = notifier.VERDICT_LINE_FORMAT.format(verdict="green", settled="true", build_id=build_of(40), url=SPYGLASS)
+        green = poller.VERDICT_LINE_FORMAT.format(verdict=poller.VERDICT_GREEN, settled=poller.SETTLED_TRUE, build_id=build_of(40), url=SPYGLASS)
         self.assertIsNone(notifier.extract_red_verdict_build(green))
 
     def test_a_stalled_issue_is_never_mistaken_for_the_stage_issue(self):
