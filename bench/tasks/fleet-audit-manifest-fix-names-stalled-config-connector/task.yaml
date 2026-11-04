@@ -60,10 +60,12 @@ infrastructure:
   provider: "gcp"
   stack: "prebuilt/kcc-stalled-declaration"
   teardown: true
-  # Only what this case sets; project_id, kcc_cluster_*, the GitOps
-  # repository and, in namespaced mode, kcc_google_service_account arrive
-  # from the environment once a pool carries a Config Connector cluster. Each value is repeated in the stack's variables.tf and
-  # in the checks below; change one and change all.
+  # Only what this case sets. The harness gives project_id, and, because the
+  # stack declares bench_gitops_write_token_file, also the narrowed GitOps
+  # write token file, gitops_repo (owner/name), kcc_cluster_name,
+  # kcc_cluster_location and kcc_google_service_account, once a pool carries
+  # a Config Connector cluster. Each value below is repeated in the stack's
+  # variables.tf and in the checks below; change one and change all.
   variables:
     kcc_namespace: "eval-kcc-stalled"
     seeded_slot: "a"

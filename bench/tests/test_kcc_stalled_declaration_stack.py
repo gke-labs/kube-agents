@@ -575,3 +575,17 @@ def test_the_apply_refuses_an_empty_cluster_location():
     for name in ("kcc_cluster_name", "kcc_cluster_location", "gitops_repo"):
         assert f'[ -z "${{var.{name}}}" ]' in guard, name
 
+
+def test_the_stack_asks_for_the_narrowed_gitops_write_token():
+    """The harness gives the GitOps write token, and the Config Connector
+    cluster and repository, only to a stack that declares
+    `bench_gitops_write_token_file`; main.tf hands it to plant.py as its
+    token file."""
+    variables = MAIN_TF.with_name("variables.tf").read_text(encoding="utf-8")
+    assert 'variable "bench_gitops_write_token_file"' in variables
+    assert 'variable "gitops_token_file"' not in variables
+    for name in ("gitops_repo", "kcc_cluster_name", "kcc_cluster_location", "kcc_google_service_account"):
+        assert f'variable "{name}"' in variables, name
+    text = MAIN_TF.read_text(encoding="utf-8")
+    assert re.search(r"KCC_EVAL_GITOPS_TOKEN_FILE\s*=\s*var\.bench_gitops_write_token_file", text)
+
