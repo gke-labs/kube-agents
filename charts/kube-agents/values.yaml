@@ -1223,7 +1223,9 @@ platformAgent:
     # A duration is a Go duration such as 90s, 2m or 1h30m, up to 1000000h.
     # "0" turns off failedSchedulingMinSpan, settle and quietAfter.
     # dedupWindow and scaleUpHold must be above zero, and a count at least 1.
-    # A count of 1 fires on the first event. The watcher README
+    # A count of 1 fires on the first event only with its gate off:
+    # failedSchedulingMinSpan "0" for failedSchedulingMinCount, and settle "0"
+    # for backoffMinCount. The watcher README
     # (k8s-operator/cmd/k8s-event-watcher/README.md, the flag table) says what
     # each setting does. A duration that the watcher cannot read keeps its
     # default, and the container log names it. A change rolls the agent pod
