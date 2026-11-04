@@ -63,7 +63,7 @@ cannot redact becomes a 502, or on a watch ends the stream with an `ERROR` event
 64 MiB in-memory cache (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTES`; `0` disables the cache)
 with a 2 MiB per-entry limit (`--cache-max-entry-bytes` / `KUBE_PROXY_CACHE_MAX_ENTRY_BYTES`), a `0s`
 default TTL for resource `get` and `list` responses (`DefaultResourceCacheTTL`, configured via
-`--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`), and a `15m` default TTL for discovery
+`--cache-resource-ttl` / `KUBE_PROXY_CACHE_RESOURCE_TTL`), and a `30s` default TTL for discovery
 responses (`DefaultDiscoveryCacheTTL`, configured via `--cache-discovery-ttl` /
 `KUBE_PROXY_CACHE_DISCOVERY_TTL`). With the `0s` default resource TTL, the proxy coalesces concurrent
 in-flight resource `GET` and `LIST` requests without post-flight storage across per-pod

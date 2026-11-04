@@ -33,7 +33,9 @@ const (
 	// Set --cache-resource-ttl (KUBE_PROXY_CACHE_RESOURCE_TTL) or CacheConfig.DefaultResourceTTL with a shared CacheStore or sessionAffinity to cache resource responses after a flight.
 	DefaultResourceCacheTTL time.Duration = 0
 	// DefaultDiscoveryCacheTTL is the default TTL for cached discovery responses.
-	DefaultDiscoveryCacheTTL = 15 * time.Minute
+	// It is short because nothing the proxy sees invalidates discovery: a CRD or
+	// APIService installed out of band must reach kubectl within one TTL.
+	DefaultDiscoveryCacheTTL = 30 * time.Second
 
 	headerCacheControl      = "Cache-Control"
 	headerCacheStatus       = "Cache-Status"
@@ -495,7 +497,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	key := buildCacheKey(ev.ClusterID, req, meta.callerAccept)
 	now := c.now()
 
-	if !reqCC.noCache && !reqCC.zeroMaxAge {
+	if !reqCC.noCache && !reqCC.zeroMaxAge && !isConditionalRequest(req.Header) {
 		if raw, ok, err := c.store.Get(req.Context(), key); err == nil && ok {
 			if entry, err := decodeCachedResponse(raw); err == nil && isEntryFreshForRequest(entry, reqCC, now) {
 				c.metrics.recordCacheRequest(CacheResultHit, verbLabel, resLabel)
@@ -787,6 +789,13 @@ func prepareCacheableUpstreamRequest(req *http.Request) *http.Request {
 		upReq.Header.Del(headerAcceptEncoding)
 	}
 	return upReq
+}
+
+// isConditionalRequest reports whether the caller is revalidating its own copy.
+// kubectl revalidates discovery with If-None-Match after a resource type misses,
+// so answering from the store would hand its refetch the same stale document.
+func isConditionalRequest(h http.Header) bool {
+	return h.Get(headerIfNoneMatch) != "" || h.Get(headerIfModifiedSince) != ""
 }
 
 func isCacheableRequest(req *http.Request, info *request.RequestInfo, dryRun bool) (cacheable bool, isDiscovery bool) {

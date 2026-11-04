@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -186,21 +187,28 @@ func TestHandlerRefusals(t *testing.T) {
 		{"non-discovery path", http.MethodGet, "/metrics", http.StatusForbidden, metav1.StatusReasonForbidden},
 		{"unclassifiable path", http.MethodGet, "/api/v1/watch", http.StatusBadRequest, metav1.StatusReasonBadRequest},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			h, upstream := newTestHandler(t, Config{})
-			rec := serve(h, httptest.NewRequest(tc.method, tc.target, nil))
-			if rec.Code != tc.wantCode {
-				t.Fatalf("code = %d, want %d: %s", rec.Code, tc.wantCode, rec.Body.String())
-			}
-			s := decodeStatus(t, rec)
-			if s.Reason != tc.wantReason || !strings.HasPrefix(s.Message, "kube-proxy ") {
-				t.Errorf("Status = %q %q", s.Reason, s.Message)
-			}
-			if upstream.calls != 0 {
-				t.Error("a refused request reached the upstream")
-			}
-		})
+	// The cache sits behind the policy check; running each case with it on
+	// pins that a refusal never reaches the cache or the upstream.
+	for _, cache := range []*CacheConfig{nil, {}} {
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("%s/cache=%t", tc.name, cache != nil), func(t *testing.T) {
+				h, upstream := newTestHandler(t, Config{Cache: cache})
+				rec := serve(h, httptest.NewRequest(tc.method, tc.target, nil))
+				if rec.Code != tc.wantCode {
+					t.Fatalf("code = %d, want %d: %s", rec.Code, tc.wantCode, rec.Body.String())
+				}
+				s := decodeStatus(t, rec)
+				if s.Reason != tc.wantReason || !strings.HasPrefix(s.Message, "kube-proxy ") {
+					t.Errorf("Status = %q %q", s.Reason, s.Message)
+				}
+				if upstream.calls != 0 {
+					t.Error("a refused request reached the upstream")
+				}
+				if cs := rec.Header().Get(headerCacheStatus); cs != "" {
+					t.Errorf("Cache-Status = %q on a refusal, want none", cs)
+				}
+			})
+		}
 	}
 }
 

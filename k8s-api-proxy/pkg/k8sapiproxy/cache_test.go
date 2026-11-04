@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1349,16 +1352,21 @@ func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing
 	store := &countingGetStore{
 		MemoryCacheStore: NewMemoryCacheStore(DefaultCacheMaxBytes),
 		allSeen:          make(chan struct{}),
-		target:           2,
+		target:           1,
 	}
+	leaderArrived := make(chan struct{})
 	releaseUpstream := make(chan struct{})
 	var sawConditional atomic.Bool
+	var upstreamCalls atomic.Int32
 
 	upstream := &fakeUpstream{
 		handler: func(_ string, req *http.Request) (*http.Response, error) {
+			if upstreamCalls.Add(1) == 1 {
+				close(leaderArrived)
+			}
+			<-releaseUpstream
 			if req.Header.Get(headerIfNoneMatch) != "" || req.Header.Get(headerIfModifiedSince) != "" {
 				sawConditional.Store(true)
-				<-releaseUpstream
 				return &http.Response{
 					StatusCode: http.StatusNotModified,
 					Header:     http.Header{"Etag": []string{`"v1"`}},
@@ -1366,7 +1374,6 @@ func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing
 					Request:    req,
 				}, nil
 			}
-			<-releaseUpstream
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{headerContentType: []string{contentTypeJSON}, "Etag": []string{`"v1"`}},
@@ -1386,6 +1393,8 @@ func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing
 	reqCond.Header.Set(headerIfModifiedSince, "Wed, 21 Oct 2015 07:28:00 GMT")
 	reqUncond := httptest.NewRequest(http.MethodGet, "/openapi/v2", nil)
 
+	// The conditional request leads the flight: it is the one whose headers
+	// reach the upstream, so a missing strip would return 304 to both callers.
 	var recCond, recUncond *httptest.ResponseRecorder
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -1393,6 +1402,7 @@ func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing
 		defer wg.Done()
 		recCond = serve(h, reqCond)
 	}()
+	<-leaderArrived
 	go func() {
 		defer wg.Done()
 		recUncond = serve(h, reqUncond)
@@ -1406,10 +1416,63 @@ func TestHandlerCacheConditionalHeadersDoNotLeak304ToCoalescedCallers(t *testing
 	if sawConditional.Load() {
 		t.Errorf("upstream received conditional headers from cacheable fetch")
 	}
+	if n := upstreamCalls.Load(); n != 1 {
+		t.Errorf("upstream calls = %d, want 1 (the follower coalesces onto the conditional leader)", n)
+	}
 	for name, rec := range map[string]*httptest.ResponseRecorder{"conditional": recCond, "unconditional": recUncond} {
 		if rec.Code != http.StatusOK || rec.Body.String() != `{"swagger":"2.0"}` {
 			t.Errorf("%s caller got code=%d body=%q, want 200 and full body", name, rec.Code, rec.Body.String())
 		}
+	}
+	statuses := []string{recCond.Header().Get(headerCacheStatus), recUncond.Header().Get(headerCacheStatus)}
+	sort.Strings(statuses)
+	if want := []string{cacheStatusCoalesced, cacheStatusMiss}; !reflect.DeepEqual(statuses, want) {
+		t.Errorf("Cache-Status = %q, want one miss and one coalesced", statuses)
+	}
+}
+
+func TestHandlerCacheConditionalRequestRevalidatesDiscovery(t *testing.T) {
+	var gen atomic.Int32
+	gen.Store(1)
+	var upstreamCalls atomic.Int32
+	upstream := &fakeUpstream{
+		handler: func(_ string, req *http.Request) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{headerContentType: []string{contentTypeJSON}, headerCacheControl: []string{"no-cache, private"}},
+				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf(`{"gen":%d}`, gen.Load()))),
+				Request:    req,
+			}, nil
+		},
+	}
+	h, _ := newTestHandler(t, Config{Upstream: upstream, Cache: &CacheConfig{}})
+
+	get := func(conditional bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/apis", nil)
+		if conditional {
+			req.Header.Set(headerIfNoneMatch, `"gen1"`)
+		}
+		return serve(h, req)
+	}
+
+	if rec := get(false); rec.Body.String() != `{"gen":1}` || rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("cold fetch = %q %q", rec.Body.String(), rec.Header().Get(headerCacheStatus))
+	}
+	gen.Store(2)
+	if rec := get(false); rec.Body.String() != `{"gen":1}` || rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+		t.Fatalf("warm fetch = %q %q, want the stored gen 1", rec.Body.String(), rec.Header().Get(headerCacheStatus))
+	}
+	// kubectl refetches discovery with If-None-Match when a resource type is unknown.
+	rec := get(true)
+	if rec.Code != http.StatusOK || rec.Body.String() != `{"gen":2}` || rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("conditional fetch = %d %q %q, want 200 gen 2 miss", rec.Code, rec.Body.String(), rec.Header().Get(headerCacheStatus))
+	}
+	if rec := get(false); rec.Body.String() != `{"gen":2}` || rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+		t.Errorf("fetch after revalidation = %q %q, want the refreshed gen 2", rec.Body.String(), rec.Header().Get(headerCacheStatus))
+	}
+	if n := upstreamCalls.Load(); n != 2 {
+		t.Errorf("upstream calls = %d, want 2", n)
 	}
 }
 
@@ -1632,8 +1695,8 @@ func TestHandlerDefaultConfigZeroResourceTTLCoalescesAndCachesDiscovery(t *testi
 	if DefaultResourceCacheTTL != 0 {
 		t.Fatalf("DefaultResourceCacheTTL = %v, want 0", DefaultResourceCacheTTL)
 	}
-	if DefaultDiscoveryCacheTTL != 15*time.Minute {
-		t.Fatalf("DefaultDiscoveryCacheTTL = %v, want 15m", DefaultDiscoveryCacheTTL)
+	if DefaultDiscoveryCacheTTL != 30*time.Second {
+		t.Fatalf("DefaultDiscoveryCacheTTL = %v, want 30s", DefaultDiscoveryCacheTTL)
 	}
 
 	store := &countingGetStore{
@@ -1674,7 +1737,7 @@ func TestHandlerDefaultConfigZeroResourceTTLCoalescesAndCachesDiscovery(t *testi
 		Cache:    &CacheConfig{Store: store},
 	})
 
-	// 1. Discovery GET /api caches in MemoryCacheStore for 15m (1st call miss, 2nd call hit).
+	// 1. Discovery GET /api caches in MemoryCacheStore for 30s (1st call miss, 2nd call hit).
 	recDisc1 := serve(h, httptest.NewRequest(http.MethodGet, "/api", nil))
 	if recDisc1.Code != http.StatusOK || recDisc1.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("first GET /api code=%d status=%q, want 200 and miss", recDisc1.Code, recDisc1.Header().Get(headerCacheStatus))
