@@ -279,6 +279,12 @@ func TestADrainStopsAtAMessageOverThePullCap(t *testing.T) {
 // A task watch sizes each pull from what is pending then, not when the watch
 // began: a watch opened on a task with no events yet reads a burst of later
 // ones in a few pulls, not one pull per event.
+//
+// The server counts a consumer's pending messages apart from the publish
+// that stores them, so a read that starts right after the publishes can see
+// a count that has not caught up, and size its pulls from it. Under load that
+// count lagged the stored events, and the watch sent up to 15 pulls. The test
+// waits for the consumer to count all n before it reads.
 func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 	url, js := bigBus(t)
 	var pulls atomic.Int64
@@ -287,6 +293,10 @@ func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = sub.Unsubscribe() }()
+	// The server has the counting subscription before any pull goes.
+	if err := js.Conn().Flush(); err != nil {
+		t.Fatal(err)
+	}
 	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-later"}
 	w, err := dial(t, url).watchTask(context.Background(), ref)
 	if err != nil {
@@ -297,6 +307,7 @@ func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 	publishN(t, js, lib.TaskEventsSubject(ref.Addressee, ref.TaskID), []byte("{}"), n)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	waitConsumerPending(t, ctx, js, n)
 	for w.seen < n && ctx.Err() == nil {
 		if err := w.next(ctx); err != nil {
 			t.Fatal(err)
@@ -307,6 +318,34 @@ func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 	}
 	if got := pulls.Load(); got > 5 {
 		t.Errorf("sent %d pulls for %d events; want each pull sized from what is pending", got, n)
+	}
+}
+
+// waitConsumerPending waits until the TASKS stream's one consumer counts n
+// messages pending.
+func waitConsumerPending(t *testing.T, ctx context.Context, js jetstream.JetStream, n uint64) {
+	t.Helper()
+	s, err := js.Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		names := s.ConsumerNames(ctx)
+		for name := range names.Name() {
+			c, err := s.Consumer(ctx, name)
+			if err != nil {
+				continue
+			}
+			info, err := c.Info(ctx)
+			if err == nil && info.NumPending == n {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("the consumer never counted %d messages pending", n)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 
