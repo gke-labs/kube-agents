@@ -727,6 +727,10 @@ const injectConfirmOffError = `intent "confirm" is not enabled on this inject do
 // Call it before Start; without it the door refuses that intent with a 400.
 func (a *InjectAdapter) AllowConfirm() { a.allowConfirm = true }
 
+// ConfirmAllowed reports whether AllowConfirm was called, so the binary's
+// config-to-door wiring can be tested without serving a request.
+func (a *InjectAdapter) ConfirmAllowed() bool { return a.allowConfirm }
+
 // authorized reports whether one request carries the door's bearer token,
 // answering 401 itself when it does not.
 //
