@@ -430,6 +430,10 @@ func TestTheExecTierDropsEverySecretBackedVolume(t *testing.T) {
 			}
 		}
 	}
+	// By name, not through volumeHoldsSecret, which the filter itself uses.
+	if kept["future-secret"] || kept["future-projected"] {
+		t.Errorf("exec pod kept a Secret-backed volume: %v", kept)
+	}
 	if !kept["credential-proxy-ksa-token"] || !kept["credential-proxy-policy"] {
 		t.Error("exec pod lost a volume that holds no Secret")
 	}
