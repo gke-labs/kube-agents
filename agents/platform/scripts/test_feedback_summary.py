@@ -54,6 +54,8 @@ CR = {
             "remediationsOpen": 2,
             "remediationsClosedUnmergedTotal": 3,
             "proposalHumanTouches": 5,
+            "peopleSeen7d": 3,
+            "peopleSeen30d": 11,
             "lastActiveTime": "2026-10-20T17:34:06Z",
             "activeInterfaces": ["googlechat"],
         },
@@ -155,6 +157,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("  remediationsOpen: 2 (as the forge reports)\n", text)
         self.assertIn("  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n", text)
         self.assertIn("  proposalHumanTouches: 5 (as the forge reports)\n", text)
+        self.assertIn("  peopleSeen7d: 3 (as the gateway reports)\n", text)
+        self.assertIn("  peopleSeen30d: 11 (as the gateway reports)\n", text)
         self.assertIn("  remediationsProposedTotal: 4\n", text)
         self.assertIn("Rating:", text)
         self.assertIn("What worked well:", text)
@@ -275,11 +279,13 @@ class RenderTest(unittest.TestCase):
 
     def test_readings_print_no_reading_when_absent_and_counters_print_zero(self):
         cr = json.loads(json.dumps(CR))
-        cr["status"]["usage"] = {"remediationsOpen": 0}
+        cr["status"]["usage"] = {"remediationsOpen": 0, "peopleSeen7d": 0}
         text = fs.render(full_snapshot(cr=cr))
         for reading in ("remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"):
             self.assertIn(f"  {reading}: no reading (as the forge reports)\n", text)
         self.assertIn("  remediationsOpen: 0 (as the forge reports)\n", text)
+        self.assertIn("  peopleSeen7d: 0 (as the gateway reports)\n", text)
+        self.assertIn("  peopleSeen30d: no reading (as the gateway reports)\n", text)
         for counter in ("clustersRegistered", "toolExecutionsTotal", "remediationsProposedTotal"):
             self.assertIn(f"  {counter}: 0\n", text)
         self.assertNotIn("remediationsAppliedTotal", fs.USAGE_COUNTERS)
@@ -641,7 +647,7 @@ class GatewayCopyTest(unittest.TestCase):
         source = self.GO_FILE.read_text()
         start = source.index(f"var {var} = ")
         body = source[start : source.index("}", start)]
-        return re.findall(r'"([A-Za-z]+)"', body)
+        return re.findall(r'"([A-Za-z0-9]+)"', body)
 
     def test_the_gateway_prints_the_same_counters_and_readings(self):
         self.assertEqual(list(fs.USAGE_COUNTERS), self._go_strings("usageSummaryCounters"))
@@ -649,6 +655,15 @@ class GatewayCopyTest(unittest.TestCase):
 
     def test_the_gateway_prints_the_same_environment_lines(self):
         self.assertEqual(list(fs.ENVIRONMENT_KEYS), self._go_strings("usageSummaryEnvironmentKeys"))
+
+    def test_the_gateway_names_the_same_source_for_each_reading(self):
+        source = self.GO_FILE.read_text()
+        start = source.index("var usageSummaryReadings = ")
+        body = source[start : source.index("}", start)]
+        go_gateway = sorted(re.findall(r'"([A-Za-z0-9]+)":\s*usageGatewayReadingSuffix', body))
+        py_gateway = sorted(k for k, v in fs.USAGE_READINGS.items() if v == fs.USAGE_GATEWAY_READING_SUFFIX)
+        self.assertEqual(py_gateway, ["peopleSeen30d", "peopleSeen7d"])
+        self.assertEqual(go_gateway, py_gateway)
 
 
 if __name__ == "__main__":

@@ -750,6 +750,8 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
   The event watcher reads the memory limit through the Downward API and sets its Go soft memory limit to half of it, so raise `limits.memory` when the watcher is OOM-killed under a large fleet of watched clusters. Overriding `limits.cpu` also changes the watcher's `GOMAXPROCS`, which the Go runtime derives from the container's CPU limit, so leave `limits.cpu` at the default unless you mean to. Only `cpu`, `memory` and `ephemeral-storage` are accepted.
 
+  The startup peak depends on the control plane. With the `WatchList` feature gate, on at Kubernetes 1.32 and from 1.34, the watcher holds a cluster's whole initial stream until its end, so up to four of the largest backlogs are resident at once. Without the gate the watcher reads the backlog in pages of 500 Events and holds one page per cluster. Steady state scales with the number of watched clusters and their open incidents.
+
   The operator refuses a request above its limit, a negative quantity, a zero limit, `claims`, and any other resource name, whether or not the webhook is on. It ignores the override, renders the sidecar at its defaults, and reports `Degraded` with reason `InvalidAgentAPIAuthResources` when no higher-ranked `Degraded` cause is present, the agent staying Ready. There is no memory floor, unlike the credential proxy, because the watcher derives no admission count from the limit. Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply, and warns on the GKE Autopilot memory-per-vCPU band and on a `cpu` or `memory` limit set without the same key under `requests`, for the reasons `credentialProxy.resources` gives.
 
 - `initContainers` / `sidecars` — standard init and sidecar containers. A `volumeMounts` entry naming a reserved volume is refused at admission, the same as `extraVolumeMounts`. That is the route that needs no user-authored volume at all, and so the one the name reservation exists for; see [Reconcile behavior](#reconcile-behavior).
@@ -1293,7 +1295,7 @@ The operator writes observed state to the `status` subresource; [PlatformAgent f
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
-`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the six proposal readings are produced by the operator, on the leader and off the reconcile path. Every five
+`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges, the six proposal readings and the two people readings are produced by the operator, on the leader and off the reconcile path. Every five
 minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
@@ -1310,7 +1312,7 @@ operator cannot reach; the CR's events name the pod. It advances on any brokered
 those a scheduled job runs -- the Controller Stall Watch cron issues some every 30 minutes by
 default -- so a recent `lastActiveTime` is not evidence that a person used the agent; `lastHumanActiveTime` is.
 
-The six proposal fields are readings, not totals. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
+The six proposal fields and the two people fields are readings, not totals. A reading's source is the credential broker or the A2A gateway. Every 240 seconds the credential broker asks the forge (on GitHub with a read-only token of its own) for the proposals the install authored in each managed
 repository and the human events on them. The operator projects the latest poll's values as they
 stand, outside the ConfigMap.
 
@@ -1328,7 +1330,19 @@ forge calls. A small install is done within the first sweep. An install with a t
 takes some hours, and the fields are absent in between. The outcomes fields return on the first
 sweep.
 
-The operator also serves every counter, cluster gauge, proposal reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
+The people reading (`peopleSeen7d`, `peopleSeen30d`) comes from the A2A gateway: the distinct
+people who wrote on a chat platform it serves in the last 7 and 30 days, the largest count across
+gateway pods. The operator reads it only while the install renders the A2A stack under `spec.mode: next` and no chat
+platform the install enables is served through Hermes: Google Chat or Slack on its legacy consumer,
+or Teams. Otherwise both fields are absent.
+
+A poll that reads no gateway body carrying both
+windows is a miss, and so is a poll that finds no running gateway pod. The second miss in a row
+clears both. With `spec.telemetry.peopleSeen: false` the gateway serves no sample, so both fields
+clear the same way. A 0 is a reading, and neither field moves `lastActiveTime` or
+`lastHumanActiveTime`.
+
+The operator also serves every counter, cluster gauge, reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
 under `model-default`. The operator reads the LiteLLM config ConfigMap the `litellm` Deployment
@@ -1363,7 +1377,7 @@ The counters and the two times land through the poller above, which consults the
 record. Under a served CRD that predates `status.usage` they accumulate in the
 `<name>-usage-counters` ConfigMap and land with the first patch after this release's CRD is
 applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
-later (the two cluster gauges, the proposal readings, `chatMessagesInboundTotal`,
+later (the two cluster gauges, the proposal readings, the people readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
 `backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this

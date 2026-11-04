@@ -241,6 +241,16 @@ def _peer():
     return {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED, "masterAuthorizedNetworksConfig": _OPEN_BLOCK}
 
 
+def _cluster_c():
+    # No authorized-networks block, and the default pool bench/tf/fleet/main.tf
+    # plants as the pool-level outlier: a 50 GB disk with cpuCfsQuota false.
+    return {
+        "currentMasterVersion": "1.34.1-gke.1",
+        "createTime": _CREATED,
+        "nodePools": [{"name": "default-pool", "status": "RUNNING", "config": {"diskSizeGb": 50, "kubeletConfig": {"cpuCfsQuota": False}}}],
+    }
+
+
 def _cluster_b():
     return {
         "currentMasterVersion": "1.33.4-gke.1134000",
@@ -410,7 +420,7 @@ def healthy_world(*projects):
             "pod?app=storefront": {"items": []},
             "pod?app.kubernetes.io/name=envoy": {"items": []},
         },
-        "describe": {project: {"seeded-a": _peer(), "seeded-b": _cluster_b(), "seeded-c": {"currentMasterVersion": "1.34.1-gke.1", "createTime": _CREATED}, "seeded-d": _peer()} for project in projects},
+        "describe": {project: {"seeded-a": _peer(), "seeded-b": _cluster_b(), "seeded-c": _cluster_c(), "seeded-d": _peer()} for project in projects},
         "server_config": {"channels": [{"channel": "REGULAR", "defaultVersion": "1.34.1-gke.1", "validVersions": ["1.34.1-gke.1", "1.33.4-gke.1134000"]}]},
     }
 
@@ -551,10 +561,10 @@ class HealthyScan(ScanHarness):
         self.assertEqual(set(self.states(doc).values()), {"healthy"})
         self.assertEqual(set(self.states(doc)), set(self.roles))
         entry = doc["projects"][PROJECT]
-        self.assertEqual(entry["summary"], {"healthy": 40, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(entry["summary"], {"healthy": 41, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(entry["reader"], "seeded-fleet-reader@kube-agents-evals-2.iam.gserviceaccount.com")
         self.assertNotIn("error", entry)
-        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 40, "drifted": 0, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 1, "checked": 1, "drifted_projects": 0, "absent_projects": 0, "healthy": 41, "drifted": 0, "absent": 0, "not_checked": 0})
         self.assertEqual(doc["previous"], {"scanned_at": None, "drifted": {}})
         self.assertEqual(err, "")
 
@@ -608,7 +618,7 @@ class Drift(ScanHarness):
         doc, _ = self.scan(world, projects=(PROJECT, OTHER))
         self.assertEqual(set(self.states(doc, PROJECT).values()), {"healthy"})
         self.assertEqual(self.states(doc, OTHER)["crashloop-workload"], "drifted")
-        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 79, "drifted": 1, "absent": 0, "not_checked": 0})
+        self.assertEqual(doc["summary"], {"projects": 2, "checked": 2, "drifted_projects": 1, "absent_projects": 0, "healthy": 81, "drifted": 1, "absent": 0, "not_checked": 0})
 
 
 class NotChecked(ScanHarness):

@@ -6,7 +6,7 @@
   "cluster_slots": {
     "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
-    "c": "The consistency outlier: no master authorized networks. Labelled `upgrade-family=seeded-regular`.",
+    "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with cpuCfsQuota off where every other pool runs 20 GB and no kubelet block. Labelled `upgrade-family=seeded-regular`.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
   },
   "roles": {
@@ -282,6 +282,28 @@
           "op": "any_eq",
           "value": "open-for-eval",
           "why": "stands in for the other half of the SOP's ON, a non-empty cidrBlocks, by naming the one block bench/tf/fleet/main.tf plants (open-for-eval, 0.0.0.0/0). Without any block the facet reads OFF even with enabled true, with the same 2/4 vote as above. A renamed or replaced block reads as drift here too, though the SOP would still read ON; the re-apply puts it back"
+        }
+      ]
+    },
+    "drift-pool-outlier": {
+      "cluster_slot": "c",
+      "namespace": null,
+      "probes": [],
+      "fixture": "default-pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota false, where every other pool in the fleet runs a 20 GB disk and no kubelet block; planted ahead of the boot-disk and kubelet-config drift facets, which the drift SOP does not read yet",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='default-pool')].config.diskSizeGb",
+          "op": "eq",
+          "value": 50,
+          "why": "the boot-disk half of the outlier. Every peer pool runs 20 GB, so a default-pool back at 20 GB gives the drift cohort an agreement on disk size and the boot-disk facet nothing to find on slot c. A separate role from drift-outlier on purpose: consistency-drift-outlier lists drift-outlier alone, and this half drifting (every project reads 20 GB until the reconcile rolls the change) must excuse nothing from it. bench/tf/fleet/main.tf's seeded_c_default plants it; a re-apply restores it in place"
+        },
+        {
+          "subject": "cluster",
+          "path": "nodePools[?(@.name=='default-pool')].config.kubeletConfig.cpuCfsQuota",
+          "op": "eq",
+          "value": false,
+          "why": "the kubelet-config half. False, not the default true, so the facet reads a difference whether it treats an absent key as unset or as the default; a key removed, or flipped to true by hand, reads here as drift and as a 4/4 agreement to the facet. GKE serializes an explicit false (the field is a wrapped bool), so `observed nothing` means the key was never set, which is what every project shows until the reconcile rolls it; the same re-apply restores it in place"
         }
       ]
     },
