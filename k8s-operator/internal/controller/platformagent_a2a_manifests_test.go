@@ -1576,6 +1576,12 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != 20 {
 		t.Fatalf("tuned quota with the MCP server = %d, want 20 (cap 2 + headroom 17 + 1)", pods.Value())
 	}
+
+	// And the profile dispatcher, one more while its image is set (#4808).
+	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != 21 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher = %d, want 21 (cap 2 + headroom 17 + 2)", pods.Value())
+	}
 }
 
 // The CR field reaches the gateway as an explicit env value even when unset:

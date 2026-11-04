@@ -33,6 +33,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _ROOT / "charts" / "kube-agents"
 _VALUES = _CHART / "values.yaml"
 _FOOTPRINT = _CHART / "files" / "footprint.yaml"
+_FLAGGED_PODS = _CHART / "files" / "flagged-pods.yaml"
 _SCHEMA = _CHART / "values.schema.json"
 _PREFLIGHT_TPL = _CHART / "templates" / "quota-preflight.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
@@ -851,38 +852,45 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self._bridge_delta(env), cli)
 
-    def test_mode_next_counts_the_mcp_server_at_the_consoles_size_when_its_flag_is_on(self) -> None:
-        """The operator renders the MCP server only under A2A_MCP_DOOR=true (#3869), one
-        Recreate pod sized as the console, so no golden carries it and the chart adds it."""
-        console = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aConsole"]
-        self.assertEqual(console["pods"], 1)
-        self.assertGreater(console["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+    def _flagged(self) -> dict:
+        """files/flagged-pods.yaml by name; TestTheChartCountsEveryFlaggedPod holds it to the operator."""
+        pods = {p["name"]: p for p in yaml.safe_load(_FLAGGED_PODS.read_text())["pods"]}
+        self.assertEqual(set(pods), {"mcp", "dispatcher"})
+        return pods
+
+    def _flagged_delta(self, env: list) -> dict:
         base = self._requirements(["platformAgent.mode=next"])
-        on = (
+        req = self._requirements(["platformAgent.mode=next"], values={"operator": {"extraEnv": env}})
+        return {key: req[key] - base[key] for key in base}
+
+    def _assert_counts(self, delta: dict, *pods: dict) -> None:
+        for out, key in (
+            ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+            ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+            ("requestsEphemeral", "ephemeralStorageBytesRequest"),
+            ("limitsEphemeral", "ephemeralStorageBytesLimit"),
+        ):
+            self.assertEqual(delta[out], sum(p["replicas"] * p[key] for p in pods), out)
+        self.assertEqual(delta["pods"], sum(p["replicas"] for p in pods))
+        self.assertEqual(delta["surgeRequestsCpu"], 0, "each rolls Recreate")
+
+    def test_mode_next_counts_the_mcp_server_when_its_flag_is_on(self) -> None:
+        """The operator renders the MCP server only under A2A_MCP_DOOR=true (#3869), so no
+        golden carries it and the chart adds it from files/flagged-pods.yaml."""
+        mcp = self._flagged()["mcp"]
+        self.assertGreater(mcp["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+        for name, env in (
             ("true", [{"name": "A2A_MCP_DOOR", "value": "true"}]),
             ("by valueFrom", [{"name": "A2A_MCP_DOOR",
                                "valueFrom": {"configMapKeyRef": {"name": "x", "key": "door"}}}]),
             ("not a string", [{"name": "A2A_MCP_DOOR", "value": True}]),
             ("last of two", [{"name": "A2A_MCP_DOOR", "value": "false"},
                              {"name": "A2A_MCP_DOOR", "value": "true"}]),
-        )
-        for name, env in on:
+        ):
             with self.subTest(name):
-                req = self._requirements(
-                    ["platformAgent.mode=next"], values={"operator": {"extraEnv": env}}
-                )
-                for out, key in (
-                    ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
-                    ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
-                    ("requestsEphemeral", "ephemeralStorageBytesRequest"),
-                    ("limitsEphemeral", "ephemeralStorageBytesLimit"),
-                ):
-                    self.assertEqual(req[out] - base[out], console[key], out)
-                self.assertEqual(req["pods"] - base["pods"], 1)
-                self.assertEqual(req["surgeRequestsCpu"], base["surgeRequestsCpu"], "it rolls Recreate")
+                self._assert_counts(self._flagged_delta(env), mcp)
 
     def test_the_mcp_server_is_not_counted_when_the_operator_reads_its_flag_as_off(self) -> None:
-        base = self._requirements(["platformAgent.mode=next"])
         for name, env in (
             ("false", [{"name": "A2A_MCP_DOOR", "value": "false"}]),
             ("TRUE, which the operator does not take", [{"name": "A2A_MCP_DOOR", "value": "TRUE"}]),
@@ -892,14 +900,46 @@ class PreflightDecisionTest(unittest.TestCase):
                              {"name": "A2A_MCP_DOOR", "value": "false"}]),
         ):
             with self.subTest(name):
-                self.assertEqual(
-                    self._requirements(["platformAgent.mode=next"],
-                                       values={"operator": {"extraEnv": env}}),
-                    base,
-                )
+                self.assertEqual(set(self._flagged_delta(env).values()), {0})
         # And never under today, where the operator renders no MCP server.
         door = {"operator": {"extraEnv": [{"name": "A2A_MCP_DOOR", "value": "true"}]}}
         self.assertEqual(self._requirements(values=door), self._requirements())
+
+    def test_mode_next_counts_the_profile_dispatcher_when_its_image_is_set(self) -> None:
+        """The operator renders the dispatcher, in the release namespace, while
+        A2A_DISPATCHER_IMAGE is non-blank (#4808)."""
+        dispatcher = self._flagged()["dispatcher"]
+        self.assertGreater(dispatcher["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+        for name, env in (
+            ("an image", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/dispatcher:1"}]),
+            ("padded", [{"name": "A2A_DISPATCHER_IMAGE", "value": " example.com/d:1 "}]),
+            ("by valueFrom", [{"name": "A2A_DISPATCHER_IMAGE",
+                               "valueFrom": {"configMapKeyRef": {"name": "x", "key": "image"}}}]),
+            ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""},
+                             {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]),
+        ):
+            with self.subTest(name):
+                self._assert_counts(self._flagged_delta(env), dispatcher)
+
+    def test_the_profile_dispatcher_is_not_counted_without_an_image(self) -> None:
+        for name, env in (
+            ("empty", [{"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
+            ("blank, which the operator trims", [{"name": "A2A_DISPATCHER_IMAGE", "value": "   "}]),
+            ("no value", [{"name": "A2A_DISPATCHER_IMAGE"}]),
+            ("a null value", [{"name": "A2A_DISPATCHER_IMAGE", "value": None}]),
+            ("last of two", [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"},
+                             {"name": "A2A_DISPATCHER_IMAGE", "value": ""}]),
+        ):
+            with self.subTest(name):
+                self.assertEqual(set(self._flagged_delta(env).values()), {0})
+        image = {"operator": {"extraEnv": [{"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]}}
+        self.assertEqual(self._requirements(values=image), self._requirements())
+
+    def test_mode_next_counts_both_flagged_pods_together(self) -> None:
+        pods = self._flagged()
+        env = [{"name": "A2A_MCP_DOOR", "value": "true"},
+               {"name": "A2A_DISPATCHER_IMAGE", "value": "example.com/d:1"}]
+        self._assert_counts(self._flagged_delta(env), pods["mcp"], pods["dispatcher"])
 
     def test_mode_next_counts_a_larger_a2a_bridge_resources_as_written(self) -> None:
         """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""

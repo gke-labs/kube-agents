@@ -1,0 +1,40 @@
+# Standing pods the operator renders into the release namespace only while an
+# operator env flag is on, under platformAgent.mode: next. No golden sets those
+# flags, so footprint.yaml has no entry for them, and the quota preflight adds
+# each one here when operator.extraEnv sets its flag.
+#
+# Hand-kept, and held to the operator by TestTheChartCountsEveryFlaggedPod
+# (k8s-operator/internal/controller): every workload in the operator's
+# a2aFlaggedPods has an entry here, with its flag, the value that turns it on,
+# its replicas and its pod's summed requests and limits. A change to one side
+# alone fails that test.
+#
+# enabledWhen: "true" means the operator takes only that exact value;
+# nonBlank means any value that isn't empty or whitespace. A setting the chart
+# can't read (a valueFrom, a non-string value) counts as on. Each rolls
+# Recreate, so it sizes no surge. (The key isn't "on": YAML 1.1 reads that key
+# as a boolean.)
+#
+# Profile workers aren't here: they run in the profile namespace, under the pod
+# quota the operator derives for it, not in the release namespace.
+pods:
+  - name: mcp
+    env: A2A_MCP_DOOR
+    enabledWhen: "true"
+    replicas: 1
+    cpuMillisRequest: 50
+    cpuMillisLimit: 500
+    memoryBytesRequest: 67108864
+    memoryBytesLimit: 134217728
+    ephemeralStorageBytesRequest: 0
+    ephemeralStorageBytesLimit: 0
+  - name: dispatcher
+    env: A2A_DISPATCHER_IMAGE
+    enabledWhen: nonBlank
+    replicas: 1
+    cpuMillisRequest: 50
+    cpuMillisLimit: 500
+    memoryBytesRequest: 67108864
+    memoryBytesLimit: 268435456
+    ephemeralStorageBytesRequest: 0
+    ephemeralStorageBytesLimit: 0

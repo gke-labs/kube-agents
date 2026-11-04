@@ -1193,9 +1193,11 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-When `operator.extraEnv` sets `A2A_MCP_DOOR` to `true`, or in a form the chart cannot read (a
-`valueFrom`, a non-string value), the check also counts the MCP server's pod, at the console's
-size, since the operator sizes the two alike. The mode is read from the values, so a mode set
+It also counts the standing pods the operator renders only behind an `operator.extraEnv` flag,
+listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
+is `true`, and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but
+blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own.
