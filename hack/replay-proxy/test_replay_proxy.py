@@ -611,6 +611,11 @@ class AnalysisQueueFullTest(ProxyTestCase):
         self.request("POST", "/v1/chat/completions", chat("t_22222222", stream=False))  # queued
         status, _, _ = self.request("POST", "/v1/chat/completions", chat("t_33333333", stream=False))  # dropped
         self.assertEqual(status, 200)
+        # The handler hands a request to the queue only after its response is
+        # sent, so the client can see the response before the drop is counted.
+        deadline = time.monotonic() + LOG_WAIT_SECONDS
+        while self.proxy.metrics.get("analysis_dropped") < 1 and time.monotonic() < deadline:
+            time.sleep(POLL_SECONDS)
         self.assertEqual(self.proxy.metrics.get("analysis_dropped"), 1)
         release.set()
         self.proxy.drain()
