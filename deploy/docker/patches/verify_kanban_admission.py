@@ -1120,10 +1120,26 @@ def drive(h: Harness) -> None:
     first = h.new_card(conn, "User question one", age=OLD_AGE_SECONDS, priority=USER_PRIORITY)
     second = h.new_card(conn, "User question two", age=YOUNG_AGE_SECONDS, priority=USER_PRIORITY)
     asked, res = h.tick(conn, cap=2)
-    check("G1. one slot left: the first card spawns, the second past the bound is refused",
-          asked == [first] and h.status(conn, second) == "blocked"
-          and h.last_block(conn, second).get("kind") == "capacity",
+    # In the real tree the scheduling patch tells the second card it is queued
+    # at the end of this tick, and a card noticed in a tick is not refused in
+    # it; the fixture has no notice, so there the refusal lands at once.
+    noticed = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'queued'", (second,),
+    ).fetchone()[0]
+    check("G1. one slot left: the first card spawns and the second is refused or told it is queued",
+          asked == [first] and (
+              h.status(conn, second) == "blocked" if noticed is None else h.status(conn, second) == "ready"
+          ),
           h.why(conn, res, busy, first, second))
+    asked2, res2 = h.tick(conn, cap=2)
+    blocked_id = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'blocked'", (second,),
+    ).fetchone()[0]
+    check("G1b. the next full tick refuses the second with kind capacity, after its queued line",
+          asked2 == [] and h.status(conn, second) == "blocked"
+          and h.last_block(conn, second).get("kind") == "capacity"
+          and blocked_id is not None and (noticed is None or blocked_id > noticed),
+          h.why(conn, res2, busy, first, second))
     conn.close()
     conn = h.board()
     old = h.new_card(conn, "Old question, idle install", age=OLD_AGE_SECONDS)

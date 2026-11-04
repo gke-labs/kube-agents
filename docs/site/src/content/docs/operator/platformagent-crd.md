@@ -499,11 +499,12 @@ a 4Gi limit fits about five. Raise it once you know your worker footprint and yo
 that quota is the other shared resource, and for most deployments it binds before memory does.
 
 At the operator's defaults the admission budget binds before this cap does. The budget is the
-container's memory request, 2Gi unless `spec.deployment.resources` raises it. A tick admits one new
-worker per 512 MiB of headroom under the budget: two from the idle set, one above about 1.7 GiB in
-use, none above about 1.9 GiB, whatever `maxInProgress` says. Six workers at 430 MiB are about
-2.6 GiB, so a board meant to run six at once needs a request of about 4Gi. The request is the figure
-to raise: the kubelet evicts the pod once its working set passes it ([`admission`](#specharnesstuning)).
+container's memory request, 2Gi unless `spec.deployment.resources` raises it, and it counts the
+agent container alone. A tick admits one new worker per 512 MiB of headroom under the budget. From
+the container's measured idle set of about 800 MiB that is two; above about 1 GiB in use it is one,
+and above about 1.5 GiB none. Six workers at 430 MiB add about 2.6 GiB, so a board meant to run six
+at once needs a request of about 4Gi. The request is the figure to raise: the kubelet evicts the
+pod once its working set passes it ([`admission`](#specharnesstuning)).
 
 [`docs/designs/safe-throttling.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/safe-throttling.md)
 is the design for admission by memory beside this count: a pressure guard on the container's own

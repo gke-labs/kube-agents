@@ -1046,13 +1046,14 @@ const (
 // evicts a pod under node pressure once its usage passes its memory REQUEST,
 // long before the limit would stop it: the gateway pod was evicted three times
 // at 3.1 to 3.5 GiB against a 2Gi request. The dispatcher therefore reads the
-// container's cgroup usage and counts it against a budget sized from the
+// container's working set and counts it against a budget sized from the
 // request, which is what makes its guard fire before the eviction does.
 type AdmissionSpec struct {
 	// MemoryBudgetMiB is the pod memory budget, in MiB, the dispatcher
 	// classifies memory pressure against before it spawns a worker: on every
-	// tick it reads the container's cgroup memory usage and counts it against
-	// this figure. Absent means the agent container's resolved memory request
+	// tick it reads the container's working set (its cgroup memory usage less
+	// the inactive file cache, the figure the kubelet evicts on) and counts it
+	// against this figure. Absent means the agent container's resolved memory request
 	// in MiB (2048 at the operator's default resources), so a CR that raises
 	// the request raises the budget with it.
 	//
@@ -1087,9 +1088,9 @@ type AdmissionSpec struct {
 	WorkerRssCapMiB *int32 `json:"workerRssCapMiB,omitempty"`
 
 	// QueueBoundSeconds is how long a ready card may wait, in seconds, on ticks
-	// that could not spawn it because of memory pressure or an exhausted slot
-	// budget before it is blocked with kind "capacity" instead of left in the
-	// queue. A card that waits for another reason is not touched: one that is
+	// that could not spawn it because of memory pressure, an exhausted slot
+	// budget or a slot held for the other class of card, before it is blocked
+	// with kind "capacity" instead of left in the queue. A card that waits for another reason is not touched: one that is
 	// unassigned, not spawnable, held by the respawn guard or by a per-profile
 	// cap stays ready. Absent means 120.
 	//

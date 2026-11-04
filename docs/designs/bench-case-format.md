@@ -62,8 +62,8 @@ the front door there under `spec.mode: next` too. A `session: fresh` answer carr
 thread context, which next's door does not send, so a case with one stays in
 `hack/eval/inject-lane-exclusions.txt`. Under next the reply to a wake is posted nowhere, but the
 same front door writes it, so a case that grades that reply still runs on the inject lane. A
-first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability` or
-`dependency`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
+first line of `[bench:card-block-wake]`, with `title`, `kind` (`transient`, `capability`,
+`dependency` or `capacity`) and `reason`, plants a card blocked that way instead: nothing is posted, no answer
 is sent, and the wake's reply is the run's one turn. A
 first line of
 `[bench:stop-after-first-card]`, optionally with `observe=<seconds>`, makes the rest of the

@@ -173,6 +173,10 @@ class FakeEngine:
         self.dies_on_term = set()
         #: Pids that survive SIGKILL too (a worker in uninterruptible sleep).
         self.immortal = set()
+        #: Pids the engine may not signal at all (``os.kill`` raises EPERM).
+        self.untouchable = set()
+        #: Pids that die between the liveness check and the SIGKILL.
+        self.vanish_at_sigkill = set()
         #: Called as ``on_kill(pid, sig)`` after a signal lands, for a test
         #: that changes the world while the worker dies.
         self.on_kill = None
@@ -188,6 +192,11 @@ class FakeEngine:
 
     def _kill(self, pid, sig):
         if pid not in self.alive:
+            raise ProcessLookupError(pid)
+        if pid in self.untouchable:
+            raise PermissionError(pid)
+        if sig == signal.SIGKILL and pid in self.vanish_at_sigkill:
+            self.alive.discard(pid)
             raise ProcessLookupError(pid)
         self.kills.append((pid, sig))
         if (sig == signal.SIGKILL and pid not in self.immortal) or pid in self.dies_on_term:
@@ -821,24 +830,50 @@ class RssCapTest(unittest.TestCase):
         self.assertEqual(got, ["t_sum"])
         self.assertIn("2,000 MiB against the 1,536 MiB cap", engine.blocks[0][2])
 
-    def test_a_worker_that_survives_the_ladder_keeps_its_card_this_tick(self):
-        """SIGKILL did not take (uninterruptible sleep): the card is not blocked
-        under a live worker; the next tick measures and tries again."""
+    def test_a_worker_the_ladder_cannot_signal_keeps_its_card_this_tick(self):
+        """``os.kill`` is refused (EPERM): nothing was delivered, the worker is
+        alive, so the card is not blocked under it; the next tick tries again."""
         conn = board()
-        running(conn, "t_immortal", pid=33)
+        running(conn, "t_untouchable", pid=33)
         engine = FakeEngine(alive={33})
-        engine.immortal = {33}
+        engine.untouchable = {33}
         with self.assertLogs(admission.logger, level="WARNING") as logs:
             got = self.enforce(conn, engine, {33: 4000})
         self.assertEqual(got, [])
-        self.assertEqual(engine.kills, [(33, signal.SIGTERM), (33, signal.SIGKILL)])
-        self.assertEqual((status(conn, "t_immortal"), engine.blocks), ("running", []))
+        self.assertEqual(engine.kills, [])
+        self.assertEqual((status(conn, "t_untouchable"), engine.blocks), ("running", []))
         self.assertTrue(any("survived termination" in line for line in logs.output))
 
+    def test_a_worker_in_uninterruptible_sleep_is_blocked_once_sigkill_is_delivered(self):
+        """The probe right after the SIGKILL still sees the worker (a large
+        address space being torn down, or a D state): a delivered SIGKILL is
+        a death sentence, so the card is blocked rather than left to be
+        reclaimed as a crash by a later tick that finds the pid gone."""
+        conn = board()
+        running(conn, "t_dstate", pid=34)
+        engine = FakeEngine(alive={34})
+        engine.immortal = {34}
+        self.assertEqual(self.enforce(conn, engine, {34: 4000}), ["t_dstate"])
+        self.assertEqual(engine.kills, [(34, signal.SIGTERM), (34, signal.SIGKILL)])
+        self.assertEqual(status(conn, "t_dstate"), "blocked")
+
+    def test_a_worker_that_dies_between_the_poll_and_the_sigkill_is_blocked(self):
+        """Upstream reports nothing delivered when the SIGKILL finds no process;
+        the pid is gone, so the card is blocked, not skipped."""
+        conn = board()
+        running(conn, "t_vanished", pid=35)
+        engine = FakeEngine(alive={35})
+        engine.vanish_at_sigkill = {35}
+        self.assertEqual(self.enforce(conn, engine, {35: 4000}), ["t_vanished"])
+        self.assertEqual(engine.kills, [(35, signal.SIGTERM)])
+        self.assertEqual(status(conn, "t_vanished"), "blocked")
+
     def test_the_workers_process_group_is_swept_for_a_child_forked_in_the_grace(self):
-        """A child forked after the descendants snapshot is reparented when the
-        worker dies, so the parent-field walk no longer finds it; its process
-        group still names the worker, and that pass kills it."""
+        """A child forked into the worker's group after the descendants snapshot
+        (an in-process fork; a terminal tool's subprocess gets a session of its
+        own) is reparented when the worker dies, so the parent-field walk no
+        longer finds it; its process group still names the worker, and that
+        pass kills it."""
         tree = FakeTree()
         self.addCleanup(tree.close)
         tree.process(1, ppid=0, rss_kib=1)
@@ -974,13 +1009,17 @@ class OverdueTest(unittest.TestCase):
 
     def test_a_review_sent_back_or_reopened_waits_from_that_event(self):
         """Upstream's ``request_changes``, ``reopen_review_task``, a manual
-        status change and a reclaim return a card to ready with an event and
-        no new run, so the wait starts at the event, not at the old run's end."""
+        promotion, an assignment and a reclaim return a card to ready with an
+        event and no new run, so the wait starts at the event, not at the old
+        run's end. With ``promoted`` and ``unblocked`` above, that is every
+        kind in ``READY_ENTRY_EVENT_KINDS``."""
         conn = board()
+        covered = {"promoted", "unblocked"}
         for tid, kind in (
             ("t_changes", "changes_requested"), ("t_reopened", "review_reopened"),
-            ("t_status", "status"), ("t_reclaimed", "reclaimed"),
+            ("t_manual", "promoted_manual"), ("t_assigned", "assigned"), ("t_reclaimed", "reclaimed"),
         ):
+            covered.add(kind)
             ready(conn, tid, age=90000)
             ended_run(conn, tid, NOW - 21600)
             event(conn, tid, kind, NOW - 30)
@@ -990,9 +1029,10 @@ class OverdueTest(unittest.TestCase):
         got = self.refuse(conn)
         self.assertEqual(got, ["t_reopened_old"])
         self.assertIn("waited 200 s", blocks(conn, "t_reopened_old")[0]["reason"])
-        for tid in ("t_changes", "t_reopened", "t_status", "t_reclaimed"):
+        for tid in ("t_changes", "t_reopened", "t_manual", "t_assigned", "t_reclaimed"):
             with self.subTest(tid=tid):
                 self.assertEqual(status(conn, tid), "ready")
+        self.assertEqual(covered, set(admission.READY_ENTRY_EVENT_KINDS))
 
     def test_a_card_told_it_is_queued_this_tick_is_refused_no_earlier_than_the_next(self):
         """At the end of a tick the sibling patch has already posted the queued

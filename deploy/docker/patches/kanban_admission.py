@@ -164,6 +164,17 @@ AUTO_BLOCKED_FIELD = "auto_blocked"
 #: reservation held back this tick. Read here, never written.
 RESERVED_FIELD = "skipped_reserved"
 
+#: The keys of the dict ``_stop_worker`` returns, and the two it reads from
+#: upstream's ``_terminate_reclaimed_worker`` result.
+OUTCOME_PID = "pid"
+OUTCOME_TERMINATED = "terminated"
+OUTCOME_SIGKILL = "sigkill"
+OUTCOME_ORPHANS = "orphans_killed"
+OUTCOME_GROUP = "group_killed"
+OUTCOME_TERMINATION = "termination"
+TERMINATION_TERMINATED_KEY = "terminated"
+TERMINATION_SIGKILL_KEY = "sigkill"
+
 #: The reason text: ``capacity: <cause>; <tail> <options>``.
 SCOPE_CLUSTERS = 10
 REASON_TAIL = "the install cannot take this now."
@@ -172,13 +183,14 @@ REASON_OPTIONS = (
     f"{SCOPE_CLUSTERS} clusters), or use the scheduled report."
 )
 
-#: Events that return a card to the ready lane without closing a run: a
-#: promotion, an unblock, an assignment, a reviewer's changes request, a review
-#: reopened, a manual status change and a reclaim. With the card's creation and
-#: its last run's end, they bound how long it has waited.
+#: Events that return a card to the ready lane without closing a run, each
+#: written by the pinned release: a promotion (``recompute_ready``, or by
+#: hand), an unblock, an assignment, a reviewer's changes request, a review
+#: reopened and a reclaim. With the card's creation and its last run's end,
+#: they bound how long it has waited.
 READY_ENTRY_EVENT_KINDS = (
-    "promoted", "promoted_manual", "unblocked", "assigned", "reassigned",
-    "changes_requested", "review_reopened", "status", "reclaimed",
+    "promoted", "promoted_manual", "unblocked", "assigned",
+    "changes_requested", "review_reopened", "reclaimed",
 )
 
 _READY_ENTRY_PLACEHOLDERS = ", ".join("?" for _ in READY_ENTRY_EVENT_KINDS)
@@ -236,6 +248,9 @@ class _HermesEngine:
 
     def host_prefix(self) -> str:
         return self.db._host_prefix()
+
+    def pid_alive(self, pid: int) -> bool:
+        return bool(self.dispatch._pid_alive(pid))
 
     def kill_fn(self, signal_fn) -> Optional[Callable[[int, int], None]]:
         return self.dispatch._kill_fn(signal_fn)
@@ -745,8 +760,10 @@ def _group_members(pid: int, *, proc_root: str) -> list:
     """Every other process in ``pid``'s process group that exists now.
 
     The dispatcher starts a worker as a session leader, so its group id is
-    its pid, and what the worker forks without a session of its own, the ssh
-    client of a terminal command among them, stays in the group.
+    its pid, and what the worker forks without a session of its own stays in
+    the group. A terminal tool's subprocess gets a session of its own and is
+    outside this pass; the pressure guard, which reads the whole container,
+    still counts it.
     """
     members: list = []
     try:
@@ -766,21 +783,21 @@ def _stop_worker(engine, pid: int, claim_lock: str, signal_fn, *, proc_root: str
 
     ``_terminate_reclaimed_worker`` sends SIGTERM, waits a short grace and
     sends SIGKILL if the worker stays; ``terminated`` in its result says
-    whether the worker is gone. Then two sweeps, because a worker's tool
+    whether the worker is gone. Then two sweeps, because a worker's
     subprocesses hold the memory as much as the worker does: the descendants
     snapshotted before the SIGTERM, each checked by start time so a reused pid
     is not mistaken for one, and the live members of the worker's process
-    group, which catches a child forked during the grace window.
+    group, which catches a child forked into the group during the grace.
     """
     descendants = _descendant_identities(pid, proc_root=proc_root)
     termination = engine.terminate(int(pid), claim_lock, signal_fn)
     outcome = {
-        "pid": int(pid),
-        "terminated": bool(termination.get("terminated")),
-        "sigkill": bool(termination.get("sigkill")),
-        "orphans_killed": [],
-        "group_killed": [],
-        "termination": termination,
+        OUTCOME_PID: int(pid),
+        OUTCOME_TERMINATED: bool(termination.get(TERMINATION_TERMINATED_KEY)),
+        OUTCOME_SIGKILL: bool(termination.get(TERMINATION_SIGKILL_KEY)),
+        OUTCOME_ORPHANS: [],
+        OUTCOME_GROUP: [],
+        OUTCOME_TERMINATION: termination,
     }
     kill = engine.kill_fn(signal_fn)
     if kill is None:
@@ -788,11 +805,29 @@ def _stop_worker(engine, pid: int, claim_lock: str, signal_fn, *, proc_root: str
     for member, started in descendants:
         if started is not None and _stat_field(proc_root, member, STAT_STARTTIME_INDEX) == started:
             if engine.sigkill(kill, member):
-                outcome["orphans_killed"].append(member)
+                outcome[OUTCOME_ORPHANS].append(member)
     for member in _group_members(pid, proc_root=proc_root):
-        if member not in outcome["orphans_killed"] and engine.sigkill(kill, member):
-            outcome["group_killed"].append(member)
+        if member not in outcome[OUTCOME_ORPHANS] and engine.sigkill(kill, member):
+            outcome[OUTCOME_GROUP].append(member)
     return outcome
+
+
+def _worker_outlived_the_ladder(engine, pid: int, outcome: Mapping[str, Any]) -> bool:
+    """Whether the worker is still there after a ladder that could not take it down.
+
+    Upstream reports ``terminated`` from one probe right after the SIGKILL,
+    which a large address space still being torn down fails, and reports
+    nothing delivered when the worker died between the poll and the SIGKILL.
+    Neither is a survivor: a delivered SIGKILL is a death sentence, and a gone
+    pid is gone. Only a worker the ladder could not signal, and that is still
+    alive when asked again, keeps its card.
+    """
+    termination = outcome.get(OUTCOME_TERMINATION) or {}
+    if not engine.survived(termination):
+        return False
+    if termination.get(TERMINATION_SIGKILL_KEY):
+        return False
+    return bool(engine.pid_alive(pid))
 
 
 def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[AdmissionSettings] = None,
@@ -801,10 +836,11 @@ def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[Admissio
 
     Mirrors ``enforce_max_runtime``: host-local claims only, kill with grace,
     then the card leaves ``running``, here through ``block_task`` with kind
-    ``capacity`` and the figures in the reason. A worker that survives the
-    ladder keeps its card, so a card is never blocked under a live worker; the
-    next tick measures it again. ``signal_fn`` and ``rss_fn`` are test hooks.
-    Returns the ids blocked.
+    ``capacity`` and the figures in the reason. A worker the ladder could not
+    signal keeps its card, so a card is never blocked under a live worker the
+    dispatcher cannot stop; the next tick measures it again. A worker with a
+    SIGKILL delivered is treated as gone, whatever the first probe said.
+    ``signal_fn`` and ``rss_fn`` are test hooks. Returns the ids blocked.
     """
     engine = engine or _ENGINE
     stopped: list = []
@@ -825,7 +861,7 @@ def enforce_worker_rss_caps(conn, *, signal_fn=None, settings: Optional[Admissio
             if rss_kib is None or rss_kib <= cap_kib:
                 continue
             outcome = _stop_worker(engine, pid, lock, signal_fn, proc_root=proc_root)
-            if engine.survived(outcome["termination"]):
+            if _worker_outlived_the_ladder(engine, pid, outcome):
                 logger.warning(
                     "%s worker %s of %s is over the cap and survived termination (%s); "
                     "the card stays running and the next tick tries again",

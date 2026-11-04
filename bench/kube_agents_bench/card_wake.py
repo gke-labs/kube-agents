@@ -141,7 +141,7 @@ _BLOCK_FIELDS = ("title", "kind", "reason")
 # The block kind a question replay files, and the kinds a block replay may
 # name: Hermes' VALID_BLOCK_KINDS less the question's, which needs an answer.
 NEEDS_INPUT = "needs_input"
-BLOCK_KINDS = ("transient", "capability", "dependency")
+BLOCK_KINDS = ("transient", "capability", "dependency", "capacity")
 
 # The name of the harness trajectory entry carrying the card as the run left
 # it: ``args.card`` is the card, ``result`` is ``Settled.as_metadata()`` or

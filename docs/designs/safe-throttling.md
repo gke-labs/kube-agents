@@ -210,13 +210,13 @@ The sampler hands `classify_pressure` two numbers: `total = memory_budget_mib` a
 `available = memory_budget_mib - usage`. The classifier and its thresholds stay as upstream ships
 them, so the dispatcher, the dashboard's memory banner and the lifecycle ledger's OOM heuristics
 keep one vocabulary. At the default budget, the container's 2,048 MiB request, the tick is
-`elevated` above 1,741 MiB used (one new worker) and `critical` above 1,946 MiB (none). At a
-4,096 MiB request, 3,482 and 3,891 MiB. The classifier's 15% band is the reserve the guard keeps
-under the request: 307 MiB at 2 GiB, 614 MiB at 4 GiB. One setting carries it; there is no second
-constant for the reserve, and the reserve moves with the request.
+`elevated` above 1,741 MiB used and `critical` above 1,946 MiB. At a 4,096 MiB request, 3,482 and
+3,891 MiB. `elevated` permits one worker; whether one is admitted is the headroom cap's decision
+below: at 2 GiB the 307 MiB left is under one reserve, so none, and at 4 GiB the 614 MiB left is
+one. The classifier's 15% band is the reserve the guard keeps under the request. One setting
+carries it; there is no second constant for the reserve, and the reserve moves with the request.
 
-The sample is taken once per tick, 5 s on the gateway's profile (`kanban.dispatch_interval_seconds`), and the tick's spawns are then bounded by the budget's headroom at one worker per 512 MiB (`cap_spawn_budget`, the reserve upstream's memory-derived default cap divides by), so an `ok` reading cannot let one tick spawn the whole slot budget past the budget;
-so a decision holds for a tick by construction: the one-tick half of N3.
+The sample is taken once per tick, 5 s on the gateway's profile (`kanban.dispatch_interval_seconds`), and the tick's spawns are then bounded by the budget's headroom at one worker per 512 MiB (`cap_spawn_budget`, the reserve upstream's memory-derived default cap divides by). An `ok` reading therefore cannot let one tick spawn the whole slot budget past the budget, and a decision holds for a tick by construction: the one-tick half of N3.
 
 `sample_memory()` itself and the cgroup v2 patch stay as they are. The heartbeat, the dashboard and
 the OOM heuristics keep reading them; only the dispatcher's guard switches to the new sampler,
@@ -252,10 +252,13 @@ a reclaim stops one, through upstream's `_terminate_reclaimed_worker`: SIGTERM, 
 SIGKILL if it stays, and a result that says whether the worker is gone. Then two sweeps, because a
 worker's tool subprocesses hold the memory as much as the worker does: the descendants snapshotted
 before the SIGTERM, each checked by start time so a reused pid is not mistaken for one, and the live
-members of the worker's process group, which is how a child forked during the grace is caught (the
-dispatcher starts a worker as a session leader, so the group is its pid). A worker that survives the
-ladder keeps its card and is measured again next tick, so a card is never blocked under a live
-worker. Then, in one write transaction, its card is blocked with `block_task(..., kind="capacity")`
+members of the worker's process group, which is how a child forked into the group during the grace
+is caught (the dispatcher starts a worker as a session leader, so the group is its pid; a terminal
+tool's subprocess gets a session of its own and is outside both sweeps, where the pressure guard
+still counts it). A worker the ladder could not signal keeps its card and is measured again next
+tick, so a card is never blocked under a live worker the dispatcher cannot stop; a worker with a
+SIGKILL delivered is treated as gone, whatever the first probe said, so the block is never lost to a
+later tick that finds the pid gone. Then, in one write transaction, its card is blocked with `block_task(..., kind="capacity")`
 and its run ended as `blocked`. Not `timed_out`: a timed-out card is returned to its source phase
 for the next tick to spawn again, into the same wall. The scope is the claims this host made, by the
 `claim_lock` prefix, as `enforce_max_runtime()` scopes itself.
@@ -273,10 +276,9 @@ its children are workers of their own, spawned by the dispatcher, not descendant
 A card that waits for a slot costs nothing while it waits, and it starts eventually. What it costs
 is the user's time. The success criteria ask for a simple question answered under one minute and
 a first acknowledgement within ten seconds
-([`kube-agents-success-criteria.md`](../kube-agents-success-criteria.md), SC3 and SC4), and a
-delegated answer spends about forty seconds in worker start and model turns after its card is
-spawned (the per-phase breakdown there). A card still queued at two minutes is past any answer the
-user is waiting for, and a strategy change, the scheduled report or a smaller scope, serves the
+([`kube-agents-success-criteria.md`](../kube-agents-success-criteria.md), SC3 and SC4). A card
+still queued at two minutes is past any answer the user is waiting for, and a strategy change, the
+scheduled report or a smaller scope, serves the
 user better than an answer twenty minutes later. Two minutes is 24 ticks at the 5 s dispatch
 interval: 24 chances to spawn before the refusal.
 
@@ -289,7 +291,7 @@ per-profile capped: those are routing and quota states, and a `capacity` reason 
 wrong cause and send the user the wrong alternatives. The age is the time since the card last
 entered the ready lane: the latest of its creation, the end of its last run, and the event that
 returned it to the lane (a promotion, an unblock, an assignment, a reviewer's changes request, a
-review reopened, a manual status change, a reclaim). The reason follows the same shape:
+review reopened, a reclaim). The reason follows the same shape:
 `capacity: the card waited 300 s for a worker slot against the 120 s bound; the install cannot take this now. Options: ...`.
 
 A card refused this way is not retried on its own. `kanban_unblock` returns it to `ready` and its
@@ -486,8 +488,8 @@ on every pull request.
 
 1. Settled in the first change: the age clock of the pass by queue age is the latest of the card's
    creation, its last run's end and its last lane-entry event (`promoted`, `promoted_manual`,
-   `unblocked`, `assigned`, `reassigned`, `changes_requested`, `review_reopened`, `status`,
-   `reclaimed`), the events the pinned release writes when a card returns to `ready` without a run.
+   `unblocked`, `assigned`, `changes_requested`, `review_reopened`, `reclaimed`), the events the
+   pinned release writes when a card returns to `ready` without a run.
 2. A setting outside the sane range relative to the resolved resources (a budget above the limit,
    a cap above the budget): clamp in the operator, warn in the CR's status, or accept and log in the
    dispatcher. The bounds in the schema are absolute and cannot express the relation.
