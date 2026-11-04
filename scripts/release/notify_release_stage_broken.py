@@ -34,9 +34,10 @@ a row cut no staging tag and stall the release chain; that opens one
 `ci:release-stalled` issue with a row per night (the run, the candidate
 commit, the eval build the step-5 log links), adds a row each later RED
 night, and closes on the next run whose eval passed. A night that fails on a
-stage before the eval passes leaves it alone, and a night that skips the
-eval step (`skip_promotion`, or a hand-dispatched `skip_pipeline`) neither
-counts nor ends the streak.
+stage before the eval passes leaves it alone. A night that skips the eval
+step, a `skip_promotion` night or a hand-dispatched `skip_pipeline` one,
+neither counts nor ends the streak; past `STALL_SKIP_NIGHTS_MAX` such nights
+the walk stops looking further back.
 
 Two bounds on what a green run may close. A run being re-run leaves
 `status=completed`, so the newest run by number is read whatever its status,
@@ -317,12 +318,13 @@ NOT_CONFIGURED = "chat not configured: set CI_HEALTH_CHAT_SPACE and CI_HEALTH_CH
 # stage before the eval passes leaves it alone: the stage issue covers that
 # night.
 STALL_NIGHTS = 2
-# A week of skip nights is the most the walk looks past before it treats
-# the streak as broken; each one passed over costs a jobs read per sweep.
+# A week of skip nights is the most the walk looks past, over the whole walk;
+# each one passed over costs a jobs read per sweep. Past it the walk stops,
+# so with no issue open the streak counts only the RED nights it reached.
 STALL_SKIP_NIGHTS_MAX = 7
 STALL_LABEL = "ci:release-stalled"
 STALL_LABEL_COLOR = "b60205"
-STALL_LABEL_DESCRIPTION = "The release-candidate eval has rejected every candidate for several nights"
+STALL_LABEL_DESCRIPTION = "The release-candidate eval has returned RED several nights in a row"
 TRIAGE_LABEL = "needs-triage"
 # Its own marker kind, so it never collides with the stage issue on the same
 # workflow; the stamp lists the RED runs the body has rows for, newest first.
@@ -335,7 +337,7 @@ STALL_TABLE_HEADER = "| Night (UTC) | Promotion run | Candidate | Eval build |"
 STALL_TABLE_RULE = "| --- | --- | --- | --- |"
 STALL_ROW = "| {night} | {run} | {candidate} | {build} |"
 STALL_FOOTER = "The failing cases are in each eval build's verdict; this issue names the nights, not the cases."
-STALL_COMMENT = "Rejected again: {runs}. The RC eval has now returned RED {n} nights in a row."
+STALL_COMMENT = "RED again: {runs}. The RC eval has now returned RED {n} nights in a row."
 STALL_CLOSED_COMMENT = "{run} ({when}) passed the release-candidate eval; the release chain is moving again. Closing."
 CHAT_STALLED = STALL_TITLE + " — {url}"
 CHAT_MOVING = "✅ release chain moving again: run #{run_number} passed the gate — closed {url}"
@@ -1089,9 +1091,9 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
     `closed`.
 
     A settled-RED night counts the RED nights in a row behind it, newest
-    first, passing over a night that skips the eval step (`skip_promotion`,
-    or a hand-dispatched `skip_pipeline`: green, step 5 skipped),
-    and stops at the first run that is not one (green, or red on a stage)
+    first, passing over up to `STALL_SKIP_NIGHTS_MAX` nights that skip the
+    eval step (green, step 5 skipped: a `skip_promotion` night or a
+    hand-dispatched `skip_pipeline` one), and stops at the first run that is not one (green, or red on a stage)
     or that the open issue already stamps; jobs are read only that far. A
     run whose eval passed closes the issue, whatever happened to the run
     after the gate. A night that fails on a stage before the eval passes
@@ -1145,9 +1147,10 @@ def reconcile_stall(api: GitHubAPI, workflow: dict, runs: list, current: dict, d
         if run["id"] in stamped_ids:
             break
         jobs = jobs_for(run)
-        # A night that skips the eval step (`skip_promotion`, or a
-        # hand-dispatched `skip_pipeline`) says nothing about the gate, so it
-        # neither counts nor ends the streak.
+        # A night that skips the eval step, a `skip_promotion` night or a
+        # hand-dispatched `skip_pipeline` one, says nothing about the gate, so
+        # it neither counts nor ends the streak, up to `STALL_SKIP_NIGHTS_MAX`
+        # of them; at one more the walk stops.
         if run["conclusion"] not in FAILING_CONCLUSIONS:
             if eval_skipped(jobs) and skipped < STALL_SKIP_NIGHTS_MAX:
                 skipped += 1

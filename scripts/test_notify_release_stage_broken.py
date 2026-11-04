@@ -1013,7 +1013,7 @@ class StalledChainTest(unittest.TestCase):
         method, path, payload = github.writes[0]
         self.assertEqual((method, path), ("POST", f"/repos/{REPO}/labels"))
         self.assertEqual(payload["name"], "ci:release-stalled")
-        self.assertEqual(payload["description"], "The release-candidate eval has rejected every candidate for several nights")
+        self.assertEqual(payload["description"], "The release-candidate eval has returned RED several nights in a row")
         method, path, payload = github.writes[1]
         self.assertEqual((method, path), ("POST", f"/repos/{REPO}/issues"))
         self.assertEqual(payload["title"], STALL_TITLE_2)
@@ -1042,6 +1042,8 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual([(w[0], w[1]) for w in github.writes], [("POST", f"/repos/{REPO}/issues/4001/comments"), ("PATCH", f"/repos/{REPO}/issues/4001")])
         comment = github.writes[0][2]["body"]
         self.assertEqual(len(comment.splitlines()), 1)
+        self.assertTrue(comment.startswith("RED again: "), comment)
+        self.assertTrue(comment.endswith("The RC eval has now returned RED 3 nights in a row."), comment)
         self.assertIn(f"[#33](https://github.com/{REPO}/actions/runs/{night_run_id(33)})", comment)
         patch = github.writes[1][2]
         self.assertEqual(patch["title"], STALL_TITLE_3)
@@ -1158,11 +1160,12 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(chat.posted, [])
         self.assertIn("closed #3999", err)
 
-    def test_more_skip_nights_than_the_ceiling_break_the_streak_and_fewer_do_not(self):
+    def test_the_walk_looks_past_the_ceiling_of_skip_nights_and_no_further(self):
         """`STALL_SKIP_NIGHTS_MAX` bounds the jobs reads one sweep spends on
-        skip nights: past it, the walk treats the streak as broken."""
+        skip nights: past it the walk stops looking, so with no issue open
+        the streak counts only the RED nights it reached."""
         self.assertEqual(notifier.STALL_SKIP_NIGHTS_MAX, 7)
-        for skips, outcome in ((8, "nothing"), (6, "stall-opened")):
+        for skips, outcome in ((8, "nothing"), (7, "stall-opened")):
             with self.subTest(skips=skips):
                 gap = [skip_promotion_night(40 + index, 2 + index, SHA_32) for index in range(skips)]
                 github = stalled_github(night(31, 1, SHA_31), *gap, night(60, 20, SHA_33))
