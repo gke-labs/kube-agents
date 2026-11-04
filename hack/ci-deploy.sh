@@ -214,30 +214,34 @@ readonly EVAL_KANBAN_MAX_IN_PROGRESS="5"
 readonly EVAL_LITELLM_NUM_RETRIES="${EVAL_LITELLM_NUM_RETRIES:-2}"
 readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-20}"
 
-# The credential-proxy container's memory limit on the eval install. The broker
-# admits a request only while its child memory reservation fits the budget it
-# derives from this limit (agents/platform/scripts/credential_proxy.py,
-# docs/designs/credential-proxy-child-memory-budget.md): at the operator's 1Gi
-# default that is four requests at once, under its slot cap of eight. The eval
-# runs EVAL_TASK_PARALLELISM lanes of Platform Agents, each fanning Cluster
-# Agents out over the seeded fleet, and on the default the queue behind those
-# four reached p50 waits of 8-22s and a longest wait of 56.7s against the
-# broker's 60s refusal: Cluster Agents' commands timed out and the judge graded
-# the answers as regressions on pull requests that never touched the path
-# (#2632). At 2Gi the budget admits nine, so the slot cap is the binding bound
-# again and the queue is the one the broker had before the budget existed,
-# with the OOM the budget exists to prevent still held off by the budget
-# (#2455's live test ran this figure: the broker's startup line read "admits 9
-# requests at once beside the slot cap of 8"). Set on this install only, through
-# spec.deployment.credentialProxy.resources, so the production default stays
-# where the CRD reference argues it should and an install that outgrows it
-# raises the same field. A string, because the CRD's quantity is int-or-string.
+# The credential-proxy container's memory limit on the eval install, pinned.
+# The broker admits a request only while its child memory reservation fits the
+# budget it derives from this limit (agents/platform/scripts/credential_proxy.py,
+# docs/designs/credential-proxy-child-memory-budget.md): at 2Gi the budget
+# admits nine, so the slot cap of eight is the binding bound. The operator's
+# default limit is 2Gi as well, and so is its default memory request on GKE
+# Autopilot, so today this override changes nothing. It stays as a pin: if the
+# operator default moves, the eval install keeps the budget its cases were
+# measured at. The cost is that the eval does not run the operator default;
+# to run it there, drop this constant, its echo and --set-string below, and the
+# three limit tests in tests/test_ci_deploy_credential_proxy_limit.py (that
+# file's CRD-order test guards step 5b' and stays).
+# The figure comes from #2632: at the 1Gi limit the operator defaulted to then,
+# the budget admitted four, and the eval's EVAL_TASK_PARALLELISM lanes of
+# Platform Agents, each fanning Cluster Agents out over the seeded fleet, queued
+# behind those four at p50 waits of 8-22s and a longest wait of 56.7s against
+# the broker's 60s refusal: Cluster Agents' commands timed out and the judge
+# graded the answers as regressions on pull requests that never touched the
+# path. #2455's live test ran this figure: the broker's startup line read
+# "admits 9 requests at once beside the slot cap of 8". Set on this install
+# only, through spec.deployment.credentialProxy.resources. A string, because
+# the CRD's quantity is int-or-string.
 # Limits only: the pool's host clusters are Autopilot with bursting, where a
 # limit above its request stands (the #2454 presubmit's proxy pod rendered
 # limits.memory 1Gi over a 512Mi request, QoS Burstable, and its broker read
 # the 1Gi), so requests.memory stays at the operator's default. On an Autopilot
-# cluster without bursting this override would be inert, as the CRD field doc
-# says, and requests.memory is the figure to raise there.
+# cluster without bursting the limit equals the request, and requests.memory is
+# the figure to set there.
 # tests/test_ci_deploy_credential_proxy_limit.py pins the flag, that the limit
 # admits at least the slot cap, and the chart rendering it onto the CR.
 readonly EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT="2Gi"
