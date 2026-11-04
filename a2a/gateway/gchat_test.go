@@ -281,7 +281,10 @@ type fakeChatRelay struct {
 	mu        sync.Mutex
 	calls     []relayCall
 	responses map[string]any // "spaces.messages/create" -> response body
-	tokens    []string
+	// queue holds one-shot responses per method key, answered in order
+	// before responses is read.
+	queue  map[string][]any
+	tokens []string
 }
 
 // fakeChatAPIError, as a response, makes the fake relay answer a call with
@@ -298,7 +301,7 @@ type relayCall struct {
 }
 
 func newFakeChatRelay(t *testing.T) *fakeChatRelay {
-	f := &fakeChatRelay{t: t, responses: map[string]any{}}
+	f := &fakeChatRelay{t: t, responses: map[string]any{}, queue: map[string][]any{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -319,6 +322,10 @@ func newFakeChatRelay(t *testing.T) *fakeChatRelay {
 		f.calls = append(f.calls, relayCall{body.Resource, body.Method, body.Arguments})
 		key := strings.Join(body.Resource, ".") + "/" + body.Method
 		resp, ok := f.responses[key]
+		if queued := f.queue[key]; len(queued) > 0 {
+			resp, ok = queued[0], true
+			f.queue[key] = queued[1:]
+		}
 		if !ok {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]any{"error": "Google Chat operation failed"})

@@ -87,7 +87,11 @@ type gchatAccessoryWidget struct {
 }
 
 type gchatButton struct {
-	Text    string `json:"text"`
+	Text string `json:"text"`
+	// Type is FILLED on an emphasised button and empty otherwise; AltText
+	// is a rating button's accessible label.
+	Type    string `json:"type"`
+	AltText string `json:"altText"`
 	OnClick struct {
 		OpenLink struct {
 			URL string `json:"url"`
@@ -156,12 +160,16 @@ type gchatUX struct {
 	answered     map[string]bool
 	lines        map[string]string
 	answeredRing []string
+	// rated is the rating buttons each rated answer carries, by message
+	// name (gchat_feedback.go), and ratedOrder its ring.
+	rated      map[string]gchatRating
+	ratedOrder []string
 }
 
 func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 	if a.ux == nil {
 		a.ux = &gchatUX{questions: map[string]gchatQuestion{}, open: map[string]string{}, pending: map[string]gchatPendingClick{},
-			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{}}
+			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{}, rated: map[string]gchatRating{}}
 	}
 	return a.ux
 }

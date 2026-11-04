@@ -375,6 +375,9 @@ type GoogleChatAdapter struct {
 	// syncRewrites runs an answered question's rewrite inline, under test.
 	ux           *gchatUX
 	syncRewrites bool
+	// feedback is the answer-feedback recorder the gateway hands over
+	// (FeedbackSink); until then no rating buttons are drawn.
+	feedback FeedbackRecorder
 
 	// countInterval paces the received-events summary line
 	// (gchatEventCountInterval; tests shorten it). subscription is the Chat
@@ -520,10 +523,13 @@ func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
 // PostMessage posts a message value: a chat message laid out as a text
 // message with accessory buttons (renderGchatChat, gchat_chat.go), with
 // m.Text as the fallback the gateway posts when the layout is refused; one
-// with no chat message is Post. A layout this renderer will not send, or one
+// with no chat message is Post, or postRatedText for a rated answer. A layout this renderer will not send, or one
 // Chat's API refuses, is ErrLayoutRefused, so the gateway posts the text
 // instead (Gateway.chatOutcome); a failed call is returned as it is.
 func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil && a.rates(m) {
+		return a.postRatedText(conversation, m)
+	}
 	if m.Chat == nil {
 		return a.Post(conversation, m.Text)
 	}
@@ -550,7 +556,10 @@ func (a *GoogleChatAdapter) PostNotifyMessage(space, thread string, m OutMessage
 
 // createLaidOut lays m.Chat out and creates it in space, as a reply on
 // thread when one is given, and remembers it when it carries choices,
-// bound to conversation (empty for a home post).
+// bound to conversation (empty for a home post). A rated answer in a
+// conversation ends with the rating buttons; when Chat refuses that layout
+// it is created once more without them, and that outcome is returned. The
+// question is remembered without the rating buttons.
 func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m OutMessage) (message, landed string, err error) {
 	layout, err := renderGchatChat(m.Chat)
 	if err != nil {
@@ -559,9 +568,24 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 	if conversation == "" {
 		layout = gchatHomeButtons(layout)
 	}
-	message, landed, err = a.create(space, thread, gchatLayoutBody(layout))
+	var rating gchatRating
+	if conversation != "" && a.rates(m) {
+		rating.task = m.Feedback
+	}
+	rated := gchatChatLayout{Text: layout.Text, Widgets: gchatWithRating(layout.Widgets, rating)}
+	message, landed, err = a.create(space, thread, gchatLayoutBody(rated))
 	if err != nil {
-		return "", "", gchatLayoutError(err, false)
+		err = gchatLayoutError(err, false)
+		if rating.task == "" || !errors.Is(err, ErrLayoutRefused) {
+			return "", "", err
+		}
+		rating = gchatRating{}
+		if message, landed, err = a.create(space, thread, gchatLayoutBody(layout)); err != nil {
+			return "", "", gchatLayoutError(err, false)
+		}
+	}
+	if rating.task != "" {
+		a.rememberRating(message, rating)
 	}
 	a.trackQuestion(message, conversation, m.Chat, layout)
 	return message, landed, nil
