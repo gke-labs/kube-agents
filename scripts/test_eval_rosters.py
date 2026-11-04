@@ -48,6 +48,8 @@ import sys
 import tempfile
 import unittest
 
+import yaml
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import eval_rosters
@@ -402,14 +404,13 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(eval_rosters.blocking_roster())
 
 
-CERTIFICATION_SUITE_LINE_RE = re.compile(r"^suite:\s*certification\s*$", re.MULTILINE)
-
-
 def cases_without_a_suite_line(roster: pathlib.Path, tasks_dir: pathlib.Path) -> list[str]:
-    """Certification-roster cases whose task file lacks `suite: certification`."""
+    """Certification-roster cases whose task file lacks `suite: certification`,
+    read as the validator reads it: the parsed top-level key, not a raw line."""
     return [
         case for case in eval_rosters.certification_cases(roster)
-        if not CERTIFICATION_SUITE_LINE_RE.search((tasks_dir / case / "task.yaml").read_text(encoding="utf-8"))
+        if (yaml.safe_load((tasks_dir / case / "task.yaml").read_text(encoding="utf-8")) or {}).get("suite")
+        != eval_rosters.CERTIFICATION_SUITE
     ]
 
 
@@ -435,12 +436,18 @@ class CertificationFileTest(unittest.TestCase):
     def test_the_suite_line_check_runs_over_a_scratch_roster(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            for case, body in (("with-line", "id: with-line\nsuite: certification\n"), ("without-line", "id: without-line\n")):
+            cases = (
+                ("with-line", "id: with-line\nsuite: certification\n"),
+                ("quoted-with-note", 'id: quoted-with-note\nsuite: "certification"  # the page row\n'),
+                ("without-line", "id: without-line\n"),
+                ("line-in-prompt", "id: line-in-prompt\nprompt: |\n  x\nsuite: certification\n".replace("\nsuite:", "\n  suite:")),
+            )
+            for case, body in cases:
                 (root / case).mkdir()
                 (root / case / "task.yaml").write_text(body)
             roster = root / "certification-cases.txt"
-            roster.write_text("./tasks/with-line/task.yaml\n./tasks/without-line/task.yaml\n")
-            self.assertEqual(cases_without_a_suite_line(roster, root), ["without-line"])
+            roster.write_text("".join(f"./tasks/{case}/task.yaml\n" for case, _ in cases))
+            self.assertEqual(cases_without_a_suite_line(roster, root), ["without-line", "line-in-prompt"])
 
     def test_the_real_file_parses_and_shares_no_case_with_the_other_rosters(self):
         certification = eval_rosters.certification_cases()

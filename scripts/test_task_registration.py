@@ -637,8 +637,15 @@ class TestTheRulesReject(unittest.TestCase):
     def test_a_rostered_certification_case_without_the_line_is_reported(self):
         self._only("is in hack/eval/certification-cases.txt but declares no 'suite: certification'", certification={"made-up-case"})
 
-    def test_a_suite_line_outside_the_roster_is_reported(self):
-        self._only("is not in hack/eval/certification-cases.txt", suite="certification", certification=set())
+    def test_a_suite_line_outside_the_roster_is_reported_once(self):
+        # Registered nowhere at all: the suite finding names the right file,
+        # and the general registration finding (which would say
+        # nightly-cases.txt) stays quiet.
+        self._only("is not in hack/eval/certification-cases.txt", suite="certification", certification=set(), registered=set())
+
+    def test_a_parked_certification_case_may_carry_its_suite_line(self):
+        with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
+            self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
 
     def test_an_unknown_suite_is_reported(self):
         self._only("the only suite is 'certification'", suite="nightly")

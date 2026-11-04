@@ -1219,7 +1219,16 @@ def validate_case(
                 f"is in {_roster_display(CERTIFICATION_CASES_FILE)} but declares no "
                 f"'{SUITE_KEY}: {CERTIFICATION_SUITE}'; add the line, or take the case off the roster"
             )
-        if name not in certification and suite == CERTIFICATION_SUITE:
+        # A parked case (FIXTURE_NOT_READY, KNOWN_UNREGISTERED) may carry its
+        # suite line before its roster line lands; the registration check
+        # below leaves a suite case to this finding, so the two never ask for
+        # a nightly line and a certification line at once.
+        if (
+            name not in certification
+            and suite == CERTIFICATION_SUITE
+            and name not in KNOWN_UNREGISTERED
+            and name not in FIXTURE_NOT_READY
+        ):
             problems.append(
                 f"declares '{SUITE_KEY}: {CERTIFICATION_SUITE}' but is not in "
                 f"{_roster_display(CERTIFICATION_CASES_FILE)}; a certification case runs on that lane only"
@@ -1521,12 +1530,16 @@ def validate_case(
 
     # Registration. hack/ci-eval-pr.sh runs the cases in
     # hack/eval/presubmit-cases.txt and, on the nightly tier,
-    # hack/eval/nightly-cases.txt -- and only those.
+    # hack/eval/nightly-cases.txt, and on the certification tier those in
+    # hack/eval/certification-cases.txt -- and only those. A `suite:
+    # certification` case is reported by the suite check above instead,
+    # which names the right file.
     if (
         registered is not None
         and name not in registered
         and name not in KNOWN_UNREGISTERED
         and name not in FIXTURE_NOT_READY
+        and suite != CERTIFICATION_SUITE
     ):
         problems.append(
             "is registered nowhere and never runs. Add it to "
