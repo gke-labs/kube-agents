@@ -114,14 +114,16 @@ func TestSlackSessionTitleNoCompatibilityForm(t *testing.T) {
 }
 
 // linearTitleBudget is the CPU time one 40 000-unit input may take. One
-// linear parse of it takes about 0.4 s under the race detector. The budget is
-// CPU time on the parsing thread, not wall time: wall time also counts the
-// time the thread waited for a core, and on a loaded runner that took a
-// linear parse past 5 s. The shape this guards against is a parse of the rest
-// of the message per unit, 10 000 to 40 000 such parses depending on the
-// unit, which runs for hours; a bare byte rescan per unit is cheaper than one
-// parse here, and no time budget tells it apart.
-const linearTitleBudget = 5 * time.Second
+// linear parse of it takes 0.3 s to 0.7 s of CPU under the race detector, on
+// an idle host or a loaded one, and the budget is three times the top of that.
+// The budget is CPU time on the parsing thread, not wall time: wall time also
+// counts the time the thread waited for a core, and on a loaded runner that
+// took a linear parse past 5 s. The shape this guards against is a parse of
+// the rest of the message per unit, 10 000 to 40 000 such parses depending on
+// the unit, which runs for hours; a regex scan of the rest of the title every
+// 100 bytes already costs 3.1 s to 9.9 s. A bare byte rescan per unit is
+// cheaper than one parse here, and no time budget tells it apart.
+const linearTitleBudget = 2 * time.Second
 
 func TestSlackSessionTitleLinearOnUnclosedMarkup(t *testing.T) {
 	const slackMessageMax = 40_000
