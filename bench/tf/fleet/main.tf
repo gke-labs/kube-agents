@@ -573,7 +573,7 @@ resource "google_container_cluster" "seeded_b" {
 
   # The other peer of the consistency majority: B matches A (authorized
   # networks ON, open block -- see seeded_a for why this is safe), so C is
-  # the single outlier on a single facet.
+  # the single outlier on the authorized-networks facet.
   master_authorized_networks_config {
     cidr_blocks {
       cidr_block   = "0.0.0.0/0"
@@ -645,9 +645,12 @@ resource "google_container_node_pool" "seeded_b_default" {
 # normalizes to OFF -- absence on one cluster against an ON majority is the
 # finding (SOP 4.5, base critical, the severity that survives a
 # three-cluster cohort's two ladder steps). Two agree, one differs: the
-# reason this fleet is at least three clusters and not two. Everything else on C
-# deliberately matches its peers, so C is an outlier on exactly one facet
-# and the split-cluster guard never mistakes it for an uncohorted cluster.
+# reason this fleet is at least three clusters and not two. Everything else
+# on C's control plane deliberately matches its peers; its default pool
+# differs on boot-disk size and kubelet config (seeded_c_default below),
+# which no facet reads today and two will. One facet today, three once
+# those land, either count under the six at which the split-cluster guard
+# (SOP 3.6) stops calling C drift and calls it a different kind of cluster.
 resource "google_container_cluster" "seeded_c" {
   name     = "${var.cluster_prefix}-c"
   location = var.zone
@@ -662,7 +665,8 @@ resource "google_container_cluster" "seeded_c" {
   }
 
   # Upgrade-SOP background closure, as on seeded-a: REGULAR channel and a
-  # window. The consistency defect above is authorized networks alone.
+  # window. The consistency defects are authorized networks on the control
+  # plane (above) and the default pool's disk and kubelet config (below).
   release_channel {
     channel = "REGULAR"
   }
@@ -683,6 +687,20 @@ resource "google_container_cluster" "seeded_c" {
   }
 }
 
+# Defect (consistency, pool-level): the same cluster's default pool is the
+# outlier on two node facets the drift SOP does not read yet, `boot-disk`
+# and `kubelet-config`. Every other pool in this stack runs a 20 GB boot
+# disk of the default type with no kubelet block; this one runs 50 GB (type
+# unchanged: size alone differed in the incident behind the facets) and
+# sets one kubelet key, cpu_cfs_quota, to false. False rather than the
+# default true, so the facet reads a difference whether it treats an absent
+# key as unset or as the default; CFS quota off on a node that runs only
+# system pods changes nothing anyone measures. Both fields update in place
+# on the pinned provider (8.4.0): GKE recreates the pool's one node, the
+# pool keeps its identity, and the cluster's createTime does not move, so
+# the drift SOP's 24-hour cohort gate is untouched and no reconcile-allow
+# entry is needed. The fixture role is drift-pool-outlier (fixtures.json);
+# the facets and the case that reads it are the follow-up.
 resource "google_container_node_pool" "seeded_c_default" {
   name       = "default-pool"
   location   = var.zone
@@ -691,10 +709,14 @@ resource "google_container_node_pool" "seeded_c_default" {
 
   node_config {
     machine_type    = "e2-small"
-    disk_size_gb    = 20
+    disk_size_gb    = 50
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    kubelet_config {
+      cpu_cfs_quota = false
+    }
 
     workload_metadata_config {
       mode = "GKE_METADATA"
