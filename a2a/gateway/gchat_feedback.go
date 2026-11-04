@@ -3,6 +3,8 @@ package gateway
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // Answer feedback on Google Chat (feedback.go): two rating buttons, 👍 then
@@ -26,6 +28,29 @@ const (
 	gchatFeedbackCancelValue = "1"
 	gchatFeedbackUpText      = "👍"
 	gchatFeedbackDownText    = "👎"
+	// gchatFeedbackSeenPrefix keys a rating tap in the dedupe ring, apart
+	// from a choice click on the same message at the same time.
+	gchatFeedbackSeenPrefix = "feedback:"
+	// The relay call that patches a rated message, and the widget keys of
+	// its one button list.
+	gchatSpacesResource   = "spaces"
+	gchatMessagesResource = "messages"
+	gchatPatchMethod      = "patch"
+	gchatNameArg          = "name"
+	gchatUpdateMaskArg    = "updateMask"
+	gchatBodyArg          = "body"
+	gchatButtonListKey    = "buttonList"
+	gchatButtonsKey       = "buttons"
+
+	// The reasons a rating tap is not a turn, for the pull loop's log.
+	gchatRatingOff        = "a rating tap with answer feedback off"
+	gchatRatingNoTask     = "a rating tap with no task"
+	gchatRatingUnknown    = "a rating tap with an unknown rating "
+	gchatRatingNoEmail    = "rater has no email"
+	gchatRatingNoMessage  = "rating tap names no space or no message"
+	gchatRatingDuplicate  = "duplicate delivery of rating tap "
+	gchatRatingUnverified = "a rating tap from an unverified sender"
+	gchatRatingTaken      = "a rating tap, recorded off the pull loop: "
 )
 
 // gchatButtonKind is what a button on a message does, told apart by its
@@ -203,4 +228,100 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 	}
 	a.rememberRating(message, rating)
 	return message, nil
+}
+
+// feedbackClick takes a tap on a rating button. It is never a turn: it
+// always returns the reason the pull loop logs. A tap the gateway cannot
+// read, a redelivery, or one from a sender the recorder does not admit
+// changes nothing. Otherwise the rating is recorded off the pull loop
+// (Rate carries its own deadline, the relay calls theirs), and then the
+// message is patched with the tapped button filled. A failed write logs and
+// leaves the message as it was. The tap claims no question: a choice click
+// on the message is still a turn.
+func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
+	click := ev.click
+	recorder := a.feedbackRecorder()
+	task := strings.TrimSpace(click.Parameters[gchatFeedbackParamTask])
+	value := click.Parameters[gchatFeedbackParamRating]
+	switch {
+	case recorder == nil:
+		return gchatRatingOff
+	case task == "":
+		return gchatRatingNoTask
+	case value != FeedbackUp && value != FeedbackDown:
+		return gchatRatingUnknown + strconv.Quote(value)
+	case click.User.Email == "":
+		return gchatRatingNoEmail
+	case ev.Space.Name == "" || ev.Message.Name == "":
+		return gchatRatingNoMessage
+	}
+	message := ev.Message.Name
+	id := gchatClickID(message, click.EventTime)
+	a.mu.Lock()
+	// As a choice click: a tap with no event time has no id of its own.
+	if click.EventTime != "" && a.seenLocked(gchatFeedbackSeenPrefix+id) {
+		a.mu.Unlock()
+		return gchatRatingDuplicate + id
+	}
+	conversation := a.clickConversationLocked(ev)
+	a.mu.Unlock()
+	if !recorder.Admits(gchatBackend, click.User.Email) {
+		return gchatRatingUnverified
+	}
+	rating := FeedbackRating{Platform: platformGoogleChat, Backend: gchatBackend, Rater: click.User.Email,
+		Conversation: conversation, MessageID: message, TaskID: task, Rating: value, Answer: ev.Message.Text}
+	chosen := gchatRating{task: task, chosen: value}
+	a.goRewrite(func() {
+		if _, err := recorder.Rate(rating); err != nil {
+			a.log.Warn("gchat: recording a rating failed", "message", message, "taskId", task, "err", err)
+			return
+		}
+		a.rememberRating(message, chosen)
+		if err := a.patchRating(message, a.ratedLayout(ev, chosen)); err != nil {
+			a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
+		}
+		// Task 4: a 👎 asks for a note here.
+	})
+	return gchatRatingTaken + value
+}
+
+// ratedLayout is the layout a rating tap patches message ev to, with r's
+// buttons at the end: (a) a remembered question not yet answered keeps its
+// own layout; (b) an answered one takes the event's text and its link
+// buttons only, so a tap never restores the choices the answer removed; (c)
+// any other message, one from before a restart, takes the event's text and
+// its choice and link buttons, in the event's order.
+func (a *GoogleChatAdapter) ratedLayout(ev *gchatEvent, r gchatRating) gchatChatLayout {
+	a.mu.Lock()
+	ux := a.uxLocked()
+	answered := ux.answered[ev.Message.Name]
+	q, remembered := ux.questions[ev.Message.Name]
+	a.mu.Unlock()
+	if remembered && !answered {
+		return gchatChatLayout{Text: q.layout.Text, Widgets: gchatWithRating(q.layout.Widgets, r)}
+	}
+	var buttons []map[string]any
+	for _, w := range ev.Message.AccessoryWidgets {
+		for _, b := range w.ButtonList.Buttons {
+			kind := classifyGchatButton(b)
+			if kind == gchatButtonLink || (kind == gchatButtonChoice && !answered) {
+				buttons = append(buttons, gchatButtonWidget(b))
+			}
+		}
+	}
+	var widgets []map[string]any
+	if len(buttons) > 0 {
+		widgets = []map[string]any{{gchatButtonListKey: map[string]any{gchatButtonsKey: buttons}}}
+	}
+	return gchatChatLayout{Text: ev.Message.Text, Widgets: gchatWithRating(widgets, r)}
+}
+
+// patchRating patches message to layout.
+func (a *GoogleChatAdapter) patchRating(message string, layout gchatChatLayout) error {
+	arguments := map[string]any{
+		gchatNameArg:       message,
+		gchatUpdateMaskArg: gchatLayoutUpdateMask,
+		gchatBodyArg:       gchatLayoutBody(layout),
+	}
+	return a.apiCall([]string{gchatSpacesResource, gchatMessagesResource}, gchatPatchMethod, arguments, nil)
 }

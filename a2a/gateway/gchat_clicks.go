@@ -287,7 +287,12 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	if click == nil {
 		return InboundMessage{}, "a click event with no click"
 	}
-	if click.Function != gchatChatFunction {
+	switch click.Function {
+	case gchatFeedbackFunction:
+		// A rating tap is never a turn (gchat_feedback.go).
+		return InboundMessage{}, a.feedbackClick(ev)
+	case gchatChatFunction:
+	default:
 		return InboundMessage{}, "a click on a button this adapter did not draw (" + strconv.Quote(click.Function) + ")"
 	}
 	reply := strings.TrimSpace(click.Parameters[gchatChatParamReply])
@@ -300,7 +305,7 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	if ev.Space.Name == "" || ev.Message.Name == "" {
 		return InboundMessage{}, "click names no space or no message"
 	}
-	kind, thread := gchatSurface(ev)
+	kind, _ := gchatSurface(ev)
 	index, err := strconv.Atoi(click.Parameters[gchatChatParamChoice])
 	if err != nil {
 		index = gchatChoiceUnknown
@@ -327,12 +332,8 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	if p.clicker == "" {
 		p.clicker = namelessClicker
 	}
-	bound := ""
+	bound := a.clickConversationLocked(ev)
 	if q, ok := ux.questions[ev.Message.Name]; ok {
-		// A remembered question binds its click to the conversation it was
-		// posted in; the event's surface binds any other click (a home post,
-		// which has no conversation, or one from before a restart).
-		bound = q.conversation
 		p.text, p.links = q.layout.Text, q.links
 		if index >= 0 && index < len(q.choices) {
 			p.label = q.choices[index]
@@ -349,9 +350,6 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	// email from here, as after a typed message.
 	a.rememberUserLocked(click.User)
 	a.mu.Unlock()
-	if bound == "" {
-		bound = gchatConversationID(ev.Space.Name, thread, kind)
-	}
 	return InboundMessage{
 		Conversation: bound,
 		Kind:         kind,
@@ -360,6 +358,18 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 		Text:         reply,
 		Click:        true,
 	}, ""
+}
+
+// clickConversationLocked is the conversation a click on ev's message binds
+// to: a remembered question binds it to the conversation it was posted in,
+// and the event's surface binds any other click (a home post, which has no
+// conversation, or one from before a restart). Called under a.mu.
+func (a *GoogleChatAdapter) clickConversationLocked(ev *gchatEvent) string {
+	if q, ok := a.uxLocked().questions[ev.Message.Name]; ok && q.conversation != "" {
+		return q.conversation
+	}
+	kind, thread := gchatSurface(ev)
+	return gchatConversationID(ev.Space.Name, thread, kind)
 }
 
 // gchatClickID names one click for the audit chain and the pending map: the

@@ -1,8 +1,11 @@
 package gateway
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
@@ -266,4 +269,328 @@ func TestGchatRatingButtonsRoundTrip(t *testing.T) {
 			t.Errorf("button %d re-encodes as\n %s\nwant %s", i, got, want)
 		}
 	}
+}
+
+// gchatRatingEvent is the add-on click fixture as a tap on rating, with the
+// rating buttons at the end of the message's button list, as Chat shows a
+// rated answer.
+func gchatRatingEvent(t *testing.T, rating string) *gchatEvent {
+	t.Helper()
+	ev := gchatClickEvent(t)
+	ev.click.Function = gchatFeedbackFunction
+	ev.click.Parameters = map[string]string{"task": "t-root", "rating": rating}
+	raw, _ := json.Marshal(gchatRatingButtons(gchatRating{task: "t-root"}))
+	var buttons []gchatButton
+	if err := json.Unmarshal(raw, &buttons); err != nil {
+		t.Fatal(err)
+	}
+	list := &ev.Message.AccessoryWidgets[0].ButtonList
+	list.Buttons = append(list.Buttons, buttons...)
+	return ev
+}
+
+// gchatSpaceEvent moves ev into a threaded space.
+func gchatSpaceEvent(ev *gchatEvent) *gchatEvent {
+	ev.Space = gchatSpace{Name: "spaces/AAA", SpaceType: "SPACE", SpaceThreadingState: "THREADED_MESSAGES"}
+	ev.Message.Name = "spaces/AAA/messages/M1"
+	ev.Message.Thread.Name = "spaces/AAA/threads/T1"
+	return ev
+}
+
+func relayCallCount(f *fakeChatRelay) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
+}
+
+func recordedRatings(rec *fakeRecorder) []FeedbackRating {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]FeedbackRating{}, rec.ratings...)
+}
+
+// checkPatch checks that call i patches message's layout, and returns its
+// body.
+func checkPatch(t *testing.T, f *fakeChatRelay, i int, message string) map[string]any {
+	t.Helper()
+	c := f.call(i)
+	if c.method != "patch" || c.arguments["name"] != message || c.arguments["updateMask"] != gchatLayoutUpdateMask {
+		t.Fatalf("call %d = %+v, want a patch of %s's layout", i, c, message)
+	}
+	return callBody(t, c)
+}
+
+// checkFilled checks the two rating buttons at the end of buttons: the
+// chosen one FILLED, the other with no type.
+func checkFilled(t *testing.T, buttons []gchatButton, chosen string) {
+	t.Helper()
+	if len(buttons) < 2 {
+		t.Fatalf("buttons = %+v, want the two rating buttons last", buttons)
+	}
+	up, down := buttons[len(buttons)-2], buttons[len(buttons)-1]
+	wantUp, wantDown := "", ""
+	if chosen == "up" {
+		wantUp = "FILLED"
+	} else {
+		wantDown = "FILLED"
+	}
+	if up.Text != "👍" || up.Type != wantUp || buttonParams(up)["rating"] != "up" || buttonParams(up)["task"] != "t-root" {
+		t.Errorf("👍 = %+v, want type %q", up, wantUp)
+	}
+	if down.Text != "👎" || down.Type != wantDown || buttonParams(down)["rating"] != "down" || buttonParams(down)["task"] != "t-root" {
+		t.Errorf("👎 = %+v, want type %q", down, wantDown)
+	}
+}
+
+func TestGchatRatingInBothEventLayoutsIsRecorded(t *testing.T) {
+	a, _, rec := newFeedbackGchatAdapter(t)
+	if _, reason := a.classify(gchatRatingEvent(t, "down")); reason == "" {
+		t.Fatal("an add-on rating tap is a turn")
+	}
+	raw, err := os.ReadFile("testdata/gchat/legacy-dm-button-click.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	wire["common"] = map[string]any{"invokedFunction": "kage.feedback", "parameters": map[string]any{"task": "t-root", "rating": "down"}}
+	legacy, _ := json.Marshal(wire)
+	ev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString(legacy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := a.classify(ev); reason == "" {
+		t.Fatal("a legacy rating tap is a turn")
+	}
+	got := recordedRatings(rec)
+	if len(got) != 2 {
+		t.Fatalf("ratings = %+v, want one per layout", got)
+	}
+	for i, r := range got {
+		if r.TaskID != "t-root" || r.Rating != "down" || r.Rater != "sender@example.com" {
+			t.Errorf("rating %d = %+v", i, r)
+		}
+	}
+}
+
+func TestGchatRatingTapsTheGatewayCannotReadAreDropped(t *testing.T) {
+	cases := map[string]func(ev *gchatEvent){
+		"no task":    func(ev *gchatEvent) { delete(ev.click.Parameters, "task") },
+		"sideways":   func(ev *gchatEvent) { ev.click.Parameters["rating"] = "sideways" },
+		"no email":   func(ev *gchatEvent) { ev.click.User.Email = "" },
+		"no message": func(ev *gchatEvent) { ev.Message.Name = "" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			a, f, rec := newFeedbackGchatAdapter(t)
+			ev := gchatRatingEvent(t, "up")
+			mutate(ev)
+			msg, reason := a.classify(ev)
+			if reason == "" || msg != (InboundMessage{}) {
+				t.Errorf("classify = %+v %q, want a reason and no turn", msg, reason)
+			}
+			if got := recordedRatings(rec); len(got) != 0 {
+				t.Errorf("ratings = %+v, want none", got)
+			}
+			if n := relayCallCount(f); n != 0 {
+				t.Errorf("relay calls = %d, want none", n)
+			}
+		})
+	}
+}
+
+func TestGchatUpRatingIsRecordedAndIsNoTurn(t *testing.T) {
+	a, _, rec := newFeedbackGchatAdapter(t)
+	msg, reason := a.classify(gchatRatingEvent(t, "up"))
+	if msg != (InboundMessage{}) || reason == "" {
+		t.Fatalf("classify = %+v %q, want no turn and a reason", msg, reason)
+	}
+	got := recordedRatings(rec)
+	want := FeedbackRating{Platform: "googlechat", Backend: "gchat", Rater: "sender@example.com",
+		Conversation: "gchat:dm/spaces/_c2fixtureAA/threads/BOT1", MessageID: "spaces/_c2fixtureAA/messages/BOT1.BOT1",
+		TaskID: "t-root", Rating: "up", Answer: "*Which cluster?*\n\nTwo clusters run one."}
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("ratings = %+v\nwant [%+v]", got, want)
+	}
+}
+
+func TestGchatRatingAfterARestartPatchesFromTheEventsCopy(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	ev := gchatRatingEvent(t, "up")
+	a.classify(ev)
+	if n := relayCallCount(f); n != 1 {
+		t.Fatalf("relay calls = %d, want one patch", n)
+	}
+	body := checkPatch(t, f, 0, gchatRatedMessage)
+	if body["text"] != ev.Message.Text {
+		t.Errorf("text = %q, want the event's %q", body["text"], ev.Message.Text)
+	}
+	buttons := bodyButtons(t, body)
+	if len(buttons) != 5 {
+		t.Fatalf("buttons = %+v, want two choices, the link and two rating", buttons)
+	}
+	if buttons[0].Text != "Look at the first one" || buttons[0].Type != "FILLED" || classifyGchatButton(buttons[0]) != gchatButtonChoice ||
+		buttonParams(buttons[0])["reply"] != "Look at the first one: prod-eu" {
+		t.Errorf("first choice = %+v", buttons[0])
+	}
+	if buttons[1].Text != "Skip" || buttons[1].Type != "" || classifyGchatButton(buttons[1]) != gchatButtonChoice {
+		t.Errorf("second choice = %+v", buttons[1])
+	}
+	if buttons[2].Text != "board" || buttons[2].OnClick.OpenLink.URL != "https://x.example/b" {
+		t.Errorf("link = %+v", buttons[2])
+	}
+	checkFilled(t, buttons, "up")
+}
+
+func TestGchatRatingOnARememberedAnswerPatchesFromItsLayout(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	name, err := a.PostMessage("gchat:dm/spaces/_c2fixtureAA", OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	posted := callBody(t, f.call(0))
+	ev := gchatRatingEvent(t, "down")
+	ev.Message.Text = "a stale copy"
+	a.classify(ev)
+	body := checkPatch(t, f, 1, name)
+	if body["text"] != posted["text"] {
+		t.Errorf("text = %q, want the posted %q", body["text"], posted["text"])
+	}
+	buttons := bodyButtons(t, body)
+	if len(buttons) != 5 {
+		t.Fatalf("buttons = %+v", buttons)
+	}
+	kinds := []gchatButtonKind{gchatButtonChoice, gchatButtonChoice, gchatButtonLink, gchatButtonRating, gchatButtonRating}
+	for i, b := range buttons {
+		if classifyGchatButton(b) != kinds[i] {
+			t.Errorf("button %d = %+v, want %q", i, b, kinds[i])
+		}
+	}
+	checkFilled(t, buttons, "down")
+	// The tap claimed nothing: a choice click is still a turn.
+	if _, reason := a.classify(gchatClickEvent(t)); reason != "" {
+		t.Errorf("a choice click after the tap is dropped: %q", reason)
+	}
+}
+
+func TestGchatRatingNeverRestoresAnsweredChoices(t *testing.T) {
+	a, f, _ := newFeedbackGchatAdapter(t)
+	name, err := a.PostMessage("gchat:dm/spaces/_c2fixtureAA", OutMessage{Text: "fallback", Chat: gchatFeedbackQuestion(), Feedback: "t-root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, reason := a.classify(gchatClickEvent(t))
+	if reason != "" {
+		t.Fatalf("choice click: %q", reason)
+	}
+	a.InboundVerified(msg.Conversation, msg.MessageID, true)
+	a.classify(gchatRatingEvent(t, "up"))
+	buttons := bodyButtons(t, checkPatch(t, f, 2, name))
+	for _, b := range buttons {
+		if classifyGchatButton(b) == gchatButtonChoice {
+			t.Errorf("the tap restored a choice: %+v", b)
+		}
+	}
+	if len(buttons) != 3 || classifyGchatButton(buttons[0]) != gchatButtonLink || buttons[0].OnClick.OpenLink.URL != "https://x.example/b" {
+		t.Fatalf("buttons = %+v, want the link and two rating", buttons)
+	}
+	checkFilled(t, buttons, "up")
+}
+
+func TestGchatReRatingReplacesTheFilledButton(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	a.classify(gchatRatingEvent(t, "down"))
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 0, gchatRatedMessage)), "down")
+	a.classify(gchatRatingEvent(t, "up"))
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 1, gchatRatedMessage)), "up")
+	if r := a.ratingOf(gchatRatedMessage); r.task != "t-root" || r.chosen != FeedbackUp {
+		t.Errorf("ratingOf = %+v, want t-root up", r)
+	}
+	if got := recordedRatings(rec); len(got) != 2 {
+		t.Errorf("ratings = %+v, want two", got)
+	}
+}
+
+func TestGchatRatingFromAnUnverifiedSenderChangesNothing(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.admit = map[string]bool{}
+	if _, reason := a.classify(gchatRatingEvent(t, "up")); reason == "" {
+		t.Error("an unverified rating tap is a turn")
+	}
+	if got := recordedRatings(rec); len(got) != 0 {
+		t.Errorf("ratings = %+v", got)
+	}
+	if n := relayCallCount(f); n != 0 {
+		t.Errorf("relay calls = %d", n)
+	}
+	if r := a.ratingOf(gchatRatedMessage); r.chosen != "" {
+		t.Errorf("ratingOf = %+v", r)
+	}
+}
+
+func TestGchatRedeliveredRatingIsHandledOnce(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	ev := gchatRatingEvent(t, "up")
+	a.classify(ev)
+	_, reason := a.classify(ev)
+	if !strings.Contains(reason, "duplicate") {
+		t.Errorf("second reason = %q, want a duplicate", reason)
+	}
+	if got := recordedRatings(rec); len(got) != 1 {
+		t.Errorf("ratings = %+v, want one", got)
+	}
+	if n := relayCallCount(f); n != 1 {
+		t.Errorf("relay calls = %d, want one patch", n)
+	}
+}
+
+func TestGchatFailedRatingWriteLeavesTheMessage(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.rateErr = errFeedbackContended
+	a.classify(gchatRatingEvent(t, "down"))
+	if n := relayCallCount(f); n != 0 {
+		t.Errorf("relay calls = %d, want none", n)
+	}
+	if r := a.ratingOf(gchatRatedMessage); r.task != "" {
+		t.Errorf("ratingOf = %+v, want nothing remembered", r)
+	}
+}
+
+func TestGchatRatingWithFeedbackOffChangesNothing(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/patch"] = map[string]any{"name": gchatRatedMessage}
+	a := newTestGchatAdapterWithRelay(t, f)
+	a.syncRewrites = true
+	if _, reason := a.classify(gchatRatingEvent(t, "up")); reason == "" {
+		t.Error("a rating tap with feedback off is a turn")
+	}
+	if n := relayCallCount(f); n != 0 {
+		t.Errorf("relay calls = %d, want none", n)
+	}
+	if r := a.ratingOf(gchatRatedMessage); r.task != "" {
+		t.Errorf("ratingOf = %+v", r)
+	}
+}
+
+func TestGchatTwoRatersInASpaceKeepTheirOwnRatings(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.admit = map[string]bool{"a@example.com": true, "b@example.com": true}
+	first := gchatSpaceEvent(gchatRatingEvent(t, "up"))
+	first.click.User.Email = "a@example.com"
+	second := gchatSpaceEvent(gchatRatingEvent(t, "down"))
+	second.click.User.Email = "b@example.com"
+	a.classify(first)
+	a.classify(second)
+	got := recordedRatings(rec)
+	if len(got) != 2 || got[0].Rater != "a@example.com" || got[1].Rater != "b@example.com" {
+		t.Fatalf("ratings = %+v, want one per rater", got)
+	}
+	for i, r := range got {
+		if r.Conversation != "gchat:spaces/AAA/threads/T1" || r.MessageID != "spaces/AAA/messages/M1" {
+			t.Errorf("rating %d = %+v", i, r)
+		}
+	}
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, relayCallCount(f)-1, "spaces/AAA/messages/M1")), "down")
 }
