@@ -268,7 +268,7 @@ func TestMetricsOutcomesThatAreNotTheUpstreams(t *testing.T) {
 			name:     "authentication unavailable",
 			authn:    staticAuthenticator{err: fmt.Errorf("%w: %w", errAuthenticationUnavailable, errors.New("connection refused"))},
 			upstream: podList,
-			target:   "/api/v1/namespaces/default/pods",
+			target:   "/clusters/in-cluster/api/v1/namespaces/default/pods",
 			wantCode: http.StatusServiceUnavailable,
 			want:     `outcome="auth_unavailable",resource="unknown",status_code="503"`,
 		},
@@ -279,7 +279,7 @@ func TestMetricsOutcomesThatAreNotTheUpstreams(t *testing.T) {
 				return nil, req.Context().Err()
 			},
 			ctx:      canceled,
-			target:   "/api/v1/namespaces/default/pods",
+			target:   "/clusters/in-cluster/api/v1/namespaces/default/pods",
 			wantCode: http.StatusBadGateway,
 			want:     `outcome="canceled",resource="pods",status_code="502"`,
 		},
@@ -287,7 +287,7 @@ func TestMetricsOutcomesThatAreNotTheUpstreams(t *testing.T) {
 			name:     "unredactable secret",
 			authn:    staticAuthenticator{caller: &CallerIdentity{Username: "shell"}},
 			upstream: podList,
-			target:   "/api/v1/namespaces/default/secrets/db",
+			target:   "/clusters/in-cluster/api/v1/namespaces/default/secrets/db",
 			wantCode: http.StatusBadGateway,
 			want:     `outcome="upstream_error",resource="secrets",status_code="502"`,
 			notWant:  `kubeagents_kube_proxy_secrets_redacted_total{action="payload_scrubbed"} 1`,
@@ -296,12 +296,11 @@ func TestMetricsOutcomesThatAreNotTheUpstreams(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			metrics := NewMetrics()
 			h, err := NewHandler(Config{
-				Authenticator:    tc.authn,
-				Upstream:         &fakeUpstream{handler: tc.upstream},
-				DefaultClusterID: InClusterID,
-				Policy:           Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
-				Logger:           slog.New(slog.DiscardHandler),
-				Metrics:          metrics,
+				Authenticator: tc.authn,
+				Upstream:      &fakeUpstream{handler: tc.upstream},
+				Policy:        Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+				Logger:        slog.New(slog.DiscardHandler),
+				Metrics:       metrics,
 			})
 			if err != nil {
 				t.Fatalf("NewHandler: %v", err)
