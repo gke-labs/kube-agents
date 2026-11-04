@@ -35,7 +35,8 @@ POD_CPU_LIMIT = "500m"
 POD_MEMORY_LIMIT = "512Mi"
 SERVICE_PORT = 80
 SERVICE_TARGET_PORT = 8080
-NAMESPACE_FORMAT = "team-{:03d}"
+NAMESPACE_PREFIX = "team-"
+NAMESPACE_FORMAT = NAMESPACE_PREFIX + "{:03d}"
 DEPLOYMENT_FORMAT = "svc-{:02d}"
 # Warning Events of the kinds a large cluster carries, against Pods of the workload namespaces.
 EVENT_REASONS = (

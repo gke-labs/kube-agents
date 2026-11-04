@@ -5,6 +5,8 @@
     python -m kube_agents_bench.oom_repro --host-context <context> proxy
     python -m kube_agents_bench.oom_repro events --count 400000
     python -m kube_agents_bench.oom_repro --host-context <context> watcher --runc
+    python -m kube_agents_bench.oom_repro --nodes 3000 --namespaces 300 fleet load --names oom-01,oom-02
+    python -m kube_agents_bench.oom_repro --host-context <context> proxy --size L
     python -m kube_agents_bench.oom_repro fleet delete
 
 ``bench/oom-repro/README.md`` has the procedure. A scenario runs under the install's live-test lease.
@@ -70,6 +72,26 @@ DEFAULT_LIMITS = {
     "agentAPIAuth": {"cpu": "1", "memory": "2Gi"},
     "shellSandbox": {"cpu": "2", "memory": "2Gi"},
 }
+# The L preset: a raised size for a large fleet, in decimal gigabytes. It is this harness's own and
+# larger than the fleet tier below for the shell and the event watcher's CPU.
+SIZES = {
+    "default": DEFAULT_LIMITS,
+    "L": {
+        "credentialProxy": {"cpu": "8", "memory": "8G"},
+        "agentAPIAuth": {"cpu": "2", "memory": "4G"},
+        "shellSandbox": {"cpu": "8", "memory": "8G"},
+    },
+    # The fleet tier's limits (charts/kube-agents/examples/values-fleet.yaml, described in
+    # docs/site/src/content/docs/deploy/fleet-sizing.md): the credential proxy at 8 vCPU and 8 GiB,
+    # agent-api-auth at a 4 GiB memory limit with its CPU limit left at the default (the watcher's
+    # GOMAXPROCS follows it), and the shell unchanged.
+    "fleet": {
+        "credentialProxy": {"cpu": "8", "memory": "8Gi"},
+        "agentAPIAuth": {**DEFAULT_LIMITS["agentAPIAuth"], "memory": "4Gi"},
+        "shellSandbox": DEFAULT_LIMITS["shellSandbox"],
+    },
+}
+DEFAULT_SIZE = "default"
 RUNTIME_CLASS_KEYS = ("deployment", "availability", "runtimeClassName")
 SPEC_POINTER = "/spec"
 RUNTIME_CLASS_PATH = SPEC_POINTER + "/" + "/".join(RUNTIME_CLASS_KEYS)
@@ -104,6 +126,12 @@ CREATE_KUBECONFIG_FORMAT = "create-{cluster}.kubeconfig"
 # included, and the KWOK controller needs a core and a half; 6 e2-standard-8 hold both.
 FULL_MACHINE_TYPE = "e2-standard-8"
 FULL_REAL_NODES = 6
+# Larger fleets get one more real node per this many KWOK nodes.
+KWOK_NODES_PER_REAL_NODE = 250
+REAL_NODE_POOL = "default-pool"
+NAMES_SEPARATOR = ","
+MACHINE_TYPE_FORMAT = "value(config.machineType)"
+NAMESPACE_OBJECT_PREFIX = "namespace/"
 EVENTS_MACHINE_TYPE = "e2-standard-4"
 EVENTS_REAL_NODES = 2
 NODE_DISK_GB = "50"
@@ -243,7 +271,12 @@ class Fleet:
         self.reached.add(cluster)
 
 
-def create_cluster(fleet: Fleet, name: str, block: int, events_only: bool) -> None:
+def real_nodes(kwok_nodes: int) -> int:
+    """Real nodes a full cluster needs for its system Pods and the KWOK controller."""
+    return max(FULL_REAL_NODES, -(-kwok_nodes // KWOK_NODES_PER_REAL_NODE))
+
+
+def create_cluster(fleet: Fleet, name: str, block: int, events_only: bool, kwok_nodes: int) -> None:
     subnet = SUBNET_FORMAT.format(cluster=name)
     pods, services = POD_RANGE_FORMAT.format(cluster=name), SERVICE_RANGE_FORMAT.format(cluster=name)
     net = f"{NETWORK_PREFIX}{block}"
@@ -257,7 +290,7 @@ def create_cluster(fleet: Fleet, name: str, block: int, events_only: bool) -> No
     run(["gcloud", "container", "clusters", "create", name, "--project", fleet.project, "--zone", fleet.zone,
          "--release-channel", RELEASE_CHANNEL,
          "--machine-type", EVENTS_MACHINE_TYPE if events_only else FULL_MACHINE_TYPE,
-         "--num-nodes", str(EVENTS_REAL_NODES if events_only else FULL_REAL_NODES), "--disk-size", NODE_DISK_GB,
+         "--num-nodes", str(EVENTS_REAL_NODES if events_only else real_nodes(kwok_nodes)), "--disk-size", NODE_DISK_GB,
          "--enable-ip-alias", "--subnetwork", subnet, "--cluster-secondary-range-name", pods,
          "--services-secondary-range-name", services, "--labels", f"{FLEET_LABEL_KEY}={FLEET_LABEL_VALUE}",
          "--workload-pool", WORKLOAD_POOL_FORMAT.format(project=fleet.project), "-q"],
@@ -321,8 +354,7 @@ def load_cluster(fleet: Fleet, cluster: str, args: argparse.Namespace) -> None:
     target = int(args.nodes * READY_FRACTION)
 
     def ready() -> int:
-        out = fleet.kubectl(cluster, "get", "nodes", "-l", f"{fixtures.KWOK_NODE_LABEL}={fixtures.KWOK_NODE_LABEL_VALUE}",
-                            "--no-headers", check=False)
+        out = fleet.kubectl(cluster, "get", "nodes", "-l", kwok_selector(), "--no-headers", check=False)
         return sum(1 for line in out.splitlines() if " Ready " in line)
 
     apply_parallel(fleet, cluster, nodes)
@@ -350,7 +382,7 @@ def fleet_create(args: argparse.Namespace) -> None:
     names = [f"{fleet.prefix}{i:02d}" for i in range(args.first, args.first + args.clusters)]
     blocks = fixtures.free_blocks(subnets, len(names))
     with pool(len(names)) as workers:
-        list(workers.map(lambda nb: create_cluster(fleet, nb[0], nb[1], args.events_only), zip(names, blocks)))
+        list(workers.map(lambda nb: create_cluster(fleet, nb[0], nb[1], args.events_only, args.nodes), zip(names, blocks)))
     for name in names:
         # Serially, before the parallel loads below: get-credentials writes one shared kubeconfig.
         fleet.credentials(name)
@@ -359,6 +391,63 @@ def fleet_create(args: argparse.Namespace) -> None:
     if not args.events_only:
         with pool(len(names)) as workers:
             list(workers.map(lambda n: load_cluster(fleet, n, args), names))
+
+
+def kwok_selector() -> str:
+    return f"{fixtures.KWOK_NODE_LABEL}={fixtures.KWOK_NODE_LABEL_VALUE}"
+
+
+def kwok_node_count(fleet: Fleet, cluster: str) -> int:
+    # check=True: a failed read must not count as zero, or the guard below would pass a shrink.
+    return len(fleet.kubectl(cluster, "get", "nodes", "-l", kwok_selector(), "-o", "name").split())
+
+
+def workload_namespace_count(fleet: Fleet, cluster: str) -> int:
+    prefix = NAMESPACE_OBJECT_PREFIX + fixtures.NAMESPACE_PREFIX
+    return sum(1 for n in fleet.kubectl(cluster, "get", "namespaces", "-o", "name").split() if n.startswith(prefix))
+
+
+def pool_machine_type(fleet: Fleet, cluster: str) -> str:
+    return run(["gcloud", "container", "node-pools", "describe", REAL_NODE_POOL, "--cluster", cluster,
+                "--zone", fleet.zone, "--project", fleet.project, "--format", MACHINE_TYPE_FORMAT]).strip()
+
+
+def load_targets(requested: str, existing: list[str]) -> list[str]:
+    """The clusters --names asks for, refusing a name that is not a fleet cluster."""
+    names = list(dict.fromkeys(n for n in requested.split(NAMES_SEPARATOR) if n))
+    unknown = sorted(set(names) - set(existing))
+    if unknown or not names:
+        raise SystemExit(f"not fleet clusters: {', '.join(unknown) or '(none named)'}")
+    return names
+
+
+def fleet_load(args: argparse.Namespace) -> None:
+    """Bring the named fleet clusters up to --nodes KWOK nodes and the workload size given.
+
+    It only grows a cluster: KWOK nodes and namespaces above the size given would stay, sized for
+    fewer real nodes, so a smaller --nodes or --namespaces than the cluster has is refused. A smaller
+    --replicas scales the Deployments down.
+    """
+    fleet = Fleet(args)
+    names = load_targets(args.names, fleet.names())
+    for name in names:
+        machine = pool_machine_type(fleet, name)
+        if machine != FULL_MACHINE_TYPE:
+            raise SystemExit(f"{name} runs {machine}, not {FULL_MACHINE_TYPE}: an Events-only cluster is not grown")
+        fleet.credentials(name)  # serially: get-credentials writes one shared kubeconfig
+        have = kwok_node_count(fleet, name)
+        if have > args.nodes:
+            raise SystemExit(f"{name} has {have} KWOK nodes, more than --nodes {args.nodes}; fleet load only grows")
+        spaces = workload_namespace_count(fleet, name)
+        if spaces > args.namespaces:
+            raise SystemExit(f"{name} has {spaces} workload namespaces, more than --namespaces {args.namespaces}; "
+                             "fleet load only grows")
+    with pool(len(names)) as workers:
+        list(workers.map(lambda n: run(["gcloud", "container", "clusters", "resize", n, "--node-pool", REAL_NODE_POOL,
+                                        "--num-nodes", str(real_nodes(args.nodes)), "--zone", fleet.zone,
+                                        "--project", fleet.project, "-q"]), names))
+    with pool(len(names)) as workers:
+        list(workers.map(lambda n: load_cluster(fleet, n, args), names))
 
 
 def fleet_delete(args: argparse.Namespace) -> None:
@@ -715,13 +804,18 @@ def report(out: Path, recorder: Recorder, strict: bool = True) -> None:
         raise SystemExit(f"no samples of {recorder.container}: check --watch, --host-context and --namespace")
 
 
+def limits_for(size: str, field: str) -> dict:
+    """The limits a scenario sets for ``field`` at ``size``."""
+    return SIZES[size][field]
+
+
 def scenario(args: argparse.Namespace, field: str, container: str, selector: str, start,
              python: str = CONTAINER_PYTHON) -> None:
     """Run one scenario. ``field`` names the PlatformAgent resources (RESOURCE_PATHS) to set and restore."""
     host = Host(args)
     out = args.out / f"{args.command}-{time.strftime(RUN_DIR_FORMAT, time.gmtime())}"
     out.mkdir(parents=True)
-    limits = DEFAULT_LIMITS[field]
+    limits = limits_for(args.size, field)
     runtime_class = bool(getattr(args, "runc", False))
     with lease(host, f"oom-repro {field}") as lease_lost:
         host.stop = lease_lost
@@ -800,6 +894,8 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     create.add_argument("--clusters", type=int, required=True)
     create.add_argument("--first", type=int, default=1)
     create.add_argument("--events-only", action="store_true", help="no KWOK nodes or Pods; Events only")
+    load = fleet.add_parser("load", help="grow named fleet clusters to --nodes and the workload size given")
+    load.add_argument("--names", required=True, help="comma-separated full fleet clusters to grow")
     fleet.add_parser("delete")
     ev = sub.add_parser("events")
     ev.add_argument("--count", type=int, required=True, help="Events to create in each fleet cluster")
@@ -809,6 +905,7 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
         s = sub.add_parser(name)
         s.add_argument("--seconds", type=int, default=DEFAULT_SCENARIO_SECONDS)
         s.add_argument("--kills", type=int, default=DEFAULT_KILLS, help="stop after this many OOMKills")
+        s.add_argument("--size", choices=sorted(SIZES), default=DEFAULT_SIZE, help="container limits to set")
         if name == "proxy":
             s.add_argument("--watch", choices=sorted(WATCH_TARGETS), default=DEFAULT_WATCH,
                            help="the container the audit's kubectl runs in: shell (default), or proxy on builds before the Kubernetes API proxy")
@@ -823,6 +920,9 @@ def parse(argv: list[str] | None) -> argparse.Namespace:
     return args
 
 
+FLEET_ACTIONS = {"create": fleet_create, "load": fleet_load, "delete": fleet_delete}
+
+
 def stop_on_signal(signum, _frame) -> None:
     # SIGTERM or SIGHUP (a closed terminal) unwinds like Ctrl-C, so a scenario restores and releases.
     raise SystemExit(f"stopped by signal {signum}")
@@ -834,7 +934,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse(argv)
     handlers = {"events": events, "proxy": proxy, "watcher": watcher}
     if args.command == "fleet":
-        (fleet_create if args.action == "create" else fleet_delete)(args)
+        FLEET_ACTIONS[args.action](args)
     else:
         handlers[args.command](args)
     return 0

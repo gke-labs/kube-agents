@@ -17,6 +17,9 @@ The test reproduces three failures at the operator's default memory limits:
 - The event watcher sends cluster Events to the agent. It is OOMKilled at start-up when it reads
   the Events of several large clusters at the same time.
 
+At larger limits on a larger fleet the failures still happen: all three at the harness's L size,
+and the event watcher's at the fleet tier of the sizing page.
+
 No CI job runs this test, and the nightly evaluation does not include it. You run it by hand
 against an install and a GCP project of your own.
 
@@ -60,12 +63,55 @@ To raise a limit the tests reach, see the fleet sizing page
 ([`fleet-sizing.md`](../../docs/site/src/content/docs/deploy/fleet-sizing.md)): the shell's limits
 come from `spec.harness.experimental.shellSandbox.resources`.
 
+## At the L container size
+
+`--size L` sets this harness's L preset, a raised size for a large fleet: the
+shell 8 CPU and 8 GB, the credential proxy 8 CPU and 8 GB, and the event watcher's container 2 CPU
+and 4 GB, in decimal gigabytes. It is not the fleet tier of the sizing page
+([`fleet-sizing.md`](../../docs/site/src/content/docs/deploy/fleet-sizing.md)), which uses binary
+GiB (8 GiB and 4 GiB, about 7 % more), leaves the event watcher's CPU limit at 1, and leaves the shell
+at 2 GiB. `--size fleet` sets that tier's limits; requests stay as they are. All three failures reproduce at L on a larger fleet;
+shares under 1 % are left out of the table.
+
+| Container (L limit)                                                           | Build      | Fleet                                                                          | Result                               | Share of memory at the kill                                                                                                      |
+| ----------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------ | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `shell` (8 CPU, 8 GB)                                                         | `b3d78bc8` | two clusters of about 2,900 KWOK nodes and 86,000 to 89,000 Pods               | OOMKilled once                       | two `kubectl get deploy,sts,ds,cronjob,pod -A -o json` processes (3,857 and 3,500 MiB) 99 %                                      |
+| `envoy-credential-proxy` (8 CPU, 8 GB)                                        | `fb56483b` | two clusters of about 2,900 KWOK nodes and 80,000 Pods                         | OOMKilled once                       | two `kubectl get deploy,sts,ds,cronjob,pod -A -o json` children (4,272 and 3,238 MiB) 97 %, Envoy 2 %, the credential broker 1 % |
+| `agent-api-auth` (2 CPU, 4 GB)                                                | `b3d78bc8` | four clusters of 900,000 to 990,000 Events, 500,000 of them with 1 KB messages | OOMKilled 3 times in about 2 minutes | `k8s-event-watcher` 98.5 %, the API authenticator 1.5 %                                                                          |
+| `agent-api-auth` (1 CPU, 4 GiB: `--size fleet`, the sizing page's fleet tier) | `b3d78bc8` | the same Event batches, about 900,000 per cluster                              | OOMKilled 3 times in about 4 minutes | `k8s-event-watcher` 98.6 %, the API authenticator 1.4 %                                                                          |
+
+The reports are in [`evidence/proxy-shell-L-main-b3d78bc8.md`](evidence/proxy-shell-L-main-b3d78bc8.md),
+[`evidence/proxy-L-main-fb56483b.md`](evidence/proxy-L-main-fb56483b.md) and
+[`evidence/watcher-L-main-b3d78bc8.md`](evidence/watcher-L-main-b3d78bc8.md); the fleet-tier run is in
+[`evidence/watcher-fleet-main-b3d78bc8.md`](evidence/watcher-fleet-main-b3d78bc8.md). At the fleet
+tier the shell keeps its 2 GiB default, which the shell row of "What it reproduces" covers; the
+sizing page's raises do not stop the event watcher's OOMKill.
+
+To reach the L limits, grow the two full clusters to 3,000 KWOK nodes and 90,000 Pods, then, within
+one hour, add both batches of Events and run `watcher`:
+
+```bash
+uv run python -m kube_agents_bench.oom_repro --nodes 3000 --namespaces 300 fleet load --names oom-01,oom-02
+uv run python -m kube_agents_bench.oom_repro --host-context <context> proxy --size L   # --watch proxy on older builds
+uv run python -m kube_agents_bench.oom_repro events --count 400000
+uv run python -m kube_agents_bench.oom_repro events --count 500000 --pad-to 1024
+uv run python -m kube_agents_bench.oom_repro --host-context <context> watcher --size L --runc
+```
+
+`events` keeps the Events-only clusters' namespace count (150 by default), because `fleet load` does
+not grow them: leave `--namespaces` off the two `events` commands. `fleet load` takes the full
+clusters by name, only grows their node and namespace counts, and resizes each real node pool to
+one `e2-standard-8` per 250 KWOK nodes, at least six: twelve per full cluster at 3,000 nodes. The
+evidence fleet used `--prefix kwok-`. The credential proxy's L kill came at about 80,000 Pods per
+cluster and the shell's at 86,000 to 89,000.
+
 ## What you need
 
 - An install of kube-agents ([INSTALL.md](../../INSTALL.md)) whose scope includes the GCP project
   of the test fleet, and a kubectl context for its cluster.
-- Quota in that project for the fleet's real nodes: 6 `e2-standard-8` per full cluster and 2
-  `e2-standard-4` per Events-only cluster. The KWOK nodes use no quota.
+- Quota in that project for the fleet's real nodes: one `e2-standard-8` per 250 KWOK nodes, at
+  least 6, per full cluster (12 at 3,000 KWOK nodes), and 2 `e2-standard-4` per Events-only
+  cluster. The KWOK nodes use no quota.
 - `gcloud`, `kubectl`, `gke-gcloud-auth-plugin` and `uv`, and Application Default Credentials
   (`gcloud auth application-default login`): the Event injector authenticates with them.
 
@@ -89,7 +135,8 @@ reconcile, or start it in the agent pod:
 
 Each scenario writes to its own directory under `--out`. It takes the install's live-test lease and
 saves the `PlatformAgent` spec to `platformagent-before.json`. It sets the watched container to the
-operator's default limits, lowering any request above a limit, and waits until the running pod
+limits of `--size` (the operator's defaults unless `--size L` or `--size fleet`), lowering any request
+above a limit, and waits until the running pod
 carries them. Then it starts the trigger and waits for `--kills` OOMKills of that container, or
 `--seconds`. At the end it puts the container's resources (and the runtime class) back as they were
 and writes `report.md`: the samples it took, the kills, and for each kill the share of each process
@@ -126,8 +173,9 @@ so the container's own limit applies, as it does on runc.
 - GKE refuses the FlowSchema in KWOK's release manifest (it names the cluster-critical `exempt`
   priority level); the harness drops it.
 - GKE scales `kube-dns` and `konnectivity-agent` with the node count, KWOK nodes included. On
-  three real nodes these system Pods requested over 90 % of the CPU; six `e2-standard-8` leave room
-  for the KWOK controller.
+  three real nodes these system Pods requested over 90 % of the CPU at 1,500 KWOK nodes. The
+  harness gives a full cluster at least six `e2-standard-8`, one more per 250 KWOK nodes above
+  1,500, which leaves room for the KWOK controller.
 - The control plane resizes when the node count jumps (`RESIZE_CLUSTER`) and refuses connections
   for a few minutes. The harness tries a failed apply stream up to six times in all, a minute
   apart, and applies the nodes once more if fewer than 99 % are `Ready` after an hour.
