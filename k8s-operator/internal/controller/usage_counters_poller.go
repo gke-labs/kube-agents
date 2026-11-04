@@ -802,8 +802,9 @@ func usageTopToolsEqual(a, b []agentv1alpha1.ToolUsageSummary) bool {
 }
 
 // usageReadingStatusField is the status field a reading spec's field names, nil
-// for a name that is none; TestUsageGauges_PointerRowsForTheSixReadings and
-// the poller's tests reach every spec.
+// for a name that is none; TestUsageGauges_PointerRowsForTheSixReadings,
+// TestUsageGauges_PointerRowsForTheNineOriginReadings and the poller's tests
+// reach every spec.
 func usageReadingStatusField(u *agentv1alpha1.AgentUsageStatus, field string) **int64 {
 	switch field {
 	case usageExportRemediationsMerged:

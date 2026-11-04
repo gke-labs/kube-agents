@@ -2924,17 +2924,18 @@ type AgentUsageStatus struct {
 	ProposalsFromChat *int64 `json:"proposalsFromChat,omitempty"`
 
 	// ProposalsFromConsole is ProposalsFromChat for work started from the web
-	// console, the admin console's chat page or the dashboard:
-	// kubeagents_proposals_opened under origin console. A 0 is a reading.
-	// Absent on the same terms as ProposalsFromChat. Moves neither
-	// LastActiveTime nor LastHumanActiveTime.
+	// console, the admin console's chat page, the A2A gateway's console
+	// backend or the dashboard: kubeagents_proposals_opened under origin
+	// console. A 0 is a reading. Absent on the same terms as
+	// ProposalsFromChat. Moves neither LastActiveTime nor LastHumanActiveTime.
 	// +optional
 	ProposalsFromConsole *int64 `json:"proposalsFromConsole,omitempty"`
 
-	// ProposalsFromApi is ProposalsFromChat for work a caller on the agent API
-	// or an A2A door started: kubeagents_proposals_opened under origin api. A
-	// 0 is a reading. Absent on the same terms as ProposalsFromChat. Moves
-	// neither LastActiveTime nor LastHumanActiveTime.
+	// ProposalsFromApi is ProposalsFromChat for work a caller on an A2A door
+	// started: kubeagents_proposals_opened under origin api. Turns on the
+	// gateway's own agent API port count under ProposalsFromOther until that
+	// door writes a record. A 0 is a reading. Absent on the same terms as
+	// ProposalsFromChat. Moves neither LastActiveTime nor LastHumanActiveTime.
 	// +optional
 	ProposalsFromApi *int64 `json:"proposalsFromApi,omitempty"`
 

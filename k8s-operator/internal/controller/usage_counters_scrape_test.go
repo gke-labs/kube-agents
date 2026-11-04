@@ -1175,11 +1175,13 @@ func usageOriginsBody(rows ...string) string {
 }
 
 // usageOriginsRows is one ledger row per origin, chat split over two
-// platforms, every other origin under the empty platform.
+// platforms, every other origin under the empty platform, and a row for an
+// origin outside the nine, which resolves no field.
 var usageOriginsRows = []string{
 	`kubeagents_proposals_opened{origin="chat",platform="googlechat"} 4`,
 	`kubeagents_proposals_opened{origin="chat",platform="slack"} 3`,
 	`kubeagents_proposals_opened{origin="console",platform=""} 1`,
+	`kubeagents_proposals_opened{origin="robot",platform=""} 40`,
 	`kubeagents_proposals_opened{origin="api",platform=""} 0`,
 	`kubeagents_proposals_opened{origin="event",platform=""} 5`,
 	`kubeagents_proposals_opened{origin="drift",platform=""} 2`,
@@ -1190,9 +1192,9 @@ var usageOriginsRows = []string{
 }
 
 // The chat listener's ledger series lands in the nine origin fields, chat
-// summed over its platforms, a zero as a zero, and marks the origins reading
-// present, with no age series. The chat counters read beside it are the
-// body's, as without it.
+// summed over its platforms, a zero as a zero, an unknown origin ignored, and
+// marks the origins reading present, with no age series. The chat counters
+// read beside it are the body's, as without it.
 func TestPodUsageSource_ReadsTheNineOriginReadingsFromTheChatBody(t *testing.T) {
 	addr := serveBody(t, http.StatusOK, usageOriginsBody(usageOriginsRows...))
 	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageChatCounters, []usageReadingKind{usageReadingOrigins})
