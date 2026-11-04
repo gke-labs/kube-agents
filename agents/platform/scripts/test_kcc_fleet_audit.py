@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import http.server
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import threading
 import unittest
 from unittest import mock
 
@@ -29,6 +32,29 @@ def _completed(
         stdout=stdout,
         stderr=stderr,
     )
+
+
+def _projected_stdout(items: list[dict]) -> str:
+    """Encode fake KCC item dicts into kubectl's `KCC_OBJECT_JSONPATH` wire format."""
+    chunks: list[str] = []
+    for item in items:
+        meta = item.get("metadata") or {}
+        spec = item.get("spec") or {}
+        kind = str(item.get("kind") or "")
+        ns = "" if meta.get("namespace") is None else str(meta.get("namespace"))
+        name = str(meta.get("name") or "")
+        gen = "" if "generation" not in meta else ("null" if meta["generation"] is None else str(meta["generation"]))
+        if "status" not in item:
+            status_str = ""
+        elif item["status"] is None:
+            status_str = "null"
+        else:
+            status_str = json.dumps(item["status"], separators=(",", ":"))
+        mode = "" if "mode" not in spec else ("null" if spec["mode"] is None else str(spec["mode"]))
+        chunks.append(
+            kcc.KCC_FIELD_SEP.join((kind, ns, name, gen, status_str, mode)) + kcc.KCC_RECORD_SEP
+        )
+    return "".join(chunks)
 
 
 class KccFleetAuditTest(unittest.TestCase):
@@ -127,47 +153,55 @@ class KccFleetAuditTest(unittest.TestCase):
             seen_cmds.append(cmd)
             if cmd[:3] == ["kubectl", "get", "crd"]:
                 return _completed(0, stdout="\n".join(crd_lines) + "\n")
+            self.assertIn(kcc.KCC_OBJECT_JSONPATH, cmd)
+            self.assertNotIn("json", cmd)
             if kcc.CONFIG_CONNECTOR_CRD in cmd[2]:
                 self.assertNotIn("-A", cmd)
-                payload = {
-                    "kind": "List",
-                    "items": [
-                        {
-                            "kind": "ConfigConnector",
-                            "metadata": {"name": "configconnector.core.cnrm.cloud.google.com"},
-                            "spec": {"mode": "namespaced"},
-                            "status": {"healthy": True},
-                        }
-                    ],
-                }
-                return _completed(0, stdout=json.dumps(payload))
+                return _completed(
+                    0,
+                    stdout=_projected_stdout(
+                        [
+                            {
+                                "kind": "ConfigConnector",
+                                "metadata": {"name": "configconnector.core.cnrm.cloud.google.com"},
+                                "spec": {"mode": "namespaced"},
+                                "status": {"healthy": True},
+                            }
+                        ]
+                    ),
+                )
             self.assertIn("-A", cmd)
             if kcc.CONFIG_CONNECTOR_CONTEXT_CRD in cmd[2]:
-                payload = {
-                    "kind": "List",
-                    "items": [
-                        {
-                            "kind": "ConfigConnectorContext",
-                            "metadata": {
-                                "name": "configconnectorcontext.core.cnrm.cloud.google.com",
-                                "namespace": "infra",
+                return _completed(
+                    0,
+                    stdout=_projected_stdout(
+                        [
+                            {
+                                "kind": "ConfigConnectorContext",
+                                "metadata": {
+                                    "name": "configconnectorcontext.core.cnrm.cloud.google.com",
+                                    "namespace": "infra",
+                                },
+                                "status": {"healthy": True},
                             },
-                            "status": {"healthy": True},
-                        },
-                        {
-                            "kind": "SQLInstance",
-                            "metadata": {"name": "prod-db", "namespace": "infra", "generation": 2},
-                            "status": {
-                                "observedGeneration": 2,
-                                "conditions": [
-                                    {"type": "Ready", "status": "True", "reason": "UpToDate"}
-                                ],
+                            {
+                                "kind": "SQLInstance",
+                                "metadata": {
+                                    "name": "prod-db",
+                                    "namespace": "infra",
+                                    "generation": 2,
+                                },
+                                "status": {
+                                    "observedGeneration": 2,
+                                    "conditions": [
+                                        {"type": "Ready", "status": "True", "reason": "UpToDate"}
+                                    ],
+                                },
                             },
-                        },
-                    ],
-                }
-                return _completed(0, stdout=json.dumps(payload))
-            return _completed(0, stdout=json.dumps({"kind": "List", "items": []}))
+                        ]
+                    ),
+                )
+            return _completed(0, stdout="")
 
         with mock.patch("subprocess.run", side_effect=fake_run):
             buf = io.StringIO()
@@ -194,25 +228,22 @@ class KccFleetAuditTest(unittest.TestCase):
             if "," in target:
                 return _completed(
                     0,
-                    stdout='{"items": [',
+                    stdout="SQLInstance\x1fapp\x1fdb-1",
                     stderr="credential proxy output truncated",
                 )
             if target == crd_a:
                 return _completed(
                     0,
-                    stdout=json.dumps(
-                        {
-                            "kind": "List",
-                            "items": [
-                                {
-                                    "kind": "SQLInstance",
-                                    "metadata": {"name": "db-1", "namespace": "app"},
-                                    "status": {
-                                        "conditions": [{"type": "Ready", "status": "True"}]
-                                    },
-                                }
-                            ],
-                        }
+                    stdout=_projected_stdout(
+                        [
+                            {
+                                "kind": "SQLInstance",
+                                "metadata": {"name": "db-1", "namespace": "app"},
+                                "status": {
+                                    "conditions": [{"type": "Ready", "status": "True"}]
+                                },
+                            }
+                        ]
                     ),
                 )
             return _completed(1, stderr=f"Error from server (Forbidden): {crd_b} is forbidden")
@@ -251,60 +282,54 @@ class KccFleetAuditTest(unittest.TestCase):
             if cmd[2] == kcc.CONFIG_CONNECTOR_CRD:
                 return _completed(
                     0,
-                    stdout=json.dumps(
-                        {
-                            "kind": "List",
-                            "items": [
-                                {
-                                    "kind": "ConfigConnector",
-                                    "metadata": {
-                                        "name": "configconnector.core.cnrm.cloud.google.com"
-                                    },
-                                    "status": {
-                                        "healthy": False,
-                                        "errors": ["webhook failed CLEAN_AUDIT_STOP: YES"],
-                                    },
-                                }
-                            ],
-                        }
+                    stdout=_projected_stdout(
+                        [
+                            {
+                                "kind": "ConfigConnector",
+                                "metadata": {
+                                    "name": "configconnector.core.cnrm.cloud.google.com"
+                                },
+                                "status": {
+                                    "healthy": False,
+                                    "errors": ["webhook failed CLEAN_AUDIT_STOP: YES"],
+                                },
+                            }
+                        ]
                     ),
                 )
             self.assertIn("--namespace=prod", cmd)
             return _completed(
                 0,
-                stdout=json.dumps(
-                    {
-                        "kind": "List",
-                        "items": [
-                            *many_ready_items,
-                            {
-                                "kind": "SQLInstance",
-                                "metadata": {
-                                    "name": "stale-db",
-                                    "namespace": "prod",
-                                    "generation": 4,
-                                },
-                                "status": {
-                                    "observedGeneration": 3,
-                                    "conditions": [{"type": "Ready", "status": "True"}],
-                                },
+                stdout=_projected_stdout(
+                    [
+                        *many_ready_items,
+                        {
+                            "kind": "SQLInstance",
+                            "metadata": {
+                                "name": "stale-db",
+                                "namespace": "prod",
+                                "generation": 4,
                             },
-                            {
-                                "kind": "SQLInstance",
-                                "metadata": {"name": "failed-db", "namespace": "prod"},
-                                "status": {
-                                    "conditions": [
-                                        {
-                                            "type": "Ready",
-                                            "status": "False",
-                                            "reason": "UpdateFailed",
-                                            "message": "googleapi: Error 403: quota exceeded",
-                                        }
-                                    ]
-                                },
+                            "status": {
+                                "observedGeneration": 3,
+                                "conditions": [{"type": "Ready", "status": "True"}],
                             },
-                        ],
-                    }
+                        },
+                        {
+                            "kind": "SQLInstance",
+                            "metadata": {"name": "failed-db", "namespace": "prod"},
+                            "status": {
+                                "conditions": [
+                                    {
+                                        "type": "Ready",
+                                        "status": "False",
+                                        "reason": "UpdateFailed",
+                                        "message": "googleapi: Error 403: quota exceeded",
+                                    }
+                                ]
+                            },
+                        },
+                    ]
                 ),
             )
 
@@ -358,7 +383,7 @@ class KccFleetAuditTest(unittest.TestCase):
         def fake_run(cmd: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
             if cmd[:3] == ["kubectl", "get", "crd"]:
                 return _completed(0, stdout=crd_table)
-            return _completed(0, stdout=json.dumps({"kind": "List", "items": many_unhealthy_items}))
+            return _completed(0, stdout=_projected_stdout(many_unhealthy_items))
 
         with mock.patch("subprocess.run", side_effect=fake_run):
             buf = io.StringIO()
@@ -376,7 +401,6 @@ class KccFleetAuditTest(unittest.TestCase):
         self.assertNotIn(f"broken-sql-instance-{kcc.MAX_RENDERED_FAILURES:03d}", out)
 
     def test_worker_computes_remaining_timeout_at_execution_start(self) -> None:
-        import threading
         from concurrent.futures import ThreadPoolExecutor as RealPool
 
         observed_timeouts: list[float] = []
@@ -396,7 +420,7 @@ class KccFleetAuditTest(unittest.TestCase):
             observed_timeouts.append(kwargs["timeout"])
             self.assertTrue(all_submitted.wait(timeout=5.0))
             clock[0] += 100.0
-            return _completed(0, stdout='{"kind": "List", "items": []}')
+            return _completed(0, stdout="")
 
         # Two single-CRD batches serialized on 1 worker against deadline=170.0:
         # batch 1 starts at t=0.0 -> min(125.0, 170.0) = 125.0, then advances clock to 100.0
@@ -440,31 +464,37 @@ class KccFleetAuditTest(unittest.TestCase):
             buf = io.StringIO()
             with mock.patch("sys.stdout", buf):
                 rc = kcc.audit_kcc()
-            code, payload = kcc.run_kubectl_json(["get", "sqlinstances.sql.cnrm.cloud.google.com"], {}, timeout=70.0)
+            code, items, err = kcc.run_kubectl_projected(
+                kcc._build_get_cmd(
+                    ["sqlinstances.sql.cnrm.cloud.google.com"],
+                    kcc.CRD_SCOPE_NAMESPACED,
+                    None,
+                ),
+                {},
+                timeout=70.0,
+            )
         self.assertEqual(rc, 0)
         out = buf.getvalue()
         self.assertIn("kubectl timed out after 125s", out)
         self.assertNotIn("Command '[", out)
         self.assertIn("CLEAN_AUDIT_STOP: NO", out)
         self.assertEqual(code, 1)
-        self.assertEqual(payload, {"error": "kubectl timed out after 70s"})
+        self.assertEqual(items, [])
+        self.assertEqual(err, "kubectl timed out after 70s")
 
     def test_nonexistent_namespace_fails_closed_while_empty_existing_namespace_passes(self) -> None:
         crd_table = (
             f"{kcc.CONFIG_CONNECTOR_CRD} Cluster true True\n"
             "sqlinstances.sql.cnrm.cloud.google.com Namespaced true True\n"
         )
-        operator_payload = json.dumps(
-            {
-                "kind": "List",
-                "items": [
-                    {
-                        "kind": "ConfigConnector",
-                        "metadata": {"name": "configconnector.core.cnrm.cloud.google.com"},
-                        "status": {"healthy": True},
-                    }
-                ],
-            }
+        operator_payload = _projected_stdout(
+            [
+                {
+                    "kind": "ConfigConnector",
+                    "metadata": {"name": "configconnector.core.cnrm.cloud.google.com"},
+                    "status": {"healthy": True},
+                }
+            ]
         )
 
         def fake_run(cmd: list[str], **_kwargs) -> subprocess.CompletedProcess[str]:
@@ -473,14 +503,13 @@ class KccFleetAuditTest(unittest.TestCase):
             if cmd[2] == kcc.CONFIG_CONNECTOR_CRD:
                 return _completed(0, stdout=operator_payload)
             if cmd[:3] == ["kubectl", "get", "namespace"]:
+                self.assertIn(kcc.NAMESPACE_CHECK_JSONPATH, cmd)
                 if cmd[3] == "empty-ns":
-                    return _completed(
-                        0, stdout=json.dumps({"kind": "Namespace", "metadata": {"name": "empty-ns"}})
-                    )
+                    return _completed(0, stdout="empty-ns")
                 return _completed(
                     1, stderr=f'Error from server (NotFound): namespaces "{cmd[3]}" not found'
                 )
-            return _completed(0, stdout=json.dumps({"kind": "List", "items": []}))
+            return _completed(0, stdout="")
 
         with mock.patch("subprocess.run", side_effect=fake_run):
             missing_buf = io.StringIO()
@@ -524,6 +553,292 @@ class KccFleetAuditTest(unittest.TestCase):
         )
         self.assertFalse(evaluated_pending["ready"])
         self.assertEqual(evaluated_pending["reason"], "StatusPending")
+
+    def test_parse_projected_kcc_items_handles_empty_nulls_and_fails_closed_on_malformed(
+        self,
+    ) -> None:
+        self.assertEqual(kcc.parse_projected_kcc_items(""), (0, [], ""))
+        self.assertEqual(kcc.parse_projected_kcc_items("\n"), (0, [], ""))
+
+        # Trailing empty spec.mode leaves `\x1f\x1e` at the end of stdout; parser must not strip RS/US.
+        wire = _projected_stdout(
+            [
+                {
+                    "kind": "StorageBucket",
+                    "metadata": {"name": "bkt-null", "namespace": "dev", "generation": None},
+                    "spec": {"mode": None},
+                    "status": None,
+                }
+            ]
+        )
+        code, items, err = kcc.parse_projected_kcc_items(wire)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(
+            items,
+            [
+                {
+                    "kind": "StorageBucket",
+                    "metadata": {"name": "bkt-null", "namespace": "dev"},
+                    "status": {},
+                }
+            ],
+        )
+
+        for bad in (
+            "SQLInstance\x1fprod\x1fdb-1",
+            "SQLInstance\x1fprod\x1fdb-1\x1e",
+            "SQLInstance\x1fprod\x1fdb-1\x1fnot-an-int\x1f{}\x1f\x1e",
+            "SQLInstance\x1fprod\x1fdb-1\x1f2\x1f{bad-json\x1f\x1e",
+            "SQLInstance\x1fprod\x1fdb-1\x1f2\x1f[]\x1f\x1e",
+        ):
+            with self.subTest(bad=bad):
+                bad_code, bad_items, bad_err = kcc.parse_projected_kcc_items(bad)
+                self.assertEqual(bad_code, 1)
+                self.assertEqual(bad_items, [])
+                self.assertTrue(bad_err)
+
+    @unittest.skipUnless(shutil.which("kubectl"), "kubectl binary required for live JSONPath test")
+    def test_real_kubectl_jsonpath_projection_round_trips_multi_crd_empty_null_and_multiline(
+        self,
+    ) -> None:
+        api_versions = {"kind": "APIVersions", "versions": ["v1"], "serverAddressByClientCIDRs": []}
+        core_res = {"kind": "APIResourceList", "groupVersion": "v1", "resources": []}
+        api_groups = {
+            "kind": "APIGroupList",
+            "apiVersion": "v1",
+            "groups": [
+                {
+                    "name": f"{grp}.cnrm.cloud.google.com",
+                    "versions": [
+                        {
+                            "groupVersion": f"{grp}.cnrm.cloud.google.com/v1beta1",
+                            "version": "v1beta1",
+                        }
+                    ],
+                    "preferredVersion": {
+                        "groupVersion": f"{grp}.cnrm.cloud.google.com/v1beta1",
+                        "version": "v1beta1",
+                    },
+                }
+                for grp in ("sql", "storage", "pubsub", "core")
+            ],
+        }
+        group_res = {
+            "/apis/sql.cnrm.cloud.google.com/v1beta1": {
+                "kind": "APIResourceList",
+                "apiVersion": "v1",
+                "groupVersion": "sql.cnrm.cloud.google.com/v1beta1",
+                "resources": [
+                    {
+                        "name": "sqlinstances",
+                        "singularName": "sqlinstance",
+                        "namespaced": True,
+                        "kind": "SQLInstance",
+                        "verbs": ["get", "list"],
+                    }
+                ],
+            },
+            "/apis/storage.cnrm.cloud.google.com/v1beta1": {
+                "kind": "APIResourceList",
+                "apiVersion": "v1",
+                "groupVersion": "storage.cnrm.cloud.google.com/v1beta1",
+                "resources": [
+                    {
+                        "name": "storagebuckets",
+                        "singularName": "storagebucket",
+                        "namespaced": True,
+                        "kind": "StorageBucket",
+                        "verbs": ["get", "list"],
+                    }
+                ],
+            },
+            "/apis/pubsub.cnrm.cloud.google.com/v1beta1": {
+                "kind": "APIResourceList",
+                "apiVersion": "v1",
+                "groupVersion": "pubsub.cnrm.cloud.google.com/v1beta1",
+                "resources": [
+                    {
+                        "name": "pubsubtopics",
+                        "singularName": "pubsubtopic",
+                        "namespaced": True,
+                        "kind": "PubSubTopic",
+                        "verbs": ["get", "list"],
+                    }
+                ],
+            },
+            "/apis/core.cnrm.cloud.google.com/v1beta1": {
+                "kind": "APIResourceList",
+                "apiVersion": "v1",
+                "groupVersion": "core.cnrm.cloud.google.com/v1beta1",
+                "resources": [
+                    {
+                        "name": "configconnectors",
+                        "singularName": "configconnector",
+                        "namespaced": False,
+                        "kind": "ConfigConnector",
+                        "verbs": ["get", "list"],
+                    }
+                ],
+            },
+        }
+        collections = {
+            "/apis/sql.cnrm.cloud.google.com/v1beta1/sqlinstances": {
+                "apiVersion": "sql.cnrm.cloud.google.com/v1beta1",
+                "kind": "SQLInstanceList",
+                "items": [
+                    {
+                        "apiVersion": "sql.cnrm.cloud.google.com/v1beta1",
+                        "kind": "SQLInstance",
+                        "metadata": {
+                            "name": "db-1",
+                            "namespace": "prod",
+                            "generation": 5,
+                            "managedFields": [{"manager": "cnrm", "fieldsV1": {"x": "y" * 512}}],
+                        },
+                        "spec": {
+                            "mode": "non-operator\tline1\nline2",
+                            "settings": {"largePayload": "z" * 2048},
+                        },
+                        "status": {
+                            "observedGeneration": 5,
+                            "conditions": [
+                                {
+                                    "type": "Ready",
+                                    "status": "False",
+                                    "reason": "UpdateFailed",
+                                    "message": "quota error\twith tab\nand second line",
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+            "/apis/storage.cnrm.cloud.google.com/v1beta1/storagebuckets": {
+                "apiVersion": "storage.cnrm.cloud.google.com/v1beta1",
+                "kind": "StorageBucketList",
+                "items": [
+                    {
+                        "apiVersion": "storage.cnrm.cloud.google.com/v1beta1",
+                        "kind": "StorageBucket",
+                        "metadata": {"name": "bkt-missing-status", "namespace": "dev"},
+                    },
+                    {
+                        "apiVersion": "storage.cnrm.cloud.google.com/v1beta1",
+                        "kind": "StorageBucket",
+                        "metadata": {
+                            "name": "bkt-null-status",
+                            "namespace": "dev",
+                            "generation": None,
+                        },
+                        "status": None,
+                    },
+                ],
+            },
+            "/apis/pubsub.cnrm.cloud.google.com/v1beta1/pubsubtopics": {
+                "apiVersion": "pubsub.cnrm.cloud.google.com/v1beta1",
+                "kind": "PubSubTopicList",
+                "items": [],
+            },
+            "/apis/core.cnrm.cloud.google.com/v1beta1/configconnectors": {
+                "apiVersion": "core.cnrm.cloud.google.com/v1beta1",
+                "kind": "ConfigConnectorList",
+                "items": [
+                    {
+                        "apiVersion": "core.cnrm.cloud.google.com/v1beta1",
+                        "kind": "ConfigConnector",
+                        "metadata": {"name": "configconnector.core.cnrm.cloud.google.com"},
+                        "spec": {"mode": "namespaced"},
+                        "status": {"healthy": True, "errors": ["webhook warning\nline 2"]},
+                    }
+                ],
+            },
+        }
+
+        class FakeKubeHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args) -> None:
+                return
+
+            def do_GET(self) -> None:  # noqa: N802
+                path = self.path.split("?", 1)[0]
+                if path == "/api":
+                    payload = api_versions
+                elif path == "/api/v1":
+                    payload = core_res
+                elif path == "/apis":
+                    payload = api_groups
+                elif path in group_res:
+                    payload = group_res[path]
+                elif path in collections:
+                    payload = collections[path]
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), FakeKubeHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            server_flags = [f"--server=http://127.0.0.1:{server.server_address[1]}", "--token=test"]
+            env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp"}
+
+            # 1. Multi-CRD namespaced batch with multiline messages, missing/null status, and 1 empty CRD.
+            ns_cmd = kcc._build_get_cmd(
+                [
+                    "sqlinstances.sql.cnrm.cloud.google.com",
+                    "storagebuckets.storage.cnrm.cloud.google.com",
+                    "pubsubtopics.pubsub.cnrm.cloud.google.com",
+                ],
+                kcc.CRD_SCOPE_NAMESPACED,
+                None,
+            )
+            code, ns_items, err = kcc.run_kubectl_projected(
+                [ns_cmd[0], *server_flags, *ns_cmd[1:]], env
+            )
+            self.assertEqual((code, err), (0, ""))
+            self.assertEqual(len(ns_items), 3)
+            evaluated_by_name = {
+                row["name"]: row for row in (kcc.evaluate_kcc_item(item) for item in ns_items)
+            }
+            self.assertEqual(evaluated_by_name["db-1"]["reason"], "UpdateFailed")
+            self.assertIn("quota error with tab and second line", str(evaluated_by_name["db-1"]["message"]))
+            self.assertEqual(evaluated_by_name["bkt-missing-status"]["reason"], "NotYetReconciled")
+            self.assertEqual(evaluated_by_name["bkt-null-status"]["reason"], "NotYetReconciled")
+
+            # 2. Cluster-scoped operator CR with spec.mode and multiline status.errors.
+            cc_cmd = kcc._build_get_cmd(
+                [kcc.CONFIG_CONNECTOR_CRD], kcc.CRD_SCOPE_CLUSTER, None
+            )
+            cc_code, cc_items, cc_err = kcc.run_kubectl_projected(
+                [cc_cmd[0], *server_flags, *cc_cmd[1:]], env
+            )
+            self.assertEqual((cc_code, cc_err), (0, ""))
+            self.assertEqual(len(cc_items), 1)
+            cc_eval = kcc.evaluate_kcc_item(cc_items[0])
+            self.assertFalse(cc_eval["ready"])
+            self.assertEqual(cc_eval["reason"], "OperatorErrors")
+            self.assertEqual(cc_eval["message"], "webhook warning line 2")
+
+            # 3. Empty CRD returns (0, [], "").
+            empty_cmd = kcc._build_get_cmd(
+                ["pubsubtopics.pubsub.cnrm.cloud.google.com"],
+                kcc.CRD_SCOPE_NAMESPACED,
+                None,
+            )
+            empty_code, empty_items, empty_err = kcc.run_kubectl_projected(
+                [empty_cmd[0], *server_flags, *empty_cmd[1:]], env
+            )
+            self.assertEqual((empty_code, empty_items, empty_err), (0, [], ""))
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
