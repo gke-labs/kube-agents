@@ -629,22 +629,33 @@ def test_scenario_sets_the_limits_of_the_size_argument(monkeypatch, tmp_path):
         "resources": {"limits": cli.SIZES["L"]["shellSandbox"]}}}}}]
 
 
+def fake_full_fleet(monkeypatch, names):
+    """Fakes fleet_load's reads for full clusters of the default size; returns its commands and loads, in order."""
+    calls = []
+    monkeypatch.setattr(cli.Fleet, "names", lambda self: names)
+    monkeypatch.setattr(cli, "pool_machine_type", lambda fleet, name: cli.FULL_MACHINE_TYPE)
+    monkeypatch.setattr(cli.Fleet, "credentials", lambda self, name: None)
+    monkeypatch.setattr(cli, "kwok_node_count", lambda fleet, name: cli.DEFAULT_NODES)
+    monkeypatch.setattr(cli, "workload_namespace_count", lambda fleet, name: cli.DEFAULT_NAMESPACES)
+    monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or "")
+    monkeypatch.setattr(cli, "load_cluster", lambda fleet, name, a: calls.append(["load", name]))
+    return calls
+
+
+def resizes(calls):
+    return [c for c in calls if c[:4] == ["gcloud", "container", "clusters", "resize"]]
+
+
 def test_fleet_load_resizes_then_loads_each_named_cluster_once(monkeypatch, tmp_path):
     args = cli.parse(["--project", "p", "--out", str(tmp_path), "--nodes", "3000", "--namespaces", "300",
                       "fleet", "load", "--names", "oom-01,oom-01,oom-02"])
-    calls, loaded = [], []
-    monkeypatch.setattr(cli.Fleet, "names", lambda self: ["oom-01", "oom-02", "oom-03"])
-    monkeypatch.setattr(cli, "pool_machine_type", lambda fleet, name: cli.FULL_MACHINE_TYPE)
-    monkeypatch.setattr(cli.Fleet, "credentials", lambda self, name: None)
-    monkeypatch.setattr(cli, "kwok_node_count", lambda fleet, name: 1500)
-    monkeypatch.setattr(cli, "workload_namespace_count", lambda fleet, name: 150)
-    monkeypatch.setattr(cli, "run", lambda cmd, **kw: calls.append(cmd) or "")
-    monkeypatch.setattr(cli, "load_cluster", lambda fleet, name, a: loaded.append(name))
+    calls = fake_full_fleet(monkeypatch, ["oom-01", "oom-02", "oom-03"])
     cli.fleet_load(args)
-    resized = sorted(c[4] for c in calls if c[:4] == ["gcloud", "container", "clusters", "resize"])
-    assert resized == ["oom-01", "oom-02"]
-    assert all(c[c.index("--num-nodes") + 1] == "12" for c in calls if "resize" in c)
-    assert sorted(loaded) == ["oom-01", "oom-02"]
+    loads = [c for c in calls if c[0] == "load"]
+    assert sorted(c[4] for c in resizes(calls)) == ["oom-01", "oom-02"]
+    assert all(c[c.index("--num-nodes") + 1] == "12" for c in resizes(calls))
+    assert sorted(c[1] for c in loads) == ["oom-01", "oom-02"]
+    assert max(calls.index(c) for c in resizes(calls)) < calls.index(loads[0])  # every resize precedes the first load
 
 
 def test_fleet_load_refuses_fewer_namespaces(monkeypatch, tmp_path):
