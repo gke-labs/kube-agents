@@ -4,7 +4,7 @@ paths:
   - ".github/workflows/**"
   - ".github/buildkitd.toml"
 trigger: model_decision
-description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, hardening pull_request_target workflows, collapsing superseded pull-request runs with a concurrency group, detecting changed files with git rather than the API, and pulling Docker Hub images through mirror.gcr.io."
+description: "GitHub Actions workflow rules: pinning third-party actions to full commit SHAs, guarding credentialed workflows against forks, hardening pull_request_target workflows, collapsing superseded pull-request runs with a concurrency group, detecting changed files with git rather than the API, pulling Docker Hub images through mirror.gcr.io, and capping the Actions cache segment download wait."
 ---
 
 # GitHub Actions rules
@@ -117,6 +117,32 @@ days; pin a digest where that matters. The kind node image the installer matrix 
 exception: kind pairs that image with its own release, so naming one on the mirror would also pin
 the Kubernetes version the matrix tests, and that is a separate decision. Cloud Build pulls from
 Google's egress and is out of scope.
+
+## Cap the Actions cache segment download wait
+
+A workflow with a step that restores an Actions cache sets `SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"` in
+its top-level `env`. `@actions/cache` downloads a cache in segments of 128 MiB and waits up to ten
+minutes on each. When GitHub throttles the account's cache egress (`Failed to restore: Egress is
+over the account limit`, a 503 from the blob store) the download is refused within seconds, but the
+segment timer is cleared only on success, so the refused restore keeps the step alive until the
+timer fires. On 2026-10-30 that cost each setup step of `python-tests.yml`'s agent-image job ten
+minutes (`Set up the agent image's Python` 13:29:17 to 13:39:18, `Set up Go` 13:39:18 to 13:49:26
+in the first attempt of run 41063628607); the tests started twenty minutes into a 35-minute budget
+and the job was cancelled in its test step. A miss is not a failure for any of these steps: each
+falls through to a cold install. The throttle is account-wide, so every workflow that restores a
+cache carries the exposure, not only the one it hit.
+
+The value is a trade-off against a slow but healthy restore: one minute per 128 MiB segment aborts
+a download under about 2 MiB/s and turns it into a miss (`Aborting cache download as the download
+time exceeded the timeout`). Restores on GitHub-hosted runners run at 20 to 150 MB/s, so a segment
+takes seconds. Re-check the value if the toolkit changes its segment size. The variable affects
+restores only; saves read `CACHE_UPLOAD_CONCURRENCY` and `CACHE_UPLOAD_CHUNK_SIZE`. It reaches the
+`setup-python`, `setup-go` and `setup-node` actions and `actions/cache` alike, because all of them
+restore through the same package and read it from the process environment, and `setup-go` caches
+unless told `cache: false`. A composite action that runs `actions/cache` as a nested step,
+`aquasecurity/trivy-action` and `github/codeql-action/init` here, restores the same way.
+`tests/test_cache_segment_timeout.py` finds every workflow with a step on that list and holds the
+variable and its ceiling on each; its synthetic cases hold the classification and each wrong value.
 
 ## Harden `pull_request_target` workflows
 

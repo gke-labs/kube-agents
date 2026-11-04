@@ -42,37 +42,37 @@ type Health struct {
 	DroppedAnswers int64
 }
 
-func (d *Dispatcher) noteWaiting(taskID, durable string, queued time.Time, why string) {
+func (d *Dispatcher) noteWaiting(hk holdKey, queued time.Time, why string) {
 	now := d.now()
 	if queued.IsZero() {
 		queued = now
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	w, ok := d.waiting[taskID]
+	w, ok := d.waiting[hk]
 	if !ok {
-		w = waiting{durable: durable, queued: queued}
+		w = waiting{durable: lib.ProfileDurableName(hk.profile, hk.tier, hk.kind), queued: queued}
 	}
 	w.lastSeen, w.why = now, why
-	d.waiting[taskID] = w
+	d.waiting[hk] = w
 }
 
 // offeringWaiting is a reserved submission's waiting entry as its offer
 // round starts. Waiting over a cap ends there: the slot is taken. Waiting
 // for a worker doesn't: until a pod accepts, the submission still waits for
 // one, and the health line keeps saying so through the round.
-func (d *Dispatcher) offeringWaiting(taskID string) {
+func (d *Dispatcher) offeringWaiting(hk holdKey) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if w, ok := d.waiting[taskID]; ok && w.why != ReasonNoWorker {
-		delete(d.waiting, taskID)
+	if w, ok := d.waiting[hk]; ok && w.why != ReasonNoWorker {
+		delete(d.waiting, hk)
 	}
 }
 
-func (d *Dispatcher) clearWaiting(taskID string) {
+func (d *Dispatcher) clearWaiting(hk holdKey) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	delete(d.waiting, taskID)
+	delete(d.waiting, hk)
 }
 
 // Health reports the current state.
@@ -82,26 +82,22 @@ func (d *Dispatcher) Health() Health {
 	defer d.mu.Unlock()
 	h := Health{Running: map[string]int{}, Offering: map[string]int{}, Waiting: map[string]int{}, NoWorker: map[string]int{},
 		OldestWait: map[string]time.Duration{}, DroppedAnswers: d.droppedAnswers.Load()}
-	// offering is the tasks out on offer, by durable: a waiting entry for
-	// one is not forgotten while its offer round runs, however long the
-	// accept timeouts make it.
-	offering := map[string]map[string]bool{}
+	// offering is the tasks out on offer: a waiting entry for one is not
+	// forgotten while its offer round runs, however long the accept
+	// timeouts make it.
+	offering := map[holdKey]bool{}
 	for _, a := range d.active {
 		if a.confirmed {
 			h.Running[a.profile]++
 			continue
 		}
 		h.Offering[a.profile]++
-		durable := lib.ProfileDurableName(a.profile, a.tier, a.kind)
-		if offering[durable] == nil {
-			offering[durable] = map[string]bool{}
-		}
-		offering[durable][a.taskID] = true
+		offering[a.key()] = true
 	}
 	forget := time.Duration(waitingForgetAfter) * d.cfg.RetryDelay
-	for id, w := range d.waiting {
-		if now.Sub(w.lastSeen) > forget && !offering[w.durable][id] {
-			delete(d.waiting, id)
+	for hk, w := range d.waiting {
+		if now.Sub(w.lastSeen) > forget && !offering[hk] {
+			delete(d.waiting, hk)
 			continue
 		}
 		h.Waiting[w.durable]++

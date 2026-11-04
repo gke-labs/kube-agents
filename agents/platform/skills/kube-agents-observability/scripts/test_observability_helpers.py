@@ -892,7 +892,7 @@ class GetChatUsersTest(unittest.TestCase):
         # message's claim that no notice arrives for gcloud rests on the
         # broker appending one for kubectl alone.
         broker = (Path(credential_proxy_client.__file__).with_name("credential_proxy.py")).read_text(encoding="utf-8")
-        exit_code = re.search(r"exit_code=(\d+) if captured\.timed_out else process\.returncode", broker)
+        exit_code = re.search(r"exit_code=\(?(\d+) if captured\.timed_out\b", broker)
         self.assertIsNotNone(exit_code, "the broker's timed-out exit code was not found")
         self.assertEqual(get_chat_users.BROKER_DEADLINE_EXIT_CODE, int(exit_code.group(1)))
         deadline = re.search(r'os\.getenv\("CREDENTIAL_PROXY_TIMEOUT_SECONDS", "(\d+)"\)', broker)
