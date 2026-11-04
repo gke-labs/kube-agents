@@ -279,7 +279,19 @@ class ClipCronResponseTest(unittest.TestCase):
 # itself: save/deliver moved into `_save_compose_deliver` over a `_RunDelivery`
 # record and the bookkeeping tail into `_finish_completed_run`, so the report is
 # written from the seam between them and the saved path rides on the record.
-SCHEDULER_STUB = '''from dataclasses import dataclass
+def _finish_execution(execution_id, success=True, error=None):
+    """The scheduler stub's ledger close: a failed run fails the test where it happened.
+
+    The stub's body, like upstream's, swallows any exception into
+    ``finish_execution(..., success=False)``, so a stub that breaks inside
+    ``_save_compose_deliver`` would otherwise pass every origin check.
+    """
+    if not success:
+        raise AssertionError(f"the stub run {execution_id} failed inside the scheduler body: {error!r}")
+
+
+SCHEDULER_STUB = '''import contextlib
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -302,6 +314,12 @@ def run_one_job(
                 execution_token=execution_token))
     finally:
         pass
+
+
+class _FireOwnership:
+    @contextlib.contextmanager
+    def side_effect_fence(self):
+        yield True
 
 
 @dataclass
@@ -348,17 +366,18 @@ def _run_one_job_body(
             success, output, final_response, error = run_job(job, **_run_kwargs)
         except BaseException:
             raise
+        fence = _FireOwnership()
         d = _RunDelivery(job=job, success=success, error=error)
         try:
             _save_compose_deliver(
-                d, None, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
+                d, fence, final_response, output, adapters=adapters, loop=loop, verbose=verbose,
                 execution_token=execution_token)
         finally:
             delivery_error = d.delivery_error
         fire_owner = None
         return _finish_completed_run(d, fire_owner, execution_id)
-    except Exception:
-        finish_execution(execution_id, success=False)
+    except Exception as exc:
+        finish_execution(execution_id, success=False, error=exc)
         return False
 
 
@@ -686,7 +705,7 @@ class ApplierTest(unittest.TestCase):
             run_job=run_job,
             _run_with_fire_claim_heartbeat=lambda job, run: run(None),
             claim_job_for_fire=lambda job_id, return_job=False: {"id": job_id, **TICK_JOB},
-            finish_execution=lambda *a, **k: None,
+            finish_execution=_finish_execution,
             save_job_output=lambda job_id, output: Path("/tmp/out.md"),
         )
 
@@ -705,7 +724,7 @@ class ApplierTest(unittest.TestCase):
         self._template()
         seen: list = []
         ns = self._scheduler(self._apply_all(), seen)
-        ns["_process_due_job"]({"id": JOB_ID, "execution_id": "e1"}, None, None, False)
+        self.assertTrue(ns["_process_due_job"]({"id": JOB_ID, "execution_id": "e1"}, None, None, False))
         self.assertEqual(seen, [(JOB_ID, ("audit", ""))])
         self.assertIsNone(current_cron_origin())
         # A job that no longer matches the template and has no record is other.
@@ -765,8 +784,19 @@ class ApplierTest(unittest.TestCase):
         session.set("sess-chat")
         raw = tool["cronjob"]("run", job_id=JOB_ID)
         self.assertTrue(json.loads(raw)["success"], raw)
+        self.assertEqual(json.loads(raw)["job"].get("output_file"), "/tmp/out.md", "the run reached the body's tail")
         self.assertEqual(seen, [(JOB_ID, ("chat", "slack"))])
         self.assertIsNone(current_cron_origin())
+
+    def test_a_direct_run_inside_a_kanban_worker_resolves_as_its_card(self):
+        """A worker's turn has no session record; its card's stamp is the asking origin."""
+        self._template()
+        self._asking_turn({})
+        seen: list = []
+        tool = self._direct_tool(self._apply_all(), seen)
+        with mock.patch.object(kanban_origin, "card_origin", return_value=("chat", "slack")):
+            tool["cronjob"]("run", job_id=JOB_ID)
+        self.assertEqual(seen, [(JOB_ID, ("chat", "slack"))])
 
     def test_a_direct_run_from_an_unresolved_turn_is_other_not_the_template(self):
         """An unresolved asking turn runs as ``other``, never as the tick's ``audit``."""

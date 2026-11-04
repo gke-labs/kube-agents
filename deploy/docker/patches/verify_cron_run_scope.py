@@ -33,6 +33,9 @@ os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="cron-run-scope-verify-")
 CALLER_CARD = "t_caller"
 JOB_ID = "obtainability-audit"
 LEDGER_URL = "https://example.invalid/issues/30"
+# What the stand-in turn resolver answers for the direct run, so the check
+# below can tell "the run action asked the resolver" from "nothing resolved".
+DIRECT_RUN_ORIGIN = ("api", "")
 # A real Path, not a string. The string version is what let the Path bug ship.
 OUTPUT_FILE = pathlib.Path("/opt/data/profiles/platform/cron/output/x/y.md")
 
@@ -322,11 +325,23 @@ def main() -> int:
     _real_dispatch = ct._try_dispatch_background_run
     ct._try_dispatch_background_run = lambda job, **kw: None
 
+    # The turn resolver, hermes_cli/kanban_origin.py, is installed by a later
+    # Dockerfile step (verify_kanban_origin.py gates it there). Without one,
+    # direct_run_origin answers ("other", "") without asking anything, so a
+    # stand-in under the first name it imports is installed for the run.
+    import types
+    from tools.cron_run_scope import KANBAN_ORIGIN_MODULES
+
+    resolver = types.ModuleType(KANBAN_ORIGIN_MODULES[0])
+    resolver.turn_origin = lambda: DIRECT_RUN_ORIGIN
+    sys.modules[KANBAN_ORIGIN_MODULES[0]] = resolver
     try:
         raw = ct.cronjob(action="run", job_id=JOB_ID)
     except Exception as exc:  # noqa: BLE001 — any exception here is the bug
         failures.append(f"cronjob(action='run') raised {type(exc).__name__}: {exc}")
         raw = ""
+    finally:
+        del sys.modules[KANBAN_ORIGIN_MODULES[0]]
 
     if raw:
         try:
@@ -341,9 +356,9 @@ def main() -> int:
         check("output_file is a string", isinstance(job.get("output_file"), str), True)
         check("output_file is the real path", job.get("output_file"), str(OUTPUT_FILE))
         check("delivery_error in the JSON", bool(job.get("delivery_error")), True)
-    # The run action binds the asking turn's origin for the run. The build has
-    # no turn, so it is the unresolved origin, and never None (no scope).
-    check("a direct run carries the asking turn's origin", seen.get("direct_origin"), ("other", ""))
+    # The run action binds the origin the turn resolver answers for the asking
+    # turn, inside the run's scope.
+    check("a direct run carries the turn resolver's origin", seen.get("direct_origin"), DIRECT_RUN_ORIGIN)
     check("and the origin is cleared after the run", current_cron_origin(), None)
 
     # --- and the dispatched path, which carries no report at all ------------
