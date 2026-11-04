@@ -5,7 +5,7 @@
 The resource broker is the set of components that run tool calls for the agents. It runs every
 `kubectl`, `gcloud` and Git command, every Cloud API call, and every skill script. Today three
 components make up the resource broker: the credential proxy, the Kubernetes API proxy and the
-sandbox shell. Each one runs in a container with a fixed memory limit.
+sandbox shell. Each one runs in a container with a memory limit.
 
 An OOMKill is the kernel stopping a container that uses more memory than its limit. When agents
 send more work than the resource broker can hold, a container is OOMKilled. All work in that
