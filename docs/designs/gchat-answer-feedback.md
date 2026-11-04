@@ -162,8 +162,8 @@ buttons, filled state included. The rewrite is built from memory, so the adapter
 tracked question keeps the message's feedback task id beside its links, and the per-message
 rating from Call 2 gives the filled state. A rewrite after a restart of a question the adapter
 no longer remembers takes its buttons from the event's copy of the message, for which the button
-struct also decodes `type` and `altText`; a typed answer after a restart redraws the two buttons
-unfilled, and the bucket still holds the rating. The restart-recovery of a choice click's link
+struct also decodes `type` and `altText`. The rating memory starts empty after a restart, so
+the filled state then comes from the event's copy, and the bucket still holds the rating. The restart-recovery of a choice click's link
 buttons (`gchatMessageButtons`) tells the three kinds apart by function and link, not by index.
 Buttons are classified by `onClick.action.function` (`kage.choice`, `kage.feedback`,
 `kage.feedback-note`) or `onClick.openLink`.
