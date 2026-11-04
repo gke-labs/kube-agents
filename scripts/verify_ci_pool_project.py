@@ -758,7 +758,7 @@ NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.
 # The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
 # ci-kube-agents-pull-sweep on main) signs the agent's App through each
 # project's copy of the key, so it needs signer on that key and nothing on the
-# project. A project without the grant fails every ten-minute sweep from the
+# project. A project without the grant fails every sweep from the
 # first, so the check names the one command that adds it -- the provisioning
 # script must not be re-run on a registered project (docs/ci-pool-projects.md
 # section 8).

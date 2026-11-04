@@ -1022,6 +1022,8 @@ class WorkflowWiring(unittest.TestCase):
         self.assertNotIn("ci-kube-agents-fleet-reconcile-all", periodics.WATCHED_BY_JOB)
         self.assertEqual(set(periodics.RECONCILE_RUN_WORDS), {DAILY.job, POST.job})
         self.assertEqual(DAILY.stale_after, timedelta(hours=36))
+        # Twice the hourly cron: one missed fire is not stale, two are.
+        self.assertEqual(SWEEP.stale_after, timedelta(hours=2))
 
     def test_main_names_what_it_wrote(self):
         objects = archive(SWEEP.job, {"7": (finished(NOW - timedelta(minutes=5)), None)})
