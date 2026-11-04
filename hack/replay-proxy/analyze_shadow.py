@@ -38,9 +38,12 @@ stored, scrubbed text of both is under their request_id for a diff.
 Many earlier requests can share that prefix (every worker conversation opens
 the same way). With `--store`, the copied-out REPLAY_STORE_DIR, the closest is
 the one whose next message is most alike by the words they share, relative to
-both messages' length, among the 64 most recent distinct next messages. It falls
-back to the earliest available when the miss's own text wasn't stored, and
-without `--store`. The health
+both messages' length, among the 64 most recent distinct next messages that
+have stored text. Each miss then says how it was chosen (`closest_by`: `text`,
+or `earliest` and why: the miss's own text wasn't stored, no candidate's was,
+or every message matched), and the report counts the misses ranked by text, so
+a store missing some jobs shows as such. Without `--store`, the earliest
+available, as before. The health
 counts show a broken setup; check them after the first day.
 
 A collision audit (did two requests that matched lead to different results?)
@@ -80,6 +83,13 @@ NAME_KEY = "name"
 ARGUMENTS_KEY = "arguments"
 # The score of an earlier request whose text could not be read.
 UNRANKED = -1.0
+# How a miss's closest request was chosen, with --store: ranked by text, or the
+# earliest available, and why it could not be ranked.
+CLOSEST_BY_TEXT = "text"
+CLOSEST_BY_EARLIEST = "earliest"
+UNRANKED_OWN_TEXT_MISSING = "own_text_missing"
+UNRANKED_NO_CANDIDATE_TEXT = "no_candidate_text"
+UNRANKED_ALL_MATCHED = "all_messages_matched"
 ASSISTANT_ROLE = "assistant"
 # Stands in for an assistant message's content in the simulated key: its place
 # in the conversation counts, its words do not.
@@ -212,6 +222,9 @@ class Miss:
     request: Record
     closest: Optional[Record]
     matched_messages: int
+    # With --store: CLOSEST_BY_TEXT, or CLOSEST_BY_EARLIEST and why (an UNRANKED_* reason).
+    closest_by: Optional[str] = None
+    unranked_reason: Optional[str] = None
 
     @property
     def first_difference_role(self) -> str:
@@ -379,40 +392,52 @@ class PrefixSources(Sources):
         return (bool(request.pr) and record.pr == request.pr and record.build != request.build
                 and self.build_end[record.build_key] <= request.ts)
 
-    def closest(self, request: Record, texts: Optional[StoredText] = None) -> Tuple[Optional[Record], int]:
+    def closest(self, request: Record, texts: Optional[StoredText] = None) -> Miss:
         if request.search_hashes is None:
-            return None, 0
+            return Miss(request, None, 0)
         root = request.search_settings_hash
         best = self.find(root, request, nightly_only=False)
         if best is None:
-            return None, 0
+            return Miss(request, None, 0)
         matched, key = 0, root
         for prefix in request.chain(hashes=request.search_hashes, root=root):
             found = self.find(prefix, request, nightly_only=False)
             if found is None:
                 break
             best, matched, key = found, matched + 1, prefix
-        if texts is not None and self.members is not None and matched < len(request.search_hashes):
-            best = self.most_alike(best, key, matched, request, texts)
-        return best, matched
-
-    def most_alike(self, best: Record, key: str, index: int, request: Record, texts: StoredText) -> Record:
-        """Of the usable requests sharing `key`, the one whose message `index` is most like the request's."""
-        current = texts.message(request.request_id, index)
+        if texts is None or self.members is None:
+            return Miss(request, best, matched)
+        if matched >= len(request.search_hashes):
+            return Miss(request, best, matched, CLOSEST_BY_EARLIEST, UNRANKED_ALL_MATCHED)
+        current = texts.message(request.request_id, matched)
         if current is None:
-            return best
+            return Miss(request, best, matched, CLOSEST_BY_EARLIEST, UNRANKED_OWN_TEXT_MISSING)
+        ranked = self.most_alike(key, matched, request, current, texts)
+        if ranked is None:
+            return Miss(request, best, matched, CLOSEST_BY_EARLIEST, UNRANKED_NO_CANDIDATE_TEXT)
+        return Miss(request, ranked, matched, CLOSEST_BY_TEXT)
+
+    def most_alike(self, key: str, index: int, request: Record, current: str, texts: StoredText) -> Optional[Record]:
+        """Of the usable requests sharing `key`, the one whose message `index` is most like `current`.
+
+        None when none of them has readable text. A copy whose text is missing
+        neither stands in for nor uses up the slot of its next message, so an
+        older copy of the same message is still read.
+        """
         seen = set()
-        ranked = (UNRANKED, best)
+        ranked: Tuple[float, Optional[Record]] = (UNRANKED, None)
         # Newest first: the latest run of the same case is the likeliest match.
         for record in reversed(self.members.get(key, [])):
             following = record.search_hashes[index] if index < len(record.search_hashes or []) else ""
             if following in seen or not self.usable(record, request):
                 continue
+            text = texts.message(record.request_id, index)
+            if text is None:
+                continue
             seen.add(following)
             if len(seen) > MAX_PREFIX_CANDIDATES:
                 break
-            text = texts.message(record.request_id, index)
-            score = similarity(text, current) if text is not None else UNRANKED
+            score = similarity(text, current)
             if score > ranked[0]:
                 ranked = (score, record)
         return ranked[1]
@@ -481,8 +506,7 @@ def find_misses(
     misses = []
     for record, hit in iter_hits(records, HIGH, require_storable, merged):
         if hit is None:
-            closest, matched = prefixes.closest(record, texts)
-            misses.append(Miss(record, closest, matched))
+            misses.append(prefixes.closest(record, texts))
     return misses
 
 
@@ -566,9 +590,21 @@ def summarize(
             "first_difference_role": m.first_difference_role,
             "closest_request_id": m.closest.request_id if m.closest else None,
             "closest_kind": m.closest.kind if m.closest else None,
+            **({"closest_by": m.closest_by, "unranked_reason": m.unranked_reason} if m.closest_by else {}),
         }
         for m in misses[:top]
     ]
+    if texts is not None:
+        ranked = [m for m in misses if m.closest_by is not None]
+        reasons: Dict[str, int] = {}
+        for m in ranked:
+            if m.unranked_reason:
+                reasons[m.unranked_reason] = reasons.get(m.unranked_reason, 0) + 1
+        report["closest_by_text"] = {
+            "misses": len(ranked),
+            "ranked_by_text": sum(1 for m in ranked if m.closest_by == CLOSEST_BY_TEXT),
+            "earliest_because": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+        }
     return report
 
 
@@ -593,10 +629,15 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
     lines += ["", f"miss tokens by first differing message: {report['miss_tokens_by_first_difference']}", "",
               "top misses (prompt tokens, matched/total messages, first difference, closest earlier request):"]
     for m in report["top_misses"]:
+        by = f", by {m['closest_by']}" + (f": {m['unranked_reason']}" if m.get("unranked_reason") else "") if m.get("closest_by") else ""
         lines.append(
             f"  {m['request_id']}  {m['prompt_tokens']}  {m['matched_messages']}/{m['messages']}"
-            f"  {m['first_difference_role']}  {m['closest_request_id']} ({m['closest_kind']})"
+            f"  {m['first_difference_role']}  {m['closest_request_id']} ({m['closest_kind']}{by})"
         )
+    if "closest_by_text" in report:
+        c = report["closest_by_text"]
+        lines += ["", f"closest request ranked by text for {c['ranked_by_text']} of {c['misses']} misses;"
+                      f" the earliest for the rest because: {c['earliest_because']}"]
     return "\n".join(lines)
 
 
@@ -617,8 +658,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--ignore-storable", action="store_true", help="count sightings replay would not have saved")
     args = parser.parse_args(argv)
-    if args.store and not os.path.isdir(os.path.join(args.store, request_store.REQUESTS_DIR)):
-        parser.error(f"--store {args.store} has no {request_store.REQUESTS_DIR}/ directory")
+    for needed in (request_store.REQUESTS_DIR, request_store.BLOBS_DIR) if args.store else ():
+        if not os.path.isdir(os.path.join(args.store, needed)):
+            parser.error(f"--store {args.store} has no {needed}/ directory")
     records, skipped = load(args.logs)
     report = summarize(
         records, require_storable=not args.ignore_storable, top=args.top, merged=load_merged(args.merged), skipped=skipped,

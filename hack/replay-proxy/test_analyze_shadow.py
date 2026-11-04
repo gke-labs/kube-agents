@@ -424,6 +424,67 @@ class ClosestByTextRulesTest(unittest.TestCase):
                  presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
         self.assertEqual(report(lines, texts=texts)[0]["top_misses"][0]["closest_request_id"], "n1")
 
+    def test_an_unreadable_newest_copy_does_not_hide_an_older_readable_one(self):
+        # n_new carries the same next message as n_old but its text was never
+        # stored; the unrelated n_other sits between them.
+        lines = [line("n_old", 1, "nightly", "n", "A", ["s", "w", "tx"]),
+                 line("n_other", 1.5, "nightly", "n", "B", ["s", "w", "ty"]),
+                 line("n_new", 1.8, "nightly", "n", "A2", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        texts = analyze_shadow.StoredText(write_store({
+            "n_old": self.TEXTS["x"],
+            "n_other": ["sys", "work", "card: open a pull request bumping a node pool version for cluster beta"],
+            "p1": self.TEXTS["p1"],
+        }))
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"]), ("n_old", "text"))
+
+    def test_the_report_says_how_each_closest_request_was_chosen(self):
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"], tokens=300),
+                 presubmit("p2", 11, "10", "b2", "D", ["s", "w", "td"], tokens=200)]
+        texts = analyze_shadow.StoredText(write_store({
+            "n1": self.TEXTS["n1"], "x": self.TEXTS["x"], "p1": self.TEXTS["p1"]}))
+        rep, _ = report(lines, texts=texts)
+        by = {m["request_id"]: (m["closest_by"], m["unranked_reason"]) for m in rep["top_misses"]}
+        self.assertEqual(by["p1"], ("text", None))
+        self.assertEqual(by["p2"], ("earliest", "own_text_missing"))
+        self.assertEqual(rep["closest_by_text"]["ranked_by_text"], 1)
+        self.assertEqual(rep["closest_by_text"]["earliest_because"]["own_text_missing"], 1)
+        self.assertNotIn("closest_by", report(lines)[0]["top_misses"][0], "without --store nothing is claimed")
+
+    def test_no_readable_candidate_is_reported_as_such(self):
+        texts = analyze_shadow.StoredText(write_store({"p1": self.TEXTS["p1"]}))
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"], miss["unranked_reason"]),
+                         ("n1", "earliest", "no_candidate_text"))
+
+    def test_all_messages_matching_is_reported_as_nothing_to_rank(self):
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w"]), presubmit("p1", 10, "10", "b2", "B", ["s", "w"])]
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual((miss["closest_by"], miss["unranked_reason"]), ("earliest", "all_messages_matched"))
+
+    def test_the_text_output_counts_the_ranked_misses(self):
+        root = write_store(self.TEXTS)
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            analyze_shadow.main([write(lines), "--store", root])
+        self.assertIn("closest request ranked by text for 1 of 1 misses", out.getvalue())
+        self.assertIn("(nightly, by text)", out.getvalue())
+
+    def test_a_store_without_blobs_is_refused(self):
+        root = write_store(self.TEXTS)
+        shutil.rmtree(os.path.join(root, "blobs"))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            analyze_shadow.main([write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", root])
+
     def test_a_store_without_requests_is_refused(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             analyze_shadow.main([write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", TEMP_DIR + "/typo"])
