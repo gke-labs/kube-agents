@@ -674,9 +674,10 @@ what the renderer does with them.
   `--lane-pr-glob gitlab=<glob>`. Any other tier, or a value that is not
   `<tier>=gs://...`, is refused.
 - `--lane-nightly-prefix <tier>=<gs prefix>` (repeatable) — a forge lane's
-  nightly, read as `--gitlab-nightly-prefix` is but tagged with `<tier>`;
-  a lane may name several (the GitLab lane's today and next nightlies),
-  each above its own job's watermark.
+  scheduled job at any cadence (a nightly, or the self-managed lanes' weekly
+  jobs), read as `--gitlab-nightly-prefix` is but tagged with `<tier>`; a
+  lane may name several (the GitLab lane's today and next nightlies), each
+  above its own job's watermark.
 - `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
   prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
   the directory index: one `<build_id>/` directory per build beside a

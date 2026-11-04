@@ -959,12 +959,14 @@ class BrowserTest(unittest.TestCase):
             self.assertIn(f"/test {job}", app)
         self.assertIn("No scheduled run on record", app)
         self.assertIn("once a week", app)
+        self.assertIn("GHES's scheduled jobs are off: not in Prow yet", app, "the page says what the digest says")
         data = copy.deepcopy(self.data)
         base = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
         lane_base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/4480/pull-kube-agents-smoke-test-gitlab-ce/2097282860221206800/"
         data["runs"] += [
             dict(base, build_id="2097282860221206800", tier="gitlab-ce", job="pull-kube-agents-smoke-test-gitlab-ce", pr=4480, result="SUCCESS", eval_verdict="GREEN", gcs_base=lane_base),
             dict(base, build_id="2097282860221206802", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"),
+            dict(base, build_id="2097282860221206803", tier="gitlab-ce", job="ci-kube-agents-eval-nightly-gitlab-ce-next", pr=None, result="SUCCESS", eval_verdict="GREEN", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-ce-next/2097282860221206803"),
             dict(base, build_id="2097282860221206801", tier="gitlab", job="ci-kube-agents-eval-nightly-gitlab-next", pr=None, result="FAILURE", eval_verdict="RED", log_url="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/2097282860221206801"),
         ]
         out = render_to(pathlib.Path(self.tmp.name) / "lanes", data, health=health_doc())
@@ -976,7 +978,11 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("<td>GitLab CE</td>", page)
         self.assertIn("<td>GHES</td>", page)
         self.assertIn("Scheduled runs", page)
-        self.assertIn("GHES 1 run, 0 green; GitLab CE 0 runs, 0 green", page)
+        self.assertIn("GHES 1 run, 0 green; GitLab CE 1 run, 1 green", page)
+        # Each scheduled row names its job, so a retired nightly's night reads as its own.
+        self.assertIn("<th>Job</th>", page)
+        self.assertIn("<td><code>ci-kube-agents-eval-nightly-gitlab-ce-next</code></td>", page)
+        self.assertIn("<td><code>ci-kube-agents-eval-weekly-ghes-next</code></td>", page)
         self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/2097282860221206802"', page)
         # The GitLab lane's next nightly is a table of its own; its today nightly says it has no night yet.
         self.assertIn("1 night on record: 0 green, 1 not", page)

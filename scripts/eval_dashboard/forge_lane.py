@@ -3,15 +3,16 @@
 
 One document per forge lane (tiers.FORGE_TIERS): the GitLab lane, the GHES
 lane and the GitLab CE lane (kube-agents#3682), each its pull-request job and
-its nightlies. What follows says it of the GitLab lane; the other two are the
-same shape under their own tier and jobs.
+its scheduled jobs (nightly for GitLab, weekly for the two self-managed lanes,
+which share a Brief section). What follows says it of the GitLab lane; the
+other two are the same shape under their own tier and jobs.
 
 The lane (``pull-kube-agents-smoke-test-gitlab``, kube-agents#2394) is the
 forge-grading cases of the catalogue driven against a pool project's
 GitLab repository. Its
 runs carry ``tier: gitlab`` (tiers.py) and so reach no gate verdict, no case
 history and no digest number (the digest's one forge line, digest_line, says
-each nightly's last result); this block is where they are seen at all: the
+each scheduled job's last result); this block is where they are seen at all: the
 newest ``RUNS_LISTED`` runs with Prow's result, the eval's own verdict, how
 many cases passed, and a build link, plus the lane's builds still in
 flight. Only stdlib, like the sibling nightly.py.
@@ -82,7 +83,7 @@ LANES = {
         "off": FORGE_WEEKLY_OFF,
     },
 }
-# The digest line on the forge lanes' nightlies (digest_line).
+# The digest line on the forge lanes' scheduled jobs (digest_line).
 DIGEST_GLYPH = "🦊"
 NEXT_JOB_SUFFIX = "-next"
 
@@ -176,7 +177,7 @@ def lane_document(data: dict, tier: str, now: datetime.datetime | None = None) -
     pull-request runs and its nights apart, each newest first and capped at
     RUNS_LISTED, with counts over every one on record; running judged
     against ``now``. ``nightly_jobs`` holds one ``{job, nights[],
-    night_counts}`` per nightly, the table's jobs first (listed even with no
+    night_counts}`` per scheduled job, the table's jobs first (listed even with no
     night yet), then any other job the lane's nights name; ``nights`` and
     ``night_counts`` are over all of them, ``nightly_job`` the newest
     night's job."""
@@ -199,6 +200,7 @@ def lane_document(data: dict, tier: str, now: datetime.datetime | None = None) -
         "section": LANES[tier]["section"],
         "section_title": SECTION_TITLES[LANES[tier]["section"]],
         "cadence": LANES[tier]["cadence"],
+        "off": LANES[tier].get("off") or None,
         "job": lane_job(data, tier=tier),
         "runs": [lane_run(r) for r in runs[:RUNS_LISTED]],
         "running": running(data, now, tier),
@@ -222,8 +224,8 @@ def gitlab_document(data: dict, now: datetime.datetime | None = None) -> dict:
 
 
 def _night_label(lane: dict, job: str) -> str:
-    """A nightly's short name in the digest: the lane's noun and its mode for
-    a job in its table, the job's own name for any other (a rename or an
+    """A scheduled job's short name in the digest: the lane's noun and its
+    mode (or ``weekly``) for a job in its table, the job's own name for any other (a rename or an
     extra prefix), so two jobs of one mode never read alike."""
     noun = lane["title"].removesuffix(" lane")
     if job not in lane["nightly_jobs"]:
@@ -237,8 +239,10 @@ def digest_line(data: dict | None, now: datetime.datetime) -> str | None:
     """One line for the daily digest on every forge lane's scheduled jobs:
     the last night's or week's result per job, by the lane's cadence (green,
     red, or none in that time); a lane with a reason (LANES' ``off``) as off,
-    with it, its table's jobs only, whatever their runs; and a job with no
-    run on record. None without data."""
+    with it, its table's jobs only, whatever their runs; a table job with no
+    run on record. A job outside the table (a rename, or a retired job with
+    runs on record) is named only with a run inside the lane's
+    window. None without data."""
     if not data:
         return None
     parts: list[str] = []
@@ -246,18 +250,22 @@ def digest_line(data: dict | None, now: datetime.datetime) -> str | None:
     for lane_doc in lanes_document(data, now):
         lane = LANES[lane_doc["tier"]]
         weekly = lane["cadence"] == CADENCE_WEEKLY
+        window = WEEKLY_MAX_AGE if weekly else nightly.LAST_NIGHT_MAX_AGE
         for entry in lane_doc["nightly_jobs"]:
             label = _night_label(lane, entry["job"])
             nights = entry["nights"]
+            in_table = entry["job"] in lane["nightly_jobs"]
+            started = parse_iso(nights[0].get("started")) if nights else None
+            if not in_table and (started is None or now - started > window):
+                continue
             if lane.get("off"):
-                if entry["job"] in lane["nightly_jobs"]:
+                if in_table:
                     waiting.setdefault(lane["off"], []).append(label)
                 continue
             if not nights:
                 waiting.setdefault("", []).append(label)
                 continue
-            started = parse_iso(nights[0].get("started"))
-            if started is None or now - started > (WEEKLY_MAX_AGE if weekly else nightly.LAST_NIGHT_MAX_AGE):
+            if started is None or now - started > window:
                 parts.append(f"{label} {'no run last week' if weekly else 'no night last night'}")
             else:
                 # A night with no recorded result is neither, as in _counts.

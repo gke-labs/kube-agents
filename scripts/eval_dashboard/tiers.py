@@ -13,8 +13,9 @@ catalogue driven against a pool project's GitLab repository
 (``EVAL_FORGE=gitlab``, kube-agents#2394), with its nightlies. The two
 self-managed forge lanes (``EVAL_FORGE=ghes`` and ``EVAL_FORGE=gitlab-ce``,
 kube-agents#3682) are tiers of the same kind, one each: a forge lane's runs
-are listed in its own section, and the digest names their nightlies' last
-results, but they are counted nowhere else. Every
+are listed on the Brief (the two self-managed lanes share a section), and the
+digest names their scheduled jobs' last results, but they are counted nowhere
+else. Every
 gate verdict -- the health adjudicator's rules, the "is this red mine?"
 classification, the Brief's runs list -- is a statement about the presubmit,
 so each of those consumers filters through ``presubmit_runs`` before it
@@ -86,5 +87,5 @@ def is_forge(run) -> bool:
 
 
 def forge_runs(runs, tier: str) -> list:
-    """One forge lane's runs: its own section of the Brief, never the gate's."""
+    """One forge lane's runs: listed on the Brief, never the gate's."""
     return [run for run in runs or [] if run_tier(run) == tier]

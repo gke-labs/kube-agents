@@ -86,6 +86,7 @@ class LaneDocumentTest(unittest.TestCase):
         self.assertEqual([(l["section"], l["section_title"], l["cadence"]) for l in lanes], [
             ("gitlab", "GitLab lane", "nightly"), ("self-managed", "Self-managed lanes", "weekly"), ("self-managed", "Self-managed lanes", "weekly"),
         ])
+        self.assertEqual([bool(l["off"]) for l in lanes], [False, True, True], "the page says why a lane's scheduled jobs are off")
         self.assertEqual([[r["build"] for r in l["runs"]] for l in lanes], [["100"], ["200"], ["300"]])
         self.assertEqual([[e["build"] for e in l["running"]] for l in lanes], [[], ["400"], []])
         self.assertEqual(lanes[2]["counts"], {"on_record": 1, "green": 0, "red": 1})
@@ -126,7 +127,7 @@ class LaneDocumentTest(unittest.TestCase):
         )
         self.assertIsNone(forge_lane.digest_line(None, now))
         # A lane with a reason reads as off even with a red run, and only its table's jobs are named:
-        # the one night each of the retired nightlies (still in data.json) does not join the line.
+        # a retired job's run on record does not join the line.
         red_off = {"runs": [
             dict(run("12", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None, result="FAILURE"), started="2026-11-03T10:00:00+00:00"),
             dict(run("13", tier="ghes", job="ci-kube-agents-eval-nightly-ghes-next", pr=None, result="FAILURE"), started="2026-11-03T05:00:00+00:00"),
@@ -150,6 +151,14 @@ class LaneDocumentTest(unittest.TestCase):
             self.assertIn("GHES weekly green", forge_lane.digest_line(weekly, now))
             weekly["runs"][0]["started"] = "2026-10-25T10:00:00+00:00"
             self.assertIn("GHES weekly no run last week", forge_lane.digest_line(weekly, now))
+            # A retired job's night outside the lane's window is not named; inside it, it is.
+            retired = {"runs": [
+                dict(run("41", tier="ghes", job="ci-kube-agents-eval-weekly-ghes-next", pr=None), started="2026-11-01T10:00:00+00:00"),
+                dict(run("42", tier="ghes", job="ci-kube-agents-eval-nightly-ghes-next", pr=None, result="FAILURE"), started="2026-10-24T05:00:00+00:00"),
+            ]}
+            self.assertNotIn("nightly-ghes-next", forge_lane.digest_line(retired, now))
+            retired["runs"][1]["started"] = "2026-11-02T05:00:00+00:00"
+            self.assertIn("GHES ci-kube-agents-eval-nightly-ghes-next red", forge_lane.digest_line(retired, now))
         # A job outside the lane's table is named, so it never reads like the table's job of its mode.
         extra = {"runs": [
             dict(run("30", job="ci-kube-agents-eval-nightly-gitlab", pr=None), started="2026-11-03T06:30:00+00:00"),

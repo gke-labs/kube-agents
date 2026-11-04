@@ -1025,7 +1025,7 @@ function releasesHtml() {
 // is the only place they show. Each row links the build where it lives (log_url for a night,
 // gcs_base for a run that records it), else Spyglass under the lane's own job name.
 const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
-function laneRow(run, withForge) {
+function laneRow(run, withForge, withJob) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);
   const pr = run.pr == null ? "—" : `<a href="${PAGE.prUrl}/${enc(run.pr)}" rel="noopener">#${esc(run.pr)}</a>`;
@@ -1033,9 +1033,9 @@ function laneRow(run, withForge) {
   const cases = `${t.pass || 0} passed · ${t.fail || 0} failed${t.infra ? ` · ${t.infra} infra` : ""}`;
   const verdict = run.eval_verdict ? esc(run.eval_verdict) : `<span class="mut">no eval banner</span>`;
   const when = run.started ? et(parseIso(run.started)) : "—";
-  return `<tr>${withForge ? `<td>${esc(run.forge || "")}</td>` : ""}<td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
+  return `<tr>${withForge ? `<td>${esc(run.forge || "")}</td>` : ""}${withJob ? `<td><code>${esc(run.job || "")}</code></td>` : ""}<td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
 }
-const laneTable = (rows, withForge) => `<table class="rel"><thead><tr>${withForge ? "<th>Forge</th>" : ""}<th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${rows.map((r) => laneRow(r, withForge)).join("")}</tbody></table>`;
+const laneTable = (rows, withForge, withJob) => `<table class="rel"><thead><tr>${withForge ? "<th>Forge</th>" : ""}${withJob ? "<th>Job</th>" : ""}<th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${rows.map((r) => laneRow(r, withForge, withJob)).join("")}</tbody></table>`;
 const laneRows = (list) => (Array.isArray(list) ? list.filter((r) => r && typeof r === "object" && r.build != null) : []);
 function laneHtml(lane) {
   const tier = String(lane.tier || "");
@@ -1092,12 +1092,15 @@ function forgeSectionHtml(section, lanes) {
   }
   const scheduled = tagged((l) => (Array.isArray(l.nightly_jobs) ? l.nightly_jobs : []).flatMap((j) => laneRows(j && j.nights)));
   const cadence = lanes[0].cadence === "weekly" ? "week" : "night";
+  // A lane's reason its scheduled jobs are off (forge_lane.LANES' `off`), as the digest says it.
+  const offs = lanes.filter((l) => l.off).map((l) => `<p class="mut small">${esc(forgeName(l))}'s scheduled jobs are off: ${esc(l.off)}.</p>`).join("");
   let schedHtml;
   if (!scheduled.length) {
     const names = lanes.flatMap((l) => (Array.isArray(l.nightly_jobs) ? l.nightly_jobs : []).map((j) => j && j.job).filter(Boolean)).map((j) => `<code>${esc(j)}</code>`).join(" and ");
-    schedHtml = `<p class="mut small">No scheduled run on record.${names ? ` ${names} run the same list once a ${cadence}.` : ""}</p>`;
+    schedHtml = `<p class="mut small">No scheduled run on record.${names ? ` ${names} run the same list once a ${cadence}.` : ""}</p>${offs}`;
   } else {
-    schedHtml = `<h3>Scheduled runs</h3><p class="mut small">${tally("night_counts", "run")}.</p>${laneTable(scheduled.slice(0, PAGE.laneRowsListed), true)}`;
+    // The Job column names each row's job, so a retired job's run reads as its own.
+    schedHtml = `<h3>Scheduled runs</h3>${offs}<p class="mut small">${tally("night_counts", "run")}.</p>${laneTable(scheduled.slice(0, PAGE.laneRowsListed), true, true)}`;
   }
   return `<div class="sec" id="${esc(section)}"><h2>${esc(title)}</h2>${body}${schedHtml}</div>`;
 }

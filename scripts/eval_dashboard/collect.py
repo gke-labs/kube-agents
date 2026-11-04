@@ -2771,10 +2771,10 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="TIER=GS_PREFIX",
-        help="a forge lane's nightly, as --gitlab-nightly-prefix is the GitLab"
-        " lane's, with the lane's tier first (repeatable: a lane may run a"
-        " today and a next nightly). Its runs carry that tier, pr=null and"
-        " their own watermark",
+        help="a forge lane's scheduled job at any cadence, as"
+        " --gitlab-nightly-prefix is the GitLab lane's nightly, with the lane's"
+        " tier first (repeatable: a lane may run a today and a next nightly)."
+        " Its runs carry that tier, pr=null and their own watermark",
     )
     parser.add_argument(
         "--nightly-job",
