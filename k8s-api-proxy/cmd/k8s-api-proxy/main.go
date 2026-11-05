@@ -23,6 +23,8 @@ import (
 
 const (
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
+	sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"
+	sessionCallersEnv       = "CREDENTIAL_PROXY_SESSION_CALLERS"
 )
 
 func envOrDefault(key, fallback string) string {
@@ -95,6 +97,18 @@ func parseAllowedCallers(raw string) ([]string, error) {
 	return callers, nil
 }
 
+func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[string][]string, error) {
+	aud := strings.TrimSpace(sessionAud)
+	if aud == "" {
+		return nil, nil
+	}
+	callers, err := parseAllowedCallers(sessionCallersRaw)
+	if err != nil {
+		return nil, errors.New(sessionCallersEnv + " is required when " + sessionAudienceEnv + " is set")
+	}
+	return map[string][]string{aud: callers}, nil
+}
+
 func main() {
 	var (
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
@@ -139,16 +153,9 @@ func main() {
 
 	inCluster := inClusterConfig(*kubeAPIServer, *kubeCAFile, *kubeTokenFile)
 
-	audienceCallers := make(map[string][]string)
-	if sessionAud := strings.TrimSpace(os.Getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE")); sessionAud != "" {
-		if sessionCallers, err := parseAllowedCallers(os.Getenv("CREDENTIAL_PROXY_SESSION_CALLERS")); err == nil {
-			audienceCallers[sessionAud] = sessionCallers
-		}
-	}
-	if profileAud := strings.TrimSpace(os.Getenv("CREDENTIAL_PROXY_PROFILE_AUDIENCE")); profileAud != "" {
-		if profileCallers, err := parseAllowedCallers(os.Getenv("CREDENTIAL_PROXY_PROFILE_CALLERS")); err == nil {
-			audienceCallers[profileAud] = profileCallers
-		}
+	audienceCallers, err := parseSessionAudienceCallers(os.Getenv(sessionAudienceEnv), os.Getenv(sessionCallersEnv))
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{

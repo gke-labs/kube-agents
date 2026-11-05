@@ -136,7 +136,9 @@
           ],
           "securityContext": {
             "capabilities": {
-              "drop": ["ALL"]
+              "drop": [
+                "ALL"
+              ]
             },
             "allowPrivilegeEscalation": false,
             "seccompProfile": {
@@ -318,7 +320,9 @@
           ],
           "securityContext": {
             "capabilities": {
-              "drop": ["ALL"]
+              "drop": [
+                "ALL"
+              ]
             },
             "allowPrivilegeEscalation": false,
             "seccompProfile": {
@@ -483,7 +487,9 @@
           ],
           "securityContext": {
             "capabilities": {
-              "drop": ["ALL"]
+              "drop": [
+                "ALL"
+              ]
             },
             "allowPrivilegeEscalation": false,
             "seccompProfile": {
@@ -708,7 +714,9 @@
           ],
           "securityContext": {
             "capabilities": {
-              "drop": ["ALL"]
+              "drop": [
+                "ALL"
+              ]
             },
             "allowPrivilegeEscalation": false,
             "seccompProfile": {

@@ -89,6 +89,13 @@ class _BrokerFixture(unittest.TestCase):
     """A real broker over TCP with a stub kubectl, and a fresh registry per test."""
 
     def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "metrics"):
             self.addCleanup(
                 self._restore,
@@ -297,6 +304,13 @@ class AbandonedCommandTest(unittest.TestCase):
                     exit_code=-9, stdout="", stderr="", duration_ms=1500, truncated=False, timed_out=False, abandoned=True,
                 )
 
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         previous = {name: CredentialProxyHandler.__dict__.get(name) for name in ("executor", "policy", "metrics", "max_request_bytes", "enforce_read_only", "authenticator")}
         for name, value in previous.items():
             self.addCleanup(setattr, CredentialProxyHandler, name, value)
@@ -1747,6 +1761,13 @@ class NeverStartedCommandTest(unittest.TestCase):
             raise AssertionError("a command that never got a slot must not run")
 
     def _serve_refusing(self, exc):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         names = ("executor", "policy", "metrics", "max_request_bytes", "enforce_read_only", "authenticator", "_request_slot")
         previous = {name: CredentialProxyHandler.__dict__.get(name) for name in names}
         for name, value in previous.items():
@@ -1808,6 +1829,13 @@ class FaultOutcomeTest(unittest.TestCase):
             raise self.exc
 
     def _post_with(self, exc):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         names = ("executor", "policy", "metrics", "max_request_bytes", "enforce_read_only", "authenticator")
         previous = {name: CredentialProxyHandler.__dict__.get(name) for name in names}
         for name, value in previous.items():

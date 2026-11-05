@@ -14,7 +14,6 @@ import (
 	"math/big"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -177,10 +176,6 @@ func hostClusterContextName(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool, tlsCertHash string) *appsv1.Deployment {
-	return buildKubeProxyDeploymentForProfiles(agent, otlpEndpoint, otlpDisabled, tlsCertHash, credentialProxyProfileConfig{})
-}
-
-func buildKubeProxyDeploymentForProfiles(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool, tlsCertHash string, profiles credentialProxyProfileConfig) *appsv1.Deployment {
 	saName := agentServiceAccountName(agent)
 	podLabels := commonLabels(agent)
 	for k, v := range kubeProxySelector(agent) {
@@ -233,12 +228,6 @@ func buildKubeProxyDeploymentForProfiles(agent *agentv1alpha1.PlatformAgent, otl
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: credentialProxySessionAudience},
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: a2aSessionBrokerCaller(agent)},
-		)
-	}
-	if profiles.enabled() {
-		envVars = append(envVars,
-			corev1.EnvVar{Name: credentialProxyProfileAudienceEnvVar, Value: credentialProxyProfileAudience},
-			corev1.EnvVar{Name: "CREDENTIAL_PROXY_PROFILE_CALLERS", Value: strings.Join(profiles.callers(), ",")},
 		)
 	}
 	envVars = append(envVars, kubeProxyOTelEnvVars(agent, otlpEndpoint, otlpDisabled)...)
@@ -472,13 +461,6 @@ func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networking
 	return np
 }
 
-func withKubeProxyProfilePeer(np *networkingv1.NetworkPolicy, agent *agentv1alpha1.PlatformAgent, c credentialProxyProfileConfig) *networkingv1.NetworkPolicy {
-	if c.enabled() && len(np.Spec.Ingress) > 0 {
-		np.Spec.Ingress[0].From = append(np.Spec.Ingress[0].From, credentialProxyProfilePeer(agent))
-	}
-	return np
-}
-
 func generateKubeProxyTLSBundle(serviceName, namespace string) (caPEM, certPEM, keyPEM []byte, err error) {
 	now := time.Now().Add(-kubeProxyTLSClockSkew)
 	notAfter := now.Add(kubeProxyTLSValidity)
@@ -629,26 +611,12 @@ func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent 
 	if err != nil {
 		return err
 	}
-	profiles, err := r.credentialProxyProfileConfigFor(ctx, agent)
-	if err != nil {
-		return err
-	}
-	netpol := buildKubeProxyNetworkPolicy(agent)
-	if profiles.enabled() {
-		fenced, err := r.profileFenced(ctx, agent)
-		if err != nil {
-			return err
-		}
-		if fenced {
-			netpol = withKubeProxyProfilePeer(netpol, agent, profiles)
-		}
-	}
 
 	objs := []client.Object{
 		buildKubeProxyService(agent),
-		buildKubeProxyDeploymentForProfiles(agent, otlpEndpoint, otlpDisabled, tlsHash, profiles),
+		buildKubeProxyDeployment(agent, otlpEndpoint, otlpDisabled, tlsHash),
 		buildKubeProxyPDB(agent),
-		netpol,
+		buildKubeProxyNetworkPolicy(agent),
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {

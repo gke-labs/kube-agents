@@ -29,12 +29,11 @@ import (
 )
 
 // AgentProfile workers as credential-broker callers (#3889). A profile worker's
-// gcloud is the credential-proxy shim (while kubectl routes through
-// <agent>-kube-proxy), so its credentialed gcloud calls reach the shared broker
-// over the ClusterIP, like a session pod's, with a projected token for an
-// audience of its own. The broker confers the `profile` role by that audience
-// and holds every call to the cluster in the task credential the worker
-// presents (credential_proxy.py, task_confinement.py).
+// gcloud is the credential-proxy shim, so its credentialed gcloud calls reach
+// the shared broker over the ClusterIP, like a session pod's, with a projected
+// token for an audience of its own. The broker confers the `profile` role by
+// that audience and holds every call to the cluster in the task credential the
+// worker presents (credential_proxy.py, task_confinement.py).
 //
 // What the broker needs from the operator, all rendered here and all reserved
 // against spec.deployment.env (mergeCredentialProxyEnv):

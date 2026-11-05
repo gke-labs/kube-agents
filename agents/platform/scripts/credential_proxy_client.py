@@ -1218,37 +1218,6 @@ def merge_context_into_default_kubeconfig(context: str) -> None:
         )
 
 
-def _task_target_from_credential_file() -> ClusterTarget | None:
-    """Extract the target cluster from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` when present."""
-    headers = task_credential_headers()
-    token = headers.get(TASK_CREDENTIAL_HEADER, "")
-    if not token:
-        return None
-    parts = token.split(".")
-    if len(parts) != 3:
-        raise TokenUnavailable("task credential is not a three-part JWT")
-    payload_b64 = parts[1]
-    padded = payload_b64 + "=" * (-len(payload_b64) % 4)
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise TokenUnavailable(f"task credential payload cannot be decoded: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise TokenUnavailable("task credential payload is not a JSON object")
-    nats_claims = payload.get("nats")
-    if not isinstance(nats_claims, dict):
-        return None
-    target = nats_claims.get("target")
-    if not isinstance(target, dict):
-        return None
-    project = target.get("project")
-    location = target.get("location")
-    cluster = target.get("cluster")
-    if not (isinstance(project, str) and isinstance(location, str) and isinstance(cluster, str)):
-        return None
-    return parse_gke_context(f"gke_{project}_{location}_{cluster}")
-
-
 def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
     """Register a `--context=gke_...` flag's cluster in the active kubeconfig before `kubectl` runs."""
     proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
@@ -1262,26 +1231,6 @@ def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
         or DEFAULT_KUBE_PROXY_TOKEN_FILE
     ).strip()
     normalized = argv if (argv and argv[0] == "kubectl") else ["kubectl", *argv]
-    if task_mode():
-        import task_confinement
-
-        target = _task_target_from_credential_file()
-        confined = task_confinement.confine(normalized, None, target)
-        if confined.isolated or target is None:
-            return
-        path = _caller_default_kubeconfig_path()
-        if path.parent.parent.is_dir():
-            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            _replace_file(
-                path,
-                build_kube_proxy_kubeconfig(
-                    target.context_name,
-                    proxy_url=proxy_url,
-                    ca_file=ca_file,
-                    token_file=token_file,
-                ),
-            )
-        return
     _ensure_host_kubeconfig_initialized(proxy_url, ca_file, token_file)
     if names_kubeconfig_flag(normalized):
         return

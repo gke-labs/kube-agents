@@ -3310,6 +3310,7 @@ class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
         }
         with patch.dict("os.environ", env, clear=False), \
                 patch.object(credential_proxy_client.os, "geteuid", return_value=os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_HERMES_UID", -1), \
                 patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", os.geteuid()), \
                 patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
                 patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
@@ -3332,6 +3333,7 @@ class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
         }
         with patch.dict("os.environ", env, clear=False), \
                 patch.object(credential_proxy_client.os, "geteuid", return_value=os.geteuid()), \
+                patch.object(credential_proxy_client, "SANDBOX_HERMES_UID", -1), \
                 patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", os.geteuid()), \
                 patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
                 patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
@@ -3342,50 +3344,6 @@ class WorkerKubeProxyKubeconfigTest(unittest.TestCase):
         text = self.worker_kubeconfig.read_text(encoding="utf-8")
         self.assertIn(f"current-context: {self.TARGET_CTX}", text)
         self.assertIn(f"{self.PROXY_URL}/clusters/{self.TARGET_CTX}", text)
-
-    def test_ensure_kube_proxy_context_enforces_task_confinement_in_task_mode(self):
-        import base64
-        import json
-
-        task_token_file = self.root / "task-token"
-        header = base64.urlsafe_b64encode(b'{"typ":"JWT","alg":"ed25519-nkey"}').decode("ascii").rstrip("=")
-        payload = base64.urlsafe_b64encode(
-            json.dumps(
-                {
-                    "nats": {
-                        "target": {
-                            "project": "acme-prod",
-                            "location": "us-central1",
-                            "cluster": "target-cluster",
-                        }
-                    }
-                }
-            ).encode("utf-8")
-        ).decode("ascii").rstrip("=")
-        task_token_file.write_text(f"{header}.{payload}.sig", encoding="utf-8")
-
-        env = {
-            "KUBE_PROXY_URL": self.PROXY_URL,
-            "KUBE_PROXY_HOST_CONTEXT": self.HOST_CTX,
-            "KUBE_PROXY_CA_FILE": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt",
-            "CREDENTIAL_PROXY_TOKEN_FILE": "/var/run/secrets/kubeagents/credential-proxy/token",
-            "CREDENTIAL_PROXY_TASK_TOKEN_FILE": str(task_token_file),
-            "KUBECONFIG": "",
-        }
-        with patch.dict("os.environ", env, clear=False), \
-                patch.object(credential_proxy_client.os, "geteuid", return_value=os.geteuid()), \
-                patch.object(credential_proxy_client, "SANDBOX_WORKER_UID", os.geteuid()), \
-                patch.object(credential_proxy_client, "SANDBOX_WORKER_KUBECONFIG_PATH", self.worker_kubeconfig), \
-                patch.object(credential_proxy_client, "SANDBOX_SHARED_KUBECONFIG_PATH", self.shared_kubeconfig):
-            credential_proxy_client.ensure_kube_proxy_context_for_argv(["kubectl", "get", "pods"])
-            text = self.worker_kubeconfig.read_text(encoding="utf-8")
-            self.assertIn(f"current-context: {self.TARGET_CTX}", text)
-            import task_confinement
-
-            with self.assertRaises(task_confinement.ConfinementRefusal):
-                credential_proxy_client.ensure_kube_proxy_context_for_argv(
-                    ["kubectl", f"--context={self.HOST_CTX}", "get", "pods"]
-                )
 
 
 if __name__ == "__main__":

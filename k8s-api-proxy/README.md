@@ -1,6 +1,6 @@
 # k8s-api-proxy
 
-The Kubernetes API proxy for the agent sandbox, A2A session pods, and `AgentProfile` worker pods (`<agent>-kube-proxy` deployment). Each caller's
+The Kubernetes API proxy for the agent sandbox and A2A session pods (`<agent>-kube-proxy` deployment). Each caller's
 `kubectl` talks to it over cluster-routed URLs (`/clusters/<cluster-id>/...`), and the proxy
 authenticates the caller (`pkg/k8sapiproxy/auth.go`), applies a per-request policy
 (`pkg/k8sapiproxy/policy.go`), redacts Secret values (`pkg/k8sapiproxy/secrets.go`), removes the
@@ -12,7 +12,7 @@ structured audit records (`pkg/k8sapiproxy/audit.go`), Prometheus metrics
 `cmd/k8s-api-proxy` builds the production server binary.
 
 `NewTokenReviewAuthenticator` (`auth.go`) is the `CallerAuthenticator`: it accepts a bearer token
-that a TokenReview on the host cluster finds valid for any of the configured audiences (`Audience` / `Audiences`), from a username on
+that a TokenReview on the host cluster finds valid for any of the configured audiences (`Audience` / `AudienceCallers`), from a username on
 an allowlist, and caches each acceptance or refusal for ten seconds by default. The audiences should
 be ones the API server does not accept, so a token sent to the proxy cannot be used against the API
 server directly; the operator picks them. A review that fails is a 503 rather than a 401.
