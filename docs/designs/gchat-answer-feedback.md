@@ -158,9 +158,10 @@ finds no button; a redelivered click is a duplicate by its id.
 
 **Call 5: the rewrites keep the ratings.** The choice-answered rewrite (`gchatAnsweredLayout`)
 and later edits drop choice buttons and keep link buttons today; both now also keep rating
-buttons, filled state included. The rewrite is built from memory, so the adapter's record of a
-tracked question keeps the message's feedback task id beside its links, and the per-message
-rating from Call 2 gives the filled state. A rewrite after a restart of a question the adapter
+buttons, filled state included. The rewrite is built from memory. The task id and the filled
+state live in a per-message rating memory (`ux.rated`), set when the answer is posted and when a
+tap is recorded. The answered rewrite's layout is kept per message (`ux.shown`), without the
+rating buttons. A rewrite after a restart of a question the adapter
 no longer remembers takes its buttons from the event's copy of the message, for which the button
 struct also decodes `type` and `altText`. The rating memory starts empty after a restart, so
 the filled state then comes from the event's copy, and the bucket still holds the rating. The restart-recovery of a choice click's link
@@ -211,8 +212,6 @@ branch's gateway image swapped in (the operator's `A2A_GATEWAY_IMAGE` override):
 
 ## Left to the builder
 
-- Whether Chat accepts an emoji-only button text; if not, the text is `Good answer` / `Bad
-answer`.
 - The wire structs for `formInputs` in both event layouts (legacy `common.formInputs`, add-on
   `commonEventObject.formInputs`), modelled on the existing `invokedFunction` handling.
 - Where the shared strings file lives in `a2a/gateway/` and whether the Slack constants are

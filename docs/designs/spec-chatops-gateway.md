@@ -2361,7 +2361,7 @@ No new scope: `chat:write` covers the ephemeral line, and `views.open` takes onl
 
 A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
-member id, the conversation and rated message, the task and context ids, the ask and the answer.
+member id or Google Chat email, the conversation and rated message, the task and context ids, the ask and the answer.
 It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
 creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
 the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
@@ -2418,7 +2418,10 @@ the `✓` line included (`shown`, held without the rating buttons), and, while t
 landed, takes the event's text and link buttons only. Any other message, one from before a
 restart, takes the event's text and its choice and link buttons. A tap therefore never restores
 the choices an answer removed. A failed write logs and patches nothing; a failed patch logs and
-keeps the rating.
+keeps the rating. Two rapid taps on one message are ordered by event time: the adapter records
+each rater's newest tap on a message when it takes the tap, and drops an older tap from that
+rater as superseded, with no patch and no note card. A tap with no event time is never
+superseded.
 
 A kept 👎 then posts the note card, the adapter's one `cardsV2` message (card id
 `kage.feedback-note`), in the answer's thread: "What went wrong?", a single-line text input
@@ -2428,7 +2431,8 @@ Cancel adding `cancel=1`. In a one-to-one DM the card posts plainly, since the D
 Anywhere else it is private to the clicker (`privateMessageViewer`), and it is not posted when
 the event names the clicker by no `users/` name, since it would then be public. A private thread
 reply Chat refuses is posted once more at the space's top level, still private; a second refusal
-logs and leaves the 👎 kept without a note. Send and Cancel are never turns either: they are
+logs and leaves the 👎 kept without a note. A repeat 👎 by the same rater posts another private
+note card, as Slack opens its box again. Send and Cancel are never turns either: they are
 dropped on the tap's checks (a `rating` other than `down` included) and handled off the pull
 loop. Cancel collapses the card (a `cards_v2` patch) to the thanks line and the form link. Send
 reads the note from `formInputs`, telling a click with no `formInputs` object from one whose value
