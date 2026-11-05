@@ -184,7 +184,7 @@ block. The lane's record is its logs bucket, read by the page per case and model
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 
-Three rules hold for every fixture a certification case plants, enforced in review until a
+Four rules hold for every fixture a certification case plants, enforced in review until a
 validator check lands with the first stack that needs it:
 
 1. A fail-closed admission webhook matches one bench-owned API group only, carries a
@@ -198,6 +198,9 @@ validator check lands with the first stack that needs it:
 3. Fixture credentials are inert literals, never a token that was once valid, and a service account
    a fixture creates is destroyed in the same stack. The expected-fail marker hides a fixture that
    failed to plant, so the `resource_property` safeguard stays on every case.
+4. A declared-gap fixture plants a signal the agent's read role reaches (a webhook configuration's
+   CA bundle, an object's condition, an event), never a Secret: agents hold no Secret access, so a
+   gap recorded on one could never close.
 
 ## Portal CUJ evaluations
 
