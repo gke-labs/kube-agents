@@ -238,6 +238,33 @@ class EnabledTest(unittest.TestCase):
         self.assertEqual(peer, {"podSelector": {"matchLabels": {"app": "litellm", _ROLE: "litellm"}}})
 
 
+class PdbTest(unittest.TestCase):
+    """The LiteLLM budget never counts the proxy; the proxy has its own."""
+
+    def _pdbs(self, sets=()):
+        res = _render(sets, show_only="templates/pdb.yaml")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return {d["metadata"]["name"]: d["spec"] for d in _docs(res.stdout) if d.get("kind") == "PodDisruptionBudget"}
+
+    def test_off_the_litellm_budget_selects_app_litellm_and_there_is_no_proxy_budget(self):
+        pdbs = self._pdbs()
+        self.assertEqual(pdbs["litellm"]["selector"]["matchLabels"], {"app": "litellm"})
+        self.assertNotIn(_PROXY, pdbs)
+
+    def test_on_each_budget_selects_one_pod_kind(self):
+        docs = _docs(_render(_ON, show_only="templates/litellm.yaml").stdout)
+        proxy_labels = _find(docs, "Deployment", _PROXY)["spec"]["template"]["metadata"]["labels"]
+        litellm_labels = _find(docs, "Deployment", "litellm")["spec"]["template"]["metadata"]["labels"]
+        pdbs = self._pdbs(_ON)
+        litellm, proxy = pdbs["litellm"], pdbs[_PROXY]
+        self.assertTrue(_selects(litellm["selector"]["matchLabels"], litellm_labels))
+        self.assertFalse(_selects(litellm["selector"]["matchLabels"], proxy_labels))
+        self.assertTrue(_selects(proxy["selector"]["matchLabels"], proxy_labels))
+        self.assertFalse(_selects(proxy["selector"]["matchLabels"], litellm_labels))
+        self.assertEqual((litellm["maxUnavailable"], proxy["maxUnavailable"]), (1, 1))
+        self.assertNotIn("minAvailable", proxy)
+
+
 class SchemaTest(unittest.TestCase):
     def test_on_without_a_job_kind_is_refused(self):
         sets = [s for s in _ON if not s.startswith("litellm.replayShadow.job.kind")]
