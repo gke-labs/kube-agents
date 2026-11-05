@@ -196,10 +196,9 @@ type gchatUX struct {
 	rated      map[string]gchatRating
 	ratedOrder []string
 	// tapped is the newest event time of a rating tap taken from each rater
-	// on each message (gchatTapKey), with the time it displaced, set when
-	// the tap is taken, before it is recorded, and tappedOrder its ring
-	// (gchat_feedback.go).
-	tapped      map[string]gchatTapTimes
+	// on each message (gchatTapKey), set when the tap is taken, before it
+	// is recorded, and tappedOrder its ring (gchat_feedback.go).
+	tapped      map[string]string
 	tappedOrder []string
 	// rewriting is the lock each message's rewrite holds from computing
 	// its layout to patching it (lockRewrite), by message name, held only
@@ -222,7 +221,7 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 		a.ux = &gchatUX{questions: map[string]gchatQuestion{}, open: map[string]string{}, pending: map[string]gchatPendingClick{},
 			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{},
 			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{},
-			tapped: map[string]gchatTapTimes{}, rewriting: map[string]*gchatRewriteLock{}}
+			tapped: map[string]string{}, rewriting: map[string]*gchatRewriteLock{}}
 	}
 	return a.ux
 }
