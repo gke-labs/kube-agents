@@ -72,7 +72,7 @@ const (
 	gchatNoteHint            = "Up to %d characters."
 	// gchatNoteCardsMask is the patch mask that replaces a message's cards.
 	gchatNoteCardsMask = "cards_v2"
-	gchatNoteLost      = "The note did not reach me, so the 👎 is kept without it."
+	gchatNoteLost      = "The note did not reach me; your rating stands as it was."
 	gchatNoteReplaced  = "This answer's rating changed, so the note was not kept."
 	// gchatCardLink is a link in a card's textParagraph, which takes HTML.
 	gchatCardLink = `<a href="%s">%s</a>`
@@ -334,6 +334,21 @@ func (a *GoogleChatAdapter) takeTap(message, rater, at string) {
 	remember(&ux.tappedOrder, key, func(k string) { delete(ux.tapped, k) })
 }
 
+// forgetTap drops at as rater's newest tap on message, when it still is.
+func (a *GoogleChatAdapter) forgetTap(message, rater, at string) {
+	if at == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ux := a.uxLocked()
+	key := gchatTapKey(message, rater)
+	if ux.tapped[key] == at {
+		delete(ux.tapped, key)
+		forget(&ux.tappedOrder, key)
+	}
+}
+
 // tapSuperseded reports whether rater has tapped message after event time
 // at.
 func (a *GoogleChatAdapter) tapSuperseded(message, rater, at string) bool {
@@ -405,8 +420,9 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 // leaves the message as it was. Rate, the layout and the patch run under the
 // message's rewrite lock (lockRewrite), so taps on one message take effect
 // in turn. A tap older than one the same rater made on the same message is
-// superseded: dropped before Rate, or, when the later tap was taken while
-// Rate ran, after it with no patch and no note card. A tap with no event
+// superseded and dropped before Rate. One taken while the later tap's Rate
+// ran is recorded and patched, and the later tap repaints after it; it posts
+// no note card. A failed Rate forgets the tap's time. A tap with no event
 // time is never superseded. A kept 👎 then asks for a note (askForNote). The
 // tap claims no question: a choice click on the message is still a turn.
 func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
@@ -461,24 +477,23 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 		}
 		askKept, err := recorder.Rate(rating)
 		if err != nil {
+			// The bucket never took this tap, so the record does not claim it.
+			a.forgetTap(message, rater, at)
 			unlock()
 			a.log.Warn("gchat: recording a rating failed", "message", message, "taskId", task, "err", err)
 			return
 		}
-		// A later tap taken while Rate ran records over this one next.
-		if a.tapSuperseded(message, rater, at) {
-			unlock()
-			a.log.Info(gchatRatingSuperseded, "message", message, "taskId", task, "rating", value)
-			return
-		}
+		// A later tap taken while Rate ran patches after this one, under
+		// the same lock, so this patch never outlives it.
 		if a.rememberTap(message, chosen) {
 			if err := a.patchRating(message, a.ratedLayout(snapshot, chosen)); err != nil {
 				a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
 			}
 		}
 		unlock()
-		// The 👎 is kept whether or not its button filled: ask for a note.
-		if value == FeedbackDown {
+		// The 👎 is kept whether or not its button filled: ask for a note,
+		// unless a later tap from the rater is on its way to replace it.
+		if value == FeedbackDown && !a.tapSuperseded(message, rater, at) {
 			a.askForNote(snapshot, task, askKept)
 		}
 	})

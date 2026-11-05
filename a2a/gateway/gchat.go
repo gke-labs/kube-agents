@@ -375,6 +375,9 @@ type GoogleChatAdapter struct {
 	// syncRewrites runs an answered question's rewrite inline, under test.
 	ux           *gchatUX
 	syncRewrites bool
+	// rewrites counts the rewrites goRewrite runs off the inbox worker,
+	// so a test can wait for them to finish.
+	rewrites sync.WaitGroup
 	// feedback is the answer-feedback recorder the gateway hands over
 	// (FeedbackSink); until then no rating buttons are drawn.
 	feedback FeedbackRecorder

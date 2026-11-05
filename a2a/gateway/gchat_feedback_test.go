@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -581,10 +580,51 @@ func TestGchatReRatingReplacesTheFilledButton(t *testing.T) {
 	}
 }
 
-// Two taps by one rater on one message, taken back to back with the first
-// Rate held until both are taken, end with the later tap's rating in the
-// bucket, on record and filled, whichever goroutine runs first; the older
-// tap is superseded, and a 👎 it replaced posts no note card.
+// rapidTaps classifies two taps by one rater on one message back to back,
+// first at an older event time than second, with the first Rate held until
+// both are taken, then waits for every rewrite to finish. With inRate, the
+// second is taken only once the first tap's Rate has started. It returns
+// the last patch's buttons and the number of note cards created.
+func rapidTaps(t *testing.T, a *GoogleChatAdapter, f *fakeChatRelay, rec *fakeRecorder, first, second string, inRate bool) ([]gchatButton, int) {
+	t.Helper()
+	a.syncRewrites = false
+	entered, taken := make(chan struct{}), make(chan struct{})
+	var rates atomic.Int32
+	rec.onRate = func() {
+		if rates.Add(1) == 1 {
+			close(entered)
+			<-taken
+		}
+	}
+	older := gchatRatingEvent(t, first)
+	older.click.EventTime = "2026-10-29T20:03:00.100000Z"
+	newer := gchatRatingEvent(t, second)
+	newer.click.EventTime = "2026-10-29T20:03:00.2Z"
+	a.classify(older)
+	if inRate {
+		<-entered
+	}
+	a.classify(newer)
+	close(taken)
+	a.rewrites.Wait()
+	last, cards := -1, 0
+	for i := range relayCallCount(f) {
+		switch f.call(i).method {
+		case "patch":
+			last = i
+		case "create":
+			cards++
+		}
+	}
+	if last < 0 {
+		t.Fatal("no patch")
+	}
+	return bodyButtons(t, checkPatch(t, f, last, gchatRatedMessage)), cards
+}
+
+// Two taps by one rater on one message end with the later tap's rating in
+// the bucket, on record and filled, whichever goroutine runs first; a 👎
+// the later tap replaced posts no note card.
 func TestGchatRapidTapsOnOneMessageKeepTheLastOne(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -596,44 +636,7 @@ func TestGchatRapidTapsOnOneMessageKeepTheLastOne(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, f, rec := newFeedbackGchatAdapter(t)
-			logs := &lockedBuffer{}
-			a.log = slog.New(slog.NewTextHandler(logs, nil))
-			a.syncRewrites = false
-			taken := make(chan struct{})
-			var rates atomic.Int32
-			rec.onRate = func() {
-				if rates.Add(1) == 1 {
-					<-taken
-				}
-			}
-			older := gchatRatingEvent(t, tc.first)
-			older.click.EventTime = "2026-10-29T20:03:00.100000Z"
-			newer := gchatRatingEvent(t, tc.second)
-			newer.click.EventTime = "2026-10-29T20:03:00.2Z"
-			a.classify(older)
-			a.classify(newer)
-			close(taken)
-
-			deadline := time.Now().Add(5 * time.Second)
-			for {
-				a.mu.Lock()
-				_, rewriting := a.uxLocked().rewriting[gchatRatedMessage]
-				a.mu.Unlock()
-				creates := 0
-				for i := range relayCallCount(f) {
-					if f.call(i).method == "create" {
-						creates++
-					}
-				}
-				if !rewriting && creates == tc.cards && a.ratingOf(gchatRatedMessage).chosen == tc.second &&
-					strings.Contains(logs.String(), "superseded") {
-					break
-				}
-				if time.Now().After(deadline) {
-					t.Fatalf("taps never settled: rating %+v, creates %d, logs:\n%s", a.ratingOf(gchatRatedMessage), creates, logs.String())
-				}
-				time.Sleep(time.Millisecond)
-			}
+			buttons, cards := rapidTaps(t, a, f, rec, tc.first, tc.second, false)
 			got := recordedRatings(rec)
 			if len(got) == 0 || got[len(got)-1].Rating != tc.second {
 				t.Errorf("ratings = %+v, want %s last", got, tc.second)
@@ -641,40 +644,53 @@ func TestGchatRapidTapsOnOneMessageKeepTheLastOne(t *testing.T) {
 			if r := a.ratingOf(gchatRatedMessage); r.task != "t-root" || r.chosen != tc.second {
 				t.Errorf("ratingOf = %+v, want t-root %s", r, tc.second)
 			}
-			last := -1
-			creates := 0
-			for i := range relayCallCount(f) {
-				switch f.call(i).method {
-				case "patch":
-					last = i
-				case "create":
-					creates++
-				}
-			}
-			if last < 0 {
-				t.Fatal("no patch")
-			}
-			checkFilled(t, bodyButtons(t, checkPatch(t, f, last, gchatRatedMessage)), tc.second)
-			if creates != tc.cards {
-				t.Errorf("note cards = %d, want %d", creates, tc.cards)
+			checkFilled(t, buttons, tc.second)
+			if cards != tc.cards {
+				t.Errorf("note cards = %d, want %d", cards, tc.cards)
 			}
 		})
 	}
 }
 
-// A tap with no event time is never superseded.
+// When the later tap, taken while the older one's Rate ran, fails its own
+// write, the older tap stays in the bucket and drawn. Its note card posts
+// only when the newer tap's failure lands before the 👎 asks for one.
+func TestGchatRapidTapsWhoseNewerWriteFailsKeepTheOlderOneDrawn(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.failRating = "up"
+	buttons, cards := rapidTaps(t, a, f, rec, "down", "up", true)
+	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "down" {
+		t.Errorf("ratings = %+v, want the 👎 alone", got)
+	}
+	if r := a.ratingOf(gchatRatedMessage); r.chosen != "down" {
+		t.Errorf("ratingOf = %+v, want down", r)
+	}
+	checkFilled(t, buttons, "down")
+	if cards > 1 {
+		t.Errorf("note cards = %d, want at most one", cards)
+	}
+}
+
+// A tap with no event time is never superseded, and never supersedes: a
+// timed tap after a timeless one is recorded and drawn.
 func TestGchatTapWithoutEventTimeIsNeverSuperseded(t *testing.T) {
 	a, f, rec := newFeedbackGchatAdapter(t)
-	newer := gchatRatingEvent(t, "up")
-	newer.click.EventTime = "2026-10-29T20:04:00Z"
-	a.classify(newer)
-	timeless := gchatRatingEvent(t, "down")
+	a.syncRewrites = false
+	timeless := gchatRatingEvent(t, "up")
 	timeless.click.EventTime = ""
 	a.classify(timeless)
+	a.rewrites.Wait()
+	timed := gchatRatingEvent(t, "down")
+	timed.click.EventTime = "2026-10-29T20:04:00Z"
+	a.classify(timed)
+	a.rewrites.Wait()
 	if got := recordedRatings(rec); len(got) != 2 || got[1].Rating != "down" {
 		t.Fatalf("ratings = %+v, want up then down", got)
 	}
 	checkFilled(t, bodyButtons(t, checkPatch(t, f, 1, gchatRatedMessage)), "down")
+	if r := a.ratingOf(gchatRatedMessage); r.chosen != "down" {
+		t.Errorf("ratingOf = %+v, want down", r)
+	}
 }
 
 func TestGchatRatingFromAnUnverifiedSenderChangesNothing(t *testing.T) {
@@ -1071,8 +1087,8 @@ func TestGchatSendWithoutFormInputsSaysTheNoteDidNotArrive(t *testing.T) {
 	if got := recordedNotes(rec); len(got) != 0 {
 		t.Errorf("notes = %q, want none", got)
 	}
-	if text := checkNotePatch(t, f, 0, gchatNoteCardMessage); text != gchatNoteLost {
-		t.Errorf("collapsed line = %q, want %q", text, gchatNoteLost)
+	if text := checkNotePatch(t, f, 0, gchatNoteCardMessage); text != "The note did not reach me; your rating stands as it was." {
+		t.Errorf("collapsed line = %q, want the note-lost line", text)
 	}
 }
 

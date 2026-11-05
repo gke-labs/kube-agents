@@ -590,7 +590,11 @@ func (a *GoogleChatAdapter) goRewrite(f func()) {
 		f()
 		return
 	}
-	go f()
+	a.rewrites.Add(1)
+	go func() {
+		defer a.rewrites.Done()
+		f()
+	}()
 }
 
 // gchatAnsweredLayout is a question's layout with its choice buttons gone,

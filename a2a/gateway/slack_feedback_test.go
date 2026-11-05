@@ -32,6 +32,9 @@ type fakeRecorder struct {
 	// onRate runs inside Rate, for a test that checks what had happened
 	// by then.
 	onRate func()
+	// failRating, when set, makes Rate fail for that rating and keep
+	// nothing.
+	failRating string
 }
 
 func (f *fakeRecorder) Admits(_, rater string) bool { return f.admit[rater] }
@@ -43,6 +46,9 @@ func (f *fakeRecorder) Rate(r FeedbackRating) (bool, error) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failRating != "" && r.Rating == f.failRating {
+		return false, errFeedbackContended
+	}
 	f.ratings = append(f.ratings, r)
 	return !f.noAsk, f.rateErr
 }
