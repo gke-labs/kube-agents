@@ -2,8 +2,8 @@
 // 2.0 surface over HTTP that lets an external coding agent or IDE host talk to
 // one in-cluster `next` install as a console client.
 //
-// It runs as its own Deployment (a2a/cmd/mcp), holding the console credential
-// and nothing else, and only when the install opts in. A caller authenticates
+// It runs as its own Deployment (a2a/cmd/mcp), holding its own bus credential,
+// console-mcp, and nothing else, and only when the install opts in. A caller authenticates
 // with the server's own bearer token; the bus never sees that token, and the
 // server never takes a caller's word for which bus to dial.
 //

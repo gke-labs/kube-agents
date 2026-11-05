@@ -2350,6 +2350,26 @@ class TestRepParsing(unittest.TestCase):
         self.assertNotIn("tokens", task["reps"][1], "no count parsed: no key, whatever partial says")
         self.assertNotIn("tokens", task["reps"][2], "no tokens line: the key is absent")
 
+    def test_a_tokens_line_carries_the_prompt_split_when_printed(self):
+        """`cached`, `cache_write` and `reasoning` follow `total` on a record
+        whose `input` excludes cache reads; each is added only when the line
+        carried it as a count, so an old line reads as it always did."""
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 tokens: input=10 output=672 total=135281 cached=125204 cache_write=9395 reasoning=0 partial=1\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 tokens: input=10 output=1 total=11 cached=7 cache_write=-1 reasoning=x\n"
+            "  rep 3: fail -- x\n"
+            "  rep 3 tokens: input=60468 output=79 total=91969\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["tokens"], {"input": 10, "output": 672, "total": 135281, "cached": 125204,
+                                                     "cache_write": 9395, "reasoning": 0, "partial": True})
+        self.assertEqual(task["reps"][1]["tokens"], {"input": 10, "output": 1, "total": 11, "cached": 7, "partial": False},
+                         "a split value that is not a count is absent, not null")
+        self.assertEqual(task["reps"][2]["tokens"], {"input": 60468, "output": 79, "total": 91969, "partial": False})
+
     def test_a_digit_run_past_the_int_limit_is_null_not_a_dropped_build(self):
         log = (
             "Task some-case Result: [FAILED] repetition 1: x\n"
@@ -2994,6 +3014,68 @@ class TestGitLabLane(_MergeBase):
         self.assertIn("gitlab scan resumed above build None", stderr)
         self.assertIn(f"gitlab nights resumed above build {BUILD_998_FULL}, 0 new", stderr)
 
+    def test_a_ghes_lane_glob_is_a_tier_and_a_section_of_its_own(self):
+        """A self-managed forge lane (kube-agents#3682) is collected the GitLab
+        lane's way under its own tier: listed in its own section, never the
+        GitLab one's, and counted in no gate verdict."""
+        gcloud, _ = self.fake_gcloud([])
+        root = self.bucket_root()
+        shutil.copytree(TESTDATA / BUILD_998_FULL, root / f"pull/gke-labs_kube-agents/998/pull-fake-smoke-ghes/{BUILD_998_FULL}")
+        glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-fake-smoke-ghes/*"
+        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        data, stderr = self.quiet_collect(lane_globs={"ghes": [glob]}, gcloud=gcloud, now=now)
+        self.assertEqual([(r["build_id"], r["tier"], r["job"]) for r in data["runs"]], [(BUILD_998_FULL, "ghes", "pull-fake-smoke-ghes")])
+        self.assertEqual(tiers.forge_runs(data["runs"], "ghes"), data["runs"])
+        self.assertEqual(tiers.gitlab_runs(data["runs"]), [], "not the GitLab lane's")
+        self.assertEqual(tiers.presubmit_runs(data["runs"]), [])
+        self.assertEqual(data["cases"], [])
+
+    def test_two_nightlies_of_one_lane_keep_a_watermark_each(self):
+        """A lane's today and next nightlies run on their own schedules: the
+        newest night of one must not hide the other's builds below it, as one
+        watermark per tier would."""
+        today = FAKE_BUCKET + "logs/ci-fake-eval-nightly-gitlab/"
+        nxt = FAKE_BUCKET + "logs/ci-fake-eval-nightly-gitlab-next/"
+        gcloud, _ = self.fake_gcloud([])
+        root = self.bucket_root()
+        for prefix, build in ((today, BUILD_998_FULL), (nxt, BUILD_956_TRUNCATED)):
+            where = root / prefix[len(FAKE_BUCKET):]
+            where.mkdir(parents=True)
+            shutil.copytree(TESTDATA / build, where / build)
+            (where / "latest-build.txt").write_text(build + "\n")
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        data, _ = self.quiet_collect(gitlab_nightly_prefix=today, gcloud=gcloud, now=now)
+        prior = self.write_prior(data)
+        merged, stderr = self.quiet_collect(
+            gitlab_nightly_prefix=today, lane_nightly_prefixes={"gitlab": [nxt]}, merge_with=prior, gcloud=gcloud, now=now,
+        )
+        by_id = {r["build_id"]: r for r in merged["runs"]}
+        self.assertEqual((by_id[BUILD_956_TRUNCATED]["tier"], by_id[BUILD_956_TRUNCATED]["job"]), ("gitlab", "ci-fake-eval-nightly-gitlab-next"), "below the today night, above its own job's watermark")
+        self.assertIn(f"gitlab nights ci-fake-eval-nightly-gitlab resumed above build {BUILD_998_FULL}, 0 new", stderr)
+        self.assertIn("gitlab nights ci-fake-eval-nightly-gitlab-next resumed above build None, 1 new", stderr)
+
+    def test_a_lane_tier_that_is_not_a_forge_lanes_is_refused(self):
+        with self.assertRaises(ValueError):
+            collect._forge_lane_sources({"nightly": ["gs://b/x/*"]}, None, None, None)
+        globs, prefixes = collect._forge_lane_sources({"gitlab-ce": ["gs://b/x/*", "gs://b/x/*"]}, {"gitlab": ["gs://b/n/"]}, ["gs://b/g/*"], "gs://b/m/")
+        self.assertEqual(globs, {"gitlab-ce": ["gs://b/x/*"], "gitlab": ["gs://b/g/*"]}, "each glob listed once, the GitLab lane's folded in")
+        self.assertEqual(prefixes, {"gitlab": ["gs://b/n/", "gs://b/m/"]})
+
+    def test_the_cli_takes_a_forge_lane_glob_and_refuses_a_malformed_one(self):
+        gcloud, _ = self.fake_gcloud([])
+        root = self.bucket_root()
+        shutil.copytree(TESTDATA / BUILD_998_FULL, root / f"pull/gke-labs_kube-agents/998/pull-fake-smoke-gitlab-ce/{BUILD_998_FULL}")
+        glob = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-fake-smoke-gitlab-ce/*"
+        out = self.tmp / "out.json"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = collect.main(["--lane-pr-glob", f"gitlab-ce={glob}", "--gcloud", gcloud, "--gh", "", "--out", str(out), "--since-days", "100000"])
+        self.assertEqual(rc, 0)
+        self.assertIn("0 presubmit, 0 nightly, 0 gitlab, 0 ghes, 1 gitlab-ce", stderr.getvalue())
+        for bad in ("gitlab-ce", "nightly=gs://b/x/*", "ghes=/local/path"):
+            with self.subTest(bad=bad), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                collect.main(["--lane-pr-glob", bad, "--gcloud", gcloud, "--gh", "", "--out", str(out)])
+
     def test_the_cli_takes_the_lane_glob_and_counts_it(self):
         gcloud, _ = self.fake_gcloud([])
         self.place_gitlab_build(BUILD_998_FULL)
@@ -3002,7 +3084,7 @@ class TestGitLabLane(_MergeBase):
         with contextlib.redirect_stderr(stderr):
             rc = collect.main(["--gitlab-pr-glob", FAKE_GITLAB_GLOB, "--gcloud", gcloud, "--gh", "", "--out", str(out), "--since-days", "100000"])
         self.assertEqual(rc, 0)
-        self.assertIn("0 presubmit, 0 nightly, 1 gitlab", stderr.getvalue())
+        self.assertIn("0 presubmit, 0 nightly, 1 gitlab, 0 ghes, 0 gitlab-ce", stderr.getvalue())
         self.assertEqual(json.loads(out.read_text())["runs"][0]["tier"], "gitlab")
 
 

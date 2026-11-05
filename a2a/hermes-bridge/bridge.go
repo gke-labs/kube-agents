@@ -434,6 +434,14 @@ type Bridge struct {
 	// when the fold returns against the publish window finalizeResult opens
 	// after it, without an answer whose fold is slow enough to time.
 	chatPart func(answer string) (lib.Part, bool)
+	// responseCap bounds the API executor's answer read, apiResponseCap by
+	// default; a field so a test can put an answer exactly at the cap
+	// without reading, folding and publishing 8 MiB under the race detector.
+	responseCap int
+	// afterDeadline arms the CLI executor's task deadline, time.AfterFunc by
+	// default; a field so a test can hold the kill until the stub has done
+	// what the test needs done before the deadline.
+	afterDeadline func(d time.Duration, f func()) *time.Timer
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
@@ -491,6 +499,8 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.deliver = b.handle
 	b.resultPublish = b.publishResult
 	b.chatPart = resultChatPart
+	b.responseCap = apiResponseCap
+	b.afterDeadline = time.AfterFunc
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}
@@ -1526,7 +1536,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	}
 	run.mu.Unlock()
 
-	deadline := time.AfterFunc(b.cfg.TaskDeadline, func() {
+	deadline := b.afterDeadline(b.cfg.TaskDeadline, func() {
 		run.deadlineHit.Store(true)
 		run.mu.Lock()
 		if run.state == stateRunning && run.proc != nil && run.proc.Process != nil {

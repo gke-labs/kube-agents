@@ -19,7 +19,8 @@ SCHEMA_VERSION = 1
 KEY_SEPARATOR = "|"
 COMMIT_KEY_LENGTH = 8
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-JSON_INDENT = 2
+# Compact: the file holds every run and is read by programs, so pretty-printing only adds size.
+JSON_INDENT = None
 
 
 def record_key(commit: str, mode: str, factor: str, level: float, operation: str, run: int) -> str:
@@ -68,6 +69,7 @@ class Record:
     values: dict[str, float] = field(default_factory=dict)
     totals: dict[str, int] = field(default_factory=dict)
     limits: dict[str, dict[str, float]] = field(default_factory=dict)
+    requests: dict[str, dict[str, float]] = field(default_factory=dict)
     # Per container name, how many running pods carried it.
     replicas: dict[str, int] = field(default_factory=dict)
     metrics: list[Metric] = field(default_factory=list)
@@ -76,6 +78,8 @@ class Record:
     answers: list[str] = field(default_factory=list)
     excluded_from: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # The runner revision that last read the record's Monitoring metrics again (``remonitor``).
+    remonitored: str = ""
 
     @property
     def key(self) -> str:

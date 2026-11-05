@@ -8117,6 +8117,7 @@ class ContentModeWorkspaceTest(unittest.TestCase):
         seen = {}
 
         def partial_mirror(repo, dest):
+            dest.mkdir(parents=True, exist_ok=True)
             (dest / "half.yaml").write_text("kind: Deployment\n")
             return False
 

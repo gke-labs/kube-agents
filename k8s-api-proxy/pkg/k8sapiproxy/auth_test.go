@@ -87,7 +87,7 @@ func newTestTokenReviewAuthenticator(t *testing.T, fake *fakeTokenReviewServer) 
 }
 
 func bearerRequest(token string) *http.Request {
-	r := httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil)
+	r := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/pods", nil)
 	if token != "" {
 		r.Header.Set("Authorization", "Bearer "+token)
 	}

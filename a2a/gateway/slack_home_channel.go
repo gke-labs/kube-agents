@@ -48,7 +48,14 @@ const (
 	HomeFileDir = "/etc/a2a/chat-home"
 	homeFileKey = "slack_home"
 
-	// The refusal vocabulary the operator maps to a condition sentence.
+	// The refusal vocabulary the operator maps to a condition sentence
+	// (homeChannelRefusedReasons in k8s-operator/internal/controller/
+	// platformagent_home_channel_record.go, a module that cannot import this
+	// one). TestHomeChannelRefusedReasonsMatchTheGatewaysVocabulary there
+	// parses this file and collects every homeRefused* string constant, so a
+	// new word is declared here, with that prefix, as a literal; one declared
+	// otherwise passes that test and renders in the operator's condition as a
+	// reason it does not know.
 	homeRefusedShared    = "shared"
 	homeRefusedArchived  = "archived"
 	homeRefusedNotMember = "not-member"

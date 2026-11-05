@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Iterable, Mapping, Sequence
+import statistics
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -57,6 +59,10 @@ CHURN = "churn_per_minute"
 FAILING_PODS = "failing_pods"
 CONCURRENT = "concurrent"
 LISTING_PODS = "listing_pods"
+# Not fleet inputs. The proxy load's workers are a load the runner sets (bench/scale/phase2.yaml);
+# a combined level is a point that moves several factors at once, not a place on an axis.
+PROXY_CONCURRENCY = "proxy_concurrency"
+COMBINED = "combined"
 # The kinds the design counts as objects. Their summed totals, per cluster, are
 # the objects factor's measured value, so the cluster's own objects count too.
 OBJECT_KINDS = ("namespaces", "deployments", "services", "hpas", "pods", "configmaps")
@@ -79,6 +85,10 @@ PLAN_BASE_LEVELS = MappingProxyType(
 # Metric names, as bench/scale/README.md lists them.
 MEMORY_PEAK = "memory_peak_bytes"
 CPU_PEAK = "cpu_peak_cores"
+CPU_SECONDS = "cpu_seconds"
+# A CPU peak this close to the container's own CPU limit is the limit, not the need: the container
+# was throttled, and what it would have used is unknown. Such a point stays out of the CPU line.
+CPU_CAPPED_SHARE = 0.9
 RESTARTS = "restarts"
 OOMKILLS = "oomkills"
 PVC_USED = "pvc_used_bytes"
@@ -88,6 +98,14 @@ PROFILES = "profiles"
 PROXY_WAIT_P50 = "proxy_wait_p50_seconds"
 PROXY_WAIT_MAX = "proxy_wait_max_seconds"
 PROXY_REFUSALS = "proxy_refusals"
+PROXY_COMMANDS = "proxy_commands"
+PROXY_COMMAND_SECONDS = "proxy_command_seconds"
+PROXY_LOAD_COMPLETED = "proxy_load_completed"
+PROXY_LOAD_ERRORS = "proxy_load_errors"
+PROXY_LOAD_RATE = "proxy_load_per_second"
+PROXY_LOAD_P50 = "proxy_load_p50_seconds"
+PROXY_LOAD_P95 = "proxy_load_p95_seconds"
+PROXY_LOAD_MAX = "proxy_load_max_seconds"
 WATCHER_SEEN = "watcher_events_seen"
 WATCHER_SEEN_RATE = "watcher_events_seen_per_minute"
 WATCHER_CREATES = "watcher_session_creates"
@@ -98,6 +116,9 @@ RUN_SLOT_REFUSALS = "run_slot_refusals"
 FAILED_PROMPTS = "failed_prompts"
 UNFINISHED_PROMPTS = "unfinished_prompts"
 RESPONSE = "response_seconds"
+# How long the slowest job a triggered window started took to run.
+JOB_SECONDS = "job_seconds"
+JOBS_COMPLETED = "jobs_completed"
 TOKENS_INPUT = "tokens_input"
 TOKENS_OUTPUT = "tokens_output"
 TOKENS_CACHED = "tokens_cached"
@@ -128,6 +149,8 @@ CONTAINER_LIMIT_KEYS = MappingProxyType({MEMORY_PEAK: LIMIT_MEMORY, CPU_PEAK: LI
 
 MIB = 1024**2
 GIB = 1024**3
+# The page shows memory in decimal gigabytes.
+GB = 1000**3
 MILLICORES_PER_CORE = 1000
 # Displayed values from this magnitude up show no decimals.
 WHOLE_NUMBER_FROM = 100
@@ -176,14 +199,17 @@ INTERPOLATED_LABEL = "within the measured range"
 MEASURED_LABEL = "measured at the base point"
 BASE_VALUE_LABEL = "base value"
 NO_VALUE = "—"
-YES_LABEL = "✓ yes"
-NO_LABEL = "no"
+NO_LIMIT_TEXT = "no limit"
+# Inputs from this value up read as whole numbers.
+NUMBER_TEXT_WHOLE = 10.0
+# Smaller inputs keep this many significant digits: 8.13, 0.5.
+NUMBER_TEXT_DIGITS = 3
 LIMIT_LABEL = "{container} limit"
 PVC_CAPACITY_LABEL = "PVC capacity {capacity}"
 # The columns of the editable limits table.
 LIMIT_CONTAINER_COLUMN = "Container"
-LIMIT_MEMORY_COLUMN = "Memory limit (MiB)"
-LIMIT_CPU_COLUMN = "CPU limit (cores)"
+LIMIT_MEMORY_COLUMN = "Memory (GB)"
+LIMIT_CPU_COLUMN = "CPU (cores)"
 
 # The PlatformAgent field that sets each harness container's resources. The
 # order is also the order of the containers' chart colours.
@@ -279,6 +305,9 @@ FACTORS = MappingProxyType(
         ),
     }
 )
+# Factors that are a load the runner applies, not a property of the fleet: charted against their
+# own runs, never a fleet input, so a prediction does not move with them.
+LOAD_FACTORS = MappingProxyType({PROXY_CONCURRENCY: "Credential proxy load workers"})
 
 
 @dataclass(frozen=True)
@@ -290,8 +319,9 @@ class MetricSpec:
 
 METRICS = MappingProxyType(
     {
-        MEMORY_PEAK: MetricSpec("Memory peak", "MiB", MIB),
+        MEMORY_PEAK: MetricSpec("Memory peak", "GB", GB),
         CPU_PEAK: MetricSpec("CPU peak", "cores"),
+        CPU_SECONDS: MetricSpec("CPU used over the window", "core-s"),
         RESTARTS: MetricSpec("Restarts"),
         OOMKILLS: MetricSpec("OOMKills"),
         PVC_USED: MetricSpec("Data PVC used", "GiB", GIB),
@@ -301,6 +331,14 @@ METRICS = MappingProxyType(
         PROXY_WAIT_P50: MetricSpec("Credential proxy wait, median", "s"),
         PROXY_WAIT_MAX: MetricSpec("Credential proxy wait, maximum", "s"),
         PROXY_REFUSALS: MetricSpec("Credential proxy refusals"),
+        PROXY_COMMANDS: MetricSpec("Brokered commands"),
+        PROXY_COMMAND_SECONDS: MetricSpec("Brokered command time, summed", "s"),
+        PROXY_LOAD_COMPLETED: MetricSpec("Proxy load: commands completed"),
+        PROXY_LOAD_ERRORS: MetricSpec("Proxy load: commands failed"),
+        PROXY_LOAD_RATE: MetricSpec("Proxy load: commands per second"),
+        PROXY_LOAD_P50: MetricSpec("Proxy load: command time, median", "s"),
+        PROXY_LOAD_P95: MetricSpec("Proxy load: command time, 95th percentile", "s"),
+        PROXY_LOAD_MAX: MetricSpec("Proxy load: command time, maximum", "s"),
         WATCHER_SEEN: MetricSpec("Watcher events seen"),
         WATCHER_SEEN_RATE: MetricSpec("Watcher events seen per minute"),
         WATCHER_CREATES: MetricSpec("Watcher session creates"),
@@ -311,6 +349,8 @@ METRICS = MappingProxyType(
         FAILED_PROMPTS: MetricSpec("Failed prompts"),
         UNFINISHED_PROMPTS: MetricSpec("Prompts answered without the operation"),
         RESPONSE: MetricSpec("Response time", "s"),
+        JOB_SECONDS: MetricSpec("Scheduled job run time", "s"),
+        JOBS_COMPLETED: MetricSpec("Scheduled jobs completed"),
         TOKENS_INPUT: MetricSpec("Input tokens, every caller (whole prompt)"),
         TOKENS_OUTPUT: MetricSpec("Output tokens, every caller"),
         TOKENS_CACHED: MetricSpec("Cached tokens, every caller"),
@@ -359,8 +399,105 @@ CAPACITY_METRICS = MappingProxyType({PVC_USED: PVC_CAPACITY})
 # The response-time gates are for typical queries: the plan's fan-out question
 # and the metadata question asked during it. The other operations are long
 # reports, such as a fleet audit; their response time is charted without a gate.
-QUERY_OPERATIONS = ("fan_out",)
+QUERY_OPERATIONS = ("fan_out", "daily_fan_out")
 QUERY_METRICS = (RESPONSE,)
+
+# How far a capacity search looks: up to this multiple of the input's base value.
+CAPACITY_CEILING = 1000.0
+# Halvings of the search interval; 30 resolve a ceiling of thousands to a thousandth.
+CAPACITY_STEPS = 30
+# Fleet-wide factors: a fleet with more clusters of the same shape has proportionally more of them.
+FLEET_WIDE_FACTORS = (CHURN, FAILING_PODS)
+# The credential proxy's container, and the operation that loads it with no model call.
+PROXY_CONTAINER = "envoy-credential-proxy"
+SHELL_CONTAINER = "shell"
+AGENT_CONTAINER = "platform-agent"
+# Containers whose limits no PlatformAgent field sets: the operator fixes them, so they cap how
+# many clusters one install holds once every settable limit is raised.
+FIXED_LIMIT_CONTAINERS = (SHELL_CONTAINER,)
+# The containers whose limits a fleet's size moves; the others keep their defaults in every measured fleet.
+SIZED_CONTAINERS = (AGENT_CONTAINER, "agent-api-auth", PROXY_CONTAINER, SHELL_CONTAINER)
+# The names the summary uses for the containers it sizes.
+CONTAINER_NAMES = MappingProxyType(
+    {
+        AGENT_CONTAINER: "Agent",
+        "agent-api-auth": "Event watcher",
+        PROXY_CONTAINER: "Credential proxy",
+        SHELL_CONTAINER: "Sandbox shell",
+    }
+)
+MINUTES_PER_DAY = 1440.0
+# An ISO timestamp's date part.
+DATE_LENGTH = 10
+# The fleet choice that starts every input at the measured base instead of an example fleet.
+CUSTOM_PROFILE = "Custom: the measured base"
+# The basis of a recommendation read from measured runs rather than a fitted line.
+MEASURED_BASIS = "measured"
+# The checks the bottleneck chart draws, in the order a growing fleet reaches them.
+BOTTLENECK_CHECKS = (
+    (CPU_PEAK, PROXY_CONTAINER),
+    (MEMORY_PEAK, PROXY_CONTAINER),
+    (CPU_PEAK, SHELL_CONTAINER),
+    (PROXY_WAIT_MAX, None),
+    (CPU_PEAK, AGENT_CONTAINER),
+    (MEMORY_PEAK, AGENT_CONTAINER),
+)
+# A share line reaches its limit at 1.0.
+LIMIT_REACHED = 1.0
+# Where the container limits table starts: the install's defaults, what Autopilot without bursting
+# gives (each request becomes the limit), or the recommended limits for this fleet.
+# Container sizes, smallest first. S is what GKE Autopilot without bursting gives (each request
+# becomes the limit), M the defaults of a Standard install, L a raised size a large fleet uses. XL
+# is the most a container can practically get on GKE Standard: a Pod has to fit on one node, and
+# one n2-standard-128 node has about 127 CPU and 530 GB allocatable; 120 CPU and 480 GB leave
+# room for the node's DaemonSets. The sandbox shell keeps the operator's fixed 2 CPU and 2 GiB in
+# every size unless the page assumes an operator change that makes it settable.
+LIMITS_S = "S: GKE Autopilot without bursting (limits equal the requests)"
+LIMITS_M = "M: defaults of a Standard install"
+LIMITS_L = "L: agent 8 CPU / 16 GB, credential proxy 8 CPU / 8 GB, event watcher 2 CPU / 4 GB"
+LIMITS_XL = "XL: the largest practical on GKE Standard, one n2-standard-128 node per container (120 CPU / 480 GB)"
+LIMITS_RECOMMENDED = "Recommended for this fleet"
+LIMIT_PRESETS = (LIMITS_S, LIMITS_M, LIMITS_L, LIMITS_XL, LIMITS_RECOMMENDED)
+LARGEST_CPU = 120.0
+LARGEST_MEMORY = 480 * GB
+# How fast the split grows when an install's containers do not fit: half again as many installs per step.
+SPLIT_GROWTH = 1.5
+RAISED_LIMITS = MappingProxyType(
+    {
+        LIMITS_L: {
+            "platform-agent": {LIMIT_CPU: 8.0, LIMIT_MEMORY: 16 * GB},
+            "envoy-credential-proxy": {LIMIT_CPU: 8.0, LIMIT_MEMORY: 8 * GB},
+            "agent-api-auth": {LIMIT_CPU: 2.0, LIMIT_MEMORY: 4 * GB},
+            SHELL_CONTAINER: {LIMIT_CPU: 8.0, LIMIT_MEMORY: 8 * GB},
+        },
+        LIMITS_XL: {
+            name: {LIMIT_CPU: LARGEST_CPU, LIMIT_MEMORY: LARGEST_MEMORY}
+            for name in ("platform-agent", "envoy-credential-proxy", "agent-api-auth", SHELL_CONTAINER)
+        },
+    }
+)
+# Where the operator fixes the sandbox shell's resources, for the page to point at.
+SHELL_RESOURCES_SOURCE = "k8s-operator/internal/controller/shell_sandbox_manifests.go"
+# The operation whose triggered window measured a Stall Watch pass, and the pass's budget.
+STALL_WATCH_OPERATION = "steady_10m"
+STALL_WATCH_BUDGET_SECONDS = 1500.0
+# A run held its install when the shell stayed under this share of its fixed CPU and nothing was refused.
+HELD_SHELL_SHARE = 0.9
+# The breakdown charts: one metric each, in its own unit, one line per owner.
+BREAKDOWN_OWNERS = MappingProxyType(
+    {
+        MEMORY_PEAK: SIZED_CONTAINERS,
+        CPU_PEAK: SIZED_CONTAINERS,
+        PROXY_WAIT_MAX: (None,),
+        RESPONSE: (None,),
+    }
+)
+# Cluster counts the bottleneck chart is drawn at: about 12 per tenfold, from 1 to 10,000.
+BOTTLENECK_POINTS_PER_DECADE = 12
+BOTTLENECK_DECADES = 4
+PROXY_LOAD_OPERATION = "proxy_load"
+SECONDS_PER_MINUTE = 60.0
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 @dataclass(frozen=True)
@@ -419,6 +556,7 @@ class Record:
     values: Mapping[str, float] = field(default_factory=dict)
     totals: Mapping[str, float] = field(default_factory=dict)
     limits: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    requests: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     # Per container, the running pods that carried it.
     replicas: Mapping[str, float] = field(default_factory=dict)
     provider_429s: int = 0
@@ -731,9 +869,17 @@ def _record(item: Any, where: str) -> Record:
     metrics = item.get("metrics")
     if not isinstance(metrics, list):
         raise HarnessDataError(f"{where}: metrics is not a list")
-    limits = item.get("limits", {})
-    if not isinstance(limits, dict):
-        raise HarnessDataError(f"{where}: limits is not an object")
+    resources = {}
+    for kind in ("limits", "requests"):
+        raw = item.get(kind, {})
+        if not isinstance(raw, dict):
+            raise HarnessDataError(f"{where}: {kind} is not an object")
+        resources[kind] = MappingProxyType(
+            {
+                str(container): MappingProxyType(_numbers(values, f"{where}: {kind}.{container}"))
+                for container, values in raw.items()
+            }
+        )
     measurements = (
         _measurement(entry, f"{where}: metric {index + 1}")
         for index, entry in enumerate(metrics)
@@ -756,14 +902,8 @@ def _record(item: Any, where: str) -> Record:
         image=image,
         values=MappingProxyType(_numbers(item.get("values", {}), f"{where}: values")),
         totals=MappingProxyType(_numbers(item.get("totals", {}), f"{where}: totals")),
-        limits=MappingProxyType(
-            {
-                str(container): MappingProxyType(
-                    _numbers(values, f"{where}: limits.{container}")
-                )
-                for container, values in limits.items()
-            }
-        ),
+        limits=resources["limits"],
+        requests=resources["requests"],
         replicas=MappingProxyType(_numbers(item.get("replicas", {}), f"{where}: replicas")),
         provider_429s=int(_number(item.get("provider_429s", 0), f"{where}: provider_429s")),
         excluded_from=_texts(item, "excluded_from", where),
@@ -840,6 +980,18 @@ def default_mode_index(available: Sequence[str]) -> int:
     return available.index(DEFAULT_MODE) if DEFAULT_MODE in available else 0
 
 
+def default_commit_index(records: Sequence[Record], available: Sequence[str]) -> int:
+    """The newest commit whose runs in its default mode have a factor axis, so a forecast can be drawn.
+
+    A commit that measured one fleet point (the real-install test) is evidence, not a forecast's input.
+    """
+    for index, commit in enumerate(available):
+        found = modes(records, commit)
+        if found and factors(select(records, commit, found[default_mode_index(found)])):
+            return index
+    return 0
+
+
 def select(records: Iterable[Record], commit: str, mode: str) -> tuple[Record, ...]:
     return tuple(
         record for record in records if record.commit == commit and record.mode == mode
@@ -852,18 +1004,25 @@ def operations(records: Iterable[Record]) -> list[str]:
 
 
 def factors(records: Iterable[Record], operation: str | None = None) -> list[str]:
-    """Every factor with runs of its own: the planned ones first, in plan order."""
+    """Every factor with runs of its own: the planned ones first, in plan order.
+
+    Combined points are not a factor's axis; ``combined_rows`` reports them.
+    """
     found = {
         record.factor
         for record in records
-        if not record.is_base and (operation is None or record.operation == operation)
+        if not record.is_base
+        and record.factor != COMBINED
+        and (operation is None or record.operation == operation)
     }
     return [name for name in FACTORS if name in found] + sorted(found - set(FACTORS))
 
 
-def unmapped_factors(records: Iterable[Record]) -> list[str]:
-    """Factors that have no fleet input, so predictions hold them at their base."""
-    return [name for name in factors(records) if name not in FACTORS]
+def factor_label(factor: str) -> str:
+    """A factor's name as the page shows it."""
+    if factor in FACTORS:
+        return FACTORS[factor].input_label
+    return LOAD_FACTORS.get(factor, factor)
 
 
 def containers(records: Iterable[Record]) -> list[str]:
@@ -902,23 +1061,42 @@ def metric_names(records: Iterable[Record]) -> list[str]:
     return [name for name in METRICS if name in found] + sorted(found - set(METRICS))
 
 
-def latest_limits(records: Iterable[Record]) -> dict[str, dict[str, float]]:
-    """Per container, the limits of the latest run that read them."""
-    limits: dict[str, dict[str, float]] = {}
+def _usual(records: Iterable[Record], kind: str) -> dict[str, dict[str, float]]:
+    """Per container, the resources most runs read; a tie goes to the later run.
+
+    A short experiment under other limits, such as runs with the credential
+    proxy's limits raised, does not change what the install's limits are.
+    """
+    seen: dict[str, dict[tuple[tuple[str, float], ...], tuple[int, str]]] = {}
     for record in sorted(records, key=lambda item: (item.started, item.key)):
-        for container, values in record.limits.items():
-            limits[container] = dict(values)
-    return limits
+        for container, values in getattr(record, kind).items():
+            key = tuple(sorted(values.items()))
+            count, _ = seen.setdefault(container, {}).get(key, (0, ""))
+            seen[container][key] = (count + 1, record.started)
+    return {
+        container: dict(max(options, key=lambda key: options[key]))
+        for container, options in seen.items()
+    }
+
+
+def usual_limits(records: Iterable[Record]) -> dict[str, dict[str, float]]:
+    """Per container, the limits most runs read."""
+    return _usual(records, "limits")
+
+
+def usual_requests(records: Iterable[Record]) -> dict[str, dict[str, float]]:
+    """Per container, the requests most runs read."""
+    return _usual(records, "requests")
 
 
 def limit_table(
     limits: Mapping[str, Mapping[str, float]], selected: Sequence[str]
 ) -> dict[str, list]:
-    """The limits as an editable table, in MiB and cores; 0 is no limit."""
+    """The limits as an editable table, in GB and cores; 0 is no limit."""
     return {
         LIMIT_CONTAINER_COLUMN: list(selected),
         LIMIT_MEMORY_COLUMN: [
-            limits.get(name, {}).get(LIMIT_MEMORY, 0.0) / MIB for name in selected
+            limits.get(name, {}).get(LIMIT_MEMORY, 0.0) / GB for name in selected
         ],
         LIMIT_CPU_COLUMN: [limits.get(name, {}).get(LIMIT_CPU, 0.0) for name in selected],
     }
@@ -930,8 +1108,8 @@ def limits_from_table(table: Mapping[str, Sequence[Any]]) -> dict[str, dict[str,
         table[LIMIT_CONTAINER_COLUMN], table[LIMIT_MEMORY_COLUMN], table[LIMIT_CPU_COLUMN]
     )
     return {
-        name: {LIMIT_MEMORY: _cell(memory_mib) * MIB, LIMIT_CPU: _cell(cores)}
-        for name, memory_mib, cores in rows
+        name: {LIMIT_MEMORY: _cell(memory_gb) * GB, LIMIT_CPU: _cell(cores)}
+        for name, memory_gb, cores in rows
     }
 
 
@@ -992,10 +1170,18 @@ def series_points(
         if x is None or y is None:
             continue
         level = BASE_LEVEL if record.is_base else f"{record.level:g}"
-        points.append(
-            Point(x, y, record.key, record.run, record.is_base, record.excluded(metric), level)
-        )
+        excluded = record.excluded(metric) or capped(record, metric, container)
+        points.append(Point(x, y, record.key, record.run, record.is_base, excluded, level))
     return tuple(sorted(points, key=lambda point: (point.x, point.key)))
+
+
+def capped(record: Record, metric: str, container: str | None) -> bool:
+    """Whether a run's CPU peak is its container's CPU limit rather than its need."""
+    if metric != CPU_PEAK or container is None:
+        return False
+    limit = record.limits.get(container, {}).get(LIMIT_CPU)
+    value = record.value(metric, container)
+    return bool(limit) and value is not None and value >= CPU_CAPPED_SHARE * limit
 
 
 def fit_line(points: Iterable[Point]) -> Fit | None:
@@ -1016,10 +1202,16 @@ def fit_line(points: Iterable[Point]) -> Fit | None:
 
 
 def base_records(records: Iterable[Record], operation: str) -> list[Record]:
-    """The base runs of an operation, or each factor's lowest level when it has none."""
+    """The base runs of an operation.
+
+    An operation with no base run of its own, such as one measured at one fleet
+    size under raised limits, has no base and does not anchor a prediction. Only
+    data with no base run at all falls back to each factor's lowest level.
+    """
+    records = list(records)
     runs = [record for record in records if record.operation == operation]
     base = [record for record in runs if record.is_base]
-    if base:
+    if base or any(record.is_base for record in records):
         return base
     lowest: dict[str, float] = {}
     for record in runs:
@@ -1048,6 +1240,7 @@ def _base_value(
         value
         for record in base_records(records, operation)
         if not record.excluded(metric)
+        and not capped(record, metric, container)
         and (value := record.value(metric, container)) is not None
     ]
     return _mean(values) if values else None
@@ -1099,16 +1292,6 @@ def base_fleet(records: Sequence[Record]) -> dict[str, float]:
     return fleet
 
 
-def grown_factors(records: Sequence[Record], fleet: Mapping[str, float]) -> list[str]:
-    """The measured factors at which the fleet differs from the base point."""
-    base = base_fleet(records)
-    return [
-        factor
-        for factor in factors(records)
-        if factor in FACTORS and not _close(fleet.get(factor, base[factor]), base[factor])
-    ]
-
-
 def _contribution(
     records: Sequence[Record],
     operation: str,
@@ -1122,6 +1305,10 @@ def _contribution(
         return None
     fit = fit_line(points)
     base_x = _base_x(records, operation, factor)
+    if base_x is None:
+        # An operation with no base run grows from the data's base point, where the base value it is
+        # added to was measured; from its own lowest run it would leave out the growth below that.
+        base_x = fleet_value(factor, base_fleet(records))
     if base_x is None and fit is not None:
         base_x = fit.x_min
     fleet_x = fleet_value(factor, fleet)
@@ -1153,6 +1340,8 @@ def predict(
     base_operation = max(bases, key=lambda operation: bases[operation])
     contributions = []
     for factor in factors(records):
+        if factor in LOAD_FACTORS:
+            continue
         candidates = [
             item
             for operation in names
@@ -1355,6 +1544,811 @@ def headroom(check: Check) -> float | None:
     return check.lines[0].value - check.prediction.value
 
 
+# --- capacity ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Capacity:
+    """Where one check first fails as an input grows from the base point."""
+
+    check: Check
+    # The input's value at the first failure; None when the check passes up to the ceiling.
+    value: float | None
+    # True when the base point itself fails the check.
+    at_base: bool = False
+
+
+def all_checks(
+    records: Sequence[Record],
+    fleet: Mapping[str, float],
+    containers: Sequence[str],
+    limits: Mapping[str, Mapping[str, float]],
+) -> list[Check]:
+    return resource_checks(records, fleet, containers, limits) + threshold_checks(
+        records, fleet, containers
+    )
+
+
+def scaled_fleet(base: Mapping[str, float], clusters: float) -> dict[str, float]:
+    """The base fleet with ``clusters`` clusters of the same shape.
+
+    Per-cluster inputs (nodes, objects) and the request-side inputs stay; the
+    fleet-wide inputs (pod churn, Pods failing at once) grow with the clusters.
+    """
+    # A base of no clusters scales nothing: the fleet-wide inputs stay as they are.
+    ratio = clusters / base[CLUSTERS] if base.get(CLUSTERS, 0.0) > 0 else 1.0
+    fleet = dict(base)
+    fleet[CLUSTERS] = clusters
+    for factor in FLEET_WIDE_FACTORS:
+        fleet[factor] = base[factor] * ratio
+    return fleet
+
+
+@dataclass(frozen=True)
+class FleetProfile:
+    """An example fleet: a size class built from customer fleets, rounded and without names."""
+
+    name: str
+    description: str
+    clusters: int
+    projects: int
+    autopilot_share: float
+    workloads_per_day: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.name}: {self.description}, {self.clusters:,} clusters"
+
+    def fleet(self, base: Mapping[str, float]) -> dict[str, float]:
+        """The base fleet's cluster shape at this many clusters; each workload counts as one Pod created."""
+        fleet = scaled_fleet(base, self.clusters)
+        fleet[CHURN] = self.workloads_per_day / MINUTES_PER_DAY
+        return fleet
+
+
+# S is made up; M, L and XL are rounded from three customer fleets. Nodes and objects per cluster
+# are not known for them, so a profile keeps the measured clusters' shape, and Pods failing at once
+# grow with the clusters as in the base.
+FLEET_PROFILES = (
+    FleetProfile("S", "startup", 4, 2, 1.0, 1_500),
+    FleetProfile("M", "mid-size company", 45, 20, 0.25, 25_000),
+    FleetProfile("L", "large company", 250, 140, 0.20, 45_000),
+    FleetProfile("XL", "largest company, the benchmark size", 2_500, 2_400, 0.90, 260_000),
+)
+
+
+@dataclass(frozen=True)
+class InstallPlan:
+    """How many installs a fleet needs, and the share of the fleet each one holds."""
+
+    # The most clusters one install holds with every settable limit raised; None when no fixed limit is reached.
+    capacity: float | None
+    # The fixed limit that sets the capacity.
+    limit: Check | None
+    installs: int
+    fleet: dict[str, float]
+
+
+def install_plan(
+    records: Sequence[Record], containers: Sequence[str], fleet: Mapping[str, float]
+) -> InstallPlan:
+    """Split ``fleet`` into installs that each stay below the first limit no setting raises.
+
+    The settable limits count as raised, so only the fixed containers' limits and the fixed
+    thresholds remain. A threshold already past at the base point (the response time) does not
+    grow with clusters and decides nothing here.
+    """
+    fixed = {name: value for name, value in usual_limits(records).items() if name in FIXED_LIMIT_CONTAINERS}
+    shaped = capacities(
+        records,
+        containers,
+        fixed,
+        lambda clusters: scaled_fleet(fleet, clusters),
+        min(fleet[CLUSTERS], base_fleet(records)[CLUSTERS]),
+        max(fleet[CLUSTERS], 1.0) * CAPACITY_CEILING,
+    )
+    reached = [item for item in shaped if item.value is not None and not item.at_base and item.check.lines]
+    if not reached:
+        return InstallPlan(None, None, 1, dict(fleet))
+    first = min(reached, key=lambda item: item.value)
+    per_install = max(math.floor(first.value), 1)
+    installs = max(math.ceil(fleet[CLUSTERS] / per_install), 1)
+    return InstallPlan(first.value, first.check, installs, scaled_fleet(fleet, fleet[CLUSTERS] / installs))
+
+
+@dataclass(frozen=True)
+class MeasuredShare:
+    """One run's reading as a share of the same threshold the line uses."""
+
+    clusters: float
+    share: float
+    key: str
+    excluded: bool
+    # The run's own nodes per cluster, from its totals.
+    nodes_per_cluster: float = 0.0
+
+
+@dataclass(frozen=True)
+class BottleneckSeries:
+    label: str
+    clusters: tuple[float, ...]
+    # The prediction as a share of the threshold: 1.0 is the limit.
+    shares: tuple[float, ...]
+    # The whole fleet at each point, for the tooltip.
+    fleets: tuple[dict[str, float], ...] = ()
+    measured: tuple[MeasuredShare, ...] = ()
+    # The owner's threshold in the series' unit, for a breakdown chart; None on the combined chart.
+    limit: float | None = None
+    # What the threshold is, for its label: "platform-agent limit: 8 GiB", "60 s: broker refuses".
+    limit_label: str = ""
+
+
+def _growth_counts() -> tuple[float, ...]:
+    return tuple(
+        10 ** (step / BOTTLENECK_POINTS_PER_DECADE)
+        for step in range(BOTTLENECK_POINTS_PER_DECADE * BOTTLENECK_DECADES + 1)
+    )
+
+
+def _growth(
+    records: Sequence[Record],
+    fleet: Mapping[str, float],
+    metric: str,
+    container: str | None,
+    divisor: float,
+    label: str,
+    limit: float | None = None,
+    limit_label: str = "",
+) -> BottleneckSeries | None:
+    """One prediction and its measured runs as the fleet grows in clusters, each value divided by ``divisor``."""
+    counts = _growth_counts()
+    fleets = tuple(scaled_fleet(fleet, clusters) for clusters in counts)
+    only = gated_operations(metric)
+    values = []
+    for point in fleets:
+        prediction = predict(records, metric, container, point, only=only)
+        values.append(prediction.value / divisor if prediction else math.nan)
+    if all(math.isnan(value) for value in values):
+        return None
+    measured = tuple(
+        MeasuredShare(
+            record.totals[CLUSTERS],
+            value / divisor,
+            record.key,
+            record.excluded(metric) or capped(record, metric, container),
+            record.totals.get(NODES, 0.0) / record.totals[CLUSTERS],
+        )
+        for record in records
+        if record.totals.get(CLUSTERS)
+        and (only is None or record.operation in only)
+        and (value := record.value(metric, container)) is not None
+    )
+    return BottleneckSeries(label, counts, tuple(values), fleets, measured, limit, limit_label)
+
+
+def _threshold(metric: str, container: str | None, limits: Mapping[str, Mapping[str, float]]) -> float | None:
+    if metric in CONTAINER_LIMIT_KEYS:
+        return limits.get(container, {}).get(CONTAINER_LIMIT_KEYS[metric]) or None
+    lines = FIXED_LINES.get(metric)
+    return lines[-1].value if lines else None
+
+
+def bottleneck_series(
+    records: Sequence[Record],
+    fleet: Mapping[str, float],
+    limits: Mapping[str, Mapping[str, float]],
+) -> list[BottleneckSeries]:
+    """Each key check's prediction against its threshold as the fleet grows in clusters, its shape kept."""
+    series = []
+    for metric, container in BOTTLENECK_CHECKS:
+        threshold = _threshold(metric, container, limits)
+        if not threshold:
+            continue
+        name = metric_spec(metric).label
+        item = _growth(records, fleet, metric, container, threshold, f"{name} · {container}" if container else name)
+        if item is not None:
+            series.append(item)
+    return series
+
+
+def breakdown_series(
+    records: Sequence[Record],
+    fleet: Mapping[str, float],
+    limits: Mapping[str, Mapping[str, float]],
+    metric: str,
+) -> list[BottleneckSeries]:
+    """One metric in its own unit as the fleet grows, one line per owner, each with its threshold."""
+    spec = metric_spec(metric)
+    series = []
+    for owner in BREAKDOWN_OWNERS.get(metric, (None,)):
+        threshold = _threshold(metric, owner, limits)
+        if threshold and owner:
+            limit_label = f"{owner} limit: {format_value(metric, threshold)}"
+        else:
+            limit_label = FIXED_LINES[metric][-1].label if threshold else ""
+        item = _growth(
+            records, fleet, metric, owner, spec.scale, owner or spec.label,
+            limit=threshold / spec.scale if threshold else None, limit_label=limit_label,
+        )
+        if item is not None:
+            series.append(item)
+    return series
+
+
+def crossing(item: BottleneckSeries) -> float | None:
+    """The cluster count at which a share line first reaches its limit (1.0), interpolated on the log axis."""
+    points = [(clusters, share) for clusters, share in zip(item.clusters, item.shares) if not math.isnan(share)]
+    for (low_x, low_y), (high_x, high_y) in zip(points, points[1:]):
+        if low_y >= LIMIT_REACHED:
+            return low_x
+        if high_y >= LIMIT_REACHED:
+            part = (LIMIT_REACHED - low_y) / (high_y - low_y)
+            return 10 ** (math.log10(low_x) + part * (math.log10(high_x) - math.log10(low_x)))
+    return None
+
+
+def first_crossing(series: Sequence[BottleneckSeries]) -> tuple[BottleneckSeries, float] | None:
+    """The line that reaches its limit at the fewest clusters, and where; None when no line does."""
+    reached = [(item, at) for item in series if (at := crossing(item)) is not None]
+    return min(reached, key=lambda pair: pair[1]) if reached else None
+
+
+def recommended_limits(items: Iterable[Recommendation]) -> dict[str, dict[str, float]]:
+    """Recommendations as a limits mapping, for a container that has one."""
+    return {
+        item.container: {LIMIT_MEMORY: item.memory_bytes or 0.0, LIMIT_CPU: item.cpu_cores or 0.0}
+        for item in items
+        if item.memory_bytes or item.cpu_cores
+    }
+
+
+def preset_limits(
+    preset: str, records: Sequence[Record], recommendations: Iterable[Recommendation], shell_settable: bool = False
+) -> dict[str, dict[str, float]]:
+    """The container limits a size preset sets; the fixed containers keep their limits unless ``shell_settable``."""
+    defaults = usual_limits(records)
+    if preset == LIMITS_S:
+        chosen = {**defaults, **usual_requests(records)}
+    elif preset == LIMITS_RECOMMENDED:
+        chosen = {**defaults, **recommended_limits(recommendations)}
+    else:
+        chosen = {**defaults, **RAISED_LIMITS.get(preset, {})}
+    # GKE Autopilot without bursting gives every container its request, the operator's fixed ones
+    # included; on Standard a fixed container keeps the operator's limit unless it is assumed settable.
+    if not shell_settable and preset != LIMITS_S:
+        for name in FIXED_LIMIT_CONTAINERS:
+            if name in defaults:
+                chosen[name] = defaults[name]
+    return chosen
+
+
+def measured_install_capacity(records: Sequence[Record]) -> float | None:
+    """The largest measured fleet at which every run held: no refusal, the shell under 90% of its fixed CPU."""
+    shell_limit = usual_limits(records).get(SHELL_CONTAINER, {}).get(LIMIT_CPU)
+    by_size: dict[float, list[Record]] = {}
+    for record in records:
+        if record.totals.get(CLUSTERS):
+            by_size.setdefault(record.totals[CLUSTERS], []).append(record)
+    held = [
+        size
+        for size, runs in by_size.items()
+        if all(
+            not (run.value(PROXY_REFUSALS) or 0.0)
+            and not (run.value(RUN_SLOT_REFUSALS) or 0.0)
+            and (shell_limit is None or (run.value(CPU_PEAK, SHELL_CONTAINER) or 0.0) < HELD_SHELL_SHARE * shell_limit)
+            for run in runs
+        )
+    ]
+    return max(held) if held else None
+
+
+def stall_watch_seconds_per_cluster(records: Iterable[Record]) -> float | None:
+    """The median Stall Watch pass time per cluster, from the windows that started one and saw it finish."""
+    rates = sorted(
+        seconds / record.totals[CLUSTERS]
+        for record in records
+        if record.operation == STALL_WATCH_OPERATION
+        and record.totals.get(CLUSTERS)
+        and (seconds := record.value(JOB_SECONDS)) is not None
+    )
+    return statistics.median(rates) if rates else None
+
+
+@dataclass(frozen=True)
+class SizeNeed:
+    """What one sized container needs for a fleet, against the limit it has now."""
+
+    container: str
+    name: str
+    memory_bytes: float | None
+    cpu_cores: float | None
+    current: dict[str, float]
+
+    @property
+    def short(self) -> tuple[str, ...]:
+        """The resources the current limit gives too little of: "memory", "CPU", or none."""
+        memory = self.current.get(LIMIT_MEMORY) or math.inf
+        cpu = self.current.get(LIMIT_CPU) or math.inf
+        return tuple(
+            name
+            for name, need, limit in (("memory", self.memory_bytes, memory), ("CPU", self.cpu_cores, cpu))
+            if (need or 0.0) > limit
+        )
+
+    @property
+    def enough(self) -> bool:
+        return not self.short
+
+
+def size_needs(
+    recommendations: Iterable[Recommendation], limits: Mapping[str, Mapping[str, float]]
+) -> list[SizeNeed]:
+    """The containers a fleet's size moves, each with its recommended size and its current limit."""
+    by_name = {item.container: item for item in recommendations}
+    return [
+        SizeNeed(name, CONTAINER_NAMES.get(name, name), by_name[name].memory_bytes, by_name[name].cpu_cores,
+                 dict(limits.get(name, {})))
+        for name in SIZED_CONTAINERS
+        if name in by_name
+    ]
+
+
+def measured_recommendations(
+    records: Sequence[Record], fleet: Mapping[str, float], containers: Sequence[str]
+) -> tuple[list[Recommendation], float | None]:
+    """Recommendations from the runs at the smallest measured fleet that is at least this one.
+
+    A container's peak there, from runs whose peak is neither left out of its fit nor held at
+    its limit, stands for its need; a container no such run measured keeps the model's line.
+    Returns the recommendations and the measured fleet size they come from, or None when the
+    fleet is past every measured size and the model's lines stand alone.
+    """
+    sizes = sorted({record.totals[CLUSTERS] for record in records if record.totals.get(CLUSTERS)})
+    at = next((size for size in sizes if size >= fleet[CLUSTERS]), None)
+    model = recommendations(records, fleet, containers)
+    if at is None:
+        return model, None
+    runs = [record for record in records if record.totals.get(CLUSTERS) == at]
+
+    def peak(metric: str, container: str) -> float | None:
+        values = [
+            value
+            for run in runs
+            if not run.excluded(metric) and not capped(run, metric, container)
+            and (value := run.value(metric, container)) is not None
+        ]
+        return max(values) if values else None
+
+    chosen = []
+    for item in model:
+        memory, cpu = peak(MEMORY_PEAK, item.container), peak(CPU_PEAK, item.container)
+        chosen.append(
+            Recommendation(
+                item.container,
+                Prediction(MEMORY_PEAK, item.container, memory, MEASURED_BASIS, ()) if memory is not None else item.memory,
+                Prediction(CPU_PEAK, item.container, cpu, MEASURED_BASIS, ()) if cpu is not None else item.cpu,
+            )
+        )
+    return chosen, at
+
+
+def too_large(items: Iterable[Recommendation]) -> list[Recommendation]:
+    """The recommendations no container on GKE can hold: past the largest practical node's share."""
+    return [
+        item for item in items
+        if (item.memory_bytes or 0.0) > LARGEST_MEMORY or (item.cpu_cores or 0.0) > LARGEST_CPU
+    ]
+
+
+@dataclass(frozen=True)
+class InstallSplit:
+    """How a fleet is split so every install fits its fixed limits and the largest containers."""
+
+    installs: int
+    fleet: dict[str, float]
+    recommendations: list[Recommendation]
+    # The measured fleet size the recommendations come from; None when they are the model's lines.
+    sized_from: float | None
+    # Containers that need more than the largest size even at one cluster per install.
+    impossible: list[Recommendation]
+
+
+def split_fleet(
+    records: Sequence[Record], fleet: Mapping[str, float], containers: Sequence[str], installs: int
+) -> InstallSplit:
+    """From ``installs``, add installs until every container's recommended size fits on GKE.
+
+    One cluster per install is the floor: a container that still needs more than the largest
+    size there makes the fleet impossible to hold on GKE with today's code.
+    """
+    clusters = max(fleet[CLUSTERS], 1.0)
+    count = max(installs, 1)
+    while True:
+        share = scaled_fleet(fleet, clusters / count)
+        chosen, sized_from = measured_recommendations(records, share, containers)
+        over = too_large(chosen)
+        if not over or count >= clusters:
+            return InstallSplit(count, share, chosen, sized_from, over)
+        count = min(math.ceil(count * SPLIT_GROWTH), math.ceil(clusters))
+
+
+@dataclass(frozen=True)
+class InputRange:
+    label: str
+    low: float
+    high: float
+    levels: int
+
+
+@dataclass(frozen=True)
+class DatasetSummary:
+    """What the measured runs cover, read from the records, for the page to state."""
+
+    runs: int
+    phases: tuple[str, ...]
+    operations: tuple[str, ...]
+    inputs: tuple[InputRange, ...]
+    containers: tuple[str, ...]
+    # Metric label and how many runs recorded it, most recorded first.
+    metrics: tuple[tuple[str, int], ...]
+    first: str
+    last: str
+
+
+def dataset_summary(records: Sequence[Record]) -> DatasetSummary:
+    """The runs, phases, operations, the range of every fleet input, and the readings they hold."""
+    inputs = []
+    for factor, spec in FACTORS.items():
+        values = sorted({value for record in records if (value := factor_value(record, factor)) is not None})
+        if values:
+            inputs.append(InputRange(spec.input_label, values[0], values[-1], len(values)))
+    counts: dict[str, int] = {}
+    for record in records:
+        for name in {measurement.name for measurement in record.metrics}:
+            counts[name] = counts.get(name, 0) + 1
+    started = sorted(record.started for record in records if record.started)
+    return DatasetSummary(
+        runs=len(records),
+        phases=tuple(sorted({record.phase for record in records})),
+        operations=tuple(operations(records)),
+        inputs=tuple(inputs),
+        containers=tuple(containers(records)),
+        metrics=tuple(
+            (metric_spec(name).label, count) for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        ),
+        first=started[0][:DATE_LENGTH] if started else "",
+        last=started[-1][:DATE_LENGTH] if started else "",
+    )
+
+
+def measured_clusters(records: Iterable[Record]) -> float:
+    """The largest fleet a run measured."""
+    return max((record.totals.get(CLUSTERS, 0.0) for record in records), default=0.0)
+
+
+def capacities(
+    records: Sequence[Record],
+    containers: Sequence[str],
+    limits: Mapping[str, Mapping[str, float]],
+    fleet_at: Callable[[float], Mapping[str, float]],
+    start: float,
+    ceiling: float,
+) -> list[Capacity]:
+    """For every check, the smallest input in [start, ceiling] at which it fails.
+
+    ``fleet_at`` maps the input to a whole fleet. The search assumes a check
+    that fails stays failed as the input grows, which holds for the straight
+    lines the predictions are made of when they rise.
+    """
+    bottom = {
+        (check.metric, check.container): check
+        for check in all_checks(records, fleet_at(start), containers, limits)
+    }
+    results = []
+    for top in all_checks(records, fleet_at(ceiling), containers, limits):
+        first = bottom[(top.metric, top.container)]
+        if past_at_base(first):
+            results.append(Capacity(first, start, at_base=True))
+            continue
+        if top.status != FAIL:
+            results.append(Capacity(top, None))
+            continue
+        only = gated_operations(top.metric)
+
+        def check_at(x: float, top: Check = top, only: tuple[str, ...] | None = only) -> Check:
+            prediction = predict(records, top.metric, top.container, fleet_at(x), only=only)
+            return _check(top.metric, top.container, top.lines, prediction)
+
+        low, high = start, ceiling
+        for _ in range(CAPACITY_STEPS):
+            middle = (low + high) / 2
+            if check_at(middle).status == FAIL:
+                high = middle
+            else:
+                low = middle
+        results.append(Capacity(check_at(high), high))
+    return sorted(
+        results,
+        key=lambda item: (not item.at_base, item.value is None, item.value or 0.0, item.check.label),
+    )
+
+
+def cluster_capacities(
+    records: Sequence[Record],
+    containers: Sequence[str],
+    limits: Mapping[str, Mapping[str, float]],
+    base: Mapping[str, float] | None = None,
+) -> list[Capacity]:
+    """Each check's breaking point in clusters, for a fleet of clusters shaped like the base."""
+    base = dict(base or base_fleet(records))
+    return capacities(
+        records,
+        containers,
+        limits,
+        lambda clusters: scaled_fleet(base, clusters),
+        base[CLUSTERS],
+        base[CLUSTERS] * CAPACITY_CEILING,
+    )
+
+
+def factor_capacities(
+    records: Sequence[Record],
+    containers: Sequence[str],
+    limits: Mapping[str, Mapping[str, float]],
+    factor: str,
+    base: Mapping[str, float] | None = None,
+) -> list[Capacity]:
+    """Each check's breaking point in one factor, with every other factor at the base."""
+    base = dict(base or base_fleet(records))
+    return capacities(
+        records,
+        containers,
+        limits,
+        lambda value: {**base, factor: value},
+        base[factor],
+        max(base[factor], 1.0) * CAPACITY_CEILING,
+    )
+
+
+@dataclass(frozen=True)
+class Onset:
+    """Where a count that has to stay at zero was first measured above it, along one factor."""
+
+    metric: str
+    container: str | None
+    factor: str
+    # The largest measured point below the onset, where every run counted zero.
+    last_zero: float | None
+    # The smallest measured point where a run counted above zero, and how many of its runs did.
+    first_above: float
+    runs_above: int
+    runs: int
+
+    @property
+    def label(self) -> str:
+        name = metric_spec(self.metric).label
+        return f"{name} · {self.container}" if self.container else name
+
+
+def count_onsets(records: Sequence[Record], factor: str) -> list[Onset]:
+    """The measured onset of every count whose threshold is "above 0", along ``factor``.
+
+    A straight line through counts that stay at zero up to a queue's capacity
+    and then jump crosses zero at once, so these are reported as measured:
+    the last point at zero and the first above it, with no line between them.
+    """
+    counts = [metric for metric, lines in FIXED_LINES.items() if lines == ABOVE_ZERO]
+    onsets = []
+    for metric in counts:
+        owners = sorted(
+            {m.container for record in records for m in record.metrics if m.name == metric},
+            key=lambda owner: owner or "",
+        )
+        for owner in owners:
+            groups: dict[str, list[tuple[float, float]]] = {}
+            for record in records:
+                if not (record.is_base or record.factor == factor):
+                    continue
+                y = record.value(metric, owner)
+                x = factor_value(record, factor)
+                if x is not None and y is not None:
+                    groups.setdefault(BASE_LEVEL if record.is_base else f"{record.level:g}", []).append((x, y))
+            ordered = sorted(groups.values(), key=lambda runs: _mean([x for x, _ in runs]))
+            above = next((index for index, runs in enumerate(ordered) if any(y > 0 for _, y in runs)), None)
+            if above is None:
+                continue
+            runs = ordered[above]
+            onsets.append(
+                Onset(
+                    metric,
+                    owner,
+                    factor,
+                    _mean([x for x, _ in ordered[above - 1]]) if above else None,
+                    _mean([x for x, _ in runs]),
+                    sum(1 for _, y in runs if y > 0),
+                    len(runs),
+                )
+            )
+    return onsets
+
+
+# --- the credential proxy's capacity --------------------------------------
+
+
+@dataclass(frozen=True)
+class ProxyLevel:
+    """The proxy load runs at one worker count, averaged."""
+
+    workers: float
+    runs: int
+    per_second: float
+    p50_seconds: float | None
+    p95_seconds: float | None
+    errors: float
+    # The largest CPU peaks over the runs: the broker's, and the sandbox shell's, where the
+    # client of every brokered command runs.
+    cpu_cores: float | None
+    shell_cpu_cores: float | None = None
+    # The broker's largest median admission wait: near zero while its slots are free.
+    wait_p50_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class ProxyDemand:
+    """The brokered commands one operation sent at one point, averaged over its runs."""
+
+    operation: str
+    factor: str
+    level: float
+    clusters: float
+    runs: int
+    commands_per_minute: float
+    # Seconds a command ran for, on average.
+    seconds_per_command: float | None
+
+    @property
+    def base_shaped(self) -> bool:
+        """Whether the point differs from the base in its cluster count alone."""
+        return self.factor in (BASE_FACTOR, CLUSTERS)
+
+    @property
+    def per_cluster_per_minute(self) -> float | None:
+        """The demand of one cluster, for a point whose clusters are shaped like the base's."""
+        return self.commands_per_minute / self.clusters if self.clusters and self.base_shaped else None
+
+
+def _optional_mean(values: Sequence[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return _mean(present) if present else None
+
+
+def _minutes(record: Record) -> float:
+    started = datetime.strptime(record.started, TIMESTAMP_FORMAT)
+    ended = datetime.strptime(record.ended, TIMESTAMP_FORMAT)
+    return max((ended - started).total_seconds(), 1.0) / SECONDS_PER_MINUTE
+
+
+@dataclass(frozen=True)
+class CpuRun:
+    """The CPU of one container in an operation's runs at one point and one CPU limit:
+    the highest peak, whether the limit capped any run, and the mean average."""
+
+    operation: str
+    factor: str
+    level: float
+    clusters: float
+    limit: float | None
+    runs: int
+    peak: float | None
+    capped: bool
+    # CPU-seconds over the window divided by the window: the work, which keeps growing after the
+    # peak stops at the limit.
+    average: float | None
+
+
+def cpu_runs(records: Iterable[Record], container: str) -> list[CpuRun]:
+    """``container``'s CPU, grouped by operation, point and CPU limit; runs left out of a metric's fit are left out here."""
+    groups: dict[tuple[str, float, str, float, float], list[Record]] = {}
+    for record in records:
+        clusters = record.totals.get(CLUSTERS)
+        if _cpu_reading(record, CPU_PEAK, container) is None and _cpu_reading(record, CPU_SECONDS, container) is None:
+            continue
+        if not clusters:
+            continue
+        limit = record.limits.get(container, {}).get(LIMIT_CPU) or 0.0
+        # The cluster count sorts the rows; the factor and level keep two points of one size apart.
+        groups.setdefault((record.operation, clusters, record.factor, record.level, limit), []).append(record)
+    rows = []
+    for (operation, clusters, factor, level, limit), runs in sorted(groups.items()):
+        peaks = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, container)) is not None]
+        averages = [
+            seconds / (_minutes(run) * SECONDS_PER_MINUTE)
+            for run in runs
+            if (seconds := _cpu_reading(run, CPU_SECONDS, container)) is not None
+        ]
+        rows.append(
+            CpuRun(
+                operation,
+                factor,
+                level,
+                clusters,
+                limit or None,
+                len(runs),
+                max(peaks) if peaks else None,
+                any(capped(run, CPU_PEAK, container) for run in runs if not run.excluded(CPU_PEAK)),
+                _mean(averages) if averages else None,
+            )
+        )
+    return rows
+
+
+def _cpu_reading(record: Record, metric: str, container: str) -> float | None:
+    return None if record.excluded(metric) else record.value(metric, container)
+
+
+def proxy_levels(records: Iterable[Record]) -> list[ProxyLevel]:
+    """The proxy load runs, one row per worker count, in rising order; a run that shared the broker is left out."""
+    groups: dict[float, list[Record]] = {}
+    for record in records:
+        workers = factor_value(record, PROXY_CONCURRENCY)
+        if record.value(PROXY_LOAD_RATE) is not None and workers is not None and not record.excluded(PROXY_LOAD_RATE):
+            groups.setdefault(workers, []).append(record)
+    levels = []
+    for workers, runs in sorted(groups.items()):
+        peaks = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, PROXY_CONTAINER)) is not None]
+        shell = [value for run in runs if (value := _cpu_reading(run, CPU_PEAK, SHELL_CONTAINER)) is not None]
+        waits = [value for run in runs if not run.excluded(PROXY_WAIT_P50) and (value := run.value(PROXY_WAIT_P50)) is not None]
+        levels.append(
+            ProxyLevel(
+                workers,
+                len(runs),
+                _mean([run.value(PROXY_LOAD_RATE) for run in runs]),
+                _optional_mean([run.value(PROXY_LOAD_P50) for run in runs]),
+                _optional_mean([run.value(PROXY_LOAD_P95) for run in runs]),
+                sum(run.value(PROXY_LOAD_ERRORS) or 0.0 for run in runs),
+                max(peaks) if peaks else None,
+                max(shell) if shell else None,
+                max(waits) if waits else None,
+            )
+        )
+    return levels
+
+
+def proxy_demand(records: Iterable[Record]) -> list[ProxyDemand]:
+    """Brokered commands per minute by operation and point, the proxy load runs aside.
+
+    Points are kept apart: ten concurrent questions on two clusters are no
+    measure of what one cluster asks of the broker.
+    """
+    groups: dict[tuple[str, str, float], list[Record]] = {}
+    for record in records:
+        if record.operation == PROXY_LOAD_OPERATION or record.value(PROXY_COMMANDS) is None:
+            continue
+        if record.excluded(PROXY_COMMANDS) or record.excluded(PROXY_COMMAND_SECONDS):
+            continue
+        if not record.totals.get(CLUSTERS):
+            continue
+        groups.setdefault((record.operation, record.factor, record.level), []).append(record)
+    demand = []
+    for (operation, factor, level), runs in sorted(groups.items()):
+        clusters = _mean([run.totals[CLUSTERS] for run in runs])
+        commands = sum(run.value(PROXY_COMMANDS) or 0.0 for run in runs)
+        timed = [value for run in runs if (value := run.value(PROXY_COMMAND_SECONDS)) is not None]
+        minutes = sum(_minutes(run) for run in runs)
+        demand.append(
+            ProxyDemand(
+                operation,
+                factor,
+                level,
+                clusters,
+                len(runs),
+                commands / minutes,
+                sum(timed) / commands if timed and commands else None,
+            )
+        )
+    return demand
+
+
 # --- recommendations --------------------------------------------------------
 
 
@@ -1442,6 +2436,25 @@ def nodes_needed(machine: MachineType, memory_bytes: float, cpu_cores: float) ->
     by_memory = math.ceil(memory_bytes / machine.allocatable_memory_bytes - EPSILON)
     by_cpu = math.ceil(cpu_cores / machine.allocatable_cpu - EPSILON)
     return max(1, by_memory, by_cpu)
+
+
+def number_text(value: float) -> str:
+    """A measured input as a reader says it: "40", "4,469", "0.5"."""
+    return f"{value:,.0f}" if value >= NUMBER_TEXT_WHOLE else f"{value:.{NUMBER_TEXT_DIGITS}g}"
+
+
+def memory_text(value_bytes: float | None) -> str:
+    """Memory as a reader says it, in GB rounded up to a tenth: "4.3 GB"; no limit when there is none."""
+    if not value_bytes:
+        return NO_LIMIT_TEXT
+    return f"{math.ceil(value_bytes / GB * 10) / 10:g} GB"
+
+
+def cpu_cores_text(cores: float | None) -> str:
+    """CPU as a reader says it, rounded up to a tenth: "3.2"; no limit when there is none."""
+    if not cores:
+        return NO_LIMIT_TEXT
+    return f"{math.ceil(cores * 10) / 10:g}"
 
 
 def memory_quantity(value_bytes: float) -> str:
@@ -1534,51 +2547,6 @@ def threshold_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
     ]
 
 
-def contribution_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
-    """How each prediction is built: its base value and every factor that grows."""
-    rows = []
-    for check in checks:
-        prediction = check.prediction
-        if prediction is None:
-            continue
-        rows.append(
-            {
-                "Check": check.label,
-                "Factor": BASE_VALUE_LABEL,
-                "Operation": prediction.base_operation,
-                "Base": NO_VALUE,
-                "This fleet": NO_VALUE,
-                "Measured": NO_VALUE,
-                "Value": format_value(check.metric, prediction.base),
-                "Fit": NO_VALUE,
-            }
-        )
-        for item in prediction.contributions:
-            if not item.grows:
-                continue
-            rows.append(
-                {
-                    "Check": check.label,
-                    "Factor": FACTORS[item.factor].input_label
-                    if item.factor in FACTORS
-                    else item.factor,
-                    "Operation": item.operation,
-                    "Base": _optional_number(item.base_x),
-                    "This fleet": _optional_number(item.fleet_x),
-                    "Measured": (
-                        f"{_axis_text(item.fit.x_min)}–{_axis_text(item.fit.x_max)}"
-                        if item.fit
-                        else NO_VALUE
-                    ),
-                    "Value": f"+{format_value(check.metric, item.delta)}"
-                    if item.delta >= 0
-                    else format_value(check.metric, item.delta),
-                    "Fit": item.fit.label if item.fit else NO_FIT_LABEL,
-                }
-            )
-    return rows
-
-
 def _optional_number(value: float | None) -> str:
     return NO_VALUE if value is None else _axis_text(value)
 
@@ -1619,43 +2587,6 @@ def _request_text(memory_bytes: float, cpu_cores: float) -> tuple[str, str]:
     )
 
 
-def pod_rows(plan: NodePlan) -> list[dict[str, str]]:
-    """Each pod's recommended requests, the inputs of the node answer."""
-    rows = []
-    for pod in plan.pods:
-        memory, cpu = _request_text(pod.memory_bytes, pod.cpu_cores)
-        rows.append(
-            {
-                "Pod": pod.name,
-                "Containers": ", ".join(pod.containers),
-                "Replicas": str(pod.replicas),
-                "Memory request": memory,
-                "CPU request": cpu,
-            }
-        )
-    return rows
-
-
-def machine_rows(plan: NodePlan) -> list[dict[str, str]]:
-    rows = []
-    for machine in MACHINE_TYPES:
-        holds = fits(machine, plan.largest_memory_bytes, plan.largest_cpu_cores)
-        nodes = nodes_needed(machine, plan.total_memory_bytes, plan.total_cpu_cores)
-        rows.append(
-            {
-                "Machine type": machine.name,
-                "vCPU": str(machine.vcpu),
-                "Memory": f"{machine.memory_gib:g} GiB",
-                "Allocatable memory": f"{machine.allocatable_memory_gib:g} GiB",
-                "Allocatable CPU": f"{machine.allocatable_cpu:g}",
-                "Holds the largest pod": YES_LABEL if holds else NO_LABEL,
-                "Nodes for every pod": str(nodes) if holds else NO_VALUE,
-                "Why it is on the list": machine.reason,
-            }
-        )
-    return rows
-
-
 def unfixable_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
     return [
         {
@@ -1671,55 +2602,8 @@ def unfixable_rows(checks: Iterable[Check]) -> list[dict[str, str]]:
     ]
 
 
-def record_rows(records: Iterable[Record]) -> list[dict[str, Any]]:
-    return [
-        {
-            "Key": record.key,
-            "Commit": record.commit[:COMMIT_LABEL_LENGTH],
-            "Mode": record.mode,
-            "Phase": record.phase,
-            "Factor": record.factor,
-            "Level": record.level,
-            "Operation": record.operation,
-            "Run": record.run,
-            "Started": record.started,
-            "Ended": record.ended,
-            "Image": record.image,
-            "Errors": "; ".join(record.errors),
-            "Provider 429s": record.provider_429s,
-            "Excluded from": ", ".join(record.excluded_from),
-            "Values": _pairs(record.values),
-            "Totals": _pairs(record.totals),
-            "Limits": "; ".join(
-                f"{container}: {_pairs(values)}" for container, values in record.limits.items()
-            ),
-            "Replicas": _pairs(record.replicas),
-        }
-        for record in records
-    ]
-
-
 def _pairs(values: Mapping[str, float]) -> str:
     return ", ".join(f"{name}={value:g}" for name, value in values.items())
-
-
-def measurement_rows(records: Iterable[Record]) -> list[dict[str, Any]]:
-    return [
-        {
-            "Key": record.key,
-            "Factor": record.factor,
-            "Level": record.level,
-            "Operation": record.operation,
-            "Run": record.run,
-            "Metric": measurement.name,
-            "Container": measurement.container or "",
-            "Value": measurement.value,
-            "Shown as": format_value(measurement.name, measurement.value),
-            "Excluded from fit": record.excluded(measurement.name),
-        }
-        for record in records
-        for measurement in record.metrics
-    ]
 
 
 # --- charts -----------------------------------------------------------------
@@ -1734,8 +2618,7 @@ def metric_charts(
 ) -> list[MetricChart]:
     """One chart per metric the factor's runs of the operation measured."""
     fleet_x = fleet_value(factor, fleet)
-    limits = latest_limits(records)
-    spec = FACTORS.get(factor)
+    limits = usual_limits(records)
     charts = []
     for metric in metric_names(records):
         owners = {
@@ -1769,7 +2652,7 @@ def metric_charts(
                 factor=factor,
                 operation=operation,
                 title=metric_info.label,
-                x_title=spec.input_label if spec else factor,
+                x_title=factor_label(factor),
                 y_title=f"{metric_info.label} ({metric_info.unit})"
                 if metric_info.unit
                 else metric_info.label,

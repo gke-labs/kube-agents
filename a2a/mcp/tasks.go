@@ -286,16 +286,21 @@ func (w *taskWatch) nextWait(ctx context.Context, maxWait time.Duration) error {
 
 func (w *taskWatch) fold() (*lib.Task, error) { return lib.FoldTask(w.ref.TaskID, w.events) }
 
+// taskAgreement is the supervisor check agreedEnvelope applies, the same
+// writers gateway.SupervisorAgreement accepts.
+var taskAgreement = lib.AgreementPolicy{Supervisor: gatewaySupervisor, OtherSupervisors: []string{lib.DispatcherSession}}
+
 // agreedEnvelope parses one TASKS message, dropping what the gateway's own
 // fold drops: an unparseable write, and an envelope that disagrees with the
-// subject it arrived on. The supervisor subject is checked against the
-// gateway by name.
+// subject it arrived on. The supervisor subject is checked by name against
+// the gateway and the profile dispatcher, which writes the terminal of a
+// profile task it fails or refuses.
 func agreedEnvelope(subject string, data []byte) *lib.Envelope {
 	env, err := lib.ParseEnvelope(data)
 	if err != nil {
 		return nil
 	}
-	if aerr := lib.CheckSubjectAgreement(subject, env, lib.AgreementPolicy{Supervisor: gatewaySupervisor}); aerr != nil && !lib.IsAdvisoryDisagreement(aerr) {
+	if aerr := lib.CheckSubjectAgreement(subject, env, taskAgreement); aerr != nil && !lib.IsAdvisoryDisagreement(aerr) {
 		return nil
 	}
 	return env

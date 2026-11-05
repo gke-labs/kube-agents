@@ -5,7 +5,7 @@ sidebar:
   order: 11
 ---
 
-The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page can. It is off by default and renders nothing under `today`.
+The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject. It is off by default and renders nothing under `today`.
 
 ## Turning it on
 
@@ -18,6 +18,8 @@ The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`, an
 If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Unset the flag and all of it is removed, the token included.
 
 ## Connecting a client
+
+To connect Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents from Antigravity](/kube-agents/install/antigravity-mcp/). A client that talks to the server directly connects as below.
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 

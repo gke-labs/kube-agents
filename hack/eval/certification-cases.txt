@@ -1,0 +1,26 @@
+# The certification suite: the cases behind the certified-capabilities page
+# (#3978). hack/ci-eval-pr.sh runs this file, and nothing else, under
+# EVAL_TIER=certification, which only the ci-kube-agents-certification
+# periodics in oss-test-infra export; no pull request and no nightly runs a
+# case named here.
+#
+# One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts
+# a comment, blank lines are skipped. A `# part N` line on its own starts
+# section N; a periodic runs one section under EVAL_CERTIFICATION_PART=N,
+# and entries above the first marker are part 1. The script refuses to start
+# on a line that names no case directory, on an entry that is also in
+# presubmit-cases.txt or nightly-cases.txt (one case, one lane, one record),
+# and on an empty file when this tier is the one running.
+#
+# WHAT BELONGS HERE. A top-level case under bench/tasks/ whose task.yaml
+# carries `suite: certification` (scripts/validate_bench_cases.py refuses an
+# entry without it) and a reason block above its line: the capability row it
+# grades and, for an `expected_fail: true` case, the issue that owns the gap.
+# The rules a case meets are the "Certification suite" section of
+# bench/README.md.
+#
+# WHO APPROVES. The normal approvers (root OWNERS), like nightly-cases.txt:
+# this file changes what one Rerun-only lane records, never what can red a
+# pull request.
+
+# part 1
