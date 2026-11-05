@@ -879,6 +879,10 @@ INJECT_LANE_REQUESTING = [
     # may propose the change as a pull request; its objective's
     # pull_request_opened leaf allows one.
     "cluster-setting-request-proposes-pr",
+    # obtainability-major-pdb-auto-pr: the sweep opens the no-pdb pull
+    # request for checkout-gateway; its objective's pull_request_opened leaf
+    # allows one.
+    "obtainability-major-pdb-auto-pr",
     # obtainability-remediation-proposal was listed in the safeguards file's
     # `requesting:` while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the
