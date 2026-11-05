@@ -1296,6 +1296,14 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/board/actions", {"action": "retry", "tasks": ["t-1"]}),
         ("GET", "/v1/tasks", None),
         ("GET", "/v1/tasks/t-1", None),
+        ("PUT", "/v1/sessions/sess-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("GET", "/v1/sessions/sess-1/origin", None),
+        ("PUT", "/v1/cron/jobs/j-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("GET", "/v1/cron/jobs/j-1/origin", None),
+        ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
+        ("GET", "/v1/proposals/opened/counts", None),
+        ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
+        ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
 
     def setUp(self):
@@ -1345,6 +1353,8 @@ class TestSessionKvServerAuth(unittest.TestCase):
                 .replace("sess-1", "{session_id}")
                 .replace("f-1", "{finding_id}")
                 .replace("t-1", "{task_id}")
+                .replace("j-1", "{job_id}")
+                .replace("tk-1", "{ticket}")
                 .replace("publication/backlog", "publication/{publisher}"),
             )
             for method, path, _ in self.PROTECTED_ROUTES
@@ -2646,7 +2656,11 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
         self.assertEqual(session_kv_server.PR_OPENED_EVENT_KIND, plugin.PR_OPENED_KIND)
-        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, plugin.OPEN_STATE)
+        # The forge check moved from the plugin to the broker's `proposal-claim`;
+        # the broker now holds the open state the fold waits for.
+        import vcs_broker
+
+        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, vcs_broker.OPEN_PROPOSAL_STATE)
         self.assertEqual(session_kv_server.PROPOSAL_URL_RE.pattern, plugin.PROPOSAL_URL.pattern)
 
     def test_off_by_default(self):
@@ -11414,6 +11428,33 @@ class TestDriftBacklog(unittest.TestCase):
         self.assertEqual(drift["sent"], 0)
         self.trigger.assert_not_called()
 
+    def test_the_backlog_card_is_stamped_drift_in_the_board_never_through_the_subprocess(self):
+        import sqlite3
+
+        self._headless()
+        self._burst()
+        board = Path(tempfile.mkdtemp()) / "kanban.db"
+        sqlite3.connect(board).close()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run, patch.object(
+            session_kv_server, "KANBAN_DB_PATH", str(board)
+        ), patch.object(session_kv_server, "_hermes_kanban", return_value=(None, None)):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("KUBE_AGENTS_CARD_ORIGIN", env)
+        self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
+        with closing_state(board) as conn:
+            rows = conn.execute("SELECT task_id, origin, origin_platform FROM kanban_task_origins").fetchall()
+        self.assertEqual(rows, [("t_digest1", "drift", "")])
+
+    def test_a_stamp_that_fails_still_files_the_card(self):
+        self._headless()
+        self._burst()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()), patch.object(
+            session_kv_server, "_stamp_board_task_origin", side_effect=FileNotFoundError("no board")
+        ) as stamp:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        stamp.assert_called_once_with("t_digest1", "drift", "")
+
     def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
         """The platform walk itself, not a patched answer: `spec.mode: next`,
         the gateway holding Slack with no home channel. The operator renders
@@ -12395,6 +12436,272 @@ class TestDataVolumeWarning(unittest.TestCase):
         self.assertGreater(total, 0)
         self.assertLessEqual(free, total)
         self.assertIsNone(session_kv_server._data_volume_usage("/nonexistent/data-volume"))
+
+
+
+class TestProposalOrigin(unittest.TestCase):
+    """The origin record, the per-job origin table and the proposals ledger: docs/designs/proposal-origin.md §2.1-§2.2."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM proposals_opened")
+                conn.execute("DELETE FROM cron_job_origins")
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _meta(self, session_id):
+        return session_kv_server._session_metadata(session_id)
+
+    def test_set_session_origin_writes_once(self):
+        sid = "a2a-origin-once"
+        self.assertTrue(session_kv_server._set_session_origin(sid, "chat", "slack"))
+        self.assertFalse(session_kv_server._set_session_origin(sid, "api", ""))
+        self.assertEqual(session_kv_server._session_origin(sid), ("chat", "slack"))
+        meta = self._meta(sid)
+        self.assertEqual(meta[session_kv_server.ORIGIN_KEY], "chat")
+        self.assertEqual(meta[session_kv_server.ORIGIN_PLATFORM_KEY], "slack")
+
+    def test_set_session_origin_keeps_the_other_keys(self):
+        created = self.client.post("/sessions").json()["sessionID"]
+        self.assertTrue(session_kv_server._set_session_origin(created, "event"))
+        meta = self._meta(created)
+        self.assertEqual(meta.get("platform"), "k8s-watcher")
+        self.assertEqual(meta[session_kv_server.ORIGIN_KEY], "event")
+
+    def test_session_origin_inherits_through_compression_parent(self):
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('orig-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('orig-mid', 'orig-root', 'compression');
+                INSERT INTO sessions VALUES ('orig-leaf', 'orig-mid', NULL);
+                INSERT INTO sessions VALUES ('orig-branch', 'orig-lone', NULL);
+                INSERT INTO sessions VALUES ('orig-lone', NULL, 'user_exit');
+                """
+            )
+        session_kv_server._set_session_origin("orig-root", "chat", "googlechat")
+        session_kv_server._set_session_origin("orig-lone", "api")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            self.assertEqual(session_kv_server._session_origin("orig-leaf"), ("chat", "googlechat"))
+            # A parent that did not end in compression is another conversation.
+            self.assertEqual(session_kv_server._session_origin("orig-branch"), ("other", ""))
+            self.assertEqual(session_kv_server._session_origin("orig-nobody"), ("other", ""))
+
+    def test_get_origin_route_answers_through_compression(self):
+        # A mid-turn compression rotates the session id; the child's row has no
+        # record, so the route answers the parent's.
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('a2a-route-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('a2a-route-child', 'a2a-route-root', NULL);
+                """
+            )
+        session_kv_server._set_session_origin("a2a-route-root", "chat", "slack")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            child = self.client.get("/v1/sessions/a2a-route-child/origin")
+            self.assertEqual(child.status_code, 200, child.text)
+            self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
+            self.assertEqual(self.client.get("/v1/sessions/a2a-route-root/origin").json(), {"origin": "chat", "platform": "slack"})
+
+    def test_session_origin_walks_the_gateway_profiles_store_on_a_front_door_install(self):
+        # With HERMES_GATEWAY_PROFILE=platform the gateway's sessions are in
+        # profiles/platform/state.db; this server's own store does not know them.
+        own = self.tmp / "state.db"
+        with closing_state(own) as conn:
+            conn.executescript("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);")
+        profile_db = self.tmp / "profiles" / "platform" / "state.db"
+        profile_db.parent.mkdir(parents=True)
+        with closing_state(profile_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('fd-origin-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('fd-origin-child', 'fd-origin-root', NULL);
+                """
+            )
+        session_kv_server._set_session_origin("fd-origin-root", "chat", "slack")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(own)), \
+                patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.tmp / "kanban.db")):
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: "platform"}):
+                self.assertEqual(session_kv_server._session_origin("fd-origin-child"), ("chat", "slack"))
+                child = self.client.get("/v1/sessions/fd-origin-child/origin")
+                self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
+            # Without the front door the profile's store is not read.
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: ""}):
+                self.assertEqual(session_kv_server._session_origin("fd-origin-child"), ("other", ""))
+            # A profile name that leaves the profiles directory names no store.
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: "../platform"}):
+                self.assertEqual(session_kv_server._origin_state_dbs(), [str(own)])
+
+    def test_get_origin_route_is_404_without_a_record_and_401_without_the_key(self):
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(self.client.get("/v1/sessions/a2a-route-nobody/origin").status_code, 404)
+        session_kv_server._set_session_origin("a2a-route-keyed", "event")
+        self.assertEqual(self.client.get("/v1/sessions/a2a-route-keyed/origin").json(), {"origin": "event", "platform": ""})
+        self.assertEqual(TestClient(session_kv_server.app).get("/v1/sessions/a2a-route-keyed/origin").status_code, 401)
+
+    def test_put_origin_route_refuses_a_second_record_with_409(self):
+        sid = "a2a-origin-route"
+        first = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": "chat", "platform": "slack"})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": "api", "platform": ""})
+        self.assertEqual(second.status_code, 409, second.text)
+        self.assertEqual(session_kv_server._session_origin(sid), ("chat", "slack"))
+
+    def test_put_origin_route_refuses_an_unknown_value(self):
+        sid = "a2a-origin-unknown"
+        for bad in ("eval", "", None, 3):
+            with self.subTest(origin=bad):
+                response = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": bad})
+                self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn(session_kv_server.ORIGIN_KEY, self._meta(sid))
+
+    def test_first_inject_stamps_event_and_drift(self):
+        stall = json.dumps({"kind": session_kv_server.INJECT_KIND_STALL})
+        drift = json.dumps({"kind": session_kv_server.INJECT_KIND_DRIFT})
+        answer = {"status": "injected"}
+        with patch.object(session_kv_server, "_inject_stall", return_value=answer), patch.object(
+            session_kv_server, "_inject_drift", return_value=answer
+        ):
+            event_sid = self.client.post("/sessions").json()["sessionID"]
+            drift_sid = self.client.post("/sessions").json()["sessionID"]
+            self.assertEqual(self.client.post(f"/sessions/{event_sid}/inject", json={"message": stall}).status_code, 200)
+            self.assertEqual(self.client.post(f"/sessions/{drift_sid}/inject", json={"message": drift}).status_code, 200)
+            # A second inject of the other kind changes nothing: the first one wins.
+            self.assertEqual(self.client.post(f"/sessions/{event_sid}/inject", json={"message": drift}).status_code, 200)
+            self.assertEqual(self.client.post(f"/sessions/{drift_sid}/inject", json={"message": stall}).status_code, 200)
+            # A session this server never created (the watcher's shared mode) gets no record.
+            self.assertEqual(self.client.post("/sessions/k8s-evt-shared0/inject", json={"message": stall}).status_code, 200)
+        self.assertEqual(session_kv_server._session_origin(event_sid), ("event", ""))
+        self.assertEqual(session_kv_server._session_origin(drift_sid), ("drift", ""))
+        self.assertEqual(self._meta("k8s-evt-shared0"), {})
+
+    def test_a_refused_inject_leaves_no_origin(self):
+        # A `controller-stall` record with no objects is refused with 400; it must
+        # not fix the origin, so the next accepted inject (drift) decides it.
+        refused = json.dumps({"kind": session_kv_server.INJECT_KIND_STALL, "cluster": "c", "namespace": "n", "objects": []})
+        drift = json.dumps({"kind": session_kv_server.INJECT_KIND_DRIFT})
+        sid = self.client.post("/sessions").json()["sessionID"]
+        self.assertEqual(self.client.post(f"/sessions/{sid}/inject", json={"message": refused}).status_code, 400)
+        self.assertNotIn(session_kv_server.ORIGIN_KEY, self._meta(sid))
+        with patch.object(session_kv_server, "_inject_drift", return_value={"status": "injected"}):
+            self.assertEqual(self.client.post(f"/sessions/{sid}/inject", json={"message": drift}).status_code, 200)
+        self.assertEqual(session_kv_server._session_origin(sid), ("drift", ""))
+
+    def test_cron_job_origin_is_upserted(self):
+        self.assertIsNone(session_kv_server._cron_job_origin("job-a"))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "chat", "platform": "slack"}).status_code, 200)
+        self.assertEqual(session_kv_server._cron_job_origin("job-a"), ("chat", "slack"))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "api"}).status_code, 200)
+        self.assertEqual(session_kv_server._cron_job_origin("job-a"), ("api", ""))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "nope"}).status_code, 400)
+
+    def test_cron_job_origin_get_route_reads_the_record_or_404(self):
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(self.client.get("/v1/cron/jobs/job-r/origin").status_code, 404)
+        self.client.put("/v1/cron/jobs/job-r/origin", json={"origin": "chat", "platform": "slack"})
+        got = self.client.get("/v1/cron/jobs/job-r/origin")
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertEqual(got.json(), {"origin": "chat", "platform": "slack"})
+        self.assertEqual(TestClient(session_kv_server.app).get("/v1/cron/jobs/job-r/origin").status_code, 401)
+
+    def test_proposals_opened_is_idempotent_on_url(self):
+        url = "https://github.com/example/fleet/pull/7"
+        body = {"url": url, "origin": "audit", "platform": "", "opened_at": "2026-11-03T10:00:00+00:00"}
+        first = self.client.post("/v1/proposals/opened", json=body)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), {"recorded": True})
+        again = dict(body, origin="chat", platform="slack")
+        second = self.client.post("/v1/proposals/opened", json=again)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json(), {"recorded": False})
+        counts = self.client.get("/v1/proposals/opened/counts").json()
+        self.assertEqual(counts["audit"], {"": 1})
+        self.assertEqual(counts["chat"], {"": 0})
+        self.assertEqual(self.client.post("/v1/proposals/opened", json=dict(body, url="")).status_code, 400)
+        self.assertEqual(self.client.post("/v1/proposals/opened", json=dict(body, url=url + "8", origin="eval")).status_code, 400)
+
+    def test_proposals_opened_counts_zero_fill_every_origin(self):
+        for n, (origin, platform) in enumerate((("chat", "slack"), ("chat", "slack"), ("chat", "googlechat"), ("drift", ""))):
+            body = {"url": f"https://github.com/example/fleet/pull/{n}", "origin": origin, "platform": platform}
+            self.assertEqual(self.client.post("/v1/proposals/opened", json=body).status_code, 200)
+        counts = self.client.get("/v1/proposals/opened/counts").json()
+        self.assertEqual(list(counts), list(session_kv_server.ORIGINS))
+        self.assertEqual(counts["chat"], {"slack": 2, "googlechat": 1})
+        self.assertEqual(counts["drift"], {"": 1})
+        for origin in set(session_kv_server.ORIGINS) - {"chat", "drift"}:
+            self.assertEqual(counts[origin], {"": 0}, origin)
+
+    def test_cleanup_leaves_the_ledger_and_job_origins(self):
+        import sqlite3
+
+        self.client.post("/v1/proposals/opened", json={"url": "https://github.com/example/fleet/pull/99", "origin": "issue"})
+        self.client.put("/v1/cron/jobs/job-old/origin", json={"origin": "chat", "platform": "slack"})
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("UPDATE proposals_opened SET opened_at = '2020-01-01T00:00:00+00:00'")
+                conn.execute("UPDATE cron_job_origins SET recorded_at = '2020-01-01T00:00:00+00:00'")
+                session_kv_server.cleanup_old_records(conn)
+        self.assertEqual(self.client.get("/v1/proposals/opened/counts").json()["issue"], {"": 1})
+        self.assertEqual(session_kv_server._cron_job_origin("job-old"), ("chat", "slack"))
+
+    def test_a_stamp_ticket_is_minted_with_the_named_length(self):
+        minted = self.client.post("/v1/board/stamp-tickets", json={"origin": "issue"})
+        self.assertEqual(minted.status_code, 200, minted.text)
+        ticket = minted.json()["ticket"]
+        self.assertRegex(ticket, rf"^[0-9a-f]{{{2 * session_kv_server.STAMP_TICKET_BYTES}}}$")
+        self.assertEqual(self.client.post("/v1/board/stamp-tickets", json={"origin": "eval"}).status_code, 400)
+
+    def test_a_stamp_ticket_redeems_once_and_a_replay_is_404(self):
+        ticket = self.client.post("/v1/board/stamp-tickets", json={"origin": "chat", "platform": "slack"}).json()["ticket"]
+        first = self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json(), {"origin": "chat", "platform": "slack"})
+        self.assertEqual(self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem").status_code, 404)
+        self.assertEqual(self.client.post("/v1/board/stamp-tickets/" + "0" * 32 + "/redeem").status_code, 404)
+
+    def test_an_expired_stamp_ticket_is_404(self):
+        ticket = self.client.post("/v1/board/stamp-tickets", json={"origin": "drift"}).json()["ticket"]
+        later = time.time() + session_kv_server.STAMP_TICKET_TTL_SECONDS + 1
+        with patch.object(session_kv_server.time, "time", return_value=later):
+            self.assertEqual(self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem").status_code, 404)
+
+    def test_board_task_origin_first_stamp_wins(self):
+        import sqlite3
+
+        board = self.tmp / "kanban.db"
+        sqlite3.connect(board).close()
+        with patch.object(session_kv_server, "KANBAN_DB_PATH", str(board)), patch.object(
+            session_kv_server, "_hermes_kanban", return_value=(None, None)
+        ):
+            self.assertTrue(session_kv_server._stamp_board_task_origin("t_abc", "chat", "slack"))
+            self.assertFalse(session_kv_server._stamp_board_task_origin("t_abc", "issue", ""))
+        with closing_state(board) as conn:
+            rows = conn.execute("SELECT task_id, origin, origin_platform FROM kanban_task_origins").fetchall()
+        self.assertEqual(rows, [("t_abc", "chat", "slack")])
+
+
+def closing_state(path):
+    import sqlite3
+    from contextlib import closing
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    return closing(conn)
+
 
 
 if __name__ == "__main__":
