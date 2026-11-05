@@ -365,8 +365,9 @@ leave open:
   A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a
   running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
   re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
-  once it is older than the stream's retention plus an hour (`lib.ProfileSubmitRetention`
-  until the dispatch config carries the stream's max age).
+  once it is older than the stream's retention plus an hour. The retention is the dispatch
+  config's `submitRetentionSeconds`, which the operator renders from the stream's max age,
+  or `lib.ProfileSubmitRetention` from an operator that doesn't render it.
 - **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.

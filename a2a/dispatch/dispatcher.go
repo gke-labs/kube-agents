@@ -1521,10 +1521,13 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 }
 
 // submitRetention is how long the submit stream keeps a submission, which
-// a tombstone must outlive. The install config will carry the stream's
-// max age (DispatchConfig.SubmitRetentionSeconds, a follow-up); until then
-// it is the operator's fixed value.
-func submitRetention(lib.DispatchConfig) time.Duration {
+// a tombstone must outlive: the stream's max age as the operator renders it
+// in the install config, or the fixed value an older operator creates the
+// stream with when the config carries none.
+func submitRetention(cfg lib.DispatchConfig) time.Duration {
+	if cfg.SubmitRetentionSeconds > 0 {
+		return time.Duration(cfg.SubmitRetentionSeconds) * time.Second
+	}
 	return lib.ProfileSubmitRetention
 }
 

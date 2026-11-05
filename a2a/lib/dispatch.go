@@ -328,10 +328,9 @@ type DispatchConfig struct {
 	// SubmitRetentionSeconds is how long ProfileSubmitStream keeps a
 	// submission (the operator renders it from the same value as the
 	// stream's max age). A durable re-created over the stream replays
-	// everything inside it, so the dispatcher is to keep a finished task's
-	// tombstone at least this long (it reads this from #4873 on; until then
-	// it keeps its own default). Zero is from an operator that predates the
-	// field; the dispatcher then uses its own default.
+	// everything inside it, so the dispatcher keeps a finished task's
+	// tombstone at least this long. Zero is from an operator that predates
+	// the field; the dispatcher then uses ProfileSubmitRetention.
 	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
