@@ -2418,10 +2418,14 @@ the `✓` line included (`shown`, held without the rating buttons), and, while t
 landed, takes the event's text and link buttons only. Any other message, one from before a
 restart, takes the event's text and its choice and link buttons. A tap therefore never restores
 the choices an answer removed. A failed write logs and patches nothing; a failed patch logs and
-keeps the rating. Two rapid taps on one message are ordered by event time: the adapter records
-each rater's newest tap on a message when it takes the tap, and drops an older tap from that
-rater as superseded, with no patch and no note card. A tap with no event time is never
-superseded.
+keeps the rating. Taps on one message are ordered by event time. The adapter records each
+rater's newest tap on a message when it takes the tap, and records, patches and asks for the note
+under the message's rewrite lock. A tap older than one the same rater already made is superseded:
+it is dropped before it is recorded, with no patch and no note card. A tap taken while the later
+tap's write runs is recorded and patched, and the later tap repaints after it; it posts no note
+card. When the later tap's write fails, its time is forgotten and the earlier tap stays drawn. An
+older tap from another rater is kept, and leaves the buttons as the newest tap drew them. A tap
+with no event time is never superseded.
 
 A kept 👎 then posts the note card, the adapter's one `cardsV2` message (card id
 `kage.feedback-note`), in the answer's thread: "What went wrong?", a single-line text input
@@ -2431,14 +2435,13 @@ Cancel adding `cancel=1`. In a one-to-one DM the card posts plainly, since the D
 Anywhere else it is private to the clicker (`privateMessageViewer`), and it is not posted when
 the event names the clicker by no `users/` name, since it would then be public. A private thread
 reply Chat refuses is posted once more at the space's top level, still private; a second refusal
-logs and leaves the 👎 kept without a note. A repeat 👎 by the same rater posts another private
-note card, as Slack opens its box again. Send and Cancel are never turns either: they are
+logs and leaves the 👎 kept without a note. A repeat 👎 by the same rater posts another note card, as Slack opens its box again. Send and Cancel are never turns either: they are
 dropped on the tap's checks (a `rating` other than `down` included) and handled off the pull
 loop. Cancel collapses the card (a `cards_v2` patch) to the thanks line and the form link. Send
 reads the note from `formInputs`, telling a click with no `formInputs` object from one whose value
 is empty. An empty value is an empty note, kept and thanked as on Slack. No object keeps no note,
-logs a warning, and collapses the card to "The note did not reach me, so the 👎 is kept without
-it." A kept note, trimmed and cut to 500 code points, collapses the card to the thanks line and
+logs a warning, and collapses the card to "The note did not reach me; your rating stands as it
+was." A kept note, trimmed and cut to 500 code points, collapses the card to the thanks line and
 the form link; `errFeedbackNotKept` (a 👍 replaced the 👎) collapses it to "This answer's rating
 changed, so the note was not kept."; any other failed write leaves the card for another Send.
 When Chat refuses the collapse patch, the adapter posts the line as a new card to the same viewer

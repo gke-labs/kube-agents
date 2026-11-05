@@ -429,7 +429,9 @@ On Slack, Send thanks you with a line only you see. It also links the project's 
 
 On Google Chat, the box is a card in the answer's thread that only you see. In a group chat or a space without threads, or when Chat will not take it in the thread, the card posts at the top level of the space, still only to you. In a direct message with the app, it is a card in the direct message itself, which only you read.
 
-In a Google Chat space, the filled button shows the latest tap by anyone, while each person's rating is kept separately. Send or Cancel collapses the card to the same thanks line and the form link. If your note did not arrive with Send, the card collapses to "The note did not reach me, so the 👎 is kept without it." If your 👎 was already replaced by a 👍, the card says the rating changed and keeps no note; if the write fails, the card stays for another Send.
+On Google Chat, Send or Cancel collapses the card to the same thanks line and the form link. If your note did not arrive with Send, the card collapses to "The note did not reach me; your rating stands as it was." If your 👎 was already replaced by a 👍, the card says the rating changed and keeps no note; if the write fails, the card stays for another Send.
+
+In a Google Chat space, the filled button shows the latest tap by anyone, while each person's rating is kept separately.
 
 You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces it, note and all, and the reverse. The last seven days' count, such as "This week: 4 👍, 1 👎", is on the Slack Home tab only, refreshed every five minutes; Google Chat has no Home tab. On Slack, no scope beyond the ones [Slack](#slack) lists is needed.
 

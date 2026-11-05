@@ -120,7 +120,10 @@ click under its own prefix. `recorder.Admits("gchat", email)` false drops it sil
 rating is `FeedbackRating{Platform: "googlechat", Backend: "gchat", Rater: email, Conversation:
 the conversation a choice click there would bind to, MessageID: the message name, TaskID,
 Rating, Answer: the message text as the event carries it}`. `Rate` runs off the pull loop under
-a deadline. On success the adapter patches the answer with the tapped rating button
+a deadline, and under the message's rewrite lock with the patch, so taps on one message take
+effect in turn. A tap older than the same rater's newest tap on the message is superseded and
+gets no write. A tap taken while a later tap's write runs patches, and the later tap repaints
+after it. On success the adapter patches the answer with the tapped rating button
 `type: FILLED` and the other plain, and remembers the rating per message so later rewrites
 redraw it. The text and the other widgets come from the adapter's record of the message when
 it has one, so a tap can never restore choice buttons the answered rewrite removed, and from the
@@ -150,8 +153,8 @@ patches the card to the same paragraph without calling `Note`. `errFeedbackNotKe
 replaced before the note arrived) patches the card to `This answer's rating changed, so the note
 was not kept.` The decoder tells a click event with no `formInputs` object from one whose value
 is empty: an empty value is an empty note, kept and thanked as on Slack; a Send with no
-`formInputs` at all logs a warning and patches the card to `The note did not reach me, so the
-👎 is kept without it.`, so the failure is visible rather than silent. If Chat refuses the patch
+`formInputs` at all logs a warning and patches the card to `The note did not reach me; your
+rating stands as it was.`, so the failure is visible rather than silent. If Chat refuses the patch
 of the private card, the adapter posts the paragraph as a new private message instead, as the
 answered-line rewrite falls back to a new message today. A second click on a collapsed card
 finds no button; a redelivered click is a duplicate by its id.
@@ -159,8 +162,9 @@ finds no button; a redelivered click is a duplicate by its id.
 **Call 5: the rewrites keep the ratings.** The choice-answered rewrite (`gchatAnsweredLayout`)
 and later edits drop choice buttons and keep link buttons today; both now also keep rating
 buttons, filled state included. The rewrite is built from memory. The task id and the filled
-state live in a per-message rating memory (`ux.rated`), set when the answer is posted and when a
-tap is recorded. The answered rewrite's layout is kept per message (`ux.shown`), without the
+state live in a per-message rating memory (`ux.rated`), set when the answer is posted, when a tap
+is recorded, and when a choice click's rewrite reads the buttons of a message the adapter does
+not remember. A tap older than the one that filled the buttons on record does not move it. The answered rewrite's layout is kept per message (`ux.shown`), without the
 rating buttons. A rewrite after a restart of a question the adapter
 no longer remembers takes its buttons from the event's copy of the message, for which the button
 struct also decodes `type` and `altText`. The rating memory starts empty after a restart, so
