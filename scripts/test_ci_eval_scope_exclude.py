@@ -269,7 +269,12 @@ class SettleTest(unittest.TestCase):
             echo {reconcile_rcs} > rcs
             kubectl() {{
               case " $* " in
-                *" jsonpath="*) printf '3 3' ;;
+                *" jsonpath="*)
+                  # The first call spins to the next whole second, so the steps
+                  # before the rollout wait always run at the clock phase that
+                  # left a budget of 1 with no time (see the short-budget cases).
+                  local tick=$SECONDS; while [ "$SECONDS" -eq "$tick" ]; do sleep 0.01; done
+                  printf '3 3' ;;
                 *" get platformagent "*) printf '%s' '{json.dumps(cr)}' ;;
                 *" get deployment/"*) echo deployment/platform-agent-gateway ;;
                 *" get statefulset/platform-agent-shell "*) echo statefulset/platform-agent-shell ;;
@@ -311,10 +316,10 @@ class SettleTest(unittest.TestCase):
         self.assertIn("env HERMES_HOME=/opt/data python3 /opt/data/scripts/cluster_agent_reconcile.py", reconciles)
 
     # The settle's deadline is bash's SECONDS, which ticks on whole wall-clock
-    # seconds, so a budget of N leaves between N-1 and N seconds. The two short
-    # budgets below are 2, not 1: one tick inside the stubbed kubectl calls before
-    # the rollout wait still leaves a second, where 1 left none and the settle
-    # failed with "no time left" instead of the message asserted on.
+    # seconds, so a budget of N leaves between N-1 and N seconds. The stub's
+    # forced tick puts the rollout wait at the worst phase on every run: the two
+    # short budgets below are 2, not 1, because 1 then leaves no time there and
+    # the settle fails with "no time left" instead of the message asserted on.
     def test_a_file_that_never_matches_fails_without_a_reconcile(self):
         result, reconciles = self.settle([], "0", seconds=2)
         self.assertIn("rc=1", result.stdout)
