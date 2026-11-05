@@ -645,21 +645,16 @@ func describeActivityForMarkdown(act ActivityItem) string {
 }
 
 // FormatStepDetailMarkdown renders a single StepDetail's expandable markdown body.
-func FormatStepDetailMarkdown(idx, total int, d StepDetail) string {
-	return FormatStepDetailMarkdownWithOptions(idx, total, d, true)
+func FormatStepDetailMarkdown(d StepDetail) string {
+	return FormatStepDetailMarkdownWithOptions(d, true)
 }
 
 // FormatStepDetailMarkdownWithOptions renders a single StepDetail's markdown
 // body, optionally including or omitting the top heading line.
-func FormatStepDetailMarkdownWithOptions(idx, total int, d StepDetail, includeHeader bool) string {
+func FormatStepDetailMarkdownWithOptions(d StepDetail, includeHeader bool) string {
 	var sb strings.Builder
-	title := humanizeStepTitle(d)
 	if includeHeader {
-		if total > 0 {
-			fmt.Fprintf(&sb, "**Step %d/%d — %s**\n\n", idx, total, title)
-		} else {
-			fmt.Fprintf(&sb, "**Step %d — %s**\n\n", idx, title)
-		}
+		fmt.Fprintf(&sb, "**%s**\n\n", humanizeStepTitle(d))
 	}
 
 	fmt.Fprintf(&sb, "- **Agent**: %s\n", formatAgentBadge(d.Agent))
@@ -761,26 +756,22 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 	// 1. Build Title & Expandable Markdown for the step card.
 	switch {
 	case len(newDetails) == 1:
-		idx := prevSteps + 1
 		d := newDetails[0]
-		title = fmt.Sprintf("Step %d: %s", idx, humanizeStepTitle(d))
-		markdown = FormatStepDetailMarkdownWithOptions(idx, totalSteps, d, false)
+		title = humanizeStepTitle(d)
+		markdown = FormatStepDetailMarkdownWithOptions(d, false)
 	case len(newDetails) > 1:
-		firstIdx := prevSteps + 1
-		lastIdx := lastSteps
 		lastD := newDetails[len(newDetails)-1]
-		title = fmt.Sprintf("Steps %d–%d: %s", firstIdx, lastIdx, humanizeStepTitle(lastD))
+		title = humanizeStepTitle(lastD)
 		var mdParts []string
-		for i, d := range newDetails {
-			stepNum := prevSteps + i + 1
-			mdParts = append(mdParts, FormatStepDetailMarkdownWithOptions(stepNum, totalSteps, d, true))
+		for _, d := range newDetails {
+			mdParts = append(mdParts, FormatStepDetailMarkdownWithOptions(d, true))
 		}
 		markdown = strings.Join(mdParts, "\n\n---\n\n")
 	case !stepOut.StillRunning:
 		if totalSteps > 0 {
 			lastD := details[totalSteps-1]
-			title = fmt.Sprintf("Completed (%d steps): %s", totalSteps, humanizeStepTitle(lastD))
-			markdown = FormatStepDetailMarkdownWithOptions(totalSteps, totalSteps, lastD, false)
+			title = humanizeStepTitle(lastD)
+			markdown = FormatStepDetailMarkdownWithOptions(lastD, false)
 		} else {
 			state := "completed"
 			if activeTask != nil && activeTask.State != "" {
@@ -842,9 +833,8 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 		writeConversation(&res, stepOut.Alias, stepOut.Token, stepOut.ByToken)
 		writeNotices(&res, stepOut.Notices)
 		if len(newDetails) > 0 {
-			for i, d := range newDetails {
-				stepNum := prevSteps + i + 1
-				res.WriteString(FormatStepDetailMarkdownWithOptions(stepNum, totalSteps, d, true))
+			for _, d := range newDetails {
+				res.WriteString(FormatStepDetailMarkdownWithOptions(d, true))
 				res.WriteString("\n\n")
 			}
 		} else if markdown != "" {
@@ -860,9 +850,8 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 	writeConversation(&res, stepOut.Alias, stepOut.Token, stepOut.ByToken)
 	writeNotices(&res, stepOut.Notices)
 	if len(newDetails) > 0 {
-		for i, d := range newDetails {
-			stepNum := prevSteps + i + 1
-			res.WriteString(FormatStepDetailMarkdownWithOptions(stepNum, totalSteps, d, true))
+		for _, d := range newDetails {
+			res.WriteString(FormatStepDetailMarkdownWithOptions(d, true))
 			res.WriteString("\n\n")
 		}
 	}

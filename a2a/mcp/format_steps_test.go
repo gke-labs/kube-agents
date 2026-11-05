@@ -97,8 +97,8 @@ func TestFormatStepDetailMarkdownAndCustomToolEnvelope(t *testing.T) {
 		Elapsed:           2 * time.Second,
 		StillRunning:      true,
 	})
-	if title1 != "Step 1: Checking cluster nodes and warning events" {
-		t.Errorf("title1 = %q, want %q", title1, "Step 1: Checking cluster nodes and warning events")
+	if title1 != "Checking cluster nodes and warning events" {
+		t.Errorf("title1 = %q, want %q", title1, "Checking cluster nodes and warning events")
 	}
 	for _, want := range []string{
 		"- **Agent**: `@platform`",
@@ -265,8 +265,8 @@ func TestHandleJSONRPC_ToolsCallMetaEnablesStepStreaming(t *testing.T) {
 	if !env1.CustomToolResult {
 		t.Fatalf("env1.CustomToolResult = false, want true")
 	}
-	if env1.Title != "Step 1: Checking cluster nodes" {
-		t.Errorf("env1.Title = %q, want %q", env1.Title, "Step 1: Checking cluster nodes")
+	if env1.Title != "Checking cluster nodes" {
+		t.Errorf("env1.Title = %q, want %q", env1.Title, "Checking cluster nodes")
 	}
 	if !strings.HasPrefix(env1.Result, StreamingStepContinuePrefix) {
 		t.Errorf("env1.Result missing %q:\n%s", StreamingStepContinuePrefix, env1.Result)
