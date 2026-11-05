@@ -71,6 +71,12 @@ Environment:
         ``ToolInvocation`` and ``Checklist`` judge scores for the process the
         harness is built in (:func:`_skip_report_only_judges`). The presubmit
         sets it on a pull request; unset, every score runs.
+    KUBE_AGENTS_SHAPE_FILE: When set, the shape of the reply the run
+        delivered is written there (best effort; the presubmit sets it per
+        repetition): whether it opens on its answer, whether it apologizes,
+        how many messages the thread received, and its word counts
+        (:mod:`kube_agents_bench.chat_shape`). Reported, never scored. Unset,
+        or a run that delivered nothing, and nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
     AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
@@ -169,7 +175,7 @@ from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -488,6 +494,9 @@ _ARTIFACTS_ENV = "ARTIFACTS"
 _TIMING_FILE_ENV = "KUBE_AGENTS_TIMING_FILE"
 _TIMING_TURN1_KEY = "turn1_s"
 _TIMING_DECIMALS = 3
+# Where the delivered reply's shape goes (chat_shape.measure), for the eval
+# dashboard. hack/ci-eval-pr.sh sets it per repetition; unset, nothing is written.
+_SHAPE_FILE_ENV = "KUBE_AGENTS_SHAPE_FILE"
 _WORKER_LOG_SUBDIR = "worker-logs"
 _PF_LOG_SUBDIR = "port-forward"
 # Written at the top of each spawn's stderr in the (appended) port log.
@@ -2350,13 +2359,41 @@ def _connection_dropped(exc: BaseException) -> bool:
 
 
 def _write_turn_timing(turn1_s: float) -> None:
-    """Write the opening turn's seconds to ``KUBE_AGENTS_TIMING_FILE``.
+    """Write the opening turn's seconds to ``KUBE_AGENTS_TIMING_FILE``."""
+    _write_sidecar(
+        _TIMING_FILE_ENV, {_TIMING_TURN1_KEY: round(turn1_s, _TIMING_DECIMALS)}, "turn timing"
+    )
+
+
+def _write_chat_shape(result: AgentResult) -> None:
+    """Write the delivered reply's shape to ``KUBE_AGENTS_SHAPE_FILE``.
+
+    Nothing is written for a run whose reply the thread never showed: none
+    at all, a silence marker the gateway swallows, or an inject answer
+    adopted from the stream because the relay posted nothing. The inject
+    transport counts the posts it saw; the api transport leaves the count to
+    the final message's delivered sections.
+    """
+    final_message = str(result.metadata.get("final_message") or "")
+    if is_intentional_silence_response(final_message) or result.metadata.get("outcome") == inject.OUTCOME_STREAM_TERMINAL:
+        return
+    posts = result.metadata.get("window_posts")
+    shape = chat_shape.measure(
+        final_message,
+        posts if isinstance(posts, int) and not isinstance(posts, bool) else None,
+    )
+    if shape is not None:
+        _write_sidecar(_SHAPE_FILE_ENV, shape, "reply shape")
+
+
+def _write_sidecar(env: str, payload: dict[str, Any], what: str) -> None:
+    """Write ``payload`` as JSON to the file ``env`` names, when it names one.
 
     Best effort, like the worker logs: a file that will not write is logged
     and never changes the run. The temp file and ``os.replace`` make sure a
     reader never sees half a file.
     """
-    path = os.environ.get(_TIMING_FILE_ENV)
+    path = os.environ.get(env)
     if not path:
         return
     target = Path(path)
@@ -2364,10 +2401,10 @@ def _write_turn_timing(turn1_s: float) -> None:
     try:
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({_TIMING_TURN1_KEY: round(turn1_s, _TIMING_DECIMALS)}, handle)
+            json.dump(payload, handle)
         os.replace(tmp, target)
     except OSError as exc:
-        _log.warning("could not write the turn timing to %s: %s", target, exc)
+        _log.warning("could not write the %s to %s: %s", what, target, exc)
         if tmp is not None:
             try:
                 os.unlink(tmp)
@@ -2567,6 +2604,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             "reason_token": fold.reason_token or None,
             "executor_states": list(fold.executor_states),
             "posts": len(fold.posts),
+            # The messages this task posted (its window), which the reply
+            # shape counts.
+            "window_posts": len(fold.window_posts),
             "entries": len(fold.entries),
             "malformed_entries": fold.malformed,
             # The marker's arguments (calls written, calls dropped), or None
@@ -2683,6 +2723,7 @@ class KubeAgentsHarness(AgentHarness):
             worker_card_parents=worker_trajectory.parents(result.metadata.get("worker_trajectory")),
             worker_runs=worker_trajectory.runs(result.metadata.get("worker_trajectory")),
         )
+        _write_chat_shape(result)
         return result
 
     def _execute(

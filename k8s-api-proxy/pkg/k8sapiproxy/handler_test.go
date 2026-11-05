@@ -251,7 +251,7 @@ func TestHandlerStripsCallerHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/pods", nil)
 	for k, v := range map[string]string{
 		"Authorization":          "Bearer sandbox-token",
-		"Proxy-Authorization":    "Basic dXNlcjpwYXNz",
+		"Proxy-Authorization":    basicAuthHeader(placeholderBasicUser, placeholderBasicPass),
 		"Cookie":                 "session=s",
 		"Audit-ID":               "forged",
 		"Sec-WebSocket-Protocol": "base64url.bearer.authorization.k8s.io.dG9rZW4, v5.channel.k8s.io",
