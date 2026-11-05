@@ -136,6 +136,34 @@ class AnswerSlotGuardTest(SlotCacheCase):
         self.assertEqual(hit[3], "answer_slots")
 
 
+class SlotPointerTest(SlotCacheCase):
+    """A slot pointer is written after its entry, and one left dangling heals."""
+
+    BODY = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_bbbbbbbb"},
+                                       {"role": "assistant", "content": "Yes."},
+                                       {"role": "user", "content": "ticket Latte"}]}
+    ANSWER = {"role": "assistant", "content": "done"}
+
+    def test_a_failed_entry_write_leaves_no_slot(self):
+        recorder = self.proxy("record", "x")
+        recorder.cache.save = lambda *args: (_ for _ in ()).throw(OSError("disk full"))
+        with self.assertRaises(OSError):
+            recorder.analyze(self.BODY, time.time(), self.upstream(self.ANSWER))
+        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.SLOTS_DIR)))
+
+    def test_a_dangling_slot_heals(self):
+        slot_key, _ = normalizer.answer_slots(normalizer.normalize_request(self.BODY, time.time()),
+                                              normalizer.KeyContext("abc", "img"))
+        replay_cache.AnswerCache(self.cache_dir).save_slot(slot_key, "0" * 64)  # an entry never written
+        self.record(self.BODY, self.ANSWER)
+        changed = dict(self.BODY, messages=self.BODY["messages"][:1] + [{"role": "assistant", "content": "Sure."}]
+                       + self.BODY["messages"][2:])
+        self.record(dict(changed, messages=changed["messages"][:1]), {"role": "assistant", "content": "Sure."})
+        hit, refused = self.proxy().lookup(changed, time.time())
+        self.assertIsNone(refused)
+        self.assertEqual((hit[0]["content"], hit[3]), ("done", "answer_slots"))
+
+
 class UnreadableEntryTest(SlotCacheCase):
     """A key that points at a missing or broken saved answer is a refused miss, never a served one."""
 

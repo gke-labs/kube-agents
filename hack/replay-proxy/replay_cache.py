@@ -143,7 +143,31 @@ class AnswerCache:
         return entry if isinstance(entry, dict) else None
 
     def save_slot(self, slot_key: str, fingerprint: str) -> bool:
-        return self._write_once(self._path(SLOTS_DIR, slot_key), json.dumps(fingerprint))
+        """Point a slot at an entry; True when this call wrote the pointer.
+
+        The first pointer wins, unless the entry it names does not exist: then
+        it is replaced atomically, so a pointer left dangling heals.
+        """
+        path, data = self._path(SLOTS_DIR, slot_key), json.dumps(fingerprint)
+        if self._write_once(path, data):
+            return True
+        current = self.load_slot(slot_key)
+        if current is not None and self.load(current) is not None:
+            return False
+        self._replace(path, data)
+        return True
+
+    def _replace(self, path: str, data: str) -> None:
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}{TMP_SUFFIX}"
+        try:
+            with open(tmp, "w", encoding=TEXT_ENCODING) as handle:
+                handle.write(data)
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
 
     def load_slot(self, slot_key: str) -> Optional[str]:
         try:

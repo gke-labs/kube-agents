@@ -636,16 +636,8 @@ class ShadowProxy:
         if entry[F.UNSTORABLE]:
             return False
         mapping = normalized.mapping
-        slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
-        # The model's own answer to this request, noted as one a later request's
-        # slot may hold (answer_variant says how replay finds it). Only answers
-        # this proxy recorded count: never a client's assistant message, a
-        # fallback's answer or any other unstorable one. Each recording notes its
-        # own, so two that answered differently both count, even where the first
-        # write of the saved answer won.
-        self.cache.add_variant(*normalizer.answer_variant(normalized, upstream["message"], self.key_context))
-        if slots:
-            self.cache.save_slot(slot_key, entry[F.FINGERPRINT])
+        # The entry first and the slot pointer last, so a failure in between
+        # never leaves a pointer to an entry that was not written.
         saved = self.cache.save(entry[F.FINGERPRINT], {
             replay_cache.ENTRY_FINGERPRINT: entry[F.FINGERPRINT],
             replay_cache.ENTRY_ANSWER: replay_cache.normalize_answer(upstream["message"], mapping),
@@ -658,6 +650,16 @@ class ShadowProxy:
             replay_cache.ENTRY_RECORDED_AT: received,
             replay_cache.ENTRY_NORMALIZER_VERSION: self.key_context.normalizer_version,
         })
+        # The model's own answer to this request, noted as one a later request's
+        # slot may hold (answer_variant says how replay finds it). Only answers
+        # this proxy recorded count: never a client's assistant message, a
+        # fallback's answer or any other unstorable one. Each recording notes its
+        # own, so two that answered differently both count, even where the first
+        # write of the saved answer won.
+        self.cache.add_variant(*normalizer.answer_variant(normalized, upstream["message"], self.key_context))
+        slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
+        if slots:
+            self.cache.save_slot(slot_key, entry[F.FINGERPRINT])
         # Each distinct message once, normalized and scrubbed, for a later miss's
         # snippet. Most are already saved (every request repeats its history), so
         # only the new ones are scrubbed, against the whole request's secret reads.
