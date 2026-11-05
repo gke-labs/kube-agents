@@ -499,6 +499,28 @@ The external address is the VM's way to github.com, which the proxy forwards to;
 
 The GitLab CE lane runs the forge table's `gitlab-ce` row: GitLab CE itself (`gitlab/gitlab-ce`, pinned by digest in `hack/ci-forge.sh`) at `gitlab.eval.internal` on an `e2-standard-4` with a 50 GB disk, which `up` stands up the same way, with these differences. There is no image build: the VM pulls the image from Docker Hub through its external address. `up` mints the two tokens the deploy and the eval read (`agent-token`: `api` and `write_repository`; `ledger-token`: `api`; dated two days out, since GitLab expires a token at 00:00 UTC on its date), hands them to the VM in metadata beside the key with the checkout-gateway manifest the remediation cases read (the provisioning script's seed), and the VM's first boot does the rest once GitLab's own readiness check passes with Gitaly up (the sign-in page answers minutes earlier): one `gitlab-rails runner` call as root makes the bot `kube-agents-eval-bot` with the two tokens set on it and the group `gke-agentic`, then root, through the API, creates the project `<PROJECT_ID>-infra` (the layout the eval derives from the lease) with its README, commits the manifest to the default branch and adds the bot as a Developer, as on gitlab.com, so the default branch keeps GitLab's protection and the bot opens merge requests; it prints `FORGE ready` only then; a cold boot takes 6 to 8 minutes, and the deadline is 30. GitLab's data lives in a docker volume, since the VM's stateful partition is mounted noexec and Gitaly runs git from that data. Then, because the eval's token check, ledger probe, resets, grader and leftovers report all call the private host from the job pod by its bare name, `up` opens a tunnel: a relay pod (`forge-relay`, socat, pinned) in the host cluster forwarding to the forge's 443, a `kubectl port-forward` to it on the job pod's loopback 443 (the only port every consumer dials, so the job runs as root, as the Prow pod does), kept up by a loop that restarts it when its API stream drops, and a line in the hosts file; the loop outlives `up`, its pid in the state directory, and `down` kills it and the port-forward, deletes the relay pod and removes the line. Last, `up` writes `ca.crt`, `agent-token` and `ledger-token` into the state directory. The lane runs `hack/eval/gitlab-cases.txt`, the gitlab.com lane's list, as `pull-kube-agents-smoke-test-gitlab-ce` on demand and `ci-kube-agents-eval-nightly-gitlab-ce-next` nightly, both under `spec.mode: next` (the nightly named in `EVAL_MODE_NEXT_JOB_NAMES`); none appends to the evidence store.
 
+### 5.9 The certification lane
+
+`ci-kube-agents-certification-1` in `oss-test-infra` (`kube-agents-periodics.yaml`) runs the
+certification suite's first roster part (`hack/eval/certification-cases.txt`, `# part 1`) under
+`EVAL_TIER=certification`, weekly on Saturday 14:00 UTC and on Deck's Rerun, at three repetitions,
+on a leased pool project, with the nightlies' identity, decoration and log bucket
+(`gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-certification-1/`). The lane is the
+record behind the certified-capabilities page: the page reads its case files from that bucket, the
+tier appends nothing to the evidence store, and no case on it is on the blocking roster, so rung 4
+never arms there. A failed build therefore reaches a person only through the CI health digest,
+which watches the job (`WATCHED` in `scripts/eval_dashboard/periodics.py`, read from the lane's
+own bucket) and notes a failed or overdue run.
+
+When the note fires, read the build in Deck first. The reds that are the lane's own: a rung 1 to 3
+verdict (a forbidden write, a check that never ran, inconsistent liveness) on a certification case,
+or rung 5, an `expected_fail` case that passed every repetition, which says its marker is stale and
+the gap issue named in the roster is closed by a fix that did not remove it. The reds that are the
+lane's plumbing: the deploy refusing `EVAL_MODE_NEXT=1` because the job's name is missing from
+`EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh`; the script refusing an empty roster or an entry
+that is also a presubmit or nightly case; a lease that never came (the pool reading in the job's pull request is why the slot is Saturday morning). An overdue note with no failed build means the
+Saturday run did not start: check the cron in the job and whether horologium created a run.
+
 ## 6. The seeded dirty fleet
 
 Six of the evaluation scenarios assert on defects that were planted on purpose — a crashlooping `payments-api`, a workload with no PodDisruptionBudget, an idle node pool, a control plane held a minor behind, a cluster missing master authorized networks. Those fixtures are not provisioned per run. They live on four small standing GKE clusters, `seeded-a` to `seeded-d`, and **each pool project needs its own set**: Boskos leases at random, so a project without them is a project where every fleet check reports `status: "error"` and `VerificationCoverage` drops below 1.0 for that run.
