@@ -975,16 +975,19 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(res.success)
         self.assertEqual(res.message_id, "m-%d" % len(sent))
         self.assertGreaterEqual(len(sent), 3)
-        texts = []
         for payload in sent:
             self.assertEqual(payload["replyToId"], "1697000000000")
+            self.assertLessEqual(len(payload["text"]), teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH)
             self.assertLessEqual(
                 teams_relay_patch.activity_size_bytes(payload),
                 teams_relay_patch.TEAMS_MAX_ACTIVITY_BYTES,
             )
             self.assertNotIn(teams_relay_patch.TEAMS_TRUNCATION_MARKER, json.dumps(payload))
-            texts.append(payload["text"])
-        self.assertEqual("".join(texts), report)
+        # The pieces are the base splitter's own, in order and none dropped.
+        self.assertEqual(
+            [p["text"] for p in sent],
+            adapter.truncate_message(report, teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH),
+        )
 
     async def test_send_replaces_a_lone_surrogate_instead_of_raising(self):
         from gateway.platform_registry import PlatformRegistry
@@ -1009,6 +1012,9 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         sent[0]["text"].encode("utf-8")
 
     async def test_send_typing_skips_a_tick_while_one_is_in_flight(self):
+        """Driven as the base's typing loop drives it: cancelled at a short
+        wait while the worker is still posting. The mark outlives the
+        cancelled coroutine, so the next tick is skipped until the post ends."""
         import threading
         from gateway.platform_registry import PlatformRegistry
 
@@ -1028,15 +1034,20 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
         meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
         with mock.patch("urllib.request.urlopen", side_effect=slow_urlopen):
-            first = asyncio.ensure_future(adapter.send_typing("conv-1", metadata=meta))
-            await asyncio.sleep(0.05)
-            await adapter.send_typing("conv-1", metadata=meta)  # skipped: one in flight
-            await adapter.send_typing("conv-2", metadata=meta)  # another conversation: posted
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.05)
+            self.assertIn("conv-1", adapter._typing_in_flight)
+            await adapter.send_typing("conv-1", metadata=meta)  # next tick: skipped
+            await adapter.send_typing("conv-2", metadata=meta)  # another conversation: posts
+            self.assertEqual(len(calls), 2)
             release.set()
-            await first
+            for _ in range(100):  # the worker clears its own mark when the post ends
+                if not adapter._typing_in_flight:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(adapter._typing_in_flight, set())
             await adapter.send_typing("conv-1", metadata=meta)  # the slot is free again
         self.assertEqual(len(calls), 3)
-        self.assertEqual(adapter._typing_in_flight, set())
 
     def test_relayed_teams_error_reads_the_brokers_error_field(self):
         import io
