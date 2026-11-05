@@ -699,7 +699,7 @@ class LogLineTest(ProxyTestCase):
         extra = ({"role": "user", "content": "earlier turn t_99999999"},)
         self.request("POST", "/v1/chat/completions", chat("t_22222222", stream=False, extra_messages=extra))
         # The two lines can land in either order (#4827): tell them apart by
-        # their message count, the one thing that differs.
+        # their message count.
         a, b = sorted(self.lines(2), key=lambda line: len(line["message_hashes"]))
         self.assertEqual([len(a["message_hashes"]), len(b["message_hashes"])], [2, 3])
         self.assertEqual(a["message_hashes"][:1], b["message_hashes"][:1])
