@@ -670,7 +670,6 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	d.mu.Lock()
 	d.lastAdmit[lib.ProfileDurableName(profile, tier, kind)] = d.now()
 	d.mu.Unlock()
-	log.Info("task confirmed to a worker", "pod", rec.Pod)
 	d.hold(ctx, log, del, h, rec, key, time.Time{})
 }
 
@@ -964,7 +963,12 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 				// starts, no renewal comes, and the task fails
 				// lease-expired. It is never offered again.
 				log.Warn("confirm not sent; the task fails when its lease runs out", "pod", pod, "err", err)
+				return rec, key, nil
 			}
+			// Logged here, where the confirm is known to have gone out:
+			// the caller holds the lease on every path that recorded one,
+			// sent or not, and can't tell them apart.
+			log.Info("task confirmed to a worker", "pod", pod)
 			return rec, key, nil
 		case answered:
 			log.Info("offer declined", "pod", pod, "reason", acc.Reason)
