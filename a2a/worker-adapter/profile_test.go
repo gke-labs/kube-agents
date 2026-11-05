@@ -840,6 +840,7 @@ echo '{"type":"system","subtype":"init","session_id":"pw-after-abandon"}'
 read first || exit 1
 case "$first" in
   *HANGWORD*) sleep 30 ;;
+  *NEXTWORD*) sleep 3 ;;
 esac
 saw=$(printf '%s' "$first" | grep -oE 'HANGWORD|NEXTWORD' | tr '\n' ' ')
 printf '{"type":"result","subtype":"success","result":"saw: %s"}\n' "$saw"
@@ -857,9 +858,11 @@ printf '{"type":"result","subtype":"success","result":"saw: %s"}\n' "$saw"
 	drainLeases(d, "task-hang", 2*time.Second)
 
 	// A consumer the abandoned task left under the pod's names, as a crash
-	// or a failed delete would: on the hung task's subject, from its start.
-	// Its start sequence can't be changed by an update, so a worker that
-	// reused the name instead of replacing it couldn't open its input.
+	// or a failed delete would, on the hung task's subject. Its start
+	// sequence matches the one the next task asks for, so JetStream would
+	// accept that task's create as an update in place: only the filter
+	// differs. The check below is what tells a fresh consumer from the
+	// leftover updated, by creation time.
 	nc, err := nats.Connect(url)
 	if err != nil {
 		t.Fatal(err)
@@ -871,19 +874,42 @@ printf '{"type":"result","subtype":"success","result":"saw: %s"}\n' "$saw"
 	}
 	jsCtx, jsCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer jsCancel()
-	if _, err := js.CreateOrUpdateConsumer(jsCtx, lib.TasksStream, jetstream.ConsumerConfig{
-		Name: lib.SessionConsumerName(pwPod, lib.SessionConsumerIn), FilterSubject: lib.TaskInSubject(pwProfile, "task-hang"),
+	inName := lib.SessionConsumerName(pwPod, lib.SessionConsumerIn)
+	left, err := js.CreateOrUpdateConsumer(jsCtx, lib.TasksStream, jetstream.ConsumerConfig{
+		Name: inName, FilterSubject: lib.TaskInSubject(pwProfile, "task-hang"),
 		DeliverPolicy: jetstream.DeliverByStartSequencePolicy, OptStartSeq: 1,
 		AckPolicy: jetstream.AckNonePolicy, MemoryStorage: true, Replicas: 1,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("leave a consumer behind: %v", err)
 	}
+	leftCreated := left.CachedInfo().Created
 
 	d.offer("task-next", profileSubmission(t, "task-next", "NEXTWORD", nil), 5)
 	if a := d.nextAccept(5 * time.Second); a.TaskID != "task-next" || !a.Accepted {
 		t.Fatalf("an offer after the abandon = %+v, want an accept", a)
 	}
 	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-next"})
+	// While it runs, its input consumer is a new one, not the leftover
+	// updated in place: an update keeps the old consumer's creation time
+	// (and everything else about it the update can't change).
+	var inInfo *jetstream.ConsumerInfo
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		cons, err := js.Consumer(jsCtx, lib.TasksStream, inName)
+		if err != nil {
+			continue
+		}
+		if info := cons.CachedInfo(); info.Config.FilterSubject == lib.TaskInSubject(pwProfile, "task-next") {
+			inInfo = info
+			break
+		}
+	}
+	if inInfo == nil {
+		t.Fatalf("the task after the abandon never had an input consumer on its own subject under %s", inName)
+	}
+	if !inInfo.Created.After(leftCreated) {
+		t.Errorf("the input consumer was the leftover updated in place (created %v, the leftover %v), not a fresh one", inInfo.Created, leftCreated)
+	}
 	waitState(t, c, pwProfile, "task-next", lib.StateCompleted)
 	if got := artifactText(foldTask(t, c, pwProfile, "task-next"), lib.ArtifactResult); !strings.Contains(got, "NEXTWORD") {
 		t.Errorf("the task after the abandon answered %q", got)
