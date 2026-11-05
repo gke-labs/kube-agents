@@ -139,8 +139,6 @@ OPTION_REPLY = "apply Option {letter}: {title}"
 SINGLE_REPLY = "apply: {title}"
 #: Where ``session_kv_server._record_alert_title`` puts the thread's session title.
 ALERT_TITLE_KEY = "title"
-#: The lines that end a drift triage's detail: a list item, a fence or a heading.
-DETAIL_STOP = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|`{3}|~{3}|#)")
 #: Where it marks a drift alert (``session_kv_server.ALERT_KIND_KEY`` / ``ALERT_KIND_DRIFT``).
 ALERT_KIND_KEY = "alert_kind"
 ALERT_KIND_DRIFT = "drift"
@@ -424,7 +422,8 @@ def drift_triage(triage: dict, report: str) -> dict:
     _headline, body = _presenter.split_answer(_section(_sections(report), WHATS_WRONG))
     prose = []
     for line in (body[0].split("\n") if body else []):
-        if DETAIL_STOP.match(line):
+        # A list, a fence or a heading under the sentence ends the detail, by the presenter's own rules.
+        if _presenter.LIST_MARKER.match(line) or _presenter.HEADING.match(line) or _presenter._opens_fence(line):
             break
         prose.append(line)
     detail = _presenter._plain(" ".join(" ".join(prose).split())).strip()
