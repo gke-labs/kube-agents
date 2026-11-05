@@ -3,7 +3,6 @@ package hermesbridge
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
@@ -308,87 +307,6 @@ func TestCancelActiveKanbanWait_MarksSessionCanceledBeforeWaitEnds(t *testing.T)
 	if !b.isSessionCanceled(sessionID) {
 		t.Fatal("isSessionCanceled(a2a-ctx-1) = false when active wait ended, want true")
 	}
-	if _, ok := b.shouldDeliverOutOfTurnKanbanCard("t_done", sessionID); ok {
-		t.Fatal("shouldDeliverOutOfTurnKanbanCard returned true for a canceled session")
-	}
-}
-
-func TestOutOfTurnWatcher_LazyDBCreationAndSlidingWindow(t *testing.T) {
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("python3 not on PATH; the kanban fixture needs it")
-	}
-	prevInterval := outOfTurnPollInterval
-	outOfTurnPollInterval = 25 * time.Millisecond
-	t.Cleanup(func() { outOfTurnPollInterval = prevInterval })
-
-	lazyDir := t.TempDir()
-	lazyDB := filepath.Join(lazyDir, "kanban.db")
-	t.Setenv(hermesKanbanDBEnv, lazyDB)
-
-	b := &Bridge{}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		b.watchOutOfTurnKanbanCards(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-
-	// Give the watcher a couple ticks while kanban.db does not exist yet.
-	time.Sleep(70 * time.Millisecond)
-
-	// Now create kanban.db lazily with a settled card in the active window.
-	now := time.Now().Unix()
-	srcDB := kanbanFixtureDB(t, now-10)
-	if out, err := exec.Command("cp", srcDB, lazyDB).CombinedOutput(); err != nil {
-		t.Fatalf("copying fixture db to lazy path: %v\n%s", err, out)
-	}
-
-	waitFor(t, 5*time.Second, "watcher to pick up lazily created kanban.db and deliver t_done", func() bool {
-		return b.isKanbanCardDelivered("t_done")
-	})
-}
-
-func TestOutOfTurnWatcher_DeliveredIDsBoundedEvictionDoesNotReplayRecentCards(t *testing.T) {
-	b := &Bridge{}
-	baseNow := time.Now()
-	prevNow := kanbanNow
-	var offsetSecs atomic.Int64
-	kanbanNow = func() time.Time {
-		return baseNow.Add(time.Duration(offsetSecs.Load()) * time.Second)
-	}
-	t.Cleanup(func() { kanbanNow = prevNow })
-
-	// Record an expired card (older than 2*kanbanOutOfTurnWindowSecs) and a set of recent cards.
-	offsetSecs.Store(-int64(kanbanTrackedRetentionSecs + 100))
-	b.markKanbanCardDelivered("t_expired")
-
-	offsetSecs.Store(0)
-	for i := 0; i < maxTrackedKanbanEntries+100; i++ {
-		offsetSecs.Add(1)
-		b.markKanbanCardDelivered(fmt.Sprintf("t_card_%04d", i))
-	}
-
-	if b.isKanbanCardDelivered("t_expired") {
-		t.Errorf("t_expired should have been evicted past retention window")
-	}
-	// The oldest cards beyond maxTrackedKanbanEntries were evicted one-by-one,
-	// while the most recent maxTrackedKanbanEntries cards remain delivered.
-	if b.isKanbanCardDelivered("t_card_0000") {
-		t.Errorf("oldest card t_card_0000 should have been evicted when exceeding maxTrackedKanbanEntries")
-	}
-	for i := 100; i < maxTrackedKanbanEntries+100; i++ {
-		id := fmt.Sprintf("t_card_%04d", i)
-		if !b.isKanbanCardDelivered(id) {
-			t.Fatalf("recent card %s was forgotten after exceeding maxTrackedKanbanEntries", id)
-		}
-		if _, ok := b.shouldDeliverOutOfTurnKanbanCard(id, "a2a-ctx-1"); ok {
-			t.Fatalf("recent card %s was re-delivered after exceeding maxTrackedKanbanEntries", id)
-		}
-	}
 }
 
 func TestSynthesizeCardAnswer_CapsPromptOnUTF8Boundary(t *testing.T) {
@@ -503,89 +421,6 @@ func TestSynthesizeCardAnswer_CancelStopsHermesTurn(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("synthesizeCardAnswer did not return after cancel")
-	}
-}
-
-func TestKanbanBlockedCard_UnblockedCompletionDeliveredAndSyntheticTaskFinalized(t *testing.T) {
-	_, url := startServer(t)
-	stub := newAPIStub(t, nil)
-	b := startAPIBridge(t, url, stub, nil)
-	c := gatewayClient(t, url)
-
-	sessionID := "a2a-ctx-unblock"
-	origin := &lib.Envelope{
-		TaskID:        "task-origin-unblock",
-		ContextID:     "ctx-unblock",
-		CorrelationID: "corr-unblock",
-		Authority:     authorityFor(t, mintFor(t, c, "task-card-t-unblock", "platform")),
-	}
-	b.rememberConsoleSession(sessionID, origin)
-	b.kanban.rememberCardOrigin("t_unblock", origin.TaskID)
-
-	blockedRow := kanbanCardRow{
-		ID:           "t_unblock",
-		Title:        "Approve prod rollout",
-		Status:       "blocked",
-		SessionID:    sessionID,
-		BlockPayload: `{"question":"Approve prod rollout?"}`,
-	}
-
-	// First confirm poll records pendingSettle; second confirm poll delivers the "blocked" state.
-	if _, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(blockedRow.ID, blockedRow.Status, sessionID); ok {
-		t.Fatal("expected first confirm poll for blocked card to wait for confirmation")
-	}
-	meta, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(blockedRow.ID, blockedRow.Status, sessionID)
-	if !ok {
-		t.Fatal("expected second confirm poll for blocked card to deliver")
-	}
-	b.publishOutOfTurnKanbanCard(testCtx(t), blockedRow, meta)
-
-	// While still "blocked", the card must not be re-delivered.
-	if !b.isKanbanCardDeliveredForStatus(blockedRow.ID, "blocked") {
-		t.Fatal("isKanbanCardDeliveredForStatus(t_unblock, blocked) = false, want true")
-	}
-	if _, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(blockedRow.ID, "blocked", sessionID); ok {
-		t.Fatal("blocked card was re-delivered while still blocked")
-	}
-
-	synthTaskID := sanitizeKanbanTaskToken(blockedRow.ID)
-	blockedTask := fold(t, c, synthTaskID)
-	if blockedTask.State != lib.StateInputRequired || blockedTask.Final {
-		t.Fatalf("blocked synthetic task state=%s final=%v, want state=input-required final=false", blockedTask.State, blockedTask.Final)
-	}
-
-	// Once the card is unblocked and finishes "done", it is not yet delivered for "done".
-	doneRow := kanbanCardRow{
-		ID:        "t_unblock",
-		Title:     "Approve prod rollout",
-		Status:    "done",
-		SessionID: sessionID,
-		Result:    "Rollout completed across all prod clusters.",
-	}
-	if b.isKanbanCardDeliveredForStatus(doneRow.ID, doneRow.Status) {
-		t.Fatal("isKanbanCardDeliveredForStatus(t_unblock, done) = true before terminal delivery, want false")
-	}
-	if _, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(doneRow.ID, doneRow.Status, sessionID); ok {
-		t.Fatal("expected first confirm poll for done state to wait for confirmation")
-	}
-	meta, ok = b.shouldDeliverOutOfTurnKanbanCardForStatus(doneRow.ID, doneRow.Status, sessionID)
-	if !ok {
-		t.Fatal("expected second confirm poll for unblocked done card to deliver")
-	}
-	b.publishOutOfTurnKanbanCard(testCtx(t), doneRow, meta)
-
-	finalTask := fold(t, c, synthTaskID)
-	if finalTask.SubmittedMissing {
-		t.Fatal("final synthetic task fold has SubmittedMissing = true")
-	}
-	if finalTask.PostFinalDropped != 0 {
-		t.Fatalf("final synthetic task fold has PostFinalDropped = %d, want 0", finalTask.PostFinalDropped)
-	}
-	if finalTask.State != lib.StateCompleted || !finalTask.Final {
-		t.Fatalf("final synthetic task state=%s final=%v, want state=completed final=true", finalTask.State, finalTask.Final)
-	}
-	if got := finalTask.Artifact(lib.ArtifactResult).Parts[0].Text; got != doneRow.Result {
-		t.Fatalf("final synthetic task result = %q, want %q", got, doneRow.Result)
 	}
 }
 
@@ -969,5 +804,29 @@ c.commit()
 	}
 	if actSub.cardsFiled.Load() {
 		t.Fatal("expected cardsFiled to be cleared after waitForKanbanCards settled all cards")
+	}
+}
+
+// A settled card's step names the card (id, title, status, verdict) and
+// carries none of its report: the report is text the card's worker wrote,
+// which can repeat a value it read, and the step goes to TASKS.
+func TestCardStepCarriesNoReportText(t *testing.T) {
+	const canary = "tok_card_report_canary_8f3a"
+	for _, c := range []kanbanCardRow{
+		{ID: "t_1", Title: "Check prod-a", Status: "done", Result: "The authentication token, " + canary + ", expired; rotated it."},
+		{ID: "t_2", Title: "Check prod-b", Status: "failed", Err: "psql: FATAL " + canary},
+		{ID: "t_3", Title: "Check prod-c", Status: "blocked", BlockPayload: `{"question":"use ` + canary + `?"}`},
+	} {
+		s := cardStep(c, 1, 3, "task-parent")
+		raw, err := json.Marshal(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), canary) || s.Thought != "" || s.Subtask == nil || s.Subtask.Summary != "" {
+			t.Errorf("card %s step carries report text: %s", c.ID, raw)
+		}
+		if s.Subtask == nil || s.Subtask.ID != c.ID || s.Subtask.Title != c.Title || s.Subtask.Status != c.Status || s.Subtask.ParentTaskID != "task-parent" {
+			t.Errorf("card %s step lost its identity: %+v", c.ID, s.Subtask)
+		}
 	}
 }

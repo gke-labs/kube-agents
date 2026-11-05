@@ -583,13 +583,6 @@ func (b *Bridge) Run(ctx context.Context) error {
 		return fmt.Errorf("startup sweep: %w", err)
 	}
 	b.serveActivity(ctx)
-	if b.cfg.Executor == ExecutorAPI {
-		b.wg.Add(1)
-		go func() {
-			defer b.wg.Done()
-			b.watchOutOfTurnKanbanCards(ctx)
-		}()
-	}
 	for i := 0; i < b.cfg.Concurrency; i++ {
 		b.wg.Add(1)
 		go b.worker(ctx)

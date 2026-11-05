@@ -480,7 +480,7 @@ validates the part kind (assertion 18), and a reader tolerates the keys it does 
 
 One unreserved name has a defined shape: `steps`, `kube-agents.step/v1` data parts
 ([`a2a/lib/stepmsg`](../../a2a/lib/stepmsg/stepmsg.go)), by which an executor may state what a turn
-planned (`kind: "plan"`), which of its subtasks settled (`kind: "subtask"`, with a `subtask` object carrying `id`, `title`, `status`, `verdict`, `summary`, `settled`, `total`, and `parentTaskId`), and when it synthesized an answer (`kind: "synthesis"`), along with an optional single-line `thought` (at most 4,096 UTF-8 bytes) and `callIds` (up to 64 tool call IDs), so a renderer lists a
+planned (`kind: "plan"`), which of its subtasks settled (`kind: "subtask"`, with a `subtask` object carrying `id`, `title`, `status`, `verdict`, `summary`, `settled`, `total`, and `parentTaskId`; the hermes bridge leaves `summary` empty, keeping a card's report off `TASKS`), and when it synthesized an answer (`kind: "synthesis"`), along with an optional single-line `thought` (at most 4,096 UTF-8 bytes) and `callIds` (up to 64 tool call IDs), so a renderer lists a
 turn's steps without parsing them out of `thinking`. It carries no reserved semantics: the relay
 ignores it, the fold keeps it, and a reader that does not know it skips it. A later version of the record is a new
 schema, as with chat messages: a v1 reader skips a `kube-agents.step/v2` part rather than guess

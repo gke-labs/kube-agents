@@ -24,7 +24,6 @@ import (
 
 const (
 	kanbanPollInterval          = time.Second
-	kanbanOutOfTurnInterval     = 2 * time.Second
 	kanbanMaxEmptyPolls         = 3
 	kanbanOutOfTurnWindowSecs   = 7200
 	kanbanTrackedRetentionSecs  = 2 * kanbanOutOfTurnWindowSecs
@@ -43,13 +42,10 @@ const (
 	platformAgentHomeEnv        = "PLATFORM_AGENT_HOME"
 	kanbanDBFilename            = "kanban.db"
 	kanbanQueryTimeout          = 5 * time.Second
-	cardStepSummaryPreviewCap   = 220
 	cardStepTitleCap            = 160
 	outOfTurnSettleConfirmPolls = 2
 	maxSubtaskIDBytes           = 128
 	maxSubtaskStatusBytes       = 64
-	kanbanTaskTokenPrefix       = "task-card-"
-	kanbanTaskTokenFallback     = "task-card-unknown"
 	kanbanBlockedDeliveryPrefix = "blocked:"
 	kanbanStatusBlocked         = "blocked"
 	defaultResultChunkSize      = 256 << 10
@@ -140,8 +136,7 @@ print(json.dumps(out))
 )
 
 var (
-	kanbanNow             = time.Now
-	outOfTurnPollInterval = kanbanOutOfTurnInterval
+	kanbanNow = time.Now
 )
 
 type kanbanTracker struct {
@@ -155,8 +150,6 @@ type kanbanTracker struct {
 	canceledOrder       []string
 	consoleSessions     map[string]consoleSessionMeta
 	consoleSessionOrder []string
-	outOfTurnOpen       map[string]consoleSessionMeta
-	outOfTurnOpenOrder  []string
 	// cardOrigins maps a card id to the task whose turn created it, so a
 	// card that settles after that turn ended is published as that task's.
 	cardOrigins     map[string]string
@@ -273,9 +266,6 @@ func (k *kanbanTracker) ensureMapsLocked() {
 	if k.consoleSessions == nil {
 		k.consoleSessions = make(map[string]consoleSessionMeta)
 	}
-	if k.outOfTurnOpen == nil {
-		k.outOfTurnOpen = make(map[string]consoleSessionMeta)
-	}
 	if k.cardOrigins == nil {
 		k.cardOrigins = make(map[string]string)
 	}
@@ -284,7 +274,6 @@ func (k *kanbanTracker) ensureMapsLocked() {
 	pruneKanbanTimestampMap(k.canceledSessions, &k.canceledOrder, cutoff)
 	pruneKanbanBoundedMap(k.pendingSettle, &k.pendingSettleOrder)
 	pruneKanbanBoundedMap(k.consoleSessions, &k.consoleSessionOrder)
-	pruneKanbanBoundedMap(k.outOfTurnOpen, &k.outOfTurnOpenOrder)
 	pruneKanbanBoundedMap(k.cardOrigins, &k.cardOriginOrder)
 }
 
@@ -303,31 +292,25 @@ func (k *kanbanTracker) rememberCardOrigin(cardID, taskID string) {
 	}
 }
 
-// cardOrigin is the task that created cardID, or "" when the creation was
-// not observed (a card created before this bridge started, say).
-func (k *kanbanTracker) cardOrigin(cardID string) string {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.cardOrigins[cardID]
-}
-
-// cardStep is the step record one settled card stands for.
+// cardStep is the step record one settled card stands for: the card's id,
+// title, status and verdict, and none of its report. The report is text the
+// card's worker wrote, which can repeat a value it read, and the step goes to
+// TASKS; the bridge's own synthesis reads the report from kanban.db instead.
+// A findings preview returns with a live channel that persists nothing
+// (#4975).
 func cardStep(c kanbanCardRow, settled, total int, parentTaskID string) stepmsg.Step {
 	shortTitle := shortCardClusterOrTitle(c.Title)
 	if shortTitle == "" {
 		shortTitle = c.ID
 	}
-	summary := capBytes(oneLinePreview(scrubInlineSecrets(formatKanbanCardOutput(c)), cardStepSummaryPreviewCap), maxThinkingBytes)
 	return stepmsg.Step{
-		Kind:    stepmsg.KindSubtask,
-		Title:   capBytes(fmt.Sprintf("Specialist check completed: %s.", shortTitle), maxStepTitleBytes),
-		Thought: summary,
+		Kind:  stepmsg.KindSubtask,
+		Title: capBytes(fmt.Sprintf("Specialist check completed: %s.", shortTitle), maxStepTitleBytes),
 		Subtask: &stepmsg.Subtask{
 			ID:           capBytes(c.ID, maxSubtaskIDBytes),
 			Title:        capBytes(capRunes(strings.TrimSpace(c.Title), cardStepTitleCap), maxStepTitleBytes),
 			Status:       capBytes(strings.ToLower(strings.TrimSpace(c.Status)), maxSubtaskStatusBytes),
 			Verdict:      capBytes(inferKanbanCardVerdict(c), maxSubtaskStatusBytes),
-			Summary:      summary,
 			Settled:      settled,
 			Total:        total,
 			ParentTaskID: capBytes(parentTaskID, maxSubtaskIDBytes),
@@ -474,38 +457,6 @@ func (b *Bridge) hasActiveKanbanWait(sessionID string) bool {
 	return b.kanban.activeWaits[sessionID] > 0
 }
 
-func (b *Bridge) rememberOutOfTurnOpenCard(cardID string, meta consoleSessionMeta) {
-	if cardID == "" {
-		return
-	}
-	b.kanban.mu.Lock()
-	defer b.kanban.mu.Unlock()
-	b.kanban.ensureMapsLocked()
-	if _, exists := b.kanban.outOfTurnOpen[cardID]; !exists {
-		b.kanban.outOfTurnOpenOrder = append(b.kanban.outOfTurnOpenOrder, cardID)
-	}
-	b.kanban.outOfTurnOpen[cardID] = meta
-	pruneKanbanBoundedMap(b.kanban.outOfTurnOpen, &b.kanban.outOfTurnOpenOrder)
-}
-
-func (b *Bridge) takeOutOfTurnOpenCard(cardID string) (consoleSessionMeta, bool) {
-	if cardID == "" {
-		return consoleSessionMeta{}, false
-	}
-	b.kanban.mu.Lock()
-	defer b.kanban.mu.Unlock()
-	b.kanban.ensureMapsLocked()
-	meta, ok := b.kanban.outOfTurnOpen[cardID]
-	if ok {
-		delete(b.kanban.outOfTurnOpen, cardID)
-	}
-	return meta, ok
-}
-
-func (b *Bridge) markKanbanCardDelivered(cardID string) {
-	b.markKanbanCardDeliveredForStatus(cardID, "")
-}
-
 func (b *Bridge) markKanbanCardDeliveredForStatus(cardID, status string, blockEventID ...int64) {
 	key := kanbanDeliveryKey(cardID, status, blockEventID...)
 	if key == "" {
@@ -536,10 +487,6 @@ func (b *Bridge) clearBlockedKanbanCardDelivery(cardID string) {
 	delete(b.kanban.pendingSettle, key)
 }
 
-func (b *Bridge) isKanbanCardDelivered(cardID string) bool {
-	return b.isKanbanCardDeliveredForStatus(cardID, "")
-}
-
 func (b *Bridge) isKanbanCardDeliveredForStatus(cardID, status string, blockEventID ...int64) bool {
 	if cardID == "" {
 		return false
@@ -553,50 +500,6 @@ func (b *Bridge) isKanbanCardDeliveredForStatus(cardID, status string, blockEven
 	}
 	_, delivered := b.kanban.deliveredIDs[key]
 	return delivered
-}
-
-func (b *Bridge) shouldDeliverOutOfTurnKanbanCard(cardID, sessionID string) (consoleSessionMeta, bool) {
-	return b.shouldDeliverOutOfTurnKanbanCardForStatus(cardID, "", sessionID)
-}
-
-func (b *Bridge) shouldDeliverOutOfTurnKanbanCardForStatus(cardID, status, sessionID string, blockEventID ...int64) (consoleSessionMeta, bool) {
-	key := kanbanDeliveryKey(cardID, status, blockEventID...)
-	if key == "" {
-		return consoleSessionMeta{}, false
-	}
-	b.kanban.mu.Lock()
-	defer b.kanban.mu.Unlock()
-	b.kanban.ensureMapsLocked()
-	_, terminalDelivered := b.kanban.deliveredIDs[cardID]
-	_, statusDelivered := b.kanban.deliveredIDs[key]
-	_, canceled := b.kanban.canceledSessions[sessionID]
-	if terminalDelivered || statusDelivered || canceled {
-		return consoleSessionMeta{}, false
-	}
-	if b.kanban.activeWaits[sessionID] > 0 {
-		delete(b.kanban.pendingSettle, key)
-		return consoleSessionMeta{}, false
-	}
-	if _, exists := b.kanban.pendingSettle[key]; !exists {
-		b.kanban.pendingSettleOrder = append(b.kanban.pendingSettleOrder, key)
-	}
-	b.kanban.pendingSettle[key]++
-	pruneKanbanBoundedMap(b.kanban.pendingSettle, &b.kanban.pendingSettleOrder)
-	if b.kanban.pendingSettle[key] < outOfTurnSettleConfirmPolls {
-		return consoleSessionMeta{}, false
-	}
-	now := kanbanNow().Unix()
-	if _, exists := b.kanban.deliveredIDs[key]; !exists {
-		b.kanban.deliveredOrder = append(b.kanban.deliveredOrder, key)
-	}
-	b.kanban.deliveredIDs[key] = now
-	delete(b.kanban.pendingSettle, key)
-	pruneKanbanTimestampMap(b.kanban.deliveredIDs, &b.kanban.deliveredOrder, now-kanbanTrackedRetentionSecs)
-	meta := b.kanban.consoleSessions[sessionID]
-	if meta.ContextID == "" && strings.HasPrefix(sessionID, apiSessionIDPrefix) {
-		meta.ContextID = strings.TrimPrefix(sessionID, apiSessionIDPrefix)
-	}
-	return meta, true
 }
 
 func hasQueuedSteer(run *taskRun) bool {
@@ -830,11 +733,6 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 					var parts []string
 					for _, c := range relevant {
 						b.markKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID)
-						if isKanbanStatusTerminal(c.Status) {
-							if openMeta, wasOpen := b.takeOutOfTurnOpenCard(c.ID); wasOpen {
-								b.publishOutOfTurnKanbanCardLifecycle(taskCtx, c, openMeta, true)
-							}
-						}
 						if out := formatKanbanCardOutput(c); out != "" {
 							parts = append(parts, out)
 						}
@@ -1079,179 +977,4 @@ func (b *Bridge) apiSynthesisTurn(run *taskRun, taskCtx context.Context, session
 		b.publishUsageLocked(run, u)
 	}
 	return content, true
-}
-
-func sanitizeKanbanTaskToken(cardID string) string {
-	s := strings.ToLower(strings.TrimSpace(cardID))
-	var sb strings.Builder
-	sb.WriteString(kanbanTaskTokenPrefix)
-	for _, r := range s {
-		switch {
-		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
-			sb.WriteRune(r)
-		case r == '-' || r == '_':
-			sb.WriteByte('-')
-		}
-	}
-	out := strings.Trim(sb.String(), "-")
-	if out == strings.TrimSuffix(kanbanTaskTokenPrefix, "-") {
-		return kanbanTaskTokenFallback
-	}
-	return out
-}
-
-func (b *Bridge) watchOutOfTurnKanbanCards(ctx context.Context) {
-	pythonBin := resolvePythonBin()
-	if dbPath := b.resolveKanbanDBPath(); dbPath != "" {
-		sinceUnix := kanbanNow().Unix() - kanbanOutOfTurnWindowSecs
-		if initial, err := querySessionKanbanCards(ctx, pythonBin, dbPath, "*", sinceUnix, nil); err == nil {
-			for _, c := range initial {
-				if isKanbanStatusSettled(c.Status) {
-					b.markKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID)
-				}
-			}
-		}
-	}
-
-	ticker := time.NewTicker(outOfTurnPollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		dbPath := b.resolveKanbanDBPath()
-		if dbPath == "" {
-			continue
-		}
-		sinceUnix := kanbanNow().Unix() - kanbanOutOfTurnWindowSecs
-		cards, err := querySessionKanbanCards(ctx, pythonBin, dbPath, "*", sinceUnix, nil)
-		if err != nil {
-			continue
-		}
-		for _, c := range cards {
-			if !isKanbanStatusBlocked(c.Status) {
-				b.clearBlockedKanbanCardDelivery(c.ID)
-			}
-			if !isKanbanStatusSettled(c.Status) || c.SessionID == "" {
-				continue
-			}
-			if p := b.recordedRoute(c.SessionID).Platform; p != "" && p != lib.NotifyPlatformConsole {
-				b.markKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID)
-				continue
-			}
-			if meta, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(c.ID, c.Status, c.SessionID, c.BlockEventID); ok {
-				b.publishOutOfTurnKanbanCard(ctx, c, meta)
-			}
-		}
-	}
-}
-
-func (b *Bridge) publishOutOfTurnKanbanCard(ctx context.Context, c kanbanCardRow, meta consoleSessionMeta) {
-	_, alreadyOpened := b.takeOutOfTurnOpenCard(c.ID)
-	b.publishOutOfTurnKanbanCardLifecycle(ctx, c, meta, alreadyOpened)
-}
-
-func (b *Bridge) publishOutOfTurnKanbanCardLifecycle(ctx context.Context, c kanbanCardRow, meta consoleSessionMeta, alreadyOpened bool) {
-	if meta.ContextID == "" || b.c == nil {
-		return
-	}
-	synthTaskID := sanitizeKanbanTaskToken(c.ID)
-	corrID := meta.CorrelationID
-	if corrID == "" {
-		corrID = synthTaskID
-	}
-	output := scrubInlineSecrets(formatKanbanCardOutput(c))
-	if output == "" {
-		output = fmt.Sprintf("Kanban card `%s` (%s) finished with status `%s`.", c.ID, c.Title, c.Status)
-	}
-	subj := lib.TaskEventsSubject(b.cfg.Profile, synthTaskID)
-	publishStatus := func(st lib.TaskState) {
-		stPayload, err := json.Marshal(lib.StatusUpdate{
-			TaskID:    synthTaskID,
-			ContextID: meta.ContextID,
-			Status:    lib.TaskStatus{State: st},
-			Final:     st.Terminal(),
-		})
-		if err != nil {
-			return
-		}
-		env, err := lib.NewStatusUpdateEnvelope(b.from, synthTaskID, meta.ContextID, corrID, stPayload)
-		if err != nil {
-			return
-		}
-		if len(meta.Authority) > 0 {
-			env.Authority = meta.Authority
-		}
-		pubCtx, cancel := context.WithTimeout(ctx, activityPublishTimeout)
-		_ = b.c.Publish(pubCtx, subj, env)
-		cancel()
-	}
-	publish := func(name string, parts []lib.Part, appendPart, lastChunk bool) {
-		payload, err := json.Marshal(lib.ArtifactUpdate{
-			TaskID:    synthTaskID,
-			ContextID: meta.ContextID,
-			Artifact: lib.Artifact{
-				ArtifactID: "artifact-" + synthTaskID + "-" + name,
-				Name:       name,
-				Parts:      parts,
-			},
-			Append:    appendPart,
-			LastChunk: lastChunk,
-		})
-		if err != nil {
-			return
-		}
-		env, err := lib.NewArtifactUpdateEnvelope(b.from, synthTaskID, meta.ContextID, corrID, payload)
-		if err != nil {
-			return
-		}
-		if len(meta.Authority) > 0 {
-			env.Authority = meta.Authority
-		}
-		pubCtx, cancel := context.WithTimeout(ctx, activityPublishTimeout)
-		_ = b.c.Publish(pubCtx, subj, env)
-		cancel()
-	}
-
-	// Open the synthetic task lifecycle with StateSubmitted on its first
-	// publication so FoldTask Assertion 9 holds on the task's events stream;
-	// if this card was previously published in StateInputRequired ("blocked"),
-	// resume it with StateWorking before publishing the terminal completion.
-	if alreadyOpened {
-		publishStatus(lib.StateWorking)
-	} else {
-		publishStatus(lib.StateSubmitted)
-	}
-
-	// The card as a step record first, naming the task whose turn created
-	// it, so a renderer files this task under that one without guessing
-	// from timestamps; then the deliverable chunked within lib.ResultChunkSize.
-	if part, err := cardStep(c, 1, 1, b.kanban.cardOrigin(c.ID)).Part(); err == nil {
-		publish(stepmsg.ArtifactName, []lib.Part{part}, alreadyOpened, false)
-	}
-	chunkSize := b.cfg.ResultChunkSize
-	if chunkSize <= 0 {
-		chunkSize = defaultResultChunkSize
-	}
-	chunks := chunkString(output, chunkSize)
-	for i, chunk := range chunks {
-		publish(lib.ArtifactResult, []lib.Part{{Kind: "text", Text: chunk}}, i > 0, i == len(chunks)-1)
-	}
-
-	termState := lib.StateCompleted
-	switch strings.ToLower(strings.TrimSpace(c.Status)) {
-	case "blocked":
-		termState = lib.StateInputRequired
-	case "failed", "gave_up":
-		termState = lib.StateFailed
-	case "canceled", "cancelled":
-		termState = lib.StateCanceled
-	}
-	publishStatus(termState)
-	if termState == lib.StateInputRequired {
-		b.rememberOutOfTurnOpenCard(c.ID, meta)
-	}
 }
