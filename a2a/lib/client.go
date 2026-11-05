@@ -799,7 +799,7 @@ func (s *durableSub) consume(cons jetstream.Consumer) error {
 		// drains, as Stop does, so what this context already pulled is given
 		// back rather than dropped (#4849).
 		if s.held != nil {
-			cc.Drain()
+			s.drainOrStop(cc)
 		} else {
 			cc.Stop()
 		}
@@ -945,8 +945,23 @@ func (s *durableSub) drainIntake() {
 	cc := s.cc
 	s.mu.Unlock()
 	if cc != nil {
-		cc.Drain()
+		s.drainOrStop(cc)
 	}
+}
+
+// drainOrStop drains a held consume context while the connection is up. While
+// it's reconnecting, the drain's unsubscribe can't go out, and the client
+// subscribes the draining inbox again on reconnect and later drops it without
+// an unsubscribe, so the server would go on sending to it. A plain stop
+// removes the subscription at once instead, and the reconnect leaves it out.
+// A disconnect between the check and the drain's cleanup still leaves a small
+// window.
+func (s *durableSub) drainOrStop(cc jetstream.ConsumeContext) {
+	if nc, _ := s.c.conn(); nc != nil && nc.Status() == nats.CONNECTED {
+		cc.Drain()
+		return
+	}
+	cc.Stop()
 }
 
 // awaitDrain returns once the current consume context has drained, and the
@@ -970,7 +985,7 @@ func (s *durableSub) awaitDrain(timeout <-chan time.Time) {
 			return
 		}
 		cc = cur
-		cc.Drain() // consume drains it too; a second Drain is a no-op
+		s.drainOrStop(cc) // consume does too; a second call is a no-op
 	}
 }
 
