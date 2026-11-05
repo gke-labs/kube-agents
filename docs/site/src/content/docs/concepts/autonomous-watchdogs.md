@@ -184,6 +184,24 @@ A watchdog therefore fires through the same execute → deliver → record path 
 
   That ledger is pruned per job rather than per board — 1000 rows each (`MAX_TERMINAL_EXECUTIONS_PER_JOB`), then a 5000-row sweep across the board that may never take a job's newest 50, so the floor outranks the ceiling and the real bound is 5000 plus 50 per job id. The distinction is the difference between a usable history and none: pruning to the newest 1000 rows across all jobs let the minute-ly ticker evict a daily watchdog's only row inside seventeen hours, so the history of the job you would actually go looking at was always empty.
 
+### Idle installs
+
+An install nobody talks to keeps its schedule only for a week. Before it looks for due work, the dispatcher reads when a person last messaged the install, `status.usage.lastHumanActiveTime` on the `PlatformAgent`, or the resource's creation time while no message has arrived, and holds the model-run jobs back in two stages:
+
+| Idle for              | Model-run jobs                                                  | `no_agent` jobs |
+| --------------------- | --------------------------------------------------------------- | --------------- |
+| under 7 days          | run on schedule                                                 | run on schedule |
+| 7 days (`throttle`)   | run at most once every 7 days, counted from each job's last run | run on schedule |
+| 14 days (`hibernate`) | do not run                                                      | run on schedule |
+
+A hold is a rewrite of the job's `next_run_at` in the profile's store, under the same lock Hermes takes. The new value is the job's own next slot at or after the hold ends, so a held audit still fires at its usual hour. The dispatcher's run output names each hold and each change of stage; `<profile-home>/cron/cron_idle_policy.json` records the stage, the last reading and the held jobs.
+
+A chat message ends the hold on the next tick: each held job moves to its next natural occurrence rather than to now, so a returning operator gets the roster back on its schedule rather than every audit at once. A job someone ran by hand meanwhile is left where Hermes put it.
+
+Two environment variables on the agent container tune it, through `spec.deployment.env`: `CRON_IDLE_THROTTLE_DAYS` (default 7) and `CRON_IDLE_HIBERNATE_DAYS` (default 14). `0` disables that stage, `0` on the throttle disables both, and an unparsable value means the default. Turning the policy off releases whatever it held.
+
+Only a chat message moves the field. Turns through the A2A inject door and the agent API do not, so an install driven only by them, an evaluation or shared test install for instance, idles like one nobody uses; set `CRON_IDLE_THROTTLE_DAYS=0` there. When the field cannot be read (the sandbox is off, or the agent's Role no longer reaches the resource) the last reading stands for a day and then nothing new is held; the dispatcher says so once in its output. A held occurrence leaves no row in the job's history: the hold moves the slot rather than skipping it.
+
 ## Job shape
 
 Each job in `jobs.json` follows this schema:
