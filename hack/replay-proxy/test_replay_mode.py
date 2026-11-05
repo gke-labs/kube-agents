@@ -113,14 +113,15 @@ class AnswerSlotGuardTest(SlotCacheCase):
         bob = self.body("Yes, web-7d4b9c8f6d-x2k9p.")
         alice_yes = self.body("Yes please, web-5f6c7d8b9c-m8n7q.")
         self.record(bob, {"role": "assistant", "content": "restart web-7d4b9c8f6d-x2k9p"}, others=[alice_yes])
-        self.assertIsNone(self.proxy().lookup(alice_yes, time.time()),
-                          "Bob's answer would restart the pod Alice's yes named")
+        hit, refused = self.proxy().lookup(alice_yes, time.time())
+        self.assertIsNone(hit, "Bob's answer would restart the pod Alice's yes named")
+        self.assertEqual(refused, {"via": "answer_slots", "guard": "value_only_in_answers"})
 
     def test_a_value_bound_by_the_tool_output_is_served(self):
         bob = self.body("Yes.", ticket="ticket Latte for web-7d4b9c8f6d-x2k9p")
         alice_yes = self.body("Yes please.", ticket="ticket Latte for web-5f6c7d8b9c-m8n7q")
         self.record(bob, {"role": "assistant", "content": "restart web-7d4b9c8f6d-x2k9p"}, others=[alice_yes])
-        hit = self.proxy().lookup(alice_yes, time.time())
+        hit, _ = self.proxy().lookup(alice_yes, time.time())
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0]["content"], "restart web-5f6c7d8b9c-m8n7q")
         self.assertEqual(hit[3], "answer_slots")
@@ -155,7 +156,7 @@ class AnswerSlotActionsTest(SlotCacheCase):
                     others=[self.conversation(complete, self.result('{"ok": true, "status": "done"}'))])
         replayed = self.conversation(self.act("kanban_complete", {"summary": "done"}, call_id="call_9__thought__eHl6"),
                                      self.result('{"ok": true}', call_id="call_9__thought__eHl6"))
-        self.assertIsNone(self.proxy().lookup(replayed, time.time()))
+        self.assertEqual(self.proxy().lookup(replayed, time.time()), (None, None))
 
     def test_the_same_tool_call_in_other_words_is_served(self):
         self.record(self.conversation(self.act("kanban_comment", {"body": "x"}, said="Leaving a note."),
@@ -166,7 +167,7 @@ class AnswerSlotActionsTest(SlotCacheCase):
         replayed = self.conversation(self.act("kanban_comment", {"body": "x"}, said="Commenting.",
                                               call_id="call_7__thought__bmV3"),
                                      self.result('{"ok": true}', call_id="call_7__thought__bmV3"))
-        hit = self.proxy().lookup(replayed, time.time())
+        hit, _ = self.proxy().lookup(replayed, time.time())
         self.assertIsNotNone(hit)
         self.assertEqual((hit[0]["content"], hit[3]), ("Noted on ticket t_bbbbbbbb.", "answer_slots"))
 
@@ -382,7 +383,9 @@ class ReplayTest(ProxyTestCase):
         calls = len(FakeLiteLLM.calls)
         self.request("POST", COMPLETIONS, self.pickup("t_cccccccc", "No, cancel it.", "Latte"), port=port)
         self.assertEqual(len(FakeLiteLLM.calls), calls + 1)
-        self.assertFalse(self.lines(1, out)[0]["served"])
+        line = self.lines(1, out)[0]
+        self.assertFalse(line["served"])
+        self.assertEqual(line["miss"]["refused"], {"via": "answer_slots", "guard": "answer_not_recorded"})
 
     def test_only_answers_the_proxy_recorded_fill_a_slot(self):
         # The first opening's answer came from a fallback, and the client went on
@@ -404,7 +407,9 @@ class ReplayTest(ProxyTestCase):
         calls = len(FakeLiteLLM.calls)
         self.request("POST", COMPLETIONS, self.pickup("t_cccccccc", "answer 1 for t_cccccccc", "Mocha"), port=port)
         self.assertEqual(len(FakeLiteLLM.calls), calls + 1)
-        self.assertFalse(self.lines(1, out)[0]["served"])
+        line = self.lines(1, out)[0]
+        self.assertFalse(line["served"])
+        self.assertNotIn("refused", line["miss"], "no key matched: an ordinary fork")
 
     def test_an_exact_match_says_so(self):
         self.record_two_pickups()
@@ -481,7 +486,9 @@ class ReplayTest(ProxyTestCase):
         status, headers, _ = self.request("POST", COMPLETIONS, chat("t_22222222", stream=False), port=port)
         self.assertEqual(len(FakeLiteLLM.calls), calls + 1)
         self.assertNotIn("x-replay-served", headers)
-        self.assertFalse(self.lines(1, out)[0]["served"])
+        line = self.lines(1, out)[0]
+        self.assertFalse(line["served"])
+        self.assertEqual(line["miss"]["refused"], {"via": "exact", "guard": "unbound_placeholder"})
 
 
 if __name__ == "__main__":

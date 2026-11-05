@@ -106,6 +106,19 @@ MISS_SAVED_SNIPPET = "saved_snippet"
 MISS_CURRENT_SNIPPET = "current_snippet"
 # The two windows with digit and hex runs collapsed, for grouping misses.
 MISS_SIGNATURE = "signature"
+# On a replay miss whose request did match a saved answer that a guard then
+# refused to serve: which key matched (VIA_EXACT or VIA_ANSWER_SLOTS) and why.
+MISS_REFUSED = "refused"
+REFUSED_VIA = "via"
+REFUSED_GUARD = "guard"
+# A slot held an answer no recording stored for its context.
+GUARD_ANSWER_NOT_RECORDED = "answer_not_recorded"
+# Through a slot, the saved answer names a value only an assistant message binds.
+GUARD_VALUE_ONLY_IN_ANSWERS = "value_only_in_answers"
+# The saved answer names a placeholder this request does not bind.
+GUARD_UNBOUND_PLACEHOLDER = "unbound_placeholder"
+# The saved answer is missing or not an answer.
+GUARD_UNREADABLE_ENTRY = "unreadable_entry"
 # Where the first difference is when it is not a message.
 MISS_ROLE_SETTINGS = "settings"
 MISS_ROLE_NONE = "none"

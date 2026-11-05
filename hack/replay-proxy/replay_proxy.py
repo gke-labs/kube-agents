@@ -443,6 +443,11 @@ def diff_snippets(saved: Optional[str], current: str) -> Dict[str, Any]:
     }
 
 
+def refusal(via: str, guard: str) -> Dict[str, str]:
+    """The miss block's record of a matched saved answer a guard refused to serve."""
+    return {F.REFUSED_VIA: via, F.REFUSED_GUARD: guard}
+
+
 # Tells the analysis worker to stop.
 _STOP = object()
 
@@ -474,30 +479,39 @@ class ShadowProxy:
         self._worker = threading.Thread(target=self._work, name="replay-shadow-analysis", daemon=True)
         self._worker.start()
 
-    def lookup(self, body: Dict[str, Any], received: float) -> Optional[Tuple[Dict[str, Any], Dict[str, Any], str, str]]:
-        """Replay mode: (restored answer, saved entry, fingerprint, how it matched) on a servable hit, else None."""
+    def lookup(
+        self, body: Dict[str, Any], received: float,
+    ) -> Tuple[Optional[Tuple[Dict[str, Any], Dict[str, Any], str, str]], Optional[Dict[str, str]]]:
+        """Replay mode: ((restored answer, saved entry, fingerprint, how it matched), None) on a servable hit.
+
+        On a miss, (None, None), or (None, refusal) when a key matched a saved
+        answer that a guard refused: the key and the guard, for the miss block.
+        """
         normalized = normalizer.normalize_request(body, received)
         fingerprint = normalizer.fingerprint(normalized, self.key_context)
         via = F.VIA_EXACT
         entry = self.cache.load(fingerprint)
         if entry is None:
-            # The same conversation recorded after a different answer the model
-            # gave to the same context: every answer here must be a recorded one.
+            # The same conversation recorded after the same actions worded
+            # differently: every answer here must be one a recording stored.
             slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
             recorded = self.cache.load_slot(slot_key) if slots else None
-            if recorded is None or not all(self.cache.has_variant(c, a) for c, a in slots):
-                return None
+            if recorded is None:
+                return None, None
             fingerprint, via, entry = recorded, F.VIA_ANSWER_SLOTS, self.cache.load(recorded)
+            if not all(self.cache.has_variant(c, a) for c, a in slots):
+                return None, refusal(via, F.GUARD_ANSWER_NOT_RECORDED)
         if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
-            return None
+            return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
         if via == F.VIA_ANSWER_SLOTS:
             named = set(normalizer.PLACEHOLDER_RE.findall(json.dumps(entry[replay_cache.ENTRY_ANSWER], ensure_ascii=False)))
             if not named <= normalizer.placeholders_outside_answers(normalized):
-                return None  # a value only an answer named could carry another number here
+                # A value only an answer named could carry another number here.
+                return None, refusal(via, F.GUARD_VALUE_ONLY_IN_ANSWERS)
         answer, missing = replay_cache.restore_answer(entry[replay_cache.ENTRY_ANSWER], normalized.mapping)
         if missing:
-            return None  # the answer names a value this request does not bind
-        return answer, entry, fingerprint, via
+            return None, refusal(via, F.GUARD_UNBOUND_PLACEHOLDER)
+        return (answer, entry, fingerprint, via), None
 
     def submit(
         self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int,
@@ -624,8 +638,18 @@ class ShadowProxy:
             self.metrics.add("recorded")
         return saved
 
-    def miss_block(self, entry: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any]) -> Dict[str, Any]:
-        """Replay mode, on a miss: the closest saved request and where this one first differs."""
+    def miss_block(
+        self, entry: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any],
+        refused: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Replay mode, on a miss: the closest saved request, where this one first differs, and any refusal."""
+        block = self._closest(entry, raw_messages, diag_walked)
+        if refused:
+            block[F.MISS_REFUSED] = refused
+        return block
+
+    def _closest(self, entry: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any]) -> Dict[str, Any]:
+        """The closest saved request and where this one first differs from it."""
         if self.index_empty:
             return {F.MISS_ROLE: F.MISS_ROLE_NO_CACHE}
         hashes = entry[F.DIAG_MESSAGE_HASHES]
@@ -751,7 +775,7 @@ class ShadowProxy:
         if self.config.mode == F.MODE_RECORD:
             entry[F.RECORDED] = self.record(body, entry, upstream, normalized, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
-            entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked)
+            entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked, upstream.get("refused"))
         entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
         skipped = self.store.store(request_id, fingerprint, body)
         entry[F.STORED] = skipped is None
@@ -841,9 +865,10 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, RecursionError):
                 body = None
         received = time.time()
+        refused = None
         if body is not None and self.proxy.config.mode == F.MODE_REPLAY:
             try:
-                hit = self.proxy.lookup(body, received)
+                hit, refused = self.proxy.lookup(body, received)
             except Exception:  # a cache that cannot be read is a miss, never a failed request
                 self.proxy.metrics.add("analysis_errors")
                 hit = None
@@ -858,6 +883,7 @@ class Handler(BaseHTTPRequestHandler):
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))
         if body is None:
             return
+        upstream["refused"] = refused
         self.proxy.metrics.add("completions")
         self.proxy.submit(body, received, upstream, len(raw))
 
