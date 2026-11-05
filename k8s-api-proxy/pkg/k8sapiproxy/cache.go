@@ -116,7 +116,8 @@ type CacheConfig struct {
 	// Ignored when Store is non-nil.
 	MaxBytes int64
 	// MaxEntryBytes bounds the maximum response body size in bytes that can be cached;
-	// DefaultCacheMaxEntryBytes when <= 0. Responses larger than MaxEntryBytes stream
+	// DefaultCacheMaxEntryBytes when <= 0, and at most 64 MiB and the memory store's
+	// MaxBytes. Responses larger than MaxEntryBytes stream
 	// directly to the caller without full buffering.
 	MaxEntryBytes int64
 	// DefaultResourceTTL is the default TTL for resource get and list responses;
@@ -127,6 +128,10 @@ type CacheConfig struct {
 	DefaultDiscoveryTTL time.Duration
 	// Now returns the current time for TTL and Age calculations; time.Now when nil.
 	Now func() time.Time
+	// HostClusterID is the gke_ ID the upstream also routes to the in-cluster API server, if
+	// any. The cache files it under InClusterID so a write through either name invalidates
+	// reads through the other.
+	HostClusterID string
 }
 
 type memoryCacheEntry struct {
@@ -372,6 +377,7 @@ type responseCache struct {
 	fetchTimeout        time.Duration
 	now                 func() time.Time
 	metrics             *Metrics
+	hostClusterID       string
 
 	flightMu sync.Mutex
 	flights  map[string]*inflightCall
@@ -383,6 +389,9 @@ type responseCache struct {
 	scopeMu   sync.Mutex
 	scopeKeys map[string]map[string]time.Time
 	keyScope  map[string]string
+	// staleKeys holds keys whose eviction the store refused. A read treats them as a miss
+	// until a later store or delete of the key succeeds.
+	staleKeys map[string]struct{}
 }
 
 func newResponseCache(cfg *CacheConfig, metrics *Metrics) *responseCache {
@@ -403,6 +412,11 @@ func newResponseCache(cfg *CacheConfig, metrics *Metrics) *responseCache {
 	if maxEntry <= 0 {
 		maxEntry = DefaultCacheMaxEntryBytes
 	}
+	// A body the envelope or the memory store cannot hold would be buffered and never stored.
+	maxEntry = min(maxEntry, maxCacheBodyBytes)
+	if mem, ok := store.(*MemoryCacheStore); ok {
+		maxEntry = min(maxEntry, mem.maxBytes)
+	}
 	resTTL := cfg.DefaultResourceTTL
 	if resTTL <= 0 {
 		resTTL = DefaultResourceCacheTTL
@@ -419,9 +433,11 @@ func newResponseCache(cfg *CacheConfig, metrics *Metrics) *responseCache {
 		fetchTimeout:        defaultUpstreamFetchTimeout,
 		now:                 nowFn,
 		metrics:             metrics,
+		hostClusterID:       cfg.HostClusterID,
 		flights:             make(map[string]*inflightCall),
 		scopeKeys:           make(map[string]map[string]time.Time),
 		keyScope:            make(map[string]string),
+		staleKeys:           make(map[string]struct{}),
 	}
 	if mem, ok := store.(*MemoryCacheStore); ok {
 		mem.mu.Lock()
@@ -473,11 +489,12 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	ev := eventFrom(req)
 	meta, _ := req.Context().Value(cacheRequestMetaKey{}).(cacheRequestMeta)
 	info := meta.info
+	clusterID := c.cacheClusterID(ev.ClusterID)
 
 	if info != nil && info.IsResourceRequest && !ev.DryRun && mutatingVerbs.Has(info.Verb) {
 		resp, err := next(req)
 		if err == nil && resp != nil && shouldInvalidateOnMutation(resp.StatusCode) {
-			c.invalidateResourceScope(req.Context(), ev.ClusterID, info)
+			c.invalidateResourceScope(req.Context(), clusterID, info)
 		}
 		return resp, err
 	}
@@ -486,7 +503,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	if !cacheable {
 		resp, err := next(req)
 		if err == nil && resp != nil && info != nil && info.IsResourceRequest && isAuthFailureStatus(resp.StatusCode) {
-			c.invalidateResourceScope(req.Context(), ev.ClusterID, info)
+			c.invalidateResourceScope(req.Context(), clusterID, info)
 		}
 		return resp, err
 	}
@@ -502,18 +519,18 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 		resp, err := next(req)
 		if err == nil && resp != nil {
 			if info != nil && info.IsResourceRequest && isAuthFailureStatus(resp.StatusCode) {
-				c.invalidateResourceScope(req.Context(), ev.ClusterID, info)
+				c.invalidateResourceScope(req.Context(), clusterID, info)
 			}
 			resp.Header.Set(headerCacheStatus, cacheStatusBypass)
 		}
 		return resp, err
 	}
 
-	key := buildCacheKey(ev.ClusterID, req, meta.callerAccept)
+	key := buildCacheKey(clusterID, req, meta.callerAccept)
 	now := c.now()
 
 	if !reqCC.noCache && !reqCC.zeroMaxAge {
-		if raw, ok, err := c.store.Get(req.Context(), key); err == nil && ok {
+		if raw, ok, err := c.store.Get(req.Context(), key); err == nil && ok && !c.isStale(key) {
 			if entry, err := decodeCachedResponse(raw); err == nil && isEntryFreshForRequest(entry, reqCC, now) {
 				recordResult(CacheResultHit)
 				return buildResponseFromCache(req, entry, now), nil
@@ -522,7 +539,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	}
 
 	upReq := prepareCacheableUpstreamRequest(req)
-	call := c.acquireFlight(upReq, key, ev.ClusterID, info, isDiscovery, next)
+	call := c.acquireFlight(upReq, key, clusterID, info, isDiscovery, next)
 
 	select {
 	case <-req.Context().Done():
@@ -768,6 +785,7 @@ func (c *responseCache) fetchAndPopulate(
 		}, rawBody)
 		if err == nil {
 			if setErr := c.store.Set(req.Context(), key, encoded, storeTTL); setErr == nil {
+				c.setStale(key, false)
 				if sp, ok := c.store.(CacheStatsProvider); ok {
 					st := sp.Stats()
 					c.metrics.setCacheOccupancy(st.Bytes, st.Entries)
@@ -795,9 +813,23 @@ func (c *responseCache) fetchAndPopulate(
 	}, nil
 }
 
+// cacheClusterID names the host cluster one way whichever ID the caller addressed it by.
+func (c *responseCache) cacheClusterID(clusterID string) string {
+	if c.hostClusterID != "" && clusterID == c.hostClusterID {
+		return InClusterID
+	}
+	return clusterID
+}
+
+// evictKey deletes key even when the caller has gone, and keeps it indexed if the store
+// refused, so the next invalidation of its scope tries again.
 func (c *responseCache) evictKey(ctx context.Context, key string) {
-	_ = c.store.Delete(ctx, key)
-	c.removeScopeKey(key)
+	if err := c.store.Delete(context.WithoutCancel(ctx), key); err != nil {
+		c.setStale(key, true)
+	} else {
+		c.setStale(key, false)
+		c.removeScopeKey(key)
+	}
 	if sp, ok := c.store.(CacheStatsProvider); ok {
 		st := sp.Stats()
 		c.metrics.setCacheOccupancy(st.Bytes, st.Entries)
@@ -903,6 +935,48 @@ func (c *responseCache) removeScopeKey(key string) {
 	}
 }
 
+func (c *responseCache) isStale(key string) bool {
+	c.scopeMu.Lock()
+	defer c.scopeMu.Unlock()
+	_, ok := c.staleKeys[key]
+	return ok
+}
+
+func (c *responseCache) setStale(key string, stale bool) {
+	c.scopeMu.Lock()
+	defer c.scopeMu.Unlock()
+	if stale {
+		c.staleKeys[key] = struct{}{}
+	} else {
+		delete(c.staleKeys, key)
+	}
+}
+
+// indexedKey is a scope index entry taken out for invalidation.
+type indexedKey struct {
+	key       string
+	scope     string
+	expiresAt time.Time
+}
+
+// restoreScopeKey puts back an entry the store refused to delete, unless a newer store
+// indexed the key meanwhile.
+func (c *responseCache) restoreScopeKey(k indexedKey) {
+	c.scopeMu.Lock()
+	defer c.scopeMu.Unlock()
+
+	if _, ok := c.keyScope[k.key]; ok {
+		return
+	}
+	keys, ok := c.scopeKeys[k.scope]
+	if !ok {
+		keys = make(map[string]time.Time)
+		c.scopeKeys[k.scope] = keys
+	}
+	keys[k.key] = k.expiresAt
+	c.keyScope[k.key] = k.scope
+}
+
 func (c *responseCache) pruneExpiredScopeKeysLocked(now time.Time) {
 	for scope, keys := range c.scopeKeys {
 		for k, exp := range keys {
@@ -924,11 +998,11 @@ func (c *responseCache) invalidateResourceScope(ctx context.Context, clusterID s
 	now := c.now()
 	c.scopeMu.Lock()
 	c.pruneExpiredScopeKeysLocked(now)
-	var toDelete []string
+	var toDelete []indexedKey
 	collect := func(scope string) {
 		if keys, ok := c.scopeKeys[scope]; ok {
-			for k := range keys {
-				toDelete = append(toDelete, k)
+			for k, exp := range keys {
+				toDelete = append(toDelete, indexedKey{key: k, scope: scope, expiresAt: exp})
 				delete(c.keyScope, k)
 			}
 			delete(c.scopeKeys, scope)
@@ -949,9 +1023,17 @@ func (c *responseCache) invalidateResourceScope(ctx context.Context, clusterID s
 	c.scopeMu.Unlock()
 
 	for _, k := range toDelete {
-		_, ok, getErr := c.store.Get(ctx, k)
-		if err := c.store.Delete(ctx, k); err == nil && getErr == nil && ok {
-			c.metrics.recordCacheEviction(CacheEvictionInvalidated)
+		_, ok, getErr := c.store.Get(ctx, k.key)
+		err := c.store.Delete(ctx, k.key)
+		switch {
+		case err != nil:
+			c.setStale(k.key, true)
+			c.restoreScopeKey(k)
+		default:
+			c.setStale(k.key, false)
+			if getErr == nil && ok {
+				c.metrics.recordCacheEviction(CacheEvictionInvalidated)
+			}
 		}
 	}
 	if len(toDelete) > 0 {

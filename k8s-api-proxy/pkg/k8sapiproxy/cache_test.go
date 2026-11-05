@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
 func TestMemoryCacheStoreLRUEvictionAndFrequency(t *testing.T) {
@@ -238,6 +240,14 @@ func TestHandlerCustomCacheStoreAndFailOpen(t *testing.T) {
 	custom.mu.Unlock()
 	if getCalls < 3 || setCalls < 2 || delCalls < 1 {
 		t.Errorf("store calls get=%d set=%d delete=%d, want >= 3, 2, 1", getCalls, setCalls, delCalls)
+	}
+
+	// The first GET's entry outlived the refused delete; it must not answer once the store heals.
+	custom.mu.Lock()
+	custom.getErr, custom.setErr, custom.deleteErr = nil, nil, nil
+	custom.mu.Unlock()
+	if rec := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("GET after a refused invalidation delete Cache-Status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
 }
 
@@ -2044,5 +2054,166 @@ func TestHandlerDefaultConfigZeroResourceTTLCoalescesAndCachesDiscovery(t *testi
 	}
 	if st := store.Stats(); st.Entries != 1 {
 		t.Fatalf("store.Stats().Entries = %d, want 1 (only discovery entry stored)", st.Entries)
+	}
+}
+
+func TestHandlerCacheHostClusterAliasSharesKeyAndScope(t *testing.T) {
+	const hostID = "gke_proj_us-central1_host"
+	h, upstream := newTestHandler(t, Config{
+		Policy: Policy{Mode: ModeReadWrite, RedactSecrets: true},
+		Cache:  &CacheConfig{DefaultResourceTTL: time.Minute, HostClusterID: hostID},
+	})
+	const path = "/api/v1/namespaces/default/pods/p1"
+	inCluster := "/clusters/" + InClusterID + path
+	viaHost := "/clusters/" + hostID + path
+
+	for _, step := range []struct{ method, target, want string }{
+		{http.MethodGet, inCluster, cacheStatusMiss},
+		{http.MethodGet, viaHost, cacheStatusHit},
+		{http.MethodDelete, viaHost, ""},
+		{http.MethodGet, inCluster, cacheStatusMiss},
+	} {
+		rec := serve(h, newClusterRequest(step.method, step.target, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s code = %d, want 200", step.method, step.target, rec.Code)
+		}
+		if got := rec.Header().Get(headerCacheStatus); got != step.want {
+			t.Fatalf("%s %s Cache-Status = %q, want %q", step.method, step.target, got, step.want)
+		}
+	}
+	if upstream.calls != 3 {
+		t.Fatalf("upstream.calls = %d, want 3", upstream.calls)
+	}
+}
+
+func TestResponseCacheEvictKeyDeletesForAGoneCallerAndKeepsARefusedKey(t *testing.T) {
+	const key = "k"
+	info := &request.RequestInfo{IsResourceRequest: true, Resource: "pods", Namespace: "default"}
+	store := &faultyCacheStore{inner: NewMemoryCacheStore(DefaultCacheMaxBytes)}
+	c := newResponseCache(&CacheConfig{Store: store, DefaultResourceTTL: time.Minute}, NewMetrics())
+	stored := func() bool {
+		_, ok, _ := store.inner.Get(context.Background(), key)
+		return ok
+	}
+	indexed := func() bool {
+		c.scopeMu.Lock()
+		defer c.scopeMu.Unlock()
+		_, ok := c.keyScope[key]
+		return ok
+	}
+	put := func() {
+		if err := store.Set(context.Background(), key, []byte("v"), time.Minute); err != nil {
+			t.Fatalf("Set: %v", err)
+		}
+		c.recordScopeKey(InClusterID, info, key, c.now(), time.Minute)
+	}
+
+	put()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	c.evictKey(cancelled, key)
+	if stored() || indexed() {
+		t.Fatalf("after evictKey under a cancelled context stored=%v indexed=%v, want neither", stored(), indexed())
+	}
+
+	put()
+	store.deleteErr = errors.New("store delete failed")
+	c.evictKey(context.Background(), key)
+	if !stored() || !indexed() || !c.isStale(key) {
+		t.Fatalf("after a refused evictKey stored=%v indexed=%v stale=%v, want all true", stored(), indexed(), c.isStale(key))
+	}
+
+	c.invalidateResourceScope(context.Background(), InClusterID, info)
+	if !indexed() || !c.isStale(key) {
+		t.Fatalf("after a refused invalidation indexed=%v stale=%v, want both true", indexed(), c.isStale(key))
+	}
+	store.deleteErr = nil
+	c.invalidateResourceScope(context.Background(), InClusterID, info)
+	if stored() || indexed() || c.isStale(key) {
+		t.Fatalf("after a retried invalidation stored=%v indexed=%v stale=%v, want none", stored(), indexed(), c.isStale(key))
+	}
+}
+
+func TestHandlerCacheNoStoreFlightAnswersLeaderAsBypassAndCoalescesSharer(t *testing.T) {
+	const (
+		workers = 2
+		auditID = "upstream-audit-id"
+	)
+	store := &countingGetStore{
+		MemoryCacheStore: NewMemoryCacheStore(DefaultCacheMaxBytes),
+		allSeen:          make(chan struct{}),
+		target:           workers,
+	}
+	release := make(chan struct{})
+	var upstreamCalls atomic.Int32
+	upstream := &fakeUpstream{
+		handler: func(_ string, req *http.Request) (*http.Response, error) {
+			upstreamCalls.Add(1)
+			<-release
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					headerContentType:  []string{contentTypeJSON},
+					headerCacheControl: []string{"no-store"},
+					headerAuditID:      []string{auditID},
+				},
+				Body:    io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","items":[]}`)),
+				Request: req,
+			}, nil
+		},
+	}
+	sink := &auditRecordingSink{}
+	h, _ := newTestHandler(t, Config{
+		Audit:    sink,
+		Upstream: upstream,
+		Cache:    &CacheConfig{Store: store},
+	})
+
+	recorders := make([]*httptest.ResponseRecorder, workers)
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := range workers {
+		go func() {
+			defer wg.Done()
+			recorders[i] = serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+		}()
+	}
+	<-store.allSeen
+	time.Sleep(15 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream.calls = %d, want 1", got)
+	}
+	var bypass, coalesced int
+	for i, rec := range recorders {
+		switch status := rec.Header().Get(headerCacheStatus); status {
+		case cacheStatusBypass:
+			bypass++
+			if got := rec.Header().Get(headerAuditID); got != auditID {
+				t.Errorf("bypass response Audit-Id = %q, want %q", got, auditID)
+			}
+		case cacheStatusCoalesced:
+			coalesced++
+			if got := rec.Header().Get(headerAuditID); got != "" {
+				t.Errorf("coalesced response Audit-Id = %q, want none", got)
+			}
+			if age := rec.Header().Get(headerAge); age != "0" {
+				t.Errorf("coalesced response Age = %q, want 0", age)
+			}
+		default:
+			t.Errorf("worker %d Cache-Status = %q, want bypass or coalesced", i, status)
+		}
+	}
+	if bypass != 1 || coalesced != 1 {
+		t.Fatalf("bypass=%d coalesced=%d, want 1 and 1", bypass, coalesced)
+	}
+	results := map[string]int{}
+	for _, ev := range sink.snapshot() {
+		results[ev.Cache]++
+	}
+	if results[CacheResultBypass] != 1 || results[CacheResultCoalesced] != 1 {
+		t.Fatalf("audit cache results = %v, want one bypass and one coalesced", results)
 	}
 }

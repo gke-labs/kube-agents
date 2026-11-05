@@ -187,6 +187,9 @@ func main() {
 	})
 
 	var upstreamTransport k8sapiproxy.UpstreamTransport
+	// The scoped pool does not route the host's gke_ ID in-cluster, so only the default
+	// transport makes it an alias the cache folds into in-cluster.
+	var inClusterAlias string
 	if scopedPoolEnabled(os.Getenv(scopedPoolFlagEnv)) {
 		poolPath := envOrDefault(scopedPoolFileEnv, defaultScopedPoolFile)
 		members, err := loadScopedSAPool(poolPath)
@@ -206,6 +209,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("failed to initialize upstream transport: %v", err)
 		}
+		inClusterAlias = *hostClusterIDF
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -219,6 +223,7 @@ func main() {
 			MaxEntryBytes:       *cacheMaxEntryBytes,
 			DefaultResourceTTL:  *cacheResourceTTL,
 			DefaultDiscoveryTTL: *cacheDiscoveryTTL,
+			HostClusterID:       inClusterAlias,
 		}
 	}
 
