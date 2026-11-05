@@ -137,14 +137,15 @@ type fakeDelivery struct {
 	acks int
 }
 
-func (f *fakeDelivery) Envelope() *lib.Envelope { return f.env }
-func (f *fakeDelivery) Subject() string         { return f.subj }
-func (f *fakeDelivery) Received() time.Time     { return time.Time{} }
-func (f *fakeDelivery) NumDelivered() uint64    { return 1 }
-func (f *fakeDelivery) Sequence() uint64        { return f.seq }
-func (f *fakeDelivery) Ack() error              { f.acks++; return nil }
-func (f *fakeDelivery) Nak(time.Duration) error { return nil }
-func (f *fakeDelivery) Term() error             { return nil }
+func (f *fakeDelivery) Envelope() *lib.Envelope       { return f.env }
+func (f *fakeDelivery) Subject() string               { return f.subj }
+func (f *fakeDelivery) Received() time.Time           { return time.Time{} }
+func (f *fakeDelivery) NumDelivered() uint64          { return 1 }
+func (f *fakeDelivery) Sequence() uint64              { return f.seq }
+func (f *fakeDelivery) Ack() error                    { f.acks++; return nil }
+func (f *fakeDelivery) AckSync(context.Context) error { f.acks++; return nil }
+func (f *fakeDelivery) Nak(time.Duration) error       { return nil }
+func (f *fakeDelivery) Term() error                   { return nil }
 
 // TestTheRelayRendersADeliveryItAlreadyRenderedOnce: a question a task
 // posts while it runs, redelivered to the next gateway after the first one
