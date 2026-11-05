@@ -79,13 +79,12 @@ variable "kcc_google_service_account" {
 }
 
 # Contents read and write, and pull requests write, on gitops_repo. The name
-# is the marker by which the bench harness will give a stack the narrowed
-# GitOps write token: only a stack that declares this variable gets
+# is the marker for the narrowed GitOps write token: the harness gives these
+# inputs to a stack that declares bench_gitops_write_token_file (#4742):
 # TF_VAR_bench_gitops_write_token_file, with TF_VAR_gitops_repo,
 # TF_VAR_kcc_cluster_name, TF_VAR_kcc_cluster_location and
-# TF_VAR_kcc_google_service_account. That harness behaviour depends on
-# #4742, which is not merged; until it is, nothing sets these variables.
-# Empty uses BENCH_GITHUB_TOKEN from the environment.
+# TF_VAR_kcc_google_service_account. Empty uses BENCH_GITHUB_TOKEN from the
+# environment.
 variable "bench_gitops_write_token_file" {
   type        = string
   description = "File that holds the GitHub write token for gitops_repo"

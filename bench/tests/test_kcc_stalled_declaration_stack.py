@@ -241,10 +241,13 @@ def test_the_note_finish_writes_for_the_plant_carries_the_cases_phrases(tmp_path
     check = deciding["check"]
 
     def passes(row):
+        # As LedgerIssueContainsVerifier matches its phrases: a case-folded
+        # substring of the body, with no other normalisation.
+        text = row.lower()
         return (
-            all(phrase in row for phrase in check["required_phrases"])
-            and any(phrase in row for phrase in check["any_of_phrases"])
-            and not any(phrase in row for phrase in check["forbidden_phrases"])
+            all(phrase.lower() in text for phrase in check["required_phrases"])
+            and any(phrase.lower() in text for phrase in check["any_of_phrases"])
+            and not any(phrase.lower() in text for phrase in check["forbidden_phrases"])
         )
 
     # A manifest fix of the planted file, and the live run's case: the worker

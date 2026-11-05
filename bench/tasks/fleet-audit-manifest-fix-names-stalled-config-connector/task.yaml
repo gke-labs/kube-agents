@@ -61,12 +61,11 @@ infrastructure:
   provider: "gcp"
   stack: "prebuilt/kcc-stalled-declaration"
   teardown: true
-  # Only what this case sets. The harness gives project_id. Because the stack
-  # declares bench_gitops_write_token_file, the harness will also give the
-  # narrowed GitOps write token file, gitops_repo (owner/name),
-  # kcc_cluster_name, kcc_cluster_location and kcc_google_service_account,
-  # once a pool carries a Config Connector cluster. That depends on #4742,
-  # which is not merged. Each value below is repeated in the stack's
+  # Only what this case sets. The harness gives project_id. The harness gives
+  # the narrowed GitOps write token file, gitops_repo (owner/name),
+  # kcc_cluster_name, kcc_cluster_location and kcc_google_service_account to
+  # a stack that declares bench_gitops_write_token_file (#4742), once a pool
+  # carries a Config Connector cluster. Each value below is repeated in the stack's
   # variables.tf and in the checks below; change one and change all.
   variables:
     kcc_namespace: "eval-kcc-stalled"
@@ -92,7 +91,10 @@ verification_spec:
   # degraded manual one included, names the file in the first sentence
   # (audit_report.KCC_STALLED_DECLARED_MARK). The forbidden phrase is the old
   # text that said "this file" about a fix of another file and then named the
-  # declaration, so the case is red where the first sentence is wrong.
+  # declaration. So the case is red on the old text only when the fix is
+  # manual or edits another file, as in the live run whose fix degraded to
+  # manual; for a manifest fix of the planted file the old and new texts
+  # agree, and the case passes on both.
   - name: the-fix-says-config-connector-is-not-applying-its-file
     role: objective
     mode: assert
