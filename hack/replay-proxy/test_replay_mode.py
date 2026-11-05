@@ -130,6 +130,28 @@ class AnswerSlotGuardTest(SlotCacheCase):
         self.assertEqual(hit[3], "answer_slots")
 
 
+class UnreadableEntryTest(SlotCacheCase):
+    """A key that points at a missing or broken saved answer is a refused miss, never a served one."""
+
+    BODY = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_bbbbbbbb"},
+                                       {"role": "assistant", "content": "Yes."},
+                                       {"role": "user", "content": "ticket Latte"}]}
+
+    def test_a_broken_exact_entry(self):
+        self.record(self.BODY, {"role": "assistant", "content": "done"})
+        for path in Path(self.cache_dir, replay_cache.ANSWERS_DIR).iterdir():
+            path.write_text(json.dumps({"answer": "not an answer"}))
+        self.assertEqual(self.proxy().lookup(self.BODY, time.time()),
+                         (None, {"via": "exact", "guard": "unreadable_entry"}))
+
+    def test_a_slot_whose_entry_is_gone(self):
+        self.record(self.BODY, {"role": "assistant", "content": "done"})
+        for path in Path(self.cache_dir, replay_cache.ANSWERS_DIR).iterdir():
+            path.unlink()
+        self.assertEqual(self.proxy().lookup(self.BODY, time.time()),
+                         (None, {"via": "answer_slots", "guard": "unreadable_entry"}))
+
+
 class AnswerSlotActionsTest(SlotCacheCase):
     """A slot blanks an answer's words, never its tool calls."""
 
