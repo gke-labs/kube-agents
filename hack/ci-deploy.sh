@@ -923,6 +923,7 @@ resolve_agent_gemini_api_key() {
   key="${key#"${key%%[![:space:]]*}"}"
   key="${key%"${key##*[![:space:]]}"}"
   AGENT_GEMINI_API_KEY="${key}"
+  echo "Agent key: Secret Manager ${PROJECT_ID}/${EVAL_AGENT_GEMINI_KEY_SECRET} (MODEL_PROVIDER=${MODEL_PROVIDER})"
 }
 # --- agent key: end
 resolve_agent_gemini_api_key
