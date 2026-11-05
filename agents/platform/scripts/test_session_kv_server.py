@@ -11060,6 +11060,44 @@ class TestCardStop(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
 
+class AliveHelperTest(unittest.TestCase):
+    """The test helper `_alive` against a process reaped mid-check (#4828)."""
+
+    def test_a_process_reaped_after_the_signal_check_is_not_alive(self):
+        # os.kill(pid, 0) still succeeds, then the process is reaped before its
+        # stat file is opened: the race CI hit.
+        real_open = open
+
+        def reaped_open(path, *args, **kwargs):
+            if str(path) == "/proc/4242/stat":
+                raise FileNotFoundError(2, "No such file or directory", path)
+            return real_open(path, *args, **kwargs)
+
+        real_isdir, real_exists = os.path.isdir, os.path.exists
+
+        def no_ps(*args, **kwargs):
+            raise AssertionError("with a /proc, a reaped process must not fall through to ps")
+
+        # The stat file still exists when looked for, and is gone when opened.
+        with patch.object(os, "kill", return_value=None), \
+                patch("builtins.open", reaped_open), \
+                patch.object(os.path, "exists", lambda p: True if p == "/proc/4242/stat" else real_exists(p)), \
+                patch.object(os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                patch("subprocess.run", no_ps):
+            self.assertFalse(_alive(4242))
+
+    def test_a_running_process_is_alive_and_an_exited_one_is_not(self):
+        import subprocess
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(_alive(child.pid))
+        finally:
+            child.kill()
+            child.wait(5)
+        self.assertFalse(_alive(child.pid))
+
+
 def _alive(pid):
     """True while `pid` runs; a zombie is not running."""
     import subprocess
@@ -11068,9 +11106,15 @@ def _alive(pid):
         os.kill(pid, 0)
     except OSError:
         return False
-    if os.path.exists(f"/proc/{pid}/stat"):
+    # One open, no exists() first: a process reaped between the two used to
+    # raise FileNotFoundError out of the test (#4828). With a /proc, a missing
+    # entry is a process that's gone; without one (macOS), ask ps.
+    try:
         with open(f"/proc/{pid}/stat") as fh:
             return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (FileNotFoundError, ProcessLookupError):
+        if os.path.isdir("/proc/self"):
+            return False
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return bool(state) and not state.startswith("Z")
 
