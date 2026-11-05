@@ -3447,12 +3447,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// so the agent-side callers that used to `hermes send` a proactive post
 	// route it to the gateway's chat.notify home channel instead. This names
 	// the platform they reroute; the bus identity above is what sends it.
-	// Only with a home channel the route posts to: otherwise every proactive
-	// post would be refused, and on a Chat-and-Slack install the agent would
-	// count Chat as a platform to post to ahead of Slack.
-	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
+	// With a home channel the route posts; without one it refuses and keeps
+	// the post for the digest, so the route is named whenever the backend
+	// is the only platform the posts could reach (a2aGchatHomeRouted). On a
+	// Chat-and-Slack install with no Chat home the agent is not routed, so
+	// it does not count Chat as a platform to post to ahead of Slack.
+	if a2aAgentSurface(agent) && a2aGchatHomeRouted(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
+	} else if a2aAgentSurface(agent) && a2aSlackHomeRouted(agent) {
 		// Slack's half of the same rule: the Hermes slack platform is off
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
 		// the single-backend gateway, so at most one platform is routed. Only
@@ -3465,7 +3467,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// audit relay gates its report card on knowing a channel and records
 		// it on the incident's routing row. The Hermes slack platform is off
 		// here, so this arms nothing on the agent but those readers.
-		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: a2aSlackHomeChannel(agent)})
+		if home := a2aSlackHomeChannel(agent); home != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: home})
+		}
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in, and onboarding's first report into the conversation the user first
@@ -4913,6 +4917,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyProfileIdentitiesEnvVar,
 		credentialProxyTaskSigningKeysEnvVar,
 		credentialProxyTaskCredentialMaxLifetimeEnvVar,
+		// The dispatcher's seed path, which no broker-side container
+		// reads; reserved so a CR can't hand one a seed file of its choosing.
+		a2aTaskSigningSeedFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;

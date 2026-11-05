@@ -2350,6 +2350,26 @@ class TestRepParsing(unittest.TestCase):
         self.assertNotIn("tokens", task["reps"][1], "no count parsed: no key, whatever partial says")
         self.assertNotIn("tokens", task["reps"][2], "no tokens line: the key is absent")
 
+    def test_a_tokens_line_carries_the_prompt_split_when_printed(self):
+        """`cached`, `cache_write` and `reasoning` follow `total` on a record
+        whose `input` excludes cache reads; each is added only when the line
+        carried it as a count, so an old line reads as it always did."""
+        log = (
+            "Task some-case Result: [FAILED] repetition 1: x\n"
+            "  rep 1: fail -- x\n"
+            "  rep 1 tokens: input=10 output=672 total=135281 cached=125204 cache_write=9395 reasoning=0 partial=1\n"
+            "  rep 2: fail -- x\n"
+            "  rep 2 tokens: input=10 output=1 total=11 cached=7 cache_write=-1 reasoning=x\n"
+            "  rep 3: fail -- x\n"
+            "  rep 3 tokens: input=60468 output=79 total=91969\n"
+        )
+        (task,) = collect.parse_build_log(log)["tasks"]
+        self.assertEqual(task["reps"][0]["tokens"], {"input": 10, "output": 672, "total": 135281, "cached": 125204,
+                                                     "cache_write": 9395, "reasoning": 0, "partial": True})
+        self.assertEqual(task["reps"][1]["tokens"], {"input": 10, "output": 1, "total": 11, "cached": 7, "partial": False},
+                         "a split value that is not a count is absent, not null")
+        self.assertEqual(task["reps"][2]["tokens"], {"input": 60468, "output": 79, "total": 91969, "partial": False})
+
     def test_a_digit_run_past_the_int_limit_is_null_not_a_dropped_build(self):
         log = (
             "Task some-case Result: [FAILED] repetition 1: x\n"

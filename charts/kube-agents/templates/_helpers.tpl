@@ -1935,6 +1935,50 @@ and the chart's own replicaCount keys take one too. Only an absent value default
 {{- end }}
 
 {{/*
+The pods the chart may run at once in the release namespace, for the next-mode session quota:
+its standing pods (the operator, LiteLLM, Hindsight's two, the GitHub minter and the web
+console, at their replica counts, as kube-agents.quotaRequirements sums them, less the
+pre-delete cleanup hook, which runs only at uninstall), plus one surge pod for each of those
+that rolls surge-first and runs at least one replica (the same `surges` entries in
+quotaRequirements' list: everything but Hindsight's PostgreSQL StatefulSet). A chart bump
+rolls several of them in one upgrade, since the chart's version label is in their pod
+templates, and each surge pod counts against the quota while it starts.
+platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods,
+and the operator sizes the quota above the session cap from it (#3848): those pods share the
+quota, and only the chart knows which of them it renders. tests/test_quota_preflight.py ties
+it to quotaRequirements' pods and chartSurgePods.
+*/}}
+{{- define "kube-agents.chartQuotaPods" -}}
+{{- $pods := 0 -}}
+{{- $surges := 0 -}}
+{{- if .Values.operator.enabled -}}
+  {{- $n := include "kube-agents.replicaCount" .Values.operator.replicaCount | int64 -}}
+  {{- $pods = add $pods $n -}}
+  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
+{{- end -}}
+{{- if .Values.litellm.enabled -}}
+  {{- $n := include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64 -}}
+  {{- $pods = add $pods $n -}}
+  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
+{{- end -}}
+{{- if include "kube-agents.hindsightEnabled" . -}}
+  {{- /* The API surges; the PostgreSQL StatefulSet does not. */ -}}
+  {{- $pods = add $pods 2 -}}
+  {{- $surges = add $surges 1 -}}
+{{- end -}}
+{{- if .Values.githubMinter.enabled -}}
+  {{- $n := include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64 -}}
+  {{- $pods = add $pods $n -}}
+  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
+{{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- $pods = add $pods 1 -}}
+  {{- $surges = add $surges 1 -}}
+{{- end -}}
+{{- add $pods $surges -}}
+{{- end }}
+
+{{/*
 Preflight validation against namespace ResourceQuotas (#749).
 
 Split into three templates so the parts that need no cluster can be tested without one:
@@ -2424,6 +2468,8 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
        used+required fits the release at rest and then stalls its first rollout, which is the
        failure values.yaml warns about under hindsight.api.rollingUpdate. Rollouts are
        per-workload, so room for one surge Pod at a time is enough. */ -}}
+{{- /* How many chart workloads roll with a surge pod: kube-agents.chartQuotaPods counts one each. */ -}}
+{{- $chartSurgePods := 0 -}}
 {{- $surgeCpuReq := 0 -}}
 {{- $surgeCpuLim := 0 -}}
 {{- $surgeMemReq := 0 -}}
@@ -2475,6 +2521,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- $limEph = add $limEph (mul $res.ephemeralLimit $replicas) -}}
   {{- /* A workload scaled to zero has no pod to surge from, so it sizes no patch. */ -}}
   {{- if and $workload.surges (gt $replicas (int64 0)) -}}
+    {{- $chartSurgePods = add $chartSurgePods 1 -}}
     {{- $surgeCpuReq = max $surgeCpuReq $res.cpuRequest -}}
     {{- $surgeCpuLim = max $surgeCpuLim $res.cpuLimit -}}
     {{- $surgeMemReq = max $surgeMemReq $res.memoryRequest -}}
@@ -2881,6 +2928,7 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       "surgeRequestsCpu" $surgeCpuReq "surgeLimitsCpu" $surgeCpuLim
       "surgeRequestsMemory" $surgeMemReq "surgeLimitsMemory" $surgeMemLim
       "surgeRequestsEphemeral" $surgeEphReq "surgeLimitsEphemeral" $surgeEphLim
+      "chartSurgePods" $chartSurgePods
    | toJson -}}
 {{- end }}
 

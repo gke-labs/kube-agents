@@ -91,7 +91,7 @@ func TestTheChartCountsEveryFlaggedPod(t *testing.T) {
 			for _, v := range off {
 				t.Setenv(w.env, v)
 				if w.enabled() && v == "" {
-					t.Errorf("%s unset: the operator renders it. If it's on by default now, the goldens and footprint.yaml count it: drop it from a2aFlaggedPods and the chart's file, and raise a2aQuotaHeadroom by its replicas, since the headroom is a constant", w.env)
+					t.Errorf("%s unset: the operator renders it. If it's on by default now, the goldens and footprint.yaml count it: drop it from a2aFlaggedPods and the chart's file, and count its builder with a2aStandingPods' unconditional ones", w.env)
 				} else if w.enabled() {
 					t.Errorf("%s=%q: the operator renders it, the chart (%s) doesn't count it", w.env, v, c.EnabledWhen)
 				}

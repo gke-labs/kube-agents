@@ -956,14 +956,16 @@ reads, such as `prevent-deletion`, `enable-litellm-network-policy`, and
 The Terraform composition uses the same route for one annotation the operator
 does not read, `network-policy-enforcement: absent-accepted`, the record of an
 install that chose to proceed onto a cluster enforcing no NetworkPolicy.
-Three of those the chart also stamps from values: `litellm.networkPolicy=false`
+Four of those the chart also stamps from values: `litellm.networkPolicy=false`
 stamps `enable-litellm-network-policy: "false"`, a non-empty
 `telemetry.collectorNamespace` stamps `otlp-collector-namespace`, and
 `litellm.modelProvider=openai_compatible` stamps `litellm-upstream-egress`
 with the egress rule derived from `litellm.openaiCompatible`, as compact JSON:
 `{"namespace":"<ns>","port":<targetPort>}` for an in-cluster Service, or
 `{"cidrs":["<cidr>",...],"port":<port>}` (not stamped for a public port-443
-endpoint, which needs no rule). When the
+endpoint, which needs no rule), and every render stamps
+`a2a-quota-chart-pods` with the chart's pods and their rollout surges (see Quota
+preflight). When the
 chart stamps a key, the value wins because it drives the rest of the release
 too, and an entry in `platformAgent.annotations` that disagrees with it fails
 the render instead of being overwritten. When the chart does not stamp the key
@@ -1200,7 +1202,13 @@ blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string v
 as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
-a `ResourceQuota` of its own.
+a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
+pods with a surge pod for each that rolls with one (which the chart stamps on the
+`PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it)
+and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`,
+so a next-mode one written by hand in the release namespace must carry that annotation
+itself, with the figure `helm template` stamps for the same values; without it the quota
+counts 5 for the chart's pods however many the release runs.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.

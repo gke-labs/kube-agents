@@ -38,16 +38,15 @@ type a2aFlaggedPod struct {
 	build func(*agentv1alpha1.PlatformAgent) *appsv1.Deployment
 }
 
-// a2aFlaggedPods is every such workload. The session quota adds each one's
-// replicas while its flag is on, and the chart's quota preflight counts the
+// a2aFlaggedPods is every such workload. The session quota's standing pods
+// (a2aStandingPods) add each one's replicas while its flag is on, and the chart's quota preflight counts the
 // same list from files/flagged-pods.yaml when operator.extraEnv sets the flag
 // (TestTheChartCountsEveryFlaggedPod holds the two equal, in sizes too).
 //
 // A feature that adds a standing pod behind a flag goes here, and leaves when
-// it's on by default: from then on the goldens render it and footprint.yaml
-// counts it. The session quota's headroom is a hand-set constant
-// (a2aQuotaHeadroom), so the same change raises it by the workload's replicas,
-// or the quota comes out short. Profile work
+// it's on by default: from then on the goldens render it, footprint.yaml
+// counts it, and a2aStandingPods has to count its builder with the
+// unconditional ones (TestA2AStandingPodsMatchTheNextModeGolden). Profile work
 // doesn't: the warm workers and the Job-mode pods run in the profile
 // namespace, under the pod quota the operator derives for it from the warm
 // pools and the profile ceiling, not in this namespace or its quota.
