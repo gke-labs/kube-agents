@@ -276,7 +276,7 @@ In a thread, the Planning Agent posts nothing after carrying your answer to the 
 
 With `KAGE_SLACK_UX` on, the alert for a crash-looping workload reads as one line on Slack, such as "🚨 **payments-api in prod-east keeps crashing.** Looking now."; alerts for other reasons, and alerts on other platforms, read as before. An incident's triage edits its alert in place instead of replying under it. The alert becomes a one-line headline, then a button per proposed option showing its title, with the recommended one highlighted and marked "(recommended)", and a button for each console link on the report's 🔗 line. The report, up to its first horizontal rule, is folded underneath.
 
-A drift alert's triage adds a line under the headline saying what changed, who changed it and when, and marks the recommended button by its highlight alone.
+A drift alert's triage adds a line under the headline saying what changed, who changed it and when, and marks the recommended button by its highlight alone. Its usual buttons are **Put Git's version back** and **Keep it · update Git**, each of which opens a pull request, and its fold is titled **diff**, since the report opens on the changed field's value before and after.
 
 Clicking an option answers as if you had replied in the thread yourself with `apply Option B: <its title>`, or `apply: <its title>` when there is a single fix. The agent replaces the option buttons with a line such as "✓ <your name>: <its title>", your Slack name in plain text (or, if Slack refuses that edit, posts that line in the thread). Your reply passes the same user and channel checks a typed reply does. A click never needs an @-mention.
 
