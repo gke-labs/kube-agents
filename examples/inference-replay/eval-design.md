@@ -144,8 +144,22 @@ The rules that keep this safe:
   differ only in a signature count as the same. Only the `id` of an entry in a message's
   `tool_calls` list is treated this way, whatever its prefix (`call_…` from Gemini, `toolu_…` from
   Claude); any other `id` field, like a card or a cluster, goes through the normal rules.
-- **Answers are rewritten by whole token only, and never for bare numbers.** An unrelated `99`
-  in an answer must not become this run's row id.
+- **Answers are rewritten where the key found the value, and never for bare numbers.** Each kind
+  of identifier is found in an answer by the same pattern that found it in the request, so
+  `--id=t_…` or `~/.hermes/sessions/<session>/` in an answer is swapped wherever the key swapped
+  it. A tool call's JSON arguments are read as the key reads them, parsed first. Anything else the
+  request bound is swapped only where it is a whole token, and an unrelated `99` in an answer
+  never becomes this run's row id.
+- **An answer that would keep an identifier isn't saved.** After the rewrite, if the answer still
+  holds an identifier or IP the request bound, anywhere, it isn't saved, because a replay would act
+  on the recording's card or pod. In the lane trials' 351 answers this refused none.
+- **A timestamp an answer copies is restored; one the model made isn't saved.** The key buckets
+  timestamps (below), but the mapping also numbers each timestamp's exact text. An answer quoting a
+  timestamp the request holds verbatim, usually from a tool's output, keeps a placeholder there and
+  gets this run's timestamp when served, so the next request, which echoes it, buckets the same as
+  in the recording. An answer quoting a timestamp found nowhere in the request isn't saved. In the
+  lane trials' 351 answers, 33 quoted a timestamp and are now restored, and 2 quoted one the
+  request doesn't hold (a date written on its own, and a reformatted time) and are refused.
 - **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
   request but can't safely be put back in an answer: bare numbers like a `pid`, a row `id`,
   `resourceVersion` or `generation`, and epoch timestamps, which become an unnumbered
@@ -731,11 +745,6 @@ request, so the gate stays fair, and we add cases as each one's lane results hol
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We
   need to check the two options and pick one before stage 3.
-- **Answers that quote a full timestamp.** About 1 in 8 saved answers in the replay lane trials
-  quote a timestamp from a tool's output ("As of 2026-11-04T23:37:32Z"). The key treats timestamps
-  as "how long ago", so a replayed answer keeps the recording's time. None of the trials' verdicts
-  changed, but it puts a stale "as of" in reports. Refusing to save those answers would throw away
-  about 1 in 8 saved answers; the better fix is to make timestamps restorable, so a served answer gets this run's time.
 - **Why does the obtainability case reuse so little?** It stayed at 31–45% in both trials while the
   others improved. There is likely another fork or normalizer gap like the ones above.
 - **How big does the cache get, and when do entries expire?** Answers recorded for an old version of

@@ -36,6 +36,7 @@ MESSAGE_HASH_HEX_CHARS = 16
 # recorded answer to that same context fills (answer_slots). A slot keeps the
 # answer's tool calls, by name and arguments, and blanks its words.
 ASSISTANT_ROLE = "assistant"
+ROLE_FIELD = "role"
 # Tools whose arguments a slot blanks too; the name always stays. A tool is here
 # only when its source shows that calling it changes nothing, with any
 # arguments: then a replay that called it differently and got the same result
@@ -148,6 +149,10 @@ DASH_RULE_RE = re.compile(r"^[\s-]+$")
 # Timestamps become how far they are from the request time, unnumbered:
 # whether a certificate expired is what matters, not which second it did.
 TIME_CLASS = "TIME"
+# The literal text of each bucketed timestamp is also bound, numbered by first
+# appearance, but only for answers: the key keeps the bucket. A served answer
+# that quotes a timestamp from the request then gets this run's (Mapping.restore).
+TIME_LITERAL_CLASS = "TIMEVAL"
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
@@ -223,6 +228,15 @@ ID_CLASSES: List[Tuple[str, "re.Pattern[str]", int]] = [
     ("POD", re.compile(r"\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-([" + K8S_SAFE + r"]{6,10}-[" + K8S_SAFE + r"]{5})\b"), 1),
 ]
 
+# The identifier classes, whose values a stored answer must never keep literal
+# (Mapping.identifier_left_literal). An IP is found only where no digit or
+# `.`+digit borders it.
+IDENTIFIER_CLASSES = tuple(cls for cls, _, _ in ID_CLASSES) + (IP_CLASS,)
+IP_LITERAL_BEFORE = r"(?<![\d.])"
+IP_LITERAL_AFTER = r"(?!\d|\.\d)"
+# The timestamp shapes the key buckets, in the order text() applies them.
+TIMESTAMP_PATTERNS = (ISO_TS_RE, RFC1123_RE, OPENSSL_TS_RE, LS_DATE_RE)
+
 # Hermes appends `## Recent work by @<assignee>` (the assignee's last runs on
 # other cards, one `- ` line each, then a blank line) to every card view. It
 # differs between otherwise identical runs, so it is dropped from the key
@@ -255,6 +269,14 @@ NUMBER_AFTER = r"(?!\w|\.\d)"
 DIGIT_RE = re.compile(r"\d")
 # Joins a mapping key's class scope and its value.
 MAPPING_KEY_SEPARATOR = "\0"
+# Classes keyed apart and never swapped into an answer by value: opaque fields,
+# bare numbers, and timestamp literals (swapped by their own patterns).
+UNSWAPPABLE_CLASSES = (OPAQUE_CLASS, NUMBER_CLASS, TIME_LITERAL_CLASS)
+
+
+def token_class(token: str) -> str:
+    """The class a placeholder names: `POD` for `⟦POD_2⟧`."""
+    return token[len(OPEN):-len(CLOSE)].rsplit("_", 1)[0]
 
 
 def stable_hash(value: Any) -> str:
@@ -330,7 +352,7 @@ class Mapping:
     bare_numbers: set = field(default_factory=set)
 
     def placeholder(self, cls: str, value: str) -> str:
-        key = (cls if cls in (OPAQUE_CLASS, NUMBER_CLASS) else "") + MAPPING_KEY_SEPARATOR + value
+        key = (cls if cls in UNSWAPPABLE_CLASSES else "") + MAPPING_KEY_SEPARATOR + value
         if key not in self.to_placeholder:
             number = self.counts.get(cls, 0) + 1
             self.counts[cls] = number
@@ -354,8 +376,38 @@ class Mapping:
             out[value] = token
         return out
 
+    def bound(self, value: str) -> Optional[str]:
+        """The placeholder a swappable value is bound to, if any."""
+        return self.to_placeholder.get(MAPPING_KEY_SEPARATOR + value)
+
+    def bound_time(self, literal: str) -> Optional[str]:
+        """The placeholder a timestamp's literal text is bound to, if any."""
+        return self.to_placeholder.get(TIME_LITERAL_CLASS + MAPPING_KEY_SEPARATOR + literal)
+
     def apply_to_answer(self, text: str) -> str:
-        """Swap bound values in an answer for their placeholders, by whole token only."""
+        """Swap bound values in an answer for their placeholders.
+
+        Each identifier class is found in the answer by the same pattern, with
+        the same boundaries, that bound it in the request (ID_CLASSES, then IPs),
+        so a value the key swapped after `=`, `/` or `_` is swapped there too. A
+        timestamp the request holds verbatim is swapped for its literal's
+        placeholder. Any bound value still left is then swapped where it is a
+        whole token (an age, a value in a shape its pattern does not match).
+
+        A JSON document (a tool call's arguments) is read as the key reads one:
+        parsed, each string swapped, and written back, but only when a swap
+        changed something, so other answers keep their exact text. The key
+        parses it too, so the rewritten layout keys the same.
+        """
+        parsed = Normalizer.nested_json(text)
+        if parsed is not None:
+            swapped = self.apply_to_parsed(parsed)
+            return json.dumps(swapped, ensure_ascii=False) if swapped != parsed else text
+        for cls, pattern, group in ID_CLASSES:
+            text = Normalizer.sub_group(pattern, group, lambda v: self.bound(v) or v, text)
+        text = IPV4_RE.sub(lambda m: self.bound(m.group(0)) or m.group(0), text)
+        for pattern in TIMESTAMP_PATTERNS:
+            text = pattern.sub(lambda m: self.bound_time(m.group(0)) or m.group(0), text)
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
             if value not in text:
                 continue
@@ -382,6 +434,36 @@ class Mapping:
 
         return PLACEHOLDER_RE.sub(sub, text), missing
 
+    def apply_to_parsed(self, value: Any) -> Any:
+        """apply_to_answer on every string of a parsed JSON value; keys stay, as the key leaves them."""
+        if isinstance(value, str):
+            return self.apply_to_answer(value)
+        if isinstance(value, list):
+            return [self.apply_to_parsed(v) for v in value]
+        if isinstance(value, dict):
+            return {k: self.apply_to_parsed(v) for k, v in value.items()}
+        return value
+
+    def identifier_left_literal(self, text: str) -> bool:
+        """Whether a normalized answer still holds, anywhere, an identifier or IP the request bound.
+
+        A backstop for apply_to_answer: such an answer would be served with the
+        recording's value. IPs count only where no digit or `.`+digit borders
+        them, so 10.1.2.3 is not found in 10.1.2.30.
+        """
+        for key, token in self.to_placeholder.items():
+            cls, value = key.split(MAPPING_KEY_SEPARATOR, 1)
+            if cls or token_class(token) not in IDENTIFIER_CLASSES or value not in text:
+                continue
+            if token_class(token) != IP_CLASS or re.search(IP_LITERAL_BEFORE + re.escape(value) + IP_LITERAL_AFTER, text):
+                return True
+        return False
+
+    @staticmethod
+    def has_timestamp(text: str) -> bool:
+        """Whether a normalized answer still holds a timestamp: one the request did not hold verbatim."""
+        return any(pattern.search(text) for pattern in TIMESTAMP_PATTERNS)
+
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""
         for value in self.bare_numbers:
@@ -405,6 +487,8 @@ class Normalizer:
         self.now = now
         self.keep_ips = keep_ips
         self.mapping = Mapping()
+        # The time-literal placeholders walked since the caller last cleared this.
+        self.time_literals: Set[str] = set()
 
     # -- structure ---------------------------------------------------------
 
@@ -532,6 +616,11 @@ class Normalizer:
         text = OPENSSL_TS_RE.sub(self.openssl, text)
         return LS_DATE_RE.sub(self.ls_date, text)
 
+    def timestamp(self, literal: str, when: float) -> str:
+        """A timestamp's key token; its literal text is bound for answers (TIME_LITERAL_CLASS)."""
+        self.time_literals.add(self.mapping.placeholder(TIME_LITERAL_CLASS, literal))
+        return time_bucket(when, self.now)
+
     def iso(self, m: "re.Match[str]") -> str:
         year, month, day, hour, minute, second, zone = m.groups()
         try:
@@ -544,7 +633,7 @@ class Normalizer:
             digits = zone[1:].replace(":", "")
             hours, minutes = digits[:ZONE_HOUR_DIGITS], digits[ZONE_HOUR_DIGITS:]
             offset = sign * (int(hours) * SECONDS_PER_HOUR + int(minutes) * SECONDS_PER_MINUTE)
-        return time_bucket(calendar.timegm(when.timetuple()) - offset, self.now)
+        return self.timestamp(m.group(0), calendar.timegm(when.timetuple()) - offset)
 
     def rfc1123(self, m: "re.Match[str]") -> str:
         try:
@@ -553,7 +642,7 @@ class Normalizer:
             return m.group(0)
         if when.tzinfo is None:
             when = when.replace(tzinfo=timezone.utc)
-        return time_bucket(when.timestamp(), self.now)
+        return self.timestamp(m.group(0), when.timestamp())
 
     def openssl(self, m: "re.Match[str]") -> str:
         month, day, hour, minute, second, year = m.groups()
@@ -561,7 +650,7 @@ class Normalizer:
             when = datetime(int(year), MONTHS.index(month) + 1, int(day), int(hour), int(minute), int(second))
         except ValueError:
             return m.group(0)
-        return time_bucket(calendar.timegm(when.timetuple()), self.now)
+        return self.timestamp(m.group(0), calendar.timegm(when.timetuple()))
 
     def ls_date(self, m: "re.Match[str]") -> str:
         month, day, hour, minute, year = m.groups()
@@ -581,7 +670,7 @@ class Normalizer:
                     )
         except ValueError:
             return m.group(0)
-        return time_bucket(when, self.now)
+        return self.timestamp(m.group(0), when)
 
     def age_columns(self, text: str) -> str:
         """Replace ages in a table's AGE / LAST SEEN / Age column, by column position."""
@@ -634,6 +723,7 @@ class NormalizedRequest:
     now: float = 0.0
     keep_ips: bool = False
     history_mapping: Mapping = field(default_factory=Mapping)
+    time_outside_answers: Set[str] = field(default_factory=set)
 
     @property
     def message_hashes(self) -> List[str]:
@@ -663,13 +753,22 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     keep_ips = CIDR_RE.search(json.dumps(kept, ensure_ascii=False)) is not None
     normalizer = Normalizer(now, keep_ips)
     raw_messages = kept.pop(MESSAGES_FIELD, None)
-    messages = [normalizer.walk(m) for m in raw_messages] if isinstance(raw_messages, list) else []
+    messages = []
+    # Timestamp literals outside assistant messages: bucketed in the key, so
+    # placeholders_outside_answers cannot read them off the normalized text.
+    time_outside_answers: Set[str] = set()
+    for message in raw_messages if isinstance(raw_messages, list) else []:
+        normalizer.time_literals = set()
+        messages.append(normalizer.walk(message))
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE):
+            time_outside_answers |= normalizer.time_literals
     history_mapping = normalizer.mapping.copy()
     settings = {k: normalizer.walk(kept[k], k) for k in sorted(kept)}
     if raw_messages is not None and not isinstance(raw_messages, list):
         settings[MESSAGES_FIELD] = normalizer.walk(raw_messages)
     return NormalizedRequest(messages=messages, settings=settings, mapping=normalizer.mapping,
-                             now=now, keep_ips=keep_ips, history_mapping=history_mapping)
+                             now=now, keep_ips=keep_ips, history_mapping=history_mapping,
+                             time_outside_answers=time_outside_answers)
 
 
 @dataclass(frozen=True)
@@ -796,7 +895,7 @@ def placeholders_outside_answers(normalized: NormalizedRequest) -> Set[str]:
     these binds it: a value only an assistant message named can carry a
     different number when the answers differ.
     """
-    found: Set[str] = set()
+    found: Set[str] = set(normalized.time_outside_answers)
     for message, role in zip(normalized.messages, normalized.roles()):
         if role != ASSISTANT_ROLE:
             found.update(PLACEHOLDER_RE.findall(json.dumps(message, ensure_ascii=False)))

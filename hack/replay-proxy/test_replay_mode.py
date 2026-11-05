@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 # A fixed clock for the tests that move it: 2027-01-15T08:00:00Z.
 CLOCK = 1_800_000_000
 MINUTE = 60
+DAY = 86400
 COMPLETIONS = "/v1/chat/completions"
 SUBPROCESS_TIMEOUT_SECONDS = 30
 
@@ -64,40 +65,45 @@ class GuardTest(unittest.TestCase):
         self.assertEqual((config.mode, config.cache_dir), ("shadow", "/c"))
 
 
-class SlotCacheCase(unittest.TestCase):
-    """A replay proxy over a cache the test fills as record mode would."""
+class AnalyzeCase(unittest.TestCase):
+    """Record and replay proxies over one cache, driven through ShadowProxy.analyze and lookup."""
 
     def setUp(self):
         self.cache_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.cache_dir, ignore_errors=True)
 
-    def proxy(self):
-        config = replay_proxy.Config(mode="replay", allow_serve=True, cache_dir=self.cache_dir,
-                                     litellm_config_checksum="abc", litellm_image="img")
+    def proxy(self, mode="replay", build="r"):
+        config = replay_proxy.Config(mode=mode, allow_serve=mode == "replay", cache_dir=self.cache_dir,
+                                     store_dir=os.path.join(self.cache_dir, "store-" + build),
+                                     redactor_path=REDACTOR, transcript_rules_path=RULES,
+                                     litellm_config_checksum="abc", litellm_image="img", job_build=build)
         proxy = replay_proxy.ShadowProxy(config, out=io.StringIO())
         self.addCleanup(proxy.close)
         return proxy
 
-    def record(self, body, answer, others=()):
-        """Save `answer` for `body` as record mode would.
+    @staticmethod
+    def upstream(answer):
+        return {"status": 200, "latency_ms": 1, "client_disconnected": False, "upstream_incomplete": False,
+                "observe_failed": False, "observe_too_large": False, "usage": {"prompt_tokens": 10},
+                "headers": {"x-litellm-model-group": "m", "x-litellm-attempted-fallbacks": "0"},
+                "message": answer, "finish_reason": "stop"}
 
-        Each assistant message in `body` and in `others` is noted as the answer a
-        recording got to the messages before it, as record mode notes the answer
-        to each request it records.
-        """
-        context = normalizer.KeyContext("abc", "img")
-        cache = replay_cache.AnswerCache(self.cache_dir)
-        normalized = normalizer.normalize_request(body, time.time())
-        fingerprint = normalizer.fingerprint(normalized, context)
-        cache.save(fingerprint, {"fingerprint": fingerprint, "answer": replay_cache.normalize_answer(answer, normalized.mapping)})
-        slot_key, slots = normalizer.answer_slots(normalized, context)
-        cache.save_slot(slot_key, fingerprint)
+    def recorded(self, body, answer, at=None, build="x"):
+        """Record mode's log line for `body` answered with `answer`."""
+        return self.proxy("record", build).analyze(body, time.time() if at is None else at, self.upstream(answer))
+
+
+class SlotCacheCase(AnalyzeCase):
+    """A replay proxy over a cache filled by record mode."""
+
+    def record(self, body, answer, others=()):
+        """Record `answer` to `body`, and each assistant message in `body` and `others` as the answer to what preceded it."""
         for other in (body, *others):
             for index, message in enumerate(other["messages"]):
                 if message["role"] == "assistant":
                     asked = dict(other, messages=other["messages"][:index])
-                    cache.add_variant(*normalizer.answer_variant(
-                        normalizer.normalize_request(asked, time.time()), message, context))
+                    self.assertEqual(self.recorded(asked, message)["unstorable"], [], message)
+        self.assertEqual(self.recorded(body, answer)["unstorable"], [])
 
 
 class AnswerSlotGuardTest(SlotCacheCase):
@@ -217,7 +223,7 @@ class AnswerSlotActionsTest(SlotCacheCase):
         self.assertEqual((hit[0]["content"], hit[3]), ("Noted on ticket t_bbbbbbbb.", "answer_slots"))
 
 
-class VariantContextTest(unittest.TestCase):
+class VariantContextTest(AnalyzeCase):
     """A recorded answer still fills its slot when the later request normalizes what came before it differently.
 
     Record mode notes an answer when it records the request the answer
@@ -225,26 +231,6 @@ class VariantContextTest(unittest.TestCase):
     (how old a timestamp is, whether any CIDR keeps IPs literal, how settings
     placeholders are numbered) can differ between the two.
     """
-
-    def setUp(self):
-        self.cache_dir = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, self.cache_dir, ignore_errors=True)
-
-    def proxy(self, mode, build):
-        config = replay_proxy.Config(mode=mode, allow_serve=mode == "replay", cache_dir=self.cache_dir,
-                                     store_dir=os.path.join(self.cache_dir, "store-" + build),
-                                     redactor_path=REDACTOR, transcript_rules_path=RULES,
-                                     litellm_config_checksum="abc", litellm_image="img", job_build=build)
-        proxy = replay_proxy.ShadowProxy(config, out=io.StringIO())
-        self.addCleanup(proxy.close)
-        return proxy
-
-    @staticmethod
-    def upstream(answer):
-        return {"status": 200, "latency_ms": 1, "client_disconnected": False, "upstream_incomplete": False,
-                "observe_failed": False, "observe_too_large": False, "usage": {"prompt_tokens": 10},
-                "headers": {"x-litellm-model-group": "m", "x-litellm-attempted-fallbacks": "0"},
-                "message": answer, "finish_reason": "tool_calls"}
 
     @staticmethod
     def act(said, call_id):
@@ -290,6 +276,93 @@ class VariantContextTest(unittest.TestCase):
                                                                 "description": "runs on web-7d4b9c8f6d-x2k9p"}}]}
         opening = [{"role": "user", "content": "list the files"}]
         self.assert_served(self.fork(opening, "api-5f6c7d8b9c-m8n7q.log", settings=settings))
+
+
+class BoundValueTest(AnalyzeCase):
+    """An identifier the key swapped is swapped in the stored answer too, wherever the key found it."""
+
+    CASES = (
+        # (what the request shows, recorded value, replayed value, the answer naming it)
+        ("work kanban task {}", "t_abcdef12", "t_99999999", "hermes kanban comment --id={} done"),
+        ("session {} started", "20261102_002640_791a68", "20261103_101010_abcdef", "ls ~/.hermes/sessions/{}/"),
+        ("message {} arrived", "inj-4821", "inj-77", "cat /tmp/{}/body"),
+        ("work kanban task {}", "t_abcdef12", "t_99999999", "label+{} added"),
+        ("pod {} is pending", "web-7d4b9c8f6d-x2k9p", "web-5f6c7d8b9c-m8n7q", "kubectl logs pod/{}"),
+    )
+
+    @staticmethod
+    def body(shown):
+        return {"model": "m", "messages": [{"role": "user", "content": shown}]}
+
+    def test_the_answer_is_served_with_this_runs_value(self):
+        for shown, recorded, replayed, said in self.CASES:
+            with self.subTest(said=said):
+                self.setUp()
+                line = self.recorded(self.body(shown.format(recorded)), {"role": "assistant", "content": said.format(recorded)})
+                self.assertEqual(line["unstorable"], [])
+                hit, _ = self.proxy().lookup(self.body(shown.format(replayed)), time.time())
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit[0]["content"], said.format(replayed))
+
+    def test_an_identifier_after_a_json_escape_in_tool_arguments(self):
+        # Escaped, a tab before the uid is `\\t`, and no pattern finds the uid after
+        # its `t`; parsed, as the key reads the arguments, it is found.
+        def answer(uid):
+            return {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {
+                "name": "kanban_comment", "arguments": json.dumps({"body": f"pending\t{uid}"})}}]}
+
+        old, new = "c7fa9f5e-12ba-46a4-9fbb-16d1991ecff5", "6f79db96-15b3-4308-83df-7c4f203b6015"
+        self.assertEqual(self.recorded(self.body(f"pod uid {old}"), answer(old))["unstorable"], [])
+        hit, _ = self.proxy().lookup(self.body(f"pod uid {new}"), time.time())
+        self.assertEqual(json.loads(hit[0]["tool_calls"][0]["function"]["arguments"]), {"body": f"pending\t{new}"})
+
+    def test_an_answer_that_keeps_a_bound_identifier_literal_is_not_stored(self):
+        # `_` borders the id on both sides, so no pattern finds it there; the key
+        # swapped it in the request, so a stored answer would carry the recording's.
+        line = self.recorded(self.body("work kanban task t_abcdef12"),
+                             {"role": "assistant", "content": "archive card_t_abcdef12_old"})
+        self.assertEqual(line["unstorable"], ["bound_value_left_literal"])
+
+    def test_an_ip_is_not_found_inside_a_longer_one(self):
+        line = self.recorded(self.body("node 10.1.2.3 is cordoned"),
+                             {"role": "assistant", "content": "10.1.2.30 is the gateway"})
+        self.assertEqual(line["unstorable"], [])
+
+
+class TimestampTest(AnalyzeCase):
+    """A timestamp an answer copied from the request is restored to this run's; one the model made is never stored."""
+
+    @staticmethod
+    def stamp(when):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+
+    def card(self, at):
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "work kanban task t_bbbbbbbb"},
+            {"role": "tool", "tool_call_id": "call_1", "content": f"card created {self.stamp(at - 30 * MINUTE)}"}]}
+
+    def said(self, at):
+        return {"role": "assistant", "content": f"As of {self.stamp(at - 30 * MINUTE)} the card is open."}
+
+    def test_a_copied_timestamp_is_restored_a_day_later_and_the_next_request_still_matches(self):
+        self.assertEqual(self.recorded(self.card(CLOCK), self.said(CLOCK), at=CLOCK)["unstorable"], [])
+        went_on = self.card(CLOCK)
+        went_on["messages"] += [self.said(CLOCK), {"role": "user", "content": "thanks"}]
+        self.recorded(went_on, {"role": "assistant", "content": "Done."}, at=CLOCK + MINUTE)
+
+        replay = self.proxy()
+        later = CLOCK + DAY
+        hit, _ = replay.lookup(self.card(later), later)
+        self.assertEqual(hit[0]["content"], self.said(later)["content"], "this run's time, not the recording's")
+        echoed = self.card(later)
+        echoed["messages"] += [hit[0], {"role": "user", "content": "thanks"}]
+        hit, refused = replay.lookup(echoed, later + MINUTE)
+        self.assertIsNone(refused)
+        self.assertEqual((hit[0]["content"], hit[3]), ("Done.", "exact"))
+
+    def test_a_timestamp_the_model_made_is_not_stored(self):
+        made = {"role": "assistant", "content": f"Checked at {self.stamp(CLOCK + 5)}."}
+        self.assertEqual(self.recorded(self.card(CLOCK), made, at=CLOCK)["unstorable"], ["unbound_timestamp"])
 
 
 class LostAnalysisLinesTest(unittest.TestCase):

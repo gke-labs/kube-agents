@@ -71,6 +71,12 @@ UNSTORABLE_NO_MODEL_GROUP = "no_model_group_header"
 UNSTORABLE_OTHER_MODEL_GROUP = "answered_by_other_model_group"
 UNSTORABLE_FALLBACK = "fallback_attempted"
 UNSTORABLE_REPEATS_NUMBER = "repeats_swapped_number"
+# Normalized, the answer still names an identifier or IP the request bound, so
+# it would be served with the recording's value.
+UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
+# The answer quotes a timestamp the request does not hold verbatim (one the
+# model made), which no placeholder can bring up to date.
+UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"
 UNSTORABLE_SCRUB_MASKS_CREDENTIAL = "scrub_masks_credential"
 UNSTORABLE_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
 UNSTORABLE_SCRUB_FAILED = "scrub_failed"

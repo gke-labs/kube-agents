@@ -86,6 +86,13 @@ def normalize_answer(message: Dict[str, Any], mapping: normalizer.Mapping) -> Di
     return _walk(message, mapping.apply_to_answer)
 
 
+def answer_texts(message: Dict[str, Any]) -> List[str]:
+    """Every string of an answer the normalizer reads: opaque fields (ids, signatures) left out."""
+    found: List[str] = []
+    _walk(message, lambda text: found.append(text) or text)
+    return found
+
+
 def restore_answer(saved: Dict[str, Any], mapping: normalizer.Mapping) -> Tuple[Dict[str, Any], List[str]]:
     """The saved answer with the current request's values; and the placeholders it does not bind."""
     missing: List[str] = []

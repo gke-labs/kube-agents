@@ -417,6 +417,11 @@ def unstorable_reasons(
     texts = [str(view["content"] or "")] + [str(c["arguments"] or "") for c in view["tool_calls"]]
     if any(mapping.answer_repeats_bare_number(t) for t in texts):
         reasons.append(F.UNSTORABLE_REPEATS_NUMBER)
+    normalized = replay_cache.answer_texts(replay_cache.normalize_answer(message, mapping))
+    if any(mapping.identifier_left_literal(t) for t in normalized):
+        reasons.append(F.UNSTORABLE_BOUND_VALUE_LEFT_LITERAL)
+    if any(mapping.has_timestamp(t) for t in normalized):
+        reasons.append(F.UNSTORABLE_UNBOUND_TIMESTAMP)
     if not scrubber.available:
         reasons.append(F.UNSTORABLE_SCRUBBERS_UNAVAILABLE)
         return reasons
