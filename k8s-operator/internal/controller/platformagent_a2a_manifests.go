@@ -125,6 +125,19 @@ const (
 	// lib.SubmitSubjectPrefix). Its consumers are the operator's alone.
 	a2aProfileSubmitStream = "PROFILE_SUBMITS"
 	a2aProfileSubmitPrefix = "a2a.submit."
+	// a2aProfileSubmitMaxAge is PROFILE_SUBMITS' max age. The dispatch
+	// config carries it too (SubmitRetentionSeconds), so the dispatcher
+	// keeps finished tasks' tombstones at least as long as a re-created
+	// durable could replay them.
+	a2aProfileSubmitMaxAge = 72 * time.Hour
+
+	// a2aDispatchStopStream holds the gateway's stop records, one per task
+	// on a2aDispatchStopPrefix<profile>.<task> (contract addendum 9; lib's
+	// names for them arrive with the gateway's stop, #4127). The gateway is its only
+	// writer, once its grant lands with #4127 (until then nothing writes it),
+	// and the dispatcher its only reader.
+	a2aDispatchStopStream = "DISPATCH_STOPS"
+	a2aDispatchStopPrefix = "a2a.stop."
 
 	// a2aNATSConfGrantLine renders one allow-list entry at the depth
 	// renderA2APermission puts them: the subject-list indent, two more for
@@ -1665,7 +1678,7 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
-	"KV_PROFILE_LEASES", "PROFILE_SUBMITS",
+	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -2991,7 +3004,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the five streams, six KV
+// a2aProvisionScript is the provisioning payload: the six streams, six KV
 // buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
@@ -3326,9 +3339,21 @@ $NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --hi
 # profiles; nothing else makes a consumer here.
 $NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SUBMITS --allow-direct \
   --subjects='a2a.submit.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=1073741824 --discard=old --replicas=1 \
+  --max-age=` + strconv.Itoa(int(a2aProfileSubmitMaxAge.Hours())) + `h --max-bytes=1073741824 --discard=old --replicas=1 \
   --max-msgs-per-subject=1 --dupe-window=2m \
   --max-consumers=` + strconv.Itoa(a2aProfileDurablesAllowed) + ` --defaults
+
+# DISPATCH_STOPS: the gateway's stop records for AgentProfile tasks, one per
+# task (a2a.stop.<profile>.<task>), read by the dispatcher by subject (contract
+# addendum 9). It is outside a2a.dispatch. on purpose: the dispatcher publishes
+# there, and a stop must have one writer, the gateway (granted with #4127). A
+# record outlives any task (24h against the 6h deadline cap). Nothing makes a
+# consumer here; --max-consumers=1 is the tightest cap JetStream has, since 0
+# means unlimited.
+$NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream add DISPATCH_STOPS --allow-direct \
+  --subjects='a2a.stop.>' --storage=file --retention=limits \
+  --max-age=24h --max-bytes=67108864 --discard=old --replicas=1 \
+  --max-msgs-per-subject=1 --max-consumers=1 --defaults
 
 # TASKS older than this render: the limits the create above could not apply.
 #
