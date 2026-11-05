@@ -1322,6 +1322,10 @@ read is final.
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
+`storm` the `incident` also carries `causes`, the repetitions' own words for
+how they died with counts (`[[words, n], …]`, every phrasing, commonest first,
+scrubbed and cut as the periodics' quoted log line is), which the Chat
+sentence names short. For
 `lost_pods` the `incident` also carries `nodes` (`{node name: runs lost on
 it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and

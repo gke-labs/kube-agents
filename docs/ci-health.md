@@ -184,7 +184,11 @@ below a storm because a 429-starved worker hits the same wait; the storm
 also needs the pool's peak hourly Vertex 429 share to clear 10 % over the hours
 those runs spent on their calls, when the 429 reading below covers them; a
 reading that does not, and no reading, leaves the runs to decide and the
-evidence says the storm is unconfirmed), or setup
+evidence says the storm is unconfirmed; the evidence line and the Chat
+sentence also quote the repetitions' own words for how they died, as the
+harness wrote them and after the same scrub as the periodics' quoted log line,
+commonest first, so a batch that said `hermes-rate-limited` reads as that and
+not as the bot's guess), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded
