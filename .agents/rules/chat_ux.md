@@ -5,12 +5,18 @@ paths:
   - "agents/chat/defaults/**"
   - "agents/platform/scripts/slack_*.py"
   - "agents/platform/scripts/chat_*.py"
+  - "agents/platform/scripts/*_presenter.py"
   - "a2a/gateway/slack_*.go"
   - "a2a/gateway/gchat*.go"
+  - "a2a/gateway/*chat*.go"
   - "a2a/gateway/relay*.go"
+  - "a2a/gateway/busy.go"
+  - "a2a/gateway/stopgate.go"
   - "a2a/hermes-bridge/chat*.go"
   - "a2a/lib/chatmsg/**"
   - "deploy/docker/patches/kanban_notifier.py"
+  - "deploy/docker/patches/kanban_progress_lines.py"
+  - "deploy/docker/patches/kanban_chat_notify.py"
   - "deploy/docker/patches/slack_*.py"
 trigger: model_decision
 description: "Chat UX rules for anything a user reads in Slack or Google Chat: answer first, named acks, one live status line, no plumbing, buttons for choices, one-line failures, speaking up only when it matters, confirmed destructive actions, and renderers that never compose."
@@ -37,9 +43,9 @@ the reader dig for the verdict.
 Today: the agents are told so in [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1 ("Keep your
 replies short", "Write replies as warm, full sentences that lead with the fact") and in
 [`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 ("Short by default") and §7. The
-layout is `split_answer` in `agents/platform/scripts/slack_presenter.py` and its port `answerChat`
-in `a2a/hermes-bridge/chat.go`: the first sentence becomes `headline`, capped at 150 characters
-and rendered bold, and a rest too long for `detail` goes under `fold`.
+layout is `answer_message` in `agents/platform/scripts/chat_message.py` and its port `answerChat`
+in `a2a/hermes-bridge/chat.go`: the first sentence becomes `headline`, cut at a clause to stay
+within 150 characters and rendered bold, and a rest too long for `detail` goes under `fold`.
 
 ## The acknowledgement names its target
 
@@ -66,13 +72,14 @@ Today: under `next`, the `progress` artifact is "the task's one live message, ed
 the placeholder rather than following it. Under `today`, a card's heartbeats share one message
 ([`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0, "Show your progress"), the plan is
 one message per thread (`agents/platform/scripts/slack_status.py`), and `kanban_notifier.py`'s
-`drop_superseded` removes a failure line once the card recovers.
+`drop_superseded` drops a held failure line, before it posts, once the card recovers.
 
 ## No plumbing in user text
 
 User-facing text carries no task id, card id, session key, file path, tool name, JSON, CLI flag,
-exit code or internal agent name. An identifier the user can act on — a cluster, a workload, a pull
-request as a link — is content, not plumbing.
+exit code, or roster id used as a name (`cluster-foo` where "the foo cluster agent" is meant). An
+identifier the user can act on — a cluster, a workload, a pull request as a link — is content, not
+plumbing, and so is a specialist's name where `SOUL.md` asks for attribution.
 
 Why: plumbing is noise to the person who asked, and an internal name tells them nothing they can
 use.
@@ -112,8 +119,9 @@ gateway's own failure lines follow the same shape: `slackStopCouldntReply` in
 
 ## Speak up only when it matters
 
-A message of its own, one that notifies, is for one of three things: a pull request opened, a
-question only the user can answer, or done. Everything else updates the live line or stays silent.
+Beyond the acknowledgement, a message of its own, one that notifies, is for a pull request opened,
+a question only the user can answer, a failure, or done. Everything else updates the live line or
+stays silent.
 
 Why: every extra post notifies, and noise trains the user to ignore the thread.
 
@@ -127,23 +135,23 @@ the head line above a report and hold a failure line the wake will explain.
 ## A destructive action needs the asker's confirm
 
 Before anything destructive — delete, drain, downscale, roll back — the target is stated back and
-the person who asked confirms it explicitly. Nobody else's click or yes counts, and a control that
-halts the asker's work is theirs to press.
+the person who asked confirms it explicitly. Nobody else's click or yes counts.
 
 Why: in a shared channel, a misread possessive or a bystander's tap otherwise reaches the wrong
 cluster.
 
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 ("state the resolved target back to
-them and wait for a yes") and §3's `/feedback` confirmation, which shows the exact submission and waits for a yes;
-`mayStop` in `a2a/gateway/stopgate.go`, which lets only a requester of the thread press Slack's
-Stop.
+them and wait for a yes") and §3's `/feedback` confirmation, which shows the exact submission and waits for a yes. In the
+gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press Slack's
+Stop button; a typed `stop`, and Stop on other backends, are not gated.
 
 ## Renderers never compose
 
 Every word in a structured message comes from the message. A renderer lays out, escapes and
-validates; it never invents a field, reads the text to fill one, or rewords. The only things it adds
-are its backend's own: step markers, a side bar's colour, a reaction's emoji, the labels on the
-board row buttons. An invalid message posts its text fallback whole rather than a clipped or
+validates; it never invents a field, reads the text to fill one, or rewords. What it adds is its
+backend's own, such as step markers, a side bar's colour, which emoji a mark shows, the "✓ name:
+choice" receipt of an answered question and the labels on the board row buttons; the spec's "The
+emitter composes, the renderer lays out" paragraph is the full list. An invalid message posts its text fallback whole rather than a clipped or
 repaired layout.
 
 Why: the emitter is the one place a word is decided, so a renderer that composes makes Slack and
