@@ -26,8 +26,9 @@ request starts, the same refusal in the credential proxy, and metrics.
 
 **Status:** design of record, written 2026-11-04 with the first change, which is built: the
 container sampler, the pressure guard that fails closed, the headroom cap on a tick's spawns, the
-resident cap per worker, the refusal by queue age, the `capacity` block kind and the four
-`spec.harness.tuning.admission` fields. Not built: the rest of Stage 1 (the front door's reply for
+resident cap per worker, the refusal by queue age, the `capacity` block kind, the four
+`spec.harness.tuning.admission` fields, and the operator's default memory request for the agent
+container raised from 2 GiB to 4 GiB. Not built: the rest of Stage 1 (the front door's reply for
 `capacity`, the cost estimate, hysteresis) and Stage 2. The first change edits no SOUL, prompt or
 SOP. The tracker entries, the measurements and the sibling changes are listed under References.
 
@@ -43,8 +44,9 @@ SOP. The tracker entries, the measurements and the sibling changes are listed un
 
 ## Non-goals
 
-- Sizing the container. The raise of the memory request from 2 GiB to 4 GiB is a separate change;
-  this design takes the resolved request as given and derives its budget from it.
+- Sizing the container beyond its request. The design takes the resolved request as given and
+  derives its budget from it; the one sizing change it carries is the operator's default request,
+  2 GiB to 4 GiB, because the presubmit install showed the two cannot be separated (below).
 - A change to what an agent says or decides. The first change edits no SOUL, prompt or SOP. The
   front door answers a `capacity` block with the rule it already has for a blocked card; the reply
   written for `capacity` is the next change in Stage 1.
@@ -100,19 +102,19 @@ Non-functional:
 
 Where each lands:
 
-| Stage                  | Requirements                                                                                 | Shape                                                    |
-| ---------------------- | -------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| Stage 0                | R9, the restart alert, the request raise                                                     | no new machinery; separate changes                       |
-| Stage 1, first change  | R1, R2, R4, R8, N1; the one-tick hold of N3; the `capacity` kind and the reason R6 relies on | the dispatcher patch, the operator fields, this document |
-| Stage 1, later changes | R3, the front door's reply of R6, hysteresis (N3), the cases of N4                           | a SOUL rule, the estimate, eval cases                    |
-| Stage 2                | R5, R7, N2, the soak                                                                         | class budgets, the proxy's refusal, metrics              |
+| Stage                  | Requirements                                                                                                    | Shape                                                                        |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Stage 0                | R9, the restart alert                                                                                           | no new machinery; separate changes                                           |
+| Stage 1, first change  | R1, R2, R4, R8, N1; the one-tick hold of N3; the `capacity` kind and the reason R6 relies on; the request raise | the dispatcher patch, the operator fields and default request, this document |
+| Stage 1, later changes | R3, the front door's reply of R6, hysteresis (N3), the cases of N4                                              | a SOUL rule, the estimate, eval cases                                        |
+| Stage 2                | R5, R7, N2, the soak                                                                                            | class budgets, the proxy's refusal, metrics                                  |
 
 ## The state before the first change
 
 ### The container's counters under GKE Sandbox
 
 The gateway pod's `platform-agent` container runs under GKE Sandbox (gVisor) on Autopilot, with the
-operator's default resources: a 2 GiB memory request and an 8 GiB limit (`resolveResources` in
+operator's default resources as they were: a 2 GiB memory request and an 8 GiB limit (`resolveResources` in
 [`manifest_helpers.go`](../../k8s-operator/internal/controller/manifest_helpers.go)). Read inside
 the container on the development install on 2026-11-04:
 
@@ -210,11 +212,11 @@ kubelet acts.
 The sampler hands `classify_pressure` two numbers: `total = memory_budget_mib` and
 `available = memory_budget_mib - usage`. The classifier and its thresholds stay as upstream ships
 them, so the dispatcher, the dashboard's memory banner and the lifecycle ledger's OOM heuristics
-keep one vocabulary. At the default budget, the container's 2,048 MiB request, the tick is
-`elevated` above 1,741 MiB used and `critical` above 1,946 MiB. At a 4,096 MiB request, 3,482 and
-3,891 MiB. `elevated` permits one worker; whether one is admitted is the headroom cap's decision
-below: at 2 GiB the 307 MiB left is under one reserve, so none, and at 4 GiB the 614 MiB left is
-one. The classifier's 15% band is the reserve the guard keeps under the request. One setting
+keep one vocabulary. At the default budget, the container's 4,096 MiB request, the tick is
+`elevated` above 3,482 MiB used and `critical` above 3,891 MiB; at a 2,048 MiB request, the
+default before this change, 1,741 and 1,946 MiB. `elevated` permits one worker; whether one is
+admitted is the headroom cap's decision below: at 4 GiB the 614 MiB left is one, and at 2 GiB the
+307 MiB left is under one reserve, so none. The classifier's 15% band is the reserve the guard keeps under the request. One setting
 carries it; there is no second constant for the reserve, and the reserve moves with the request.
 
 The sample is taken once per tick, 5 s on the gateway's profile (`kanban.dispatch_interval_seconds`), and the tick's spawns are then bounded by the budget's headroom at one worker per 512 MiB (`cap_spawn_budget`, the reserve upstream's memory-derived default cap divides by). An `ok` reading therefore cannot let one tick spawn the whole slot budget past the budget, and a decision holds for a tick by construction: the one-tick half of N3.
@@ -366,12 +368,12 @@ spec:
 
 ## Settings and defaults
 
-| Key under `kanban.admission` | CR field            | Default                                                           | Bounds        | Why this value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ---------------------------- | ------------------- | ----------------------------------------------------------------- | ------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `memory_budget_mib`          | `memoryBudgetMiB`   | the agent container's resolved memory request in MiB; 2,048 today | 512 to 65,536 | on Autopilot the request is where the eviction fires, and a budget at the limit admits 8 GiB of work into a pod evicted at 2; following the resolved request means a raise of it, through `spec.deployment.resources` or a new operator default, moves the budget with it; the floor is the least value the schema and the operator admit, and a derived budget under it (a request the operator cannot read as one) is clamped to it and logged: at the floor the dispatcher still admits nothing, because every measured container idles above 512 MiB, and refuses every card after the bound, which is what the clamp buys over a silent fall-back to the meminfo guard, a refusal that names its figures; the ceiling is above any node the install runs on |
-| `worker_rss_cap_mib`         | `workerRssCapMiB`   | 1,536                                                             | 256 to 65,536 | an idle worker is about 430 MiB and a long poll loop grows past 1 GiB; 1.5 GiB leaves a fleet-sized card room and stops a runaway before it alone carries the pod from its 1.8 GiB idle set past a 4 GiB request; under a 2 GiB request the pressure guard acts first; the floor is below an idle worker on purpose, for a test install, and a value under 430 stops every worker as its proxies start                                                                                                                                                                                                                                                                                                                                                           |
-| `queue_bound_seconds`        | `queueBoundSeconds` | 120                                                               | 10 to 3,600   | two minutes is 24 ticks at the 5 s dispatch interval, and a card still queued then is past the one-minute answer the success criteria set for a simple question, so a strategy change serves the user better; the floor is two ticks, so no card is refused before the dispatcher has tried twice; the ceiling is an hour, past which a refusal tells the user nothing                                                                                                                                                                                                                                                                                                                                                                                           |
-| `fail_closed`                | `failClosed`        | `true`                                                            |               | a dispatcher that cannot read memory and spawns anyway is the one that evicted the pod; the chain of sources ends at `/proc/self/status`, so the closed state marks a real fault, which the log names; `false` is the way out where the fault is permanent and accepted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Key under `kanban.admission` | CR field            | Default                                                           | Bounds        | Why this value                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------- | ------------------- | ----------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `memory_budget_mib`          | `memoryBudgetMiB`   | the agent container's resolved memory request in MiB; 4,096 today | 512 to 65,536 | on Autopilot the request is where the eviction fires, and a budget at the limit admits 8 GiB of work into a pod evicted at its request; the operator's default request is 4 GiB from this change, because a `spec.mode: next` gateway idles at about 1.5 GiB of working set and the 2 GiB default admitted no worker on the presubmit install (every tick capped at zero, every card refused after the bound); following the resolved request means a raise of it, through `spec.deployment.resources` or a new operator default, moves the budget with it; the floor is the least value the schema and the operator admit, and a derived budget under it (a request the operator cannot read as one) is clamped to it and logged: at the floor the dispatcher still admits nothing, because every measured container idles above 512 MiB, and refuses every card after the bound, which is what the clamp buys over a silent fall-back to the meminfo guard, a refusal that names its figures; the ceiling is above any node the install runs on |
+| `worker_rss_cap_mib`         | `workerRssCapMiB`   | 1,536                                                             | 256 to 65,536 | an idle worker is about 430 MiB and a long poll loop grows past 1 GiB; 1.5 GiB leaves a fleet-sized card room and stops a runaway before it alone carries the pod from its 1.8 GiB idle set past a 4 GiB request; under a 2 GiB request the pressure guard acts first; the floor is below an idle worker on purpose, for a test install, and a value under 430 stops every worker as its proxies start                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `queue_bound_seconds`        | `queueBoundSeconds` | 120                                                               | 10 to 3,600   | two minutes is 24 ticks at the 5 s dispatch interval, and a card still queued then is past the one-minute answer the success criteria set for a simple question, so a strategy change serves the user better; the floor is two ticks, so no card is refused before the dispatcher has tried twice; the ceiling is an hour, past which a refusal tells the user nothing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `fail_closed`                | `failClosed`        | `true`                                                            |               | a dispatcher that cannot read memory and spawns anyway is the one that evicted the pod; the chain of sources ends at `/proc/self/status`, so the closed state marks a real fault, which the log names; `false` is the way out where the fault is permanent and accepted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ## What later stages add
 
@@ -401,8 +403,8 @@ Stage 2:
   named.
 - The 72-hour soak as a periodic.
 
-Stage 0, in flight as separate changes with no new machinery: the request raised to 4 GiB; the
-restart and eviction alert in the chart's health rules, on by default; the readiness report routed
+Stage 0, with no new machinery: the request raised to 4 GiB, carried by the first change; as
+separate changes, the restart and eviction alert in the chart's health rules, on by default; the readiness report routed
 in batches of at most ten clusters per card, the daily watch's report preferred when it is fresh;
 the foreground run cut by the tool-call guard killed with its process tree (R9).
 
@@ -420,8 +422,8 @@ the foreground run cut by the tool-call guard killed with its process tree (R9).
    otherwise spawn the whole slot budget, six workers at about 430 MiB each from an idle board, on
    one reading that said the pod was under 1,741 MiB. The tick's spawns are therefore bounded by
    the budget's headroom at one worker per 512 MiB (`cap_spawn_budget`): at 800 MiB used of a
-   2,048 MiB budget that is two new workers per tick, and the next tick reads the result before
-   admitting more. The cost estimate of a later stage refines the reserve per request.
+   4,096 MiB budget that is six new workers per tick, at 1,500 MiB used five, and the next tick
+   reads the result before admitting more. The cost estimate of a later stage refines the reserve per request.
 4. Running workers together exceed the budget while each stays under its cap. Six workers at
    1.5 GiB are 9 GiB. The cap bounds one runaway, the pattern of the three evictions; the sum is
    bounded only by `max_in_progress` times the cap until the class budgets land. The guard stops

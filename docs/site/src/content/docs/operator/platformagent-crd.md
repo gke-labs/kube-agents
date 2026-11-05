@@ -397,7 +397,7 @@ pod under node pressure once its working set passes the request. Under GKE Sandb
 cgroup's, so Hermes' own `/proc/meminfo` guard never fires there.
 
 Unset, `memoryBudgetMiB` is the agent container's memory request in MiB (`spec.deployment.resources`,
-`2048` at the default `2Gi`), so raising the request raises the budget. `workerRssCapMiB` (`1536`)
+`4096` at the default `4Gi`), so raising the request raises the budget. `workerRssCapMiB` (`1536`)
 stops a running worker whose process tree passes it and blocks its card the same way.
 `queueBoundSeconds` (`120`) refuses a ready card that memory pressure or a full board has held for
 that long. `failClosed` (`true`) makes a tick that cannot read the memory counters spawn nothing.
@@ -498,12 +498,13 @@ should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the
 a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
 that quota is the other shared resource, and for most deployments it binds before memory does.
 
-At the operator's defaults the admission budget binds before this cap does. The budget is the
-container's memory request, 2Gi unless `spec.deployment.resources` raises it, and it counts the
-agent container alone. A tick admits one new worker per 512 MiB of headroom under the budget. From
-the container's measured idle set of about 800 MiB that is two; above about 1 GiB in use it is one,
-and above about 1.5 GiB none. Six workers at 430 MiB add about 2.6 GiB, so a board meant to run six
-at once needs a request of about 4Gi. The request is the figure to raise: under node pressure the kubelet evicts the pod once its working set passes it ([`admission`](#specharnesstuning)).
+At the operator's defaults the budget and this cap are close. The budget is the container's memory
+request, 4Gi unless `spec.deployment.resources` changes it, and it counts the agent container alone.
+A tick admits one new worker per 512 MiB of headroom under the budget: from an idle set of about
+800 MiB that is six, from the 1.5 GiB a `spec.mode: next` gateway idles at, five. Six workers at
+430 MiB add about 2.6 GiB, inside the request from the smaller idle set and one worker short from
+the larger. To admit more, raise the request, not the limit: under node pressure the kubelet evicts
+the pod once its working set passes the request ([`admission`](#specharnesstuning)).
 
 [`docs/designs/safe-throttling.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/safe-throttling.md)
 is the design for admission by memory beside this count: a pressure guard on the container's own

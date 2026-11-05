@@ -48,12 +48,12 @@ declared column from the two files and fails when the page falls behind them.
 | Workload                                                     | Pods | Runtime                                                                | Default (declared)                  | Fleet (modeled)                                | Ephemeral (declared)     | Persistent                                               |
 | ------------------------------------------------------------ | ---- | ---------------------------------------------------------------------- | ----------------------------------- | ---------------------------------------------- | ------------------------ | -------------------------------------------------------- |
 | Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 2 / 2                  | 4 / 8 then 8 / 8                               | 8 GiB, request and limit | none                                                     |
-| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
+| Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 5 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
 | Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
 | Operator                                                     | 1    | standard                                                               | 0.05 / 0.125 then 0.5 / 0.5         | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
 | LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
 | GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
-| **Total**                                                    | 8    |                                                                        | **2.556 / 8.75 then 12 / 23.25**    | **6.6 / 22.25 then 18 / 35.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| **Total**                                                    | 8    |                                                                        | **2.556 / 10.75 then 12 / 23.25**   | **6.6 / 22.25 then 18 / 35.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
 
 On GKE Autopilot the operator renders the credential proxy's requests at 2 vCPU and 2 GiB
 instead of 0.5 and 1, because Autopilot without bursting clamps a container's limits to its
@@ -64,7 +64,7 @@ The gateway pod's fleet row raises two containers. `agent-api-auth` is the examp
 `agentAPIAuth.resources`, 0.5 vCPU and 2 GiB requests with a 4 GiB memory limit. The agent
 container is the CR's `spec.deployment.resources`, which the chart has no value for; the row
 models it at 1 vCPU and 6 GiB requests and 3 vCPU and 12 GiB limits. That field replaces the
-operator's defaults (1 vCPU and 2 GiB requests, 3 vCPU and 8 GiB limits) as a whole block, so
+operator's defaults (1 vCPU and 4 GiB requests, 3 vCPU and 8 GiB limits) as a whole block, so
 set every key you want to keep. Set it on the CR with `kubectl edit`; a later `helm upgrade`
 leaves it alone, because Helm patches only the fields its render changes. The
 [CRD page](/kube-agents/operator/platformagent-crd/#specdeployment) describes the field.

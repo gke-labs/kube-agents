@@ -5611,24 +5611,24 @@ func TestKanbanAdmissionIsPinnedInTheManagedScope(t *testing.T) {
 	}
 
 	// Untuned: every default, and the budget is the operator's default memory request in MiB.
-	// The 2048 is asserted against resolveResources rather than written twice, so a change to
+	// The 4096 is asserted against resolveResources rather than written twice, so a change to
 	// the default request fails here with the reason rather than as a bare mismatch.
-	if defaultRequest := resolveResources(nil).Requests[corev1.ResourceMemory]; defaultRequest.Value() != 2048<<20 {
-		t.Fatalf("the operator's default memory request is %s; this test assumes 2Gi, so update its budget figures with the default", defaultRequest.String())
+	if defaultRequest := resolveResources(nil).Requests[corev1.ResourceMemory]; defaultRequest.Value() != 4096<<20 {
+		t.Fatalf("the operator's default memory request is %s; this test assumes 4Gi, so update its budget figures with the default", defaultRequest.String())
 	}
 	assertAdmission(t, "untuned", managedAdmission(t, newTestPlatformAgent()),
-		2048, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+		4096, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
 	if !defaultAdmissionFailClosed {
 		t.Error("fail_closed defaults open; the admission exists for installs whose memory counters are unreadable, and an open default spawns into the eviction there")
 	}
 
 	// A raised request raises the budget with it; the limit does not enter into it.
 	raised := withResources(corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("6Gi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("16Gi")},
 	})
 	assertAdmission(t, "raised request", managedAdmission(t, raised),
-		4096, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+		6144, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
 
 	// A resources block that sets only a limit: the kubelet gives the container a request
 	// equal to it, so the budget follows the limit rather than the operator's default.
@@ -5645,7 +5645,7 @@ func TestKanbanAdmissionIsPinnedInTheManagedScope(t *testing.T) {
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
 	})
 	assertAdmission(t, "cpu only", managedAdmission(t, cpuOnly),
-		2048, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+		4096, defaultAdmissionWorkerRssCapMiB, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
 
 	// A request that is not a whole number of MiB rounds down: the dispatcher must not be
 	// told a budget larger than the request it stands for.
@@ -5693,7 +5693,7 @@ func TestKanbanAdmissionIsPinnedInTheManagedScope(t *testing.T) {
 	}})
 	partial.Spec.Deployment = raised.Spec.Deployment
 	assertAdmission(t, "partial", managedAdmission(t, partial),
-		4096, 1024, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
+		6144, 1024, defaultAdmissionQueueBoundSeconds, defaultAdmissionFailClosed)
 
 	// One route only: an overlay copy would be merged into a profile's config.yaml and then
 	// overruled by the pin, and would outlive the CR field.

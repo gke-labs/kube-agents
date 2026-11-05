@@ -846,7 +846,7 @@ type TuningSpec struct {
 	// "capacity" and a reason that names the figures, so the thread that filed it is
 	// told it is throttled instead of losing the worker to an eviction. Unset, every
 	// field takes the operator's default, and the budget is the agent container's
-	// memory request (spec.deployment.resources, 2Gi unless set).
+	// memory request (spec.deployment.resources, 4Gi unless set).
 	//
 	// The block is rendered into the managed scope whatever this field says, so the
 	// dispatcher never runs without one: an install that sets nothing runs the
@@ -1045,7 +1045,7 @@ const (
 // memory guard, which reads /proc/meminfo, never fires there. And the kubelet
 // evicts a pod under node pressure once its usage passes its memory REQUEST,
 // long before the limit would stop it: the gateway pod was evicted three times
-// at 3.1 to 3.5 GiB against a 2Gi request. The dispatcher therefore reads the
+// at 3.1 to 3.5 GiB against the 2Gi request it had then. The dispatcher therefore reads the
 // container's working set and counts it against a budget sized from the
 // request, which is what makes its guard fire before the eviction does.
 type AdmissionSpec struct {
@@ -1054,7 +1054,7 @@ type AdmissionSpec struct {
 	// tick it reads the container's working set (its cgroup memory usage less
 	// the inactive file cache, the figure the kubelet evicts on) and counts it
 	// against this figure. Absent means the agent container's resolved memory request
-	// in MiB (2048 at the operator's default resources), so a CR that raises
+	// in MiB (4096 at the operator's default resources), so a CR that raises
 	// the request raises the budget with it.
 	//
 	// Two bounds act on the budget. Each tick admits one new worker per
