@@ -62,6 +62,7 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
+from kube_agents_bench import chat_shape
 from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, CaseSpec
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 
@@ -100,6 +101,9 @@ MISSING = "MISSING"
 #: harness's KUBE_AGENTS_TIMING_FILE into the run directory, and its one key.
 _TIMING_FILE = "timing.json"
 _TIMING_TURN1_KEY = "turn1_s"
+#: The delivered reply's shape, which hack/ci-eval-pr.sh copies from the
+#: harness's KUBE_AGENTS_SHAPE_FILE into the run directory (chat_shape.KEYS).
+_SHAPE_FILE = "shape.json"
 
 #: ``VerificationCorrectness`` at or above this is a passing repetition. The
 #: existing presubmit floor, unchanged; the CLI reads it from the environment.
@@ -432,8 +436,8 @@ class RunRecord:
     ``results.json`` is the scoring contract: it is the only artifact carrying
     ``VerificationCoverage`` and the per-check ``verification_report``.
     ``manifest.json`` and ``rows.json`` are read for the version key and for
-    latency/token reporting, and ``timing.json`` (copied in by
-    hack/ci-eval-pr.sh) for the opening turn's seconds.
+    latency/token reporting, and ``timing.json`` and ``shape.json`` (copied in
+    by hack/ci-eval-pr.sh) for the opening turn's seconds and the reply's shape.
     """
 
     run_dir: Path
@@ -468,6 +472,9 @@ class RunRecord:
     #: ``tool_calls_optional``, where a reply on a record with no error
     #: stands in for the trajectory.
     output: str = ""
+    #: The delivered reply's shape, from ``shape.json`` (:func:`chat_shape.parse`).
+    #: Reported, never scored; None when the file is absent or holds nothing valid.
+    shape: dict[str, bool | int] | None = None
 
     @property
     def catastrophic(self) -> float | None:
@@ -550,6 +557,7 @@ def load_run(run_dir: str | Path) -> RunRecord | None:
 
     manifest = _read_json(path / "manifest.json") or {}
     turn1_s = _positive_seconds(_read_json(path / _TIMING_FILE), _TIMING_TURN1_KEY)
+    shape = chat_shape.parse(_read_json(path / _SHAPE_FILE))
     rows = _read_json(path / "rows.json") or []
     row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
 
@@ -574,6 +582,7 @@ def load_run(run_dir: str | Path) -> RunRecord | None:
             scoring_version=_as_str(row.get("scoringVersion")),
             agent_model=_as_str(manifest.get("model")),
             output=str(rec.get("output") or ""),
+            shape=shape,
         )
 
     # The documented empty-list record: the file exists, zero tasks were
@@ -665,6 +674,9 @@ class RepResult:
     #: The agent's final report, verbatim, for the build log's excerpt line.
     #: Not in the hand-off: the dashboard reads it from the log.
     report: str = ""
+    #: The delivered reply's shape, for the build log's shape line. Not in
+    #: the hand-off: the dashboard reads it from the log.
+    shape: dict[str, bool | int] | None = None
     #: Named checks the inject lane set aside as not applicable on this
     #: record's transport (``tool_called``, ``worker_commands``,
     #: ``worker_agents``, ``worker_budget``). Empty on
@@ -1180,6 +1192,7 @@ def classify_rep(
             output_tokens=token_count(record.tokens.get("output")) if record else None,
             tokens_partial=_tokens_partial(record.tokens) if record else False,
             report=record.output if record else "",
+            shape=record.shape if record else None,
             not_applicable_checks=list(lane.not_applicable) if lane else [],
         )
 

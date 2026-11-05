@@ -287,6 +287,7 @@ def test_the_per_repetition_detail_is_printed(kanban_task, tmp_path, capsys):
 REPORT_PREFIX = "  rep 1 report: "
 TIMING_PREFIX = "  rep 1 timing: "
 TOKENS_PREFIX = "  rep 1 tokens: "
+SHAPE_PREFIX = "  rep 1 shape: "
 
 
 def test_a_failing_repetition_quotes_the_agents_report_under_its_grading_line(
@@ -443,6 +444,37 @@ def test_no_tokens_line_when_the_record_has_no_count(kanban_task, make_run, tmp_
     run_case(kanban_task, [_tokened_run(make_run, tokens)], tmp_path / "case.json")
     printed = capsys.readouterr().out
     assert "  rep 1: " in printed and TOKENS_PREFIX not in printed
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        (
+            {"opens_on_verdict": False, "apology": True, "bot_messages": 3,
+             "words_before_answer": 7, "answer_words": 240},
+            SHAPE_PREFIX + "opens_on_verdict=0 apology=1 bot_messages=3 words_before_answer=7 answer_words=240",
+        ),
+        ({"answer_words": 24, "opens_on_verdict": True}, SHAPE_PREFIX + "opens_on_verdict=1 answer_words=24"),
+    ],
+    ids=["every-key", "keys-in-order-and-missing-left-out"],
+)
+def test_the_shape_line_follows_the_tokens_line(kanban_task, make_run, tmp_path, capsys, shape, expected):
+    """The dashboard reads each repetition's reply shape from `rep N shape:`,
+    a shape the collector's `rep N:` match skips. Reported, never graded."""
+    run = make_run("kanban_red_1")
+    (run / "shape.json").write_text(json.dumps(shape), encoding="utf-8")
+    run_case(kanban_task, [run], tmp_path / "case.json")
+    lines = capsys.readouterr().out.splitlines()
+    graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: "))
+    assert lines[graded + 2].startswith(TOKENS_PREFIX)
+    assert lines[graded + 3] == expected
+    assert lines[graded + 4].startswith(REPORT_PREFIX)
+
+
+def test_no_shape_line_without_a_shape(kanban_task, make_run, tmp_path, capsys):
+    run_case(kanban_task, [make_run("kanban_red_1")], tmp_path / "case.json")
+    printed = capsys.readouterr().out
+    assert "  rep 1: " in printed and SHAPE_PREFIX not in printed
 
 
 @pytest.mark.parametrize(
