@@ -53,3 +53,13 @@ agents/platform/scripts/credential_proxy.py MetricsHandler.handle 1
 # (the check cannot tell this closure, run once, from a handler's), so the
 # docstring says this shape is pinned rather than bounded.
 a2a/authcallout/store.go WatchConfigMapShards 1
+
+# One goroutine per authorization request, handed off by the subscription
+# callback so the callback returns at once. Each lives for at most
+# authDecisionBudget (the context handle() starts it under), and the work it
+# does takes a slot on the calloutWorkers-sized `slots` channel inside
+# decide(), so at most calloutWorkers decisions run at once and a burst
+# holds at most its own arrival count of goroutines for one budget. The
+# semaphore sits in decide(), not in the block of the `go` statement, which
+# is the only place the check reads one from.
+a2a/authcallout/service.go handle 1
