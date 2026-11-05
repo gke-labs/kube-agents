@@ -116,8 +116,8 @@ func TestBuildProfileNetworkPolicy(t *testing.T) {
 	if len(np.Spec.Ingress) != 0 {
 		t.Errorf("ingress rules %+v, want none", np.Spec.Ingress)
 	}
-	if len(np.Spec.Egress) != 4 {
-		t.Fatalf("egress rules %d, want exactly DNS, NATS, LiteLLM and the credential broker: %+v", len(np.Spec.Egress), np.Spec.Egress)
+	if len(np.Spec.Egress) != 5 {
+		t.Fatalf("egress rules %d, want exactly DNS, NATS, LiteLLM, the credential broker and kube-proxy: %+v", len(np.Spec.Egress), np.Spec.Egress)
 	}
 	if p := np.Spec.Egress[0].Ports; len(p) != 2 || p[0].Port.IntVal != a2aDNSPort {
 		t.Errorf("first egress rule ports %+v, want DNS", p)
@@ -148,6 +148,12 @@ func TestBuildProfileNetworkPolicy(t *testing.T) {
 		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(a2aTestAgent())) ||
 		!reflect.DeepEqual(broker.To[0].NamespaceSelector.MatchLabels, map[string]string{"kubernetes.io/metadata.name": "test-ns"}) {
 		t.Errorf("fourth egress rule %+v, want the broker's pods in the agent's namespace on its credentialed port", broker)
+	}
+	kubeProxy := np.Spec.Egress[4]
+	if len(kubeProxy.Ports) != 1 || kubeProxy.Ports[0].Port.IntVal != kubeProxyPort || len(kubeProxy.To) != 1 ||
+		!reflect.DeepEqual(kubeProxy.To[0].PodSelector.MatchLabels, kubeProxySelector(a2aTestAgent())) ||
+		!reflect.DeepEqual(kubeProxy.To[0].NamespaceSelector.MatchLabels, map[string]string{"kubernetes.io/metadata.name": "test-ns"}) {
+		t.Errorf("fifth egress rule %+v, want kube-proxy pods in the agent's namespace on port %d", kubeProxy, kubeProxyPort)
 	}
 }
 

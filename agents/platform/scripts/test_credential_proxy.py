@@ -2699,7 +2699,7 @@ class GitLeaseGateWiringTest(_ExecRouteServer):
         patcher = mock.patch.object(
             credential_proxy,
             "EXEC_ROUTE_EXECUTABLES",
-            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git"),
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git", "kubectl"),
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -2938,7 +2938,7 @@ class ResourcePressureRouteTest(unittest.TestCase):
 
     def test_a_session_caller_is_admitted_at_the_hard_watermark_and_everyone_under_it(self):
         self.as_role(credential_proxy.CALLER_ROLE_SESSION)
-        status, headers, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        status, headers, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(200, status, body)
         self.assertNotIn("Retry-After", headers)
         self.set_memory_percent(50)
@@ -3060,6 +3060,13 @@ class ExecRouteTruncationReplyTest(unittest.TestCase):
     """A cut reply says how much it kept and what the cap was, beside `truncated`."""
 
     def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         policy_path = Path(self.temp_dir.name) / "policy.json"
@@ -3124,6 +3131,13 @@ class ExecRouteCapacityTest(unittest.TestCase):
     """The concurrency cap and the caller watch as the agent meets them: over /v1/exec."""
 
     def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         policy_path = Path(self.temp_dir.name) / "policy.json"
@@ -3963,12 +3977,31 @@ class SessionRoleExecutableTest(unittest.TestCase):
                 with error:
                     return error.code, json.loads(error.read())
 
+    def _with_session_kubectl_admitted(self):
+        stack = contextlib.ExitStack()
+        stack.enter_context(
+            mock.patch.object(
+                credential_proxy,
+                "EXEC_ROUTE_EXECUTABLES",
+                (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+            )
+        )
+        stack.enter_context(
+            mock.patch.dict(
+                credential_proxy.ROLE_EXECUTABLES,
+                {credential_proxy.CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"})},
+            )
+        )
+        return stack
+
     def test_the_table(self):
         for role, executable, want in (
-            (credential_proxy.CALLER_ROLE_SESSION, "kubectl", True),
+            (credential_proxy.CALLER_ROLE_SESSION, "kubectl", False),
             (credential_proxy.CALLER_ROLE_SESSION, "gcloud", True),
             (credential_proxy.CALLER_ROLE_SESSION, "git", False),
             (credential_proxy.CALLER_ROLE_SESSION, "gh", False),
+            (credential_proxy.CALLER_ROLE_PROFILE, "kubectl", False),
+            (credential_proxy.CALLER_ROLE_PROFILE, "gcloud", True),
             (credential_proxy.CALLER_ROLE_SHELL, "gcloud", True),
             (credential_proxy.CALLER_ROLE_SHELL, "kubectl", False),
             (credential_proxy.CALLER_ROLE_SHELL, "git", False),
@@ -3988,15 +4021,19 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(credential_proxy.RULE_EXECUTABLE_ALLOWLIST, body["rule"])
 
     def test_the_role_check_stands_behind_the_route(self):
-        # Widen the route the way the git-routing tests do and the session is
-        # still held to its two CLIs (and the shell to gcloud), with the rule
-        # the shim prints, while a roleless caller runs what the route now
-        # carries. This is what the role check buys once the route list and the
-        # session list are the same two names.
-        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "git")
+        # Widen the route the way the git-routing tests do and both the session
+        # and the shell are held to gcloud, with the rule the shim prints,
+        # while a roleless caller runs what the route now carries.
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl", "git")
         with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
                 status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["git", "status"]})
+            self.assertEqual(403, status)
+            self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+            self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
+            self.assertIn("session", body["message"])
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
             self.assertEqual(403, status)
             self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
             self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
@@ -4011,12 +4048,13 @@ class SessionRoleExecutableTest(unittest.TestCase):
             self.assertEqual(200, status, body)
 
     def test_a_read_from_a_session_runs(self):
-        status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
+        with self._with_session_kubectl_admitted():
+            status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
         self.assertEqual(200, status, body)
         self.assertEqual(0, body["exitCode"])
 
     def test_a_mutation_from_a_session_is_refused_read_only(self):
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        with self._with_session_kubectl_admitted(), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
                 credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "delete", "pod", "x"]}
             )
@@ -4112,7 +4150,7 @@ class SessionRoleExecutableTest(unittest.TestCase):
                 self.assertEqual(want, credential_proxy.session_kubectl_flag_refusal(role, argv))
 
     def test_a_clustered_file_flag_from_a_session_is_refused_before_it_reaches_kubectl(self):
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        with self._with_session_kubectl_admitted(), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
                 credential_proxy.CALLER_ROLE_SESSION,
                 {"argv": ["kubectl", "get", "-Af", "/etc/credential-proxy/policy.json"]},
@@ -4123,7 +4161,7 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertIn("-f", body["message"])
 
     def test_a_file_backed_output_format_from_a_session_is_refused(self):
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        with self._with_session_kubectl_admitted(), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             status, body = self.post_as(
                 credential_proxy.CALLER_ROLE_SESSION,
                 {"argv": ["kubectl", "get", "ns", "-o", "go-template-file=/etc/credential-proxy/policy.json"]},
@@ -4133,27 +4171,30 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertIn("--output", body["message"])
 
     def test_the_shell_is_refused_kubectl_while_the_roleless_caller_passes_a_file_argument(self):
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
-            status, body = self.post_as(
-                credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]}
-            )
-        self.assertEqual(403, status)
-        self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
-        status, body = self.post_as("", {"argv": ["kubectl", "get", "-f", "x.yaml"]})
-        self.assertEqual(200, status, body)
+        routed = (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl")
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", routed):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(
+                    credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "-f", "x.yaml"]}
+                )
+            self.assertEqual(403, status)
+            self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
+            status, body = self.post_as("", {"argv": ["kubectl", "get", "-f", "x.yaml"]})
+            self.assertEqual(200, status, body)
 
     def test_a_metrics_read_from_a_session_is_refused_as_a_flag_before_the_policy(self):
         # The raw-path rule admits /metrics for every caller; the walker keeps
         # it from the session, plain or percent-encoded, under the flag rule.
-        for path in ("/metrics", "/%6detrics"):
-            with self.subTest(path=path), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
-                status, body = self.post_as(
-                    credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "--raw", path]}
-                )
-                self.assertEqual(403, status)
-                self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
-                self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
-                self.assertIn("--raw", body["message"])
+        with self._with_session_kubectl_admitted():
+            for path in ("/metrics", "/%6detrics"):
+                with self.subTest(path=path), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                    status, body = self.post_as(
+                        credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "--raw", path]}
+                    )
+                    self.assertEqual(403, status)
+                    self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+                    self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
+                    self.assertIn("--raw", body["message"])
 
 
 class GetCredentialsFlagsBetweenWordsTest(unittest.TestCase):
@@ -11409,6 +11450,13 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
     """A mutation must stop at the proxy socket, not merely at a decision function."""
 
     def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.executed = []
         owner = self
 
@@ -13540,6 +13588,13 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
             )
 
     def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for attribute in (
             "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator",
         ):
@@ -13683,6 +13738,13 @@ class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):
             )
 
     def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for attribute in (
             "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator",
         ):
@@ -15679,6 +15741,13 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
             )
 
     def setUp(self):
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.executor = self._RecordingExecutor()
         for attribute in (
             "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator",
@@ -16503,6 +16572,14 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
 
     def setUp(self):
         import scoped_sa_pool
+
+        patcher = mock.patch.object(
+            credential_proxy,
+            "EXEC_ROUTE_EXECUTABLES",
+            (*credential_proxy.EXEC_ROUTE_EXECUTABLES, "kubectl"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -19287,7 +19364,7 @@ class ScopeExecRouteTest(unittest.TestCase):
             ({"argv": SCOPE_ASSET_SEARCH, "cwd": "/tmp"}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
             ({"argv": SCOPE_ASSET_SEARCH, "kubeconfigContext": "gke_p_l_c"}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
             ({"argv": SCOPE_ASSET_SEARCH, "wantsKubeconfig": True}, credential_proxy.scope_policy.RULE_SCOPE_REQUEST),
-            ({"argv": ["kubectl", "get", "pods"]}, credential_proxy.RULE_CALLER_EXECUTABLE),
+            ({"argv": ["kubectl", "get", "pods"]}, credential_proxy.RULE_EXECUTABLE_ALLOWLIST),
         ):
             with self.subTest(payload=payload):
                 self.refused(payload, rule)

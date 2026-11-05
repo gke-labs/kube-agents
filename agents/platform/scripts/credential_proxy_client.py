@@ -223,6 +223,8 @@ DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/to
 KUBE_PROXY_USER_NAME = "kube-proxy-caller"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
+SANDBOX_WORKER_UID = 1000
+SANDBOX_WORKER_KUBECONFIG_PATH = Path("/home/node/.kube/config")
 SANDBOX_SHARED_KUBECONFIG_PATH = Path("/opt/data/.kubeconfig")
 # What a workspace `open` labels itself with, so the broker's log can say who
 # holds a slot when the store is full: the kanban card first, the session
@@ -1021,9 +1023,12 @@ def build_kube_proxy_kubeconfig(
 
 
 def _caller_default_kubeconfig_path() -> Path:
-    """Return the default kubeconfig path for the active sandbox user."""
-    if os.geteuid() == SANDBOX_HERMES_UID:
+    """Return the default kubeconfig path for the active sandbox or worker user."""
+    uid = os.geteuid()
+    if uid == SANDBOX_HERMES_UID:
         return SANDBOX_HERMES_KUBECONFIG_PATH
+    if uid == SANDBOX_WORKER_UID and SANDBOX_WORKER_KUBECONFIG_PATH.parent.parent.is_dir():
+        return SANDBOX_WORKER_KUBECONFIG_PATH
     return SANDBOX_SHARED_KUBECONFIG_PATH
 
 
@@ -1035,6 +1040,33 @@ def _default_kubeconfig_candidates() -> list[Path]:
 def _is_default_sandbox_kubeconfig(path: str | Path) -> bool:
     """Return True when `path` is one of the sandbox default multi-context kubeconfigs."""
     return Path(path) in _default_kubeconfig_candidates()
+
+
+def _ensure_host_kubeconfig_initialized(
+    proxy_url: str,
+    ca_file: str,
+    token_file: str,
+) -> None:
+    """Create the caller's default kubeconfig for `KUBE_PROXY_HOST_CONTEXT` when absent."""
+    host_context = os.environ.get("KUBE_PROXY_HOST_CONTEXT", "").strip()
+    if not host_context:
+        return
+    path = _caller_default_kubeconfig_path()
+    if path.exists() or path.is_symlink():
+        return
+    if not path.parent.parent.is_dir():
+        return
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        content = build_kube_proxy_kubeconfig(
+            host_context,
+            proxy_url=proxy_url,
+            ca_file=ca_file,
+            token_file=token_file,
+        )
+        _replace_file(path, content)
+    except OSError:
+        pass
 
 
 def _merge_context_into_kubeconfig_file(
@@ -1049,6 +1081,20 @@ def _merge_context_into_kubeconfig_file(
 
     try:
         if not path.parent.is_dir():
+            if path == _caller_default_kubeconfig_path() and path.parent.parent.is_dir():
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            else:
+                return
+        if not path.exists() and not path.is_symlink() and path == _caller_default_kubeconfig_path():
+            _replace_file(
+                path,
+                build_kube_proxy_kubeconfig(
+                    context,
+                    proxy_url=proxy_url,
+                    ca_file=ca_file,
+                    token_file=token_file,
+                ),
+            )
             return
         lock_path = path.with_name(f".{path.name}.lock")
         lock_flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
@@ -1161,6 +1207,7 @@ def merge_context_into_default_kubeconfig(context: str) -> None:
         os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
         or DEFAULT_KUBE_PROXY_TOKEN_FILE
     ).strip()
+    _ensure_host_kubeconfig_initialized(proxy_url, ca_file, token_file)
     seen: set[Path] = set()
     for path in _default_kubeconfig_candidates():
         if path in seen:
@@ -1171,12 +1218,71 @@ def merge_context_into_default_kubeconfig(context: str) -> None:
         )
 
 
+def _task_target_from_credential_file() -> ClusterTarget | None:
+    """Extract the target cluster from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` when present."""
+    headers = task_credential_headers()
+    token = headers.get(TASK_CREDENTIAL_HEADER, "")
+    if not token:
+        return None
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise TokenUnavailable("task credential is not a three-part JWT")
+    payload_b64 = parts[1]
+    padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise TokenUnavailable(f"task credential payload cannot be decoded: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise TokenUnavailable("task credential payload is not a JSON object")
+    nats_claims = payload.get("nats")
+    if not isinstance(nats_claims, dict):
+        return None
+    target = nats_claims.get("target")
+    if not isinstance(target, dict):
+        return None
+    project = target.get("project")
+    location = target.get("location")
+    cluster = target.get("cluster")
+    if not (isinstance(project, str) and isinstance(location, str) and isinstance(cluster, str)):
+        return None
+    return parse_gke_context(f"gke_{project}_{location}_{cluster}")
+
+
 def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
     """Register a `--context=gke_...` flag's cluster in the active kubeconfig before `kubectl` runs."""
     proxy_url = os.environ.get("KUBE_PROXY_URL", "").strip().rstrip("/")
     if not proxy_url:
         return
+    ca_file = (
+        os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
+    ).strip()
+    token_file = (
+        os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
+        or DEFAULT_KUBE_PROXY_TOKEN_FILE
+    ).strip()
     normalized = argv if (argv and argv[0] == "kubectl") else ["kubectl", *argv]
+    if task_mode():
+        import task_confinement
+
+        target = _task_target_from_credential_file()
+        confined = task_confinement.confine(normalized, None, target)
+        if confined.isolated or target is None:
+            return
+        path = _caller_default_kubeconfig_path()
+        if path.parent.parent.is_dir():
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _replace_file(
+                path,
+                build_kube_proxy_kubeconfig(
+                    target.context_name,
+                    proxy_url=proxy_url,
+                    ca_file=ca_file,
+                    token_file=token_file,
+                ),
+            )
+        return
+    _ensure_host_kubeconfig_initialized(proxy_url, ca_file, token_file)
     if names_kubeconfig_flag(normalized):
         return
     flag = kubectl_context_flag(normalized)
@@ -1188,13 +1294,6 @@ def ensure_kube_proxy_context_for_argv(argv: list[str]) -> None:
     if env_kc and os.pathsep not in env_kc:
         candidate = Path(env_kc)
         if candidate not in _default_kubeconfig_candidates():
-            ca_file = (
-                os.environ.get("KUBE_PROXY_CA_FILE", "") or DEFAULT_KUBE_PROXY_CA_FILE
-            ).strip()
-            token_file = (
-                os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "")
-                or DEFAULT_KUBE_PROXY_TOKEN_FILE
-            ).strip()
             _merge_context_into_kubeconfig_file(
                 candidate, target.context_name, proxy_url, ca_file, token_file
             )
@@ -2437,7 +2536,16 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "--ensure-kubectl-context":
-        ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])
+        try:
+            ensure_kube_proxy_context_for_argv(["kubectl", *sys.argv[2:]])
+        except TokenUnavailable as exc:
+            print(f"credential proxy: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+        except Exception as exc:
+            if hasattr(exc, "message") and hasattr(exc, "rule"):
+                print(exc.message, file=sys.stderr)
+                raise SystemExit(1) from None
+            raise
         raise SystemExit(0)
     invoked_as = os.path.basename(sys.argv[0])
     fallback = None

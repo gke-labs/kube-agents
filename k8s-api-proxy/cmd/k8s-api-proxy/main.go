@@ -139,10 +139,23 @@ func main() {
 
 	inCluster := inClusterConfig(*kubeAPIServer, *kubeCAFile, *kubeTokenFile)
 
+	audienceCallers := make(map[string][]string)
+	if sessionAud := strings.TrimSpace(os.Getenv("CREDENTIAL_PROXY_SESSION_AUDIENCE")); sessionAud != "" {
+		if sessionCallers, err := parseAllowedCallers(os.Getenv("CREDENTIAL_PROXY_SESSION_CALLERS")); err == nil {
+			audienceCallers[sessionAud] = sessionCallers
+		}
+	}
+	if profileAud := strings.TrimSpace(os.Getenv("CREDENTIAL_PROXY_PROFILE_AUDIENCE")); profileAud != "" {
+		if profileCallers, err := parseAllowedCallers(os.Getenv("CREDENTIAL_PROXY_PROFILE_CALLERS")); err == nil {
+			audienceCallers[profileAud] = profileCallers
+		}
+	}
+
 	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
-		Kubernetes:     inCluster,
-		Audience:       *audience,
-		AllowedCallers: callers,
+		Kubernetes:      inCluster,
+		Audience:        *audience,
+		AllowedCallers:  callers,
+		AudienceCallers: audienceCallers,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)

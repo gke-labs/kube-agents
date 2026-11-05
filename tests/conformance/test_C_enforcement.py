@@ -1542,18 +1542,31 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the spawner's projection of the session audience",
         )
 
-        for name in ("A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"):
+        for name in (
+            "A2A_SESSION_CLUSTER_VIEW",
+            "A2A_CREDENTIAL_PROXY_URL",
+            "A2A_KUBE_PROXY_URL",
+            "A2A_KUBE_PROXY_CA_CONFIGMAP",
+            "A2A_KUBE_PROXY_HOST_CONTEXT",
+        ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
                 self._one_match(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
 
-        # The shim's half: the spawner sets three names and the client reads
-        # three names, in a Go module and a Python script that share nothing.
-        # A rename on either side ships green and the first kubectl of the
-        # first flag-on session fails with "CREDENTIAL_PROXY_URL is not
-        # configured", a 401, or a kubeconfig filed under /opt/data.
+        # The shim's half: the spawner sets the broker and kube-proxy names and
+        # the client reads them, in a Go module and a Python script that share
+        # nothing. A rename on either side ships green and the first gcloud or
+        # kubectl of the first flag-on session fails with "CREDENTIAL_PROXY_URL
+        # is not configured", a 401, or a kubeconfig filed under /opt/data.
         shim = h.text("credential_proxy_client")
-        for name in ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"):
+        for name in (
+            "CREDENTIAL_PROXY_URL",
+            "CREDENTIAL_PROXY_TOKEN_FILE",
+            "HERMES_HOME",
+            "KUBE_PROXY_URL",
+            "KUBE_PROXY_CA_FILE",
+            "KUBE_PROXY_HOST_CONTEXT",
+        ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
                 self.assertTrue(

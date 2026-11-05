@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -39,7 +40,8 @@ const (
 	kubeProxyImageEnvVar                 = "KUBE_PROXY_IMAGE"
 	kubeProxyRepositoryName              = "kube-proxy"
 	kubeProxyTLSSecretSuffix             = "-kube-proxy-tls" // #nosec G101 -- Secret name suffix, not a credential
-	kubeProxyTLSVolumeName               = "kube-proxy-tls"  // #nosec G101 -- Volume name, not a credential
+	kubeProxyCABundleSuffix              = "-kube-proxy-ca-bundle"
+	kubeProxyTLSVolumeName               = "kube-proxy-tls" // #nosec G101 -- Volume name, not a credential
 	kubeProxyTLSMountPath                = "/var/run/secrets/kubeagents/kube-proxy-tls"
 	kubeProxyCAVolumeName                = "kube-proxy-ca"
 	kubeProxyCAMountPath                 = "/var/run/secrets/kubeagents/kube-proxy-ca"
@@ -100,6 +102,10 @@ func kubeProxyName(agent *agentv1alpha1.PlatformAgent) string {
 
 func kubeProxyTLSSecretName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + kubeProxyTLSSecretSuffix
+}
+
+func kubeProxyCABundleName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + kubeProxyCABundleSuffix
 }
 
 func kubeProxySelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
@@ -171,6 +177,10 @@ func hostClusterContextName(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool, tlsCertHash string) *appsv1.Deployment {
+	return buildKubeProxyDeploymentForProfiles(agent, otlpEndpoint, otlpDisabled, tlsCertHash, credentialProxyProfileConfig{})
+}
+
+func buildKubeProxyDeploymentForProfiles(agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool, tlsCertHash string, profiles credentialProxyProfileConfig) *appsv1.Deployment {
 	saName := agentServiceAccountName(agent)
 	podLabels := commonLabels(agent)
 	for k, v := range kubeProxySelector(agent) {
@@ -206,6 +216,7 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
 
+	allowedCallers := fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent))
 	envVars := []corev1.EnvVar{
 		{Name: "KUBE_PROXY_LISTEN_ADDR", Value: fmt.Sprintf(":%d", kubeProxyPort)},
 		{Name: kubeProxyMetricsPortEnv, Value: strconv.Itoa(int(kubeProxyMetricsPort))},
@@ -214,9 +225,21 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: "KUBE_PROXY_MODE", Value: "read-only-dry-run"},
 		{Name: "KUBE_PROXY_REDACT_SECRETS", Value: "true"},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
-		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent, brokerCallerOwnership{})},
+		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedCallers},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
+	}
+	if a2aSessionClusterViewEnabled(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_AUDIENCE", Value: credentialProxySessionAudience},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SESSION_CALLERS", Value: a2aSessionBrokerCaller(agent)},
+		)
+	}
+	if profiles.enabled() {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: credentialProxyProfileAudienceEnvVar, Value: credentialProxyProfileAudience},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_PROFILE_CALLERS", Value: strings.Join(profiles.callers(), ",")},
+		)
 	}
 	envVars = append(envVars, kubeProxyOTelEnvVars(agent, otlpEndpoint, otlpDisabled)...)
 
@@ -415,6 +438,11 @@ func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networking
 	callers := []networkingv1.NetworkPolicyPeer{
 		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
 	}
+	if a2aSessionClusterViewEnabled(agent) {
+		callers = append(callers, networkingv1.NetworkPolicyPeer{
+			PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()},
+		})
+	}
 	np := &networkingv1.NetworkPolicy{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{Name: kubeProxyName(agent), Namespace: agent.Namespace},
@@ -441,6 +469,13 @@ func buildKubeProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networking
 		},
 	}
 	withCommonLabels(np, agent)
+	return np
+}
+
+func withKubeProxyProfilePeer(np *networkingv1.NetworkPolicy, agent *agentv1alpha1.PlatformAgent, c credentialProxyProfileConfig) *networkingv1.NetworkPolicy {
+	if c.enabled() && len(np.Spec.Ingress) > 0 {
+		np.Spec.Ingress[0].From = append(np.Spec.Ingress[0].From, credentialProxyProfilePeer(agent))
+	}
 	return np
 }
 
@@ -523,6 +558,9 @@ func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, 
 			return "", fmt.Errorf("kube-proxy TLS Secret %s/%s already exists and is not owned by PlatformAgent %s", agent.Namespace, secretName, agent.Name)
 		}
 		if len(existing.Data["ca.crt"]) > 0 && len(existing.Data["tls.crt"]) > 0 && len(existing.Data["tls.key"]) > 0 {
+			if err := r.ensureKubeProxyCABundle(ctx, agent, existing.Data["ca.crt"]); err != nil {
+				return "", err
+			}
 			return kubeProxyTLSSecretHash(existing.Data), nil
 		}
 	} else if !errors.IsNotFound(err) {
@@ -554,11 +592,36 @@ func (r *PlatformAgentReconciler) ensureKubeProxyTLSSecret(ctx context.Context, 
 		if err := ctrl.SetControllerReference(agent, secret, r.Scheme); err != nil {
 			return "", err
 		}
-		return bundleHash, r.Create(ctx, secret)
+		if err := r.Create(ctx, secret); err != nil {
+			return "", err
+		}
+		return bundleHash, r.ensureKubeProxyCABundle(ctx, agent, caPEM)
 	}
 
 	existing.Data = bundleData
-	return bundleHash, r.Update(ctx, existing)
+	if err := r.Update(ctx, existing); err != nil {
+		return "", err
+	}
+	return bundleHash, r.ensureKubeProxyCABundle(ctx, agent, caPEM)
+}
+
+func (r *PlatformAgentReconciler) ensureKubeProxyCABundle(ctx context.Context, agent *agentv1alpha1.PlatformAgent, caPEM []byte) error {
+	bundle := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      kubeProxyCABundleName(agent),
+			Namespace: agent.Namespace,
+			Labels:    commonLabels(agent),
+		},
+		Data: map[string]string{"ca.crt": string(caPEM)},
+	}
+	if err := ctrl.SetControllerReference(agent, bundle, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, bundle); err != nil {
+		return fmt.Errorf("failed to apply kube-proxy CA bundle ConfigMap: %w", err)
+	}
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint string, otlpDisabled bool) error {
@@ -566,12 +629,26 @@ func (r *PlatformAgentReconciler) reconcileKubeProxy(ctx context.Context, agent 
 	if err != nil {
 		return err
 	}
+	profiles, err := r.credentialProxyProfileConfigFor(ctx, agent)
+	if err != nil {
+		return err
+	}
+	netpol := buildKubeProxyNetworkPolicy(agent)
+	if profiles.enabled() {
+		fenced, err := r.profileFenced(ctx, agent)
+		if err != nil {
+			return err
+		}
+		if fenced {
+			netpol = withKubeProxyProfilePeer(netpol, agent, profiles)
+		}
+	}
 
 	objs := []client.Object{
 		buildKubeProxyService(agent),
-		buildKubeProxyDeployment(agent, otlpEndpoint, otlpDisabled, tlsHash),
+		buildKubeProxyDeploymentForProfiles(agent, otlpEndpoint, otlpDisabled, tlsHash, profiles),
 		buildKubeProxyPDB(agent),
-		buildKubeProxyNetworkPolicy(agent),
+		netpol,
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {

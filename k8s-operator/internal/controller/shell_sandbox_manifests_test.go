@@ -2173,6 +2173,39 @@ func TestKubeProxyObservabilityManifests(t *testing.T) {
 		np.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app"] != shellSandboxName(agent) {
 		t.Errorf("expected kube-proxy NetworkPolicy port 8443 ingress only from %q, got %#v", shellSandboxName(agent), np.Spec.Ingress[0].From)
 	}
+
+	nextAgent := agent.DeepCopy()
+	nextAgent.Spec.Mode = ptr.To("next")
+	t.Setenv(a2aSessionClusterViewEnvVar, "true")
+	profiles := credentialProxyProfileConfig{
+		Identities: []credentialProxyProfileIdentity{
+			{ServiceAccount: "system:serviceaccount:kubeagents-profiles:auditor-read", Profile: "auditor", Tier: "read"},
+		},
+	}
+	profDep := buildKubeProxyDeploymentForProfiles(nextAgent, "", true, "tls-hash", profiles)
+	profEnvs := make(map[string]string)
+	for _, e := range profDep.Spec.Template.Spec.Containers[0].Env {
+		profEnvs[e.Name] = e.Value
+	}
+	if got := profEnvs["CREDENTIAL_PROXY_SESSION_AUDIENCE"]; got != credentialProxySessionAudience {
+		t.Errorf("CREDENTIAL_PROXY_SESSION_AUDIENCE = %q, want %q", got, credentialProxySessionAudience)
+	}
+	if got := profEnvs["CREDENTIAL_PROXY_SESSION_CALLERS"]; got != "system:serviceaccount:test-ns:test-agent-a2a-session" {
+		t.Errorf("CREDENTIAL_PROXY_SESSION_CALLERS = %q, want session SA", got)
+	}
+	if got := profEnvs[credentialProxyProfileAudienceEnvVar]; got != credentialProxyProfileAudience {
+		t.Errorf("%s = %q, want %q", credentialProxyProfileAudienceEnvVar, got, credentialProxyProfileAudience)
+	}
+	if got := profEnvs["CREDENTIAL_PROXY_PROFILE_CALLERS"]; got != "system:serviceaccount:kubeagents-profiles:auditor-read" {
+		t.Errorf("CREDENTIAL_PROXY_PROFILE_CALLERS = %q, want profile SA", got)
+	}
+	if got := profEnvs["CREDENTIAL_PROXY_ALLOWED_CALLERS"]; got != "system:serviceaccount:test-ns:test-agent-shell" {
+		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want only shell SA", got)
+	}
+	profNP := withKubeProxyProfilePeer(buildKubeProxyNetworkPolicy(nextAgent), nextAgent, profiles)
+	if len(profNP.Spec.Ingress[0].From) != 3 {
+		t.Fatalf("expected 3 peers (shell, a2a-session, profile namespace) on kube-proxy NetworkPolicy, got %#v", profNP.Spec.Ingress[0].From)
+	}
 }
 
 func TestHostClusterContextNameAgreesOnKindAndGKE(t *testing.T) {

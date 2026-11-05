@@ -205,13 +205,14 @@ func profileNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // buildProfileNetworkPolicy fences every pod in the profile namespace: no
-// ingress, and egress to DNS, the bus, LiteLLM and the credential broker's
-// credentialed port only. The broker is where a worker's kubectl and gcloud
-// run (#3889); its side admits the profile namespace, and confines each call
-// to the task's cluster, once a profile identity exists
-// (credential_proxy_profiles.go). The egress is unconditional: a namespace
-// that exists only for profiles needs no second gate, and the broker's
-// TokenReview refuses any pod the identity map doesn't name.
+// ingress, and egress to DNS, the bus, LiteLLM, the credential broker's
+// credentialed port, and kube-proxy only. The broker is where a worker's
+// gcloud runs and kube-proxy is where its kubectl runs (#3889); both admit the
+// profile namespace, and the broker confines each call to the task's cluster,
+// once a profile identity exists (credential_proxy_profiles.go,
+// kube_proxy_manifests.go). The egress is unconditional: a namespace that
+// exists only for profiles needs no second gate, and TokenReview refuses any
+// pod the identity map doesn't name.
 func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -254,6 +255,12 @@ func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs
 					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
 					To: []networkingv1.NetworkPolicyPeer{
 						namespacedPodPeer(agent.Namespace, credentialProxySelector(agent)),
+					},
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{tcpPort(kubeProxyPort)},
+					To: []networkingv1.NetworkPolicyPeer{
+						namespacedPodPeer(agent.Namespace, kubeProxySelector(agent)),
 					},
 				},
 			},

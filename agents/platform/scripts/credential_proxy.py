@@ -1403,10 +1403,11 @@ CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
 # The session pod the A2A gateway spawns, under the operator's
-# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it kubectl and
-# gcloud only (ROLE_EXECUTABLES): the pod executes model output, and the
-# read-only posture command_policy enforces is the view it gets. A demo aid
-# until declarative profiles carry a session's identity and tools.
+# A2A_SESSION_CLUSTER_VIEW flag. Exec route only, and within it gcloud only
+# (ROLE_EXECUTABLES; kubectl routes through <agent>-kube-proxy): the pod
+# executes model output, and the read-only posture command_policy enforces is
+# the view it gets. A demo aid until declarative profiles carry a session's
+# identity and tools.
 CALLER_ROLE_SESSION = "session"
 # The gateway pod's agent-api-auth container: the k8s-event-watcher and the
 # drift-detector. Its token is projected into that container only, never into
@@ -1418,8 +1419,8 @@ CALLER_ROLE_WATCHER = "watcher"
 # so nothing it can be asked to do may write to a forge, clone into the broker,
 # or spend the forge credential on anything but a read of a managed repository.
 CALLER_ROLE_MCP = "mcp"
-# An AgentProfile worker pod (#3889). Exec route only, kubectl and gcloud only,
-# with the session's kubectl flag allowlist, and every call held to the target
+# An AgentProfile worker pod (#3889). Exec route only, gcloud only (kubectl
+# routes through <agent>-kube-proxy), and every call held to the target
 # cluster in the task credential the pod presents (TASK_CREDENTIAL_HEADER). The
 # credential is mandatory for anything that reaches a cluster or a project: a
 # profile caller without a valid one runs local-only commands and nothing else.
@@ -1459,15 +1460,13 @@ CALLER_ROLES = (
 )
 
 # Which executables a role may hand to /v1/exec. A role absent here keeps
-# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the session and
-# profile roles are narrowed to the two CLIs that reach a cluster read-only,
-# and the shell and scope roles are narrowed to `gcloud` (the sandbox runs
-# stock `kubectl` against `kube-proxy`, so `/usr/local/bin/credential-proxy-exec`
-# in the sandbox cannot bypass `kube-proxy`).
+# whatever the route carries (`EXEC_ROUTE_EXECUTABLES`); the shell, session,
+# profile, and scope roles are narrowed to `gcloud` (all pods run stock
+# `kubectl` against `kube-proxy`, so `/v1/exec` never executes `kubectl`).
 ROLE_EXECUTABLES: dict[str, frozenset[str]] = {
     CALLER_ROLE_SHELL: frozenset({"gcloud"}),
-    CALLER_ROLE_SESSION: frozenset({"kubectl", "gcloud"}),
-    CALLER_ROLE_PROFILE: frozenset({"kubectl", "gcloud"}),
+    CALLER_ROLE_SESSION: frozenset({"gcloud"}),
+    CALLER_ROLE_PROFILE: frozenset({"gcloud"}),
     CALLER_ROLE_SCOPE: frozenset({"gcloud"}),
 }
 
@@ -7652,13 +7651,14 @@ def forge_registry() -> providers.Registry:
         return _forge_registry
 
 
-# What `/v1/exec` runs for the sandbox, enforced here because the client is
-# only a convenience: anything holding the sandbox's token can post its own
-# argv. Neither `git` nor any forge CLI is on it: a repository and a forge are
+# What `/v1/exec` runs for callers, enforced here because the client is
+# only a convenience: anything holding a caller token can post its own
+# argv. Neither `kubectl`, `git`, nor any forge CLI is on it: Kubernetes API
+# reads go through `<agent>-kube-proxy`, and a repository and a forge are
 # reached through the verbs, which run them on the broker's own behalf. `git`
 # here would run under the broker's credential helper, and a read such as
 # `ls-remote` is no write for a lease to fence.
-EXEC_ROUTE_EXECUTABLES = ("gcloud", "kubectl")
+EXEC_ROUTE_EXECUTABLES = ("gcloud",)
 
 
 def broker_executables() -> tuple[str, ...]:
@@ -7670,11 +7670,13 @@ def broker_executables() -> tuple[str, ...]:
     ask to have run on its behalf. They used to be the same four names, which
     read as one decision and was two.
 
-    `gcloud` and `kubectl` are on both: the agent names them and this process
-    runs them. `git` and any forge CLI are here for the broker's own use -- it
-    issues them on its own behalf for the verbs. `/v1/exec` refuses both
-    (`EXEC_ROUTE_EXECUTABLES`), so a sandbox caller that composes its own
-    request reaches neither. What this list
+    `gcloud` is on `/v1/exec`: the agent names it and this process runs it
+    (while `kubectl` in the sandbox, session pods, and profile workers routes
+    through `<agent>-kube-proxy`). `git` and any forge CLI are here for the
+    broker's own use -- it issues them on its own behalf for the verbs.
+    `/v1/exec` refuses `kubectl`, `git`, and any forge CLI
+    (`EXEC_ROUTE_EXECUTABLES`), so a caller that composes its own `/v1/exec`
+    request reaches only `gcloud`. What this list
     decides on its own is the forge CLI: one is here only if some forge this
     install built declares one, so an install whose forges all speak HTTP
     grants no forge binary rather than inheriting the union of every binary

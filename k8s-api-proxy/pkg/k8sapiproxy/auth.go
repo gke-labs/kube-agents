@@ -43,40 +43,87 @@ type TokenReviewConfig struct {
 	Kubernetes *rest.Config
 	// Audience is the audience a caller's token must be issued for. Set it to one the API
 	// server does not accept, so a token sent to the proxy cannot be used against the API
-	// server directly. Required.
+	// server directly. Comma-separated values are split. Either Audience, Audiences, or
+	// AudienceCallers is required.
 	Audience string
-	// AllowedCallers are the usernames admitted, such as
-	// "system:serviceaccount:<namespace>:<name>". Required.
+	// Audiences lists additional accepted TokenReview audiences bound to AllowedCallers.
+	Audiences []string
+	// AllowedCallers are the usernames admitted for Audience / Audiences, such as
+	// "system:serviceaccount:<namespace>:<name>".
 	AllowedCallers []string
+	// AudienceCallers binds additional audiences to their own allowed caller usernames, so a
+	// caller admitted for one audience cannot authenticate with another audience's token.
+	AudienceCallers map[string][]string
 	// CacheTTL is how long a review is reused; defaultTokenReviewCacheTTL when zero.
 	CacheTTL time.Duration
 }
 
 type tokenReviewAuthenticator struct {
-	audiences authenticator.Audiences
-	allowed   sets.Set[string]
-	bearer    authenticator.Request
+	audiences         authenticator.Audiences
+	allowedByAudience map[string]sets.Set[string]
+	bearer            authenticator.Request
 }
 
 // NewTokenReviewAuthenticator returns a CallerAuthenticator that accepts a bearer token in
-// the Authorization header when a TokenReview finds it valid for cfg.Audience and its user
-// is in cfg.AllowedCallers. Reviews that accept or refuse the token are cached for
-// cfg.CacheTTL; a review that fails is not.
+// the Authorization header when a TokenReview finds it valid for a configured audience and
+// its user is in that audience's allowed caller set. Reviews that accept or refuse the
+// token are cached for cfg.CacheTTL; a review that fails is not.
 func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, error) {
 	if cfg.Kubernetes == nil {
 		return nil, errors.New("k8sapiproxy: TokenReviewConfig.Kubernetes is required")
 	}
-	audience := strings.TrimSpace(cfg.Audience)
-	if audience == "" {
-		return nil, errors.New("k8sapiproxy: TokenReviewConfig.Audience is required")
-	}
-	allowed := sets.New[string]()
-	for _, c := range cfg.AllowedCallers {
-		if c = strings.TrimSpace(c); c != "" {
-			allowed.Insert(c)
+	var audiences authenticator.Audiences
+	seenAudiences := sets.New[string]()
+	allowedByAudience := make(map[string]sets.Set[string])
+	addBinding := func(rawAud string, callers []string) {
+		callerSet := sets.New[string]()
+		for _, c := range callers {
+			if c = strings.TrimSpace(c); c != "" {
+				callerSet.Insert(c)
+			}
+		}
+		if callerSet.Len() == 0 {
+			return
+		}
+		for _, entry := range strings.Split(rawAud, ",") {
+			aud := strings.TrimSpace(entry)
+			if aud == "" {
+				continue
+			}
+			if !seenAudiences.Has(aud) {
+				seenAudiences.Insert(aud)
+				audiences = append(audiences, aud)
+			}
+			existing, ok := allowedByAudience[aud]
+			if !ok {
+				existing = sets.New[string]()
+				allowedByAudience[aud] = existing
+			}
+			existing.Insert(callerSet.UnsortedList()...)
 		}
 	}
-	if allowed.Len() == 0 {
+
+	for _, raw := range append([]string{cfg.Audience}, cfg.Audiences...) {
+		addBinding(raw, cfg.AllowedCallers)
+	}
+	for rawAud, callers := range cfg.AudienceCallers {
+		addBinding(rawAud, callers)
+	}
+	if len(audiences) == 0 {
+		hasAudience := strings.TrimSpace(cfg.Audience) != ""
+		for _, a := range cfg.Audiences {
+			if strings.TrimSpace(a) != "" {
+				hasAudience = true
+			}
+		}
+		for a := range cfg.AudienceCallers {
+			if strings.TrimSpace(a) != "" {
+				hasAudience = true
+			}
+		}
+		if !hasAudience {
+			return nil, errors.New("k8sapiproxy: TokenReviewConfig.Audience is required")
+		}
 		return nil, errors.New("k8sapiproxy: TokenReviewConfig.AllowedCallers is required")
 	}
 	ttl := cfg.CacheTTL
@@ -92,9 +139,9 @@ func NewTokenReviewAuthenticator(cfg TokenReviewConfig) (CallerAuthenticator, er
 	}
 	review := &tokenReviewer{reviews: client.TokenReviews()}
 	return &tokenReviewAuthenticator{
-		audiences: authenticator.Audiences{audience},
-		allowed:   allowed,
-		bearer:    bearertoken.New(cache.New(review, false, ttl, ttl)),
+		audiences:         audiences,
+		allowedByAudience: allowedByAudience,
+		bearer:            bearertoken.New(cache.New(review, false, ttl, ttl)),
 	}, nil
 }
 
@@ -108,7 +155,14 @@ func (a *tokenReviewAuthenticator) AuthenticateRequest(r *http.Request) (*Caller
 		return nil, errNotAuthenticated
 	}
 	name := resp.User.GetName()
-	if !a.allowed.Has(name) {
+	allowed := false
+	for _, aud := range resp.Audiences {
+		if callers, ok := a.allowedByAudience[aud]; ok && callers.Has(name) {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
 		return nil, fmt.Errorf("caller %q is not allowed", name)
 	}
 	return &CallerIdentity{Username: name, UID: resp.User.GetUID(), Groups: resp.User.GetGroups()}, nil
