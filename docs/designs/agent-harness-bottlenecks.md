@@ -6,7 +6,9 @@ kube-agents runs the Platform Agent and its supporting components in one GKE clu
 
 This research measures the harness on small fleets. Each experiment increases one stress point. A stress point is one property of the fleet or of its use, for example the number of clusters. The research fits a model to the data and predicts the breaking points for larger fleets. The result is a chart that answers two questions. First: are the current container limits enough for a given fleet? Second: which node size and container limits does a given fleet need?
 
-The first measurement, Phase 1, found no container near its memory limit at 8 clusters. It found that Warning events make the event watcher open many sessions, one for each event. It also found that the credential proxy reaches its CPU limit at 8 clusters. The credential proxy is the component that runs the agent's kubectl and gcloud commands.
+The measurements cover fleets of 2 to 22 small clusters. A bottleneck is the part of the harness that stops a larger fleet first. The credential proxy is the first bottleneck. The credential proxy is the component that runs the agent's kubectl and gcloud commands. With the default limits, the proxy reached its CPU limit during onboarding at 6, 8 and 22 clusters. When the first-run audits run at once, it reaches the limit at every fleet size. Then commands wait. With the audits at once at 16 clusters, and during onboarding at 22, a command waited between 30 and 60 seconds. After 60 seconds the proxy refuses a command. The proxy's memory nears its limit at about 15 to 25 clusters. At 16 clusters the proxy needs about 2.5 CPU cores, and its default limit is 1. The agent's memory and the event watcher stay far below their limits. The agent's CPU reached 2 of its 3 cores.
+
+More resources do not remove some bottlenecks. The agent runs at most 10 requests at once. The sandbox shell is the container where the agent's commands start. It passes at most about 1.5 commands per second. A question that checks the fleet takes a median of more than 2 minutes at every fleet size. An HPA (HorizontalPodAutoscaler) is an object that changes the number of Pods of a workload. A fleet with many Pods and HPAs makes the event watcher open thousands of sessions an hour, even with nothing failing.
 
 # Context
 
@@ -30,7 +32,7 @@ Model responses vary from run to run, and a provider 429 can look like a harness
 
 ## Metrics
 
-Each metric has a threshold. The breaking point of a metric is the stress level where it reaches its threshold. The last column says whether the Phase 1 runner records the metric; the rest are Phase 2 work.
+Each metric has a threshold. The breaking point of a metric is the stress level where it reaches its threshold. The last column says whether the Phase 1 runner records the metric. Phases 2 and 3 add each container's requests and the CPU it used over each window (`cpu_seconds`), the commands the credential proxy ran and their run time, and the proxy load's commands per second and their times (`bench/scale/README.md` lists every metric).
 
 | Metric                                                                                                                                                                                                                                                                        | Source                                                                                                                                                                                                                             | Threshold                                                                                     | Phase 1                                                               |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
@@ -115,8 +117,11 @@ Each operation runs against the factors that load it, not against every factor. 
 | Restart the agent pod while the fleet holds standing Warning events (boot burst)                                                                                                     | Pods failing at once                               |
 | Ask "which clusters, if any, are stressed?" (a fan-out); at concurrency above 1, the other requests are "which clusters do you monitor?", sent at the same moment                    | Clusters, concurrent requests                      |
 | List every Pod of the listing namespace on the first test cluster                                                                                                                    | Listing size                                       |
-| Run the scheduled jobs: hourly Cluster Agent reconcile, Controller Stall Watch, drift detection (Phase 2; drift detection is off in the experiment install)                          | Clusters                                           |
-| Read every Config Connector resource on one cluster (needs Config Connector installed on a test cluster; Phase 2)                                                                    | Objects per cluster                                |
+| The first 30 minutes after a reset: the reconcile and the scan (Phase 3)                                                                                                             | Clusters                                           |
+| OOBE's first-run audits, all started at the beginning of a 30-minute window (Phase 3)                                                                                                | Clusters                                           |
+| Brokered commands from the sandbox shell, a set number at once, with no model call (proxy load)                                                                                      | Commands at once                                   |
+| Run the scheduled jobs: hourly Cluster Agent reconcile, Controller Stall Watch, drift detection (not measured yet; drift detection is off in the experiment install)                 | Clusters                                           |
+| Read every Config Connector resource on one cluster (needs Config Connector installed on a test cluster; not measured yet)                                                           | Objects per cluster                                |
 
 # Delivery / Success Criteria
 
@@ -129,7 +134,7 @@ Each operation runs against the factors that load it, not against every factor. 
 
 ## Decisions
 
-1. **Where the data lives.** The measured data is committed to the repository as `bench/scale/harness-limits.json`: one record per run, with the commit and image the install ran, the runner's own commit, the mode, the date, the factor and its level, every factor's planned value, the clusters' real object totals, the containers' limits and replica counts, the operation, each metric's value, the start of each prompt's answer, and any error that made the run differ from its plan. Its schema is in `bench/scale/README.md`. A page in the admin console (`scripts/admin_portal.sh`) loads that file, so the chart works without a connected install. A new run merges its records into the file, keyed by commit, mode, factor, level, operation and run number; it replaces only a record with the same key. Records from earlier commits stay; the page shows one commit at a time.
+1. **Where the data lives.** The measured data is committed to the repository as `bench/scale/harness-limits.json`: one record per run, with the commit and image the install ran, the runner's own commit, the mode, the date, the factor and its level, every factor's planned value, the clusters' real object totals, the containers' requests, limits and replica counts, the operation, each metric's value, the start of each prompt's answer, and any error that made the run differ from its plan. Its schema is in `bench/scale/README.md`. A page in the admin console (`scripts/admin_portal.sh`) loads that file, so the chart works without a connected install. A new run merges its records into the file, keyed by commit, mode, factor, level, operation and run number; it replaces only a record with the same key. Records from earlier commits stay; the page shows one commit at a time.
 2. **Safety margin.** Question 2 sets each container limit 30% above its predicted peak. The margin covers three things the fit does not: the spread between the 3 runs at a point, bursts shorter than the sampling interval (the boot burst, a fan-out), and garbage-collector headroom: the event watcher sets `GOMEMLIMIT` to half its container limit, so its heap is collected harder as it approaches that point. The 30% is the whole margin. Phase 1 draws no error band: its points have 3 runs at most, and the onboarding and soak points one, too few for a band to mean much; a prediction past the largest measured point is labelled predicted, not measured.
 3. **Node placement.** All kube-agents pods run on one node pool. The node size is the smallest machine type whose allocatable memory and CPU fit the largest pod's recommended requests; the pool's node count is the sum of every pod's requests, replicas included, divided by that machine's allocatable. The node-size answer picks from five machine types. Allocatable memory is what remains after GKE's system reservation and the 100Mi eviction threshold; the values are approximate, from GKE's reservation formula:
 
@@ -149,21 +154,21 @@ Each operation runs against the factors that load it, not against every factor. 
 7. **Safety and the API.** The experiment install has no chat platform and no GitOps repository or GitHub token, so a planted fault cannot post to a channel or open a pull request ([#660](https://github.com/gke-labs/kube-agents/issues/660)). The runner sends every request through the agent API, over the repository's `kubectl exec` relay because the agent pod runs under gVisor, and counts triage outcomes from the agent's log lines and the API's answers. The alert ceilings stay at their defaults.
 8. **Real nodes and Pods.** Every level uses real nodes and Pods. Fixture Pods run the pause image (`registry.k8s.io/pause`) with a 1m CPU and 8Mi memory request, on a fixture pool of `e2-small` nodes that the runner resizes per level beside each cluster's 2-node default pool, so the cost is mostly nodes: 100 `e2-small` nodes cost about $1.70 per hour. A node holds at most 110 Pods, so a level with many Pods also needs more nodes: 1,200 Pods need at least 11 nodes, and 4,000 need at least 37. The factors therefore do not change fully alone; each run records the clusters' real totals by kind, including nodes, and the fit uses those totals.
 9. **Reusable tooling.** The measurement repeats as the codebase changes, so the tooling is a tool, not a one-off script:
-   - The plan is data: factors, levels, operations and run counts live in a plan file (`bench/scale/phase1.yaml`), so a later run changes the plan, not the code. Phase 2 is another plan file.
+   - The plan is data: factors, levels, operations and run counts live in a plan file (`bench/scale/phase1.yaml`), so a later run changes the plan, not the code. Phases 2 and 3 are other plan files in the same directory.
    - The target is a parameter: the plan's `target` block names no project, and every key can be set as `SCALE_<KEY>` in the environment. The host context is derived from the host cluster, and a context that does not name it is refused.
    - Fixtures are idempotent: each level applies and removes its objects by label, so a level can be re-applied or torn down after a failed run.
-   - The runner's commands are `plan`, `run`, `apply` (one level), `teardown` and `reclassify` (re-applies the current rules to stored records); `run` resumes from the records already in the file.
+   - The runner's commands are `plan`, `run`, `apply` (one level), `teardown`, `reclassify` (applies the current rules to stored records again) and `remonitor` (reads stored records' Cloud Monitoring values again); `run` resumes from the records already in the file, checks the plan before it starts, and stops when a level cannot be applied.
    - Each record carries the image the install ran and the commit its tag pins, so results from two builds compare directly. A build is keyed by its commit when the tag pins one, and by its whole tag otherwise, so a new build is a new set of keys.
    - Tests sit in `bench/tests/` and run with `make test-bench`; `make scale-plan` and `make scale-run` start the runner.
 
 ## Open questions
 
-1. **Fleet size has more than one dimension.** Memory depends on total watched objects (clusters × objects per cluster), but single-factor experiments vary each factor alone. Plot memory against total watched objects so the two experiments fall on one axis, and confirm with one combined point (for example 8 clusters × 4,000 objects).
+1. **Fleet size has more than one dimension.** Memory depends on total watched objects (clusters × objects per cluster), but single-factor experiments vary each factor alone. Plot memory against total watched objects so the two experiments fall on one axis, and confirm with one combined point (for example 8 clusters × 4,000 objects). Phase 2 measured that point: for memory the single-factor lines add up within about 15%, the agent's peak the furthest above the sum at 1.15 times; the shell's CPU was 2.1 times the sum (Phase 2 and Phase 3 results).
 2. **Which mode.** `spec.mode: today` and `spec.mode: next` load the harness differently (session pods, the A2A bus, kanban dispatch). The results hold only for the mode measured; each record carries it.
 
 # Phases
 
-The work runs in two phases. Phase 1 ran from 2026-10-22 to 2026-10-24; its results are under Phase 1 results below. Phase 2 is decided from what Phase 1 shows.
+Phase 1 ran from 2026-10-22 to 2026-10-24; its results are under Phase 1 results below. Phase 2, from 2026-10-26 to 2026-10-27, measured the points the Phase 1 data pointed at. Phase 3, from 2026-10-27 to 2026-10-28, measured the cluster levels again in 30-minute windows.
 
 ## Phase 1: two data points per factor
 
@@ -205,23 +210,138 @@ Steps, in order:
 4. The other runs.
 5. An admin console page that loads `bench/scale/harness-limits.json` and shows, per metric, the two points against the metric's threshold, with the raw data in a toggled section. It answers the two sizing questions from the two-point estimates.
 
-## Phase 2: decided from the Phase 1 result
+## Phase 2: the points Phase 1 pointed at
 
-Phase 1's chart decides what follows. Its data points at four of the candidates first: event volume, where the session storm grows (more levels between 68 and 1,200 events per minute); the cluster count, where the credential proxy starts to queue (16 and 32 clusters); concurrency around the 10 run slots (10 and 12); and a churn fixture that applies batches in parallel, so the 1,000 per minute level is reached. The candidates:
+Phase 2 (`bench/scale/phase2.yaml`) ran on the same image as Phase 1 and reused its base runs. It measured:
 
-- The remaining planned levels, for the metrics whose line comes close to a threshold inside realistic fleet sizes.
-- More points near a threshold, to find the knee for the queue metrics.
-- The 64-cluster level, after a quota check (cluster management costs about $0.10 per cluster-hour).
-- The combined point (8 clusters × 4,000 objects).
-- 3 runs for the onboarding window and the watcher soak.
-- The Config Connector read, on a test cluster with Config Connector installed.
-- The scheduled jobs' sweep duration, kanban queue depth, CPU throttling, network throughput, time to first card and time to first token.
-- New stress points the Phase 1 data suggests.
-- The instrumentation: a counter for triage starts lost ([#3583](https://github.com/gke-labs/kube-agents/issues/3583)) and a gauge for occupied Hermes run slots ([#3724](https://github.com/gke-labs/kube-agents/issues/3724)).
-- An issue for each limit the data shows below a realistic fleet size, linked from the Known Issues table.
-- A recurring run: the Phase 1 config on each release candidate, with the page flagging a metric that moved past a set fraction of the previous release.
+| What changed                                                  | Levels          | Operations                        | Why                                                                                                                               |
+| ------------------------------------------------------------- | --------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Commands sent to the credential proxy at once, from the shell | 1, 4, 8, 16, 32 | Proxy load                        | How many commands per second the command path carries, and what stops it: the shell's CPU, the proxy's CPU or the proxy's 8 slots |
+| Questions sent at once                                        | 8, 10, 12       | Fan-out                           | The step at the agent's 10 run slots                                                                                              |
+| Pods failing at once                                          | 10, 30          | Event watcher soak, boot burst    | Where the session storm starts                                                                                                    |
+| 8 clusters × 4,000 objects                                    | one point       | Onboarding, watcher soak, fan-out | Whether the effects of the factors add up                                                                                         |
+| Clusters                                                      | 22              | Onboarding (2-hour window)        | The largest fleet the project could hold                                                                                          |
 
-All planned points at 3 runs each would take about 95–115 h of machine time, 1.5–2 weeks of calendar time with re-runs.
+The proxy load is a new operation. Workers in the sandbox shell run `kubectl get pods --all-namespaces` through `credential-proxy-exec`, the path every agent command takes, for 3 minutes, and the run records the commands per second and the time each took. No model is called. Every run now also records how many commands the proxy ran and for how long, and each container's requests beside its limits.
+
+The plan was 16 and 32 clusters. Two things stopped it. The project's default network has room for the Pod ranges of about 30 clusters (a /14 each in 10.0.0.0/9), and the project's other clusters use 8 of them. The zone also ran out of E2 and then N2 machines for hours. So the largest fleet was 22 clusters. At 22 clusters the fixture Pods run on each cluster's 2 default nodes, without a separate fixture pool.
+
+## Phase 3: 30-minute windows
+
+Phases 1 and 2 measured onboarding over 2 hours and soaks over 1 hour, which made each point slow. Phase 3 measures every window in 30 minutes without missing the peak.
+
+Cloud Monitoring's 1-minute samples show when each container peaked in the earlier 2-hour onboarding windows:
+
+| Container                                           | Minute of the peak (2 clusters, 8 clusters, 8 × 4,000 objects) | Share of the peak in the first 30 minutes |
+| --------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------- |
+| Agent container (`platform-agent`), memory and CPU  | 4–11                                                           | 90–100%                                   |
+| Event watcher (`agent-api-auth`)                    | 1–2                                                            | 100%                                      |
+| Credential proxy (`envoy-credential-proxy`), memory | 40–81                                                          | 44–97%                                    |
+| Credential proxy, CPU                               | 15–59                                                          | 78–100%                                   |
+| Sandbox shell (`shell`), memory and CPU             | 15–121                                                         | 27–100%                                   |
+
+The late peaks come from the onboarding job, OOBE ([`oobe.md`](oobe.md)). After its scan, it runs its first-run audits one after another, and each audit reads every cluster through the credential proxy. At 22 clusters the first audit ran from minute 33 to minute 53 of the window, and the proxy's and the shell's memory peaks came during it. The Stall Watch job also reads every cluster, one at a time, every 30 minutes. At 22 clusters it used up its 25-minute budget after 19 clusters, and the next run went on from there.
+
+So Phase 3 (`bench/scale/phase3.yaml`) splits onboarding into two 30-minute windows:
+
+1. Onboarding: the reset, the Cluster Agent reconcile and the scan.
+2. Audits: the runner starts all of OOBE's first-run audits at the start of the window, the same way OOBE starts them. On the measured build four exist: fleet-wide cost analysis, compliance, obtainability and stockout prevention (`upgrade-retrospective` is not on that build's roster). Four audits at once are harder on the harness than one after another, so this window shows a worst case.
+
+The runs go from the largest fleet down, so clusters are only deleted, never created: 16, 8, 6 and 4 clusters, then the base of 2. Fan-out questions run where no earlier run exists. Every Phase 3 point has 2 nodes per cluster.
+
+Two more changes measure what the credential proxy needs, not only what it uses:
+
+- In the earlier onboarding windows the proxy ran at its 1-core CPU limit from 8 clusters, so its CPU peak showed the limit, not the need. Every record now also stores the CPU time each container used over its window (`cpu_seconds`), which keeps growing after the peak stops at the limit. The plan was to forecast from 4 and 6 clusters, below the limit. In the event the audit window reached the limit at every size, 2 clusters included, so the proxy's CPU need comes from the raised-limit runs below.
+- At 2 and 16 clusters, `bench/scale/phase3-proxy-raised.yaml` repeats both windows with the proxy's limits raised to 4 CPU and 4 GiB, so its CPU peak shows the need.
+
+Phase 3 did not repeat the 22-cluster point. A plan error deleted those clusters first; the runner now checks a plan before it starts and stops when a level fails. The 22-cluster point is the Phase 2 window.
+
+Not measured yet:
+
+- 32 and 64 clusters, which need another network for the Pod ranges and a quota and cost check (cluster management costs about $0.10 per cluster-hour);
+- a churn fixture that applies batches in parallel, so the 1,000 per minute level is reached;
+- more than one run of each onboarding and audit window;
+- the Config Connector read, on a test cluster with Config Connector installed;
+- the scheduled jobs' sweep duration, CPU throttling, kanban queue depth, network throughput, time to first card and time to first token;
+- a counter for triage starts lost ([#3583](https://github.com/gke-labs/kube-agents/issues/3583)) and a gauge for busy run slots ([#3724](https://github.com/gke-labs/kube-agents/issues/3724));
+- a recurring run on each release candidate, with the page flagging a metric that moved past a set fraction of the previous release.
+
+Each limit the data shows below a realistic fleet size gets an issue, linked from the Known Issues table.
+
+# Answers for a default install
+
+This section answers the two questions in Delivery / Success Criteria for a default install: the operator's default resources, on a Standard host cluster, in mode `next`, with image `eeb8a95c`. The test fleet's clusters are small: 2 to 4 nodes and about 300 objects each. The numbers come from the Phase 1, 2 and 3 records, through the same model as the Harness limits page and `python3 -m admin_console.estimate`, which answer for other fleets and other limits. Where a measured run disagrees with the model's line, this section says so and gives both.
+
+The default resources, read from the install's pods:
+
+| Container                        | Request           | Limit          | Set by                                      |
+| -------------------------------- | ----------------- | -------------- | ------------------------------------------- |
+| Agent (`platform-agent`)         | 1 CPU, 2 GiB      | 3 CPU, 8 GiB   | `spec.deployment.resources`                 |
+| Credential proxy                 | 0.5 CPU, 1 GiB    | 1 CPU, 2 GiB   | `spec.deployment.credentialProxy.resources` |
+| Event watcher (`agent-api-auth`) | 0.15 CPU, 384 MiB | 1 CPU, 2 GiB   | `spec.deployment.agentAPIAuth.resources`    |
+| Sandbox shell                    | 0.2 CPU, 512 MiB  | 2 CPU, 2 GiB   | no field: fixed in the operator             |
+| LiteLLM, 2 replicas              | 0.1 CPU, 2 GiB    | 0.5 CPU, 3 GiB | Helm value `litellm.resources`              |
+
+## Question 1: are the default limits enough for this fleet?
+
+For a fleet of small clusters like the test fleet, the credential proxy is the bottleneck. Commands wait for it from 4 clusters when the first-run audits run at once, and from 8 clusters when they run one after another, as a new install runs them. At about 16 to 22 clusters the waits are between 30 and 60 seconds, next to the 60-second refusal bound, and its memory nears its 2 GiB limit: the model's line says at about 15 clusters, the measured runs at about 25. No other container reaches its limit in the measured range, except the sandbox shell under 4 or more commands at once and in a session storm.
+
+| Limit                               | When the fleet reaches it                                                                                                                                                                                                                                                                                                                                                                  | What happens                                                                                                                                |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Credential proxy CPU, 1 core        | During onboarding, at 6, 8 and 22 clusters, though not at 16 (one run each). With the first-run audits running at once, at every size from 2 clusters; with them one after another, at about 8 clusters.                                                                                                                                                                                   | Commands wait for the proxy: 15–30 s at 4 and 6 clusters and 5–10 s at 8 with the audits at once; 10–15 s at 8 with them one after another. |
+| Credential proxy refusal, 60 s wait | The longest waits were between 30 and 60 s at 16 clusters with the audits at once, and at 22 clusters with them one after another. The model's line puts the longest wait at 60 s at about 19 clusters.                                                                                                                                                                                    | A command that waits 60 s is refused. No command was refused yet at 16 or 22 clusters.                                                      |
+| Credential proxy memory, 2 GiB      | 1.5 GiB at 16 clusters and 1.7 GiB at 22. The model's line reaches 2 GiB at about 15 clusters but over-predicts those two runs; continuing the runs from 8 to 22 clusters reaches it at about 25.                                                                                                                                                                                          | An OOMKill of the proxy stops every brokered command until it restarts.                                                                     |
+| Sandbox shell CPU, 2 cores          | With 4 or more brokered commands at once, at any fleet size, and at 8 clusters × 4,000 objects during the session storm (2.3 cores). In the 2-hour onboarding windows it stayed at 0.8 to 0.9 cores at 2, 8 and 22 clusters, and in the 30-minute windows between 0.3 and 1.0. The model's line, from the Phase 1 upgrade readiness runs at 2 and 8 clusters, reaches 2 cores at about 15. | The command path carries at most about 1.5 commands per second.                                                                             |
+| Agent CPU, 3 cores                  | The line reaches it at about 28 clusters.                                                                                                                                                                                                                                                                                                                                                  | Slower turns.                                                                                                                               |
+| Agent memory, 8 GiB                 | 2.3 GiB at 16 clusters; the line reaches it at about 80 clusters.                                                                                                                                                                                                                                                                                                                          | OOMKill.                                                                                                                                    |
+| Event watcher memory, 2 GiB         | 0.2 GiB at 22 clusters; far beyond the measured range.                                                                                                                                                                                                                                                                                                                                     | —                                                                                                                                           |
+
+Limits that no container resource moves:
+
+- **Response time.** A fan-out question took a median of 134 to 144 seconds at every size from 2 to 16 clusters (single runs 101 to 199 s), against the 60-second investigate gate ([#3140](https://github.com/gke-labs/kube-agents/issues/3140)).
+- **Run slots.** The agent runs 10 conversations at once. With 10 questions sent together all were answered; with 12, two were refused in every run ([#3724](https://github.com/gke-labs/kube-agents/issues/3724)).
+- **The command path.** A brokered command costs about 0.8 to 1 s of sandbox shell CPU when one runs at a time, most of it compiling the Python standard library ([#4027](https://github.com/gke-labs/kube-agents/issues/4027)). The shell's 2 cores are fixed, and the proxy runs at most 8 commands at once, also fixed.
+- **Stall Watch.** It reads every cluster one at a time every 30 minutes, within a 25-minute budget. At 22 clusters, during onboarding, it read 19 clusters in one run.
+- **Warning events.** The event watcher opens a session for each new incident, and Pods or HPAs that keep failing make many incidents. Sessions start between 10 and 30 Pods failing at once. With 4,800 HPAs and about 11,000 Pods in an 8-cluster fleet and nothing made to fail, it opened 7,483 sessions in an hour; the daily alert ceiling suppressed all of them, but that hour still used 3.2 million input tokens ([#3567](https://github.com/gke-labs/kube-agents/issues/3567)).
+- **Model quota.** The onboarding scan used 7 to 13 million input tokens in its first 30 minutes at 2 to 16 clusters, and the 2-hour onboarding window 9 to 22 million.
+
+On GKE Autopilot without room to burst, each container gets only its request. In the measured runs the agent passes its 2 GiB request at about 8 clusters (2.1 GiB), and the credential proxy its 1 GiB and the shell its 512 MiB between 8 and 16 clusters (at most 0.9 GiB and 0.5 GiB up to 8 clusters, 1.5 GiB and 0.8 GiB at 16). The model's lines say earlier: the proxy at about 3 clusters, the agent at about 6 and the shell at about 7; the proxy's line starts from one 2-cluster run at 926 MiB, above every cluster-count run at 4 to 8 clusters. Each container risks an OOMKill where it passes its request. Their CPU is above its request already at 2 clusters, so they run slower than on a Standard node from the start.
+
+## Question 2: what node size and container limits does this fleet need?
+
+Each limit below is the peak the data shows or predicts, plus the 30% margin of Decision 2. Fleets past 22 clusters are predicted, not measured.
+
+| Fleet                  | Agent: memory, CPU | Credential proxy: memory, CPU | Node pool          |
+| ---------------------- | ------------------ | ----------------------------- | ------------------ |
+| 8 clusters             | 2.8 GiB, 2.2 CPU   | 1.8 GiB, 2.6 CPU              | 2 × e2-standard-4  |
+| 16 clusters            | 3.7 GiB, 2.9 CPU   | 2.7 GiB, 3.4 CPU              | 3 × e2-standard-4  |
+| 32 clusters, predicted | 5.4 GiB, 4.2 CPU   | 4.5 GiB, 5.0 CPU              | 2 × e2-standard-8  |
+| 64 clusters, predicted | 8.9 GiB, 6.9 CPU   | 8.0 GiB, 8.1 CPU              | 2 × n2-standard-16 |
+
+- **Credential proxy CPU** comes from the runs with the proxy's limits raised to 4 CPU and 4 GiB. Every audit run at the default limit sat at 1 core, so it shows the limit, not the need. With the four audits at once the proxy needed 1.6 cores at 2 clusters and 2.5 at 16. The rows above start from 1.6 cores at 2 clusters and add about 0.07 cores per cluster, the growth of the raised-limit onboarding window, plus small terms for the Pod churn and failing Pods that grow with the fleet. With the audits one after another, as a new install runs them, the proxy still sat at its 1-core limit from 8 clusters (Phase 1), so its need there is not measured, and these rows are the safe side.
+- **The event watcher and LiteLLM** keep their defaults at every size here: the event watcher would use under 0.5 GiB at 64 clusters.
+- **The sandbox shell's** 2 CPU and 2 GiB are fixed, and nothing in the `PlatformAgent` raises them. In the default-limit 30-minute windows it used 0.3 to 1.0 CPU and at most 0.8 GiB; at 16 clusters, once the proxy had the CPU it needed, it used 1.3 CPU. It reaches its 2 cores under 4 or more commands at once and in a session storm. The node pool counts it at the model's line for it, which is higher than these measurements, so the pool sizes are on the safe side.
+- **The node pool** holds every long-running pod at the limits above, from the machine types in Decision 3. On Autopilot, set the requests to these values instead.
+- **Where to set them.** On a Helm install the chart forwards `platformAgent.deployment.credentialProxy.resources` and `platformAgent.deployment.agentAPIAuth.resources` to the `PlatformAgent`; the agent container's `spec.deployment.resources` has no Helm value, so it is set on the `PlatformAgent` itself.
+
+For 16 clusters, in the `PlatformAgent`. `resources` replaces the agent container's whole block, so it keeps the default requests; `credentialProxy.resources` replaces only the keys it sets:
+
+```yaml
+spec:
+  deployment:
+    resources:
+      requests: { cpu: "1", memory: 2Gi }
+      limits: { cpu: "3", memory: 4Gi }
+    credentialProxy:
+      resources:
+        limits: { cpu: "3500m", memory: 2816Mi }
+```
+
+What no setting changes, and what it would take:
+
+- The shell's 2 cores and the proxy's 8 command slots are fixed in the operator. Once the proxy has the CPU it needs, more commands reach the shell (1.3 cores at 16 clusters), and under 4 or more commands at once the shell is at its 2 cores. Past that the brokered command path needs code changes: a compiled standard library in the sandbox ([#4027](https://github.com/gke-labs/kube-agents/issues/4027)), a slot count that follows the proxy's limits, or more than one proxy replica ([#2637](https://github.com/gke-labs/kube-agents/issues/2637)).
+- The 10 run slots, Stall Watch's per-cluster loop and the session per incident are code, not resources.
+- The data volume: the agent's profiles used under 200 MiB at 22 clusters, so the default 50 GiB volume is not a limit in this range ([#3704](https://github.com/gke-labs/kube-agents/issues/3704) estimates about 3,200 clusters).
 
 # Phase 1 results
 
@@ -233,7 +353,7 @@ The Phase 1 records are in `bench/scale/harness-limits.json` (46 runs, image `ee
 - **The credential proxy reaches its CPU limit and starts to queue at 8 clusters.** In the 8-cluster onboarding window it peaked at 1.05 of its 1-core limit, its admission wait reached the 10–15 s histogram bucket (at most 0.1 s at every other measured point), and its memory reached 712 MiB, against 0.61 cores and 536 MiB in the 2-cluster onboarding window. It reached 1.06 cores in one 8-cluster upgrade readiness run and 0.94 in another ([#2637](https://github.com/gke-labs/kube-agents/issues/2637)). The sandbox shell container reached 1.9–1.95 of its 2 cores in the 4,000-object onboarding window and the failing-Pods soak.
 - **Warning events open sessions far faster than they become triages.** At the base the event watcher opened no session. With 100 nodes per cluster it opened 163 in an hour (GKE's own `netd` Pods failing on new nodes), with about 260 Pods created per minute 1,006, with 100 Pods failing at once 208, and while 4,000 listing Pods waited to be scheduled up to about 5,000 in half an hour. Across all 46 runs it opened 10,731 sessions for 8 triages: the daily alert ceiling suppressed 10,532, and each suppressed event still opened a session ([#3567](https://github.com/gke-labs/kube-agents/issues/3567)). The agent container's memory rose with the session count, from 556 MiB at the base soak to about 1.32–1.38 GiB at the churn and failing-Pods levels.
 - **Every typical question is past the investigate gate already at 2 clusters.** A fan-out question took 140–146 s at 2 clusters and 101–173 s at 8; listing a 100-Pod namespace took 231–261 s, against the [#3140](https://github.com/gke-labs/kube-agents/issues/3140) gates (under 30 s OK, over 60 s investigate). With 4,000 Pods in one namespace, a fleet audit took 481–512 s and one run outlasted the 1,800 s delegation wait.
-- **Fleet audit and upgrade readiness did not run as intended on this install.** Both can need a registered GitOps repository, which the experiment install deliberately has none of (Decision 7): of the runs whose answers were kept, 2 of 3 fleet audits at 8 clusters cancelled on a misread of the scope ([#3933](https://github.com/gke-labs/kube-agents/issues/3933)) and the third was declined for want of a repository, and one upgrade readiness run was declined. The records keep those runs, out of the response-time fit; the base runs of both operations, and the first 4,000-object fleet audit, were written before answers were kept and are out of it too.
+- **Fleet audit and upgrade readiness did not run as intended on this install.** Both can need a registered GitOps repository, which the experiment install deliberately has none of (Decision 7): of the runs whose answers were kept, 2 of 3 fleet audits at 8 clusters cancelled on a misread of the scope ([#3933](https://github.com/gke-labs/kube-agents/issues/3933)) and the third was declined for want of a repository, and one upgrade readiness run was declined. The records keep those runs, out of every fit; the base runs of both operations, and the first 4,000-object fleet audit, were written before answers were kept and are out of it too.
 - **Concurrent requests meet the 10 run slots.** With 15 questions sent at once, all 15 were answered in one run; in each of the other two, 5 were refused with `Too many concurrent runs` ([#3724](https://github.com/gke-labs/kube-agents/issues/3724)).
 - **The onboarding window costs millions of tokens.** LiteLLM counted 9.2 M input tokens over the 2-hour window at 2 clusters, 10.4 M at 8 clusters and 15.6 M at 4,000 objects per cluster; output tokens stayed between 0.07 and 0.13 M.
 
@@ -252,6 +372,58 @@ The Phase 1 records are in `bench/scale/harness-limits.json` (46 runs, image `ee
 - **Soaks and onboarding ran once per point,** so their points have no spread, and the prompt operations' response times varied by up to 4.8 times between runs of one point.
 - **The runner restarts the gateway** when the watcher does not watch exactly the test fleet ([#3932](https://github.com/gke-labs/kube-agents/issues/3932)), so each such run starts on a fresh agent process.
 - **The admission wait is a histogram bucket bound,** not an exact time: 15 s means between 10 and 15 s.
+
+# Phase 2 and Phase 3 results
+
+The Phase 2 and Phase 3 records are in `bench/scale/harness-limits.json` beside the Phase 1 records: the same image `eeb8a95c` and mode `next`. The Harness limits page charts them; this section states what they show.
+
+## What the data shows
+
+**The credential proxy is the first bottleneck, and the first-run audits are what reach it.** In the 30-minute windows (Phase 3, default limits):
+
+| Clusters | Onboarding: proxy CPU peak | Audits at once: proxy CPU peak | Audits at once: longest wait | Audits at once: proxy memory peak | Onboarding: agent memory peak |
+| -------- | -------------------------- | ------------------------------ | ---------------------------- | --------------------------------- | ----------------------------- |
+| 2        | 0.65                       | 1.02 (at its limit)            | 0.1 s                        | 705 MiB                           | 1,484 MiB                     |
+| 4        | 0.81                       | 0.97 (at its limit)            | 30 s                         | 689 MiB                           | 1,987 MiB                     |
+| 6        | 1.00 (at its limit)        | 1.03 (at its limit)            | 30 s                         | 871 MiB                           | 2,005 MiB                     |
+| 8        | 1.04 (at its limit)        | 1.12 (at its limit)            | 10 s                         | 496 MiB                           | 2,118 MiB                     |
+| 16       | 0.75                       | 1.12 (at its limit)            | 60 s                         | 1,506 MiB                         | 2,316 MiB                     |
+
+The 2-hour Phase 2 window at 22 clusters, with the audits one after another, showed the same bottleneck: the proxy at 1.11 cores, waits between 30 and 60 s and 1,779 MiB of memory, with 3,711 commands at 6.3 s each.
+
+**With its limits raised, the proxy shows what it needs.** At 16 clusters, with 4 CPU and 4 GiB instead of 1 CPU and 2 GiB, the audit window peaked at 2.54 cores, the longest wait fell from 60 s to 10 s, the proxy ran 36 commands per minute at 3 s each instead of 22 at 17 s, and all four audits finished inside the window. The default-limit window lost two audits to an outside IAM failure at minute 20, so part of that difference in commands is fewer audits running. Its memory peak did not change (1,490 MiB against 1,506 MiB). In the onboarding window it peaked at 1.24 cores, and its memory stayed at 229 MiB against 874 MiB with the default limit: a proxy short of CPU keeps commands alive longer, and they hold memory.
+
+**The work grows with the fleet even where the peak cannot.** The CPU the proxy used over a 30-minute window, divided by the window, went from 0.12 cores at 2 clusters to 0.35 at 8 and 0.47 at 16 (limits raised) in onboarding, and from 0.12 to 0.9 in the audit window. The peak stops at the limit; this average does not.
+
+**The command path carries at most about 1.5 commands per second, and the sandbox shell sets that.** Workers in the shell ran `kubectl get pods --all-namespaces` through the proxy with no model call. One worker got 0.76 commands per second at 1.3 s each. At 4 workers it got 1.5 per second at 2.6 s each, with the shell's 1-minute CPU peak at 1.8 of its 2 cores; from 8 to 32 workers the shell was at its 2 cores, throughput stayed at 1.4 per second and each command took longer: 5.5 s at 8 workers, 11 s at 16 and 22 s at 32. The proxy stayed near 0.8 cores and its median wait at 0.1 s throughout. One command at a time costs about 0.8 to 1 s of shell CPU, most of it compiling the Python standard library; with a bytecode cache, measured in the shell, the client costs 0.39 s ([#4027](https://github.com/gke-labs/kube-agents/issues/4027)). Five of the nine runs at 4 to 16 workers shared the broker with other commands (more brokered commands than the workers sent) and are left out of these numbers.
+
+**When the requests arrive together, run slots stop at exactly 10.** With 8 or 10 questions sent at once, every one was answered in all 3 runs (median 130–137 s). With 12, each run had exactly 2 refused with `HTTP 429` (`Too many concurrent runs`). In Phase 1, one of three runs with 15 at once had none refused.
+
+**Fan-out questions take the same time from 2 to 16 clusters:** a median of 134 to 144 seconds.
+
+**The session storm starts between 10 and 30 Pods failing at once.** In an hour the event watcher opened no session at 1 and 10 failing Pods, 3 at 30 and 208 at 100 (Phase 1). At 10, 30 and 100 failing Pods, a restart of the gateway opened 0, 4 to 7 and 63 to 68 sessions in the next 15 minutes. At 8 clusters × 4,000 objects (4,808 HPAs and about 11,000 Pods) it opened 7,483 sessions in an hour with nothing made to fail; the daily alert ceiling suppressed every one, and the hour still used 3.2 million input tokens and 1,848 brokered commands ([#3567](https://github.com/gke-labs/kube-agents/issues/3567)).
+
+**The factors add up within about 15% for memory.** At 8 clusters × 4,000 objects the agent's memory peak was 1.15 times the sum of the single-factor lines (2,188 MiB against 1,898 MiB), the credential proxy's 1.02, the shell's 0.92 and the event watcher's 0.91, as the Phase 2 model computed them when the point was measured; the page no longer recomputes them. The proxy's CPU sat at its limit, and the shell's reached 2.3 cores in that point's session storm, 2.1 times the sum.
+
+**Stall Watch runs out of time at about 20 clusters during onboarding.** It reads every cluster one at a time every 30 minutes, within a 25-minute budget; at 22 clusters it read 19 in one run and continued from there in the next.
+
+## Findings filed
+
+- [#4027](https://github.com/gke-labs/kube-agents/issues/4027): every brokered command recompiles the Python standard library in the sandbox shell's client, which caps the command path at about 1.5 commands per second.
+- [#4106](https://github.com/gke-labs/kube-agents/issues/4106): the credential proxy reaches its default 1-core CPU limit at every size when the first-run audits run at once, and in onboarding at 6, 8 and 22 clusters; at 16 clusters it needs about 2.5 cores.
+- The measured session storms and run-slot refusals are added to [#3567](https://github.com/gke-labs/kube-agents/issues/3567) and [#3724](https://github.com/gke-labs/kube-agents/issues/3724).
+
+## What limits the result
+
+- **22 clusters at most.** The project's default network has room for the Pod ranges of about 30 clusters, and the zone ran out of E2 and N2 machines for hours. Larger fleets are predicted, not measured; a queue grows faster than a straight line once it fills.
+- **Two methods.** The 22-cluster point is a 2-hour window with the audits one after another; the Phase 3 points are 30-minute windows with the audits at once, which is harder on the proxy. A plan error deleted the 22-cluster fleet before Phase 3 reached it.
+- **The audit window is a worst case.** Four audits at once is more than a new install runs. On the measured build only four of OOBE's five first-run audits exist: `upgrade-retrospective` is not on that build's Platform Agent roster.
+- **Small clusters, 2 nodes each.** Every Phase 3 point and the 22-cluster point have 2 nodes per cluster and no fixture pool. The Phase 1 points and the earlier Phase 2 points have a fixture pool beside the 2 default nodes: 3 or 4 nodes per cluster at the base, more at the node and object levels.
+- **One run per onboarding and audit window,** so those points have no spread. The proxy's onboarding peaks move up and down between neighbouring points: its memory between 297 and 926 MiB from 2 to 16 clusters.
+- **An outside IAM automation** removed the install's bindings again during the 16-cluster audit window. Two audits failed on a model call 20 minutes in, after the window's peaks, and the obtainability audit ran on into the next two fan-out runs, which are left out of the resource fits. At 6 clusters one audit was skipped, so that window ran three.
+- **Runs that shared the broker are left out of the resource fits.** Stall Watch reads every cluster through the broker at :00 and :30, so the 13 short prompt runs and 8 boot-burst windows that started inside one of its reads or held a tick are left out, as are the proxy load runs that had commands from outside the load. The length of a Stall Watch read (2 minutes plus 30 seconds per cluster) is set from the short runs on either side of a tick, not measured directly.
+- **A CPU line leaves out runs at the limit,** so where only low runs stay in, it can predict too little. The proxy's CPU answer uses the raised-limit runs for that reason.
+- **The raised-limit runs met model quota limits:** 54 provider 429s in the 16-cluster onboarding window.
 
 # Out of scope
 
@@ -286,13 +458,15 @@ Each row is a GitHub issue that reports a scale bottleneck with evidence. "Scale
 
 ### Credential proxy: one broker for every command
 
-| Issue                                                        | Bottleneck                                                                                                         | Scale                                   | Evidence                                                                                                                                    |
-| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| [#2324](https://github.com/gke-labs/kube-agents/issues/2324) | 8 concurrent `gcloud` children exceed the broker's memory limit                                                    | 143 clusters, 36 projects               | The Stall Watch cron fans out 8 at once; `memory.peak` 948MB against 1Gi                                                                    |
-| [#2045](https://github.com/gke-labs/kube-agents/issues/2045) | `kubectl` children are capped by count, not by size                                                                | 4,000 pods                              | One `-o yaml` listing takes 1,281 MiB; the cgroup v2 group OOM killer stops the whole container                                             |
-| [#2652](https://github.com/gke-labs/kube-agents/issues/2652) | An audit retries large-cluster reads into the proxy it crashed; `collect.py` runs 8-wide against 4 admission slots | 7-cluster audit on the 26-cluster fleet | Proxy at 827Mi, 6+ OOMKills; the audit never finishes                                                                                       |
-| [#2637](https://github.com/gke-labs/kube-agents/issues/2637) | One replica handles all brokered execs; the admission budget turns the OOM into a queue                            | 143 clusters                            | ~6,000 execs/hour at the CPU limit; up to 1,225 queued requests, p50 wait 22.5s, max 56.7s; the broker refuses at 60s, the preflight at 15s |
-| [#3142](https://github.com/gke-labs/kube-agents/issues/3142) | The agent reads CRDs one at a time through the broker                                                              | 233 Config Connector CRDs               | 769s at 3.3s per RPC; batched reads take 30s                                                                                                |
+| Issue                                                        | Bottleneck                                                                                                                               | Scale                                   | Evidence                                                                                                                                    |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| [#2324](https://github.com/gke-labs/kube-agents/issues/2324) | 8 concurrent `gcloud` children exceed the broker's memory limit                                                                          | 143 clusters, 36 projects               | The Stall Watch cron fans out 8 at once; `memory.peak` 948MB against 1Gi                                                                    |
+| [#2045](https://github.com/gke-labs/kube-agents/issues/2045) | `kubectl` children are capped by count, not by size                                                                                      | 4,000 pods                              | One `-o yaml` listing takes 1,281 MiB; the cgroup v2 group OOM killer stops the whole container                                             |
+| [#2652](https://github.com/gke-labs/kube-agents/issues/2652) | An audit retries large-cluster reads into the proxy it crashed; `collect.py` runs 8-wide against 4 admission slots                       | 7-cluster audit on the 26-cluster fleet | Proxy at 827Mi, 6+ OOMKills; the audit never finishes                                                                                       |
+| [#2637](https://github.com/gke-labs/kube-agents/issues/2637) | One replica handles all brokered execs; the admission budget turns the OOM into a queue                                                  | 143 clusters                            | ~6,000 execs/hour at the CPU limit; up to 1,225 queued requests, p50 wait 22.5s, max 56.7s; the broker refuses at 60s, the preflight at 15s |
+| [#3142](https://github.com/gke-labs/kube-agents/issues/3142) | The agent reads CRDs one at a time through the broker                                                                                    | 233 Config Connector CRDs               | 769s at 3.3s per RPC; batched reads take 30s                                                                                                |
+| [#4027](https://github.com/gke-labs/kube-agents/issues/4027) | Every brokered command recompiles the Python standard library in the sandbox shell's client                                              | any fleet                               | 0.85 s of shell CPU per command; the shell's 2-core limit caps the command path at about 1.5 commands per second                            |
+| [#4106](https://github.com/gke-labs/kube-agents/issues/4106) | The default 1-core CPU limit is reached at every size with the first-run audits at once; they need 1.6 cores at 2 clusters and 2.5 at 16 | 2 to 22 test clusters                   | Waits of 30 to 60 s at 16 and 22 clusters; 1.8 GiB of memory at 22 against a 2 GiB limit                                                    |
 
 ### Event volume: fan-out per pod, not per fault
 

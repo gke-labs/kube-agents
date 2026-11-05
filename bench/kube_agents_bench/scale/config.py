@@ -19,7 +19,13 @@ import yaml
 from kube_agents_bench.scale import kube
 
 BASE_FACTOR = "base"
+# A factor whose levels are points that move several factors at once: level N is the plan's
+# Nth ``combined`` point (1-based). It is listed under ``factors`` like any other, so the
+# plan's order decides when it runs.
+COMBINED_FACTOR = "combined"
 ENV_PREFIX = "SCALE_"
+PROXY_LOAD_KIND = "proxy_load"
+TRIGGER_SOAK_KIND = "trigger_soak"
 TARGET_KEYS = (
     "project_id",
     "host_context",
@@ -36,6 +42,9 @@ TARGET_KEYS = (
 REQUIRED_TARGET_KEYS = ("project_id", "host_cluster", "host_location", "namespace", "zone", "cluster_prefix", "cluster_label", "mode")
 
 DEFAULT_RUNS = 1
+# Settings the runner reads without a default; a plan that lacks one is refused at load, before
+# any level touches a cluster.
+REQUIRED_SETTINGS = ("churn_pod_lifetime_seconds", "fixture_machine_type", "fixture_pool", "pods_per_node")
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,12 @@ class Operation:
     follow_up: str = ""
     window_seconds: int = 0
     timeout_seconds: int = 0
+    # proxy_load: the command each worker repeats, as an argv after the CLI name.
+    command: tuple[str, ...] = ()
+    # trigger_soak: the cron jobs marked due at the window's start, and the home of the
+    # profile whose roster holds them.
+    jobs: tuple[str, ...] = ()
+    jobs_home: str = ""
 
 
 @dataclass(frozen=True)
@@ -66,30 +81,41 @@ class Plan:
     factors: dict[str, list[float]]
     operations: list[Operation]
     settings: dict[str, Any] = field(default_factory=dict)
+    combined: list[dict[str, float]] = field(default_factory=list)
+    # Run the base point after the factors' levels, so a plan whose levels shrink the fleet ends
+    # at its smallest fleet instead of starting there.
+    base_last: bool = False
 
     def level_values(self, factor: str, level: float) -> dict[str, float]:
-        """Every factor's value at one point: the base, with ``factor`` set to ``level``."""
+        """Every factor's value at one point: the base, with ``factor`` set to ``level``,
+        or with the level's point applied when ``factor`` is the combined factor."""
         values = dict(self.base)
-        if factor != BASE_FACTOR:
+        if factor == COMBINED_FACTOR:
+            values.update(self.combined[int(level) - 1])
+        elif factor != BASE_FACTOR:
             values[factor] = level
         return values
 
     def matrix(self) -> list[RunSpec]:
-        """Every run the plan asks for, base first, in factor and level order.
+        """Every run the plan asks for, the base first (or last, with ``base_last``), then each factor's
+        levels in plan order.
 
         The base point runs every operation once per configured run; each
         factor's other levels run only the operations that list the factor.
         """
         specs: list[RunSpec] = []
-        for operation in self.operations:
-            for run in range(1, operation.runs + 1):
-                specs.append(RunSpec(BASE_FACTOR, 0, operation, run))
+        base = [RunSpec(BASE_FACTOR, 0, operation, run) for operation in self.operations
+                for run in range(1, operation.runs + 1)]
+        if not self.base_last:
+            specs += base
         for factor, levels in self.factors.items():
             for level, operation in itertools.product(levels, self.operations):
                 if level == self.base.get(factor) or factor not in operation.factors:
                     continue
                 for run in range(1, operation.runs + 1):
                     specs.append(RunSpec(factor, level, operation, run))
+        if self.base_last:
+            specs += base
         return specs
 
 
@@ -123,18 +149,48 @@ def load_plan(path: Path, environ: dict[str, str] | None = None, validate_target
             follow_up=spec.get("follow_up", ""),
             window_seconds=int(spec.get("window_seconds", 0)),
             timeout_seconds=int(spec.get("timeout_seconds", 0)),
+            command=tuple(spec.get("command") or ()),
+            jobs=tuple(spec.get("jobs") or ()),
+            jobs_home=str(spec.get("jobs_home") or ""),
         )
         for name, spec in (raw.get("operations") or {}).items()
     ]
     factors = {name: [float(level) for level in levels] for name, levels in raw["factors"].items()}
+    for op, spec in zip(operations, (raw.get("operations") or {}).values()):
+        command = spec.get("command")
+        if op.kind == PROXY_LOAD_KIND and not (
+            isinstance(command, list) and command and all(isinstance(word, str) for word in command)
+            and op.window_seconds > 0
+        ):
+            raise ValueError(f"{path}: operation {op.name} needs a command (a list of words) and window_seconds")
+        jobs = spec.get("jobs")
+        if op.kind == TRIGGER_SOAK_KIND and not (
+            isinstance(jobs, list) and jobs and all(isinstance(job, str) for job in jobs)
+            and op.jobs_home and op.window_seconds > 0
+        ):
+            raise ValueError(f"{path}: operation {op.name} needs jobs (a list of job ids), jobs_home and window_seconds")
     unknown = sorted({f for op in operations for f in op.factors} - set(factors))
     if unknown:
         raise ValueError(f"{path}: operations name unknown factors {unknown}")
+    settings = raw.get("settings") or {}
+    absent = [name for name in REQUIRED_SETTINGS if name not in settings]
+    if absent:
+        raise ValueError(f"{path}: settings is missing {', '.join(absent)}")
+    combined = [{name: float(value) for name, value in point.items()} for point in raw.get("combined") or []]
+    points = range(1, len(combined) + 1)
+    bad = [level for level in factors.get(COMBINED_FACTOR, []) if level not in points]
+    if bad:
+        raise ValueError(f"{path}: combined levels {bad} name no point; the plan has {len(combined)}")
+    strays = sorted({name for point in combined for name in point} - set(raw["base"]))
+    if strays:
+        raise ValueError(f"{path}: combined points set factors the base does not have: {strays}")
     return Plan(
         phase=str(raw["phase"]),
         target=target,
         base={name: float(value) for name, value in raw["base"].items()},
         factors=factors,
         operations=operations,
-        settings=raw.get("settings") or {},
+        settings=settings,
+        combined=combined,
+        base_last=bool(raw.get("base_last", False)),
     )

@@ -12,6 +12,7 @@ pod's totals nor hides what the new one did.
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import re
@@ -39,6 +40,8 @@ MIN_WINDOW_SECONDS = 1
 QUOTA_PROJECT_HEADER = "x-goog-user-project"
 HTTP_TIMEOUT_SECONDS = 60
 RFC3339_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# A point's time to the second, before any fraction or zone suffix.
+POINT_TIME_CHARS = 19
 LOCALHOST = "127.0.0.1"
 METRICS_PATH = "/metrics"
 PYTHON_FETCH = "import sys, urllib.request; sys.stdout.write(urllib.request.urlopen(sys.argv[1]).read().decode())"
@@ -86,6 +89,11 @@ WATCHER_COUNTERS = {
     "watcher_quota_suppressed": "k8s_event_watcher_events_quota_suppressed_total",
 }
 PROXY_REFUSALS = "kubeagents_credential_proxy_admission_refusals_total"
+# Every brokered command the proxy ran, and the seconds they ran for: the demand a fleet puts on
+# the broker. The duration histogram's count covers exactly the commands its sum does; the
+# invocation counter also counts the ones refused by policy or by the slot wait, which never ran.
+PROXY_COMMANDS = "kubeagents_tool_execution_duration_seconds_count"
+PROXY_COMMAND_SECONDS = "kubeagents_tool_execution_duration_seconds_sum"
 PROXY_WAIT = "kubeagents_credential_proxy_admission_wait_seconds"
 PROXY_WAIT_QUANTILES = (("proxy_wait_p50_seconds", 0.5), ("proxy_wait_max_seconds", 1.0))
 TOKEN_FAMILIES = {
@@ -187,6 +195,8 @@ class Snapshot:
     oom: set[tuple[str, str]] = field(default_factory=set)
     # scrape target -> pod UID -> samples
     scraped: dict[str, dict[str, list[Sample]]] = field(default_factory=dict)
+    # pod UIDs that were running but could not be scraped; their growth is unknown, not their whole count
+    unread: set[str] = field(default_factory=set)
     errors: list[str] = field(default_factory=list)
 
     def samples(self, target: str) -> list[Sample]:
@@ -229,15 +239,22 @@ class Install:
         return ""
 
     def limits(self) -> dict[str, dict[str, float]]:
+        return self._resources("limits")
+
+    def requests(self) -> dict[str, dict[str, float]]:
+        """What each container requests: on Autopilot without bursting, also its limit."""
+        return self._resources("requests")
+
+    def _resources(self, kind: str) -> dict[str, dict[str, float]]:
         result: dict[str, dict[str, float]] = {}
         for pod in self.pods():
             for container in _running_containers(pod):
-                limits = container.get("resources", {}).get("limits", {})
+                resources = container.get("resources", {}).get(kind, {})
                 entry: dict[str, float] = {}
-                if "memory" in limits:
-                    entry["memory_bytes"] = parse_quantity(limits["memory"])
-                if "cpu" in limits:
-                    entry["cpu_cores"] = parse_quantity(limits["cpu"])
+                if "memory" in resources:
+                    entry["memory_bytes"] = parse_quantity(resources["memory"])
+                if "cpu" in resources:
+                    entry["cpu_cores"] = parse_quantity(resources["cpu"])
                 if entry:
                     result[container["name"]] = entry
         return result
@@ -277,11 +294,13 @@ class Install:
                 port = _metrics_port(pod, container, env_name)
                 if not port:
                     snap.errors.append(f"no metrics port on {name}/{container}")
+                    snap.unread.add(pod["metadata"]["uid"])
                     continue
                 try:
                     per_pod[pod["metadata"]["uid"]] = scrape(self.context, self.namespace, name, container, port)
                 except kube.CommandError as exc:
                     snap.errors.append(f"scrape {name}: {exc}")
+                    snap.unread.add(pod["metadata"]["uid"])
             snap.scraped[attr] = per_pod
         return snap
 
@@ -362,7 +381,12 @@ class Install:
         return counts
 
     def container_peaks(self, start: float, end: float) -> dict[str, dict[str, float]]:
-        """Per container, the highest memory and CPU over [start, end], from Cloud Monitoring.
+        """Per container, the highest memory and CPU over [start, end], and the CPU-seconds used, from
+        Cloud Monitoring.
+
+        The CPU-seconds are the work: a container at its CPU limit shows the limit as its peak,
+        while the work a fleet asks of it grows with the fleet. They are summed over the
+        container's replicas; the peaks are the highest of any one.
 
         Monitoring refuses an interval whose end is not after its start, so a
         window shorter than a second is widened to one second.
@@ -375,16 +399,24 @@ class Install:
             f'AND resource.labels.namespace_name="{self.namespace}"'
         )
         queries = (
-            ("memory_peak_bytes", f'metric.type="{MEMORY_METRIC}" AND metric.labels.memory_type="{MEMORY_TYPE}" AND {base}', "ALIGN_MAX"),
-            ("cpu_peak_cores", f'metric.type="{CPU_METRIC}" AND {base}', "ALIGN_RATE"),
+            ("memory_peak_bytes", f'metric.type="{MEMORY_METRIC}" AND metric.labels.memory_type="{MEMORY_TYPE}" AND {base}', "ALIGN_MAX", max),
+            ("cpu_peak_cores", f'metric.type="{CPU_METRIC}" AND {base}', "ALIGN_RATE", max),
+            ("cpu_seconds", f'metric.type="{CPU_METRIC}" AND {base}', "ALIGN_DELTA", sum),
         )
-        for name, query, aligner in queries:
+        for name, query, aligner, reduce in queries:
             for series in self._time_series(query, aligner, start, end):
                 container = series["resource"]["labels"].get("container_name", "")
-                values = [_point_value(point) for point in series.get("points", [])]
+                points = series.get("points", [])
+                if reduce is max:
+                    values = [_point_value(point) for point in points]
+                else:
+                    # An aligned point holds the minute before its end, so the first one reaches back
+                    # before the window: count only the share of it that falls inside.
+                    values = [_point_value(point) * _share_inside(point, start) for point in points]
                 if container and values:
                     current = peaks.setdefault(container, {}).get(name, 0.0)
-                    peaks[container][name] = max(current, max(values))
+                    # One series per replica: the peak is the highest, the work the sum.
+                    peaks[container][name] = max(current, max(values)) if reduce is max else current + sum(values)
         return peaks
 
     def _time_series(self, query: str, aligner: str, start: float, end: float) -> list[dict[str, Any]]:
@@ -434,6 +466,12 @@ def _metrics_port(pod: dict[str, Any], container_name: str, env_name: str | None
     return None
 
 
+def _share_inside(point: dict[str, Any], start: float) -> float:
+    """The share of an aligned point's interval that falls after ``start``."""
+    ended = calendar.timegm(time.strptime(point["interval"]["endTime"][:POINT_TIME_CHARS] + "Z", RFC3339_FORMAT))
+    return min(1.0, max(0.0, (ended - start) / ALIGNMENT_SECONDS))
+
+
 def _point_value(point: dict[str, Any]) -> float:
     value = point["value"]
     return float(value.get("doubleValue", value.get("int64Value", 0)))
@@ -454,9 +492,15 @@ def counter_increase(before: float, after: float) -> float:
 
 
 def _growth(before: Snapshot, after: Snapshot, target: str, family: str) -> float:
-    """A counter family's growth, pod by pod; a new pod or a reset counter counts from zero."""
+    """A counter family's growth, pod by pod; a new pod or a reset counter counts from zero.
+
+    A pod that was running at the start but could not be read then is left out: counting it
+    from zero would report its whole count since start as the window's growth.
+    """
     total = 0.0
     for pod, samples in after.scraped.get(target, {}).items():
+        if pod in before.unread:
+            continue
         earlier = family_sum(before.scraped.get(target, {}).get(pod, []), family)
         total += counter_increase(earlier, family_sum(samples, family))
     return total
@@ -482,6 +526,8 @@ def counter_metrics(before: Snapshot, after: Snapshot) -> list[Metric]:
             metrics.append(Metric(name, _growth(before, after, "watcher", family)))
     if after.scraped.get("proxy"):
         metrics.append(Metric("proxy_refusals", _growth(before, after, "proxy", PROXY_REFUSALS)))
+        metrics.append(Metric("proxy_commands", _growth(before, after, "proxy", PROXY_COMMANDS)))
+        metrics.append(Metric("proxy_command_seconds", _growth(before, after, "proxy", PROXY_COMMAND_SECONDS)))
         delta: dict[float, float] = {}
         for pod, samples in after.scraped["proxy"].items():
             earlier = histogram_buckets(before.scraped.get("proxy", {}).get(pod, []), PROXY_WAIT)

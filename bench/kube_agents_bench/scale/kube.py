@@ -11,8 +11,10 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -44,10 +46,14 @@ TRANSIENT_RE = re.compile(
 )
 STDERR_TAIL_CHARS = 2000
 FIXTURE_DISK_GB = 20
+# Clusters counted at once; a 32-cluster level is otherwise minutes of serial kubectl calls per run.
+TOTALS_PARALLELISM = 8
 RELEASE_CHANNEL = "regular"
 NODE_POOL_LABEL = "cloud.google.com/gke-nodepool"
 LABELS_FIELD = "resourceLabels"
 WORKLOAD_POOL_SUFFIX = ".svc.id.goog"
+APART_KUBECONFIG_PREFIX = "harness-scale-gcloud-"
+APART_KUBECONFIG_NAME = "kubeconfig"
 CONTEXT_FORMAT = "gke_{project}_{location}_{cluster}"
 # Kinds the runner counts in every test cluster; the record's totals use these names.
 COUNTED_KINDS = {
@@ -67,7 +73,10 @@ class CommandError(RuntimeError):
     pass
 
 
-def run(args: list[str], *, stdin: str | None = None, timeout: float = DEFAULT_TIMEOUT_SECONDS) -> str:
+def run(
+    args: list[str], *, stdin: str | None = None, timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    env: dict[str, str] | None = None,
+) -> str:
     """Run a command; retry it with backoff when it fails for a reason that passes.
 
     A day-long campaign meets expired tokens, a dropped network and API-server
@@ -80,7 +89,8 @@ def run(args: list[str], *, stdin: str | None = None, timeout: float = DEFAULT_T
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         LOG.debug("run: %s", " ".join(args))
         try:
-            proc = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=timeout, check=False)
+            proc = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=timeout, check=False,
+                                  env=env)
         except subprocess.TimeoutExpired as exc:
             raise CommandError(f"{shown}... timed out after {timeout}s") from exc
         if proc.returncode == 0:
@@ -159,9 +169,14 @@ def count(context: str, resource: str) -> int:
 def totals(contexts: list[str]) -> dict[str, int]:
     """Object counts by kind, summed over the test clusters, plus the cluster count."""
     result = {name: 0 for name in COUNTED_KINDS}
-    for context in contexts:
-        for name, resource in COUNTED_KINDS.items():
-            result[name] += count(context, resource)
+
+    def one(context: str) -> dict[str, int]:
+        return {name: count(context, resource) for name, resource in COUNTED_KINDS.items()}
+
+    with ThreadPoolExecutor(max_workers=max(1, min(TOTALS_PARALLELISM, len(contexts)))) as pool:
+        for counts in pool.map(one, contexts):
+            for name, value in counts.items():
+                result[name] += value
     result["clusters"] = len(contexts)
     return result
 
@@ -227,8 +242,10 @@ def node_pool_size(project: str, zone: str, cluster: str, pool: str) -> int | No
 
 
 def ensure_node_pool(project: str, zone: str, cluster: str, pool: str, machine_type: str, size: int) -> None:
-    """Create the fixture pool at ``size`` nodes, or resize it when it exists."""
+    """Create the fixture pool at ``size`` nodes, or resize it when it exists; never create an empty one."""
     current = node_pool_size(project, zone, cluster, pool)
+    if current is None and size == 0:
+        return
     if current is None:
         gcloud(
             "container", "node-pools", "create", pool, f"--cluster={cluster}", f"--zone={zone}",
@@ -243,8 +260,19 @@ def ensure_node_pool(project: str, zone: str, cluster: str, pool: str, machine_t
         )
 
 
+def _apart(*args: str, project: str, timeout: float) -> str:
+    """A gcloud command that writes a kubeconfig entry, given a throwaway kubeconfig of its own.
+
+    ``clusters create`` and ``clusters delete`` rewrite the kubeconfig; several at once lose each
+    other's writes, and with them the host cluster's context.
+    """
+    with tempfile.TemporaryDirectory(prefix=APART_KUBECONFIG_PREFIX) as directory:
+        env = {**os.environ, "KUBECONFIG": os.path.join(directory, APART_KUBECONFIG_NAME)}
+        return run([GCLOUD, *args, f"--project={project}", "--quiet"], timeout=timeout, env=env)
+
+
 def create_cluster(project: str, zone: str, cluster: str, machine_type: str, nodes: int, labels: str) -> None:
-    gcloud(
+    _apart(
         "container", "clusters", "create", cluster, f"--zone={zone}", f"--num-nodes={nodes}",
         f"--machine-type={machine_type}", f"--release-channel={RELEASE_CHANNEL}", f"--labels={labels}",
         f"--workload-pool={project}{WORKLOAD_POOL_SUFFIX}",
@@ -253,5 +281,5 @@ def create_cluster(project: str, zone: str, cluster: str, machine_type: str, nod
 
 
 def delete_cluster(project: str, zone: str, cluster: str) -> None:
-    gcloud("container", "clusters", "delete", cluster, f"--zone={zone}", project=project,
+    _apart("container", "clusters", "delete", cluster, f"--zone={zone}", project=project,
            timeout=CREATE_CLUSTER_TIMEOUT_SECONDS)

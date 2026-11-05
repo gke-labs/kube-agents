@@ -388,10 +388,6 @@ class FitTest(unittest.TestCase):
         self.assertFalse(any(item.excluded for item in used))
         # The base value is the run whose prompts all completed.
         self.assertAlmostEqual(prediction.value, 20)
-        self.assertEqual(
-            [row["Excluded from fit"] for row in hl.measurement_rows(records[1:2])],
-            [True, False],
-        )
 
     def test_the_transport_failure_marker_also_marks_a_failed_prompt(self):
         marked, unrelated = parse(
@@ -454,12 +450,6 @@ class PredictionTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(prediction.value, 168)
-        self.assertEqual(
-            hl.grown_factors(records, self.fleet(records, clusters=8, nodes=10)),
-            [hl.CLUSTERS, hl.NODES],
-        )
-        self.assertEqual(hl.grown_factors(records, self.fleet(records, clusters=8)), [hl.CLUSTERS])
-        self.assertEqual(hl.grown_factors(records, hl.base_fleet(records)), [])
 
     def test_the_largest_base_and_the_largest_increase_count(self):
         records = parse(
@@ -589,7 +579,7 @@ class CheckTest(unittest.TestCase):
         return {check.metric: check for check in checks}
 
     def test_headroom_and_status_against_the_limit(self):
-        limits = hl.latest_limits(self.records)
+        limits = hl.usual_limits(self.records)
 
         passing = self.checks(8, limits)[hl.MEMORY_PEAK]
         failing = self.checks(40, limits)[hl.MEMORY_PEAK]
@@ -601,10 +591,11 @@ class CheckTest(unittest.TestCase):
         self.assertAlmostEqual(hl.headroom(failing), (2048 - 2400) * MIB)
         self.assertAlmostEqual(failing.reached, (2048 - 500) / (2400 - 500))
 
-    def test_the_limits_table_round_trips_in_mib_and_cores(self):
-        table = hl.limit_table(hl.latest_limits(self.records), ["agent-api-auth", "other"])
+    def test_the_limits_table_round_trips_in_gb_and_cores(self):
+        table = hl.limit_table(hl.usual_limits(self.records), ["agent-api-auth", "other"])
 
-        self.assertEqual(table[hl.LIMIT_MEMORY_COLUMN], [2048.0, 0.0])
+        # 2 GiB is 2.147483648 GB.
+        self.assertEqual(table[hl.LIMIT_MEMORY_COLUMN], [2 * GIB / hl.GB, 0.0])
         table[hl.LIMIT_CPU_COLUMN] = [None, 0.5]
         self.assertEqual(
             hl.limits_from_table(table),
@@ -683,7 +674,7 @@ class CheckTest(unittest.TestCase):
         self.assertIsNone(hl.reached_at(at_base, 2 * GIB))
 
     def test_the_first_limit_is_crossed_at_the_smallest_growth(self):
-        checks = self.checks(40, hl.latest_limits(self.records))
+        checks = self.checks(40, hl.usual_limits(self.records))
 
         first = hl.first_limit(checks.values())
 
@@ -872,9 +863,6 @@ class NodePlanTest(unittest.TestCase):
 
         self.assertIsNone(plan.machine)
         self.assertIsNone(plan.nodes)
-        rows = hl.machine_rows(plan)
-        self.assertEqual({row["Holds the largest pod"] for row in rows}, {hl.NO_LABEL})
-        self.assertEqual({row["Nodes for every pod"] for row in rows}, {hl.NO_VALUE})
 
     def test_a_container_without_a_recommendation_requests_nothing(self):
         plan = hl.node_plan(
@@ -1059,6 +1047,16 @@ class HarnessLimitsPageTest(unittest.TestCase):
         app = AppTest.from_file(APP_PATH, default_timeout=60).run()
         return app.switch_page(PAGE_PATH).run()
 
+    def first_commit_and_mode(self) -> tuple[str, str]:
+        records = hl.load_dataset().records
+        commit = hl.commits(records)[0]
+        available = hl.modes(records, commit)
+        return commit, available[hl.default_mode_index(available)]
+
+    def custom_fleet(self, app: AppTest) -> AppTest:
+        app.selectbox(key="harness_limits:profile").set_value(hl.CUSTOM_PROFILE)
+        return app.run()
+
     def test_the_page_renders_the_sample_without_a_connection(self):
         app = self.open_page()
 
@@ -1066,31 +1064,37 @@ class HarnessLimitsPageTest(unittest.TestCase):
         self.assertEqual(app.title[0].value, "Harness limits")
         self.assertTrue(any("Sample data" in item.value for item in app.warning))
         self.assertFalse(any("Connect a project" in item.value for item in app.info))
-        self.assertTrue(any("checks pass" in item.value for item in app.success))
-        # The gateway pod (3,235Mi, 1,586m) fits an e2-standard-2; every pod's
-        # 2,717m of CPU needs two of them.
-        self.assertTrue(any("**2 × e2-standard-2**" in item.value for item in app.success))
-        self.assertEqual(app.expander[-1].label, "Raw records")
-        raw = app.expander[-1].dataframe[0].value
-        self.assertIn("Errors", raw.columns)
-        self.assertIn(PROMPT_FAILURE, set(raw["Errors"]))
+        # The benchmark size is the default fleet, and both questions are answered for it.
+        self.assertEqual(app.selectbox(key="harness_limits:profile").value, hl.FLEET_PROFILES[-1].label)
+        parts = " ".join(str(item.value) for item in app.header)
+        self.assertIn("Part 1: Limits forecast", parts)
+        self.assertIn("Part 2: Empirical evidence", parts)
+        self.assertIn("Can this fleet be handled?", " ".join(str(item.value) for item in app.subheader))
+        self.assertNotIn("Raw records", [item.label for item in app.expander])
 
-    def test_the_failing_pods_input_is_a_count(self):
-        app = self.open_page()
+    def test_the_custom_fleet_starts_at_the_measured_base(self):
+        app = self.custom_fleet(self.open_page())
 
         (failing,) = [item for item in app.number_input if item.label == "Pods failing at once"]
 
         self.assertEqual(failing.value, 1.0)
         self.assertNotIn("minute", failing.help)
+        verdicts = [item.value for item in [*app.success, *app.error]]
+        self.assertTrue(any("One install holds all" in text for text in verdicts))
 
-    def test_the_margin_note_claims_no_error_band(self):
+    def test_the_benchmark_fleet_is_split_into_installs(self):
         app = self.open_page()
+        # The count the page states: the XL fleet over the largest fleet a run held, in whole clusters.
+        records = hl.select(hl.load_dataset().records, *self.first_commit_and_mode())
+        held = hl.measured_install_capacity(records) or hl.install_plan(
+            records, hl.containers(records), hl.FLEET_PROFILES[-1].fleet(hl.base_fleet(records))
+        ).capacity
+        installs = math.ceil(hl.FLEET_PROFILES[-1].clusters / max(int(held), 1))
+        self.assertTrue(any(f"**{installs:,} installs of about" in item.value for item in [*app.success, *app.error]))
 
-        (note,) = [item.value for item in app.info if "Why 30%" in item.value]
-
-        self.assertIn("The 30% is the whole margin.", note)
-        self.assertIn("Phase 1 draws no error band", note)
-        self.assertIn("predicted, not measured", note)
+        verdicts = [item.value for item in [*app.success, *app.error]]
+        self.assertTrue(any("installs of about" in text for text in verdicts))
+        self.assertTrue(any("Split into" in str(item.value) for item in app.markdown))
 
     def test_the_page_names_no_project_or_cluster(self):
         app = self.open_page()
@@ -1119,18 +1123,13 @@ class HarnessLimitsPageTest(unittest.TestCase):
                 self.assertFalse([pattern for pattern in patterns if re.search(pattern, text)])
 
     def test_a_larger_fleet_fails_and_is_predicted_not_measured(self):
-        app = self.open_page()
+        app = self.custom_fleet(self.open_page())
         next(item for item in app.number_input if item.label == "Clusters").set_value(64.0)
         app = app.run()
 
         self.assertEqual(len(app.exception), 0, [item.value for item in app.exception])
-        self.assertTrue(any("checks fail" in item.value for item in app.error))
-        self.assertTrue(
-            any("predicted, not measured" in item.value for item in app.warning)
-        )
-        self.assertTrue(any("**2 × n2-standard-16**" in item.value for item in app.success))
-
-
+        verdicts = [item.value for item in [*app.success, *app.error]]
+        self.assertTrue(any("installs of about" in text for text in verdicts))
 
 
 class LevelCountTest(unittest.TestCase):
@@ -1197,5 +1196,328 @@ class ChurnAxisTest(unittest.TestCase):
         self.assertEqual(hl.factor_value(record, hl.CHURN), 260.0)
 
 
+
+class Phase2FactorTest(unittest.TestCase):
+    def test_a_combined_point_is_no_axis(self):
+        container = "platform-agent"
+        records = parse(
+            record(metrics=(memory(container, 500),), values=planned()),
+            record(
+                "clusters",
+                8,
+                metrics=(memory(container, 800),),
+                totals={"clusters": 8, "nodes": 16},
+                values=planned(clusters=8),
+            ),
+            record(
+                "combined",
+                1,
+                metrics=(memory(container, 1000),),
+                totals={"clusters": 8, "nodes": 16},
+                values=planned(clusters=8, objects=4000),
+            ),
+        )
+        self.assertEqual(hl.factors(records), [hl.CLUSTERS])
+        # Objects has no single-factor runs here, so the prediction is the clusters line alone.
+        prediction = hl.predict(records, hl.MEMORY_PEAK, container, {**hl.base_fleet(records), hl.CLUSTERS: 8})
+        self.assertAlmostEqual(prediction.value, 800 * MIB)
+
+    def test_proxy_load_workers_are_charted_but_move_no_prediction(self):
+        records = parse(
+            record(operation="proxy_load", metrics=((hl.CPU_PEAK, "credential-proxy", 0.4),),
+                   values=planned(proxy_concurrency=1)),
+            record("proxy_concurrency", 8, operation="proxy_load",
+                   metrics=((hl.CPU_PEAK, "credential-proxy", 1.0),), values=planned(proxy_concurrency=8)),
+        )
+        self.assertEqual(hl.factors(records, "proxy_load"), [hl.PROXY_CONCURRENCY])
+        self.assertEqual(hl.factor_label(hl.PROXY_CONCURRENCY), "Credential proxy load workers")
+        prediction = hl.predict(records, hl.CPU_PEAK, "credential-proxy", hl.base_fleet(records))
+        self.assertEqual(prediction.contributions, ())
+        self.assertAlmostEqual(prediction.value, 0.4)
+        points = hl.series_points(records, "proxy_load", hl.PROXY_CONCURRENCY, hl.CPU_PEAK, "credential-proxy")
+        self.assertEqual([p.x for p in points], [1.0, 8.0])
+
+
+class CapacityTest(unittest.TestCase):
+    CONTAINER = "platform-agent"
+    LIMITS = {"platform-agent": {"memory_bytes": 1000 * MIB}}
+
+    def records(self) -> tuple[hl.Record, ...]:
+        """Memory 500 MiB at 2 clusters and 800 MiB at 8: 50 MiB per cluster."""
+        return parse(
+            record(metrics=(memory(self.CONTAINER, 500),), values=planned()),
+            record(
+                "clusters",
+                8,
+                metrics=(memory(self.CONTAINER, 800),),
+                totals={"clusters": 8, "nodes": 16},
+                values=planned(clusters=8),
+            ),
+        )
+
+    def test_a_fleet_of_more_clusters_keeps_their_shape(self):
+        fleet = hl.scaled_fleet(planned(), 8)
+        self.assertEqual(fleet[hl.CLUSTERS], 8)
+        self.assertEqual(fleet[hl.CHURN], 40.0)
+        self.assertEqual(fleet[hl.FAILING_PODS], 4.0)
+        self.assertEqual(fleet[hl.OBJECTS], planned()[hl.OBJECTS])
+
+    def test_the_breaking_point_is_where_the_line_meets_the_limit(self):
+        [memory_check] = [
+            item
+            for item in hl.cluster_capacities(self.records(), [self.CONTAINER], self.LIMITS)
+            if item.check.metric == hl.MEMORY_PEAK
+        ]
+        self.assertFalse(memory_check.at_base)
+        self.assertAlmostEqual(memory_check.value, 12.0, places=3)
+
+    def test_a_limit_below_the_base_fails_at_the_base(self):
+        limits = {"platform-agent": {"memory_bytes": 400 * MIB}}
+        [memory_check] = hl.cluster_capacities(self.records(), [self.CONTAINER], limits)
+        self.assertTrue(memory_check.at_base)
+
+    def test_a_flat_metric_never_fails(self):
+        limits = {"platform-agent": {"memory_bytes": 100_000 * MIB}}
+        [memory_check] = hl.factor_capacities(self.records(), [self.CONTAINER], limits, hl.NODES)
+        self.assertIsNone(memory_check.value)
+
+    def test_a_count_onset_is_the_measured_step(self):
+        refusals = hl.RUN_SLOT_REFUSALS
+        records = parse(
+            record(operation="fan_out", metrics=((refusals, None, 0),), values=planned()),
+            *(
+                record("concurrent", level, "fan_out", run, metrics=((refusals, None, count),),
+                       values=planned(concurrent=level))
+                for level, run, count in ((10, 1, 0), (10, 2, 0), (12, 1, 0), (12, 2, 2), (15, 1, 5))
+            ),
+        )
+        [onset] = hl.count_onsets(records, hl.CONCURRENT)
+        self.assertEqual((onset.last_zero, onset.first_above), (10.0, 12.0))
+        self.assertEqual((onset.runs_above, onset.runs), (1, 2))
+
+
+class ProxyCapacityTest(unittest.TestCase):
+    def test_load_levels_average_their_runs(self):
+        records = parse(
+            *(
+                record("proxy_concurrency", workers, "proxy_load", run,
+                       metrics=((hl.PROXY_LOAD_RATE, None, rate), (hl.PROXY_LOAD_P50, None, 1.0 * workers),
+                                (hl.CPU_PEAK, hl.PROXY_CONTAINER, cpu)),
+                       values=planned(proxy_concurrency=workers))
+                for workers, run, rate, cpu in ((4, 1, 2.0, 0.6), (4, 2, 3.0, 0.7), (8, 1, 3.5, 1.0))
+            ),
+        )
+        levels = hl.proxy_levels(records)
+        self.assertEqual([(level.workers, level.runs, level.per_second) for level in levels],
+                         [(4.0, 2, 2.5), (8.0, 1, 3.5)])
+        self.assertEqual(levels[0].cpu_cores, 0.7)
+
+    def test_a_proxy_load_run_that_shared_the_broker_is_left_out(self):
+        records = parse(
+            *(
+                record("proxy_concurrency", 4, "proxy_load", run,
+                       metrics=((hl.PROXY_LOAD_RATE, None, rate), (hl.CPU_PEAK, hl.PROXY_CONTAINER, cpu)),
+                       values=planned(proxy_concurrency=4), excluded=excluded)
+                for run, rate, cpu, excluded in ((1, 1.5, 0.8, ()), (2, 1.1, 0.95, (hl.PROXY_LOAD_RATE, hl.CPU_PEAK)))
+            ),
+        )
+        [level] = hl.proxy_levels(records)
+        self.assertEqual((level.runs, level.per_second, level.cpu_cores), (1, 1.5, 0.8))
+
+    def test_demand_is_commands_per_minute_per_cluster(self):
+        records = parse(
+            record("clusters", 8, "watcher_soak", metrics=((hl.PROXY_COMMANDS, None, 240.0),
+                                                         (hl.PROXY_COMMAND_SECONDS, None, 480.0)),
+                   totals={"clusters": 8}, started="2026-10-23T01:00:00Z"),
+        )
+        [demand] = hl.proxy_demand(records)
+        self.assertEqual(demand.commands_per_minute, 8.0)
+        self.assertEqual(demand.per_cluster_per_minute, 1.0)
+        self.assertEqual(demand.seconds_per_command, 2.0)
+
+    def test_points_at_one_cluster_count_are_kept_apart(self):
+        # Ten concurrent questions on two clusters say nothing about what one cluster asks.
+        records = parse(
+            record(operation="fan_out", metrics=((hl.PROXY_COMMANDS, None, 60.0),), totals={"clusters": 2}),
+            *(
+                record("concurrent", 10, "fan_out", run, metrics=((hl.PROXY_COMMANDS, None, 600.0),),
+                       totals={"clusters": 2})
+                for run in (1, 2)
+            ),
+        )
+        base, concurrent = hl.proxy_demand(records)
+        self.assertEqual((base.factor, base.commands_per_minute, base.per_cluster_per_minute), ("base", 2.0, 1.0))
+        self.assertEqual((concurrent.factor, concurrent.runs, concurrent.commands_per_minute), ("concurrent", 2, 20.0))
+        self.assertIsNone(concurrent.per_cluster_per_minute)
+
+    def test_a_run_left_out_of_the_proxy_fits_adds_no_demand(self):
+        loaded = (hl.PROXY_COMMANDS, hl.PROXY_COMMAND_SECONDS)
+        records = parse(
+            record("clusters", 16, "fan_out", 1, metrics=((hl.PROXY_COMMANDS, None, 900.0),), totals={"clusters": 16},
+                   excluded=loaded),
+            record("clusters", 16, "fan_out", 2, metrics=((hl.PROXY_COMMANDS, None, 60.0),), totals={"clusters": 16}),
+        )
+        [demand] = hl.proxy_demand(records)
+        self.assertEqual((demand.runs, demand.commands_per_minute), (1, 2.0))
+
+
+class CappedCpuTest(unittest.TestCase):
+    def test_a_cpu_peak_at_the_limit_stays_out_of_the_line(self):
+        proxy, limits = "envoy-credential-proxy", {"envoy-credential-proxy": {"cpu_cores": 1.0}}
+        records = parse(
+            record(metrics=((hl.CPU_PEAK, proxy, 0.4),), limits=limits, values=planned()),
+            record("clusters", 4, metrics=((hl.CPU_PEAK, proxy, 0.6),), limits=limits,
+                   totals={"clusters": 4}, values=planned(clusters=4)),
+            # Pinned at the 1-core limit: the need is unknown, so it is not a point of the line.
+            record("clusters", 16, metrics=((hl.CPU_PEAK, proxy, 1.0),), limits=limits,
+                   totals={"clusters": 16}, values=planned(clusters=16)),
+        )
+        points = hl.series_points(records, "fleet_audit", hl.CLUSTERS, hl.CPU_PEAK, proxy)
+        self.assertEqual([p.excluded for p in points], [False, False, True])
+        fit = hl.fit_line(points)
+        # 0.4 at 2 clusters and 0.6 at 4: 0.1 per cluster, so 1.8 cores of need at 16.
+        self.assertAlmostEqual(fit.at(16), 1.8)
+
+    def test_cpu_runs_group_by_operation_fleet_and_limit(self):
+        proxy = "envoy-credential-proxy"
+        records = parse(
+            *(
+                record("clusters", 16, "audits_30m", run, totals={"clusters": 16},
+                       limits={proxy: {"cpu_cores": limit}},
+                       metrics=((hl.CPU_PEAK, proxy, peak), (hl.CPU_SECONDS, proxy, seconds)))
+                for run, limit, peak, seconds in ((1, 1.0, 1.0, 1440.0), (2, 1.0, 0.8, 1080.0), (3, 4.0, 2.2, 3600.0))
+            ),
+        )
+        default, raised = hl.cpu_runs(records, proxy)
+        self.assertEqual((default.limit, default.runs, default.peak, default.capped), (1.0, 2, 1.0, True))
+        # 1,440 and 1,080 CPU-seconds over 30-minute windows: 0.8 and 0.6 cores on average.
+        self.assertAlmostEqual(default.average, 0.7)
+        self.assertEqual((raised.limit, raised.peak, raised.capped), (4.0, 2.2, False))
+
+    def test_cpu_runs_keep_two_points_of_one_size_apart(self):
+        proxy = "envoy-credential-proxy"
+        records = parse(
+            record(operation="fan_out", totals={"clusters": 2}, metrics=((hl.CPU_PEAK, proxy, 0.2),)),
+            record("concurrent", 10, "fan_out", totals={"clusters": 2}, metrics=((hl.CPU_PEAK, proxy, 0.9),)),
+        )
+        rows = hl.cpu_runs(records, proxy)
+        self.assertEqual([(row.factor, row.peak) for row in rows], [("base", 0.2), ("concurrent", 0.9)])
+
+    def test_cpu_runs_leave_out_a_run_left_out_of_the_cpu_fits(self):
+        proxy, limits = "envoy-credential-proxy", {"envoy-credential-proxy": {"cpu_cores": 1.0}}
+        records = parse(
+            record("clusters", 16, "fan_out", 1, totals={"clusters": 16}, limits=limits,
+                   metrics=((hl.CPU_PEAK, proxy, 1.0), (hl.CPU_SECONDS, proxy, 1500.0)),
+                   excluded=(hl.CPU_PEAK, hl.CPU_SECONDS)),
+            record("clusters", 16, "fan_out", 3, totals={"clusters": 16}, limits=limits,
+                   metrics=((hl.CPU_PEAK, proxy, 0.26),)),
+        )
+        [row] = hl.cpu_runs(records, proxy)
+        self.assertEqual((row.peak, row.capped, row.average), (0.26, False, None))
+
+
+class UnanchoredOperationTest(unittest.TestCase):
+    def test_an_operation_without_base_runs_anchors_nothing(self):
+        container = "envoy-credential-proxy"
+        records = parse(
+            record(metrics=((hl.CPU_PEAK, container, 0.6),), values=planned()),
+            # Measured once, at 16 clusters under raised limits: no base point of its own.
+            record("clusters", 16, "audits_raised", metrics=((hl.CPU_PEAK, container, 2.5),),
+                   totals={"clusters": 16}, values=planned(clusters=16)),
+        )
+        self.assertEqual(hl.base_fleet(records)[hl.CLUSTERS], 2.0)
+        self.assertAlmostEqual(hl.predict(records, hl.CPU_PEAK, container, hl.base_fleet(records)).base, 0.6)
+
+
+class UsualLimitsTest(unittest.TestCase):
+    def test_a_short_experiment_under_raised_limits_does_not_change_the_limits(self):
+        default, raised = {"cpu_cores": 1.0, "memory_bytes": 2 * GIB}, {"cpu_cores": 4.0, "memory_bytes": 4 * GIB}
+        records = parse(
+            record(run=1, limits={"envoy-credential-proxy": default}, started="2026-10-27T01:00:00Z"),
+            record(run=2, limits={"envoy-credential-proxy": default}, started="2026-10-27T02:00:00Z"),
+            record("clusters", 16, "audits_raised", limits={"envoy-credential-proxy": raised},
+                   started="2026-10-27T03:00:00Z"),
+        )
+        self.assertEqual(hl.usual_limits(records)["envoy-credential-proxy"], default)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ForecastNumbersTest(unittest.TestCase):
+    """The Limits forecast's numbers, asserted, on a small fleet whose answers can be worked by hand."""
+
+    proxy, shell = "envoy-credential-proxy", "shell"
+    limits = {proxy: {"cpu_cores": 1.0, "memory_bytes": 2 * GIB}, shell: {"cpu_cores": 2.0, "memory_bytes": 2 * GIB}}
+
+    def runs(self) -> tuple[hl.Record, ...]:
+        # The proxy's CPU is 0.4 cores at 2 clusters and 0.8 at 8, under the 90% at which a peak counts as
+        # held at its limit. The shell's CPU stays at 0.5 cores; at 16 clusters a run refused a command.
+        def run(clusters: float, proxy_cpu: float, refused: float = 0.0, run_index: int = 1) -> dict:
+            factor, level = ("base", 0) if clusters == 2 else ("clusters", clusters)
+            return record(
+                factor, level, "fan_out", run_index,
+                metrics=((hl.CPU_PEAK, self.proxy, proxy_cpu), (hl.CPU_PEAK, self.shell, 0.5),
+                         (hl.PROXY_REFUSALS, None, refused)),
+                totals={"clusters": clusters, "nodes": clusters * 2}, limits=self.limits,
+                requests={self.shell: {"cpu_cores": 0.2, "memory_bytes": 512 * MIB}},
+                values=planned(clusters=clusters),
+            )
+
+        return parse(run(2, 0.4), run(8, 0.8), run(16, 0.8, refused=1.0))
+
+    def test_the_share_line_divides_by_the_limit_and_crosses_where_it_reaches_it(self):
+        records = self.runs()
+        fleet = hl.base_fleet(records)
+        [line] = [item for item in hl.bottleneck_series(records, fleet, self.limits) if self.proxy in item.label]
+        # 0.4 cores at 2 clusters against a 1-core limit.
+        at_two = min(range(len(line.clusters)), key=lambda index: abs(line.clusters[index] - 2))
+        self.assertAlmostEqual(line.shares[at_two] / hl.predict(records, hl.CPU_PEAK, self.proxy, hl.scaled_fleet(fleet, line.clusters[at_two])).value, 1.0)
+        # Measured dots are divided by the same limit: 0.8 cores is 80% at 8 clusters.
+        self.assertIn(0.8, [round(point.share, 2) for point in line.measured])
+        self.assertIsNotNone(hl.crossing(line))
+
+    def test_the_largest_size_that_held_is_the_install_capacity(self):
+        # 2 and 8 clusters held; at 16 a command was refused.
+        self.assertEqual(hl.measured_install_capacity(self.runs()), 8)
+
+    def test_a_fleet_is_split_into_installs_that_fit(self):
+        records = self.runs()
+        fleet = hl.scaled_fleet(hl.base_fleet(records), 40)
+        split = hl.split_fleet(records, fleet, [self.proxy, self.shell], 5)
+        self.assertEqual(split.installs, 5)
+        self.assertAlmostEqual(split.fleet[hl.CLUSTERS], 8)
+        # Sized from the runs at 8 clusters: 0.8 cores plus 30%.
+        self.assertEqual(split.sized_from, 8)
+        [proxy] = [item for item in split.recommendations if item.container == self.proxy]
+        self.assertAlmostEqual(proxy.cpu_cores, 0.8 * 1.3)
+        self.assertEqual(split.impossible, [])
+
+    def test_container_sizes_set_the_limits_and_keep_the_shell_fixed_on_standard(self):
+        records = self.runs()
+        medium = hl.preset_limits(hl.LIMITS_M, records, [])
+        large = hl.preset_limits(hl.LIMITS_L, records, [])
+        small = hl.preset_limits(hl.LIMITS_S, records, [])
+        settable = hl.preset_limits(hl.LIMITS_L, records, [], shell_settable=True)
+        self.assertEqual(medium[self.proxy]["cpu_cores"], 1.0)
+        self.assertEqual(large[self.proxy]["cpu_cores"], 8.0)
+        self.assertEqual(large[self.shell]["cpu_cores"], 2.0)
+        self.assertEqual(settable[self.shell]["cpu_cores"], 8.0)
+        # Autopilot without bursting gives the shell its request.
+        self.assertEqual(small[self.shell]["cpu_cores"], 0.2)
+
+    def test_a_size_is_short_of_each_resource_its_need_passes(self):
+        need = hl.SizeNeed(self.proxy, "Credential proxy", 1 * GIB, 3.2, {"cpu_cores": 1.0, "memory_bytes": 2 * GIB})
+        self.assertEqual(need.short, ("CPU",))
+        self.assertFalse(need.enough)
+
+    def test_no_clusters_does_not_divide_by_zero(self):
+        fleet = hl.scaled_fleet({**hl.base_fleet(self.runs()), hl.CLUSTERS: 0.0}, 5)
+        self.assertEqual(fleet[hl.CLUSTERS], 5)
+
+    def test_the_dataset_summary_counts_runs_and_input_ranges(self):
+        summary = hl.dataset_summary(self.runs())
+        self.assertEqual(summary.runs, 3)
+        [clusters] = [item for item in summary.inputs if item.label == "Clusters"]
+        self.assertEqual((clusters.low, clusters.high, clusters.levels), (2, 16, 3))
