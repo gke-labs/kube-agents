@@ -443,7 +443,11 @@ class TestTheValidatorItself(unittest.TestCase):
         for node, phrase in (
             ({"scope": "finding", "required_phrases": ["x"]}, "names no 'finding_check'"),
             ({"scope": "finding", "finding_check": [" "], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": 123, "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [123], "required_phrases": ["x"]}, "names no 'finding_check'"),
             ({"finding_check": "no-pdb", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"finding_check": "", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"scope": "finding_ids", "finding_check": [], "any_of_phrases": ["x"]}, "read only under scope 'finding'"),
         ):
             problems = []
             validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)

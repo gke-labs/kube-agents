@@ -4279,16 +4279,20 @@ def _rendered_finding(
     cluster: str = "seeded-a",
     namespace: str = "seeded-workloads",
     impact: str = "",
+    title: str = "",
+    excerpt: str = "kind: Deployment",
 ) -> str:
     """One finding the way audit_report.py renders it: the anchor, the heading
-    with its id marker, the Where: line and the agent's text under it."""
+    with the agent's title and the id marker, the Where: line and the agent's
+    text under it. The default title names the object, as an agent's does, so
+    a test that must not read the title passes one that names another."""
     fid = f"{check}.{cluster}.{namespace}.{obj.lower().replace('/', '-')}"
     return (
         f'<a id="user-content-finding-{fid}"></a>\n\n'
-        f"#### {check} on {obj} <!-- finding:{fid} -->\n\n"
+        f"#### {title or f'{check} on {obj}'} <!-- finding:{fid} -->\n\n"
         f"- **Where:** `{cluster}` / `{namespace}` — `{obj}`\n"
         f"- **Impact:** {impact or f'the agent\'s sentence about {obj}.'}\n"
-        "- **Evidence:**\n\n```\n# (no command supplied)\n---\nkind: Deployment\n```\n\n"
+        f"- **Evidence:**\n\n```\n# (no command supplied)\n---\n{excerpt}\n```\n\n"
     )
 
 
@@ -4323,21 +4327,54 @@ def test_finding_scope_passes_when_one_finding_carries_the_check_and_the_object(
     assert res.raw["finding_check"] == "no-memory-limit"
 
 
-def test_finding_scope_never_reads_the_agents_text_under_a_finding(token, github):
-    """The impact sentence, the evidence excerpt and the next finding's anchor
-    are the agent's or the next finding's; a phrase there binds nothing."""
+def test_finding_scope_never_reads_the_agents_text_of_a_finding(token, github):
+    """The title, the impact sentence, the evidence excerpt and the next
+    finding's anchor are the agent's or the next finding's; the planted
+    workload's name there, in any shape the renderer itself uses, binds
+    nothing."""
     _stash_report()
-    other = _rendered_finding(
-        "no-memory-limit",
-        "Deployment/other-worker",
-        impact="compare Deployment/memory-unbounded-worker, which has the same shape.",
+    where = "- **Where:** `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker`"
+    row = (
+        "- **major** — t — `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker` "
+        "(`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-worker`)"
     )
-    # The planted workload's own finding sits right under, so its anchor line
-    # (which names its id, hence its object) follows the other finding's text.
-    findings = other + _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
-    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
-    res = _finding_bound().verify(5.0)
-    assert res.status == "fail", res.reason
+    shapes = {
+        "title": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", title="no-memory-limit, cf. Deployment/memory-unbounded-worker"
+        ),
+        "impact": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", impact="compare Deployment/memory-unbounded-worker."
+        ),
+        "where line in the impact": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", impact=f"see\n{where}"
+        ),
+        "where line in the excerpt": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", excerpt=where
+        ),
+        "listed row outside the brackets": _rendered_finding(
+            "no-memory-limit", "Deployment/other-worker", impact=f"see\n{row}"
+        ),
+        "listed row with the location shape in its title": (
+            "<!-- audit-listed:begin -->\n"
+            "- **major** — t — `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker` (`x`) — `seeded-a` / "
+            "`seeded-workloads` — `Deployment/other-worker` "
+            "(`no-memory-limit.seeded-a.seeded-workloads.deployment-other-worker`)\n"
+            "<!-- audit-listed:end -->\n"
+        ),
+        # The title holds a newline, so the marker sits on a line the heading
+        # regex never matches; the Where: line under it must not join the
+        # no-memory-limit finding above.
+        "newline title under a finding of the check": _rendered_finding("no-memory-limit", "Deployment/other-worker")
+        + "#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
+        f"{where}\n\n",
+    }
+    for shape, other in shapes.items():
+        # The planted workload's own finding sits right under, so its anchor
+        # line (which names its id, hence its object) follows the other text.
+        findings = other + _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
+        github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+        res = _finding_bound().verify(5.0)
+        assert res.status == "fail", (shape, res.reason)
 
 
 def test_finding_scope_leaves_out_held_and_not_rechecked_findings(token, github):
@@ -4366,9 +4403,10 @@ def test_finding_scope_reads_a_finding_listed_without_detail(token, github):
     _stash_report()
     findings = (
         _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
-        + "### Listed without detail (1)\n\n"
+        + "### Listed without detail (1)\n\n<!-- audit-listed:begin -->\n"
         "- **major** — no-memory-limit on Deployment/memory-unbounded-worker — `seeded-a` / `seeded-workloads` — "
-        "`Deployment/memory-unbounded-worker` (`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-w-1a2b3c`)\n\n"
+        "`Deployment/memory-unbounded-worker` (`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-w-1a2b3c`)"
+        " — Fixed — https://example.invalid/pr/1\n<!-- audit-listed:end -->\n\n"
     )
     github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
     res = _finding_bound().verify(5.0)
@@ -4398,6 +4436,18 @@ def test_finding_scope_grades_the_nearest_finding_of_the_check(token, github):
     res = _finding_bound("memory-unbounded-worker", any_of_phrases=["Deployment/", "DaemonSet/"]).verify(5.0)
     assert res.status == "fail", res.reason
     assert "Deployment/" in res.reason
+
+
+def test_finding_scope_reads_the_object_alone_not_its_cluster_or_namespace(token, github):
+    """The cluster and namespace sit on the Where: line too, but a phrase for
+    them binds nothing: a case names the object alone."""
+    _stash_report()
+    findings = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound(any_of_phrases=["seeded-workloads", "seeded-a"]).verify(5.0)
+    assert res.status == "fail", res.reason
+    res = _finding_bound("seeded-workloads").verify(5.0)
+    assert res.status == "fail", res.reason
 
 
 def test_finding_scope_with_no_finding_of_the_check_fails_and_says_so(token, github):
@@ -4933,10 +4983,11 @@ def test_no_body_scoped_ledger_phrase_collides_with_a_roster_check_slug():
             if check.get("type") != "ledger_issue_contains":
                 continue
             # finding_ids is the fix, not the bug: there a slug means a filed
-            # finding. forbidden_phrases invert the direction -- a slug
-            # collision there fails a good run, which is a different defect
-            # and is not what this test is about.
-            if check.get("scope", "body") == "finding_ids":
+            # finding; under finding the text is one finding's location, which
+            # the check-evidence table never reaches. forbidden_phrases invert
+            # the direction -- a slug collision there fails a good run, which
+            # is a different defect and is not what this test is about.
+            if check.get("scope", "body") in ("finding_ids", "finding"):
                 continue
             graded += 1
             phrases = (check.get("required_phrases") or []) + (

@@ -4112,12 +4112,18 @@ _parse_github_time = github_writes.parse_github_time
 # Mirrors audit_report's `LISTED_LINE_RE`: a finding listed without detail is
 # one bullet, severity, title, location, then the object and the id in two
 # code spans: ``- **major** — <title> — `c` / `ns` — `Deployment/x` (`<id>`)``.
+# The greedy title leaves the LAST location segment to the groups, which is
+# the renderer's; a location shape inside the title stays in the title.
 _LISTED_FINDING_LINE_RE = re.compile(
     r"^- \*\*[a-z]+\*\* — .* — `[^`\n]*`(?: / `[^`\n]*`| / _cluster-scoped_)"
-    r" — `[^`\n]*` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$"
+    r" — `([^`\n]*)` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$"
 )
-# The renderer's location line under a finding's heading.
-_WHERE_LINE_PREFIX = "- **Where:**"
+# The renderer brackets its listed rows; the same shape anywhere else is text.
+_LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
+_LISTED_SECTION_END = "<!-- audit-listed:end -->"
+# The renderer's location line, the first line under a finding's heading; the
+# object is its last code span, after the cluster and namespace.
+_WHERE_LINE_OBJECT_RE = re.compile(r"^- \*\*Where:\*\* .* — `([^`\n]*)`[ \t]*$")
 # The separator between a finding's id and its object segments, as
 # ``audit_report.py`` composes the id: ``<check>.<cluster>.<namespace>.<object>``.
 _FINDING_ID_SEPARATOR = "."
@@ -4134,35 +4140,50 @@ def _held_ids(body: str) -> set[str]:
     }
 
 
-def _finding_lines(body: str) -> list[tuple[str, str]]:
-    """Each finding the ledger renders, as ``(id, text)``, the text being the
-    lines the renderer writes and the agent does not: the heading
-    (``#### <title> <!-- finding:<id> -->``) and the ``Where:`` line under it,
-    or, for a finding listed without detail, the one line that names it.
+def _finding_objects(body: str) -> list[tuple[str, str]]:
+    """Each finding the ledger renders, as ``(id, object)``: the id from the
+    heading's ``<!-- finding:<id> -->`` marker and the object the renderer
+    writes last on the one ``- **Where:** `cluster` / `ns` — `object``` line
+    right under it, or, for a finding listed without detail, the id and the
+    object span of its row inside the ``audit-listed`` brackets.
 
-    A finding runs to the next finding heading or listed row; nothing in
-    between (the impact, the evidence excerpt, the recommendation, a ``#``
-    comment or a ``---`` inside a fence, the next finding's anchor) is read,
-    so the text graded under ``scope: finding`` is never the agent's.
+    Nothing else is kept: the title on the heading and on the row is the
+    agent's, so only the marker is read from the heading and only the trailing
+    object from the row; the lines under the ``Where:`` line (impact,
+    evidence, recommendation) are never read, so a ``Where:``- or row-shaped
+    line in them binds nothing. A heading the marker regex does not match (a
+    title holding a newline) opens no finding, so the object under it joins
+    none; that finding then cannot bind, a fail and the safe direction.
     """
     found: list[tuple[str, str]] = []
-    current: list[str] | None = None
+    pending_id: str | None = None
+    in_listed = False
     for line in body.splitlines():
-        heading = _HEADING_ID_RE.match(line)
-        listed = _LISTED_FINDING_LINE_RE.match(line)
-        if heading or listed:
-            if current is not None:
-                found.append((current[0], "\n".join(current[1:])))
-                current = None
-            if heading:
-                current = [heading.group(1), line]
-            else:
-                found.append((listed.group(1), line))
+        stripped = line.strip()
+        if stripped == _LISTED_SECTION_BEGIN:
+            in_listed = True
+            pending_id = None
             continue
-        if current is not None and line.startswith(_WHERE_LINE_PREFIX):
-            current.append(line)
-    if current is not None:
-        found.append((current[0], "\n".join(current[1:])))
+        if stripped == _LISTED_SECTION_END:
+            in_listed = False
+            continue
+        heading = _HEADING_ID_RE.match(line)
+        if heading:
+            if pending_id is not None:
+                found.append((pending_id, ""))
+            pending_id = heading.group(1)
+            continue
+        if pending_id is not None and stripped:
+            where = _WHERE_LINE_OBJECT_RE.match(line)
+            found.append((pending_id, where.group(1) if where else ""))
+            pending_id = None
+            continue
+        if in_listed:
+            listed = _LISTED_FINDING_LINE_RE.match(line)
+            if listed:
+                found.append((listed.group(2), listed.group(1)))
+    if pending_id is not None:
+        found.append((pending_id, ""))
     return found
 
 
@@ -4281,10 +4302,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     ``finding`` — one rendered finding at a time, those of the check (or
     checks) ``finding_check`` names (the first segment of the id), the ids the
     ledger only carries (collector-held, not re-checked) left out. The phrases
-    must all sit inside ONE such finding, on the lines the renderer writes:
-    its heading and its ``Where:`` line, or, for a finding listed without
-    detail, the one line that names it; never the impact, evidence or
-    recommendation text. Use it to bind a CHECK to an OBJECT: a ``body`` phrase for the
+    must all sit in ONE such finding's object, the last code span of the
+    ``Where:`` line the renderer writes under its heading, or of its row when
+    it is listed without detail; never its title, cluster, namespace, impact,
+    evidence or recommendation text. Use it to bind a CHECK to an OBJECT: a ``body`` phrase for the
     object matches every finding on that object, an id phrase for the check
     matches that check on every object, and nothing in the pair requires one
     finding to carry both. The id itself cannot carry the pair, since its
@@ -4649,8 +4670,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             prefixes = tuple(f"{c}{_FINDING_ID_SEPARATOR}".lower() for c in checks)
             held = _held_ids(ledger["body"])
             candidates = [
-                lines.lower()
-                for fid, lines in _finding_lines(ledger["body"])
+                obj.lower()
+                for fid, obj in _finding_objects(ledger["body"])
                 if fid.lower().startswith(prefixes) and fid not in held
             ]
 

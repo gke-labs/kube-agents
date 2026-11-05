@@ -1112,15 +1112,23 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{list(fields)}, so it can only pass"
         )
 
+    # The same two rules the verifier's model applies after the cluster lease:
+    # the scope needs its check, a name or a list of names; the field is
+    # refused, blank or not, under any other scope.
     if node_type == LEDGER_CHECK_TYPE:
         scoped = node.get("scope") == LEDGER_FINDING_SCOPE
-        named = _populated(node.get(LEDGER_FINDING_CHECK_FIELD))
+        check_names = node.get(LEDGER_FINDING_CHECK_FIELD)
+        names = check_names if isinstance(check_names, list) else [check_names]
+        named = check_names is not None and all(isinstance(n, str) for n in names) and any(
+            n.strip() for n in names if isinstance(n, str)
+        )
         if scoped and not named:
             problems.append(
                 f"{where}: check '{node_type}' under scope '{LEDGER_FINDING_SCOPE}' "
-                f"names no '{LEDGER_FINDING_CHECK_FIELD}', the check whose findings it reads"
+                f"names no '{LEDGER_FINDING_CHECK_FIELD}' (a check name, or a list of them), "
+                "the check whose findings it reads"
             )
-        elif named and not scoped:
+        elif check_names is not None and not scoped:
             problems.append(
                 f"{where}: check '{node_type}' sets '{LEDGER_FINDING_CHECK_FIELD}', "
                 f"which is read only under scope '{LEDGER_FINDING_SCOPE}'"
