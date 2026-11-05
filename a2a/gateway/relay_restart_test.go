@@ -373,3 +373,33 @@ func TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing(t *testing.T) {
 		t.Fatalf("no log line for the abandoned batch:\n%s", r.logs.String())
 	}
 }
+
+// TestATerminalOnAnotherAddresseesSubjectIsNotTheTasks: an executor that
+// learns a task id can publish a terminal for it on its own subjects; the
+// task went to platform, so the relay drops it and posts nothing, and the
+// task's own terminal still renders.
+func TestATerminalOnAnotherAddresseesSubjectIsNotTheTasks(t *testing.T) {
+	r := startRig(t)
+	r.adapter.inbox <- InboundMessage{
+		Conversation: "discord:g1/t-forged", Kind: "group",
+		AuthorID: "1001", MessageID: "d-forged", Text: "how is the fleet?",
+	}
+	origin := r.awaitTask(t, "platform")
+	publishFinal(t, r, origin, "intruder", lib.StateFailed, "forged result")
+	// The stream keeps publish order, so a forged terminal that rendered
+	// would land before the real one, which would then be a straggler.
+	publishFinal(t, r, origin, "platform", lib.StateFailed, "the real reason")
+	waitFor(t, "the task's own terminal", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if strings.Contains(p, "the real reason") {
+				return true
+			}
+		}
+		return false
+	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "forged result") {
+			t.Fatalf("the forged terminal was rendered: %q", p)
+		}
+	}
+}
