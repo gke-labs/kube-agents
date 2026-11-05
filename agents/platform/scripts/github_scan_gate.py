@@ -87,6 +87,21 @@ import script_log
 # Comma-separated sweep names. Unset means all of them.
 SWEEPS_ENV = "GITHUB_WATCHER_SWEEPS"
 
+# Whether proposed decisions and lessons open GitOps pull requests on
+# `platform-agent/memory/<ID>`. Defaults to True; set to "false"/"0"/"off" on
+# multi-cluster installations that share one GitOps repository or when humans
+# curate `knowledge/` externally and want runtime learnings kept in Hindsight.
+DECISION_MEMORY_GITOPS_PRS_ENV = "DECISION_MEMORY_GITOPS_PRS"
+_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
+
+
+def _gitops_prs_enabled() -> bool:
+    raw = os.environ.get(DECISION_MEMORY_GITOPS_PRS_ENV, "").strip().lower()
+    if not raw:
+        return True
+    return raw not in _FALSEY_ENV_VALUES
+
+
 # Every card this job files goes to the privileged specialist: the Chat Agent's
 # toolsets are stripped to `mcp-router` + `kanban`, so it could not act on one.
 ASSIGNEE = "platform"
@@ -1245,6 +1260,8 @@ def sweep_memory_proposals(
         pr_num = _parse_pr_number(pr_ref)
 
         if pr_num is None:
+            if not _gitops_prs_enabled():
+                continue
             try:
                 ans = forge.call(
                     "proposal-list",

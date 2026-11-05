@@ -2083,6 +2083,36 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         self.assertIn("payments/Deployment/payment-worker:OOMKilled", emit_cmd)
         self.assertIn("OOMKilled (exit 137) under peak traffic", " ".join(emit_cmd))
 
+    def test_gitops_prs_disabled_skips_filing_pr_card_for_pending_record(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-014",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Keep shared rules in Hindsight only",
+                    "path": "knowledge/decisions/DEC-2026-014-hindsight-only.md",
+                    "branch": "platform-agent/memory/DEC-2026-014",
+                    "pr_markdown": "---\ntype: decision\nid: DEC-2026-014\nstatus: active\n---\n\n## Decision\n\nHindsight only.",
+                }
+            ],
+        })
+        with mock.patch.dict(
+            "os.environ",
+            {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "false"},
+        ), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", return_value=_completed(pending_json)), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call") as forge_call_mock:
+            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        forge_call_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

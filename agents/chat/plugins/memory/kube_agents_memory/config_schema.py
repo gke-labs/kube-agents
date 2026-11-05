@@ -14,11 +14,14 @@ copy rather than import.
 """
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
 PROVIDER_NAME = "kube_agents_memory"
 DEFAULT_BANK_ID = "kube-agents-memory"
+DECISION_MEMORY_GITOPS_PRS_ENV = "DECISION_MEMORY_GITOPS_PRS"
+_FALSEY_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 
 # The tag every organisation-wide fact carries. Anything without it is only ever
 # returned to the one user whose tag it bears.
@@ -155,3 +158,31 @@ def thread_sessions_are_per_user() -> bool:
     except Exception as e:
         logger.debug("Could not read thread_sessions_per_user, assuming shared: %s", e)
     return False
+
+
+def decision_memory_gitops_prs_enabled() -> bool:
+    """Whether shared decisions and lessons open GitOps pull requests.
+
+    Controlled by ``DECISION_MEMORY_GITOPS_PRS`` (default ``True``) or
+    ``memory.gitops_prs`` in ``config.yaml``. When set to ``False``, shared
+    rules stated in chat are stored directly in Hindsight (`kube-agents-memory`
+    under ``scope:shared``) without opening ``platform-agent/memory/*`` pull
+    requests in the GitOps repository, while existing ``knowledge/`` OKF files
+    in Git continue to be indexed and enforced.
+    """
+    raw = os.environ.get(DECISION_MEMORY_GITOPS_PRS_ENV, "").strip().lower()
+    if raw:
+        return raw not in _FALSEY_ENV_VALUES
+    try:
+        from hermes_cli.config import load_config
+        config = load_config() or {}
+        memory = config.get("memory")
+        if isinstance(memory, dict) and "gitops_prs" in memory:
+            val = memory["gitops_prs"]
+            if isinstance(val, str):
+                return val.strip().lower() not in _FALSEY_ENV_VALUES
+            return bool(val)
+    except Exception as e:
+        logger.debug("Could not read memory.gitops_prs, assuming enabled: %s", e)
+    return True
+

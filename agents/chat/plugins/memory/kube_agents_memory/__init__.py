@@ -89,6 +89,7 @@ from .client import (
 from .config_schema import (
     BANK_MISSION,
     CHECKPOINT_STRATEGY,
+    DECISION_MEMORY_GITOPS_PRS_ENV,
     DEFAULT_BANK_ID,
     PERSONAL_RETAIN_MISSION,
     PERSONAL_STRATEGY,
@@ -101,6 +102,7 @@ from .config_schema import (
     TAGS_MATCH,
     USER_TAG_PREFIX,
     VALID_BUDGETS,
+    decision_memory_gitops_prs_enabled,
     memory_is_read_only,
     thread_sessions_are_per_user,
 )
@@ -122,6 +124,7 @@ from .session import KubeAgentsMemoryProvider, sanitize_user_id
 __all__ = [
     "BANK_MISSION",
     "CHECKPOINT_STRATEGY",
+    "DECISION_MEMORY_GITOPS_PRS_ENV",
     "DEFAULT_BANK_ID",
     "KubeAgentsMemoryProvider",
     "MEMORY_ABSENCE_RULE",
@@ -148,6 +151,7 @@ __all__ = [
     "VALID_BUDGETS",
     "apply_budget",
     "apply_scoping",
+    "decision_memory_gitops_prs_enabled",
     "ensure_bank",
     "hindsight_is_available",
     "load_hindsight",

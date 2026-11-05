@@ -255,6 +255,32 @@ class TestUnattendedSharedWrites(unittest.TestCase):
             ]
             self.assertNotIn("memory_retain", names, names)
 
+    def test_decision_memory_gitops_prs_opt_out_stores_shared_in_hindsight_without_pr(self):
+        """When DECISION_MEMORY_GITOPS_PRS=false, shared writes skip Curator PR emission
+        and store directly in Hindsight (`kube-agents-memory` under `scope:shared`).
+        """
+        from unittest.mock import patch
+        from kube_agents_memory import client as kam_client
+
+        p, retained = provider(unattended=False)
+        with patch.dict(
+            os.environ,
+            {
+                "NATS_URL": "nats://localhost:4222",
+                "DECISION_MEMORY_GITOPS_PRS": "false",
+            },
+        ), patch.object(kam_client, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+           patch("subprocess.run") as run_mock:
+            r = json.loads(
+                p.handle_tool_call(
+                    "memory_retain",
+                    {"content": "Keep shared rules in Hindsight without opening GitHub PRs.", "scope": "shared"},
+                )
+            )
+            run_mock.assert_not_called()
+            self.assertEqual(r.get("result"), "Stored in shared memory.", r)
+            self.assertEqual(retained["items"][0]["tags"], [SHARED_TAG], retained)
+
 
 if __name__ == "__main__":
     unittest.main()

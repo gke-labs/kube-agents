@@ -36,6 +36,7 @@ from .config_schema import (
     SHARED_TAG,
     TAGS_MATCH,
     VALID_BUDGETS,
+    decision_memory_gitops_prs_enabled,
 )
 from .prompts import RECALL_PREAMBLE
 
@@ -397,8 +398,11 @@ def emit_shared_decision(content: str, context: str = "") -> Dict[str, Any] | No
     Returns the parsed ``curator emit`` JSON payload when ``curator`` succeeds
     so the caller can report the allocated ``DEC-*`` ID and PR branch without
     storing a duplicate unreviewed copy in ``kube-agents-memory``. Returns
-    ``None`` when ``NATS_URL`` is unset or ``curator`` is unavailable.
+    ``None`` when ``DECISION_MEMORY_GITOPS_PRS`` is disabled, ``NATS_URL`` is
+    unset, or ``curator`` is unavailable.
     """
+    if not decision_memory_gitops_prs_enabled():
+        return None
     text = str(content or "").strip()
     if not text or not os.environ.get("NATS_URL", "").strip():
         return None
