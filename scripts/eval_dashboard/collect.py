@@ -502,10 +502,16 @@ _REP_TIMING_KEYS = ("agent_s", "turn1_s")
 # plus `partial=1` when the record says the counts are short (the inject
 # transport's `tokens.usage_partial`, a worker in `tokens.workers.unbilled`,
 # or `tokens.workers` null: the run delegated and no worker was billed).
+# After `total` come `cached`, `cache_write` and `reasoning` when the
+# record's `input` excludes cache reads (the api transport with the front
+# door's session row read; never the inject transport), absent otherwise and
+# on every line printed before they existed.
 # Its own shape, `rep N tokens:`, so `_REP_LINE` never matches it.
 #   rep 2 tokens: input=60468 output=79 total=60547 partial=1
+#   rep 1 tokens: input=10 output=672 total=135281 cached=125204 cache_write=9395 reasoning=0
 _REP_TOKENS_LINE = re.compile(r"^\s+rep (?P<n>\d+) tokens: (?P<fields>.*)$")
 _REP_TOKENS_KEYS = ("input", "output", "total")
+_REP_TOKENS_SPLIT_KEYS = ("cached", "cache_write", "reasoning")
 _REP_TOKENS_PARTIAL = "partial=1"
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
@@ -653,23 +659,27 @@ def _attach_tokens(task: dict, n: int, fields: str) -> None:
 
     ``{"input", "output", "total"}`` each an int, or None when the line did
     not carry it or its value is not a whole number at or above zero, and
-    ``partial`` true when the line says the counts are short. A line with no
-    count that parses adds no key -- absence means unknown -- and a line for
-    a repetition the log never graded is dropped.
+    ``partial`` true when the line says the counts are short. Each of
+    ``_REP_TOKENS_SPLIT_KEYS`` is added only when the line carried it as such
+    a count. A line with no count that parses adds no key -- absence means
+    unknown -- and a line for a repetition the log never graded is dropped.
     """
     words = fields.split()
     counts: dict = {key: None for key in _REP_TOKENS_KEYS}
+    split: dict = {}
     for pair in words:
         key, _, raw = pair.partition("=")
-        if key in counts and raw.isascii() and raw.isdigit():
+        target = counts if key in counts else split if key in _REP_TOKENS_SPLIT_KEYS else None
+        if target is not None and raw.isascii() and raw.isdigit():
             # int() refuses a digit run past the interpreter's limit; a
             # count that size is not one, and must not drop the build.
             try:
-                counts[key] = int(raw)
+                target[key] = int(raw)
             except ValueError:
                 pass
-    if all(value is None for value in counts.values()):
+    if all(value is None for value in counts.values()) and not split:
         return
+    counts.update(split)
     counts["partial"] = _REP_TOKENS_PARTIAL in words
     for rep in reversed(task.get("reps") or []):
         if rep["n"] == n:
