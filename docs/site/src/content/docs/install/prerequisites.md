@@ -101,6 +101,8 @@ The chart's quota check counts the `spec.mode: next` additions in the capacity r
 
 Two next-mode workloads run only behind an operator flag, set through the chart's `operator.extraEnv`, and the check counts each while its flag is set. With `A2A_MCP_DOOR=true`, the MCP server adds one pod (50m CPU and 64Mi memory, limits 500m and 128Mi). With `A2A_DISPATCHER_IMAGE` set, the profile dispatcher adds one pod (50m CPU and 64Mi memory, limits 500m and 256Mi). Both run in the release namespace. AgentProfile workers don't: they run in the profile namespace, `<release-namespace>-profiles`, under a pod quota the operator renders there.
 
+The scope publisher's Job runs in the release namespace too, one pod at a time every 15 minutes (50m CPU and 192Mi memory, limits 500m and 512Mi). It runs where the gateway pod admission policy is on and `platformAgent.scope` names a folder, organization, Shared VPC host or Metrics Scope, and the check counts it then.
+
 The `install.sh` pre-flight summary prints the release's requested CPU, memory, pods and persistent storage, with a monthly cost modeled from us-central1 list prices, model tokens excluded, before anything is applied. The apply shows no chart notes; `helm get notes kube-agents -n <NAMESPACE>` prints the same figures afterwards.
 
 A quota is more than CPU and memory, and so is the check: a `today` install also needs 9
