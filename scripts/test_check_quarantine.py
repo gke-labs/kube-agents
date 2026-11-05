@@ -174,13 +174,17 @@ class GitHubTest(unittest.TestCase):
         self.assertEqual(1, len(report.failures))
         self.assertIn("Suspected cause", report.failures[0])
 
-    def test_a_bare_yes_without_a_reason_fails(self):
-        for line in ("Product race ruled out: yes", "Product race ruled out: yes\nnext line"):
-            with self.subTest(line=line):
-                body = "Suspected cause: timing.\n" + line
-                report = self.run_check(FakeAPI({4357: issue(4357, body=body)}))
-                self.assertEqual(1, len(report.failures))
-                self.assertIn("Product race ruled out", report.failures[0])
+    def test_yes_on_the_next_line_does_not_count(self):
+        body = "Suspected cause: timing.\nProduct race ruled out:\nyes"
+        report = self.run_check(FakeAPI({4357: issue(4357, body=body)}))
+        self.assertEqual(1, len(report.failures))
+        self.assertIn("Product race ruled out", report.failures[0])
+
+    def test_any_reason_after_yes_is_accepted(self):
+        for why in (", `FakeClock` is test-only", " (test-only fake)", ' -- "fake" clock', ""):
+            with self.subTest(why=why):
+                body = "Suspected cause: timing.\nProduct race ruled out: yes" + why
+                self.assertEqual([], self.run_check(FakeAPI({4357: issue(4357, body=body)})).failures)
 
     def test_one_unreadable_issue_is_reported_and_the_rest_still_checked(self):
         class Refusing(FakeAPI):
@@ -275,6 +279,27 @@ class NotifyTest(unittest.TestCase):
         report = cq.check_github(api, scanned(("a_test.go", go), ("test_b.py", PY_GATED)), NOW)
         self.assertEqual(1, cq.notify(api, report))
         self.assertIn("could not be posted", report.failures[-1])
+
+    def test_a_bot_filed_unassigned_issue_says_unassigned(self):
+        bot_filed = issue(4357, assignees=())
+        bot_filed["user"] = {"login": "github-actions[bot]"}
+        api = FakeAPI({4357: bot_filed})
+        report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
+        self.assertEqual(1, cq.notify(api, report))
+        self.assertNotIn("@github-actions", api.posted[-1][1]["body"])
+        self.assertIn("Unassigned.", api.posted[-1][1]["body"])
+
+    def test_a_refused_label_creation_still_posts_the_notices(self):
+        class RefusingLabel(FakeAPI):
+            def post(self, path, payload=None, tolerate=()):
+                if path.endswith("/labels"):
+                    raise urllib.error.HTTPError(path, 403, "Forbidden", {}, None)
+                super().post(path, payload, tolerate)
+
+        api = RefusingLabel({4357: issue(4357, state="closed")})
+        report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
+        self.assertEqual(1, cq.notify(api, report))
+        self.assertIn("label could not be created", report.failures[-1])
 
     def test_nothing_wrong_posts_nothing(self):
         api = FakeAPI({4357: issue(4357)})

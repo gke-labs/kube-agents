@@ -96,10 +96,8 @@ STALE_DAYS = 14
 #: `[^\S\n]` is whitespace short of a newline: the text has to be on the same line, so a blank
 #: `Suspected cause:` does not borrow the next line's.
 CAUSE_RE = re.compile(r"^[^\S\n]*suspected cause:[^\S\n]*\S", re.IGNORECASE | re.MULTILINE)
-#: `yes` and then a reason, on the same line.
-RACE_RE = re.compile(
-    r"^[^\S\n]*product race ruled out:[^\S\n]*yes\b[^\S\n]*[,:;.\u2014-]?[^\S\n]*\w", re.IGNORECASE | re.MULTILINE
-)
+#: `yes` on the same line. The docs ask for a reason after it; the check does not parse one.
+RACE_RE = re.compile(r"^[^\S\n]*product race ruled out:[^\S\n]*yes\b", re.IGNORECASE | re.MULTILINE)
 USER_AGENT = "kube-agents-check-quarantine"
 TIMELINE_LABELED = "labeled"
 SECONDS_PER_DAY = 86400
@@ -270,11 +268,14 @@ def notify(api, report: Report) -> int:
     """Comment once per issue per kind of problem, naming its assignees. Returns comments posted."""
     posted = 0
     if report.notices:
-        api.post(
-            f"/repos/{api.repo}/labels",
-            {"name": LABEL, "color": LABEL_COLOR, "description": LABEL_DESCRIPTION},
-            tolerate=(422,),
-        )
+        try:
+            api.post(
+                f"/repos/{api.repo}/labels",
+                {"name": LABEL, "color": LABEL_COLOR, "description": LABEL_DESCRIPTION},
+                tolerate=(422,),
+            )
+        except API_ERRORS as error:
+            report.failures.append(f"the `{LABEL}` label could not be created ({error})")
     for number, kinds in sorted(report.notices.items()):
         read = report.issues.get(number, {})
         # Only this workflow's own comments count: anyone can post the marker text.
@@ -282,7 +283,7 @@ def notify(api, report: Report) -> int:
             c.get("body") or "" for c in read.get("comments", []) if (c.get("user") or {}).get("login") == BOT_LOGIN
         ]
         logins = [a["login"] for a in read.get("assignees", []) if a.get("login")]
-        if not logins and read.get("author"):
+        if not logins and read.get("author") and not read["author"].endswith("[bot]"):
             logins = [read["author"]]  # nobody owns it yet: tell whoever filed it
         owners = " ".join(f"@{login}" for login in logins)
         for kind, items in sorted(kinds.items()):
