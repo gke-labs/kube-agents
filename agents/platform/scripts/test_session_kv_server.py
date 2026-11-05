@@ -11074,6 +11074,78 @@ class TestCardStop(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
 
+class AliveHelperTest(unittest.TestCase):
+    """The test helper `_alive` against a process reaped mid-check (#4828)."""
+
+    PID = 4242
+
+    def _with_proc(self, stat):
+        """Run `_alive(PID)` as on Linux, with `stat` standing in for opening
+        /proc/PID/stat: an exception to raise, or the file's text. The pid
+        answers os.kill, and ps must not be asked. os.path.exists says the
+        file is there, which only the pre-#4828 helper asked."""
+        import io
+
+        path = f"/proc/{self.PID}/stat"
+        real_open, real_kill = open, os.kill
+        real_isdir, real_exists = os.path.isdir, os.path.exists
+
+        def fake_open(p, *args, **kwargs):
+            if str(p) != path:
+                return real_open(p, *args, **kwargs)
+            if isinstance(stat, BaseException):
+                raise stat
+            if callable(stat):
+                return stat()
+            return io.StringIO(stat)
+
+        def no_ps(*args, **kwargs):
+            raise AssertionError("with a /proc, the stat file decides and ps is never asked")
+
+        with patch.object(os, "kill", lambda pid, sig: None if pid == self.PID else real_kill(pid, sig)), \
+                patch("builtins.open", fake_open), \
+                patch.object(os.path, "exists", lambda p: True if p == path else real_exists(p)), \
+                patch.object(os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                patch("subprocess.run", no_ps):
+            return _alive(self.PID)
+
+    def test_a_process_reaped_after_the_signal_check_is_not_alive(self):
+        # os.kill(pid, 0) still succeeds, then the process is reaped before its
+        # stat file is opened: the race CI hit.
+        self.assertFalse(self._with_proc(FileNotFoundError(2, "No such file or directory")))
+
+    def test_a_process_that_exits_while_its_stat_is_read_is_not_alive(self):
+        class Gone:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                raise ProcessLookupError(3, "No such process")
+
+        self.assertFalse(self._with_proc(Gone))
+
+    def test_the_stat_state_decides_on_linux(self):
+        self.assertTrue(self._with_proc("4242 (sleep) S 1 4242 4242 0 -1"))
+        self.assertFalse(self._with_proc("4242 (sleep) Z 1 4242 4242 0 -1"), "a zombie has exited")
+        # A ")" inside the command name: the state is after the last one.
+        self.assertTrue(self._with_proc("4242 (a) b) R 1 4242"))
+        self.assertFalse(self._with_proc("4242 (sleep"), "a stat with no state field")
+
+    def test_a_running_process_is_alive_and_an_exited_one_is_not(self):
+        import subprocess
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(_alive(child.pid))
+        finally:
+            child.kill()
+            child.wait(5)
+        self.assertFalse(_alive(child.pid))
+
+
 def _alive(pid):
     """True while `pid` runs; a zombie is not running."""
     import subprocess
@@ -11082,9 +11154,17 @@ def _alive(pid):
         os.kill(pid, 0)
     except OSError:
         return False
-    if os.path.exists(f"/proc/{pid}/stat"):
+    # One open, no exists() first: a process reaped between the two used to
+    # raise FileNotFoundError out of the test (#4828). With a /proc, a missing
+    # entry is a process that's gone; without one (macOS), ask ps.
+    try:
         with open(f"/proc/{pid}/stat") as fh:
             return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except IndexError:  # a stat with no state field: as production's _proc_alive reads it
+        return False
+    except (FileNotFoundError, ProcessLookupError):
+        if os.path.isdir("/proc/self"):
+            return False
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return bool(state) and not state.startswith("Z")
 
