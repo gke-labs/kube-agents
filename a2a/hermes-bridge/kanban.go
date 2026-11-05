@@ -43,7 +43,6 @@ const (
 	kanbanDBFilename            = "kanban.db"
 	kanbanQueryTimeout          = 5 * time.Second
 	cardStepTitleCap            = 160
-	outOfTurnSettleConfirmPolls = 2
 	maxSubtaskIDBytes           = 128
 	maxSubtaskStatusBytes       = 64
 	kanbanBlockedDeliveryPrefix = "blocked:"
@@ -144,16 +143,10 @@ type kanbanTracker struct {
 	activeWaits         map[string]int
 	deliveredIDs        map[string]int64
 	deliveredOrder      []string
-	pendingSettle       map[string]int
-	pendingSettleOrder  []string
 	canceledSessions    map[string]int64
 	canceledOrder       []string
 	consoleSessions     map[string]consoleSessionMeta
 	consoleSessionOrder []string
-	// cardOrigins maps a card id to the task whose turn created it, so a
-	// card that settles after that turn ended is published as that task's.
-	cardOrigins     map[string]string
-	cardOriginOrder []string
 }
 
 type kanbanCardRow struct {
@@ -171,9 +164,8 @@ type kanbanCardRow struct {
 }
 
 type consoleSessionMeta struct {
-	ContextID     string
-	CorrelationID string
-	Authority     json.RawMessage
+	ContextID string
+	Authority json.RawMessage
 }
 
 func pruneKanbanTimestampMap(m map[string]int64, order *[]string, cutoff int64) {
@@ -257,39 +249,16 @@ func (k *kanbanTracker) ensureMapsLocked() {
 	if k.deliveredIDs == nil {
 		k.deliveredIDs = make(map[string]int64)
 	}
-	if k.pendingSettle == nil {
-		k.pendingSettle = make(map[string]int)
-	}
 	if k.canceledSessions == nil {
 		k.canceledSessions = make(map[string]int64)
 	}
 	if k.consoleSessions == nil {
 		k.consoleSessions = make(map[string]consoleSessionMeta)
 	}
-	if k.cardOrigins == nil {
-		k.cardOrigins = make(map[string]string)
-	}
 	cutoff := kanbanNow().Unix() - kanbanTrackedRetentionSecs
 	pruneKanbanTimestampMap(k.deliveredIDs, &k.deliveredOrder, cutoff)
 	pruneKanbanTimestampMap(k.canceledSessions, &k.canceledOrder, cutoff)
-	pruneKanbanBoundedMap(k.pendingSettle, &k.pendingSettleOrder)
 	pruneKanbanBoundedMap(k.consoleSessions, &k.consoleSessionOrder)
-	pruneKanbanBoundedMap(k.cardOrigins, &k.cardOriginOrder)
-}
-
-// rememberCardOrigin records the task whose turn created cardID.
-func (k *kanbanTracker) rememberCardOrigin(cardID, taskID string) {
-	if cardID == "" || taskID == "" {
-		return
-	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.ensureMapsLocked()
-	if _, seen := k.cardOrigins[cardID]; !seen {
-		k.cardOrigins[cardID] = taskID
-		k.cardOriginOrder = append(k.cardOriginOrder, cardID)
-		pruneKanbanBoundedMap(k.cardOrigins, &k.cardOriginOrder)
-	}
 }
 
 // cardStep is the step record one settled card stands for: the card's id,
@@ -299,7 +268,10 @@ func (k *kanbanTracker) rememberCardOrigin(cardID, taskID string) {
 // A findings preview returns with a live channel that persists nothing
 // (#4975).
 func cardStep(c kanbanCardRow, settled, total int, parentTaskID string) stepmsg.Step {
-	shortTitle := shortCardClusterOrTitle(c.Title)
+	// The title is model-written too (the coordinator names the card when it
+	// files it), so it passes the scrubber as a net, like an argument value.
+	title := scrubInlineSecrets(strings.TrimSpace(c.Title))
+	shortTitle := shortCardClusterOrTitle(title)
 	if shortTitle == "" {
 		shortTitle = c.ID
 	}
@@ -308,7 +280,7 @@ func cardStep(c kanbanCardRow, settled, total int, parentTaskID string) stepmsg.
 		Title: capBytes(fmt.Sprintf("Specialist check completed: %s.", shortTitle), maxStepTitleBytes),
 		Subtask: &stepmsg.Subtask{
 			ID:           capBytes(c.ID, maxSubtaskIDBytes),
-			Title:        capBytes(capRunes(strings.TrimSpace(c.Title), cardStepTitleCap), maxStepTitleBytes),
+			Title:        capBytes(capRunes(title, cardStepTitleCap), maxStepTitleBytes),
 			Status:       capBytes(strings.ToLower(strings.TrimSpace(c.Status)), maxSubtaskStatusBytes),
 			Verdict:      capBytes(inferKanbanCardVerdict(c), maxSubtaskStatusBytes),
 			Settled:      settled,
@@ -415,9 +387,8 @@ func (b *Bridge) rememberConsoleSession(sessionID string, origin *lib.Envelope) 
 		b.kanban.consoleSessionOrder = append(b.kanban.consoleSessionOrder, sessionID)
 	}
 	b.kanban.consoleSessions[sessionID] = consoleSessionMeta{
-		ContextID:     origin.ContextID,
-		CorrelationID: origin.CorrelationID,
-		Authority:     append(json.RawMessage(nil), origin.Authority...),
+		ContextID: origin.ContextID,
+		Authority: append(json.RawMessage(nil), origin.Authority...),
 	}
 	pruneKanbanBoundedMap(b.kanban.consoleSessions, &b.kanban.consoleSessionOrder)
 }
@@ -470,8 +441,6 @@ func (b *Bridge) markKanbanCardDeliveredForStatus(cardID, status string, blockEv
 		b.kanban.deliveredOrder = append(b.kanban.deliveredOrder, key)
 	}
 	b.kanban.deliveredIDs[key] = now
-	delete(b.kanban.pendingSettle, key)
-	delete(b.kanban.pendingSettle, cardID)
 	pruneKanbanTimestampMap(b.kanban.deliveredIDs, &b.kanban.deliveredOrder, now-kanbanTrackedRetentionSecs)
 }
 
@@ -484,7 +453,6 @@ func (b *Bridge) clearBlockedKanbanCardDelivery(cardID string) {
 	defer b.kanban.mu.Unlock()
 	b.kanban.ensureMapsLocked()
 	delete(b.kanban.deliveredIDs, key)
-	delete(b.kanban.pendingSettle, key)
 }
 
 func (b *Bridge) isKanbanCardDeliveredForStatus(cardID, status string, blockEventID ...int64) bool {
@@ -567,9 +535,21 @@ func kanbanDeliveryKey(cardID, status string, blockEventID ...int64) string {
 	return cardID
 }
 
+// knownKanbanVerdicts are the verdict words a subtask step may carry. The
+// card's verdict comes from task_runs.metadata, a dict the worker's model
+// writes when it completes the card, so it is free text: anything outside
+// this set is replaced by the card's status (kanban's own column), since the
+// step goes to TASKS.
+var knownKanbanVerdicts = map[string]bool{
+	"pass": true, "passed": true, "ok": true, "success": true, "succeeded": true, "healthy": true,
+	"fail": true, "failed": true, "failure": true, "unhealthy": true, "degraded": true, "critical": true,
+	"warn": true, "warning": true, "error": true, "unknown": true, "inconclusive": true,
+	"blocked": true, "done": true, "completed": true, "skipped": true, "canceled": true, "cancelled": true,
+}
+
 func inferKanbanCardVerdict(c kanbanCardRow) string {
-	if v := strings.TrimSpace(c.Verdict); v != "" {
-		return strings.ToLower(v)
+	if v := strings.ToLower(strings.TrimSpace(c.Verdict)); knownKanbanVerdicts[v] {
+		return v
 	}
 	if st := strings.ToLower(strings.TrimSpace(c.Status)); st != "" {
 		return st

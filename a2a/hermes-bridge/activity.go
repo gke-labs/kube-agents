@@ -832,9 +832,9 @@ func (a *activityState) signalStop() {
 // debugErrorTextEnv turns on a failed call's error text in its activity
 // entry, for debugging. Off by default: error text is free text a tool wrote,
 // which can carry a value the tool was handed, and the entries go to TASKS.
-// It is the bridge container's own variable, set by hand while debugging;
-// the operator renders it nowhere and no CR field reaches it, so it is never
-// on in a customer's install by configuration.
+// It is the bridge container's own variable, set by hand while debugging:
+// the operator's rendered bridge drops any inherited copy and sets it false
+// itself, so it is never on in a customer's install by configuration.
 const debugErrorTextEnv = "BRIDGE_DEBUG_ERROR_TEXT"
 
 // debugErrorTextCap bounds the debug error text: its first line, scrubbed.
@@ -1379,9 +1379,6 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	entry, ok, steps := act.observe(d)
 	b.publishSteps(run, act, steps)
 	if ok {
-		if entry.CardID != "" && d.SessionID == act.sessionID {
-			b.kanban.rememberCardOrigin(entry.CardID, run.origin.TaskID)
-		}
 		if run.state == stateRunning {
 			if act.underBudget() {
 				if !b.publishActivityEntry(run, entry) {

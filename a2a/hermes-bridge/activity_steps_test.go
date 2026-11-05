@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
@@ -736,6 +737,11 @@ func TestAPI_DebugErrorTextCarriesTheScrubbedFirstLine(t *testing.T) {
 	}
 	if e = call("c3", hookStatusOK, "", `"all good"`); e.ErrorMessage != "" {
 		t.Errorf("a successful call carried error text %q", e.ErrorMessage)
+	}
+	// A long line is cut at the cap on a rune boundary.
+	long := strings.Repeat("é", 300) + " end"
+	if e = call("c5", "error", long, `null`); len(e.ErrorMessage) > debugErrorTextCap || !utf8.ValidString(e.ErrorMessage) || e.ErrorMessage == "" {
+		t.Errorf("error text of %d bytes (valid UTF-8 %v), want at most %d and valid", len(e.ErrorMessage), utf8.ValidString(e.ErrorMessage), debugErrorTextCap)
 	}
 	t.Setenv(debugErrorTextEnv, "false")
 	if e = call("c4", "error", "psql: FATAL", `null`); e.ErrorMessage != "" {

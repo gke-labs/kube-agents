@@ -808,7 +808,8 @@ c.commit()
 }
 
 // A settled card's step names the card (id, title, status, verdict) and
-// carries none of its report: the report is text the card's worker wrote,
+// carries none of its report, and a verdict outside the known words (the
+// worker's model writes it) falls back to the card's status: the report is text the card's worker wrote,
 // which can repeat a value it read, and the step goes to TASKS.
 func TestCardStepCarriesNoReportText(t *testing.T) {
 	const canary = "tok_card_report_canary_8f3a"
@@ -816,6 +817,8 @@ func TestCardStepCarriesNoReportText(t *testing.T) {
 		{ID: "t_1", Title: "Check prod-a", Status: "done", Result: "The authentication token, " + canary + ", expired; rotated it."},
 		{ID: "t_2", Title: "Check prod-b", Status: "failed", Err: "psql: FATAL " + canary},
 		{ID: "t_3", Title: "Check prod-c", Status: "blocked", BlockPayload: `{"question":"use ` + canary + `?"}`},
+		{ID: "t_4", Title: "Check prod-d", Status: "done", Verdict: canary},
+		{ID: "t_5", Title: "Check prod-e", Status: "done", Verdict: "healthy but the key is " + canary},
 	} {
 		s := cardStep(c, 1, 3, "task-parent")
 		raw, err := json.Marshal(s)
@@ -828,5 +831,58 @@ func TestCardStepCarriesNoReportText(t *testing.T) {
 		if s.Subtask == nil || s.Subtask.ID != c.ID || s.Subtask.Title != c.Title || s.Subtask.Status != c.Status || s.Subtask.ParentTaskID != "task-parent" {
 			t.Errorf("card %s step lost its identity: %+v", c.ID, s.Subtask)
 		}
+		if s.Subtask != nil && c.Verdict != "" && s.Subtask.Verdict != c.Status {
+			t.Errorf("card %s free-text verdict %q became %q, want the card's status %q", c.ID, c.Verdict, s.Subtask.Verdict, c.Status)
+		}
+	}
+}
+
+// A known verdict word passes through, lower-cased.
+func TestAKnownCardVerdictPassesThrough(t *testing.T) {
+	if got := cardStep(kanbanCardRow{ID: "t_1", Title: "x", Status: "done", Verdict: " Degraded "}, 1, 1, "").Subtask.Verdict; got != "degraded" {
+		t.Errorf("verdict = %q, want degraded", got)
+	}
+}
+
+// The delivered-card record the in-turn wait reads to skip a settled card it
+// already folded is bounded both by age and by count: a record past the
+// retention window is forgotten, the oldest past maxTrackedKanbanEntries are
+// evicted one by one, and every recent one is kept.
+func TestDeliveredCardsAreBoundedByAgeAndCount(t *testing.T) {
+	b := &Bridge{}
+	baseNow := time.Now()
+	prevNow := kanbanNow
+	var offsetSecs atomic.Int64
+	kanbanNow = func() time.Time { return baseNow.Add(time.Duration(offsetSecs.Load()) * time.Second) }
+	t.Cleanup(func() { kanbanNow = prevNow })
+
+	offsetSecs.Store(-int64(kanbanTrackedRetentionSecs + 100))
+	b.markKanbanCardDeliveredForStatus("t_expired", "done")
+	offsetSecs.Store(0)
+	for i := 0; i < maxTrackedKanbanEntries+100; i++ {
+		offsetSecs.Add(1)
+		b.markKanbanCardDeliveredForStatus("t_card_"+strconv.Itoa(10000+i), "done")
+	}
+	if b.isKanbanCardDeliveredForStatus("t_expired", "done") {
+		t.Error("a delivered card past the retention window is still recorded")
+	}
+	if b.isKanbanCardDeliveredForStatus("t_card_10000", "done") {
+		t.Error("the oldest delivered card past maxTrackedKanbanEntries is still recorded")
+	}
+	for i := 100; i < maxTrackedKanbanEntries+100; i++ {
+		if id := "t_card_" + strconv.Itoa(10000+i); !b.isKanbanCardDeliveredForStatus(id, "done") {
+			t.Fatalf("recent delivered card %s was forgotten", id)
+		}
+	}
+}
+
+// A card's title is model-written, so it passes the scrubber before it names
+// the step and the subtask.
+func TestCardStepScrubsTheTitle(t *testing.T) {
+	const secret = "hunter2xyzzy-title"
+	s := cardStep(kanbanCardRow{ID: "t_1", Title: "Rotate creds password=" + secret, Status: "done"}, 1, 1, "")
+	raw, _ := json.Marshal(s)
+	if strings.Contains(string(raw), secret) {
+		t.Errorf("a card title's secret reached the step: %s", raw)
 	}
 }

@@ -239,12 +239,12 @@ func (a *activityState) observeWorkerContextLocked(d hookDelivery, rawInput json
 	}
 	effectiveTool, parsed := unwrapHermesToolCall(d.ToolName, rawInput)
 	if effectiveTool == kanbanCreateTool && createdCardID != "" {
-		if short := shortCardClusterOrTitle(extractArgStr(parsed, "title")); short != "" {
+		if short := shortCardClusterOrTitle(scrubInlineSecrets(extractArgStr(parsed, "title"))); short != "" {
 			a.trace.cardTitles[createdCardID] = short
 		}
 	}
 	if strings.HasPrefix(effectiveTool, "kanban_") && sessID != "" && sessID != a.sessionID {
-		if cid := extractArgStr(parsed, "card_id", "task_id", "id"); cid != "" {
+		if cid := capBytes(extractArgStr(parsed, "card_id", "task_id", "id"), maxSubtaskIDBytes); cid != "" {
 			a.trace.sessionCards[sessID] = cid
 			a.trace.claimedSessions[sessID] = true
 		}
@@ -421,8 +421,9 @@ func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry Activ
 	}
 	// The one result detail that goes on the bus: the id of the card a
 	// successful kanban_create made, an identifier the task's own subtask
-	// steps name again. Any other tool's output, and every error message,
-	// stays in the pod (the executor note in activity.go).
+	// steps name again. Any other tool's output stays in the pod, and so does
+	// every error message unless the maintainer's BRIDGE_DEBUG_ERROR_TEXT
+	// switch is on (debugErrorText, activity.go).
 	if status != ActivityStatusError && effectiveTool == kanbanCreateTool && createdCardID != "" {
 		e.ResultPreview = "card_id=" + createdCardID
 	}
