@@ -7052,6 +7052,9 @@ class TestDriftInject(unittest.TestCase):
             "alert_title": "checkout Deployment drift in prod-us-east1",
             "alert_kind": session_kv_server.ALERT_KIND_DRIFT,
         })
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {"alert_title": None, "alert_kind": ""})
 
     def test_the_drift_title_names_the_object_its_kind_and_cluster(self):
         payload = {**self.DRIFT_PAYLOAD, "cluster": "seeded-b", "resource": {

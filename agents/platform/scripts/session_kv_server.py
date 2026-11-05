@@ -6110,10 +6110,15 @@ def _inject_drift(
         payload,
         event_row_id,
         alert_title=_drift_session_title(payload),
-        alert_kind=ALERT_KIND_DRIFT,
+        alert_kind=_drift_alert_kind(),
     )
 
     return {"status": "injected"}
+
+
+def _drift_alert_kind() -> str:
+    """The mark a drift alert's routing row gets with KAGE_SLACK_UX on, else "": only the flag's layout reads it."""
+    return ALERT_KIND_DRIFT if slack_presenter.enabled() else ""
 
 
 def _drift_session_title(payload: Dict[str, Any]) -> str | None:
@@ -6531,7 +6536,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
         threading.Thread(
             target=trigger_agent_troubleshooter,
             args=(session_id, _drift_alert_message(_drift_summary(payload)), payload, row["id"]),
-            kwargs={"alert_title": _drift_session_title(payload), "alert_kind": ALERT_KIND_DRIFT},
+            kwargs={"alert_title": _drift_session_title(payload), "alert_kind": _drift_alert_kind()},
             name=f"drift-backlog-card-{row['id']}",
             daemon=True,
         ).start()
