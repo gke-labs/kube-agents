@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 import analyze_replay
+import replay_cache
 
 TEMP_DIR = None
 
@@ -86,6 +87,10 @@ class ConversationTest(unittest.TestCase):
             line("a4", 4, ["s", "u", "a", "t", "a2x", "t2x"], True),
         ])]))
         self.assertEqual(len(convs), 1)
+
+    def test_a_conversation_chain_is_the_miss_index_prefix_chain(self):
+        (parsed,) = analyze_replay.load([write([line("a1", 1, ["s", "u"], True)])])
+        self.assertEqual(parsed.chain, list(replay_cache.prefix_keys("s", ["s", "u"]))[1:])
 
     def test_the_same_messages_in_another_build_are_another_conversation(self):
         convs = analyze_replay.conversations(analyze_replay.load([write([

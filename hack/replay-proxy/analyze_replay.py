@@ -27,18 +27,17 @@ VERDICTS.json maps a build ID to "pass" or "fail".
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import replay_cache
 import schema as F
 
 DEFAULT_TOP = 20
 PERCENT = 100.0
 PERCENT_DECIMALS = 1
-CHAIN_SEPARATOR = "|"
 VERDICT_MATCH = "match"
 VERDICT_MISMATCH = "mismatch"
 VERDICT_UNKNOWN = "unknown"
@@ -63,10 +62,9 @@ class Line:
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
         job = entry.get(F.JOB) or {}
-        chain, current = [], str(entry.get(F.DIAG_SETTINGS_HASH) or "")
-        for message_hash in entry.get(F.DIAG_MESSAGE_HASHES) or []:
-            current = hashlib.sha256(f"{current}{CHAIN_SEPARATOR}{message_hash}".encode()).hexdigest()
-            chain.append(current)
+        # The miss index's prefix keys, without the settings-only root.
+        hashes = [str(h) for h in entry.get(F.DIAG_MESSAGE_HASHES) or []]
+        chain = list(replay_cache.prefix_keys(str(entry.get(F.DIAG_SETTINGS_HASH) or ""), hashes))[1:]
         served_from = entry.get(F.SERVED_FROM) or {}
         return cls(
             request_id=str(entry.get(F.REQUEST_ID, "")),
