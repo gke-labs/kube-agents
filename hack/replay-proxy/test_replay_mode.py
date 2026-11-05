@@ -14,9 +14,12 @@ from pathlib import Path
 import normalizer
 import replay_cache
 import replay_proxy
-from test_replay_proxy import TOKEN, FakeLiteLLM, ProxyTestCase, chat
+from test_replay_proxy import REDACTOR, RULES, TOKEN, FakeLiteLLM, ProxyTestCase, chat
 
 HERE = Path(__file__).resolve().parent
+# A fixed clock for the tests that move it: 2027-01-15T08:00:00Z.
+CLOCK = 1_800_000_000
+MINUTE = 60
 COMPLETIONS = "/v1/chat/completions"
 SUBPROCESS_TIMEOUT_SECONDS = 30
 
@@ -93,8 +96,8 @@ class SlotCacheCase(unittest.TestCase):
             for index, message in enumerate(other["messages"]):
                 if message["role"] == "assistant":
                     asked = dict(other, messages=other["messages"][:index])
-                    asked_key, _ = normalizer.answer_slots(normalizer.normalize_request(asked, time.time()), context)
-                    cache.add_variant(asked_key, normalizer.answer_in_context(asked, message, time.time()))
+                    cache.add_variant(*normalizer.answer_variant(
+                        normalizer.normalize_request(asked, time.time()), message, context))
 
 
 class AnswerSlotGuardTest(SlotCacheCase):
@@ -192,6 +195,81 @@ class AnswerSlotActionsTest(SlotCacheCase):
         self.assertEqual((hit[0]["content"], hit[3]), ("Noted on ticket t_bbbbbbbb.", "answer_slots"))
 
 
+class VariantContextTest(unittest.TestCase):
+    """A recorded answer still fills its slot when the later request normalizes what came before it differently.
+
+    Record mode notes an answer when it records the request the answer
+    replied to; replay checks it from a later request. Whole-request choices
+    (how old a timestamp is, whether any CIDR keeps IPs literal, how settings
+    placeholders are numbered) can differ between the two.
+    """
+
+    def setUp(self):
+        self.cache_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cache_dir, ignore_errors=True)
+
+    def proxy(self, mode, build):
+        config = replay_proxy.Config(mode=mode, allow_serve=mode == "replay", cache_dir=self.cache_dir,
+                                     store_dir=os.path.join(self.cache_dir, "store-" + build),
+                                     redactor_path=REDACTOR, transcript_rules_path=RULES,
+                                     litellm_config_checksum="abc", litellm_image="img", job_build=build)
+        proxy = replay_proxy.ShadowProxy(config, out=io.StringIO())
+        self.addCleanup(proxy.close)
+        return proxy
+
+    @staticmethod
+    def upstream(answer):
+        return {"status": 200, "latency_ms": 1, "client_disconnected": False, "upstream_incomplete": False,
+                "observe_failed": False, "observe_too_large": False, "usage": {"prompt_tokens": 10},
+                "headers": {"x-litellm-model-group": "m", "x-litellm-attempted-fallbacks": "0"},
+                "message": answer, "finish_reason": "tool_calls"}
+
+    @staticmethod
+    def act(said, call_id):
+        return {"role": "assistant", "content": said, "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": "terminal", "arguments": '{"command": "ls"}'}}]}
+
+    def fork(self, opening, result, settings=None, later=0):
+        """Two recordings answer `opening` in other words; the second goes on to `result` `later` seconds on.
+
+        A replay that was served the first recording's answer then asks for the
+        second recording's next step. Returns the replay's lookup.
+        """
+        settings = settings or {}
+        asked = dict(settings, model="m", messages=opening)
+        first, second = self.act("Listing.", "call_1"), self.act("Let me list.", "call_2")
+        self.proxy("record", "x").analyze(asked, CLOCK, self.upstream(first))
+        recorder = self.proxy("record", "b")
+        recorder.analyze(asked, CLOCK, self.upstream(second))
+        went_on = dict(asked, messages=opening + [second, {"role": "tool", "tool_call_id": "call_2", "content": result}])
+        recorder.analyze(went_on, CLOCK + later, self.upstream({"role": "assistant", "content": "All listed."}))
+        replay = self.proxy("replay", "r")
+        replay.lookup(asked, CLOCK)  # the replay's own earlier request, served the first answer
+        replayed = dict(asked, messages=opening + [first, {"role": "tool", "tool_call_id": "call_1", "content": result}])
+        return replay.lookup(replayed, CLOCK + later)
+
+    def assert_served(self, looked_up):
+        hit, refused = looked_up
+        self.assertIsNone(refused)
+        self.assertIsNotNone(hit)
+        self.assertEqual((hit[0]["content"], hit[3]), ("All listed.", "answer_slots"))
+
+    def test_a_timestamp_that_crosses_the_hour_before_the_later_request(self):
+        created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(CLOCK - 50 * MINUTE))
+        opening = [{"role": "user", "content": f"card t_bbbbbbbb created {created}"}]
+        self.assert_served(self.fork(opening, "a.txt", later=20 * MINUTE))
+
+    def test_a_cidr_only_in_a_later_message(self):
+        opening = [{"role": "user", "content": "node 10.1.2.3 is cordoned"}]
+        self.assert_served(self.fork(opening, "allowed 10.0.0.0/8"))
+
+    def test_a_settings_placeholder_shifted_by_a_later_id(self):
+        settings = {"tools": [{"type": "function", "function": {"name": "terminal",
+                                                                "description": "runs on web-7d4b9c8f6d-x2k9p"}}]}
+        opening = [{"role": "user", "content": "list the files"}]
+        self.assert_served(self.fork(opening, "api-5f6c7d8b9c-m8n7q.log", settings=settings))
+
+
 class LostAnalysisLinesTest(unittest.TestCase):
     """A request line whose analysis was dropped or failed still says whether it was served."""
 
@@ -259,6 +337,15 @@ class RecordTest(ProxyTestCase):
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=extra))
         self.lines(2)
         self.assertEqual(len(scrubbed), 3, "only the new turn is scrubbed; the rest were saved already")
+
+    def test_a_recorded_request_is_normalized_once(self):
+        calls = []
+        original = normalizer.normalize_request
+        normalizer.normalize_request = lambda *args: calls.append(args) or original(*args)
+        self.addCleanup(setattr, normalizer, "normalize_request", original)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False))
+        self.assertTrue(self.lines(1)[0]["recorded"])
+        self.assertEqual(len(calls), 1, "the answer is noted from the analysis's normalization")
 
     def test_unstorable_answer_is_not_saved(self):
         FakeLiteLLM.fallbacks = "1"

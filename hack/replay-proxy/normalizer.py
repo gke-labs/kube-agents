@@ -341,6 +341,9 @@ class Mapping:
             self.bare_numbers.add(value)
         return self.to_placeholder[key]
 
+    def copy(self) -> "Mapping":
+        return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers))
+
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
         out = {}
@@ -626,6 +629,11 @@ class NormalizedRequest:
     messages: List[Any]
     settings: Dict[str, Any]
     mapping: Mapping
+    # What the next answer is normalized with (answer_after): the request time,
+    # the IP decision, and the mapping as the messages left it, before the settings.
+    now: float = 0.0
+    keep_ips: bool = False
+    history_mapping: Mapping = field(default_factory=Mapping)
 
     @property
     def message_hashes(self) -> List[str]:
@@ -656,10 +664,12 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     normalizer = Normalizer(now, keep_ips)
     raw_messages = kept.pop(MESSAGES_FIELD, None)
     messages = [normalizer.walk(m) for m in raw_messages] if isinstance(raw_messages, list) else []
+    history_mapping = normalizer.mapping.copy()
     settings = {k: normalizer.walk(kept[k], k) for k in sorted(kept)}
     if raw_messages is not None and not isinstance(raw_messages, list):
         settings[MESSAGES_FIELD] = normalizer.walk(raw_messages)
-    return NormalizedRequest(messages=messages, settings=settings, mapping=normalizer.mapping)
+    return NormalizedRequest(messages=messages, settings=settings, mapping=normalizer.mapping,
+                             now=now, keep_ips=keep_ips, history_mapping=history_mapping)
 
 
 @dataclass(frozen=True)
@@ -730,7 +740,9 @@ def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[st
     conversations in which the agent changed different things, however alike
     the tool results that followed. A slot's context is the
     chain of everything before it, earlier answers as slots too, so the tool
-    results that followed an answer still have to match.
+    results that followed an answer still have to match. The returned contexts
+    are as this whole request normalizes them; the recorded-answer check
+    computes each from the slot's own prefix instead (answer_variant).
     """
     current = settings_hash(normalized, context)
     slots: List[Tuple[str, str]] = []
@@ -744,18 +756,37 @@ def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[st
     return current, slots
 
 
-def answer_in_context(body: Dict[str, Any], answer: Dict[str, Any], now: float) -> str:
-    """The identity `answer` has as the next assistant message of `body`'s conversation.
+def answer_after(normalized: NormalizedRequest, answer: Any) -> str:
+    """The identity `answer` has as the next assistant message after `normalized`'s messages.
 
-    The answer is normalized after the request's messages, with their mapping,
-    as it will be when a later request's history holds it, so record mode can
-    note it under the context answer_slots gives that later request's slot.
+    Walked with the request's time, IP decision and mapping as its messages
+    left them, so numbering continues where the history stopped, without
+    normalizing the request again.
     """
-    messages = body.get(MESSAGES_FIELD)
-    history = list(messages) if isinstance(messages, list) else []
-    extended = dict(body)
-    extended[MESSAGES_FIELD] = history + [dict(answer, role=ASSISTANT_ROLE)]
-    return answer_identity(normalize_request(extended, now).messages[-1])
+    walker = Normalizer(normalized.now, normalized.keep_ips)
+    walker.mapping = normalized.history_mapping.copy()
+    message = dict(answer, role=ASSISTANT_ROLE) if isinstance(answer, dict) else answer
+    return answer_identity(walker.walk(message))
+
+
+def answer_variant(normalized: NormalizedRequest, answer: Any, context: KeyContext) -> Tuple[str, str]:
+    """(context, answer) as record mode notes an answer to the request `normalized` is, and replay checks it.
+
+    Both sides compute it from the request the answer replied to, normalized
+    on its own as of that request's time: record mode when it records that
+    request, replay from a later request's prefix up to the answer, at the
+    time that prefix was first seen. Normalizing the whole later request
+    instead would let its later messages and its later time change how the
+    prefix normalizes (a timestamp's age, a CIDR keeping IPs literal, the
+    numbering of settings placeholders walked after every message).
+    """
+    slot_key, _ = answer_slots(normalized, context)
+    return slot_key, answer_after(normalized, answer)
+
+
+def answer_in_context(body: Dict[str, Any], answer: Dict[str, Any], now: float) -> str:
+    """The identity `answer` has as the next assistant message of `body`'s conversation, as of `now`."""
+    return answer_after(normalize_request(body, now), answer)
 
 
 def placeholders_outside_answers(normalized: NormalizedRequest) -> Set[str]:

@@ -54,6 +54,10 @@ class DiagnosisHasher:
                     self.first_seen.popitem(last=False)
             return seen
 
+    def first_seen_times(self, messages: List[Any], now: float) -> List[float]:
+        """When this proxy first saw each message, noting `now` for the ones it has not seen."""
+        return [self._first_seen(json.dumps(m, sort_keys=True, ensure_ascii=False), now) for m in messages]
+
     def settings_hash(self, body: Dict[str, Any], context: Dict[str, str], now: float) -> str:
         """The request's settings alone, normalized without any message's context."""
         kept = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}

@@ -109,6 +109,7 @@ UNRANKED = -1.0
 DEFAULT_REDACTOR_PATH = "/app/scrubbers/redactor.py"
 DEFAULT_TRANSCRIPT_RULES_PATH = "/app/scrubbers/worker_transcript.py"
 UNSET = ""
+ROLE_KEY = "role"
 
 # Request headers not forwarded: hop-by-hop ones, and Accept-Encoding so the
 # upstream answers uncompressed and the usage block can be read.
@@ -487,6 +488,11 @@ class ShadowProxy:
         On a miss, (None, None), or (None, refusal) when a key matched a saved
         answer that a guard refused: the key and the guard, for the miss block.
         """
+        messages = body.get(request_store.MESSAGES_KEY)
+        messages = messages if isinstance(messages, list) else []
+        # Noted now, not by the background analysis, so a later request's
+        # slots can normalize this one's messages as of when they arrived.
+        first_seen = self.diagnosis.first_seen_times(messages, received)
         normalized = normalizer.normalize_request(body, received)
         fingerprint = normalizer.fingerprint(normalized, self.key_context)
         via = F.VIA_EXACT
@@ -499,7 +505,7 @@ class ShadowProxy:
             if recorded is None:
                 return None, None
             fingerprint, via, entry = recorded, F.VIA_ANSWER_SLOTS, self.cache.load(recorded)
-            if not all(self.cache.has_variant(c, a) for c, a in slots):
+            if not self.answers_recorded(body, messages, first_seen, received):
                 return None, refusal(via, F.GUARD_ANSWER_NOT_RECORDED)
         if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
             return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
@@ -512,6 +518,26 @@ class ShadowProxy:
         if missing:
             return None, refusal(via, F.GUARD_UNBOUND_PLACEHOLDER)
         return (answer, entry, fingerprint, via), None
+
+    def answers_recorded(
+        self, body: Dict[str, Any], messages: List[Any], first_seen: List[float], received: float,
+    ) -> bool:
+        """Whether each assistant message is an answer a recording stored for the request it replied to.
+
+        Each is checked against that request: the messages before it, with the
+        settings, normalized on their own as of when the last of them arrived,
+        as record mode normalized the request when it noted the answer.
+        """
+        for index, message in enumerate(messages):
+            if not (isinstance(message, dict) and message.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE):
+                continue
+            asked = dict(body)
+            asked[request_store.MESSAGES_KEY] = messages[:index]
+            now = first_seen[index - 1] if index else received
+            context, answer = normalizer.answer_variant(normalizer.normalize_request(asked, now), message, self.key_context)
+            if not self.cache.has_variant(context, answer):
+                return False
+        return True
 
     def submit(
         self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int,
@@ -605,12 +631,13 @@ class ShadowProxy:
             return False
         mapping = normalized.mapping
         slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
-        # The model's own answer to this context, noted as one a later request's
-        # slot may hold. Only answers this proxy recorded count: never a client's
-        # assistant message, a fallback's answer or any other unstorable one. Each
-        # recording notes its own, so two that answered differently both count,
-        # even where the first write of the saved answer won.
-        self.cache.add_variant(slot_key, normalizer.answer_in_context(body, upstream["message"], received))
+        # The model's own answer to this request, noted as one a later request's
+        # slot may hold (answer_variant says how replay finds it). Only answers
+        # this proxy recorded count: never a client's assistant message, a
+        # fallback's answer or any other unstorable one. Each recording notes its
+        # own, so two that answered differently both count, even where the first
+        # write of the saved answer won.
+        self.cache.add_variant(*normalizer.answer_variant(normalized, upstream["message"], self.key_context))
         if slots:
             self.cache.save_slot(slot_key, entry[F.FINGERPRINT])
         saved = self.cache.save(entry[F.FINGERPRINT], {
