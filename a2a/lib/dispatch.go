@@ -30,7 +30,8 @@ const ProfileLeaseBucket = "PROFILE_LEASES"
 // submission, acked or not: it mirrors the operator's `--max-age=72h` on
 // PROFILE_SUBMITS (a limits-retention stream). A durable re-created with
 // DeliverAll replays everything inside it, so the dispatcher keeps a
-// finished task's tombstone (LeaseRecord.FinishedAt) at least this long.
+// finished task's tombstone (LeaseRecord.FinishedAt) at least this long
+// when the dispatch config carries no SubmitRetentionSeconds.
 const ProfileSubmitRetention = 72 * time.Hour
 
 // ProfileLeaseRefusedPod is the pod token of the tombstone the dispatcher
@@ -241,7 +242,8 @@ type LeaseRecord struct {
 	// FinishedAt, set, makes the record a tombstone: the task ended (its
 	// final renewal came, or the dispatcher wrote its terminal: failed, or
 	// rejected at admission) at this time. A submission stream keeps acked
-	// submissions for ProfileSubmitRetention, so a durable re-created with
+	// submissions for its max age (DispatchConfig.SubmitRetentionSeconds,
+	// or ProfileSubmitRetention), so a durable re-created with
 	// DeliverAll replays finished tasks; the tombstone, kept under the same
 	// key at least that long, is how the dispatcher knows a replay is one
 	// and acks it without running or failing it again. A tombstone holds no

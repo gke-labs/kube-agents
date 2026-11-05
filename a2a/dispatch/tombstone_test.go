@@ -358,3 +358,24 @@ func TestLeasedPodsReadsTheTombstonesInOnePass(t *testing.T) {
 	}
 	t.Logf("leasedPods over %d tombstones took %v", tombstones, took)
 }
+
+// The configured retention counts when it is longer than the fixed value,
+// and never shortens it: the operator doesn't edit an existing stream, so a
+// lowered constant would leave an older stream longer than the config says.
+// No value gets the fixed value.
+func TestSubmitRetentionIsTheConfiguredMaxAgeButNeverLess(t *testing.T) {
+	long := 2 * lib.ProfileSubmitRetention
+	for name, tc := range map[string]struct {
+		seconds int
+		want    time.Duration
+	}{
+		"none":            {0, lib.ProfileSubmitRetention},
+		"longer":          {int(long / time.Second), long},
+		"shorter":         {int(time.Hour / time.Second), lib.ProfileSubmitRetention},
+		"the fixed value": {int(lib.ProfileSubmitRetention / time.Second), lib.ProfileSubmitRetention},
+	} {
+		if got := submitRetention(lib.DispatchConfig{SubmitRetentionSeconds: tc.seconds}); got != tc.want {
+			t.Errorf("%s: submitRetention = %v, want %v", name, got, tc.want)
+		}
+	}
+}

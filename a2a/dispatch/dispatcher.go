@@ -1521,14 +1521,14 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 }
 
 // submitRetention is how long the submit stream keeps a submission, which
-// a tombstone must outlive: the stream's max age as the operator renders it
-// in the install config, or the fixed value an older operator creates the
-// stream with when the config carries none.
+// a tombstone must outlive: the max age the operator renders in the install
+// config, from the constant it creates the stream with. It is never less
+// than lib.ProfileSubmitRetention: the operator never edits an existing
+// stream, so a lowered constant would leave an older stream longer than the
+// config says. A config with no value (an older operator) gets the fixed
+// value.
 func submitRetention(cfg lib.DispatchConfig) time.Duration {
-	if cfg.SubmitRetentionSeconds > 0 {
-		return time.Duration(cfg.SubmitRetentionSeconds) * time.Second
-	}
-	return lib.ProfileSubmitRetention
+	return max(time.Duration(cfg.SubmitRetentionSeconds)*time.Second, lib.ProfileSubmitRetention)
 }
 
 // tierBoundLocked reports whether every durable of a (profile, tier) the
