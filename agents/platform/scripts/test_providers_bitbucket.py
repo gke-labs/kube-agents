@@ -1030,5 +1030,23 @@ class GitRefusedTest(CloudCase):
             broker.clone({"repository": "https://github.com/acme/infra"})
 
 
+
+class MergeCommitTest(unittest.TestCase):
+    def test_only_a_merged_pull_request_names_its_merge_commit(self):
+        merged = {"hash": "b7aec0d9a64b", "type": "commit"}
+        cases = (
+            ("MERGED", merged, "b7aec0d9a64b"),
+            ("MERGED", None, None),
+            ("MERGED", "b7aec0d9a64b", None),
+            ("OPEN", merged, None),
+            ("DECLINED", merged, None),
+        )
+        for state, merge_commit, expected in cases:
+            node = pull(8, state, merge_commit=merge_commit)
+            with self.subTest(state=state, merge_commit=merge_commit):
+                answer = forge().proposal_view(lambda *args, **kwargs: node, "acme/infra", {"number": 8})
+                self.assertEqual(expected, answer["proposal"]["mergeCommit"])
+
+
 if __name__ == "__main__":
     unittest.main()

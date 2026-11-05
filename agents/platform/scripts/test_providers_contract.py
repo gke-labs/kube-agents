@@ -140,6 +140,11 @@ FORGES_WITHOUT_A_COUNT = frozenset({"bitbucket-datacenter"})
 # Forges whose author filter cannot find the install's account, so the forge
 # reads the repository's proposals and keeps the author's itself.
 FORGES_THAT_FILTER_THE_AUTHOR_HERE = frozenset({"bitbucket-datacenter"})
+# How a merged proposal's `mergeCommit` reads, per forge, where it is not the
+# full 40-character sha: Bitbucket Cloud abbreviates it to 12, and the recorded
+# Data Center listings leave it out, so it is None there.
+MERGE_COMMIT_PATTERN = {"bitbucket": r"^[0-9a-f]{12}$"}
+FORGES_WITHOUT_A_MERGE_COMMIT = frozenset({"bitbucket-datacenter"})
 RECORDED_TALLY = {"open": 2, "merged": 5, "closed": 1}
 RECORDED_CLOSER = {"actor": "example-maintainer", "bot": False}
 # The address the broker stamps the install's proxied commits with. No forge
@@ -385,20 +390,24 @@ class ContractTest(unittest.TestCase):
                 states = {item["state"] for item in answer["proposals"]}
                 self.assertIn("merged", states)
                 for item in answer["proposals"]:
-                    if item["state"] == "merged":
-                        self.assertRegex(item["mergeCommit"], r"^[0-9a-f]{40}$")
+                    if item["state"] == "merged" and name in FORGES_WITHOUT_A_MERGE_COMMIT:
+                        self.assertIsNone(item["mergeCommit"])
+                    elif item["state"] == "merged":
+                        pattern = MERGE_COMMIT_PATTERN.get(name, r"^[0-9a-f]{40}$")
+                        self.assertRegex(item["mergeCommit"], pattern)
                     else:
                         self.assertIsNone(item["mergeCommit"])
 
-    def test_an_open_proposal_view_names_no_merge_commit(self):
-        # The recorded open pull request carries GitHub's test-merge sha.
+    def test_an_unmerged_proposal_view_names_no_merge_commit(self):
+        # The recorded open pull request carries GitHub's test-merge sha; the
+        # Bitbucket recordings view a declined one.
         for name, forge, directory in self.instances():
             if "proposal-view" not in forge.verbs:
                 continue
             fixture = self.load(directory, "proposal-view")
             with self.subTest(forge=name):
                 answer, _ = self.invoke(forge, "proposal-view", fixture)
-                self.assertEqual(answer["proposal"]["state"], "open")
+                self.assertNotEqual(answer["proposal"]["state"], "merged")
                 self.assertIsNone(answer["proposal"]["mergeCommit"])
 
     def test_a_listing_declares_itself_truncated_against_the_limit(self):
