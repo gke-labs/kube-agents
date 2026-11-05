@@ -85,7 +85,7 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	if queued.IsZero() {
 		queued = now
 	}
-	if wait, _ := d.breakers.wait(prof.Name, tier, now, d.inFlight(prof.Name, tier),
+	if wait, _ := d.breakers.wait(prof.Name, tier, now, d.probing(prof.Name, tier),
 		d.olderWaiting(hk, queued)); wait {
 		return nil, errHeldBack
 	}

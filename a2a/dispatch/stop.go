@@ -22,10 +22,6 @@ const (
 	// (lib.DispatchStopStream) keeps the record longer; this covers a
 	// stream not yet provisioned.
 	stoppedMemory = 24 * time.Hour
-	// stopResubscribe is how often syncStops makes the stop subscriptions
-	// afresh, so one the bus refused for want of a grant starts working
-	// once the grant is there.
-	stopResubscribe = 5 * time.Minute
 	// stopCheckTimeout bounds one direct read of the stop stream.
 	stopCheckTimeout = 2 * time.Second
 	// directGetPrefix is JetStream's direct get by subject: the last message
@@ -60,42 +56,80 @@ func stopFor(profile, subject string, data []byte) (string, bool) {
 
 // syncStops keeps one live subscription to each configured profile's stop
 // subject, a2a.stop.<profile>.*, and drops those of profiles gone from the
-// config. A subscribe the bus refuses for want of the grant still succeeds
-// client-side (the refusal is an asynchronous permissions error, and
-// nats.go keeps the subscription), so every stopResubscribe the
-// subscriptions are made afresh: one made before its grant existed starts
-// working within that period of the grant arriving.
+// config. The subscriptions are the fast path only: one the bus refuses
+// (grants are fixed per connection) or a reconnect's gap loses a stop, and
+// recheckStops finds it on the stream. The bus calls run outside d.mu, as
+// in syncBindings.
 func (d *Dispatcher) syncStops() {
 	want := map[string]bool{}
 	for _, p := range d.src.Config().Profiles {
 		want[p.Name] = true
 	}
+	var gone []lib.Subscription
+	var add []string
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	if now := d.now(); now.Sub(d.stopSubsAt) >= stopResubscribe {
-		for profile, sub := range d.stopSubs {
-			sub.Stop()
-			delete(d.stopSubs, profile)
-		}
-		d.stopSubsAt = now
-	}
 	for profile, sub := range d.stopSubs {
 		if !want[profile] {
-			sub.Stop()
+			gone = append(gone, sub)
 			delete(d.stopSubs, profile)
 		}
 	}
 	for profile := range want {
-		if _, ok := d.stopSubs[profile]; ok {
-			continue
+		if _, ok := d.stopSubs[profile]; !ok {
+			add = append(add, profile)
 		}
-		profile := profile
+	}
+	d.mu.Unlock()
+	for _, sub := range gone {
+		sub.Stop()
+	}
+	for _, profile := range add {
 		sub, err := d.bus.SubscribeCore(lib.DispatchStopPrefix+profile+".*", func(m *nats.Msg) { d.onStop(profile, m) })
 		if err != nil {
 			d.log.Warn("subscribe to a profile's stops; retrying", "profile", profile, "err", err)
 			continue
 		}
-		d.stopSubs[profile] = sub
+		d.mu.Lock()
+		_, dup := d.stopSubs[profile]
+		if !dup {
+			d.stopSubs[profile] = sub
+		}
+		d.mu.Unlock()
+		if dup {
+			sub.Stop()
+		}
+	}
+}
+
+// recheckStops reads the stop stream for every task the dispatcher holds
+// that has no stop yet, so a stop the live subscription missed (refused
+// for want of a grant, lost across a reconnect, or published while a
+// subscription was being made) still ends the task, within a refresh.
+func (d *Dispatcher) recheckStops(ctx context.Context) {
+	type task struct{ profile, taskID string }
+	var tasks []task
+	seen := map[task]bool{}
+	d.mu.Lock()
+	for k, h := range d.active {
+		t := task{k.profile, k.taskID}
+		if !h.stopRequested && !seen[t] {
+			seen[t] = true
+			tasks = append(tasks, t)
+		}
+	}
+	d.mu.Unlock()
+	for _, t := range tasks {
+		if ctx.Err() != nil || !d.stopRequested(ctx, d.log, t.profile, t.taskID) {
+			continue
+		}
+		d.mu.Lock()
+		d.stopped[t.profile+"/"+t.taskID] = d.now()
+		for k, h := range d.active {
+			if k.profile == t.profile && k.taskID == t.taskID {
+				d.requestStopLocked(h)
+			}
+		}
+		d.mu.Unlock()
 	}
 }
 

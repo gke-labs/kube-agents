@@ -578,7 +578,8 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	jobTemplates := dispatchJobTemplates(agent, profiles, r.imageVolumeSupported(agent))
 	// Wanted: the chart's signal, and the policy in the cluster as
 	// rendered. A read that answers neither way changes nothing.
-	jobMode := dispatcherJobPolicyRendered()
+	signal := dispatcherJobPolicyRendered()
+	jobMode := signal
 	if jobMode {
 		ok, why, err := r.dispatcherJobPolicyInPlace(ctx)
 		if err != nil {
@@ -594,13 +595,16 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// that names the templates, so the config never says Job mode while the
 	// dispatcher can't run one. Any failure, or a profile namespace not
 	// ready or not selected by the policy's binding (the binding selects
-	// profile namespaces by labels it may lack), revokes the Jobs Role alone and leaves the templates out, so
-	// unattended tasks take the pool; Jobs already running stay. Not
-	// wanted (a deliberate gate-off) tears Job mode down below.
+	// profile namespaces by labels it may lack), or a policy not in place,
+	// revokes the Jobs Role alone and leaves the templates out, so unattended
+	// tasks take the pool; Jobs already running stay, since the policy holds
+	// only creates and each was held to its template when made. Only the
+	// signal off (a deliberate gate-off) tears Job mode down, below.
 	var jobErr error
 	switch {
 	case !jobMode:
 		jobTemplates = nil
+		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
 	case !profileNamespaceReady:
 		jobTemplates = nil
 		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
@@ -686,8 +690,8 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
-	// Not wanted: what an earlier pass rendered goes.
-	if !jobMode {
+	// Gated off: what an earlier pass rendered goes.
+	if !signal {
 		return r.deleteDispatcherJobResources(ctx, agent), nil
 	}
 	return jobErr, nil

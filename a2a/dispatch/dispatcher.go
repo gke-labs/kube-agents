@@ -115,6 +115,9 @@ type holding struct {
 	pod       string
 	confirmed bool
 	settled   bool
+	// probe is a task reserved while its (profile, tier)'s breaker was half
+	// open: the one task tried at a time (breaker.go).
+	probe bool
 	// stopRequested is a stop record for the task (stop.go); stopc, made
 	// when hold starts, wakes hold for it.
 	stopRequested bool
@@ -219,9 +222,7 @@ type Dispatcher struct {
 	// stopSubs is the live subscription to each profile's stop subject, and
 	// stopped the stops heard live, by profile/task (stop.go).
 	stopSubs map[string]lib.Subscription
-	// stopSubsAt is when they were last made afresh (syncStops).
-	stopSubsAt time.Time
-	stopped    map[string]time.Time
+	stopped  map[string]time.Time
 	// stopStreamErr is why the last read of the stop stream failed ("" once
 	// one succeeds), and stopReadRetry when to read it again (stop.go).
 	stopStreamErr string
@@ -304,7 +305,7 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 	defer health.Stop()
 	sweep := time.NewTicker(d.cfg.SweepInterval)
 	defer sweep.Stop()
-	var sweeping atomic.Bool
+	var sweeping, rechecking atomic.Bool
 	for {
 		select {
 		case <-ctx.Done():
@@ -313,6 +314,15 @@ func (d *Dispatcher) Run(ctx context.Context) error {
 		case <-refresh.C:
 			d.syncBindings(ctx)
 			d.syncStops()
+			// The stream reads run off the loop, one pass at a time.
+			if rechecking.CompareAndSwap(false, true) {
+				d.bg.Add(1)
+				go func() {
+					defer d.bg.Done()
+					defer rechecking.Store(false)
+					d.recheckStops(ctx)
+				}()
+			}
 		case <-health.C:
 			d.logHealth()
 		case <-sweep.C:
@@ -862,6 +872,7 @@ func (d *Dispatcher) reserve(snap lib.DispatchConfig, prof lib.DispatchProfile, 
 		return nil, "the free slots are reserved for other kinds"
 	}
 	h := &holding{profile: prof.Name, tier: tier, kind: kind, taskID: taskID, unattended: unattended,
+		probe:    d.breakers.halfOpen(prof.Name, tier, d.now()),
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.active[hk] = h
 	return h, ""

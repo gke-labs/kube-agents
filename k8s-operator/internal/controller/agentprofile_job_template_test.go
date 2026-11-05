@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
@@ -429,8 +430,8 @@ func shippedDispatcherJobPolicy(t *testing.T) (*admissionregistrationv1.Validati
 // Job mode needs the policy in the cluster as the chart renders it, not
 // only the chart's signal: with the binding gone or loosened in any of the
 // ways the policy's guarantee rests on, there are no Job templates in the
-// config, no params and no Jobs Role, and a Role an earlier pass granted is
-// revoked.
+// config and no Jobs Role: a Role an earlier pass granted is revoked, and
+// Jobs already running stay.
 func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
 	for name, loosen := range map[string]func(*admissionregistrationv1.ValidatingAdmissionPolicy, *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (keepPolicy, keepBinding bool){
 		"the binding gone": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, _ *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
@@ -499,20 +500,22 @@ func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			running := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "dispatch-running", Namespace: pns, Labels: dispatchJobLabels(agent)}}
+			if err := c.Create(ctx, running); err != nil {
+				t.Fatal(err)
+			}
 			if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
 				t.Fatalf("loosened: %v / %v", err, profileErr)
 			}
-			for _, o := range []struct {
-				obj  client.Object
-				name string
-			}{
-				{&rbacv1.RoleBinding{}, a2aDispatcherJobsRoleName(agent)},
-				{&rbacv1.Role{}, a2aDispatcherJobsRoleName(agent)},
-				{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobTemplatePrefix + "tse"},
-			} {
-				if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: o.name}, o.obj); !apierrors.IsNotFound(err) {
-					t.Errorf("%T %s survived %s: %v", o.obj, o.name, name, err)
+			for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
+				if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, obj); !apierrors.IsNotFound(err) {
+					t.Errorf("the Jobs %T survived %s: %v", obj, name, err)
 				}
+			}
+			// Revoked, not torn down: the policy holds only creates, and a
+			// Job running now was held to its template when it was made.
+			if err := c.Get(ctx, client.ObjectKeyFromObject(running), &batchv1.Job{}); err != nil {
+				t.Errorf("a running dispatcher Job went with %s: %v", name, err)
 			}
 			var cm corev1.ConfigMap
 			if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
@@ -522,6 +525,59 @@ func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
 				t.Errorf("the dispatch config still carries a Job template with %s", name)
 			}
 		})
+	}
+}
+
+// The chart's signal gone (a deliberate gate-off) tears Job mode down: the
+// Jobs Role, the dispatcher's running Jobs and the params all go.
+func TestGatingJobModeOffTearsItDown(t *testing.T) {
+	agent := a2aTestAgent()
+	r, c := jobTemplateTestReconciler(t, agent)
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	pns := profileNamespaceName(agent)
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("render: %v / %v", err, profileErr)
+	}
+	running := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "dispatch-running", Namespace: pns, Labels: dispatchJobLabels(agent)}}
+	if err := c.Create(ctx, running); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("gated off: %v / %v", err, profileErr)
+	}
+	for _, o := range []struct {
+		obj client.Object
+		key types.NamespacedName
+	}{
+		{&rbacv1.RoleBinding{}, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}},
+		{&rbacv1.Role{}, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}},
+		{&batchv1.Job{}, client.ObjectKeyFromObject(running)},
+		{&agentv1alpha1.DispatchJobTemplate{}, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}},
+	} {
+		if err := c.Get(ctx, o.key, o.obj); !apierrors.IsNotFound(err) {
+			t.Errorf("%T %s survived the gate-off: %v", o.obj, o.key.Name, err)
+		}
+	}
+}
+
+// Where the DispatchJobTemplate kind isn't served (a helm upgrade doesn't
+// apply crds/, and the chart then renders no policy), tearing Job mode down
+// finds no templates to delete rather than failing every reconcile.
+func TestTheJobTeardownToleratesAnUnservedTemplateKind(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent)).
+		WithInterceptorFuncs(interceptor.Funcs{List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+			if _, ok := list.(*agentv1alpha1.DispatchJobTemplateList); ok {
+				return &meta.NoKindMatchError{GroupKind: schema.GroupKind{Group: "kubeagents.x-k8s.io", Kind: "DispatchJobTemplate"}}
+			}
+			return cl.List(ctx, list, opts...)
+		}}).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	if err := r.deleteDispatcherJobResources(context.Background(), agent); err != nil {
+		t.Errorf("teardown without the template kind: %v", err)
 	}
 }
 

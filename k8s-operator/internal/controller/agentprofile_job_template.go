@@ -557,7 +557,13 @@ func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Conte
 		}
 	}
 	var params agentv1alpha1.DispatchJobTemplateList
-	if err := r.a2aReader().List(ctx, &params, client.InNamespace(ns), client.MatchingLabels(dispatchJobParamLabels(agent))); err != nil {
+	err := r.a2aReader().List(ctx, &params, client.InNamespace(ns), client.MatchingLabels(dispatchJobParamLabels(agent)))
+	switch {
+	case isCRDNotInstalledError(err):
+		// The kind isn't served (a helm upgrade doesn't apply crds/), so
+		// there are no templates to delete.
+		return nil
+	case err != nil:
 		return fmt.Errorf("list the dispatcher's Job templates: %w", err)
 	}
 	// The index last.

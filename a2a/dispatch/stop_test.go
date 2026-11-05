@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
@@ -454,32 +455,26 @@ func TestAStopHeardDuringAdmissionIsNotLost(t *testing.T) {
 
 // The stop subscriptions are made afresh every stopResubscribe, so one the
 // bus refused for want of a grant (which still succeeds client-side) starts
-// working once the grant is there; within the period they're kept.
-func TestStopSubscriptionsAreMadeAfreshPeriodically(t *testing.T) {
-	b := newBus(t, "tse-0")
+// A dispatcher whose connection can't subscribe to stops (grants are fixed
+// per connection, and this one was made without a2a.stop.>) still ends a
+// running task that is stopped: recheckStops finds the record on the
+// stream.
+func TestAStopTheLiveSubscriptionMissesIsFoundOnTheStream(t *testing.T) {
+	b := newBusWith(t, []*natsserver.User{{Username: "disp-nostop", Password: dispPass, Permissions: &natsserver.Permissions{
+		Subscribe: &natsserver.SubjectPermission{Allow: []string{">"}, Deny: []string{lib.DispatchStopPrefix + ">"}}}}}, "tse-0")
+	withStopStream(t, b)
 	b.ensure("tse", 1, 0, "read")
-	d, _ := b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0"), &fakeVerifier{})
-	waitFor(t, 5*time.Second, "the stop subscription", func() bool {
-		d.mu.Lock()
-		defer d.mu.Unlock()
-		return d.stopSubs["tse"] != nil
-	})
-	d.mu.Lock()
-	first := d.stopSubs["tse"]
-	d.mu.Unlock()
-	d.syncStops()
-	d.mu.Lock()
-	kept := d.stopSubs["tse"] == first
-	d.stopSubsAt = d.now().Add(-stopResubscribe - time.Second)
-	d.mu.Unlock()
-	if !kept {
-		t.Error("a stop subscription was remade within the period")
-	}
-	d.syncStops()
-	d.mu.Lock()
-	remade := d.stopSubs["tse"] != nil && d.stopSubs["tse"] != first
-	d.mu.Unlock()
-	if !remade {
-		t.Error("the stop subscription wasn't made afresh after the period")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	var g grantSwitch
+	g.set("disp-nostop")
+	ti := oneProfile("tse", 1, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.StopGraceSeconds = 1 })
+	b.runDispatcherOn(b.connectAs(&g), testConfig(), ti, &fakeVerifier{})
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 running", func() bool { return w.startedTask("task-1") })
+	b.stop("tse", "task-1")
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCanceled || !hasReason(ts, ReasonStopped) {
+		t.Errorf("terminal %+v, want canceled stopped", ts)
 	}
 }

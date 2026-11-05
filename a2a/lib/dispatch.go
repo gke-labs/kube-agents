@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -378,6 +379,11 @@ type DispatchDurable struct {
 	Name string `json:"name"`
 }
 
+// MaxDispatchSeconds bounds every second count in a DispatchConfig, so each
+// converts to a time.Duration, and a sum of three to a Job's deadline,
+// without overflow.
+const MaxDispatchSeconds = math.MaxInt32
+
 // Validate reports the first way c can't be dispatched on, or nil. The
 // operator renders only configs that pass; the dispatcher checks again and
 // keeps its last good config rather than run on a broken one.
@@ -399,6 +405,9 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: breaker threshold %d and cooldown %ds may not be negative", c.BreakerThreshold, c.BreakerCooldownSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
+	case max(c.LeaseSeconds, c.RenewSeconds, c.RestartGraceSeconds, c.AcceptTimeoutSeconds,
+		c.BreakerCooldownSeconds, c.JobStartSeconds, c.StopGraceSeconds) > MaxDispatchSeconds:
+		return fmt.Errorf("dispatch config: a second count is over %d", MaxDispatchSeconds)
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Profiles {
@@ -406,6 +415,9 @@ func (c DispatchConfig) Validate() error {
 			return fmt.Errorf("dispatch config: profile %q is not a subject token, or is listed twice", p.Name)
 		}
 		seen[p.Name] = true
+		if max(p.QueueTimeoutSeconds, p.ActiveDeadlineSeconds) > MaxDispatchSeconds {
+			return fmt.Errorf("dispatch config: profile %s has a second count over %d", p.Name, MaxDispatchSeconds)
+		}
 		if p.Concurrency < 1 || len(p.Tiers) == 0 || len(p.Durables) == 0 {
 			return fmt.Errorf("dispatch config: profile %s needs a concurrency, a tier and a durable", p.Name)
 		}

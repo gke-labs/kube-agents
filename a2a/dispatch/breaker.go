@@ -41,9 +41,11 @@ func newBreakers() *breakers { return &breakers{m: map[ptKey]*breaker{}} }
 
 // wait reports whether a submission of profile at tier must stay queued
 // rather than be admitted, and whether that is because its breaker is open:
-// while open; and while half open, either with a task of that profile and
-// tier in flight (busy) or with an older submission of theirs waiting
-// (older), so the oldest held task is the one tried, one at a time. A held
+// while open; and while half open, either with a probe of that profile and
+// tier in flight (busy: a task reserved while half open, never one that was
+// already running when the breaker opened, such as a parent waiting on this
+// child) or with an older submission of theirs waiting (older), so the
+// oldest held task is the one tried, one at a time. A held
 // submission is never refused for the breaker: it waits, as over a cap, and
 // ends with queue-timeout if the breaker never closes. A refusal would let
 // one input that keeps killing workers fail every other user's task on that
@@ -62,6 +64,18 @@ func (b *breakers) wait(profile, tier string, now time.Time, busy, older bool) (
 		return true, true
 	}
 	return br.halfOpen && (busy || older), false
+}
+
+// halfOpen reports whether profile's breaker at tier is half open at now:
+// past its cooldown, trying one task at a time.
+func (b *breakers) halfOpen(profile, tier string, now time.Time) bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	br, ok := b.m[ptKey{profile, tier}]
+	return ok && br.halfOpen && !now.Before(br.openUntil)
 }
 
 // expired counts a task of profile at tier whose lease expired, and opens
@@ -126,12 +140,12 @@ func breakerCooldown(cfg lib.DispatchConfig) time.Duration {
 	return defaultBreakerCooldown
 }
 
-// inFlight reports whether a task of profile at tier is held here.
-func (d *Dispatcher) inFlight(profile, tier string) bool {
+// probing reports whether a probe of profile at tier is held here.
+func (d *Dispatcher) probing(profile, tier string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for k := range d.active {
-		if k.profile == profile && k.tier == tier {
+	for k, h := range d.active {
+		if k.profile == profile && k.tier == tier && h.probe {
 			return true
 		}
 	}

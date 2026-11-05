@@ -69,6 +69,37 @@ func TestAHalfOpenBreakerTriesTheOldestOneAtATime(t *testing.T) {
 	}
 }
 
+// A task already running when the breaker opened is not its probe: once
+// half open, a new submission is tried though that task still runs (a
+// parent waiting on its child, or a healthy long task).
+func TestAHalfOpenBreakerIsNotHeldByATaskRunningBeforeItOpened(t *testing.T) {
+	b := newBus(t, "tse-0", "tse-1", "tse-2")
+	b.ensure("tse", 3, 0, "read")
+	long := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	dead := b.worker("tse", "read", "tse-1", answerAccept, time.Hour)
+	dead.noRenew = true
+	b.worker("tse", "read", "tse-2", answerAccept, 300*time.Millisecond)
+	ti := oneProfile("tse", 3, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.BreakerThreshold, c.BreakerCooldownSeconds = 1, 2 })
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-long")
+	waitFor(t, 10*time.Second, "task-long running", func() bool { return long.startedTask("task-long") })
+	ti.pool.Set("tse", "read", "tse-1")
+	b.submit("tse", "read", lib.SubmitKindTop, "task-dead")
+	if ts := b.waitTerminal("task-dead", 20*time.Second); !hasReason(ts, ReasonLeaseExpired) {
+		t.Fatalf("task-dead terminal %+v, want lease-expired", ts)
+	}
+	ti.pool.Set("tse", "read", "tse-2")
+	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
+	if ts := b.waitTerminal("task-2", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Errorf("task-2 terminal %+v, want completed while task-long runs", ts)
+	}
+	if ts := b.terminalsOf("task-long"); len(ts) != 0 {
+		t.Errorf("task-long ended %+v; the test needs it running throughout", ts)
+	}
+}
+
 // A config that leaves the knobs at 0 takes the defaults.
 func TestBreakerDefaults(t *testing.T) {
 	if breakerThreshold(lib.DispatchConfig{}) != defaultBreakerThreshold || breakerCooldown(lib.DispatchConfig{}) != defaultBreakerCooldown {
