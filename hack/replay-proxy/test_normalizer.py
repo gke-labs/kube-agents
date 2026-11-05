@@ -183,6 +183,26 @@ class AnswerSlotTest(unittest.TestCase):
         self.assertEqual(a_slots[0][0], b_slots[0][0], "both answers fill the same context")
         self.assertNotEqual(a_slots[0][1], b_slots[0][1])
 
+    @staticmethod
+    def acted(name, arguments, said, call_id):
+        return normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "user", "content": "work kanban task t_aaaaaaaa"},
+            {"role": "assistant", "content": said, "tool_calls": [{"id": call_id, "type": "function", "function": {
+                "name": name, "arguments": json.dumps(arguments)}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": '{"ok": true}'},
+        ]}, NOW)
+
+    def test_the_slot_key_keeps_the_tool_calls_and_blanks_only_the_words(self):
+        base, _ = normalizer.answer_slots(self.acted("kanban_show", {}, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
+        worded, slots = normalizer.answer_slots(
+            self.acted("kanban_show", {}, "Let me look.", "call_8__thought__WFla"), self.CONTEXT)
+        self.assertEqual(base, worded, "other words, another call id and thought signature: the same slot")
+        for name, arguments in (("kanban_complete", {}), ("kanban_show", {"task_id": "t_aaaaaaaa"})):
+            other, _ = normalizer.answer_slots(self.acted(name, arguments, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
+            self.assertNotEqual(base, other, (name, arguments))
+        self.assertNotEqual(slots[0][1], normalizer.answer_slots(
+            self.acted("kanban_show", {}, "Looking.", "call_1"), self.CONTEXT)[1][0][1], "the words name the answer")
+
     def test_placeholders_outside_answers(self):
         n = self.convo("I'll look at web-7d4b9c8f6d-x2k9p", "ticket for web-5f6c7d8b9c-m8n7q")
         self.assertEqual(normalizer.placeholders_outside_answers(n), {"⟦TASK_1⟧", "⟦POD_2⟧"})

@@ -61,8 +61,8 @@ class GuardTest(unittest.TestCase):
         self.assertEqual((config.mode, config.cache_dir), ("shadow", "/c"))
 
 
-class AnswerSlotGuardTest(unittest.TestCase):
-    """A saved answer is served through a slot only if every value it names is bound outside the answers."""
+class SlotCacheCase(unittest.TestCase):
+    """A replay proxy over a cache the test fills as record mode would."""
 
     def setUp(self):
         self.cache_dir = tempfile.mkdtemp()
@@ -74,14 +74,6 @@ class AnswerSlotGuardTest(unittest.TestCase):
         proxy = replay_proxy.ShadowProxy(config, out=io.StringIO())
         self.addCleanup(proxy.close)
         return proxy
-
-    @staticmethod
-    def body(said, ticket="ticket Latte"):
-        return {"model": "m", "messages": [
-            {"role": "user", "content": "work kanban task t_bbbbbbbb"},
-            {"role": "assistant", "content": said},
-            {"role": "user", "content": ticket},
-        ]}
 
     def record(self, body, answer, others=()):
         """Save `answer` for `body` as record mode would, and note `others` as recorded answers too."""
@@ -95,6 +87,18 @@ class AnswerSlotGuardTest(unittest.TestCase):
         for other in (body, *others):
             for c, a in normalizer.answer_slots(normalizer.normalize_request(other, time.time()), context)[1]:
                 cache.add_variant(c, a)
+
+
+class AnswerSlotGuardTest(SlotCacheCase):
+    """A saved answer is served through a slot only if every value it names is bound outside the answers."""
+
+    @staticmethod
+    def body(said, ticket="ticket Latte"):
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "work kanban task t_bbbbbbbb"},
+            {"role": "assistant", "content": said},
+            {"role": "user", "content": ticket},
+        ]}
 
     def test_a_value_only_an_answer_named_is_not_served_through_a_slot(self):
         # Bob named his own pod in his yes; Alice's recorded yes named another.
@@ -112,6 +116,51 @@ class AnswerSlotGuardTest(unittest.TestCase):
         self.assertIsNotNone(hit)
         self.assertEqual(hit[0]["content"], "restart web-5f6c7d8b9c-m8n7q")
         self.assertEqual(hit[3], "answer_slots")
+
+
+class AnswerSlotActionsTest(SlotCacheCase):
+    """A slot blanks an answer's words, never its tool calls."""
+
+    OPENING = [{"role": "system", "content": "You are the platform agent."},
+               {"role": "user", "content": "work kanban task t_bbbbbbbb"}]
+
+    @staticmethod
+    def act(name, arguments, said="", call_id="call_1__thought__c2ln"):
+        return {"role": "assistant", "content": said, "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}]}
+
+    @staticmethod
+    def result(content, call_id="call_1__thought__c2ln"):
+        return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+    def conversation(self, *messages):
+        return {"model": "m", "messages": self.OPENING + list(messages)}
+
+    def test_another_tool_call_followed_by_the_same_result_misses(self):
+        # Recording 1 commented and got {"ok": true}, then kept working; recording
+        # 2 completed the card. A replay that completed it and also got {"ok": true}
+        # must not be served recording 1's "keep working".
+        comment = self.act("kanban_comment", {"body": "still checking"})
+        complete = self.act("kanban_complete", {"summary": "done"})
+        self.record(self.conversation(comment, self.result('{"ok": true}')),
+                    self.act("kanban_comment", {"body": "found it"}, call_id="call_2"),
+                    others=[self.conversation(complete, self.result('{"ok": true, "status": "done"}'))])
+        replayed = self.conversation(self.act("kanban_complete", {"summary": "done"}, call_id="call_9__thought__eHl6"),
+                                     self.result('{"ok": true}', call_id="call_9__thought__eHl6"))
+        self.assertIsNone(self.proxy().lookup(replayed, time.time()))
+
+    def test_the_same_tool_call_in_other_words_is_served(self):
+        self.record(self.conversation(self.act("kanban_comment", {"body": "x"}, said="Leaving a note."),
+                                      self.result('{"ok": true}')),
+                    {"role": "assistant", "content": "Noted on ticket t_bbbbbbbb."},
+                    others=[self.conversation(self.act("kanban_comment", {"body": "x"}, said="Commenting."),
+                                              self.result('{"ok": true, "other": 1}'))])
+        replayed = self.conversation(self.act("kanban_comment", {"body": "x"}, said="Commenting.",
+                                              call_id="call_7__thought__bmV3"),
+                                     self.result('{"ok": true}', call_id="call_7__thought__bmV3"))
+        hit = self.proxy().lookup(replayed, time.time())
+        self.assertIsNotNone(hit)
+        self.assertEqual((hit[0]["content"], hit[3]), ("Noted on ticket t_bbbbbbbb.", "answer_slots"))
 
 
 class LostAnalysisLinesTest(unittest.TestCase):

@@ -239,7 +239,11 @@ answers instead of the model.
 | **All four together**                        | **23%**     | **63%**                      |
 
 The second column is the first replay pass of the second trial. Its other two passes reused
-nothing, for the midnight reason below.
+nothing, for the midnight reason below. Of its 63%, 10 points (26 of the fleet case's 80) were six
+requests of one conversation served through the second key described under "Different words for
+the same answer", as the trial ran it: with the earlier answers' tool calls blanked too. The key
+now keeps tool calls and would not have served them, which puts that pass at about 53% and the
+fleet case at about 54%.
 
 Every run passed, recordings and replays. And every replayed conversation that was served saved
 answers got the same pass or fail as the run it reused them from: 33 of 33 conversations in the
@@ -255,9 +259,10 @@ What the trials taught us:
 - **The model answers the same request in different words.** Every worker's opening request is the
   same once IDs are swapped ("work kanban task ⟦TASK⟧"), and the model sometimes looked its card up
   with no arguments and sometimes with the task id. The cache kept the first answer and served it to
-  every worker, so a case whose recording took the other answer never matched again. Treating recorded
-  answers to the same request as interchangeable ("What goes into the cache key") took the fleet
-  case from 10% to 80%.
+  every worker, so a case whose recording took the other answer never matched again. Every fork the
+  second trial served through the second key was this one: the same tool, different arguments, no
+  words on either side. None differed in words alone. The second key now keeps tool calls, so it
+  no longer serves this fork ("Different words for the same answer" says why).
 - **The day changes the key.** Every system prompt says which day the conversation started. The
   second trial's last two passes ran after midnight UTC and reused nothing, because every request
   now said Thursday where the recording said Wednesday. In CI the nightly records one day and
@@ -451,19 +456,23 @@ it fell back (see [the gateway page](../../docs/site/src/content/docs/concepts/i
 The proxy only saves an answer when it came from the main setup with no fallback. Our prototype
 didn't check these headers, so this part hasn't been tested yet.
 
-**Different words for the same answer.** The model doesn't always answer the same request the same
-way. A worker opening its card might call `kanban_show()` in one run and `kanban_show(task_id=…)` in
-the next. Both fetch the same card. The cache keeps one answer per request, so if a case's recording took the other answer, the next request (which includes that answer) never matches its
-recording, and the agents after it miss too.
+**Different words for the same answer.** The model doesn't always word an answer the same way: one
+run says "Let me check the card" before a tool call and the next says nothing. The cache keeps one
+answer per request, so if a case's recording took the other wording, the next request (which
+includes that answer) never matches its recording, and the agents after it miss too.
 
-So the proxy also files each saved answer under a second key, where the model's own earlier
-answers are left as blanks. A request that misses on the exact key can still be served from the
-second one, but only if:
+So the proxy also files each saved answer under a second key, where the words of the model's own
+earlier answers are left blank. Their tool calls, by name and arguments, stay in the key. A request
+that misses on the exact key can still be served from the second one, but only if:
 
 - every earlier answer in it is one the model really gave to that same point in a recording, never
   a made-up one;
-- everything the tools returned still matches exactly, since tool results stay in the key. If the
-  two answers led to different tool output, it's still a miss;
+- the agent did the same things: every tool call matches by name and arguments. A different action
+  that happened to get the same output (`{"ok": true}` from completing a card rather than commenting
+  on it) is still a miss, and so is the same tool with different arguments, even a harmless one such
+  as `kanban_show()` and `kanban_show(task_id=…)` on the worker's own card: telling a harmless
+  difference from a harmful one would take per-tool rules;
+- everything the tools returned still matches exactly, since tool results stay in the key;
 - every value the saved answer names (a pod, a card) also appears outside the model's own earlier
   answers. Otherwise that value's placeholder could point at something else in this run.
 

@@ -33,9 +33,14 @@ NORMALIZER_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:NO
 # with a few hundred messages small.
 MESSAGE_HASH_HEX_CHARS = 16
 # Replay keys a request a second way, each assistant message as a slot any
-# recorded answer to that same context fills (answer_slots).
+# recorded answer to that same context fills (answer_slots). A slot keeps the
+# answer's tool calls, by name and arguments, and blanks its words.
 ASSISTANT_ROLE = "assistant"
 ANSWER_SLOT = "recorded-answer"
+CONTENT_FIELD = "content"
+FUNCTION_FIELD = "function"
+NAME_FIELD = "name"
+ARGUMENTS_FIELD = "arguments"
 
 # Request fields that change how the answer is delivered or who asked, never
 # what the model sees. Everything else is in the key.
@@ -640,23 +645,47 @@ def settings_hash(normalized: NormalizedRequest, context: KeyContext) -> str:
     return stable_hash({"settings": normalized.settings, "context": context.as_dict()})
 
 
-def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[str, List[Tuple[str, str]]]:
-    """The request's key with each assistant message as a slot, and each slot's (context, answer).
+def answer_actions(message: Any) -> List[Dict[str, Any]]:
+    """A normalized assistant message's tool calls: name and arguments, without ids or signatures."""
+    calls = message.get(TOOL_CALLS_KEY) if isinstance(message, dict) else None
+    actions = []
+    for call in calls if isinstance(calls, list) else []:
+        function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+        function = function if isinstance(function, dict) else {}
+        actions.append({NAME_FIELD: function.get(NAME_FIELD), ARGUMENTS_FIELD: function.get(ARGUMENTS_FIELD)})
+    return actions
 
-    The model can answer one request in different words that do the same thing
-    (a card lookup with or without the task id), and a conversation recorded
-    after one answer then never matches a replay that was served the other.
-    Keyed this way, it matches as long as each answer it holds is one the model
-    gave to that same context in a recording, which the caller checks per slot.
-    A slot's context is the chain of everything before it, earlier answers as
-    slots too, so the tool results that followed an answer still have to match.
+
+def answer_identity(message: Any) -> str:
+    """Which answer a normalized assistant message is: its words and its tool calls.
+
+    Ids, signatures and reasoning are left out: they differ between two
+    deliveries of the same answer. A missing and an empty text are the same.
+    """
+    content = message.get(CONTENT_FIELD) if isinstance(message, dict) else message
+    return stable_hash({CONTENT_FIELD: content or "", TOOL_CALLS_KEY: answer_actions(message)})
+
+
+def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[str, List[Tuple[str, str]]]:
+    """The request's key with each assistant message's words blanked, and each slot's (context, answer).
+
+    The model can word the same action differently from one run to the next,
+    and a conversation recorded after one wording then never matches a replay
+    that was served the other. Keyed this way, it matches as long as each
+    answer it holds is one the model gave to that same context in a recording,
+    which the caller checks per slot. Only the words are blanked: each
+    answer's tool calls, by name and arguments, stay in the key, so a slot
+    never joins two conversations in which the agent did different things,
+    however alike the tool results that followed. A slot's context is the
+    chain of everything before it, earlier answers as slots too, so the tool
+    results that followed an answer still have to match.
     """
     current = settings_hash(normalized, context)
     slots: List[Tuple[str, str]] = []
-    for message_hash, role in zip(normalized.message_hashes, normalized.roles()):
+    for message, message_hash, role in zip(normalized.messages, normalized.message_hashes, normalized.roles()):
         if role == ASSISTANT_ROLE:
-            slots.append((current, message_hash))
-            part = ANSWER_SLOT
+            slots.append((current, answer_identity(message)))
+            part: Any = {ANSWER_SLOT: answer_actions(message)}
         else:
             part = message_hash
         current = stable_hash({"prefix": current, "message": part})
