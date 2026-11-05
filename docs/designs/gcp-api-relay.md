@@ -289,7 +289,7 @@ class ApiSession:
 ```
 
 `relay_url` rewrites `https://<host>/<path>?<query>` onto `{broker}/v1/gcp/<host>/<path>?<query>`,
-where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set, else
+where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set and well-formed, else
 `CREDENTIAL_PROXY_URL` ([credential-broker-exec-tier.md](credential-broker-exec-tier.md) §3.2
 has the routing and the fallback). `requests` is imported inside the
 constructor and nowhere at module scope, so the broker and every other importer of the module
@@ -389,7 +389,9 @@ standing in for `monitoring.googleapis.com` and the real `GoogleApiRelay.fetch` 
 
 - A permitted `GET` reaches the fake upstream with exactly `Host`, `Authorization` and `Accept`, the caller's `Authorization` replaced by the broker's, the stripped query keys absent and every other pair byte-for-byte — including `match[]=up` and `up[5m]` on the Prometheus routes and a bare `[b]`, with the brackets sent raw.
 - The upstream's status, `Content-Type` and body come back unchanged, including a 403, a 429,
-  a 404 and a front-end 414 with `Connection: close` from upstream, a body with no
+  a 404 (the sandbox's `ApiSession` hands these back as they are, and re-sends only a reply
+  whose top-level `code` is the broker's own busy or resource-pressure code: the exec-tier
+  design, §4.3) and a front-end 414 with `Connection: close` from upstream, a body with no
   `Content-Type`, a close-delimited response, and an HTTP/1.0 response without a
   `Content-Length` read to EOF.
 - A caller with the `chat` role gets `CALLER_ROLE_FORBIDDEN` before an `api` line is written;

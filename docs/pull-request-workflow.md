@@ -172,7 +172,14 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+`docker-build.yml` also retries whole steps: the buildx setup and each image build that fetches
+from the network run once more, after a pause, when the first attempt fails. The in-image gate
+check runs once, because its failure is a test verdict. A new `docker/setup-buildx-action` or
+`docker/build-push-action` step there takes the same id, pause and retry steps, or joins
+`_EXEMPT_STEPS` with a reason. `python3 -m unittest tests.test_docker_build_retry` checks the
+shape.
+
+`tests/test_third_party_download_retry.py` gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
 the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
 nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
@@ -720,8 +727,6 @@ statuses on the head when an input changes — a push, a label, a new smoke stat
 green, so a gate missing from the head has not passed yet. Its `merge_group` jobs decide the same
 two again on the queue commit, and the enqueue sweep re-posts the head statuses of approved pull
 requests on its schedule. `scripts/merge_gate.py` is the reference for what each one reads.
-[`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) still re-pins a green's
-`BaseSHA:` suffix to the new head of `main`, which only Tide read.
 
 A push starts a fresh smoke run.
 [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0, makes some runs cheap: before

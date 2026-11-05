@@ -16,9 +16,10 @@ import fleet_health as fh  # noqa: E402
 # these listing tests into refusals.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)
 # The sweep width is read from the credential broker (broker_admission); with its
-# URL unset that read makes no request and the width is the fallback, four, so
+# URLs unset that read makes no request and the width is the fallback, four, so
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"

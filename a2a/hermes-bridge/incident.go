@@ -114,12 +114,14 @@ type incidentAddress struct {
 // subscription's key also carries the filing turn's task, which a later
 // reply does not know, so that row is not found).
 //
-// A key that names a whole conversation rather than a thread (a Google Chat
-// DM or space with no thread, a thread-less Slack DM) takes neither: every
-// later message there shares the key and the session, so a row stored
-// under it would be spliced ahead of every question for the row's life,
-// and the first card's report would answer a reply to the second's. The
-// hook never had this, since it looks up the message's own thread.
+// A key that names a whole conversation rather than a thread takes neither:
+// a Google Chat space with no thread, a thread-less Slack DM, and the
+// thread-less Google Chat DM key, which is the legacy and openDirect shape
+// (a Google Chat DM ask keys its own thread). Every later message
+// under such a key shares it and the session, so a row stored under it
+// would be spliced ahead of every question for the row's life, and the
+// first card's report would answer a reply to the second's. The hook never
+// had this, since it looks up the message's own thread.
 func incidentAddresses(key, sessionID string) []incidentAddress {
 	key = strings.TrimSpace(key)
 	if key == "" || incidentWholeConversation(key) {
