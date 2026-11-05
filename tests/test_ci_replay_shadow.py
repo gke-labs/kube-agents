@@ -295,10 +295,10 @@ class CollectorLifecycleTest(unittest.TestCase):
                 + 'REPLAY_SHADOW_COLLECTOR_PID=""\n' + functions + body)
 
     def _run(self, body, stop_wait=2, **overrides):
-        env = _env(PATH=f"{self.bin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin",
-                   ARTIFACTS=str(self.artifacts), TARGET_NAMESPACE="kubeagents-system",
+        overrides.setdefault("PATH", f"{self.bin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin")
+        env = _env(ARTIFACTS=str(self.artifacts), TARGET_NAMESPACE="kubeagents-system",
                    AGENT_CLUSTER_CONTEXT="gke_p_us-central1_platform-agent-host", **overrides)
-        return subprocess.run(["bash", "-c", self._script(body, stop_wait)], env=env, capture_output=True,
+        return subprocess.run([shutil.which("bash"), "-c", self._script(body, stop_wait)], env=env, capture_output=True,
                               text=True, timeout=_WAIT_SECONDS * 2)
 
     def _wait_for_argv(self):
@@ -368,8 +368,13 @@ class CollectorLifecycleTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("pid=[]", proc.stdout)
         self.assertIn("WARNING", proc.stderr)
+        # A PATH with only what the function needs besides gcloud: a gcloud
+        # installed on the machine running the test must not stand in.
         (self.bin / "gcloud").unlink()
-        proc = self._run(body)
+        for tool in ("mkdir",):
+            (self.bin / tool).symlink_to(shutil.which(tool))
+        (self.bin / "python3").symlink_to(sys.executable)
+        proc = self._run(body, PATH=str(self.bin))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("pid=[]", proc.stdout)
         self.assertIn("no gcloud on PATH", proc.stderr)
