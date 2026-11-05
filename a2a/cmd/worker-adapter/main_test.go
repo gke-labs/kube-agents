@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -612,5 +613,29 @@ func TestAProfileWorkersBaseArgvLeavesToolsToThePersona(t *testing.T) {
 		if !strings.Contains(argv, want) {
 			t.Errorf("the profile base argv lacks %s: %s", want, argv)
 		}
+	}
+}
+
+// A profile worker binds no delegate socket: its harness argv is the
+// persona's, which carries no delegate MCP server, so a listener would serve
+// a tool the harness is never told of.
+func TestAProfileWorkerBindsNoDelegateSocket(t *testing.T) {
+	t.Setenv("TASK_ID", "task-profile")
+	t.Setenv("PROFILE", "chat")
+	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+	t.Setenv("A2A_CAPABILITY_REQUIRED", "false")
+	cfg, ok := configFromEnv(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if !ok {
+		t.Fatal("configFromEnv rejected the environment")
+	}
+	if cfg.DelegateSocket == "" {
+		t.Fatal("the session config binds no delegate socket to begin with; the check below would pass on nothing")
+	}
+	got := profileModeConfig(cfg)
+	if got.DelegateSocket != "" {
+		t.Errorf("profile mode keeps the delegate socket %q", got.DelegateSocket)
+	}
+	if !reflect.DeepEqual(got.HarnessCommand, profileHarnessCommand()) || got.HarnessCommandNoDelegate != nil {
+		t.Errorf("profile mode argv = %q / %q, want the persona's base argv and no no-delegate variant", got.HarnessCommand, got.HarnessCommandNoDelegate)
 	}
 }

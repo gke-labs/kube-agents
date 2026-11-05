@@ -1,9 +1,11 @@
 package workeradapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -124,14 +126,16 @@ func profileSubmission(t *testing.T, task, text string, params map[string]string
 	return env
 }
 
-func freeAddr(t *testing.T) string {
+// readyListener binds the readiness port for a test worker and hands over
+// the listener itself, so the port can't be taken between choosing it and
+// listening on it.
+func readyListener(t *testing.T) (net.Listener, string) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	return ln.Addr().String()
+	return ln, ln.Addr().String()
 }
 
 func profileWorkerConfig(t *testing.T, url string, harness []string) Config {
@@ -150,10 +154,10 @@ func profileWorkerConfig(t *testing.T, url string, harness []string) Config {
 // listening, which is the moment the dispatcher may offer.
 func startProfileWorker(t *testing.T, ctx context.Context, cfg Config, oneShot bool) <-chan error {
 	t.Helper()
-	addr := freeAddr(t)
+	ln, addr := readyListener(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- RunProfileWorker(ctx, cfg, ProfileWorkerConfig{Tier: pwTier, OneShot: oneShot, ReadyAddr: addr, deadlineMargin: time.Second})
+		done <- RunProfileWorker(ctx, cfg, ProfileWorkerConfig{Tier: pwTier, OneShot: oneShot, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second})
 	}()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -310,6 +314,53 @@ sleep 30
 	}
 }
 
+// Nothing of an abandoned task goes out while its harness drains, and a
+// SIGTERM in that window is not a second terminal. The stub leaves a child in
+// its own process group holding stdout, so the kill on abandon does not end
+// the drain: the child writes an assistant line after the abandon, and the
+// worker is told to stop while it is still holding the pipe.
+func TestAnAbandonedTaskPublishesNothingWhileItDrains(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"pw-drain"}'
+read first || exit 1
+perl -e '$|=1; setpgrp(0,0); sleep 1; print qq({"type":"assistant","message":{"content":[{"type":"text","text":"late-text"}]}}\n); sleep 4' &
+sleep 30
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startProfileWorker(t, ctx, profileWorkerConfig(t, url, harness), false)
+
+	const task = "task-abandon-drain"
+	d.offer(task, profileSubmission(t, task, "long job", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+	waitState(t, testClient(t, url), pwProfile, task, lib.StateWorking)
+	before := len(replayEvents(t, url, pwProfile, task))
+	d.send(lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: task, Reason: "lease-expired - test"})
+
+	// The late line lands about a second after the abandon; the SIGTERM
+	// comes after it, while the child still holds stdout.
+	time.Sleep(2 * time.Second)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the worker did not stop after SIGTERM")
+	}
+
+	after := replayEvents(t, url, pwProfile, task)
+	if len(after) != before {
+		for _, e := range after[before:] {
+			t.Errorf("published after the abandon: %s", e.Kind)
+		}
+	}
+	if got := foldTask(t, testClient(t, url), pwProfile, task); got.Final {
+		t.Errorf("the worker published a terminal (%s) for an abandoned task", got.State)
+	}
+}
+
 // A one-shot worker, a Job's pod, ends after its first task.
 func TestAOneShotWorkerEndsAfterItsTask(t *testing.T) {
 	url := startServer(t)
@@ -389,9 +440,9 @@ printf '{"type":"result","subtype":"success","result":"token=%%s"}\n' "$(cat %s)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
-	addr := freeAddr(t)
+	ln, addr := readyListener(t)
 	go func() {
-		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{Tier: pwTier, ReadyAddr: addr, TaskTokenFile: tokenFile, deadlineMargin: time.Second})
+		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{Tier: pwTier, ReadyAddr: addr, readyListener: ln, TaskTokenFile: tokenFile, deadlineMargin: time.Second})
 	}()
 	waitReady(t, addr)
 
@@ -490,10 +541,10 @@ printf '{"type":"result","subtype":"success","result":"md=%%s flags=%%s"}\n' "$m
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
-	addr := freeAddr(t)
+	ln, addr := readyListener(t)
 	go func() {
 		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
-			Tier: pwTier, ReadyAddr: addr, deadlineMargin: time.Second,
+			Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second,
 			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: root,
 		})
 	}()
@@ -549,11 +600,11 @@ printf '{"type":"result","subtype":"success","result":"settings=%%s md=%%s state
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
-	addr := freeAddr(t)
+	ln, addr := readyListener(t)
 	configRoot := t.TempDir()
 	go func() {
 		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
-			Tier: pwTier, ReadyAddr: addr, deadlineMargin: time.Second,
+			Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second,
 			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: configRoot,
 		})
 	}()
@@ -598,10 +649,10 @@ echo '{"type":"result","subtype":"success","result":"ok"}'
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cfg := profileWorkerConfig(t, url, harness)
-	addr := freeAddr(t)
+	ln, addr := readyListener(t)
 	go func() {
 		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{
-			Tier: pwTier, ReadyAddr: addr, deadlineMargin: time.Second,
+			Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second,
 			PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: t.TempDir(),
 		})
 	}()
@@ -689,5 +740,21 @@ sleep 30
 	if !last.Final || last.Status.State != lib.StateFailed || last.Status.Message == nil ||
 		!strings.Contains(last.Status.Message.Parts[0].Text, "can be resubmitted") {
 		t.Errorf("the interrupted task's terminal %+v; want failed, saying it can be resubmitted", last)
+	}
+}
+
+// What the render leaves out of a persona is in the pod's log: the render
+// reports it in Warnings and logs nothing itself.
+func TestPersonaRenderWarningsAreLogged(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	logPersonaWarnings(log, &persona.Output{Warnings: []string{`mcp server "fleet" (via: broker) dropped: no relay target`}})
+	if !strings.Contains(buf.String(), `fleet`) || !strings.Contains(buf.String(), "level=WARN") {
+		t.Errorf("the render's warning is not in the log: %q", buf.String())
+	}
+	buf.Reset()
+	logPersonaWarnings(log, nil)
+	if buf.Len() != 0 {
+		t.Errorf("logged %q with no persona", buf.String())
 	}
 }
