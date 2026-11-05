@@ -394,7 +394,7 @@ including:
 - arbitrary binary or unbounded streaming input/output;
 - file paths that refer to sandbox-only files;
 - background processes or commands that outlive the request;
-- commands exceeding request, output, or timeout limits; and
+- commands exceeding request, output, or timeout limits;
 - more commands at once than the broker admits: at most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
   as fit the child memory budget it derives from its container's memory limit (four at
@@ -402,18 +402,25 @@ including:
   refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
   cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
   caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
-  `Retry-After`; the session role keeps one slot up to a higher ceiling.
-- more commands in one session than its budget allows. The wrapper sends the card or
-  session id it runs under (`HERMES_KANBAN_TASK`, else `HERMES_SESSION_ID`) as the
-  request's `sessionId`, and the broker counts per key: a session of the shell, profile
-  or scope role is refused past `BROKER_SESSION_MAX_TOOL_CALLS` commands (1500) with
-  `403 BROKER_SESSION_BUDGET_EXCEEDED`, and any session is refused the same command,
-  on the same cluster, after it failed or was blocked `BROKER_SESSION_MAX_IDENTICAL_FAILURES`
-  times running (5) with `403 BROKER_LOOP_BREAKER`; `0` turns either off. The key is
-  a loop guard, never an identity: it comes from the body, which the model composes, so
-  no policy decision reads it, a request without one (a `no_agent` collector) is
-  uncounted, and the authenticated principal stays the only input to who may do what.
-  Each broker process counts alone, in an LRU of 1024 sessions.
+  `Retry-After`; the session role keeps one slot up to a higher ceiling; and
+- more commands in one session than its budget allows. The wrapper sends the key of
+  the run it belongs to as the request's `sessionId`: the kanban card, else the
+  scheduled run, else the session (`HERMES_KANBAN_TASK`, `HERMES_CRON_RUN`,
+  `HERMES_SESSION_ID`). No process environment crosses the SSH hop into the shell
+  sandbox, so there the ForceCommand recovers the first two from the command's working
+  directory, the card workspace or the run directory the cron workdir patch minted, and
+  a chat turn, which runs from neither, sends no key; the session id reaches the wrapper
+  where the terminal runs in its own pod, the profile and session pods. The broker counts
+  per key: a shell, profile or scope session past `BROKER_SESSION_MAX_TOOL_CALLS`
+  commands is refused with `403 BROKER_SESSION_BUDGET_EXCEEDED`, and any keyed session
+  is refused the same command, on the same cluster, after it failed or was blocked
+  `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times running, with `403 BROKER_LOOP_BREAKER`;
+  the site's [troubleshooting entries](site/src/content/docs/reference/credential-isolation.md#troubleshooting)
+  carry the defaults and the operator's knobs. The key is a loop guard, never an
+  identity: it comes from the body, which the model composes, so no policy decision
+  reads it, a request with no key is uncounted, and the authenticated principal stays
+  the only input to who may do what. Each broker process counts alone, in a bounded
+  LRU of sessions, so an exec tier of N replicas admits about N times the ceiling.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.

@@ -521,14 +521,19 @@ ENV_PROFILE_SLOTS = "CREDENTIAL_PROXY_PROFILE_SLOTS"
 # bounds a background run's turns, but one turn can run a shell loop that
 # sends thousands of commands, or the same failing command over and over, and
 # nothing between the loop and the broker notices. The broker counts commands
-# per `sessionId`, a body field the shim fills from the card or session it
-# runs under (credential_proxy_client.CALLER_LABEL_ENV): a loop-guard key,
-# never an authorization input, since the body is the model's to compose. A
-# request without one -- a `no_agent` collector, a bare curl -- is uncounted.
-# The ceiling applies to the background-running roles only
-# (SESSION_BUDGET_CEILING_ROLES), so a chat conversation is never cut off; the
-# loop breaker applies to every role. 0 disables each. Both are read once at
-# import, like the issue's shape; spec.deployment.env reaches them.
+# per `sessionId`, a body field the shim fills from the kanban card, the
+# scheduled run or the session it runs under (credential_proxy_client.
+# CALLER_LABEL_ENV; in the shell sandbox the first two are recovered from the
+# command's cwd by the ForceCommand, since no environment crosses the SSH hop):
+# a loop-guard key, never an authorization input, since the body is the
+# model's to compose. A request with no key in its environment -- a collector
+# an operator runs by hand, a bare curl -- is uncounted; a collector a card or
+# a run launches inherits the key and counts against it. The ceiling applies
+# to the background-running roles only (SESSION_BUDGET_CEILING_ROLES), and a
+# chat turn in the shell sandbox runs from no card or run directory and so
+# sends no key, which together keep a conversation out of it; the loop
+# breaker applies to every keyed request. 0 disables each. Both are read once
+# at import, like the issue's shape; spec.deployment.env reaches them.
 ENV_SESSION_MAX_TOOL_CALLS = "BROKER_SESSION_MAX_TOOL_CALLS"
 DEFAULT_SESSION_MAX_TOOL_CALLS = 1500
 ENV_SESSION_MAX_IDENTICAL_FAILURES = "BROKER_SESSION_MAX_IDENTICAL_FAILURES"
@@ -543,8 +548,10 @@ SESSION_ID_FIELD = "sessionId"
 SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
 LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
 # The refusal texts, with the code first so the model's transcript shows the
-# stop in its first words; the shim prints the message as it prints a policy
-# block, and the runtime's refusal stop reads that shape.
+# stop in its first words. The shim prints the message as it prints a policy
+# block and exits the policy-blocked code, so the runtime does not read the
+# refusal as a missing executable; its refusal stop halts on the read-only
+# rule's write refusals only, so here the text is the instruction.
 SESSION_BUDGET_EXCEEDED_MESSAGE = (
     "{code}: session exceeded {limit} tool invocations; summarize current findings and finish the turn."
 )
@@ -2216,7 +2223,9 @@ BACKGROUND_ROLES = frozenset({CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE})
 # The roles whose sessions take the per-session tool-call ceiling
 # (SessionToolBudget): the shell's cron runs and kanban workers, the profile
 # workers and the scope publisher, the background runs the ceiling exists for.
-# The session role is a person's conversation and gets the loop breaker only.
+# The shell role carries a person's chat turns too, but those arrive with no
+# key (see ENV_SESSION_MAX_TOOL_CALLS) and are not counted; the session pod's
+# role is a conversation by construction and gets the loop breaker only.
 SESSION_BUDGET_CEILING_ROLES = frozenset({CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE})
 
 
@@ -3878,13 +3887,16 @@ class ResourceWatermarkGate:
 def session_slot_limit_from_env(
     env_name: str = ENV_SESSION_MAX_CONCURRENT_COMMANDS,
     default: int = DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS,
+    minimum: int = 1,
 ) -> int:
-    """A role's concurrent-command bound, from the env or the default.
+    """A role's bound, from the env or the default.
 
-    The session role's by default; the scope role's with its own env name and
-    default. Anything that is not a positive integer falls back to the default
-    with a warning, so a typo narrows rather than opens: the default is the
-    small number, and an unset or broken knob is never "unlimited".
+    The session role's concurrent-command bound by default; the scope role's
+    with its own env name and default; the per-session tool-call bounds with
+    ``minimum=0``, where 0 is a value and means off. Anything that is not an
+    integer of at least ``minimum`` falls back to the default with a warning,
+    so a typo narrows rather than opens: the default is the small number, and
+    an unset or broken knob is never "unlimited".
     """
     raw = os.getenv(env_name, "").strip()
     if not raw:
@@ -3892,11 +3904,11 @@ def session_slot_limit_from_env(
     try:
         value = int(raw)
     except ValueError:
-        value = 0
-    if value <= 0:
+        value = minimum - 1
+    if value < minimum:
         LOGGER.warning(
-            "%s=%r is not a positive integer; using the default of %d",
-            env_name, raw, default,
+            "%s=%r is not an integer of at least %d; using the default of %d",
+            env_name, raw, minimum, default,
         )
         return default
     return value
@@ -4001,31 +4013,11 @@ class SessionSlots:
                 self._in_flight -= 1
 
 
-def session_tool_limit_from_env(env_name: str, default: int) -> int:
-    """A per-session tool-call bound from the env, or its default.
-
-    0 is a value here, and means off; a negative or non-integer value falls back
-    to the default with a warning, so a typo narrows rather than opens.
-    """
-    raw = os.getenv(env_name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        value = -1
-    if value < 0:
-        LOGGER.warning(
-            "%s=%r is not a non-negative integer; using the default of %d",
-            env_name, raw, default,
-        )
-        return default
-    return value
-
-
-SESSION_MAX_TOOL_CALLS = session_tool_limit_from_env(ENV_SESSION_MAX_TOOL_CALLS, DEFAULT_SESSION_MAX_TOOL_CALLS)
-SESSION_MAX_IDENTICAL_FAILURES = session_tool_limit_from_env(
-    ENV_SESSION_MAX_IDENTICAL_FAILURES, DEFAULT_SESSION_MAX_IDENTICAL_FAILURES
+# Read once at import rather than in serve(), because the budget below is a
+# module-level instance the route reads directly (the issue's shape).
+SESSION_MAX_TOOL_CALLS = session_slot_limit_from_env(ENV_SESSION_MAX_TOOL_CALLS, DEFAULT_SESSION_MAX_TOOL_CALLS, minimum=0)
+SESSION_MAX_IDENTICAL_FAILURES = session_slot_limit_from_env(
+    ENV_SESSION_MAX_IDENTICAL_FAILURES, DEFAULT_SESSION_MAX_IDENTICAL_FAILURES, minimum=0
 )
 
 

@@ -2967,14 +2967,26 @@ class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):
     """The exec body carries the card or session id the shim runs under, so the
     broker can count the run's commands; absent when there is none."""
 
-    ENV = {"KUBECONFIG": "", "HERMES_KANBAN_TASK": "", "HERMES_SESSION_ID": ""}
+    ENV = {"KUBECONFIG": "", "HERMES_KANBAN_TASK": "", "HERMES_CRON_RUN": "", "HERMES_SESSION_ID": ""}
 
     def test_the_card_comes_first(self):
         payload = self.submit(
             ["gcloud", "projects", "list"],
-            {**self.ENV, "HERMES_KANBAN_TASK": "t_f660e9c5", "HERMES_SESSION_ID": "20260925_001944_b09c64"},
+            {
+                **self.ENV, "HERMES_KANBAN_TASK": "t_f660e9c5", "HERMES_CRON_RUN": "job_7c1e2a_e6b9f0d1",
+                "HERMES_SESSION_ID": "20260925_001944_b09c64",
+            },
         )
         self.assertEqual("t_f660e9c5", payload["sessionId"])
+
+    def test_the_scheduled_run_comes_next(self):
+        # The ForceCommand in the shell sandbox derives this one from the run's
+        # cwd (tests/test_sandbox_session_command.py); the shim sends it.
+        payload = self.submit(
+            ["gcloud", "projects", "list"],
+            {**self.ENV, "HERMES_CRON_RUN": "job_7c1e2a_e6b9f0d1", "HERMES_SESSION_ID": "20260925_001944_b09c64"},
+        )
+        self.assertEqual("job_7c1e2a_e6b9f0d1", payload["sessionId"])
 
     def test_the_session_otherwise(self):
         payload = self.submit(["gcloud", "projects", "list"], {**self.ENV, "HERMES_SESSION_ID": "20260925_001944_b09c64"})
@@ -2997,7 +3009,8 @@ class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):
 
 class TestSessionRefusalsReadAsAPolicyBlock(unittest.TestCase):
     """The broker's two per-session refusals print like a policy block and exit
-    EXIT_SECURITY_POLICY_BLOCKED, so the runtime's refusal stop reads them."""
+    EXIT_SECURITY_POLICY_BLOCKED, so the runtime does not read them as a missing
+    executable; the message is what tells the model to stop."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

@@ -202,9 +202,13 @@ EXEC_ROUTE = "/v1/exec"
 # can count a run's commands and break its retry loops. Omitted when there is
 # none; a request without one is uncounted.
 SESSION_ID_FIELD = "sessionId"
-# The refusal codes the shim prints as a policy block and exits
-# EXIT_SECURITY_POLICY_BLOCKED on, so the runtime's refusal stop reads them:
-# the policy's own, and the broker's two per-session bounds.
+# The refusal codes the shim prints as a policy block (the message, then
+# `policy rule: <rule>`) and exits EXIT_SECURITY_POLICY_BLOCKED on: the policy's
+# own, and the broker's two per-session bounds. The exit code keeps the runtime
+# from reading the refusal as a missing executable; the runtime's refusal stop
+# (deploy/docker/patches/permission_refusal_stop.py) halts on the read-only
+# rule's write refusals only, so for the two session bounds the message is
+# what tells the model to stop.
 SECURITY_POLICY_BLOCKED_CODE = "SECURITY_POLICY_BLOCKED"
 SESSION_BUDGET_EXCEEDED_CODE = "BROKER_SESSION_BUDGET_EXCEEDED"
 LOOP_BREAKER_CODE = "BROKER_LOOP_BREAKER"
@@ -236,11 +240,17 @@ SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_SHARED_KUBECONFIG_PATH = Path("/opt/data/.kubeconfig")
 # What an exec request sends as its `sessionId`, so the broker can count the
-# run's commands: the kanban card first, the session otherwise. The grammar
-# mirrors the broker's SESSION_ID_RE; a value outside it is dropped rather
-# than sent, because the key serves the broker's count and must never be
-# what fails a command.
-CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID")
+# run's commands: the kanban card first, then the scheduled run, then the
+# session. Where each comes from matters, because no process environment
+# crosses the SSH hop into the shell sandbox: there the ForceCommand
+# (deploy/sandbox/session-command.sh) recovers the card and the cron run from
+# the command's cwd, and a chat turn, which runs from neither, sends no key.
+# HERMES_SESSION_ID reaches the shim only where the terminal runs in the
+# shim's own pod, the profile and session pods. The grammar mirrors the
+# broker's SESSION_ID_RE; a value outside it is dropped rather than sent,
+# because the key serves the broker's count and must never be what fails a
+# command.
+CALLER_LABEL_ENV = ("HERMES_KANBAN_TASK", "HERMES_CRON_RUN", "HERMES_SESSION_ID")
 CALLER_LABEL_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
 PER_TARGET_KUBECONFIG_NAME = "kubeconfig_{project}_{cluster}_{location}.yaml"
 
@@ -1842,7 +1852,8 @@ class WorkspaceRequestError(RuntimeError):
 
 
 def default_caller_label() -> str:
-    """The card or session id this process runs under, or "" when it has none.
+    """The card, scheduled run or session id this process runs under, or ""
+    when it has none.
 
     Read at call time, like `session_lease` in the skill, because the agent
     runs each command in a fresh process and the identity lives in its

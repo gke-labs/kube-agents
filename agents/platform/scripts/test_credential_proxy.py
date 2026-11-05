@@ -20959,18 +20959,23 @@ class SessionToolBudgetTest(unittest.TestCase):
         self.assertEqual("BROKER_LOOP_BREAKER", budget.admit("run-3", self.DELETE, ceiling=False).code)
         self.assertEqual(1024, len(budget))
 
-    def test_the_env_reader(self):
-        read = credential_proxy.session_tool_limit_from_env
+    def test_the_env_reader_admits_zero_as_off(self):
+        # The slot limits' reader with minimum=0: 0 is a value here.
+        read = credential_proxy.session_slot_limit_from_env
         name = credential_proxy.ENV_SESSION_MAX_TOOL_CALLS
         with mock.patch.dict(os.environ, {name: ""}):
-            self.assertEqual(1500, read(name, 1500))
+            self.assertEqual(1500, read(name, 1500, minimum=0))
         with mock.patch.dict(os.environ, {name: "0"}):
-            self.assertEqual(0, read(name, 1500))
+            self.assertEqual(0, read(name, 1500, minimum=0))
         with mock.patch.dict(os.environ, {name: " 7 "}):
-            self.assertEqual(7, read(name, 1500))
+            self.assertEqual(7, read(name, 1500, minimum=0))
         for raw in ("-1", "many", "1.5"):
-            with mock.patch.dict(os.environ, {name: raw}), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
-                self.assertEqual(1500, read(name, 1500))
+            with mock.patch.dict(os.environ, {name: raw}), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                self.assertEqual(1500, read(name, 1500, minimum=0))
+            self.assertIn("at least 0", logs.output[0])
+        # And the slot limits still refuse 0.
+        with mock.patch.dict(os.environ, {name: "0"}), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            self.assertEqual(2, read(name, 2))
         self.assertEqual("BROKER_SESSION_MAX_TOOL_CALLS", name)
         self.assertEqual("BROKER_SESSION_MAX_IDENTICAL_FAILURES", credential_proxy.ENV_SESSION_MAX_IDENTICAL_FAILURES)
 
