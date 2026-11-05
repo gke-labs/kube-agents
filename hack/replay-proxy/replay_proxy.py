@@ -422,6 +422,11 @@ def unstorable_reasons(
         reasons.append(F.UNSTORABLE_BOUND_VALUE_LEFT_LITERAL)
     if any(mapping.has_timestamp(t) for t in normalized):
         reasons.append(F.UNSTORABLE_UNBOUND_TIMESTAMP)
+    # Read after the swap: a timestamp the answer copied from the request is a
+    # placeholder by now and is served with this run's value, so only a date it
+    # wrote itself (or a weekday) still counts as repeating the recording's day.
+    if any(mapping.answer_repeats_date(t) for t in normalized):
+        reasons.append(F.UNSTORABLE_REPEATS_DATE)
     if not scrubber.available:
         reasons.append(F.UNSTORABLE_SCRUBBERS_UNAVAILABLE)
         return reasons

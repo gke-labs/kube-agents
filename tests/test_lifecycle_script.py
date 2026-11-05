@@ -8,6 +8,11 @@ Tests safety guards in lifecycle.sh before terraform apply:
 - guard_kms_identity: prevents the CMEK key ring or key being replaced (and the live
   key's versions scheduled for destruction) when GKE_DB_KMS_KEYRING / GKE_DB_KMS_KEY
   disagree with state.
+- guard_standard_node_count: prevents the Standard cluster's replacement when
+  standard_node_count (its ForceNew initial_node_count) disagrees with state.
+- guard_node_pool_shape: prevents a lost or blanked sizing line in install.env from
+  recreating every node of a Standard pool onto the small profile; a sizing input
+  the operator named lets the resize through.
 """
 
 import os
@@ -81,6 +86,27 @@ def _scratch_composition(root):
     return comp
 
 
+# The six explicit shape inputs guard_node_pool_shape reads, unset, and the
+# module's resolved-shape outputs at the small profile, as the stub answers
+# them unless a test says otherwise.
+_UNSET_POOL_SHAPES = {
+    "standard_machine_type": "null",
+    "standard_disk_size_gb": "null",
+    "standard_disk_type": "null",
+    "gvisor_machine_type": "null",
+    "gvisor_disk_size_gb": "null",
+    "gvisor_disk_type": "null",
+}
+_SMALL_MODULE_OUTPUTS = {
+    "standard_machine_type": '"e2-standard-4"',
+    "standard_disk_size_gb": "100",
+    "standard_disk_type": '"pd-balanced"',
+    "gvisor_machine_type": '"e2-standard-4"',
+    "gvisor_disk_size_gb": "100",
+    "gvisor_disk_type": '"pd-balanced"',
+}
+
+
 class LifecycleScriptGuardTest(unittest.TestCase):
     def _run_guard(self, func_call, state_list="", state_show="", tfvar_agent_sa="null",
                    tfvar_create_cluster="true", gcloud_stub="exit 1",
@@ -107,6 +133,15 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_enable_stockout="false",
                    tfvar_stockout_topic='"gke-stockout-alerts-topic"',
                    tfvar_stockout_sub='"gke-stockout-alerts-sub"',
+                   tfvar_standard_node_count="1",
+                   tfvar_sizing_profile="null",
+                   tfvar_enable_gvisor="true",
+                   tfvar_pool_shapes=None,
+                   module_outputs=None,
+                   recorded_outputs=None,
+                   state_show_by_address=None,
+                   output_stderr_noise="",
+                   output_stub=None,
                    console_fail_var="",
                    apply_stub="exit 0",
                    show_rc=0,
@@ -151,6 +186,47 @@ fi
 """)
             gcloud.chmod(0o755)
 
+            # What `terraform console` answers for the six explicit shape inputs
+            # (var.<pool>_<attr>; null unless a test names one) and for the
+            # gke-cluster module's resolved-shape outputs
+            # (module.gke_cluster.<pool>_<attr>; the small profile unless a test
+            # says otherwise). Strings quoted and numbers bare, as console prints.
+            pool_shapes = dict(_UNSET_POOL_SHAPES)
+            pool_shapes.update(tfvar_pool_shapes or {})
+            outputs = dict(_SMALL_MODULE_OUTPUTS)
+            outputs.update(module_outputs or {})
+            pool_shape_case = "\n".join(
+                f"        {name}) echo '{answer}'; exit 0 ;;" for name, answer in pool_shapes.items())
+            module_output_case = "\n".join(
+                f"        {name}) echo '{answer}'; exit 0 ;;" for name, answer in outputs.items())
+            # Quoted: a state address carries `[0]`, a bracket expression in
+            # an unquoted case pattern.
+            state_show_case = "\n".join(
+                f"        \"{addr}\") cat << 'EOF'\n{text}\nEOF\n        exit 0 ;;"
+                for addr, text in (state_show_by_address or {}).items())
+
+            # What `terraform output -raw <name>` answers: the root outputs the
+            # last apply recorded in state. A name not in recorded_outputs gets
+            # the binary's not-found error (exit 1), the shape a state from
+            # before the output was declared gives; output_stub replaces the
+            # whole branch for the other shapes (a state with no outputs at all
+            # exits 0 and prints nothing; a backend failure exits 1 otherwise).
+            # output_stderr_noise is written to stderr first, on every answer:
+            # what TF_LOG in the operator's shell, or a provider warning, adds
+            # to a read that still exits 0.
+            recorded_output_case = "\n".join(
+                f"        {name}) echo '{answer}'; exit 0 ;;"
+                for name, answer in (recorded_outputs or {}).items())
+            noise = f"echo '{output_stderr_noise}' >&2\n    " if output_stderr_noise else ""
+            if output_stub is None:
+                output_stub = f"""{noise}name="${{@: -1}}"
+    case "$name" in
+{recorded_output_case}
+    esac
+    echo "Error: Output \\"$name\\" not found" >&2
+    echo "The output variable requested could not be found in the state file." >&2
+    exit 1"""
+
             # Stub terraform CLI to return configured state list, state show, and console outputs
             terraform_stub = bin_dir / "terraform"
             terraform_stub.write_text(f"""#!/usr/bin/env bash
@@ -164,10 +240,17 @@ if [[ "$cmd" == "state" && "${{2:-}}" == "list" ]]; then
 EOF
     exit 0
 elif [[ "$cmd" == "state" && "${{2:-}}" == "show" ]]; then
+    # The address is the last argument (`state show -no-color <addr>`). One
+    # named in state_show_by_address gets its own text; any other gets state_show.
+    case "${{@: -1}}" in
+{state_show_case}
+    esac
     cat << 'EOF'
 {state_show}
 EOF
     exit 0
+elif [[ "$cmd" == "output" ]]; then
+    {output_stub}
 elif [[ "$cmd" == "console" ]]; then
     read -r expr
     # console_fail_var models a terraform console that cannot answer -- a state
@@ -176,6 +259,20 @@ elif [[ "$cmd" == "console" ]]; then
     if [[ -n "{console_fail_var}" && "$expr" == *"{console_fail_var}"* ]]; then
         echo 'Error: could not load the configuration' >&2
         exit 1
+    fi
+    if [[ "$expr" == "var.sizing_profile" ]]; then
+        echo '{tfvar_sizing_profile}'
+        exit 0
+    elif [[ "$expr" == module.gke_cluster.* ]]; then
+        case "${{expr#module.gke_cluster.}}" in
+{module_output_case}
+        esac
+        echo "unknown module output $expr" >&2
+        exit 1
+    elif [[ " {' '.join(pool_shapes)} " == *" ${{expr#var.}} "* ]]; then
+        case "${{expr#var.}}" in
+{pool_shape_case}
+        esac
     fi
     if [[ "$expr" == *"agent_service_account_id"* ]]; then
         echo '{tfvar_agent_sa}'
@@ -239,6 +336,12 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"stockout_pubsub_subscription"* ]]; then
         echo '{tfvar_stockout_sub}'
+        exit 0
+    elif [[ "$expr" == *"standard_node_count"* ]]; then
+        echo '{tfvar_standard_node_count}'
+        exit 0
+    elif [[ "$expr" == *"enable_gvisor_node_pool"* ]]; then
+        echo '{tfvar_enable_gvisor}'
         exit 0
     fi
     echo 'null'
@@ -664,6 +767,421 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
         self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
+
+    # terraform state show prints a number bare and the top-level attributes
+    # before the nested blocks; the node_pool block repeats the name.
+    _STANDARD_CLUSTER_STATE = (
+        'resource "google_container_cluster" "standard" {\n'
+        '    initial_node_count = 1\n'
+        '    name               = "fleet-host"\n'
+        '    node_pool {\n'
+        '        initial_node_count = 1\n'
+        '        name               = "default-pool"\n'
+        '    }\n'
+        '}'
+    )
+
+    def test_guard_standard_node_count_no_op_without_a_standard_cluster_in_state(self):
+        """An Autopilot install, or an adopted cluster, has no standard[0] to replace."""
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.autopilot[0]",
+            tfvar_standard_node_count="3",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_standard_node_count_passes_when_configuration_matches_state(self):
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.standard[0]",
+            state_show=self._STANDARD_CLUSTER_STATE,
+            tfvar_standard_node_count="1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_standard_node_count_refuses_a_changed_count(self):
+        """initial_node_count is ForceNew on the cluster: a changed count plans its destroy-and-recreate."""
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.standard[0]",
+            state_show=self._STANDARD_CLUSTER_STATE,
+            tfvar_standard_node_count="2",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("standard_node_count resolved to '2', but this state's cluster was created with 1 node(s) per zone", proc.stderr)
+        self.assertIn("cluster's DESTRUCTION", proc.stderr)
+        self.assertIn("TF_VAR_standard_node_count=1", proc.stderr)
+
+    # terraform state show on the Standard cluster: attributes first, then the
+    # nested blocks sorted, so cluster_autoscaling (whose
+    # auto_provisioning_defaults carries its own disk_type) precedes
+    # node_config, and node_pool repeats the pool's node_config after it.
+    @staticmethod
+    def _standard_cluster_state(machine_type, disk_size_gb, disk_type):
+        return (
+            'resource "google_container_cluster" "standard" {\n'
+            '    initial_node_count = 1\n'
+            '    name               = "fleet-host"\n'
+            '    cluster_autoscaling {\n'
+            '        enabled = false\n'
+            '        auto_provisioning_defaults {\n'
+            '            disk_size = 100\n'
+            '            disk_type = "pd-ssd"\n'
+            '        }\n'
+            '    }\n'
+            '    node_config {\n'
+            f'        disk_size_gb = {disk_size_gb}\n'
+            f'        disk_type    = "{disk_type}"\n'
+            f'        machine_type = "{machine_type}"\n'
+            '        workload_metadata_config {\n'
+            '            mode = "GKE_METADATA"\n'
+            '        }\n'
+            '    }\n'
+            '    node_pool {\n'
+            '        initial_node_count = 1\n'
+            '        name               = "default-pool"\n'
+            '        node_config {\n'
+            f'            disk_size_gb = {disk_size_gb}\n'
+            f'            disk_type    = "{disk_type}"\n'
+            f'            machine_type = "{machine_type}"\n'
+            '        }\n'
+            '    }\n'
+            '}'
+        )
+
+    @staticmethod
+    def _gvisor_pool_state(machine_type, disk_size_gb, disk_type):
+        return (
+            'resource "google_container_node_pool" "gvisor" {\n'
+            '    initial_node_count = 1\n'
+            '    name               = "gvisor-pool"\n'
+            '    node_config {\n'
+            f'        disk_size_gb = {disk_size_gb}\n'
+            f'        disk_type    = "{disk_type}"\n'
+            f'        machine_type = "{machine_type}"\n'
+            '        sandbox_config {\n'
+            '            type = "GVISOR"\n'
+            '        }\n'
+            '    }\n'
+            '}'
+        )
+
+    # The fleet profile's gVisor shape, and the same pool built with an
+    # explicit gvisor_machine_type beside the profile.
+    _FLEET_GVISOR_SHAPE = ("n2-standard-4", 150, "pd-balanced")
+    _FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE = ("n2-standard-8", 150, "pd-balanced")
+    _FLEET_GVISOR_OUTPUTS = {"gvisor_machine_type": '"n2-standard-4"', "gvisor_disk_size_gb": "150"}
+    _FLEET_STANDARD_OUTPUTS = {"standard_machine_type": '"n2-standard-8"', "standard_disk_size_gb": "200"}
+    _STANDARD_ADDRESS = "module.gke_cluster.google_container_cluster.standard[0]"
+    _GVISOR_ADDRESS = "module.gke_cluster.google_container_node_pool.gvisor[0]"
+
+    def test_guard_node_pool_shape_no_op_without_a_standard_pool_in_state(self):
+        """An Autopilot install has neither pool; a first Standard apply has none in state yet."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list="module.gke_cluster.google_container_cluster.autopilot[0]",
+            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_passes_when_the_resolved_shape_matches_state(self):
+        """A small host with nothing named: the recorded shape is the resolved one. The
+        cluster_autoscaling block's pd-ssd must not be read as the pool's disk type."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_refuses_a_lost_profile_line(self):
+        """A fleet host whose TF_VAR_sizing_profile line is gone resolves the small shape;
+        with no sizing input named, the apply that would recreate every node is refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "standard_machine_type resolved to 'e2-standard-4', but this state's cluster runs the default pool on 'n2-standard-8'",
+            proc.stderr)
+        self.assertIn("recreate EVERY node of the default pool", proc.stderr)
+        self.assertIn("TF_VAR_sizing_profile=<profile>", proc.stderr)
+        self.assertIn("TF_VAR_standard_machine_type=n2-standard-8", proc.stderr)
+
+    def test_guard_node_pool_shape_treats_a_blanked_profile_line_as_lost(self):
+        """TF_VAR_sizing_profile= exports "", which the module reads as small; so does the guard."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
+            tfvar_sizing_profile='""',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no sizing input asks for the change", proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_resize_the_profile_names(self):
+        """sizing_profile set to a profile other than the one the last apply recorded, small
+        included, is the operator asking for the shape."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
+            tfvar_sizing_profile='"small"',
+            recorded_outputs={"sizing_profile": "fleet"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_profile_set_on_a_state_that_recorded_none(self):
+        """A state from before the composition recorded the profile (terraform output says the
+        output is not found): a profile set now names the shape, as any first setting does."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_STANDARD_OUTPUTS,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_node_pool_shape_treats_a_state_with_no_outputs_as_recording_none(self):
+        """terraform output prints nothing and exits 0 when the state carries no output at all."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_STANDARD_OUTPUTS,
+            output_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_node_pool_shape_refuses_a_lost_explicit_line_beside_a_kept_profile(self):
+        """A fleet host built with TF_VAR_gvisor_machine_type=n2-standard-8 beside
+        TF_VAR_sizing_profile=fleet, the explicit line lost and the profile kept: the profile is
+        the one the last apply recorded, so it names no change, and the apply that would recreate
+        the gVisor pool's nodes onto the profile's n2-standard-4 is refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet"},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "gvisor_machine_type resolved to 'n2-standard-4', but this state's cluster runs the gVisor pool on 'n2-standard-8'",
+            proc.stderr)
+        self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
+        self.assertIn("TF_VAR_gvisor_machine_type=n2-standard-8", proc.stderr)
+
+    # The host the fleet sizing guide's `mode: next` row describes, as the
+    # installer builds it: both pools on the small profile, the gVisor pool's
+    # machine type set beside it by an explicit TF_VAR_gvisor_machine_type line,
+    # and the last apply's two root outputs recording that.
+    _SMALL_STANDARD_SHAPE = ("e2-standard-4", 100, "pd-balanced")
+    _SMALL_GVISOR_SHAPE_EXPLICIT_MACHINE = ("n2-standard-8", 100, "pd-balanced")
+    _FLEET_OUTPUTS = {**_FLEET_STANDARD_OUTPUTS, **_FLEET_GVISOR_OUTPUTS}
+    _SMALL_HOST_RECORDED_OUTPUTS = {"sizing_profile": "small",
+                                    "node_pool_shape_inputs": "gvisor_machine_type"}
+
+    def _small_host_state(self):
+        return {
+            self._STANDARD_ADDRESS: self._standard_cluster_state(*self._SMALL_STANDARD_SHAPE),
+            self._GVISOR_ADDRESS: self._gvisor_pool_state(*self._SMALL_GVISOR_SHAPE_EXPLICIT_MACHINE),
+        }
+
+    def test_guard_node_pool_shape_refuses_a_lost_explicit_line_beside_a_changed_profile(self):
+        """That host upsized to the fleet profile from a shell or clone without the gVisor
+        line: the changed profile names the default pool's resize, which goes through, and
+        nothing about the gVisor pool's machine type, which the last apply recorded as an
+        explicit input; the apply that would recreate the gVisor pool's nodes onto the
+        profile's n2-standard-4 is refused with the line to put back."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=f"{self._STANDARD_ADDRESS}\n{self._GVISOR_ADDRESS}",
+            state_show_by_address=self._small_host_state(),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_OUTPUTS,
+            recorded_outputs=self._SMALL_HOST_RECORDED_OUTPUTS,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "gvisor_machine_type resolved to 'n2-standard-4', but this state's cluster runs the gVisor pool on 'n2-standard-8'",
+            proc.stderr)
+        self.assertIn("a shape the last apply set", proc.stderr)
+        self.assertIn("through TF_VAR_gvisor_machine_type", proc.stderr)
+        self.assertIn("Put back TF_VAR_gvisor_machine_type=n2-standard-8", proc.stderr)
+        self.assertNotIn("standard_machine_type resolved", proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_changed_profile_beside_a_kept_explicit_line(self):
+        """The same upsizing with the gVisor line still in place: the profile names the resize
+        of every attribute it decides, the default pool's and the gVisor disk's, and the
+        explicit machine type resolves to the shape in state, so nothing is refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=f"{self._STANDARD_ADDRESS}\n{self._GVISOR_ADDRESS}",
+            state_show_by_address=self._small_host_state(),
+            tfvar_sizing_profile='"fleet"',
+            tfvar_pool_shapes={"gvisor_machine_type": '"n2-standard-8"'},
+            module_outputs={**self._FLEET_OUTPUTS, "gvisor_machine_type": '"n2-standard-8"'},
+            recorded_outputs=self._SMALL_HOST_RECORDED_OUTPUTS,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_refuses_a_recorded_explicit_line_before_reading_the_profile(self):
+        """A kept profile beside a lost explicit line the last apply recorded: the refusal names
+        the recorded line rather than the profile, which is read only for an attribute no
+        explicit input decided."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet",
+                              "node_pool_shape_inputs": "gvisor_machine_type"},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("a shape the last apply set", proc.stderr)
+        self.assertNotIn("the profile the last apply recorded", proc.stderr)
+
+    def test_guard_node_pool_shape_lets_a_dropped_explicit_line_go_when_the_shape_matches(self):
+        """An explicit line dropped once the profile renders the same shape asks for no change:
+        the resolved shape is the recorded one, so no output is consulted and the next apply
+        records the input as unset."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet",
+                              "node_pool_shape_inputs": "gvisor_machine_type gvisor_disk_size_gb"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_reads_the_recorded_profile_past_stderr_noise(self):
+        """The same lost explicit line beside a kept profile, with terraform output writing a
+        TF_LOG line to stderr before the value it prints: the recorded profile is the value
+        alone, so the profile still names no change and the apply is still refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet"},
+            output_stderr_noise="2026-11-04T08:00:00.000Z [INFO]  Terraform version: 1.15.8",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
+
+    def test_guard_node_pool_shape_lets_a_gvisor_pool_being_removed_go(self):
+        """enable_gvisor_node_pool off with the pool still in state is the apply that destroys
+        it, not one that recreates its nodes: the pool's shape is not read, whatever it was
+        built with, and the lost explicit line beside it asks for nothing to be put back."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet"},
+            tfvar_enable_gvisor="false",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_refuses_a_kept_profile_whose_shape_changed(self):
+        """When medium gets a shape of its own, a host on a kept TF_VAR_sizing_profile=medium
+        line asked for nothing; the resize waits until an input names it."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_sizing_profile='"medium"',
+            module_outputs=self._FLEET_STANDARD_OUTPUTS,
+            recorded_outputs={"sizing_profile": "medium"},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sizing_profile is 'medium', the profile the last apply recorded", proc.stderr)
+
+    def test_guard_node_pool_shape_fails_closed_when_the_recorded_profile_cannot_be_read(self):
+        """A terraform output that fails for any reason but a missing output is the backend's
+        failure, and the guard refuses rather than reading it as a first setting. The first
+        output read is the recorded inputs, so that is the read the refusal names."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_STANDARD_OUTPUTS,
+            output_stub="echo 'Error: Failed to load state: storage: object does not exist' >&2; exit 1",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("could not read output node_pool_shape_inputs", proc.stderr)
+        self.assertIn("Failed to load state", proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_resize_the_explicit_input_names(self):
+        """An explicit standard_machine_type beside a lost profile line changes that one
+        attribute deliberately; the disks still match the small state, so nothing else trips."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_pool_shapes={"standard_machine_type": '"n2-standard-8"'},
+            module_outputs={"standard_machine_type": '"n2-standard-8"'},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_node_pool_shape_refuses_a_changed_gvisor_disk(self):
+        """The gVisor pool is read too, and a number attribute (state show prints it bare)."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE),
+            module_outputs={"gvisor_machine_type": '"n2-standard-4"'},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "gvisor_disk_size_gb resolved to '100', but this state's cluster runs the gVisor pool on '150'",
+            proc.stderr)
+        self.assertIn("TF_VAR_gvisor_disk_size_gb=150", proc.stderr)
+
+    def test_guard_node_pool_shape_refuses_an_older_default_pools_disk_type_until_named(self):
+        """A default pool created when GKE defaulted to pd-standard: the module resolves
+        pd-balanced, a rolling node recreation, so the move waits for standard_disk_type."""
+        state = self._standard_cluster_state("e2-standard-4", 100, "pd-standard")
+        refused = self._run_guard(
+            "guard_node_pool_shape", state_list=self._STANDARD_ADDRESS, state_show=state)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("standard_disk_type resolved to 'pd-balanced'", refused.stderr)
+        named = self._run_guard(
+            "guard_node_pool_shape", state_list=self._STANDARD_ADDRESS, state_show=state,
+            tfvar_pool_shapes={"standard_disk_type": '"pd-balanced"'})
+        self.assertEqual(named.returncode, 0, named.stderr)
+
+    def test_guard_node_pool_shape_reads_a_typed_null_number_as_unset(self):
+        """terraform console prints an unset number input as tonumber(null); read raw, it
+        would count as a named input and let the shrink through. The machine type matches
+        the small output so the guard, which refuses on the first mismatch, reaches the
+        disk size, the one attribute whose input is a number."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 200, "pd-balanced"),
+            tfvar_pool_shapes={"standard_disk_size_gb": "tonumber(null)"},
+            tfvar_sizing_profile="tostring(null)",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("standard_disk_size_gb resolved to '100'", proc.stderr)
 
     def test_guard_pubsub_subscription_no_op_when_chat_disabled(self):
         """A subscription in state whose feature is switched off is a teardown, not a rename."""

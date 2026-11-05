@@ -923,9 +923,9 @@ nightly runs the same list once a night on its own leased project
 (`ci-kube-agents-eval-nightly-gitlab`, #2832), and never appends to the evidence store, since a
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
 GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
-(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
-show in Prow only, as the dashboard collects the GitLab lane's today-mode nightly alone and the GitLab
-lane never records.
+(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its nights are
+listed under the Brief's GitLab lane section beside the today-mode nightly's, in no gate number or case
+record, and the GitLab lane never records.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the lane
 arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on the GitHub

@@ -551,7 +551,8 @@ if repo and (lists or integration.get("forges") or integration.get("repositories
         r for r in integration.get("repositories") or [] if r.get("role") != "gitops"]
 elif repo:
     integration.setdefault("github", {})["gitRepo"] = repo
-d["spec"].setdefault("harness", {})["eventWatcher"] = {"enabled": watcher}
+harness = d["spec"].setdefault("harness", {})
+harness["eventWatcher"] = {**(harness.get("eventWatcher") or {}), "enabled": watcher}
 if drift_field:
     d["spec"]["harness"]["driftDetector"] = {**(d["spec"]["harness"].get("driftDetector") or {}), "enabled": drift}
 print(json.dumps(d))' "${backup}" "${GITOPS_REPO:-}" "${AGENT_EVENT_WATCHER:-false}" "${lists}" "${AGENT_DRIFT_DETECTOR:-false}" "${drift_field}" "${GITOPS_REPO_HELPER%/*}" > "${reapply}"

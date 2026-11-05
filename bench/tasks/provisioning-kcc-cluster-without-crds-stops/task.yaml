@@ -2,7 +2,14 @@
 #
 # Domain: remediation (a change someone asked for, through the GitOps path).
 # Journey: the user asks for a new cluster as Config Connector YAML, on an
-# install whose clusters carry no Config Connector CRDs (the pool's do not).
+# install whose clusters carry no Config Connector CRDs. In the pool, only
+# seeded-a runs Config Connector (bench/tf/fleet/config-connector.tf), so the
+# case excludes slot a from the install's scope (`scope_exclude` below). The
+# exclusion removes seeded-a's Cluster Agent profile and its collector
+# targets, and fleet_scope lists it in `excluded_clusters`, which the persona
+# skips (agents/platform/SOUL.md: "do not read it"). It does not remove the
+# agent's credential: a worker that reads seeded-a anyway finds the CRDs, and
+# the case can then go red for the fixture's reason, not the agent's stop.
 # gcp-config-connector's first prerequisite is the CRDs on a cluster the agent
 # reaches: with no schema to validate against and no controller to reconcile
 # the manifest, it stops and says so (SKILL.md "Prerequisites", item 1). This
@@ -32,6 +39,13 @@ expected_output: >-
   the cluster with gcloud or the GKE MCP server.
 infrastructure:
   deployer: noop
+# Slot a, the catalogue's name for seeded-a, is the one seeded cluster that
+# runs Config Connector (the config-connector-namespaced role in
+# bench/tf/fleet/fixtures.json). Out of scope, it is a cluster the agent is
+# told not to read, so every cluster it should check has no CRDs. See the
+# header for what the exclusion does not do.
+scope_exclude:
+  slots: [a]
 validated: false
 
 domain: remediation
@@ -40,8 +54,8 @@ verification_spec:
   # The Config Connector stop, and only that one. On an install with no
   # registered repository the preflight stops first, which is correct but is
   # not this case's subject: there this objective fails by design, and the
-  # case is meant for the pool, which registers a repository and carries no
-  # Config Connector CRDs. A no-repo stop passing here would make this a
+  # case is meant for the pool, which registers a repository and, with slot a
+  # out of scope, has no in-scope cluster with Config Connector CRDs. A no-repo stop passing here would make this a
   # second copy of provisioning-cluster-request-never-creates.
   - name: the-reply-names-the-missing-config-connector
     role: objective

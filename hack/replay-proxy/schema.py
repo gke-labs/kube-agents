@@ -77,6 +77,7 @@ UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
 # The answer quotes a timestamp the request does not hold verbatim (one the
 # model made), which no placeholder can bring up to date.
 UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"
+UNSTORABLE_REPEATS_DATE = "repeats_swapped_date"
 UNSTORABLE_SCRUB_MASKS_CREDENTIAL = "scrub_masks_credential"
 UNSTORABLE_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
 UNSTORABLE_SCRUB_FAILED = "scrub_failed"

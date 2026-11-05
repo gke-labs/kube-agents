@@ -1188,11 +1188,11 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args for c in alert.call_args_list],
                          [("google_chat", "alert", "s1"), ("slack", "slack alert", "s1")])
-        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
 
     def test_the_title_is_recorded_before_the_turn_starts(self):
         def start(*_args):
-            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
             return STARTED
 
         session_kv_server._start_agent_turn.side_effect = start
@@ -1203,6 +1203,24 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert", "s1")])
         session_kv_server._record_alert_title.assert_not_called()
+
+    def test_a_drift_kind_is_recorded_with_the_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title="the title", alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", session_kv_server.ALERT_KIND_DRIFT)
+
+    def test_a_drift_kind_is_recorded_without_a_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title=None, alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", None, session_kv_server.ALERT_KIND_DRIFT)
 
     def test_under_next_a_google_chat_thread_gets_the_title(self):
         # The title heads the plan the cards draw, which the gateway lays out on
@@ -1238,6 +1256,28 @@ class TestAlertTitleRecord(unittest.TestCase):
     def test_a_missing_row_is_not_an_error(self):
         session_kv_server._record_alert_title("k8s-evt-none", "x")
 
+    def test_a_kind_joins_the_routing_row_beside_the_title(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", "checkout HPA drift in seeded-b", "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {
+            "platform": "slack", "thread_id": "1.0", "title": "checkout HPA drift in seeded-b", "alert_kind": "drift",
+        })
+
+    def test_a_kind_without_a_title_is_still_recorded(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", None, "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {"platform": "slack", "thread_id": "1.0", "alert_kind": "drift"})
+
     def test_the_gateway_reads_the_title_recorded(self):
         import importlib.util
         import sqlite3
@@ -1253,6 +1293,13 @@ class TestAlertTitleRecord(unittest.TestCase):
             )
         session_kv_server._record_alert_title("k8s-evt-t2", "payments-api crashloop in seeded-debug")
         self.assertEqual(reader.alert_title("C1", "2.0", temp_db_path), "payments-api crashloop in seeded-debug")
+        self.assertFalse(reader.is_drift_alert("C1", "2.0", temp_db_path))
+        session_kv_server._record_alert_title("k8s-evt-t2", "checkout HPA drift", session_kv_server.ALERT_KIND_DRIFT)
+        self.assertTrue(reader.is_drift_alert("C1", "2.0", temp_db_path))
+        self.assertEqual(
+            (reader.ALERT_KIND_KEY, reader.ALERT_KIND_DRIFT),
+            (session_kv_server.ALERT_KIND_KEY, session_kv_server.ALERT_KIND_DRIFT),
+        )
 
 
 class TestSessionKvServerAuth(unittest.TestCase):
@@ -7012,6 +7059,30 @@ class TestDriftInject(unittest.TestCase):
         self.assertNotIn("Unknown", alert_msg)
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_drift_alert_carries_its_title_and_kind(self, trigger):
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {
+            "alert_title": "checkout Deployment drift in prod-us-east1",
+            "alert_kind": session_kv_server.ALERT_KIND_DRIFT,
+        })
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {"alert_title": None, "alert_kind": ""})
+
+    def test_the_drift_title_names_the_object_its_kind_and_cluster(self):
+        payload = {**self.DRIFT_PAYLOAD, "cluster": "seeded-b", "resource": {
+            "group": "autoscaling", "namespace": "shop", "resource": "horizontalpodautoscalers", "name": "checkout-gateway"}}
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            self.assertEqual(session_kv_server._drift_session_title(payload), "checkout-gateway HPA drift in seeded-b")
+            unlisted = {**payload, "cluster": "", "resource": {"resource": "leases", "name": "l1"}}
+            with patch.dict(os.environ, {"GKE_CLUSTER_NAME": "host-a"}):
+                self.assertEqual(session_kv_server._drift_session_title(unlisted), "l1 leases drift in host-a")
+            self.assertIsNone(session_kv_server._drift_session_title({**payload, "resource": {"resource": "pods"}}))
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self.assertIsNone(session_kv_server._drift_session_title(payload))
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_an_event_payload_still_takes_the_event_path(self, trigger):
         """The other half of the same dispatch: the watcher is unaffected."""
         event = {
@@ -11074,6 +11145,78 @@ class TestCardStop(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
 
+class AliveHelperTest(unittest.TestCase):
+    """The test helper `_alive` against a process reaped mid-check (#4828)."""
+
+    PID = 4242
+
+    def _with_proc(self, stat):
+        """Run `_alive(PID)` as on Linux, with `stat` standing in for opening
+        /proc/PID/stat: an exception to raise, or the file's text. The pid
+        answers os.kill, and ps must not be asked. os.path.exists says the
+        file is there, which only the pre-#4828 helper asked."""
+        import io
+
+        path = f"/proc/{self.PID}/stat"
+        real_open, real_kill = open, os.kill
+        real_isdir, real_exists = os.path.isdir, os.path.exists
+
+        def fake_open(p, *args, **kwargs):
+            if str(p) != path:
+                return real_open(p, *args, **kwargs)
+            if isinstance(stat, BaseException):
+                raise stat
+            if callable(stat):
+                return stat()
+            return io.StringIO(stat)
+
+        def no_ps(*args, **kwargs):
+            raise AssertionError("with a /proc, the stat file decides and ps is never asked")
+
+        with patch.object(os, "kill", lambda pid, sig: None if pid == self.PID else real_kill(pid, sig)), \
+                patch("builtins.open", fake_open), \
+                patch.object(os.path, "exists", lambda p: True if p == path else real_exists(p)), \
+                patch.object(os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                patch("subprocess.run", no_ps):
+            return _alive(self.PID)
+
+    def test_a_process_reaped_after_the_signal_check_is_not_alive(self):
+        # os.kill(pid, 0) still succeeds, then the process is reaped before its
+        # stat file is opened: the race CI hit.
+        self.assertFalse(self._with_proc(FileNotFoundError(2, "No such file or directory")))
+
+    def test_a_process_that_exits_while_its_stat_is_read_is_not_alive(self):
+        class Gone:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                raise ProcessLookupError(3, "No such process")
+
+        self.assertFalse(self._with_proc(Gone))
+
+    def test_the_stat_state_decides_on_linux(self):
+        self.assertTrue(self._with_proc("4242 (sleep) S 1 4242 4242 0 -1"))
+        self.assertFalse(self._with_proc("4242 (sleep) Z 1 4242 4242 0 -1"), "a zombie has exited")
+        # A ")" inside the command name: the state is after the last one.
+        self.assertTrue(self._with_proc("4242 (a) b) R 1 4242"))
+        self.assertFalse(self._with_proc("4242 (sleep"), "a stat with no state field")
+
+    def test_a_running_process_is_alive_and_an_exited_one_is_not(self):
+        import subprocess
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(_alive(child.pid))
+        finally:
+            child.kill()
+            child.wait(5)
+        self.assertFalse(_alive(child.pid))
+
+
 def _alive(pid):
     """True while `pid` runs; a zombie is not running."""
     import subprocess
@@ -11082,9 +11225,17 @@ def _alive(pid):
         os.kill(pid, 0)
     except OSError:
         return False
-    if os.path.exists(f"/proc/{pid}/stat"):
+    # One open, no exists() first: a process reaped between the two used to
+    # raise FileNotFoundError out of the test (#4828). With a /proc, a missing
+    # entry is a process that's gone; without one (macOS), ask ps.
+    try:
         with open(f"/proc/{pid}/stat") as fh:
             return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except IndexError:  # a stat with no state field: as production's _proc_alive reads it
+        return False
+    except (FileNotFoundError, ProcessLookupError):
+        if os.path.isdir("/proc/self"):
+            return False
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return bool(state) and not state.startswith("Z")
 

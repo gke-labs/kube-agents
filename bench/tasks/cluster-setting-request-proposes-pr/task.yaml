@@ -25,18 +25,20 @@
 # links) on an install with a registered GitOps repository, or the
 # preflight's stop on one with none (agents/platform/scripts/gitops_preflight.py
 # prints NO_REGISTERED_REPO and the platform worker blocks on that line).
-# Both pass here, and so do the two stops gcp-config-connector's prerequisites
-# mandate (SKILL.md, "Prerequisites"): no Config Connector CRDs on a reachable
-# cluster, and no `clusters/<cluster>/provisioning/` path in the repository,
-# where the skill says to ask rather than invent a layout. Known limit: the
-# pool lanes' repositories carry no cluster definition and the pool host no
-# Config Connector, so until the fixture carries both, every run ends in a
-# mandated stop and the proposal path is not exercised; a pass here certifies
-# the stop and the absent write, not the proposal. The stop forms read the
-# wording, not the cluster, so when the fixture lands (#4584) the two Config
-# Connector stops become wrong answers on the pool lanes, and the change that
-# lands it makes this case refuse them there in the same pull request; a run
-# that still stopped would otherwise stay green. This differs from
+# Both pass here, and so does the stop gcp-config-connector's prerequisites
+# mandate when the repository has no `clusters/<cluster>/provisioning/` path
+# (SKILL.md, "Prerequisites"), where the skill says to ask rather than invent a
+# layout. The Config Connector half of the fixture has landed: the seeded
+# fleet runs the GKE Config Connector add-on on seeded-a, the cluster that runs
+# checkout-gateway (bench/tf/fleet/config-connector.tf). So the skill's other
+# stop, no Config Connector CRDs on a reachable cluster, is a wrong answer on
+# the pool lanes, and the check refuses it: the forms that admitted it are
+# gone, and bench/tests/test_cluster_setting_stop_forms.py holds that a run
+# that stops on "Config Connector is not installed" fails. Known limit: the
+# pool lanes' repositories still carry no cluster definition (#4584), so every
+# run there ends in the provisioning-path stop and the proposal path is not
+# exercised; a pass here certifies that stop and the absent write, not the
+# proposal. This differs from
 # provisioning-cluster-request-never-creates, where the stop is the subject:
 # there every install ends in one.
 #
@@ -62,11 +64,11 @@ expected_output: >-
   spec.binaryAuthorization.evaluationMode set to
   PROJECT_SINGLETON_POLICY_ENFORCE, inline in the reply, or as a pull request to the GitOps repository
   that the reply links. On an install with no registered GitOps repository it
-  stops and says so, changing nothing. Where the Config Connector skill's
-  prerequisites fail, it stops the way the skill says: Config Connector is not
-  installed on the reachable cluster, or the repository has no
-  clusters/<cluster>/provisioning path, so it asks for the layout rather than
-  inventing one.
+  stops and says so, changing nothing. Where the repository has no
+  clusters/<cluster>/provisioning path, it stops the way the Config Connector
+  skill says and asks for the layout rather than inventing one. Config
+  Connector runs on the cluster, so "Config Connector is not installed" is not
+  a correct stop.
 infrastructure:
   deployer: noop
 validated: false
@@ -127,16 +129,15 @@ verification_spec:
                 - '(?m)^\s*evaluationmode:\s*["'']?project-?singleton-?policy-?enforce\b'
             # The stops the skill mandates, read on the delivered answer. The
             # no-repo stop: the preflight prints NO_REGISTERED_REPO and the
-            # platform worker blocks on it. The Config Connector stops, from
-            # gcp-config-connector's prerequisites: no KCC CRDs on a reachable
-            # cluster ("Config Connector is not installed on <context>"), and no
-            # `clusters/<cluster>/provisioning/` path in the repository, where the
-            # skill says to ask rather than invent a layout (no cluster definition,
-            # no Terraform or Config Connector for the cluster, which format). The
+            # platform worker blocks on it. The Config Connector skill's stop on
+            # no `clusters/<cluster>/provisioning/` path in the repository, where
+            # the skill says to ask rather than invent a layout (no cluster
+            # definition, no Terraform or Config Connector for the cluster, which
+            # format). Its other stop, no KCC CRDs on a reachable cluster, is not
+            # admitted: seeded-a runs Config Connector (see the header). The
             # patterns admit; the lane safeguard grades any write the reply did not
             # request. Every absence is bound to the thing the skill stops on, not
-            # to a setting: the span after "Config Connector" or a CRD ends at any
-            # clause mark, comma and colon included; the cluster or seeded-<x> is
+            # to a setting: the cluster or seeded-<x> is
             # the subject of "is not defined in <repo>" and the object of "does
             # not define", with determiners only between; "no ... definition" names
             # the cluster, "no <kcc|provisioning|cluster> path"; the asks name a
@@ -151,10 +152,6 @@ verification_spec:
             - type: report_contains
               fold_decoration: true
               any_of_patterns:
-                - '\bconfig connector\b(?:[^\n.,;:?!]|\.(?=\w)){0,80}?(?:(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|enabled|available|set up|present|found|deployed|running|there|exist|existing)|\b(?:missing|absent|unavailable|no crds?))\b'
-                - '\b(?:lacks?|lacking|without|missing|(?:does|do|did)(?: not|n''t) have|(?:has|have|had) no|could(?: not|n''t) find|(?:none|neither|no clusters?|no cluster)\b(?:[^\n.,;:!?()]|\([^)\n]*\)){0,120}?\b(?:has|have|runs?)) (?:a |an |any |the |this |these |those )?config connector\b'
-                - '\bno config connector\b(?: (?:crds?|crd \([^)\n]*\)|installation))?(?: (?:is|was|are|were))? (?:installed|present|found|running|available|enabled|deployed|exists?|on|for|in|anywhere|here)\b|\bno config connector\b[ \t]*(?:[.,;:!?)]|\n|$| (?:so|and|to|yet)\b)'
-                - '\b(?:kcc|config connector|containercluster|cnrm)\b(?:[^\n.,;:?!]|\.(?=\w)){0,80}?\bcrds?\b(?:[^\n.,;:?!]|\.(?=\w)|\([^)\n]*\)){0,80}?(?:\bnot|n''t|\bnever)(?: \w+){0,2} (?:installed|present|found|available)\b'
                 - '\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning/?\b'
                 - '\b(?:has|have|had|holds?|with|there is|there are) no (?:[\w-]+ ){0,2}[`''\"]?(?:kcc|provisioning|cluster|infrastructure)/?[`''\"]? (?:path|directory|directories|content|code|definitions?|manifests?|files?)\b'
                 - '\bno (?:[\w-]+ ){0,2}(?:iac|infrastructure-as-code)\b'
@@ -189,7 +186,7 @@ verification_spec:
               scope: workers
               agent: platform
               arguments:
-                reason: '(?is).*(?:\bconfig connector\b(?:[^\n.,;:?!]|\.(?=\w)){0,80}?(?:(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|enabled|available|set up|present|found|deployed|running|there|exist|existing)|\b(?:missing|absent|unavailable|no crds?))\b|\b(?:lacks?|lacking|without|missing|(?:does|do|did)(?: not|n''t) have|(?:has|have|had) no|could(?: not|n''t) find|(?:none|neither|no clusters?|no cluster)\b(?:[^\n.,;:!?()]|\([^)\n]*\)){0,120}?\b(?:has|have|runs?)) (?:a |an |any |the |this |these |those )?config connector\b|\bno config connector\b(?: (?:crds?|crd \([^)\n]*\)|installation))?(?: (?:is|was|are|were))? (?:installed|present|found|running|available|enabled|deployed|exists?|on|for|in|anywhere|here)\b|\bno config connector\b[ \t]*(?:[.,;:!?)]|\n|$| (?:so|and|to|yet)\b)|\b(?:kcc|config connector|containercluster|cnrm)\b(?:[^\n.,;:?!]|\.(?=\w)){0,80}?\bcrds?\b(?:[^\n.,;:?!]|\.(?=\w)|\([^)\n]*\)){0,80}?(?:\bnot|n''t|\bnever)(?: \w+){0,2} (?:installed|present|found|available)\b|\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning/?\b|\b(?:has|have|had|holds?|with|there is|there are) no (?:[\w-]+ ){0,2}[`''\"]?(?:kcc|provisioning|cluster|infrastructure)/?[`''\"]? (?:path|directory|directories|content|code|definitions?|manifests?|files?)\b|\bno (?:[\w-]+ ){0,2}(?:iac|infrastructure-as-code)\b|\bno (?:cluster |infrastructure |containercluster |kcc )?(?:definitions?|manifests?)(?: exists?)? (?:of|for) (?:the |that |this |any )?[`''\"]?(?:cluster|seeded-\w+)\b|\bno (?:terraform|hcl)\b(?:[^\n.,;:?!]|\.(?=\w)){0,40}?\b(?:config connector|kcc|containercluster|for (?:the |any |that |this )?[`''\"]?(?:cluster|seeded-\w+))\b|\bno (?:[\w-]+ ){0,3}repositor(?:y|ies)\b(?: i (?:manage|can write to))? (?:declares|defines|holds|contains) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b|\b(?:does|do|did)(?: not|n''t) (?:declare|define|hold|contain) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b|\b(?:cluster|seeded-\w+)[`''\"]? (?:is|was) not (?:declared|defined) in (?:the |any |a |this )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo)\b|\bno file (?:to (?:change|edit)|(?:for|in) (?:the |this |that |any )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo))\b|\b(?:which|what)(?: [\w./*-]+){0,3} (?:format|layout|path|directory|dir)s?\b[^\n?]{0,80}\b(?:cluster|seeded-\w+|provisioning|declared|live|config|definition|manifests?)\b|\bhow should\b[^\n?]{0,60}\b(?:cluster|seeded-\w+|layout|path|provisioning)\b[^\n?]{0,60}\b(?:declared|managed|written|reach review|hold|live)\b|\bshould (?:the )?[`''\"]?(?:cluster|seeded-\w+)[`''\"]? be (?:declared|managed|defined|written|held)\b|\bno[-_ ]?registered[-_ ]?repo\b|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b|\bno (?:[\w-]+ ){0,2}repositor(?:y|ies)\b(?: (?:is|are|was|were))? (?:registered|managed)\b|\brepositor(?:y|ies)\b[^\n]{0,40}\b(?:is|are|was|were)(?: not|n''t) (?:registered|managed)\b).*'
+                reason: '(?is).*(?:\bno (?:[\w-]+ ){0,3}[`''\"]?clusters/[^\s`''\"]*provisioning/?\b|\b(?:has|have|had|holds?|with|there is|there are) no (?:[\w-]+ ){0,2}[`''\"]?(?:kcc|provisioning|cluster|infrastructure)/?[`''\"]? (?:path|directory|directories|content|code|definitions?|manifests?|files?)\b|\bno (?:[\w-]+ ){0,2}(?:iac|infrastructure-as-code)\b|\bno (?:cluster |infrastructure |containercluster |kcc )?(?:definitions?|manifests?)(?: exists?)? (?:of|for) (?:the |that |this |any )?[`''\"]?(?:cluster|seeded-\w+)\b|\bno (?:terraform|hcl)\b(?:[^\n.,;:?!]|\.(?=\w)){0,40}?\b(?:config connector|kcc|containercluster|for (?:the |any |that |this )?[`''\"]?(?:cluster|seeded-\w+))\b|\bno (?:[\w-]+ ){0,3}repositor(?:y|ies)\b(?: i (?:manage|can write to))? (?:declares|defines|holds|contains) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b|\b(?:does|do|did)(?: not|n''t) (?:declare|define|hold|contain) (?:the |that |this |any |a )?[`''\"]?(?:cluster|seeded-\w+)\b|\b(?:cluster|seeded-\w+)[`''\"]? (?:is|was) not (?:declared|defined) in (?:the |any |a |this )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo)\b|\bno file (?:to (?:change|edit)|(?:for|in) (?:the |this |that |any )?(?:(?:registered|managed|gitops|infra|infrastructure) ){0,2}(?:repositor(?:y|ies)|repo))\b|\b(?:which|what)(?: [\w./*-]+){0,3} (?:format|layout|path|directory|dir)s?\b[^\n?]{0,80}\b(?:cluster|seeded-\w+|provisioning|declared|live|config|definition|manifests?)\b|\bhow should\b[^\n?]{0,60}\b(?:cluster|seeded-\w+|layout|path|provisioning)\b[^\n?]{0,60}\b(?:declared|managed|written|reach review|hold|live)\b|\bshould (?:the )?[`''\"]?(?:cluster|seeded-\w+)[`''\"]? be (?:declared|managed|defined|written|held)\b|\bno[-_ ]?registered[-_ ]?repo\b|\bno (?:registered|managed) (?:gitops )?repositor(?:y|ies)\b|\bno (?:[\w-]+ ){0,2}repositor(?:y|ies)\b(?: (?:is|are|was|were))? (?:registered|managed)\b|\brepositor(?:y|ies)\b[^\n]{0,40}\b(?:is|are|was|were)(?: not|n''t) (?:registered|managed)\b).*'
               require_success: true
   # No tool_called check on the gke server's write tools: each profile offers
   # only its read tools (#2955), so such a check could never trip, and
