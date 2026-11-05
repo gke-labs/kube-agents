@@ -23689,6 +23689,33 @@ metadata:
             audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
             self.assertTrue(finding["remediation"]["note"].startswith(audit_report.KCC_STALLED_NOTE_MARK))
 
+    def test_a_worker_sentence_with_the_same_start_is_not_stripped(self):
+        """Review finding: the strip pattern took everything after the shared
+        start of the paragraph's first sentence, so a worker sentence that
+        starts the same way lost its end. Only an exact first sentence is a
+        copied paragraph."""
+        worker = ("Raise maxNodeCount to 6 in the pool file. **Config Connector is not applying the pool's last change**, "
+                  "so check its status first, then merge the pull request.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_exact_first_sentence_is_stripped(self):
+        tail = " When the audit ran, Config Connector reported `Ready=False` on `X a/b` (`UpdateFailed`)."
+        for mark in (
+            audit_report.KCC_STALLED_NOTE_MARK,
+            audit_report.KCC_STALLED_OBJECT_MARK,
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml`"),
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml` in the repository `acme/infra`"),
+        ):
+            with self.subTest(mark=mark):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + mark + tail}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, {})
