@@ -324,12 +324,23 @@ func (g *Gateway) relayItemIn(ctx context.Context, item relayItem) {
 }
 
 // eventFromTasksAddressee reports whether an event arrived on a subject of
-// the addressee the gateway published its task to (rec.AddresseeFor): the
+// the addressee the gateway published its task to (taskAddressee): the
 // delivery-time check holds the envelope to its subject's task id, and only
 // this ties the subject to the task's executor.
 func eventFromTasksAddressee(rec *SessionRecord, item relayItem) bool {
 	addressee, taskID, _, ok := lib.ParseTaskSubject(item.subject)
-	return ok && taskID == item.env.TaskID && addressee == rec.AddresseeFor(item.env.TaskID)
+	return ok && taskID == item.env.TaskID && addressee == taskAddressee(rec, item.env.TaskID)
+}
+
+// taskAddressee is the addressee a task was published to: the card stop's own
+// for the conversation's card-stop control, which isn't on the task history
+// and keeps its addressee when the conversation moves on, and otherwise
+// rec.AddresseeFor.
+func taskAddressee(rec *SessionRecord, taskID string) string {
+	if rec.CardStop != nil && rec.CardStop.TaskID == taskID {
+		return rec.CardStop.Addressee
+	}
+	return rec.AddresseeFor(taskID)
 }
 
 // relayBatch renders a session's queued events in order. Rolling-line edits
@@ -427,7 +438,7 @@ func (g *Gateway) relayBatch(sessionKey string, batch []relayItem) {
 			// the task's. Dropped, never rendered and never a wake.
 			addressee, _, _, _ := lib.ParseTaskSubject(item.subject)
 			g.log.Warn("relay: event dropped; it came on another addressee's subject",
-				"session", sessionKey, "taskId", item.env.TaskID, "subjectAddressee", addressee, "taskAddressee", rec.AddresseeFor(item.env.TaskID))
+				"session", sessionKey, "taskId", item.env.TaskID, "subjectAddressee", addressee, "taskAddressee", taskAddressee(rec, item.env.TaskID))
 			g.settle(item)
 			continue
 		}
