@@ -420,6 +420,8 @@ def unstorable_reasons(
     normalized = replay_cache.answer_texts(replay_cache.normalize_answer(message, mapping))
     if any(mapping.identifier_left_literal(t) for t in normalized):
         reasons.append(F.UNSTORABLE_BOUND_VALUE_LEFT_LITERAL)
+    if any(mapping.has_identifier(t) for t in normalized):
+        reasons.append(F.UNSTORABLE_UNBOUND_IDENTIFIER)
     if any(mapping.has_timestamp(t) for t in normalized):
         reasons.append(F.UNSTORABLE_UNBOUND_TIMESTAMP)
     # Read after the swap: a timestamp the answer copied from the request is a

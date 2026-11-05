@@ -125,6 +125,10 @@ PID_PROSE_RE = re.compile(r"(?<![A-Za-z0-9_])(pid|PID)(\s+)(\d+)\b")
 AGE_SHAPE = r"\d+[smhdy](?:\d+[smhd])?"
 AGE_FULL_RE = re.compile(r"^" + AGE_SHAPE + r"$")
 AGE_TOKEN_RE = re.compile(r"(?<![\w.])" + AGE_SHAPE + r"(?![\w.])")
+# A table cell under an age column is read only when it starts with an age; a
+# line below the header that is not a row (JSON printed after the table) would
+# otherwise have an age cut out of whatever sits at that column, a uid's `83d`.
+AGE_CELL_RE = re.compile(r"^\s*" + AGE_SHAPE + r"(?![\w.])")
 AGE_CLASS = "AGE"
 # An age is only an age in one of these contexts; `120m` CPU never is.
 AGE_KEYS = ("age", "lastSeen", "last_seen")
@@ -565,6 +569,16 @@ class Mapping:
         return False
 
     @staticmethod
+    def has_identifier(text: str) -> bool:
+        """Whether a normalized answer still holds an identifier shape (ID_CLASSES).
+
+        After apply_to_answer, any left is one the key never bound (it sat in
+        text the key drops, like the recent-work digest, or the model made it),
+        so no placeholder can bring it up to date.
+        """
+        return any(pattern.search(text) for _, pattern, _ in ID_CLASSES)
+
+    @staticmethod
     def has_timestamp(text: str) -> bool:
         """Whether a normalized answer still holds a timestamp: one the request did not hold verbatim."""
         return any(pattern.search(text) for pattern in TIMESTAMP_PATTERNS)
@@ -844,7 +858,8 @@ class Normalizer:
                     continue
                 stop = len(line) if end < 0 else end
                 cell = line[start:stop]
-                line = line[:start] + AGE_TOKEN_RE.sub(lambda m: self.age(m.group(0)), cell) + line[stop:]
+                if AGE_CELL_RE.match(cell):
+                    line = line[:start] + AGE_TOKEN_RE.sub(lambda m: self.age(m.group(0)), cell) + line[stop:]
             lines[index] = line
         return "\n".join(lines)
 

@@ -74,6 +74,9 @@ UNSTORABLE_REPEATS_NUMBER = "repeats_swapped_number"
 # Normalized, the answer still names an identifier or IP the request bound, so
 # it would be served with the recording's value.
 UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
+# Normalized, the answer still holds an identifier shape (a card, a pod, a
+# session) the request never bound, so it would be served as recorded.
+UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
 # The answer quotes a timestamp the request does not hold verbatim (one the
 # model made), which no placeholder can bring up to date.
 UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"

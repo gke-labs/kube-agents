@@ -114,10 +114,19 @@ class AnswerSlotGuardTest(SlotCacheCase):
         ]}
 
     def test_a_value_only_an_answer_named_is_not_served_through_a_slot(self):
-        # Bob named his own pod in his yes; Alice's recorded yes named another.
+        # Bob named his own pod in his yes; Alice's yes named another. Neither yes
+        # can be a recorded answer (each names a pod its request never bound),
+        # so record mode refuses them; the slot guard is the second line, met by
+        # noting them by hand.
         bob = self.body("Yes, web-7d4b9c8f6d-x2k9p.")
         alice_yes = self.body("Yes please, web-5f6c7d8b9c-m8n7q.")
-        self.record(bob, {"role": "assistant", "content": "restart web-7d4b9c8f6d-x2k9p"}, others=[alice_yes])
+        opening = dict(bob, messages=bob["messages"][:1])
+        self.assertEqual(self.recorded(opening, bob["messages"][1])["unstorable"], ["unbound_identifier"])
+        self.recorded(bob, {"role": "assistant", "content": "restart web-7d4b9c8f6d-x2k9p"})
+        context = normalizer.KeyContext("abc", "img")
+        for said in (bob["messages"][1], alice_yes["messages"][1]):
+            replay_cache.AnswerCache(self.cache_dir).add_variant(*normalizer.answer_variant(
+                normalizer.normalize_request(opening, time.time()), said, context))
         hit, refused = self.proxy().lookup(alice_yes, time.time())
         self.assertIsNone(hit, "Bob's answer would restart the pod Alice's yes named")
         self.assertEqual(refused, {"via": "answer_slots", "guard": "value_only_in_answers"})
@@ -346,6 +355,14 @@ class BoundValueTest(AnalyzeCase):
         line = self.recorded(self.body("work kanban task t_abcdef12"),
                              {"role": "assistant", "content": "archive card_t_abcdef12_old"})
         self.assertEqual(line["unstorable"], ["bound_value_left_literal"])
+
+    def test_an_identifier_the_key_never_bound_is_not_stored(self):
+        # The recent-work digest is dropped from the key before identifiers are
+        # bound, so a card named only there has no placeholder to restore.
+        card = "card t_bbbbbbbb\n## Recent work by @platform\n- t_deadbeef: audited the fleet\n\nstatus: running"
+        answer = {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {
+            "name": "kanban_show", "arguments": json.dumps({"task_id": "t_deadbeef"})}}]}
+        self.assertEqual(self.recorded(self.body(card), answer)["unstorable"], ["unbound_identifier"])
 
     def test_an_ip_is_not_found_inside_a_longer_one(self):
         line = self.recorded(self.body("node 10.1.2.3 is cordoned"),

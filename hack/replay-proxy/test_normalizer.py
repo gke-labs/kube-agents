@@ -149,6 +149,18 @@ class AgeTest(unittest.TestCase):
         self.assertNotEqual(fp(request("cpu: 120m")), fp(request("cpu: 250m")))
 
 
+class AgeColumnTest(unittest.TestCase):
+    def test_a_line_below_the_header_that_is_not_a_row_keeps_its_text(self):
+        # The AGE cell spans columns 60-67; on the JSON line below the table that
+        # is the uid's `-83d`, which once read as an age of 83 days.
+        header = "NAME".ljust(60) + "AGE     IP"
+        row = "web-7d4b9c8f6d-x2k9p".ljust(60) + "5m".ljust(8) + "10.1.2.3"
+        line = '{"name":"' + "x" * 28 + '","uid":"6f79db96-15b3-4308-83df-7c4f203b6015","phase":"Pending"}'
+        out = norm("\n".join((header, row, line)))
+        self.assertIn('"uid":"⟦UID_1⟧"', out)
+        self.assertRegex(out, r"⟦AGEm_\d+⟧")
+
+
 class StderrOrderTest(unittest.TestCase):
     def test_a_warning_before_or_after_the_output_gives_one_key(self):
         warning = "WARNING: --filter : operator evaluation is changing for consistency across Google APIs."
