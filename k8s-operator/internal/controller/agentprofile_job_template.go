@@ -121,6 +121,9 @@ func stubProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, p *agentv1alph
 				{Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 			},
 			SecurityContext: &corev1.SecurityContext{
+				// Writes go to the mounted emptyDirs (the workspace, the
+				// task token), never the image's root.
+				ReadOnlyRootFilesystem:   ptr.To(true),
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 			},

@@ -188,6 +188,7 @@
                   "ALL"
                 ]
               },
+              "readOnlyRootFilesystem": true,
               "allowPrivilegeEscalation": false
             }
           }

@@ -1,5 +1,5 @@
 {
-  "version": "deffb7c04adcc2ce",
+  "version": "0bdcf63ba12ae1b6",
   "namespace": "test-ns",
   "profileNamespace": "test-ns-profiles",
   "ceiling": 6,
@@ -208,6 +208,7 @@
                     "ALL"
                   ]
                 },
+                "readOnlyRootFilesystem": true,
                 "allowPrivilegeEscalation": false
               }
             }
