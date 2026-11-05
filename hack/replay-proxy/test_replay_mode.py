@@ -664,20 +664,23 @@ class ReplayTest(ProxyTestCase):
         self.assertEqual(line["served_from"]["build"], "7")
         self.assertNotIn("miss", line)
 
-    def test_a_replay_request_is_normalized_once(self):
+    def test_a_replay_request_is_normalized_and_fingerprinted_once(self):
         self.record(chat("t_11111111", stream=False))
-        replay, port, out = self.replay()
+        _, port, out = self.replay()
         for body in (chat("t_22222222", stream=False), chat("t_33333333", stream=False, extra_messages=(
                 {"role": "user", "content": "a turn never recorded"},))):
-            calls = []
-            original = normalizer.normalize_request
-            normalizer.normalize_request = lambda *args: calls.append(args) or original(*args)
+            calls = {"normalize_request": [], "fingerprint": []}
+            originals = {name: getattr(normalizer, name) for name in calls}
+            for name, original in originals.items():
+                setattr(normalizer, name, lambda *args, n=name, o=original: calls[n].append(args) or o(*args))
             try:
                 self.request("POST", COMPLETIONS, body, port=port)
-                replay.drain()
+                self.lines(1, out)  # the analysis has run before the originals come back
             finally:
-                normalizer.normalize_request = original
-            self.assertEqual(len(calls), 1, "a hit and a miss are each normalized once")
+                for name, original in originals.items():
+                    setattr(normalizer, name, original)
+            self.assertEqual({n: len(c) for n, c in calls.items()}, {"normalize_request": 1, "fingerprint": 1},
+                             "a hit and a miss are each normalized and fingerprinted once")
             out.truncate(0)
             out.seek(0)
 

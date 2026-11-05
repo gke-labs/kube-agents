@@ -473,6 +473,9 @@ def refusal(via: str, guard: str) -> Dict[str, str]:
     return {F.REFUSED_VIA: via, F.REFUSED_GUARD: guard}
 
 
+# A request normalized as of when it arrived, and its exact fingerprint.
+Keyed = Tuple[normalizer.NormalizedRequest, str]
+
 # Tells the analysis worker to stop.
 _STOP = object()
 
@@ -504,24 +507,27 @@ class ShadowProxy:
         self._worker = threading.Thread(target=self._work, name="replay-shadow-analysis", daemon=True)
         self._worker.start()
 
+    def keyed(self, body: Dict[str, Any], received: float) -> Keyed:
+        """The request normalized as of `received`, and its exact fingerprint."""
+        normalized = normalizer.normalize_request(body, received)
+        return normalized, normalizer.fingerprint(normalized, self.key_context)
+
     def lookup(
-        self, body: Dict[str, Any], received: float, normalized: Optional[normalizer.NormalizedRequest] = None,
+        self, body: Dict[str, Any], received: float, keyed: Optional[Keyed] = None,
     ) -> Tuple[Optional[Tuple[Dict[str, Any], Dict[str, Any], str, str]], Optional[Dict[str, str]]]:
         """Replay mode: ((restored answer, saved entry, fingerprint, how it matched), None) on a servable hit.
 
         On a miss, (None, None), or (None, refusal) when a key matched a saved
         answer that a guard refused: the key and the guard, for the miss block.
-        `normalized` is the request normalized as of `received`, when the caller
-        has it already.
+        `keyed` is the request's normalization and fingerprint (keyed()), when
+        the caller has them already.
         """
         messages = body.get(request_store.MESSAGES_KEY)
         messages = messages if isinstance(messages, list) else []
         # Noted now, not by the background analysis, so a later request's
         # slots can normalize this one's messages as of when they arrived.
         first_seen = self.diagnosis.first_seen_times(messages, received)
-        if normalized is None:
-            normalized = normalizer.normalize_request(body, received)
-        fingerprint = normalizer.fingerprint(normalized, self.key_context)
+        normalized, fingerprint = keyed or self.keyed(body, received)
         via = F.VIA_EXACT
         entry = self.cache.load(fingerprint)
         if entry is None:
@@ -570,15 +576,15 @@ class ShadowProxy:
 
     def submit(
         self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int,
-        served: Optional[Dict[str, Any]] = None, normalized: Optional[normalizer.NormalizedRequest] = None,
+        served: Optional[Dict[str, Any]] = None, keyed: Optional[Keyed] = None,
     ) -> None:
         """Queue one request's analysis; never waits. A full queue drops it and logs that.
 
-        `normalized`, when replay mode already normalized the request to look
-        it up, is carried to the analysis so it is not normalized again.
+        `keyed`, when replay mode already normalized and fingerprinted the
+        request to look it up, is carried to the analysis so neither is redone.
         """
         try:
-            self._queue.put_nowait((body, received, upstream, request_bytes, served, normalized))
+            self._queue.put_nowait((body, received, upstream, request_bytes, served, keyed))
         except queue.Full:
             self.metrics.add("analysis_dropped")
             self.log({F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
@@ -607,10 +613,10 @@ class ShadowProxy:
             if item is _STOP:
                 self._queue.task_done()
                 return
-            body, received, upstream, request_bytes, served, normalized = item
+            body, received, upstream, request_bytes, served, keyed = item
             try:
                 try:
-                    entry = self.analyze(body, received, upstream, request_bytes, served, normalized)
+                    entry = self.analyze(body, received, upstream, request_bytes, served, keyed)
                 except Exception as exc:  # one bad request never stops the worker
                     self.metrics.add("analysis_errors")
                     # The type name only: an exception's message can quote request text.
@@ -792,7 +798,7 @@ class ShadowProxy:
 
     def analyze(
         self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int = 0,
-        served: Optional[Dict[str, Any]] = None, normalized: Optional[normalizer.NormalizedRequest] = None,
+        served: Optional[Dict[str, Any]] = None, keyed: Optional[Keyed] = None,
     ) -> Dict[str, Any]:
         """The log line for one completed chat request; stores its scrubbed text as a side effect."""
         request_id = uuid.uuid4().hex
@@ -824,9 +830,7 @@ class ShadowProxy:
         entry[F.TOKENS_ESTIMATED] = entry[F.PROMPT_TOKENS] is None
         if entry[F.TOKENS_ESTIMATED]:
             entry[F.PROMPT_TOKENS] = request_bytes // BYTES_PER_TOKEN
-        if normalized is None:
-            normalized = normalizer.normalize_request(body, received)
-        fingerprint = normalizer.fingerprint(normalized, self.key_context)
+        normalized, fingerprint = keyed or self.keyed(body, received)
         entry[F.FINGERPRINT] = fingerprint
         entry[F.SETTINGS_HASH] = normalizer.settings_hash(normalized, self.key_context)
         entry[F.ROLES] = normalized.roles()
@@ -945,11 +949,11 @@ class Handler(BaseHTTPRequestHandler):
                 body = None
         received = time.time()
         refused = None
-        normalized = None
+        keyed = None
         if body is not None and self.proxy.config.mode == F.MODE_REPLAY:
             try:
-                normalized = normalizer.normalize_request(body, received)
-                hit, refused = self.proxy.lookup(body, received, normalized)
+                keyed = self.proxy.keyed(body, received)
+                hit, refused = self.proxy.lookup(body, received, keyed)
             except Exception:  # a cache that cannot be read is a miss, never a failed request
                 self.proxy.metrics.add("analysis_errors")
                 hit = None
@@ -959,14 +963,14 @@ class Handler(BaseHTTPRequestHandler):
                 answer, saved, fingerprint, via = hit
                 upstream = self._serve(body, answer, saved, fingerprint)
                 upstream["served_via"] = via
-                self.proxy.submit(body, received, upstream, len(raw), served=saved, normalized=normalized)
+                self.proxy.submit(body, received, upstream, len(raw), served=saved, keyed=keyed)
                 return
         upstream = self._forward(raw, observe=body is not None, streaming=bool(body and body.get("stream")))
         if body is None:
             return
         upstream["refused"] = refused
         self.proxy.metrics.add("completions")
-        self.proxy.submit(body, received, upstream, len(raw), normalized=normalized)
+        self.proxy.submit(body, received, upstream, len(raw), keyed=keyed)
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _handle
 
