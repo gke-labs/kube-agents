@@ -101,6 +101,7 @@ MAX_CELL_CHARS = 200
 MAX_ID_CHARS = 80
 MAX_REASON_CHARS = 64
 MAX_SAMPLE_CRDS_IN_SUMMARY = 8
+MAX_KUBECONFIG_BYTES = 1024 * 1024
 # Bound each variable-length section so worst-case stdout stays well below Hermes's 50 KB
 # terminal output cap even on large or all-unhealthy KCC clusters (~5 KB CRD issues +
 # ~15 KB failure bullets + ~12 KB Ready object rows + ~2 KB summary < 50 KB). Unhealthy
@@ -496,6 +497,31 @@ def evaluate_kcc_item(item: dict) -> dict[str, object]:
     }
 
 
+def _read_kubeconfig_current_context(env: dict[str, str]) -> str | None:
+    """Read `current-context` from the active kubeconfig file if present on disk."""
+    kc_env = env.get("KUBECONFIG") or ""
+    candidates = [entry.strip() for entry in kc_env.split(os.pathsep) if entry.strip()]
+    if not candidates:
+        candidates = ["/opt/data/.kubeconfig"]
+    for raw_path in candidates:
+        path = Path(raw_path)
+        try:
+            if not path.is_file() or path.stat().st_size > MAX_KUBECONFIG_BYTES:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("current-context:"):
+                val = stripped.partition(":")[2].strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    val = val[1:-1].strip()
+                if val:
+                    return sanitize_cell(val, MAX_CELL_CHARS)
+    return None
+
+
 def audit_kcc(
     kubeconfig: str | None = None,
     *,
@@ -510,11 +536,14 @@ def audit_kcc(
         env["PATH"] = f"{PROXY_WRAPPER_BIN}:" + env.get("PATH", "")
     if kubeconfig:
         env["KUBECONFIG"] = kubeconfig
+    target_context = _read_kubeconfig_current_context(env)
 
     phase1_timeout = min(float(KUBECTL_TIMEOUT_SECONDS), deadline - monotonic_fn())
     served_crd_scopes, unserved_crds, crd_error = discover_kcc_crds(env, timeout=phase1_timeout)
     if served_crd_scopes is None:
         print("## Config Connector (KCC) Fleet Audit\n")
+        if target_context:
+            print(f"- **Target Context:** `{target_context}`")
         print(f"- **Config Connector Status:** UNKNOWN (CRD listing failed: {crd_error})\n")
         print("**Config Connector Audit Verdict: Incomplete** (could not read: customresourcedefinitions).")
         print("CLEAN_AUDIT_STOP: NO — Report Config Connector state as unread, not healthy.\n")
@@ -523,6 +552,8 @@ def audit_kcc(
     total_kcc_crds = len(served_crd_scopes) + len(unserved_crds)
     if total_kcc_crds == 0:
         print("## Config Connector (KCC) Fleet Audit\n")
+        if target_context:
+            print(f"- **Target Context:** `{target_context}`")
         print("- **kcc_installed:** `false`")
         print(
             "- **Config Connector Status:** NOT INSTALLED on this cluster "
@@ -616,12 +647,17 @@ def audit_kcc(
     )
 
     print("## Config Connector (KCC) Fleet Audit\n")
+    if target_context:
+        print(f"- **Target Context:** `{target_context}`")
     print("- **kcc_installed:** `true`")
+    crd_counts_clause = (
+        f"{len(served_crd_scopes)} served: {crd_preview}; {len(unserved_crds)} unserved/unestablished"
+        if crd_preview
+        else f"{len(served_crd_scopes)} served, {len(unserved_crds)} unserved/unestablished"
+    )
     print(
         f"- **Config Connector CRDs:** {total_kcc_crds} `*.cnrm.cloud.google.com` CRDs "
-        f"({len(served_crd_scopes)} served, {len(unserved_crds)} unserved/unestablished"
-        + (f": {crd_preview}" if crd_preview else "")
-        + ")"
+        f"({crd_counts_clause})"
     )
     print(f"- **Operator Objects (`ConfigConnector` / `ConfigConnectorContext`):** {operator_summary}")
     print(f"- **Managed KCC Resources:** {managed_summary}")
@@ -664,8 +700,9 @@ def audit_kcc(
             f"{len(unhealthy_operator) + len(unhealthy_managed)} unhealthy objects)."
         )
         print(
-            "CLEAN_AUDIT_STOP: NO — Report any unverified namespace or unread CRDs as unread "
-            "(never as 0 resources) and inspect any unhealthy Config Connector objects listed below.\n"
+            "CLEAN_AUDIT_STOP: NO — Report any unverified namespace, unread CRDs, or "
+            "unserved/unestablished CRDs (never as 0 resources or healthy) and inspect "
+            "any unhealthy Config Connector objects listed below.\n"
         )
     else:
         print(
