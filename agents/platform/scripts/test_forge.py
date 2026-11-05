@@ -409,6 +409,12 @@ class CallTest(BrokerCase):
         self.assertEqual(ctx.exception.reason, "BROKER_UNREACHABLE")
         self.assertEqual(ctx.exception.value, "the proxy fell over")
 
+    def test_no_time_left_starts_nothing_on_the_direct_path_either(self):
+        with self.assertRaises(forge.ForgeError) as ctx:
+            forge.call("proposal-claim", {}, REPO, timeout_s=0)
+        self.assertEqual(ctx.exception.reason, forge.REASON_SANDBOX_UNREACHABLE)
+        self.assertEqual(self.broker.calls, [])
+
     # -- the one retry -----------------------------------------------------
     def test_a_transient_failure_on_a_read_is_tried_once_more(self):
         """What `_call(..., retry_transient=True)` gave the reads before the port.
@@ -575,6 +581,74 @@ class ForwardTest(unittest.TestCase):
         run = self._run(stdout=json.dumps({"answer": {}}))
         forge.call("capabilities", {}, REPO)
         self.assertEqual(run.call_args.kwargs["timeout"], forge.FORWARD_TIMEOUT_S)
+
+    def test_a_callers_ceiling_bounds_the_hop(self):
+        """A caller with a deadline passes what is left of it, and the hop gets that."""
+        run = self._run(stdout=json.dumps({"answer": {}}))
+        forge.call("proposal-claim", {}, REPO, timeout_s=7)
+        self.assertEqual(run.call_args.kwargs["timeout"], 7)
+
+    def test_no_ceiling_keeps_the_default_bound(self):
+        run = self._run(stdout=json.dumps({"answer": {}}))
+        forge.call("capabilities", {}, REPO, timeout_s=None)
+        self.assertEqual(run.call_args.kwargs["timeout"], forge.FORWARD_TIMEOUT_S)
+
+    def test_a_timed_out_hop_names_the_ceiling_that_applied(self):
+        self._run(side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=7))
+        with self.assertRaises(forge.ForgeError) as ctx:
+            forge.call("proposal-claim", {}, REPO, timeout_s=7)
+        self.assertEqual(ctx.exception.reason, forge.REASON_SANDBOX_UNREACHABLE)
+        self.assertIn("within 7s", ctx.exception.value)
+        self.assertNotIn(f"{forge.FORWARD_TIMEOUT_S}s", ctx.exception.value)
+
+    def test_no_time_left_starts_nothing(self):
+        """A caller whose budget is gone gets the timed-out hop's code, without the hop."""
+        for spent in (0, -0.5):
+            with self.subTest(timeout_s=spent):
+                run = self._run(stdout=json.dumps({"answer": {}}))
+                with self.assertRaises(forge.ForgeError) as ctx:
+                    forge.call("proposal-claim", {}, REPO, timeout_s=spent)
+                self.assertEqual(ctx.exception.reason, forge.REASON_SANDBOX_UNREACHABLE)
+                run.assert_not_called()
+                self.assertEqual(self.broker.calls, [])
+
+    def test_the_retry_gets_what_is_left_of_the_ceiling(self):
+        """The ceiling bounds the whole call: a retry is not a second helping of it."""
+        transient = json.dumps(
+            {"refusal": {"message": "blip", "code": "FORGE_UNAVAILABLE"}}
+        )
+        run = self._run(stdout=transient)
+        clock, answer, spent = [100.0], run.return_value, 3.0
+
+        def timed(*args, **kwargs):
+            clock[0] += spent
+            return answer
+
+        run.side_effect = timed
+        with mock.patch.object(forge.time, "monotonic", lambda: clock[0]), \
+                self.assertRaises(forge.ForgeError):
+            forge.call("proposal-list", {}, REPO, retry_transient=True, timeout_s=7)
+        self.assertEqual([c.kwargs["timeout"] for c in run.call_args_list], [7, 7 - spent])
+
+    def test_a_retry_with_no_time_left_is_not_started(self):
+        transient = json.dumps(
+            {"refusal": {"message": "blip", "code": "FORGE_UNAVAILABLE"}}
+        )
+        run = self._run(stdout=transient)
+        clock, answer, spent = [100.0], run.return_value, 8.0
+
+        def timed(*args, **kwargs):
+            clock[0] += spent
+            return answer
+
+        run.side_effect = timed
+        with mock.patch.object(forge.time, "monotonic", lambda: clock[0]), \
+                self.assertNoLogs(forge.LOGGER, "WARNING"), \
+                self.assertRaises(forge.ForgeError) as ctx:
+            forge.call("proposal-list", {}, REPO, retry_transient=True, timeout_s=7)
+        self.assertEqual(ctx.exception.reason, forge.REASON_SANDBOX_UNREACHABLE)
+        self.assertIn("was not retried", str(ctx.exception))
+        self.assertEqual(run.call_count, 1, "the retry had no time left and was not started")
 
     def test_a_refusal_survives_the_crossing_with_its_code(self):
         """Flattening it to "the far side exited 1" loses what the callers act on."""
