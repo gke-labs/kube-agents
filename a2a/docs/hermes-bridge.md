@@ -797,36 +797,36 @@ task finalizes — deadline, cancel, a crash mid-tool, or a `post_tool_call` the
 read (logged, not counted, since the call is then in the trace; an unreadable `pre_tool_call`
 costs nothing, its `post` carries the record whole) — is flushed as `interrupted` inside
 the finalize lock, ahead of the result and the terminal, so the trace is complete and
-nothing of it follows the final event. What of the input is published is its **shape**: its
+nothing of it follows the final event. What of the input is published depends on the executor:
+
+- **Under `cli` (shape mode):** `input` is capped at 2 KiB (`activityInputCap`) and published as its **shape**: its
 structure with every string value replaced by `<string, N chars>` and every key that is not
 shaped like a schema key (a letter or `_` first, then letters, digits, `_`, `-`, at most 48, and not token-like: no credential prefix, no long digit, hex or single-case run, few changes of character class) by
 `<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
 wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
-name, a wrapper's nested names). No grammar tells a resource name from a credential under the
-same key, so none is attempted, no string value rides the trace under any key, and there is no
-value scrub to have a reach: a credential a model pastes into a terminal command is one string
-under `command` and ships as a length. Values under keys with `token`, `secret`, `password`,
+name, a wrapper's nested names). No string value rides the `cli` trace under any key, and no tool results are included.
+- **Under `api` (scrubbed detail mode):** `input` is capped at 4 KiB (`detailedInputCap`), string values are scrubbed for inline credential tokens, `Bearer`/`Basic` headers, URL userinfo, and `key=value` secrets (`scrubInlineSecrets`) and capped at 512 bytes (`detailedStringCap`), and non-schema or token-shaped keys are replaced by `<key n, N chars>` with their values shaped. Each `api` activity entry also carries a human-readable `title`, `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and a one-line scrubbed `resultPreview` (or `errorMessage` on failure) capped at 320 bytes (`entryPreviewCap`).
+
+In both modes, values under keys with `token`, `secret`, `password`,
 `passwd`, `authorization`, `passphrase`, `api_key`/`api-key`, `private_key`, `ssh_key`,
 `signing_key`, `key_data`, `cookie` or `credential` as a whole component (`access_token`,
 `SECRET_KEY`, `accessToken`, `clientSecret`, `SecretAccessKey`, `secretAccessKey`, `PGPASSWORD`,
 `client-key-data`, `Cookie`; not `tokenizer`, and not a key that opens with the word and goes on
-as a name, reference or location, `secretName`, `tokenPath`) are replaced by `[redacted]` before
-the shaping, so the trace still says a secret-looking key was there. The door reads a delivery of at most 8 MiB (hermes carries the tool input and result whole, so a
+as a name, reference or location, `secretName`, `tokenPath`) are replaced by `[redacted]` first, so the trace still says a secret-looking key was there. The door reads a delivery of at most 8 MiB (hermes carries the tool input and result whole, so a
 large file write is a few MiB); a larger one is refused and logged, and since the cut body cannot
 be verified nothing counts it, the one loss the `activity-budget` marker does not see. The
 over-size delivery is normally the call's `post_tool_call`, the one carrying the result, whose
 small `pre_tool_call` arrived and opened the call: that call then ends `interrupted` at the
 terminal although the tool finished. An over-size `pre_tool_call` leaves the call absent, and its
 plan step without it. An over-size `post_api_request` (it carries the model's response) loses that
-request's boundary and its synthesis step, uncounted. `input` is capped (2 KiB): over the cap it becomes
+request's boundary and its synthesis step, uncounted. Over the input cap (`2 KiB` on `cli`, `4 KiB` on `api`), `input` becomes
 `{"truncated": true, "bytes": N, "head": "..."}`, except for hermes's `tool_call` wrapper,
 where each nested call's `arguments` is capped on its own so the nested tool names stay
-readable. Tool results are not published: no check
-reads them and they are the riskiest payload in the pod. One task publishes at most 3000
-trace and progress parts together: the task's events subject is capped at 4096 messages, and
+readable. One task publishes at most 3000
+trace, thinking, and progress parts together: the task's events subject is capped at 4096 messages, and
 a looping persona publishing without bound would evict its own `submitted` and `working`. The
-two have shares of their own: the heartbeat 120 (one a minute for the default two-hour
-deadline), the trace the rest, so the heartbeat keeps going on exactly the run that spends the
+heartbeat reserves 120 parts (one a minute for the default two-hour
+deadline), and trace/step/thinking parts share the remaining 2880 (`thinking` is additionally capped at 64 parts per task, `activityThinkingBudget`), so the heartbeat keeps going on exactly the run that spends the
 trace's share, and an interval short enough to spend the heartbeat's share silences the
 heartbeat and never the trace. Past the trace's share, calls are counted and one entry, `tool` `activity-budget` with `status`
 `truncated` and `dropped` saying how many, goes out at the terminal ahead of the result. The stream keeps every activity
@@ -834,26 +834,16 @@ part; the relay drops the artifact on purpose (debug and audit views never rende
 chat), and the inject door's probe is where a reader sees it.
 
 The turn's steps go on a `steps` artifact as `kube-agents.step/v1` records
-([`a2a/lib/stepmsg`](../lib/stepmsg/stepmsg.go)). A `plan` step is made from the trace itself: each
+([`a2a/lib/stepmsg`](../lib/stepmsg/stepmsg.go)):
+
+- **Under `cli`:** a `plan` step is made from the trace itself (`activity_steps.go`): each
 `pre_tool_call` opens or extends one, titled with the call's tool name and carrying its call id, the
-same name and id its activity entry carries, so a renderer places each entry under its step.
+same id its activity entry carries, so a renderer places each entry under its step.
 Consecutive calls of one tool within one model request share a step; a call of another tool, the
-next model request, or the task's finalize closes it and publishes it. The model request
-(`post_api_request`) is read only for where one request ends and the next begins, and for the
-`synthesis` step: a request of the turn's own session that stopped with no call planned, after work
-(a later request in the turn, or one after a call that turn completed; a follow-up turn of an `api` task counts its own calls only), titled `Writing the answer`. It is
-never the source of a title or an id, since it fires before hermes validates and repairs the calls'
-names and de-duplicates their ids: a name read off it could be one the model invented, or one
-handed to it, and an id one the trace never carries. The turn's own session is the task's session
-under `api`; under `cli` it is the session of the turn's first delivery, which comes before any
-delegated child can run. A delegated child runs in the same process and posts its own requests under
-its own session, so its last request makes no synthesis step, and nor does a request with no
-session id; its calls are plan steps when the trace takes them, which under `cli` it does (under
-`api` a child's deliveries are not attributed to the task at all). A step is structure only, like
-the trace: a tool's name, call ids, a kind and a fixed title, never the model's text, a call's
-arguments, or a tool's result or error text, and `thinking` is not published from the hook. A failed
-call's class stays on its activity entry as `errorType`; its error text is not published anywhere. A
-step the record refuses to encode is skipped, with one log line per task. One task publishes at most
+next model request, or the task's finalize closes it and publishes it. `post_api_request` marks where one request ends and the next begins and emits the `synthesis` step (`Writing the answer`) when a request stops after work.
+- **Under `api`:** `post_api_request` (`activity_thinking.go`) builds descriptive `plan` steps from the planned tool calls (`expandPlannedToolCall` / `describePlannedTool`, grouping batch `kanban_create` calls into `Dispatching N specialist tasks on the Kanban board.`), attaches scrubbed single-line reasoning to the step's `thought` field (capped at 1,200 runes / 4,000 bytes, validated under `stepmsg.MaxThoughtBytes` = 4,096 bytes), publishes scrubbed multi-line reasoning to the `thinking` artifact, and emits a `synthesis` step (`Synthesizing findings into final response.` when planned titles or reasoning were seen, else `Writing the answer`) when the model stops after prior work. When `BRIDGE_WAIT_KANBAN_IN_TURN` is enabled (default `true`, active on non-Slack/GChat routes such as the console and MCP doors), a turn that files Kanban cards holds the task open after the coordinator turn and polls SQLite `kanban.db` (`resolveKanbanDBPath()` / `querySessionKanbanCards`, `kanban.go`). As cards run and settle, it maps worker sessions (`SyncKanbanCard`, `/kanban/workspaces/<cardId>`) so worker tool calls and reasoning are attributed to `@card:<id> (<title>)`, publishes `subtask` steps (`stepmsg.KindSubtask`, titled `Specialist check completed: <shortTitle>.`) and `progress` updates, and when multiple cards settle runs a synthesis turn (`Idempotency-Key: <taskId>/synth-<turn>`, step `Synthesizing findings across N specialist card(s).`) to fold the card reports into the final `result` artifact. If a console session's card settles after its turn has already ended, `watchOutOfTurnKanbanCards` publishes a synthetic task (`task-card-<sanitized-id>`) with `submitted`, the `steps` subtask record (`parentTaskId` naming the originating task), the scrubbed `result` artifact, and the terminal status.
+
+A step the record refuses to encode is skipped, with one log line per task. One task publishes at most
 256 steps, counted against the trace's share as well, and past either they are dropped uncounted
 (the `activity-budget` marker counts calls). The relay ignores `steps`, as it ignores `activity`.
 
@@ -895,10 +885,9 @@ cannot see, one that leaves `BRIDGE_CONCURRENCY` unset or takes it through `envF
 bridge with the door open and no key logs a warning at start, and so does one whose door is not
 where the hook posts; either reports `tool trace off`. Every hermes
 process in the pod now posts to the door, and a delivery's `session_id` is what attributes it:
-it counts for the task whose session id matches and which holds that session's turn at the
-moment, and is dropped otherwise, so a kanban worker's or a chat message's tool calls, which
-carry their own session ids, never reach an A2A trace. Kanban work the turn delegates is
-therefore absent from the trace; only the gateway profile's own calls appear. The `cli`
+it counts for the task whose session id matches (or whose turn registered that `kanban-<card_id>` worker session on `kanban_create`) and which holds that session's turn at the
+moment, and is dropped otherwise, so another chat conversation's or an unrelated worker's tool calls, which
+carry their own session ids, never reach the task's trace. The `cli`
 executor still uses a per-task key, and a child it spawns drops the pod-wide entry from the
 managed config it is given, so a delivery is never signed twice. The managed scope merges per
 leaf and a list is one leaf, so the rendered `hooks.outbound` replaces any list a profile sets

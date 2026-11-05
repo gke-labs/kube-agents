@@ -120,6 +120,7 @@ const (
 	// it is absent, and the task ends hermes-api-unreachable.
 	DefaultAPIConnectRetry  = 2 * time.Minute
 	apiConnectRetryInterval = time.Second
+	kanbanStartGraceSeconds = 2
 )
 
 // errWaitingForTurn is the error a task whose context ended while it waited
@@ -339,6 +340,11 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 	sessionID := apiSessionID(run.origin.ContextID)
+	defer func() {
+		if run.canceled.Load() {
+			b.markSessionCanceled(sessionID)
+		}
+	}()
 	// The task's own context: the deadline bounds every turn together;
 	// cancel and shutdown end whichever request is in flight. Not the
 	// consumer's context, which a shutdown cancels before shutdownTasks can
@@ -396,6 +402,10 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
+	waitKanbanInTurn := !run.routeRecorded.Load() || isConsoleOrigin(run.origin)
+	if waitKanbanInTurn {
+		b.rememberConsoleSession(sessionID, run.origin)
+	}
 	// The opening turn only: a follow-up runs in a session that has already
 	// read the report, and the hook this mirrors reads the thread once per
 	// message a person sends, which the opening turn is.
@@ -416,6 +426,11 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	go b.runActivity(run)
 	run.mu.Unlock()
 
+	if waitKanbanInTurn {
+		b.beginKanbanWait(sessionID)
+		defer b.endKanbanWait(sessionID)
+	}
+	taskStartUnix := time.Now().Unix() - kanbanStartGraceSeconds
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1
 	var prev string         // the turn before's answer, published as a turn artifact
 	for turn := 1; ; turn++ {
@@ -424,6 +439,15 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return
+		}
+		if waitKanbanInTurn {
+			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
+			if !ok {
+				return
+			}
+			if !act.cardsFiled.Load() {
+				taskStartUnix = time.Now().Unix() - kanbanStartGraceSeconds
+			}
 		}
 		next, nextPrompt := b.runnableSteer(ctx, run)
 		if next == nil {

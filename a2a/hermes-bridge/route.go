@@ -67,6 +67,17 @@ var routePlatforms = map[string]string{
 // that carries its task (conversationRoute.TaskID).
 const consoleRoutePrefix = "console:"
 
+func isConsoleOrigin(env *lib.Envelope) bool {
+	if env == nil {
+		return false
+	}
+	auth, err := parseRouteAuthority(env)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(strings.TrimSpace(auth.Audience.Conversation), consoleRoutePrefix)
+}
+
 // errNoChatConversation is an authority that names no chat conversation the
 // notify route serves; nothing is recorded and nothing is wrong.
 var errNoChatConversation = errors.New("no chat conversation to route to")

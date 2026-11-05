@@ -304,7 +304,7 @@ inbox path keeps the relay out from the placeholder post to the edit, so there t
 always still submitted; the check is for any path that loses that ordering. A turn whose placeholder post failed has no line to edit and gets the
 notice as a post. Nothing is refused, held back, or dropped; the notice is information, and
 a count that fails sends none. The operator renders the threshold as the bridge's worker
-count, 10 by default, so the turn told it waits is the first one that finds every worker
+count, 2 by default, so the turn told it waits is the first one that finds every worker
 taken; the operator's own `A2A_BUSY_NOTICE_AT` overrides it. It goes to every chat backend
 (Google Chat, Slack and Discord all edit the line in place) and the console. The inject and
 A2A doors get none, because their callers read the status line as data: the A2A door takes
