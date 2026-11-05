@@ -66,9 +66,6 @@ func NewCurator(cfg CuratorConfig) (*Curator, error) {
 	if cfg.RepoDir == "" {
 		cfg.RepoDir = "/opt/data/memory/knowledge-store"
 	}
-	if cfg.RepoID == "" {
-		cfg.RepoID = "default/infra"
-	}
 	if cfg.Session == "" {
 		cfg.Session = "agent"
 	}

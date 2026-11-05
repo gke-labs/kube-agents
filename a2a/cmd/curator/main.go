@@ -153,7 +153,7 @@ func defaultRepoID() string {
 			}
 		}
 	}
-	return "default/infra"
+	return ""
 }
 
 func defaultRepoDir() string {

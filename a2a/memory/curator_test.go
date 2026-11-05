@@ -227,7 +227,7 @@ spec:
 
 	cur, err := NewCurator(CuratorConfig{
 		RepoDir:             repoDir,
-		RepoID:              "dshnayder-org/infra",
+		RepoID:              "acme/infra",
 		Session:             "agent",
 		Profile:             "platform",
 		RecurrenceThreshold: 2,
@@ -287,11 +287,11 @@ spec:
 		Kind:        OutcomeProposed,
 		RecordID:    "DEC-2026-004",
 		RecordType:  RecordTypeDecision,
-		Repo:        "dshnayder-org/infra",
+		Repo:        "acme/infra",
 		Title:       "No infrastructure PR merges on Fridays",
 		Summary:     "Proposed in group chat: do not submit infrastructure PRs on Friday.",
 		Rule:        "Do not merge infrastructure pull requests on Fridays without an incident override.",
-		PullRequest: "https://github.com/dshnayder-org/infra/pull/280 (#280)",
+		PullRequest: "https://github.com/acme/infra/pull/280 (#280)",
 		Scope: &RecordScope{
 			Paths: []string{"clusters/**"},
 		},
@@ -304,10 +304,10 @@ spec:
 		t.Fatalf("expected 0 active records while proposed, got %d", bp.Counts.Active)
 	}
 	mockHS.mu.Lock()
-	doc004, ok := mockHS.docs["okf:dshnayder-org/infra:DEC-2026-004"]
+	doc004, ok := mockHS.docs["okf:acme/infra:DEC-2026-004"]
 	mockHS.mu.Unlock()
 	if !ok {
-		t.Fatal("expected okf:dshnayder-org/infra:DEC-2026-004 in Hindsight")
+		t.Fatal("expected okf:acme/infra:DEC-2026-004 in Hindsight")
 	}
 	if !matchesTags(doc004.Tags, []string{"scope:shared", "kind:decision", "status:proposed", "id:DEC-2026-004"}, "all_strict") {
 		t.Fatalf("unexpected tags on proposed DEC-2026-004: %v", doc004.Tags)
@@ -331,8 +331,8 @@ spec:
 		Kind:           OutcomeRefused,
 		RecordID:       "DEC-2026-004",
 		RecordType:     RecordTypeDecision,
-		Repo:           "dshnayder-org/infra",
-		PullRequest:    "https://github.com/dshnayder-org/infra/pull/280 (#280)",
+		Repo:           "acme/infra",
+		PullRequest:    "https://github.com/acme/infra/pull/280 (#280)",
 		ReviewerReason: "Rejected: EU clusters deploy on Fridays during daytime hours.",
 	})
 
@@ -340,7 +340,7 @@ spec:
 		return d.Counts.Rejected == 1 && d.Counts.Proposed == 0
 	})
 	mockHS.mu.Lock()
-	doc004After := mockHS.docs["okf:dshnayder-org/infra:DEC-2026-004"]
+	doc004After := mockHS.docs["okf:acme/infra:DEC-2026-004"]
 	mockHS.mu.Unlock()
 	if !matchesTags(doc004After.Tags, []string{"scope:shared", "kind:decision", "status:rejected", "id:DEC-2026-004"}, "all_strict") {
 		t.Fatalf("expected DEC-2026-004 to transition in-place to status:rejected, got tags %v", doc004After.Tags)
@@ -360,7 +360,7 @@ spec:
 		Kind:         OutcomeResolvedMerged,
 		RecordID:     "LES-2026-001",
 		RecordType:   RecordTypeLesson,
-		Repo:         "dshnayder-org/infra",
+		Repo:         "acme/infra",
 		Cluster:      "cluster-eu-01",
 		CheckID:      "autopilot-cpu-floor",
 		Title:        "Checkout CPU request floor on cluster-eu-01",
@@ -369,7 +369,7 @@ spec:
 		Verification: "Latency returned to baseline and finding autopilot-cpu-floor cleared.",
 		Prevention:   "Keep checkout CPU request >= 400m.",
 		Rule:         "Keep checkout CPU request >= 400m.",
-		PullRequest:  "https://github.com/dshnayder-org/infra/pull/281 (#281)",
+		PullRequest:  "https://github.com/acme/infra/pull/281 (#281)",
 		Scope: &RecordScope{
 			Paths:    []string{"clusters/**/checkout/deployment.yaml"},
 			Clusters: []string{"cluster-eu-01"},
@@ -397,7 +397,7 @@ spec:
 		Kind:         OutcomeResolvedMerged,
 		RecordID:     "LES-2026-002",
 		RecordType:   RecordTypeLesson,
-		Repo:         "dshnayder-org/infra",
+		Repo:         "acme/infra",
 		Cluster:      "cluster-us-01",
 		CheckID:      "autopilot-cpu-floor",
 		Title:        "Checkout CPU request floor on cluster-us-01",
@@ -406,7 +406,7 @@ spec:
 		Verification: "Finding autopilot-cpu-floor resolved on cluster-us-01.",
 		Prevention:   "Keep checkout CPU request >= 400m across all clusters.",
 		Rule:         "Keep checkout CPU request >= 400m.",
-		PullRequest:  "https://github.com/dshnayder-org/infra/pull/284 (#284)",
+		PullRequest:  "https://github.com/acme/infra/pull/284 (#284)",
 		Scope: &RecordScope{
 			Paths:    []string{"clusters/**/checkout/deployment.yaml"},
 			Clusters: []string{"cluster-us-01"},
@@ -477,11 +477,11 @@ spec:
 		Kind:        OutcomeApproved,
 		RecordID:    "DEC-2026-006",
 		RecordType:  RecordTypeDecision,
-		Repo:        "dshnayder-org/infra",
+		Repo:        "acme/infra",
 		Title:       "Checkout PDB minimum available replicas",
 		Summary:     "Require minAvailable >= 2 on checkout PodDisruptionBudget.",
 		Rule:        "Keep checkout PDB minAvailable >= 2.",
-		PullRequest: "https://github.com/dshnayder-org/infra/pull/290 (#290)",
+		PullRequest: "https://github.com/acme/infra/pull/290 (#290)",
 		Scope: &RecordScope{
 			Paths: []string{"clusters/**/checkout/pdb.yaml"},
 		},
@@ -522,7 +522,7 @@ spec:
 		Schema:     OutcomeSchema,
 		Kind:       OutcomeProposed,
 		RecordType: RecordTypeDecision,
-		Repo:       "dshnayder-org/infra",
+		Repo:       "acme/infra",
 		Title:      "All staging Ingress resources must include managed-certificates",
 		Summary:    "Staging Ingress resources require networking.gke.io/managed-certificates.",
 		Rule:       "All staging Ingress resources must include the networking.gke.io/managed-certificates annotation.",
@@ -534,7 +534,7 @@ spec:
 		Schema:     OutcomeSchema,
 		Kind:       OutcomeProposed,
 		RecordType: RecordTypeDecision,
-		Repo:       "dshnayder-org/infra",
+		Repo:       "acme/infra",
 		Title:      "All staging Ingress resources must include managed-certificates",
 		Summary:    "Staging Ingress resources require networking.gke.io/managed-certificates.",
 		Rule:       "All staging Ingress resources must include the networking.gke.io/managed-certificates annotation.",
@@ -550,8 +550,8 @@ spec:
 		Schema:      OutcomeSchema,
 		Kind:        OutcomeProposed,
 		RecordID:    prop1.RecordID,
-		Repo:        "dshnayder-org/infra",
-		PullRequest: "https://github.com/dshnayder-org/infra/pull/273 (#273)",
+		Repo:        "acme/infra",
+		PullRequest: "https://github.com/acme/infra/pull/273 (#273)",
 	}, "")
 	if err != nil {
 		t.Fatalf("ProcessOutcome link PR: %v", err)
@@ -567,8 +567,8 @@ spec:
 		Schema:          OutcomeSchema,
 		Kind:            OutcomeModifiedMerged,
 		RecordID:        prop1.RecordID,
-		Repo:            "dshnayder-org/infra",
-		PullRequest:     "https://github.com/dshnayder-org/infra/pull/273 (#273)",
+		Repo:            "acme/infra",
+		PullRequest:     "https://github.com/acme/infra/pull/273 (#273)",
 		Rule:            "All staging and preprod Ingress resources must include networking.gke.io/managed-certificates.",
 		ReviewerReason:  "Reviewer expanded scope from staging-only to staging and preprod before merging.",
 		InitialProposal: "All staging Ingress resources must include the networking.gke.io/managed-certificates annotation.",

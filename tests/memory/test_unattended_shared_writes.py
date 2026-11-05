@@ -108,7 +108,7 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         """
         p, retained = provider()
         r = json.loads(p.handle_tool_call("memory_retain", {
-            "content": "Dataplane V2 is off on kage-management, so NetworkPolicies are inert."
+            "content": "Dataplane V2 is off on staging-cluster-1, so NetworkPolicies are inert."
         }))
         self.assertEqual(r.get("result"), "Stored in shared memory.", r)
         self.assertEqual(retained["items"][0]["tags"], [SHARED_TAG], retained)
@@ -131,7 +131,7 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         """
         p, retained = provider(unattended=False)
         r = json.loads(p.handle_tool_call("memory_retain", {
-            "content": "Dmitry is on call for networking next week.",
+            "content": "Alice is on call for networking next week.",
         }))
         self.assertIn("error", r, r)
         self.assertEqual(r["error"], SHARED_SESSION_NOTICE, r)

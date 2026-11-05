@@ -284,10 +284,14 @@ func Slug(s string) string {
 // (proposed -> active, proposed -> rejected, active -> superseded) overwrite
 // the exact same Hindsight document via update_mode: replace.
 func (r Record) DocumentID(repoID string) string {
-	if r.Meta.ID != "" {
-		return fmt.Sprintf("%s%s:%s", DocPrefix, repoID, r.Meta.ID)
+	key := r.Meta.ID
+	if key == "" {
+		key = r.Path
 	}
-	return fmt.Sprintf("%s%s:%s", DocPrefix, repoID, r.Path)
+	if repoID == "" {
+		return fmt.Sprintf("%s%s", DocPrefix, key)
+	}
+	return fmt.Sprintf("%s%s:%s", DocPrefix, repoID, key)
 }
 
 // Tags returns the sorted Hindsight tag list for this record.

@@ -1761,7 +1761,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
 
     def test_pending_record_without_pr_files_card_for_platform_agent(self):
         pending_json = json.dumps({
-            "repo": "dshnayder-org/infra",
+            "repo": "acme/infra",
             "records": [
                 {
                     "id": "DEC-2026-010",
@@ -1777,22 +1777,22 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", return_value=_completed(pending_json)), \
-             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
              mock.patch.object(forge, "BrokerProvider") as bp_cls, \
              mock.patch.object(forge, "call", return_value={"proposals": []}):
-            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
             result = gate.sweep_memory_proposals()
 
         self.assertEqual(len(result.cards), 1)
         card = result.cards[0]
-        self.assertEqual(card.idempotency_key, "memory-pr-dshnayder-org-infra-DEC-2026-010")
+        self.assertEqual(card.idempotency_key, "memory-pr-acme-infra-DEC-2026-010")
         self.assertIn("submit_suggestion.py prepare", card.body)
         self.assertIn("platform-agent/memory/DEC-2026-010", card.body)
         self.assertIn("status: active", card.body)
 
     def test_merged_pr_emits_approved_to_curator(self):
         pending_json = json.dumps({
-            "repo": "dshnayder-org/infra",
+            "repo": "acme/infra",
             "records": [
                 {
                     "id": "DEC-2026-010",
@@ -1801,7 +1801,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "title": "Require ttl-hours annotation on preview namespaces",
                     "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
                     "branch": "platform-agent/memory/DEC-2026-010",
-                    "pull_request": "https://github.com/dshnayder-org/infra/pull/295 (#295)",
+                    "pull_request": "https://github.com/acme/infra/pull/295 (#295)",
                 }
             ],
         })
@@ -1816,7 +1816,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
-             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
              mock.patch.object(forge, "BrokerProvider") as bp_cls, \
              mock.patch.object(
                  forge,
@@ -1825,11 +1825,11 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                      "proposal": {
                          "number": 295,
                          "state": "merged",
-                         "url": "https://github.com/dshnayder-org/infra/pull/295",
+                         "url": "https://github.com/acme/infra/pull/295",
                      }
                  },
              ):
-            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
             result = gate.sweep_memory_proposals()
 
         self.assertEqual(result.cards, [])
@@ -1840,7 +1840,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
 
     def test_closed_unmerged_pr_emits_refused_with_reviewer_reason(self):
         pending_json = json.dumps({
-            "repo": "dshnayder-org/infra",
+            "repo": "acme/infra",
             "records": [
                 {
                     "id": "DEC-2026-010",
@@ -1849,7 +1849,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "title": "Require ttl-hours annotation on preview namespaces",
                     "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
                     "branch": "platform-agent/memory/DEC-2026-010",
-                    "pull_request": "https://github.com/dshnayder-org/infra/pull/295 (#295)",
+                    "pull_request": "https://github.com/acme/infra/pull/295 (#295)",
                 }
             ],
         })
@@ -1864,7 +1864,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
-             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
              mock.patch.object(forge, "BrokerProvider") as bp_cls, \
              mock.patch.object(
                  forge,
@@ -1873,14 +1873,14 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                      "proposal": {
                          "number": 295,
                          "state": "closed",
-                         "url": "https://github.com/dshnayder-org/infra/pull/295",
+                         "url": "https://github.com/acme/infra/pull/295",
                      },
                      "comments": [
                          {"author": "alice", "body": "Stateful preview namespaces cannot use automatic TTL deletion."}
                      ],
                  },
              ):
-            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
             result = gate.sweep_memory_proposals()
 
         self.assertEqual(result.cards, [])
@@ -1892,7 +1892,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
 
     def test_merged_pr_modified_by_reviewer_emits_modified_merged(self):
         pending_json = json.dumps({
-            "repo": "dshnayder-org/infra",
+            "repo": "acme/infra",
             "records": [
                 {
                     "id": "DEC-2026-011",
@@ -1901,7 +1901,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "title": "Require ttl-hours annotation on preview namespaces",
                     "path": "knowledge/decisions/DEC-2026-011-require-ttl-hours.md",
                     "branch": "platform-agent/memory/DEC-2026-011",
-                    "pull_request": "https://github.com/dshnayder-org/infra/pull/296 (#296)",
+                    "pull_request": "https://github.com/acme/infra/pull/296 (#296)",
                     "guard_rule": "require annotation preview.example.com/ttl-hours in [1..48]",
                 }
             ],
@@ -1917,7 +1917,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
-             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
              mock.patch.object(forge, "BrokerProvider") as bp_cls, \
              mock.patch.object(
                  forge,
@@ -1926,10 +1926,10 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                      "proposal": {
                          "number": 296,
                          "state": "merged",
-                         "url": "https://github.com/dshnayder-org/infra/pull/296",
+                         "url": "https://github.com/acme/infra/pull/296",
                          "edited_guard_rule": "require annotation preview.example.com/ttl-hours in [1..168]",
                          "commits": [
-                             {"author": "dshnayder"},
+                             {"author": "kage-bot"},
                              {"author": "alice"},
                          ],
                      },
@@ -1938,7 +1938,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                      ],
                  },
              ):
-            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
             result = gate.sweep_memory_proposals()
 
         self.assertEqual(result.cards, [])
@@ -1954,7 +1954,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
 
     def test_merged_lesson_pr_holds_while_soaking_then_emits_resolved_merged_after_24h(self):
         pending_json = json.dumps({
-            "repo": "dshnayder-org/infra",
+            "repo": "acme/infra",
             "records": [
                 {
                     "id": "LES-2026-012",
@@ -1963,7 +1963,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "title": "Bump memory limit to 1Gi on checkout-worker",
                     "path": "knowledge/lessons/LES-2026-012-checkout-oom.md",
                     "branch": "platform-agent/memory/LES-2026-012",
-                    "pull_request": "https://github.com/dshnayder-org/infra/pull/297 (#297)",
+                    "pull_request": "https://github.com/acme/infra/pull/297 (#297)",
                     "finding_id": "checkout/Deployment/checkout-worker:OOMKilled",
                     "soak_window": "24h",
                 }
@@ -1982,7 +1982,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 "number": 297,
                 "state": "merged",
                 "merged_at": "2026-11-01T12:00:00Z",
-                "url": "https://github.com/dshnayder-org/infra/pull/297",
+                "url": "https://github.com/acme/infra/pull/297",
                 "sync_status": "Synced",
                 "health_status": "Healthy",
             }
@@ -1995,10 +1995,10 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                  mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
                  mock.patch.object(gate, "INTERCEPTED_EVENTS_PATH", events_path), \
                  mock.patch("subprocess.run", side_effect=fake_run), \
-                 mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
                  mock.patch.object(forge, "BrokerProvider") as bp_cls, \
                  mock.patch.object(forge, "call", return_value=merged_view):
-                bp_cls.return_value.viewer_login.return_value = "dshnayder"
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
                 # At T+10m (12:10 UTC), the 24h soak is still in progress: no emit call.
                 t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
                 result_early = gate.sweep_memory_proposals(now=t_10m)
@@ -2019,7 +2019,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
 
     def test_merged_lesson_pr_emits_pr_merged_persists_when_finding_recurs_in_events(self):
         pending_json = json.dumps({
-            "repo": "dshnayder-org/infra",
+            "repo": "acme/infra",
             "records": [
                 {
                     "id": "LES-2026-013",
@@ -2028,7 +2028,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                     "title": "Bump memory limit to 512Mi on payment-worker",
                     "path": "knowledge/lessons/LES-2026-013-payment-oom.md",
                     "branch": "platform-agent/memory/LES-2026-013",
-                    "pull_request": "https://github.com/dshnayder-org/infra/pull/298 (#298)",
+                    "pull_request": "https://github.com/acme/infra/pull/298 (#298)",
                     "finding_id": "payments/Deployment/payment-worker:OOMKilled",
                     "soak_window": "24h",
                 }
@@ -2047,7 +2047,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 "number": 298,
                 "state": "merged",
                 "merged_at": "2026-11-01T12:00:00Z",
-                "url": "https://github.com/dshnayder-org/infra/pull/298",
+                "url": "https://github.com/acme/infra/pull/298",
                 "sync_status": "Synced",
                 "health_status": "Healthy",
             }
@@ -2067,10 +2067,10 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                  mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
                  mock.patch.object(gate, "INTERCEPTED_EVENTS_PATH", events_path), \
                  mock.patch("subprocess.run", side_effect=fake_run), \
-                 mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
                  mock.patch.object(forge, "BrokerProvider") as bp_cls, \
                  mock.patch.object(forge, "call", return_value=merged_view):
-                bp_cls.return_value.viewer_login.return_value = "dshnayder"
+                bp_cls.return_value.viewer_login.return_value = "kage-bot"
                 t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
                 result = gate.sweep_memory_proposals(now=t_10m)
 
@@ -2085,7 +2085,7 @@ class MemoryProposalsSweepTest(unittest.TestCase):
 
     def test_gitops_prs_disabled_skips_filing_pr_card_for_pending_record(self):
         pending_json = json.dumps({
-            "repo": "dshnayder-org/infra",
+            "repo": "acme/infra",
             "records": [
                 {
                     "id": "DEC-2026-014",
@@ -2112,10 +2112,10 @@ class MemoryProposalsSweepTest(unittest.TestCase):
         ), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
              mock.patch("subprocess.run", side_effect=fake_run), \
-             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["acme/infra"]), \
              mock.patch.object(forge, "BrokerProvider") as bp_cls, \
              mock.patch.object(forge, "call") as forge_call_mock:
-            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            bp_cls.return_value.viewer_login.return_value = "kage-bot"
             result = gate.sweep_memory_proposals()
 
         self.assertEqual(result.cards, [])

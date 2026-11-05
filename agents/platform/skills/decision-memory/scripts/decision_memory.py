@@ -134,7 +134,8 @@ class Record:
         return self.meta.get("evidence") or {}
 
     def document_id(self, repo_id: str) -> str:
-        return f"{DOC_PREFIX}{repo_id}:{self.id or self.path}"
+        key = self.id or self.path
+        return f"{DOC_PREFIX}{repo_id}:{key}" if repo_id else f"{DOC_PREFIX}{key}"
 
     def tags(self) -> List[str]:
         tags = [SHARED_TAG, f"kind:{self.type}", f"status:{self.status}", f"id:{self.id}"]
