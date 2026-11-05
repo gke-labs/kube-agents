@@ -20,12 +20,24 @@ var (
 	cmdClusterFlagRe     = regexp.MustCompile(`(?:--cluster|--context)[=\s]+['"]?([A-Za-z0-9_.:-]+)['"]?`)
 	kanbanCardIDPattern  = regexp.MustCompile(`\b(t_[A-Za-z0-9_-]{2,32})\b`)
 
-	inlineTokenValuePattern   = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
-	inlineAuthHeaderPattern   = regexp.MustCompile(`(?i)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
-	inlineURLCredPattern      = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s/]+(@)`)
-	inlineKVSecretPattern     = regexp.MustCompile(`(?:\\?["'])?([A-Za-z0-9_.-]+)(?:\\?["'])?[ \t]*[=:][ \t]*`)
-	leadingKVTokenPattern     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*[ \t]*[=:]`)
-	base64PaddingTokenPattern = regexp.MustCompile(`^[A-Za-z0-9+/]+={1,2}(?:[\s,;)\]}>]|\\?["'](?:\s|$)|$)`)
+	inlineTokenValuePattern       = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|1//[0-9A-Za-z_-]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|r8_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
+	pemPrivateKeyBlockPattern     = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----.*?-----END [A-Z0-9 _-]*PRIVATE KEY-----`)
+	pemPrivateKeyOpenPattern      = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----.*`)
+	inlineAuthHeaderPattern       = regexp.MustCompile(`(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
+	inlineAuthSchemePrefixPattern = regexp.MustCompile(`(?i)^(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|AWS4-HMAC-SHA256|Mutual|OAuth)([ \t]+)`)
+	inlineURLCredPattern          = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s/'"]+(@)`)
+	cliUserPassPattern            = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+))(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
+	cliAttachedPassPattern        = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)([^\s"';|&]+)`)
+	cliSpacedPassPattern          = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	cliLongSecretFlagPattern      = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	proseSecretPattern            = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+is\s+(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
+	inlineKVSecretPattern         = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
+	inlineExtraSecretKeyPattern   = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
+	leadingEqAssignmentPattern    = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_.-]*)=[^\s=]`)
+	allCapsEnvKeyPattern          = regexp.MustCompile(`^[A-Z_][A-Z0-9_]+$`)
+	base64PaddingTokenPattern     = regexp.MustCompile(`^[A-Za-z0-9+/_-]+={1,2}(?:[\s,;)\]}>]|\\?["'](?:\s|$)|$)`)
+	yamlSecretBlockHeaderPattern  = regexp.MustCompile(`^([ \t]*)(?:data|stringData)[ \t]*:[ \t]*(?:#.*)?$`)
+	yamlBlockEntryPattern         = regexp.MustCompile(`^([ \t]+[-A-Za-z0-9_./]+[ \t]*:[ \t]*)([^\r\n#]+?)([ \t]*(?:#.*)?)$`)
 
 	// envFlagsWithValue are flags to `env` that consume the following
 	// argument before the command name.
@@ -78,7 +90,6 @@ const (
 	detailedInputCap           = activityInputCap * 2
 	detailedStringCap          = 512
 	errorResultPreviewCap      = 240
-	okResultPreviewCap         = 200
 	sessionTimestampPrefixLen  = 15
 	sessionTimestampClockSkew  = 2 * time.Second
 	maxStepTitleBytes          = 250
@@ -921,14 +932,89 @@ func extractLeadingCommand(cmd string) (bin, sub string) {
 	return "", ""
 }
 
+func inlineSecretKey(k string) bool {
+	return secretLookingKey(k) || inlineExtraSecretKeyPattern.MatchString(k)
+}
+
 func scrubInlineSecrets(s string) string {
 	if s == "" || s == redactedValue {
 		return s
 	}
+	s = pemPrivateKeyBlockPattern.ReplaceAllString(s, redactedValue)
+	s = pemPrivateKeyOpenPattern.ReplaceAllString(s, redactedValue)
+	s = scrubYAMLSecretBlocks(s)
 	s = inlineTokenValuePattern.ReplaceAllString(s, redactedValue)
 	s = inlineAuthHeaderPattern.ReplaceAllString(s, "$1 "+redactedValue)
 	s = inlineURLCredPattern.ReplaceAllString(s, "${1}"+redactedValue+"${2}")
+	s = scrubCLISecretFlags(s)
+	s = proseSecretPattern.ReplaceAllString(s, "${1}"+redactedValue)
 	return scrubInlineKVSecrets(s)
+}
+
+func scrubCLISecretFlags(s string) string {
+	s = cliUserPassPattern.ReplaceAllString(s, "${1}${2}${3}:"+redactedValue+"${5}")
+	s = cliSpacedPassPattern.ReplaceAllStringFunc(s, func(m string) string {
+		sub := cliSpacedPassPattern.FindStringSubmatch(m)
+		if len(sub) < 3 || strings.HasPrefix(sub[2], "-") {
+			return m
+		}
+		return sub[1] + redactedValue
+	})
+	s = cliAttachedPassPattern.ReplaceAllString(s, "${1}"+redactedValue)
+	s = cliLongSecretFlagPattern.ReplaceAllStringFunc(s, func(m string) string {
+		sub := cliLongSecretFlagPattern.FindStringSubmatch(m)
+		if len(sub) < 5 || !inlineSecretKey(sub[2]) {
+			return m
+		}
+		if sub[3] != "=" && strings.HasPrefix(sub[4], "-") {
+			return m
+		}
+		return sub[1] + redactedValue
+	})
+	return s
+}
+
+func scrubYAMLSecretBlocks(s string) string {
+	if !strings.Contains(s, "data:") && !strings.Contains(s, "stringData:") {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	inSecretBlock := false
+	blockIndent := 0
+	for i, line := range lines {
+		trimmedLine := strings.TrimRight(line, "\r")
+		if m := yamlSecretBlockHeaderPattern.FindStringSubmatch(trimmedLine); m != nil {
+			inSecretBlock = true
+			blockIndent = len(m[1])
+			continue
+		}
+		if !inSecretBlock {
+			continue
+		}
+		if strings.TrimSpace(trimmedLine) == "" || strings.HasPrefix(strings.TrimSpace(trimmedLine), "#") {
+			continue
+		}
+		indent := len(trimmedLine) - len(strings.TrimLeft(trimmedLine, " \t"))
+		if indent <= blockIndent {
+			inSecretBlock = false
+			if m := yamlSecretBlockHeaderPattern.FindStringSubmatch(trimmedLine); m != nil {
+				inSecretBlock = true
+				blockIndent = len(m[1])
+			}
+			continue
+		}
+		if em := yamlBlockEntryPattern.FindStringSubmatch(trimmedLine); em != nil {
+			val := strings.TrimSpace(em[2])
+			if val != "" && val != "{}" && val != "[]" && val != "|" && val != ">" && val != "|-" && val != ">-" {
+				cr := ""
+				if strings.HasSuffix(line, "\r") {
+					cr = "\r"
+				}
+				lines[i] = em[1] + redactedValue + em[3] + cr
+			}
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func scrubInlineKVSecrets(s string) string {
@@ -940,9 +1026,15 @@ func scrubInlineKVSecrets(s string) string {
 			sb.WriteString(s[pos:])
 			break
 		}
+		matchStart := pos + loc[0]
 		matchEnd := pos + loc[1]
-		key := s[pos+loc[2] : pos+loc[3]]
-		if !secretLookingKey(key) {
+		openQuote := s[pos+loc[2] : pos+loc[3]]
+		key := s[pos+loc[4] : pos+loc[5]]
+		closeQuote := s[pos+loc[6] : pos+loc[7]]
+		sep := s[pos+loc[10]]
+		hadPreSepSpace := loc[10] > loc[8]
+		hadPostSepSpace := loc[9] > loc[11]
+		if !inlineSecretKey(key) {
 			sb.WriteString(s[pos:matchEnd])
 			pos = matchEnd
 			continue
@@ -953,10 +1045,27 @@ func scrubInlineKVSecrets(s string) string {
 			pos = matchEnd
 			continue
 		}
-		hadPostSepSpace := matchEnd > 0 && (s[matchEnd-1] == ' ' || s[matchEnd-1] == '\t')
-		if hadPostSepSpace && isFollowingKVAssignment(rest) {
+		if sep == '=' && !hadPreSepSpace && hadPostSepSpace && isFollowingKVAssignment(rest) {
 			pos = matchEnd
 			continue
+		}
+		if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(rest); sloc != nil {
+			sb.WriteString(rest[:sloc[1]])
+			matchEnd += sloc[1]
+			rest = rest[sloc[1]:]
+		}
+		if openQuote != "" && closeQuote == "" && sep == ':' && !strings.HasPrefix(rest, `"`) && !strings.HasPrefix(rest, `'`) && !strings.HasPrefix(rest, `\"`) && !strings.HasPrefix(rest, `\'`) {
+			var closeIdx int
+			if len(openQuote) == 2 {
+				closeIdx = findUnescapedEscapedQuote(rest, openQuote[1])
+			} else {
+				closeIdx = findUnescapedQuote(rest, openQuote[0])
+			}
+			if closeIdx >= 0 {
+				sb.WriteString(redactedValue)
+				pos = matchEnd + closeIdx
+				continue
+			}
 		}
 		switch {
 		case strings.HasPrefix(rest, `\"`), strings.HasPrefix(rest, `\'`):
@@ -977,7 +1086,11 @@ func scrubInlineKVSecrets(s string) string {
 			q := rest[0]
 			afterOpen := rest[1:]
 			if closeIdx := findUnescapedQuote(afterOpen, q); closeIdx >= 0 {
+				inner := afterOpen[:closeIdx]
 				sb.WriteByte(q)
+				if sloc := inlineAuthSchemePrefixPattern.FindStringSubmatchIndex(inner); sloc != nil {
+					sb.WriteString(inner[:sloc[1]])
+				}
 				sb.WriteString(redactedValue)
 				sb.WriteByte(q)
 				pos = matchEnd + 1 + closeIdx + 1
@@ -994,13 +1107,28 @@ func scrubInlineKVSecrets(s string) string {
 			sb.WriteString(redactedValue)
 			pos = matchEnd + len(redactedValue)
 		default:
+			if sep == ':' && openQuote == "" && closeQuote == "" && isLineLeadingKVKey(s, matchStart) {
+				lineEnd := len(rest)
+				if nl := strings.IndexAny(rest, "\r\n"); nl >= 0 {
+					lineEnd = nl
+				}
+				lineRest := strings.TrimRight(rest[:lineEnd], " \t")
+				if lineRest != "" && !strings.ContainsAny(lineRest, "{};") && !hasLaterInlineKVAssignment(lineRest) {
+					sb.WriteString(redactedValue)
+					pos = matchEnd + len(lineRest)
+					continue
+				}
+			}
 			valLen := 0
 			for valLen < len(rest) {
 				if strings.HasPrefix(rest[valLen:], `\"`) || strings.HasPrefix(rest[valLen:], `\'`) {
 					break
 				}
 				c := rest[valLen]
-				if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"' || c == '\'' || c == ',' || c == ';' || c == ')' || c == '}' || c == ']' || c == '>' {
+				if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"' || c == '\'' || c == ',' || c == ')' || c == '}' || c == ']' || c == '>' {
+					break
+				}
+				if c == ';' && (sep == '=' || valLen+1 >= len(rest) || rest[valLen+1] == ' ' || rest[valLen+1] == '\t') {
 					break
 				}
 				valLen++
@@ -1016,15 +1144,37 @@ func scrubInlineKVSecrets(s string) string {
 	return sb.String()
 }
 
+func isLineLeadingKVKey(s string, matchStart int) bool {
+	lineStart := 0
+	if nl := strings.LastIndexByte(s[:matchStart], '\n'); nl >= 0 {
+		lineStart = nl + 1
+	}
+	prefix := strings.TrimLeft(s[lineStart:matchStart], " \t")
+	return prefix == "" || prefix == "-"
+}
+
+func hasLaterInlineKVAssignment(lineRest string) bool {
+	ws := strings.IndexAny(lineRest, " \t")
+	if ws < 0 {
+		return false
+	}
+	afterFirstToken := strings.TrimLeft(lineRest[ws:], " \t")
+	if loc := inlineKVSecretPattern.FindStringSubmatchIndex(afterFirstToken); loc != nil {
+		return inlineSecretKey(afterFirstToken[loc[4]:loc[5]])
+	}
+	return false
+}
+
 func isFollowingKVAssignment(rest string) bool {
-	loc := leadingKVTokenPattern.FindStringIndex(rest)
-	if loc == nil {
+	if base64PaddingTokenPattern.MatchString(rest) {
 		return false
 	}
-	if rest[loc[1]-1] == ':' && strings.HasPrefix(rest[loc[1]:], "//") {
+	m := leadingEqAssignmentPattern.FindStringSubmatch(rest)
+	if len(m) < 2 {
 		return false
 	}
-	return !base64PaddingTokenPattern.MatchString(rest)
+	candKey := m[1]
+	return inlineSecretKey(candKey) || allCapsEnvKeyPattern.MatchString(candKey)
 }
 
 func findUnescapedQuote(s string, q byte) int {
@@ -1056,6 +1206,31 @@ func findUnescapedEscapedQuote(s string, q byte) int {
 	return -1
 }
 
+func redactKeysDetailed(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		if nameVal, ok := t["name"].(string); ok && inlineSecretKey(nameVal) {
+			if _, hasVal := t["value"]; hasVal {
+				t["value"] = redactedValue
+			}
+		}
+		for k, val := range t {
+			if inlineSecretKey(k) {
+				t[k] = redactedValue
+			} else {
+				t[k] = redactKeysDetailed(val)
+			}
+		}
+		return t
+	case []any:
+		for i := range t {
+			t[i] = redactKeysDetailed(t[i])
+		}
+		return t
+	}
+	return v
+}
+
 func redactInputDetailed(tool string, raw json.RawMessage) json.RawMessage {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
@@ -1067,7 +1242,7 @@ func redactInputDetailed(tool string, raw json.RawMessage) json.RawMessage {
 	if err := dec.Decode(&v); err != nil {
 		return json.RawMessage(unparseableInput)
 	}
-	red := scrubValueDetailed(redactKeys(v))
+	red := scrubValueDetailed(redactKeysDetailed(v))
 	out, err := json.Marshal(red)
 	if err != nil {
 		return json.RawMessage(unparseableInput)
@@ -1140,7 +1315,7 @@ func summarizeToolResult(toolName, status, rawErrMsg string, rawResult json.RawM
 			createdCardID = cid
 		}
 		if rawErrMsg == "" {
-			rawErrMsg = extractArgStr(m, "error", "error_message", "stderr", "message")
+			rawErrMsg = scrubInlineSecrets(extractArgStr(m, "error", "error_message", "stderr", "message"))
 		}
 	}
 	if createdCardID == "" && toolName == kanbanCreateTool && trimmed != "" {
@@ -1156,11 +1331,10 @@ func summarizeToolResult(toolName, status, rawErrMsg string, rawResult json.RawM
 		return rawErrMsg, rawErrMsg, createdCardID
 	}
 
+	// Only surface the created Kanban card ID on non-error tool calls; arbitrary
+	// tool outputs (e.g. a bare base64-decoded secret value) are never placed on TASKS.
 	if toolName == kanbanCreateTool && createdCardID != "" {
 		return "card_id=" + createdCardID, "", createdCardID
-	}
-	if s := extractResultText(decoded, trimmed); s != "" {
-		return oneLinePreview(scrubInlineSecrets(s), okResultPreviewCap), "", createdCardID
 	}
 	return "", "", createdCardID
 }
@@ -1175,11 +1349,11 @@ func extractResultText(decoded any, fallbackRaw string) string {
 				return strings.TrimSpace(v)
 			}
 		}
-		if b, err := json.Marshal(scrubValueDetailed(redactKeys(t))); err == nil {
+		if b, err := json.Marshal(scrubValueDetailed(redactKeysDetailed(t))); err == nil {
 			return string(b)
 		}
 	case []any:
-		if b, err := json.Marshal(scrubValueDetailed(redactKeys(t))); err == nil {
+		if b, err := json.Marshal(scrubValueDetailed(redactKeysDetailed(t))); err == nil {
 			return string(b)
 		}
 	}

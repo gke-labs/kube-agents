@@ -75,6 +75,7 @@ type ActivityItem struct {
 // StepDetail holds the enriched view of a single agent step, pairing its
 // stepmsg.Step metadata with its thought and associated tool activities.
 type StepDetail struct {
+	StepKey    string
 	Step       stepmsg.Step
 	Agent      string
 	Thought    string
@@ -100,6 +101,7 @@ type TurnStepOutcome struct {
 	ByToken           bool
 	Notices           []string
 	StepDetails       []StepDetail
+	NewStepDetails    []StepDetail
 	TotalActivities   int
 	PrevReportedSteps int
 	LastReportedSteps int
@@ -226,6 +228,7 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 
 	for i, s := range steps {
 		details[i] = StepDetail{
+			StepKey: fmt.Sprintf("%s#step:%d", ref, i),
 			Step:    s,
 			Agent:   agentDefault,
 			Thought: strings.TrimSpace(s.Thought),
@@ -241,10 +244,14 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 	}
 
 	// Pair activities to steps by CallID/StepID first, then by order among eligible ID-less plan steps.
-	unmatchedActs := make([]ActivityItem, 0, len(activities))
-	for _, act := range activities {
+	type indexedActivity struct {
+		idx int
+		act ActivityItem
+	}
+	unmatchedActs := make([]indexedActivity, 0, len(activities))
+	for actIdx, act := range activities {
 		if isTruncatedActivityMarker(act) {
-			unmatchedActs = append(unmatchedActs, act)
+			unmatchedActs = append(unmatchedActs, indexedActivity{idx: actIdx, act: act})
 			continue
 		}
 		matched := false
@@ -264,12 +271,13 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 			}
 		}
 		if !matched {
-			unmatchedActs = append(unmatchedActs, act)
+			unmatchedActs = append(unmatchedActs, indexedActivity{idx: actIdx, act: act})
 		}
 	}
 
 	if len(unmatchedActs) > 0 && len(steps) > 0 {
-		for _, act := range unmatchedActs {
+		for _, ua := range unmatchedActs {
+			act := ua.act
 			if isTruncatedActivityMarker(act) {
 				attached := false
 				for i := len(details) - 1; i >= 0; i-- {
@@ -280,7 +288,9 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 					}
 				}
 				if !attached {
-					details = append(details, synthesizeActivityStepDetail(act, "", agentDefault))
+					d := synthesizeActivityStepDetail(act, "", agentDefault)
+					d.StepKey = fmt.Sprintf("%s#act:%d:%s", ref, ua.idx, act.CallID)
+					details = append(details, d)
 				}
 				continue
 			}
@@ -302,7 +312,9 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 					continue
 				}
 			}
-			details = append(details, synthesizeActivityStepDetail(act, "", agentDefault))
+			d := synthesizeActivityStepDetail(act, "", agentDefault)
+			d.StepKey = fmt.Sprintf("%s#act:%d:%s", ref, ua.idx, act.CallID)
+			details = append(details, d)
 		}
 	}
 
@@ -331,27 +343,28 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 
 	// Synthesize steps from raw activities/thinking if the agent emitted no step artifacts.
 	if len(details) == 0 && (len(activities) > 0 || len(thinking) > 0) {
-		if len(activities) > 0 {
-			for i, act := range activities {
-				thought := ""
-				if i < len(thinking) {
-					thought = thinking[i]
-				}
-				details = append(details, synthesizeActivityStepDetail(act, thought, agentDefault))
+		for i, act := range activities {
+			thought := ""
+			if i < len(thinking) {
+				thought = thinking[i]
 			}
-		} else {
-			for _, th := range thinking {
-				details = append(details, StepDetail{
-					Step: stepmsg.Step{
-						Schema:  stepmsg.Schema,
-						Kind:    stepmsg.KindPlan,
-						Title:   summarizeThoughtTitle(th),
-						Thought: th,
-					},
-					Agent:   agentDefault,
+			d := synthesizeActivityStepDetail(act, thought, agentDefault)
+			d.StepKey = fmt.Sprintf("%s#act:%d:%s", ref, i, act.CallID)
+			details = append(details, d)
+		}
+		for i := len(activities); i < len(thinking); i++ {
+			th := thinking[i]
+			details = append(details, StepDetail{
+				StepKey: fmt.Sprintf("%s#thought:%d", ref, i),
+				Step: stepmsg.Step{
+					Schema:  stepmsg.Schema,
+					Kind:    stepmsg.KindPlan,
+					Title:   summarizeThoughtTitle(th),
 					Thought: th,
-				})
-			}
+				},
+				Agent:   agentDefault,
+				Thought: th,
+			})
 		}
 	}
 
@@ -813,7 +826,13 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 	}
 
 	var newDetails []StepDetail
-	if lastSteps > prevSteps {
+	if stepOut.NewStepDetails != nil {
+		newDetails = make([]StepDetail, len(stepOut.NewStepDetails))
+		for i, d := range stepOut.NewStepDetails {
+			d.Agent = canonicalStepAgent(d.Agent, stepOut.Alias)
+			newDetails[i] = d
+		}
+	} else if lastSteps > prevSteps {
 		newDetails = details[prevSteps:lastSteps]
 	}
 

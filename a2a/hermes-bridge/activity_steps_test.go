@@ -491,6 +491,30 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 			forbidden: []string{"c2VjcmV0==", "https://hooks.example.com/T00/B00/X00", "T00/B00/X00", "abc=def"},
 			wantSub:   []string{`password="[redacted]"`, `{"password": "[redacted]"}`, `webhook_secret="[redacted]"`, `password: [redacted]`, `password=[redacted]`},
 		},
+		{
+			name:      "unquoted colon values with equals or colons (url-safe base64, user:pass, v1=, connstring)",
+			in:        `password: c2Vj_cmV0= and password: user:secret and webhook_secret: v1=9f3c2a1b and connection_secret: host=10.0.0.1;pass=secret`,
+			forbidden: []string{"c2Vj_cmV0", "user:secret", "9f3c2a1b", "host=10.0.0.1", "pass=secret"},
+			wantSub:   []string{"password: [redacted] and password: [redacted] and webhook_secret: [redacted] and connection_secret: [redacted]"},
+		},
+		{
+			name:      "cli short and long secret flags and user:pass",
+			in:        `mysql -u root -psupersecret1 && mysql -u root -p supersecret2 && redis-cli -a redispass9 && curl -u admin:curlpass9 https://api.internal && docker login --docker-password dockpass9 && kubectl --token=k8stok9 get pods`,
+			forbidden: []string{"supersecret1", "supersecret2", "redispass9", "curlpass9", "dockpass9", "k8stok9"},
+			wantSub:   []string{"-p[redacted]", "-p [redacted]", "-a [redacted]", "-u admin:[redacted]", "--docker-password [redacted]", "--token=[redacted]"},
+		},
+		{
+			name:      "non-bearer authorization headers and schemes",
+			in:        `curl -H "Authorization: Token tok_secret_99" -H "Authorization: Digest username=admin, response=9f3c2a" -H "Authorization: ApiKey key_secret_88" && Authorization: Token bare_tok_77`,
+			forbidden: []string{"tok_secret_99", "9f3c2a", "key_secret_88", "bare_tok_77"},
+			wantSub:   []string{`"Authorization: Token [redacted]"`, `"Authorization: Digest [redacted]"`, `"Authorization: ApiKey [redacted]"`, `Authorization: Token [redacted]`},
+		},
+		{
+			name:      "pem private key blocks, oauth refresh tokens, prose secrets, and yaml data blocks",
+			in:        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA7\n-----END RSA PRIVATE KEY-----\nrefresh=1//0gABCDEF0123456789abcdefXYZ\nThe password is hunter299.\nDB_PASSWORD: my secret phrase\ndata:\n  tls.key: LS0tLS1CRUdJTi\n  custom_entry: YmFyBaz123",
+			forbidden: []string{"MIIEpAIBAAKCAQEA7", "1//0gABCDEF", "hunter299", "my secret phrase", "LS0tLS1CRUdJTi", "YmFyBaz123"},
+			wantSub:   []string{"[redacted]", "The password is [redacted].", "DB_PASSWORD: [redacted]", "  tls.key: [redacted]", "  custom_entry: [redacted]"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -559,6 +583,9 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 	entry, ok, _, _ := a.observeWithThinking(postDel)
 	if !ok {
 		t.Fatal("expected post_tool_call entry")
+	}
+	if entry.ResultPreview != "" {
+		t.Fatalf("expected non-kanban tool ResultPreview to be empty on TASKS, got %q", entry.ResultPreview)
 	}
 	rawEntry, _ := json.Marshal(entry)
 	for _, leaked := range []string{"my-db-pass", "two words", "super-secret-value", "redispass"} {
@@ -680,6 +707,30 @@ func TestMatchWorkerDeliveryRun_IgnoresUnrelatedBackgroundSession(t *testing.T) 
 	}
 	if got := matchWorkerDeliveryRun(runs, unrelated); got != nil {
 		t.Fatalf("unrelated background session matched waiting run: %+v", got)
+	}
+
+	// A worker delivery naming another session's card (not owned by a.hasCardID) is dropped.
+	otherSessionCard := hookDelivery{
+		Event:     hookPreToolCall,
+		SessionID: "20990101_120000_otherworker",
+		Cwd:       "/var/lib/hermes/kanban/workspaces/t_card99_other/repo",
+		ToolName:  "kanban_comment",
+		ToolInput: json.RawMessage(`{"card_id":"t_card99_other","comment":"done"}`),
+	}
+	if got := matchWorkerDeliveryRun(runs, otherSessionCard); got != nil {
+		t.Fatalf("worker delivery for another session's card matched waiting run: %+v", got)
+	}
+
+	// A delivery from another coordinator session (a2a-*) is dropped even if its Cwd or args name t_card42.
+	otherCoordinator := hookDelivery{
+		Event:     hookPreToolCall,
+		SessionID: "a2a-other-conversation",
+		Cwd:       "/var/lib/hermes/kanban/workspaces/t_card42/repo",
+		ToolName:  "kanban_get",
+		ToolInput: json.RawMessage(`{"card_id":"t_card42"}`),
+	}
+	if got := matchWorkerDeliveryRun(runs, otherCoordinator); got != nil {
+		t.Fatalf("other coordinator a2a-* session matched waiting run via matchWorkerDeliveryRun: %+v", got)
 	}
 
 	// A delivery carrying the card's workspace in Cwd matches and claims the worker session.
@@ -874,5 +925,3 @@ func TestWorkerHooks_DoNotMutateCoordinatorStepsOrCardsFiled(t *testing.T) {
 		t.Fatalf("worker post_tool_call incremented coordinator turnCalls = %d, want 0", a.turnCalls)
 	}
 }
-
-

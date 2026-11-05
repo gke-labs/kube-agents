@@ -426,12 +426,12 @@ type heldDelivery struct {
 	disposed bool // a disposition reached the connection
 }
 
-func (d *heldDelivery) Envelope() *Envelope { return d.env }
-func (d *heldDelivery) Subject() string     { return d.subject }
-func (d *heldDelivery) Received() time.Time { return d.received }
+func (d *heldDelivery) Envelope() *Envelope  { return d.env }
+func (d *heldDelivery) Subject() string      { return d.subject }
+func (d *heldDelivery) Received() time.Time  { return d.received }
 func (d *heldDelivery) NumDelivered() uint64 { return d.delivered }
-func (d *heldDelivery) Ack() error  { return d.dispose([]byte("+ACK")) }
-func (d *heldDelivery) Term() error { return d.dispose([]byte("+TERM")) }
+func (d *heldDelivery) Ack() error           { return d.dispose([]byte("+ACK")) }
+func (d *heldDelivery) Term() error          { return d.dispose([]byte("+TERM")) }
 func (d *heldDelivery) Nak(delay time.Duration) error {
 	if delay <= 0 {
 		return d.dispose([]byte("-NAK"))

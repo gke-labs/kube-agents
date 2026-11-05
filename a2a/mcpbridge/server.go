@@ -374,7 +374,7 @@ func (g *gatewayBridgeSession) callRemoteTool(
 		_ = json.Unmarshal(rawArgs, &argsAny)
 	}
 	// Only the called conversation's entry goes upstream, never the rest of the local table
-	// (the in-cluster server reads nothing from _meta today).
+	// (the in-cluster server reads _meta.conversation_id to auto-enable step streaming).
 	metaMap := map[string]any{}
 	if alias := calledConversation(argsAny); alias != "" {
 		if entry, ok := snap.Conversations[alias]; ok {
@@ -397,7 +397,7 @@ func (g *gatewayBridgeSession) callRemoteTool(
 	} else if onProgress != nil {
 		metaMap["progressToken"] = "bridge-progress"
 	}
-	if (meta.ConversationID != "" || meta.ProgressToken != nil) && (toolName == ToolSendMessage || toolName == ToolTaskControl) {
+	if meta.ConversationID != "" && (toolName == ToolSendMessage || toolName == ToolTaskControl) {
 		if m, ok := argsAny.(map[string]any); ok {
 			if _, has := m["stream_steps"]; !has {
 				m["stream_steps"] = true

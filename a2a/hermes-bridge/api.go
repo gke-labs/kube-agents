@@ -447,7 +447,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		if !ok {
 			return
 		}
-		if waitKanbanInTurn && (act.cardsFiled.Load() || carriedCards || (!run.canceled.Load() && taskCtx.Err() == nil)) {
+		if waitKanbanInTurn {
 			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
 			if !ok {
 				return

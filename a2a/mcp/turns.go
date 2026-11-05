@@ -92,6 +92,7 @@ const (
 	delegationSettleGrace = 400 * time.Millisecond
 	delegationFollowGrace = 2 * time.Second
 	reportGatherBudget    = 5 * time.Second
+	stepWatchIdleRelease  = 2 * time.Second
 )
 
 // ConsoleInFrame is what the console door reads (gateway.ConsoleInFrame).
@@ -610,6 +611,8 @@ type taskStepState struct {
 	followEmptySince     time.Time
 	settledDelegationsAt time.Time
 	settledFollowedCount int
+	followedRefs         []TaskRef
+	seenStepKeys         map[string]bool
 	watch                *turnWatch
 	watchTimer           *time.Timer
 	taskWatches          map[TaskRef]*taskWatch
@@ -622,14 +625,21 @@ func (s *taskStepState) isUnsubmittedRootLocked(ref TaskRef) bool {
 	return ref == s.ref && s.watch == nil && s.lastReportedSteps == 0 && s.lastReportedActs == 0 && s.finalTasks[ref] == nil && s.failedTasks[ref] == nil
 }
 
+func (s *taskStepState) syncFollowedTasksLocked() []TaskRef {
+	if s.watch != nil {
+		for _, ref := range s.watch.followedTasks() {
+			if ref.TaskID != "" && !slices.Contains(s.followedRefs, ref) {
+				s.followedRefs = append(s.followedRefs, ref)
+			}
+		}
+	}
+	return slices.Clone(s.followedRefs)
+}
+
 func (s *taskStepState) followedTasks() []TaskRef {
 	s.mu.Lock()
-	w := s.watch
-	s.mu.Unlock()
-	if w == nil {
-		return nil
-	}
-	return w.followedTasks()
+	defer s.mu.Unlock()
+	return s.syncFollowedTasksLocked()
 }
 
 func (s *taskStepState) hasFollowedTaskID(wantIDs map[string]bool) bool {
@@ -668,8 +678,15 @@ func (s *taskStepState) closeTaskWatchesLocked() {
 	}
 }
 
+func (s *taskStepState) closeTaskWatches() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeTaskWatchesLocked()
+}
+
 func (s *taskStepState) closeAllLocked() {
 	s.active.Store(false)
+	s.syncFollowedTasksLocked()
 	s.closeTaskWatchesLocked()
 	if s.watchTimer != nil {
 		s.watchTimer.Stop()
@@ -982,11 +999,7 @@ func (c *Conversations) activeStepFollowedTasks(token string, ref TaskRef) []Tas
 	var out []TaskRef
 	for _, st := range candidates {
 		st.mu.Lock()
-		w := st.watch
-		var followed []TaskRef
-		if w != nil {
-			followed = w.followedTasks()
-		}
+		followed := st.syncFollowedTasksLocked()
 		matched := directMatch[st]
 		if !matched && len(wantRef) > 0 {
 			for _, f := range followed {
@@ -997,6 +1010,7 @@ func (c *Conversations) activeStepFollowedTasks(token string, ref TaskRef) []Tas
 			}
 		}
 		if matched {
+			st.closeTaskWatchesLocked()
 			for _, f := range followed {
 				if f.TaskID == "" || seenRef[f.TaskID] {
 					continue
@@ -1735,13 +1749,13 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	st := convs.getOrCreateTaskStepState(root, w)
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	// Always release JetStream task reader slots before returning so idle or
-	// between-poll turns hold zero maxTaskReaders slots.
-	defer st.closeTaskWatchesLocked()
 
 	if st.idleTimer != nil {
 		st.idleTimer.Stop()
 		st.idleTimer = nil
+	}
+	if st.watch != nil && st.watchTimer != nil {
+		st.watchTimer.Reset(MaxTurnWait)
 	}
 
 	window := nextStepWaitWindow
@@ -1779,16 +1793,19 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 				if unsubmittedRoot {
 					convs.deleteTaskStepState(root, st)
 				}
+			} else {
+				st.idleTimer = time.AfterFunc(stepWatchIdleRelease, st.closeTaskWatches)
 			}
 			return TurnStepOutcome{}, err
 		}
 		details, totalActs = CollectTurnStepDetails(out)
+		unseen := unseenStepDetails(details, st.seenStepKeys)
 
-		if len(details) > prevSteps {
+		if len(unseen) > 0 {
 			if firstNewStepAt.IsZero() {
 				firstNewStepAt = time.Now()
 			}
-			latestStep := details[len(details)-1]
+			latestStep := unseen[len(unseen)-1]
 			stepReady := stepReadyForDisplay(latestStep)
 			if chainSettled {
 				break
@@ -1816,18 +1833,24 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		}
 	}
 
-	nextSteps := prevSteps
-	if chainSettled || len(details) > prevSteps {
+	newDetails := unseenStepDetails(details, st.seenStepKeys)
+	if newDetails == nil {
+		newDetails = []StepDetail{}
+	}
+	if st.seenStepKeys == nil {
+		st.seenStepKeys = map[string]bool{}
+	}
+	for _, d := range newDetails {
+		if d.StepKey != "" {
+			st.seenStepKeys[d.StepKey] = true
+		}
+	}
+
+	nextSteps := prevSteps + len(newDetails)
+	if chainSettled && len(details) > nextSteps {
 		nextSteps = len(details)
 	}
 	nextActs := totalActs
-	if nextSteps < len(details) {
-		actsUpToNext := 0
-		for i := 0; i < nextSteps; i++ {
-			actsUpToNext += len(details[i].Activities)
-		}
-		nextActs = actsUpToNext
-	}
 
 	stillRunning := !chainSettled
 	elapsed := time.Since(st.startedAt)
@@ -1836,7 +1859,7 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	}
 
 	waitTitle := ""
-	if stillRunning && nextSteps == prevSteps {
+	if stillRunning && len(newDetails) == 0 {
 		waitTitle = synthesizeWaitStepTitle(out, details, elapsed, st.lastWaitStepTitle)
 		st.lastWaitStepTitle = waitTitle
 	}
@@ -1867,11 +1890,16 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		}
 		st.closeAllLocked()
 		convs.removeTaskStepState(st)
-	} else if st.token != "" {
-		if unf := out.Unfinished(); unf != nil {
-			convs.setRunning(st.token, unf)
-		} else {
-			convs.setRunning(st.token, &st.ref)
+	} else {
+		if len(st.taskWatches) > 0 {
+			st.idleTimer = time.AfterFunc(stepWatchIdleRelease, st.closeTaskWatches)
+		}
+		if st.token != "" {
+			if unf := out.Unfinished(); unf != nil {
+				convs.setRunning(st.token, unf)
+			} else {
+				convs.setRunning(st.token, &st.ref)
+			}
 		}
 	}
 
@@ -1882,6 +1910,7 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		ByToken:           st.byToken,
 		Notices:           notices,
 		StepDetails:       details,
+		NewStepDetails:    newDetails,
 		TotalActivities:   totalActs,
 		PrevReportedSteps: prevSteps,
 		LastReportedSteps: nextSteps,
@@ -1891,6 +1920,17 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		StillRunning:      stillRunning,
 		WaitStepTitle:     waitTitle,
 	}, nil
+}
+
+func unseenStepDetails(details []StepDetail, seen map[string]bool) []StepDetail {
+	var out []StepDetail
+	for _, d := range details {
+		if d.StepKey != "" && seen[d.StepKey] {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 func stepReadyForDisplay(d StepDetail) bool {
@@ -1915,13 +1955,16 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 	if t == nil || !t.Final {
 		return out, false, waitedRoot, nil
 	}
-	if !delegated(t) || st.watch == nil {
+	if !delegated(t) {
 		return out, true, waitedRoot, nil
 	}
 
 	waitedAny := waitedRoot
-	followedRefs := st.watch.followedTasks()
+	followedRefs := st.syncFollowedTasksLocked()
 	if len(followedRefs) == 0 {
+		if st.watch == nil {
+			return out, true, waitedAny, nil
+		}
 		if st.followEmptySince.IsZero() {
 			st.followEmptySince = time.Now()
 		}

@@ -123,9 +123,11 @@ for r in rows:
         ev = conn.execute("SELECT id, kind, COALESCE(payload, '') AS payload FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'gave_up') ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
         if ev:
             ev_kind = (ev["kind"] or "").strip().lower()
-            if ev_kind == "gave_up" and (item.get("status") or "").strip().lower() == "blocked":
+            eff_status = (item.get("status") or "").strip().lower()
+            if ev_kind == "gave_up" and eff_status == "blocked":
                 item["status"] = "gave_up"
-            if ev_kind in ("blocked", "gave_up"):
+                eff_status = "gave_up"
+            if ev_kind in ("blocked", "gave_up") and eff_status in ("blocked", "gave_up"):
                 if ev["payload"]:
                     item["block_payload"] = ev["payload"]
                 if ev["id"] is not None:
@@ -673,6 +675,19 @@ func inferKanbanCardVerdict(c kanbanCardRow) string {
 }
 
 func formatKanbanCardOutput(c kanbanCardRow) string {
+	if isKanbanStatusBlocked(c.Status) {
+		if bp := strings.TrimSpace(c.BlockPayload); bp != "" {
+			var parsed map[string]any
+			if json.Unmarshal([]byte(bp), &parsed) == nil {
+				for _, k := range []string{"question", "reason", "message", "summary", "error"} {
+					if v, ok := parsed[k].(string); ok && strings.TrimSpace(v) != "" {
+						return strings.TrimSpace(v)
+					}
+				}
+			}
+			return bp
+		}
+	}
 	if res := strings.TrimSpace(c.Result); res != "" {
 		return res
 	}
@@ -692,9 +707,6 @@ func formatKanbanCardOutput(c kanbanCardRow) string {
 			if errText := strings.TrimSpace(c.Err); errText != "" {
 				return errText
 			}
-		}
-		if isKanbanStatusBlocked(c.Status) {
-			return bp
 		}
 	}
 	return strings.TrimSpace(c.Err)

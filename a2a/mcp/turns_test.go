@@ -1496,3 +1496,168 @@ func TestWaitForTurnStepPersistsDelegationSettleAcrossShortPolls(t *testing.T) {
 		t.Fatal("delegated turn never settled across short-window WaitForTurnStep polls")
 	}
 }
+
+func TestWaitForTurnStepReusesTaskWatchAcrossPollsWithReapDelay(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	rootID := "task-reuse-watch-root"
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		publishSubmission(t, js, fakeAddressee, rootID, conv, f.Text, "")
+		publishRun(t, js, fakeAddressee, rootID, "", false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	var created atomic.Int32
+	sub, err := js.Conn().Subscribe("$JS.API.CONSUMER.CREATE.>", func(m *nats.Msg) {
+		if strings.Contains(string(m.Data), rootID) {
+			created.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	b := dial(t, url)
+	// Use the production 5s reapDelay so releasing a reader on every poll would
+	// exhaust maxTaskReaders (8) before 12 polls complete.
+	b.reapDelay = taskConsumerIdle
+	convs := NewConversations().WithEvents(b.Events())
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, w, err := b.SendTurn(t.Context(), convs, token, "long streaming turn", 5*time.Second)
+	if err != nil || res.Task == nil {
+		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+	}
+	convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+
+	// Poll 12 times (> maxTaskReaders = 8) while the task is still running.
+	for i := 0; i < 12; i++ {
+		stepOut, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 60*time.Millisecond)
+		if err != nil {
+			t.Fatalf("WaitForTurnStep poll %d failed: %v", i+1, err)
+		}
+		if !stepOut.StillRunning {
+			t.Fatalf("WaitForTurnStep poll %d unexpectedly finished early", i+1)
+		}
+	}
+
+	publishResult(t, js, fakeAddressee, rootID, answerText)
+	publishStatus(t, js, fakeAddressee, rootID, lib.StateCompleted, true)
+
+	stepOut, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 2*time.Second)
+	if err != nil {
+		t.Fatalf("final WaitForTurnStep failed: %v", err)
+	}
+	if stepOut.StillRunning {
+		t.Fatal("expected turn to finish after completed status")
+	}
+	if n := created.Load(); n != 1 {
+		t.Errorf("created %d JetStream consumers across 13 polls, want 1", n)
+	}
+}
+
+func TestWaitForTurnStepFollowsDelegatedChildAfterTurnWatchCloses(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	rootID := "task-long-deleg-root"
+	childID := "task-long-deleg-child"
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		publishSubmission(t, js, fakeAddressee, rootID, conv, f.Text, "")
+		publishRun(t, js, fakeAddressee, rootID, "", false)
+		publishArtifact(t, js, fakeAddressee, rootID, lib.ArtifactDelegate, "cluster-a: inspect")
+		publishStatus(t, js, fakeAddressee, rootID, lib.StateCompleted, true)
+		publishSubmission(t, js, "cluster-a", childID, conv, "inspect", rootID)
+		publishRun(t, js, "cluster-a", childID, "", false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate long child", 5*time.Second)
+	if err != nil || res.Task == nil {
+		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+	}
+	st := convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+
+	// Poll 1 discovers the running child task.
+	stepOut1, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 200*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitForTurnStep 1: %v", err)
+	}
+	if !stepOut1.StillRunning {
+		t.Fatal("expected delegated turn to still be running while child is working")
+	}
+
+	// Simulate watchTimer expiring (st.closeAll) while child is still running.
+	st.closeAll()
+
+	// Next poll must still see the unfinished child via persisted st.followedRefs, not settle early.
+	stepOut2, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 150*time.Millisecond)
+	if err != nil {
+		t.Fatalf("WaitForTurnStep 2: %v", err)
+	}
+	if !stepOut2.StillRunning {
+		t.Fatal("expected delegated turn to stay running after st.closeAll while child is unfinished")
+	}
+
+	// Finish the child and verify the turn settles with the child's answer.
+	publishResult(t, js, "cluster-a", childID, wakeAnswer)
+	publishStatus(t, js, "cluster-a", childID, lib.StateCompleted, true)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var finalOut TurnStepOutcome
+	for time.Now().Before(deadline) {
+		finalOut, err = b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 150*time.Millisecond)
+		if err != nil {
+			t.Fatalf("WaitForTurnStep final: %v", err)
+		}
+		if !finalOut.StillRunning {
+			break
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	if finalOut.StillRunning {
+		t.Fatal("delegated turn did not settle after child completed")
+	}
+	_, _, resultText := FormatTurnCustomToolEnvelope(finalOut)
+	mustContain(t, resultText, wakeAnswer)
+}

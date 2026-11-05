@@ -794,3 +794,128 @@ func TestCollectTaskStepDetailsUnmatchedActivitiesAndTruncationMarker(t *testing
 		t.Errorf("step 2 markdown should not render raw `activity-budget` tool call:\n%s", md)
 	}
 }
+
+func TestCollectTaskStepDetailsAndUnseenStepsAcrossThinkingToActivitiesTransition(t *testing.T) {
+	ref := TaskRef{Addressee: "platform", TaskID: "t-transition"}
+	seen := map[string]bool{}
+
+	// Poll 1: 2 thinking chunks, 0 activities, 0 step artifacts.
+	taskPoll1 := &lib.Task{
+		ID:    ref.TaskID,
+		State: lib.StateWorking,
+		Artifacts: []lib.Artifact{
+			{
+				Name: lib.ArtifactThinking,
+				Parts: []lib.Part{
+					{Kind: "text", Text: "First I will check cluster nodes."},
+					{Kind: "text", Text: "Second I will inspect namespaces."},
+				},
+			},
+		},
+	}
+	details1, _ := CollectTaskStepDetails(ref, taskPoll1)
+	if len(details1) != 2 {
+		t.Fatalf("poll 1 len(details1) = %d, want 2", len(details1))
+	}
+	unseen1 := unseenStepDetails(details1, seen)
+	if len(unseen1) != 2 {
+		t.Fatalf("poll 1 len(unseen1) = %d, want 2", len(unseen1))
+	}
+	for _, d := range unseen1 {
+		seen[d.StepKey] = true
+	}
+
+	// Poll 2: 1st activity arrives while 2 thinking chunks are present and 0 step artifacts exist.
+	taskPoll2 := &lib.Task{
+		ID:    ref.TaskID,
+		State: lib.StateWorking,
+		Artifacts: []lib.Artifact{
+			{
+				Name: lib.ArtifactThinking,
+				Parts: []lib.Part{
+					{Kind: "text", Text: "First I will check cluster nodes."},
+					{Kind: "text", Text: "Second I will inspect namespaces."},
+				},
+			},
+			{
+				Name: lib.ArtifactActivity,
+				Parts: []lib.Part{
+					mustDataPart(t, map[string]any{
+						"tool":   "kubectl",
+						"callId": "call-1",
+						"title":  "kubectl get nodes",
+					}),
+				},
+			},
+		},
+	}
+	details2, _ := CollectTaskStepDetails(ref, taskPoll2)
+	if len(details2) != 2 {
+		t.Fatalf("poll 2 len(details2) = %d, want 2 (1 activity step + 1 trailing thought step)", len(details2))
+	}
+	unseen2 := unseenStepDetails(details2, seen)
+	if len(unseen2) != 1 || len(unseen2[0].Activities) != 1 || unseen2[0].Activities[0].CallID != "call-1" {
+		t.Fatalf("poll 2 unseen2 = %+v, want 1st activity step (call-1)", unseen2)
+	}
+	for _, d := range unseen2 {
+		seen[d.StepKey] = true
+	}
+
+	// Poll 3: 2nd activity arrives.
+	taskPoll3 := &lib.Task{
+		ID:    ref.TaskID,
+		State: lib.StateWorking,
+		Artifacts: []lib.Artifact{
+			{
+				Name: lib.ArtifactThinking,
+				Parts: []lib.Part{
+					{Kind: "text", Text: "First I will check cluster nodes."},
+					{Kind: "text", Text: "Second I will inspect namespaces."},
+				},
+			},
+			{
+				Name: lib.ArtifactActivity,
+				Parts: []lib.Part{
+					mustDataPart(t, map[string]any{
+						"tool":   "kubectl",
+						"callId": "call-1",
+						"title":  "kubectl get nodes",
+					}),
+					mustDataPart(t, map[string]any{
+						"tool":   "kubectl",
+						"callId": "call-2",
+						"title":  "kubectl get ns",
+					}),
+				},
+			},
+		},
+	}
+	details3, _ := CollectTaskStepDetails(ref, taskPoll3)
+	unseen3 := unseenStepDetails(details3, seen)
+	if len(unseen3) != 1 || len(unseen3[0].Activities) != 1 || unseen3[0].Activities[0].CallID != "call-2" {
+		t.Fatalf("poll 3 unseen3 = %+v, want 2nd activity step (call-2)", unseen3)
+	}
+	for _, d := range unseen3 {
+		seen[d.StepKey] = true
+	}
+
+	// Poll 4: Agent publishes structured step artifact grouping call-1 and call-2.
+	stepPart := mustStepPart(t, stepmsg.Step{
+		Kind:    stepmsg.KindPlan,
+		Title:   "Checked nodes and namespaces",
+		CallIDs: []string{"call-1", "call-2"},
+	})
+	taskPoll4 := &lib.Task{
+		ID:    ref.TaskID,
+		State: lib.StateWorking,
+		Artifacts: append(taskPoll3.Artifacts, lib.Artifact{
+			Name:  stepmsg.ArtifactName,
+			Parts: []lib.Part{stepPart},
+		}),
+	}
+	details4, _ := CollectTaskStepDetails(ref, taskPoll4)
+	unseen4 := unseenStepDetails(details4, seen)
+	if len(unseen4) != 1 || unseen4[0].Step.Title != "Checked nodes and namespaces" {
+		t.Fatalf("poll 4 unseen4 = %+v, want published step 'Checked nodes and namespaces'", unseen4)
+	}
+}

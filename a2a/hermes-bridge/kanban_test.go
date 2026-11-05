@@ -41,7 +41,7 @@ rows = [
   ("t_done",    "Health check for drift-peer-ap-1", "done",    "cluster-diagnostics", "a2a-ctx-1", "All nodes Ready.", "", since + 10, None),
   ("t_running", "Health check for drift-peer-ap-2", "running", "cluster-diagnostics", "a2a-ctx-1", "",                 "", since + 11, None),
   ("t_child",   "Sub-check for drift-peer-ap-2",    "running", "cluster-diagnostics", "worker-9",  "",                 "", since + 12, "t_running"),
-  ("t_blocked", "Approve rollout",                  "blocked", "release",             "a2a-ctx-1", "",                 "", since + 13, None),
+  ("t_blocked", "Approve rollout",                  "blocked", "release",             "a2a-ctx-1", "Checked staging cluster; ready for prod.", "", since + 13, None),
   ("t_failed",  "Broken check",                     "failed",  "cluster-diagnostics", "a2a-ctx-1", "",                 "boom", since + 14, None),
   ("t_other",   "Someone else's card",              "done",    "cluster-diagnostics", "a2a-ctx-2", "n/a",              "", since + 15, None),
   ("t_old",     "Card from an earlier turn",        "done",    "cluster-diagnostics", "a2a-ctx-1", "old result",       "", since - 100, None),
@@ -689,10 +689,28 @@ func TestWaitForKanbanCards_CompletedTurnWithNoCardsWinsCancelRace(t *testing.T)
 
 	_, url := startServer(t)
 	c := gatewayClient(t, url)
-	var origin *lib.Envelope
-	var bridge *Bridge
+	var (
+		originMu sync.Mutex
+		origin   *lib.Envelope
+		bridge   *Bridge
+	)
+	originReady := make(chan struct{})
 
 	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, call apiCall) {
+		if call.sessionID == "a2a-ctx-nocards-e2e" {
+			<-originReady
+			originMu.Lock()
+			orig := origin
+			originMu.Unlock()
+			if orig != nil {
+				bridge.mu.Lock()
+				r := bridge.tasks[orig.TaskID]
+				bridge.mu.Unlock()
+				if r != nil {
+					r.canceled.Store(true)
+				}
+			}
+		}
 		writeCompletion(w, call.sessionID, "completed answer before cancel")
 	})
 	bridge = startAPIBridge(t, url, stub, func(cfg *Config) {
@@ -723,7 +741,10 @@ func TestWaitForKanbanCards_CompletedTurnWithNoCardsWinsCancelRace(t *testing.T)
 	}
 
 	// End-to-end via runTaskAPI: cancel arrives just as apiTurn finishes its response on a turn with no cards.
+	originMu.Lock()
 	origin = submitIn(t, c, "task-nocards-e2e", "ctx-nocards-e2e", "quick question")
+	originMu.Unlock()
+	close(originReady)
 	task := waitTerminal(t, c, origin.TaskID)
 	if task.State != lib.StateCompleted {
 		t.Fatalf("task state = %s, want completed", task.State)
@@ -768,6 +789,11 @@ c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
   ("t_reblock", "Re-blocked card", "blocked", "cluster-d", "a2a-ctx-1", "", "", now_ts, now_ts, None))
 c.execute("INSERT INTO task_events (id, task_id, kind, payload) VALUES (?,?,?,?)",
   (30, "t_reblock", "blocked", '{"question":"First question?"}'))
+# 5. Card recovered via reassign_task (no 'unblocked' event) that later failed.
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_reassigned_err", "Reassigned then failed", "failed", "cluster-e", "a2a-ctx-1", "", "post-reassign failure", now_ts, now_ts, None))
+c.execute("INSERT INTO task_events (id, task_id, kind, payload) VALUES (?,?,?,?)",
+  (40, "t_reassigned_err", "blocked", '{"question":"Stale question before reassign?"}'))
 c.commit()
 `
 	if out, err := exec.Command("python3", "-c", initScript, db, strconv.FormatInt(oldCreated, 10), strconv.FormatInt(now, 10)).CombinedOutput(); err != nil {
@@ -811,6 +837,17 @@ c.commit()
 	}
 	if gotOut := formatKanbanCardOutput(unblockedErr); gotOut != "post-unblock failure" {
 		t.Fatalf("formatKanbanCardOutput(t_unblocked_err) = %q, want %q", gotOut, "post-unblock failure")
+	}
+
+	reassignedErr, ok := byID["t_reassigned_err"]
+	if !ok {
+		t.Fatal("wildcard query omitted t_reassigned_err")
+	}
+	if reassignedErr.BlockPayload != "" {
+		t.Fatalf("t_reassigned_err BlockPayload = %q when status is failed, want empty", reassignedErr.BlockPayload)
+	}
+	if gotOut := formatKanbanCardOutput(reassignedErr); gotOut != "post-reassign failure" {
+		t.Fatalf("formatKanbanCardOutput(t_reassigned_err) = %q, want %q", gotOut, "post-reassign failure")
 	}
 
 	// 4. Repeat block after unblock has a distinct delivery key and is not suppressed by the first block's delivery.

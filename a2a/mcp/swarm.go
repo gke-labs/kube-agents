@@ -29,16 +29,16 @@ import (
 )
 
 const (
-	swarmDefaultTitle      = "kube-agents swarm"
-	swarmLedgerSchema      = 8
-	swarmManagedByTag      = "kube-agents"
-	swarmRoleCoordinator   = "coordinator"
-	swarmRoleNarrator      = "narrator"
-	swarmRoleWorker        = "worker"
-	swarmWakeMentions      = "mentions"
-	swarmWakeWorking       = "working"
-	swarmMemberCoordinator = "coordinator"
-	swarmMemberNarrator    = "narrator"
+	swarmDefaultTitle          = "kube-agents swarm"
+	swarmLedgerSchema          = 8
+	swarmManagedByTag          = "kube-agents"
+	swarmRoleCoordinator       = "coordinator"
+	swarmRoleNarrator          = "narrator"
+	swarmRoleWorker            = "worker"
+	swarmWakeMentions          = "mentions"
+	swarmWakeWorking           = "working"
+	swarmMemberCoordinator     = "coordinator"
+	swarmMemberNarrator        = "narrator"
 	swarmMemberPlatform        = "platform"
 	swarmMemberGateway         = "gateway"
 	swarmConsolePrefix         = "console:"

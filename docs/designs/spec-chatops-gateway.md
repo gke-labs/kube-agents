@@ -2403,10 +2403,11 @@ carrying the notice; a console client reads the child's answer from TASKS. A kan
 turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
 notice carries none of those fields, so a client waiting on a turn can tell the three apart. The
 page reads answers from TASKS and gets the notices, so it skips the result frames, and a lost result
-frame costs it nothing. It shows the notify frames for out-of-turn posts, while the bridge's
-out-of-turn watcher (`watchOutOfTurnKanbanCards`) also mirrors each out-of-turn settled card onto
-`TASKS` as a synthetic `task-card-<id>` task lifecycle (`a2a.tasks.<profile>.task-card-<id>.events`)
-alongside publishing `chat.notify.*`. Because `.out` is core NATS, a notify frame published while no
+frame costs it nothing. It shows the notify frames for out-of-turn posts: the bridge's
+out-of-turn watcher (`watchOutOfTurnKanbanCards`) publishes each out-of-turn settled card onto
+`TASKS` as a synthetic `task-card-<id>` task lifecycle (`a2a.tasks.<profile>.task-card-<id>.events`),
+which the gateway (`watchConsoleOutOfTurnCardTasks`) relays to the console conversation's `.out`
+subject as a `notify` frame. Because `.out` is core NATS, a notify frame published while no
 client holds the conversation's `.out` subscription (the tab closed, a page reconnecting, the MCP
 server restarting) is not replayed on `.out`, whereas console and MCP clients with `TASKS` consumer
 grants can still observe the synthetic `task-card-<id>` events on `TASKS` (and card reports become
