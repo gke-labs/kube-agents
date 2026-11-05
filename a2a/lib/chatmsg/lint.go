@@ -31,8 +31,10 @@ var cardIDRE = regexp.MustCompile(`\bt_[0-9a-f]{8}\b`)
 // "#412" is a pull request, not a heading.
 var headingRE = regexp.MustCompile(`^[ \t]*#{1,6}([ \t]|$)`)
 
-// apologyRE is an opening that apologises before saying what happened.
-var apologyRE = regexp.MustCompile(`(?i)^\W*(sorry|apologies|i apologi[sz]e|unfortunately)\b`)
+// apologyRE is an opening that apologises before saying what happened:
+// "Sorry", "I'm sorry", "We are so sorry", "My apologies", "I apologize",
+// "Unfortunately".
+var apologyRE = regexp.MustCompile(`(?i)^\W*(((i|we)(['’](m|re)|[ \t]+(am|are))[ \t]+)?((so|very|truly)[ \t]+)?sorry|(my[ \t]+)?apologies|(i|we)[ \t]+apologi[sz]e|unfortunately)\b`)
 
 // codeFences are the markers that open a fenced code block.
 var codeFences = []string{"```", "~~~"}

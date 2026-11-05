@@ -73,7 +73,11 @@ CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b", re.ASCII)
 #: classes are spelled out, as in Go, where ``\s`` excludes a vertical tab.
 HEADING = re.compile(r"^[ \t]*#{1,6}([ \t]|$)")
 #: An opening that apologises before saying what happened.
-APOLOGY = re.compile(r"^\W*(sorry|apologies|i apologi[sz]e|unfortunately)\b", re.ASCII | re.IGNORECASE)
+APOLOGY = re.compile(
+    r"^\W*(((i|we)(['’](m|re)|[ \t]+(am|are))[ \t]+)?((so|very|truly)[ \t]+)?sorry"
+    r"|(my[ \t]+)?apologies|(i|we)[ \t]+apologi[sz]e|unfortunately)\b",
+    re.ASCII | re.IGNORECASE,
+)
 CODE_FENCES = ("```", "~~~")
 SLASH_MARK = "/"
 CODE_MARK = "`"

@@ -107,6 +107,63 @@
       "findings": ["headline-apology"]
     },
     {
+      "name": "failure-opens-with-im-sorry",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I’m sorry, the upgrade failed."
+      },
+      "findings": ["headline-apology"]
+    },
+    {
+      "name": "failure-opens-with-we-are-so-sorry",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "We are so sorry: the audit timed out."
+      },
+      "findings": ["headline-apology"]
+    },
+    {
+      "name": "failure-opens-with-my-apologies",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "My apologies, seeded-z is not in the fleet."
+      },
+      "findings": ["headline-apology"]
+    },
+    {
+      "name": "a-pronoun-opening-is-not-an-apology",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I'm sure the upgrade finished; we are so close."
+      },
+      "findings": []
+    },
+    {
+      "name": "every-tool-as-a-command-line",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Which should I run?",
+        "choices": [
+          { "text": "gcloud container clusters list" },
+          { "text": "helm rollback checkout" },
+          { "text": "git revert HEAD" },
+          { "text": "gh pr merge 412" },
+          { "text": "terraform apply" },
+          { "text": "tofu plan" },
+          { "text": "docker ps" }
+        ]
+      },
+      "findings": [
+        "choice-raw-command",
+        "choice-raw-command",
+        "choice-raw-command",
+        "choice-raw-command",
+        "choice-raw-command",
+        "choice-raw-command",
+        "choice-raw-command"
+      ]
+    },
+    {
       "name": "choices-are-raw-commands",
       "chat": {
         "schema": "kube-agents.chat/v1",
