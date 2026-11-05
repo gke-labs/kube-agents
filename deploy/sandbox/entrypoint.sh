@@ -68,8 +68,9 @@ SANDBOX_SCOPE_DECLARED_FILE="/run/kube-agents-sandbox/scope-declared"
 SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"
 # CREDENTIAL_PROXY_EXEC_URL: the exec tier's URL, which the shim sends kubectl,
 # gcloud and Cloud API relay calls to when the operator set it, falling back on
-# CREDENTIAL_PROXY_URL when no connection can be made. Unforwarded, a session
-# would always take the fallback and nothing would say so.
+# CREDENTIAL_PROXY_URL when no connection can be made or the URL is malformed.
+# Unforwarded, a session would always take the fallback and nothing would say
+# so.
 SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_EXEC_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_PROXY_URL KUBE_PROXY_CA_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED KUBEAGENTS_AUDIT_AUTO_PROMOTE"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
