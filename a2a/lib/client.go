@@ -746,8 +746,9 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // mid-retry) in place of the refusal. A missing durable keeps the window.
 //
 // With cfg.WaitForStream, a missing stream does not count against the
-// window: the bind retries until the stream appears or ctx ends, and the
-// window restarts from the first attempt that finds it. The wait logs its
+// window, and neither does a lost connection (connectionLost), across which
+// the client rebuilds: the bind retries until the stream appears or ctx
+// ends, and the window restarts from the first attempt that finds it. The wait logs its
 // first attempt and then at most once per streamWaitLogInterval, and warns
 // once per streamWaitWarnEvery, so a stream that never comes is loud, not
 // silent; the caller reports itself not ready meanwhile.
@@ -812,6 +813,12 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 			js = s.c.currentJS()
 			continue
 		}
+		if s.cfg.WaitForStream && connectionLost(err) {
+			// Whether the stream exists is unknown while the connection is
+			// down, so the outage does not count against the window either:
+			// the client rebuilds the connection, and the wait goes on there.
+			deadline = time.Now().Add(subscribeBindWindow)
+		}
 		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
 			return err
 		}
@@ -824,6 +831,14 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		}
 		js = s.c.currentJS()
 	}
+}
+
+// connectionLost is whether err says the attempt never reached a server
+// that could answer: the connection is closed, reconnecting or gone, or the
+// request found no responder or timed out.
+func connectionLost(err error) bool {
+	return errors.Is(err, nats.ErrConnectionClosed) || errors.Is(err, nats.ErrConnectionReconnecting) ||
+		errors.Is(err, nats.ErrDisconnected) || errors.Is(err, nats.ErrNoResponders) || errors.Is(err, nats.ErrTimeout)
 }
 
 type durableSub struct {

@@ -294,3 +294,78 @@ func TestSubscribeDurable_WaitForStreamSurvivesARebuild(t *testing.T) {
 	}
 	waitFor(t, 15e9, "delivery on the rebuilt connection", func() bool { return col.count() == 1 })
 }
+
+// An outage several times the bind window, mid-wait, ends the wait no more
+// than a missing stream does: the attempts that fail on the lost connection
+// do not count against the window either (connectionLost).
+func TestSubscribeDurable_WaitForStreamOutlastsAnOutageLongerThanTheWindow(t *testing.T) {
+	shortenStreamWait(t, 50*time.Millisecond, time.Hour, time.Hour)
+	fixBindBackoff(50 * time.Millisecond)
+	dir := t.TempDir()
+	s1 := runJetStreamServer(t, -1, dir, nil)
+	port := serverPort(s1)
+
+	capture := &logCapture{}
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s1), WithName("relay"), WithLogger(slog.New(capture)),
+		WithNATSOptions(nats.MaxReconnects(1), nats.ReconnectWait(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	col := &collector{}
+	bound := make(chan error, 1)
+	go func() {
+		_, err := c.SubscribeDurable(ctx, SubscribeConfig{
+			Stream: TasksStream, Subject: TaskInSubject("chatops", "task-wait"),
+			Durable: "relay-outage", Session: "chatops", WaitForStream: true,
+		}, col.handle)
+		bound <- err
+	}()
+	waitFor(t, 10e9, "the wait to start", func() bool { return capture.contains("waiting for the stream to be created") })
+
+	s1.Shutdown()
+	s1.WaitForShutdown()
+	waitFor(t, 10e9, "terminal close logged", func() bool { return capture.contains("nats connection closed") })
+	time.Sleep(10 * subscribeBindWindow)
+	select {
+	case err := <-bound:
+		t.Fatalf("the wait returned during the outage: %v", err)
+	default:
+	}
+	s2 := runJetStreamServer(t, port, dir, nil)
+	t.Cleanup(s2.Shutdown)
+	waitFor(t, 15e9, "the rebuild to complete with no stream", func() bool { return c.rebuilds.Load() == 1 })
+	select {
+	case err := <-bound:
+		t.Fatalf("the wait returned across the rebuild: %v", err)
+	default:
+	}
+	if capture.contains("nats rebuild re-subscribe failed") {
+		t.Errorf("the rebuild tried to bind the waiting durable:\n%s", strings.Join(capture.lines, "\n"))
+	}
+
+	provisionTasksStream(t, clientURL(s2))
+	select {
+	case err := <-bound:
+		if err != nil {
+			t.Fatalf("the wait after the rebuild: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the wait never bound the stream on the rebuilt connection")
+	}
+	pub, err := Connect(ctx, clientURL(s2), WithName("pub"))
+	if err != nil {
+		t.Fatalf("Connect publisher: %v", err)
+	}
+	defer pub.Close()
+	env, err := NewMessageEnvelope(Party{Session: "w"}, "task-wait", "ctx-1", "corr-1", validMessagePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Publish(ctx, TaskInSubject("chatops", "task-wait"), env); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	waitFor(t, 15e9, "delivery on the rebuilt connection", func() bool { return col.count() == 1 })
+}
