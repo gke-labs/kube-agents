@@ -1332,7 +1332,12 @@ type DeploymentSpec struct {
 	// cpu, memory and ephemeral-storage the step adds, takes the highest
 	// tier the quotas have room for (the running one when they have room for
 	// none) and sets the SizingCappedByQuota condition for the step refused,
-	// rather than rolling out pods the quota would refuse. An
+	// rather than rolling out pods the quota would refuse. The check reads
+	// ResourceQuota, not node capacity: on GKE Standard the medium and fleet
+	// rows' broker requests (1 and 4 CPU) have to fit on one node before the
+	// recreated broker can start, so a Standard pool needs nodes that fit the
+	// fleet row's 4 CPU request (e2-standard-8 or larger) before the count
+	// reaches 25 under auto. An
 	// explicit tier is applied as written, without the quota check. The agent
 	// container's own resources are not part of a profile. A change of tier
 	// recreates the proxy pod once and rolls the gateway and the shell pod.
