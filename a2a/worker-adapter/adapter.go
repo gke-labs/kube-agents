@@ -629,6 +629,10 @@ type turnPlan struct {
 	// result line prices its own turn rather than the whole session.
 	costSeen  float64
 	costKnown bool
+	// setupErr is a pod-side setup failure from before the run (the
+	// dispatched worker's persona config). The run publishes a failed
+	// terminal for it and runs nothing.
+	setupErr error
 }
 
 // turnOutcome is one task's run, as the session loop needs it: the terminal
@@ -708,6 +712,12 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 		if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
 			return done(Result{}, fmt.Errorf("publish submitted: %w", err))
 		}
+	}
+
+	if plan.setupErr != nil {
+		state := lib.StateFailed
+		ferr := a.finalize(state, "reason: harness-config-failed - "+plan.setupErr.Error(), "")
+		return broken(Result{State: state}, ferr)
 	}
 
 	// Authorization comes before content. The capability the gateway minted

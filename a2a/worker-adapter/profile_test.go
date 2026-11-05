@@ -1337,6 +1337,68 @@ echo '{"type":"result","subtype":"success","result":"done"}'
 	case <-time.After(15 * time.Second):
 		t.Fatal("a pod with a broken config root kept running")
 	}
+	// Its task gets a failed terminal and a final renewal before the pod
+	// ends, so the dispatcher doesn't wait for the lease to lapse.
+	got := foldTask(t, testClient(t, url), pwProfile, "task-noconf")
+	if !got.Final || got.State != lib.StateFailed {
+		t.Errorf("the task the pod couldn't set up = %s (final %v), want a failed terminal", got.State, got.Final)
+	}
+	if got.FinalMessage == nil || len(got.FinalMessage.Parts) == 0 || !strings.HasPrefix(got.FinalMessage.Parts[0].Text, "reason: harness-config-failed ") {
+		t.Errorf("the terminal's reason = %+v, want it to lead with harness-config-failed", got.FinalMessage)
+	}
+	if _, final := drainLeases(d, "task-noconf", 2*time.Second); !final {
+		t.Error("no final renewal for the task the pod couldn't set up")
+	}
+}
+
+// The after-task reset runs beside the worker loop: an offer that arrives
+// while it runs is declined as busy at once, and once it's done the next
+// offer is accepted.
+func TestAnOfferDuringTheAfterTaskResetIsAnsweredAtOnce(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	harness := stub(t, `
+read first || exit 1
+echo '{"type":"result","subtype":"success","result":"done"}'
+`)
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	var logBuf syncBuffer
+	startWorkerWithReset(t, context.Background(), url, harness, ProfileWorkerConfig{
+		ResetPaths: []string{t.TempDir()},
+		resetHook: func(phase string) {
+			if phase == "after-task" {
+				once.Do(func() { close(started) })
+				<-release
+			}
+		},
+	}, &logBuf, true)
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	d.offer("task-first", profileSubmission(t, "task-first", "first", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-first"})
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the after-task reset never started")
+	}
+	d.offer("task-during", profileSubmission(t, "task-during", "during", nil), 5)
+	if a := d.nextAccept(time.Second); a.TaskID != "task-during" || a.Accepted || a.Reason != declineBusy {
+		t.Errorf("an offer during the reset = %+v, want a prompt busy decline", a)
+	}
+	close(release)
+	time.Sleep(200 * time.Millisecond)
+	d.offer("task-after", profileSubmission(t, "task-after", "after", nil), 5)
+	if a := d.nextAccept(5 * time.Second); a.TaskID != "task-after" || !a.Accepted {
+		t.Errorf("an offer after the reset = %+v, want an accept", a)
+	}
 }
 
 // Liveness fails once the bus connection is closed for good, so the kubelet
