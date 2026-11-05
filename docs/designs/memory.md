@@ -38,7 +38,7 @@ This document defines the unified two-layer memory architecture for `kube-agents
 | Hindsight recall configuration        | [`agents/chat/defaults/hindsight/config.json`](../../agents/chat/defaults/hindsight/config.json)                                                                                                                                               |
 | Hindsight in-cluster manifests        | [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)                                                                                                                                    |
 | Conversational scope rules            | [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6                                                                                                                                                                                        |
-| Conversational scale experiment suite | [`tests/memory-scale/`](https://github.com/gke-labs/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md)                                                                                                                 |
+| Conversational scale experiment suite | [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md)                                                                                                                 |
 
 ---
 
@@ -148,7 +148,7 @@ Hermes supports external memory provider plugins (`agent/memory_provider.py`). W
 
 **Hindsight** (MIT license) is the only provider that self-hosts inside the cluster, supports both per-user and shared scopes via tags, and embeds and reranks queries offline inside its own pod (`HF_HUB_OFFLINE=1`) using the existing LiteLLM gateway for fact extraction.
 
-We also benchmarked a self-hosted `honcho` deployment head-to-head against Hindsight on the same 1,664-record fleet corpus ([full comparison results](https://github.com/gke-labs/kube-agents/blob/experiment/memory-honcho-ab/tests/memory-scale/honcho/RESULTS.md)). On queries where a runbook had been retired and replaced, `honcho` returned the retired runbook on **100% of procedural probes** (contamination $1.000$ vs Hindsight's $0.000$) because its message search still matches superseded messages verbatim.
+We also benchmarked a self-hosted `honcho` deployment head-to-head against Hindsight on the same 1,664-record fleet corpus ([full comparison results](https://github.com/dshnayder/kube-agents/blob/experiment/memory-honcho-ab/tests/memory-scale/honcho/RESULTS.md)). On queries where a runbook had been retired and replaced, `honcho` returned the retired runbook on **100% of procedural probes** (contamination $1.000$ vs Hindsight's $0.000$) because its message search still matches superseded messages verbatim.
 
 ### Retaining `multiuser_memory` for small installations
 
@@ -801,7 +801,7 @@ When `submit_suggestion.py` (or a CI workflow) runs `decision_memory.py check --
 
 We evaluated both memory layers in two reproducible benchmarks:
 
-- **Part 1** tests Layer 1 (Conversational Memory) as the shared knowledge store scales from $100$ to $1,414$ records across a 500-cluster fleet ([`tests/memory-scale/`](https://github.com/gke-labs/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md)).
+- **Part 1** tests Layer 1 (Conversational Memory) as the shared knowledge store scales from $100$ to $1,414$ records across a 500-cluster fleet ([`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md)).
 - **Part 2** tests Layer 2 (Decision and Lesson Memory) end-to-end on a live GKE cluster against 10 real-world Kubernetes outage scenarios across a 500-cluster GitOps repository.
 
 ---
@@ -821,7 +821,7 @@ To mirror real organizational history, six policies exist in three dated version
 3. **Why Hindsight's $0.702$ exact-ID recall ($97.7\%$ content recall with `--batch 1`) missed citations, and how Layer 2 fixes it**:
    - Out of $34$ gold documents across the $26$ queries at rung $1,414$, Hindsight missed $12$ exact document IDs. Inspecting the retrieved text with `diagnose_miss()` showed that **$11$ of the $12$ misses ($92\%$) were `id_stripped`**: Hindsight retrieved the correct policy content ($97.1\%$ content recall at `--batch 5`), but its LLM observation synthesizer rewrote the sentence and dropped the `EXC-*`, `OWN-*`, or `CONV-*` identifier.
    - The single content miss (`ADR-2026-052`) was caused by seeding $5$ records per `retain` call (`--batch 5`), which caused Hindsight to pack $5$ records under a single document label. When seeded one record per call (`--batch 1`), `ADR-2026-052` was retrieved and cited accurately (**$97.7\%$ content recall**).
-   - In head-to-head live agent answers ([full transcript](https://github.com/gke-labs/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md)), both providers answered all $10$ live questions accurately, and Hindsight produced **$1.74\times$ more verifiable citations** ($59$ vs $34$) because it preserves metadata identifiers that flat Markdown comments strip.
+   - In head-to-head live agent answers ([full transcript](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md)), both providers answered all $10$ live questions accurately, and Hindsight produced **$1.74\times$ more verifiable citations** ($59$ vs $34$) because it preserves metadata identifiers that flat Markdown comments strip.
    - These two findings directly shaped Layer 2: `decision_memory.py index` retains **one record per document** (`--batch 1` equivalent) and disables observation synthesis (`retain_extraction_mode: chunks`, `enable_observations: false`) so decision and lesson IDs are never stripped.
 4. **Why specialist subagents need read-only memory access**:
    - When specialist subagents ran with memory completely disabled, they did not simply answer _"I don't know."_ Instead, across four probes, the specialist improvised unsanctioned ways to find the data—including querying PostgreSQL directly and writing a **$79,815$-byte private copy of the shared corpus into its own skill file** (`SKILL.md`). Giving the Platform Agent profile `read_only: true` access to shared memory eliminates the incentive to build unreviewed local caches.
@@ -884,8 +884,9 @@ Scanning `git log` live on every task worked for simple single-file reverts (`BB
 
 ## Related
 
-- [`tests/memory-scale/`](https://github.com/gke-labs/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md) — Benchmark harness, synthetic corpus generator, Kubernetes Job manifests, and raw scorer outputs for the Part 1 conversational scale evaluation.
-- [`tests/memory-scale/transcript/`](https://github.com/gke-labs/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md) — Verbatim probe transcripts and scoring details for the Part 1 evaluation.
+- [`tests/memory-scale/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/README.md) — Benchmark harness, synthetic corpus generator, Kubernetes Job manifests, and raw scorer outputs for the Part 1 conversational scale evaluation.
+- [`tests/memory-scale/honcho/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-honcho-ab/tests/memory-scale/honcho/RESULTS.md) — Head-to-head evaluation results and manifests comparing self-hosted `honcho` against Hindsight on the 1,664-record corpus.
+- [`tests/memory-scale/transcript/`](https://github.com/dshnayder/kube-agents/blob/experiment/memory-scale-ab/tests/memory-scale/transcript/README.md) — Verbatim probe transcripts and scoring details for the Part 1 evaluation.
 - [`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md) — Kubernetes manifests and operational guide for the `hindsight-api` and `hindsight-postgresql` workloads.
 - [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 — Persona rules governing personal vs. shared conversational memory writes.
 - [`agents/platform/skills/decision-memory/SKILL.md`](../../agents/platform/skills/decision-memory/SKILL.md) — Platform Agent skill and CLI reference for `decision_memory.py`.
