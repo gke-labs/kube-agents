@@ -186,10 +186,10 @@ The agent's labels are `agent_namespace` and `agent`, not `namespace` and `name`
 
 #### Answer feedback across installs
 
-Answer ratings leave an install only as counts, through a collector you run. Two series carry them, and neither carries a note, a question, an answer, a user or a cluster name:
+Answer ratings leave an install only as counts, through a collector you run. Two series carry them. Neither carries a note, a question, an answer or a user; the collector adds the project, location and cluster it scraped:
 
-- `kubeagents_platformagent_usage{field="negativeFeedbackTotal"}`, the operator's gauge of each install's thumbs-downs, beside `{field="chatMessagesInboundTotal"}` for the messages they were out of. One scrape of the operator covers every install in its cluster.
-- `kubeagents_a2a_gateway_answer_feedback_total{platform, rating}`, each 👍 and 👎 on a `next` install's [answer feedback](/kube-agents/concepts/chatops/#answer-feedback) controls, straight from its A2A gateway. On a `next` install with Slack through the A2A gateway, `negativeFeedbackTotal` reads 0 and this series is the count.
+- `kubeagents_platformagent_usage{field="negativeFeedbackTotal"}`, the operator's gauge of each install's thumbs-down reactions on Slack through the Hermes gateway, beside `{field="chatMessagesInboundTotal"}` for its chat messages. It reads 0 on Google Chat, which delivers no reactions. One scrape of the operator covers every install in its cluster.
+- `kubeagents_a2a_gateway_answer_feedback_total{platform, rating}`, each 👍 and 👎 tap on a `next` install's [answer feedback](/kube-agents/concepts/chatops/#answer-feedback) controls, straight from its A2A gateway, a changed rating counted again. On a `next` install with Slack through the A2A gateway, `negativeFeedbackTotal` reads 0 and this series is the count.
 
 Managed Prometheus writes every cluster's samples to its project with `project_id`, `location` and `cluster` labels. A Cloud Monitoring [metrics scope](https://cloud.google.com/monitoring/settings) that monitors several projects lets one PromQL query read all of them. These queries give a fleet view:
 
@@ -198,21 +198,21 @@ Managed Prometheus writes every cluster's samples to its project with `project_i
 sum by (project_id, cluster, agent_namespace, agent) (
   increase(kubeagents_platformagent_usage{field="negativeFeedbackTotal"}[1d]))
 
-# Thumbs-downs per 100 chat messages across the fleet, last 7 days
-100 * sum(increase(kubeagents_platformagent_usage{field="negativeFeedbackTotal"}[7d]))
-  / sum(increase(kubeagents_platformagent_usage{field="chatMessagesInboundTotal"}[7d]))
+# Thumbs-downs per 100 chat messages, per install with any, last 7 days
+100 * sum by (project_id, cluster, agent_namespace, agent) (increase(kubeagents_platformagent_usage{field="negativeFeedbackTotal"}[7d]) > 0)
+  / sum by (project_id, cluster, agent_namespace, agent) (increase(kubeagents_platformagent_usage{field="chatMessagesInboundTotal"}[7d]))
 
 # Share of next-mode ratings that were 👍, per cluster, last 7 days
 sum by (project_id, cluster) (increase(kubeagents_a2a_gateway_answer_feedback_total{rating="up"}[7d]))
   / sum by (project_id, cluster) (increase(kubeagents_a2a_gateway_answer_feedback_total{rating=~"up|down"}[7d]))
 ```
 
-An install whose metrics you cannot reach still has the counters in `status.usage`. This prints one line of counts per install across every context in your kubeconfig, with no names:
+An install whose metrics you cannot reach still has the counters in `status.usage`. This prints the two counts per install across every context in your kubeconfig, with no names; `<none>` is 0:
 
 ```bash
 for ctx in $(kubectl config get-contexts -o name); do
-  kubectl --context "$ctx" get platformagents -A \
-    -o jsonpath='{range .items[*]}{.status.usage.negativeFeedbackTotal}{" "}{.status.usage.chatMessagesInboundTotal}{"\n"}{end}'
+  kubectl --context "$ctx" --request-timeout=10s get platformagents -A --no-headers \
+    -o custom-columns=THUMBS_DOWN:.status.usage.negativeFeedbackTotal,MESSAGES:.status.usage.chatMessagesInboundTotal
 done
 ```
 
