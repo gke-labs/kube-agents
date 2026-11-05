@@ -164,6 +164,41 @@ Two speeds, deliberately: the deterministic `Verification*` scores decide whethe
 
 Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_AGGREGATE_MIN_SCORED`, `EVAL_AGGREGATE_ARMED` (unset by default: the suite aggregate is computed and reported against main's rate but cannot red the job until this is set to `1`, `true` or `yes`), `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, `EVAL_BASELINE_STORE`, `EVAL_BASELINE_MAX_OBJECTS`, `EVAL_BASELINE_CAT_WORKERS` (default 16: how many per-case `gcloud storage cat` calls a GCS read runs at once), `EVAL_ADMISSION_MODE` (`roster` by default: the list decides and the record is reported; `record`: the record decides once it holds a full window) and `BOOTSTRAP_ADMITTED` (the blocking roster, read from `hack/eval/blocking-roster.txt`; [`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md) has the decision and what the record must show before the mode changes).
 
+## Certification suite
+
+The certification suite is the set of cases behind the certified-capabilities page. It has its
+own lane and nothing else: `hack/eval/certification-cases.txt` is its roster, `EVAL_TIER=certification` in
+`hack/ci-eval-pr.sh` runs that file alone (one `# part N` section of it under
+`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, rerun from Deck and never on a cron),
+and no pull request and no nightly runs a case named there. A certification case is an ordinary
+case under `bench/tasks/<id>/` whose `task.yaml` carries `suite: certification`;
+`scripts/validate_bench_cases.py` refuses a rostered case without the line and a case with the line
+outside the roster, and the script refuses an entry that is also in `presubmit-cases.txt` or
+`nightly-cases.txt`, so one case holds one record on one lane. The blocking roster is a subset of
+the presubmit, so nothing on this lane arms rung 4: a failing certification case is a record for
+the page, not a red. What does red a run of the lane is the same as anywhere: rungs 1 to 3 (a
+forbidden write, a check that never ran, inconsistent liveness) and rung 5, a case marked
+`expected_fail: true` that passes every repetition, which says its marker is stale. A case the
+suite declares as a known gap carries that marker and names its gap issue in the roster's reason
+block. The lane's record is its logs bucket, read by the page per case and model: the tier is
+kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
+lanes are.
+
+Three rules hold for every fixture a certification case plants, enforced in review until a
+validator check lands with the first stack that needs it:
+
+1. A fail-closed admission webhook matches one bench-owned API group only, carries a
+   `namespaceSelector` that excludes `kube-system`, `config-management-system` and
+   `kubeagents-system`, an `objectSelector` on a bench label, a short timeout, and a live backend.
+   Where the scenario needs `failurePolicy: Fail` with no backend, the check reads the
+   configuration fields and the plant uses an inert group, never one the host's controllers call.
+2. No fixture edits the host cluster's node service-account roles, the project's quota or IAM, or
+   the host's pod CIDR. The host cluster is kept across leases, and only the stack's own destroy
+   restores it; a scenario that needs such a condition plants a signal instead.
+3. Fixture credentials are inert literals, never a token that was once valid, and a service account
+   a fixture creates is destroyed in the same stack. The expected-fail marker hides a fixture that
+   failed to plant, so the `resource_property` safeguard stays on every case.
+
 ## Portal CUJ evaluations
 
 The portal evaluator is the black-box path for conversational CUJs with

@@ -385,6 +385,12 @@ through as typed, and the Planning Agent composes the report and asks for a yes 
 platform worker files it through the credential broker. The command, the persona flow and the
 broker verb are designed in [`chat-feedback-command.md`](chat-feedback-command.md). `/feedback summary` (added 2026-10-21) is the one text form the gateway answers itself: the install's identifier-free usage and feedback summary, from the `PlatformAgent` resource and the gateway's task records, with no task started (part 7 of the same document).
 
+A typed `@bot /sethome` (or `/hermes sethome`) on Slack is the Slack adapter's own, not a gateway
+command: `answerSetHome` answers an author the gateway's own admission rule admits, in the thread, with
+the Home tab panel's state and where the home channel moves, before the text becomes a turn, so no task
+starts, no question is marked answered and no home is learned from it; the post runs off the event
+pump. An author the rule does not admit is refused as any turn is.
+
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
 channel its turns arrive on, naming the addressee and the task text. The gateway is the only
@@ -1630,8 +1636,8 @@ Slack Connect, not archived, the app a member) and written once (`slack`, `slack
 channel; the gateway's own home posts follow within one kubelet sync, about a minute, during which a
 home post is refused as having no home. A candidate the check refuses is written to `slack.refused`
 as one of the words the operator matches, `shared`, `archived`, `not-member` or `malformed` (the
-post-time check also writes `direct-message` for a hand-edited group DM id, which an operator without
-that word renders as a reason it does not know),
+post-time check also writes `direct-message` for a hand-edited group DM id, which the operator
+matches too and an operator older than that word renders as a reason it does not know),
 while the record names no channel and does not name that reason already (a write that fails is tried
 again at the next refusal; while a channel is recorded, a refusal beside it is the post-time check's
 or an older gateway's, and a learn that adopts or replaces the channel clears it) and the next

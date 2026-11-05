@@ -12,12 +12,12 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parents[1] / "scripts"
+REPO = HERE.parents[3]
 sys.path.insert(0, str(SCRIPTS))
 
 import vcs_client
@@ -27,13 +27,24 @@ plugin = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(plugin)
 
 URL = "https://github.com/acme/fleet-config/pull/99"
+REPOSITORY = "https://github.com/acme/fleet-config"
+#: The repository as the broker resolves it and stamps it on a ``proposal-create`` answer.
+REPO_NAME = "acme/fleet-config"
 TASK = "t_9f2a"
+TITLE = "Raise the checkout memory limit"
 
 
-def _vcs_record(url=URL, number=99, title="Raise the checkout memory limit"):
-    """The stderr line ``vcs_client.call`` writes for a proposal it opened."""
+def _vcs_record(url=URL, number=99, title=TITLE, claim=None, repo=None):
+    """The stderr line ``vcs_client.call`` writes for a proposal it opened, with ``claim`` as its token.
+
+    ``repo`` is the answer's top-level repository; None writes the line an older client wrote.
+    """
     stderr = io.StringIO()
     answer = {"proposal": {"url": url, "number": number, "title": title, "state": "open"}}
+    if claim is not None:
+        answer["claim"] = claim
+    if repo is not None:
+        answer["repo"] = repo
     with mock.patch.object(vcs_client, "_call", lambda verb, payload: answer), mock.patch("sys.stderr", stderr):
         vcs_client.call("proposal-create", {})
     return stderr.getvalue()
@@ -71,130 +82,374 @@ class _Kanban:
         return {"hermes_cli": package, "hermes_cli.kanban_db": kb, "hermes_cli.kanban_db_connect": connect}
 
 
-class _Forge:
-    """Stands in for the agent pod's ``forge`` module: the broker's identity and proposal reads."""
+class _Refusal(Exception):
+    """A broker refusal as ``forge.ForgeError`` carries it: the code on ``reason``."""
 
-    def __init__(self, viewer="kube-agents-bot", author="kube-agents-bot", fail=None,
-                 title="Raise the checkout memory limit", state="open", age_seconds=5):
-        self.viewer, self.author, self.fail = viewer, author, fail
-        self.title, self.state = title, state
-        self.created = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    def __init__(self, reason):
+        super().__init__(f"{reason}: {URL}")
+        self.reason = reason
+
+
+class _Broker:
+    """Stands in for the agent pod's ``forge`` module in front of the broker's ``proposal-claim``.
+
+    Each token :meth:`mint` hands out is accepted once, for the url it was minted for.
+    """
+
+    def __init__(self, title=TITLE, fail=None, refuse=None):
+        self.title, self.fail, self.refuse = title, fail, refuse
+        self.live = {}
         self.asked = []
-        self.providers = 0
+
+    def mint(self, url=URL):
+        token = f"tok{len(self.live) + len(self.asked)}-{url.rsplit('/', 1)[-1]}"
+        self.live[token] = url
+        return token
+
+    def line(self, url=URL, number=99, title=TITLE, repo=REPO_NAME):
+        return _vcs_record(url=url, number=number, title=title, claim=self.mint(url), repo=repo)
 
     def module(self):
         forge = types.ModuleType("forge")
         test = self
 
-        class BrokerProvider:
-            def __init__(self):
-                test.providers += 1
-
-            def viewer_login(self, repo):
-                test.asked.append(("identity", repo))
-                return test.viewer
-
         def call(verb, payload, repo, *, retry_transient=False):
-            test.asked.append((verb, repo, payload["number"]))
+            test.asked.append((verb, repo, dict(payload), retry_transient))
             if test.fail:
                 raise test.fail
-            base = repo + ("/-/merge_requests/" if "gitlab" in repo else "/pull/")
-            return {"proposal": {
-                "number": payload["number"], "url": f"{base}{payload['number']}", "author": test.author,
-                "title": test.title, "state": test.state, "created": test.created,
-            }}
+            url = test.live.pop(payload.get("claim"), None)
+            if test.refuse:
+                raise _Refusal(test.refuse)
+            if url is None or url != payload.get("url"):
+                raise _Refusal("CLAIM_UNKNOWN")
+            return {"url": url, "number": int(url.rsplit("/", 1)[-1]), "title": test.title}
 
-        forge.BrokerProvider = BrokerProvider
         forge.call = call
-        forge.normalise_login = lambda login: str(login or "").strip().lower().removesuffix("[bot]")
         return forge
 
 
+def _tokens(text):
+    """Every claim token left on a record line in ``text``."""
+    found = []
+    for line in (text or "").splitlines():
+        proposal = plugin.opened(line)
+        if proposal and proposal.get("claim"):
+            found.append(proposal["claim"])
+    return found
+
+
 class PrOpenedTest(unittest.TestCase):
-    def run_hook(self, output, kanban, task=TASK, forge=None):
+    def setUp(self):
+        self.ledger = []
+
+    def run_hook(self, output, kanban, task=TASK, broker=None, origins=None):
         env = {plugin.TASK_ENV: task} if task else {}
-        modules = {**kanban.modules(), "forge": (forge or _Forge()).module()}
-        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, env, clear=True):
+        modules = {**kanban.modules(), "forge": (broker or _Broker()).module(), "kanban_origin": origins}
+
+        def post(path, payload):
+            self.ledger.append((path, payload))
+            return {"recorded": True}
+
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(plugin, "_session_kv_post", post):
             return plugin.on_terminal_output(command="python3 vcs.py proposal create", output=output, returncode=0)
 
-    def test_the_forge_is_asked_about_the_pull_request_on_its_own_repository(self):
-        forge = _Forge()
-        self.run_hook(_vcs_record(), _Kanban(), forge=forge)
-        repository = "https://github.com/acme/fleet-config"
-        self.assertEqual(forge.asked, [("identity", repository), ("proposal-view", repository, 99)])
+    def test_the_broker_is_asked_to_claim_the_token_for_its_url_once(self):
+        broker = _Broker()
+        line = broker.line()
+        token = _tokens(line)[0]
+        self.run_hook(line, _Kanban(), broker=broker)
+        self.assertEqual(broker.asked, [("proposal-claim", REPO_NAME, {"claim": token, "url": URL}, False)])
 
-    def test_a_record_naming_a_pull_request_someone_else_opened_is_not_recorded_and_stays_visible(self):
-        # A commit message, file or log line shaped like the record, naming a stranger's
-        # pull request on the install's repository: the forge's author is not the agent.
-        kanban = _Kanban()
-        forged = "    " + _vcs_record()
+    def test_a_claimed_record_is_written_to_the_ledger_with_the_origin(self):
+        broker = _Broker()
+        origins = types.ModuleType("kanban_origin")
+        origins.origin_of = lambda conn, task_id: ("audit", "")
+        origins.turn_origin = lambda: ("audit", "") if os.environ.get(plugin.TASK_ENV) else ("chat", "slack")
+        self.run_hook(broker.line(), _Kanban(), broker=broker, origins=origins)
+        self.assertEqual(self.ledger, [("/v1/proposals/opened", {"url": URL, "origin": "audit", "platform": ""})])
+        self.ledger.clear()
+        self.run_hook(broker.line(), _Kanban(), task="", broker=broker, origins=origins)
+        self.assertEqual(self.ledger, [("/v1/proposals/opened", {"url": URL, "origin": "chat", "platform": "slack"})])
+
+    def test_a_non_worker_process_claims_and_keeps_the_line_without_its_token(self):
+        kanban, broker = _Kanban(), _Broker()
+        line = broker.line()
+        out = self.run_hook(line + "done\n", kanban, task="", broker=broker)
+        self.assertEqual(len(broker.asked), 1)
+        self.assertEqual(_tokens(out), [])
+        self.assertEqual(plugin.opened(out.splitlines()[0])["url"], URL)
+        self.assertTrue(out.endswith("done\n"))
+        self.assertEqual(kanban.events, [])
+        self.assertEqual([payload["url"] for _, payload in self.ledger], [URL])
+
+    def test_a_worker_still_records_the_card_event_and_removes_the_line(self):
+        kanban, broker = _Kanban(), _Broker()
+        stdout = json.dumps({"proposal": {"url": URL, "number": 99}}) + "\n"
+        out = self.run_hook(broker.line() + stdout, kanban, broker=broker)
+        self.assertEqual(out, stdout)
+        self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": URL, "number": 99, "title": TITLE}, 7)])
+        self.assertEqual([payload["url"] for _, payload in self.ledger], [URL])
+
+    def test_records_past_the_cap_lose_their_token_unclaimed(self):
+        cap = plugin.RECORDS_CHECKED_MAX
+        urls = [f"{REPOSITORY}/pull/{n}" for n in range(cap + 3)]
+        issue = "https://github.com/acme/fleet-config/issues/3"
+        for task in (TASK, ""):
+            kanban, broker = _Kanban(), _Broker()
+            first = broker.line(url=urls[0], number=0)
+            flood = broker.line(url=issue, number=3, repo=None) + first * 3 + "".join(
+                broker.line(url=url, number=n) for n, url in enumerate(urls[1:], 1)
+            )
+            with self.subTest(worker=bool(task)):
+                out = self.run_hook(flood, kanban, task=task, broker=broker)
+                self.assertEqual(
+                    [payload["url"] for _, _, payload, _ in broker.asked], urls[:cap],
+                    "one claim per distinct url, up to the cap; a record with no repo and no proposal url takes no slot",
+                )
+                self.assertEqual(_tokens(out), [], "no token survives, claimed or not")
+                kept = [plugin.opened(line)["url"] for line in out.splitlines()]
+                if task:
+                    self.assertEqual(len(kanban.events), cap)
+                    self.assertEqual(kept, [issue] + urls[cap:], "a claimed url's repeats leave with it")
+                else:
+                    self.assertEqual(kanban.events, [])
+                    self.assertEqual(kept, [issue] + [urls[0]] * 3 + urls[1:], "outside a worker every line stays")
+
+    def test_no_claim_starts_once_the_budget_is_spent_and_no_token_survives(self):
+        # Hermes skips the hook at 30 s and hands the model the raw output, so a
+        # slow broker must not take the claims past the budget.
+        clock = [1000.0]
+        urls = [f"{REPOSITORY}/pull/{n}" for n in (1, 2, 3)]
+        for task in (TASK, ""):
+            kanban, broker = _Kanban(), _Broker()
+            forge = broker.module()
+            claim = forge.call
+
+            def slow(verb, payload, repo, *, retry_transient=False):
+                clock[0] += plugin.CLAIMS_BUDGET_SECONDS + 1  # the broker sleeps past the budget
+                return claim(verb, payload, repo, retry_transient=retry_transient)
+
+            forge.call = slow
+            output = "".join(broker.line(url=url, number=n) for n, url in zip((1, 2, 3), urls))
+            with self.subTest(worker=bool(task)), \
+                    mock.patch.object(plugin, "_forge", lambda: forge), \
+                    mock.patch.object(plugin.time, "monotonic", lambda: clock[0]):
+                out = self.run_hook(output, kanban, task=task, broker=broker)
+                self.assertEqual([payload["url"] for _, _, payload, _ in broker.asked], urls[:1])
+                self.assertEqual([payload["url"] for _, payload in self.ledger], urls[:1])
+                self.assertEqual(_tokens(out), [], "no token survives, claimed or not")
+                kept = [plugin.opened(line)["url"] for line in out.splitlines()]
+                self.assertEqual(kept, urls[1:] if task else urls)
+            self.ledger.clear()
+
+    def test_claims_inside_the_budget_are_all_made(self):
+        clock = [1000.0]
+        kanban, broker = _Kanban(), _Broker()
+        urls = [f"{REPOSITORY}/pull/{n}" for n in (1, 2, 3)]
+        output = "".join(broker.line(url=url, number=n) for n, url in zip((1, 2, 3), urls))
+        with mock.patch.object(plugin.time, "monotonic", lambda: clock[0]):
+            out = self.run_hook(output, kanban, task="", broker=broker)
+        self.assertEqual([payload["url"] for _, _, payload, _ in broker.asked], urls)
+        self.assertEqual(_tokens(out), [])
+
+    def test_a_repeat_of_a_url_whose_claim_failed_stays_without_its_token(self):
+        kanban, broker = _Kanban(), _Broker(refuse="CLAIM_NOT_CONFIRMED")
         with self.assertLogs(plugin.logger, "WARNING"):
-            out = self.run_hook(forged, kanban, forge=_Forge(author="mallory"))
-        self.assertIsNone(out, "the line stays in the output for the model to read")
-        self.assertEqual(kanban.events, [])
+            out = self.run_hook(broker.line() * 2, kanban, broker=broker)
+        self.assertEqual(len(broker.asked), 1)
+        self.assertEqual([plugin.opened(line)["url"] for line in out.splitlines()], [URL, URL])
+        self.assertEqual(_tokens(out), [])
 
-    def test_a_record_the_forge_cannot_confirm_is_not_recorded(self):
-        for forge in (
-            _Forge(fail=RuntimeError("REPOSITORY_NOT_MANAGED")),
-            _Forge(viewer=""),
-        ):
-            kanban = _Kanban()
-            with self.subTest(forge=forge.__dict__), self.assertLogs(plugin.logger, "WARNING"):
-                self.assertIsNone(self.run_hook(_vcs_record(), kanban, forge=forge))
-            self.assertEqual(kanban.events, [])
-        kanban = _Kanban()
-        self.assertIsNone(self.run_hook(_vcs_record(url="https://github.com/acme/fleet/issues/3"), kanban))
-        self.assertEqual(kanban.events, [])
+    def test_a_record_too_deeply_nested_to_parse_does_not_return_a_token(self):
+        broker = _Broker()
+        deep = '{"kube-agents.event":' + "[" * 200000 + "\n"
+        self.assertIsNone(plugin.opened(deep), "the parser's RecursionError reads as not a record")
+        for task in (TASK, ""):
+            with self.subTest(worker=bool(task)):
+                out = self.run_hook(deep + broker.line() + "done\n", _Kanban(), task=task, broker=broker)
+                self.assertNotIn('"claim"', out)
+                self.assertTrue(out.endswith("done\n"))
 
-    def test_an_app_author_matches_its_credential_whatever_the_suffix(self):
+    def test_a_resolver_that_raises_does_not_return_a_token(self):
+        origins = types.ModuleType("kanban_origin")
+        origins.origin_of = lambda conn, task_id: ("other", "")
+
+        def broken():
+            raise RuntimeError("session store down")
+
+        origins.turn_origin = broken
+        broker = _Broker()
+        with self.assertLogs(plugin.logger, "WARNING"):
+            out = self.run_hook(broker.line() + "done\n", _Kanban(), task="", broker=broker, origins=origins)
+        self.assertNotIn('"claim"', out)
+        self.assertEqual([payload["origin"] for _, payload in self.ledger], ["other"])
+        broker = _Broker()
+        line = broker.line()
+        with mock.patch.object(plugin, "resolve_origin", side_effect=RuntimeError("boom")), \
+                self.assertLogs(plugin.logger, "WARNING") as logs:
+            out = self.run_hook(line + "done\n", _Kanban(), broker=broker)
+        self.assertEqual(_tokens(out), [])
+        self.assertEqual(plugin.opened(out.splitlines()[0])["url"], URL)
+        self.assertIn("RuntimeError", "\n".join(logs.output))
+
+    def test_a_record_merged_after_other_text_loses_its_token_unclaimed(self):
+        # `2>&1` can put the record after text on the same line; it is not counted, and never read back.
+        kanban, broker = _Kanban(), _Broker()
+        line = broker.line()
+        token = _tokens(line)[0]
+        out = self.run_hook("Cloning into 'wc'... " + line, kanban, broker=broker)
+        self.assertNotIn(token, out)
+        self.assertIn('"claim":""', out)
+        self.assertEqual((broker.asked, kanban.events), ([], []))
+
+    def test_a_failed_claim_leaves_the_line_without_its_token(self):
+        for refusal in ("CLAIM_NOT_CONFIRMED", "REPOSITORY_NOT_MANAGED", "FORGE_UNAVAILABLE"):
+            kanban, broker = _Kanban(), _Broker(refuse=refusal)
+            line = broker.line()
+            with self.subTest(refusal=refusal), self.assertLogs(plugin.logger, "WARNING"):
+                out = self.run_hook(line, kanban, broker=broker)
+            self.assertEqual(_tokens(out), [])
+            self.assertEqual(plugin.opened(out)["url"], URL)
+            self.assertEqual((kanban.events, self.ledger), ([], []))
+
+    def test_a_replayed_token_counts_nothing_and_logs_no_url(self):
+        broker = _Broker()
+        line = broker.line()
+        token = _tokens(line)[0]
+        self.run_hook(line, _Kanban(), broker=broker)
         kanban = _Kanban()
-        self.run_hook(_vcs_record(), kanban, forge=_Forge(viewer="kube-agents-bot[bot]", author="Kube-Agents-Bot"))
-        self.assertEqual(len(kanban.events), 1)
+        self.ledger.clear()
+        with self.assertLogs(plugin.logger, "WARNING") as logs:
+            out = self.run_hook(line, kanban, broker=broker)
+        self.assertEqual((kanban.events, self.ledger), ([], []))
+        self.assertEqual(_tokens(out), [])
+        joined = "\n".join(logs.output)
+        self.assertIn("CLAIM_UNKNOWN", joined)
+        self.assertNotIn(URL, joined)
+        self.assertNotIn(token, joined)
+
+    def test_resolution_order_card_then_run_then_session_then_convention_then_other(self):
+        origins = _load_kanban_origin()
+        cron = types.ModuleType("cron_run_scope")
+        priority = types.ModuleType("kanban_priority")
+        state = {"card": ("audit", ""), "cron": ("scheduled", ""), "session": "sess-1", "record": None}
+        state["record"] = {"origin": "chat", "platform": "slack"}
+        cron.current_cron_origin = lambda: state["cron"]
+        priority.trusted_origin_session = lambda: state["session"]
+        modules = {
+            **_Kanban().modules(), "kanban_origin": origins, "cron_run_scope": cron, "kanban_priority": priority,
+            "tools.cron_run_scope": None, "hermes_cli.kanban_priority": None, "hermes_cli.kanban_origin": None,
+        }
+        steps = [
+            ({}, ("audit", "")),
+            ({"card": origins.NO_ORIGIN}, ("scheduled", "")),
+            ({"cron": None}, ("chat", "slack")),
+            ({"record": None, "session": "web-console-42"}, ("console", "")),
+            ({"session": "sess-2"}, ("other", "")),
+        ]
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {plugin.TASK_ENV: TASK}, clear=True), \
+                mock.patch.object(origins, "origin_of", lambda conn, task_id: state["card"]), \
+                mock.patch.object(origins, "_fetch_session_origin", lambda session_id: state["record"]):
+            for change, want in steps:
+                state.update(change)
+                with self.subTest(**{key: str(value) for key, value in change.items()}):
+                    self.assertEqual(plugin.resolve_origin(), want)
+            state.update({"card": ("audit", ""), "cron": ("scheduled", "")})
+            os.environ.pop(plugin.TASK_ENV)
+            self.assertEqual(plugin.resolve_origin(), ("scheduled", ""), "no card outside a worker")
+        with mock.patch.dict(sys.modules, {"kanban_origin": None, "hermes_cli.kanban_origin": None}):
+            self.assertEqual(plugin.resolve_origin(), ("other", ""), "no module, no origin")
+
+    def test_a_record_line_without_a_token_is_left_as_text_and_counts_nothing(self):
+        # A broker older than the token, or a line someone typed: nothing to claim.
+        kanban, broker = _Kanban(), _Broker()
+        self.assertIsNone(self.run_hook("    " + _vcs_record(), kanban, broker=broker))
+        self.assertEqual((broker.asked, kanban.events, self.ledger), ([], [], []))
 
     def test_the_names_agree_with_the_client_that_writes_the_record(self):
         self.assertEqual(plugin.PROPOSAL_OPENED_KEY, vcs_client.PROPOSAL_OPENED_KEY)
         self.assertEqual(plugin.PROPOSAL_OPENED_EVENT, vcs_client.PROPOSAL_OPENED_EVENT)
         self.assertEqual(plugin.PROPOSAL_OPENED_FIELDS, vcs_client.PROPOSAL_OPENED_FIELDS)
+        self.assertEqual(plugin.CLAIM_FIELD, vcs_client.CLAIM_TOKEN_FIELD)
 
-    def test_a_proposal_the_broker_opened_is_recorded_on_the_card_and_taken_out_of_the_output(self):
-        kanban = _Kanban()
-        stdout = json.dumps({"proposal": {"url": URL, "number": 99}}) + "\n"
-        out = self.run_hook(_vcs_record() + stdout, kanban)
-        self.assertEqual(out, stdout)
-        self.assertEqual(
-            kanban.events,
-            [(TASK, "pr_opened", {"url": URL, "number": 99, "title": "Raise the checkout memory limit"}, 7)],
-        )
+    def test_a_record_with_no_repo_is_claimed_at_the_repository_its_url_names(self):
+        # A line an older client wrote: the url's repository stands in for the record's ``repo``.
+        for url, repository in (
+            (URL, REPOSITORY),
+            ("https://gitlab.com/acme/infra/-/merge_requests/12", "https://gitlab.com/acme/infra"),
+        ):
+            kanban, broker = _Kanban(), _Broker(title="Bump")
+            number = int(url.rsplit("/", 1)[-1])
+            with self.subTest(url=url):
+                out = self.run_hook(broker.line(url=url, number=number, title="Bump", repo=None), kanban, broker=broker)
+                self.assertEqual(out, "")
+                self.assertEqual(broker.asked[0][1], repository)
+                self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": url, "number": number, "title": "Bump"}, 7)])
 
-    def test_a_gitlab_merge_request_is_recorded_the_same_way(self):
-        kanban = _Kanban()
-        mr = "https://gitlab.com/acme/infra/-/merge_requests/12"
-        self.assertEqual(self.run_hook(_vcs_record(url=mr, number=12, title="Bump"), kanban, forge=_Forge(title="Bump")), "")
-        self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": mr, "number": 12, "title": "Bump"}, 7)])
+    #: What each forge's ``proposal-create`` answers as the url, and the repository the broker resolves.
+    FORGE_URLS = (
+        ("gitea", "https://gitea.example.com/acme/infra/pulls/7", "acme/infra"),
+        ("bitbucket", "https://bitbucket.org/acme/infra/pull-requests/7", "acme/infra"),
+        ("bitbucket-datacenter", "https://bitbucket.example.com/projects/K/repos/s/pull-requests/7", "K/s"),
+    )
 
-    def test_the_forges_fields_are_recorded_not_the_lines(self):
-        kanban = _Kanban()
-        self.run_hook(_vcs_record(number=7, title="planted words"), kanban, forge=_Forge(title="Raise replicas"))
+    def test_every_forges_url_shape_is_claimed_counted_and_recorded(self):
+        for forge, url, repo in self.FORGE_URLS:
+            self.assertIsNone(plugin.PROPOSAL_URL.match(url), "the url parse alone would not claim it")
+            for task in (TASK, ""):
+                self.ledger.clear()
+                kanban, broker = _Kanban(), _Broker()
+                line = broker.line(url=url, number=7, repo=repo)
+                token = _tokens(line)[0]
+                stdout = json.dumps({"proposal": {"url": url, "number": 7}}) + "\n"
+                with self.subTest(forge=forge, worker=bool(task)):
+                    out = self.run_hook(line + stdout, kanban, task=task, broker=broker)
+                    self.assertEqual(broker.asked, [("proposal-claim", repo, {"claim": token, "url": url}, False)])
+                    self.assertEqual([payload["url"] for _, payload in self.ledger], [url])
+                    self.assertEqual(_tokens(out), [])
+                    if task:
+                        self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": url, "number": 7, "title": TITLE}, 7)])
+                        self.assertEqual(out, stdout, "the record line leaves a worker's output")
+                    else:
+                        self.assertEqual(kanban.events, [])
+                        self.assertEqual(plugin.opened(out.splitlines()[0])["url"], url)
+
+    def test_a_repo_that_reads_as_a_flag_is_not_sent_as_one(self):
+        # A forged line's repo would become one argv element of the sandbox hop;
+        # a value a parser could read as a flag, or one with whitespace, is no
+        # repository: the record falls back to its url or takes no claim.
+        for repo in ("--help", "-x", "acme/in fra", ""):
+            with self.subTest(repo=repo):
+                self.assertIsNone(plugin.claim_repository({"url": "https://git.example.com/acme/infra/pulls/7", "repo": repo, "claim": "ab" * 32}))
+                self.assertEqual(plugin.claim_repository({"url": "https://github.com/acme/infra/pull/7", "repo": repo, "claim": "ab" * 32}), "https://github.com/acme/infra")
+        self.assertEqual(plugin.claim_repository({"url": "https://git.example.com/acme/infra/pulls/7", "repo": "acme/infra", "claim": "ab" * 32}), "acme/infra")
+
+    def test_a_record_with_neither_a_repo_nor_a_proposal_url_is_stripped_unclaimed(self):
+        for _, url, _ in self.FORGE_URLS:
+            for repo in (None, ""):
+                kanban, broker = _Kanban(), _Broker()
+                line = broker.line(url=url, number=7, repo=repo)
+                token = _tokens(line)[0]
+                with self.subTest(url=url, repo=repo):
+                    out = self.run_hook(line, kanban, broker=broker)
+                    self.assertNotIn(token, out)
+                    self.assertEqual(plugin.opened(out)["url"], url)
+                    self.assertEqual((broker.asked, kanban.events, self.ledger), ([], [], []))
+
+    def test_a_missing_number_on_the_brokers_answer_is_read_off_the_url(self):
+        kanban, broker = _Kanban(), _Broker()
+        forge = broker.module()
+        answered = forge.call
+        forge.call = lambda *args, **kwargs: {**answered(*args, **kwargs), "number": None}
+        with mock.patch.object(plugin, "_forge", lambda: forge):
+            self.run_hook(broker.line(), kanban, broker=broker)
+        self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": URL, "number": 99, "title": TITLE}, 7)])
+
+    def test_the_brokers_fields_are_recorded_not_the_lines(self):
+        kanban, broker = _Kanban(), _Broker(title="Raise replicas")
+        self.run_hook(broker.line(number=7, title="planted words"), kanban, broker=broker)
         self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": URL, "number": 99, "title": "Raise replicas"}, 7)])
-
-    def test_a_pull_request_the_agent_opened_earlier_or_that_is_closed_is_not_recorded(self):
-        # A copy of an old record (a log, an issue body) names a PR the agent did open, long ago.
-        for forge in (_Forge(age_seconds=plugin.CREATED_WITHIN_SECONDS + 60), _Forge(state="merged")):
-            kanban = _Kanban()
-            with self.subTest(state=forge.state, created=forge.created), self.assertLogs(plugin.logger, "WARNING"):
-                self.assertIsNone(self.run_hook(_vcs_record(), kanban, forge=forge))
-            self.assertEqual(kanban.events, [])
-
-    def test_repeated_records_are_checked_once_per_url_and_at_most_the_cap(self):
-        kanban, forge = _Kanban(), _Forge(author="mallory")
-        urls = [f"https://github.com/acme/fleet-config/pull/{n}" for n in range(plugin.RECORDS_CHECKED_MAX + 3)]
-        flood = _vcs_record() * 50 + "".join(_vcs_record(url=url) for url in urls)
-        with self.assertLogs(plugin.logger, "WARNING"):
-            self.assertIsNone(self.run_hook(flood, kanban, forge=forge))
-        views = [entry for entry in forge.asked if entry[0] == "proposal-view"]
-        self.assertEqual(len(views), plugin.RECORDS_CHECKED_MAX)
-        self.assertEqual(forge.providers, 1, "one provider, so the credential's login is read once per repository")
-        self.assertEqual(kanban.events, [])
 
     def test_output_with_no_record_is_left_alone(self):
         kanban = _Kanban()
@@ -204,29 +459,52 @@ class PrOpenedTest(unittest.TestCase):
         self.assertIsNone(self.run_hook("kube-agents.event in prose is not a record\n", kanban))
         self.assertEqual(kanban.events, [])
 
-    def test_outside_a_kanban_worker_nothing_is_checked_recorded_or_taken_out(self):
-        kanban, forge = _Kanban(), _Forge()
-        self.assertIsNone(self.run_hook(_vcs_record() + "done\n", kanban, task="", forge=forge))
-        self.assertEqual((kanban.events, forge.asked), ([], []))
-
-    def test_a_record_that_cannot_be_written_is_logged_and_the_line_stays(self):
-        kanban = _Kanban(fail=RuntimeError("database is locked"))
+    def test_a_record_that_cannot_be_written_is_logged_and_the_line_stays_without_its_token(self):
+        kanban, broker = _Kanban(fail=RuntimeError("database is locked")), _Broker()
         with self.assertLogs(plugin.logger, "WARNING"):
-            self.assertIsNone(self.run_hook(_vcs_record(), kanban))
+            out = self.run_hook(broker.line(), kanban, broker=broker)
+        self.assertEqual(_tokens(out), [])
+        self.assertEqual(plugin.opened(out)["url"], URL)
+        self.assertEqual([payload["url"] for _, payload in self.ledger], [URL], "the ledger still counts it")
 
-    def test_a_check_that_fails_ends_the_asking_for_that_output(self):
+    def test_a_ledger_write_that_fails_is_logged_with_the_url_and_the_card_still_gets_its_event(self):
+        kanban, broker = _Kanban(), _Broker()
+        env = {plugin.TASK_ENV: TASK}
+        modules = {**kanban.modules(), "forge": broker.module(), "kanban_origin": None}
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(plugin, "_session_kv_post", side_effect=OSError("connection refused")), \
+                self.assertLogs(plugin.logger, "WARNING") as logs:
+            out = plugin.on_terminal_output(output=broker.line())
+        self.assertEqual(out, "")
+        self.assertEqual(len(kanban.events), 1)
+        self.assertEqual(len(broker.asked), 1, "a burned token is not claimed again")
+        self.assertIn(URL, "\n".join(logs.output))
+
+    def test_a_claim_that_is_not_answered_ends_the_asking_and_still_strips_every_token(self):
         # A broker or sandbox hop that is down costs one timeout, not one per url.
-        kanban, forge = _Kanban(), _Forge(fail=RuntimeError("SANDBOX_UNREACHABLE"))
-        urls = [f"https://github.com/acme/fleet-config/pull/{n}" for n in range(3)]
-        output = "".join(_vcs_record(url=url) for url in urls)
-        with self.assertLogs(plugin.logger, "WARNING"):
-            self.assertIsNone(self.run_hook(output, kanban, forge=forge))
-        self.assertEqual(len([entry for entry in forge.asked if entry[0] == "proposal-view"]), 1)
-        self.assertEqual(kanban.events, [])
+        for fail in (_Refusal("SANDBOX_UNREACHABLE"), RuntimeError("timed out")):
+            kanban, broker = _Kanban(), _Broker(fail=fail)
+            output = "".join(broker.line(url=f"{REPOSITORY}/pull/{n}", number=n) for n in range(3))
+            with self.subTest(fail=repr(fail)), self.assertLogs(plugin.logger, "WARNING") as logs:
+                out = self.run_hook(output, kanban, broker=broker)
+            self.assertEqual(len(broker.asked), 1)
+            self.assertEqual(_tokens(out), [])
+            self.assertEqual(len(out.splitlines()), 3)
+            self.assertEqual((kanban.events, self.ledger), ([], []))
+            self.assertNotIn(REPOSITORY, "\n".join(logs.output))
+
+    def test_no_forge_here_still_strips_every_token(self):
+        kanban, broker = _Kanban(), _Broker()
+        line = broker.line()
+        modules = {**kanban.modules(), "forge": None}
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {}, clear=True), \
+                self.assertLogs(plugin.logger, "WARNING"):
+            out = plugin.on_terminal_output(output=line)
+        self.assertEqual(_tokens(out), [])
 
     def test_the_title_is_bounded(self):
-        kanban = _Kanban()
-        self.run_hook(_vcs_record(), kanban, forge=_Forge(title="x" * (plugin.TITLE_MAX * 2)))
+        kanban, broker = _Kanban(), _Broker(title="x" * (plugin.TITLE_MAX * 2))
+        self.run_hook(broker.line(), kanban, broker=broker)
         self.assertEqual(len(kanban.events[0][2]["title"]), plugin.TITLE_MAX)
 
     def test_registers_the_terminal_output_and_pre_tool_call_hooks(self):
@@ -236,6 +514,15 @@ class PrOpenedTest(unittest.TestCase):
             ("transform_terminal_output", plugin.on_terminal_output),
             ("pre_tool_call", plugin.on_pre_tool_call),
         ])
+
+
+def _load_kanban_origin():
+    """``deploy/docker/patches/kanban_origin.py``, loaded fresh by path."""
+    spec = importlib.util.spec_from_file_location("kanban_origin", REPO / "deploy/docker/patches/kanban_origin.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 
 PREPARE = (
@@ -368,36 +655,43 @@ class EndedRunGuardTest(unittest.TestCase):
         self.assertIsNone(self.call(PREPARE, status="done", tool="read_file"))
 
 
-class RealForgeTest(unittest.TestCase):
-    """:meth:`plugin.Checker.ours` through the real ``forge.py``, with only the broker under ``vcs_client`` stubbed."""
 
-    def check(self, author):
+class RealForgeTest(unittest.TestCase):
+    """:func:`plugin.claim` through the real ``forge.py``, with only the broker under ``vcs_client`` stubbed."""
+
+    def claim(self, broker):
         import forge
         import sandbox_exec
 
         asked = []
-        created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        def broker(verb, payload):
-            asked.append((verb, payload.get("repository"), payload.get("number")))
-            if verb == "identity":
-                return {"identity": {"login": "kube-agents-bot[bot]"}}
-            return {"proposal": {
-                "number": payload["number"], "url": URL, "author": author, "title": "Raise the limit",
-                "state": "open", "created": created,
-            }}
+        def call(verb, payload):
+            asked.append((verb, dict(payload)))
+            return broker(verb, payload)
 
-        with mock.patch.object(vcs_client, "_call", broker), \
+        with mock.patch.object(vcs_client, "_call", call), \
                 mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False), \
                 mock.patch.dict(sys.modules, {"forge": forge}):
-            verdict = plugin.Checker().ours({"url": URL, "number": 99, "title": "t"})
-        repository = "https://github.com/acme/fleet-config"
-        self.assertEqual(asked, [("identity", repository, None), ("proposal-view", repository, 99)])
+            verdict = plugin.claim({"url": URL, "number": 99, "title": "t", "claim": "tok", "repo": REPO_NAME})
+        self.assertEqual(asked, [("proposal-claim", {"claim": "tok", "url": URL, "repository": REPO_NAME})])
         return verdict
 
-    def test_the_agents_own_pull_request_is_ours_and_a_strangers_is_not(self):
-        self.assertEqual(self.check("kube-agents-bot"), {"url": URL, "number": 99, "title": "Raise the limit"})
-        self.assertIsNone(self.check("mallory"))
+    def test_the_brokers_answer_is_the_verdict_and_a_refusal_is_none(self):
+        answer = {"url": URL, "number": 99, "title": "Raise the limit"}
+        self.assertEqual(self.claim(lambda verb, payload: answer), answer)
+
+        def refuse(verb, payload):
+            raise vcs_client.VcsError("no live claim", code="CLAIM_UNKNOWN")
+
+        with self.assertLogs(plugin.logger, "WARNING"):
+            self.assertIsNone(self.claim(refuse))
+
+    def test_a_broker_that_does_not_answer_is_unanswered(self):
+        def down(verb, payload):
+            raise vcs_client.VcsError("connection refused")
+
+        with self.assertRaises(plugin.ClaimUnanswered):
+            self.claim(down)
 
 
 def _hermes_importable():
@@ -421,9 +715,11 @@ class RealBoardTest(unittest.TestCase):
                 kb.init_db()
                 with connect_closing() as conn:
                     task_id = kb.create_task(conn, title="raise the limit")
+                broker = _Broker()
                 with mock.patch.dict(os.environ, {plugin.TASK_ENV: task_id}), \
-                        mock.patch.dict(sys.modules, {"forge": _Forge().module()}):
-                    plugin.on_terminal_output(output=_vcs_record(), returncode=0)
+                        mock.patch.dict(sys.modules, {"forge": broker.module(), "kanban_origin": None}), \
+                        mock.patch.object(plugin, "_session_kv_post", return_value={"recorded": True}):
+                    plugin.on_terminal_output(output=broker.line(), returncode=0)
                 with connect_closing() as conn:
                     rows = conn.execute(
                         "SELECT kind, payload FROM task_events WHERE task_id = ? AND kind = ?",
@@ -490,12 +786,13 @@ class RealBoardTest(unittest.TestCase):
         hooks = manager._hooks.setdefault("transform_terminal_output", [])
         plugin.register(types.SimpleNamespace(register_hook=lambda name, fn: hooks.append(fn)))
         self.addCleanup(hooks.remove, plugin.on_terminal_output)
-        kanban = _Kanban()
+        kanban, broker = _Kanban(), _Broker()
         stdout = json.dumps({"proposal": {"url": URL, "number": 99}}) + "\n"
-        modules = {**kanban.modules(), "forge": _Forge().module()}
-        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {plugin.TASK_ENV: TASK}):
+        modules = {**kanban.modules(), "forge": broker.module(), "kanban_origin": None}
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {plugin.TASK_ENV: TASK}), \
+                mock.patch.object(plugin, "_session_kv_post", return_value={"recorded": True}):
             out = terminal_tool_result._apply_output_transform_hook(
-                "python3 vcs.py proposal create --title t", _vcs_record() + stdout, 0, "task-1", "ssh",
+                "python3 vcs.py proposal create --title t", broker.line() + stdout, 0, "task-1", "ssh",
             )
         self.assertEqual(out, stdout)
         self.assertEqual([event[1] for event in kanban.events], ["pr_opened"])

@@ -387,8 +387,9 @@ request would pass without anything being written to the cache. So:
   never match;
 - the proxy's files, in `hack/replay-proxy/`, need eval-crew approval in `hack/OWNERS`.
 
-Like the scorer's pin, this still relies on eval-crew reviewing changes to the deploy scripts that
-do the pinning, since those run from the pull request's code.
+Like the scorer's pin, this still relies on review of changes to the deploy scripts that do the
+pinning, since those run from the pull request's code: a root approver's approval (self-approval on
+their own change) and one `lgtm` from anyone `OWNERS` lists.
 
 ### What goes into the cache key
 
