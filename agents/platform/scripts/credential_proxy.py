@@ -3861,8 +3861,9 @@ class ServiceAccountAuthenticator:
 
 
 # The profile role's configuration (#3889). All four are reserved against
-# spec.deployment.env (mergeCredentialProxyEnv). The operator renders the first
-# three; it doesn't render the max lifetime yet, so the 6h default holds.
+# spec.deployment.env (mergeCredentialProxyEnv), and the operator renders all
+# four: the max lifetime is the same value the callout and the dispatcher get
+# (a2aTaskCredentialMaxLifetimeEnv). The 6h default holds only without it.
 PROFILE_AUDIENCE_ENV = "CREDENTIAL_PROXY_PROFILE_AUDIENCE"
 # JSON: {"system:serviceaccount:<ns>:<sa>": {"profile": ..., "tier": ...}}.
 PROFILE_IDENTITIES_ENV = "CREDENTIAL_PROXY_PROFILE_IDENTITIES"

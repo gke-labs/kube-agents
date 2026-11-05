@@ -240,10 +240,6 @@ func buildA2ADispatcherServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev
 	}
 }
 
-// buildA2ADispatcherDeployment runs one dispatcher, replaced with Recreate:
-// two at once would each hold their own share of every durable's in-flight
-// count and enforce the ceiling against half the picture. The gap Recreate
-// leaves is what restartGraceSeconds covers.
 // a2aTaskSigningKeyHashAnnotation carries a2aTaskSigningKeyHash on the
 // dispatcher's pod template.
 const a2aTaskSigningKeyHashAnnotation = "kubeagents.x-k8s.io/task-signing-key-hash"
@@ -255,6 +251,10 @@ func a2aTaskSigningKeyHash(public string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
+// buildA2ADispatcherDeployment runs one dispatcher, replaced with Recreate:
+// two at once would each hold their own share of every durable's in-flight
+// count and enforce the ceiling against half the picture. The gap Recreate
+// leaves is what restartGraceSeconds covers.
 func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aDispatcherName(agent)
 	selector := a2aDispatcherPodSelector(agent)

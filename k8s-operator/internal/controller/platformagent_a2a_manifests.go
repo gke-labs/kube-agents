@@ -131,8 +131,8 @@ const (
 	a2aProfileSubmitMaxAge = 72 * time.Hour
 
 	// a2aDispatchStopStream holds the gateway's stop records, one per task
-	// on a2aDispatchStopPrefix<profile>.<task> (lib.DispatchStopStream and
-	// lib.DispatchStopSubject; contract addendum 9). The gateway is its only
+	// on a2aDispatchStopPrefix<profile>.<task> (contract addendum 9; lib's
+	// names for them arrive with the gateway's stop, #4127). The gateway is its only
 	// writer, once its grant lands with #4127 (until then nothing writes it),
 	// and the dispatcher its only reader.
 	a2aDispatchStopStream = "DISPATCH_STOPS"
