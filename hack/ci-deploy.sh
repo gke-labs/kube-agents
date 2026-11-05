@@ -219,7 +219,7 @@ readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-2
 # The broker admits a request only while its child memory reservation fits the
 # budget it derives from this limit (agents/platform/scripts/credential_proxy.py,
 # docs/designs/credential-proxy-child-memory-budget.md): at 2Gi the budget
-# admits nine, so the slot cap of eight is the binding bound. The operator's
+# admits ten, so the slot cap of eight is the binding bound. The operator's
 # default limit is 2Gi as well, and so is its default memory request on GKE
 # Autopilot, so today this override changes nothing. It stays as a pin: if the
 # operator default moves, the eval install keeps the budget its cases were

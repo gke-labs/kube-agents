@@ -3726,7 +3726,6 @@ class ClassAdmissionTest(unittest.TestCase):
         per_request = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + credential_proxy.OUTPUT_COPIES_PER_COMMAND * 1024
         limit = (
             credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
-            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
             + admits * per_request
         )
         with mock.patch.object(credential_proxy, "BUDGET_MINIMUM_ADMITTED_REQUESTS", min(admits, 2)):
@@ -3890,7 +3889,6 @@ class ClassAdmissionTest(unittest.TestCase):
         # behind it takes no slot and is admitted past it.
         executor = self.executor(
             memory_limit_bytes=credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
-            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
             + 9 * (credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + credential_proxy.OUTPUT_COPIES_PER_COMMAND * 1024)
         )
         self.assertEqual(8, executor.admitted_requests())
@@ -4465,7 +4463,6 @@ class ChildMemoryBudgetDerivationTest(unittest.TestCase):
         mib = credential_proxy.MEBIBYTE
         self.assertEqual(128 * mib, credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES)
         self.assertEqual(192 * mib, credential_proxy.BROKER_RESIDENT_RESERVE_BYTES)
-        self.assertEqual(128 * mib, credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES)
         self.assertEqual(6, credential_proxy.OUTPUT_COPIES_PER_COMMAND)
         self.assertEqual("CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES", credential_proxy.ENV_MEMORY_LIMIT_BYTES)
         self.assertEqual(1024 * 1024, mib)
@@ -6102,13 +6099,13 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertIsNone(executor.children_budget_bytes)
         self.assertIsNone(executor.requests_the_budget_admits())
 
-    def test_the_budget_is_the_limit_less_the_two_fixed_reserves(self):
+    def test_the_budget_is_the_limit_less_the_resident_reserve(self):
         mib = credential_proxy.MEBIBYTE
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
             executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
         self.assertEqual(1024 * mib, executor.memory_limit_bytes)
-        self.assertEqual((1024 - 192 - 128) * mib, executor.children_budget_bytes)
-        # 704 MiB against 128 MiB reserve + 6 x 8 MiB output per request = 176 MiB.
+        self.assertEqual((1024 - 192) * mib, executor.children_budget_bytes)
+        # 832 MiB against 128 MiB reserve + 6 x 8 MiB output per request = 176 MiB.
         self.assertEqual(4, executor.requests_the_budget_admits())
         self.assertTrue(
             any("child memory budget enabled" in line and "admits 4" in line for line in logs.output),
@@ -6123,9 +6120,9 @@ class CommandExecutorTest(unittest.TestCase):
         mib = credential_proxy.MEBIBYTE
         with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
             executor = self.executor(memory_limit_bytes=2048 * mib, max_output_bytes=8 * mib)
-        # 1,728 MiB over 176 MiB a request fits 9; the slot cap of 8 binds.
+        # 1,856 MiB over 176 MiB a request fits 10; the slot cap of 8 binds.
         self.assertEqual(
-            {"slot_cap": 8, "budget_admits": 9, "admitted": 8, "interactive_cap": 7, "session_cap": 2},
+            {"slot_cap": 8, "budget_admits": 10, "admitted": 8, "interactive_cap": 7, "session_cap": 2},
             self._admission_report(executor),
         )
 
@@ -6133,7 +6130,7 @@ class CommandExecutorTest(unittest.TestCase):
         mib = credential_proxy.MEBIBYTE
         with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
             executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
-        # GKE Autopilot without bursting, with a CR that sets a 1Gi request: the limit is the request, and 704 MiB fits 4.
+        # GKE Autopilot without bursting, with a CR that sets a 1Gi request: the limit is the request, and 832 MiB fits 4.
         self.assertEqual(
             {"slot_cap": 8, "budget_admits": 4, "admitted": 4, "interactive_cap": 3, "session_cap": 2},
             self._admission_report(executor),
@@ -6241,7 +6238,7 @@ class CommandExecutorTest(unittest.TestCase):
         warning = [line for line in logs.output if "under the floor" in line]
         self.assertEqual(1, len(warning), logs.output)
         self.assertIn("512 MiB", warning[0])
-        self.assertIn("672 MiB", warning[0])
+        self.assertIn("544 MiB", warning[0])
         # Slot-only admission, as today: a reservation neither waits nor counts.
         self.hold_a_slot(executor, seconds=1)
         with executor.reserve_child_memory():
@@ -6250,7 +6247,7 @@ class CommandExecutorTest(unittest.TestCase):
     def test_a_limit_at_the_floor_enables_the_budget_for_two(self):
         mib = credential_proxy.MEBIBYTE
         floor = credential_proxy.child_memory_budget_floor_bytes(8 * mib)
-        self.assertEqual(672 * mib, floor)
+        self.assertEqual(544 * mib, floor)
         self.assertEqual(credential_proxy.CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP, floor)
         executor = self.executor(memory_limit_bytes=floor, max_output_bytes=8 * mib)
         self.assertEqual(2, executor.requests_the_budget_admits())
@@ -6382,7 +6379,6 @@ class CommandExecutorTest(unittest.TestCase):
         )
         limit = (
             credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
-            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
             + admits * per_request
         )
         # A budget for one is under the production floor and would be treated
@@ -6457,9 +6453,9 @@ class CommandExecutorTest(unittest.TestCase):
 
     def test_four_requests_fit_at_the_defaults_and_a_fifth_waits(self):
         _without_interactive_headroom(self)
-        # Design §2.2: a 1024 MiB limit and an 8 MiB output cap leave 704 MiB
+        # Design §2.2: a 1024 MiB limit and an 8 MiB output cap leave 832 MiB
         # for children, four requests of 128 + 6 x 8 MiB. Without the
-        # slots-in-use output term a fifth would fit (5 x 128 = 640 <= 704).
+        # slots-in-use output term a fifth would fit (5 x 128 = 640 <= 832).
         mib = credential_proxy.MEBIBYTE
         executor = self.executor(
             memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib, max_concurrent_commands=8
@@ -6907,11 +6903,6 @@ class CommandExecutorTest(unittest.TestCase):
                 result = executor.execute_internal(["/bin/echo", "inside"])
             self.assertEqual("inside\n", result.stdout)
             self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
-
-    def test_the_fixed_workspace_term_is_subtracted_with_no_workspace_open(self):
-        mib = credential_proxy.MEBIBYTE
-        executor = self.executor(memory_limit_bytes=1024 * mib)
-        self.assertEqual((1024 - 192 - 128) * mib, executor.children_budget_bytes)
 
     def test_a_transient_reservation_is_released_after_a_timed_out_command(self):
         # Review focus 2.
@@ -8608,13 +8599,10 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         )
         executor.memory_limit_bytes = (
             credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
-            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
             + admits * per_request
         )
         executor.children_budget_bytes = (
-            executor.memory_limit_bytes
-            - credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
-            - credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+            executor.memory_limit_bytes - credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
         )
         self.assertEqual(admits, executor.requests_the_budget_admits())
         executor.execute_internal = lambda argv, cwd=None: credential_proxy.ExecutionResult(
@@ -9456,7 +9444,7 @@ class ForgeRefreshRouteTest(unittest.TestCase):
     def test_a_refresh_refused_by_the_budget_answers_the_busy_503(self):
         def busy(provider, repository, caller=None):
             raise credential_proxy.CommandSlotUnavailable(
-                "the credential proxy is at its child memory budget (128 MiB in use of 704 MiB: "
+                "the credential proxy is at its child memory budget (128 MiB in use of 832 MiB: "
                 "128 MiB reserved for children, 0 MiB of output allowance for 0 requests)"
             )
 

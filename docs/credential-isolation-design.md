@@ -898,20 +898,20 @@ Consequences:
   the output allowance of the slots in use has to fit the budget the broker derives
   from its container's memory limit (`CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES`, a Downward
   API `resourceFieldRef` the operator renders; the cgroup's `memory.max` when it is
-  absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy and
-  128 MiB for the content workspace's one process tree at a time. At the operator's
-  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits nine
+  absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy.
+  At the operator's
+  defaults (a 2Gi limit, raised from 1Gi when the kanban slot default rose to six) that admits ten
   requests at once, whatever executable fills them; the slot cap of eight is the upper
   bound. The container's limit moves through the CR,
   `spec.deployment.credentialProxy.resources`, which merges over the operator's
   defaults per key; raising it raises the admitted count. The caps stay the
   operator's, because a CR override of a cap would detach it from the limit. A limit under which the budget would admit fewer than two
-  requests at once (672 MiB at the 8 MiB output cap) is treated as no budget, with a
+  requests at once (544 MiB at the 8 MiB output cap) is treated as no budget, with a
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
   it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
-  above the floor, so that the budget engages there too, admitting nine, held to eight by
+  above the floor, so that the budget engages there too, admitting ten, held to eight by
   the slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the

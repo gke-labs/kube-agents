@@ -312,21 +312,17 @@ ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # the same -- are most of what a wide-scope install's container holds. So a
 # request that runs commands also reserves this much for its children when it
 # is admitted, and the sum of reservations has to fit what is left of the
-# limit after the broker's own resident set and the content workspace's one
-# process tree at a time. One size for every route, because every route can
-# end up running the heavy case (§2.1). The operator's sizing test declares
-# the same four figures under matching names (credential_proxy_manifests.go)
-# and asserts the arithmetic against the rendered limit; change them together.
+# limit after the broker's own resident set. One size for every route, because
+# every route can end up running the heavy case (§2.1). The operator's sizing
+# test declares the same three figures under matching names
+# (credential_proxy_manifests.go) and asserts the arithmetic against the
+# rendered limit; change them together.
 # They, and BUDGET_MINIMUM_ADMITTED_REQUESTS below, are held equal by
 # tests/test_credential_proxy_sizing_parity.py.
 MEBIBYTE = 1024 * 1024
 REQUEST_CHILD_MEMORY_RESERVE_BYTES = 128 * MEBIBYTE
 # The broker process and Envoy: 168 MiB measured, with margin.
 BROKER_RESIDENT_RESERVE_BYTES = 192 * MEBIBYTE
-# The content workspace store serves one verb at a time under its own lock, so
-# at most one of its process trees exists at any moment; that is a fixed term
-# rather than a reservation per verb, and it is one request's worth.
-CONTENT_WORKSPACE_RESERVE_BYTES = 128 * MEBIBYTE
 # What the broker itself holds per admitted request, as a multiple of the
 # output cap: the two capped stream buffers, their decoded text, the JSON body
 # and its encoding. Charged for the slots in use, not for the cap.
@@ -344,12 +340,12 @@ OUTPUT_COPIES_PER_COMMAND = 6
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
 # child_memory_budget_floor_bytes at the 8 MiB output cap the operator sets
 # (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES; the broker's own fallback is not the
-# deployed cap): 672 MiB. Declared as a literal so that the copies elsewhere can
+# deployed cap): 544 MiB. Declared as a literal so that the copies elsewhere can
 # be compared with it as text. test_credential_proxy.py holds it to the
 # function, and tests/test_credential_proxy_sizing_parity.py holds it equal to
 # the operator's credentialProxyMemoryFloorBytesAtDefaultCap and the chart's
 # kube-agents.credentialProxyMemoryFloorBytes.
-CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 704643072
+CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = 570425344
 # Where the limit comes from, in order: the operator's Downward API variable,
 # then the cgroup v2 file for a broker whose Deployment predates the variable.
 # A value of `max` in the file means no limit, and no limit means no budget.
@@ -3069,11 +3065,7 @@ def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
     """The smallest container limit at which the budget admits
     BUDGET_MINIMUM_ADMITTED_REQUESTS slot-taking requests at once."""
     per_request = REQUEST_CHILD_MEMORY_RESERVE_BYTES + OUTPUT_COPIES_PER_COMMAND * max_output_bytes
-    return (
-        BROKER_RESIDENT_RESERVE_BYTES
-        + CONTENT_WORKSPACE_RESERVE_BYTES
-        + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
-    )
+    return BROKER_RESIDENT_RESERVE_BYTES + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
 
 
 class CommandSlotUnavailable(RuntimeError):
@@ -8745,9 +8737,7 @@ class CommandExecutor:
         self.memory_limit_bytes = memory_limit_bytes
         self.children_budget_bytes: int | None = None
         if memory_limit_bytes is not None:
-            self.children_budget_bytes = (
-                memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES - CONTENT_WORKSPACE_RESERVE_BYTES
-            )
+            self.children_budget_bytes = memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES
         # Bytes reserved by admitted requests right now; guarded by
         # `_slot_condition` like the slot count, because admission reads both.
         self._reserved_bytes = 0
