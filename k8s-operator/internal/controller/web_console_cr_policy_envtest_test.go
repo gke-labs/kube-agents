@@ -132,23 +132,25 @@ func TestTheWebConsoleCRPolicyHoldsTheConsoleToItsOwnFields(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 
-	// What a2a/cmd/web-console writes is admitted.
-	for name, body := range map[string]string{
-		"the active model (models.go)":    `{"metadata":{"annotations":{"kubeagents.x-k8s.io/active-model":"claude"}}}`,
-		"the model target (models.go)":    `{"metadata":{"annotations":{"kubeagents.x-k8s.io/active-model-target":"vertex"}}}`,
-		"the reasoning level (models.go)": `{"metadata":{"annotations":{"kubeagents.x-k8s.io/reasoning-level":"high"}}}`,
-		"the applied PRs (patches.go)":    `{"metadata":{"annotations":{"kubeagents.x-k8s.io/applied-prs":"[1,2]"}}}`,
-		"a console annotation removed":    `{"metadata":{"annotations":{"kubeagents.x-k8s.io/reasoning-level":null}}}`,
-		"the repositories page (repositories.go), from the github alias": `{"metadata":{"annotations":{` +
+	// What a2a/cmd/web-console writes is admitted, in the order the console
+	// writes it: a slice, not a map, because a repository is valid only after
+	// the repositories page has declared its forge.
+	for _, tc := range []struct{ name, body string }{
+		{"the active model (models.go)", `{"metadata":{"annotations":{"kubeagents.x-k8s.io/active-model":"claude"}}}`},
+		{"the model target (models.go)", `{"metadata":{"annotations":{"kubeagents.x-k8s.io/active-model-target":"vertex"}}}`},
+		{"the reasoning level (models.go)", `{"metadata":{"annotations":{"kubeagents.x-k8s.io/reasoning-level":"high"}}}`},
+		{"the applied PRs (patches.go)", `{"metadata":{"annotations":{"kubeagents.x-k8s.io/applied-prs":"[1,2]"}}}`},
+		{"a console annotation removed", `{"metadata":{"annotations":{"kubeagents.x-k8s.io/reasoning-level":null}}}`},
+		{"the repositories page (repositories.go), from the github alias", `{"metadata":{"annotations":{` +
 			`"kubeagents.x-k8s.io/repository-topology":"single","kubeagents.x-k8s.io/repository-metadata":"{}"}},` +
 			`"spec":{"integration":{"forges":[{"name":"github","namespace":"gke-labs"}],` +
-			`"repositories":[{"forge":"github","repository":"gke-labs/kube-agents","role":"gitops"}],"github":null}}}`,
-		"a repository added": `{"spec":{"integration":{"repositories":[` +
+			`"repositories":[{"forge":"github","repository":"gke-labs/kube-agents","role":"gitops"}],"github":null}}}`},
+		{"a repository added", `{"spec":{"integration":{"repositories":[` +
 			`{"forge":"github","repository":"gke-labs/kube-agents","role":"gitops"},` +
-			`{"forge":"github","repository":"kubernetes/kubernetes","role":"context"}]}}}`,
+			`{"forge":"github","repository":"kubernetes/kubernetes","role":"context"}]}}}`},
 	} {
-		if err := patch(console, body); err != nil {
-			t.Errorf("%s: refused, want admitted: %v", name, err)
+		if err := patch(console, tc.body); err != nil {
+			t.Errorf("%s: refused, want admitted: %v", tc.name, err)
 		}
 	}
 
