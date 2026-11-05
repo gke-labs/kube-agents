@@ -335,6 +335,14 @@ type DispatchConfig struct {
 	// its own after a stop record (contract addendum 9) before the
 	// dispatcher ends it. 0 takes the dispatcher's default (30).
 	StopGraceSeconds int `json:"stopGraceSeconds,omitempty"`
+	// SubmitRetentionSeconds is how long ProfileSubmitStream keeps a
+	// submission (the operator renders it from the same value as the
+	// stream's max age). A durable re-created over the stream replays
+	// everything inside it, so the dispatcher is to keep a finished task's
+	// tombstone at least this long (it reads this from #4873 on; until then
+	// it keeps its own default). Zero is from an operator that predates the
+	// field; the dispatcher then uses its own default.
+	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
@@ -389,6 +397,8 @@ func (c DispatchConfig) Validate() error {
 	case max(c.LeaseSeconds, c.RenewSeconds, c.RestartGraceSeconds, c.AcceptTimeoutSeconds,
 		c.BreakerCooldownSeconds, c.StopGraceSeconds) > MaxDispatchSeconds:
 		return fmt.Errorf("dispatch config: a second count is over %d", MaxDispatchSeconds)
+	case c.SubmitRetentionSeconds < 0:
+		return fmt.Errorf("dispatch config: submitRetentionSeconds %d", c.SubmitRetentionSeconds)
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Profiles {

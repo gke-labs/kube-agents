@@ -134,7 +134,9 @@ def test_settle_records_the_commands_before_purging(monkeypatch):
 
     def fake_shell(script, timeout):
         calls.append(script)
-        return _LOG if "head -c" in script and ".log" in script else ""  # the purge gets ""
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            return "purged\n"
+        return _LOG if "head -c" in script and ".log" in script else ""
 
     monkeypatch.setattr(harness, "_agent_shell", fake_shell)
     result = AgentResult(output="answer", trajectory=[])
@@ -157,6 +159,8 @@ def test_a_stalled_card_is_archived_after_its_transcript_is_read_and_before_the_
         calls.append(script)
         if "kanban archive" in script:
             return "Archived t_2\n"
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            return "purged\n"
         return _LOG if "head -c" in script and ".log" in script else ""
 
     monkeypatch.setattr(harness, "_agent_shell", fake_shell)

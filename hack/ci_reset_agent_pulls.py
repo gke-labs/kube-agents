@@ -30,6 +30,17 @@ What goes, and what stays:
 * every branch but the default, whatever its name, unless an open pull request
   that stays still has it as head. A pool repository is a fixture nothing else
   keeps branches in.
+* a file in PLANTED_STACK_FILES on the default branch that carries the stack
+  label (`managed-by: kube-agents-bench` on a line of its own). The one entry
+  is the Kustomize root that bench/tf/prebuilt/kustomize-overlay-declaration
+  plants for obtainability-pdb-kustomize-overlay and removes at its destroy.
+  Two things leave it: a unit killed before that destroy, and a teardown
+  that failed (devops-bench logs a teardown error and goes on, and the state
+  is the run's own, so nothing applies the destroy again). Then
+  obtainability-major-pdb-auto-pr's fix is manual on that project at every
+  run. A file at that path without the label stays. The GitHub path only:
+  the GitLab path (hack/ci_gitlab_forge.py) deletes no file, and the stack
+  writes to GitHub only.
 
 Never any repository but the leased project's: `expected_repo` refuses a pair
 that does not match, and the token the caller minted is narrowed to that one
@@ -42,6 +53,7 @@ JSON beside the job's artifacts, so every run carries its own proof;
 from __future__ import annotations
 
 import argparse
+import base64
 import http.client
 import json
 import os
@@ -80,6 +92,16 @@ RETRYABLE_STATUS_FLOOR = 500
 # What a GitHub call can raise: urllib's HTTPError, the socket's OSError, and
 # http.client's own faults for a response cut short, which urllib passes on.
 CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
+# The files a case stack plants on the default branch and that this reset
+# deletes when a killed unit left them, and the label that makes such a file
+# the stack's. bench/tf/prebuilt/kustomize-overlay-declaration/plant.py writes
+# the same path and label; scripts/test_ci_eval_agent_pulls_reset.py holds
+# them equal.
+PLANTED_STACK_FILES = ("clusters/seeded-a/seeded-reliability/kustomization.yaml",)
+STACK_LABEL_KEY = "managed-by"
+STACK_LABEL_VALUE = "kube-agents-bench"
+STACK_FILE_DELETE_MESSAGE = "test(bench): remove {path}, which an eval stack left behind (reset {scope})"
+HTTP_NOT_FOUND = 404
 RECORD_SCHEMA_VERSION = 1
 ISO_UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -203,6 +225,25 @@ def _branches_in_use(pull: dict, repo: str) -> set[str]:
     return {name for name in names if name}
 
 
+def planted_stack_file(repo: str, path: str, branch: str, token: str) -> tuple[dict | None, bool]:
+    """(the contents entry of `path` on `branch`, whether it carries the
+    stack label); (None, False) when no file is there."""
+    try:
+        entry = call("GET", f"/repos/{repo}/contents/{urllib.parse.quote(path)}?ref={urllib.parse.quote(branch)}", token)
+    except urllib.error.HTTPError as exc:
+        if exc.code == HTTP_NOT_FOUND:
+            return None, False
+        raise
+    if not isinstance(entry, dict) or not entry.get("sha"):
+        raise ResetError(f"GitHub answered the contents read of {path} in {repo} without a file")
+    try:
+        text = base64.b64decode(str(entry.get("content") or "")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ResetError(f"GitHub answered the contents read of {path} in {repo} with content that does not decode: {exc}") from exc
+    label = f"{STACK_LABEL_KEY}: {STACK_LABEL_VALUE}"
+    return entry, any(line.strip() == label for line in text.splitlines())
+
+
 def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -> dict:
     """What a call reports, before anything is read: the caller writes it on
     every exit, so the reset that faulted is the one with a record too."""
@@ -225,6 +266,9 @@ def new_record(repo: str, project: str, build: str, scope: str, dry_run: bool) -
         "deleted": [],
         "undeleted": [],
         "kept_branches": [],
+        "stack_files_deleted": [],
+        "stack_files_undeleted": [],
+        "stack_files_kept": [],
         "open_after": None,
         "branches_after": None,
         "clean": False,
@@ -294,8 +338,35 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
             record["undeleted"].append(name)
             continue
         record["deleted"].append(name)
+    # A file a killed stack unit left on the default branch (PLANTED_STACK_FILES).
+    stack_files = []
+    for path in PLANTED_STACK_FILES:
+        entry, ours = planted_stack_file(repo, path, default, token)
+        if entry is None:
+            continue
+        if not ours:
+            record["stack_files_kept"].append(path)
+            print(f"  {path} kept, it does not carry the stack label")
+            continue
+        stack_files.append(path)
+        print(f"  {path}, left by an eval stack")
+        if dry_run:
+            continue
+        try:
+            write("DELETE", f"/repos/{repo}/contents/{urllib.parse.quote(path)}", token, {
+                "message": STACK_FILE_DELETE_MESSAGE.format(path=path, scope=scope),
+                "sha": entry["sha"],
+                "branch": default,
+            })
+        except CALL_FAULTS as exc:
+            print(f"  {path} was not deleted ({describe(exc)})", file=sys.stderr)
+            record["stack_files_undeleted"].append(path)
+            continue
+        record["stack_files_deleted"].append(path)
     if dry_run:
         print(f"would close {len(agent_pulls)} pull request(s) and delete {len(leftover) - len(record['kept_branches'])} branch(es) in {repo} {scope}")
+        if stack_files:
+            print(f"would delete {len(stack_files)} stack file(s) in {repo} {scope}")
         return record
     # The read-back is the guarantee, not the writes: what is open now is
     # what the unit's agent would find.
@@ -305,9 +376,10 @@ def reset(repo: str, project: str, build: str, scope: str, token: str, dry_run: 
     for pull in after_pulls:
         heads_after |= _branches_in_use(pull, repo)
     still_branches = [name for name in branches(repo, token) if name != default and name not in heads_after]
+    still_files = [path for path in PLANTED_STACK_FILES if planted_stack_file(repo, path, default, token)[1]]
     record["open_after"] = len(still_agent)
     record["branches_after"] = len(still_branches)
-    record["clean"] = not still_agent and not still_branches
+    record["clean"] = not still_agent and not still_branches and not still_files
     record["finished_at"] = time.strftime(ISO_UTC_FORMAT, time.gmtime(time.time()))
     print(
         f"closed {len(record['closed'])} pull request(s) and deleted {len(record['deleted'])} branch(es) in {repo} {scope}; "

@@ -263,6 +263,18 @@ const (
 	// around it, and a substring match would also hold an event from some
 	// other writer that quoted it.
 	noNodesAvailableMessage = "no nodes available to schedule pods"
+	// reasonFailed is kubelet's reason for a container it could not create
+	// and for one it created but could not start (events.FailedToCreateContainer
+	// and events.FailedToStartContainer are both "Failed").
+	reasonFailed = "Failed"
+	// hostIPUnknownMessage opens kubelet's event when building a container's
+	// config needs the node's IP (a status.hostIP env var) and the Node
+	// carries no InternalIP or ExternalIP: "Error: " (kuberuntime's
+	// startContainer) around pkg/util/node's GetNodeHostIPs error. A node the
+	// autoscaler is deleting loses its addresses while its DaemonSet pods are
+	// still being started. Matched as a prefix so another writer that quotes
+	// the text mid-message does not match.
+	hostIPUnknownMessage = "Error: host IP unknown; known addresses:"
 )
 
 // newFilterConfig creates a new filterConfig, applying defaults for missing values.
@@ -542,7 +554,7 @@ func (f *filter) Decide(ev TriageEvent) filterGate {
 	// both and the count intact. The cost is the next sighting after the
 	// period, up to kubelet's 5m back-off ceiling on a long-running crash
 	// loop. Zero timestamps fail open, as an unknown count does.
-	if f.cfg.settle > 0 && settleApplies(canonicalizeReason(ev.Key.Reason, ev.Message)) && !settled(ev, f.cfg.settle) {
+	if f.cfg.settle > 0 && settleApplies(canonicalizeReason(ev.Key.Reason, ev.Message), ev.Message) && !settled(ev, f.cfg.settle) {
 		return gateSettle
 	}
 	if scaleUpVerdictFor(ev.Key.Reason) != scaleUpNone {
@@ -812,7 +824,8 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 		strings.TrimSpace(ev.Message) == noNodesAvailableMessage
 }
 
-// settleApplies reports whether the canonical reason is in the settle family:
+// settleApplies reports whether the canonical reason, and for Failed the
+// message, is in the settle family:
 // the reasons Autopilot's node churn emits routinely, that clear on their own
 // more often than not, and that are re-emitted while they last. The
 // crash-loop family is the motivating one (a kubelet object-cache warm-up on
@@ -827,12 +840,33 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 // autoscaler gate reads with a better signal than time; and FailedToDrainNode.
 // The family is read on the canonical reason so kubelet's Reason=BackOff
 // crash loop is in it and its image-pull BackOff is not.
-func settleApplies(canonicalReason string) bool {
+//
+// A plain Failed joins it only when the message is one of kubelet's config
+// errors (retriedConfigError). A start error stays out because a container
+// that was created and failed to start is retried only as its pod's
+// restartPolicy allows, so under Never it fails once and a span would never
+// reach the period; the other config errors stay out only because the list
+// holds the messages seen as noise, and kubelet would retry them too.
+func settleApplies(canonicalReason, message string) bool {
 	switch canonicalReason {
 	case "CrashLoopBackOff", "FailedMount", "Unhealthy":
 		return true
+	case reasonFailed:
+		return retriedConfigError(message)
 	}
 	return false
+}
+
+// retriedConfigError reports whether a Failed event's message is a config
+// error kubelet raises before any container exists. ShouldContainerBeRestarted
+// starts a container with no status whatever the restartPolicy, so kubelet
+// retries such an error on every pod sync while it lasts and stops only when
+// the pod is deleted: a lasting one crosses the settle period, and one whose
+// pod went with its node is never sighted again. A list of known messages
+// rather than "every Failed but the start errors", so a message not on it
+// still fires on its first sighting.
+func retriedConfigError(message string) bool {
+	return strings.HasPrefix(message, hostIPUnknownMessage)
 }
 
 // settled reports whether the event's own sightings span the settle period.

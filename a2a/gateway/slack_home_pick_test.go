@@ -717,3 +717,25 @@ func TestSlackHomePickOnADisarmedGateway(t *testing.T) {
 		t.Errorf("view = %q, patches %d; want the not-armed line and no write", text, homePatches(cs))
 	}
 }
+
+// TestSlackHomeNoticeReadsThePanelState: the answer to a typed
+// /sethome names the Home tab's view of the home, says there is none yet, or
+// says the field decides; it makes no Slack call.
+func TestSlackHomeNoticeReadsThePanelState(t *testing.T) {
+	a, api, _, dir := newHomePickAdapter(t, map[string]string{homeRecordKeySlack: "C0OLD1", homeRecordKeySetBy: "U0", homeRecordKeyWriter: homeTestImage})
+	writeHomeFile(t, dir, "C0OLD1\n")
+	if got, want := a.homeNotice(), fmt.Sprintf(slackHomeNoticeHome, "C0OLD1")+" "+slackHomeNoticeMove; got != want {
+		t.Errorf("notice with a home = %q, want %q", got, want)
+	}
+	writeHomeFile(t, dir, "")
+	if got, want := a.homeNotice(), slackHomeLineNoHome+" "+slackHomeNoticeMove; got != want {
+		t.Errorf("notice with no home = %q, want %q", got, want)
+	}
+	a.homeLearn.record.client = nil
+	if got, want := a.homeNotice(), slackHomeLineNotArmed+" "+slackHomeNoticeNoSet; got != want {
+		t.Errorf("notice when not armed = %q, want %q", got, want)
+	}
+	if api.conversationInfoCalls != 0 || api.userInfoCalls != 0 {
+		t.Errorf("the notice called Slack: conversations.info %d, users.info %d", api.conversationInfoCalls, api.userInfoCalls)
+	}
+}

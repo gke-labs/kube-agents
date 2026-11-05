@@ -1174,6 +1174,16 @@
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
 
+# The obtainability audit's sweep opens a pull request for a major finding
+# with a declared workload: checkout-gateway's no-pdb fix, beside the
+# clusters/seeded-a/seeded-reliability/checkout-gateway.yaml declaration
+# that every pool repository holds (#2228, scripts/verify_ci_pool_project.py
+# checks it). deployer: noop, role no-pdb-workload. It requests a pull
+# request, so it runs alone in the second phase, and the repository reset
+# runs before each repetition. Nightly from the merge that removes its
+# FIXTURE_NOT_READY entry.
+./tasks/obtainability-major-pdb-auto-pr/task.yaml
+
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its
 # tool results or from the card's run row, not under the 250 the fleet audits

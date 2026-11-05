@@ -73,6 +73,7 @@ _A2A_CALLOUT = _CONTROLLER / "platformagent_a2a_callout.go"
 _A2A_VERIFIER = _CONTROLLER / "platformagent_a2a_verifier.go"
 _A2A_CONSOLE = _CONTROLLER / "platformagent_a2a_console.go"
 _A2A_BRIDGE = _CONTROLLER / "platformagent_a2a_bridge.go"
+_A2A_GATEWAY_LEASE = _CONTROLLER / "platformagent_a2a_gateway_lease.go"
 _A2A_DISPATCHER = _CONTROLLER / "platformagent_a2a_dispatcher.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
@@ -98,8 +99,9 @@ _PLATFORM_URI = f"{_AR_REPO}/platform-agent:{_TAG}"
 _FLAG_UNSET_SPELLINGS = (None, "", "0", "true", "yes")
 # The Prow jobs (oss-test-infra) section 2b admits the flag on without a pull
 # request: the merge-blocking presubmit (in a batch Tide ran), the main
-# nightly's three parts and the GitLab and GHES next nightlies; the today-mode
-# GitLab nightly and a made-up job stand for every other Prow run.
+# nightly's three parts, the GitLab and GHES next nightlies and the
+# certification lane's first slice; the today-mode GitLab nightly and a
+# made-up job stand for every other Prow run.
 _NEXT_LANE_JOB_NAMES = (
     "pull-kube-agents-smoke-test",
     "ci-kube-agents-eval-nightly",
@@ -108,6 +110,7 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-eval-nightly-gitlab-next",
     "ci-kube-agents-eval-nightly-ghes-next",
     "ci-kube-agents-eval-nightly-gitlab-ce-next",
+    "ci-kube-agents-certification-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
 )
@@ -413,6 +416,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             "operator.extraEnv[8].value=true",
         ]
+        # The gateway's election, off for installs and on for the lane, under
+        # the name the operator reads it by, which opens it only on "true".
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[9].name={go_constant(_A2A_GATEWAY_LEASE, 'a2aGatewayElectionEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[9].value=true",
+        ]
         # Nothing turns the AgentProfile dispatcher on: it is off by default,
         # and the lane installs what a default install does.
         self.assertNotIn(go_constant(_A2A_DISPATCHER, "a2aDispatcherImageEnvVar"), " ".join(args))
@@ -568,7 +579,9 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[6], f"operator.extraEnv[6].value={_RC_REGISTRY_PREFIX}/hermes-bridge:{_RC_COMMIT_SHA}")
         self.assertEqual(values[7], f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}")
         self.assertEqual(values[8], "operator.extraEnv[8].value=true")
-        self.assertEqual(len(values), 9, values)
+        # The gateway's election, on for the lane on this path too.
+        self.assertEqual(values[9], "operator.extraEnv[9].value=true")
+        self.assertEqual(len(values), 10, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")

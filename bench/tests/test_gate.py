@@ -402,6 +402,7 @@ _API_TOKENS = {
     "front_door": {"input": 10, "cached": 100, "cache_write": 50, "reasoning": 0, "output": 7, "total": 167},
     "workers": {"input": 8, "total": 274986, "by_agent": {}, "unbilled": []},
 }
+_API_LINE = "input=18 output=1867 total=275153 cached=128562 cache_write=144706 reasoning=261"
 _INJECT_TOKENS = {
     "input": 60468, "cached": None, "cache_write": None, "reasoning": None, "output": 79,
     "total": 151969, "children": {"input": 91204, "output": 218, "total": 91422},
@@ -411,18 +412,28 @@ _INJECT_TOKENS = {
 @pytest.mark.parametrize(
     ("tokens", "expected"),
     [
-        (_API_TOKENS, TOKENS_PREFIX + "input=18 output=1867 total=275153"),
+        (_API_TOKENS, TOKENS_PREFIX + _API_LINE),
+        (
+            {key: value for key, value in _API_TOKENS.items() if key not in ("front_door", "workers")},
+            TOKENS_PREFIX + _API_LINE,
+        ),
+        # The front door's row was not read: `input` is the envelope's prompt
+        # total, and `cached` the workers' alone, so no split is printed.
+        (
+            {**_API_TOKENS, "front_door": {**_API_TOKENS["front_door"], "cached": None}},
+            TOKENS_PREFIX + "input=18 output=1867 total=275153",
+        ),
         (_INJECT_TOKENS, TOKENS_PREFIX + "input=60468 output=79 total=151969"),
         ({**_INJECT_TOKENS, "usage_partial": True}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
         (
             {**_API_TOKENS, "workers": {**_API_TOKENS["workers"], "unbilled": [{"session": "s1"}]}},
-            TOKENS_PREFIX + "input=18 output=1867 total=275153 partial=1",
+            TOKENS_PREFIX + _API_LINE + " partial=1",
         ),
         ({**_INJECT_TOKENS, "workers": None}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
         ({"input": None, "output": 0, "total": 0}, TOKENS_PREFIX + "output=0 total=0"),
         ({"input": True, "output": 1.5, "total": 40}, TOKENS_PREFIX + "total=40"),
     ],
-    ids=["api", "inject", "inject-partial", "unbilled-worker", "workers-unbilled-whole", "zero-is-a-count", "non-counts-left-out"],
+    ids=["api", "api-no-workers", "api-front-door-unsplit", "inject", "inject-partial", "unbilled-worker", "workers-unbilled-whole", "zero-is-a-count", "non-counts-left-out"],
 )
 def test_the_tokens_line_follows_the_timing_line(kanban_task, make_run, tmp_path, capsys, tokens, expected):
     """The dashboard reads each repetition's token counts from `rep N
