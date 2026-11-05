@@ -674,7 +674,9 @@ leaves the record as it was:
 A refusal at any step posts its reason (a turn's "not started", a delegation's "delegation
 refused") and submits nothing. A turn naming a profile while the conversation has a task running is refused rather than
 steered into that task. A profile task may delegate in turn, under the same checks as a session
-turn except the incarnation's author set, since a warm worker is reset between tasks. A child's
+turn except the incarnation's author set, since a warm worker is reset between tasks. Like a
+session turn, it delegates once: a second request from the same task is dropped as a repeat,
+because nothing yet tells a new request from a redelivered one. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
@@ -682,7 +684,9 @@ chain's end, delegated or not. A stop while the child runs cancels the child and
 task waiting open above it. Beside each profile task's cancel, the gateway writes a stop record,
 `{"v":1,"taskId":…}` on `a2a.stop.<profile>.<task>` in the `DISPATCH_STOPS` stream, for the
 dispatcher, which has no read on `.in`. The gateway is the record's one writer, and a task
-addressed to platform or a session gets none. The cards are re-read every five minutes, so a card or tombstone
+addressed to platform or a session gets none. The stream and the dispatcher's reader aren't
+built yet. Until they are, nothing stores the record, and a task the dispatcher still holds
+queued runs when a slot frees, or is refused at its queue timeout. The cards are re-read every five minutes, so a card or tombstone
 published while the gateway's connection was down is picked up, and a profile no longer on
 `DIRECTORY` is forgotten. The delegate tool
 the worker adapter serves still offers no `parameters`, so a session can delegate to a pinned

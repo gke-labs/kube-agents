@@ -417,7 +417,8 @@ leave open:
   tells warm workers to abandon the task (and resets them) or deletes the Job. It learns of the
   stop from a stop record the gateway writes beside each profile task's cancel
   (`a2a.stop.<profile>.<task>` on `DISPATCH_STOPS`), so a task it still holds queued is dropped
-  rather than admitted later.
+  rather than admitted later. The gateway writes the record today, and the stream and the
+  dispatcher's reader are still to be built.
 
 ### What this spec leaves to the build
 

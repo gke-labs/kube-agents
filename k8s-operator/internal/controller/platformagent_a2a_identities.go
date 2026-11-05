@@ -445,9 +445,9 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		// The gateway is the subject's one writer: the dispatcher reads it
 		// through its durables, and no worker or session holds it.
 		a2aProfileSubmitSubjects,
-		// A stop for a profile task, the record the dispatcher reads in place
-		// of the task's `…in` (addendum 9 on #3655). The gateway is its one
-		// writer.
+		// A stop for a profile task, the record the dispatcher is to read in
+		// place of the task's `…in` (addendum 9 on #3655). The gateway is its
+		// one writer; the stream and the dispatcher's reader come later.
 		a2aDispatchStopSubjects,
 		// The session registry's data plane. The bucket is spelled here and
 		// named by constant inside the grant function; the two are held

@@ -202,6 +202,9 @@ func TestDeliverChildResult_ReachesAProfileParentOnItsIn(t *testing.T) {
 			Attribution: json.RawMessage(`{"requester":{"backend":"discord","subject":"hmac:00"}}`)},
 		{ID: "task-child", Addressee: "prod-east", Role: taskRoleChild, ParentTaskID: "task-parent"},
 	}}
+	if err := r.g.reg.IndexTask(context.Background(), "task-parent", rec.Key); err != nil {
+		t.Fatal(err)
+	}
 	child, _ := rec.TaskRefFor("task-child")
 	if !r.g.deliverChildResult(context.Background(), rec, child, lib.StateCompleted, "the pod is OOMKilled", "") {
 		t.Fatal("not delivered")
@@ -605,5 +608,80 @@ func TestAProfileThatDoesntRunAtTheTierIsRefusedUpFront(t *testing.T) {
 	waitFor(t, "the refusal", postedContaining(r, "chat doesn't run at tier read"))
 	if envs := streamEnvelopes(t, r.url, "a2a.submit.chat.>"); len(envs) != 0 {
 		t.Fatalf("%d submission(s) for a tier the profile doesn't allow", len(envs))
+	}
+}
+
+func TestAChildResultThatFailsToPublishStillRestoresTheProfileParent(t *testing.T) {
+	r := startProfileRig(t)
+	rec := &SessionRecord{Key: "discord:13/13", ContextID: "ctx-13", Tasks: []TaskRef{
+		{ID: "task-parent", Addressee: "cluster", Tier: "read", CorrelationID: "corr-p",
+			Attribution: json.RawMessage(`not json`)},
+		{ID: "task-child", Addressee: "prod-east", Role: taskRoleChild, ParentTaskID: "task-parent"},
+	}}
+	if err := r.g.reg.IndexTask(context.Background(), "task-parent", rec.Key); err != nil {
+		t.Fatal(err)
+	}
+	child, _ := rec.TaskRefFor("task-child")
+	if !r.g.deliverChildResult(context.Background(), rec, child, lib.StateCompleted, "done", "") {
+		t.Fatal("a profile parent's failed delivery fell through to the session wake")
+	}
+	if rec.ActiveTask == nil || rec.ActiveTask.TaskID != "task-parent" {
+		t.Fatalf("active task = %+v, want the parent back so a stop reaches it", rec.ActiveTask)
+	}
+}
+
+func TestAChildResultIsNotDeliveredToAParentTheRelayEnded(t *testing.T) {
+	r := startProfileRig(t)
+	rec := &SessionRecord{Key: "discord:14/14", ContextID: "ctx-14", Tasks: []TaskRef{
+		{ID: "task-parent", Addressee: "cluster", Tier: "read", CorrelationID: "corr-p",
+			Attribution: json.RawMessage(`{"requester":{"backend":"discord","subject":"hmac:00"}}`)},
+		{ID: "task-child", Addressee: "prod-east", Role: taskRoleChild, ParentTaskID: "task-parent"},
+	}}
+	// The parent's index entry is absent, as the relay leaves it on the
+	// parent's terminal; the history entry carries no flag.
+	child, _ := rec.TaskRefFor("task-child")
+	if !r.g.deliverChildResult(context.Background(), rec, child, lib.StateCompleted, "done", "") {
+		t.Fatal("an ended profile parent's child fell through to the session wake")
+	}
+	if rec.ActiveTask != nil {
+		t.Fatalf("active task = %+v, want none for an ended parent", rec.ActiveTask)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := streamEnvelopes(t, r.url, lib.TaskInSubject("cluster", "task-parent")); len(got) != 0 {
+		t.Fatalf("%d child result(s) on an ended parent's .in", len(got))
+	}
+}
+
+func TestARestoredProfileParentGetsItsRollingLineBack(t *testing.T) {
+	r := startProfileRig(t)
+	rec := &SessionRecord{Key: "discord:15/15", ContextID: "ctx-15", Tasks: []TaskRef{
+		{ID: "task-parent", Addressee: "cluster", Tier: "read", CorrelationID: "corr-p", StatusMsgID: "line-1",
+			Attribution: json.RawMessage(`{"requester":{"backend":"discord","subject":"hmac:00"}}`)},
+		{ID: "task-child", Addressee: "prod-east", Role: taskRoleChild, ParentTaskID: "task-parent"},
+	}}
+	if err := r.g.reg.IndexTask(context.Background(), "task-parent", rec.Key); err != nil {
+		t.Fatal(err)
+	}
+	child, _ := rec.TaskRefFor("task-child")
+	if !r.g.deliverChildResult(context.Background(), rec, child, lib.StateCompleted, "done", "") {
+		t.Fatal("not delivered")
+	}
+	if rec.ActiveTask == nil || rec.ActiveTask.StatusMsgID != "line-1" {
+		t.Fatalf("active task = %+v, want the parent's line line-1", rec.ActiveTask)
+	}
+	if parent, _ := rec.TaskRefFor("task-parent"); parent.StatusMsgID != "" {
+		t.Fatalf("the entry still holds line %q, so two copies would close it", parent.StatusMsgID)
+	}
+}
+
+func TestATargetTheMergeMakesInvalidIsRefusedBeforeTheMint(t *testing.T) {
+	r := startProfileRig(t)
+	r.g.profiles.put("odd", &lib.AgentCard{Name: "odd",
+		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "my prod"}})
+	conv := "discord:16/16"
+	r.adapter.inbox <- profileTurn(conv, "odd", nil)
+	waitFor(t, "the refusal", postedContaining(r, "the task's parameters aren't valid"))
+	if envs := streamEnvelopes(t, r.url, "a2a.submit.odd.>"); len(envs) != 0 {
+		t.Fatalf("%d submission(s) for an invalid parameter set", len(envs))
 	}
 }
