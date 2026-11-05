@@ -391,3 +391,57 @@ func TestTheSweepRunsPastFailures(t *testing.T) {
 		t.Errorf("the pool whose delete was refused is gone anyway (the test's premise): %v", err)
 	}
 }
+
+// Every mount of the worker is either read-only or on the list the worker
+// empties after each task, for a plain profile and one with tools, so a
+// writable mount can't slip past the reset. Everything on the list is a
+// writable emptyDir, so the reset never meets a directory it can't empty.
+func TestEveryWritableWorkerMountIsResetBetweenTasks(t *testing.T) {
+	agent := a2aTestAgent()
+	for name, mutate := range map[string]func(*agentv1alpha1.AgentProfile){
+		"plain": func(*agentv1alpha1.AgentProfile) {},
+		"with tools": func(p *agentv1alpha1.AgentProfile) {
+			p.Spec.Tools = []agentv1alpha1.AgentProfileTool{{Name: "jq", Image: "registry.example/jq:1"}}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			profile := testAgentProfile(agent.Namespace, "auditor", mutate)
+			spec := buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, false)
+			c := spec.Containers[0]
+			reset := map[string]bool{}
+			for _, p := range strings.Split(envOf(c)[profileWorkerResetPathsEnv], ":") {
+				if p != "" {
+					reset[p] = true
+				}
+			}
+			emptyDirs := map[string]bool{}
+			for _, v := range spec.Volumes {
+				if v.EmptyDir != nil {
+					emptyDirs[v.Name] = true
+				}
+			}
+			listed := map[string]bool{}
+			for _, m := range c.VolumeMounts {
+				switch {
+				case reset[m.MountPath]:
+					listed[m.MountPath] = true
+					if m.ReadOnly || !emptyDirs[m.Name] {
+						t.Errorf("%s is on the reset list but isn't a writable emptyDir", m.MountPath)
+					}
+				case !m.ReadOnly:
+					t.Errorf("%s is writable and not on the reset list (%s): a task's files there would reach the next task", m.MountPath, envOf(c)[profileWorkerResetPathsEnv])
+				}
+			}
+			for p := range reset {
+				if !listed[p] {
+					t.Errorf("the reset list names %s, which the worker doesn't mount", p)
+				}
+			}
+			for _, want := range []string{profileWorkerScratchPath, profileWorkerHomePath, profileWorkerTmpPath, profileWorkerConfigPath, profileWorkerTaskTokenPath} {
+				if !reset[want] {
+					t.Errorf("%s isn't reset between tasks", want)
+				}
+			}
+		})
+	}
+}

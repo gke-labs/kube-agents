@@ -11,6 +11,7 @@ import (
 	goerrors "errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +37,9 @@ const (
 
 const (
 	profileWorkerContainer = "worker"
+	// profileWorkerResetPathsEnv is lib.EnvProfileResetPaths: the
+	// directories the worker empties after every task.
+	profileWorkerResetPathsEnv = "A2A_PROFILE_RESET_PATHS"
 	// profileWorkerUID is the worker image's user (a2a-worker, node:22's
 	// node user), and its FSGroup.
 	profileWorkerUID = 1000
@@ -56,15 +60,15 @@ const (
 	profileWorkerTmpPath          = "/tmp"
 	profileWorkerHomeTmpSizeLimit = "1Gi"
 
-	// The proxy token the confirm carries (addendum 8), written by the
-	// worker for the task's lifetime. Memory-backed, so it never lands on a
-	// node disk.
 	// The harness's per-task config directories (its CLAUDE_CONFIG_DIR):
 	// an emptyDir of their own, apart from the working directory, which the
 	// worker renders the persona into read-only (lib.ProfileConfigRoot).
 	profileWorkerConfigVolume = "harness-config"
 	profileWorkerConfigPath   = "/var/run/kube-agents/harness-config"
 
+	// The proxy token the confirm carries (addendum 8), written by the
+	// worker for the task's lifetime. Memory-backed, so it never lands on a
+	// node disk.
 	profileWorkerTaskTokenVolume = "task-token"
 	profileWorkerTaskTokenPath   = "/var/run/kube-agents/task-token"
 
@@ -182,6 +186,10 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		a2aNATSCABundleVolume(agent),
 	}
 	volumes = append(volumes, rendered.Volumes...)
+	// Every writable mount is emptied by the worker after each task, so one
+	// task's files never reach the next on a warm pod. The list is derived
+	// from the mounts, so a writable mount added later is on it too.
+	env = append(env, corev1.EnvVar{Name: profileWorkerResetPathsEnv, Value: strings.Join(profileWorkerResetPaths(mounts, volumes), ":")})
 
 	res := profile.Spec.Resources
 	return corev1.PodSpec{
@@ -226,6 +234,26 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 			},
 		}},
 	}
+}
+
+// profileWorkerResetPaths is every mount of the worker that is writable and
+// backed by an emptyDir: what a task can leave behind for the next. A mount
+// marked read-only, or of any other kind of volume, holds nothing a task
+// wrote.
+func profileWorkerResetPaths(mounts []corev1.VolumeMount, volumes []corev1.Volume) []string {
+	emptyDirs := map[string]bool{}
+	for _, v := range volumes {
+		if v.EmptyDir != nil {
+			emptyDirs[v.Name] = true
+		}
+	}
+	var paths []string
+	for _, m := range mounts {
+		if !m.ReadOnly && emptyDirs[m.Name] {
+			paths = append(paths, m.MountPath)
+		}
+	}
+	return paths
 }
 
 // profilePoolName is the warm pool Deployment for one (profile, tier).
