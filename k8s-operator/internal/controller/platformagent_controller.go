@@ -33,6 +33,7 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -70,6 +71,9 @@ import (
 const PlatformAgentControllerName = fieldOwner
 
 const (
+	// a2aPendingRequeue is how soon a pass comes back while the A2A stack is
+	// still coming up or its gateway is held or waking.
+	a2aPendingRequeue      = 30 * time.Second
 	platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
 	// usageStatusReprobeInterval is how long a CR stays marked as served by a
 	// CRD without status.usage before the Ready writer probes again (see
@@ -515,6 +519,15 @@ type PlatformAgentReconciler struct {
 	// with no entry was not read by this process yet, and the status writers
 	// then leave the condition as it stands. Cleared when the CR is deleted.
 	dataVolumeExpansion sync.Map
+
+	// gatewayLeaseSeen records each A2A gateway Lease this process has seen
+	// exist, and gatewayLeaseGoneAt when it first saw a seen one missing:
+	// a deletion's recreate is held back from then (ensureA2AGatewayLease).
+	// Keyed by the Lease's ObjectKey; cleared when the CR is deleted.
+	gatewayLeaseSeen   sync.Map
+	gatewayLeaseGoneAt sync.Map
+	// gatewayLeaseHold overrides a2aGatewayLeaseRecreateHold; tests only.
+	gatewayLeaseHold time.Duration
 
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
@@ -1226,14 +1239,24 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// busHeld shares it for the gateway's reason: the bus waits on the
 	// callout's rollout, and the pass that sees it finish has to happen.
 	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking || a2aState.busHeld) {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		requeue := a2aPendingRequeue
+		// A held-back Lease recreate can be due sooner (ensureA2AGatewayLease).
+		if a2aState.leaseRequeue > 0 {
+			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
 	// which triggers no reconcile of its own, so poll while the condition
 	// stands rather than leave it until an unrelated event (rbac_selfcheck.go).
 	if rbacDegraded {
-		return ctrl.Result{RequeueAfter: rbacReprobeInterval}, nil
+		requeue := rbacReprobeInterval
+		// A held-back Lease recreate is due sooner (ensureA2AGatewayLease).
+		if a2aState.leaseRequeue > 0 {
+			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// Secret material reaches the gateway as environment, and a container's
@@ -1269,6 +1292,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that turns ScopeResolved False have to be asked for.
 	if a2aNext && a2aState.scopeRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.scopeRequeue)
+	}
+	// A deleted gateway Lease whose recreate is being held back: nothing
+	// else wakes the pass that creates it.
+	if a2aNext && a2aState.leaseRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.leaseRequeue)
 	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
@@ -1404,6 +1432,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
+		r.forgetA2AGatewayLease(agent)
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -5840,7 +5869,11 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
 		Owns(&networkingv1.NetworkPolicy{}).
-		Owns(&policyv1.PodDisruptionBudget{})
+		Owns(&policyv1.PodDisruptionBudget{}).
+		// The A2A gateway's Lease, so a deletion is seen and the Lease
+		// recreated (ensureA2AGatewayLease). The cache holds only Leases
+		// carrying a2aGatewayLeaseLabel (ManagerCacheOptions).
+		Owns(&coordinationv1.Lease{}, builder.WithPredicates(a2aGatewayLeaseEvents))
 
 	enqueueAgentsInNamespace := func(ctx context.Context, namespace string) []reconcile.Request {
 		var list agentv1alpha1.PlatformAgentList

@@ -304,7 +304,11 @@ class SharedCasesTest(unittest.TestCase):
         self.assertGreater(len(cases), 0)
         for case in cases:
             with self.subTest(case=case["name"]):
-                self.assertEqual(_as_case(self.run_case(case), case["expected"]), case["expected"])
+                outputs = _as_case(self.run_case(case), case["expected"])
+                self.assertEqual(outputs, case["expected"])
+                for out in outputs:
+                    if out is not None:
+                        self.assertEqual(chat_cases.lint(out["chat"]), [], "the chat UX rules")
 
 
 class QuestionDrawnOnceTest(unittest.TestCase):

@@ -921,7 +921,9 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(detail[periodics.DETAIL_LIMIT], "and 7 more")
         self.assertEqual(detail[-1], "7 write(s) left for the next run (the run's write budget)")
         self.assertEqual(len(detail), periodics.DETAIL_LIMIT + 2)
-        # A reconcile's first failed build is news, with its own lines untouched.
+        # A reconcile's first failed build is news, with its own lines untouched:
+        # the daily runs once a day, so waiting for a second would hold it a day.
+        self.assertEqual({DAILY.run_alert_after, periodics.WATCHED_BY_JOB[periodics.RECONCILE_POSTSUBMIT_JOB].run_alert_after}, {periodics.FIRST_FAILURE})
         weekly = {"job": DAILY.job, "build": "7", "finished_at": NOW.isoformat(timespec="seconds"), "passed": False, "result": "FAILURE",
                   "artifact": {"outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}}}}
         streaks = periodics.streaks({DAILY.job: weekly}, None)

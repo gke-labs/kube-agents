@@ -44,7 +44,8 @@ const sessionKindGroup = "group"
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // feedbackCommandNotice answers a bare "/feedback", the gateway's second slash
-// command (docs/designs/chat-feedback-command.md): where a report about
+// command (docs/designs/chat-feedback-command.md; a typed "/sethome" on Slack
+// is the Slack adapter's own, answered before the turn reaches here): where a report about
 // kube-agents itself goes, what one needs, and how to have the agent write
 // one up. Deterministic and model-free, like every gateway affordance; the
 // two links are chattext's, shared with the personas. "/feedback <text>" is
@@ -2021,7 +2022,9 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 }
 
 // sessionCommand resolves the first of the two slash commands the gateway
-// owns (the other, a bare /feedback, is answered inline in routeTurn):
+// owns (the other, a bare /feedback, is answered inline in routeTurn; a
+// typed /sethome on Slack never reaches the gateway, the Slack adapter
+// answers it):
 // "/session" marks the conversation session-routed, "/session <text>" marks
 // it and runs <text> as the first turn, "/session off" releases the
 // incarnation and re-homes to the default addressee. Deterministic, like
