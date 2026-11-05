@@ -74,8 +74,10 @@ var delegateToolSchema = map[string]any{
 	"inputSchema": map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \"platform\"."},
+			"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to: \"platform\", or an agent profile by name."},
 			"text":      map[string]any{"type": "string", "description": "The task, as you would state it to that agent."},
+			"parameters": map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"},
+				"description": "The task parameters the agent profile declares, by name. A profile that works on one cluster takes project, location and cluster. Leave out for platform. The gateway refuses a name the profile does not declare, or a required one left out, and its refusal names the ones the profile takes."},
 		},
 		"required": []string{"addressee", "text"},
 	},

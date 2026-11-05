@@ -355,17 +355,28 @@ func finalText(task *lib.Task) string {
 	return task.FinalMessage.Parts[0].Text
 }
 
-// No gateway reads a delegate request's parameters yet, so the adapter
-// refuses any rather than publish a request whose child would be minted
-// without the target it asked for. One without parameters goes as before.
-func TestValidateDelegateRefusesParametersUntilAGatewayReadsThem(t *testing.T) {
+// The gateway reads a delegate request's parameters and holds them to the
+// target profile's card, so the adapter passes them on, refusing only a set
+// that breaks the bounds every reader holds (lib.ValidateTaskParameters).
+func TestValidateDelegatePassesParametersWithinTheBounds(t *testing.T) {
 	plain := lib.DelegateRequest{Addressee: "cluster", Text: "check web-1"}
 	if got := validateDelegate(plain); got != "" {
 		t.Fatalf("a request without parameters was refused: %s", got)
 	}
 	with := plain
-	with.Parameters = map[string]string{"cluster": "web-1"}
-	if got := validateDelegate(with); got != delegateParametersNotYet {
-		t.Fatalf("a request with parameters = %q, want the not-yet refusal", got)
+	with.Parameters = map[string]string{"project": "p1", "location": "us-east1", "cluster": "web-1"}
+	if got := validateDelegate(with); got != "" {
+		t.Fatalf("a request with parameters was refused: %s", got)
+	}
+	for _, bad := range []map[string]string{
+		{"cluster": "a/b"},    // would split the verifier's resource path
+		{"Cluster": "web-1"},  // not a lower-case identifier
+		{"cluster": "--kube"}, // reads as a flag
+	} {
+		req := plain
+		req.Parameters = bad
+		if got := validateDelegate(req); got == "" {
+			t.Fatalf("parameters %v passed the adapter", bad)
+		}
 	}
 }

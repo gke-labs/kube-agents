@@ -1750,7 +1750,7 @@ class C1IsolationIsStructural(unittest.TestCase):
             self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
-        """The MCP tool schema and `lib.DelegateRequest` spell the same fields, bar `parameters`.
+        """The MCP tool schema and `lib.DelegateRequest` spell the same fields.
 
         The session's harness speaks MCP to the worker-adapter's own server,
         which answers `tools/list` with `delegateToolSchema` -- a
@@ -1774,30 +1774,22 @@ class C1IsolationIsStructural(unittest.TestCase):
             all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
-        # `parameters` is on the wire struct but not the tool: the worker
-        # adapter refuses a request carrying any until a gateway reads them
-        # (validateDelegate), so the model is not offered the field. The
-        # exemption holds only while that refusal does.
-        self.assertIn(
-            "if len(req.Parameters) > 0 {",
-            h.text("a2a_worker_adapter_delegate"),
-            "the adapter no longer refuses delegate parameters; declare them in delegateToolSchema",
-        )
-        tags = [t for t in all_tags if t != "parameters"]
-
         mcp = h.text("a2a_worker_adapter_mcp")
         schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
-        properties = sorted(re.findall(r'"(\w+)":\s*map\[string\]any\{"type": "string"', schema))
+        # A property opens its own line; `additionalProperties` inside one doesn't.
+        properties = sorted(re.findall(r'^\s*"(\w+)":\s*map\[string\]any\{"type": "(?:string|object)"', schema, re.M))
         self.assertEqual(
-            tags,
+            all_tags,
             properties,
             "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
         )
+        # `parameters` is optional on both sides: platform takes none, and the
+        # wire struct's tag is omitempty.
         required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
         self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
         required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
         self.assertEqual(
-            tags,
+            [t for t in all_tags if t != "parameters"],
             required,
             "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
         )

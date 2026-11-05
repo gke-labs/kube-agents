@@ -158,3 +158,42 @@ func TestDelegateSocketPathDefaultsAndRespectsEnv(t *testing.T) {
 		t.Fatalf("env override: got %q, want /tmp/custom.sock", got)
 	}
 }
+
+// The tool offers parameters, optional, as a map of names to strings, and a
+// call's parameters reach the adapter on the request.
+func TestDelegateMCPOffersAndForwardsParameters(t *testing.T) {
+	sock, got := fakeAdapterSocket(t, delegateReply{OK: true, Message: "delegated; this turn ends now"})
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ServeDelegateMCP(ctx, inR, outW, sock, slog.Default()) }()
+	out := bufio.NewReader(outR)
+
+	list := rpc(t, inW, out, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	schema := list["result"].(map[string]any)["tools"].([]any)[0].(map[string]any)["inputSchema"].(map[string]any)
+	params, ok := schema["properties"].(map[string]any)["parameters"].(map[string]any)
+	if !ok || params["type"] != "object" || params["additionalProperties"].(map[string]any)["type"] != "string" {
+		t.Fatalf("parameters property = %v, want an object of strings", params)
+	}
+	for _, r := range schema["required"].([]any) {
+		if r == "parameters" {
+			t.Fatal("parameters is required; platform takes none")
+		}
+	}
+
+	call := rpc(t, inW, out, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delegate","arguments":{"addressee":"cluster","text":"why is web crashing?","parameters":{"project":"p1","location":"us-east1","cluster":"dev"}}}}`)
+	if res := call["result"].(map[string]any); res["isError"] == true {
+		t.Fatalf("call errored: %v", call)
+	}
+	reqs := got()
+	want := map[string]string{"project": "p1", "location": "us-east1", "cluster": "dev"}
+	if len(reqs) != 1 || len(reqs[0].Parameters) != len(want) {
+		t.Fatalf("adapter got %+v", reqs)
+	}
+	for k, v := range want {
+		if reqs[0].Parameters[k] != v {
+			t.Fatalf("adapter got parameters %v, want %v", reqs[0].Parameters, want)
+		}
+	}
+}
