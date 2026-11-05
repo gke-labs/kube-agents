@@ -1068,6 +1068,18 @@ class QuotaPacingTest(unittest.TestCase):
                 self.assertEqual(["quota_floor"], harness.metrics.failures)
                 self.assertTrue(any("paused" in line for line in logs.output))
 
+    def test_the_first_quota_reading_for_a_scope_is_logged_once(self):
+        forge = proposals_forge(5, QuotaReading(QUOTA_LIMIT, 4000, QUOTA_RESET))
+        harness = Harness({REPO: forge}, interval=WIDE)
+
+        with self.assertLogs(LOGGER_NAME, level="INFO") as logs:
+            harness.sweep.run_once()
+            harness.sweep.run_once()
+
+        paced = [line for line in logs.output if "pace on" in line]
+        self.assertEqual(1, len(paced), logs.output)
+        self.assertIn(f"limit={QUOTA_LIMIT} remaining=4000 floor=500", paced[0])
+
     def test_one_call_above_the_floor_proceeds(self):
         for quota in (QuotaReading(QUOTA_LIMIT, 501, QUOTA_RESET), QuotaReading(None, 301, QUOTA_RESET)):
             with self.subTest(quota=quota):

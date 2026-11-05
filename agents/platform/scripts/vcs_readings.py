@@ -402,6 +402,9 @@ class ReadingsSweep:
         # knows no quota until it calls.
         self._wall = wall_clock
         self._paused: dict[tuple[str, str], float] = {}
+        # The quota keys whose first reading has been logged, so an operator
+        # can see the sweep is pacing on a quota without a log line per call.
+        self._quota_logged: set[tuple[str, str]] = set()
 
     # ---- the timer -----------------------------------------------------
 
@@ -777,6 +780,16 @@ class ReadingsSweep:
         if reading is None:
             return False
         floor = quota_floor(reading.limit)
+        if key not in self._quota_logged:
+            self._quota_logged.add(key)
+            host, scope = key
+            LOGGER.info(
+                "proposal readings: per-proposal reads pace on %s's quota limit=%s remaining=%d floor=%d",
+                f"{host} ({scope})" if scope else host,
+                reading.limit,
+                reading.remaining,
+                floor,
+            )
         if reading.remaining > floor:
             return False
         self._pause(bound.quota_key, reading, f"remaining={reading.remaining} floor={floor}")
