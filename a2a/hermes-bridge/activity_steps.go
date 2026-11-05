@@ -16,8 +16,10 @@ package hermesbridge
 //     kind, and fixed title).
 //   - Under the `api` executor (sessionID bound, activity_thinking.go and
 //     kanban.go), post_api_request also produces descriptive plan/synthesis
-//     titles and scrubbed `thought` text, and settled Kanban cards emit
-//     `subtask` step records.
+//     titles (a tool's name and the short identifier it acts on), and
+//     settled Kanban cards emit `subtask` step records. The model's
+//     reasoning marks a step boundary and is not published; a step's
+//     `thought` is set only on a `subtask` record, from the card's report.
 
 import (
 	"encoding/json"
@@ -60,32 +62,31 @@ type apiResponse struct {
 	} `json:"assistant_message"`
 }
 
-// observeStepsAndThinkingLocked is observe's step and thinking half, under
-// a.mu: on the CLI executor (a.sessionID == "") it delegates to
-// observeStepsLocked; on the API executor (a.sessionID != "") it reads rich
-// planned tool titles and reasoning from post_api_request and falls back to
-// opening a step on pre_tool_call only when the call was not already planned.
-func (a *activityState) observeStepsAndThinkingLocked(d hookDelivery) ([]stepmsg.Step, string) {
+// observeExecutorStepsLocked is observe's step half, under a.mu: on the CLI
+// executor (a.sessionID == "") it delegates to observeStepsLocked; on the
+// API executor (a.sessionID != "") it reads the planned tool titles from
+// post_api_request and falls back to opening a step on pre_tool_call only
+// when the call was not already planned.
+func (a *activityState) observeExecutorStepsLocked(d hookDelivery) []stepmsg.Step {
 	if a.sessionID == "" {
-		return a.observeStepsLocked(d), ""
+		return a.observeStepsLocked(d)
 	}
 	a.initSessionTraceLocked()
 	switch d.Event {
 	case hookPreToolCall:
 		callID := strings.TrimSpace(d.Extra.ToolCallID)
 		if callID != "" && a.trace.plannedTitles[callID] != "" {
-			return a.closeStepLocked(), ""
+			return a.closeStepLocked()
 		}
 		if d.SessionID != "" && d.SessionID != a.sessionID {
-			return nil, ""
+			return nil
 		}
-		return a.observeStepsLocked(d), ""
+		return a.observeStepsLocked(d)
 	case hookPostAPIRequest:
 		closed := a.closeStepLocked()
-		steps, reasoning := a.observePostAPIRequestLocked(d)
-		return append(closed, steps...), reasoning
+		return append(closed, a.observePostAPIRequestLocked(d)...)
 	}
-	return nil, ""
+	return nil
 }
 
 // observeStepsLocked is observe's step half, under a.mu, for a delivery

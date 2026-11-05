@@ -9,7 +9,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
@@ -20,9 +19,11 @@ var (
 	cmdClusterFlagRe     = regexp.MustCompile(`(?:--cluster|--context)[=\s]+['"]?([A-Za-z0-9_.:-]+)['"]?`)
 	kanbanCardIDPattern  = regexp.MustCompile(`\b(t_[A-Za-z0-9_-]{2,32})\b`)
 
-	inlineTokenValuePattern       = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|1//[0-9A-Za-z_-]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|r8_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
-	pemPrivateKeyBlockPattern     = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----.*?-----END [A-Z0-9 _-]*PRIVATE KEY-----`)
-	pemPrivateKeyOpenPattern      = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY-----.*`)
+	inlineTokenValuePattern = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|1//[0-9A-Za-z_-]{20,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|r8_[A-Za-z0-9]{20,}|npm_[A-Za-z0-9]{20,}|pypi-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
+	// A private-key armour header ends in "PRIVATE KEY-----" (PEM, OpenSSH,
+	// PKCS#8, EC, RSA, DSA) or "PRIVATE KEY BLOCK-----" (PGP).
+	pemPrivateKeyBlockPattern     = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----.*?-----END [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----`)
+	pemPrivateKeyOpenPattern      = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 _-]*PRIVATE KEY(?: BLOCK)?-----.*`)
 	inlineAuthHeaderPattern       = regexp.MustCompile(`(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
 	inlineAuthSchemePrefixPattern = regexp.MustCompile(`(?i)^(Bearer|Basic|Token|ApiKey|Api-Key|Digest|Negotiate|AWS4-HMAC-SHA256|Mutual|OAuth)([ \t]+)`)
 	inlineURLCredPattern          = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s/'"]+(@)`)
@@ -30,9 +31,20 @@ var (
 	cliAttachedPassPattern        = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)([^\s"';|&]+)`)
 	cliSpacedPassPattern          = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
 	cliLongSecretFlagPattern      = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
-	proseSecretPattern            = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+is\s+(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
-	inlineKVSecretPattern         = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
-	inlineExtraSecretKeyPattern   = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
+	// Prose that states a secret: "the password is hunter2", "password for
+	// admin is hunter2", "the token was abc", "the password is now hunter2",
+	// "the secret is set to abc". The verb may be followed by a qualifier
+	// (now, currently, still, just, simply, set to, equal to) or a colon,
+	// none of which is the value.
+	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:for\s+[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
+	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
+	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
+	// An all-caps env-style key whose last component says it holds a key,
+	// credentials, a DSN or private material (ENCRYPTION_KEY, STRIPE_KEY,
+	// AWS_CREDS, DB_DSN, RSA_PRIVATE): the spelling is the credential's,
+	// whatever the first component names. Case-sensitive on purpose, so a
+	// prose "primary key" or a JSON "sort_key" is not blanked.
+	allCapsSecretSuffixKeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*_(?:KEY|KEYS|CREDS|DSN|PRIVATE)$`)
 	leadingEqAssignmentPattern    = regexp.MustCompile(`^([A-Za-z_][A-Za-z0-9_.-]*)=[^\s=]`)
 	allCapsEnvKeyPattern          = regexp.MustCompile(`^[A-Z_][A-Z0-9_]+$`)
 	base64PaddingTokenPattern     = regexp.MustCompile(`^[A-Za-z0-9+/_-]+={1,2}(?:[\s,;)\]}>]|\\?["'](?:\s|$)|$)`)
@@ -67,9 +79,11 @@ const (
 	// apiSynthesisStepTitle is the step the bridge publishes on rich API
 	// turns when the model stops calling tools and writes its answer.
 	apiSynthesisStepTitle = "Synthesizing findings into final response."
-	// stepTitleSentenceCap bounds the first sentence of a reasoning-only
-	// API request that becomes the step's title.
-	stepTitleSentenceCap = 72
+	// reasoningStepTitle is the step a request that reasoned without
+	// planning a call and without stopping stands for. It is a fixed title:
+	// the reasoning's text does not go on the bus (see the executor note in
+	// activity.go).
+	reasoningStepTitle = "Reasoning about the next step."
 	// maxPlannedTitles bounds the call-id -> title map one task keeps so
 	// activity entries can carry the title their step was published under.
 	maxPlannedTitles = 4096
@@ -78,7 +92,6 @@ const (
 	kanbanWorkspacesMarker     = "/kanban/workspaces/"
 	workerLabelSessionCap      = 24
 	entryTitleFallbackCap      = activityWordCap * 4
-	entryPreviewCap            = 320
 	shortClusterRefCap         = 48
 	shortFilePathCap           = 56
 	shortCardTitleCap          = 64
@@ -87,9 +100,6 @@ const (
 	shortCardSuffixMinPrefix   = 8
 	toolSearchQueryCap         = 36
 	leadingSubcommandCap       = 24
-	detailedInputCap           = activityInputCap * 2
-	detailedStringCap          = 512
-	errorResultPreviewCap      = 240
 	sessionTimestampPrefixLen  = 15
 	sessionTimestampClockSkew  = 2 * time.Second
 	maxStepTitleBytes          = 250
@@ -97,12 +107,13 @@ const (
 )
 
 // sessionTrace is the API-executor side of activityState: what the door
-// learns from post_api_request deliveries (the model's plan and reasoning,
-// published as step records and thinking text) and how worker sessions map
-// to the Kanban cards they execute.
+// learns from post_api_request deliveries (the model's plan, published as
+// step records whose titles name the tools and the identifiers they act on)
+// and how worker sessions map to the Kanban cards they execute. The model's
+// reasoning text is read only to tell a request that reasoned from one that
+// did not; none of it is published.
 type sessionTrace struct {
 	apiCalls             int
-	partsPublished       int
 	turnCardsFiled       bool
 	prevBatchKey         string
 	plannedTitles        map[string]string // tool call id -> the step title it was planned under
@@ -262,9 +273,9 @@ func (a *activityState) workerLabelLocked(sessionID string) string {
 	return "worker:" + capRunes(sessionID, workerLabelSessionCap)
 }
 
-func (a *activityState) observePostAPIRequestLocked(d hookDelivery) ([]stepmsg.Step, string) {
+func (a *activityState) observePostAPIRequestLocked(d hookDelivery) []stepmsg.Step {
 	if a.sessionID != "" && (d.SessionID == "" || (d.SessionID != a.sessionID && !a.waitingCard.Load())) {
-		return nil, ""
+		return nil
 	}
 	a.trace.apiCalls++
 	a.initSessionTraceLocked()
@@ -272,17 +283,15 @@ func (a *activityState) observePostAPIRequestLocked(d hookDelivery) ([]stepmsg.S
 	if isWorker {
 		a.observeWorkerContextLocked(d, nil, "")
 	}
-	steps, reasoning := buildAPIRequestSteps(d, a.trace.apiCalls, a.turnCalls, a.sessionID != "", len(a.trace.plannedTitles) > 0)
+	steps := buildAPIRequestSteps(d, a.trace.apiCalls, a.turnCalls, a.sessionID != "", len(a.trace.plannedTitles) > 0)
 	if len(steps) == 1 && steps[0].IsSynthesis() {
-		if isWorker {
-			steps, reasoning = nil, ""
-		} else if a.trace.turnCardsFiled && a.waitInTurn.Load() {
+		if isWorker || (a.trace.turnCardsFiled && a.waitInTurn.Load()) {
 			steps = nil
 		}
 	}
-	key := stepBatchKey(steps, reasoning)
+	key := stepBatchKey(steps)
 	if key == "" || key == a.trace.prevBatchKey {
-		return nil, ""
+		return nil
 	}
 	a.trace.prevBatchKey = key
 	for _, st := range steps {
@@ -293,13 +302,13 @@ func (a *activityState) observePostAPIRequestLocked(d hookDelivery) ([]stepmsg.S
 			a.trace.plannedTitles[id] = st.Title
 		}
 	}
-	return steps, reasoning
+	return steps
 }
 
 // stepBatchKey identifies one API request's step batch, so a model that
-// restates the same plan with the same reasoning is published once.
-func stepBatchKey(steps []stepmsg.Step, reasoning string) string {
-	if len(steps) == 0 && reasoning == "" {
+// restates the same plan is published once.
+func stepBatchKey(steps []stepmsg.Step) string {
+	if len(steps) == 0 {
 		return ""
 	}
 	var sb strings.Builder
@@ -311,17 +320,20 @@ func stepBatchKey(steps []stepmsg.Step, reasoning string) string {
 		sb.WriteString(strings.Join(st.CallIDs, ","))
 		sb.WriteByte('\n')
 	}
-	sb.WriteString(reasoning)
 	return sb.String()
 }
 
+// enrichPreToolCallLocked adds the api executor's attribution to a call's
+// opening entry: the step title it was planned under, the session and the
+// worker or card it ran for. The entry's input is the shape observe already
+// set, the same as under the cli executor; the raw arguments are read here
+// only to name the title's identifier and map worker sessions to cards.
 func (a *activityState) enrichPreToolCallLocked(d hookDelivery, entry *ActivityEntry) {
 	if a.sessionID == "" {
 		return
 	}
 	a.initSessionTraceLocked()
 	entry.Title = a.entryTitleLocked(d.Extra.ToolCallID, d.ToolName, d.ToolInput)
-	entry.Input = redactInputDetailed(d.ToolName, d.ToolInput)
 	a.observeWorkerContextLocked(d, d.ToolInput, "")
 	entry.SessionID = capRunes(d.SessionID, activityCallIDCap)
 	entry.Worker = a.workerLabelLocked(d.SessionID)
@@ -342,33 +354,47 @@ func (a *activityState) entryTitleLocked(callID, toolName string, rawInput json.
 	return capRunes(strings.Join(titles, " "), entryTitleFallbackCap)
 }
 
-func (a *activityState) popOpenCallLocked(id string, d hookDelivery) ActivityEntry {
-	if openEntry, seen := a.open[id]; seen {
-		delete(a.open, id)
-		a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == id })
-		return openEntry
+// popOpenCallLocked closes the open call a post_tool_call ends and returns
+// its opening entry and the raw arguments the pre_tool_call carried (kept
+// in memory only, never published), or zero values when no start was seen.
+func (a *activityState) popOpenCallLocked(id string, d hookDelivery) (ActivityEntry, json.RawMessage) {
+	take := func(key string) (ActivityEntry, json.RawMessage) {
+		oe := a.open[key]
+		raw := a.openRaw[key]
+		delete(a.open, key)
+		delete(a.openRaw, key)
+		a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == key })
+		return oe, raw
+	}
+	if _, seen := a.open[id]; seen {
+		return take(id)
 	}
 	if a.sessionID != "" && d.SessionID != "" {
 		fallbackTool := capRunes(d.ToolName, activityToolNameCap)
 		for _, openID := range a.openOrder {
 			oe := a.open[openID]
 			if oe.SessionID == d.SessionID && oe.Tool == fallbackTool {
-				delete(a.open, openID)
-				a.openOrder = slices.DeleteFunc(a.openOrder, func(v string) bool { return v == openID })
-				return oe
+				return take(openID)
 			}
 		}
 	}
-	return ActivityEntry{}
+	return ActivityEntry{}, nil
 }
 
-func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry ActivityEntry, status string, e *ActivityEntry) {
+// enrichPostToolCallLocked adds the api executor's attribution to a call's
+// closing entry: its step title, session, worker or card, and, on a
+// kanban_create that made a card, the card's id. The entry's input is the
+// shape observe set (the opening entry's when the end carried no input), and
+// nothing of the tool's result or error text goes on it: the raw arguments
+// and result are read here only for the tool name inside hermes's wrapper,
+// the card id a kanban_create returned, and the worker-to-card mapping.
+func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry ActivityEntry, openRaw json.RawMessage, status string, e *ActivityEntry) {
 	if a.sessionID == "" {
 		return
 	}
 	rawToolInput := d.ToolInput
-	if len(rawToolInput) == 0 && len(openEntry.Input) > 0 {
-		rawToolInput = openEntry.Input
+	if len(rawToolInput) == 0 {
+		rawToolInput = openRaw
 	}
 	effectiveTool, _ := unwrapHermesToolCall(d.ToolName, rawToolInput)
 	if (d.SessionID == "" || d.SessionID == a.sessionID) && status != ActivityStatusError && (effectiveTool == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(rawToolInput), kanbanCreateTool))) {
@@ -380,11 +406,10 @@ func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry Activ
 	if e.Title == "" {
 		e.Title = a.entryTitleLocked(d.Extra.ToolCallID, d.ToolName, rawToolInput)
 	}
-	e.Input = redactInputDetailed(d.ToolName, d.ToolInput)
 	if len(e.Input) == 0 && len(openEntry.Input) > 0 {
 		e.Input = openEntry.Input
 	}
-	resPreview, errMsg, createdCardID := summarizeToolResult(effectiveTool, status, d.Extra.ErrorMessage, d.Extra.Result)
+	createdCardID := createdKanbanCardID(effectiveTool, d.Extra.Result)
 	a.observeWorkerContextLocked(d, rawToolInput, createdCardID)
 	e.SessionID = capRunes(d.SessionID, activityCallIDCap)
 	e.Worker = a.workerLabelLocked(d.SessionID)
@@ -394,34 +419,13 @@ func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry Activ
 	if e.CardID == "" {
 		e.CardID = a.trace.sessionCards[strings.TrimSpace(d.SessionID)]
 	}
-	if status == ActivityStatusError && errMsg != "" {
-		e.ErrorMessage = capRunes(errMsg, entryPreviewCap)
+	// The one result detail that goes on the bus: the id of the card a
+	// successful kanban_create made, an identifier the task's own subtask
+	// steps name again. Any other tool's output, and every error message,
+	// stays in the pod (the executor note in activity.go).
+	if status != ActivityStatusError && effectiveTool == kanbanCreateTool && createdCardID != "" {
+		e.ResultPreview = "card_id=" + createdCardID
 	}
-	if resPreview != "" {
-		e.ResultPreview = capRunes(resPreview, entryPreviewCap)
-	}
-}
-
-// publishThinking publishes reasoning text onto the thinking artifact while
-// the task runs and under its part budget. Callers hold run.mu.
-func (b *Bridge) publishThinking(run *taskRun, act *activityState, reasoning string) {
-	reasoning = strings.TrimSpace(reasoning)
-	if reasoning != "" && run.state == stateRunning && act.partUnderBudget() {
-		b.publishArtifactPart(run, lib.ArtifactThinking, lib.Part{Kind: "text", Text: reasoning})
-	}
-}
-
-// partUnderBudget bounds the thinking parts published for one task and
-// shares the per-task TASKS stream budget with activity/step parts.
-func (a *activityState) partUnderBudget() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.trace.partsPublished < activityThinkingBudget && a.published < activityEntryBudget-activityHeartbeatReserve {
-		a.trace.partsPublished++
-		a.published++
-		return true
-	}
-	return false
 }
 
 func (a *activityState) hasWorkerSession(sessionID string) bool {
@@ -443,11 +447,11 @@ func (a *activityState) hasCardID(cardID string) bool {
 }
 
 // buildAPIRequestSteps reads one post_api_request delivery into the step
-// records it stands for and the reasoning text the model stated: the planned
-// tool calls become plan steps (the first carrying the reasoning as its
-// thought), a stop after work becomes the synthesis step, and reasoning
-// without a tool call becomes a step titled by its first sentence.
-func buildAPIRequestSteps(d hookDelivery, fallbackStep, completedTools int, detailed bool, hadPlannedTitles bool) (steps []stepmsg.Step, reasoning string) {
+// records it stands for: the planned tool calls become plan steps, a stop
+// after work becomes the synthesis step, and reasoning without a tool call
+// becomes a step with a fixed title. The model's reasoning is read only to
+// tell whether the request reasoned at all; none of its text is kept.
+func buildAPIRequestSteps(d hookDelivery, fallbackStep, completedTools int, detailed bool, hadPlannedTitles bool) []stepmsg.Step {
 	step := fallbackStep
 	if n := durationMillis(d.Extra.APICallCount); n > 0 {
 		step = int(n)
@@ -491,37 +495,34 @@ func buildAPIRequestSteps(d hookDelivery, fallbackStep, completedTools int, deta
 		}
 	}
 
-	var reasoningParts []string
-	addReasoning := func(s string) {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return
+	// hadReasoning says whether the request stated any reasoning, in any of
+	// the shapes the providers use. The text itself is dropped here: a
+	// model that has read a secret may restate it, and no scrubber is a
+	// contract (the executor note in activity.go).
+	hadReasoning := false
+	noteReasoning := func(s string) {
+		if strings.TrimSpace(s) != "" {
+			hadReasoning = true
 		}
-		for _, existing := range reasoningParts {
-			if existing == s || strings.Contains(existing, s) {
-				return
-			}
-		}
-		reasoningParts = append(reasoningParts, s)
 	}
 
-	addReasoning(msg.ReasoningContent)
-	addReasoning(msg.Reasoning)
+	noteReasoning(msg.ReasoningContent)
+	noteReasoning(msg.Reasoning)
 
-	if len(msg.ReasoningDetails) > 0 {
+	if !hadReasoning && len(msg.ReasoningDetails) > 0 {
 		var details []map[string]any
 		if json.Unmarshal(msg.ReasoningDetails, &details) == nil {
 			for _, item := range details {
 				if txt, ok := item["text"].(string); ok {
-					addReasoning(txt)
+					noteReasoning(txt)
 				}
 				if sum, ok := item["summary"].(string); ok {
-					addReasoning(sum)
+					noteReasoning(sum)
 				}
 			}
 		}
 	}
-	if len(msg.AnthropicContentBlocks) > 0 {
+	if !hadReasoning && len(msg.AnthropicContentBlocks) > 0 {
 		var blocks []struct {
 			Type     string `json:"type"`
 			Thinking string `json:"thinking"`
@@ -529,7 +530,7 @@ func buildAPIRequestSteps(d hookDelivery, fallbackStep, completedTools int, deta
 		if json.Unmarshal(msg.AnthropicContentBlocks, &blocks) == nil {
 			for _, blk := range blocks {
 				if blk.Type == "thinking" {
-					addReasoning(blk.Thinking)
+					noteReasoning(blk.Thinking)
 				}
 			}
 		}
@@ -539,14 +540,14 @@ func buildAPIRequestSteps(d hookDelivery, fallbackStep, completedTools int, deta
 	for _, re := range []*regexp.Regexp{thinkTagPattern, scratchpadTagPattern} {
 		for _, m := range re.FindAllStringSubmatch(content, -1) {
 			if len(m) > 1 {
-				addReasoning(m[1])
+				noteReasoning(m[1])
 			}
 		}
 		content = re.ReplaceAllString(content, "")
 	}
 	content = strings.TrimSpace(content)
 	if content != "" && (d.Extra.FinishReason == "tool_calls" || len(msg.ToolCalls) > 0) {
-		addReasoning(content)
+		noteReasoning(content)
 	}
 
 	kanbanCreateCount := 0
@@ -586,45 +587,30 @@ func buildAPIRequestSteps(d hookDelivery, fallbackStep, completedTools int, deta
 		}
 	}
 
-	explicit := capBytes(capRunes(scrubInlineSecrets(strings.Join(reasoningParts, "\n")), activityThinkingCap), maxThinkingBytes)
-	thoughtSingle := capBytes(capRunes(strings.Join(strings.Fields(explicit), " "), activityThinkingCap), maxThinkingBytes)
 	synthTitle := synthesisStepTitle
-	if hadPlannedTitles || explicit != "" {
+	if hadPlannedTitles || hadReasoning {
 		synthTitle = apiSynthesisStepTitle
 	}
 	switch {
 	case len(planned) > 0:
-		planned[0].Thought = thoughtSingle
-		return planned, explicit
-	case explicit != "":
+		return planned
+	case hadReasoning:
 		// Reasoning with no tool call: when the model stopped on turn 1 with
-		// no prior tool work, return only the thinking text (no synthesis or
-		// plan step); after prior work, emit a synthesis step.
+		// no prior tool work, nothing is published; after prior work, the
+		// synthesis step; and a request that reasoned without stopping is a
+		// plan step under the fixed title.
 		if d.Extra.FinishReason == finishReasonStop {
 			if step > 1 || completedTools > 0 {
-				return []stepmsg.Step{{Kind: stepmsg.KindSynthesis, Title: synthTitle, Thought: thoughtSingle}}, explicit
+				return []stepmsg.Step{{Kind: stepmsg.KindSynthesis, Title: synthTitle}}
 			}
-			return nil, explicit
+			return nil
 		}
-		return []stepmsg.Step{{Kind: stepmsg.KindPlan, Title: capBytes(leadingSentence(thoughtSingle, stepTitleSentenceCap), maxStepTitleBytes), Thought: thoughtSingle}}, explicit
+		return []stepmsg.Step{{Kind: stepmsg.KindPlan, Title: reasoningStepTitle}}
 	case d.Extra.FinishReason == finishReasonStop && (step > 1 || completedTools > 0):
-		return []stepmsg.Step{{Kind: stepmsg.KindSynthesis, Title: synthTitle}}, ""
+		return []stepmsg.Step{{Kind: stepmsg.KindSynthesis, Title: synthTitle}}
 	default:
-		return nil, ""
+		return nil
 	}
-}
-
-// leadingSentence is the first sentence of s when it ends within limit
-// runes, else s cut at limit.
-func leadingSentence(s string, limit int) string {
-	s = strings.TrimSpace(s)
-	if idx := strings.Index(s, ". "); idx > 0 && utf8.RuneCountInString(s[:idx+1]) <= limit {
-		return s[:idx+1]
-	}
-	if utf8.RuneCountInString(s) <= limit {
-		return s
-	}
-	return capRunes(s, limit)
 }
 
 func firstNonEmptyToolName(a, b string) string {
@@ -932,10 +918,20 @@ func extractLeadingCommand(cmd string) (bin, sub string) {
 	return "", ""
 }
 
+// inlineSecretKey says whether a key seen inside text (a key=value pair, a
+// --flag, a YAML entry) names a credential: the bus-wide secretLookingKey
+// rule, the extra spellings text uses (pass, pwd, auth, a key file's
+// extension), and the all-caps env-style suffixes.
 func inlineSecretKey(k string) bool {
-	return secretLookingKey(k) || inlineExtraSecretKeyPattern.MatchString(k)
+	return secretLookingKey(k) || inlineExtraSecretKeyPattern.MatchString(k) || allCapsSecretSuffixKeyPattern.MatchString(k)
 }
 
+// scrubInlineSecrets is the defence in depth on the little text the api
+// executor does publish: the identifier a step title names (a cluster, a
+// file's tail, a search query, a card's title) and a settled card's report.
+// Tool arguments, results, error messages and model reasoning never reach
+// it, because they are not published at all (the executor note in
+// activity.go); a scrubber is a net, not a contract.
 func scrubInlineSecrets(s string) string {
 	if s == "" || s == redactedValue {
 		return s
@@ -1206,159 +1202,44 @@ func findUnescapedEscapedQuote(s string, q byte) int {
 	return -1
 }
 
-func redactKeysDetailed(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		if nameVal, ok := t["name"].(string); ok && inlineSecretKey(nameVal) {
-			if _, hasVal := t["value"]; hasVal {
-				t["value"] = redactedValue
-			}
-		}
-		for k, val := range t {
-			if inlineSecretKey(k) {
-				t[k] = redactedValue
-			} else {
-				t[k] = redactKeysDetailed(val)
-			}
-		}
-		return t
-	case []any:
-		for i := range t {
-			t[i] = redactKeysDetailed(t[i])
-		}
-		return t
-	}
-	return v
-}
-
-func redactInputDetailed(tool string, raw json.RawMessage) json.RawMessage {
-	trimmed := strings.TrimSpace(string(raw))
+// createdKanbanCardID is the id of the card a kanban_create's result names
+// (its id, card_id or task_id field, else the first card token in the raw
+// result), or "" when the call made no card or was not a kanban_create. It
+// is the one thing read out of a tool result: an identifier with the card
+// token's shape, which the task's own subtask steps name again.
+func createdKanbanCardID(toolName string, rawResult json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(rawResult))
 	if trimmed == "" || trimmed == "null" {
-		return nil
+		return ""
 	}
+	isCardID := func(s string) bool {
+		s = strings.TrimSpace(s)
+		return strings.HasPrefix(s, "t_") && kanbanCardIDPattern.FindString(s) == s
+	}
+	var decoded any
 	dec := json.NewDecoder(strings.NewReader(trimmed))
 	dec.UseNumber()
-	var v any
-	if err := dec.Decode(&v); err != nil {
-		return json.RawMessage(unparseableInput)
-	}
-	red := scrubValueDetailed(redactKeysDetailed(v))
-	out, err := json.Marshal(red)
-	if err != nil {
-		return json.RawMessage(unparseableInput)
-	}
-	if len(out) <= detailedInputCap {
-		return out
-	}
-	if tool == hermesToolCallWrapper {
-		if capped, ok := capWrapperCalls(red, detailedInputCap); ok {
-			return capped
-		}
-	}
-	out, _ = json.Marshal(truncatedStandIn(out, activityInputHead))
-	return out
-}
-
-func scrubValueDetailed(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(t))
-		shaped := 0
-		for k, val := range t {
-			nk := k
-			if tokenShapedKey(k) || !schemaKeyPattern.MatchString(k) {
-				shaped++
-				nk = fmt.Sprintf("<key %d, %d chars>", shaped, utf8.RuneCountInString(k))
-				out[nk] = shapeValueIn(val, k, false, 1, false)
-				continue
-			}
-			out[nk] = scrubValueDetailed(val)
-		}
-		return out
-	case []any:
-		for i := range t {
-			t[i] = scrubValueDetailed(t[i])
-		}
-		return t
-	case string:
-		if t == redactedValue {
-			return t
-		}
-		return capRunes(scrubInlineSecrets(t), detailedStringCap)
-	}
-	return v
-}
-
-func summarizeToolResult(toolName, status, rawErrMsg string, rawResult json.RawMessage) (resPreview, errMsg, createdCardID string) {
-	rawErrMsg = strings.TrimSpace(scrubInlineSecrets(rawErrMsg))
-	trimmed := strings.TrimSpace(string(rawResult))
-	var decoded any
-	if trimmed != "" && trimmed != "null" {
-		dec := json.NewDecoder(strings.NewReader(trimmed))
-		dec.UseNumber()
-		if dec.Decode(&decoded) == nil {
-			if s, ok := decoded.(string); ok {
-				if st := strings.TrimSpace(s); strings.HasPrefix(st, "{") || strings.HasPrefix(st, "[") {
-					var inner any
-					innerDec := json.NewDecoder(strings.NewReader(st))
-					innerDec.UseNumber()
-					if innerDec.Decode(&inner) == nil {
-						decoded = inner
-					}
+	if dec.Decode(&decoded) == nil {
+		if s, ok := decoded.(string); ok {
+			if st := strings.TrimSpace(s); strings.HasPrefix(st, "{") {
+				var inner any
+				if json.Unmarshal([]byte(st), &inner) == nil {
+					decoded = inner
 				}
 			}
 		}
 	}
-
 	if m, ok := decoded.(map[string]any); ok {
-		if cid := extractArgStr(m, "id", "card_id", "task_id"); strings.HasPrefix(cid, "t_") {
-			createdCardID = cid
-		}
-		if rawErrMsg == "" {
-			rawErrMsg = scrubInlineSecrets(extractArgStr(m, "error", "error_message", "stderr", "message"))
-		}
-	}
-	if createdCardID == "" && toolName == kanbanCreateTool && trimmed != "" {
-		if m := kanbanCardIDPattern.FindStringSubmatch(trimmed); len(m) > 1 {
-			createdCardID = m[1]
-		}
-	}
-
-	if status == ActivityStatusError {
-		if rawErrMsg == "" && trimmed != "" && trimmed != "null" {
-			rawErrMsg = oneLinePreview(scrubInlineSecrets(extractResultText(decoded, trimmed)), errorResultPreviewCap)
-		}
-		return rawErrMsg, rawErrMsg, createdCardID
-	}
-
-	// Only surface the created Kanban card ID on non-error tool calls; arbitrary
-	// tool outputs (e.g. a bare base64-decoded secret value) are never placed on TASKS.
-	if toolName == kanbanCreateTool && createdCardID != "" {
-		return "card_id=" + createdCardID, "", createdCardID
-	}
-	return "", "", createdCardID
-}
-
-func extractResultText(decoded any, fallbackRaw string) string {
-	switch t := decoded.(type) {
-	case string:
-		return strings.TrimSpace(t)
-	case map[string]any:
-		for _, k := range []string{"output", "content", "result", "text", "stdout", "message", "summary"} {
-			if v, ok := t[k].(string); ok && strings.TrimSpace(v) != "" {
+		for _, k := range []string{"id", "card_id", "task_id"} {
+			if v, ok := m[k].(string); ok && isCardID(v) {
 				return strings.TrimSpace(v)
 			}
 		}
-		if b, err := json.Marshal(scrubValueDetailed(redactKeysDetailed(t))); err == nil {
-			return string(b)
-		}
-	case []any:
-		if b, err := json.Marshal(scrubValueDetailed(redactKeysDetailed(t))); err == nil {
-			return string(b)
-		}
 	}
-	if fallbackRaw != "" && fallbackRaw != "null" {
-		return fallbackRaw
+	if toolName == kanbanCreateTool {
+		if m := kanbanCardIDPattern.FindStringSubmatch(trimmed); len(m) > 1 {
+			return m[1]
+		}
 	}
 	return ""
 }

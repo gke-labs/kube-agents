@@ -1737,3 +1737,58 @@ func TestWaitForTurnStepFollowsDelegatedChildAfterTurnWatchCloses(t *testing.T) 
 	_, _, resultText := FormatTurnCustomToolEnvelope(finalOut)
 	mustContain(t, resultText, wakeAnswer)
 }
+
+// stubFetcher is a msgFetcher that fetches nothing and counts Unsubscribe,
+// so a taskWatch built on it says whether it was closed.
+type stubFetcher struct{ unsubscribed atomic.Int32 }
+
+func (f *stubFetcher) Fetch(int, ...nats.PullOpt) ([]*nats.Msg, error) {
+	return nil, nats.ErrTimeout
+}
+
+func (f *stubFetcher) Unsubscribe() error {
+	f.unsubscribed.Add(1)
+	return nil
+}
+
+// An idle-release firing that was waiting on the state's lock while a new
+// poll ran is stale once that poll re-arms (or disarms) the release: it
+// must leave the watches the poll just kept alone. Only the armed
+// generation releases them. The mutant this kills: a release that ignores
+// its generation and closes whatever watches it finds.
+func TestIdleReleaseIgnoresAStaleGeneration(t *testing.T) {
+	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-stale-idle"}
+	f := &stubFetcher{}
+	st := &taskStepState{
+		ref: ref,
+		taskWatches: map[TaskRef]*taskWatch{
+			ref: {ref: ref, r: &budgetReader{sub: f}, release: func(bool) {}},
+		},
+	}
+
+	st.mu.Lock()
+	st.armIdleReleaseLocked()
+	stale := st.idleGen
+	// The next poll begins: it disarms the pending release, polls, and
+	// arms a fresh one. The first timer's body then gets the lock.
+	st.disarmIdleReleaseLocked()
+	st.armIdleReleaseLocked()
+	current := st.idleGen
+	st.mu.Unlock()
+
+	st.releaseIdleWatches(stale)
+	st.mu.Lock()
+	kept := len(st.taskWatches) == 1 && st.idleTimer != nil && st.idleGen == current
+	st.mu.Unlock()
+	if !kept || f.unsubscribed.Load() != 0 {
+		t.Fatalf("a stale idle release closed the watches a later poll kept (watches kept=%v, unsubscribed=%d)", kept, f.unsubscribed.Load())
+	}
+
+	st.releaseIdleWatches(current)
+	st.mu.Lock()
+	released := len(st.taskWatches) == 0 && st.idleTimer == nil
+	st.mu.Unlock()
+	if !released || f.unsubscribed.Load() != 1 {
+		t.Fatalf("the armed idle release did not close the watches (released=%v, unsubscribed=%d)", released, f.unsubscribed.Load())
+	}
+}

@@ -197,9 +197,6 @@ const (
 	hookSignaturePrefix = "sha256="
 	hookStatusOK        = "ok"
 
-	activityThinkingCap    = 4096
-	activityThinkingBudget = 768
-
 	// Statuses on the activity entry. completed and error are the api path's
 	// vocabulary; interrupted is a call whose end never arrived before the
 	// task's terminal - deadline, cancel, or a crash mid-tool.
@@ -210,20 +207,25 @@ const (
 	redactedValue = "[redacted]"
 )
 
-// What of an input reaches the bus depends on the executor mode, because
-// this stream is retained for days and copied into eval records. First, in
-// both modes, redactedKeyPattern and its siblings name input keys whose
-// values never go on the bus, so the trace still says a secret-looking key
-// was there. Then:
-//   - Under the cli executor, every remaining string value becomes its
-//     shape (shapeValue): the graders on the inject lane read tool names
-//     (an entry's tool, a tool_call wrapper's calls[].name) and nothing of
-//     the arguments, so no string value leaves the pod whatever its key.
-//   - Under the api executor (when a sessionID is bound), arguments and
-//     concise result/error previews are scrubbed for inline credential
-//     patterns (scrubInlineSecrets) and non-schema/token-shaped keys
-//     (scrubValueDetailed) so interactive console clients can render step
-//     cards without exposing tokens, headers, or URL credentials.
+// What of an input reaches the bus does not depend on the executor mode,
+// because this stream is retained for days and copied into eval records.
+// First, redactedKeyPattern and its siblings name input keys whose values
+// never go on the bus, so the trace still says a secret-looking key was
+// there. Then every remaining string value becomes its shape (shapeValue):
+// the graders on the inject lane read tool names (an entry's tool, a
+// tool_call wrapper's calls[].name) and nothing of the arguments, so no
+// string value leaves the pod whatever its key. Results are not published
+// either, and neither is a failed call's error text: the entry carries the
+// call's status and hermes's own errorType word. The api executor (a
+// sessionID bound) adds attribution on top of the same entry: the step
+// title the call was planned under, the session, the worker or card it ran
+// for, and, on a kanban_create that made a card, the card's id. A title is
+// the one place a value taken from the arguments is published, and it is a
+// short identifier the renderer needs (a cluster, a file's tail, a search
+// query, a card's title), passed through scrubInlineSecrets as a net. The
+// model's reasoning is read for the step boundary it marks and is not
+// published: a model that has read a secret may restate it, and a scrubber
+// is not a contract.
 //
 // activityEntryBudget bounds the parts one task publishes on its trace and
 // its heartbeat together. Both ride the task's own events subject, which
@@ -507,11 +509,16 @@ type activityState struct {
 	// to check a session's delivery against.
 	traced bool
 
-	mu         sync.Mutex
-	open       map[string]ActivityEntry // calls started and not yet ended
-	openOrder  []string                 // their ids, in start order
-	seen       map[string]struct{}      // delivery ids, so a hermes retry is one call
-	seenRing   []string                 // the ids in arrival order, the oldest forgotten past activitySeenCap
+	mu        sync.Mutex
+	open      map[string]ActivityEntry // calls started and not yet ended
+	openOrder []string                 // their ids, in start order
+	// openRaw is the raw tool input of each open call, kept in memory for
+	// the api executor's attribution when the call's end carries none (the
+	// nested tool name in hermes's wrapper, the worker-to-card mapping);
+	// it is never published.
+	openRaw    map[string]json.RawMessage
+	seen       map[string]struct{} // delivery ids, so a hermes retry is one call
+	seenRing   []string            // the ids in arrival order, the oldest forgotten past activitySeenCap
 	seenNext   int
 	calls      int
 	published  int // trace parts sent, against the budget less the reserve
@@ -549,6 +556,7 @@ type activityState struct {
 func newActivityState(withKey bool) *activityState {
 	a := &activityState{
 		open:      make(map[string]ActivityEntry),
+		openRaw:   make(map[string]json.RawMessage),
 		seen:      make(map[string]struct{}),
 		startedAt: time.Now(),
 		appended:  make(map[string]bool),
@@ -645,12 +653,9 @@ func hookSigned(key, sig string, body []byte) bool {
 // observe records one delivery. A start opens a call; an end closes it and
 // yields the entry to publish. Ends are the entries (one per invocation, the
 // spec's rule); starts exist so an interrupted call can still be reported.
+// The steps are the step records the delivery closed or planned
+// (activity_steps.go, activity_thinking.go).
 func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.Step) {
-	entry, ok, steps, _ := a.observeWithThinking(d)
-	return entry, ok, steps
-}
-
-func (a *activityState) observeWithThinking(d hookDelivery) (ActivityEntry, bool, []stepmsg.Step, string) {
 	id := d.Extra.ToolCallID
 	if id == "" {
 		// Inline executors carry no call id; the tool name pairs start to
@@ -667,7 +672,7 @@ func (a *activityState) observeWithThinking(d hookDelivery) (ActivityEntry, bool
 	defer a.mu.Unlock()
 	if d.DeliveryID != "" {
 		if _, dup := a.seen[d.DeliveryID]; dup {
-			return ActivityEntry{}, false, nil, ""
+			return ActivityEntry{}, false, nil
 		}
 		// The most recent activitySeenCap ids: a retry follows its first
 		// delivery closely, so the oldest id is the one safe to forget.
@@ -680,29 +685,31 @@ func (a *activityState) observeWithThinking(d hookDelivery) (ActivityEntry, bool
 		}
 		a.seen[d.DeliveryID] = struct{}{}
 	}
-	steps, reasoning := a.observeStepsAndThinkingLocked(d)
+	steps := a.observeExecutorStepsLocked(d)
 	switch d.Event {
 	case hookPreToolCall:
 		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
 		}
-		var input json.RawMessage
-		if a.sessionID == "" {
-			input = redactInput(d.ToolName, d.ToolInput)
-		}
+		// The input goes on the bus as its shape under both executors
+		// (the note above redactInput); the api executor keeps the raw
+		// arguments of an open call in memory for its attribution only.
 		entry := ActivityEntry{
 			Tool:   capRunes(d.ToolName, activityToolNameCap),
-			Input:  input,
+			Input:  redactInput(d.ToolName, d.ToolInput),
 			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			At:     capRunes(d.Timestamp, activityWordCap),
 		}
 		a.enrichPreToolCallLocked(d, &entry)
 		a.open[id] = entry
-		return ActivityEntry{}, false, steps, reasoning
+		if a.sessionID != "" && len(d.ToolInput) > 0 {
+			a.openRaw[id] = d.ToolInput
+		}
+		return ActivityEntry{}, false, steps
 	case hookPostToolCall:
 		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
-		openEntry := a.popOpenCallLocked(id, d)
+		openEntry, openRaw := a.popOpenCallLocked(id, d)
 		a.calls++
 		status := activityStatus(d)
 		if a.sessionID == "" || d.SessionID == "" || d.SessionID == a.sessionID {
@@ -711,13 +718,9 @@ func (a *activityState) observeWithThinking(d hookDelivery) (ActivityEntry, bool
 				a.cardsFiled.Store(true)
 			}
 		}
-		var input json.RawMessage
-		if a.sessionID == "" {
-			input = redactInput(d.ToolName, d.ToolInput)
-		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
-			Input:      input,
+			Input:      redactInput(d.ToolName, d.ToolInput),
 			CallID:     capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			Status:     status,
 			DurationMs: durationMillis(d.Extra.DurationMs),
@@ -726,10 +729,10 @@ func (a *activityState) observeWithThinking(d hookDelivery) (ActivityEntry, bool
 		if status == ActivityStatusError {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
 		}
-		a.enrichPostToolCallLocked(d, openEntry, status, &e)
-		return e, true, steps, reasoning
+		a.enrichPostToolCallLocked(d, openEntry, openRaw, status, &e)
+		return e, true, steps
 	}
-	return ActivityEntry{}, false, steps, reasoning
+	return ActivityEntry{}, false, steps
 }
 
 // interrupted returns the calls still open, in start order, as entries, and
@@ -747,6 +750,7 @@ func (a *activityState) interrupted() []ActivityEntry {
 		out = append(out, e)
 	}
 	a.open = make(map[string]ActivityEntry)
+	a.openRaw = make(map[string]json.RawMessage)
 	a.openOrder = nil
 	return out
 }
@@ -1340,9 +1344,8 @@ func (b *Bridge) handleActivity(w http.ResponseWriter, r *http.Request) {
 	// trace neither as completed nor as interrupted.
 	act := run.act.Load()
 	run.mu.Lock()
-	entry, ok, steps, reasoning := act.observeWithThinking(d)
+	entry, ok, steps := act.observe(d)
 	b.publishSteps(run, act, steps)
-	b.publishThinking(run, act, reasoning)
 	if ok {
 		if entry.CardID != "" && d.SessionID == act.sessionID {
 			b.kanban.rememberCardOrigin(entry.CardID, run.origin.TaskID)

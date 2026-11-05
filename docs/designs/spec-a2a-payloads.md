@@ -475,7 +475,7 @@ or unreported at its drain; `dropped` counts them all, and a delivery the execut
 read or refused over its body cap is outside it, logged, the call it belonged to in the trace
 as `interrupted` when its opening delivery arrived and whole from the closing one when the
 opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
-an error), `durationMs`, `at`, and (on the Hermes bridge's `api` executor) `title`, `sessionId`, `worker`, `cardId`, `resultPreview` (`card_id=<id>` on `kanban_create` only; raw tool output is omitted), and `errorMessage`; the library
+an error), `durationMs`, `at`, and (on the Hermes bridge's `api` executor) `title`, `sessionId`, `worker`, `cardId`, and `resultPreview` (`card_id=<id>` on a successful `kanban_create` only; no other tool output, and no error text, is published - `input` is the argument shape under both executors); the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 One unreserved name has a defined shape: `steps`, `kube-agents.step/v1` data parts

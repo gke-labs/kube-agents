@@ -618,7 +618,43 @@ type taskStepState struct {
 	taskWatches          map[TaskRef]*taskWatch
 	finalTasks           map[TaskRef]*lib.Task
 	failedTasks          map[TaskRef]error
-	idleTimer            *time.Timer
+	// idleTimer releases the task watches a streamed poll kept once no
+	// poll has followed within stepWatchIdleRelease; idleGen is bumped by
+	// every arm and disarm, and a firing that finds another generation is
+	// stale (it was waiting on mu while a new poll ran) and does nothing,
+	// so it cannot close the watches that poll just kept.
+	idleTimer *time.Timer
+	idleGen   uint64
+}
+
+// armIdleReleaseLocked schedules the task watches' release after
+// stepWatchIdleRelease, superseding any earlier schedule. Caller holds s.mu.
+func (s *taskStepState) armIdleReleaseLocked() {
+	s.disarmIdleReleaseLocked()
+	gen := s.idleGen
+	s.idleTimer = time.AfterFunc(stepWatchIdleRelease, func() { s.releaseIdleWatches(gen) })
+}
+
+// disarmIdleReleaseLocked cancels the scheduled release and retires its
+// generation, so a firing already past Stop finds itself stale. Caller
+// holds s.mu.
+func (s *taskStepState) disarmIdleReleaseLocked() {
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
+	s.idleGen++
+}
+
+// releaseIdleWatches is the idle timer's body: it closes the task watches
+// only when gen is still the armed generation.
+func (s *taskStepState) releaseIdleWatches(gen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idleGen != gen {
+		return
+	}
+	s.closeTaskWatchesLocked()
 }
 
 func (s *taskStepState) isUnsubmittedRootLocked(ref TaskRef) bool {
@@ -668,10 +704,7 @@ func (s *taskStepState) attachWatch(w *turnWatch) {
 }
 
 func (s *taskStepState) closeTaskWatchesLocked() {
-	if s.idleTimer != nil {
-		s.idleTimer.Stop()
-		s.idleTimer = nil
-	}
+	s.disarmIdleReleaseLocked()
 	for k, tw := range s.taskWatches {
 		tw.close()
 		delete(s.taskWatches, k)
@@ -1750,10 +1783,7 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	if st.idleTimer != nil {
-		st.idleTimer.Stop()
-		st.idleTimer = nil
-	}
+	st.disarmIdleReleaseLocked()
 	if st.watch != nil && st.watchTimer != nil {
 		st.watchTimer.Reset(MaxTurnWait)
 	}
@@ -1794,7 +1824,7 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 					convs.deleteTaskStepState(root, st)
 				}
 			} else {
-				st.idleTimer = time.AfterFunc(stepWatchIdleRelease, st.closeTaskWatches)
+				st.armIdleReleaseLocked()
 			}
 			return TurnStepOutcome{}, err
 		}
@@ -1892,7 +1922,7 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		convs.removeTaskStepState(st)
 	} else {
 		if len(st.taskWatches) > 0 {
-			st.idleTimer = time.AfterFunc(stepWatchIdleRelease, st.closeTaskWatches)
+			st.armIdleReleaseLocked()
 		}
 		if st.token != "" {
 			if unf := out.Unfinished(); unf != nil {

@@ -1400,36 +1400,3 @@ func TestServeActivity_CloseIsNotAStoppedDoor(t *testing.T) {
 		t.Fatalf("close logged a stopped door: %s", logs.String())
 	}
 }
-
-// redactInputDetailed caps hermes_tool_call_wrapper at detailedInputCap
-// (4096 bytes) rather than activityInputCap (2048 bytes), so a wrapper whose
-// pass-1 redacted JSON lands between 2049 and 4096 bytes retains its calls
-// array with non-empty head previews.
-func TestRedactInputDetailed_WrapperRespectsDetailedCap(t *testing.T) {
-	big := `[` + strings.Repeat("1,", activityInputCap) + `1]`
-	var calls []string
-	for i := 0; i < 9; i++ {
-		calls = append(calls, fmt.Sprintf(`{"name":"kanban_comment_%d","arguments":{"body":%s}}`, i, big))
-	}
-	in := json.RawMessage(`{"calls":[` + strings.Join(calls, ",") + `]}`)
-	out := redactInputDetailed(hermesToolCallWrapper, in)
-	if len(out) <= activityInputCap || len(out) > detailedInputCap {
-		t.Fatalf("redactInputDetailed wrapper len = %d, want in (%d, %d]", len(out), activityInputCap, detailedInputCap)
-	}
-	var parsed struct {
-		Truncated *bool `json:"truncated"`
-		Calls     []struct {
-			Name string         `json:"name"`
-			Args map[string]any `json:"arguments"`
-		} `json:"calls"`
-	}
-	if err := json.Unmarshal(out, &parsed); err != nil || parsed.Truncated != nil || len(parsed.Calls) != 9 {
-		t.Fatalf("wrapper collapsed or malformed: %s (%v)", out, err)
-	}
-	for i, c := range parsed.Calls {
-		head, _ := c.Args["head"].(string)
-		if head == "" {
-			t.Fatalf("call %d head was wiped to empty despite fitting under detailedInputCap: %s", i, out)
-		}
-	}
-}

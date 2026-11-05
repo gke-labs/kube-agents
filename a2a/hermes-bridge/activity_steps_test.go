@@ -515,6 +515,18 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 			forbidden: []string{"MIIEpAIBAAKCAQEA7", "1//0gABCDEF", "hunter299", "my secret phrase", "LS0tLS1CRUdJTi", "YmFyBaz123"},
 			wantSub:   []string{"[redacted]", "The password is [redacted].", "DB_PASSWORD: [redacted]", "  tls.key: [redacted]", "  custom_entry: [redacted]"},
 		},
+		{
+			name:      "pgp private key block and prose with a qualifier, past tense, or a named user",
+			in:        "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQdGBF8pgpkeyBody\n-----END PGP PRIVATE KEY BLOCK-----\nThe password is now hunter301. The token was tok_old_302, and the password for admin is hunter303; the secret is set to s3cr3t304.",
+			forbidden: []string{"lQdGBF8pgpkeyBody", "hunter301", "tok_old_302", "hunter303", "s3cr3t304"},
+			wantSub:   []string{"The password is now [redacted].", "The token was [redacted],", "the password for admin is [redacted];", "the secret is set to [redacted]."},
+		},
+		{
+			name:      "all-caps env keys ending in _KEY, _CREDS, _DSN or _PRIVATE",
+			in:        "ENCRYPTION_KEY=enc_key_401 STRIPE_KEY=sk_live_402 AWS_CREDS=creds403 DB_DSN=postgres://u:p404@db/prod RSA_PRIVATE=priv405 sort_key=name PRIMARY_KEY_ID=7",
+			forbidden: []string{"enc_key_401", "sk_live_402", "creds403", "p404", "priv405"},
+			wantSub:   []string{"ENCRYPTION_KEY=[redacted]", "STRIPE_KEY=[redacted]", "AWS_CREDS=[redacted]", "DB_DSN=[redacted]", "RSA_PRIVATE=[redacted]", "sort_key=name", "PRIMARY_KEY_ID=7"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -531,14 +543,28 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 			}
 		})
 	}
+}
 
-	// Verify through API-mode activity and thinking observation as well.
+// Under the api executor, what a tool was given, what it returned, what it
+// failed with and what the model reasoned stay in the pod: the entry
+// carries the input's shape (as under the cli executor), the status and
+// hermes's error word, and the steps carry titles only. A scrubber is not
+// relied on for any of it. The mutants this kills: publishing the detailed
+// input, the error text, a result preview, or the reasoning as a thought.
+func TestAPI_EntriesCarryShapesAndNoResultErrorOrReasoningText(t *testing.T) {
 	a := newActivityState(false)
-	a.sessionID = "a2a-scrub-test"
+	a.sessionID = "a2a-shape-test"
+	const (
+		reasoningSecret = "the admin password is hunter2-reasoning"
+		argSecret       = "my-db-pass-in-args"
+		resultSecret    = "super-secret-result-value"
+		errSecret       = "token=tok_in_error_text"
+	)
+
 	var apiDel hookDelivery
 	apiBody, _ := json.Marshal(map[string]any{
 		"hook_event_name": hookPostAPIRequest,
-		"session_id":      "a2a-scrub-test",
+		"session_id":      "a2a-shape-test",
 		"delivery_id":     "api-1",
 		"extra": map[string]any{
 			"api_call_count": 1,
@@ -546,9 +572,9 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 			"response": map[string]any{
 				"finish_reason": "tool_calls",
 				"assistant_message": map[string]any{
-					"reasoning_content": ` Connecting with {"password": "super-secret-value"} and password="my secret phrase" to postgresql://admin:my-db-pass@db.internal:5432/prod.`,
+					"reasoning_content": "Connecting to the database; " + reasoningSecret + ".",
 					"tool_calls": []map[string]any{
-						{"id": "c1", "function": map[string]any{"name": "terminal", "arguments": json.RawMessage(`{"command":"psql postgresql://admin:my-db-pass@db.internal:5432/prod"}`)}},
+						{"id": "c1", "function": map[string]any{"name": "terminal", "arguments": json.RawMessage(`{"command":"psql postgresql://admin:` + argSecret + `@db.internal:5432/prod"}`)}},
 					},
 				},
 			},
@@ -557,64 +583,135 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 	if err := json.Unmarshal(apiBody, &apiDel); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, reasoning := a.observeWithThinking(apiDel)
-	for _, leaked := range []string{"super-secret-value", "my secret phrase", "my-db-pass"} {
-		if strings.Contains(reasoning, leaked) {
-			t.Fatalf("API reasoning leaked %q: %q", leaked, reasoning)
+	_, _, steps := a.observe(apiDel)
+	if len(steps) != 1 || steps[0].Kind != stepmsg.KindPlan || !slices.Equal(steps[0].CallIDs, []string{"c1"}) {
+		t.Fatalf("planned steps = %+v, want one plan step for c1", steps)
+	}
+	if steps[0].Thought != "" {
+		t.Fatalf("a plan step carried the model's reasoning as its thought: %q", steps[0].Thought)
+	}
+	rawSteps, _ := json.Marshal(steps)
+	for _, leaked := range []string{"hunter2-reasoning", argSecret, "Connecting to the database"} {
+		if strings.Contains(string(rawSteps), leaked) {
+			t.Fatalf("steps leaked %q: %s", leaked, rawSteps)
 		}
 	}
 
-	var postDel hookDelivery
-	postBody, _ := json.Marshal(map[string]any{
-		"hook_event_name": hookPostToolCall,
-		"session_id":      "a2a-scrub-test",
-		"delivery_id":     "post-1",
-		"tool_name":       "terminal",
-		"tool_input":      map[string]any{"command": `psql postgresql://admin:my-db-pass@db.internal:5432/prod -c "SET password='two words'"`},
+	// A request that reasoned and planned nothing, without stopping, is a
+	// step under the fixed title; its text is not in the record.
+	var reasonOnly hookDelivery
+	reasonBody, _ := json.Marshal(map[string]any{
+		"hook_event_name": hookPostAPIRequest,
+		"session_id":      "a2a-shape-test",
+		"delivery_id":     "api-2",
 		"extra": map[string]any{
-			"tool_call_id": "c1",
-			"status":       "ok",
-			"result":       `{"output": "{\"password\": \"super-secret-value\", \"redis\": \"redis://default:redispass@10.0.0.1:6379\"}"}`,
+			"api_call_count": 2,
+			"finish_reason":  "length",
+			"response": map[string]any{
+				"finish_reason":     "length",
+				"assistant_message": map[string]any{"reasoning_content": "Still thinking; " + reasoningSecret + "."},
+			},
 		},
 	})
-	if err := json.Unmarshal(postBody, &postDel); err != nil {
+	if err := json.Unmarshal(reasonBody, &reasonOnly); err != nil {
 		t.Fatal(err)
 	}
-	entry, ok, _, _ := a.observeWithThinking(postDel)
-	if !ok {
-		t.Fatal("expected post_tool_call entry")
+	_, _, steps = a.observe(reasonOnly)
+	if len(steps) != 1 || steps[0].Title != reasoningStepTitle || steps[0].Thought != "" {
+		t.Fatalf("reasoning-only request steps = %+v, want one %q step with no thought", steps, reasoningStepTitle)
 	}
-	if entry.ResultPreview != "" {
-		t.Fatalf("expected non-kanban tool ResultPreview to be empty on TASKS, got %q", entry.ResultPreview)
+
+	for _, tc := range []struct {
+		name   string
+		status string
+		result string
+		errMsg string
+	}{
+		{name: "completed", status: hookStatusOK, result: `{"output": "{\"password\": \"` + resultSecret + `\"}"}`},
+		{name: "failed", status: "error", result: `{"output": "` + resultSecret + ` on line 1\nmore"}`, errMsg: "psql: FATAL " + errSecret},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pre := hookDelivery{Event: hookPreToolCall, SessionID: "a2a-shape-test", DeliveryID: "pre-" + tc.name, ToolName: "terminal",
+				ToolInput: json.RawMessage(`{"command":"psql postgresql://admin:` + argSecret + `@db.internal:5432/prod","cluster":"gke_p_us-east4_prod-a"}`)}
+			pre.Extra.ToolCallID = "call-" + tc.name
+			a.observe(pre)
+			post := hookDelivery{Event: hookPostToolCall, SessionID: "a2a-shape-test", DeliveryID: "post-" + tc.name, ToolName: "terminal",
+				ToolInput: json.RawMessage(`{"command":"psql postgresql://admin:` + argSecret + `@db.internal:5432/prod","cluster":"gke_p_us-east4_prod-a"}`)}
+			post.Extra.ToolCallID = "call-" + tc.name
+			post.Extra.Status = tc.status
+			post.Extra.Result = json.RawMessage(tc.result)
+			post.Extra.ErrorMessage = tc.errMsg
+			entry, ok, _ := a.observe(post)
+			if !ok {
+				t.Fatal("expected post_tool_call entry")
+			}
+			var input map[string]any
+			if err := json.Unmarshal(entry.Input, &input); err != nil {
+				t.Fatalf("entry input is not an object: %s (%v)", entry.Input, err)
+			}
+			if cmd, _ := input["command"].(string); !strings.HasPrefix(cmd, "<string, ") {
+				t.Fatalf("entry input command = %q, want its shape", cmd)
+			}
+			if entry.ResultPreview != "" || entry.ErrorMessage != "" {
+				t.Fatalf("entry carried result or error text: preview=%q error=%q", entry.ResultPreview, entry.ErrorMessage)
+			}
+			if tc.status != hookStatusOK && entry.Status != ActivityStatusError {
+				t.Fatalf("entry status = %q, want error", entry.Status)
+			}
+			if entry.Title == "" || entry.Worker != "platform" {
+				t.Fatalf("entry lost its attribution: title=%q worker=%q", entry.Title, entry.Worker)
+			}
+			// The title names the cluster the command ran against (the one
+			// argument-derived identifier that is published); the command,
+			// the result and the error text are not anywhere on the entry.
+			rawEntry, _ := json.Marshal(entry)
+			for _, leaked := range []string{argSecret, resultSecret, errSecret, "tok_in_error_text", "on line 1", "FATAL", "psql"} {
+				if strings.Contains(string(rawEntry), leaked) {
+					t.Fatalf("entry leaked %q: %s", leaked, rawEntry)
+				}
+			}
+		})
+	}
+
+	// The one result detail published: the id of the card a kanban_create
+	// made, on the entry and as its preview; the card's title names the
+	// step (by design), its body does not appear anywhere.
+	create := hookDelivery{Event: hookPostToolCall, SessionID: "a2a-shape-test", DeliveryID: "post-create", ToolName: kanbanCreateTool,
+		ToolInput: json.RawMessage(`{"title":"Rotate the credential on prod-a","body":"` + argSecret + `"}`)}
+	create.Extra.ToolCallID = "call-create"
+	create.Extra.Status = hookStatusOK
+	create.Extra.Result = json.RawMessage(`{"id":"t_card_shape_1","title":"Rotate the credential on prod-a","body":"` + argSecret + `","output":"` + resultSecret + `"}`)
+	entry, ok, _ := a.observe(create)
+	if !ok || entry.CardID != "t_card_shape_1" || entry.ResultPreview != "card_id=t_card_shape_1" {
+		t.Fatalf("kanban_create entry = %+v, want cardId and preview card_id=t_card_shape_1", entry)
+	}
+	if !strings.Contains(entry.Title, "Rotate the credential on prod-a") {
+		t.Fatalf("kanban_create entry title = %q, want the card's title", entry.Title)
 	}
 	rawEntry, _ := json.Marshal(entry)
-	for _, leaked := range []string{"my-db-pass", "two words", "super-secret-value", "redispass"} {
+	for _, leaked := range []string{argSecret, resultSecret} {
 		if strings.Contains(string(rawEntry), leaked) {
-			t.Fatalf("API ActivityEntry leaked %q: %s", leaked, rawEntry)
+			t.Fatalf("kanban_create entry leaked %q: %s", leaked, rawEntry)
 		}
 	}
 }
 
-func TestStep_BeginTurnResetsCardsFiledAndPreservesCoordinatorReasoning(t *testing.T) {
+func TestStep_BeginTurnResetsCardsFiledAndKeepsTheSynthesisRule(t *testing.T) {
 	a := newActivityState(false)
 	a.sessionID = "a2a-coord"
 
 	// Turn 1: coordinator calls kanban_create, then finishes turn 1 with reasoning.
 	var createPost hookDelivery
 	_ = json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","session_id":"a2a-coord","delivery_id":"d1","tool_name":"kanban_create","tool_input":{"title":"Check cluster-a"},"extra":{"tool_call_id":"c1","status":"ok","result":{"id":"t_card1"}}}`), &createPost)
-	a.observeWithThinking(createPost)
+	a.observe(createPost)
 	if !a.cardsFiled.Load() {
 		t.Fatal("expected cardsFiled to be true after kanban_create")
 	}
 
 	var turn1Stop hookDelivery
 	_ = json.Unmarshal([]byte(`{"hook_event_name":"post_api_request","session_id":"a2a-coord","delivery_id":"d2","extra":{"api_call_count":2,"finish_reason":"stop","response":{"finish_reason":"stop","assistant_message":{"reasoning_content":"Dispatched card to worker; waiting for results.","content":"Card filed."}}}}`), &turn1Stop)
-	_, _, steps1, reasoning1 := a.observeWithThinking(turn1Stop)
-	if len(steps1) != 0 {
+	if _, _, steps1 := a.observe(turn1Stop); len(steps1) != 0 {
 		t.Fatalf("turn 1 synthesis step should be suppressed when cardsFiled is true, got %+v", steps1)
-	}
-	if !strings.Contains(reasoning1, "Dispatched card to worker") {
-		t.Fatalf("coordinator reasoning was discarded when cardsFiled was true: got %q", reasoning1)
 	}
 
 	// Turn 2: beginTurn resets turnCardsFiled while keeping task-wide cardsFiled intact for handoff,
@@ -629,16 +726,16 @@ func TestStep_BeginTurnResetsCardsFiledAndPreservesCoordinatorReasoning(t *testi
 
 	var turn2Tool hookDelivery
 	_ = json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","session_id":"a2a-coord","delivery_id":"d3","tool_name":"kubectl","tool_input":{"cmd":"get nodes"},"extra":{"tool_call_id":"c2","status":"ok"}}`), &turn2Tool)
-	a.observeWithThinking(turn2Tool)
+	a.observe(turn2Tool)
 
 	var turn2Stop hookDelivery
 	_ = json.Unmarshal([]byte(`{"hook_event_name":"post_api_request","session_id":"a2a-coord","delivery_id":"d4","extra":{"api_call_count":2,"finish_reason":"stop","response":{"finish_reason":"stop","assistant_message":{"reasoning_content":"All nodes are Ready.","content":"Final report."}}}}`), &turn2Stop)
-	_, _, steps2, reasoning2 := a.observeWithThinking(turn2Stop)
-	if len(steps2) != 1 || !steps2[0].IsSynthesis() {
+	_, _, steps2 := a.observe(turn2Stop)
+	if len(steps2) != 1 || !steps2[0].IsSynthesis() || steps2[0].Title != apiSynthesisStepTitle {
 		t.Fatalf("turn 2 synthesis step not emitted after beginTurn: %+v", steps2)
 	}
-	if !strings.Contains(reasoning2, "All nodes are Ready") {
-		t.Fatalf("turn 2 reasoning = %q", reasoning2)
+	if steps2[0].Thought != "" {
+		t.Fatalf("the synthesis step carried the model's reasoning: %q", steps2[0].Thought)
 	}
 }
 
@@ -671,18 +768,18 @@ func TestStep_ConsecutiveToolCallsWithSameTitleAndDifferentCallIDsEmitBothSteps(
 		return d
 	}
 
-	_, _, steps1, _ := a.observeWithThinking(mkReq("api-1", "call_1", 1))
+	_, _, steps1 := a.observe(mkReq("api-1", "call_1", 1))
 	if len(steps1) != 1 || len(steps1[0].CallIDs) != 1 || steps1[0].CallIDs[0] != "call_1" {
 		t.Fatalf("first post_api_request steps = %+v, want call_1", steps1)
 	}
 
-	_, _, steps2, _ := a.observeWithThinking(mkReq("api-2", "call_2", 2))
+	_, _, steps2 := a.observe(mkReq("api-2", "call_2", 2))
 	if len(steps2) != 1 || len(steps2[0].CallIDs) != 1 || steps2[0].CallIDs[0] != "call_2" {
 		t.Fatalf("second post_api_request with distinct CallID was dropped: %+v", steps2)
 	}
 
 	// A true duplicate delivery with the exact same CallID is still deduped.
-	_, _, stepsDup, _ := a.observeWithThinking(mkReq("api-2-dup", "call_2", 2))
+	_, _, stepsDup := a.observe(mkReq("api-2-dup", "call_2", 2))
 	if len(stepsDup) != 0 {
 		t.Fatalf("duplicate post_api_request with identical CallID was not deduped: %+v", stepsDup)
 	}
@@ -856,7 +953,7 @@ func TestBatchKanban_PlansAllCallIDsAndSuppressesFallbackSteps(t *testing.T) {
 	if err := json.Unmarshal(reqBody, &apiReq); err != nil {
 		t.Fatal(err)
 	}
-	_, _, steps, _ := a.observeWithThinking(apiReq)
+	_, _, steps := a.observe(apiReq)
 	wantTitle := "Dispatching 2 specialist tasks on the Kanban board."
 	if len(steps) != 1 || steps[0].Title != wantTitle || !slices.Equal(steps[0].CallIDs, []string{"c1", "c2"}) {
 		t.Fatalf("batch kanban planned steps = %+v, want single step %q with CallIDs [c1 c2]", steps, wantTitle)
@@ -874,7 +971,7 @@ func TestBatchKanban_PlansAllCallIDsAndSuppressesFallbackSteps(t *testing.T) {
 			ToolInput: json.RawMessage(`{"title":"Inspect cluster"}`),
 		}
 		pre.Extra.ToolCallID = cid
-		if _, _, preSteps, _ := a.observeWithThinking(pre); len(preSteps) != 0 {
+		if _, _, preSteps := a.observe(pre); len(preSteps) != 0 {
 			t.Fatalf("pre_tool_call for %s emitted unexpected steps: %+v", cid, preSteps)
 		}
 		if a.openStep != nil {
@@ -897,7 +994,7 @@ func TestWorkerHooks_DoNotMutateCoordinatorStepsOrCardsFiled(t *testing.T) {
 		ToolInput:  json.RawMessage(`{"command":"kubectl get pods"}`),
 	}
 	workerPre.Extra.ToolCallID = "w-call-1"
-	if _, _, steps, _ := a.observeWithThinking(workerPre); len(steps) != 0 {
+	if _, _, steps := a.observe(workerPre); len(steps) != 0 {
 		t.Fatalf("worker unplanned pre_tool_call emitted steps: %+v", steps)
 	}
 	if a.openStep != nil {
@@ -915,7 +1012,7 @@ func TestWorkerHooks_DoNotMutateCoordinatorStepsOrCardsFiled(t *testing.T) {
 	workerPost.Extra.ToolCallID = "w-call-2"
 	workerPost.Extra.Status = hookStatusOK
 	workerPost.Extra.Result = json.RawMessage(`{"id":"t_child1"}`)
-	if _, ok, steps, _ := a.observeWithThinking(workerPost); !ok || len(steps) != 0 {
+	if _, ok, steps := a.observe(workerPost); !ok || len(steps) != 0 {
 		t.Fatalf("worker post_tool_call ok=%v steps=%+v", ok, steps)
 	}
 	if a.cardsFiled.Load() || a.trace.turnCardsFiled {
