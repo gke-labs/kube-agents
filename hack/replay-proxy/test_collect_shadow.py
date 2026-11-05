@@ -32,6 +32,8 @@ DEST = C.job_prefix(BUCKET, "presubmit", "2026-11-04", "1790000000000000000")
 HEX = "ab" * 32
 # What a subprocess test waits for, at most.
 PROCESS_WAIT_SECONDS = 30
+# Longer than any fixed pause a test might take before signalling.
+SLOW_START_SECONDS = 1.0
 
 
 class FakeCluster:
@@ -579,9 +581,17 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
 
     def test_missing_tools_still_exit_0(self):
-        env = dict(self.env, PATH=os.path.join(self.root, "empty"))
+        # A slow interpreter start (here a sitecustomize that sleeps) would
+        # let a TERM sent after a fixed pause land before the handler; the
+        # `start` line is printed only once the handler is in.
+        site = os.path.join(self.root, "site")
+        os.makedirs(site)
+        with open(os.path.join(site, "sitecustomize.py"), "w") as handle:
+            handle.write(f"import time\ntime.sleep({SLOW_START_SECONDS})\n")
+        env = dict(self.env, PATH=os.path.join(self.root, "empty"), PYTHONPATH=site)
         proc = self.start("--final-deadline", "1", env=env)
-        time.sleep(0.5)
+        first = json.loads(proc.stdout.readline())
+        self.assertEqual(first["event"], "start")
         proc.send_signal(signal.SIGTERM)
         out, _ = proc.communicate(timeout=PROCESS_WAIT_SECONDS)
         self.assertEqual(proc.returncode, 0)

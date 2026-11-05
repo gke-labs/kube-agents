@@ -33,8 +33,15 @@ _CLOUDBUILD = _ROOT / "deploy" / "docker" / "cloudbuild-ci.yaml"
 _BUCKET = "kube-agents-replay-shadow"
 _BUILD = "1790000000000000000"
 _PROJECT = "kube-agents-evals-07"
+# Every bash below runs with stdin on /dev/null: bash sources ~/.bashrc when
+# its stdin is a socket (as under some remote shells and agent harnesses), and
+# that file can rewrite PATH out from under the fakes.
 # Seconds a test waits for a background process, at most.
 _WAIT_SECONDS = 20
+# The stand-in collector's pause between writing its argv and taking TERM: a
+# caller that signals on the argv file instead of the "collector running" line
+# kills it in that gap, every time.
+_FAKE_HANDLER_DELAY_SECONDS = 0.5
 
 
 def _constants(text, prefix):
@@ -73,7 +80,7 @@ _REPORT = textwrap.dedent("""\
 def _resolve(**overrides):
     script = "set -euo pipefail\n" + _lifted("resolve_replay_shadow") + "rc=0\nresolve_replay_shadow || rc=$?\n" \
         + 'echo "rc=${rc}"\n' + _REPORT
-    proc = subprocess.run(["bash", "-c", script], env=_env(**overrides), capture_output=True, text=True)
+    proc = subprocess.run(["bash", "-c", script], env=_env(**overrides), capture_output=True, text=True, stdin=subprocess.DEVNULL)
     assert proc.returncode == 0, proc.stderr
     values = dict(line.split("=", 1) for line in proc.stdout.splitlines())
     return values, proc.stderr
@@ -169,7 +176,7 @@ class HelmArgsTest(unittest.TestCase):
                   + "resolve_replay_shadow\nreplay_shadow_helm_args repo/replay-proxy-shadow t1\n"
                   + 'echo "count=${#REPLAY_SHADOW_HELM_ARGS[@]}"\n'
                   + 'for a in ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"}; do echo "arg=$a"; done\n')
-        proc = subprocess.run(["bash", "-c", script], env=_env(**overrides), capture_output=True, text=True)
+        proc = subprocess.run(["bash", "-c", script], env=_env(**overrides), capture_output=True, text=True, stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = proc.stdout.splitlines()
         return int(lines[0].split("=", 1)[1]), [l.split("=", 1)[1] for l in lines[1:]]
@@ -240,7 +247,7 @@ class CloudBuildStepTest(unittest.TestCase):
     def _run(self, uri):
         script = self.script.replace("$_REPLAY_SHADOW_PROXY_URI", uri)
         env = {"PATH": f"{self.tmp}:/usr/bin:/bin", "DOCKER_CALLS": str(self.calls)}
-        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
     def test_empty_uri_is_a_no_op(self):
         proc = self._run("")
@@ -278,6 +285,7 @@ class CollectorLifecycleTest(unittest.TestCase):
         self.fake.write_text(textwrap.dedent(f"""\
             import signal, sys, time
             open({str(self.argv)!r}, "w").write("\\n".join(sys.argv[1:]))
+            time.sleep({_FAKE_HANDLER_DELAY_SECONDS})
             signal.signal(signal.SIGTERM, {handler})
             print("collector running", flush=True)
             time.sleep(60)
@@ -285,9 +293,10 @@ class CollectorLifecycleTest(unittest.TestCase):
 
     def _script(self, body, stop_wait=2):
         text = _CI_ENV.read_text()
-        constants = _constants(text, "REPLAY_SHADOW_").replace(
-            "readonly REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS=75",
-            f"readonly REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS={stop_wait}")
+        constants, count = re.subn(r"^readonly REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS=.*$",
+                                   f"readonly REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS={stop_wait}",
+                                   _constants(text, "REPLAY_SHADOW_"), flags=re.MULTILINE)
+        assert count == 1, f"expected one REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS in {_CI_ENV}, replaced {count}"
         functions = "".join(lift_function(n, text, _CI_ENV) for n in (
             "resolve_replay_shadow", "start_replay_shadow_collector", "signal_replay_shadow_collector",
             "wait_replay_shadow_collector"))
@@ -298,7 +307,7 @@ class CollectorLifecycleTest(unittest.TestCase):
         overrides.setdefault("PATH", f"{self.bin}:{os.path.dirname(sys.executable)}:/usr/bin:/bin")
         env = _env(ARTIFACTS=str(self.artifacts), TARGET_NAMESPACE="kubeagents-system",
                    AGENT_CLUSTER_CONTEXT="gke_p_us-central1_platform-agent-host", **overrides)
-        return subprocess.run([shutil.which("bash"), "-c", self._script(body, stop_wait)], env=env, capture_output=True,
+        return subprocess.run([shutil.which("bash"), "-c", self._script(body, stop_wait)], env=env, capture_output=True, stdin=subprocess.DEVNULL,
                               text=True, timeout=_WAIT_SECONDS * 2)
 
     def _wait_for_argv(self):
@@ -314,12 +323,14 @@ class CollectorLifecycleTest(unittest.TestCase):
         body = textwrap.dedent("""\
             start_replay_shadow_collector
             pid="${REPLAY_SHADOW_COLLECTOR_PID}"
-            for _ in $(seq 1 200); do [ -s "$ARGV" ] && break; sleep 0.05; done
+            # The line the stand-in prints once it has taken TERM.
+            for _ in $(seq 1 200); do grep -q "collector running" "$COLLECTOR_LOG" 2>/dev/null && break; sleep 0.05; done
             signal_replay_shadow_collector
             wait_replay_shadow_collector
             if kill -0 "$pid" 2>/dev/null; then echo "still running"; else echo "stopped"; fi
         """)
-        proc = self._run(body, ARGV=str(self.argv), JOB_TYPE="presubmit", PULL_NUMBER="4700")
+        proc = self._run(body, COLLECTOR_LOG=str(self.artifacts / "replay-shadow-collector.log"),
+                         JOB_TYPE="presubmit", PULL_NUMBER="4700")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("stopped", proc.stdout)
         self.assertNotIn(_BUCKET, proc.stdout + proc.stderr)
@@ -342,13 +353,14 @@ class CollectorLifecycleTest(unittest.TestCase):
         body = textwrap.dedent("""\
             start_replay_shadow_collector
             pid="${REPLAY_SHADOW_COLLECTOR_PID}"
-            for _ in $(seq 1 200); do [ -s "$ARGV" ] && break; sleep 0.05; done
+            # The line the stand-in prints once it has taken TERM.
+            for _ in $(seq 1 200); do grep -q "collector running" "$COLLECTOR_LOG" 2>/dev/null && break; sleep 0.05; done
             started=$SECONDS
             wait_replay_shadow_collector
             sleep 0.2
             if kill -0 "$pid" 2>/dev/null; then echo "still running"; else echo "stopped after $((SECONDS - started))s"; fi
         """)
-        proc = self._run(body, stop_wait=2, ARGV=str(self.argv))
+        proc = self._run(body, stop_wait=2, COLLECTOR_LOG=str(self.artifacts / "replay-shadow-collector.log"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertRegex(proc.stdout, r"stopped after [2-4]s")
         self.assertIn("did not finish its last pass", proc.stderr)
