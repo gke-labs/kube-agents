@@ -474,6 +474,8 @@ For a usage summary of this install you can paste into a report, send `/feedback
 
 Sent with text, `/feedback the cost report posted twice this morning`, the message is an ordinary turn and the Planning Agent answers it. It writes the report up as the form would receive it, a one-line summary, the kind and what happened in your words, says that a submission becomes a public issue on `gke-labs/kube-agents`, and asks for a yes. Nothing is filed until you give one. On `yes` it hands the exact text to the platform specialist, which files it through the public feedback form; the reply names the issue the form opened. The form needs no account and the install needs no GitHub credential for it. The same text sent again within a day is not filed twice: the reply names the issue already open.
 
+The draft also offers to add the install's usage summary, the versions and counters [`/feedback summary`](#feedback-summary) prints with no names in it. Say `add the usage summary`, and the next draft you see carries the exact block, so nothing is attached that you did not read before your yes.
+
 When the install cannot reach the form, the reply says that nothing was filed and gives the composed text back with the two links above, so you can file it yourself. An air-gapped install, or one whose credential broker has no route to the form's hosts, answers this way every time.
 
 On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/session`.

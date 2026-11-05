@@ -81,6 +81,14 @@ CONFIRMATION_LINE = "user-confirmed: yes"
 SKILL_NAME = "kube-agents-feedback"
 TITLE_CAP = "120"
 SKILL_MD = REPO_ROOT / "agents/platform/skills/kube-agents-feedback/SKILL.md"
+# The opt-in (docs/designs/chat-feedback-command.md §8): the draft offers the
+# usage summary in these words, the front door reads the summary card before
+# it re-shows the draft, and the skill renders the block with the script's
+# second subcommand. One phrase in three files, or the person is offered
+# something no card answers.
+OPT_IN_PHRASE = "add the usage summary"
+CARD_READ_TOOL = "kanban_show"
+SUMMARY_COMMAND = re.compile(r"file_feedback\.py\s+summary\b")
 BROKER_MODULE = REPO_ROOT / "agents/platform/scripts/feedback_broker.py"
 GATEWAY_COMMANDS = REPO_ROOT / "a2a/lib/chattext/commands.go"
 
@@ -202,6 +210,14 @@ class FeedbackReferenceTest(unittest.TestCase):
             self.assertIn(phrase, bullet, "the front door composes the whole submission and dispatches it confirmed")
         self.assertRegex(bullet, PUBLIC_WARNING)
         self.assertRegex(bullet, REDACTION_RULE)
+
+    def test_chat_persona_offers_the_usage_summary_and_reads_the_card_before_the_yes(self) -> None:
+        bullet = _line_with(CHAT_SOUL, CHAT_BULLET_MARKER)
+        self.assertIn(OPT_IN_PHRASE, bullet, "the draft offers the block in the words the skill expects")
+        self.assertIn(CARD_READ_TOOL, bullet, "the block is shown from the card's result, never from memory")
+        skill = SKILL_MD.read_text(encoding="utf-8")
+        self.assertIn(OPT_IN_PHRASE, skill, "the skill names the opt-in a summary card answers")
+        self.assertRegex(skill, SUMMARY_COMMAND, "the skill runs the script's summary subcommand")
 
     def test_chat_persona_routes_the_feedback_command_to_platform(self) -> None:
         rows = [line for line in CHAT_SOUL.read_text(encoding="utf-8").splitlines()
