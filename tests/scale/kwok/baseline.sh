@@ -437,11 +437,19 @@ PROXY_MEM_JSON="$(mem_json "$PROXY_PID")"
 curl -fsS "http://$LOOPBACK:$BASELINE_PROXY_METRICS_PORT$METRICS_PATH" >"$TMP_DIR/proxy.metrics" 2>/dev/null || : >"$TMP_DIR/proxy.metrics"
 PROXY_REQUESTS_JSON="$(prom_samples "$TMP_DIR/proxy.metrics" "$PROXY_REQUESTS_METRIC")"
 PROXY_DURATION_JSON="$(prom_samples "$TMP_DIR/proxy.metrics" "$PROXY_DURATION_METRIC")"
-# The metric names are copied from the proxy's Go source. Reads went through
-# the proxy a moment ago, so an empty family is a renamed metric (or a dead
-# listener), which is a step that could not run, not a measurement.
-[ "$(jq 'length' <<<"$PROXY_REQUESTS_JSON")" -gt 0 ] \
-  || die "the proxy's metrics carry no $PROXY_REQUESTS_METRIC series after the reads; the name in this script no longer matches the proxy's"
+# The metric names are copied from the proxy's Go source. A proxy that is
+# still running after the reads and answered its metrics port without the
+# family has renamed it, and a running proxy whose metrics port did not
+# answer has lost its listener: both are a step that could not run, not a
+# measurement. A proxy that died during the reads is a measurement: its exit
+# code, the reads that failed and the empty families all go into the record,
+# and the failed reads fail the run once the record is written.
+if kill -0 "$PROXY_PID" 2>/dev/null && [ "$(jq 'length' <<<"$PROXY_REQUESTS_JSON")" -eq 0 ]; then
+  if [ -s "$TMP_DIR/proxy.metrics" ]; then
+    die "the proxy's metrics carry no $PROXY_REQUESTS_METRIC series after the reads; the name in this script no longer matches the proxy's"
+  fi
+  die "the proxy is running but its metrics port $BASELINE_PROXY_METRICS_PORT did not answer after the reads; see $PROXY_LOG"
+fi
 stop_process "$PROXY_PID"
 PROXY_PID=""
 PROXY_EXIT="$STOPPED_EXIT"

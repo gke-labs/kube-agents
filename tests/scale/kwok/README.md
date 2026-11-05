@@ -7,10 +7,11 @@ binaries that read a cluster at scale: `k8s-event-watcher` and `k8s-api-proxy`. 
 of sizing the install for such clusters: measure before anything is sized. The lane measures and
 records; it does not grade. The only gates are "it ran": a seeder request that fails or a Running
 wait that times out, a binary that does not build, a proxy that never becomes healthy, a CLI read
-that exits non-zero, or the proxy's `requests_total` family or the watcher's `cluster_up` gauge
-coming back empty after the reads and the sync (those names are copied from the Go sources, so an
-empty family means a rename, not a measurement). A slow list or a large resident set does not fail
-anything.
+that exits non-zero, or a proxy still running after the reads whose `requests_total` family is
+empty, or a watcher synced on its gauge whose `cluster_up` is absent (those names are copied from
+the Go sources, so an empty family on a live process means a rename, not a measurement; a proxy
+that died during the reads is recorded and fails the run through its failed reads). A slow list or
+a large resident set does not fail anything.
 
 KWOK runs a real API server, etcd, controller-manager and its own node and pod simulator as plain
 processes (no container engine), so a cluster of 2,000 nodes and 60,000 pods fits one machine.
