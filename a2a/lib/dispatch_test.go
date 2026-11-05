@@ -150,6 +150,56 @@ func TestALeaseExpiresAfterItsGrace(t *testing.T) {
 	}
 }
 
+// A tombstone is expired whatever its ExpiresAt, is told from a running
+// lease by FinishedAt alone, and round-trips; a running record carries no
+// finishedAt at all.
+func TestATombstoneIsFinishedAndNeverLive(t *testing.T) {
+	at := time.Date(2026, 10, 28, 18, 0, 0, 0, time.UTC)
+	tomb := LeaseRecord{TaskID: "t1", Pod: "tse-0", ExpiresAt: at.Add(time.Hour), FinishedAt: at}
+	if !tomb.Finished() || !tomb.Expired(at, 0) || !tomb.Expired(at, 24*time.Hour) {
+		t.Errorf("a tombstone with a future expiry: finished %v, expired %v", tomb.Finished(), tomb.Expired(at, 0))
+	}
+	stale := LeaseRecord{TaskID: "t1", Pod: "tse-0", ExpiresAt: at.Add(-time.Hour)}
+	if stale.Finished() || !stale.Expired(at, 0) {
+		t.Error("an expired running lease reads as a tombstone")
+	}
+	raw, err := json.Marshal(tomb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back LeaseRecord
+	if err := json.Unmarshal(raw, &back); err != nil || !back.FinishedAt.Equal(at) || !strings.Contains(string(raw), `"finishedAt"`) {
+		t.Errorf("tombstone round trip: %s -> %+v, %v", raw, back, err)
+	}
+	if raw, _ := json.Marshal(stale); strings.Contains(string(raw), "finishedAt") {
+		t.Errorf("a running record carries finishedAt: %s", raw)
+	}
+}
+
+// Validate refuses a record that names no task or pod, and a running lease
+// with no expiry; the refused-pod token is taken only on a tombstone.
+func TestALeaseRecordIsValidated(t *testing.T) {
+	at := time.Date(2026, 10, 28, 18, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		rec  LeaseRecord
+		ok   bool
+	}{
+		{"running", LeaseRecord{TaskID: "t1", Pod: "tse-0", ExpiresAt: at}, true},
+		{"tombstone", LeaseRecord{TaskID: "t1", Pod: "tse-0", FinishedAt: at}, true},
+		{"refusal tombstone", LeaseRecord{TaskID: "t1", Pod: ProfileLeaseRefusedPod, FinishedAt: at}, true},
+		{"tombstone with no task", LeaseRecord{Pod: "tse-0", FinishedAt: at}, false},
+		{"running with no task", LeaseRecord{Pod: "tse-0", ExpiresAt: at}, false},
+		{"tombstone with no pod", LeaseRecord{TaskID: "t1", FinishedAt: at}, false},
+		{"running on the refused pod", LeaseRecord{TaskID: "t1", Pod: ProfileLeaseRefusedPod, ExpiresAt: at}, false},
+		{"running with no expiry", LeaseRecord{TaskID: "t1", Pod: "tse-0"}, false},
+	} {
+		if err := tc.rec.Validate(); (err == nil) != tc.ok {
+			t.Errorf("%s: Validate = %v, want ok %v", tc.name, err, tc.ok)
+		}
+	}
+}
+
 // A card with the routing fields round-trips, and one without them (what
 // the operator published before) still parses as an agent card.
 func TestAProfileCardCarriesItsRoutingFields(t *testing.T) {
@@ -263,9 +313,7 @@ func TestTheOperatorsDispatchConfigDecodesAndValidates(t *testing.T) {
 
 // The durable the operator makes and the pool labels it renders (its
 // fixture, written by the operator's tests) agree with this package's
-// constants, and the durable passes SubscribeHeld's config checks (its
-// intake check still takes the .in class on this tree; the dispatcher's PR
-// moves it to the submission shape). The operator
+// constants, and the durable passes SubscribeHeld's checks: the operator
 // can't import lib, so this is what holds its copies of the held mark, the
 // AckWait and the labels equal to these. The two tamper lists aren't
 // compared; a drift makes the dispatcher refuse to bind, which fails safe.

@@ -275,6 +275,8 @@ kubectl get pods -n kubeagents-system -l app=platform-agent-shell
 kubectl logs -n kubeagents-system platform-agent-shell-0
 ```
 
+**A proxied command prints `CREDENTIAL_PROXY_EXEC_URL ignored (…); commands go to the stateful broker`.** The sandbox has an exec-tier URL that the shim cannot use: it is not a valid `http://` URL, it has no host, its port is not a number from 0 to 65535, or it has a query or a fragment. The shim ignores it, and the command runs on the stateful broker as on an install without the exec tier. The operator sets this variable, so check the operator version and the sandbox's environment.
+
 **A proxied command fails with `credential proxy error: the connection dropped after the request was sent …; the command may have run`.** The connection to the broker closed after the command was sent and before its answer came back, for example because the broker Pod restarted. The shim does not send the command again, because the broker may have run it. Check what the command changed before you run it again: a `kubectl get` is safe to repeat, but an `apply` or a `delete` may already have taken effect.
 
 **A `401` from every proxied command** is the other half of the same path, and it is authentication rather than availability. The broker verifies an audience-bound projected token with a `TokenReview`, so a `401` means the token was absent, expired, minted for another audience, or presented by a ServiceAccount that is not in `CREDENTIAL_PROXY_ALLOWED_CALLERS`. The broker's log names the reason; the caller never gets it.
