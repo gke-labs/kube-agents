@@ -889,7 +889,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	// A repeat blip on an event object kubelet kept from an earlier one
 	// carries that one's first sighting; the memo knows where this blip
 	// began, and the gate measures the span from there (settleMemo.BlipStart).
-	if settleApplies(canonical) {
+	if settleApplies(canonical, ev.Message) {
 		if start, ok := d.settles.BlipStart(ev, canonical, d.clock()); ok && start.After(ev.FirstSeen) {
 			ev.FirstSeen = start
 		}
@@ -904,7 +904,7 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		// has to remember too: one that clears at two sightings and repeats
 		// inside the event's TTL would otherwise arrive at count three with
 		// the object's old first sighting and no tombstone to measure from.
-		if (gate == gateBackoffMinCount || gate == gateUnhealthyMinCount) && d.filter.cfg.settle > 0 && settleApplies(canonical) {
+		if (gate == gateBackoffMinCount || gate == gateUnhealthyMinCount) && d.filter.cfg.settle > 0 && settleApplies(canonical, ev.Message) {
 			d.settles.Hold(ev, canonical, d.clock())
 		}
 		if gate == gateScaleUpMark {
