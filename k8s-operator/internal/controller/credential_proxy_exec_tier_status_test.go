@@ -163,9 +163,11 @@ func TestTheStatusWriterFollowsTheTierAsItBecomesReady(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
 	ctx := context.Background()
 	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	var last ctrl.Result
 	condition := func(t *testing.T) *metav1.Condition {
 		t.Helper()
-		if _, err := r.Reconcile(ctx, req); err != nil {
+		var err error
+		if last, err = r.Reconcile(ctx, req); err != nil {
 			t.Fatalf("Reconcile: %v", err)
 		}
 		got := &agentv1alpha1.PlatformAgent{}
@@ -196,8 +198,76 @@ func TestTheStatusWriterFollowsTheTierAsItBecomesReady(t *testing.T) {
 	if c := condition(t); c == nil || c.Status != metav1.ConditionFalse || c.Message != "1 of 2 exec-tier replicas are Ready." {
 		t.Fatalf("after one replica: %+v", c)
 	}
+	if last.RequeueAfter == 0 || last.RequeueAfter > credentialProxyExecShortRequeue {
+		t.Errorf("a short tier requeues after %v, want at most %v", last.RequeueAfter, credentialProxyExecShortRequeue)
+	}
 	setReady(t, 2)
 	if c := condition(t); c == nil || c.Status != metav1.ConditionTrue || c.Message != "2 of 2 exec-tier replicas are Ready." {
 		t.Fatalf("after both replicas: %+v", c)
+	}
+}
+
+func TestATerminatingPodIsNotNamedAsUnschedulable(t *testing.T) {
+	gone := execTierStatusPod("exec-old", corev1.PodCondition{
+		Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable, Message: "old",
+	})
+	gone.DeletionTimestamp = ptr.To(metav1.Now())
+	gone.Finalizers = []string{"test/hold"}
+	c := execTierCondition(t, ptr.To(int32(2)), execTierStatusDeployment(1), gone)
+	if c == nil || c.Reason != credentialProxyExecUnavailableReason {
+		t.Fatalf("condition = %+v, want %s", c, credentialProxyExecUnavailableReason)
+	}
+}
+
+// A name too long for the tier's objects is refused before render; Degraded
+// says so, and there is no tier to count.
+func TestANameRefusedForTheTierRemovesTheCondition(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	agent.Name = strings.Repeat("a", credentialProxyExecTierMaxAgentName+1)
+	agent.Status.Conditions = []metav1.Condition{{Type: credentialProxyExecReadyConditionType, Status: metav1.ConditionTrue, Reason: credentialProxyExecReadyReason}}
+	r, _ := execTierTestReconciler(t, agent)
+	read := r.readCredentialProxyExecReady(context.Background(), agent)
+	setCredentialProxyExecReadyCondition(agent, read, metav1.Now())
+	if c := meta.FindStatusCondition(agent.Status.Conditions, credentialProxyExecReadyConditionType); c != nil {
+		t.Fatalf("a refused name keeps the condition: %+v", c)
+	}
+}
+
+// A park that rendered the tier (here, no sandbox keypair yet, which can last
+// days) still reports it and still removes the condition at 0.
+func TestAParkThatRenderedTheTierStillReportsIt(t *testing.T) {
+	scheme := setupScheme()
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	stored := func(t *testing.T) *agentv1alpha1.PlatformAgent {
+		t.Helper()
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		got := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	stored(t)
+	got := stored(t)
+	if ready := meta.FindStatusCondition(got.Status.Conditions, "Ready"); ready == nil || ready.Reason != "ShellSandboxKeysMissing" {
+		t.Fatalf("Ready = %+v, want the ShellSandboxKeysMissing park", ready)
+	}
+	if c := meta.FindStatusCondition(got.Status.Conditions, credentialProxyExecReadyConditionType); c == nil || c.Message != "0 of 2 exec-tier replicas are Ready." {
+		t.Fatalf("on the park: %+v", c)
+	}
+	got.Spec.Deployment.CredentialProxy.Exec.Replicas = ptr.To(int32(0))
+	if err := cl.Update(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(stored(t).Status.Conditions, credentialProxyExecReadyConditionType); c != nil {
+		t.Fatalf("at 0 on the park the condition stays: %+v", c)
 	}
 }

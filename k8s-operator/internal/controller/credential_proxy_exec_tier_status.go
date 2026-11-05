@@ -50,9 +50,10 @@ const (
 	// credentialProxyExecReadyMessageFormat takes the Ready and the desired count.
 	credentialProxyExecReadyMessageFormat = "%d of %d exec-tier replicas are Ready."
 	// credentialProxyExecUnschedulableMessageFormat takes the Ready count, the
-	// desired count, the pod's name and the scheduler's message.
+	// desired count, the pod's name, the scheduler's message, and the
+	// replica's CPU request twice.
 	credentialProxyExecUnschedulableMessageFormat = "%d of %d exec-tier replicas are Ready. Pod %s cannot be " +
-		"scheduled: %s Each replica requests 2 CPU, so the tier needs nodes with 2 free CPU each, plus room for " +
+		"scheduled: %s Each replica requests %s CPU, so the tier needs nodes with %s free CPU each, plus room for " +
 		"the shell sandbox, which restarts when the tier turns on. Callers fall back to the stateful broker meanwhile."
 	// How soon the next pass reads the tier again while it is short. The
 	// scheduler's verdict lands on the pod, which is not watched, so without
@@ -108,7 +109,8 @@ func (r *PlatformAgentReconciler) readCredentialProxyExecReady(ctx context.Conte
 			log.Info("exec tier pods not read; CredentialProxyExecReady gives no scheduling reason", "error", readErr.Error())
 		} else if name != "" {
 			condition.Reason = credentialProxyExecUnschedulableReason
-			condition.Message = fmt.Sprintf(credentialProxyExecUnschedulableMessageFormat, ready, desired, name, why)
+			condition.Message = fmt.Sprintf(credentialProxyExecUnschedulableMessageFormat, ready, desired, name, why,
+				credentialProxyExecTierCPU, credentialProxyExecTierCPU)
 		}
 	}
 	return credentialProxyExecReadyRead{condition: condition, known: true}

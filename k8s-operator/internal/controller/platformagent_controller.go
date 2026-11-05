@@ -1272,6 +1272,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.leaseRequeue > 0 {
 			requeue = min(requeue, a2aState.leaseRequeue)
 		}
+		if credentialProxyExecShort(instance) {
+			requeue = min(requeue, credentialProxyExecShortRequeue)
+		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
@@ -5701,7 +5704,7 @@ const (
 // condition's status, reason, message, and observedGeneration, plus the rendered-gated
 // VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded
 // condition, which is not gated on the render.
-func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool) bool {
+func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool, execReady credentialProxyExecReadyRead) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	if existing == nil ||
 		agent.Status.Phase != "Degraded" ||
@@ -5716,7 +5719,8 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		return true
 	}
 	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg) &&
-		replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
+		replicasLimitedConditionCurrent(agent, replicasLimitedMsg) &&
+		credentialProxyExecReadyCurrent(agent, execReady)
 }
 
 // updateStatusDegraded parks the agent on a refusal: phase Degraded, and a
@@ -5798,14 +5802,20 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// pass's, which still describes the claims. An unknown state (no claim
 	// read by this process yet) leaves the condition as it stands.
 	dataVolumeMsg, dataVolumeKnown := r.dataVolumeExpansionMessage(agent)
-	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown) {
+	// CredentialProxyExecReady too: a park that rendered rendered the tier, and
+	// one can last days (ShellSandboxKeysMissing). An unrendered pass leaves it.
+	execReady := credentialProxyExecReadyRead{}
+	if rendered {
+		execReady = r.readCredentialProxyExecReady(ctx, agent)
+	}
+	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady) {
 		return nil
 	}
 
 	// If the cached agent missed the status condition due to watch event lag,
 	// check the live object before attempting an Update that would conflict (409).
 	if r.liveAgentSatisfies(ctx, agent, func(live *agentv1alpha1.PlatformAgent) bool {
-		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown)
+		return degradedStatusCurrent(live, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady)
 	}) {
 		return nil
 	}
@@ -5827,6 +5837,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	if rendered {
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 		setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
+		setCredentialProxyExecReadyCondition(agent, execReady, now)
 	}
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 	return r.Status().Update(ctx, agent)
