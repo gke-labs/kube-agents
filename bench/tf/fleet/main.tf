@@ -167,8 +167,7 @@ resource "google_service_account_iam_member" "fleet_reader_token_creators" {
 # project-level read here: the project and its IAM policy, the service
 # accounts' policies, the service listing, the cluster listing, the
 # repository, the key and its policy, the state bucket's metadata, the forge
-# pieces' zone, records, addresses and firewall rules, the API keys and the
-# Gemini key secret's metadata and policy. These roles cover
+# pieces' zone, records, addresses and firewall rules. These roles cover
 # every read those checks make on the project; none writes. The
 # warm-cache repository's policy in the Prow project stays unread. They live in this
 # stack, beside the reader's token-creator grant, because this is the one
@@ -186,10 +185,6 @@ locals {
     "roles/storage.bucketViewer",
     "roles/compute.networkViewer",
     "roles/dns.reader",
-    # The Gemini key check lists the project's API keys, never a key string.
-    "roles/serviceusage.apiKeysViewer",
-    # The Gemini key check reads the key secret's versions and policy, never its value.
-    "roles/secretmanager.viewer",
   ]
   pool_state_reader_grants = {
     for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :

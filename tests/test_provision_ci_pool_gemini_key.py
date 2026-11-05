@@ -38,7 +38,6 @@ _ACCESSORS = [
     "prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com",
     "eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com",
 ]
-_VIEWER = "eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com"
 
 # A Python fake: the state machine (a key that appears once created, a secret
 # that exists once created) is clearer here than in a case statement.
@@ -66,6 +65,12 @@ def log():
 if argv[:2] == ["services", "enable"]:
     log(); sys.exit(0)
 if head == ["services", "api-keys", "list"]:
+    refused = state / "list_refused"
+    count = int(refused.read_text()) if refused.exists() else 0
+    if count < int(os.environ.get("FAKE_LIST_DISABLED_TIMES", "0")):
+        refused.write_text(str(count + 1))
+        fail("ERROR: (gcloud.services.api-keys.list) PERMISSION_DENIED: API Keys API has not been used in "
+             "project 123 before or it is disabled.\n  reason: SERVICE_DISABLED")
     if os.environ.get("FAKE_KEY_EXISTS") == "1" or key_created.exists():
         out(os.environ["FAKE_KEY_NAME"] + "\n")
     log(); sys.exit(0)
@@ -115,9 +120,14 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
         fake.write_text(_FAKE_GCLOUD)
         fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
         self.log = root / "gcloud.log"
+        # The retry's sleep, logged instead of slept.
+        self.sleeps = root / "sleeps.log"
+        sleep = self.bindir / "sleep"
+        sleep.write_text(f'#!/usr/bin/env bash\necho "$1" >> "{self.sleeps}"\n')
+        sleep.chmod(sleep.stat().st_mode | stat.S_IEXEC)
 
     def _run(self, *args, key_exists=False, secret_exists=False, key_string="k1", current_value=None,
-             create_fails=False, bash_flags=()):
+             create_fails=False, bash_flags=(), list_disabled_times=0):
         overrides = {
             "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
             "FAKE_GCLOUD_LOG": str(self.log),
@@ -127,6 +137,7 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
             "FAKE_KEY_NAME": _KEY_NAME,
             "FAKE_KEY_STRING": key_string,
             "FAKE_CREATE_FAILS": "1" if create_fails else "0",
+            "FAKE_LIST_DISABLED_TIMES": str(list_disabled_times),
         }
         absent = ()
         if current_value is None:
@@ -160,8 +171,7 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
 
     def _assert_grants(self, calls):
         self.assertEqual(
-            [(f"serviceAccount:{sa}", "roles/secretmanager.secretAccessor") for sa in _ACCESSORS]
-            + [(f"serviceAccount:{_VIEWER}", "roles/secretmanager.viewer")],
+            [(f"serviceAccount:{sa}", "roles/secretmanager.secretAccessor") for sa in _ACCESSORS],
             self._bindings(calls),
         )
 
@@ -251,6 +261,30 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
         self.assertNotIn(key, proc.stdout)
         argvs = [c["argv"] for c in calls]
         self.assertFalse([a for a in argvs if a[:2] == ["secrets", "create"]], argvs)
+
+    def _sleeps(self):
+        return self.sleeps.read_text().split() if self.sleeps.exists() else []
+
+    def test_a_fresh_api_keys_enable_answering_service_disabled_is_retried(self):
+        proc, calls = self._run(_PROJECT, list_disabled_times=1)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual(["20"], self._sleeps())
+        self.assertIn("not ready yet", proc.stderr)
+        argvs = [c["argv"] for c in calls]
+        # Refused once, then listed again before the create.
+        create = self._index(calls, ["services", "api-keys", "create"])
+        self.assertEqual(2, len([a for a in argvs[:create] if a[:3] == ["services", "api-keys", "list"]]), argvs)
+        self.assertEqual(1, len([a for a in argvs if a[:3] == ["services", "api-keys", "create"]]), argvs)
+
+    def test_service_disabled_three_times_stops_the_script(self):
+        proc, calls = self._run(_PROJECT, list_disabled_times=3)
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("could not list API keys", proc.stderr)
+        self.assertIn("SERVICE_DISABLED", proc.stderr)
+        self.assertEqual(["20", "20"], self._sleeps())
+        argvs = [c["argv"] for c in calls]
+        self.assertEqual(3, len([a for a in argvs if a[:3] == ["services", "api-keys", "list"]]), argvs)
+        self.assertFalse([a for a in argvs if a[:3] == ["services", "api-keys", "create"]], argvs)
 
     def test_a_project_argument_is_required(self):
         proc, calls = self._run()

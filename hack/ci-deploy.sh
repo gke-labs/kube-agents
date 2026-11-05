@@ -262,6 +262,8 @@ readonly EVAL_LITELLM_SESSION_AFFINITY_SLOTS="${EVAL_LITELLM_SESSION_AFFINITY_SL
 # Developer API key under MODEL_PROVIDER=gemini. scripts/provision_ci_pool_gemini_key.sh
 # writes it.
 readonly EVAL_AGENT_GEMINI_KEY_SECRET="${EVAL_AGENT_GEMINI_KEY_SECRET:-kube-agents-eval-gemini-api-key}"
+# The MODEL_PROVIDER value under which the agent reads that key.
+readonly MODEL_PROVIDER_GEMINI="gemini"
 # Both reach `helm --set` and the chart's schema, which refuses anything but a
 # boolean and a positive integer only at step 5c, after the image build. This
 # check is stricter than Helm: lowercase true/false, at most three digits.
@@ -908,7 +910,7 @@ export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
 # whitespace-only value counts as empty, and the surrounding whitespace of a
 # stored value (a trailing newline, a CRLF's \r) is dropped.
 resolve_agent_gemini_api_key() {
-  if [ "${MODEL_PROVIDER}" != "gemini" ]; then
+  if [ "${MODEL_PROVIDER}" != "${MODEL_PROVIDER_GEMINI}" ]; then
     AGENT_GEMINI_API_KEY="${GEMINI_API_KEY}"
     return 0
   fi

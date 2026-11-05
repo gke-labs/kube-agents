@@ -166,15 +166,13 @@ lease-silent, in the verifier's default set from day one, and a second one-line 
 to blocking once the repairs are done and verified. It is kept out of the hourly pool-state scan
 until that flip.
 
-The scan runs as `eval-dashboard-publisher`. Reading the key's metadata needs
-`roles/serviceusage.apiKeysViewer` and listing the secret's versions needs
-`roles/secretmanager.viewer`; neither is in `roles/iam.securityReviewer`. Both join
-`POOL_STATE_READER_ROLES`, which the fleet stack grants at project level and its reconcile
-delivers (section 6.2 of the pool doc): the verifier's own test requires every gcloud surface a
-check reads to name a project-level pool-state reader role, so a secret-level grant alone would
-not satisfy it. The key script grants the bot `roles/secretmanager.viewer` on the secret as well,
-so a project repaired before the reconcile still scans. Until the reconcile has run on a project,
-the scan reports the finding there as not checked, which the lease-silent phase absorbs.
+The scan runs as `eval-dashboard-publisher`, which already holds `roles/iam.securityReviewer`
+on every pool project. That role carries the three reads the check makes beside the service
+listing: `apikeys.keys.list`, `secretmanager.versions.list` and
+`secretmanager.secrets.getIamPolicy`. So this change grants the bot no new role, and the
+verifier maps the `secrets` surface to `roles/iam.securityReviewer`. The design first named
+`roles/serviceusage.apiKeysViewer` for the key listing. That role was rejected: it carries
+`apikeys.keys.getKeyString`, so the bot could read every key string.
 
 ### 5. The deploy
 
@@ -268,8 +266,8 @@ tracks the move, beside the last Vertex night's.
   when the presubmits follow.
 - **The verifier finding is lease-silent until the repairs finish, then flipped.** A blocking
   finding during the repair window would blame the pool for the change's own gap.
-- **Project-level reader roles for the health bot go through the fleet stack; the secret-level
-  role through the key script.** That is where each kind of grant already lives.
+- **No new reader role for the health bot.** `roles/iam.securityReviewer` already covers the
+  check's reads; `roles/serviceusage.apiKeysViewer` would also read key strings.
 - **No new collection code for the first night's numbers.** The logs give the 429 count; the
   project's own usage reporting gives tokens per minute and the cache share.
 - **The five live nightlies, and only those.** The roster names lanes that are not in the live

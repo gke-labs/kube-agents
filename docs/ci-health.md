@@ -1440,19 +1440,13 @@ or more calls; `reason` says which.
 **The identity and the grant.** Every read runs as the bot itself,
 `eval-dashboard-publisher@kube-agents-prow`, which needs `roles/iam.securityReviewer`,
 `roles/container.clusterViewer`, `roles/artifactregistry.reader`, `roles/cloudkms.viewer`,
-`roles/storage.bucketViewer`, `roles/compute.networkViewer`, `roles/dns.reader`,
-`roles/serviceusage.apiKeysViewer` and `roles/secretmanager.viewer` on each
+`roles/storage.bucketViewer`, `roles/compute.networkViewer` and `roles/dns.reader` on each
 project (`POOL_STATE_READER_ROLES` in the
 verifier; together they cover every read the scan's checks make, and none writes;
-the last two let the Gemini key check read the key's metadata and the secret's versions;
 the one read outside the project, the warm-cache repository's policy in the Prow
 project, is the verifier's `warm_cache` check, which the scan does not run). `bench/tf/fleet`
 grants them (`pool_state_readers`), so a project gets them from its fleet apply and
-the verifier fails one that lacks them (`--report` carries the binding). A role added
-to the list reaches registered projects through the fleet reconcile
-(`docs/ci-pool-projects.md` §6.2): `post-kube-agents-fleet-reconcile` runs on the merge
-that changes `bench/tf/fleet/*.tf`, and the 08:30 UTC daily is the backstop, so the
-missing-role findings after that merge clear without the loop below. Grant them
+the verifier fails one that lacks them (`--report` carries the binding). Grant them
 on the project: the check reads the project's own policy, so a grant on a folder or
 the organisation, or through a group, is not seen and reads as missing on every
 project. Projects applied before that default, or before a role joined the list, are one
@@ -1464,8 +1458,7 @@ for p in $(sed -n '/^gitops_repo_for_project() {/,/^}/p' hack/ci-deploy.sh \
           | sed -n 's/^[[:space:]]*\(kube-agents-evals[-0-9]*\)).*/\1/p'); do
   for role in roles/iam.securityReviewer roles/container.clusterViewer \
               roles/artifactregistry.reader roles/cloudkms.viewer roles/storage.bucketViewer \
-              roles/compute.networkViewer roles/dns.reader \
-              roles/serviceusage.apiKeysViewer roles/secretmanager.viewer; do
+              roles/compute.networkViewer roles/dns.reader; do
     gcloud projects add-iam-policy-binding "$p" --member "serviceAccount:${BOT}" --role "$role" --quiet >/dev/null
   done
 done

@@ -485,12 +485,19 @@ GEMINI_KEY_DISPLAY_NAME = "kube-agents-eval-gemini"
 GEMINI_KEY_SECRET_NAME = "kube-agents-eval-gemini-api-key"
 GEMINI_KEY_API_TARGET = "generativelanguage.googleapis.com"
 GEMINI_KEY_ACCESSOR_ROLE = "roles/secretmanager.secretAccessor"
-GEMINI_KEY_SECRET_ACCESSORS = (
-    "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com",
-    "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com",
-)
+# How much of a failed gcloud read's stderr a warning quotes.
+GEMINI_KEY_ERR_EXCERPT = 200
 # The state of a secret version the nightly's `versions access latest` reads.
 GEMINI_KEY_VERSION_ENABLED = "ENABLED"
+# Client restrictions on an API key: a key that carries any of them accepts
+# calls only from that browser, server address or app, so the agent pod's
+# calls are refused.
+GEMINI_KEY_CLIENT_RESTRICTIONS = (
+    "browserKeyRestrictions",
+    "serverKeyRestrictions",
+    "androidKeyRestrictions",
+    "iosKeyRestrictions",
+)
 # The key script enables the API Keys and Secret Manager APIs, and nothing else
 # in the pool does, so on a project it never ran against both reads answer
 # PERMISSION_DENIED with reason SERVICE_DISABLED. The general classifier keeps
@@ -502,14 +509,6 @@ FINDING_GEMINI_KEY_MISSING = "apikeys/gemini/missing"
 FINDING_GEMINI_KEY_RESTRICTION = "apikeys/gemini/restriction"
 FINDING_GEMINI_KEY_SECRET_MISSING = "secrets/gemini-api-key/missing"
 FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX = "secrets/gemini-api-key/accessor/"
-# Lease-silent while the registered projects are repaired: the key script runs
-# against each of them after this check lands, so until then every project
-# carries these findings and the pool-drift advice would blame the pool.
-GEMINI_KEY_FINDINGS = frozenset(
-    {FINDING_GEMINI_KEY_MISSING, FINDING_GEMINI_KEY_RESTRICTION, FINDING_GEMINI_KEY_SECRET_MISSING}
-    | {FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + member for member in GEMINI_KEY_SECRET_ACCESSORS}
-)
-LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | GEMINI_KEY_FINDINGS
 
 DEFAULT_GITHUB_APP_ID = 4675512
 
@@ -799,6 +798,19 @@ PROW_RUNNER_MEMBER = "serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gse
 # holding no role there at all (gke-labs/kube-agents#1491).
 NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 
+# The two runners read the eval nightlies' Gemini key secret, so each holds
+# GEMINI_KEY_ACCESSOR_ROLE on it.
+GEMINI_KEY_SECRET_ACCESSORS = (PROW_RUNNER_MEMBER, NIGHTLY_RUNNER_MEMBER)
+# Lease-silent while the registered projects are repaired: the key script runs
+# against each of them after this check lands, so until then every project
+# carries these findings and the pool-drift advice would blame the pool. A
+# later change makes them blocking, tracked in #4850.
+GEMINI_KEY_FINDINGS = frozenset(
+    {FINDING_GEMINI_KEY_MISSING, FINDING_GEMINI_KEY_RESTRICTION, FINDING_GEMINI_KEY_SECRET_MISSING}
+    | {FINDING_GEMINI_KEY_SECRET_ACCESSOR_PREFIX + member for member in GEMINI_KEY_SECRET_ACCESSORS}
+)
+LEASE_SILENT_FINDINGS = LEASE_SILENT_FINDINGS | GEMINI_KEY_FINDINGS
+
 # The pull-request sweep (hack/ci_sweep_agent_pulls.py, the periodic
 # ci-kube-agents-pull-sweep on main) signs the agent's App through each
 # project's copy of the key, so it needs signer on that key and nothing on the
@@ -899,10 +911,6 @@ POOL_STATE_READER_ROLES = {
     # without them those scan as unchecked (the VM identity still reads).
     "roles/compute.networkViewer",
     "roles/dns.reader",
-    # CHECK_GEMINI_KEY lists the project's API keys (restrictions, never the string).
-    "roles/serviceusage.apiKeysViewer",
-    # CHECK_GEMINI_KEY reads the key secret's versions and policy, never its value.
-    "roles/secretmanager.viewer",
 }
 
 # Each gcloud surface the checks read, and the roles above that read it. The
@@ -914,6 +922,10 @@ POOL_STATE_READER_ROLES = {
 # store, not the project. `projects describe` needs projects.get, which
 # securityReviewer lacks and clusterViewer carries. The `kms` surface also
 # covers the KMS sign in check_ledger_read_credential, which the scan does not run.
+# securityReviewer also carries the three reads check_gemini_api_key makes
+# beside the service listing (apikeys.keys.list, secretmanager.versions.list,
+# secretmanager.secrets.getIamPolicy). roles/serviceusage.apiKeysViewer is not
+# used: it carries apikeys.keys.getKeyString, which reads the key string.
 GCLOUD_SURFACE_READ_ROLES = {
     "artifacts": ("roles/artifactregistry.reader",),
     "auth": (),
@@ -923,8 +935,8 @@ GCLOUD_SURFACE_READ_ROLES = {
     "iam": ("roles/iam.securityReviewer",),
     "kms": ("roles/cloudkms.viewer",),
     "projects": ("roles/iam.securityReviewer", "roles/container.clusterViewer"),
-    "secrets": ("roles/secretmanager.viewer",),
-    "services": ("roles/iam.securityReviewer", "roles/serviceusage.apiKeysViewer"),
+    "secrets": ("roles/iam.securityReviewer",),
+    "services": ("roles/iam.securityReviewer",),
     "storage": ("roles/storage.bucketViewer",),
 }
 
@@ -4217,8 +4229,9 @@ def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckRes
 
 def check_gemini_api_key(project_id: str) -> CheckResult:
     """The eval nightlies' Gemini Developer API key in this project: one key
-    named GEMINI_KEY_DISPLAY_NAME restricted to GEMINI_KEY_API_TARGET alone, an
-    enabled latest version of GEMINI_KEY_SECRET_NAME, and the runners' accessor
+    named GEMINI_KEY_DISPLAY_NAME restricted to GEMINI_KEY_API_TARGET alone with
+    no client restriction, that API enabled, an enabled latest version of
+    GEMINI_KEY_SECRET_NAME, and the runners' accessor
     grant on that secret. Metadata and IAM only: no read here returns the key
     string or the secret's value.
     """
@@ -4261,10 +4274,11 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
         ["gcloud", "services", "api-keys", "list", f"--project={project_id}", f"--filter=displayName={GEMINI_KEY_DISPLAY_NAME}", "--format=json"],
         f"the API key {GEMINI_KEY_DISPLAY_NAME}",
     )
+    missing: List[str] = []
     if keys_checked:
         keys = keys or []
         if not keys:
-            drift(FINDING_GEMINI_KEY_MISSING, f"No API key named {GEMINI_KEY_DISPLAY_NAME} in {project_id}; the eval nightly has no Gemini Developer API key here")
+            missing.append(f"No API key named {GEMINI_KEY_DISPLAY_NAME} in {project_id}; the eval nightly has no Gemini Developer API key here")
         if len(keys) > 1:
             warnings.append(
                 f"{len(keys)} API keys are named {GEMINI_KEY_DISPLAY_NAME} in {project_id}: "
@@ -4272,16 +4286,47 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
             )
         for key in keys:
             key_name = key.get("name", "?")
-            targets = sorted(t.get("service", "") for t in ((key.get("restrictions") or {}).get("apiTargets") or []))
-            if targets != [GEMINI_KEY_API_TARGET]:
+            restrictions = key.get("restrictions") or {}
+            targets = sorted(t.get("service", "") for t in (restrictions.get("apiTargets") or []))
+            clients = [field for field in GEMINI_KEY_CLIENT_RESTRICTIONS if field in restrictions]
+            set_target = f"gcloud services api-keys update {key_name} --project={project_id} --api-target=service={GEMINI_KEY_API_TARGET}"
+            if clients:
+                # gcloud refuses --clear-restrictions beside --api-target, so
+                # the repair is two commands: clear, then set the API target.
+                drift(
+                    FINDING_GEMINI_KEY_RESTRICTION,
+                    f"API key {key_name} ({GEMINI_KEY_DISPLAY_NAME}) in {project_id} carries client restrictions "
+                    f"({', '.join(clients)}), so the agent pod's calls are refused",
+                    f"gcloud services api-keys update {key_name} --project={project_id} --clear-restrictions && {set_target}",
+                )
+            elif targets != [GEMINI_KEY_API_TARGET]:
                 drift(
                     FINDING_GEMINI_KEY_RESTRICTION,
                     f"API key {key_name} ({GEMINI_KEY_DISPLAY_NAME}) in {project_id} is restricted to "
                     f"{', '.join(targets) or 'no API at all (unrestricted)'}, not {GEMINI_KEY_API_TARGET} alone",
-                    f"gcloud services api-keys update {key_name} --project={project_id} --api-target=service={GEMINI_KEY_API_TARGET}",
+                    set_target,
                 )
             else:
                 details.append(f"✓ API key {key_name} restricted to {GEMINI_KEY_API_TARGET}")
+
+    # The key script enables the Generative Language API with the other two;
+    # a key on a project without it answers every call SERVICE_DISABLED.
+    rc, out, err = run_cmd(
+        ["gcloud", "services", "list", "--enabled", f"--project={project_id}", f"--filter=config.name={GEMINI_KEY_API_TARGET}", "--format=value(config.name)"]
+    )
+    api_checked = rc == 0
+    if not api_checked:
+        # A failed listing says nothing about the API, refused or not.
+        reason = _unread_reason(err) or (err or "").strip()[:GEMINI_KEY_ERR_EXCERPT]
+        warnings.append(Unread(f"Could not read whether {GEMINI_KEY_API_TARGET} is enabled in {project_id}: {reason}"))
+    else:
+        read_any = True
+        if GEMINI_KEY_API_TARGET in out.split():
+            details.append(f"✓ {GEMINI_KEY_API_TARGET} is enabled")
+        else:
+            missing.append(f"{GEMINI_KEY_API_TARGET} is not enabled in {project_id}, so the Gemini key there serves no call")
+    if missing:
+        drift(FINDING_GEMINI_KEY_MISSING, "; ".join(missing))
 
     secret = GEMINI_KEY_SECRET_NAME
     versions, versions_checked = read(
@@ -4339,6 +4384,7 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
     partial = _partial_summary(
         [
             ("the API key", keys_checked),
+            (f"the {GEMINI_KEY_API_TARGET} API", api_checked),
             ("the secret's latest version", versions_checked),
             ("the secret's accessors", grants_checked),
         ]

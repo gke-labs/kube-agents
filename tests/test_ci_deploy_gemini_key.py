@@ -29,6 +29,7 @@ _REPAIR_SCRIPT = "provision_ci_pool_gemini_key.sh"
 _BEGIN_MARKER = "# --- agent key: begin"
 _END_MARKER = "# --- agent key: end"
 _CONSTANT_LINE = 'readonly EVAL_AGENT_GEMINI_KEY_SECRET="${EVAL_AGENT_GEMINI_KEY_SECRET:-kube-agents-eval-gemini-api-key}"'
+_PROVIDER_CONSTANT_LINE = 'readonly MODEL_PROVIDER_GEMINI="gemini"'
 
 # Logs argv as one JSON line per call; prints FAKE_GCLOUD_STDOUT and exits FAKE_GCLOUD_EXIT.
 _FAKE_GCLOUD = r"""#!/usr/bin/env python3
@@ -42,6 +43,7 @@ sys.exit(int(os.environ.get("FAKE_GCLOUD_EXIT", "0")))
 # Runs the extracted function, then prints the resolved key on a marked line.
 _HARNESS = """set -euo pipefail
 {constant}
+{provider_constant}
 eval "$(sed -n '/^{begin}/,/^{end}/p' "$CI_DEPLOY")"
 resolve_agent_gemini_api_key
 printf 'RESOLVED=[%s]\\n' "${{AGENT_GEMINI_API_KEY}}"
@@ -63,7 +65,9 @@ class CiDeployGeminiKeyTest(unittest.TestCase):
         self.log.touch()
 
     def _run(self, provider: str, stdout: str = "", exit_code: int = 0) -> subprocess.CompletedProcess:
-        harness = _HARNESS.format(constant=_CONSTANT_LINE, begin=_BEGIN_MARKER, end=_END_MARKER)
+        harness = _HARNESS.format(
+            constant=_CONSTANT_LINE, provider_constant=_PROVIDER_CONSTANT_LINE, begin=_BEGIN_MARKER, end=_END_MARKER
+        )
         env = get_isolated_test_env(
             overrides={
                 "CI_DEPLOY": str(_CI_DEPLOY),
@@ -84,6 +88,11 @@ class CiDeployGeminiKeyTest(unittest.TestCase):
 
     def test_the_secret_name_is_a_named_constant_with_an_env_override(self) -> None:
         self.assertTrue(_CONSTANT_LINE in self.text, f"hack/ci-deploy.sh lacks: {_CONSTANT_LINE}")
+
+    def test_the_gemini_provider_is_a_named_constant(self) -> None:
+        self.assertTrue(_PROVIDER_CONSTANT_LINE in self.text, f"hack/ci-deploy.sh lacks: {_PROVIDER_CONSTANT_LINE}")
+        block = self.text[self.text.index(_BEGIN_MARKER) : self.text.index(_END_MARKER)]
+        self.assertNotIn('"gemini"', block)
 
     def test_the_helm_credential_line_passes_the_resolved_key(self) -> None:
         self.assertTrue(

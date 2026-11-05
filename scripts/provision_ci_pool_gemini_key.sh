@@ -30,15 +30,18 @@ readonly GEMINI_KEY_APIS="apikeys.googleapis.com secretmanager.googleapis.com ge
 # The two runners: prowjob-default-sa runs the presubmits, eval-baseline-recorder
 # runs the nightlies.
 readonly GEMINI_KEY_SECRET_ACCESSORS="prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
-# The health bot: it checks the secret exists and has a version, never the value.
-readonly GEMINI_KEY_SECRET_VIEWERS="eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com"
 readonly GEMINI_KEY_ACCESSOR_ROLE="roles/secretmanager.secretAccessor"
-readonly GEMINI_KEY_VIEWER_ROLE="roles/secretmanager.viewer"
 readonly GEMINI_KEY_REPLICATION_POLICY="automatic"
 # gcloud's error text for an absent secret, and for a secret with no readable
 # latest version (none added yet, or the latest one disabled or destroyed).
 readonly GCLOUD_NOT_FOUND="NOT_FOUND"
 readonly GCLOUD_FAILED_PRECONDITION="FAILED_PRECONDITION"
+# gcloud's error text for an API that is disabled, or enabled moments ago and
+# not yet ready: a fresh enable of the API Keys API answers this for a while.
+readonly GCLOUD_SERVICE_DISABLED="SERVICE_DISABLED|before or it is disabled"
+# How often, and how far apart, the first key listing runs on that answer.
+readonly GEMINI_KEY_LIST_ATTEMPTS=3
+readonly GEMINI_KEY_LIST_RETRY_SECONDS=20
 # The create operation prints its result, key string included; drop that line
 # from any error output shown.
 readonly GCLOUD_KEY_STRING_FIELD="keyString"
@@ -80,7 +83,24 @@ find_key() {
     --filter="displayName=${GEMINI_KEY_DISPLAY_NAME}" --format='value(name)'
 }
 
-KEY_NAMES="$(find_key)" || die "could not list API keys"
+# The first listing follows the enable above, so it retries while the API
+# Keys API still answers SERVICE_DISABLED.
+list_keys_after_enable() {
+  local attempt
+  for ((attempt = 1; ; attempt++)); do
+    if KEY_NAMES="$(find_key 2>"${ERR_FILE}")"; then
+      return 0
+    fi
+    if ((attempt >= GEMINI_KEY_LIST_ATTEMPTS)) || ! grep -qE "${GCLOUD_SERVICE_DISABLED}" "${ERR_FILE}"; then
+      show_err
+      return 1
+    fi
+    echo "[${PROJECT_ID}] The API Keys API is not ready yet; retrying in ${GEMINI_KEY_LIST_RETRY_SECONDS}s" >&2
+    sleep "${GEMINI_KEY_LIST_RETRY_SECONDS}"
+  done
+}
+
+list_keys_after_enable || die "could not list API keys"
 if [[ -z "${KEY_NAMES}" ]]; then
   echo "[${PROJECT_ID}] Creating API key ${GEMINI_KEY_DISPLAY_NAME} for ${GEMINI_KEY_API_TARGET}"
   if ! gcloud services api-keys create --project="${PROJECT_ID}" \
@@ -148,9 +168,6 @@ grant() {
 
 for sa in ${GEMINI_KEY_SECRET_ACCESSORS}; do
   grant "${sa}" "${GEMINI_KEY_ACCESSOR_ROLE}"
-done
-for sa in ${GEMINI_KEY_SECRET_VIEWERS}; do
-  grant "${sa}" "${GEMINI_KEY_VIEWER_ROLE}"
 done
 
 echo "[${PROJECT_ID}] Gemini API key ${KEY_NAME} is in secret ${GEMINI_KEY_SECRET_NAME}"
