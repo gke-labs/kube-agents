@@ -36,6 +36,22 @@ MESSAGE_HASH_HEX_CHARS = 16
 # recorded answer to that same context fills (answer_slots). A slot keeps the
 # answer's tool calls, by name and arguments, and blanks its words.
 ASSISTANT_ROLE = "assistant"
+# Tools whose arguments a slot blanks too; the name always stays. A tool is here
+# only when its source shows that calling it changes nothing, with any
+# arguments: then a replay that called it differently and got the same result
+# (the result stays in the key) left the world and what the model saw as the
+# recording did. Hermes' runtime auto-heartbeat ticks on any tool call, so it
+# does not tell one tool from another and does not count against a tool here.
+READ_ONLY_TOOLS = (
+    # Reads a card. hermes-agent v2026.9.14 tools/kanban_tools.py `_handle_show`
+    # resolves the id (`_require_task_id`; no id means the worker's own card) and
+    # returns get_task, parent_ids, child_ids, list_comments, list_events,
+    # list_runs and build_worker_context from hermes_cli/kanban_db.py, each a
+    # SELECT; no claim, heartbeat or write, and no image patch wraps it. The
+    # lane trial's only slot fork was kanban_show() against
+    # kanban_show(task_id=<own card>).
+    "kanban_show",
+)
 ANSWER_SLOT = "recorded-answer"
 CONTENT_FIELD = "content"
 FUNCTION_FIELD = "function"
@@ -683,6 +699,14 @@ def answer_actions(message: Any) -> List[Dict[str, Any]]:
     return actions
 
 
+def slot_actions(message: Any) -> List[Dict[str, Any]]:
+    """A normalized assistant message's tool calls as its slot keeps them: arguments blanked for READ_ONLY_TOOLS."""
+    return [
+        {NAME_FIELD: action[NAME_FIELD]} if action[NAME_FIELD] in READ_ONLY_TOOLS else action
+        for action in answer_actions(message)
+    ]
+
+
 def answer_identity(message: Any) -> str:
     """Which answer a normalized assistant message is: its words and its tool calls.
 
@@ -700,10 +724,11 @@ def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[st
     and a conversation recorded after one wording then never matches a replay
     that was served the other. Keyed this way, it matches as long as each
     answer it holds is one the model gave to that same context in a recording,
-    which the caller checks per slot. Only the words are blanked: each
-    answer's tool calls, by name and arguments, stay in the key, so a slot
-    never joins two conversations in which the agent did different things,
-    however alike the tool results that followed. A slot's context is the
+    which the caller checks per slot. Only the words are blanked, and the
+    arguments of a call to one of READ_ONLY_TOOLS: every tool call's name, and
+    every other call's arguments, stay in the key, so a slot never joins two
+    conversations in which the agent changed different things, however alike
+    the tool results that followed. A slot's context is the
     chain of everything before it, earlier answers as slots too, so the tool
     results that followed an answer still have to match.
     """
@@ -712,7 +737,7 @@ def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[st
     for message, message_hash, role in zip(normalized.messages, normalized.message_hashes, normalized.roles()):
         if role == ASSISTANT_ROLE:
             slots.append((current, answer_identity(message)))
-            part: Any = {ANSWER_SLOT: answer_actions(message)}
+            part: Any = {ANSWER_SLOT: slot_actions(message)}
         else:
             part = message_hash
         current = stable_hash({"prefix": current, "message": part})

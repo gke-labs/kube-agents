@@ -208,15 +208,25 @@ class AnswerSlotTest(unittest.TestCase):
         ]}, NOW)
 
     def test_the_slot_key_keeps_the_tool_calls_and_blanks_only_the_words(self):
-        base, _ = normalizer.answer_slots(self.acted("kanban_show", {}, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
+        get = {"command": "kubectl get pods"}
+        base, _ = normalizer.answer_slots(self.acted("terminal", get, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
         worded, slots = normalizer.answer_slots(
-            self.acted("kanban_show", {}, "Let me look.", "call_8__thought__WFla"), self.CONTEXT)
+            self.acted("terminal", get, "Let me look.", "call_8__thought__WFla"), self.CONTEXT)
         self.assertEqual(base, worded, "other words, another call id and thought signature: the same slot")
-        for name, arguments in (("kanban_complete", {}), ("kanban_show", {"task_id": "t_aaaaaaaa"})):
+        for name, arguments in (("kanban_complete", get), ("terminal", {"command": "kubectl delete pods --all"})):
             other, _ = normalizer.answer_slots(self.acted(name, arguments, "Looking.", "call_1__thought__QUJD"), self.CONTEXT)
             self.assertNotEqual(base, other, (name, arguments))
         self.assertNotEqual(slots[0][1], normalizer.answer_slots(
-            self.acted("kanban_show", {}, "Looking.", "call_1"), self.CONTEXT)[1][0][1], "the words name the answer")
+            self.acted("terminal", get, "Looking.", "call_1"), self.CONTEXT)[1][0][1], "the words name the answer")
+
+    def test_a_read_only_tool_keeps_its_name_and_blanks_its_arguments(self):
+        show, _ = normalizer.answer_slots(self.acted("kanban_show", {}, "", "call_1"), self.CONTEXT)
+        own, slots = normalizer.answer_slots(self.acted("kanban_show", {"task_id": "t_aaaaaaaa"}, "", "call_2"), self.CONTEXT)
+        self.assertEqual(show, own)
+        other, _ = normalizer.answer_slots(self.acted("kanban_list", {}, "", "call_1"), self.CONTEXT)
+        self.assertNotEqual(show, other, "the name stays in the key")
+        self.assertNotEqual(slots[0][1], normalizer.answer_slots(
+            self.acted("kanban_show", {}, "", "call_1"), self.CONTEXT)[1][0][1], "the arguments still name the answer")
 
     def test_an_answer_noted_at_record_time_is_the_one_a_later_slot_holds(self):
         asked = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_aaaaaaaa"}]}

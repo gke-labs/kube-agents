@@ -158,6 +158,26 @@ class AnswerSlotActionsTest(SlotCacheCase):
                                      self.result('{"ok": true}', call_id="call_9__thought__eHl6"))
         self.assertEqual(self.proxy().lookup(replayed, time.time()), (None, None))
 
+    def lookups(self, replayed_arguments, replayed_result, name="kanban_show"):
+        """Two recordings looked the card up with and without its id; replay `name` with other arguments."""
+        self.record(self.conversation(self.act(name, {"task_id": "t_bbbbbbbb"}), self.result('{"task": "running"}')),
+                    self.act("kanban_comment", {"body": "started"}, call_id="call_2"),
+                    others=[self.conversation(self.act(name, {}), self.result('{"task": "done"}'))])
+        replayed = self.conversation(self.act(name, replayed_arguments, call_id="call_5__thought__cXJz"),
+                                     self.result(replayed_result, call_id="call_5__thought__cXJz"))
+        return self.proxy().lookup(replayed, time.time())
+
+    def test_a_read_only_lookup_with_other_arguments_and_the_same_result_is_served(self):
+        hit, _ = self.lookups({}, '{"task": "running"}')
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[3], "answer_slots")
+
+    def test_a_read_only_lookup_with_another_result_misses(self):
+        self.assertEqual(self.lookups({}, '{"task": "blocked"}'), (None, None))
+
+    def test_another_tool_with_other_arguments_misses(self):
+        self.assertEqual(self.lookups({}, '{"task": "running"}', name="kanban_heartbeat"), (None, None))
+
     def test_the_same_tool_call_in_other_words_is_served(self):
         self.record(self.conversation(self.act("kanban_comment", {"body": "x"}, said="Leaving a note."),
                                       self.result('{"ok": true}')),

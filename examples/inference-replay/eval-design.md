@@ -240,10 +240,10 @@ answers instead of the model.
 
 The second column is the first replay pass of the second trial. Its other two passes reused
 nothing, for the midnight reason below. Of its 63%, 10 points (26 of the fleet case's 80) were six
-requests of one conversation served through the second key described under "Different words for
-the same answer", as the trial ran it: with the earlier answers' tool calls blanked too. The key
-now keeps tool calls and would not have served them, which puts that pass at about 53% and the
-fleet case at about 54%.
+requests of one conversation served through the second key described under "Different words for the
+same answer". The trial ran that key with the earlier answers' tool calls blanked whole; the key as
+it now stands, with only `kanban_show`'s arguments blanked, serves the same six requests (checked
+offline against the trial's saved requests).
 
 Every run passed, recordings and replays. And every replayed conversation that was served saved
 answers got the same pass or fail as the run it reused them from: 33 of 33 conversations in the
@@ -259,10 +259,11 @@ What the trials taught us:
 - **The model answers the same request in different words.** Every worker's opening request is the
   same once IDs are swapped ("work kanban task ⟦TASK⟧"), and the model sometimes looked its card up
   with no arguments and sometimes with the task id. The cache kept the first answer and served it to
-  every worker, so a case whose recording took the other answer never matched again. Every fork the
-  second trial served through the second key was this one: the same tool, different arguments, no
-  words on either side. None differed in words alone. The second key now keeps tool calls, so it
-  no longer serves this fork ("Different words for the same answer" says why).
+  every worker, so a case whose recording took the other answer never matched again. Every fork
+  the second trial served through the second key was this one: the same tool, different arguments,
+  no words on either side. None differed in words alone. `kanban_show` only reads, so the second key
+  ignores its arguments and still serves this fork; for any other tool, arguments count ("Different
+  words for the same answer").
 - **The day changes the key.** Every system prompt says which day the conversation started. The
   second trial's last two passes ran after midnight UTC and reused nothing, because every request
   now said Thursday where the recording said Wednesday. In CI the nightly records one day and
@@ -462,17 +463,21 @@ answer per request, so if a case's recording took the other wording, the next re
 includes that answer) never matches its recording, and the agents after it miss too.
 
 So the proxy also files each saved answer under a second key, where the words of the model's own
-earlier answers are left blank. Their tool calls, by name and arguments, stay in the key. A request
+earlier answers are left blank. Their tool calls stay in the key: the tool's name always, and its
+arguments too unless the tool is on a short list of tools that only read. A tool goes on that list
+only when its source shows that calling it changes nothing, with any arguments. Today the list is
+`kanban_show`, which reads a card and writes nothing. A worker that called `kanban_show()` in one
+run and `kanban_show(task_id=…)` for its own card in the next did the same thing, and the card it
+got back is in the key either way. A request
 that misses on the exact key can still be served from the second one, but only if:
 
 - every earlier answer in it is one the model really gave to that same point in a recording, and
   that the proxy itself recorded and could have stored: never one the client wrote into the history,
   and never an answer from a fallback;
-- the agent did the same things: every tool call matches by name and arguments. A different action
-  that happened to get the same output (`{"ok": true}` from completing a card rather than commenting
-  on it) is still a miss, and so is the same tool with different arguments, even a harmless one such
-  as `kanban_show()` and `kanban_show(task_id=…)` on the worker's own card: telling a harmless
-  difference from a harmful one would take per-tool rules;
+- the agent did the same things: every tool call matches by name, and by arguments unless the tool
+  only reads. A different action that happened to get the same output (`{"ok": true}` from
+  completing a card rather than commenting on it) is still a miss, and so is any other tool called
+  with different arguments;
 - everything the tools returned still matches exactly, since tool results stay in the key;
 - every value the saved answer names (a pod, a card) also appears outside the model's own earlier
   answers. Otherwise that value's placeholder could point at something else in this run.
