@@ -1,0 +1,124 @@
+{
+  "notes": "The chat UX lint's shared cases (.agents/rules/chat_ux.md): each chat message passes the validator, and findings lists the rule ids the lint reports for it, in its order. a2a/lib/chatmsg/lint_test.go and agents/platform/scripts/test_chat_cases.py both read this file, so the Go and Python lints cannot drift.",
+  "cases": [
+    {
+      "name": "a-plain-answer",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "checkout-gateway is crashlooping on an OOM.",
+        "choices": [{ "text": "Raise the limit" }, { "text": "Open PR #412" }]
+      },
+      "findings": []
+    },
+    {
+      "name": "a-pull-request-number-is-not-a-heading",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "#412 is ready to merge."
+      },
+      "findings": []
+    },
+    {
+      "name": "a-short-card-like-word-is-not-a-card",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The t_max setting is 30 seconds; the get_t_a1b2c3d4 helper reads it."
+      },
+      "findings": []
+    },
+    {
+      "name": "an-apology-mid-sentence",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "The upgrade failed, and I'm sorry to say it rolled back."
+      },
+      "findings": []
+    },
+    {
+      "name": "headline-names-a-card",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Card t_a8f58a2a finished the audit."
+      },
+      "findings": ["headline-card-id"]
+    },
+    {
+      "name": "headline-is-a-heading",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "## Summary"
+      },
+      "findings": ["headline-heading"]
+    },
+    {
+      "name": "headline-carries-a-fence",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Run ```kubectl get pods``` to see them."
+      },
+      "findings": ["headline-code-fence"]
+    },
+    {
+      "name": "headline-carries-a-tilde-fence",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "~~~ the log follows"
+      },
+      "findings": ["headline-code-fence"]
+    },
+    {
+      "name": "failure-opens-with-sorry",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Sorry, I couldn't find seeded-z.",
+        "choices": [{ "text": "Try again" }]
+      },
+      "findings": ["headline-apology"]
+    },
+    {
+      "name": "failure-opens-with-i-apologize",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "I apologize for the delay: the audit timed out.",
+        "tone": "critical"
+      },
+      "findings": ["headline-apology"]
+    },
+    {
+      "name": "failure-opens-with-unfortunately",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Unfortunately the upgrade failed.",
+        "mark": { "settle": "failed" }
+      },
+      "findings": ["headline-apology"]
+    },
+    {
+      "name": "choices-are-raw-commands",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Which should I run?",
+        "choices": [
+          { "text": "/approve" },
+          { "text": "kubectl rollout undo deploy/checkout" },
+          { "text": "Run `helm rollback`" },
+          { "text": "Roll back" }
+        ]
+      },
+      "findings": ["choice-raw-command", "choice-raw-command", "choice-raw-command"]
+    },
+    {
+      "name": "every-headline-rule-at-once",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "# Sorry: t_0123abcd hit ```"
+      },
+      "findings": [
+        "headline-card-id",
+        "headline-heading",
+        "headline-code-fence",
+        "headline-apology"
+      ]
+    }
+  ]
+}

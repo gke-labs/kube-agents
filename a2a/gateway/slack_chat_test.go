@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -340,5 +341,65 @@ func TestSlackChatPlanDrawsAWaitingItemInProgressWithItsStepsDone(t *testing.T) 
 	}
 	if strings.Contains(string(raw), slackChatStepOpen) {
 		t.Errorf("details %s mark a step open on a waiting item", raw)
+	}
+}
+
+// slackActionRows is the element count of every actions block in layout,
+// the side bar's included, read off the JSON Slack is sent.
+func slackActionRows(t *testing.T, layout slackChatLayout) []int {
+	t.Helper()
+	raw, err := json.Marshal(layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Blocks      []map[string]any `json:"blocks"`
+		Attachments []struct {
+			Blocks []map[string]any `json:"blocks"`
+		} `json:"attachments"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	blocks := doc.Blocks
+	for _, a := range doc.Attachments {
+		blocks = append(blocks, a.Blocks...)
+	}
+	var rows []int
+	for _, b := range blocks {
+		if b["type"] == slackChatActionsBlock {
+			elements, _ := b["elements"].([]any)
+			rows = append(rows, len(elements))
+		}
+	}
+	return rows
+}
+
+// The chat UX rule of at most five buttons a row (.agents/rules/chat_ux.md)
+// is the renderer's to keep: the most choices and links the validator
+// admits wrap into rows of slackChatButtonsPerRow, every button drawn.
+func TestSlackChatButtonsWrapFiveToARow(t *testing.T) {
+	m := chatmsg.Message{Schema: chatmsg.Schema, Headline: "h", Tone: chatmsg.ToneAttention}
+	for i := range 10 {
+		m.Choices = append(m.Choices, chatmsg.Choice{Text: fmt.Sprintf("choice %d", i)})
+		m.Links = append(m.Links, chatmsg.Link{Text: fmt.Sprintf("link %d", i), URL: fmt.Sprintf("https://example.com/%d", i)})
+	}
+	if layout, _ := chatmsg.Validate(m, chatmsg.Result); layout != nil {
+		t.Fatal(layout)
+	}
+	layout, err := renderSlackChat(&m, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := slackActionRows(t, layout)
+	total := 0
+	for _, n := range rows {
+		if n > slackChatButtonsPerRow {
+			t.Fatalf("a row of %d buttons, want at most %d: %v", n, slackChatButtonsPerRow, rows)
+		}
+		total += n
+	}
+	if total != 20 {
+		t.Fatalf("%d buttons drawn in rows %v, want all 20", total, rows)
 	}
 }

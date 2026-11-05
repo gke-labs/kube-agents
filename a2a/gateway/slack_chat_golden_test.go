@@ -86,6 +86,11 @@ func TestSlackChatGolden(t *testing.T) {
 				if err != nil {
 					t.Fatalf("expected[%d]: %v", i, err)
 				}
+				for _, n := range slackActionRows(t, layout) {
+					if n > slackChatButtonsPerRow {
+						t.Errorf("expected[%d]: a row of %d buttons, at most %d", i, n, slackChatButtonsPerRow)
+					}
+				}
 				layouts = append(layouts, goldenLayout{Expected: i, Carrier: out.Carrier, Blocks: layout.Blocks, Attachments: layout.Attachments})
 			}
 			if len(layouts) == 0 {
