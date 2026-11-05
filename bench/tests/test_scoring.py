@@ -3049,3 +3049,22 @@ def test_the_not_graded_hand_off_round_trips(blind_only_spec, inject_run):
     assert suite.outcome == SUITE_OUTCOME_GREEN
     assert suite.not_graded == ["card-only"]
     assert suite.to_dict()["not_graded"] == ["card-only"]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "split"),
+    [
+        ({"input": 10, "cached": 125204, "cache_write": 9395}, True),
+        ({"input": 10, "cached": 100, "workers": {"cached": 40}, "front_door": {"cached": 60}}, True),
+        ({"input": 10, "cached": 40, "workers": {"cached": 40}, "front_door": {"cached": None}}, False),
+        # A card-wake merge: the wake turn's workers added to an answer turn whose
+        # session row could not be read, so `input` still counts its cache reads.
+        ({"input": 3050, "cached": 5000, "cache_write": 500, "workers": {"cached": 5000}}, False),
+        ({"input": 10, "cached": 100, "workers": None, "usage_partial": True}, True),
+        ({"input": 10, "cached": None}, False),
+    ],
+    ids=["api", "api-workers-split", "front-door-unsplit", "card-wake-merge", "workers-unbilled", "inject"],
+)
+def test_the_prompt_split_is_trusted_only_when_input_excludes_cache_reads(tokens, split):
+    assert scoring._tokens_split(tokens) is split
+
