@@ -1266,6 +1266,32 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         index = fs.pool_label_index(pools, [node("n1", "default-pool", self.STAMPED)])
         self.assertEqual(fs.pinned_pool(pod("a", {"seeded-role": "pinned-inference"}), pools, index), "pinned-inference-pool")
 
+    def test_on_a_cluster_with_one_pool_every_selected_pod_is_that_pool_s(self):
+        """The common Standard shape: one pool with nodes, or one beside pools
+        scaled to zero. The question is where the pod can go, so a selector
+        its nodes satisfy pins the pod to it, whether the selector names the
+        pool's own label or a label every node carries."""
+        only = {**self.DEFAULT_POOL, "config": {"machineType": "e2-small", "labels": {"role": "inference"}}}
+        pools = [only]
+        index = fs.pool_label_index(pools, [node("n1", "default-pool", {**self.STAMPED, "role": "inference"})])
+        for name, selector in (("own-label", {"role": "inference"}), ("os-only", {"kubernetes.io/os": "linux"}), ("zone", {"topology.kubernetes.io/zone": "us-central1-a"})):
+            with self.subTest(name=name):
+                self.assertEqual(fs.pinned_pool(pod(name, selector, tolerations=()), pools, index), "default-pool")
+        self.assertIsNone(fs.pinned_pool(pod("other", {"role": "batch"}, tolerations=()), pools, index))
+        # Beside a pool scaled to zero, the same pods still resolve to the one pool their selector names.
+        scaled_to_zero = {**self.PINNED_POOL, "name": "idle-batch-pool", "config": {"machineType": "e2-small", "labels": {"role": "batch"}}}
+        index = fs.pool_label_index([only, scaled_to_zero], [node("n1", "default-pool", {**self.STAMPED, "role": "inference"})])
+        self.assertEqual(fs.pinned_pool(pod("a", {"role": "inference"}, tolerations=()), [only, scaled_to_zero], index), "default-pool")
+        self.assertEqual(fs.pinned_pool(pod("b", {"role": "batch"}, tolerations=()), [only, scaled_to_zero], index), "idle-batch-pool")
+
+    def test_a_shared_selector_resolves_through_the_taints_the_pod_tolerates(self):
+        """Two pools satisfy a zone-only selector; the pod tolerates only the
+        pinned pool's taint, so the default pool is the one place it can go."""
+        pools, index = self.two_pools()
+        zone = {"topology.kubernetes.io/zone": "us-central1-a"}
+        self.assertEqual(fs.pinned_pool(pod("bare", zone, tolerations=()), pools, index), "default-pool")
+        self.assertIsNone(fs.pinned_pool(pod("tolerant", zone), pools, index))
+
     def test_the_workload_name_is_the_cost_stream_s_owner_rule(self):
         """The controller reference names the workload, whatever its position;
         a Deployment stands in for its ReplicaSet; an unowned pod is itself."""
@@ -2035,8 +2061,9 @@ class CollectClusterTest(unittest.TestCase):
         items += [pod(f"inference-server-7d9f8b6c4-{i}", selector) for i in range(9)]
         items.append(pod("placed", selector, scheduled="True", reason=None))
         items.append(pod("elsewhere-7d9f8b6c4-x", {"seeded-role": "idle-batch"}))
-        # Pinned to the zone both pools share: no pool's backlog, counted nowhere.
-        items += [pod(f"zone-only-{i}", {"topology.kubernetes.io/zone": "us-central1-a"}, tolerations=()) for i in range(2)]
+        # Pinned to the zone both pools share and tolerating both: no pool's
+        # backlog, counted nowhere.
+        items += [pod(f"zone-only-{i}", {"topology.kubernetes.io/zone": "us-central1-a"}) for i in range(2)]
         entry = self.run_with(dump_items=items, pools=[self.PINNED_POOL, second])
         flagged = {c["object"]: c for c in entry["candidates"] if c["check"] == "single-zone-nodepool"}
         candidate = flagged["NodePool/pinned-inference-pool"]

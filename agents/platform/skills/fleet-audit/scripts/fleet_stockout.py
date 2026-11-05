@@ -1354,39 +1354,31 @@ def pool_label_index(node_pools: list[dict], nodes: list[dict]) -> dict[tuple[st
 
 
 def pinned_pool(pod: dict, node_pools: list[dict], label_index: dict[tuple[str, str], set[str]]) -> str | None:
-    """The one pool a pod is pinned to, or None. Its `nodeSelector` must narrow
-    it to exactly one pool (a label every pool carries is no preference, and a
-    selector two pools satisfy pins it to neither), and it must tolerate that
-    pool's blocking taints, or the scheduler could never place it there. An
-    empty selector pins the pod nowhere; a pod held by affinity alone is not
-    read here."""
-    from upgrade_retrospective import (
-        RECORD_TAINT_EFFECTS,
-        _selector_pools,
-        _tolerates,
-        pod_tolerations,
-    )
+    """The one pool the scheduler could place the pod on, or None. A pool is a
+    candidate when its nodes carry every pair of the pod's `nodeSelector` and
+    the pod tolerates the pool's blocking taints; the pod is this pool's
+    backlog only when it is the sole candidate. Two candidates pin it to
+    neither. On a cluster with one pool, every selected pod is that pool's.
+    An empty selector pins the pod nowhere; a pod held by affinity alone is
+    not read here. The question is where the pod can go, not which pool it
+    prefers, so the retrospective's narrowing rule does not apply."""
+    from upgrade_retrospective import _tolerates, pod_tolerations, pool_records_of
 
     spec = pod.get("spec") or {}
     selector = spec.get("nodeSelector") or {}
     if not selector:
         return None
-    pools = _selector_pools(selector, label_index)
-    if len(pools) != 1:
-        return None
-    name = next(iter(pools))
-    pool = next((p for p in node_pools if p.get("name") == name), None)
-    if pool is None:
-        return None
-    taints = [
-        {"key": t.get("key") or "", "value": t.get("value") or "", "effect": RECORD_TAINT_EFFECTS.get(t.get("effect") or "", t.get("effect") or "")}
-        for t in (pool.get("config") or {}).get("taints") or []
-        if isinstance(t, dict)
-    ]
     tolerations = pod_tolerations(spec)
-    if not all(_tolerates(tolerations, taint) for taint in taints):
-        return None
-    return name
+    records = pool_records_of({"nodePools": node_pools})
+    candidates = []
+    for pool in node_pools:
+        name = str(pool.get("name", ""))
+        if not all(name in label_index.get((str(k), str(v)), set()) for k, v in selector.items()):
+            continue
+        if not all(_tolerates(tolerations, taint) for taint in records.get(name, {}).get("taints", [])):
+            continue
+        candidates.append(name)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def read_unschedulable_pods(*, run: RunFn, env: dict) -> tuple[list[dict], str]:
