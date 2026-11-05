@@ -18,9 +18,9 @@ collector keeps it as `reps[].excerpt`, and the Brief and the run page show
 it beside the grader's reason (builds graded before 2026-09-15 carry none).
 In the same way, a `rep N timing:` line under each grading line carries the
 repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show,
-and a `rep N shape:` line the shape of the reply it delivered (whether it opens on its
-answer, an apology, the messages posted and word counts), which the Nightly page shows
-([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
+and a `rep N shape:` line the shape of the reply it delivered, from which the Nightly
+page shows how many repetitions opened on the answer, the apologies and the answer's
+median length ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
@@ -994,9 +994,11 @@ Nightly report's.
   delivered one and was not lost to infra: the share opening on the answer rather than a lead-in or a heading,
   the answer's median length, the median messages posted for the ask, and the share
   that apologized, each against its typical, worked out as the latency line's are. A
-  number gets a ⚠ mark when the share opening on the answer drops 10 points or more,
+  number gets a ⚠ mark when the share opening on the answer drops 5 points or more,
   the share apologizing rises as much, or the answer or the message count reaches
-  1.5× its typical. A night cut off at the deadline, or with a part missing or still
+  1.5× its typical. A second line gives the two shares for the chat-and-routing
+  cases alone, whose replies are what they grade, marked at 10 points: a drop
+  confined to them barely moves the whole suite's share. A night cut off at the deadline, or with a part missing or still
   running, carries the line too, labelled as the latency block is. It is advisory and
   moves no state, verdict or gate. `scripts/eval_dashboard/nightly_tone.py`
   holds the rules, and `bench/kube_agents_bench/chat_shape.py` measures each reply.

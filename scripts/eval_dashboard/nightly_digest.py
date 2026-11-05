@@ -315,11 +315,12 @@ class Builder:
         return [line, *self.capped(nightly_latency.SLOW_HEADING, items)]
 
     def trend_blocks(self, fields: dict) -> list[str]:
-        """The latency block, then the reply-shape line (``nightly_tone.py``)
-        when last night measured a reply, over one build of the reports."""
+        """The latency block, then the reply-shape lines (``nightly_tone.py``,
+        every case and the chat-and-routing cases) when last night measured
+        a reply, over one build of the reports."""
         nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
-        tone = nightly_tone.night_line(nights)
-        return [*self.latency_block(fields, nights), *([tone] if tone else [])]
+        tone = [line for line in (nightly_tone.night_line(nights), nightly_tone.focus_line(nights)) if line]
+        return [*self.latency_block(fields, nights), *tone]
 
     # ---- the night
 

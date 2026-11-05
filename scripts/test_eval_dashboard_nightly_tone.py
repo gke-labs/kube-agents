@@ -43,14 +43,14 @@ class NightLineTest(unittest.TestCase):
         self.assertIn("messages p50 3 ⚠ (typical 2)", line)
         self.assertIn("10% apologize ⚠ (typical 0%)", line)
 
-    def test_an_exact_ten_point_rise_from_a_nonzero_typical_is_marked(self):
+    def test_an_exact_rise_from_a_nonzero_typical_is_marked(self):
         # 0.2 + 0.1 is 0.30000000000000004 in floats; the points are whole.
         nights = [night(n=10, verdict=9, apology=3)] + steady(7, n=10, verdict=9, apology=2)
         self.assertEqual(nt.regressions(nights), [nt.APOLOGY_SHARE])
 
-    def test_the_verdict_share_mark_at_and_just_short_of_ten_points(self):
-        self.assertEqual(nt.regressions([night(verdict=32)] + steady(7)), [nt.VERDICT_SHARE])
-        self.assertEqual(nt.regressions([night(verdict=33)] + steady(7)), [])
+    def test_the_verdict_share_mark_at_and_just_short_of_five_points(self):
+        self.assertEqual(nt.regressions([night(verdict=34)] + steady(7)), [nt.VERDICT_SHARE])
+        self.assertEqual(nt.regressions([night(verdict=35)] + steady(7)), [])
 
     def test_a_half_point_rounds_up_as_the_page_does(self):
         self.assertIn("13% of 40 reps", nt.night_line([night(verdict=5)] + steady(2)))
@@ -64,7 +64,7 @@ class NightLineTest(unittest.TestCase):
         self.assertEqual(nt.regressions([night(messages=5)] + base), [nt.MESSAGES_P50])
 
     def test_just_short_of_the_threshold_is_not_marked(self):
-        nights = [night(verdict=33, apology=3, words=89)] + steady(7)
+        nights = [night(verdict=35, apology=1, words=89)] + steady(7)
         self.assertEqual(nt.regressions(nights), [])
 
     def test_fewer_than_three_earlier_nights_give_no_typical(self):
@@ -91,6 +91,34 @@ class NightLineTest(unittest.TestCase):
         line = nt.night_line([last] + steady(7))
         self.assertNotIn("answer p50", line)
         self.assertIn("messages p50 2", line)
+
+
+def focused(chat=(30, 0), other=(400, 0), chat_n=36, other_n=440, **fields):
+    """A night whose cases split into the focus domain and the rest, each a
+    single case rollup ``(opens_on_verdict, apology)`` out of ``*_n``."""
+    def case(domain, n, counts):
+        return {"case": domain, "domain": domain, "shape": {"n": n, "opens_on_verdict": counts[0], "apology": counts[1]}}
+
+    out = night(n=chat_n + other_n, verdict=chat[0] + other[0], apology=chat[1] + other[1], **fields)
+    out["cases"] = [case(nt.FOCUS_DOMAIN, chat_n, chat), case("capacity", other_n, other)]
+    return out
+
+
+class FocusLineTest(unittest.TestCase):
+    def test_shares_only_over_the_focus_domain(self):
+        line = nt.focus_line([focused()] + [focused() for _ in range(7)])
+        self.assertEqual(line, "🗣 *Reply shape, chat and routing*: 83% of 36 reps open on the answer (typical 83%) · 0% apologize (typical 0%)")
+
+    def test_a_drop_confined_to_the_focus_domain_is_marked_there_and_not_on_the_whole_line(self):
+        nights = [focused(chat=(26, 0))] + [focused() for _ in range(7)]
+        self.assertEqual(nt.regressions(nights, nt.focus_shape, nt.FOCUS_DROP_POINTS), [nt.VERDICT_SHARE])
+        self.assertIn("72% of 36 reps open on the answer ⚠", nt.focus_line(nights))
+        self.assertEqual(nt.regressions(nights), [], "four reps of 476 is under a point")
+
+    def test_no_focus_case_measured_is_no_line(self):
+        last = night()
+        last["cases"] = [{"case": "x", "domain": "capacity", "shape": {"n": 3, "opens_on_verdict": 3, "apology": 0}}]
+        self.assertIsNone(nt.focus_line([last] + steady(3)))
 
 
 if __name__ == "__main__":
