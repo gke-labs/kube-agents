@@ -359,22 +359,19 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 			"backend", r.Backend, "author", r.Rater, "conversation", r.Conversation)
 		return false, errFeedbackUnverified
 	}
-	g.metrics.answerRated(r.Platform, r.Rating)
 	key := feedbackKey(r.TaskID, r.Rater)
 	// Locked before the deadline starts, so waiting on the rater's previous
 	// tap does not spend this one's budget.
 	defer d.lockKey(key)()
 	ctx, cancel := context.WithTimeout(g.runCtx, feedbackRecorderDeadline)
 	defer cancel()
-	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
-	if err != nil {
-		return false, fmt.Errorf("feedback bucket: %w", err)
-	}
 	// The ask is the human message that started the rated chain, as the
 	// session record holds it (TaskRef.Request, until AskTTL clears it),
 	// and the context id joins the rating to the stream's copy of the
 	// conversation; both best effort, since a reaped session has neither.
-	contextID, ask := "", ""
+	// The same root says what answered the ask, for the metric's answer
+	// label.
+	contextID, ask, answer := "", "", metricsLabelOther
 	if session, err := g.reg.Get(ctx, r.Conversation); err != nil {
 		g.log.Warn("answer feedback: the session record could not be read; the rating is kept without its ask", "conversation", r.Conversation, "err", err)
 	} else if session != nil {
@@ -382,7 +379,18 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 		if root, ok := session.TaskRefFor(r.TaskID); ok {
 			// As written, line breaks kept: a pasted manifest stays one.
 			ask = root.Request
+			answer = answerReply
+			if root.CardsAnswer {
+				answer = answerCard
+			}
 		}
+	}
+	// Counted before the bucket is opened, so a rating it could not keep
+	// still counts.
+	g.metrics.answerRated(r.Platform, r.Rating, answer)
+	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
+	if err != nil {
+		return false, fmt.Errorf("feedback bucket: %w", err)
 	}
 	rating := FeedbackDown
 	if r.Rating != FeedbackDown {
