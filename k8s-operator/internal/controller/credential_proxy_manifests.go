@@ -163,8 +163,8 @@ const (
 	// credentialProxyRequestReserveBytes per admitted request, and admits a
 	// request only when the reservations plus the output allowance of the
 	// slots in use fit the limit less credentialProxyResidentReserveBytes --
-	// ten at once at the 2Gi below, held to eight by the slot cap (credentialProxyMaxConcurrentCommands),
-	// which is the upper bound. 2Gi rather than the earlier 1Gi (four at once)
+	// ten at once at the 2Gi below, held to eight by the slot cap
+	// (credentialProxyMaxConcurrentCommands), which is the upper bound. 2Gi rather than the earlier 1Gi (four at once)
 	// because the default kanban cap is six workers, and each can have a
 	// brokered command in flight. The sizing test in
 	// platformagent_manifests_test.go and ValidateCredentialProxyResources
