@@ -72,7 +72,8 @@ itself reads. A fault in the policy is one line in the output and the tick
 goes on as before.
 
 Output is empty on a quiet minute (``deliver: local`` plus empty stdout is a
-silent run). It speaks only when a tick was dispatched, and exits non-zero if
+silent run). It speaks only when a tick was dispatched or the idle policy held
+or released a job, and exits non-zero if
 one failed to start or came back non-zero within
 :data:`DEFAULT_BUDGET_SECONDS` — so a broken ticker shows up as a failed cron
 run instead of reproducing the silence it was written to end. A tick still

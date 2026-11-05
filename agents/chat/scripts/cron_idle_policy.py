@@ -19,12 +19,13 @@ that field and holds the prompt-driven jobs back in two stages:
   and again each time it comes due, until a person writes.
 
 Jobs with ``no_agent`` prompt no model and are never touched; neither is a job
-whose ``next_run_at`` Hermes has yet to compute, or whose schedule is not a
-cron expression. A missing field falls back to the CR's creation time, so an
-install nobody has ever messaged idles from the day it was created. Turns
-through the A2A inject door and the agent API do not move the field either,
-by the field's own definition; an install driven only by them opts out with
-``CRON_IDLE_THROTTLE_DAYS=0`` in ``spec.deployment.env``.
+whose ``next_run_at`` Hermes has yet to compute. A missing field falls back to
+the CR's creation time, so an install nobody has ever messaged idles from the
+day it was created. The field counts every chat message the gateway accepted,
+the agent API's included; turns through the A2A inject door are the one door
+it does not count, so an install driven only through that door opts out with
+``CRON_IDLE_THROTTLE_DAYS=0`` in ``spec.deployment.env`` (the operator copies
+both names from there onto the agent container).
 
 **Why ``next_run_at`` and not a skip list.** ``profile_cron_tick.py`` decides
 only whether to spawn ``hermes cron tick`` against a profile, and the platform
@@ -32,10 +33,22 @@ store's ``no_agent`` entries make it spawn every few minutes; Hermes then fires
 every job in the store whose ``next_run_at`` has passed. The one lever that
 holds a job is the timestamp Hermes itself reads, so this module rewrites it,
 under the same ``.jobs.lock`` Hermes takes, before the ticker looks for due
-work. Hermes rewrites ``next_run_at`` only when it claims or finishes a run, so
-a held timestamp stays where it was put. Held timestamps are computed with
-``croniter`` on the expression's own lattice, so a held audit still fires at
-its usual hour.
+work. Held timestamps are computed with ``croniter`` on the expression's own
+lattice, in the zone Hermes evaluates the expression in (``HERMES_TIMEZONE``,
+else the profile's ``config.yaml`` ``timezone``, else UTC), so a held audit
+still fires at its usual hour; an ``interval`` schedule is held by its period
+instead. Hermes leaves a stored ``next_run_at`` alone until the job is claimed
+or finishes, with one exception that matters here: its due scan re-arms a job
+whose last run ended in ``error`` to the next legal slot when that is earlier
+than the stored one, which undoes a throttle hold on such a job every day. No
+extra run comes of it (the hold is written again before Hermes scans), but the
+hold line repeats daily and the release on wake finds nothing to rewind.
+
+**A run asked for by hand is not held.** ``hermes cron run <job-id>`` marks a
+job due by moving ``next_run_at`` into the past, off the schedule's own grid;
+a due timestamp that is not one of the expression's slots (or, for an
+``interval`` job, not one period after ``last_run_at``) is such a request and
+is left for the next tick to run.
 
 **Wake.** The state file beside the store records each held job with the
 timestamp written. When the stage drops (a person wrote, or the thresholds
@@ -50,19 +63,22 @@ hold is on record, so a quiet minute costs no ``kubectl``. An unreadable
 signal keeps the last reading for :data:`SIGNAL_STALE_AFTER`, then the stage
 is unknown: nothing new is held and nothing is rewound, so the holds already
 written expire on their own schedule. A store lock that cannot be taken skips
-the write for that tick rather than writing outside it. Nothing here raises
-into the ticker: every fault is a line in its output.
+the write for that tick rather than writing outside it, and a missing
+``croniter`` holds nothing and says so once. Nothing here raises into the
+ticker: every fault is a line in its output.
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 # The two knobs, read from the ticker's environment, which `spec.deployment.env`
 # reaches. Days, whole numbers; `0` on the throttle disables both stages, `0`
@@ -114,6 +130,19 @@ STAGE_THROTTLE = "throttle"
 STAGE_HIBERNATE = "hibernate"
 STAGE_RANK = {STAGE_ACTIVE: 0, STAGE_THROTTLE: 1, STAGE_HIBERNATE: 2}
 SCHEDULE_KIND_CRON = "cron"
+SCHEDULE_KIND_INTERVAL = "interval"
+SECONDS_PER_MINUTE = 60
+# How far an interval job's natural `next_run_at` may sit from `last_run_at`
+# plus its period and still count as Hermes' own (it writes both from one
+# clock reading); anything further off is a hand-marked run.
+INTERVAL_SLACK = timedelta(seconds=1)
+
+# The zone Hermes evaluates a cron expression in, read the way Hermes does:
+# the variable first, then the profile's own config, else UTC.
+TIMEZONE_ENV = "HERMES_TIMEZONE"
+CONFIG_FILE_NAME = "config.yaml"
+CONFIG_TIMEZONE_KEY = "timezone"
+CRONITER_MODULE = "croniter"
 
 # How many characters of an error reach the ticker's output line.
 ERROR_EXCERPT_CHARS = 160
@@ -241,6 +270,8 @@ def load_state(path: Path) -> dict:
         return empty_state()
     state = empty_state()
     state["stage"] = data.get("stage") if data.get("stage") in STAGE_RANK else None
+    if data.get("croniter_missing"):
+        state["croniter_missing"] = True
     state["signal"] = data.get("signal") if isinstance(data.get("signal"), dict) else {}
     held = data.get("held")
     state["held"] = {
@@ -278,31 +309,89 @@ def _cron_expr(job: dict) -> str | None:
     return expr if isinstance(expr, str) and expr.strip() else None
 
 
+def _interval(job: dict) -> timedelta | None:
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict) or schedule.get("kind") != SCHEDULE_KIND_INTERVAL:
+        return None
+    try:
+        minutes = float(schedule.get("minutes") or 0)
+    except (TypeError, ValueError):
+        return None
+    return timedelta(seconds=minutes * SECONDS_PER_MINUTE) if minutes > 0 else None
+
+
 def _due(job: dict, now: datetime) -> bool:
     when = parse_timestamp(job.get("next_run_at"))
     return when is not None and when <= now
 
 
-def next_occurrence(expr: str, horizon: datetime, *, inclusive: bool) -> datetime | None:
+def croniter_available() -> bool:
+    return importlib.util.find_spec(CRONITER_MODULE) is not None
+
+
+def schedule_zone(profile: Path, environ: dict | None = None) -> tzinfo:
+    """The zone Hermes evaluates this profile's cron expressions in."""
+    env = os.environ if environ is None else environ
+    name = str(env.get(TIMEZONE_ENV, "") or "").strip()
+    if not name:
+        try:
+            import yaml
+
+            config = yaml.safe_load((profile / CONFIG_FILE_NAME).read_text(encoding="utf-8"))
+            name = str(config.get(CONFIG_TIMEZONE_KEY) or "").strip() if isinstance(config, dict) else ""
+        except Exception:
+            name = ""
+    if name:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return timezone.utc
+
+
+def next_occurrence(
+    expr: str, horizon: datetime, *, inclusive: bool, zone: tzinfo = timezone.utc
+) -> datetime | None:
     """The schedule's first occurrence after ``horizon``, or at it too when
-    ``inclusive``. None when croniter is missing or the expression is bad.
+    ``inclusive``, as a UTC instant. None when the expression is bad.
 
     The inclusive form reads ``horizon`` to the minute, the lattice a
     five-field expression lives on: a hold computed thirty seconds into the
     due minute still lands on tomorrow's slot rather than the day after's.
+    The expression is walked in ``zone``, the clock Hermes reads it by.
     """
-    try:
-        from croniter import croniter
-    except ImportError:
-        return None
+    from croniter import croniter
+
+    base = horizon.astimezone(zone)
     if inclusive:
-        base = horizon.replace(second=0, microsecond=0) - timedelta(seconds=1)
-    else:
-        base = horizon
+        base = base.replace(second=0, microsecond=0) - timedelta(seconds=1)
     try:
-        return croniter(expr, base.astimezone(timezone.utc)).get_next(datetime)
+        return croniter(expr, base).get_next(datetime).astimezone(timezone.utc)
     except Exception:
         return None
+
+
+def marked_by_hand(job: dict, due_at: datetime, zone: tzinfo) -> bool:
+    """Whether a due ``next_run_at`` is a request rather than a scheduled slot.
+
+    Every timestamp Hermes writes for a cron expression is one of its slots,
+    and for an interval job one period after ``last_run_at``; ``hermes cron
+    run`` marks a job due by moving the timestamp into the past, off that
+    grid. A job the policy cannot classify is treated as scheduled.
+    """
+    expr = _cron_expr(job)
+    if expr is not None:
+        from croniter import croniter
+
+        try:
+            return not croniter.match(expr, due_at.astimezone(zone))
+        except Exception:
+            return False
+    period = _interval(job)
+    last_run = parse_timestamp(job.get("last_run_at"))
+    if period is None or last_run is None:
+        return False
+    return abs((due_at - last_run) - period) > INTERVAL_SLACK
 
 
 # --------------------------------------------------------------------------
@@ -350,19 +439,42 @@ class _LockWatch:
         self.message = message
 
 
-def _hold_target(job: dict, stage: str, now: datetime, throttle_days: int) -> datetime | None:
+def _at_or_after(job: dict, horizon: datetime, zone: tzinfo) -> datetime | None:
+    """The job's first slot at or after ``horizon``; an interval job has no
+    grid, so the horizon itself."""
     expr = _cron_expr(job)
-    if expr is None:
-        return None
+    if expr is not None:
+        return next_occurrence(expr, horizon, inclusive=True, zone=zone)
+    return horizon if _interval(job) is not None else None
+
+
+def _hold_target(
+    job: dict, stage: str, now: datetime, throttle_days: int, zone: tzinfo
+) -> datetime | None:
     if stage == STAGE_HIBERNATE:
-        return next_occurrence(expr, now + HIBERNATE_HOLD, inclusive=True)
+        return _at_or_after(job, now + HIBERNATE_HOLD, zone)
     last_run = parse_timestamp(job.get("last_run_at"))
     if last_run is None:
         return None  # never ran: nothing to space it from, so it fires
     window = timedelta(days=throttle_days)
     if now - last_run >= window:
         return None  # a window has passed since it last ran: it fires
-    return next_occurrence(expr, last_run + window, inclusive=True)
+    return _at_or_after(job, last_run + window, zone)
+
+
+def _release_target(job: dict, now: datetime, zone: tzinfo) -> datetime | None:
+    """The job's next natural occurrence after ``now``: the expression's next
+    slot, or for an interval job the first multiple of its period past now
+    counted from its last run."""
+    expr = _cron_expr(job)
+    if expr is not None:
+        return next_occurrence(expr, now, inclusive=False, zone=zone)
+    period = _interval(job)
+    if period is None:
+        return None
+    base = parse_timestamp(job.get("last_run_at")) or now
+    elapsed = max(now - base, timedelta(0))
+    return base + period * (elapsed // period + 1)
 
 
 def _record_rank(record: dict) -> int:
@@ -372,7 +484,13 @@ def _record_rank(record: dict) -> int:
 
 
 def _apply_locked(
-    store_path: Path, state: dict, stage: str, now: datetime, throttle_days: int, label: str
+    store_path: Path,
+    state: dict,
+    stage: str,
+    now: datetime,
+    throttle_days: int,
+    label: str,
+    zone: tzinfo,
 ) -> tuple[bool, list[str]]:
     """Rewrite the store for ``stage``; returns whether it changed and the lines."""
     try:
@@ -395,9 +513,8 @@ def _apply_locked(
         record = held.get(job_id)
         if record is not None and STAGE_RANK[stage] < _record_rank(record):
             held.pop(job_id, None)
-            expr = _cron_expr(job)
-            if job.get("next_run_at") == record.get("next_run_at") and expr is not None:
-                target = next_occurrence(expr, now, inclusive=False)
+            if job.get("next_run_at") == record.get("next_run_at"):
+                target = _release_target(job, now, zone)
                 if target is not None:
                     job["next_run_at"] = target.isoformat()
                     changed = True
@@ -405,7 +522,9 @@ def _apply_locked(
             continue
         if stage == STAGE_ACTIVE or not _due(job, now):
             continue
-        target = _hold_target(job, stage, now, throttle_days)
+        if marked_by_hand(job, parse_timestamp(job.get("next_run_at")), zone):
+            continue  # `hermes cron run`: somebody asked for this one
+        target = _hold_target(job, stage, now, throttle_days, zone)
         if target is None or target <= now:
             continue
         job["next_run_at"] = target.isoformat()
@@ -478,6 +597,15 @@ def apply_profile(
         STAGE_RANK[stage] < _record_rank(record) for record in state["held"].values()
     )
     if stage is not None and (rewind or (due_prompt and stage != STAGE_ACTIVE)):
+        if not croniter_available():
+            if not state.get("croniter_missing"):
+                lines.append(f"{label}: cron idle policy cannot import {CRONITER_MODULE}; nothing held")
+            state["croniter_missing"] = True
+            stage = None  # fall through to the state save with nothing written
+        else:
+            state.pop("croniter_missing", None)
+    if stage is not None and (rewind or (due_prompt and stage != STAGE_ACTIVE)):
+        zone = schedule_zone(profile, environ)
         watch = _LockWatch()
         try:
             lock = _platform_module(LOCK_MODULE).cron_jobs_lock
@@ -488,7 +616,9 @@ def apply_profile(
                 if watch.fell_open:
                     lines.append(f"{label}: cron idle policy skipped this tick, the store lock is held ({watch.message})")
                 else:
-                    _, held_lines = _apply_locked(store_path, state, stage, now, throttle_days, label)
+                    _, held_lines = _apply_locked(
+                        store_path, state, stage, now, throttle_days, label, zone
+                    )
                     lines.extend(held_lines)
 
     if json.dumps(state, sort_keys=True) != before:

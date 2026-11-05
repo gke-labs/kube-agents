@@ -32,6 +32,14 @@ def days_ago(n: float, since: datetime = NOW) -> datetime:
     return since - timedelta(days=n)
 
 
+def due(expr: str, before: datetime = NOW) -> datetime:
+    """The expression's newest slot at or before ``before``: a due timestamp
+    Hermes itself would have written, on the schedule's own grid."""
+    from croniter import croniter
+
+    return croniter(expr, before + timedelta(seconds=1)).get_prev(datetime)
+
+
 def prompt_job(job_id, expr, next_run_at, last_run_at=None, **extra):
     entry = {
         "id": job_id,
@@ -43,6 +51,19 @@ def prompt_job(job_id, expr, next_run_at, last_run_at=None, **extra):
     if last_run_at is not None:
         entry["last_run_at"] = iso(last_run_at) if isinstance(last_run_at, datetime) else last_run_at
     entry.update(extra)
+    return entry
+
+
+def interval_job(job_id, minutes, next_run_at, last_run_at=None):
+    entry = {
+        "id": job_id,
+        "enabled": True,
+        "schedule": {"kind": "interval", "minutes": minutes},
+        "next_run_at": iso(next_run_at),
+        "max_turns": 250,
+    }
+    if last_run_at is not None:
+        entry["last_run_at"] = iso(last_run_at)
     return entry
 
 
@@ -225,7 +246,7 @@ class ThrottleTest(PolicyCase):
         # Last ran at 09:41 on a 09:20 schedule: the window ends 09:41 on the
         # 11th, so the hold lands on the 12th at 09:20, not on an off-grid time.
         last = datetime(2026, 8, 4, 9, 41, 12, tzinfo=timezone.utc)
-        self.write(prompt_job("stockout-prevention", "20 9 * * *", NOW, last))
+        self.write(prompt_job("stockout-prevention", "20 9 * * *", due("20 9 * * *"), last))
         self.run_policy(Reader(days_ago(8)))
         self.assertEqual(self.next_run("stockout-prevention"), "2026-08-12T09:20:00+00:00")
 
@@ -244,15 +265,39 @@ class ThrottleTest(PolicyCase):
         self.assertEqual(self.next_run("ai-security-audit"), iso(tomorrow))
         self.assertEqual(list(self.state()["held"]), ["compliance-audit"])
 
-    def test_interval_and_unscheduled_jobs_are_left_to_hermes(self):
-        self.write(
-            {"id": "ticker-ish", "enabled": True, "schedule": {"kind": "interval", "minutes": 5},
-             "next_run_at": iso(NOW), "last_run_at": iso(days_ago(1))},
-            prompt_job("fresh", "20 6 * * *", None),
-        )
+    def test_an_unscheduled_job_is_left_to_hermes(self):
+        self.write(prompt_job("fresh", "20 6 * * *", None))
         before = self.store.read_text()
         self.run_policy(Reader(days_ago(8)))
         self.assertEqual(self.store.read_text(), before)
+
+    def test_an_interval_job_is_held_by_its_period(self):
+        # `cronjob(action='create', schedule='every 2h')` stores an interval;
+        # Hermes writes next_run_at as last_run_at plus the period.
+        last = days_ago(2)
+        self.write(interval_job("two-hourly", 120, last + timedelta(hours=2), last))
+        lines = self.run_policy(Reader(days_ago(8)))
+        self.assertIn("held two-hourly until 2026-08-11T06:20:30+00:00 (throttle)", "\n".join(lines))
+        self.assertEqual(self.next_run("two-hourly"), iso(last + timedelta(days=7)))
+
+    def test_a_run_asked_for_by_hand_is_not_held(self):
+        # `hermes cron run` marks a job due by moving next_run_at into the
+        # past, off the expression's grid; that run is somebody's request.
+        asked = NOW - timedelta(minutes=3, seconds=17)
+        self.write(
+            prompt_job("compliance-audit", "20 6 * * *", asked, days_ago(2)),
+            prompt_job("ai-security-audit", "50 8 * * *", due("50 8 * * *"), days_ago(2)),
+        )
+        lines = self.run_policy(Reader(days_ago(8)))
+        self.assertEqual(self.next_run("compliance-audit"), iso(asked))
+        self.assertNotEqual(self.next_run("ai-security-audit"), iso(due("50 8 * * *")))
+        self.assertEqual([line for line in lines if "compliance-audit" in line], [])
+
+    def test_a_hand_run_of_an_interval_job_is_not_held(self):
+        last = days_ago(2)
+        self.write(interval_job("two-hourly", 120, NOW - timedelta(minutes=1), last))
+        self.run_policy(Reader(days_ago(15)))
+        self.assertEqual(self.next_run("two-hourly"), iso(NOW - timedelta(minutes=1)))
 
     def test_disabled_job_is_not_held(self):
         self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(2), enabled=False))
@@ -264,8 +309,8 @@ class HibernateTest(PolicyCase):
     def roster(self):
         return (
             prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)),
-            prompt_job("security-patch-orchestrator", "20 7 * * 1", NOW, days_ago(20)),
-            prompt_job("never-ran", "0 8 * * *", NOW),
+            prompt_job("security-patch-orchestrator", "20 7 * * 1", due("20 7 * * 1"), days_ago(20)),
+            prompt_job("never-ran", "0 8 * * *", due("0 8 * * *")),
             script_job("stall-watch", "*/30 * * * *", NOW),
             script_job("github-repo-watcher", "*/10 * * * *", NOW),
         )
@@ -297,6 +342,17 @@ class HibernateTest(PolicyCase):
         self.assertEqual(self.next_run("never-ran"), "2026-08-07T08:00:00+00:00")
         self.assertEqual(self.next_run("security-patch-orchestrator"), "2026-08-10T07:20:00+00:00")
 
+    def test_an_interval_job_hibernates_and_releases_on_its_period(self):
+        last = NOW - timedelta(hours=2)
+        self.write(interval_job("two-hourly", 120, NOW, last))
+        self.run_policy(Reader(days_ago(15)))
+        self.assertEqual(self.next_run("two-hourly"), iso(NOW + timedelta(days=1)))
+        later = NOW + timedelta(minutes=50)
+        lines = self.run_policy(Reader(later), now=later)
+        self.assertIn("released two-hourly", "\n".join(lines))
+        # The first multiple of the period past now, counted from the last run.
+        self.assertEqual(self.next_run("two-hourly"), iso(last + timedelta(hours=4)))
+
     def test_an_overdue_job_after_a_restart_is_held_a_day_from_now(self):
         self.write(prompt_job("compliance-audit", "20 6 * * *", days_ago(3), days_ago(4)))
         late = NOW + timedelta(hours=5)
@@ -308,7 +364,7 @@ class WakeTest(PolicyCase):
     def hibernate(self):
         self.write(
             prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)),
-            prompt_job("obtainability-audit", "50 6 * * *", NOW, days_ago(1)),
+            prompt_job("obtainability-audit", "50 6 * * *", due("50 6 * * *"), days_ago(1)),
             script_job("stall-watch", "*/30 * * * *", NOW),
         )
         self.run_policy(Reader(days_ago(15)))
@@ -379,6 +435,50 @@ class DisabledTest(PolicyCase):
         self.assertIn("released compliance-audit", "\n".join(lines))
         self.assertEqual(self.next_run("compliance-audit"), "2026-08-07T06:20:00+00:00")
         self.assertEqual(self.state()["held"], {})
+
+
+class ScheduleZoneTest(PolicyCase):
+    def test_defaults_to_utc(self):
+        self.assertEqual(cip.schedule_zone(self.profile, {}), timezone.utc)
+
+    def test_variable_then_profile_config_then_utc(self):
+        (self.profile / "config.yaml").write_text("timezone: Europe/Brussels\n", encoding="utf-8")
+        self.assertEqual(str(cip.schedule_zone(self.profile, {})), "Europe/Brussels")
+        self.assertEqual(str(cip.schedule_zone(self.profile, {cip.TIMEZONE_ENV: "Asia/Tokyo"})), "Asia/Tokyo")
+        self.assertEqual(cip.schedule_zone(self.profile, {cip.TIMEZONE_ENV: "Mars/Olympus"}), timezone.utc)
+
+    def test_a_hold_lands_on_the_zones_slot(self):
+        # 06:20 Brussels in August is 04:20 UTC; the due slot and the hold both
+        # sit on that clock, and the stored instant stays UTC.
+        (self.profile / "config.yaml").write_text("timezone: Europe/Brussels\n", encoding="utf-8")
+        local_due = datetime(2026, 8, 6, 4, 20, tzinfo=timezone.utc)
+        self.write(prompt_job("compliance-audit", "20 6 * * *", local_due, days_ago(1)))
+        self.run_policy(Reader(days_ago(15)), now=local_due + timedelta(seconds=30))
+        self.assertEqual(self.next_run("compliance-audit"), "2026-08-07T04:20:00+00:00")
+
+    def test_a_utc_slot_is_a_hand_run_on_another_clock(self):
+        (self.profile / "config.yaml").write_text("timezone: Europe/Brussels\n", encoding="utf-8")
+        self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)))
+        self.run_policy(Reader(days_ago(15)))
+        self.assertEqual(self.next_run("compliance-audit"), iso(NOW))
+
+
+class CroniterMissingTest(PolicyCase):
+    def test_says_so_once_and_holds_nothing(self):
+        self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)))
+        self._patch(cip, "croniter_available", lambda: False)
+        lines = self.run_policy(Reader(days_ago(15)))
+        self.assertEqual([line for line in lines if "cannot import croniter" in line][0],
+                         "platform: cron idle policy cannot import croniter; nothing held")
+        self.assertEqual(self.next_run("compliance-audit"), iso(NOW))
+        again = self.run_policy(Reader(days_ago(15)), now=NOW + timedelta(minutes=1))
+        self.assertEqual([line for line in again if "croniter" in line], [])
+        self.assertTrue(self.state()["croniter_missing"])
+
+    def _patch(self, obj, attr, value):
+        original = getattr(obj, attr)
+        setattr(obj, attr, value)
+        self.addCleanup(setattr, obj, attr, original)
 
 
 class SignalCacheTest(PolicyCase):
