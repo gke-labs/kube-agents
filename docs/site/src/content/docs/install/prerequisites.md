@@ -117,11 +117,16 @@ namespace quota that caps pod or
 claim counts below what the release needs refuses the install the same way; note that
 constraining ephemeral storage additionally requires every container to declare it (or
 a `LimitRange` to default it), as the chart README explains. Under `spec.mode: next`,
-NATS adds three 40 GiB JetStream persistent volume claims by default, one per server (bringing the total to 7 claims totalling 222 GiB of `requests.storage`; 5 claims and 142 GiB with one server), and the operator renders a namespace-wide `ResourceQuota` on
-`pods` of `maxSessions + 17`, plus one for each NATS server past the first (29 pods by
-default, from `spec.harness.tuning.maxSessions: 10` and three servers; one more with
-`A2A_MCP_DOOR=true`, for the MCP server), sized for the session pods plus the rest
-of the release; anything else you run in the namespace counts against it. The claims
+NATS adds three 40 GiB JetStream persistent volume claims by default, one per server (bringing the total to 7 claims totalling 222 GiB of `requests.storage`; 5 claims and 142 GiB with one server), and the operator renders a namespace-wide
+`ResourceQuota` on `pods` of `maxSessions` plus a headroom it derives: the pods it
+runs for the agent, each NATS server among them (one more with `A2A_MCP_DOOR=true`, for the MCP server), the chart's own pods in the namespace with a rollout surge pod
+for each that rolls with one (the chart stamps them on the `PlatformAgent`; 5
+without the chart), and 7 for the operator's rollout surges, the provisioning and
+scope-publishing Jobs and the gateway's count-then-create overshoot (36 pods by
+default, from `spec.harness.tuning.maxSessions: 10` and three servers, 42 with
+Hindsight and the GitHub minter; two fewer with one server),
+sized for the session pods plus the rest of the release; anything else you run in
+the namespace counts against it. The claims
 are also disks: on GKE's default `standard-rwo` class they are balanced persistent
 disks, which count against the project's regional SSD quota (`SSD_TOTAL_GB`) with the
 node boot disks. The chart does not check that quota. A new claim that exceeds it stays

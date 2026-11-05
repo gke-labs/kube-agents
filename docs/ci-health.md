@@ -1170,7 +1170,8 @@ the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
 per graded repetition and, when the week has a trend, its change from last
 week on the same scenarios, which the text says because it is not measured
-against that median), a "Needs attention" box, one row per area with
+against that median; and its cache hit rate when repetitions carry the prompt
+split), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -1183,8 +1184,12 @@ are left out of the median and their number is shown. The change compares
 the two weeks' figures over the scenarios with a full count in both weeks.
 Each such scenario's median is taken over its full counts in each week, and a
 week's figure is the median of those per-scenario medians, so every scenario
-weighs the same and its partial counts do not move it. The tokens tile and the Chat line are
-left out when no repetition the week compared carries a count.
+weighs the same and its partial counts do not move it. When full counts carry the prompt
+split, the tile and the Chat line add the cache hit rate: their cache reads over their
+whole prompt (`cached / (input + cached + cache_write)`), summed over those repetitions so
+a long run weighs by its tokens; the tile also gives how many repetitions it covers. The
+tokens tile and the Chat line are left out when no repetition the week compared carries a
+count.
 
 The page is written only when every check passes; otherwise the script prints
 each reason and exits 1, the step logs a warning, and the last published copy

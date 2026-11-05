@@ -136,9 +136,9 @@ func a2aMCPDoorEnabled() bool {
 }
 
 // a2aMCPStandingPods is the pods the MCP server adds to the namespace while
-// the flag is on, and none otherwise. The namespace pod quota's headroom
-// counts the standing pods, and no golden renders this one, so the quota adds
-// it on its own (#3869).
+// the flag is on, and none otherwise (#3869). a2aStandingPods counts it for
+// the namespace pod quota's headroom; no golden renders it, so
+// TestA2AStandingPodsCountTheConditionalWorkloads names it.
 func a2aMCPStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	if !a2aMCPDoorEnabled() {
 		return 0
