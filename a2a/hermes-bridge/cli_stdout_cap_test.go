@@ -101,7 +101,7 @@ func TestCLI_OversizeStdoutIsRefusedWithTheLimitNamed(t *testing.T) {
 	startBridge(t, url, printingScript(t, cliStdoutCap+1))
 	c := gatewayClient(t, url)
 	submit(t, c, "task-cli-oversize", "write something enormous")
-	task := waitTerminalFor(t, c, "task-cli-oversize", atCapTerminalWait)
+	task := waitTerminalFor(t, c, "task-cli-oversize", 3*terminalWait)
 	if task.State != lib.StateFailed {
 		t.Fatalf("state = %s, want failed: an answer over the cap must not complete truncated", task.State)
 	}
@@ -118,16 +118,19 @@ func TestCLI_OversizeStdoutIsRefusedWithTheLimitNamed(t *testing.T) {
 	}
 }
 
-// The boundary's other side: a child whose stdout is exactly cliStdoutCap
-// bytes completes with the whole answer, so the cap refuses nothing it
-// admits. The terminal budget is the api at-cap test's, for the same reason:
-// the chat fold and the chunked publish of an 8 MiB answer.
+// The boundary's other side: a child whose stdout is exactly the cap
+// completes with the whole answer, so the cap refuses nothing it admits.
+// The bridge runs at atCapAnswerBytes here, not cliStdoutCap, as the api
+// at-cap test does: the chat fold and the chunked publish scale with the
+// answer, and at 8 MiB they outran the publish window on a loaded runner.
 func TestCLI_StdoutAtTheCapCompletes(t *testing.T) {
 	_, url := startServer(t)
-	startBridge(t, url, printingScript(t, cliStdoutCap))
+	startBridgeWith(t, url, printingScript(t, atCapAnswerBytes), 0, func(b *Bridge) {
+		b.stdoutCap = atCapAnswerBytes
+	})
 	c := gatewayClient(t, url)
 	submit(t, c, "task-cli-atcap", "write something large")
-	task := waitTerminalFor(t, c, "task-cli-atcap", atCapTerminalWait)
+	task := waitTerminalFor(t, c, "task-cli-atcap", 3*terminalWait)
 	if task.State != lib.StateCompleted {
 		t.Fatalf("state = %s (%s), want completed", task.State, terminalReason(t, task))
 	}
@@ -140,8 +143,8 @@ func TestCLI_StdoutAtTheCapCompletes(t *testing.T) {
 	for _, part := range result.Parts {
 		got += len(part.Text)
 	}
-	if got != cliStdoutCap {
-		t.Errorf("result is %d bytes across %d parts, want the child's %d", got, len(result.Parts), cliStdoutCap)
+	if got != atCapAnswerBytes {
+		t.Errorf("result is %d bytes across %d parts, want the child's %d", got, len(result.Parts), atCapAnswerBytes)
 	}
 }
 
@@ -151,10 +154,10 @@ func TestCLI_StdoutAtTheCapCompletes(t *testing.T) {
 // quotes that error, not the last bytes under the cap. The reason adds how
 // much the cap dropped; a child that fit adds nothing.
 func TestCLI_FailedRunPastTheCapQuotesTheStreamsEnd(t *testing.T) {
-	if got := cliStdoutCutNote(0); got != "" {
+	if got := cliStdoutCutNote(cliStdoutCap, 0); got != "" {
 		t.Fatalf("a stream that fit added %q", got)
 	}
-	got := cliStdoutCutNote(42)
+	got := cliStdoutCutNote(cliStdoutCap, 42)
 	want := fmt.Sprintf("; stdout kept to the %d-byte cap (cliStdoutCap in bridge.go), 42 bytes past it dropped", cliStdoutCap)
 	if !strings.HasPrefix(got, want) {
 		t.Fatalf("note = %q, want prefix %q", got, want)
@@ -165,7 +168,7 @@ func TestCLI_FailedRunPastTheCapQuotesTheStreamsEnd(t *testing.T) {
 		`head -c %d /dev/zero | tr '\0' x; echo "Error: the retries gave up"; echo "the real error" >&2; exit 1`, cliStdoutCap+1)))
 	c := gatewayClient(t, url)
 	submit(t, c, "task-cli-cut-failed", "dump and fail")
-	task := waitTerminalFor(t, c, "task-cli-cut-failed", atCapTerminalWait)
+	task := waitTerminalFor(t, c, "task-cli-cut-failed", 3*terminalWait)
 	if task.State != lib.StateFailed {
 		t.Fatalf("state = %s, want failed", task.State)
 	}

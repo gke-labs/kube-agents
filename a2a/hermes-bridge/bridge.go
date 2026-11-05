@@ -451,6 +451,9 @@ type Bridge struct {
 	// default; a field so a test can put an answer exactly at the cap
 	// without reading, folding and publishing 8 MiB under the race detector.
 	responseCap int
+	// stdoutCap bounds what the CLI executor keeps of a child's stdout,
+	// cliStdoutCap by default; a field for the same reason as responseCap.
+	stdoutCap int
 	// afterDeadline arms the CLI executor's task deadline, time.AfterFunc by
 	// default; a field so a test can hold the kill until the stub has done
 	// what the test needs done before the deadline.
@@ -512,6 +515,7 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 	b.resultPublish = b.publishResult
 	b.chatPart = resultChatPart
 	b.responseCap = apiResponseCap
+	b.stdoutCap = cliStdoutCap
 	b.afterDeadline = time.AfterFunc
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
@@ -1488,7 +1492,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	// stdout is the answer, kept to the cap; stdoutTail is the last
 	// stdoutTailBytes of the same stream for a failed run's terminal, which
 	// the cap cannot cut (the two writers' comments at the constants).
-	stdout := newBoundedBuffer(cliStdoutCap)
+	stdout := newBoundedBuffer(b.stdoutCap)
 	stdoutTail := newTailBuffer(stdoutTailBytes)
 	stderr := newTailBuffer(stderrTailBytes)
 	cmd.Stdout = io.MultiWriter(stdout, stdoutTail)
@@ -1591,7 +1595,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 		if dropped := stdout.Dropped(); dropped > 0 {
 			// Refused, not truncated, as on the API executor: a cut answer
 			// published as complete would read as the whole one.
-			b.finalize(run, lib.StateFailed, cliOversizeReason(hermesSessionID(stderr.String()), dropped), nil)
+			b.finalize(run, lib.StateFailed, cliOversizeReason(b.stdoutCap, hermesSessionID(stderr.String()), dropped), nil)
 			return
 		}
 		out := stdout.String()
@@ -1622,20 +1626,20 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
 		}
 		run.mu.Unlock()
-		b.finalize(run, lib.StateFailed, failureReason(err, stdoutTail.String(), stderr.String())+cliStdoutCutNote(stdout.Dropped()), nil)
+		b.finalize(run, lib.StateFailed, failureReason(err, stdoutTail.String(), stderr.String())+cliStdoutCutNote(b.stdoutCap, stdout.Dropped()), nil)
 	}
 }
 
 // cliStdoutCutNote is what a failed run's reason adds when the child's
-// stdout went past cliStdoutCap by dropped bytes, or "". The stdout tail
+// stdout went past the cap applied (b.stdoutCap) by dropped bytes, or "". The stdout tail
 // the reason quotes comes from its own writer and is the stream's end
 // either way, so the note says what the cap did cut: the answer the run
 // would have published, had it exited clean, and how much of it.
-func cliStdoutCutNote(dropped int64) string {
+func cliStdoutCutNote(capBytes int, dropped int64) string {
 	if dropped <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("; stdout kept to the %d-byte cap (cliStdoutCap in bridge.go), %d bytes past it dropped; the stdout tail above is still the stream's end", cliStdoutCap, dropped)
+	return fmt.Sprintf("; stdout kept to the %d-byte cap (cliStdoutCap in bridge.go), %d bytes past it dropped; the stdout tail above is still the stream's end", capBytes, dropped)
 }
 
 // reapCutNote is the detail a killed run's reason adds when the reap after
@@ -1713,13 +1717,13 @@ func failureReason(err error, stdout, stderr string) string {
 }
 
 // cliOversizeReason is the terminal for a cli run whose stdout went past
-// cliStdoutCap by dropped bytes: the token, the session if hermes printed
+// the cap applied (b.stdoutCap) by dropped bytes: the token, the session if hermes printed
 // one, and the limit named, so a reader lands on the answer's size rather
 // than on Hermes or the protocol.
-func cliOversizeReason(session string, dropped int64) string {
+func cliOversizeReason(capBytes int, session string, dropped int64) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "reason: hermes-cli-oversize - the child's stdout is over the %d-byte limit (cliStdoutCap in bridge.go) by %d bytes",
-		cliStdoutCap, dropped)
+		capBytes, dropped)
 	if session != "" {
 		fmt.Fprintf(&sb, "; session: %s", session)
 	}
