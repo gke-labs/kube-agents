@@ -242,7 +242,8 @@ during a `working` task is a steer, per the 8/24 decision above.
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
 placeholder that opens a task ("submitted…", which becomes the rolling line the relay
-edits; none on a backend that shows a task's status itself, `StatusShower`, which is Slack with
+edits, posted and edited with `OutMessage.Stop` while the task runs so that a backend that
+draws a Stop control draws it there, which Google Chat does, below; none on a backend that shows a task's status itself, `StatusShower`, which is Slack with
 Agent Sessions, where a submission that never reached the bus is posted instead), the status card, the steer acknowledgement, the release line for a task that
 produced no first event inside the grace (its id and the grace; Session lifecycle
 below), the notice the reap scan posts once when that grace passes with no turn to
@@ -1681,8 +1682,8 @@ rather than dropping them, and Slack's own refusal (`invalid_blocks`) comes back
 `error`, so the caller falls back to text. Blocks cannot be escaped the way text is, so the
 gateway refuses any block that carries a mention (`<!channel>`, `<!here>`, `<!subteam^…>`,
 `<@U…>`, a bare `@here`, `@channel` or `@everyone`, which a mrkdwn text object may parse into one, or a rich_text `broadcast`, `user` or `usergroup` element), and the caller posts the
-escaped text instead. The gateway answers clicks only on the choice buttons and rating controls
-it draws itself (the Slack adapter section, and "Chat messages on Google Chat"), so a button on such a card would be clicked into
+escaped text instead. The gateway answers clicks only on the choice buttons, rating controls
+and, on Google Chat, the Stop button it draws itself (the Slack adapter section, and "Chat messages on Google Chat"), so a button on such a card would be clicked into
 nothing, or, as a rating block, rate under a task id the sender chose: the gateway refuses any
 interactive block or element in raw blocks (an `actions` or `input` block, a button, a select, a
 date or time picker, a text input, a `context_actions` block and its `feedback_buttons` and
@@ -1783,6 +1784,25 @@ are held in the process: after a restart a question keeps its buttons until clic
 is still a turn, and the rewrite reads the message the event carries, its text, its link
 buttons and the clicked button's label. A click on a button the adapter did not draw is
 logged and acked.
+
+**The Stop button.** A task's live message, the "⏳ submitted…" line the gateway posts and
+edits as the task moves, arrives at the adapter with `OutMessage.Stop` while the task runs, and
+the adapter draws a `Stop` button under it: after the message's own buttons when the newest
+progress laid it out (a progress message's links), alone under the text otherwise. The terminal
+edit arrives without `Stop` and takes the button off, as any text edit does. Slack's Stop is
+native to Agent Sessions (the Slack adapter section); Chat has no such control, so this one is
+drawn, and a line Chat refuses with the button is posted or patched once more without it, so the
+line itself never fails for the button. A click on it arrives as a `CARD_CLICKED` interaction
+like a choice click, with the button's function `kage.stop` and one parameter, the conversation
+key the line was posted under: the click's event names the surface the line is on, which is not
+the key a DM's thread-less line was posted under. The adapter turns it into the typed `stop` in
+every way: `IntentCancel` with no text, from the clicker, bound to that conversation, which must
+be in the space the click came from, and handed over like a typed message, so the allowlist
+decides and the gateway's stop path answers it as it answers the word, for anyone the allowlist
+admits (the Slack button's requester gate, `stopgate.go`, is Slack's). A redelivered click is a
+duplicate by its id, as a choice click is. Nothing is remembered for it: a line posted before a
+restart carries its conversation in the button, and a click on it after the task ended is
+answered as a `stop` with nothing running.
 
 ## The Slack adapter (added 9/4)
 

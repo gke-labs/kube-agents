@@ -98,7 +98,7 @@ func (g *Gateway) showBusy(rec *SessionRecord, taskID string, ahead int) {
 			"conversation", rec.Key, "taskId", taskID)
 		return
 	}
-	if g.editLine(rec.Key, active.StatusMsgID, line) {
+	if g.editLine(rec.Key, active.StatusMsgID, line, true) {
 		rs.lastLine = line
 		rs.busyShown = true
 		g.log.Info("busy notice shown on the status line",

@@ -279,6 +279,9 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	if click == nil {
 		return InboundMessage{}, "a click event with no click"
 	}
+	if click.Function == gchatStopFunction {
+		return a.classifyStop(ev)
+	}
 	if click.Function != gchatChatFunction {
 		return InboundMessage{}, "a click on a button this adapter did not draw (" + strconv.Quote(click.Function) + ")"
 	}

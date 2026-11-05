@@ -150,13 +150,15 @@ func (g *Gateway) chatOutcome(conversation string, err error) bool {
 // chat message to lay out, is the text edit the relay always made. One that
 // was laid out and has none now is replaced by its text, layout cleared. A
 // chat message the adapter will not lay out falls back to the text edit.
-func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayState) bool {
+// running is editLine's: the Stop control stays on a running task's line
+// and comes off at the terminal.
+func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayState, running bool) bool {
 	line = truncateRunes(line, discordChunk)
 	if rs.lineTextOnly || (rs.lineChat == nil && !rs.lineLaidOut) {
-		return g.editLine(conversation, messageID, line)
+		return g.editLine(conversation, messageID, line, running)
 	}
 	if rs.lineChat != nil {
-		err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: line, Chat: rs.lineChat})
+		err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: line, Chat: rs.lineChat, Stop: running})
 		if g.chatOutcome(conversation, err) {
 			rs.lineLaidOut = true
 			return true
@@ -182,11 +184,11 @@ func (g *Gateway) renderLine(conversation, messageID, line string, rs *relayStat
 				// message changed, and this backend did not lay it out.
 				return true
 			}
-			return g.editLine(conversation, messageID, line)
+			return g.editLine(conversation, messageID, line, running)
 		}
 	}
 	// The line shows a layout it should not any more: replace it whole.
-	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: line}); err != nil {
+	if err := g.adapter.EditMessage(conversation, messageID, OutMessage{Text: line, Stop: running}); err != nil {
 		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
 		return false
 	}

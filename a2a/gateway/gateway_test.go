@@ -210,6 +210,12 @@ type fakeAdapter struct {
 	// answers errNoTerminalFrames, as a chat backend would.
 	takesTerminals bool
 	terminals      []fakeTerminal
+	// stopLines records every post and edit that carried OutMessage.Stop,
+	// a running task's live message; laidOut the messages whose current
+	// edit is a layout, so an edit back to text is recorded in chatEdits as
+	// nil, and a text edit of a text line is not.
+	stopLines []fakePost
+	laidOut   map[string]bool
 }
 
 type fakeTerminal struct {
@@ -267,7 +273,13 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 		a.mu.Unlock()
 	}
 	if m.Chat == nil {
-		return a.Post(conversation, m.Text)
+		id, err := a.Post(conversation, m.Text)
+		if err == nil && m.Stop {
+			a.mu.Lock()
+			a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
+			a.mu.Unlock()
+		}
+		return id, err
 	}
 	a.mu.Lock()
 	rendersChat, refuseChat := a.rendersChat, a.refuseChat
@@ -281,8 +293,25 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 	id, err := a.Post(conversation, m.Text)
 	a.mu.Lock()
 	a.chatPosts = append(a.chatPosts, m.Chat)
+	a.setLaidOutLocked(id, true)
+	if m.Stop {
+		a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
+	}
 	a.mu.Unlock()
 	return id, err
+}
+
+func (a *fakeAdapter) setLaidOutLocked(messageID string, laidOut bool) {
+	if a.laidOut == nil {
+		a.laidOut = map[string]bool{}
+	}
+	a.laidOut[messageID] = laidOut
+}
+
+func (a *fakeAdapter) stopLinesCopy() []fakePost {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fakePost(nil), a.stopLines...)
 }
 
 func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
@@ -306,7 +335,13 @@ func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) 
 		return err
 	}
 	a.mu.Lock()
-	a.chatEdits = append(a.chatEdits, m.Chat)
+	if m.Chat != nil || a.laidOut[messageID] {
+		a.chatEdits = append(a.chatEdits, m.Chat)
+	}
+	a.setLaidOutLocked(messageID, m.Chat != nil)
+	if m.Stop {
+		a.stopLines = append(a.stopLines, fakePost{conversation, messageID, m.Text})
+	}
 	a.mu.Unlock()
 	return nil
 }

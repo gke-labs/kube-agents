@@ -2707,7 +2707,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
 	if !lineless {
 		var err error
-		statusMsgID, err = g.adapter.Post(rec.Key, withLineNote("⏳ submitted…", ts.LineNote))
+		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: true})
 		if err != nil {
 			g.log.Error("placeholder post failed", "conversation", rec.Key, "err", err)
 		}
