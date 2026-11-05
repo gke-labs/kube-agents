@@ -187,9 +187,7 @@ func run() int {
 		if harness == "" {
 			harness = persona.ClaudeCode
 		}
-		// The persona supplies the tool flags, so the base argv carries none.
-		cfg.HarnessCommand = profileHarnessCommand()
-		cfg.HarnessCommandNoDelegate = nil
+		cfg = profileModeConfig(cfg)
 		pw := workeradapter.ProfileWorkerConfig{
 			Tier:       os.Getenv(lib.EnvProfileTier),
 			OneShot:    oneShot == "1" || oneShot == "true",
@@ -235,6 +233,17 @@ func run() int {
 // capability switch is the one that matters — see CapabilityOptional below.
 // The bool is false when the required trio is missing or A2A_AUTHORITY_SCOPE
 // is malformed, which run reports as exit 1.
+// profileModeConfig is cfg for a profile worker. The persona supplies the
+// tool flags, so the base argv carries none, and the delegate tool is not
+// among them, so no delegate socket is bound for a harness that would never
+// be told of it.
+func profileModeConfig(cfg workeradapter.Config) workeradapter.Config {
+	cfg.HarnessCommand = profileHarnessCommand()
+	cfg.HarnessCommandNoDelegate = nil
+	cfg.DelegateSocket = ""
+	return cfg
+}
+
 func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")

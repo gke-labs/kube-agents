@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -64,6 +65,10 @@ type ProfileWorkerConfig struct {
 	// task's lifetime (CREDENTIAL_PROXY_TASK_TOKEN_FILE, a tmpfs emptyDir),
 	// for the kubectl and gcloud shims to send to the broker. Empty skips it.
 	TaskTokenFile string
+	// readyListener, when set, is a listener already bound to ReadyAddr,
+	// which serveReadiness uses instead of binding one. Tests set it, so no
+	// other process can take the port between choosing it and listening.
+	readyListener net.Listener
 	// deadlineMargin is how long before the offer's deadline the harness is
 	// stopped, so the worker's own deadline-exceeded terminal and its final
 	// renewal reach the bus before the dispatcher's abandon. Zero is
@@ -112,6 +117,7 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 		if w.persona, err = renderPersona(pw); err != nil {
 			return err
 		}
+		logPersonaWarnings(cfg.Logger, w.persona)
 	}
 	sub, err := b.nc.ChanSubscribe(lib.DispatchSubject(cfg.Profile, pw.Tier, cfg.PodName), w.msgs)
 	if err != nil {
@@ -126,7 +132,7 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 		return fmt.Errorf("flush the dispatch subscription: %w", err)
 	}
 	if pw.ReadyAddr != "" {
-		stop, err := w.serveReadiness(pw.ReadyAddr)
+		stop, err := w.serveReadiness(pw.ReadyAddr, pw.readyListener)
 		if err != nil {
 			return err
 		}
@@ -168,6 +174,20 @@ func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// logPersonaWarnings logs what rendering left out of the persona: a broker
+// MCP server with no relay target yet, a skill script without a shell
+// grant, a server with no tools entry. The render reports them and doesn't
+// log, and without this the pod's log would say nothing about a server
+// that never appears.
+func logPersonaWarnings(log *slog.Logger, out *persona.Output) {
+	if out == nil {
+		return
+	}
+	for _, w := range out.Warnings {
+		log.Warn("persona render left something out", "warning", w)
+	}
 }
 
 // userSettingsFile is the harness's user settings, the only settings source
@@ -568,10 +588,12 @@ func taskParameterEnv(origin *lib.Envelope, log interface{ Warn(string, ...any) 
 
 // serveReadiness answers /readyz with 200 once the worker is listening, and
 // /healthz always.
-func (w *profileWorker) serveReadiness(addr string) (func(), error) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("readiness listener: %w", err)
+func (w *profileWorker) serveReadiness(addr string, ln net.Listener) (func(), error) {
+	if ln == nil {
+		var err error
+		if ln, err = net.Listen("tcp", addr); err != nil {
+			return nil, fmt.Errorf("readiness listener: %w", err)
+		}
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", func(rw http.ResponseWriter, _ *http.Request) {

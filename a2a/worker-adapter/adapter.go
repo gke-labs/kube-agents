@@ -871,6 +871,11 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 				events = nil
 				continue
 			}
+			// An abandoned task's stdout is drained, not published: the
+			// dispatcher has written its terminal.
+			if abandoned {
+				continue
+			}
 			switch ev.Type {
 			case "system":
 				if ev.Subtype == "init" {
@@ -928,6 +933,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			}
 
 		case text := <-steerCh:
+			if abandoned {
+				log.Info("steer for an abandoned task dropped", "task", a.taskID)
+				continue
+			}
 			if sawResult || exited {
 				// Post-deliverable steer: the deliverable is chosen and
 				// the harness is wrapping up, so this correction cannot be
@@ -961,7 +970,7 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// Cancel and the deadline end the turn when they fire, not when
 			// the harness finally dies: a call in that window would publish
 			// a child and turn the canceled task into a completed one.
-			if sawResult || exited || canceled || deadlineHit {
+			if sawResult || exited || canceled || deadlineHit || abandoned {
 				ask.reply <- delegateReply{Message: "this turn has already ended"}
 				continue
 			}
@@ -1018,6 +1027,10 @@ func (a *adapter) supervise(ctx context.Context, proc *harnessProc, steerCh <-ch
 			// Eviction: kubelet SIGTERM landed. Flush what the harness
 			// already produced, state the reason honestly, exit 143.
 			proc.kill(0)
+			// The dispatcher already wrote an abandoned task's terminal.
+			if abandoned {
+				return Result{Abandoned: true}, nil
+			}
 			// A turn that delegated has its deliverable already: the
 			// one-line result. The SIGTERM is not a failure of it, and is
 			// expected: a child that ends fast wakes the session, and a
