@@ -299,6 +299,57 @@ func TestDeskCountsACardAnswerAndAnUnknownOneApart(t *testing.T) {
 	}
 }
 
+// The metric counts rating changes: a first rating and each flip count once,
+// a repeat of the rating already kept does not.
+func TestDeskCountsOnlyARatingChange(t *testing.T) {
+	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
+	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
+	desk := r.g.feedback.Load()
+	origin := completeTurn(t, r, "discord:g1/fb13", "d-1", "it is OOMKilled")
+	rate := func(rating string) {
+		t.Helper()
+		if _, err := desk.Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb13",
+			MessageID: "m1", TaskID: origin.TaskID, Rating: rating, Answer: "it is OOMKilled"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := r.g.Metrics()
+	counted := func(rating string) float64 {
+		return counterValue(t, m.answerFeedback.WithLabelValues(platformSlack, rating, answerReply))
+	}
+	for _, step := range []struct {
+		rating   string
+		up, down float64
+	}{
+		{FeedbackDown, 0, 1}, // first rating
+		{FeedbackDown, 0, 1}, // repeat: not counted
+		{FeedbackUp, 1, 1},   // flip
+		{FeedbackUp, 1, 1},   // repeat
+		{FeedbackDown, 1, 2}, // flip back
+	} {
+		rate(step.rating)
+		if up, down := counted(FeedbackUp), counted(FeedbackDown); up != step.up || down != step.down {
+			t.Fatalf("after %s: up %v down %v, want %v and %v", step.rating, up, down, step.up, step.down)
+		}
+	}
+}
+
+// A rating the bucket did not keep is not counted.
+func TestDeskDoesNotCountARatingItCouldNotKeep(t *testing.T) {
+	r := startRig(t)
+	desk := &feedbackDesk{g: r.g, ttl: time.Hour}
+	_, err := desk.Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001",
+		Conversation: "discord:g1/fb14", TaskID: "t-5", Rating: FeedbackDown, Answer: "x"})
+	if err == nil {
+		t.Fatal("Rate with no feedback bucket succeeded")
+	}
+	for _, answer := range []string{answerReply, answerCard, metricsLabelOther} {
+		if got := counterValue(t, r.g.Metrics().answerFeedback.WithLabelValues(platformSlack, FeedbackDown, answer)); got != 0 {
+			t.Errorf("a rating the bucket did not keep was counted under %s: %v", answer, got)
+		}
+	}
+}
+
 func TestDeskReRatingKeepsTheNote(t *testing.T) {
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })

@@ -23,8 +23,7 @@ import (
 // them there; today that is Slack, with its own feedback buttons. A rating
 // from a sender the gateway would not take a turn from changes nothing.
 //
-// Each rating is counted (answer_feedback_total) and kept in the feedback
-// bucket: the ask that started the rated chain, the answer and the ids, and
+// Each rating is kept in the feedback bucket: the ask that started the rated chain, the answer and the ids, and
 // for a 👎 an optional note from the rater, and nothing else of the thread.
 // A rater has one rating per answer, so a 👍 after a 👎 replaces it (and its
 // note, which said what went wrong), and the reverse. The
@@ -34,8 +33,9 @@ import (
 // provision Job and the seed tooling can see its keys); an operator reads
 // it through the gateway binary (`/gateway feedback export`, feedback_export.go),
 // which writes each rating as a draft eval case: a 👎 as a case to fix, a
-// 👍 as a good answer to keep. Logs and the metric carry ids and the
-// rating, never the text.
+// 👍 as a good answer to keep. Logs carry ids and the rating, and the metric
+// the platform, the rating and what kind of answer was rated, one count per
+// rating change; neither carries the text.
 const (
 	// FeedbackUp and FeedbackDown are the two ratings, as the metric's
 	// rating label and the record carry them.
@@ -385,9 +385,6 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 			}
 		}
 	}
-	// Counted before the bucket is opened, so a rating it could not keep
-	// still counts.
-	g.metrics.answerRated(r.Platform, r.Rating, answer)
 	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
 	if err != nil {
 		return false, fmt.Errorf("feedback bucket: %w", err)
@@ -398,8 +395,9 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 	}
 	// Merged, not replaced: a 👎 tapped again keeps the note already there.
 	// A 👍 drops it, since the note said what went wrong.
-	askKept := false
+	askKept, prior := false, ""
 	if _, err := mergeFeedback(ctx, kv, key, true, func(rec *FeedbackRecord) bool {
+		prior = rec.Rating
 		note := rec.Note
 		if rating != FeedbackDown {
 			note = ""
@@ -430,6 +428,12 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 		return true
 	}); err != nil {
 		return false, err
+	}
+	// Counted once the record is kept, and only when the rater's rating
+	// changed: a first rating, or a 👍 after a 👎 and the reverse. A repeat
+	// tap of the same rating, or a rating the bucket did not keep, is not.
+	if prior != rating {
+		g.metrics.answerRated(r.Platform, rating, answer)
 	}
 	g.log.Info("answer rated", "platform", r.Platform, "rating", r.Rating, "taskId", r.TaskID,
 		"conversation", r.Conversation, "kept", true)
