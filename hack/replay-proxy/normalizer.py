@@ -617,8 +617,9 @@ class Normalizer:
         now_year = datetime.fromtimestamp(self.now, timezone.utc).year
         try:
             if year:
-                # Old files show a year and no time; a time beside it (`Nov  5
-                # 2026 10:42:01`) means it is not an ls date and keeps the date.
+                # Old files show a year and no time. date_token keeps the date
+                # as written when a time is within TIME_NEAR_DATE_CHARS of it
+                # (`Nov  5 2026 10:42:01`), even across a line break.
                 return self.date_token(m, datetime(int(year), MONTHS.index(month) + 1, int(day)).date())
             else:
                 when = calendar.timegm(
