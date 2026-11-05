@@ -12,6 +12,7 @@ client, interpreter, wrapper, pipe, heredoc or assignment carries it.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import yaml
@@ -61,6 +62,35 @@ def test_the_red_s_workspace_route_fails():
     opened = f"H=$(python3 {SCRIPT} open --repo gke-labs/kube-agents --depth 1)"
     assert not _passes(opened, "curl -s https://raw.githubusercontent.com/gke-labs/kube-agents/0.13.0/tags.env")
     assert not _passes(opened, CLONE_PUBLIC)
+
+
+RED_RUN = Path(__file__).resolve().parent / "fixtures" / "inspect_repository_red_20261103.json"
+
+
+def _grade_calls(trajectory: list[dict]):
+    doc = yaml.safe_load(TASK.read_text())
+    (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
+    # No log line for the card, so the verifier reads its tagged calls as typed.
+    transcript.set("", trajectory, worker_commands=[])
+    try:
+        return WorkerCommandsVerifier(**check["check"]).verify(5.0)
+    finally:
+        transcript.clear()
+
+
+def test_the_recorded_red_run_fails_on_its_open_call():
+    # The worker's calls from the 2026-11-03 red run (main before the snapshot
+    # move). That main cannot be installed on cw-host after #4688, so this
+    # check grades the recorded calls. The run fails on its `open` call, and
+    # the same calls without it pass.
+    calls = json.loads(RED_RUN.read_text())["trajectory"]
+    result = _grade_calls(calls)
+    assert result.status == "fail", result.reason
+    assert "forbidden run(s) made by worker commands: inspect_repository.py ran as" in result.reason
+    assert f"{SCRIPT} open --repo gke-labs/kube-ag" in result.reason
+    without_open = [c for c in calls if f"{SCRIPT} open " not in c["args"].get("command", "")]
+    assert len(without_open) == len(calls) - 1
+    assert _grade_calls(without_open).status == "pass"
 
 
 def test_no_clone_at_all_fails():
