@@ -2506,6 +2506,24 @@ class ScanGateTest(unittest.TestCase):
         # the one path where no Cluster Agent supplies them.
         self.assertIn("Steps 2 to 4 of the single-cluster audit SOP", body)
 
+    def test_step_3_names_the_collector_once_per_cluster(self):
+        # Three by-hand SOP walks do not fit the platform worker's turn budget
+        # (#4115): the sweep completed with one past-cap cluster recorded, or ran
+        # past the hand-off's wait. Step 3 is one command per cluster, and the
+        # by-hand walk is the fallback for a cluster the script cannot reach.
+        body = bootstrap_scan_gate._task_body()
+        self.assertIn(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH, body)
+        self.assertIn("--project <project> --location <location> --cluster <cluster>", body)
+        self.assertIn("put the object it prints into `clusters` unchanged", body)
+        self.assertIn("only where the script itself cannot run", body)
+        # The constant is the sandbox path of a file this repository ships: the
+        # staged root /opt/data/profiles/platform/ maps onto agents/platform/.
+        staged_root = "/opt/data/profiles/platform/"
+        self.assertTrue(bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH.startswith(staged_root))
+        relative = bootstrap_scan_gate.CLUSTER_INVENTORY_COLLECTOR_PATH[len(staged_root):]
+        self.assertTrue((Path(__file__).resolve().parents[2] / "platform" / relative).is_file(), relative)
+        self.assertIn("`timeout` set to 600", body)
+
     def test_cluster_cards_are_keyed_by_profile_name(self):
         # The gate re-files a missing card every tick until the hand-off; the
         # key is what keeps a repeat from duplicating one.
