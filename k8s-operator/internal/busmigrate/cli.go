@@ -173,7 +173,7 @@ func snapshotAll(ctx context.Context, nc *nats.Conn, streams []string, dir strin
 		if err := os.MkdirAll(sdir, 0o700); err != nil {
 			return err
 		}
-		f, err := os.Create(filepath.Join(sdir, SnapshotDataFile))
+		f, err := os.Create(filepath.Join(sdir, SnapshotDataFile)) // #nosec G304 -- under the Job's own --snapshot-dir, a fixed file name
 		if err != nil {
 			return err
 		}
@@ -230,7 +230,7 @@ func writeReport(path string, r Report) error {
 			return err
 		}
 		if len(b) <= terminationMessageLimit {
-			return os.WriteFile(path, b, 0o644)
+			return os.WriteFile(path, b, 0o600)
 		}
 	}
 	r.Warnings = []string{fmt.Sprintf("%d warnings", len(all))}
@@ -239,7 +239,7 @@ func writeReport(path string, r Report) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	return os.WriteFile(path, b, 0o600)
 }
 
 // restoreRetries bounds the attempts at one stream's restore when the server
@@ -266,7 +266,7 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 		if !ok || !hasPolicy {
 			return warnings, fmt.Errorf("stream %s: the run file has no digest or no policy for it", name)
 		}
-		metaBytes, err := os.ReadFile(filepath.Join(dir, name, SnapshotMetaFile))
+		metaBytes, err := os.ReadFile(filepath.Join(dir, name, SnapshotMetaFile)) // #nosec G304 -- under the Job's own --snapshot-dir; name is a stream from the run file
 		if err != nil {
 			return warnings, fmt.Errorf("stream %s: %w", name, err)
 		}
@@ -279,7 +279,7 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 		}
 		warnings = append(warnings, policy.MissingSubjects(meta.Config)...)
 		warnings = append(warnings, fresh.OutsidePolicyDrift(meta.Config)...)
-		open := func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, SnapshotDataFile)) }
+		open := func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, SnapshotDataFile)) } // #nosec G304 -- under the Job's own --snapshot-dir
 		// What a restored stream is held to: the render's limits going
 		// forward, the snapshot's own on the way back (RestoreAsItWas).
 		built := policy
@@ -377,7 +377,7 @@ func HashMain(args []string, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
-	if err := os.WriteFile(*out, b, 0o644); err != nil {
+	if err := os.WriteFile(*out, b, 0o600); err != nil {
 		fmt.Fprintf(stderr, "bus-hash: %v\n", err)
 		return 1
 	}
@@ -402,7 +402,7 @@ func HashStaged(dir string, streams []string) (map[string]StagedDigest, error) {
 			file string
 			into *string
 		}{{SnapshotDataFile, &d.Data}, {SnapshotMetaFile, &d.Meta}} {
-			sum, err := digestOf(func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, f.file)) })
+			sum, err := digestOf(func() (io.ReadCloser, error) { return os.Open(filepath.Join(dir, name, f.file)) }) // #nosec G304 -- under the Job's own --snapshot-dir, a fixed file name
 			if err != nil {
 				return nil, fmt.Errorf("stream %s: %w", name, err)
 			}
