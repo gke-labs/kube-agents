@@ -860,6 +860,23 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 
 // Stop ends the subscription and removes it from the rebuild registry.
 func (s *durableSub) Stop() {
+	if s.held != nil {
+		// Held mode cancels its handlers only once the drain is done: a
+		// give-back sent while the consumer is still subscribed can come
+		// straight back to it and be dropped, leaving the task to wait out
+		// AckWait (#4849). Stop itself doesn't wait (callers hold their own
+		// locks); it stays registered meanwhile, so Close can still cancel.
+		drained := s.drainIntake()
+		go func() {
+			select {
+			case <-drained:
+			case <-time.After(heldDrainTimeout):
+			}
+			s.held.cancel()
+			s.unregister()
+		}()
+		return
+	}
 	s.stopLocal()
 	s.unregister()
 }
@@ -909,6 +926,28 @@ func (s *durableSub) stopDeferred() {
 		}
 	}
 	s.deferred.giveBack()
+}
+
+// drainIntake stops a held subscription's intake the way stopDeferred does
+// a deferred one's, without waiting: intake closes first, so whatever
+// arrives from here on is given back as it is dispatched, then the consume
+// context drains, so the deliveries already buffered or in flight are
+// dispatched (and given back) rather than dropped. The channel closes once
+// the drain is done and the server has the unsubscribe; a connection
+// already gone never closes it.
+func (s *durableSub) drainIntake() <-chan struct{} {
+	s.stopped.Store(true)
+	s.held.stopIntake()
+	s.mu.Lock()
+	cc := s.cc
+	s.mu.Unlock()
+	if cc == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	cc.Drain()
+	return cc.Closed()
 }
 
 // stopIntake stops taking deliveries.
