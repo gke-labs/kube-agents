@@ -220,12 +220,12 @@ base and makes a wrong route fail loudly.
 
 | Caller                                          | Today                                                                                          | Proposed                                                                                           |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Sandbox shim, `execute()`                       | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set, else `CREDENTIAL_PROXY_URL`                                  |
+| Sandbox shim, `execute()`                       | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set and well-formed, else `CREDENTIAL_PROXY_URL`                  |
 | Sandbox shim, `Workspace`, vcs, forge           | `CREDENTIAL_PROXY_URL`                                                                         | Unchanged                                                                                          |
 | Session pods (under the cluster-view flag only) | `CREDENTIAL_PROXY_URL`, from the gateway's `A2A_CREDENTIAL_PROXY_URL` (`a2a/gateway/spawn.go`) | Also get `CREDENTIAL_PROXY_EXEC_URL`, through a new `A2A_CREDENTIAL_PROXY_EXEC_URL` on the gateway |
 | Fleet audits (agent cron jobs)                  | The model's shell, then the shim                                                               | Same path; background by default once the turn token exists (§4.1); until then, interactive (§12)  |
 | Watches, reconcile                              | Through `sandbox_exec` and the shim                                                            | Same path; background by default once the turn token exists (§4.1); until then, interactive (§12)  |
-| Cloud API relay callers (`ApiSession`)          | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set, else `CREDENTIAL_PROXY_URL`                                  |
+| Cloud API relay callers (`ApiSession`)          | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set and well-formed, else `CREDENTIAL_PROXY_URL`                  |
 | Gateway relays, watchers                        | Their own URL variables                                                                        | Unchanged                                                                                          |
 
 The fallback means an exec tier that is off, or a new shim against an old operator, behaves as
@@ -238,7 +238,11 @@ check: exec-role commands on `stateful` while replicas > 0 mean the exec path is
 API relay client (`ApiSession`) also falls back on a connection error that comes after the request
 was sent, because every relay call is a GET and sending it again is safe; it then stays on the
 stateful broker for the rest of the session, and it retries the broker's own busy reply on §4.3's
-schedule. The command path never resends after a send, because a command may have run. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
+schedule. The command path never resends after a send, because a command may have run. A
+malformed `CREDENTIAL_PROXY_EXEC_URL` (not a valid `http://` URL, no host, or a port that is not a number
+from 0 to 65535, or a query or fragment) is ignored when `CREDENTIAL_PROXY_URL` is set: both callers
+use the stateful broker, and the shim writes one stderr line per process. A shape the check does not
+know still falls back in `execute()` when it fails before a byte is sent. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
 (`deploy/sandbox/entrypoint.sh`), so `CREDENTIAL_PROXY_EXEC_URL` is added there. Without that, the
 shim always takes the fallback and nothing reports it.
 
@@ -318,17 +322,34 @@ shim always takes the fallback and nothing reports it.
 
 ### 3.5 Capacity the tier reports
 
-The admission route `GET /v1/exec/admission` in #4084 will report
-what one pod admits, and the sweeps will size their pools from it. Behind a Service, one replica
-answers. With N replicas it must report the tier, or the sweeps under-read by N. The operator
-writes the replica count to a ConfigMap that the exec pods mount, and the route reads it on each
-request. A scale change then does not change the pod template, so it does not restart the tier
-and refill its caches (§3.4). The route reports `B × replicas` as what a sweep may use (the
-background share, §4.2), with `admitted × replicas` and the per-replica numbers beside it. It
-also reports the profile share, `P` per replica and `P × replicas`, with the profile commands in
-use; a sweep sizes to `B × replicas`, which profile work shares. A
-sweep sized to `admitted × replicas` would run past its share. It is a target, not a promise: a
-replica that is not ready lowers the real number until the rollout ends.
+The admission route `GET /v1/exec/admission` reports what one pod admits: `slot_cap`,
+`budget_admits`, `admitted`, `interactive_cap` and `session_cap`. The fleet sweeps size their pools
+from it (`broker_admission.py`). Behind a Service, one replica answers. With N replicas it must
+report the tier, or the sweeps under-read by N. The operator writes the replica count to a
+ConfigMap that the exec pods mount, and the route reads it on each request. A scale change then
+does not change the pod template, so it does not restart the tier and refill its caches (§3.4).
+
+When the file holds a positive integer N, the route adds three keys beside the per-replica numbers:
+
+- `replicas`: N, held to the CR field's bound of 32 (§12).
+- `tier_admitted`: `admitted × N`.
+- `tier_interactive_cap`: `interactive_cap × N`.
+
+A file that is absent, as on the stateful pod, or that does not hold a positive integer adds none
+of them. The sweeps' admission client reads the exec URL when it is set, else
+`CREDENTIAL_PROXY_URL`. It sizes against the tier numbers when the report has all three, else
+against the per-replica numbers, as before.
+
+Until the turn token exists (§4.1), the fleet sweeps run on the shell role, which §12 makes
+interactive. So a sweep sizes inside `interactive_cap × N`, not inside the background share. It
+keeps the session cap free on each replica, because each connection can land on any replica. The
+width is `(interactive_cap − session_cap) × N`, and never below four, or the tier's interactive cap
+where that is lower: five per replica at the 2 GiB default. When the sweeps become background
+work, a sweep sizes to the background share `B × N` (§4.2), which profile work shares. The route
+then also reports `B` and the profile share `P`, per replica and times N.
+
+A sweep sized to `admitted × N` would run past its share. The tier numbers are a target, not a
+promise: a replica that is not ready lowers the real number until the rollout ends.
 
 ### 3.6 Relation to the k8s-api-proxy (#3760, epic #4128)
 
@@ -444,8 +465,8 @@ drop the split and scale one broker, once both are gone:
 
 - **The content workspace is removed.** Its callers on `main` today: the fleet audit's
   remediation push and its reads (`audit_report.py`, `_land_group_via_broker` and
-  `detect_content_mode`), the collectors' repository mirror (`collect.py`), the deprecation scan
-  (`api_deprecation_scan.py`) and `inspect-repository`. The snapshot verb (`POST /v1/vcs/snapshot`)
+  `detect_content_mode`), the deprecation scan (`api_deprecation_scan.py`) and
+  `inspect-repository`. The snapshot verb (`POST /v1/vcs/snapshot`)
   covers the reads that the other `/v1/vcs` verbs do not: repositories the install does not
   manage, context repositories, and a shallow read. The read-only callers, such as
   `inspect-repository`'s `clone` and `api_deprecation_scan.py`, can move to it.
@@ -854,7 +875,7 @@ cache contract.
    as today. The operator sets N. It is not derived from the fleet size and not an autoscaling
    floor (open question 13). The signals for raising it are per replica (§8.1): the background
    admission wait (its p50 above the lowest bucket), refusals by bound (`slot` or `budget`), and
-   CPU throttling, which the admission route (§3.5) also reports for the tier. Raise N while
+   CPU throttling, from the proxy container's cgroup `cpu.stat` (§8.1). Raise N while
    those persist. The implementation changes the slot-wait advice in the site's `observability.md`
    to name this field, beside narrowing the reconcile.
 2. **Per-class metrics and the session-role class first,** on the single pod. They give the
@@ -973,10 +994,10 @@ copies, and `test_exec_tier_contract.py` checks that they match this section.
 | Labels                | `app: <agent>-credential-proxy-exec-tier` and `kubeagents.x-k8s.io/component: credential-proxy-exec-tier`. Not the stateful broker's labels, and no `kubeagents.x-k8s.io/has-credential-proxy`.                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Broker role           | `CREDENTIAL_PROXY_ROLE=exec`. An exec pod runs the broker and Envoy only: no watchers and no relays.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | Exec routes           | `POST /v1/exec`, `GET /v1/gcp/…` (a `POST` there reaches the relay, so its policy refusal is audited), `GET /v1/exec/admission`, `/healthz` and metrics. Every other route answers 404 on an exec pod, after authentication (401) and the route's role check (403). The `scope` role's `/v1/exec` call is refused there with 403 `CALLER_ROLE_FORBIDDEN`, because its member window lives on the stateful pod.                                                                                                                                                                                                                            |
-| Caller URL            | `CREDENTIAL_PROXY_EXEC_URL`, the exec Service's URL, for the sandbox, session pods and profile workers; the A2A gateway reads it from `A2A_CREDENTIAL_PROXY_EXEC_URL`. Unset at 0 replicas, so callers use `CREDENTIAL_PROXY_URL`. The scope publisher Job keeps `CREDENTIAL_PROXY_URL`. The fleet audit's admission client (`broker_admission.py`) reads `CREDENTIAL_PROXY_URL`; the capacity change (§3.5) points it at the exec URL.                                                                                                                                                                                                   |
-| Replica count in pods | The ConfigMap's key `replicas`, mounted at `/etc/credential-proxy-exec-tier/replicas`; `CREDENTIAL_PROXY_EXEC_REPLICAS_FILE` names that path. A scale change rewrites the ConfigMap and does not restart the pods.                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Caller URL            | `CREDENTIAL_PROXY_EXEC_URL`, the exec Service's URL, for the sandbox, session pods and profile workers; the A2A gateway reads it from `A2A_CREDENTIAL_PROXY_EXEC_URL`. Unset at 0 replicas, so callers use `CREDENTIAL_PROXY_URL`. The scope publisher Job keeps `CREDENTIAL_PROXY_URL`. The fleet audit's admission client (`broker_admission.py`) reads `CREDENTIAL_PROXY_EXEC_URL` when it is set, else `CREDENTIAL_PROXY_URL` (§3.5).                                                                                                                                                                                                 |
+| Replica count in pods | The ConfigMap's key `replicas`, mounted at `/etc/credential-proxy-exec-tier/replicas`; `CREDENTIAL_PROXY_EXEC_REPLICAS_FILE` names that path. A scale change rewrites the ConfigMap and does not restart the pods. The admission route reads the file on each request and, for a positive count, adds `replicas`, `tier_admitted` and `tier_interactive_cap` to its report (§3.5).                                                                                                                                                                                                                                                        |
 | Busy reply            | HTTP 503 `{"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "bound": "<bound>", "error": "…"}`. The bounds are `slot`, `budget`, `refresh-lock`, `session`, `profile`, `scope`, `background`, `draining` and `other`; `background` is the background cap `B` (§4.2) after the 60 s wait; `draining` is a replica that is stopping (§9 step 0). `scope` is the scope publisher role's refusal, not a capacity bound, so the shim does not retry it.                                                                                                                                                                                      |
 | Shim retry            | Up to 4 times (5 attempts) and inside 170 s of the first send (or the shorter deadline a caller names in `CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS`), each on a new connection after a jittered wait (a numeric Retry-After held between 2 s and 30 s, else 2·2^k capped at 16 s; §4.3), for the bounds `slot`, `budget`, `background`, `draining` and `profile`, and for a reply with no bound; never for the others, and never after a dropped connection. The relay client (ApiSession) applies the same loop to a reply whose top-level code is the broker's busy or resource-pressure code and passes an upstream 429 or 503 through. |
-| Connect fallback      | When a connection to `CREDENTIAL_PROXY_EXEC_URL` cannot be made, the shim sends the request to `CREDENTIAL_PROXY_URL` and writes one stderr line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Connect fallback      | When a connection to `CREDENTIAL_PROXY_EXEC_URL` cannot be made, or the request fails before a byte is sent, the shim sends the request to `CREDENTIAL_PROXY_URL` and writes one stderr line.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Classes               | `interactive` and `background`; the metric label is `class`, on the admission wait, the refusals and the command duration. The profile and `scope` roles are background. Every other slot-taking role is interactive: the session role, the MCP role, and the shell role (its vcs and forge routes too) until the turn token exists (§4.1). Interactive work is held at `admitted − 1`, so one admission stays free for background work. Background children run at nice 10, set on their process group right after they start. The reserve `R = 2` and the caps are constants.                                                           |
 | Audit fields          | `broker_tier` (`exec` or `stateful`), `class` and `broker_pod` on each tool-execution record. §5's `requestId` and caller name are fields of their own, outside `principal`.                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

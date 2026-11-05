@@ -61,13 +61,14 @@ func a2aTestCreds() *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"},
 		Data: map[string][]byte{
-			"gateway-password": []byte("pw-gateway"),
-			"bridge-password":  []byte("pw-bridge"),
-			"seed-password":    []byte("pw-seed"),
-			"web-password":     []byte("pw-web"),
-			"console-password": []byte("pw-console"),
-			"sys-password":     []byte("pw-sys"),
-			"callout-password": []byte("pw-callout"),
+			"gateway-password":     []byte("pw-gateway"),
+			"bridge-password":      []byte("pw-bridge"),
+			"seed-password":        []byte("pw-seed"),
+			"web-password":         []byte("pw-web"),
+			"console-password":     []byte("pw-console"),
+			"console-mcp-password": []byte("pw-console-mcp"),
+			"sys-password":         []byte("pw-sys"),
+			"callout-password":     []byte("pw-callout"),
 		},
 	}
 }
@@ -245,11 +246,12 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		// ack to hold — and a consumer on KV_cap is precisely the thing its
 		// grants are shaped to forbid, because one would be a live feed of
 		// every capability in flight.
-		"verifier": nil,
-		"seed":     nil,
-		"web":      nil,
-		"console":  nil,
-		"sys":      nil,
+		"verifier":        nil,
+		"seed":            nil,
+		"web":             nil,
+		"console":         nil,
+		a2aConsoleMCPUser: nil,
+		"sys":             nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {
@@ -762,6 +764,7 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
 		"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 		"chat.console.*.in",
+		"chat.console.*.confirm",
 		"_INBOX.console.>",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -771,8 +774,8 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
 	}
-	// web's subtraction: `a2a.>` covers the verifier's queue group.
-	if want := []string{"a2a.cap.>"}; !reflect.DeepEqual(gotSubDeny, want) {
+	// web's subtraction: `a2a.>` covers the verifier's queue group and dispatch offers.
+	if want := []string{"a2a.cap.>", "a2a.dispatch.>"}; !reflect.DeepEqual(gotSubDeny, want) {
 		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
 	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
@@ -783,8 +786,8 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		}
 	}
 
-	// The other half of the door: the gateway can hear the inbound subject
-	// and answer on the outbound one.
+	// The other half of the door: the gateway can hear the inbound and
+	// confirm subjects and answer on the outbound one.
 	gw := conf[strings.Index(conf, "user: gateway"):]
 	gw = gw[:strings.Index(gw[1:], "user: ")+1]
 	if !strings.Contains(gw, `"chat.console.*.out"`) {
@@ -792,6 +795,9 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 	if !strings.Contains(gw, `"chat.console.*.in"`) {
 		t.Error("gateway cannot subscribe the console inbound subject")
+	}
+	if !strings.Contains(gw, `"chat.console.*.confirm"`) {
+		t.Error("gateway cannot subscribe the console confirm subject")
 	}
 }
 
@@ -1554,15 +1560,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
 	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 26 {
-		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
+	if pods.Value() != 27 {
+		t.Fatalf("default quota = %d, want 27 (cap 10 + headroom 17)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 18 {
-		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
+	if pods.Value() != 19 {
+		t.Fatalf("tuned quota = %d, want 19 (cap 2 + headroom 17)", pods.Value())
 	}
 }
 
@@ -4026,6 +4032,8 @@ func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
 	if before == "" {
 		t.Fatal("pod template carries no config hash")
 	}
+	// A changed config moves a running bus only behind a rolled-out callout.
+	theCalloutIsRolledOut(t, ctx, cl, agent)
 
 	// A reconcile that changes nothing must not roll the bus.
 	if _, err := r.Reconcile(ctx, req); err != nil {
@@ -5142,7 +5150,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
+		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
 		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -5920,6 +5928,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams:      consoleStreams,
 			accountLevel: []string{"$JS.API.INFO"},
 		},
+		a2aConsoleMCPUser: {
+			streams:      consoleStreams,
+			accountLevel: []string{"$JS.API.INFO"},
+		},
 		"provision": {
 			callout:      true,
 			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
@@ -6181,6 +6193,7 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 // namespace wholesale in rule 2 would be wider than the thing being held.
 const (
 	consoleInbound  = "chat.console.*.in"
+	consoleConfirm  = "chat.console.*.confirm"
 	consoleOutbound = "chat.console.*.out"
 )
 
@@ -6201,7 +6214,7 @@ const (
 
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
+var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
@@ -6234,6 +6247,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		allowed bool
 	}{
 		{consoleInbound, true},
+		{consoleConfirm, true},
 		{consoleOutbound, true},
 		{notifyRequest, true},
 		{notifyRequestSlack, true},
@@ -6275,28 +6289,31 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 
 // consoleDoorViolations returns one line per grant, across ids, that
 // overlaps a console door subject pattern on a principal other than that
-// side's one intended holder: publish on chat.console.*.in is console's
-// alone, subscribe there is gateway's alone, and the reverse for
-// chat.console.*.out.
+// side's intended holders: publish on chat.console.*.in is console and
+// console-mcp's alone, publish on chat.console.*.confirm is console's alone,
+// subscribe on both is gateway's alone, and the reverse for chat.console.*.out.
 func consoleDoorViolations(ids []a2aIdentity) []string {
 	rules := []struct {
-		verb, pattern, owner string
-		grants               func(a2aIdentity) []string
+		verb, pattern string
+		owners        []string
+		grants        func(a2aIdentity) []string
 	}{
-		{"publish", consoleInbound, "console", func(id a2aIdentity) []string { return id.publish }},
-		{"publish", consoleOutbound, "gateway", func(id a2aIdentity) []string { return id.publish }},
-		{"subscribe", consoleInbound, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
-		{"subscribe", consoleOutbound, "console", func(id a2aIdentity) []string { return id.subscribe }},
+		{"publish", consoleInbound, []string{"console", a2aConsoleMCPUser}, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", consoleConfirm, []string{"console"}, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", consoleOutbound, []string{"gateway"}, func(id a2aIdentity) []string { return id.publish }},
+		{"subscribe", consoleInbound, []string{"gateway"}, func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", consoleConfirm, []string{"gateway"}, func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", consoleOutbound, []string{"console", a2aConsoleMCPUser}, func(id a2aIdentity) []string { return id.subscribe }},
 	}
 	var out []string
 	for _, id := range ids {
 		for _, r := range rules {
-			if id.user == r.owner {
+			if slices.Contains(r.owners, id.user) {
 				continue
 			}
 			for _, g := range r.grants(id) {
 				if subjectPatternsOverlap(g, r.pattern) {
-					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %s may %s it", id.user, r.verb, g, r.pattern, r.owner, r.verb))
+					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %v may %s it", id.user, r.verb, g, r.pattern, r.owners, r.verb))
 				}
 			}
 		}

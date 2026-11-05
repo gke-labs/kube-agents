@@ -34,11 +34,17 @@ func withDispatcher(t *testing.T) {
 	t.Setenv(a2aDispatcherImageEnvVar, testDispatcherImage)
 }
 
-// Without an image the operator renders no dispatcher, not even its bus
-// identity: the image isn't in the release set yet.
+// The dispatcher is off by default until profiles dispatch end to end:
+// with A2A_DISPATCHER_IMAGE unset the operator renders none of it, even
+// where the release set would resolve its image (OPERATOR_IMAGE set). No
+// Deployment, no dispatch ConfigMap, no identity-map entry (and none of
+// the operator's own grants for the profile durables). TASKS is the same
+// size either way: the durables are on PROFILE_SUBMITS (contract addendum
+// 7). Setting the image turns all of it on.
 func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
-	hasDispatcher := func() bool {
-		doc, err := renderA2AAuthMap(a2aTestAgent(), nil)
+	agent := a2aTestAgent()
+	hasIdentity := func() bool {
+		doc, err := renderA2AAuthMap(agent, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -50,12 +56,59 @@ func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
 		return false
 	}
 	t.Setenv(a2aDispatcherImageEnvVar, "")
-	if hasDispatcher() {
-		t.Fatal("the identity map carries the dispatcher with no image to run it")
+	t.Setenv(operatorImageEnvVar, "registry.example/kube-agents/k8s-operator:1.2.3")
+	// The release set knows the image; the default doesn't use it yet.
+	if got, want := a2aDispatcherReleaseImage(), "registry.example/kube-agents/a2a-dispatcher:1.2.3"; got != want {
+		t.Errorf("the release image resolves to %q, want %q", got, want)
 	}
+	if a2aDispatcherEnabled() || a2aDispatcherImage() != "" {
+		t.Fatalf("the dispatcher is on with A2A_DISPATCHER_IMAGE unset (image %q)", a2aDispatcherImage())
+	}
+	if hasIdentity() {
+		t.Error("the identity map carries the dispatcher with A2A_DISPATCHER_IMAGE unset")
+	}
+	tasksWithout := a2aTasksMaxConsumers(agent)
+	if want := max(a2aTasksConsumerBudget(agent), a2aTasksMaxConsumersFloor); tasksWithout != want {
+		t.Errorf("TASKS is created at %d, want %d with no dispatcher", tasksWithout, want)
+	}
+	if got := a2aTasksMaxConsumers(&agentv1alpha1.PlatformAgent{}); got != a2aTasksMaxConsumersFloor {
+		t.Errorf("a default install's TASKS is created at %d, want the floor %d", got, a2aTasksMaxConsumersFloor)
+	}
+
+	scheme := setupScheme()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent)).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
+		t.Fatalf("reconcile: %v / %v", err, profileErr)
+	}
+	name := a2aDispatcherName(agent)
+	for _, check := range []struct {
+		obj client.Object
+		key types.NamespacedName
+	}{
+		{&appsv1.Deployment{}, types.NamespacedName{Namespace: agent.Namespace, Name: name}},
+		{&corev1.ConfigMap{}, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}},
+		{&corev1.ServiceAccount{}, types.NamespacedName{Namespace: agent.Namespace, Name: name}},
+	} {
+		if err := c.Get(ctx, check.key, check.obj); !apierrors.IsNotFound(err) {
+			t.Errorf("%T %s rendered with A2A_DISPATCHER_IMAGE unset: %v", check.obj, check.key, err)
+		}
+	}
+
 	withDispatcher(t)
-	if !hasDispatcher() {
+	if !hasIdentity() {
 		t.Error("with an image, the identity map has no dispatcher")
+	}
+	if got := a2aTasksMaxConsumers(agent); got != tasksWithout {
+		t.Errorf("with an image, TASKS is created at %d, want %d: the profile durables take no TASKS slot", got, tasksWithout)
+	}
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
+		t.Fatalf("reconcile with an image: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: name}, &appsv1.Deployment{}); err != nil {
+		t.Errorf("with an image, no Deployment: %v", err)
 	}
 }
 

@@ -5,7 +5,7 @@ sidebar:
   order: 11
 ---
 
-The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page can. It is off by default and renders nothing under `today`.
+The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject. It is off by default and renders nothing under `today`.
 
 ## Turning it on
 

@@ -18,12 +18,13 @@
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import sandbox_exec
@@ -57,6 +58,15 @@ SANDBOX_MIRROR = Path(
 # Comfortably past the mirror's own `--wait 30` plus one SSH round trip per
 # cluster profile, so this timeout only fires when the mirror itself is stuck.
 SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
+# A prune's batch (#4574): how many names delete_profiles holds locks for at once.
+# Each held lock is an open file until its chunk's sandbox removal is done, the
+# descriptor lesson of #4628; a prune larger than this runs in several chunks,
+# each still one mirror start and one SSH hop.
+DELETE_BATCH_MAX = 50
+# sandbox_mirror.REMOVE_RESULT_PREFIX: the line --remove-profile prints with each
+# name's outcome. Spelled here because that script is run, not imported;
+# test_cluster_agent_profile holds the two equal.
+MIRROR_REMOVE_RESULT_PREFIX = "remove-result: "
 ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
 ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
@@ -436,7 +446,8 @@ def _remove_sandbox_layout(name: str) -> None:
     SSH hop: the mirror's ``--remove-profile`` mode, which refuses a name that
     still has anything under this pod's profiles/. delete_profile calls it under
     the profile's lock, after the home here is gone, so no scaffold of the same
-    name can be between those two steps.
+    name can be between those two steps. A prune's batch uses
+    _remove_sandbox_layouts instead: one call for many names (#4574).
 
     Never fatal, for the reason the push is not: a sandbox that is down leaves a
     stale skeleton, which costs disk and nothing else.
@@ -457,6 +468,106 @@ def _remove_sandbox_layout(name: str) -> None:
     except Exception as e:  # noqa: BLE001 - no sandbox, or a sandbox that is down
         log(f"{name}: could not remove the profile layout from the shell sandbox ({e}); "
             "its directory stays there until somebody removes it")
+
+
+def _remove_sandbox_layouts(names: list[str]) -> dict[str, str]:
+    """Remove several deleted profiles' homes from the sandbox in one mirror call.
+
+    `_remove_sandbox_layout` for a batch (#4574): one mirror start and one SSH hop
+    for every name, rather than one each. Returns each name's outcome as the
+    mirror reports it: "removed", "left" (the rm could not take it) or "refused"
+    (something of it is still here). A name the mirror said nothing about, because
+    there is no sandbox, it did not answer, or its answer cannot be read, is
+    "unreached". Never fatal, for the reason the single removal is not.
+    """
+    if not names:
+        return {}
+    unreached = {name: "unreached" for name in names}
+    if not SANDBOX_MIRROR.is_file():
+        return unreached
+    argv = [sys.executable, str(SANDBOX_MIRROR), "--agent-home", str(HERMES_HOME), "--skeleton-only",
+            "--wait", "30"]
+    for name in names:
+        argv += ["--remove-profile", name]
+    try:
+        done = subprocess.run(argv, check=False, capture_output=True, text=True,
+                              timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS)
+        lines = [line for line in done.stdout.splitlines() if line.startswith(MIRROR_REMOVE_RESULT_PREFIX)]
+        if not lines and done.returncode == 0:
+            # The mirror's "no sandbox to mirror" exits (no ssh terminal backend, no
+            # agent home): zero, before it reads the names. Nothing to remove there.
+            return {name: "removed" for name in names}
+        if not lines:
+            raise ValueError(f"no result line (exit {done.returncode})")
+        result = json.loads(lines[-1][len(MIRROR_REMOVE_RESULT_PREFIX):])
+    except Exception as e:  # noqa: BLE001 - no sandbox, a sandbox that is down, or a bad answer
+        log(f"could not remove {len(names)} profile layout(s) from the shell sandbox ({e}); "
+            "their directories stay there until somebody removes them")
+        return unreached
+    outcomes = dict(unreached)
+    for outcome in ("removed", "left", "refused"):
+        for name in result.get(outcome) or []:
+            if name in outcomes:
+                outcomes[name] = outcome
+    return outcomes
+
+
+def delete_profiles(names: list[str]) -> dict[str, str]:
+    """Delete several profiles, here and in the sandbox; return each one's outcome (#4574).
+
+    delete_profile for a prune's worth of names, with the sandbox removals made in
+    one mirror call per chunk rather than one per name. Each name keeps
+    delete_profile's guarantee: its sandbox home goes only while its lock is held
+    and its home here is gone. The locks are taken in sorted order and without
+    blocking: a held one is a scaffold or delete of that name running now, so that
+    name alone is skipped, and the next run tries it again.
+
+    Outcomes: "deleted" (here and in the sandbox), "locked" (skipped: its lock was
+    held), "home-remains" (its home here survived the delete, so its sandbox home
+    was not touched), "sandbox-unlocked" (its lock could not be opened: deleted
+    here, as delete_profile does, and its sandbox home left), and "sandbox-left",
+    "sandbox-refused" or "sandbox-unreached" (gone here; the sandbox home stays, as
+    the mirror said).
+
+    A held lock is a scaffold or delete that a blocking create of the same name
+    may queue behind; while a chunk holds its locks, such a create waits for that
+    chunk's deletes and its one mirror call, not one delete's.
+    """
+    outcomes: dict[str, str] = {}
+    ordered = sorted(set(names))
+    for start in range(0, len(ordered), DELETE_BATCH_MAX):
+        with ExitStack() as held:
+            mine = []
+            for name in ordered[start:start + DELETE_BATCH_MAX]:
+                errors: list[str] = []
+                if held.enter_context(profile_lock(profile_lock_root(), name, blocking=False,
+                                                   on_error=lambda e, errs=errors: errs.append(str(e)))):
+                    mine.append(name)
+                elif errors:
+                    # As delete_profile does without its lock: delete here, keep the
+                    # sandbox home. Skipping the name outright would keep its
+                    # project retiring for as long as the lock directory is broken.
+                    _delete_profile(name)
+                    outcomes[name] = "sandbox-unlocked"
+                    log(f"{name}: its profile lock could not be opened ({errors[0]}); "
+                        "deleted here, its sandbox home stays")
+                else:
+                    outcomes[name] = "locked"
+                    log(f"{name}: not deleted this run, its profile lock is held")
+            for name in mine:
+                _delete_profile(name)
+            gone = [name for name in mine if not os.path.lexists(profile_home(name))]
+            for name in mine:
+                if name not in gone:
+                    outcomes[name] = "home-remains"
+                    log(f"{name}: its home survived the delete; its sandbox home stays")
+            sandbox = _remove_sandbox_layouts(gone)
+            for name in gone:
+                outcomes[name] = {"removed": "deleted"}.get(sandbox[name], f"sandbox-{sandbox[name]}")
+            removed = [name for name in gone if outcomes[name] == "deleted"]
+            if removed:
+                log(f"removed {len(removed)} profile layout(s) from the shell sandbox in one call: {', '.join(removed)}")
+    return outcomes
 
 
 def profile_lock_root() -> Path:
