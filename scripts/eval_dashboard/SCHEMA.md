@@ -159,8 +159,9 @@ layout and are collected from the moment they start running.
     task's verdict line, in log order:
     `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`,
     plus `"excerpt": <string>` when the log carried one, `"agent_s"` /
-    `"turn1_s"` when the log carried them, and `"tokens"` when the log
-    carried a count (below).
+    `"turn1_s"` when the log carried them, `"tokens"` when the log
+    carried a count, and `"shape"` when the log carried the reply's shape
+    (below).
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
@@ -261,6 +262,27 @@ layout and are collected from the moment they start running.
       no such line (every build graded before it existed, and any record
       with no token accounting), or when the line follows no grading line
       of that repetition: absence means unknown.
+    - `shape` — **optional, additive**: how the reply the repetition
+      delivered reads, from the
+      `rep N shape: opens_on_verdict=<0|1> apology=<0|1> bot_messages=<n> words_before_answer=<n> answer_words=<n>`
+      line `bench-gate case` prints under the tokens line, measured by
+      `bench/kube_agents_bench/chat_shape.py` on every case whatever its
+      own checks, as `{"opens_on_verdict": <bool>, "apology": <bool>,
+      "bot_messages": <int>, "words_before_answer": <int>,
+      "answer_words": <int>}`. The answer is the last delivered card result
+      of a delegated ask and the whole reply otherwise; `opens_on_verdict`
+      is false when its first line is a heading, ends on a colon, or opens
+      on a lead-in phrase ("Let me", "Sure", "Here's"), `apology` reads the
+      whole reply, the ack included, `bot_messages` counts the thread's
+      messages for the ask, and the two word counts are the words ahead of
+      the answer and the answer's own. Reported, never graded. The collector
+      consumes the line whole, like the timing line, and keeps a flag given
+      as `0` or `1` and a count that is a whole number at or above zero;
+      each key is **absent** when the line did not carry it, and `shape`
+      when the line carried nothing that parses, when the log has no such
+      line (a run that delivered no reply, and every build graded before
+      it existed), or when the line follows no grading line of that
+      repetition: absence means unknown.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;
@@ -993,7 +1015,7 @@ each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
 failed, infra, missing}, missing[], newly_failing[], fixed[],
 previous_build, parts[], missing_parts[], running_parts[],
-verdict_withheld_by, turn1_p50_s, turn1_p95_s, cases[]}`. A
+verdict_withheld_by, turn1_p50_s, turn1_p95_s, shape, cases[]}`. A
 night is one nightly run, or the main, main-b and writers parts' runs of
 one date:
 a run's date is the UTC date of its start plus 15 minutes
@@ -1042,7 +1064,7 @@ verdict for the night, though `newly_failing` still lists what the parts on
 record show.
 `cases[]` is every task row the night measured,
 sorted by domain then name, as `{case, domain, state, reps{pass, fail,
-infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s}` with `state` in `pass|partial|fail|infra`
+infra}, reason, transcript_url, turn1_p50_s, turn1_p90_s, agent_p50_s, agent_p90_s, shape}` with `state` in `pass|partial|fail|infra`
 by the strip's rule over the task's reps (no `reps` key: the task's result
 is one rep), `reason` the first failing rep's grader text (`null` on a
 pass), and `turn1_p50_s` / `agent_p50_s` the median of the task's reps'
@@ -1054,7 +1076,13 @@ every rep of the night's `cases[]` that is not `infra` (`null` when none
 carries it). They are advisory: the page and the digest show the p95 beside
 the chat-turn target, p95 under 10 s (`TURN1_P95_TARGET_S`, from
 `docs/architecture/05-system-architecture.md`), and nothing judges the
-night on it. `expected` counts the cases `nightly_active` on this checkout,
+night on it. A case's `shape` is `nightly.shape_rollup` over its reps'
+`shape` that are not `infra`, `{n, opens_on_verdict, apology,
+bot_messages_p50, words_before_answer_p50, answer_words_p50}`: `n` the reps
+that carried one, each flag the number of them it was true on, and each
+count's nearest-rank median (`null` when no rep carried it); `null` when no
+rep carried a shape. The night's `shape` is the same over every such rep of
+the night's `cases[]`. Reported, never a verdict. `expected` counts the cases `nightly_active` on this checkout,
 less any case a part of the night dropped on the inject lane
 (`runs[].lane_excluded`); `missing[]` names the expected cases the night did
 not record.

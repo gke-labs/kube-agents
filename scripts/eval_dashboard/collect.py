@@ -507,6 +507,15 @@ _REP_TIMING_KEYS = ("agent_s", "turn1_s")
 _REP_TOKENS_LINE = re.compile(r"^\s+rep (?P<n>\d+) tokens: (?P<fields>.*)$")
 _REP_TOKENS_KEYS = ("input", "output", "total")
 _REP_TOKENS_PARTIAL = "partial=1"
+# The shape of the reply the run delivered: one optional line under the
+# tokens line, printed by `bench-gate case` from the harness's shape.json
+# (bench/kube_agents_bench/chat_shape.py): `opens_on_verdict` and `apology`
+# as 1 or 0, then three counts. Reported, never graded. Its own shape,
+# `rep N shape:`, so `_REP_LINE` never matches it.
+#   rep 2 shape: opens_on_verdict=1 apology=0 bot_messages=2 words_before_answer=0 answer_words=48
+_REP_SHAPE_LINE = re.compile(r"^\s+rep (?P<n>\d+) shape: (?P<fields>.*)$")
+_REP_SHAPE_FLAGS = ("opens_on_verdict", "apology")
+_REP_SHAPE_COUNTS = ("bot_messages", "words_before_answer", "answer_words")
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
 _REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
@@ -677,6 +686,33 @@ def _attach_tokens(task: dict, n: int, fields: str) -> None:
             return
 
 
+def _attach_shape(task: dict, n: int, fields: str) -> None:
+    """Record a `rep N shape:` line as ``shape`` on the rep it follows.
+
+    A flag is kept as a bool when its value is ``1`` or ``0``, a count as an
+    int when it is a whole number at or above zero; anything else, and an
+    unknown key, is skipped, never raised on. A line with nothing that parses
+    adds no key -- absence means unknown -- and a line for a repetition the
+    log never graded is dropped.
+    """
+    shape: dict = {}
+    for pair in fields.split():
+        key, _, raw = pair.partition("=")
+        if key in _REP_SHAPE_FLAGS and raw in ("0", "1"):
+            shape[key] = raw == "1"
+        elif key in _REP_SHAPE_COUNTS and raw.isascii() and raw.isdigit():
+            try:
+                shape[key] = int(raw)
+            except ValueError:
+                pass
+    if not shape:
+        return
+    for rep in reversed(task.get("reps") or []):
+        if rep["n"] == n:
+            rep["shape"] = shape
+            return
+
+
 def read_retrying(read, name: str) -> str | None:
     """One file, read up to LOG_READ_ATTEMPTS times. A recorded build is
     never re-read, so a transient miss on a file that carries its tasks
@@ -708,8 +744,8 @@ def parse_build_log(text: str) -> dict:
     era, or a log truncated before grading) simply gets no `reps` key --
     absence means unknown, never fabricated. A `rep N report:` line under a
     grading line becomes that rep's `excerpt`, the agent's own words, a
-    `rep N timing:` line its `agent_s` and `turn1_s`, and a `rep N tokens:`
-    line its `tokens`.
+    `rep N timing:` line its `agent_s` and `turn1_s`, a `rep N tokens:`
+    line its `tokens`, and a `rep N shape:` line its `shape`.
     """
     project = None
     tasks = []
@@ -723,7 +759,7 @@ def parse_build_log(text: str) -> dict:
         # pattern below that is an unanchored `search` (the lease, the final
         # verdict) would otherwise read the report as if the log had said
         # it. A report line that follows no grading block is dropped, and so
-        # is a timing or tokens line.
+        # is a timing, tokens or shape line.
         m = _REP_REPORT_LINE.match(line)
         if m:
             if current is not None:
@@ -738,6 +774,11 @@ def parse_build_log(text: str) -> dict:
         if m:
             if current is not None:
                 _attach_tokens(current, int(m.group("n")), m.group("fields"))
+            continue
+        m = _REP_SHAPE_LINE.match(line)
+        if m:
+            if current is not None:
+                _attach_shape(current, int(m.group("n")), m.group("fields"))
             continue
         m = _LEASE.search(line)
         if m:

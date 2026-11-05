@@ -214,6 +214,41 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual([p["build"] for p in brief["pending"]], ["3000000000000000004"], "the Grid's running columns are the presubmit's")
 
 
+class ShapeRollupTest(unittest.TestCase):
+    GOOD = {"opens_on_verdict": True, "apology": False, "bot_messages": 2, "words_before_answer": 0, "answer_words": 40}
+    BAD = {"opens_on_verdict": False, "apology": True, "bot_messages": 3, "words_before_answer": 7, "answer_words": 300}
+
+    def test_a_share_and_medians_over_the_reps_that_carried_a_shape(self):
+        reps = [dict(rep(1, "pass"), shape=self.GOOD), dict(rep(2, "fail"), shape=self.BAD),
+                dict(rep(3, "pass"), shape=self.GOOD), rep(4, "pass")]
+        self.assertEqual(nightly.shape_rollup(reps), {
+            "n": 3, "opens_on_verdict": 2, "apology": 1,
+            "bot_messages_p50": 2, "words_before_answer_p50": 0, "answer_words_p50": 40,
+        })
+
+    def test_an_infra_rep_and_a_missing_count_are_unknown(self):
+        reps = [dict(rep(1, "infra"), shape=self.BAD), dict(rep(2, "pass"), shape={"opens_on_verdict": True})]
+        self.assertEqual(nightly.shape_rollup(reps), {
+            "n": 1, "opens_on_verdict": 1, "apology": 0,
+            "bot_messages_p50": None, "words_before_answer_p50": None, "answer_words_p50": None,
+        })
+
+    def test_no_shape_on_record_is_none(self):
+        self.assertIsNone(nightly.shape_rollup([rep(1, "pass"), dict(rep(2, "infra"), shape=self.GOOD)]))
+        self.assertIsNone(nightly.shape_rollup(None))
+
+    def test_the_night_and_its_cases_carry_the_rollup(self):
+        data = two_nights()
+        for r in data["runs"][-1]["tasks"][0]["reps"]:
+            r["shape"] = self.GOOD
+        data["runs"][-1]["tasks"][1]["reps"][0]["shape"] = self.BAD
+        last = nightly.night_reports(data)[0]
+        by_case = {c["case"]: c for c in last["cases"]}
+        self.assertEqual(by_case["case-a"]["shape"]["n"], 3)
+        self.assertIsNone(by_case["case-c"]["shape"])
+        self.assertEqual((last["shape"]["n"], last["shape"]["opens_on_verdict"], last["shape"]["apology"]), (4, 3, 1))
+
+
 class BuildUrlTest(unittest.TestCase):
     """The links follow the bucket the collector read the build from
     (``runs[].log_url``); a record without the field is from the bucket the
@@ -1023,6 +1058,11 @@ class NightlyPageTest(unittest.TestCase):
         # Last night's case-a carries the reps' timing; nothing else does.
         for r, (agent, turn1) in zip(data["runs"][-1]["tasks"][0]["reps"], [(100.0, 4.0), (120.0, 11.5), (110.0, 6.0)]):
             r.update(agent_s=agent, turn1_s=turn1)
+        # And its reply shape: two reps open on the verdict, one on a lead-in
+        # with an apology.
+        for r, (verdict, words) in zip(data["runs"][-1]["tasks"][0]["reps"], [(True, 30), (False, 240), (True, 40)]):
+            r["shape"] = {"opens_on_verdict": verdict, "apology": not verdict, "bot_messages": 2,
+                          "words_before_answer": 0 if verdict else 7, "answer_words": words}
         # A third night in flight at render time (NOW is Tue 10:30 AM ET).
         data["pending_builds"] = [{"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"}]
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset()), \
@@ -1037,7 +1077,7 @@ class NightlyPageTest(unittest.TestCase):
 
     def test_the_no_domain_group_row_carries_the_label_and_tooltip(self):
         tip = 'title="cases with no domain on record"'
-        self.assertIn(f'<tr class="grp"><td colspan="6" {tip}>no domain</td></tr>', dom_text(self.page))
+        self.assertIn(f'<tr class="grp"><td colspan="7" {tip}>no domain</td></tr>', dom_text(self.page))
 
     def test_last_nights_report(self):
         app = dom_text(self.page)
@@ -1047,7 +1087,7 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn("The job ran to the end in 6h 40m: 3 cases recorded of 3 expected.", app)
         self.assertIn(f'href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_2}"', app)
         # Grouped by domain, each case with its state pill, reps and reason.
-        self.assertLess(app.index('<tr class="grp"><td colspan="6">cost</td></tr>'), app.index('<tr class="grp"><td colspan="6">reliability</td></tr>'))
+        self.assertLess(app.index('<tr class="grp"><td colspan="7">cost</td></tr>'), app.index('<tr class="grp"><td colspan="7">reliability</td></tr>'))
         self.assertIn('<tr class="newly"><td class="nm">case-b</td><td><span class="pill p-fail"', app)
         self.assertIn('<span class="pill p-partial" title="failed some reps">partial</span></td><td class="num" title="repetitions passed / graded">2/3</td>', app)
         self.assertIn("check y: required phrases absent", app)
@@ -1057,6 +1097,12 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn(">— / —</td>", app)
         self.assertIn('<div class="k">Chat turn 1</div><div class="v">6.0<small>s p50</small></div><div class="d2">p95 11.5 s · advisory target p95 &lt; 10 s</div>', app)
         self.assertNotIn('<div class="k">Chat turn 1</div>', dom_text(self.page, fragment=f"#build={NIGHT_1}"), "no tile for a night with no timing")
+        # The reply shape: case-a's count and median length, a dash where
+        # none was measured, and the night's share as a seventh tile.
+        self.assertIn('title="repetitions whose answer opens on its verdict / repetitions measured, then the answer\'s median length; reported, never graded">2/3 <small class="mut">1 apology</small><br><small class="mut">40 words</small></td>', app)
+        self.assertIn('<div class="tiles seven">', app)
+        self.assertIn('<div class="k">Opens on answer</div><div class="v">67%</div><div class="d2">of 3 reps · answer p50 40 words · 1 with an apology</div>', app)
+        self.assertNotIn('<div class="k">Opens on answer</div>', dom_text(self.page, fragment=f"#build={NIGHT_1}"), "no tile for a night with no shape")
         self.assertIn("chat turn 1 p50 5.3 s, p95 9.0 s (6 reps) · agent p50 120.0 s (6 reps)", dom_text(self.out / "cases.html"))
         self.assertIn(f'href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_2}/artifacts/eval_case-b_rep1.log"', app)
         self.assertIn('href="cases.html#case-b"', app)

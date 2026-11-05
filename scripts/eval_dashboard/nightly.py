@@ -179,6 +179,14 @@ DIGEST_NAMED_CASES = 3
 # its terminal).
 REP_AGENT_S = "agent_s"
 REP_TURN1_S = "turn1_s"
+# The per-rep reply shape the collector records from `rep N shape:`
+# (SCHEMA.md: runs[].tasks[].reps[].shape), its two flags and its three
+# counts, which ``shape_rollup`` reads as a share and medians.
+REP_SHAPE = "shape"
+SHAPE_FLAGS = ("opens_on_verdict", "apology")
+SHAPE_COUNTS = ("bot_messages", "words_before_answer", "answer_words")
+SHAPE_REPS = "n"
+SHAPE_MEDIAN_SUFFIX = "_p50"
 # The slow-run percentile the Nightly page shows beside a case's medians, for
 # the agent run and the opening turn: the variation is in the tail, which a
 # median hides.
@@ -286,6 +294,36 @@ def latency_rollup(reps) -> dict:
     return out
 
 
+def rep_shapes(reps) -> list[dict]:
+    """The ``shape`` of every rep that is not ``infra`` and carries one; a
+    rep without it is unknown, not a reply that read badly."""
+    out = []
+    for rep in reps if isinstance(reps, list) else []:
+        shape = rep.get(REP_SHAPE) if isinstance(rep, dict) and rep.get("result") != "infra" else None
+        if isinstance(shape, dict) and shape:
+            out.append(shape)
+    return out
+
+
+def shape_rollup(reps) -> dict | None:
+    """The reps' reply shape as the Nightly page reads it (SCHEMA.md):
+    ``{n, opens_on_verdict, apology, bot_messages_p50,
+    words_before_answer_p50, answer_words_p50}``, ``n`` the reps that
+    carried a shape, each flag how many of them it was true on, and each
+    count's median over the reps that carried it (``null`` when none did);
+    None when no rep carried a shape. Reported, never a verdict."""
+    shapes = rep_shapes(reps)
+    if not shapes:
+        return None
+    out: dict = {SHAPE_REPS: len(shapes)}
+    for flag in SHAPE_FLAGS:
+        out[flag] = sum(1 for s in shapes if s.get(flag) is True)
+    for key in SHAPE_COUNTS:
+        values = [v for s in shapes for v in [s.get(key)] if isinstance(v, int) and not isinstance(v, bool) and v >= 0]
+        out[key + SHAPE_MEDIAN_SUFFIX] = percentile(values, 50)
+    return out
+
+
 def domains(data: dict) -> dict[str, str]:
     out = {}
     for case in data.get("cases") or []:
@@ -355,6 +393,7 @@ def night_cases(run: dict, domain_of: dict[str, str]) -> list[dict]:
             "turn1_p90_s": percentile(turn1, SLOW_PCT),
             "agent_p50_s": percentile(agent, 50),
             "agent_p90_s": percentile(agent, SLOW_PCT),
+            "shape": shape_rollup(task.get("reps")),
         })
     out.sort(key=lambda c: (c["domain"], c["case"]))
     return out
@@ -642,6 +681,7 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
     cases: list[dict] = []
     parts = []
     turn1: list[float] = []
+    shaped: list[dict] = []
     for part in PARTS:
         if part not in night:
             continue
@@ -654,6 +694,7 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
         for task in night[part].get("tasks") or []:
             if isinstance(task, dict) and task.get("name") in names:
                 turn1 += rep_seconds(task.get("reps"), REP_TURN1_S)
+                shaped += [rep for rep in task.get("reps") or [] if isinstance(rep, dict)]
         parts.append(part_document(part, night[part], mine, borrowed.get(part)))
     cases.sort(key=lambda c: (c["domain"], c["case"]))
     recorded = {c["case"] for c in cases}
@@ -723,6 +764,9 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
         # infra; advisory beside TURN1_P95_TARGET_S, never a verdict.
         "turn1_p50_s": percentile(turn1, 50),
         "turn1_p95_s": percentile(turn1, TURN1_TARGET_PCT),
+        # The reply shape over every rep of the night that is not infra;
+        # reported, never a verdict.
+        "shape": shape_rollup(shaped),
         "cases": cases,
     }
 
