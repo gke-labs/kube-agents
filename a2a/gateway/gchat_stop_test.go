@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -143,6 +144,14 @@ func TestGchatStopButtonRefusedFallsBackToTheLine(t *testing.T) {
 	f.respondOnce("spaces.messages/create", fakeChatAPIError{status: 500, reason: "backend"})
 	if _, err := a.PostMessage(conv, OutMessage{Text: "⏳ submitted…", Stop: true}); err == nil || len(f.calls) != 5 {
 		t.Errorf("a failed create: err=%v calls=%d", err, len(f.calls))
+	}
+
+	// A laid-out line refused is the layout's refusal: one patch, the
+	// refusal returned, no retry without the button.
+	f.respondOnce("spaces.messages/patch", fakeChatAPIError{status: 400, reason: "bad link"})
+	plan := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Upgrade readiness", Links: []chatmsg.Link{{Text: "board", URL: "https://x.example/b"}}}
+	if err := a.EditMessage(conv, id, OutMessage{Text: "⚙️ working", Chat: plan, Stop: true}); !errors.Is(err, ErrLayoutRefused) || len(f.calls) != 6 {
+		t.Errorf("a refused laid-out line: err=%v calls=%d", err, len(f.calls))
 	}
 }
 

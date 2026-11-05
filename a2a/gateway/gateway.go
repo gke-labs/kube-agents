@@ -2725,6 +2725,14 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		}
 	}
 
+	// A detached task this turn supersedes (a stop whose terminal has not
+	// arrived, or never will) would keep its line as it was: the relay's
+	// terminal edit finds the active task or a delegating parent, and after
+	// this write the task is neither. Its line closes here, as the record
+	// already counts the task (MarkCanceled), with no Stop control on it.
+	if old := rec.ActiveTask; old != nil && old.Detached && old.StatusMsgID != "" {
+		g.editLine(rec.Key, old.StatusMsgID, withLineNote(terminalLine(lib.StateCanceled, ""), old.LineNote), false)
+	}
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.

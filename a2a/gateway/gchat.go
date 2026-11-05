@@ -622,8 +622,10 @@ func (a *GoogleChatAdapter) EditNotifyMessage(space, _, messageID string, m OutM
 // layout is refused forgets the earlier answer, since the notifier's text
 // edit follows and must not carry the answer's line; one that fails with the
 // message left as it was keeps the answer the message still shows. A
-// running task's line (m.Stop) takes the Stop button after its own buttons,
-// and is patched once more without it when Chat refuses it with the button.
+// running task's line (m.Stop) takes the Stop button after its own buttons.
+// A text line Chat refuses with the button is patched once more without it;
+// a laid-out line's refusal is the layout's, answered as any refused layout
+// is (the relay edits the text instead, which then takes this path).
 func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMessage) error {
 	layout := gchatChatLayout{Text: toGchatText(m.Text)}
 	asks := m.Chat != nil && len(m.Chat.Choices) > 0
@@ -650,8 +652,8 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 	}
 	if err := a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil); err != nil {
 		err = gchatLayoutError(err, true)
-		if m.Stop && errors.Is(err, ErrLayoutRefused) {
-			a.log.Warn("gchat: the Stop button was refused; patching the line without it", "conversation", conversation, "err", err)
+		if m.Stop && m.Chat == nil && errors.Is(err, ErrLayoutRefused) {
+			a.log.Warn("gchat: the Stop button was refused; patching the text line without it", "conversation", conversation, "err", err)
 			m.Stop = false
 			return a.editLaidOut(conversation, messageID, m)
 		}

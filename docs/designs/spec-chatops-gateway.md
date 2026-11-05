@@ -1787,24 +1787,7 @@ is still a turn, and the rewrite reads the message the event carries, its text, 
 buttons and the clicked button's label. A click on a button the adapter did not draw is
 logged and acked.
 
-**The Stop button.** A task's live message, the "⏳ submitted…" line the gateway posts and
-edits as the task moves, arrives at the adapter with `OutMessage.Stop` while the task runs, and
-the adapter draws a `Stop` button under it: after the message's own buttons when the newest
-progress laid it out (a progress message's links), alone under the text otherwise. The terminal
-edit arrives without `Stop` and takes the button off, as any text edit does. Slack's Stop is
-native to Agent Sessions (the Slack adapter section); Chat has no such control, so this one is
-drawn, and a line Chat refuses with the button is posted or patched once more without it, so the
-line itself never fails for the button. A click on it arrives as a `CARD_CLICKED` interaction
-like a choice click, with the button's function `kage.stop` and one parameter, the conversation
-key the line was posted under: the click's event names the surface the line is on, which is not
-the key a DM's thread-less line was posted under. The adapter turns it into the typed `stop` in
-every way: `IntentCancel` with no text, from the clicker, bound to that conversation, which must
-be in the space the click came from, and handed over like a typed message, so the allowlist
-decides and the gateway's stop path answers it as it answers the word, for anyone the allowlist
-admits (the Slack button's requester gate, `stopgate.go`, is Slack's). A redelivered click is a
-duplicate by its id, as a choice click is. Nothing is remembered for it: a line posted before a
-restart carries its conversation in the button, and a click on it after the task ended is
-answered as a `stop` with nothing running.
+**The Stop button.** A task's live message, the "⏳ submitted…" line the gateway posts and edits as the task moves, arrives at the adapter with `OutMessage.Stop` while the task runs, and the adapter draws a `Stop` button under it: after the message's own buttons when the newest progress laid it out (a progress message's links), alone under the text otherwise. The terminal edit arrives without `Stop` and takes the button off, as any text edit does. Slack's Stop is native to Agent Sessions (the Slack adapter section); Chat has no such control, so this one is drawn, and a text line Chat refuses with the button is posted or patched once more without it, so the line itself never fails for the button; a laid-out line's refusal is the layout's, and the relay falls back to its text, which then takes the same path. A click on it arrives as a `CARD_CLICKED` interaction like a choice click, with the button's function `kage.stop` and one parameter, the conversation key the line was posted under: the click's event names the surface the line is on, which is not the key a DM's thread-less line was posted under. The adapter turns it into the typed `stop` in every way: `IntentCancel` with no text, from the clicker, bound to that conversation, which must be in the space the click came from, and handed over like a typed message, so the allowlist decides and the gateway's stop path answers it as it answers the word, for anyone the allowlist admits (the Slack button's requester gate, `stopgate.go`, is Slack's). A redelivered click is a duplicate by its id, as a choice click is. Nothing is remembered for it: a line posted before a restart carries its conversation in the button, and a click on it after the task ended is answered as a `stop` with nothing running. A task the heal ends has its line closed by the heal, and a stopped task the next ask supersedes before its terminal has its line closed as canceled by that turn, since the relay's terminal edit would find neither, so no line outlives its task with the button on it.
 
 ## The Slack adapter (added 9/4)
 

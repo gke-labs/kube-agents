@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,43 @@ func TestTheHealEndsTheLiveLineWithoutStop(t *testing.T) {
 	for _, l := range r.adapter.stopLinesCopy() {
 		if l.MessageID == "m-stale" {
 			t.Fatalf("the heal's terminal edit carried Stop: %+v", l)
+		}
+	}
+}
+
+// A stopped task whose terminal has not arrived when the next ask starts
+// keeps its line otherwise, with its Stop control on it: the new turn
+// closes it as canceled, without Stop, and the new task's line carries the
+// control instead.
+func TestANewTurnClosesASupersededStoppedLine(t *testing.T) {
+	r := startRig(t)
+	conv := "discord:g1/superseded-line"
+	startChatTask(t, r, conv, false)
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-stop", Text: "stop"}
+	waitFor(t, "the cancel notice", func() bool {
+		return slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "cancel sent") })
+	})
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-2", Text: "and now the nodes"}
+	r.awaitTask(t, "platform")
+	first := r.adapter.stopLinesCopy()[0]
+	waitFor(t, "the old line closed", func() bool {
+		r.adapter.mu.Lock()
+		defer r.adapter.mu.Unlock()
+		for _, e := range r.adapter.edits {
+			if e.MessageID == first.MessageID && strings.Contains(e.Text, "canceled") {
+				return true
+			}
+		}
+		return false
+	})
+	lines := r.adapter.stopLinesCopy()
+	last := lines[len(lines)-1]
+	if last.MessageID == first.MessageID || !strings.Contains(last.Text, "submitted") {
+		t.Fatalf("stop lines = %+v; want the new task's placeholder last", lines)
+	}
+	for _, l := range lines {
+		if l.MessageID == first.MessageID && strings.Contains(l.Text, "canceled") {
+			t.Fatalf("the closing edit carried Stop: %+v", l)
 		}
 	}
 }

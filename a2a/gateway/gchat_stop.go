@@ -18,8 +18,10 @@ import (
 // and the gateway's stop path answers it as it answers the word, in the
 // conversation, for anyone the allowlist admits. Slack's Stop is native to
 // its Agent Sessions (slack_stop.go); this one is drawn, since Chat has no
-// such control, and a line Chat refuses with it is posted or patched once
-// more without it, so the line itself never fails for the button.
+// such control, and a text line Chat refuses with it is posted or patched
+// once more without it, so the line itself never fails for the button (a
+// laid-out line's refusal is the layout's, and the relay falls back to the
+// text, which then takes the same path).
 const (
 	// gchatStopFunction is the onClick action the Stop button sends, with
 	// the conversation its line belongs to as its one parameter: the
