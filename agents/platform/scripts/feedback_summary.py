@@ -46,7 +46,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextI
 
 # Independent of the gateway's usageSummaryMaxLines: this block has lines the
 # gateway's lacks.
-SUMMARY_MAX_LINES = 41
+SUMMARY_MAX_LINES = 43
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
@@ -124,19 +124,26 @@ USAGE_COUNTERS: Tuple[str, ...] = (
     "remediationsClosedUnmergedTotal",
     "proposalHumanTouches",
     "proposalsMergedUntouched",
+    "peopleSeen7d",
+    "peopleSeen30d",
 )
-#: The fields the broker reads off the forge rather than counts: absent means it
-#: has no reading yet, which is not 0.
-USAGE_READINGS = frozenset({
-    "remediationsMergedTotal",
-    "proposalsAuthored",
-    "remediationsOpen",
-    "remediationsClosedUnmergedTotal",
-    "proposalHumanTouches",
-    "proposalsMergedUntouched",
-})
 USAGE_NO_READING = "no reading"
-USAGE_READING_SUFFIX = " (as the forge reports)"
+USAGE_FORGE_READING_SUFFIX = " (as the forge reports)"
+USAGE_GATEWAY_READING_SUFFIX = " (as the gateway reports)"
+#: The fields read off a source rather than counted, each to the suffix naming
+#: that source: absent means no reading yet, which is not 0. The broker reads
+#: the six off the forge; the operator reads the two people readings off the
+#: A2A gateway.
+USAGE_READINGS: Mapping[str, str] = {
+    "remediationsMergedTotal": USAGE_FORGE_READING_SUFFIX,
+    "proposalsAuthored": USAGE_FORGE_READING_SUFFIX,
+    "remediationsOpen": USAGE_FORGE_READING_SUFFIX,
+    "remediationsClosedUnmergedTotal": USAGE_FORGE_READING_SUFFIX,
+    "proposalHumanTouches": USAGE_FORGE_READING_SUFFIX,
+    "proposalsMergedUntouched": USAGE_FORGE_READING_SUFFIX,
+    "peopleSeen7d": USAGE_GATEWAY_READING_SUFFIX,
+    "peopleSeen30d": USAGE_GATEWAY_READING_SUFFIX,
+}
 #: Kanban statuses folded into the roll-up's buckets; anything else is "other".
 STATUS_BUCKETS: Mapping[str, str] = {
     "done": "done",
@@ -641,9 +648,10 @@ def render(snapshot: Snapshot) -> str:
     lines.append("usage:")
     for counter in USAGE_COUNTERS:
         value = usage.get(counter)
-        if counter in USAGE_READINGS:
+        suffix = USAGE_READINGS.get(counter)
+        if suffix is not None:
             shown = USAGE_NO_READING if value is None else int(value)
-            lines.append(f"  {counter}: {shown}{USAGE_READING_SUFFIX}")
+            lines.append(f"  {counter}: {shown}{suffix}")
         else:
             lines.append(f"  {counter}: {int(value or 0)}")
     lines.append(f"  lastActive: {usage.get('lastActiveTime') or NEVER}")

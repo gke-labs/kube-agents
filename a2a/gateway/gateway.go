@@ -44,7 +44,8 @@ const sessionKindGroup = "group"
 const topLevelNothingRunningNotice = "🤷 nothing is running here — each question runs in its own thread, so reply in that question's thread"
 
 // feedbackCommandNotice answers a bare "/feedback", the gateway's second slash
-// command (docs/designs/chat-feedback-command.md): where a report about
+// command (docs/designs/chat-feedback-command.md; a typed "/sethome" on Slack
+// is the Slack adapter's own, answered before the turn reaches here): where a report about
 // kube-agents itself goes, what one needs, and how to have the agent write
 // one up. Deterministic and model-free, like every gateway affordance; the
 // two links are chattext's, shared with the personas. "/feedback <text>" is
@@ -141,8 +142,9 @@ const (
 // authority: what makes a supervisor terminal the supervisor's is the subject
 // it is published on (`…supervisor`, which only the gateway's grant reaches),
 // and from is checked for agreement with that subject by every consumer -
-// a terminal on `…supervisor` whose from is not this party is a protocol
-// error, and so is one on an executor's `…events` wearing it. That is how
+// a terminal on `…supervisor` whose from is not this party (or the profile
+// dispatcher, SupervisorAgreement) is a protocol error, and so is one on an
+// executor's `…events` wearing it. That is how
 // replay distinguishes "the worker said failed" from "the supervisor declared
 // it dead" without trusting a field the publisher writes.
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
@@ -151,7 +153,10 @@ var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 // gateway's own consumers, and the one main hands the bus client so that
 // tasks/get replay and the relay agree about who the supervisor is. The
 // gateway is the supervisor for every session it spawned, so the
-// `…supervisor` writer check is exact rather than the negative form.
+// `…supervisor` writer check is exact rather than the negative form. The
+// profile dispatcher is named beside it: it writes the terminal of a profile
+// task it refuses or fails on that task's `…supervisor`, a subject its grant
+// reaches only for the profiles it dispatches.
 //
 // The strict flag is config, not code, on purpose. The `…events` writer-class
 // check ships advisory because for one TASKS retention window after an
@@ -163,6 +168,7 @@ var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 func SupervisorAgreement(cfg *Config) lib.AgreementPolicy {
 	return lib.AgreementPolicy{
 		Supervisor:         gatewayParty.Session,
+		OtherSupervisors:   []string{lib.DispatcherSession},
 		StrictEventsWriter: cfg != nil && cfg.StrictEventsWriter,
 	}
 }
@@ -397,8 +403,9 @@ func New(o Options) (*Gateway, error) {
 	// its whole identity join. On Slack the map is an optional override (the
 	// allowlist admits, and an unmapped sender is attributed by member id),
 	// so an empty one is noted, not warned. The console does not use one
-	// either: its grant is the mechanism, since only the console credential
-	// may publish on the console subject. And a gateway whose only ingress
+	// either: its grant is the mechanism, since only the console's
+	// credentials (console and console-mcp, the MCP server's) may publish on
+	// the console subject. And a gateway whose only ingress
 	// is the side door uses the door's map below instead of this one.
 	// Naming the backend matters, because the other ingresses beside it
 	// keep working.
@@ -2015,7 +2022,9 @@ func (g *Gateway) freshIncarnation(ctx context.Context, rec *SessionRecord) bool
 }
 
 // sessionCommand resolves the first of the two slash commands the gateway
-// owns (the other, a bare /feedback, is answered inline in routeTurn):
+// owns (the other, a bare /feedback, is answered inline in routeTurn; a
+// typed /sethome on Slack never reaches the gateway, the Slack adapter
+// answers it):
 // "/session" marks the conversation session-routed, "/session <text>" marks
 // it and runs <text> as the first turn, "/session off" releases the
 // incarnation and re-homes to the default addressee. Deterministic, like

@@ -62,14 +62,14 @@ data:
 # Totals for a stock install, re-derived by hand from values.yaml and footprint.yaml. These
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
-_DEFAULT_PODS = 8
-_DEFAULT_REQUESTS_CPU_MILLIS = 2606
-_DEFAULT_LIMITS_CPU_MILLIS = 12200
+_DEFAULT_PODS = 9
+_DEFAULT_REQUESTS_CPU_MILLIS = 2706
+_DEFAULT_LIMITS_CPU_MILLIS = 13200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 9152 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 23936 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 9408 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 24448 * 1024**2
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
 # replicas, and the cleanup hook's 1088Mi.
@@ -851,6 +851,56 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(self._bridge_delta(env), cli)
 
+    def test_mode_next_counts_the_mcp_server_at_the_consoles_size_when_its_flag_is_on(self) -> None:
+        """The operator renders the MCP server only under A2A_MCP_DOOR=true (#3869), one
+        Recreate pod sized as the console, so no golden carries it and the chart adds it."""
+        console = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aConsole"]
+        self.assertEqual(console["pods"], 1)
+        self.assertGreater(console["cpuMillisLimit"], 0, "a limits.cpu quota refuses a pod with none")
+        base = self._requirements(["platformAgent.mode=next"])
+        on = (
+            ("true", [{"name": "A2A_MCP_DOOR", "value": "true"}]),
+            ("by valueFrom", [{"name": "A2A_MCP_DOOR",
+                               "valueFrom": {"configMapKeyRef": {"name": "x", "key": "door"}}}]),
+            ("not a string", [{"name": "A2A_MCP_DOOR", "value": True}]),
+            ("last of two", [{"name": "A2A_MCP_DOOR", "value": "false"},
+                             {"name": "A2A_MCP_DOOR", "value": "true"}]),
+        )
+        for name, env in on:
+            with self.subTest(name):
+                req = self._requirements(
+                    ["platformAgent.mode=next"], values={"operator": {"extraEnv": env}}
+                )
+                for out, key in (
+                    ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+                    ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+                    ("requestsEphemeral", "ephemeralStorageBytesRequest"),
+                    ("limitsEphemeral", "ephemeralStorageBytesLimit"),
+                ):
+                    self.assertEqual(req[out] - base[out], console[key], out)
+                self.assertEqual(req["pods"] - base["pods"], 1)
+                self.assertEqual(req["surgeRequestsCpu"], base["surgeRequestsCpu"], "it rolls Recreate")
+
+    def test_the_mcp_server_is_not_counted_when_the_operator_reads_its_flag_as_off(self) -> None:
+        base = self._requirements(["platformAgent.mode=next"])
+        for name, env in (
+            ("false", [{"name": "A2A_MCP_DOOR", "value": "false"}]),
+            ("TRUE, which the operator does not take", [{"name": "A2A_MCP_DOOR", "value": "TRUE"}]),
+            ("no value", [{"name": "A2A_MCP_DOOR"}]),
+            ("a null value", [{"name": "A2A_MCP_DOOR", "value": None}]),
+            ("last of two", [{"name": "A2A_MCP_DOOR", "value": "true"},
+                             {"name": "A2A_MCP_DOOR", "value": "false"}]),
+        ):
+            with self.subTest(name):
+                self.assertEqual(
+                    self._requirements(["platformAgent.mode=next"],
+                                       values={"operator": {"extraEnv": env}}),
+                    base,
+                )
+        # And never under today, where the operator renders no MCP server.
+        door = {"operator": {"extraEnv": [{"name": "A2A_MCP_DOOR", "value": "true"}]}}
+        self.assertEqual(self._requirements(values=door), self._requirements())
+
     def test_mode_next_counts_a_larger_a2a_bridge_resources_as_written(self) -> None:
         """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""
         bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]
@@ -1418,7 +1468,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"12700m"', res.stderr)
+        self.assertIn('"limits.cpu":"13700m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -1427,7 +1477,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"27008Mi"', res.stderr)
+        self.assertIn('"limits.memory":"27520Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1448,8 +1498,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        # The release's 2606m plus one LiteLLM surge Pod's 100m.
-        self.assertIn('"cpu":"2706m"', res.stderr)
+        # The release's 2706m plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"2806m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -1458,7 +1508,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"11200Mi"', res.stderr)
+        self.assertIn('"memory":"11456Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -1522,9 +1572,10 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["cpuMillisLimit"], 1000)
         self.assertEqual(op["shellSandbox"]["cpuMillisLimit"], 2000)
         self.assertEqual(op["credentialProxy"]["cpuMillisLimit"], 2000)
-        self.assertEqual(op["kubeProxy"]["cpuMillisLimit"], 1000)
+        self.assertEqual(op["kubeProxy"]["cpuMillisLimit"], 2000)
 
-        # Total operator limits on default install: 4500 + 1000 + 2000 + 2000 + 1000 = 10500m (10.5 CPU)
+        # Total operator limits on default install: 4500 + 1000 + 2000 + 2000 + 2000 = 11500m (11.5 CPU);
+        # the kube-proxy runs two replicas of 1000m each.
         total_op_cpu_limit = (
             op["agentPod"]["base"]["cpuMillisLimit"]
             + op["agentPod"]["dashboard"]["cpuMillisLimit"]
@@ -1532,7 +1583,7 @@ class QuotaPreflightTest(unittest.TestCase):
             + op["credentialProxy"]["cpuMillisLimit"]
             + op["kubeProxy"]["cpuMillisLimit"]
         )
-        self.assertEqual(total_op_cpu_limit, 10500)
+        self.assertEqual(total_op_cpu_limit, 11500)
 
         # Memory, in the same shape. A generator that stopped parsing memory would emit 0
         # here; `--check` alone would not catch that if the regenerated file were committed
@@ -1541,7 +1592,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["shellSandbox"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["credentialProxy"]["memoryBytesLimit"], 2 * 1024**3)
-        self.assertEqual(op["kubeProxy"]["memoryBytesLimit"], 512 * 1024**2)
+        self.assertEqual(op["kubeProxy"]["memoryBytesLimit"], 1024 * 1024**2)
 
         # Ephemeral storage is set on two of the four and deliberately 0 on the others;
         # asserting the zeroes is the point, since an unparsed value looks identical.

@@ -932,6 +932,40 @@ check "the gcloud wrapper dispatches rather than refusing to start" "credential 
   "$("${SSH[@]}" 'gcloud version 2>&1' 2>&1)"
 check "leeway report dispatches cluster reads through stock kubectl" "kubectl get nodes" \
   "$("${SSH[@]}" 'leeway report --clusters p/l/c' 2>&1)"
+# The kube-proxy kubeconfigs name the cluster in the server URL's path
+# (entrypoint.sh: `server: ${KUBE_PROXY_URL}/clusters/<ctx>`), and before
+# kubectl 1.34 `get --raw` replaced that path with the raw path, so every paged
+# collection read reached the proxy with no cluster in it (#4739): it landed on
+# the host and nothing failed, and the proxy now refuses such a request.
+# Proved against the installed binary rather than its version string: a server
+# inside the container records the path it receives from a `--raw` read sent
+# through a kubeconfig whose server carries `/clusters/seeded-a`.
+check "kubectl get --raw keeps the kubeconfig server's /clusters/<ctx> path" \
+  "request path /clusters/seeded-a/api/v1/pods?limit=1" \
+  "$("${SSH[@]}" "python3 - <<'PY'
+import http.server, json, os, subprocess, tempfile, threading
+seen = []
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        seen.append(self.path)
+        body = json.dumps({'kind': 'PodList', 'apiVersion': 'v1', 'metadata': {}, 'items': []}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+with tempfile.TemporaryDirectory() as d:
+    kc = os.path.join(d, 'kubeconfig')
+    with open(kc, 'w') as f:
+        f.write('apiVersion: v1\\nkind: Config\\nclusters:\\n- name: seeded-a\\n  cluster:\\n    server: http://127.0.0.1:%d/clusters/seeded-a\\nusers:\\n- name: u\\n  user:\\n    token: not-a-token\\ncontexts:\\n- name: seeded-a\\n  context: {cluster: seeded-a, user: u}\\ncurrent-context: seeded-a\\n' % srv.server_address[1])
+    r = subprocess.run(['kubectl', 'get', '--raw', '/api/v1/pods?limit=1', '--kubeconfig', kc], capture_output=True, text=True, timeout=60)
+srv.shutdown()
+print('request path', ' '.join(seen), '(exit %d)' % r.returncode, r.stderr.strip())
+PY" 2>&1)"
 check "the wrappers are on PATH" "/opt/credential-proxy/bin:" \
   "$("${SSH[@]}" 'echo "$PATH"' 2>&1)"
 # A login shell runs /etc/profile, which overwrites PATH wholesale; profile.d is

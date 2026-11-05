@@ -25,6 +25,9 @@ const (
 	// about 3s between a leader giving up (renewDeadline after its first
 	// failed renewal, which is retryPeriod after its last good one) and a
 	// standby taking over; 20s leaves about 8s for the step-down.
+	// The operator holds a deleted Lease's recreate back this long too
+	// (a2aGatewayLeaseRecreateHold in k8s-operator's
+	// platformagent_a2a_gateway_lease.go); change both together.
 	electionLeaseDuration = 20 * time.Second
 	electionRenewDeadline = 10 * time.Second
 	electionRetryPeriod   = 2 * time.Second
@@ -63,6 +66,9 @@ type Election struct {
 	Lease    string
 	Identity string
 	Log      *slog.Logger
+	// View, when set, is kept up to date with the lease's holder on every
+	// read, for the standby's doors.
+	View *LeaseView
 
 	// The election's timings. Zero means the defaults above; tests shorten
 	// them.
@@ -94,7 +100,7 @@ func (e Election) Run(ctx context.Context, leader Leader, lead func(context.Cont
 	if log == nil {
 		log = slog.Default()
 	}
-	lock := &observingLock{Interface: &resourcelock.LeaseLock{
+	lock := &observingLock{view: e.View, Interface: &resourcelock.LeaseLock{
 		LeaseMeta:  metav1.ObjectMeta{Namespace: e.Namespace, Name: e.Lease},
 		Client:     e.Client.CoordinationV1(),
 		LockConfig: resourcelock.ResourceLockConfig{Identity: e.Identity},
@@ -259,6 +265,8 @@ func orDefault(d, def time.Duration) time.Duration {
 // it stops leading), so its first successful write is the acquisition.
 type observingLock struct {
 	resourcelock.Interface
+	// view, when set, gets the holder of every read.
+	view *LeaseView
 
 	mu sync.Mutex
 	// lastHolder and lastMissing are what the most recent read found: the
@@ -281,6 +289,9 @@ func (l *observingLock) Get(ctx context.Context) (*resourcelock.LeaderElectionRe
 		l.lastHolder, l.lastMissing = "", true
 	case err == nil:
 		l.lastHolder, l.lastMissing = rec.HolderIdentity, false
+	}
+	if l.view != nil && (err == nil || apierrors.IsNotFound(err)) {
+		l.view.set(l.lastHolder)
 	}
 	return rec, raw, err
 }

@@ -289,7 +289,7 @@ class ApiSession:
 ```
 
 `relay_url` rewrites `https://<host>/<path>?<query>` onto `{broker}/v1/gcp/<host>/<path>?<query>`,
-where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set, else
+where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set and well-formed, else
 `CREDENTIAL_PROXY_URL` ([credential-broker-exec-tier.md](credential-broker-exec-tier.md) §3.2
 has the routing and the fallback). `requests` is imported inside the
 constructor and nowhere at module scope, so the broker and every other importer of the module

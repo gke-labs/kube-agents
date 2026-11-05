@@ -90,12 +90,13 @@ const (
 	//: The model line's start: the audit runs over the block without this one line.
 	usageSummaryModelLinePrefix = "  model: "
 	//: status.inference, the operator's reading of the install's default model.
-	inferenceStatusKey     = "inference"
-	inferenceProviderField = "provider"
-	inferenceModelField    = "model"
-	inferenceSeparator     = "/"
-	usageNoReading         = "no reading"
-	usageReadingSuffix     = " (as the forge reports)"
+	inferenceStatusKey        = "inference"
+	inferenceProviderField    = "provider"
+	inferenceModelField       = "model"
+	inferenceSeparator        = "/"
+	usageNoReading            = "no reading"
+	usageForgeReadingSuffix   = " (as the forge reports)"
+	usageGatewayReadingSuffix = " (as the gateway reports)"
 )
 
 // : status.usage fields, in the order the block prints them; a missing counter
@@ -105,14 +106,22 @@ var usageSummaryCounters = []string{
 	"clustersRegistered", "clustersMonitored", "chatMessagesInboundTotal", "sessionsTotal",
 	"chatSessionsTotal", "toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal",
 	"remediationsMergedTotal", "proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal",
-	"proposalHumanTouches", "proposalsMergedUntouched",
+	"proposalHumanTouches", "proposalsMergedUntouched", "peopleSeen7d", "peopleSeen30d",
 }
 
-// : The fields the broker reads off the forge rather than counts: absent means
-// : it has no reading yet, which is not 0. The script's USAGE_READINGS.
-var usageSummaryReadings = map[string]bool{
-	"remediationsMergedTotal": true, "proposalsAuthored": true, "remediationsOpen": true,
-	"remediationsClosedUnmergedTotal": true, "proposalHumanTouches": true, "proposalsMergedUntouched": true,
+// : The fields read off a source rather than counted, each to the suffix naming
+// : that source: absent means no reading yet, which is not 0. The broker reads
+// : the six off the forge; the operator reads the two people readings off this
+// : gateway. The script's USAGE_READINGS.
+var usageSummaryReadings = map[string]string{
+	"remediationsMergedTotal":         usageForgeReadingSuffix,
+	"proposalsAuthored":               usageForgeReadingSuffix,
+	"remediationsOpen":                usageForgeReadingSuffix,
+	"remediationsClosedUnmergedTotal": usageForgeReadingSuffix,
+	"proposalHumanTouches":            usageForgeReadingSuffix,
+	"proposalsMergedUntouched":        usageForgeReadingSuffix,
+	"peopleSeen7d":                    usageGatewayReadingSuffix,
+	"peopleSeen30d":                   usageGatewayReadingSuffix,
 }
 
 // : The environment lines, in the order the block prints them: the script's
@@ -398,7 +407,8 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	lines = append(lines, "usage:")
 	for _, counter := range usageSummaryCounters {
 		value, present := usage[counter]
-		if !usageSummaryReadings[counter] {
+		suffix, isReading := usageSummaryReadings[counter]
+		if !isReading {
 			lines = append(lines, fmt.Sprintf("  %s: %d", counter, asInt(value)))
 			continue
 		}
@@ -406,7 +416,7 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		if present && value != nil {
 			shown = strconv.FormatInt(asInt(value), 10)
 		}
-		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, usageReadingSuffix))
+		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, suffix))
 	}
 	last := asString(usage["lastActiveTime"])
 	if last == "" {

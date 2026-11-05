@@ -27,13 +27,17 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -129,8 +133,9 @@ func TestTheExecTierFollowsItsReplicaCount(t *testing.T) {
 	if *dep.Spec.Replicas != 2 || dep.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
 		t.Errorf("Deployment replicas %d strategy %s, want 2 RollingUpdate", *dep.Spec.Replicas, dep.Spec.Strategy.Type)
 	}
-	if ru := dep.Spec.Strategy.RollingUpdate; ru == nil || ru.MaxUnavailable == nil || ru.MaxUnavailable.IntValue() != 1 {
-		t.Errorf("rollout %+v, want maxUnavailable 1 so a full namespace quota cannot stall it", dep.Spec.Strategy.RollingUpdate)
+	if ru := dep.Spec.Strategy.RollingUpdate; ru == nil || ru.MaxUnavailable == nil || ru.MaxUnavailable.IntValue() != 1 ||
+		ru.MaxSurge == nil || ru.MaxSurge.IntValue() != 0 {
+		t.Errorf("rollout %+v, want maxUnavailable 1 and maxSurge 0 so a full namespace quota cannot stall it", dep.Spec.Strategy.RollingUpdate)
 	}
 	templateAt2 := dep.Spec.Template.DeepCopy()
 
@@ -294,6 +299,43 @@ func TestTheExecTierDeploymentIsTheBrokerWithoutItsSecrets(t *testing.T) {
 	}
 }
 
+// The tier is derived from the broker as rendered, not from the object the
+// apply hands back: a field another manager set on the broker, such as a
+// rollout restart's annotation, does not reach the exec pods.
+func TestTheExecTierIgnoresFieldsOthersSetOnTheBroker(t *testing.T) {
+	const restartedAt = "kubectl.kubernetes.io/restartedAt"
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	apply := ssaApplyInterceptor()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if err := apply.Patch(ctx, c, obj, patch, opts...); err != nil {
+					return err
+				}
+				// The server's merged answer for the broker carries the annotation.
+				if dep, ok := obj.(*appsv1.Deployment); ok && dep.Name == credentialProxyName(agent) {
+					if dep.Spec.Template.Annotations == nil {
+						dep.Spec.Template.Annotations = map[string]string{}
+					}
+					dep.Spec.Template.Annotations[restartedAt] = "2026-11-04T00:00:00Z"
+				}
+				return nil
+			},
+		}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if err := r.reconcileCredentialProxy(context.Background(), agent, brokerTestPolicyHash, nil, allBrokerCallersOwned); err != nil {
+		t.Fatal(err)
+	}
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: credentialProxyExecTierName(agent), Namespace: agent.Namespace}, dep); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := dep.Spec.Template.Annotations[restartedAt]; ok {
+		t.Errorf("exec pod template carries the broker's %s=%s, so a broker restart rolls the tier", restartedAt, v)
+	}
+}
+
 // A CR cannot give the exec pod another role: spec.deployment.env does not
 // reach the broker's role, and the exec pod sets its own once.
 func TestTheExecTierRoleCannotBeSetFromTheCR(t *testing.T) {
@@ -388,6 +430,10 @@ func TestTheExecTierDropsEverySecretBackedVolume(t *testing.T) {
 			}
 		}
 	}
+	// By name, not through volumeHoldsSecret, which the filter itself uses.
+	if kept["future-secret"] || kept["future-projected"] {
+		t.Errorf("exec pod kept a Secret-backed volume: %v", kept)
+	}
 	if !kept["credential-proxy-ksa-token"] || !kept["credential-proxy-policy"] {
 		t.Error("exec pod lost a volume that holds no Secret")
 	}
@@ -412,6 +458,20 @@ func TestTheExecTierFenceAdmitsItsCallersOnly(t *testing.T) {
 	for _, peer := range withProfiles.Spec.Ingress[0].From {
 		if peer.PodSelector != nil && peer.PodSelector.MatchLabels["app"] == agent.Name+"-gateway" {
 			t.Error("fence admits the gateway")
+		}
+	}
+	// The session pods only under the cluster view, which points them at the
+	// tier; the agent is already mode next.
+	for _, view := range []string{"true", ""} {
+		t.Setenv(a2aSessionClusterViewEnvVar, view)
+		admitted := false
+		for _, peer := range buildCredentialProxyExecTierNetworkPolicy(agent, "", credentialProxyProfileConfig{}).Spec.Ingress[0].From {
+			if peer.PodSelector != nil && reflect.DeepEqual(peer.PodSelector.MatchLabels, a2aSessionPodSelector()) {
+				admitted = true
+			}
+		}
+		if admitted != (view == "true") {
+			t.Errorf("with %s=%q the fence admits the session pods: %v", a2aSessionClusterViewEnvVar, view, admitted)
 		}
 	}
 }
@@ -450,6 +510,39 @@ func TestTheExecTierRefusesAnAgentNameTooLongForItsObjects(t *testing.T) {
 		if !tc.refused && len(credentialProxyExecTierName(agent)) != 63 {
 			t.Errorf("the longest accepted name gives a %d-character Service name, want 63", len(credentialProxyExecTierName(agent)))
 		}
+	}
+}
+
+// Without the webhook, a refused name is on the CR: Degraded with the reason
+// on every pass until it is corrected, while Ready and the phase keep what the
+// workloads say, as for the three resource refusals.
+func TestAnAgentNameTooLongForTheExecTierIsDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := execTierTestAgent(ptr.To(int32(2)))
+	agent.Name = strings.Repeat("a", credentialProxyExecTierMaxAgentName+1)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	for i := range 2 {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(context.Background(), req.NamespacedName, updated); err != nil {
+		t.Fatal(err)
+	}
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidCredentialProxyExec {
+		t.Fatalf("Degraded = %v, want True/%s", degraded, conditionReasonInvalidCredentialProxyExec)
+	}
+	if !strings.Contains(degraded.Message, "must be at most 36") {
+		t.Errorf("Degraded message %q does not name the limit", degraded.Message)
+	}
+	if updated.Status.Phase == "Degraded" {
+		t.Error("Status.Phase = Degraded; the refusal is reported on the Degraded condition only")
 	}
 }
 

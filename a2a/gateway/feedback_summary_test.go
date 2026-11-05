@@ -40,6 +40,7 @@ func summaryCR() map[string]any {
 				"remediationsProposedTotal": int64(4), "remediationsMergedTotal": int64(1),
 				"proposalsAuthored": int64(6), "remediationsOpen": int64(2),
 				"remediationsClosedUnmergedTotal": int64(3), "proposalHumanTouches": int64(5),
+				"peopleSeen7d": int64(3), "peopleSeen30d": int64(11),
 				"lastActiveTime":   "2026-10-21T11:34:06Z",
 				"activeInterfaces": []any{"slack", "googlechat"},
 			},
@@ -136,6 +137,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"  remediationsMergedTotal: 1 (as the forge reports)\n", "  proposalsAuthored: 6 (as the forge reports)\n",
 		"  remediationsOpen: 2 (as the forge reports)\n", "  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n",
 		"  proposalHumanTouches: 5 (as the forge reports)\n",
+		"  peopleSeen7d: 3 (as the gateway reports)\n", "  peopleSeen30d: 11 (as the gateway reports)\n",
 		"  lastActive: 2026-10-21T11:34:06Z",
 		"chat turns (14 days): 6 (ended 3, cancelled 2, active 1)",
 		"performance: " + usageSummaryPerformanceNote,
@@ -157,15 +159,21 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 
 func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
 	cr := summaryCR()
-	cr["status"].(map[string]any)["usage"] = map[string]any{"remediationsOpen": int64(0)}
+	cr["status"].(map[string]any)["usage"] = map[string]any{"remediationsOpen": int64(0), "peopleSeen7d": int64(0)}
 	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
 	for _, reading := range []string{"remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"} {
 		if want := "  " + reading + ": no reading (as the forge reports)\n"; !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
 	}
-	if want := "  remediationsOpen: 0 (as the forge reports)\n"; !strings.Contains(text, want) {
-		t.Errorf("block lacks %q:\n%s", want, text)
+	for _, want := range []string{
+		"  remediationsOpen: 0 (as the forge reports)\n",
+		"  peopleSeen7d: 0 (as the gateway reports)\n",
+		"  peopleSeen30d: no reading (as the gateway reports)\n",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("block lacks %q:\n%s", want, text)
+		}
 	}
 	for _, counter := range []string{"clustersRegistered", "chatSessionsTotal", "toolExecutionsTotal", "remediationsProposedTotal"} {
 		if want := "  " + counter + ": 0\n"; !strings.Contains(text, want) {

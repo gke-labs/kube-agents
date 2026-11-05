@@ -156,7 +156,8 @@ currently fails.
 | A3  | a request with no verified principal is refused                                           | 2        | `Scenario4NoVerifiedIdentity`                                                                       | a session with no principal executed under the agent's own identity, which makes D1 unenforceable                                                                                                                                                        |
 | A3  | a profile worker's call outside its task credential's target is refused                   | 1        | `test_A3_a_profile_call_outside_its_tasks_target_is_refused`                                        | a profile worker naming another cluster, project or server, or moving a stored default, with the broker's credential                                                                                                                                     |
 | A3  | a profile worker with no task credential reaches no cluster                               | 1        | `test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster`                             | a worker dropping the credential header and running unconfined on the host cluster                                                                                                                                                                       |
-| A3  | the profile role reaches the exec route alone                                             | 1        | `test_A3_the_profile_role_reaches_the_exec_route_alone`                                             | a profile worker reaching the Cloud API, MCP, watcher or forge routes, where no task target confines it                                                                                                                                                  |
+| A3  | the profile role reaches exec and the MCP relay alone                                     | 1        | `test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone`                                     | a profile worker reaching the Cloud API, watcher or forge routes, where no task target confines it                                                                                                                                                       |
+| A3  | a profile worker reaches no cluster through MCP                                           | 1        | `test_A3_a_profile_worker_reaches_no_cluster_through_mcp`                                           | a profile worker calling the gke MCP server, whose tools name any cluster, or reading through the relay with no task credential                                                                                                                          |
 | A3  | the session-inject endpoint authenticates its caller                                      | 1        | `test_A3_the_session_inject_endpoint_authenticates_its_caller`                                      | **slice 2b 1.8, closed on main**: was `/sessions/{id}/inject`, no auth, full agent turn; the server now requires the key and binds loopback, and the test keeps it that way                                                                              |
 | A3  | an unlisted user's click on a Slack choice button changes nothing                         | 1        | `test_A3_an_unlisted_users_click_changes_nothing`                                                   | a click from someone the allowlist never named, run as their turn because the handler read the clicker from the payload instead of the adapter's authorization                                                                                           |
 | A3  | the A2A `…supervisor` subject has exactly one writer                                      | 1        | `test_A3_the_supervisor_subject_has_exactly_one_writer`                                             | a session ending its own task wearing the gateway's `from`, indistinguishable on replay from the supervisor declaring it dead - impersonation asserted by the caller, on the bus (`round_2/a3-decision.md`)                                              |
@@ -370,7 +371,7 @@ suite once at the end: a run that ends red says so and exits non-zero.
    invariant and the document that records the finding — and give its class a
    `..._precondition_...` test, which the self-check requires.
 
-## `chat/` holds data, not tests
+## `chat/` and `chat-ux/` hold data, not tests
 
 Each file in `chat/` pairs an input, lifted from a `today` presenter test or
 built to show a rule one pins, with the `kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
@@ -382,4 +383,7 @@ home, but they are wire-format rules rather than security invariants, so
 `make test-python`. The emitter runs every case: the kanban notifier's half in
 `deploy/docker/patches/test_chat_conformance.py`, and the hermes-bridge's half
 (the answer, and the ask's mark on its heartbeat and terminal) in
-`a2a/hermes-bridge/chat_test.go`.
+`a2a/hermes-bridge/chat_test.go`. Each of those also lints what it checks for
+the chat UX rules code can check (`chatmsg.Lint`, `chat_cases.lint`), and
+`chat-ux/lint.json` holds the lint's own cases, which the Go and Python lints
+both read, so a case they disagree on fails one side.

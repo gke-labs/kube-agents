@@ -385,6 +385,12 @@ through as typed, and the Planning Agent composes the report and asks for a yes 
 platform worker files it through the credential broker. The command, the persona flow and the
 broker verb are designed in [`chat-feedback-command.md`](chat-feedback-command.md). `/feedback summary` (added 2026-10-21) is the one text form the gateway answers itself: the install's identifier-free usage and feedback summary, from the `PlatformAgent` resource and the gateway's task records, with no task started (part 7 of the same document).
 
+A typed `@bot /sethome` (or `/hermes sethome`) on Slack is the Slack adapter's own, not a gateway
+command: `answerSetHome` answers an author the gateway's own admission rule admits, in the thread, with
+the Home tab panel's state and where the home channel moves, before the text becomes a turn, so no task
+starts, no question is marked answered and no home is learned from it; the post runs off the event
+pump. An author the rule does not admit is refused as any turn is.
+
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
 channel its turns arrive on, naming the addressee and the task text. The gateway is the only
@@ -1287,7 +1293,9 @@ that treated the three alike is what this value exists to stop.
    reaching a listener it would otherwise only need a token to use.
 4. **Its Service is a ClusterIP.** Not a NodePort, not a LoadBalancer, and it routes nothing:
    it exists so that `kubectl port-forward svc/<cr>-a2a-inject` resolves to the pod and the
-   port.
+   port. Under the gateway's election only the Lease holder serves the door, and a standby
+   answers 503 naming the holder, so clients forward to `pod/<holder>` instead
+   (`hack/gateway-port-forward.sh`, [`gateway-replicas.md`](gateway-replicas.md)).
 5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
    network**: two ingress rules, which admit the managed-Prometheus collector's namespace and the
    operator's pods to the metrics-only port and nothing to the door (see "Metrics" below). The gateway's own fence, which renders on every next gateway whether or not a door is armed, admits the same, so this copy is the door's record of the intent rather than the pod's only fence. It is a second control over the edge the bind already
@@ -1628,8 +1636,8 @@ Slack Connect, not archived, the app a member) and written once (`slack`, `slack
 channel; the gateway's own home posts follow within one kubelet sync, about a minute, during which a
 home post is refused as having no home. A candidate the check refuses is written to `slack.refused`
 as one of the words the operator matches, `shared`, `archived`, `not-member` or `malformed` (the
-post-time check also writes `direct-message` for a hand-edited group DM id, which an operator without
-that word renders as a reason it does not know),
+post-time check also writes `direct-message` for a hand-edited group DM id, which the operator
+matches too and an operator older than that word renders as a reason it does not know),
 while the record names no channel and does not name that reason already (a write that fails is tried
 again at the next refusal; while a channel is recorded, a refusal beside it is the post-time check's
 or an older gateway's, and a learn that adopts or replaces the channel clears it) and the next

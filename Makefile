@@ -189,8 +189,8 @@ lint-python: ## Run ruff's error rules over every Python file (the set tests/tes
 # flake in a young seam test could not red an already-gating job; it finished
 # that period without a single failure, and a tier nothing gates on is a tier
 # people learn to merge around. It is deterministic by construction -- real
-# components, no model calls -- so it belongs in the sweep the `test` job runs
-# rather than beside it. The one thing that costs: the injector seam shells out
+# components, no model calls -- so it belongs in the sweep the `test-shard` jobs
+# run rather than beside it. The one thing that costs: the injector seam shells out
 # to `go test`, so every job that expands this list needs a Go toolchain on
 # PATH or those tests skip themselves and the sweep reports green without them.
 PYTHON_TEST_FILES := $(sort \
@@ -205,6 +205,7 @@ PYTHON_TEST_FILES := $(sort \
 	$(wildcard deploy/docker/test_*.py) \
 	$(wildcard deploy/docker/patches/test_*.py) \
 	$(wildcard deploy/docker/plugins/*/test_*.py) \
+	$(wildcard hack/replay-proxy/test_*.py) \
 	$(wildcard k8s-operator/internal/controller/test_*.py) \
 	$(wildcard scripts/test_*.py) \
 	$(wildcard tests/integration/test_*.py) \
@@ -645,9 +646,12 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 		exit 1; \
 	fi
 
-# The coverage directories the shards' CI jobs upload, one per shard, each with
-# the shard's combined .coverage and its failed-files list. CI downloads them
-# under COVERAGE_DIR before it runs coverage-merge.
+# The coverage directories the shards' CI jobs upload, each with the shard's
+# combined .coverage and its failed-files list. CI uploads one per shard per run
+# attempt (python-coverage-shard-<N>-attempt-<A>), downloads them under
+# COVERAGE_DIR, and keeps each shard's latest attempt under the bare name
+# python-coverage-shard-<N> (scripts/coverage_shard_attempts.py) before it runs
+# coverage-merge.
 COVERAGE_SHARD_DIRS ?= $(wildcard $(COVERAGE_DIR)/python-coverage-shard-*)
 # How many shard directories coverage-merge requires; CI passes its shard count.
 COVERAGE_SHARD_COUNT ?= 1
@@ -686,7 +690,7 @@ coverage-merge: ## Join the coverage the sharded `make coverage` runs left in CO
 	fi
 
 # 55 is a deliberately loose placeholder: the real floor gets committed from the
-# first green CI run of the `test` job's coverage sweep, not from a laptop
+# first green CI run of the coverage the `test` job joins from the shards, not from a laptop
 # measurement, because CI's Python and dependency set produce a different number.
 COVERAGE_FLOOR ?= 55
 
@@ -759,6 +763,18 @@ test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus p
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
 
+# The harness-scale measurement (docs/designs/agent-harness-bottlenecks.md). SCALE_CONFIG is a plan
+# file; the target project and clusters come from it and from SCALE_* in the environment
+# (SCALE_PROJECT_ID is required for scale-run). The data file is the plan's target.data_file.
+SCALE_CONFIG ?= bench/scale/phase1.yaml
+
+.PHONY: scale-plan scale-run
+scale-plan: ## Print the harness-scale measurement matrix for SCALE_CONFIG (default bench/scale/phase1.yaml).
+	@cd bench && python3 -m kube_agents_bench.scale.runner plan $(abspath $(SCALE_CONFIG))
+
+scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the target in SCALE_*, resuming from its data file.
+	@cd bench && python3 -m kube_agents_bench.scale.runner run $(abspath $(SCALE_CONFIG))
+
 # A broken bench case otherwise costs a full presubmit to discover: provision,
 # deploy, run the agent, score, read the log. Most of the ways a task.yaml is
 # broken are static -- an unknown domain slug, a fixture role the seeded fleet
@@ -775,7 +791,7 @@ bench-case-check: ## Validate every bench task.yaml against the case-format cont
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
 # The tier now gates: tests/integration is in PYTHON_TEST_DIRS, so `make
-# test-python` and the CI `test` job both run it, and a red seam test is a red
+# test-python` and the CI `test-shard` jobs both run it, and a red seam test is a red
 # pull request. This target is a convenience for running that one tier while
 # you work on a seam -- seconds instead of the whole sweep -- and is not what
 # CI invokes, so do not reach for it as the definition of what must pass.
