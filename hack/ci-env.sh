@@ -210,7 +210,7 @@ readonly A2A_DIAG_LOG_MAX_BYTES=$((4 * 1024 * 1024))
 readonly A2A_DIAG_MAX_PODS=40
 
 # ─── Inference-replay shadow mode ────────────────────────────────────────────
-# EVAL_REPLAY_SHADOW=true puts the shadow-mode replay proxy
+# On by default (EVAL_REPLAY_SHADOW=false turns it off), this puts the shadow-mode replay proxy
 # (hack/replay-proxy/README.md) in front of LiteLLM on the eval install and
 # copies what it records to EVAL_REPLAY_SHADOW_BUCKET while the eval runs.
 # hack/ci-deploy.sh builds the proxy image and turns on litellm.replayShadow;
@@ -226,6 +226,11 @@ readonly A2A_DIAG_MAX_PODS=40
 # The image hack/ci-deploy.sh builds, beside its other images in AR_REPO.
 # shellcheck disable=SC2034 # read by hack/ci-deploy.sh, which sources this file
 readonly REPLAY_SHADOW_IMAGE_NAME="replay-proxy-shadow"
+# On by default, into the eval pool's private bucket (kube-agents-prow; the
+# runners' grants: docs/ci-pool-projects.md). EVAL_REPLAY_SHADOW=false turns it
+# off; EVAL_REPLAY_SHADOW_BUCKET points it elsewhere.
+readonly REPLAY_SHADOW_DEFAULT="true"
+readonly REPLAY_SHADOW_DEFAULT_BUCKET="kube-agents-replay-shadow"
 # The proxy's pods and container (charts/kube-agents/templates/litellm.yaml).
 readonly REPLAY_SHADOW_POD_SELECTOR="app=litellm,kubeagents.x-k8s.io/inference-role=replay-shadow"
 readonly REPLAY_SHADOW_CONTAINER="replay-shadow-proxy"
@@ -442,7 +447,7 @@ collect_credential_proxy_evidence() {
 }
 
 # ─── Inference-replay shadow mode: the switch and the job's tags ──────────────
-# Reads EVAL_REPLAY_SHADOW (true or false, default false) and sets
+# Reads EVAL_REPLAY_SHADOW (true or false, default true) and sets
 # REPLAY_SHADOW_ACTIVE to true or false; when true, also REPLAY_SHADOW_BUCKET,
 # REPLAY_SHADOW_KIND, REPLAY_SHADOW_PROJECT, REPLAY_SHADOW_BUILD and
 # REPLAY_SHADOW_PR. Returns 1, with the reason on stderr, for a setting the run
@@ -457,6 +462,20 @@ collect_credential_proxy_evidence() {
 # Prow, where JOB_TYPE is unset, EVAL_REPLAY_SHADOW_JOB_KIND names the kind;
 # inside it, setting that too is refused, so a presubmit cannot be filed as a
 # nightly. BUILD_ID names the run, as it does every Prow job.
+#
+# Each of those refusals holds only when EVAL_REPLAY_SHADOW=true was set: left
+# at its default, a run the proxy cannot serve (a release candidate, a run
+# outside Prow without a kind, a Prow job missing its tags) goes without it,
+# with a note, so turning the default on breaks no path that never asked.
+_replay_shadow_unusable() {
+  if [ "${REPLAY_SHADOW_EXPLICIT}" = "true" ]; then
+    echo "ERROR: EVAL_REPLAY_SHADOW=true $1" >&2
+    return 1
+  fi
+  echo "Shadow replay proxy: not on this run ($1); EVAL_REPLAY_SHADOW=true would make that an error." >&2
+  return 0
+}
+
 resolve_replay_shadow() {
   REPLAY_SHADOW_ACTIVE="false"
   REPLAY_SHADOW_BUCKET=""
@@ -464,7 +483,9 @@ resolve_replay_shadow() {
   REPLAY_SHADOW_PROJECT=""
   REPLAY_SHADOW_BUILD=""
   REPLAY_SHADOW_PR=""
-  case "${EVAL_REPLAY_SHADOW:-false}" in
+  REPLAY_SHADOW_EXPLICIT="false"
+  [ -z "${EVAL_REPLAY_SHADOW:-}" ] || REPLAY_SHADOW_EXPLICIT="true"
+  case "${EVAL_REPLAY_SHADOW:-${REPLAY_SHADOW_DEFAULT}}" in
   false) return 0 ;;
   true) ;;
   *)
@@ -473,14 +494,10 @@ resolve_replay_shadow() {
     ;;
   esac
   if [ -n "${RC_COMMIT_SHA:-}" ]; then
-    echo "ERROR: EVAL_REPLAY_SHADOW=true on a release-candidate run (RC_COMMIT_SHA is set): that path installs published images and builds none, so there is no shadow proxy image to install." >&2
-    return 1
+    _replay_shadow_unusable "on a release-candidate run (RC_COMMIT_SHA is set): that path installs published images and builds none, so there is no shadow proxy image to install"
+    return
   fi
-  local bucket="${EVAL_REPLAY_SHADOW_BUCKET:-}"
-  if [ -z "${bucket}" ]; then
-    echo "ERROR: EVAL_REPLAY_SHADOW=true needs EVAL_REPLAY_SHADOW_BUCKET, the bucket the proxy's lines and stored text go to." >&2
-    return 1
-  fi
+  local bucket="${EVAL_REPLAY_SHADOW_BUCKET:-${REPLAY_SHADOW_DEFAULT_BUCKET}}"
   if ! [[ "${bucket}" =~ ${REPLAY_SHADOW_BUCKET_RE} ]]; then
     echo "ERROR: EVAL_REPLAY_SHADOW_BUCKET='${bucket}' is not a bucket name (3-63 lowercase letters, digits, '-', '_' or '.'; no gs:// and no path)." >&2
     return 1
@@ -490,7 +507,7 @@ resolve_replay_shadow() {
   presubmit) kind="${REPLAY_SHADOW_KIND_PRESUBMIT}" ;;
   periodic | postsubmit) kind="${REPLAY_SHADOW_KIND_NIGHTLY}" ;;
   batch)
-    echo "WARNING: EVAL_REPLAY_SHADOW=true on a batch run: a batch belongs to no one pull request and is not a nightly, so this run goes without the shadow proxy." >&2
+    echo "Shadow replay proxy: not on this run (a batch run belongs to no one pull request and is not a nightly)." >&2
     return 0
     ;;
   "")
@@ -498,14 +515,14 @@ resolve_replay_shadow() {
     case "${kind}" in
     "${REPLAY_SHADOW_KIND_PRESUBMIT}" | "${REPLAY_SHADOW_KIND_NIGHTLY}") ;;
     *)
-      echo "ERROR: EVAL_REPLAY_SHADOW=true outside Prow (JOB_TYPE unset) needs EVAL_REPLAY_SHADOW_JOB_KIND set to ${REPLAY_SHADOW_KIND_PRESUBMIT} or ${REPLAY_SHADOW_KIND_NIGHTLY}, not '${kind}'." >&2
-      return 1
+      _replay_shadow_unusable "outside Prow (JOB_TYPE unset) needs EVAL_REPLAY_SHADOW_JOB_KIND set to ${REPLAY_SHADOW_KIND_PRESUBMIT} or ${REPLAY_SHADOW_KIND_NIGHTLY}, not '${kind}'"
+      return
       ;;
     esac
     ;;
   *)
-    echo "ERROR: EVAL_REPLAY_SHADOW=true with JOB_TYPE='${JOB_TYPE}', which is none of presubmit, periodic, postsubmit or batch." >&2
-    return 1
+    _replay_shadow_unusable "with JOB_TYPE='${JOB_TYPE}', which is none of presubmit, periodic, postsubmit or batch"
+    return
     ;;
   esac
   if [ -n "${JOB_TYPE:-}" ] && [ -n "${EVAL_REPLAY_SHADOW_JOB_KIND:-}" ]; then
@@ -516,17 +533,17 @@ resolve_replay_shadow() {
   if [ "${kind}" = "${REPLAY_SHADOW_KIND_PRESUBMIT}" ]; then
     pr="${PULL_NUMBER:-}"
     if ! [[ "${pr}" =~ ${REPLAY_SHADOW_PR_RE} ]]; then
-      echo "ERROR: EVAL_REPLAY_SHADOW=true on a presubmit needs PULL_NUMBER, a pull request number, not '${pr}'." >&2
-      return 1
+      _replay_shadow_unusable "on a presubmit needs PULL_NUMBER, a pull request number, not '${pr}'"
+      return
     fi
   fi
   if ! [[ "${BUILD_ID:-}" =~ ${REPLAY_SHADOW_BUILD_RE} ]]; then
-    echo "ERROR: EVAL_REPLAY_SHADOW=true needs BUILD_ID (letters, digits, '.', '_', '-'), which names the run in the bucket; got '${BUILD_ID:-}'." >&2
-    return 1
+    _replay_shadow_unusable "needs BUILD_ID (letters, digits, '.', '_', '-'), which names the run in the bucket; got '${BUILD_ID:-}'"
+    return
   fi
   if [ -z "${PROJECT_ID:-}" ]; then
-    echo "ERROR: EVAL_REPLAY_SHADOW=true needs PROJECT_ID, the eval project every line is tagged with." >&2
-    return 1
+    _replay_shadow_unusable "needs PROJECT_ID, the eval project every line is tagged with"
+    return
   fi
   REPLAY_SHADOW_ACTIVE="true"
   REPLAY_SHADOW_BUCKET="${bucket}"

@@ -1,12 +1,11 @@
 # Inference replay for evals
 
-> **STATUS — proposal; measured; shadow mode built and wired into CI behind a switch, not yet
-> turned on.** A prototype proxy was run against a dev install on 2026-10-31 to 2026-11-02.
+> **STATUS — proposal; measured; shadow mode built and on by default in CI.** A prototype proxy was run against a dev install on 2026-10-31 to 2026-11-02.
 > [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the shadow-mode proxy, its
 > fingerprint log, the scrubbed request store, the hit-rate script and the CI collector; the chart
 > carries the proxy behind `litellm.replayShadow`, and `hack/ci-deploy.sh` and `hack/ci-eval-pr.sh`
-> deploy it and copy its output to a private bucket under `EVAL_REPLAY_SHADOW=true`. No job sets
-> that yet: the bucket, its grants and the Prow configuration do not exist. The join with run
+> deploy it on every Prow presubmit and nightly and copy its output to a private bucket in
+> `kube-agents-prow` (`EVAL_REPLAY_SHADOW=false` turns it off). The join with run
 > verdicts and the collision report (Rollout step 1) are not built yet. Shadow mode changes no
 > verdict.
 

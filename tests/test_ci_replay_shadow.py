@@ -78,7 +78,7 @@ _REPORT = textwrap.dedent("""\
 
 
 def _resolve(**overrides):
-    script = "set -euo pipefail\n" + _lifted("resolve_replay_shadow") + "rc=0\nresolve_replay_shadow || rc=$?\n" \
+    script = "set -euo pipefail\n" + _lifted("_replay_shadow_unusable", "resolve_replay_shadow") + "rc=0\nresolve_replay_shadow || rc=$?\n" \
         + 'echo "rc=${rc}"\n' + _REPORT
     proc = subprocess.run(["bash", "-c", script], env=_env(**overrides), capture_output=True, text=True, stdin=subprocess.DEVNULL)
     assert proc.returncode == 0, proc.stderr
@@ -87,12 +87,33 @@ def _resolve(**overrides):
 
 
 class ResolveTest(unittest.TestCase):
-    def test_off_by_default_when_empty_and_when_false(self):
-        for switch in (None, "", "false"):
-            with self.subTest(switch=switch):
-                values, err = _resolve(EVAL_REPLAY_SHADOW=switch, EVAL_REPLAY_SHADOW_BUCKET=None, JOB_TYPE=None)
+    def test_false_turns_it_off_anywhere(self):
+        for job_type in (None, "presubmit", "periodic"):
+            with self.subTest(job_type=job_type):
+                values, err = _resolve(EVAL_REPLAY_SHADOW="false", JOB_TYPE=job_type, PULL_NUMBER="4700")
                 self.assertEqual((values["rc"], values["active"]), ("0", "false"))
                 self.assertEqual(err, "")
+
+    def test_on_by_default_in_prow_into_the_pool_bucket(self):
+        for switch in (None, ""):
+            for job_type, kind in (("presubmit", "presubmit"), ("periodic", "nightly"), ("postsubmit", "nightly")):
+                with self.subTest(switch=switch, job_type=job_type):
+                    values, err = _resolve(EVAL_REPLAY_SHADOW=switch, EVAL_REPLAY_SHADOW_BUCKET=None,
+                                           JOB_TYPE=job_type, PULL_NUMBER="4700")
+                    self.assertEqual((values["rc"], values["active"], values["kind"]), ("0", "true", kind))
+                    self.assertEqual(values["bucket"], "kube-agents-replay-shadow")
+
+    def test_left_at_its_default_a_run_it_cannot_serve_goes_without_it(self):
+        # What an explicit EVAL_REPLAY_SHADOW=true refuses, the default skips with a note.
+        for overrides in ({"RC_COMMIT_SHA": "abc"}, {"JOB_TYPE": None}, {"JOB_TYPE": "weird"},
+                          {"JOB_TYPE": "presubmit", "PULL_NUMBER": None}, {"BUILD_ID": None}, {"PROJECT_ID": ""}):
+            with self.subTest(**overrides):
+                values, err = _resolve(EVAL_REPLAY_SHADOW=None, **overrides)
+                self.assertEqual((values["rc"], values["active"]), ("0", "false"))
+                self.assertIn("not on this run", err)
+                values, err = _resolve(EVAL_REPLAY_SHADOW="true", **overrides)
+                self.assertEqual((values["rc"], values["active"]), ("1", "false"))
+                self.assertIn("ERROR: EVAL_REPLAY_SHADOW=true", err)
 
     def test_a_switch_that_is_not_true_or_false_is_refused(self):
         for switch in ("1", "yes", "True", "TRUE"):
@@ -122,7 +143,7 @@ class ResolveTest(unittest.TestCase):
     def test_batch_runs_without_the_proxy_and_says_so(self):
         values, err = _resolve(JOB_TYPE="batch", PULL_NUMBER="4700")
         self.assertEqual((values["rc"], values["active"]), ("0", "false"))
-        self.assertIn("WARNING", err)
+        self.assertIn("not on this run", err)
 
     def test_a_release_candidate_run_is_refused(self):
         values, err = _resolve(RC_COMMIT_SHA="0123456789abcdef0123456789abcdef01234567")
@@ -152,7 +173,7 @@ class ResolveTest(unittest.TestCase):
         self.assertIn("JOB_TYPE", err)
 
     def test_the_bucket_is_required_and_must_be_a_bare_name(self):
-        for bucket in (None, "", "gs://kube-agents-replay", "kube-agents/replay", "Kube-Agents", "ab", "-abc",
+        for bucket in ("gs://kube-agents-replay", "kube-agents/replay", "Kube-Agents", "ab", "-abc",
                        "a" * 64, "bucket name"):
             with self.subTest(bucket=bucket):
                 values, err = _resolve(EVAL_REPLAY_SHADOW_BUCKET=bucket)
@@ -161,6 +182,11 @@ class ResolveTest(unittest.TestCase):
         for bucket in ("abc", "kube_agents.replay-shadow", "a" * 63):
             with self.subTest(bucket=bucket):
                 self.assertEqual(_resolve(EVAL_REPLAY_SHADOW_BUCKET=bucket)[0]["rc"], "0")
+        # Unset or empty: the pool's bucket.
+        for bucket in (None, ""):
+            with self.subTest(bucket=bucket):
+                values = _resolve(EVAL_REPLAY_SHADOW_BUCKET=bucket)[0]
+                self.assertEqual((values["rc"], values["bucket"]), ("0", "kube-agents-replay-shadow"))
 
     def test_the_build_id_is_required_and_path_safe(self):
         for build in (None, "", "../x", "a/b", "a b"):
@@ -172,7 +198,7 @@ class ResolveTest(unittest.TestCase):
 
 class HelmArgsTest(unittest.TestCase):
     def _args(self, **overrides):
-        script = ("set -euo pipefail\n" + _lifted("resolve_replay_shadow", "replay_shadow_helm_args")
+        script = ("set -euo pipefail\n" + _lifted("_replay_shadow_unusable", "resolve_replay_shadow", "replay_shadow_helm_args")
                   + "resolve_replay_shadow\nreplay_shadow_helm_args repo/replay-proxy-shadow t1\n"
                   + 'echo "count=${#REPLAY_SHADOW_HELM_ARGS[@]}"\n'
                   + 'for a in ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"}; do echo "arg=$a"; done\n')
@@ -182,8 +208,8 @@ class HelmArgsTest(unittest.TestCase):
         return int(lines[0].split("=", 1)[1]), [l.split("=", 1)[1] for l in lines[1:]]
 
     def test_off_is_an_empty_array(self):
-        for overrides in ({"EVAL_REPLAY_SHADOW": None}, {"EVAL_REPLAY_SHADOW": "false"},
-                          {"JOB_TYPE": "batch"}):
+        for overrides in ({"EVAL_REPLAY_SHADOW": None, "JOB_TYPE": None}, {"EVAL_REPLAY_SHADOW": "false"},
+                          {"JOB_TYPE": "batch"}, {"EVAL_REPLAY_SHADOW": None, "RC_COMMIT_SHA": "abc"}):
             with self.subTest(**overrides):
                 self.assertEqual(self._args(**overrides), (0, []))
 

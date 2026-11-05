@@ -777,7 +777,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   )
 fi
 
-# The shadow-mode replay proxy (EVAL_REPLAY_SHADOW=true, resolved above): the
+# The shadow-mode replay proxy (on by default; resolved above): the
 # image step 4 builds (cloudbuild-ci.yaml's replay-shadow-proxy step) and the
 # chart values step 5 installs it with. Both empty when it is off, so the build
 # and the release are byte-for-byte what they were. resolve_replay_shadow
@@ -787,7 +787,7 @@ REPLAY_SHADOW_HELM_ARGS=()
 if [ "${REPLAY_SHADOW_ACTIVE:-false}" = "true" ]; then
   REPLAY_SHADOW_PROXY_URI="${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}:${TAG}"
   replay_shadow_helm_args "${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}" "${TAG}"
-  echo "EVAL_REPLAY_SHADOW=true: the shadow replay proxy goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, build ${REPLAY_SHADOW_BUILD})"
+  echo "Shadow replay proxy: goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, build ${REPLAY_SHADOW_BUILD}); EVAL_REPLAY_SHADOW=false turns it off"
 fi
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
@@ -1744,7 +1744,7 @@ else
   REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
   if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
     REPLAY_SHADOW_BUILD_SUBSTITUTIONS=",_REPLAY_SHADOW_PROXY_URI=${REPLAY_SHADOW_PROXY_URI}"
-    echo "EVAL_REPLAY_SHADOW=true: also building the shadow replay proxy image"
+    echo "Shadow replay proxy: also building its image"
   fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
