@@ -100,6 +100,9 @@ type holdKey struct{ profile, tier, kind, taskID string }
 type holding struct {
 	profile, tier, kind, taskID string
 	unattended                  bool
+	// onJob is a task run on a Job of its own (job.go), whose Job endJob
+	// deletes; a pool task has none.
+	onJob bool
 	// lease and renew are what the task was offered (or, re-adopted, what
 	// its record shows): a config change never moves them.
 	lease, renew time.Duration
@@ -213,8 +216,9 @@ type Dispatcher struct {
 	// running is set while Run holds its answer subscriptions.
 	running atomic.Bool
 	// breakers hold back a (profile, tier) whose tasks keep losing their
-	// workers (breaker.go).
+	// workers (breaker.go), and jobs runs unattended tasks (job.go).
 	breakers *breakers
+	jobs     JobRunner
 	// stopSubs is the live subscription to each profile's stop subject, and
 	// stopped the stops heard live, by profile/task (stop.go).
 	stopSubs map[string]lib.Subscription
@@ -223,6 +227,9 @@ type Dispatcher struct {
 	// one succeeds), and stopReadRetry when to read it again (stop.go).
 	stopStreamErr string
 	stopReadRetry time.Time
+	// jobAdmissionErr is the last refusal of a Job by the admission
+	// policy, "" once one is admitted (job.go).
+	jobAdmissionErr string
 }
 
 // New builds a dispatcher on bus. src is the install config, pool the
@@ -623,6 +630,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	now := d.now()
 	ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if errors.Is(err, errStopped) {
+		d.dropUnstartedJob(ctx, log, prof, hk)
 		d.stopQueued(ctx, log, del, hk)
 		return
 	}
@@ -645,6 +653,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	if ref != nil {
 		log.Info("submission refused at admission", "reason", ref.reason, "detail", ref.detail)
 		d.clearWaiting(hk)
+		d.dropUnstartedJob(ctx, log, prof, hk)
 		d.reject(ctx, log, del, hk, ref)
 		return
 	}
@@ -674,7 +683,21 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 	d.offeringWaiting(hk)
 
-	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	// Job mode needs the profile's Job template; without it (the chart
+	// didn't install the Job admission policy) the pool takes the task.
+	if h.unattended && d.jobs != nil && len(prof.JobTemplate) > 0 {
+		h.onJob = true
+		var ended bool
+		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
+		if ended {
+			// The Job path ended the task itself (no worker): it no
+			// longer waits.
+			d.clearWaiting(hk)
+			return
+		}
+	} else {
+		rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	}
 	if errors.Is(err, errStopped) {
 		// Stopped while being handed out: ended as one stopped in the
 		// queue is, since no worker ever started it.
@@ -704,6 +727,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	d.mu.Unlock()
 	log.Info("task confirmed to a worker", "pod", rec.Pod)
 	d.hold(ctx, log, del, h, rec, key, time.Time{})
+	d.endJob(ctx, log, h)
 }
 
 // holder is the holding for a submission, if this process has one.
@@ -955,7 +979,7 @@ func (d *Dispatcher) registerOfferLocked(h *holding, pod string) chan lib.Dispat
 // offerTo offers h's task to pod, whose offer registerOfferLocked made, and
 // waits up to acceptTimeout for its answer: offer, accept, then the lease
 // record and the confirm, or an abandon (contract addendum 5). The pool's
-// hand-off tries pods in turn with it.
+// hand-off tries pods in turn with it; a Job offers its own pod once.
 func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []byte, snap lib.DispatchConfig,
 	prof lib.DispatchProfile, h *holding, pod string, ch chan lib.DispatchAccept, acceptTimeout time.Duration) (lib.LeaseRecord, string, offerOutcome, error) {
 	ok := offerKey{h.profile, h.tier, pod, h.taskID}
@@ -1080,7 +1104,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier),
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier), onJob: d.cfg.unattended(hk.tier) && d.jobs != nil && len(prof.JobTemplate) > 0,
 		lease: lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()
@@ -1097,6 +1121,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if released {
 		log.Info("re-adopted a task its worker had already finished; settling it", "pod", pod)
 		d.settle(ctx, log, del, h, key, rec)
+		d.endJob(ctx, log, h)
 		return
 	}
 	if rec.Deadline.IsZero() {
@@ -1120,6 +1145,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 		d.mu.Unlock()
 	}
 	d.hold(ctx, log, del, h, rec, key, graceUntil)
+	d.endJob(ctx, log, h)
 }
 
 // hold keeps a running task's submission held (the lib sends the in-progress

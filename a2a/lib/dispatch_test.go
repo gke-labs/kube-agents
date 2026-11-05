@@ -245,6 +245,13 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 	if err := validDispatchConfig().Validate(); err != nil {
 		t.Fatalf("a good config: %v", err)
 	}
+	jobs := validDispatchConfig()
+	jobs.Profiles = append([]DispatchProfile(nil), jobs.Profiles...)
+	jobs.Profiles[0].JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"worker","image":"w"}]}}`)
+	jobs.JobLabels = map[string]string{"app.kubernetes.io/part-of": "kube-agents", DispatchJobLabel: "true", "plain": ""}
+	if err := jobs.Validate(); err != nil {
+		t.Errorf("a config with a Job template and labels: %v", err)
+	}
 	one := validDispatchConfig()
 	one.Ceiling, one.ChildReserve, one.InteractiveReserve = 1, 0, 0
 	if err := one.Validate(); err != nil {
@@ -262,6 +269,13 @@ func TestADispatchConfigIsChecked(t *testing.T) {
 		"short lease":               {func(c *DispatchConfig) { c.LeaseSeconds = 59 }, "three renewals"},
 		"short grace":               {func(c *DispatchConfig) { c.RestartGraceSeconds = 39 }, "two renewals"},
 		"no accept timeout":         {func(c *DispatchConfig) { c.AcceptTimeoutSeconds = 0 }, "acceptTimeoutSeconds"},
+		"overflowing job start":     {func(c *DispatchConfig) { c.JobStartSeconds = 10_000_000_000 }, "over"},
+		"null job template":         {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`null`) }, "jobTemplate"},
+		"empty job template":        {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`{}`) }, "jobTemplate"},
+		"scalar job template":       {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`"x"`) }, "jobTemplate"},
+		"no containers":             {func(c *DispatchConfig) { c.Profiles[0].JobTemplate = json.RawMessage(`{"spec":{"containers":[]}}`) }, "jobTemplate"},
+		"bad job label key":         {func(c *DispatchConfig) { c.JobLabels = map[string]string{"-bad": "x"} }, "jobLabels"},
+		"bad job label value":       {func(c *DispatchConfig) { c.JobLabels = map[string]string{"app": "has space"} }, "jobLabels"},
 		"overflowing stop grace":    {func(c *DispatchConfig) { c.StopGraceSeconds = MaxDispatchSeconds + 1 }, "over"},
 		"overflowing cooldown":      {func(c *DispatchConfig) { c.BreakerCooldownSeconds = MaxDispatchSeconds + 1 }, "over"},
 		"overflowing deadline":      {func(c *DispatchConfig) { c.Profiles[0].ActiveDeadlineSeconds = MaxDispatchSeconds + 1 }, "over"},

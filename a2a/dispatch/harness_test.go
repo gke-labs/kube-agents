@@ -109,6 +109,9 @@ type bus struct {
 
 	mu        sync.Mutex
 	terminals map[string][]terminalSeen
+	// onTerminal, if set before the dispatcher runs, is called with each
+	// terminal's task as it arrives.
+	onTerminal func(taskID string)
 }
 
 type terminalSeen struct {
@@ -228,6 +231,9 @@ func (b *bus) onEvent(msg *nats.Msg) {
 	b.mu.Lock()
 	b.terminals[env.TaskID] = append(b.terminals[env.TaskID], terminalSeen{su.Status.State, text, env.From.Session, class})
 	b.mu.Unlock()
+	if b.onTerminal != nil {
+		b.onTerminal(env.TaskID)
+	}
 }
 
 func (b *bus) terminalsOf(taskID string) []terminalSeen {

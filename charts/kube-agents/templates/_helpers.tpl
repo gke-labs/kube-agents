@@ -174,6 +174,25 @@ true
 {{- end }}
 
 {{/*
+Whether the chart renders the A2A dispatcher's Job admission policy
+(templates/a2a-dispatcher-job-admission-policy.yaml): the same condition, and
+on an upgrade, its param kind's CRD (DispatchJobTemplate) already installed.
+`helm upgrade` never applies crds/, and a policy naming a kind the API server
+doesn't serve refuses every Job in the profile namespace; left out, the
+operator's A2A_DISPATCHER_JOB_POLICY (set from this helper) is too, and
+unattended tasks run on the pool until crds/ is applied (upgrade.sh does) and
+the release upgraded again. `lookup` is empty under `helm template`, which is
+no upgrade, so the template renders there as on a fresh install.
+*/}}
+{{- define "kube-agents.a2aDispatcherJobPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- if or (not .Release.IsUpgrade) (lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "dispatchjobtemplates.kubeagents.x-k8s.io") -}}
+true
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the Hindsight memory store renders. hindsight.enabled is a tri-state:
 true and false are answers, and null (the default) follows the agent's memory
 provider — the providers that need the Hindsight API get it, everything else

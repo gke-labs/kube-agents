@@ -269,9 +269,10 @@ func stopDeadline(cfg lib.DispatchConfig, now time.Time) time.Time { return now.
 
 // stopHeld ends a running task whose executor didn't stop within the grace:
 // the task ends canceled, the worker is told to abandon it (a warm one
-// resets), and it is tombstoned and acked. The canceled terminal is written
-// before the abandon: the worker's own terminal for an abandoned task says
-// failed, and whichever lands first is the task's end.
+// resets), and it is tombstoned and acked; its Job, if it has one, goes
+// after hold. The canceled terminal is written before the abandon: the
+// worker's own terminal for an abandoned task says failed, and whichever
+// lands first is the task's end.
 func (d *Dispatcher) stopHeld(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord) {
 	log.Info("the task didn't stop within the grace; abandoning it", "pod", rec.Pod)
 	// Ended by its requester, not by its worker either way: the breaker

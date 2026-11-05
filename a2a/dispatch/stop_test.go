@@ -188,6 +188,24 @@ func TestAStopEndsCanceledWhenTheWorkerEvictsOnTheAbandon(t *testing.T) {
 	}
 }
 
+// A stopped unattended task's Job is deleted once the task is canceled.
+func TestAStoppedJobIsDeleted(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	withStopStream(t, b)
+	b.ensure("inv", 1, 0, "unattended")
+	w := b.worker("inv", "unattended", "job-task-1", answerAccept, time.Hour)
+	jobs := newFakeJobs(0)
+	b.runDispatcherWith(testConfig(), unattendedInstall(1, func(c *lib.DispatchConfig) { c.StopGraceSeconds = 1 }), &fakeVerifier{}, jobs)
+
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 running on its Job", func() bool { return w.startedTask("task-1") })
+	b.stop("inv", "task-1")
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCanceled {
+		t.Fatalf("terminal %+v, want canceled", ts)
+	}
+	waitFor(t, 5*time.Second, "the stopped task's Job deleted", func() bool { return jobs.deleted("task-1") })
+}
+
 // A running task whose executor ends it within the grace ends as its
 // executor says, with no terminal of the dispatcher's and no abandon.
 func TestATaskEndingWithinTheStopGraceKeepsItsOwnEnd(t *testing.T) {
@@ -306,6 +324,33 @@ func (b *bus) noRedelivery(profile, tier string) {
 	}
 	if info.Delivered.Consumer != 1 {
 		b.t.Errorf("delivered %d times: a stopped task is ended where it is found, not put back in the queue", info.Delivered.Consumer)
+	}
+}
+
+// A stop while the task's Job is still starting ends the wait: the Job is
+// deleted, nothing is offered, and the task ends canceled, not no-worker,
+// and doesn't count against the breaker.
+func TestAStopWhileTheJobStartsDeletesIt(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	withStopStream(t, b)
+	b.ensure("inv", 1, 0, "unattended")
+	w := b.worker("inv", "unattended", "job-task-1", answerAccept, time.Hour)
+	jobs := newFakeJobs(time.Hour)
+	d, _ := b.runDispatcherWith(testConfig(), unattendedInstall(1, func(c *lib.DispatchConfig) { c.BreakerThreshold = 1 }), &fakeVerifier{}, jobs)
+
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "the Job launched", func() bool { return jobs.launchCount() == 1 })
+	b.stop("inv", "task-1")
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonStopped) {
+		t.Errorf("terminal %+v, want canceled stopped", ts)
+	}
+	waitFor(t, 5*time.Second, "the Job deleted", func() bool { return jobs.deleted("task-1") })
+	if w.offerCount() != 0 {
+		t.Errorf("%d offers to a stopped task's Job pod", w.offerCount())
+	}
+	if open := d.Health().OpenBreakers; len(open) != 0 {
+		t.Errorf("open breakers %v: a stop is not a worker failure", open)
 	}
 }
 
