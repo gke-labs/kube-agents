@@ -91,7 +91,7 @@ The `git` the broker runs itself for its version-control and workspace routes is
 
 The proposal readings take as long as the forge allows. The sweep sends GitHub's search API at most 25 calls a minute, under the 30 it serves, and reads each proposal's events within 1000 forge calls an hour. On an install whose GitHub repositories need more searches than that per sweep, a sweep takes longer than 240 seconds and `kubeagents_vcs_readings_age_seconds` grows with it. Each reading is still whole or absent: a slower sweep does not change what it counts.
 
-The per-proposal reads also stop, until the quota resets, while the forge reports the remaining quota at or under 300 calls or a tenth of its limit, whichever is larger. On GitHub each repository owner's App installation has its own quota, so one owner's spent quota stops only that owner's reads; on GitLab the quota covers the whole host.
+The per-proposal reads also stop, until the quota resets, while the forge reports the remaining quota at or under 300 calls or a tenth of its limit, whichever is larger. The floor is never more than half the limit, and a pause lasts at most an hour. On GitHub each repository owner's App installation has its own quota, so one owner's spent quota stops only that owner's reads; on GitLab the quota covers the whole host.
 
 #### A2A gateway series
 

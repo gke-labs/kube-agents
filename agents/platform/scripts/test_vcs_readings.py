@@ -1052,6 +1052,21 @@ class QuotaPacingTest(unittest.TestCase):
         self.assertEqual(300, vcs_readings.quota_floor(None))
         self.assertEqual(1500, vcs_readings.quota_floor(15000))
 
+    def test_the_floor_never_takes_more_than_half_a_small_limit(self):
+        self.assertEqual(300, vcs_readings.quota_floor(600))
+        self.assertEqual(200, vcs_readings.quota_floor(400))
+        self.assertEqual(150, vcs_readings.quota_floor(300))
+        self.assertEqual(0, vcs_readings.quota_floor(1))
+
+    def test_a_small_reported_limit_leaves_step_two_room(self):
+        # A fresh window on a forge configured for 300 calls: nothing spent.
+        forge = proposals_forge(5, QuotaReading(300, 300, QUOTA_RESET))
+        harness = Harness({REPO: forge}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual(5 * PER_PROPOSAL, forge.detail_calls())
+        self.assertIsNotNone(harness.last()[1])
+        self.assertEqual([], harness.metrics.failures)
+
     def test_step_two_stops_at_the_floor_and_records_quota_floor(self):
         for quota in (QuotaReading(QUOTA_LIMIT, 500, QUOTA_RESET), QuotaReading(None, 300, QUOTA_RESET)):
             with self.subTest(quota=quota):
@@ -1129,6 +1144,36 @@ class QuotaPacingTest(unittest.TestCase):
         self.assertEqual(5 * PER_PROPOSAL, forge.detail_calls())
         self.assertIsNotNone(harness.last()[1])
         self.assertEqual(["quota_floor", "quota_floor"], harness.metrics.failures)
+
+    def test_an_at_floor_reading_whose_reset_has_passed_does_not_stop_step_two(self):
+        harness_reset = 999.0  # the fake clock starts at 1000
+        forge = proposals_forge(5, QuotaReading(QUOTA_LIMIT, 100, harness_reset))
+        harness = Harness({REPO: forge}, interval=WIDE)
+        harness.sweep.run_once()
+        self.assertEqual(5 * PER_PROPOSAL, forge.detail_calls())
+        self.assertIsNotNone(harness.last()[1])
+        self.assertEqual([], harness.metrics.failures)
+
+    def test_a_pause_lasts_at_most_an_hour_whatever_reset_the_forge_reports(self):
+        # A reset in milliseconds, not seconds: decades away if taken as is.
+        forge = proposals_forge(5, QuotaReading(QUOTA_LIMIT, 100, 1767225600000.0))
+        harness = Harness({REPO: forge}, interval=WIDE)
+        with self.assertLogs(LOGGER_NAME, level="INFO") as logs:
+            harness.sweep.run_once()
+        self.assertEqual(0, forge.detail_calls())
+        self.assertTrue(any("resets in 3600s" in line for line in logs.output), logs.output)
+
+        forge.quota = None
+        start = harness.clock.now
+        harness.clock.now = start + vcs_readings.VCS_READINGS_MAX_PAUSE_SECONDS - 1
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(0, forge.detail_calls(), "still inside the hour")
+
+        harness.clock.now = start + vcs_readings.VCS_READINGS_MAX_PAUSE_SECONDS
+        forge.calls.clear()
+        harness.sweep.run_once()
+        self.assertEqual(5 * PER_PROPOSAL, forge.detail_calls())
 
     def test_above_the_floor_the_hourly_budget_is_still_the_ceiling(self):
         forge = proposals_forge(500, QuotaReading(QUOTA_LIMIT, 4000, QUOTA_RESET))

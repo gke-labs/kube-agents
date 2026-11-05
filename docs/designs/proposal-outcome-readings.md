@@ -284,14 +284,18 @@ hourly quota, which the agent's own verbs share. So step 2 is budgeted by the ho
 not in proposals: `VCS_READINGS_DETAIL_CALLS_PER_HOUR` (1000, a fifth of GitHub's five-thousand-call
 installation quota) spread evenly over the sweeps in an hour, about sixty calls a sweep at the
 default TTL, about nine ordinary proposals or fewer long ones, so a refill of a thousand proposals
-takes about seven hours and never starves the agent's own verbs. The budget is per install, so it
-is a ceiling rather than the only bound (#4615): before each proposal's step-2 reads the sweep
+takes about seven hours. The budget is per install, though, and installs that share one App
+installation spend theirs against the same quota as the agents' own verbs, so it is a ceiling
+rather than the only bound: before each proposal's step-2 reads the sweep
 consults the quota the forge last reported in its response headers (GitHub's `core`
 `x-ratelimit-*`, GitLab's `ratelimit-*`; Gitea and Bitbucket report none this code reads, and the
 budget alone applies there). At or under `VCS_READINGS_QUOTA_FLOOR` (300) or a tenth of the
-reported limit, whichever is larger, step 2 stops until the reported reset for every repository
+reported limit, whichever is larger, but never more than half the limit, step 2 stops until the
+reported reset, and for at most an hour, for every repository
 that spends that quota, and each repository it leaves unread records `reason="quota_floor"`; a
-rate-limited step-2 call whose answer reports the quota spent pauses the quota the same way. On
+rate-limited step-2 call whose answer reports the quota spent pauses the quota the same way. A
+reading whose reset has already passed stops nothing: its window has closed, and only a call can
+bring a fresh one. On
 GitHub a quota is one owner's on one host, since the sweep token is minted per owner from that
 owner's App installation, so one owner's drained quota pauses no other owner's reads; on GitLab it
 is the whole host, which one static token reads. The details reading is taken only

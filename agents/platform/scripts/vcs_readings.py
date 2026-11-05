@@ -62,10 +62,17 @@ VCS_READINGS_DETAIL_CALLS_PER_HOUR = 1000
 # and installs that share one App installation each spend theirs against the
 # one quota (#4611); the agents' own forge calls draw on that quota too, so the
 # sweep leaves them the floor: a tenth of the forge's limit, never under three
-# hundred calls, and three hundred where the forge reports no limit. Where the
-# forge reports no quota at all, the hourly budget is the only bound, as before.
+# hundred calls, and three hundred where the forge reports no limit. The floor
+# never takes more than half a reported limit, so a forge configured with a
+# small quota still leaves step 2 some of it. Where the forge reports no quota
+# at all, the hourly budget is the only bound, as before.
 VCS_READINGS_QUOTA_FLOOR = 300
-VCS_READINGS_QUOTA_FLOOR_SHARE = 10  # percent of the forge's reported limit
+VCS_READINGS_QUOTA_FLOOR_DIVISOR = 10  # the floor is limit // this, at least VCS_READINGS_QUOTA_FLOOR
+VCS_READINGS_QUOTA_FLOOR_CAP_DIVISOR = 2  # and at most limit // this
+# The longest a quota stays paused, whatever reset the forge reported: both
+# forges' windows are at most an hour, so a later reset is a unit or clock
+# error, and an hour bounds what it costs.
+VCS_READINGS_MAX_PAUSE_SECONDS = 3600
 VCS_READINGS_IGNORED_AFTER_SECONDS = 14 * 24 * 3600
 # The per-proposal gauge's cumulative `le` edges.
 VCS_READINGS_BUCKETS = (0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0, math.inf)
@@ -265,7 +272,8 @@ def quota_floor(limit: int | None) -> int:
     """The remaining quota at or under which step 2 stops, for a forge's `limit`."""
     if limit is None:
         return VCS_READINGS_QUOTA_FLOOR
-    return max(VCS_READINGS_QUOTA_FLOOR, limit * VCS_READINGS_QUOTA_FLOOR_SHARE // 100)
+    floor = max(VCS_READINGS_QUOTA_FLOOR, limit // VCS_READINGS_QUOTA_FLOOR_DIVISOR)
+    return min(floor, limit // VCS_READINGS_QUOTA_FLOOR_CAP_DIVISOR)
 
 
 def _known_quota(transport: Any) -> Any:
@@ -792,6 +800,10 @@ class ReadingsSweep:
             )
         if reading.remaining > floor:
             return False
+        if reading.reset_at is not None and reading.reset_at <= self._wall():
+            # The window this reading describes has closed, and only a call
+            # can bring a fresh one: go on, under the hourly budget.
+            return False
         self._pause(bound.quota_key, reading, f"remaining={reading.remaining} floor={floor}")
         return True
 
@@ -804,15 +816,20 @@ class ReadingsSweep:
             self._pause(bound.quota_key, reading, "rate-limited, remaining=0")
 
     def _pause(self, key: tuple[str, str], reading: Any, why: str) -> None:
+        now = self._wall()
         reset_at = reading.reset_at
-        if reset_at is None or reset_at <= self._wall() or self._paused.get(key) == reset_at:
+        if reset_at is None or reset_at <= now:
             return
-        self._paused[key] = reset_at
+        current = self._paused.get(key)
+        if current is not None and current > now:
+            return
+        until = min(reset_at, now + VCS_READINGS_MAX_PAUSE_SECONDS)
+        self._paused[key] = until
         host, scope = key
         LOGGER.info(
             "proposal readings: per-proposal reads paused for %s until the forge's quota resets in %ds (%s)",
             f"{host} ({scope})" if scope else host,
-            int(reset_at - self._wall()),
+            int(until - now),
             why,
         )
 
