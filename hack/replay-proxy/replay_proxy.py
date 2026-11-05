@@ -550,18 +550,41 @@ class ShadowProxy:
             finally:
                 self._queue.task_done()
 
-    def _scrubbed_message(self, walked: Any) -> Optional[str]:
-        """A normalized message as scrubbed text, or None when it cannot be scrubbed."""
+    def _secret_reads(self, raw: List[Any], walked: List[Any]) -> Optional[set]:
+        """The ids, as the walked messages name them, of tool calls that print a secret; None when unknowable.
+
+        Computed from the raw request, as the request store does, and carried to
+        the walked messages through each tool result's walked `tool_call_id`.
+        """
         if not self.scrubber.available:
             return None
         try:
-            return self.scrubber.text(request_store.KIND_TOOL_RESULT, json.dumps(walked, sort_keys=True, ensure_ascii=False))
+            reads = self.scrubber.secret_read_call_ids(raw)
+        except Exception:
+            return None
+        return {
+            walked_message.get(request_store.TOOL_CALL_ID_KEY)
+            for raw_message, walked_message in zip(raw, walked)
+            if isinstance(raw_message, dict) and isinstance(walked_message, dict)
+            and raw_message.get(request_store.TOOL_CALL_ID_KEY) in reads
+        }
+
+    def _scrubbed_message(self, walked: Any, secret_reads: Optional[set]) -> Optional[str]:
+        """A normalized message scrubbed as the request store scrubs one, or None when it cannot be.
+
+        A tool result whose call printed a secret is withheld whole
+        (`secret_reads`, from _secret_reads); None there means nothing is scrubbed.
+        """
+        if secret_reads is None:
+            return None
+        try:
+            return json.dumps(self.scrubber.message(walked, secret_reads), sort_keys=True, ensure_ascii=False)
         except Exception:
             return None
 
     def record(
         self, entry: Dict[str, Any], upstream: Dict[str, Any], normalized: normalizer.NormalizedRequest,
-        diag_walked: List[Any], received: float,
+        raw_messages: List[Any], diag_walked: List[Any], received: float,
     ) -> bool:
         """Record mode: save a storable answer under its fingerprint; True when this call saved it."""
         mapping = normalized.mapping
@@ -585,16 +608,20 @@ class ShadowProxy:
             replay_cache.ENTRY_RECORDED_AT: received,
             replay_cache.ENTRY_NORMALIZER_VERSION: self.key_context.normalizer_version,
         })
-        # Each distinct message once, normalized and scrubbed, for a later miss's snippet.
-        for message_hash, walked in zip(entry[F.DIAG_MESSAGE_HASHES], diag_walked):
-            text = self._scrubbed_message(walked)
+        # Each distinct message once, normalized and scrubbed, for a later miss's
+        # snippet. Most are already saved (every request repeats its history), so
+        # only the new ones are scrubbed, against the whole request's secret reads.
+        missing = [(h, w) for h, w in zip(entry[F.DIAG_MESSAGE_HASHES], diag_walked) if not self.cache.has_message(h)]
+        secret_reads = self._secret_reads(raw_messages, diag_walked) if missing else None
+        for message_hash, walked in missing:
+            text = self._scrubbed_message(walked, secret_reads)
             if text is not None:
                 self.cache.save_message(message_hash, text)
         if saved:
             self.metrics.add("recorded")
         return saved
 
-    def miss_block(self, entry: Dict[str, Any], diag_walked: List[Any]) -> Dict[str, Any]:
+    def miss_block(self, entry: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any]) -> Dict[str, Any]:
         """Replay mode, on a miss: the closest saved request and where this one first differs."""
         if self.index_empty:
             return {F.MISS_ROLE: F.MISS_ROLE_NO_CACHE}
@@ -602,7 +629,9 @@ class ShadowProxy:
         candidates, matched = self.index.candidates(entry[F.DIAG_SETTINGS_HASH], hashes)
         if not candidates:
             return {F.MISS_ROLE: F.MISS_ROLE_SETTINGS, F.MISS_MATCHED_MESSAGES: 0}
-        current = self._scrubbed_message(diag_walked[matched]) if matched < len(hashes) else None
+        current = None
+        if matched < len(hashes):
+            current = self._scrubbed_message(diag_walked[matched], self._secret_reads(raw_messages, diag_walked))
         closest, saved = self._most_alike(candidates, matched, current)
         block: Dict[str, Any] = {
             F.MISS_CLOSEST_FINGERPRINT: closest.get(replay_cache.ENTRY_FINGERPRINT),
@@ -712,13 +741,14 @@ class ShadowProxy:
         # eval-only bucket, never to Prow artifacts.
         entry[F.MESSAGE_HASHES] = normalized.message_hashes
         messages = body.get(request_store.MESSAGES_KEY)
-        diag_hashes, diag_walked = self.diagnosis.normalized(messages if isinstance(messages, list) else [], received)
+        raw_messages = messages if isinstance(messages, list) else []
+        diag_hashes, diag_walked = self.diagnosis.normalized(raw_messages, received)
         entry[F.DIAG_MESSAGE_HASHES] = diag_hashes
         entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
         if self.config.mode == F.MODE_RECORD:
-            entry[F.RECORDED] = self.record(entry, upstream, normalized, diag_walked, received)
+            entry[F.RECORDED] = self.record(entry, upstream, normalized, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
-            entry[F.MISS] = self.miss_block(entry, diag_walked)
+            entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked)
         entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)
         skipped = self.store.store(request_id, fingerprint, body)
         entry[F.STORED] = skipped is None

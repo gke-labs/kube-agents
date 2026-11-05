@@ -153,6 +153,9 @@ class AnswerCache:
     def save_message(self, message_hash: str, text: str) -> bool:
         return self._write_once(self._path(MESSAGES_DIR, message_hash), json.dumps(text, ensure_ascii=True))
 
+    def has_message(self, message_hash: str) -> bool:
+        return os.path.exists(self._path(MESSAGES_DIR, message_hash))
+
     def load_message(self, message_hash: str) -> Optional[str]:
         try:
             with open(self._path(MESSAGES_DIR, message_hash), encoding=TEXT_ENCODING) as handle:

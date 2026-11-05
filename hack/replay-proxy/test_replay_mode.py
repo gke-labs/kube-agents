@@ -170,12 +170,55 @@ class RecordTest(ProxyTestCase):
         stored = "".join(Path(self.cache_dir, replay_cache.MESSAGES_DIR, m).read_text() for m in messages)
         self.assertNotIn(TOKEN, stored, "saved messages are scrubbed")
 
+    def test_only_messages_not_yet_saved_are_scrubbed(self):
+        scrubbed = []
+        original = self.proxy._scrubbed_message
+        self.proxy._scrubbed_message = lambda walked, reads: scrubbed.append(walked) or original(walked, reads)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False))
+        self.lines(1)
+        self.assertEqual(len(scrubbed), 2)
+        extra = ({"role": "user", "content": "one more turn"},)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=extra))
+        self.lines(2)
+        self.assertEqual(len(scrubbed), 3, "only the new turn is scrubbed; the rest were saved already")
+
     def test_unstorable_answer_is_not_saved(self):
         FakeLiteLLM.fallbacks = "1"
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=False))
         line = self.lines(1)[0]
         self.assertFalse(line["recorded"])
         self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
+
+
+class SecretReadTest(ProxyTestCase):
+    """A tool result whose call printed a secret reaches neither the saved messages nor a miss line."""
+
+    @staticmethod
+    def body(value, task):
+        return {"model": "model-default", "stream": False, "messages": [
+            {"role": "system", "content": "You are the platform agent."},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "call_s", "type": "function", "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d"})}}]},
+            {"role": "tool", "tool_call_id": "call_s", "content": f"plain looking value {value}"},
+            {"role": "user", "content": f"work kanban task {task}"},
+        ]}
+
+    def test_a_secret_read_result_is_withheld_in_the_cache_and_in_a_miss(self):
+        _, record_port, record_out = self.start_proxy(mode="record")
+        self.request("POST", COMPLETIONS, self.body("hunter2", "t_11111111"), port=record_port)
+        self.lines(1, record_out)
+        _, replay_port, replay_out = self.start_proxy(mode="replay", allow_serve=True)
+        self.request("POST", COMPLETIONS, self.body("swordfish", "t_11111111"), port=replay_port)
+        miss = self.lines(1, replay_out)[0]["miss"]
+        self.assertEqual((miss["index"], miss["role"]), (2, "tool"))
+        saved = "".join(p.read_text() for p in Path(self.cache_dir, replay_cache.MESSAGES_DIR).iterdir())
+        logged = replay_out.getvalue()
+        for value in ("hunter2", "swordfish"):
+            self.assertNotIn(value, saved)
+            self.assertNotIn(value, logged)
+        self.assertIn("REDACTED_RESULT", saved)
+        self.assertEqual(miss["saved_snippet"], miss["current_snippet"], "both sides are withheld alike")
 
 
 class ShadowNeverServesTest(ProxyTestCase):
