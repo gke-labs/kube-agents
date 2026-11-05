@@ -301,9 +301,15 @@ func (a *GoogleChatAdapter) rememberRating(message string, r gchatRating) {
 	remember(&ux.ratedOrder, message, func(k string) { delete(ux.rated, k) })
 }
 
-// gchatTapTimes is a rater's newest tap time on a message, and the time it
-// displaced, which a failed write of the newest restores (forgetTap).
-type gchatTapTimes struct{ at, displaced string }
+// gchatTapTimes is a rater's newest tap time on a message, at, whether its
+// write has succeeded, and displaced, the newest time below it whose write
+// succeeded, which a failed write of at restores (forgetTap). displaced
+// only ever holds a written time.
+type gchatTapTimes struct {
+	at        string
+	written   bool
+	displaced string
+}
 
 // gchatTapKey keys a rater's taps on a message in ux.tapped.
 func gchatTapKey(message, rater string) string {
@@ -336,12 +342,41 @@ func (a *GoogleChatAdapter) takeTap(message, rater, at string) {
 	if ok && !gchatTapOlder(recorded.at, at) {
 		return
 	}
-	ux.tapped[key] = gchatTapTimes{at: at, displaced: recorded.at}
+	displaced := recorded.displaced
+	if recorded.written {
+		displaced = recorded.at
+	}
+	ux.tapped[key] = gchatTapTimes{at: at, displaced: displaced}
 	remember(&ux.tappedOrder, key, func(k string) { delete(ux.tapped, k) })
 }
 
-// forgetTap undoes takeTap for at, when it is still rater's newest tap on
-// message: the time it displaced is newest again, or none is.
+// wroteTap marks at's write as succeeded: written when at is still rater's
+// newest tap on message, or the time a failed write of the newest restores
+// when at is newer than the one held there.
+func (a *GoogleChatAdapter) wroteTap(message, rater, at string) {
+	if at == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ux := a.uxLocked()
+	key := gchatTapKey(message, rater)
+	recorded, ok := ux.tapped[key]
+	switch {
+	case !ok:
+	case recorded.at == at:
+		recorded.written = true
+		ux.tapped[key] = recorded
+	case gchatTapOlder(at, recorded.at) && (recorded.displaced == "" || gchatTapOlder(recorded.displaced, at)):
+		recorded.displaced = at
+		ux.tapped[key] = recorded
+	}
+}
+
+// forgetTap undoes takeTap for at after its write failed, while at is still
+// rater's newest tap on message: the written time it displaced is newest
+// again, or none is. Otherwise displaced, which holds only written times,
+// already leaves it out.
 func (a *GoogleChatAdapter) forgetTap(message, rater, at string) {
 	if at == "" {
 		return
@@ -354,7 +389,7 @@ func (a *GoogleChatAdapter) forgetTap(message, rater, at string) {
 	switch {
 	case recorded.at != at:
 	case recorded.displaced != "":
-		ux.tapped[key] = gchatTapTimes{at: recorded.displaced}
+		ux.tapped[key] = gchatTapTimes{at: recorded.displaced, written: true}
 	default:
 		delete(ux.tapped, key)
 		forget(&ux.tappedOrder, key)
@@ -435,8 +470,10 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 // is superseded and dropped before Rate. An older tap whose Rate was already
 // running when the newer one came in is recorded and patched, the newer one
 // repaints after it, and its 👎 asks for no note while the newer one stands.
-// A failed Rate restores the tap time this tap displaced. A tap with no
-// event time is never superseded. A kept 👎 then asks for a note (askForNote). The
+// A failed Rate restores the newest written tap time below this tap's while
+// this tap is still the newest; otherwise its time is already left out,
+// since a restored time is always one whose write succeeded. A tap
+// with no event time is never superseded. A kept 👎 then asks for a note (askForNote). The
 // tap claims no question: a choice click on the message is still a turn.
 func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 	click := ev.click
@@ -496,6 +533,7 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 			a.log.Warn("gchat: recording a rating failed", "message", message, "taskId", task, "err", err)
 			return
 		}
+		a.wroteTap(message, rater, at)
 		// A later tap taken while Rate ran patches after this one, under
 		// the same lock, so this patch never outlives it.
 		if a.rememberTap(message, chosen) {

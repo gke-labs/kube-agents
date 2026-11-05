@@ -720,6 +720,83 @@ func TestGchatAFailedTapWriteRestoresTheTimeItDisplaced(t *testing.T) {
 	checkFilled(t, bodyButtons(t, checkPatch(t, f, 0, gchatRatedMessage)), "up")
 }
 
+// tapsDuringFirstRate classifies taps, each a rating and an event time, by
+// one rater on one message: the rest are taken while the first tap's Rate
+// runs. It then waits for every rewrite to finish.
+func tapsDuringFirstRate(t *testing.T, a *GoogleChatAdapter, rec *fakeRecorder, taps ...[2]string) {
+	t.Helper()
+	a.syncRewrites = false
+	entered, taken := make(chan struct{}), make(chan struct{})
+	var rates atomic.Int32
+	rec.onRate = func() {
+		if rates.Add(1) == 1 {
+			close(entered)
+			<-taken
+		}
+	}
+	for i, tap := range taps {
+		ev := gchatRatingEvent(t, tap[0])
+		ev.click.EventTime = tap[1]
+		a.classify(ev)
+		if i == 0 {
+			<-entered
+		}
+	}
+	close(taken)
+	a.rewrites.Wait()
+	rec.mu.Lock()
+	rec.failRating = ""
+	rec.onRate = nil
+	rec.mu.Unlock()
+}
+
+// A (t1) is in Rate when B (t2) is taken, and both writes fail: no time is
+// left on record, so a late tap older than both is recorded and drawn.
+func TestGchatTwoFailedTapWritesInARowLeaveNoPhantomTime(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.failRating = "down"
+	tapsDuringFirstRate(t, a, rec, [2]string{"down", "2026-10-29T20:05:01Z"}, [2]string{"down", "2026-10-29T20:05:02Z"})
+	late := gchatRatingEvent(t, "up")
+	late.click.EventTime = "2026-10-29T20:05:00Z"
+	a.classify(late)
+	a.rewrites.Wait()
+	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "up" {
+		t.Fatalf("ratings = %+v, want the late 👍 alone", got)
+	}
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 0, gchatRatedMessage)), "up")
+}
+
+// A (t1) is in Rate when B (t2) and C (t3) are taken. A writes, B is dropped
+// as superseded, and C's write fails: the time on record is A's, never B's,
+// so a late tap between t1 and t2 is recorded and drawn. The record calls
+// are driven in that order directly, since which of B and C takes the lock
+// first is the scheduler's choice.
+func TestGchatADroppedTapNeverBecomesTheRestoredTime(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	const rater, t1, t2, t3 = "sender@example.com", "2026-10-29T20:06:01Z", "2026-10-29T20:06:02Z", "2026-10-29T20:06:03Z"
+	a.takeTap(gchatRatedMessage, rater, t1)
+	a.takeTap(gchatRatedMessage, rater, t2)
+	a.takeTap(gchatRatedMessage, rater, t3)
+	a.wroteTap(gchatRatedMessage, rater, t1)
+	if !a.tapSuperseded(gchatRatedMessage, rater, t2) {
+		t.Fatal("B is not superseded by C")
+	}
+	a.forgetTap(gchatRatedMessage, rater, t3)
+	a.mu.Lock()
+	got := a.uxLocked().tapped[gchatTapKey(gchatRatedMessage, rater)]
+	a.mu.Unlock()
+	if got != (gchatTapTimes{at: t1, written: true}) {
+		t.Fatalf("record = %+v, want A's time, written", got)
+	}
+	late := gchatRatingEvent(t, "down")
+	late.click.EventTime = "2026-10-29T20:06:01.5Z"
+	a.classify(late)
+	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "down" {
+		t.Fatalf("ratings = %+v, want the late 👎", got)
+	}
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 0, gchatRatedMessage)), "down")
+}
+
 // A tap with no event time is never superseded, and never supersedes: a
 // timed tap after a timeless one is recorded and drawn.
 func TestGchatTapWithoutEventTimeIsNeverSuperseded(t *testing.T) {

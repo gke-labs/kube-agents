@@ -123,8 +123,8 @@ Rating, Answer: the message text as the event carries it}`. `Rate` runs off the 
 a deadline, and under the message's rewrite lock with the patch, so taps on one message take
 effect in turn. A tap older than the same rater's newest tap on the message is superseded and
 gets no write. An older tap whose write was already running when the newer tap came in patches,
-and the newer tap repaints after it. A failed write of the newer tap restores the time it
-displaced. On success the adapter patches the answer with the tapped rating button
+and the newer tap repaints after it. A failed write of the newer tap restores the newest
+earlier tap time whose write succeeded. On success the adapter patches the answer with the tapped rating button
 `type: FILLED` and the other plain, and remembers the rating per message so later rewrites
 redraw it. The text and the other widgets come from the adapter's record of the message when
 it has one, so a tap can never restore choice buttons the answered rewrite removed, and from the

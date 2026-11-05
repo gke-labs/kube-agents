@@ -2425,7 +2425,8 @@ older than one the same rater has already made is superseded: it is dropped befo
 recorded, with no patch and no note card. An older tap whose write was already running when the
 newer tap came in is recorded and patched, and the newer tap repaints after it. That older 👎
 asks for no note while the newer tap stands. When the newer tap's write fails, the adapter
-restores the time the newer tap displaced, and the older 👎 stays recorded and drawn. Whether its
+restores the newest earlier tap time whose write succeeded, never a dropped or failed tap's,
+and the older 👎 stays recorded and drawn. Whether its
 note card was posted then depends on timing; a tap after that opens a new card. An older tap from
 another rater is kept, and leaves the buttons as the newest tap drew them. A tap with no event
 time is never superseded.
