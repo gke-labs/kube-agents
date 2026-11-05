@@ -296,3 +296,98 @@ func TestOnePoolFailureDoesntStrandTheRest(t *testing.T) {
 		t.Errorf("a pool survived teardown because the RBAC delete failed: %v", err)
 	}
 }
+
+// A profile with tools has PATH rebuilt with the tools' bin directories in
+// front, and the credential proxy's shims stay ahead of the system
+// directories, so kubectl and gcloud still go through the broker.
+func TestAToolEquippedWorkerKeepsTheBrokerShimsOnPath(t *testing.T) {
+	agent := a2aTestAgent()
+	profile := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Tools = []agentv1alpha1.AgentProfileTool{{Name: "jq", Image: "registry.example/jq:1"}}
+	})
+	spec := buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, false)
+	path := envOf(spec.Containers[0])["PATH"]
+	dirs := strings.Split(path, ":")
+	shims, system := -1, -1
+	for i, d := range dirs {
+		if d == "/opt/credential-proxy/bin" && shims < 0 {
+			shims = i
+		}
+		if d == "/usr/bin" && system < 0 {
+			system = i
+		}
+	}
+	if !strings.Contains(path, "jq") {
+		t.Fatalf("PATH %q has no tool directory; the profile's tools aren't on it", path)
+	}
+	if shims < 0 || system < 0 || shims > system {
+		t.Errorf("PATH %q: the credential proxy's shims must come before the system directories", path)
+	}
+}
+
+// The sweep of removed profiles' pools runs past failures: a CA bundle copy
+// the profile namespace refuses doesn't skip it, and one pool whose delete
+// is refused doesn't keep the others running.
+func TestTheSweepRunsPastFailures(t *testing.T) {
+	withDispatcher(t)
+	agent := a2aTestAgent()
+	pns := profileNamespaceName(agent)
+	scheme := setupScheme()
+	bundle := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace},
+		Data:       map[string]string{a2aNATSCACertKey: "pem"},
+	}
+	funcs := fakeServerSideApplyInterceptors()
+	apply := funcs.Patch
+	failBundle := false
+	funcs.Patch = func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+		if failBundle && obj.GetNamespace() == pns && obj.GetName() == a2aNATSCABundleName(agent) {
+			return apierrors.NewForbidden(corev1.Resource("configmaps"), obj.GetName(), nil)
+		}
+		return apply(ctx, cl, obj, patch, opts...)
+	}
+	funcs.Delete = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		if obj.GetName() == profilePoolName("b", "read") {
+			return apierrors.NewForbidden(appsv1.Resource("deployments"), obj.GetName(), nil)
+		}
+		return cl.Delete(ctx, obj, opts...)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(agent, chartProfileNamespace(agent), bundle).WithInterceptorFuncs(funcs).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	pool := func(name string) error {
+		return c.Get(ctx, types.NamespacedName{Namespace: pns, Name: profilePoolName(name, "read")}, &appsv1.Deployment{})
+	}
+	profiles := func(names ...string) []agentv1alpha1.AgentProfile {
+		var out []agentv1alpha1.AgentProfile
+		for _, n := range names {
+			out = append(out, testAgentProfile(agent.Namespace, n))
+		}
+		return out
+	}
+
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles("a", "b", "c", "keep"), true); err != nil || profileErr != nil {
+		t.Fatalf("setup: %v / %v", err, profileErr)
+	}
+	for _, n := range []string{"a", "b", "c", "keep"} {
+		if err := pool(n); err != nil {
+			t.Fatalf("setup: pool %s: %v", n, err)
+		}
+	}
+	// a, b and c are removed; the bundle copy is now refused, and so is b's
+	// delete.
+	failBundle = true
+	profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles("keep"), true)
+	if err == nil && profileErr == nil {
+		t.Error("the refused bundle copy and pool delete weren't reported")
+	}
+	for _, n := range []string{"a", "c"} {
+		if err := pool(n); !apierrors.IsNotFound(err) {
+			t.Errorf("removed profile %s's pool survived the sweep: %v", n, err)
+		}
+	}
+	if err := pool("b"); err != nil {
+		t.Errorf("the pool whose delete was refused is gone anyway (the test's premise): %v", err)
+	}
+}

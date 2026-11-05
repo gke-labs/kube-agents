@@ -77,7 +77,10 @@ const (
 
 	// profileWorkerImagePath is the worker image's PATH, which the tools'
 	// bin directories go in front of.
-	profileWorkerImagePath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	// The credential proxy's shims come first, as the image puts them
+	// (a2a/Dockerfile.worker): kubectl and gcloud resolve to them, and the
+	// image ships no native binary under those names.
+	profileWorkerImagePath = "/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 	// profileWorkerModelKey only satisfies the harness's "an API key exists"
 	// check: the install's inference gateway runs keyless (the session
@@ -315,23 +318,24 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 		// Nothing left to mount the bundle copy either.
 		return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
 	}
-	// The CA bundle the pools mount, copied before the pools that need it.
-	src := &corev1.ConfigMap{}
-	if err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSCABundleName(agent)}, src); err != nil {
-		return fmt.Errorf("reading the NATS CA bundle to copy into the profile namespace: %w", err)
-	}
-	if err := r.applyManaged(ctx, agent, buildProfileCABundle(agent, src.Data)); err != nil {
-		return fmt.Errorf("the profile namespace's NATS CA bundle: %w", err)
-	}
-	// One pool the API server refuses (a profile whose requests exceed its
-	// limits, a webhook) doesn't hold up the others or the sweep: a pool it
-	// failed to apply is still wanted, so the sweep leaves it alone.
 	want := map[string]bool{}
-	var errs []error
 	for _, pool := range pools {
 		want[pool.Name] = true
-		if err := r.applyManaged(ctx, agent, pool); err != nil {
-			errs = append(errs, fmt.Errorf("the warm pool %s: %w", pool.Name, err))
+	}
+	var errs []error
+	// The CA bundle the pools mount, copied before the pools that need it.
+	// A copy that fails skips the pool applies (they would mount nothing)
+	// but not the sweep, which needs nothing from it.
+	if err := r.copyProfileCABundle(ctx, agent); err != nil {
+		errs = append(errs, err)
+	} else {
+		// One pool the API server refuses (a profile whose requests exceed
+		// its limits, a webhook) doesn't hold up the others or the sweep: a
+		// pool it failed to apply is still wanted, so the sweep leaves it.
+		for _, pool := range pools {
+			if err := r.applyManaged(ctx, agent, pool); err != nil {
+				errs = append(errs, fmt.Errorf("the warm pool %s: %w", pool.Name, err))
+			}
 		}
 	}
 	errs = append(errs, r.deleteProfilePoolsExcept(ctx, agent, want))
@@ -342,22 +346,38 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 // namespace whose names aren't in keep. A pool without this agent's labels is
 // someone else's and stays. Read uncached: the profile namespace's
 // Deployments aren't in the manager's cache.
+// copyProfileCABundle copies the agent's NATS CA bundle into the profile
+// namespace, where the pools' pods can mount it.
+func (r *PlatformAgentReconciler) copyProfileCABundle(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	src := &corev1.ConfigMap{}
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aNATSCABundleName(agent)}, src); err != nil {
+		return fmt.Errorf("reading the NATS CA bundle to copy into the profile namespace: %w", err)
+	}
+	if err := r.applyManaged(ctx, agent, buildProfileCABundle(agent, src.Data)); err != nil {
+		return fmt.Errorf("the profile namespace's NATS CA bundle: %w", err)
+	}
+	return nil
+}
+
 func (r *PlatformAgentReconciler) deleteProfilePoolsExcept(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keep map[string]bool) error {
 	pools := &appsv1.DeploymentList{}
 	if err := r.a2aReader().List(ctx, pools, client.InNamespace(profileNamespaceName(agent)),
 		client.MatchingLabels{a2aComponentLabel: agentProfileWorkerComponent}); err != nil {
 		return fmt.Errorf("listing the warm pools: %w", err)
 	}
+	// Every unwanted pool is tried: one delete that's refused doesn't keep
+	// the ones after it running.
+	var errs []error
 	for i := range pools.Items {
 		pool := &pools.Items[i]
 		if keep[pool.Name] || !agentLabelsMarkComponent(pool, agent, agentProfileWorkerComponent) {
 			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, pool, client.PropagationPolicy(metav1.DeletePropagationBackground))); err != nil {
-			return fmt.Errorf("deleting the warm pool %s: %w", pool.Name, err)
+			errs = append(errs, fmt.Errorf("deleting the warm pool %s: %w", pool.Name, err))
 		}
 	}
-	return nil
+	return goerrors.Join(errs...)
 }
 
 // deleteProfilePools removes every warm pool of this agent's, and the CA
