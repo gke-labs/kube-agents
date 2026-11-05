@@ -964,9 +964,12 @@ _WORKLOAD_FOLD_LOCK = threading.Lock()
 # request a card opened is a `pr_opened` event on that card in kanban.db
 # (agents/platform/plugins/pr_opened). Same pattern as that plugin's
 # PROPOSAL_URL, copied because a plugin is loaded by file path: the repository
-# forge.call takes, then the number.
+# forge.call takes, then the number, for every forge the broker serves (GitHub
+# /pull/, GitLab /-/merge_requests/, Gitea /pulls/, Bitbucket /pull-requests/;
+# http for an in-cluster Gitea; the last marker before the number wins, and the
+# tail after it carries no further marker, `/-/` or `/issues/`).
 PR_OPENED_EVENT_KIND = "pr_opened"
-PROPOSAL_URL_RE = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+PROPOSAL_URL_RE = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 PROPOSAL_OPEN_STATE = "open"
 # How many of the workload's most recent incidents are searched for a fix.
 FIX_PR_INCIDENTS_SCANNED = 5

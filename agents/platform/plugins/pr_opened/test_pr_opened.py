@@ -445,6 +445,8 @@ class PrOpenedTest(unittest.TestCase):
 
     #: What each forge's ``proposal-create`` answers as the url, and the repository the broker resolves.
     FORGE_URLS = (
+        ("github", "https://github.com/acme/infra/pull/7", "acme/infra"),
+        ("gitlab", "https://gitlab.example.com/group/sub/infra/-/merge_requests/7", "group/sub/infra"),
         ("gitea", "https://gitea.example.com/acme/infra/pulls/7", "acme/infra"),
         ("bitbucket", "https://bitbucket.org/acme/infra/pull-requests/7", "acme/infra"),
         ("bitbucket-datacenter", "https://bitbucket.example.com/projects/K/repos/s/pull-requests/7", "K/s"),
@@ -452,7 +454,10 @@ class PrOpenedTest(unittest.TestCase):
 
     def test_every_forges_url_shape_is_claimed_counted_and_recorded(self):
         for forge, url, repo in self.FORGE_URLS:
-            self.assertIsNone(plugin.PROPOSAL_URL.match(url), "the url parse alone would not claim it")
+            self.assertEqual(
+                plugin.claim_repository({"url": url, "repo": repo, "claim": "ab" * 32}), repo,
+                "the record's repo wins over the repository its url names",
+            )
             for task in (TASK, ""):
                 self.ledger.clear()
                 kanban, broker = _Kanban(), _Broker()
@@ -474,15 +479,44 @@ class PrOpenedTest(unittest.TestCase):
     def test_a_repo_that_reads_as_a_flag_is_not_sent_as_one(self):
         # A forged line's repo would become one argv element of the sandbox hop;
         # a value a parser could read as a flag, or one with whitespace, is no
-        # repository: the record falls back to its url or takes no claim.
+        # repository: the record falls back to the repository its url names, on
+        # any forge, or takes no claim when the url is not a pull request's.
         for repo in ("--help", "-x", "acme/in fra", ""):
             with self.subTest(repo=repo):
-                self.assertIsNone(plugin.claim_repository({"url": "https://git.example.com/acme/infra/pulls/7", "repo": repo, "claim": "ab" * 32}))
+                self.assertEqual(plugin.claim_repository({"url": "https://git.example.com/acme/infra/pulls/7", "repo": repo, "claim": "ab" * 32}), "https://git.example.com/acme/infra")
                 self.assertEqual(plugin.claim_repository({"url": "https://github.com/acme/infra/pull/7", "repo": repo, "claim": "ab" * 32}), "https://github.com/acme/infra")
+                self.assertIsNone(plugin.claim_repository({"url": "https://git.example.com/acme/infra/issues/7", "repo": repo, "claim": "ab" * 32}))
         self.assertEqual(plugin.claim_repository({"url": "https://git.example.com/acme/infra/pulls/7", "repo": "acme/infra", "claim": "ab" * 32}), "acme/infra")
 
-    def test_a_record_with_neither_a_repo_nor_a_proposal_url_is_stripped_unclaimed(self):
+    def test_a_record_with_no_repo_on_any_forge_is_claimed_at_the_repository_its_url_names(self):
+        # An older client's line carries no repo; the url names the repository
+        # on every forge the broker serves (the GitHub and GitLab worker case is
+        # the test above; this one runs every row of FORGE_URLS outside a worker).
         for _, url, _ in self.FORGE_URLS:
+            for repo in (None, ""):
+                self.ledger.clear()
+                kanban, broker = _Kanban(), _Broker()
+                line = broker.line(url=url, number=7, repo=repo)
+                token = _tokens(line)[0]
+                repository = plugin.PROPOSAL_URL.match(url).group(1)
+                with self.subTest(url=url, repo=repo):
+                    out = self.run_hook(line, kanban, broker=broker)
+                    self.assertEqual(broker.asked, [("proposal-claim", repository, {"claim": token, "url": url}, False)])
+                    self.assertEqual([payload["url"] for _, payload in self.ledger], [url])
+                    self.assertEqual(_tokens(out), [])
+                    self.assertEqual(kanban.events, [(TASK, "pr_opened", {"url": url, "number": 7, "title": TITLE}, 7)])
+
+    #: Not a pull request on any forge: nothing to claim.
+    NOT_PROPOSAL_URLS = (
+        "https://gitea.example.com/acme/infra/issues/7",
+        "https://bitbucket.org/acme/infra/issues/7",
+        "https://bitbucket.example.com/projects/K/repos/s/commits/7",
+        # An issue under a GitLab subgroup named like a marker, with a numeric child.
+        "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+    )
+
+    def test_a_record_with_neither_a_repo_nor_a_proposal_url_is_stripped_unclaimed(self):
+        for url in self.NOT_PROPOSAL_URLS:
             for repo in (None, ""):
                 kanban, broker = _Kanban(), _Broker()
                 line = broker.line(url=url, number=7, repo=repo)
