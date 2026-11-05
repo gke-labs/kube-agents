@@ -477,6 +477,7 @@ import os, shutil, sys, time
 args = sys.argv[1:]
 bucket = os.environ["FAKE_BUCKET_DIR"]
 if os.environ.get("FAKE_GCLOUD_HANG"):
+    open(os.environ["FAKE_GCLOUD_HANG"], "w").close()  # says it is hanging now
     time.sleep(600)
 def target(url):
     return os.path.join(bucket, url[len("gs://"):])
@@ -551,8 +552,10 @@ class ProcessTest(unittest.TestCase):
     def test_sigterm_cuts_a_hung_upload_at_the_final_deadline_and_exits_0(self):
         with open(os.path.join(self.pod, "logs", "p-1-000001.jsonl"), "wb") as handle:
             handle.write(b"line\n")
-        proc = self.start("--final-deadline", "2", env=dict(self.env, FAKE_GCLOUD_HANG="1"))
-        time.sleep(1.0)  # into the hung manifest upload
+        hanging = os.path.join(self.root, "gcloud-hanging")
+        proc = self.start("--final-deadline", "2", env=dict(self.env, FAKE_GCLOUD_HANG=hanging))
+        # Into the hung manifest upload, however long the collector took to start.
+        self.wait_for(lambda: os.path.exists(hanging))
         started = time.monotonic()
         proc.send_signal(signal.SIGTERM)
         out, err = proc.communicate(timeout=PROCESS_WAIT_SECONDS)

@@ -593,29 +593,38 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # First, so a TERM that arrives while the collector is still starting asks
+    # for the last pass instead of killing it.
+    stopping = {"flag": False}
+    collector: Optional[Collector] = None
+    final_deadline = DEFAULT_FINAL_DEADLINE_SECONDS
+
+    def start_last_pass() -> None:
+        # The last pass's clock starts now, and cuts whatever is running.
+        if collector is not None and collector.deadline is None:
+            collector.deadline = collector.clock() + final_deadline
+
+    def on_term(_signum, _frame):
+        stopping["flag"] = True
+        start_last_pass()
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
     try:
         args = parse_args(argv)
     except SystemExit:  # argparse has said what was wrong; still never the eval's problem
         return 0
+    final_deadline = args.final_deadline
     started = time.time()
     day = time.strftime(DATE_FORMAT, time.gmtime(started))
-    stopping = {"flag": False}
     staging = ""
-    collector: Optional[Collector] = None
     try:
         staging = tempfile.mkdtemp(prefix=STAGING_PREFIX)
         collector = Collector(namespace=args.namespace, selector=args.selector, container=args.container,
                               dest=job_prefix(args.bucket, args.kind, day, args.build), staging=staging,
                               context=args.context, data_dir=args.data_dir)
-
-        def on_term(_signum, _frame):
-            # The last pass's clock starts now, and cuts whatever is running.
-            stopping["flag"] = True
-            if collector.deadline is None:  # type: ignore[union-attr]
-                collector.deadline = collector.clock() + args.final_deadline  # type: ignore[union-attr]
-
-        signal.signal(signal.SIGTERM, on_term)
-        signal.signal(signal.SIGINT, on_term)
+        if stopping["flag"]:
+            start_last_pass()
         collector.emit({"event": "start", "kind": args.kind, "day": day, "interval": args.interval})
         job = {"kind": args.kind, "project": args.project, "build": args.build, "pr": args.pr}
         run_loop(collector, args.interval, args.final_deadline, args.parent_pid, lambda: stopping["flag"],
