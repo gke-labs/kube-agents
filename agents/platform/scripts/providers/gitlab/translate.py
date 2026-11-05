@@ -108,6 +108,11 @@ def proposal(node: dict[str, Any], repo: str = "") -> dict[str, Any]:
 
     `closed` is when it merged or closed (GitLab leaves `closed_at` empty on a
     merge), `""` while open.
+
+    `mergeCommit` is `merge_commit_sha`, or `squash_commit_sha` when a squash
+    landed without a merge commit; `None` unless merged, and `None` for a
+    fast-forward merge, which puts the source commits on the target as they
+    are and leaves no single commit that is the merge.
     """
     raw_state = str(node.get("state") or "")
     if raw_state == "merged":
@@ -141,6 +146,11 @@ def proposal(node: dict[str, Any], repo: str = "") -> dict[str, Any]:
         "created": node.get("created_at") or "",
         "updated": node.get("updated_at") or "",
         "closed": node.get("merged_at") or node.get("closed_at") or "",
+        "mergeCommit": (
+            node.get("merge_commit_sha") or node.get("squash_commit_sha") or None
+        )
+        if state == "merged"
+        else None,
         "body": node.get("description") or "",
     }
 
