@@ -36,6 +36,16 @@ sandbox stays silent and is retried on the next tick. The first run
 ``RETIRE_AFTER_SECONDS`` or more after a delivery removes the two onboarding
 cron jobs; ``_retire_jobs`` says why the delivering run cannot.
 
+A report nobody aligns to takes a third path (#4058). Once the sweep has been
+filed for ``UNSPOKEN_FILE_AFTER_SECONDS`` with no human marker, the run files
+the report as a ledger issue in the GitOps repository, beside the first-run
+audits' own, claims the delivery, and sends one line naming the issue to the
+platform whose home posts route through the gateway (kept there for the digest
+when no home channel is set). An install with no GitOps repository keeps the
+report in the store, and ``UNDELIVERED_RETIRE_SECONDS`` after the sweep, the
+age past which the plugin primes nothing, the report is claimed without a post
+and retired in favour of the scheduled audits.
+
 With the flag on and a Slack destination, the report goes out as a card instead,
 built by ``inventory_card`` from the files the prioritization worker left beside
 the report (the items, scores, limits and shown files, read once before the claim
@@ -130,6 +140,8 @@ from typing import NamedTuple
 import bootstrap_handoff  # beside this script in the pod
 import chat_notify  # beside this script in the pod
 import findings_queue as fq  # beside this script in the pod
+import forge  # beside this script in the pod
+import gitops_workspace  # beside this script in the pod
 import inventory_card  # beside this script in the pod
 import inventory_findings  # beside this script in the pod
 import oobe  # beside this script in the pod
@@ -473,6 +485,71 @@ THREAD_ID_KEY = "thread_id"
 # retries. A greeting that runs longer still arrives, after the report.
 GREETING_PENDING_GLOB = ".bootstrap_greeting_pending.*"
 GREETING_WAIT_SECONDS = 300
+
+
+# The report when no chat thread can take it (#4058). A human who speaks in
+# Slack or Google Chat binds the report to that thread (the plugin's
+# ``.user_aligned`` markers); an install nobody speaks to, or one with no chat
+# platform at all, would otherwise hold the report forever. So once the sweep
+# has been filed for UNSPOKEN_FILE_AFTER_SECONDS with nobody aligned, the report
+# is filed as a ledger issue in the GitOps repository, beside the first-run
+# audits' own, and one line naming it goes to the home channel when a platform
+# routes there (kept by the gateway for its digest when no home channel is
+# set). The wait is what tells "nobody yet" from "nobody": a chat install's
+# first message usually comes within hours of install, and a report filed as an
+# issue before it would pre-empt the thread it was written for.
+UNSPOKEN_FILE_AFTER_SECONDS = 24 * 60 * 60
+# Past this age the plugin primes nothing (bootstrap_onboarding
+# SCAN_MAX_AGE_SECONDS), so no thread can ever take the report: a run that
+# finds it still undelivered claims it without posting and lets the scheduled
+# audits, which by then say more, stand in. Pinned equal by a test.
+UNDELIVERED_RETIRE_SECONDS = 7 * 24 * 60 * 60
+# The ledger issue: found again by its label and body marker, so a run that
+# died between the create and its record reuses the issue rather than opening
+# a second. The label mirrors chat_delivery_watch's, which the same broker
+# verbs maintain.
+REPORT_ISSUE_LABEL = "agent:onboarding"
+REPORT_ISSUE_LABEL_COLOR = "0E8A16"
+REPORT_ISSUE_LABEL_DESCRIPTION = "Onboarding's first-run inventory report, filed when no chat thread could take it"
+REPORT_ISSUE_MARKER = "<!-- onboarding-first-report -->"
+REPORT_ISSUE_TITLE = "First-run inventory report ({date} UTC)"
+REPORT_ISSUE_INTRO = (
+    "Onboarding's first-run inventory report, filed here on {date} UTC because no chat thread could take it: "
+    "nobody had written to the agent on Slack or Google Chat since the sweep was filed on {filed} UTC. "
+    "It describes the fleet as it was then; the scheduled audits carry the current picture."
+)
+REPORT_ISSUE_LIST_LIMIT = 20
+REPORT_ISSUE_DATE_FMT = "%Y-%m-%d %H:%M"
+# Where this stage records the issue it filed (repository, number, when), read
+# by a later run's log line and by an operator asking where the report went.
+REPORT_FILED_FILE = ".bootstrap_report_filed"
+FILED_REPO = "repo"
+FILED_NUMBER = "number"
+FILED_AT = "filed_at"
+# The one line that goes to the home channel once the issue is up. ``a2a notify``
+# exits NOTIFY_KEPT when the gateway kept it for its digest, which is delivery
+# enough: the digest names it, dated, once a home channel is set.
+REPORT_ISSUE_HOME_POST = (
+    "First-run inventory report: no chat thread took it, so it is filed as {ref} ({date} UTC)."
+)
+# The reasons this path records (CONVERSATION_ATTEMPTS_FILE), one per tick at most.
+NO_LEDGER_REPO_REASON = (
+    "no chat thread took the first-run report and the install has no GitOps repository to file it in; "
+    "it stays in the report store"
+)
+LEDGER_REPO_AMBIGUOUS_REASON = (
+    "no chat thread took the first-run report and the install manages {count} GitHub repositories; "
+    "not choosing one to file it in"
+)
+REPORT_RETIRED_NOTE = (
+    "the first-run report was not delivered within {days} days of the sweep and is retired; "
+    "the scheduled audits stand in for it"
+)
+REPORT_FILED_NOTE = "the first-run report went to {ref}: no chat thread took it"
+REPORT_HOME_LINE_NOTE = "the home line for the filed report {outcome}"
+HOME_LINE_POSTED = "was posted"
+HOME_LINE_KEPT = "was kept by the gateway for its digest (no home channel yet)"
+HOME_LINE_FAILED = "was not posted (a2a notify exited {code}: {detail})"
 
 
 def _data_dir() -> Path:
@@ -1788,6 +1865,212 @@ def _deliver_to_conversation(data_dir: Path, in_sandbox: bool, conversation: dic
     return True
 
 
+def _ledger_repo() -> str | None:
+    """The one managed GitHub repository, or None; several is a recorded reason, not a guess."""
+    repos = sorted(gitops_workspace.get_managed_github_repo_names())
+    if len(repos) > 1:
+        raise LedgerRepoAmbiguous(len(repos))
+    return repos[0] if repos else None
+
+
+class LedgerRepoAmbiguous(RuntimeError):
+    def __init__(self, count: int) -> None:
+        super().__init__(LEDGER_REPO_AMBIGUOUS_REASON.format(count=count))
+        self.count = count
+
+
+def _filed_record(data_dir: Path) -> dict:
+    try:
+        record = json.loads((data_dir / REPORT_FILED_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def _record_filed(data_dir: Path, repo: str, number: int) -> None:
+    target = data_dir / REPORT_FILED_FILE
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.write_text(
+            json.dumps({FILED_REPO: repo, FILED_NUMBER: number, FILED_AT: time.time()}, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(target)
+    except OSError as e:
+        sys.stderr.write(f"bootstrap_delivery: could not record the filed report: {e}\n")
+
+
+def _utc(stamp: float) -> str:
+    return datetime.fromtimestamp(stamp, timezone.utc).strftime(REPORT_ISSUE_DATE_FMT)
+
+
+def _existing_report_issue(repo: str) -> int | None:
+    """The open issue a run before this one filed the report as, by label and marker, or None."""
+    answer = forge.call(
+        "issue-list", {"labels": [REPORT_ISSUE_LABEL], "state": "open", "limit": REPORT_ISSUE_LIST_LIMIT}, repo
+    )
+    numbers = [
+        int(issue["number"])
+        for issue in answer.get("issues") or []
+        if isinstance(issue, dict) and REPORT_ISSUE_MARKER in str(issue.get("body") or "")
+    ]
+    return max(numbers) if numbers else None
+
+
+def _file_report_issue(repo: str, body: str, filed_at: float, now: float) -> int:
+    """Open the ledger issue holding the report (or reuse the one already open) and return its number.
+
+    Raises ``forge.ForgeError`` when the broker refuses. The label is best effort: the issue is
+    worth opening without it, and a repository whose labels this credential may not touch is not
+    a reason to hold the report.
+    """
+    number = _existing_report_issue(repo)
+    if number is not None:
+        return number
+    with contextlib.suppress(forge.ForgeError):
+        forge.call(
+            "label-ensure",
+            {"name": REPORT_ISSUE_LABEL, "color": REPORT_ISSUE_LABEL_COLOR, "description": REPORT_ISSUE_LABEL_DESCRIPTION},
+            repo,
+        )
+    date, filed = _utc(now), _utc(filed_at)
+    title = REPORT_ISSUE_TITLE.format(date=date)
+    text = "\n".join([REPORT_ISSUE_MARKER, REPORT_ISSUE_INTRO.format(date=date, filed=filed), "", body])
+    answer = forge.call("issue-create", {"title": title, "body": text, "labels": [REPORT_ISSUE_LABEL]}, repo)
+    number = int((answer.get("issue") or {}).get("number") or 0)
+    if not number:
+        raise forge.ForgeError(forge.REASON_UNREACHABLE, "issue-create answered with no issue number")
+    return number
+
+
+def _post_home_line(data_dir: Path, ref: str, now: float) -> None:
+    """One line naming the filed report, to the platform whose home posts route through the gateway.
+
+    After the claim and the issue, so best effort: the issue is the record. ``NOTIFY_KEPT`` is
+    the gateway holding the line for its digest, which is where a channel set later reads it.
+    """
+    platform = chat_notify.routed_platform()
+    if not platform:
+        return
+    text = REPORT_ISSUE_HOME_POST.format(ref=ref, date=_utc(now))
+    argv = chat_notify.command(platform, text, wait_seconds=chat_notify.NOTIFY_WAIT_SECONDS)
+    try:
+        res = subprocess.run(
+            argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=HOME_LINE_FAILED.format(code="none", detail=e)))
+        return
+    if res.returncode == 0:
+        outcome = HOME_LINE_POSTED
+    elif chat_notify.kept(res.returncode):
+        outcome = HOME_LINE_KEPT
+    else:
+        detail = _gateway_error(res.stdout) or (res.stderr or "").strip()
+        outcome = HOME_LINE_FAILED.format(code=res.returncode, detail=detail)
+    _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=outcome))
+
+
+def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
+    """Claim the report without posting it and set it aside; the later run's retire removes the jobs."""
+    if not _claim_delivery(data_dir):
+        return 0
+    _stage_note(data_dir, REPORT_RETIRED_NOTE.format(days=UNDELIVERED_RETIRE_SECONDS // (24 * 60 * 60)))
+    _cleanup(data_dir, in_sandbox)
+    return 0
+
+
+def _file_without_thread(data_dir: Path, in_sandbox: bool, filed_at: float, now: float) -> int:
+    """File the report as a ledger issue, after the claim, and say so in the home channel.
+
+    The reads come before the claim as on the other paths, so a sandbox that stopped answering
+    leaves no claim to undo. A refused create releases the claim and counts an attempt, with the
+    conversation path's waits between tries; past its last, the report waits for the retire.
+    """
+    record = _read_attempts(data_dir)
+    count = _attempt_count(record)
+    if count >= CONVERSATION_MAX_ATTEMPTS:
+        return 0
+    if count:
+        try:
+            last = float(record.get(ATTEMPTS_AT))
+        except (TypeError, ValueError):
+            last = 0.0
+        if now - last < CONVERSATION_RETRY_WAITS_SECONDS[count - 1]:
+            return 0
+    try:
+        repo = _ledger_repo()
+    except LedgerRepoAmbiguous as e:
+        _record_attempt(data_dir, str(e), counted=False)
+        return 0
+    if repo is None:
+        _record_attempt(data_dir, NO_LEDGER_REPO_REASON, counted=False)
+        return 0
+
+    try:
+        raw = _read_report(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
+    except (OSError, sandbox_exec.SandboxMisconfigured, sandbox_exec.SandboxReadFailed) as e:
+        sys.stderr.write(f"bootstrap_delivery: could not read INVENTORY.md: {e}\n")
+        return 1
+    if raw is None:
+        return 0  # the report is not written yet
+    if len(raw) > REPORT_MAX_BYTES:
+        sys.stderr.write(f"bootstrap_delivery: INVENTORY.md is larger than {REPORT_MAX_BYTES} bytes; not filing it\n")
+        return 1
+    content = raw.decode("utf-8", errors="replace")
+    try:
+        files = _read_sweep_files(data_dir, in_sandbox)
+    except (sandbox_exec.SandboxUnavailable, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
+        return 0
+    no_ranking = _no_ranking(data_dir)
+    suppressed = _register_findings(data_dir, no_ranking, files)
+    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platform()))
+    body = _with_note(content, note)
+
+    if not _claim_delivery(data_dir):
+        return 0
+    try:
+        number = _file_report_issue(repo, body, filed_at, now)
+    except forge.ForgeError as e:
+        _record_attempt(data_dir, f"issue-create on {repo} refused: {e.reason}: {e.value}", counted=True)
+        _release_claim(data_dir)
+        return 0
+    ref = f"{repo}#{number}"
+    _record_filed(data_dir, repo, number)
+    _stage_note(data_dir, REPORT_FILED_NOTE.format(ref=ref))
+    shown = _mark_shown(files, suppressed)
+    _cleanup(data_dir, in_sandbox, shown)
+    _post_home_line(data_dir, ref, now)
+    return 0
+
+
+def _deliver_without_thread(data_dir: Path) -> int:
+    """The path for a report nobody has aligned to: silent until the wait, then filed, then retired.
+
+    Counted from when the sweep was filed, the one stamp the plugin's own age rule reads too.
+    """
+    filed = oobe.scan_filed(data_dir)
+    if filed is None:
+        return 0  # the scan has not started
+    now = time.time()
+    age = now - filed[1]
+    if age < UNSPOKEN_FILE_AFTER_SECONDS:
+        return 0  # a human may still open the thread the report was written for
+    try:
+        in_sandbox = sandbox_exec.sandbox_enabled()
+    except sandbox_exec.SandboxMisconfigured as e:
+        sys.stderr.write(f"bootstrap_delivery: cannot tell where INVENTORY.md is: {e}\n")
+        return 1
+    if age >= UNDELIVERED_RETIRE_SECONDS:
+        return _retire_undelivered(data_dir, in_sandbox)
+    return _file_without_thread(data_dir, in_sandbox, filed[1], now)
+
+
 def main(data_dir: Path | None = None) -> int:
     if data_dir is None:
         data_dir = _data_dir()
@@ -1801,7 +2084,7 @@ def main(data_dir: Path | None = None) -> int:
         return 0
 
     if not _awaiting_delivery(data_dir):
-        return 0  # silent run — nobody to deliver to yet
+        return _deliver_without_thread(data_dir)  # nobody to deliver to yet, or ever
     conversation = _bound_conversation(data_dir)
     if conversation is not None and not _conversation_ready(data_dir, conversation):
         return 0

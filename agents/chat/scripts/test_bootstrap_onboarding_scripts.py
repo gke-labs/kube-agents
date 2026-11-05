@@ -1843,6 +1843,204 @@ class DeliveryCardTest(unittest.TestCase):
                 self.assertIn(reason, log)
 
 
+class DeliveryWithoutThreadTest(unittest.TestCase):
+    """#4058: a report nobody aligned to is filed as a ledger issue after a day, and retired after a week."""
+
+    REPORT = "# GKE Environment Discovery Report\n\nTwo things need you.\n"
+    REPO = "example-org/gitops"
+    HOUR = 60 * 60
+    DAY = 24 * HOUR
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.d = Path(self._tmp.name)
+        (self.d / INVENTORY).write_text(self.REPORT, encoding="utf-8")
+        self.repos = [self.REPO]
+        self.forge_calls = []
+        self.forge_answers = {}
+        self.forge_refusals = {}
+        self.runs = []
+        self.run_code = 0
+        for patcher in (
+            mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False),
+            mock.patch.dict(os.environ, {**NEXT_ENV, "A2A_NOTIFY_PLATFORM": "slack"}),
+            mock.patch.object(bootstrap_delivery.time, "sleep"),
+            mock.patch.object(inventory_findings, "post_batch", return_value={"results": []}),
+            mock.patch.object(bootstrap_delivery, "_post_surfaced"),
+            mock.patch.object(bootstrap_delivery.gitops_workspace, "get_managed_github_repo_names",
+                              side_effect=lambda: list(self.repos)),
+            mock.patch.object(bootstrap_delivery.forge, "call", side_effect=self._forge),
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=self._run_cli),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        notes = mock.patch.object(bootstrap_delivery, "_stage_note")
+        self.notes = notes.start()
+        self.addCleanup(notes.stop)
+
+    def _forge(self, verb, payload, repo, **_kwargs):
+        self.forge_calls.append((verb, dict(payload), repo))
+        if verb in self.forge_refusals:
+            raise bootstrap_delivery.forge.ForgeError(self.forge_refusals[verb], "nope")
+        if verb == "issue-create":
+            return self.forge_answers.get(verb, {"issue": {"number": 42}})
+        return self.forge_answers.get(verb, {"issues": []})
+
+    def _run_cli(self, argv, **_kwargs):
+        self.runs.append(argv)
+        return subprocess.CompletedProcess(argv, self.run_code, "{}\n", "")
+
+    def _filed(self, age_seconds):
+        (self.d / SCAN_FILED).write_text(
+            f"sweep=s1\ntask_id=t1\nfiled_at={int(time.time() - age_seconds)}\n", encoding="utf-8"
+        )
+
+    def _main(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = bootstrap_delivery.main(self.d)
+        self.assertEqual(buf.getvalue(), "", "this path never prints the report")
+        return rc
+
+    def _note_texts(self):
+        return [call.args[1] for call in self.notes.call_args_list]
+
+    def test_silent_before_the_scan_is_filed(self):
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+
+    def test_waits_a_day_for_a_human_to_open_the_thread(self):
+        self._filed(self.HOUR)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(self.runs, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+
+    def test_files_the_report_as_a_ledger_issue_and_says_so_in_home(self):
+        self._filed(self.DAY + self.HOUR)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list", "label-ensure", "issue-create"])
+        _, create, repo = self.forge_calls[-1]
+        self.assertEqual(repo, self.REPO)
+        self.assertIn(bootstrap_delivery.REPORT_ISSUE_MARKER, create["body"])
+        self.assertIn(self.REPORT.strip(), create["body"])
+        self.assertIn("no chat thread could take it", create["body"])
+        self.assertEqual(create["labels"], [bootstrap_delivery.REPORT_ISSUE_LABEL])
+        self.assertTrue(create["title"].startswith("First-run inventory report ("))
+        self.assertTrue((self.d / COMPLETED).exists(), "the claim marks onboarding delivered")
+        self.assertFalse((self.d / INVENTORY).exists())
+        self.assertTrue((self.d / bootstrap_delivery.DELIVERED_REPORT_NAME).exists())
+        record = bootstrap_delivery._filed_record(self.d)
+        self.assertEqual((record["repo"], record["number"]), (self.REPO, 42))
+        self.assertEqual(len(self.runs), 1)
+        argv = self.runs[0]
+        self.assertEqual(argv[:4], [chat_notify.A2A_CLI, "notify", "--platform", "slack"])
+        self.assertNotIn("--thread", argv)
+        self.assertIn(f"{self.REPO}#42", argv[-1])
+        self.assertIn(bootstrap_delivery.REPORT_FILED_NOTE.format(ref=f"{self.REPO}#42"), self._note_texts())
+        self.assertIn(
+            bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
+            self._note_texts(),
+        )
+
+    def test_a_second_run_after_filing_does_nothing(self):
+        self._filed(self.DAY + self.HOUR)
+        self._main()
+        calls, runs = len(self.forge_calls), len(self.runs)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual((len(self.forge_calls), len(self.runs)), (calls, runs))
+
+    def test_a_kept_home_line_is_delivery_enough(self):
+        self._filed(self.DAY + self.HOUR)
+        self.run_code = chat_notify.NOTIFY_KEPT
+        self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertIn(
+            bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_KEPT),
+            self._note_texts(),
+        )
+
+    def test_no_routed_platform_posts_no_home_line(self):
+        self._filed(self.DAY + self.HOUR)
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(self.runs, [])
+
+    def test_no_gitops_repository_leaves_the_report_in_place(self):
+        self._filed(self.DAY + self.HOUR)
+        self.repos = []
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+        self.assertEqual(
+            bootstrap_delivery._read_attempts(self.d).get(bootstrap_delivery.ATTEMPTS_REASON),
+            bootstrap_delivery.NO_LEDGER_REPO_REASON,
+        )
+
+    def test_two_repositories_are_recorded_not_guessed(self):
+        self._filed(self.DAY + self.HOUR)
+        self.repos = [self.REPO, "example-org/other"]
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(
+            bootstrap_delivery._read_attempts(self.d).get(bootstrap_delivery.ATTEMPTS_REASON),
+            bootstrap_delivery.LEDGER_REPO_AMBIGUOUS_REASON.format(count=2),
+        )
+
+    def test_reuses_the_issue_an_earlier_run_opened(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_answers["issue-list"] = {
+            "issues": [{"number": 7, "body": bootstrap_delivery.REPORT_ISSUE_MARKER + "\nold"}, {"number": 9, "body": "other"}]
+        }
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([verb for verb, _, _ in self.forge_calls], ["issue-list"])
+        self.assertEqual(bootstrap_delivery._filed_record(self.d)["number"], 7)
+
+    def test_a_refused_create_releases_the_claim_and_waits(self):
+        self._filed(self.DAY + self.HOUR)
+        self.forge_refusals["issue-create"] = "FORGE_FORBIDDEN"
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertTrue((self.d / INVENTORY).exists())
+        self.assertEqual(self.runs, [])
+        record = bootstrap_delivery._read_attempts(self.d)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 1)
+        self.assertIn("FORGE_FORBIDDEN", record[bootstrap_delivery.ATTEMPTS_REASON])
+        calls = len(self.forge_calls)
+        self.assertEqual(self._main(), 0, "inside the wait after a refused create")
+        self.assertEqual(len(self.forge_calls), calls)
+
+    def test_retires_the_report_after_a_week(self):
+        self._filed(8 * self.DAY)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(self.runs, [])
+        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / INVENTORY).exists())
+        self.assertIn(bootstrap_delivery.REPORT_RETIRED_NOTE.format(days=7), self._note_texts())
+
+    def test_retire_age_is_the_plugins_priming_limit(self):
+        spec = importlib.util.spec_from_file_location("bootstrap_onboarding_plugin_for_age", PLUGIN_PATH)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS, plugin.SCAN_MAX_AGE_SECONDS)
+        self.assertLess(bootstrap_delivery.UNSPOKEN_FILE_AFTER_SECONDS, bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS)
+
+    def test_a_human_who_speaks_first_still_gets_the_thread(self):
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self.forge_calls, [], "an aligned report takes the conversation path, not the ledger")
+        self.assertTrue(any("--conversation" in argv for argv in self.runs))
+
+
 class ScanGateTest(unittest.TestCase):
     """The scan gate files the sweep as a kanban task for the `platform` profile.
 

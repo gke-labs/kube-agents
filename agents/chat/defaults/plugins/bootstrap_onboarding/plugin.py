@@ -143,6 +143,8 @@ PRIMING_STALE_SECONDS = 120
 # Written by bootstrap_scan_gate.py when it files the sweep. A sweep older than
 # SCAN_MAX_AGE_SECONDS belongs to an install that ran before this path existed:
 # its first new thread would otherwise get a weeks-old report as onboarding.
+# Delivery retires an undelivered report at the same age
+# (bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS, pinned equal by its tests).
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 SCAN_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 CONVERSATION_JOB_ID = "oobe"

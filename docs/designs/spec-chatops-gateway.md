@@ -1639,7 +1639,8 @@ rather than lost. The agent-side callers
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, or is unset with
 Slack not enabled (`a2aGchatHomeRouted`), and send to every
 other platform through `hermes send` as before. The kanban notifier's report back to a gateway
-conversation (below), and onboarding's first report into the conversation the user first wrote in,
+conversation (below), and onboarding's first report into the conversation the user first wrote in
+(a day on with no such conversation, the report is a ledger issue and one home line names it),
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
 operator renders whenever the gateway arms the route: `homeChannel` unset (the route then
 serves conversation requests only) or a space name. The Hermes kanban notifier, which posts a card's events into the thread the card
