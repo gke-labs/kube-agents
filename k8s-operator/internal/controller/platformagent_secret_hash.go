@@ -75,16 +75,16 @@ import (
 //
 // The trigger is a bounded re-read on the reconcile tick, not an informer.
 // Three places in platformagent_controller.go argue against watching Secrets —
-// the grant withholds list/watch so a cached read cannot be added by accident,
-// a cached Get of an unwatched type starts a cluster-wide Secret informer that
-// holds every Secret in the cluster in memory and blocks WaitForCacheSync
-// wherever the grant is trimmed, and enqueueing on Secret writes would wake
-// every reconcile on every Secret write in the namespace. Beyond those,
-// tests/test_operator_secrets_grant.py pins the verb set to exactly
-// {get, create, update, patch, delete} and asserts separately that the operator
-// can never enumerate Secrets; that test stands in for a Trivy KSV-0041
-// exemption which cannot be scoped to one rule. A watch would have to delete
-// it.
+// `list`/`watch` on `manager-role` exist only to satisfy RBAC escalation
+// prevention for `buildMinimalPlatformRole`, a cached Get of an unwatched type
+// starts a cluster-wide Secret informer that holds every Secret in the cluster
+// in memory and blocks WaitForCacheSync wherever the grant is trimmed, and
+// enqueueing on Secret writes would wake every reconcile on every Secret write
+// in the namespace. Beyond those, tests/test_operator_secrets_grant.py pins the
+// `+kubebuilder:rbac` marker and asserts separately that controller code never
+// lists Secrets or registers a Secret informer watch; that test stands in for a
+// Trivy KSV-0041 exemption which cannot be scoped to one rule. A watch would
+// have to delete it.
 //
 // Re-reading by name costs one Get per referenced Secret per reconcile and
 // needs no verb the operator does not already hold. Where a watch on a trimmed

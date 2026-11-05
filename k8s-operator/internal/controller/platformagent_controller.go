@@ -619,12 +619,16 @@ type PlatformAgentReconciler struct {
 // DaemonSet port (issue #747 B4) — a second consumer of a grant that already existed for
 // buildMinimalPlatformRole's escalation-prevention requirement.
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
-// `secrets` and full `jobs` verbs exist for the mode-next A2A stack: the
-// generated NATS credentials/config Secrets and the provisioning Job.
-// No list/watch: the A2A code does one Get, Create, Update, apply-Patch and
-// Delete by name, and a2aReader() exists so those never go through the cache.
-// Without the enumeration verbs a cached Secret read cannot be added by accident.
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
+// `secrets` and full `jobs` verbs exist for the mode-next A2A stack (the
+// generated NATS credentials/config Secrets and the provisioning Job) and
+// `ensureKubeProxyTLSSecret`. `list` and `watch` are held so the operator
+// satisfies Kubernetes RBAC escalation prevention when reconciling
+// `buildMinimalPlatformRole`, which grants `get`/`list`/`watch` on `secrets`
+// to `<agent>-kube-proxy` (where `KUBE_PROXY_REDACT_SECRETS=true` strips
+// `.data`, `.stringData`, and `last-applied-configuration`). The operator
+// itself still reads Secrets by name through `r.APIReader` and `r.a2aReader()`
+// rather than the manager's informer cache.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.

@@ -1,6 +1,6 @@
 """The operator's `secrets` grant, and the ceiling on it.
 
-Three callers need a Secret verb on `manager-role`:
+Five callers need a Secret verb on `manager-role`:
 
 - `checkShellSandboxKeys` needs `get`. It asks whether the sandbox's
   authorized-keys Secret exists so the CR can say so, because that Secret is the
@@ -17,25 +17,28 @@ Three callers need a Secret verb on `manager-role`:
   operator generates the NATS credential Secret once and repairs a missing key,
   renders the config Secret, and deletes the config Secret on the way back to
   `today`; all of them are owner-referenced to the `PlatformAgent`.
+- `ensureKubeProxyTLSSecret` needs `get`/`create`/`update` to manage the
+  `<agent>-kube-proxy-tls` Secret.
+- `buildMinimalPlatformRole` grants `get`/`list`/`watch` on `secrets` to
+  `kubeagents:minimal:<ns>:<name>` so `<agent>-kube-proxy` can read `Secret`
+  objects and serve redacted metadata (`KUBE_PROXY_REDACT_SECRETS=true`).
+  Kubernetes RBAC escalation prevention requires `manager-role` to hold
+  `get`/`list`/`watch` on `secrets` before it can grant those verbs on a
+  managed `ClusterRole`.
 
-The verb set was `{get}` until the A2A render landed. It widened once,
-deliberately, and this file is what keeps it from widening again by accident:
-the set is pinned exactly, so an addition fails here rather than passing
-silently under the trivy ignore. The digest caller added no verb.
-
-`list` and `watch` are the ones that stay refused, and they are asserted
-separately below rather than left implicit in the exact-set check. They are the
-verbs that turn a by-name grant into cluster-wide enumeration of every Secret in
-every namespace, which is a different power from the five above; `a2aReader()`
-exists precisely so every A2A Secret read is by name and uncached, and without
-the enumeration verbs a cached read cannot be reintroduced by accident.
+Even though `manager-role` holds `list` and `watch` for RBAC escalation
+prevention, the operator itself must never list or watch `Secret` objects:
+every controller Secret read goes by name through `a2aReader()`, and
+`test_the_operator_never_watches_or_lists_secrets_in_controller_code` below
+forbids `&corev1.SecretList`, `Owns(&corev1.Secret`, and
+`Watches(&corev1.Secret` in controller Go files.
 
 Trivy's KSV-0041 flags any Secret verb on a ClusterRole as CRITICAL, and its
 ignore file has no way to scope an exemption to one rule -- `paths` globs are
 the whole vocabulary -- so exempting this grant exempts the whole of
-`k8s-operator/config/rbac/`. That is the check this file replaces. A widening to
-`list`, `watch`, `create` or anything else fails here instead of passing
-silently under the ignore.
+`k8s-operator/config/rbac/`. That is the check this file replaces: it pins the
+verb set and `+kubebuilder:rbac` marker, forbids controller `Secret` list/watch
+calls, and fails if the Trivy exemption widens past the `rbac` directory.
 
 `charts/kube-agents/templates/operator-rbac.yaml` is not read here: it is
 spliced from `role.yaml` by `hack/sync-chart-manifests.sh`, and `make
@@ -56,8 +59,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ROLE_PATH = REPO_ROOT / "k8s-operator" / "config" / "rbac" / "role.yaml"
 CORE_API_GROUP = ""
 SECRETS_RESOURCE = "secrets"
-PERMITTED_SECRET_VERBS = {"get", "create", "update", "patch", "delete"}
-REFUSED_SECRET_VERBS = {"list", "watch"}
+PERMITTED_SECRET_VERBS = {"get", "list", "watch", "create", "update", "patch", "delete"}
+CONTROLLER_DIR = REPO_ROOT / "k8s-operator" / "internal" / "controller"
 IGNORE_PATH = REPO_ROOT / ".trivyignore.yaml"
 SECRETS_MISCONFIG_ID = "KSV-0041"
 
@@ -80,31 +83,59 @@ class OperatorSecretsGrantTest(unittest.TestCase):
             f"expected one rule naming {SECRETS_RESOURCE}, found {len(rules)}: {rules}",
         )
 
-    def test_the_secret_verbs_are_exactly_the_set_three_callers_need(self):
+    def test_the_secret_verbs_are_exactly_the_permitted_set(self):
         rule = _secret_rules()[0]
         self.assertEqual(set(rule.get("verbs") or []), PERMITTED_SECRET_VERBS)
         self.assertEqual(rule.get("apiGroups"), [CORE_API_GROUP])
 
-    def test_the_operator_can_never_enumerate_secrets(self):
-        # Named separately from the exact-set check above because this is the
-        # property, not a consequence of today's list: `list`/`watch` on a
-        # cluster-scoped role means every Secret in every namespace, which is a
-        # different power from get/create/update/patch/delete by name.
-        verbs = set(_secret_rules()[0].get("verbs") or [])
-        self.assertEqual(
-            set(),
-            verbs & REFUSED_SECRET_VERBS,
-            "the operator reads Secrets by name through a2aReader(); granting "
-            "list or watch would let a cached, cluster-wide read be added",
-        )
+    def test_the_operator_never_watches_or_lists_secrets_in_controller_code(self):
+        # `list` and `watch` are held on `manager-role` only so the operator
+        # passes Kubernetes RBAC escalation prevention when reconciling
+        # `buildMinimalPlatformRole` (which grants `get`/`list`/`watch` on
+        # `secrets` to `<agent>-kube-proxy`, where Secret payloads are stripped).
+        # The operator's own Go code must never add a Secret informer watch or
+        # call `SecretList`.
+        for go_file in sorted(CONTROLLER_DIR.glob("*.go")):
+            if go_file.name.endswith("_test.go"):
+                continue
+            source = go_file.read_text(encoding="utf-8")
+            self.assertNotIn(
+                "SecretList",
+                source,
+                f"{go_file.name} lists Secrets; operator Secret reads must stay by-name via APIReader/a2aReader",
+            )
+            self.assertNotIn(
+                "Owns(&corev1.Secret",
+                source,
+                f"{go_file.name} watches Secrets via Owns(&corev1.Secret...); operator must not start a Secret informer",
+            )
+            self.assertNotIn(
+                "Watches(&corev1.Secret",
+                source,
+                f"{go_file.name} watches Secrets via Watches(&corev1.Secret...); operator must not start a Secret informer",
+            )
+            self.assertNotIn(
+                "WatchesMetadata(&corev1.Secret",
+                source,
+                f"{go_file.name} watches Secrets via WatchesMetadata(&corev1.Secret...); operator must not start a Secret informer",
+            )
 
-    def test_the_secrets_rule_names_no_other_resource(self):
-        # A verb set is only a ceiling for the resources it is attached to.
-        # Folding `secrets` into a rule that also names, say, `configmaps` would
-        # keep the verbs at `get` and still widen what a later verb addition
-        # reaches.
+    def test_the_secrets_marker_names_no_other_resource(self):
+        # controller-gen merges rules with identical apiGroups and verbs in
+        # role.yaml, so check the +kubebuilder:rbac marker in
+        # platformagent_controller.go directly to ensure `secrets` stays on its
+        # own marker line and is never folded into another resource's marker.
         rule = _secret_rules()[0]
-        self.assertEqual(rule.get("resources"), [SECRETS_RESOURCE])
+        self.assertNotIn("*", rule.get("resources") or [])
+        controller_src = (CONTROLLER_DIR / "platformagent_controller.go").read_text(encoding="utf-8")
+        secret_markers = [
+            line.strip()
+            for line in controller_src.splitlines()
+            if "+kubebuilder:rbac:" in line and "secrets" in line
+        ]
+        self.assertGreaterEqual(len(secret_markers), 1)
+        for marker in secret_markers:
+            self.assertIn("resources=secrets,", marker, f"secrets marker shares resources: {marker}")
 
     def test_the_trivy_exemption_stays_scoped_to_the_rbac_directory(self):
         ignores = yaml.safe_load(IGNORE_PATH.read_text(encoding="utf-8"))
@@ -118,7 +149,13 @@ class OperatorSecretsGrantTest(unittest.TestCase):
             1,
             f"expected one {SECRETS_MISCONFIG_ID} exemption, found {len(entries)}",
         )
-        self.assertEqual(entries[0].get("paths"), ["k8s-operator/config/rbac/**"])
+        self.assertEqual(
+            entries[0].get("paths"),
+            [
+                "k8s-operator/config/rbac/**",
+                "k8s-operator/internal/testing/testdata/platform/expected/**",
+            ],
+        )
 
 
 if __name__ == "__main__":
