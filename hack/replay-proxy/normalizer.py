@@ -156,14 +156,26 @@ LONG_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "
 LONG_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 LONG_DATE_RE = re.compile(
     r"\b(?:(?:" + "|".join(LONG_DAYS) + r"),\s+)?(" + "|".join(LONG_MONTHS) + r")\s+(\d{1,2}),\s+(\d{4})\b"
-    r"(?!,?\s+(?:at\s+)?\d{1,2}:\d{2})"
     r"(?=\s*\((?:[\w/+-]+,\s*)*UTC([+-])(\d{2}):(\d{2})\))?"
 )
 DATE_TODAY = "today"
 LONG_DATE_FORMAT = "%B %d, %Y"
-# A date an answer repeats is a whole token: not part of a longer number or word.
-DATE_BEFORE = r"(?<![\w])"
-DATE_AFTER = r"(?![\w])"
+# A date an answer repeats counts unless a letter or digit touches it, so
+# `notes_2026-11-04.md` counts and `20261104` does not.
+DATE_BEFORE = r"(?<![A-Za-z0-9])"
+DATE_AFTER = r"(?![A-Za-z0-9])"
+SHORT_DATE_FORMAT = "%b %d"
+MONTH_DAY_FORMAT = "%B %d"
+WEEKDAY_FORMAT = "%A"
+# A time of day next to a spelled-out date (`10:42`, `10:42:01`, `10 PM`,
+# `10pm`, `10h42`): then the date is left alone, since day counting would
+# drop what the time says. Looked for just after and just before the date;
+# Hermes's zone suffix starts with letters (`(UTC, UTC+00:00)`), so its offset
+# is never read as a time.
+TIME_OF_DAY = r"\d{1,2}(?::\d{2}(?::\d{2})?|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)"
+TIME_AFTER_DATE_RE = re.compile(r"[^\w\n]{0,4}(?:at\s+)?" + TIME_OF_DAY)
+TIME_BEFORE_DATE_RE = re.compile(TIME_OF_DAY + r"\s*(?:on\s+|,\s*)?$")
+TIME_NEAR_DATE_CHARS = 20
 # Fewer whole days from the request's day than this is "day" (one day either way).
 DAYS_IN_DAY_BUCKET = 2
 # Whole days from the request's day -> bucket: under each limit, with the
@@ -294,8 +306,13 @@ class Mapping:
     dates: set = field(default_factory=set)
 
     def add_date(self, when: "date", raw: str) -> None:
-        self.dates.update({raw, when.isoformat(), when.strftime(LONG_DATE_FORMAT),
-                           f"{LONG_MONTHS[when.month - 1]} {when.day}, {when.year}"})
+        month = LONG_MONTHS[when.month - 1]
+        self.dates.update({
+            raw, when.isoformat(), when.strftime(LONG_DATE_FORMAT), f"{month} {when.day}, {when.year}",
+            # Without the year, and the weekday: "findings for November 04".
+            when.strftime(MONTH_DAY_FORMAT), f"{month} {when.day}", when.strftime(SHORT_DATE_FORMAT),
+            f"{MONTHS[when.month - 1]} {when.day}", when.strftime(WEEKDAY_FORMAT),
+        })
 
     def placeholder(self, cls: str, value: str) -> str:
         key = (cls if cls in (OPAQUE_CLASS, NUMBER_CLASS) else "") + MAPPING_KEY_SEPARATOR + value
@@ -328,10 +345,12 @@ class Mapping:
             text = re.sub(before + re.escape(value) + after, lambda _m, t=token: t, text)
         return text
 
+    def answer_repeats_date(self, text: str) -> bool:
+        """Whether an answer names a date the request's key counts by days, which cannot be put back."""
+        return any(re.search(DATE_BEFORE + re.escape(value) + DATE_AFTER, text) for value in self.dates)
+
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""
-        if any(re.search(DATE_BEFORE + re.escape(value) + DATE_AFTER, text) for value in self.dates):
-            return True
         for value in self.bare_numbers:
             if len(value) >= MIN_STANDALONE_REPEAT_DIGITS:
                 pattern = NUMBER_BEFORE + re.escape(value) + NUMBER_AFTER
@@ -482,6 +501,10 @@ class Normalizer:
 
     def long_date(self, m: "re.Match[str]") -> str:
         month, day, year, sign, hours, minutes = m.groups()
+        after = m.string[m.end():m.end() + TIME_NEAR_DATE_CHARS]
+        before = m.string[max(0, m.start() - TIME_NEAR_DATE_CHARS):m.start()]
+        if TIME_AFTER_DATE_RE.match(after) or TIME_BEFORE_DATE_RE.search(before):
+            return m.group(0)
         try:
             when = datetime(int(year), LONG_MONTHS.index(month) + 1, int(day)).date()
         except ValueError:

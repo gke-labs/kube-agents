@@ -203,10 +203,14 @@ class LongDateTest(unittest.TestCase):
         body = {"messages": [{"role": "system", "content": self.PROMPT.format("Wednesday, November 04, 2026")}]}
         mapping = normalizer.normalize_request(body, self.at(2026, 11, 4)).mapping
         for answer in ('{"path": "memory/2026-11-04.md"}', "## Findings for November 04, 2026",
-                       "as of November 4, 2026", "started Wednesday, November 04, 2026"):
-            self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
-        for answer in ("memory/2026-11-05.md", "November 14, 2026", "build 20261104", "2026-11-04T10:00:00Z"):
-            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+                       "as of November 4, 2026", "started Wednesday, November 04, 2026",
+                       "notes_2026-11-04.md", "2026-11-04_standup.md", "plan_2026-11-04",
+                       "## Findings for November 04", "updated Nov 4", "today is Wednesday"):
+            self.assertTrue(mapping.answer_repeats_date(answer), answer)
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), "a date is not a number: " + answer)
+        for answer in ("memory/2026-11-05.md", "November 14, 2026", "build 20261104", "2026-11-04T10:00:00Z",
+                       "Nov 40", "Wednesdays"):
+            self.assertFalse(mapping.answer_repeats_date(answer), answer)
 
     def test_hermes_zone_names_before_the_offset(self):
         now = calendar.timegm(datetime(2026, 11, 5, 3, 0).timetuple())
@@ -229,8 +233,12 @@ class LongDateTest(unittest.TestCase):
     def test_a_date_with_a_time_of_day_is_left_alone(self):
         now = self.at(2026, 11, 5)
         for text in ("November 05, 2026 at 10:42:01", "Thursday, November 05, 2026 10:42 AM",
-                     "November 05, 2026, 9:30 PM"):
+                     "November 05, 2026, 9:30 PM", "November 05, 2026 - 10:42", "November 05, 2026 at 10 PM",
+                     "November 05, 2026 (10:42)", "November 05, 2026 10h42", "10:42 on November 05, 2026",
+                     "10pm, November 05, 2026"):
             self.assertEqual(self.norm_at(text, now), text)
+        # Hermes's zone suffix is not a time of day.
+        self.assertEqual(self.norm_at("November 05, 2026 (UTC, UTC+00:00)", now), "⟦TIME_today⟧ (UTC, UTC+00:00)")
 
 
 class TimeTest(unittest.TestCase):
