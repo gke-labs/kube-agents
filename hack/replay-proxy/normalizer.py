@@ -19,7 +19,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -143,23 +143,33 @@ OPENSSL_TS_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) (\d{2}):(\d{2
 # `Nov  2 04:13` and `Nov  2  2025` (ls -l).
 LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):(\d{2})|(\d{4}))\b")
 # `Thursday, November 05, 2026 (UTC, UTC+00:00)`: the date Hermes writes into
-# every system prompt as "Conversation started". It has no time of day, so it
+# the system prompt as "Conversation started". It has no time of day, so it
 # becomes how many calendar days it is from the request's own day (in the
-# offset after it, when one is given): a nightly recorded on Wednesday and a
-# presubmit on Thursday both read `today`. The weekday name is dropped with
-# it; the parenthesised zone stays as written.
+# offset after it, when one is given, else UTC): a nightly recorded on
+# Wednesday and a presubmit on Thursday both read `today`. The weekday name is
+# dropped with it; the parenthesised zone (Hermes writes zone names, then
+# `UTC±HH:MM`) stays as written. A spelled-out date followed by a time of day
+# is left alone: day counting would lose its time. A date-only ISO value and an
+# `ls -l` date with a year are day-counted the same way.
 LONG_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
                "October", "November", "December")
 LONG_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 LONG_DATE_RE = re.compile(
     r"\b(?:(?:" + "|".join(LONG_DAYS) + r"),\s+)?(" + "|".join(LONG_MONTHS) + r")\s+(\d{1,2}),\s+(\d{4})\b"
-    r"(?=\s*\([^()]*?UTC([+-])(\d{2}):?(\d{2})\))?"
+    r"(?!,?\s+(?:at\s+)?\d{1,2}:\d{2})"
+    r"(?=\s*\((?:[\w/+-]+,\s*)*UTC([+-])(\d{2}):(\d{2})\))?"
 )
 DATE_TODAY = "today"
-DAYS_PER_DAY_BUCKET = 1
-# Whole days from the request's day -> bucket, the same spans as TIME_BUCKETS.
+LONG_DATE_FORMAT = "%B %d, %Y"
+# A date an answer repeats is a whole token: not part of a longer number or word.
+DATE_BEFORE = r"(?<![\w])"
+DATE_AFTER = r"(?![\w])"
+# Fewer whole days from the request's day than this is "day" (one day either way).
+DAYS_IN_DAY_BUCKET = 2
+# Whole days from the request's day -> bucket: under each limit, with the
+# same month and year edges as TIME_BUCKETS, plus "day" for exactly one.
 DAY_BUCKETS = (
-    (DAYS_PER_DAY_BUCKET, "day"),
+    (DAYS_IN_DAY_BUCKET, "day"),
     (DAYS_PER_MONTH_BUCKET, "days"),
     (DAYS_PER_YEAR_BUCKET, "months"),
 )
@@ -263,7 +273,7 @@ def day_bucket(days: int) -> str:
     if days == 0:
         name = DATE_TODAY
     else:
-        span = next((label for limit, label in DAY_BUCKETS if abs(days) <= limit), TIME_BUCKET_BEYOND)
+        span = next((label for limit, label in DAY_BUCKETS if abs(days) < limit), TIME_BUCKET_BEYOND)
         name = (TIME_FUTURE_PREFIX if days > 0 else TIME_PAST_PREFIX) + span
     return f"{OPEN}{TIME_CLASS}_{name}{CLOSE}"
 
@@ -278,6 +288,14 @@ class Mapping:
     # (keyed numbers) and epoch timestamps, which become an unnumbered
     # how-far-from-now time token.
     bare_numbers: set = field(default_factory=set)
+    # Dates swapped for a day-count token, in the forms an answer would write
+    # them: the token can't be put back either, so an answer naming one is not
+    # saved (it would carry the recording's day into a replay on another day).
+    dates: set = field(default_factory=set)
+
+    def add_date(self, when: "date", raw: str) -> None:
+        self.dates.update({raw, when.isoformat(), when.strftime(LONG_DATE_FORMAT),
+                           f"{LONG_MONTHS[when.month - 1]} {when.day}, {when.year}"})
 
     def placeholder(self, cls: str, value: str) -> str:
         key = (cls if cls in (OPAQUE_CLASS, NUMBER_CLASS) else "") + MAPPING_KEY_SEPARATOR + value
@@ -312,6 +330,8 @@ class Mapping:
 
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""
+        if any(re.search(DATE_BEFORE + re.escape(value) + DATE_AFTER, text) for value in self.dates):
+            return True
         for value in self.bare_numbers:
             if len(value) >= MIN_STANDALONE_REPEAT_DIGITS:
                 pattern = NUMBER_BEFORE + re.escape(value) + NUMBER_AFTER
@@ -469,6 +489,11 @@ class Normalizer:
         offset = 0
         if sign:
             offset = (-1 if sign == ZONE_NEGATIVE else 1) * (int(hours) * SECONDS_PER_HOUR + int(minutes) * SECONDS_PER_MINUTE)
+        return self.date_token(when, m.group(0), offset)
+
+    def date_token(self, when: "date", raw: str, offset: int = 0) -> str:
+        """A date with no time of day: days from the request's day (at `offset` from UTC), noted as unrestorable."""
+        self.mapping.add_date(when, raw)
         return day_bucket((when - datetime.fromtimestamp(self.now + offset, timezone.utc).date()).days)
 
     def iso(self, m: "re.Match[str]") -> str:
@@ -477,6 +502,8 @@ class Normalizer:
             when = datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0), int(second or 0))
         except ValueError:
             return m.group(0)
+        if hour is None:
+            return self.date_token(when.date(), m.group(0))
         offset = 0
         if zone and zone != UTC_ZONE:
             sign = -1 if zone[0] == ZONE_NEGATIVE else 1
@@ -507,7 +534,7 @@ class Normalizer:
         now_year = datetime.fromtimestamp(self.now, timezone.utc).year
         try:
             if year:
-                when = calendar.timegm(datetime(int(year), MONTHS.index(month) + 1, int(day)).timetuple())
+                return self.date_token(datetime(int(year), MONTHS.index(month) + 1, int(day)).date(), m.group(0))
             else:
                 when = calendar.timegm(
                     datetime(now_year, MONTHS.index(month) + 1, int(day), int(hour), int(minute)).timetuple()

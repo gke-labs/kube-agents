@@ -177,6 +177,10 @@ class LongDateTest(unittest.TestCase):
             "January 05, 2020": "⟦TIME_past_years⟧",
             "November 06, 2026": "⟦TIME_future_day⟧",
             "December 25, 2026": "⟦TIME_future_months⟧",
+            # The month and year edges match the timestamp buckets' (30 and 365 days).
+            "December 05, 2026": "⟦TIME_future_months⟧",
+            "November 05, 2027": "⟦TIME_future_years⟧",
+            "December 04, 2026": "⟦TIME_future_days⟧",
         }
         for date, token in cases.items():
             self.assertEqual(self.norm_at("renew by " + date, now), "renew by " + token, date)
@@ -193,6 +197,40 @@ class LongDateTest(unittest.TestCase):
         now = self.at(2026, 11, 5)
         for text in ("February 30, 2026", "May 2026", "November 5th", "Mayday, November 05, 2026x"):
             self.assertNotIn("⟦TIME", self.norm_at(text, now), text)
+
+    def test_an_answer_naming_the_date_is_not_saved(self):
+        # Replayed on Thursday, Wednesday's answer would write Wednesday's notes.
+        body = {"messages": [{"role": "system", "content": self.PROMPT.format("Wednesday, November 04, 2026")}]}
+        mapping = normalizer.normalize_request(body, self.at(2026, 11, 4)).mapping
+        for answer in ('{"path": "memory/2026-11-04.md"}', "## Findings for November 04, 2026",
+                       "as of November 4, 2026", "started Wednesday, November 04, 2026"):
+            self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
+        for answer in ("memory/2026-11-05.md", "November 14, 2026", "build 20261104", "2026-11-04T10:00:00Z"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+
+    def test_hermes_zone_names_before_the_offset(self):
+        now = calendar.timegm(datetime(2026, 11, 5, 3, 0).timetuple())
+        text = "Thursday, November 05, 2026 (America/New_York, EST, UTC-05:00)"
+        self.assertEqual(self.norm_at(text, now), "⟦TIME_future_day⟧ (America/New_York, EST, UTC-05:00)")
+
+    def test_an_unrelated_bracket_is_not_read_as_the_zone(self):
+        now = self.at(2026, 11, 5, 23)
+        text = "November 05, 2026 (window, ends UTC+14:00)"
+        self.assertEqual(self.norm_at(text, now), "⟦TIME_today⟧ (window, ends UTC+14:00)")
+
+    def test_date_only_iso_and_ls_dates_count_days_too(self):
+        # Before, both flipped bucket around midnight (within the hour, then hours).
+        self.assertEqual(self.norm_at("notAfter 2026-11-05", self.at(2026, 11, 5, 0)),
+                         self.norm_at("notAfter 2026-11-06", self.at(2026, 11, 6, 13)))
+        self.assertEqual(self.norm_at("notAfter 2026-11-05", self.at(2026, 11, 5, 0)), "notAfter ⟦TIME_today⟧")
+        self.assertEqual(self.norm_at("-rw-r--r-- 1 root root 12 Nov  3  2026 a", self.at(2026, 11, 5)),
+                         "-rw-r--r-- 1 root root 12 ⟦TIME_past_days⟧ a")
+
+    def test_a_date_with_a_time_of_day_is_left_alone(self):
+        now = self.at(2026, 11, 5)
+        for text in ("November 05, 2026 at 10:42:01", "Thursday, November 05, 2026 10:42 AM",
+                     "November 05, 2026, 9:30 PM"):
+            self.assertEqual(self.norm_at(text, now), text)
 
 
 class TimeTest(unittest.TestCase):
