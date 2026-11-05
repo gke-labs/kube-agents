@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1075,5 +1076,140 @@ func TestAQueuedAbandonReachesTheTaskOnEviction(t *testing.T) {
 		}
 	default:
 		t.Error("the queued abandon didn't reach the held task")
+	}
+}
+
+// runWorkerWithReset starts a profile worker whose ResetPaths are given, with
+// its log captured, and waits for it to be Ready.
+func runWorkerWithReset(t *testing.T, ctx context.Context, url string, harness []string, reset []string, logBuf *syncBuffer) string {
+	t.Helper()
+	cfg := profileWorkerConfig(t, url, harness)
+	cfg.Logger = slog.New(slog.NewTextHandler(logBuf, nil))
+	ln, addr := readyListener(t)
+	go func() {
+		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second, ResetPaths: reset})
+	}()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if resp, err := http.Get("http://" + addr + "/readyz"); err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return addr
+			}
+		}
+	}
+	t.Fatal("the worker never became ready")
+	return ""
+}
+
+// syncBuffer is a bytes.Buffer safe for the logger's goroutines and the
+// test's reads.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// What one task leaves in the reset paths (its working directory, $HOME,
+// /tmp and the rest) is gone before the next task's harness starts, on the
+// same warm pod, and the log says the reset ran.
+func TestATasksFilesAreGoneBeforeTheNextTask(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	work, home := t.TempDir(), t.TempDir()
+	harness := stub(t, fmt.Sprintf(`
+read first || exit 1
+case "$first" in
+  *WRITEWORD*)
+    mkdir -p %[1]s/sub && echo left > %[1]s/sub/notes.md
+    echo left > %[2]s/.cache-file
+    chmod 0500 %[1]s/sub
+    echo '{"type":"result","subtype":"success","result":"wrote"}' ;;
+  *)
+    found=$(find %[1]s %[2]s -mindepth 1 | tr '\n' ' ')
+    printf '{"type":"result","subtype":"success","result":"found: %%s"}\n' "$found" ;;
+esac
+`, work, home))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logBuf syncBuffer
+	runWorkerWithReset(t, ctx, url, harness, []string{work, home}, &logBuf)
+	c := testClient(t, url)
+	run := func(task, text string) string {
+		t.Helper()
+		d.offer(task, profileSubmission(t, task, text, nil), 5)
+		if a := d.nextAccept(5 * time.Second); a.TaskID != task || !a.Accepted {
+			t.Fatalf("offer of %s = %+v, want an accept", task, a)
+		}
+		d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+		waitState(t, c, pwProfile, task, lib.StateCompleted)
+		drainLeases(d, task, time.Second)
+		return artifactText(foldTask(t, c, pwProfile, task), lib.ArtifactResult)
+	}
+
+	if got := run("task-writes", "WRITEWORD"); got != "wrote" {
+		t.Fatalf("the first task answered %q", got)
+	}
+	got := run("task-reads", "look around")
+	if got != "found: " {
+		t.Errorf("the second task found the first task's files: %q", got)
+	}
+	for _, dir := range []string{work, home} {
+		if _, err := os.Stat(dir); err != nil {
+			t.Errorf("the reset removed the mount %s itself: %v", dir, err)
+		}
+	}
+	if !strings.Contains(logBuf.String(), "workspace reset") || !strings.Contains(logBuf.String(), "paths=2") {
+		t.Errorf("the log doesn't show the reset: %s", logBuf.String())
+	}
+}
+
+// A reset that fails takes the pod out of service for good: /readyz stops
+// answering 200 and every later offer is declined, so nothing the last task
+// left can reach another.
+func TestAFailedResetTakesThePodOutOfService(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	harness := stub(t, `
+read first || exit 1
+echo '{"type":"result","subtype":"success","result":"done"}'
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logBuf syncBuffer
+	// A reset path that isn't there can't be emptied.
+	addr := runWorkerWithReset(t, ctx, url, harness, []string{filepath.Join(t.TempDir(), "missing")}, &logBuf)
+	c := testClient(t, url)
+
+	d.offer("task-one", profileSubmission(t, "task-one", "one", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-one"})
+	waitState(t, c, pwProfile, "task-one", lib.StateCompleted)
+	drainLeases(d, "task-one", time.Second)
+
+	resp, err := http.Get("http://" + addr + "/readyz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Error("/readyz answers 200 after a failed reset")
+	}
+	d.offer("task-two", profileSubmission(t, "task-two", "two", nil), 5)
+	if a := d.nextAccept(5 * time.Second); a.Accepted || a.Reason != declineUnreset {
+		t.Errorf("an offer after a failed reset = %+v, want a decline (%s)", a, declineUnreset)
+	}
+	if !strings.Contains(logBuf.String(), "workspace reset failed") {
+		t.Errorf("the log doesn't show the failed reset: %s", logBuf.String())
 	}
 }

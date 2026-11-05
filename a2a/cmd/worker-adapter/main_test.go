@@ -639,3 +639,17 @@ func TestAProfileWorkerBindsNoDelegateSocket(t *testing.T) {
 		t.Errorf("profile mode argv = %q / %q, want the persona's base argv and no no-delegate variant", got.HarnessCommand, got.HarnessCommandNoDelegate)
 	}
 }
+
+// The reset paths come from the operator, and the worker empties only
+// absolute paths it was given: never a relative one (the worker's own
+// directory) or the root.
+func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
+	got := resetPaths("/scratch::relative:/:/home/node/:/tmp")
+	want := []string{"/scratch", "/home/node", "/tmp"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("resetPaths = %q, want %q", got, want)
+	}
+	if got := resetPaths(""); len(got) != 0 {
+		t.Errorf("resetPaths(\"\") = %q, want none", got)
+	}
+}
