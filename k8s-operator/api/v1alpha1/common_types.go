@@ -2689,23 +2689,33 @@ type AgentUsageStatus struct {
 	// LastActiveTime: a card giving up is not the agent at work.
 	// +optional
 	BackgroundTasksGaveUpTotal int64 `json:"backgroundTasksGaveUpTotal,omitempty"`
-	// NegativeFeedbackTotal is the cumulative count of thumbs-down reactions
-	// put on one of the bot's Slack messages: the chat_feedback_reactions hook
-	// on the Hermes gateway counts a -1 or thumbsdown reaction, skin tone or
-	// not, whose reactor is not the bot and whose message is the bot's, once
-	// per reactor and message within one gateway process (a thumbs-down taken
-	// off and put back is one; after a restart the same one counts again, and
-	// a reaction before the first inbound message after a start is not
-	// counted), into the
-	// chat_metrics plugin's kubeagents_chat_feedback_negative_total, which is
-	// read every five minutes and kept monotonic the same way as
-	// ToolExecutionsTotal. Slack through the Hermes gateway only: Google Chat
-	// delivers no reaction events, and the A2A gateway's Slack adapter does not
-	// subscribe to them, so on a next-mode install with Slack through A2A this
-	// stays at 0. Does not move LastActiveTime: the message the person
-	// reacted to already did.
+	// NegativeFeedbackTotal is the cumulative count of thumbs-downs people
+	// gave the bot's answers. On the Hermes gateway the
+	// chat_feedback_reactions hook counts a -1 or thumbsdown reaction on one
+	// of the bot's Slack messages, skin tone or not, whose reactor is not the
+	// bot, once per reactor and message within one gateway process (a
+	// thumbs-down taken off and put back is one; after a restart the same one
+	// counts again, and a reaction before the first inbound message after a
+	// start is not counted), into the chat_metrics plugin's
+	// kubeagents_chat_feedback_negative_total; Google Chat delivers no
+	// reaction events. On a next-mode install the A2A gateway's
+	// kubeagents_a2a_gateway_answer_feedback_total under rating down joins
+	// it: each Bad answer a verified sender gave one of its answers, a
+	// changed rating counted again. Read every five minutes and kept
+	// monotonic the same way as ToolExecutionsTotal. Does not move
+	// LastActiveTime: the message the person rated already did.
 	// +optional
 	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
+	// PositiveFeedbackTotal is the cumulative count of Good answer ratings a
+	// verified sender gave one of the A2A gateway's answers:
+	// kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
+	// over its other labels, a changed rating counted again; read every five
+	// minutes and kept monotonic the same way as ToolExecutionsTotal. Next
+	// mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
+	// install this stays at 0. Does not move LastActiveTime: the message the
+	// person rated already did.
+	// +optional
+	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
 	// RemediationsClosedUnmergedTotal is the forge's count now of this
 	// install's proposals closed without a merge by a person or a bot:
 	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
@@ -2810,9 +2820,9 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran or was refused, a proposal was opened, a
 	// chat message reached the gateway, or an event was accepted for triage;
-	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal
-	// and NegativeFeedbackTotal alone leave it where it was, and the six
-	// proposal readings never move it.
+	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
+	// NegativeFeedbackTotal and PositiveFeedbackTotal alone leave it where it
+	// was, and the six proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

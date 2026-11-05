@@ -224,6 +224,17 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_chat_plugins_negative_feedback_family_is_the_one_the_poller_sums_into_negative_feedback(self):
         self.assertEqual(_py_const("CHAT_FEEDBACK_NEGATIVE_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "chatFeedbackNegativeSeries"))
 
+    def test_the_a2a_gateways_answer_ratings_are_the_feedback_counters_family(self):
+        """On a next-mode install the A2A gateway's answer ratings feed both feedback
+        counters, split on the rating label: down into negativeFeedbackTotal beside the
+        plugin's family, up into positiveFeedbackTotal."""
+        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "answerFeedbackName"))
+        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aAnswerFeedbackSeries"))
+        self.assertEqual(_go_const(_A2A_METRICS_GO, "labelRating"), _go_const(_SCRAPE_GO, "a2aRatingLabel"))
+        feedback_go = _REPO_ROOT / "a2a" / "gateway" / "feedback.go"
+        self.assertEqual(_go_const(feedback_go, "FeedbackUp"), _go_const(_SCRAPE_GO, "a2aRatingUp"))
+        self.assertEqual(_go_const(feedback_go, "FeedbackDown"), _go_const(_SCRAPE_GO, "a2aRatingDown"))
+
     def test_the_errored_states_the_poller_filters_on_are_the_a2a_libs_failed_and_rejected(self):
         """The state values are the A2A library's constants; the gateway emits them
         through its terminal list, and the operator's map is the second copy."""
