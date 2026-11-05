@@ -643,9 +643,11 @@ class ForwardTest(unittest.TestCase):
 
         run.side_effect = timed
         with mock.patch.object(forge.time, "monotonic", lambda: clock[0]), \
+                self.assertNoLogs(forge.LOGGER, "WARNING"), \
                 self.assertRaises(forge.ForgeError) as ctx:
             forge.call("proposal-list", {}, REPO, retry_transient=True, timeout_s=7)
         self.assertEqual(ctx.exception.reason, forge.REASON_SANDBOX_UNREACHABLE)
+        self.assertIn("was not retried", str(ctx.exception))
         self.assertEqual(run.call_count, 1, "the retry had no time left and was not started")
 
     def test_a_refusal_survives_the_crossing_with_its_code(self):

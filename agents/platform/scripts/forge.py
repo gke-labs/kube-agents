@@ -166,7 +166,7 @@ SANDBOX_FORGE = "/opt/vcs/libexec/platform/forge.py"
 #: Bounds the ssh hop around a forwarded verb. Not the broker's ceiling plus
 #: room -- the broker allows 300s per forge call and a verb may make several, so
 #: no single number here can sit above it. It is a bound on the verbs this
-#: module forwards, reads and the one-token claim that answer in seconds, chosen so that a
+#: module forwards, which answer in seconds, chosen so that a
 #: hung hop fails the tick instead of holding the cron's slot. A verb that
 #: legitimately runs longer than this belongs on a route of its own, not on a
 #: larger constant.
@@ -540,6 +540,12 @@ def call(
         except ForgeError as error:
             if attempt == attempts or error.reason not in TRANSIENT_CODES:
                 raise
+            if deadline is not None and deadline - time.monotonic() <= 0:
+                raise ForgeError(
+                    REASON_SANDBOX_UNREACHABLE,
+                    f"{verb} on {repo} failed with {error.reason} and was not retried: "
+                    f"no time left of its {timeout_s}s ceiling",
+                ) from error
             LOGGER.warning(
                 "%s on %s failed with %s; retrying once", verb, repo, error.reason
             )
