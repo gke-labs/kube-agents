@@ -97,8 +97,15 @@ Four behaviours worth knowing before the first run:
   unsandboxed pod shares the node kernel with everything else on the node. Autopilot, the shape a
   fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
-  node pool of one `e2-standard-4` per zone. Pass `--enable-gvisor=false` to run on the standard
-  container runtime.
+  node pool of one `e2-standard-4` per zone, autoscaling to two. The module's
+  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it; the
+  installer writes none of them, so an `install.sh`-driven install sets them as `TF_VAR_` lines in
+  `install.env` (`TF_VAR_sizing_profile=fleet`), which Terraform reads where the generated tfvars
+  is silent, and keeps them there for every later run: `lifecycle.sh` refuses an apply that would
+  resize a pool no sizing input asked to resize (the pool's own explicit input, or, for an attribute
+  no explicit input decided at the last apply, a profile other than the one that apply recorded),
+  the shape a lost line would otherwise plan. Pass
+  `--enable-gvisor=false` to run on the standard container runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
   reports it. It costs three GCP resources in the install's project — a Log Router sink, a Pub/Sub
