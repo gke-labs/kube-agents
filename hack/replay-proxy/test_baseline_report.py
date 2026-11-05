@@ -83,8 +83,13 @@ def write(lines, suffix=".jsonl", directory=None):
 
 
 def write_json(doc, name=None, directory=None):
-    path = os.path.join(directory or TEMP_DIR, name) if name else tempfile.mktemp(suffix=".json", dir=TEMP_DIR)
-    with open(path, "w", encoding="utf-8") as handle:
+    if name:
+        path = os.path.join(directory or TEMP_DIR, name)
+        handle = open(path, "w", encoding="utf-8")
+    else:
+        descriptor, path = tempfile.mkstemp(suffix=".json", dir=TEMP_DIR)
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+    with handle:
         json.dump(doc, handle)
     return path
 
@@ -92,7 +97,7 @@ def write_json(doc, name=None, directory=None):
 def report(lines, runs=None, price_as=None, since=None, until=None):
     quality = br.Quality()
     loaded, manifests = br.load_lines([write(lines)], quality)
-    loaded = br.in_window(loaded, since, until, quality)
+    loaded, _ = br.in_window(loaded, since, until, quality)
     eval_runs = br.load_eval([write_json({"runs": runs})], quality) if runs is not None else {}
     return br.build_report(loaded, manifests, eval_runs, prices(price_as), quality, since, until)
 
@@ -543,6 +548,77 @@ class ReviewFixes(unittest.TestCase):
         total = report([line("a", 1, build="b1")], runs=runs)["scopes"]["total"]
         self.assertEqual((total["harness_tokens_total"], total["harness_partial_reps"]), (150, 1))
         self.assertIsNone(report([line("a", 1)])["scopes"]["total"]["harness_partial_reps"])
+
+
+class SecondReview(unittest.TestCase):
+    def test_no_module_here_uses_the_insecure_mktemp(self):
+        call = "tempfile." + "mktemp("
+        for name in sorted(os.listdir(HERE)):
+            if name.endswith(".py"):
+                with open(os.path.join(HERE, name), encoding="utf-8") as handle:
+                    self.assertNotIn(call, handle.read(), name)
+
+    EPOCH = 1_700_000_000
+
+    def window_dir(self):
+        root = tempfile.mkdtemp(dir=TEMP_DIR)
+        write([line("a", self.EPOCH + 100, build="old"), line("b", self.EPOCH + 200, build="new")], directory=root)
+        for build, seconds in (("old", 100), ("new", 200), ("quiet-old", 50), ("quiet-new", 210)):
+            # quiet-*: builds that logged nothing, started outside and inside the window.
+            write_json({"kind": "nightly", "build": build}, name=f"job-{(self.EPOCH + seconds) * 1000}.json",
+                       directory=root)
+        return root
+
+    def test_manifests_of_builds_outside_the_window_are_dropped(self):
+        code, out, err = run_main([self.window_dir(), "--since", str(self.EPOCH + 150), "--json"])
+        self.assertEqual((code, err), (0, ""))
+        report_out = json.loads(out)
+        self.assertEqual([b["build"] for b in report_out["builds"]], ["new"])
+        self.assertEqual(report_out["data_quality"]["manifest_builds_without_lines"], ["nightly/quiet-new"])
+
+    def test_an_out_of_window_build_with_a_manifest_is_not_listed(self):
+        quality = br.Quality()
+        until = self.EPOCH + 150
+        lines, manifests = br.load_lines([self.window_dir()], quality)
+        kept, excluded = br.in_window(lines, None, until, quality)
+        self.assertEqual(excluded, {("nightly", "new")})
+        kept_manifests = br.manifests_in_window(manifests, kept, excluded, None, until)
+        r = br.build_report(kept, kept_manifests, {}, prices(), quality)
+        self.assertEqual(r["data_quality"]["manifest_builds_without_lines"], ["nightly/quiet-old"])
+        self.assertEqual(br.manifests_in_window([br.Manifest("nightly", "x", None)], [], set(), until, None),
+                         [br.Manifest("nightly", "x", None)])
+
+    def test_lines_without_a_build_id_are_no_build(self):
+        r = report([
+            line("a", 1, build="b1", prompt=100, latency_ms=1000),
+            line("b", 2, build="", prompt=300, latency_ms=3000),
+            line("c", 3, build="", prompt=500, latency_ms=5000),
+        ], runs=[eval_run("b1", [task("c", {"result": "pass"})])])
+        total = r["scopes"]["total"]
+        self.assertEqual((total["builds"], total["requests"], total["prompt_tokens"]), (1, 3, 900))
+        self.assertEqual(total["requests_per_build"], 3.0)
+        self.assertEqual(total["prompt_tokens_per_build"], 900.0)
+        self.assertEqual(total["model_time_per_build_s"], 9.0)
+        self.assertEqual(r["data_quality"]["lines_without_build"], 2)
+        self.assertEqual(r["data_quality"]["builds_without_eval_run"], 0)
+        listing = {b["build"]: b["metrics"] for b in r["builds"]}
+        self.assertIn("not a build", br.NO_BUILD)
+        self.assertEqual(listing[br.NO_BUILD]["builds"], 0)
+        self.assertIsNone(listing[br.NO_BUILD]["requests_per_build"])
+
+    def test_lines_without_a_build_id_are_windowed_one_by_one(self):
+        r = report([line("a", 100, build=""), line("b", 200, build=""), line("c", 300, build="")],
+                   since=150, until=250)
+        self.assertEqual(r["scopes"]["total"]["requests"], 1)
+        self.assertEqual(r["data_quality"]["skipped_lines"], {"outside_window": 2})
+
+    def test_parse_time_refuses_what_is_not_a_time(self):
+        for value in ("nan", "inf", "-inf", "1e400", "20261105", "-5", "", "1.5e9", "9" * 400, "soon",
+                      "20261105T010000", "2026W45"):
+            with self.assertRaises(ValueError, msg=value):
+                br.parse_time(value)
+        self.assertEqual(br.parse_time("1762300800.5"), 1762300800.5)
+        self.assertEqual(br.parse_time("2026-11-05T01:00:00Z"), 1793836800.0 + 3600)
 
 
 class MalformedInput(unittest.TestCase):

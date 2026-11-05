@@ -42,7 +42,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import analyze_shadow
 import replay_proxy
@@ -80,8 +80,10 @@ COST_SOURCE_LITELLM, COST_SOURCE_TABLE, COST_SOURCE_MIXED = "litellm", "price ta
 PROVIDER_SEPARATOR = "/"
 
 SEGMENT_SUFFIXES = (".jsonl", ".jsonl.open")
-MANIFEST_NAME = re.compile(r"^job-\d+\.json$")
-NO_BUILD = "(no build)"
+MANIFEST_NAME = re.compile(r"^job-(\d+)\.json$")
+# The listing of lines without a build id: they are no build, and stay out of
+# `builds` and every per-build figure.
+NO_BUILD = "(lines without a build id; not a build)"
 
 MS_PER_SECOND = 1000.0
 P50, P95 = 50, 95
@@ -94,6 +96,14 @@ PER_BUILD_DECIMALS = 1
 DELTA_DECIMALS = 1
 DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DATE_FORMAT = "%Y-%m-%d"
+# Epoch seconds: a plain run of digits, optionally with a fraction. Fewer than
+# nine digits is before 1973 and more likely a date written without dashes
+# (20261105 would be August 1970), so it is refused.
+EPOCH_SECONDS = re.compile(r"^\d+(\.\d+)?$")
+EPOCH_MIN_DIGITS = 9
+DECIMAL_POINT = "."
+# What a date or an ISO time starts with; anything else (nan, inf) is refused.
+ISO_START = re.compile(r"^\d{4}-\d{2}-\d{2}")
 ISO_TIMESPEC = "seconds"
 # The status_counts label of a line that carried no usable status.
 STATUS_NONE = "none"
@@ -174,7 +184,9 @@ class Metric:
 # from every line with a latency, since a 429 or a 500 still cost the agent
 # that wait. Eval metrics are null until a build in scope joins an eval run.
 METRICS: Tuple[Metric, ...] = (
-    Metric("builds", COUNT, "Distinct (job kind, build) pairs with at least one request line.", True),
+    Metric("builds", COUNT,
+           "Distinct (job kind, build) pairs with at least one request line. Lines without a build id count in "
+           "every sum but are no build, so they stay out of this and every per-build figure.", True),
     Metric("requests", COUNT,
            "Request lines, any status, including lines whose analysis failed or was dropped (each was a model "
            "request).", True),
@@ -315,6 +327,14 @@ class Line:
     @property
     def ok(self) -> bool:
         return self.status == HTTP_OK
+
+
+class Manifest(NamedTuple):
+    """A job manifest: which build ran with the proxy, and when its collector started (from the file name)."""
+
+    kind: str
+    build: str
+    started: Optional[float]
 
 
 @dataclass
@@ -529,8 +549,8 @@ def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
     )
 
 
-def load_lines(paths: Iterable[str], quality: Quality) -> Tuple[List[Line], List[Tuple[str, str]]]:
-    """The request lines in time order, and the (kind, build) of each readable manifest."""
+def load_lines(paths: Iterable[str], quality: Quality) -> Tuple[List[Line], List[Manifest]]:
+    """The request lines in time order, and each readable manifest."""
     logs, manifest_paths = expand_paths(paths)
     quality.files = len(logs)
     quality.manifests = len(manifest_paths)
@@ -551,7 +571,7 @@ def load_lines(paths: Iterable[str], quality: Quality) -> Tuple[List[Line], List
         if line is not None:
             lines.append(line)
     lines.sort(key=lambda l: l.ts)
-    manifests: List[Tuple[str, str]] = []
+    manifests: List[Manifest] = []
     for path in manifest_paths:
         try:
             with open(path, encoding="utf-8") as handle:
@@ -562,17 +582,25 @@ def load_lines(paths: Iterable[str], quality: Quality) -> Tuple[List[Line], List
         if not isinstance(doc, dict) or doc.get(F.JOB_KIND) not in JOB_KINDS:
             quality.bad_manifests += 1
             continue
-        manifests.append((doc[F.JOB_KIND], str(doc.get(F.JOB_BUILD) or "")))
+        name = MANIFEST_NAME.match(os.path.basename(path))
+        started = int(name.group(1)) / MS_PER_SECOND if name else None
+        manifests.append(Manifest(doc[F.JOB_KIND], str(doc.get(F.JOB_BUILD) or ""), started))
     return lines, manifests
 
 
 def parse_time(value: str, end_of_day: bool = False) -> float:
     """Epoch seconds from epoch seconds, an ISO date (UTC midnight; the next midnight with end_of_day)
     or an ISO datetime (UTC unless it names an offset)."""
-    try:
-        return float(value)
-    except ValueError:
-        pass
+    if EPOCH_SECONDS.match(value):
+        if len(value.split(DECIMAL_POINT, 1)[0]) < EPOCH_MIN_DIGITS:
+            raise ValueError(f"{value!r}: write a date as YYYY-MM-DD; epoch seconds need at least"
+                             f" {EPOCH_MIN_DIGITS} digits")
+        seconds = float(value)
+        if not math.isfinite(seconds):
+            raise ValueError(f"{value!r}: not a finite number of epoch seconds")
+        return seconds
+    if not ISO_START.match(value):
+        raise ValueError(f"{value!r}: expected epoch seconds, YYYY-MM-DD or an ISO 8601 time")
     if DATE_ONLY.match(value):
         day = datetime.datetime.strptime(value, DATE_FORMAT).replace(tzinfo=datetime.timezone.utc)
         if end_of_day:
@@ -584,19 +612,44 @@ def parse_time(value: str, end_of_day: bool = False) -> float:
     return moment.timestamp()
 
 
-def in_window(lines: List[Line], since: Optional[float], until: Optional[float], quality: Quality) -> List[Line]:
-    """Keep whole builds whose first request falls in [since, until), so no build is cut in two."""
+def _outside(ts: float, since: Optional[float], until: Optional[float]) -> bool:
+    return (since is not None and ts < since) or (until is not None and ts >= until)
+
+
+def in_window(
+    lines: List[Line], since: Optional[float], until: Optional[float], quality: Quality
+) -> Tuple[List[Line], Set[Tuple[str, str]]]:
+    """Keep whole builds whose first request falls in [since, until), so no build is cut in two, and lines
+    without a build id by their own time. Returns the kept lines and the (kind, build) keys left out."""
     first: Dict[Tuple[str, str], float] = {}
     for line in lines:
         first.setdefault(line.key, line.ts)
     kept = []
+    excluded: Set[Tuple[str, str]] = set()
     for line in lines:
-        start = first[line.key]
-        if (since is not None and start < since) or (until is not None and start >= until):
+        start = first[line.key] if line.build else line.ts
+        if _outside(start, since, until):
             quality.skip(SKIP_OUTSIDE_WINDOW)
+            if line.build:
+                excluded.add(line.key)
             continue
         kept.append(line)
-    return kept
+    return kept, excluded
+
+
+def manifests_in_window(
+    manifests: List[Manifest], lines: List[Line], excluded: Set[Tuple[str, str]],
+    since: Optional[float], until: Optional[float],
+) -> List[Manifest]:
+    """Drop the manifests of builds the window left out, and of builds with no lines whose collector started
+    outside it."""
+    logged = {line.key for line in lines}
+    return [
+        manifest for manifest in manifests
+        if (manifest.kind, manifest.build) not in excluded
+        and ((manifest.kind, manifest.build) in logged or manifest.started is None
+             or not _outside(manifest.started, since, until))
+    ]
 
 
 def load_eval(paths: Iterable[str], quality: Quality) -> Dict[str, EvalRun]:
@@ -654,7 +707,8 @@ def ratio(part: float, whole: float, decimals: int = RATE_DECIMALS) -> Optional[
 
 def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Dict[str, Any]:
     """Every metric in METRICS for one scope, plus status_counts and unpriced (by model label)."""
-    builds = {line.key for line in lines}
+    # Lines without a build id count in every sum but are no build.
+    builds = {line.key for line in lines if line.build}
     ok = [line for line in lines if line.ok]
     prompt = sum(line.prompt_tokens or 0 for line in ok)
     cached = sum(min(line.cached_tokens or 0, line.prompt_tokens or 0) for line in ok)
@@ -800,7 +854,7 @@ def case_table(builds: Iterable[str], runs: Dict[str, EvalRun]) -> Dict[str, Dic
 
 
 def build_report(
-    lines: List[Line], manifests: List[Tuple[str, str]], runs: Dict[str, EvalRun], prices: Prices,
+    lines: List[Line], manifests: List[Manifest], runs: Dict[str, EvalRun], prices: Prices,
     quality: Quality, since: Optional[float] = None, until: Optional[float] = None,
 ) -> Dict[str, Any]:
     by_build: Dict[Tuple[str, str], List[Line]] = {}
@@ -847,7 +901,7 @@ def build_report(
             "manifests": quality.manifests,
             "bad_manifests": quality.bad_manifests,
             "manifest_builds_without_lines": sorted(
-                f"{kind}/{build}" for kind, build in set(manifests) - logged
+                f"{kind}/{build}" for kind, build in {(m.kind, m.build) for m in manifests} - logged
             ),
             "skipped_lines": dict(sorted(quality.skipped.items())),
             "bad_field_values": dict(sorted(quality.bad_values.items())),
@@ -860,7 +914,7 @@ def build_report(
             "eval_duplicate_runs": quality.eval_duplicate_runs,
             "eval_unknown_results": quality.eval_unknown_results,
             "eval_tier_mismatches": quality.eval_tier_mismatches,
-            "builds_without_eval_run": sum(1 for _, build in logged if build not in runs) if runs else None,
+            "builds_without_eval_run": sum(1 for _, build in logged if build and build not in runs) if runs else None,
         },
     }
 
@@ -1054,7 +1108,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             since = parse_time(args.since) if args.since else None
             until = parse_time(args.until, end_of_day=True) if args.until else None
             lines, manifests = load_lines(args.logs, quality)
-            lines = in_window(lines, since, until, quality)
+            lines, excluded = in_window(lines, since, until, quality)
+            manifests = manifests_in_window(manifests, lines, excluded, since, until)
             runs = load_eval(args.eval_data, quality)
             report = build_report(lines, manifests, runs, prices, quality, since, until)
         if args.compare:

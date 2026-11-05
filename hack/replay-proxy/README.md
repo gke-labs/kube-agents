@@ -57,7 +57,7 @@ python3 baseline_report.py shadow/ --eval-data data.json --price-as model-defaul
   --since 2026-11-05 --until 2026-11-18 --json > baseline.json
 ```
 
-`--since` and `--until` take epoch seconds, a date (`--until` includes that day) or an ISO time, and keep whole builds by their first request. Read the data-quality block before freezing: skipped lines, bad field values, estimated token lines and unpriced requests each mean a number above is short. Later, run the same command over the new window with `--compare baseline.json` (add `--json` for the deltas as JSON), or compare two saved reports with `--report current.json --compare baseline.json`. The deltas are current minus baseline, absolutely (percentage points for rates) and as a percent of the baseline; a note says when the price tables, `--price-as` or the report schema differ, or when either side's cost is partial. Compare per-build metrics: two windows rarely hold the same number of builds.
+`--since` and `--until` take epoch seconds (a plain run of at least nine digits), a `YYYY-MM-DD` date (`--until` includes that day) or an ISO time that starts with one, and refuse anything else. They keep whole builds by their first request, and the manifests of the builds they keep; a line without a build id is kept or left out by its own time, and counts in every sum but in no per-build figure. Read the data-quality block before freezing: skipped lines, bad field values, estimated token lines and unpriced requests each mean a number above is short. Later, run the same command over the new window with `--compare baseline.json` (add `--json` for the deltas as JSON), or compare two saved reports with `--report current.json --compare baseline.json`. The deltas are current minus baseline, absolutely (percentage points for rates) and as a percent of the baseline; a note says when the price tables, `--price-as` or the report schema differ, or when either side's cost is partial. Compare per-build metrics: two windows rarely hold the same number of builds.
 
 The metrics, as `baseline_report.py` defines them:
 
@@ -67,7 +67,7 @@ The metrics, as `baseline_report.py` defines them:
 
 | Metric | Unit | Headline | Definition |
 | ------ | ---- | -------- | ---------- |
-| `builds` | count | yes | Distinct (job kind, build) pairs with at least one request line. |
+| `builds` | count | yes | Distinct (job kind, build) pairs with at least one request line. Lines without a build id count in every sum but are no build, so they stay out of this and every per-build figure. |
 | `requests` | count | yes | Request lines, any status, including lines whose analysis failed or was dropped (each was a model request). |
 | `requests_per_build` | count | yes | requests / builds. |
 | `ok_requests` | count |  | Request lines with status 200. |
