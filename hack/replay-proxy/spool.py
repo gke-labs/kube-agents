@@ -46,6 +46,19 @@ TEXT_ENCODING = "utf-8"
 SEGMENT_MAX_BYTES = 8 * 1024 * 1024
 # Owner only: the lines hold hashes that can be guessed against.
 SEGMENT_FILE_MODE = 0o600
+# The kubelet evicts on disk used, not on file sizes: every small file takes
+# whole blocks, so the budget counts allocated blocks (st_blocks is always in
+# 512-byte units) and rounds a noted write up to a filesystem block.
+STAT_BLOCK_BYTES = 512
+DISK_BLOCK_BYTES = 4096
+# A pod being replaced writes this file in the log directory from its preStop
+# hook (charts/kube-agents/templates/litellm.yaml); from then on a segment is
+# closed this many seconds after its first line instead of max_age_seconds, so
+# lines written while the pod drains land in closed segments the collector's
+# next pass copies before the pod and its volume are gone. Not a `.jsonl`
+# name, so the collector never lists it.
+DRAIN_MARKER_NAME = ".draining"
+DRAIN_MAX_AGE_SECONDS = 5
 # Anything but these in a pod name becomes `_` in a file name.
 UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9.-]")
 SAFE_NAME_FILLER = "_"
@@ -88,7 +101,7 @@ def close_open_segments(directory: str) -> int:
 
 
 def tree_bytes(roots: Iterable[str]) -> int:
-    """Bytes in the regular files under each root; a file that vanishes mid-walk counts nothing."""
+    """Disk used by the files and directories under each root; one that vanishes mid-walk counts nothing."""
     total = 0
     stack: List[str] = [r for r in roots if r]
     while stack:
@@ -101,15 +114,16 @@ def tree_bytes(roots: Iterable[str]) -> int:
             try:
                 if entry.is_dir(follow_symlinks=False):
                     stack.append(entry.path)
+                    total += entry.stat(follow_symlinks=False).st_blocks * STAT_BLOCK_BYTES
                 elif entry.is_file(follow_symlinks=False):
-                    total += entry.stat(follow_symlinks=False).st_size
+                    total += entry.stat(follow_symlinks=False).st_blocks * STAT_BLOCK_BYTES
             except OSError:
                 continue
     return total
 
 
 class DataBudget:
-    """Allows writes while the files under `roots` hold less than `max_bytes`.
+    """Allows writes while the files under `roots` take less than `max_bytes` of disk.
 
     Measured on a background thread every `interval_seconds`, and counted up
     by `note` between measurements, so a burst between two walks is not free.
@@ -139,8 +153,9 @@ class DataBudget:
         return self.used() < self.max_bytes
 
     def note(self, written: int) -> None:
+        """Count a write until the next measurement, as the whole blocks it takes."""
         with self._lock:
-            self._used += written
+            self._used += -(-written // DISK_BLOCK_BYTES) * DISK_BLOCK_BYTES
 
     def close(self) -> None:
         self._stop.set()
@@ -166,6 +181,7 @@ class SegmentLog:
         self.budget = budget
         self.clock = clock
         self.recovered = close_open_segments(directory)
+        self.drain_marker = os.path.join(directory, DRAIN_MARKER_NAME)
         self._lock = threading.Lock()
         self._seq = 0
         self._fd: Optional[int] = None
@@ -201,9 +217,10 @@ class SegmentLog:
             return True
 
     def roll_if_due(self) -> None:
-        """Close the open segment once it has been open for max_age_seconds."""
+        """Close the open segment once it has been open for max_age_seconds (DRAIN_MAX_AGE_SECONDS while draining)."""
+        age = DRAIN_MAX_AGE_SECONDS if os.path.exists(self.drain_marker) else self.max_age_seconds
         with self._lock:
-            if self._fd is not None and self.clock() - self._opened >= self.max_age_seconds:
+            if self._fd is not None and self.clock() - self._opened >= age:
                 self._close()
 
     def close(self) -> None:

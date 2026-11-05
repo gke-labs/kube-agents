@@ -104,6 +104,20 @@ class SegmentRotationTest(TempDirTestCase):
         self.assertEqual(spool.segment_prefix("pod/a b", 1.5), "pod_a_b-1500")
 
 
+class DrainTest(TempDirTestCase):
+    def test_a_draining_pod_closes_segments_within_seconds(self):
+        self.dir, self.clock = self.tmpdir(), FakeClock()
+        log = spool.SegmentLog(self.dir, PREFIX, AGE_SECONDS, clock=self.clock)
+        self.addCleanup(log.close)
+        log.write('{"n": 1}')
+        self.clock.now += spool.DRAIN_MAX_AGE_SECONDS
+        log.roll_if_due()
+        self.assertEqual(self.names(self.dir), [f"{PREFIX}-000001.jsonl.open"], "not draining: the usual age")
+        open(os.path.join(self.dir, spool.DRAIN_MARKER_NAME), "w").close()
+        log.roll_if_due()
+        self.assertIn(f"{PREFIX}-000001.jsonl", self.names(self.dir))
+
+
 class RecoveryTest(TempDirTestCase):
     def setUp(self):
         self.dir = self.tmpdir()
@@ -227,23 +241,38 @@ class DataBudgetTest(TempDirTestCase):
             handle.write(b"x" * 10)
         with open(os.path.join(b, "y"), "wb") as handle:
             handle.write(b"y" * 5)
-        self.assertEqual(spool.tree_bytes([a, b, "", os.path.join(a, "missing")]), 15)
-        self.assertEqual(self.budget([a, b], 100).used(), 15)
+        # Disk used, as the kubelet counts it: whole blocks for each file and directory.
+        def blocks(path):
+            return os.stat(path).st_blocks * spool.STAT_BLOCK_BYTES
+        expected = sum(blocks(p) for p in (os.path.join(a, "deep"), os.path.join(a, "deep", "x"), os.path.join(b, "y")))
+        self.assertEqual(spool.tree_bytes([a, b, "", os.path.join(a, "missing")]), expected)
+        self.assertGreater(expected, 15, "15 bytes of content take whole blocks")
+        self.assertEqual(self.budget([a, b], expected + 1).used(), expected)
+
+    def test_many_small_files_spend_the_budget_by_the_disk_they_take(self):
+        # Uploads failing, nothing emptied: thousands of small blobs. Their
+        # sizes sum to far less than the disk they use.
+        root = self.tmpdir()
+        for i in range(200):
+            with open(os.path.join(root, f"b{i}.json"), "wb") as handle:
+                handle.write(b"x" * 600)
+        budget = self.budget([root], 200 * 600 * 2)
+        self.assertFalse(budget.allows(), "200 files of 600 bytes take more than 240 kB of disk")
 
     def test_writes_count_between_measurements_and_the_budget_stops_them(self):
-        budget = self.budget([self.tmpdir()], 10)
+        budget = self.budget([self.tmpdir()], 2 * spool.DISK_BLOCK_BYTES)
         self.assertTrue(budget.allows())
-        budget.note(9)
+        budget.note(1)  # a block
         self.assertTrue(budget.allows())
-        budget.note(1)
+        budget.note(spool.DISK_BLOCK_BYTES)  # a second: spent
         self.assertFalse(budget.allows())
 
     def test_segment_log_stops_once_spent_and_resumes_when_room_returns(self):
         logs = self.tmpdir()
-        budget = self.budget([logs], 8)
+        budget = self.budget([logs], spool.DISK_BLOCK_BYTES)
         log = spool.SegmentLog(logs, PREFIX, AGE_SECONDS, budget)
         self.addCleanup(log.close)
-        self.assertTrue(log.write("1234567"))  # 8 bytes: spent
+        self.assertTrue(log.write("1234567"))  # 8 bytes, a whole block: spent
         self.assertFalse(log.write("dropped"))
         self.assertEqual(self.read(logs, f"{PREFIX}-000001.jsonl.open"), b"1234567\n")
         # The collector empties what it has uploaded; the next measurement sees it.

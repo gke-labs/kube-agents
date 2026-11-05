@@ -13,6 +13,7 @@ set, the rule tests/test_rendered_workloads_rollout_quota.py follows.
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -217,10 +218,13 @@ class EnabledTest(unittest.TestCase):
     def test_a_pod_being_replaced_outlives_one_segment_and_one_collector_pass(self):
         segment = int(self.env["REPLAY_LOG_SEGMENT_SECONDS"])
         command = self.container["lifecycle"]["preStop"]["exec"]["command"]
-        pre_stop = int(command[-1].rsplit("(", 1)[1].rstrip(")"))
-        collector_interval = 30
+        pre_stop = int(re.search(r"time\.sleep\((\d+)\)", command[-1]).group(1))
+        # The collector's pace as CI sets it, not a copy that could drift.
+        collector_interval = int(re.search(r"REPLAY_SHADOW_COLLECTOR_INTERVAL_SECONDS=(\d+)", _CI_ENV.read_text()).group(1))
         self.assertGreater(pre_stop, segment + collector_interval)
         self.assertGreater(self.proxy["spec"]["template"]["spec"]["terminationGracePeriodSeconds"], pre_stop)
+        # The hook tells the proxy it is draining, where the proxy looks for it.
+        self.assertIn(os.path.join(self.env["REPLAY_LOG_DIR"], ".draining"), command[-1])
 
     def test_egress_policy_allows_dns_and_litellm_only(self):
         policy = _find(self.docs, "NetworkPolicy", "inference-replay-shadow-egress")["spec"]

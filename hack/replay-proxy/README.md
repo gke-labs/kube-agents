@@ -71,7 +71,7 @@ done
 python3 hack/replay-proxy/analyze_shadow.py week/logs/all.jsonl
 ```
 
-`analyze_shadow.py` reads the lines only; a miss's stored text is `week/store/requests/<request_id>.json`, whose entries name files in `week/store/blobs/`. (A `--store` option that reads it is not on `main` yet.)
+`analyze_shadow.py` reads the lines only; a miss's stored text is `week/store/requests/<request_id>.json`, whose entries name files in `week/store/blobs/`.
 
 Limitations, while the bucket and its grants are still to be made:
 

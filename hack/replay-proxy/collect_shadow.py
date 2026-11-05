@@ -89,6 +89,7 @@ SAFE_NAME = re.compile(
 DEFAULT_INTERVAL_SECONDS = 30.0
 DEFAULT_FINAL_DEADLINE_SECONDS = 60.0
 DEFAULT_DATA_DIR = "/data"
+STAGING_PREFIX = "replay-shadow-"
 SLEEP_SLICE_SECONDS = 1.0
 KUBECTL_TIMEOUT_SECONDS = 120.0
 GCLOUD_TIMEOUT_SECONDS = 180.0
@@ -166,7 +167,14 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as tar:
         try:
             handle = open(full, "rb")
         except OSError:
-            continue
+            # An open segment the proxy closed since it was listed: read it
+            # under its closed name (still sent as the listed name).
+            if not full.endswith(".jsonl.open"):
+                continue
+            try:
+                handle = open(full[: -len(".open")], "rb")
+            except OSError:
+                continue
         with handle:
             info = tarfile.TarInfo(rel)
             info.size = os.fstat(handle.fileno()).st_size
@@ -595,7 +603,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     staging = ""
     collector: Optional[Collector] = None
     try:
-        staging = tempfile.mkdtemp(prefix="replay-shadow-")
+        staging = tempfile.mkdtemp(prefix=STAGING_PREFIX)
         collector = Collector(namespace=args.namespace, selector=args.selector, container=args.container,
                               dest=job_prefix(args.bucket, args.kind, day, args.build), staging=staging,
                               context=args.context, data_dir=args.data_dir)

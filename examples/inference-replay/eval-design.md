@@ -385,6 +385,11 @@ request would pass without anything being written to the cache. So:
   never match;
 - the proxy's files, in `hack/replay-proxy/`, need eval-crew approval in `hack/OWNERS`.
 
+Shadow mode (rollout step 1) doesn't follow the first rule yet: CI builds its proxy from the commit
+under test. That's acceptable while it serves nothing, since a pull request that changed the proxy
+could only change what gets logged about its own run, never a verdict. Replay can't start until the
+proxy is built from the base branch.
+
 Like the scorer's pin, this still relies on review of changes to the deploy scripts that do the
 pinning, since those run from the pull request's code: a root approver's approval (self-approval on
 their own change) and one `lgtm` from anyone `OWNERS` lists.

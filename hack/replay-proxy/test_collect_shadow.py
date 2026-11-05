@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import time
@@ -586,3 +587,23 @@ class ProcessTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpenSegmentClosedMidPassTest(unittest.TestCase):
+    """The last pass lists an open segment the proxy then closes before the copy."""
+
+    def test_the_copy_reads_it_under_its_closed_name(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        os.makedirs(os.path.join(root, "logs"))
+        opened = os.path.join(root, "logs", "p-1-000001.jsonl.open")
+        with open(opened, "w") as handle:
+            handle.write('{"a": 1}\n')
+        listed = json.loads(subprocess.run([sys.executable, "-c", C.LIST_SCRIPT, root, "1", json.dumps(C.SOURCES)],
+                                           capture_output=True, check=True).stdout)
+        os.replace(opened, opened[: -len(".open")])
+        out = subprocess.run([sys.executable, "-c", C.TAR_SCRIPT, root], input=b"\0".join(r.encode() for r, _ in listed),
+                             capture_output=True, check=True).stdout
+        members = [(m.name, m.size) for m in tarfile.open(fileobj=io.BytesIO(out), mode="r|")]
+        self.assertEqual(members, [("logs/p-1-000001.jsonl.open", 9)])
+

@@ -694,9 +694,11 @@ spec:
 {{- /*
   The proxy closes a log segment this long after its first line, and a pod
   being replaced keeps running this long after it leaves the Service
-  (preStop): long enough for the open segment to close and for the
-  collector's next pass (hack/replay-proxy/collect_shadow.py, every 30 s) to
-  copy it out before the pod and its emptyDir are gone.
+  (preStop). While it drains, its segments close 5 s after their first line
+  (spool.py's DRAIN_MAX_AGE_SECONDS), so a line written in the first 40 s of
+  the wait is in a closed segment the collector's next pass
+  (hack/replay-proxy/collect_shadow.py, every 30 s) copies before the pod and
+  its emptyDir are gone. A request still running after that can lose its line.
 */}}
 {{- $replayShadowSegmentSeconds := 30 }}
 {{- $replayShadowPreStopSeconds := 75 }}
@@ -833,7 +835,10 @@ spec:
           lifecycle:
             preStop:
               exec:
-                command: ["python3", "-c", "import time; time.sleep({{ $replayShadowPreStopSeconds }})"]
+                # Tells the proxy it is draining (hack/replay-proxy/spool.py,
+                # DRAIN_MARKER_NAME): segments then close a few seconds after
+                # their first line, so the collector copies late lines in time.
+                command: ["python3", "-c", "import time; open('/data/logs/.draining', 'w').close(); time.sleep({{ $replayShadowPreStopSeconds }})"]
           volumeMounts:
             - name: data
               mountPath: /data
