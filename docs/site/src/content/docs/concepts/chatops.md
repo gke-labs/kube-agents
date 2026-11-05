@@ -105,7 +105,7 @@ Send thanks you with a line only you see. It also links the project's [feedback 
 
 What a rating keeps can include cluster names and whatever else the question and answer held. It is stored in the `feedback` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which name the task and the Slack member who rated it. The bucket drops each record 30 days after it was given. Nothing is sent anywhere else. An install whose NATS server has no such bucket draws no buttons; the gateway checks for one again every minute for half an hour after it starts.
 
-The counts are on the gateway's metrics ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
+The counts are on the gateway's metrics and in the `PlatformAgent`'s `status.usage` as `negativeFeedbackTotal` and `positiveFeedbackTotal` ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
 
 ```bash
 kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
