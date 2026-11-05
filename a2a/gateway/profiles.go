@@ -684,9 +684,14 @@ func (g *Gateway) publishDispatchStop(ctx context.Context, ref TaskRef) {
 // the parent's own chain and grant, and is recorded on its history entry.
 func (g *Gateway) cancelWaitingProfileParents(ctx context.Context, rec *SessionRecord, taskID string, authority Authority) {
 	ref, ok := rec.TaskRefFor(taskID)
+	// Only a child's parent waits on it. A wake's parent link names the
+	// child it continues, which has ended.
+	if !ok || ref.Role != taskRoleChild {
+		return
+	}
 	for steps := 0; ok && ref.ParentTaskID != "" && steps <= taskHistoryCap; steps++ {
 		parent, held := rec.TaskRefFor(ref.ParentTaskID)
-		if !held || parent.Tier == "" {
+		if !held || parent.Tier == "" || parent.TerminalObserved || g.parentEnded(ctx, parent.ID) {
 			return
 		}
 		if !parent.Canceled && parent.CorrelationID != "" {

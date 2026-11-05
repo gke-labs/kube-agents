@@ -685,3 +685,37 @@ func TestATargetTheMergeMakesInvalidIsRefusedBeforeTheMint(t *testing.T) {
 		t.Fatalf("%d submission(s) for an invalid parameter set", len(envs))
 	}
 }
+
+func TestAStopDuringAWakeLeavesTheEndedProfileChildAlone(t *testing.T) {
+	r := startProfileRig(t)
+	rec := &SessionRecord{Key: "discord:17/17", ContextID: "ctx-17", Tasks: []TaskRef{
+		{ID: "task-turn", Addressee: "chat-otter-1a2b", CorrelationID: "corr-t"},
+		{ID: "task-child", Addressee: "prod-east", Tier: "read", Role: taskRoleChild, ParentTaskID: "task-turn", CorrelationID: "corr-c"},
+		{ID: "task-wake", Addressee: "chat-otter-1a2b", Role: taskRoleWake, ParentTaskID: "task-child", CorrelationID: "corr-w"},
+	}}
+	if err := r.g.reg.IndexTask(context.Background(), "task-child", rec.Key); err != nil {
+		t.Fatal(err)
+	}
+	r.g.cancelWaitingProfileParents(context.Background(), rec, "task-wake", Authority{})
+	if c, _ := rec.TaskRefFor("task-child"); c.Canceled {
+		t.Fatal("a stop of the wake cancelled the profile child it continues")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if got := streamEnvelopes(t, r.url, lib.TaskInSubject("prod-east", "task-child")); len(got) != 0 {
+		t.Fatalf("%d cancel(s) on the ended child's .in", len(got))
+	}
+}
+
+func TestAStopLeavesAProfileParentTheRelayEndedAlone(t *testing.T) {
+	r := startProfileRig(t)
+	rec := &SessionRecord{Key: "discord:18/18", ContextID: "ctx-18", Tasks: []TaskRef{
+		{ID: "task-parent", Addressee: "cluster", Tier: "read", CorrelationID: "corr-p"},
+		{ID: "task-child", Addressee: "prod-east", Tier: "read", Role: taskRoleChild, ParentTaskID: "task-parent", CorrelationID: "corr-c"},
+	}}
+	// The parent's index entry is absent, as the relay leaves it on the
+	// parent's terminal.
+	r.g.cancelWaitingProfileParents(context.Background(), rec, "task-child", Authority{})
+	if p, _ := rec.TaskRefFor("task-parent"); p.Canceled {
+		t.Fatal("the cascade cancelled a parent that had ended")
+	}
+}
