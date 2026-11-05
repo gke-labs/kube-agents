@@ -168,6 +168,31 @@ func TestDispatcherSettleHoldsAHostIPUnknownFromANodeScaleDown(t *testing.T) {
 	}
 }
 
+// TestDispatcherSettleKeepsAHostIPUnknownHoldPastAnotherFailed: every Failed
+// on a pod shares one memo key, so a start error on a sibling container,
+// accepted on its first sighting, must not release the held host IP unknown
+// and count it forwarded; the hold still expires as self_resolved.
+func TestDispatcherSettleKeepsAHostIPUnknownHoldPastAnotherFailed(t *testing.T) {
+	t0 := time.Date(2026, 11, 4, 1, 58, 0, 0, time.UTC)
+	ctx := context.Background()
+	now := t0
+	disp, m, injectCount := failedDispatcher(t, &now)
+	disp.Dispatch(ctx, settleFailed(t0, hostIPUnknownEvent, 0, 1))
+	now = t0.Add(5 * time.Second)
+	disp.Dispatch(ctx, settleFailed(now, startErrorEvent, 0, 1))
+	if *injectCount != 1 {
+		t.Fatalf("injects = %d; want 1, the start error", *injectCount)
+	}
+	if got := testutil.ToFloat64(m.settleOutcomes.WithLabelValues("test-cluster", "", "", reasonFailed, settleOutcomeForwarded)); got != 0 {
+		t.Errorf("settle_outcomes_total{reason=Failed,outcome=forwarded} = %v; want 0 (the hold was never forwarded)", got)
+	}
+	now = t0.Add(2*time.Minute + settleQuietSlack)
+	disp.Sweep(ctx)
+	if got := testutil.ToFloat64(m.settleOutcomes.WithLabelValues("test-cluster", "", "", reasonFailed, settleOutcomeSelfResolved)); got != 1 {
+		t.Errorf("settle_outcomes_total{reason=Failed,outcome=self_resolved} = %v; want 1", got)
+	}
+}
+
 // TestFilterDecideSettle walks the gate on the motivating incident: a BackOff
 // that cleared in 110 seconds at count 4 is held; the same pod still failing
 // two minutes on is forwarded; the gate is off at a negative threshold; and

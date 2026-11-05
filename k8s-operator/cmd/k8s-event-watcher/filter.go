@@ -824,7 +824,8 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 		strings.TrimSpace(ev.Message) == noNodesAvailableMessage
 }
 
-// settleApplies reports whether the canonical reason is in the settle family:
+// settleApplies reports whether the canonical reason, and for Failed the
+// message, is in the settle family:
 // the reasons Autopilot's node churn emits routinely, that clear on their own
 // more often than not, and that are re-emitted while they last. The
 // crash-loop family is the motivating one (a kubelet object-cache warm-up on
@@ -841,10 +842,11 @@ func autopilotScaleToZero(ev TriageEvent) bool {
 // crash loop is in it and its image-pull BackOff is not.
 //
 // A plain Failed joins it only when the message is one of kubelet's config
-// errors (retriedConfigError). The rest of Failed stays out: a container that
-// was created and failed to start is retried only as its pod's restartPolicy
-// allows, so under Never it fails once and a span would never reach the
-// period.
+// errors (retriedConfigError). A start error stays out because a container
+// that was created and failed to start is retried only as its pod's
+// restartPolicy allows, so under Never it fails once and a span would never
+// reach the period; the other config errors stay out only because the list
+// holds the messages seen as noise, and kubelet would retry them too.
 func settleApplies(canonicalReason, message string) bool {
 	switch canonicalReason {
 	case "CrashLoopBackOff", "FailedMount", "Unhealthy":
