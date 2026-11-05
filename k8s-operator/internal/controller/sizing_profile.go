@@ -441,16 +441,67 @@ func addResourceDelta(total, from, to corev1.ResourceList) {
 	}
 }
 
+// sizingScopeSelectsThePods reports whether one scope requirement of a
+// ResourceQuota selects the three sized pods, as the quota admission plugin
+// evaluates it against a pod. The answer is fixed per scope, because the three
+// pods have one shape: a request on every sized container, so never
+// BestEffort; no activeDeadlineSeconds, so never Terminating; no
+// priorityClassName (nothing in the controller sets one), so the PriorityClass
+// label admission matches against is absent, which In and Exists miss and
+// NotIn and DoesNotExist match; no cross-namespace affinity term; and
+// VolumeAttributesClass tracks claims, never a pod's cpu or memory. A scope
+// this operator does not know is read as selecting them, the side that holds
+// the tier rather than promotes past a quota that binds.
+func sizingScopeSelectsThePods(req corev1.ScopedResourceSelectorRequirement) bool {
+	switch req.ScopeName {
+	case corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeNotBestEffort:
+		return true
+	case corev1.ResourceQuotaScopeTerminating, corev1.ResourceQuotaScopeBestEffort,
+		corev1.ResourceQuotaScopeCrossNamespacePodAffinity, corev1.ResourceQuotaScopeVolumeAttributesClass:
+		return false
+	case corev1.ResourceQuotaScopePriorityClass:
+		return req.Operator == corev1.ScopeSelectorOpNotIn || req.Operator == corev1.ScopeSelectorOpDoesNotExist
+	default:
+		return true
+	}
+}
+
+// sizingQuotaBindsThePods reports whether a ResourceQuota counts the three
+// sized pods at all: an unscoped quota does, and a scoped one does when every
+// entry of spec.scopes (each an Exists requirement, as the API server reads
+// them) and every requirement of spec.scopeSelector selects them. A quota
+// that cannot count these pods cannot refuse them either, so the step-up
+// check does not read it; the chart's quota preflight skips every scoped
+// quota for the same reason, and this is the same call made per scope so a
+// NotTerminating or NotBestEffort quota, which does bind them, still holds
+// the tier.
+func sizingQuotaBindsThePods(quota *corev1.ResourceQuota) bool {
+	for _, scope := range quota.Spec.Scopes {
+		if !sizingScopeSelectsThePods(corev1.ScopedResourceSelectorRequirement{ScopeName: scope, Operator: corev1.ScopeSelectorOpExists}) {
+			return false
+		}
+	}
+	if quota.Spec.ScopeSelector == nil {
+		return true
+	}
+	for _, req := range quota.Spec.ScopeSelector.MatchExpressions {
+		if !sizingScopeSelectsThePods(req) {
+			return false
+		}
+	}
+	return true
+}
+
 // sizingQuotaShortfall is nil when every ResourceQuota in the agent's
-// namespace has room for the step from tier from to tier to, or the first
-// quota and dimension that is short, quotas in name order and dimensions in
-// sizingQuotaDimensions order so the condition message is stable across
-// passes. The hard figure is the spec's, the used figure the quota
-// controller's last accounting (zero on a quota it has not accounted yet,
-// which admission then settles). A quota with scopes is read as if it
-// applied: the operator does not evaluate scope selectors, so a scoped quota
-// that is short holds the tier, and the message names it for the person who
-// knows whether it binds. ResourceQuota is not a watched kind, so the list
+// namespace that counts the sized pods has room for the step from tier from
+// to tier to, or the first quota and dimension that is short, quotas in name
+// order and dimensions in sizingQuotaDimensions order so the condition
+// message is stable across passes. The hard figure is the spec's, the used
+// figure the quota controller's last accounting (zero on a quota it has not
+// accounted yet, which admission then settles). A quota whose scopes cannot
+// select the three pods (sizingQuotaBindsThePods) is not read: admission
+// would never evaluate them against it, so it can neither refuse the step nor
+// be raised to admit it. ResourceQuota is not a watched kind, so the list
 // goes through the API reader, as the A2A session quota's reads do.
 func (r *PlatformAgentReconciler) sizingQuotaShortfall(ctx context.Context, agent *agentv1alpha1.PlatformAgent, from, to sizingTier) (*sizingShortfall, error) {
 	quotas := &corev1.ResourceQuotaList{}
@@ -463,6 +514,9 @@ func (r *PlatformAgentReconciler) sizingQuotaShortfall(ctx context.Context, agen
 	step := sizingStepBetween(agent, r.clusterAutopilot(), from, to)
 	slices.SortFunc(quotas.Items, func(a, b corev1.ResourceQuota) int { return strings.Compare(a.Name, b.Name) })
 	for _, quota := range quotas.Items {
+		if !sizingQuotaBindsThePods(&quota) {
+			continue
+		}
 		for _, dim := range sizingQuotaDimensions {
 			hard, constrained := quota.Spec.Hard[dim.key]
 			if !constrained {
@@ -534,9 +588,10 @@ func sizingCappedConditionMessage(agent *agentv1alpha1.PlatformAgent) string {
 // is its tier, applied as written. Under auto the tier is the latched status
 // tier, whatever profile wrote it (an explicit fleet switched to auto
 // continues at fleet; small first, then auto, restarts the latch), raised to
-// what the cluster count earns when every ResourceQuota in the namespace has
-// room for the step; a short quota keeps the running tier and sets the
-// condition. A count that falls leaves the latch where it is and clears the
+// the highest tier, at or under what the cluster count earns, whose step from
+// the running tier every ResourceQuota that counts the pods has room for; a
+// quota short on every step keeps the running tier, and any refused step sets
+// the condition. A count that falls leaves the latch where it is and clears the
 // condition, since it no longer earns the step; a pass with no reading (the
 // gauges absent before the first poll, or cleared after two polls that read
 // no gateway) leaves the latch and the condition both where they are, so a
@@ -563,15 +618,27 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 		if observed, ok := observedClusterCount(agent); ok {
 			count = observed
 			if earned := sizingTierForClusterCount(count); earned > tier {
-				shortfall, err := r.sizingQuotaShortfall(ctx, agent, tier, earned)
-				if err != nil {
-					return err
-				}
-				if shortfall == nil {
-					tier = earned
-				} else {
+				// The earned tier first, then each tier between it and the
+				// running one, every step measured from the running tier
+				// against the same used totals: the highest step the quotas
+				// admit is taken, so a count that earns fleet with room for
+				// medium alone reaches medium rather than waiting at small
+				// for the whole fleet step. The cap reports the lowest step
+				// refused, the one raising the quota by the least relieves.
+				running := tier
+				for candidate := earned; candidate > running; candidate-- {
+					shortfall, err := r.sizingQuotaShortfall(ctx, agent, running, candidate)
+					if err != nil {
+						return err
+					}
+					if shortfall == nil {
+						tier = candidate
+						break
+					}
 					short = shortfall
-					capped = fmt.Sprintf(sizingCappedByQuotaMessageFormat, earned, shortfall.quota, shortfall.key, tier, tier)
+				}
+				if short != nil {
+					capped = fmt.Sprintf(sizingCappedByQuotaMessageFormat, earned, short.quota, short.key, tier, tier)
 				}
 			}
 		} else if eventWatcherEnabled(agent) {

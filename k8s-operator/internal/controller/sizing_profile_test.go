@@ -257,7 +257,10 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		// fleet row admits it, so the promotion asks the quota for 3 CPU. A
 		// step read with the override merged on both sides would move
 		// requests.cpu by zero and promote past a quota with 2 CPU free; the
-		// step the reconciler renders adds 2500m, and the quota is short.
+		// step the reconciler renders adds 2500m, and the quota is short of
+		// it. The medium row refuses the override too and renders 1 CPU, a
+		// step of 500m the quota admits, so the tier reaches medium and the
+		// cap names the fleet step.
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
 		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
@@ -268,20 +271,21 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 			Status:     corev1.ResourceQuotaStatus{Used: corev1.ResourceList{corev1.ResourceRequestsCPU: resource.MustParse("2")}},
 		}
 		stored, recorder := resolveSizing(t, agent, quota)
-		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
-			t.Fatalf("status.effectiveSizingTier = %q, want small: the step from the row to the admitted override was not counted", stored.Status.EffectiveSizingTier)
+		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: the fleet step from the row to the admitted override was not counted, or the medium step was not tried", stored.Status.EffectiveSizingTier)
 		}
 		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
-		if cond == nil || !strings.Contains(cond.Message, "ResourceQuota cpu-quota has no room on requests.cpu") {
+		if cond == nil || !strings.Contains(cond.Message, "earns the fleet tier") || !strings.Contains(cond.Message, "ResourceQuota cpu-quota has no room on requests.cpu") {
 			t.Fatalf("SizingCappedByQuota = %+v", cond)
 		}
-		select {
-		case event := <-recorder.Events:
-			if !strings.Contains(event, "the step adds 2500m") {
-				t.Errorf("event does not carry the step from the row to the override: %s", event)
-			}
-		default:
-			t.Error("no event recorded for the capped promotion")
+		// The tier change records first, then the cap with the fleet step's
+		// figures.
+		var events []string
+		for len(recorder.Events) > 0 {
+			events = append(events, <-recorder.Events)
+		}
+		if len(events) != 2 || !strings.Contains(events[1], "the step adds 2500m") {
+			t.Errorf("events = %q, want the tier change then the cap carrying the step from the row to the override", events)
 		}
 	})
 	t.Run("the event watcher switched off by spec clears the condition", func(t *testing.T) {
@@ -325,6 +329,102 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		}
 		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
 			t.Fatalf("SizingCappedByQuota still present: %+v", cond)
+		}
+	})
+	t.Run("a fleet step the quota refuses still takes the medium step it admits", func(t *testing.T) {
+		t.Parallel()
+		// Latched small at 25 clusters: the fleet step adds 7Gi of memory
+		// requests (the broker's 1Gi to 8Gi), the medium step 3Gi. A quota
+		// with 5Gi free refuses the first and admits the second, so the
+		// tier reaches medium rather than waiting at small for the whole
+		// fleet step, and the cap names fleet as earned and medium as the
+		// tier that stays; the event carries the refused step's figures.
+		stored, recorder := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil),
+			sizingQuota("platform-baseline-quota", "10Gi", "5Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: the step the quota admits was not tried", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil {
+			t.Fatal("SizingCappedByQuota absent although the fleet step was refused")
+		}
+		for _, want := range []string{"earns the fleet tier", "ResourceQuota platform-baseline-quota has no room on requests.memory", "step up from medium", "the medium tier stays"} {
+			if !strings.Contains(cond.Message, want) {
+				t.Errorf("message lacks %q: %s", want, cond.Message)
+			}
+		}
+		// The tier change and the cap each record one event, in that order.
+		var events []string
+		for len(recorder.Events) > 0 {
+			events = append(events, <-recorder.Events)
+		}
+		if len(events) != 2 || !strings.Contains(events[0], "sizing tier small -> medium") {
+			t.Fatalf("events = %q, want the tier change then the cap", events)
+		}
+		for _, want := range []string{"at 25 clusters", "5Gi of requests.memory free", "the step adds 7Gi"} {
+			if !strings.Contains(events[1], want) {
+				t.Errorf("event lacks %q: %s", want, events[1])
+			}
+		}
+	})
+	t.Run("a quota short on every step reports the lowest one", func(t *testing.T) {
+		t.Parallel()
+		// 25 clusters with 2Gi free: both steps are refused, the tier stays
+		// small, and the figures are the medium step's, the raise that
+		// relieves the broker soonest.
+		stored, recorder := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil),
+			sizingQuota("platform-baseline-quota", "10Gi", "8Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || !strings.Contains(cond.Message, "earns the fleet tier") || !strings.Contains(cond.Message, "the small tier stays") {
+			t.Fatalf("SizingCappedByQuota = %+v", cond)
+		}
+		select {
+		case event := <-recorder.Events:
+			if !strings.Contains(event, "the step adds 3Gi") {
+				t.Errorf("event does not carry the medium step: %s", event)
+			}
+		default:
+			t.Error("no event recorded for the capped promotion")
+		}
+	})
+	t.Run("a quota whose scopes cannot select the pods is not read", func(t *testing.T) {
+		t.Parallel()
+		// Each quota is short of the medium step on its own, and each is
+		// scoped to pods these are not: admission never evaluates the sized
+		// pods against it, so it can neither refuse the step nor be raised
+		// to admit it, and reading it would cap the tier on a quota the
+		// chart's preflight skips.
+		forbidden := sizingQuota("forbid-cluster-services", "10Gi", "8Gi")
+		forbidden.Spec.ScopeSelector = &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
+			{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: corev1.ScopeSelectorOpIn, Values: []string{"cluster-services"}},
+		}}
+		jobs := sizingQuota("jobs", "10Gi", "8Gi")
+		jobs.Spec.Scopes = []corev1.ResourceQuotaScope{corev1.ResourceQuotaScopeTerminating}
+		stored, _ := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil), forbidden, jobs)
+		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: a quota that cannot count the pods capped the tier", stored.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota set by a quota whose scopes do not select the pods: %+v", cond)
+		}
+	})
+	t.Run("a quota scoped to pods these are holds the tier", func(t *testing.T) {
+		t.Parallel()
+		// NotTerminating is the scope a namespace admin puts on long-running
+		// pods, and the three sized pods are such pods, so the quota binds
+		// and a short one caps the tier as an unscoped one does.
+		quota := sizingQuota("long-running", "10Gi", "8Gi")
+		quota.Spec.Scopes = []corev1.ResourceQuotaScope{corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeNotBestEffort}
+		stored, _ := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil), quota)
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small: a NotTerminating quota was skipped", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || !strings.Contains(cond.Message, "ResourceQuota long-running has no room on requests.memory") {
+			t.Fatalf("SizingCappedByQuota = %+v", cond)
 		}
 	})
 	t.Run("a quota on a dimension the step does not move is not read", func(t *testing.T) {
@@ -625,5 +725,50 @@ func TestResolveSizingTierUnderAPruningCRDWritesOncePerInterval(t *testing.T) {
 	pass("settled pass")
 	if writes != 3 {
 		t.Errorf("a settled tier under the applied CRD wrote %d times, want 3", writes)
+	}
+}
+
+func TestSizingQuotaBindsThePods(t *testing.T) {
+	t.Parallel()
+	// The fixed answer per scope: the sized pods are long-running, have
+	// requests, carry no priority class and no cross-namespace affinity.
+	scoped := func(scopes ...corev1.ResourceQuotaScope) *corev1.ResourceQuota {
+		return &corev1.ResourceQuota{Spec: corev1.ResourceQuotaSpec{Scopes: scopes}}
+	}
+	selected := func(reqs ...corev1.ScopedResourceSelectorRequirement) *corev1.ResourceQuota {
+		return &corev1.ResourceQuota{Spec: corev1.ResourceQuotaSpec{ScopeSelector: &corev1.ScopeSelector{MatchExpressions: reqs}}}
+	}
+	priority := func(op corev1.ScopeSelectorOperator, values ...string) corev1.ScopedResourceSelectorRequirement {
+		return corev1.ScopedResourceSelectorRequirement{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: op, Values: values}
+	}
+	cases := []struct {
+		name  string
+		quota *corev1.ResourceQuota
+		want  bool
+	}{
+		{"unscoped", &corev1.ResourceQuota{}, true},
+		{"NotTerminating", scoped(corev1.ResourceQuotaScopeNotTerminating), true},
+		{"NotBestEffort", scoped(corev1.ResourceQuotaScopeNotBestEffort), true},
+		{"both of them", scoped(corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeNotBestEffort), true},
+		{"Terminating", scoped(corev1.ResourceQuotaScopeTerminating), false},
+		{"BestEffort", scoped(corev1.ResourceQuotaScopeBestEffort), false},
+		{"CrossNamespacePodAffinity", scoped(corev1.ResourceQuotaScopeCrossNamespacePodAffinity), false},
+		{"VolumeAttributesClass", scoped(corev1.ResourceQuotaScopeVolumeAttributesClass), false},
+		{"PriorityClass in scopes is Exists", scoped(corev1.ResourceQuotaScopePriorityClass), false},
+		{"NotTerminating beside Terminating", scoped(corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeTerminating), false},
+		{"priorityClass In", selected(priority(corev1.ScopeSelectorOpIn, "cluster-services")), false},
+		{"priorityClass Exists", selected(priority(corev1.ScopeSelectorOpExists)), false},
+		{"priorityClass NotIn", selected(priority(corev1.ScopeSelectorOpNotIn, "cluster-services")), true},
+		{"priorityClass DoesNotExist", selected(priority(corev1.ScopeSelectorOpDoesNotExist)), true},
+		{"a selector with a NotTerminating requirement", selected(corev1.ScopedResourceSelectorRequirement{ScopeName: corev1.ResourceQuotaScopeNotTerminating, Operator: corev1.ScopeSelectorOpExists}), true},
+		{"a scope this operator does not know", scoped(corev1.ResourceQuotaScope("SomethingNewer")), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := sizingQuotaBindsThePods(tc.quota); got != tc.want {
+				t.Fatalf("sizingQuotaBindsThePods = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

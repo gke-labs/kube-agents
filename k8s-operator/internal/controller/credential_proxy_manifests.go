@@ -138,11 +138,15 @@ const (
 	// (docs/designs/credential-broker-exec-tier.md §3.3, §9 step 0), on every
 	// cluster type. How the broker gets there differs by cluster type:
 	//   - On Standard the request is scheduling weight and the broker bursts
-	//     to its limit when the node has the cores. The request stays at 500m
-	//     because a larger one has to fit on one node before the broker can
-	//     start, and its Deployment is Recreate: on a one-node default pool
-	//     with the other agent pods on it, a 2-CPU request leaves the new
-	//     broker Pending after the old one stopped.
+	//     to its limit when the node has the cores. The small row's request
+	//     stays at 500m because a larger one has to fit on one node before
+	//     the broker can start, and its Deployment is Recreate: on a one-node
+	//     default pool with the other agent pods on it, a 2-CPU request
+	//     leaves the new broker Pending after the old one stopped. The
+	//     medium and fleet rows (sizing_profile.go) raise the request to 1
+	//     and 4 CPU on both cluster types, so on Standard they need a node
+	//     that fits it, under an explicit profile and under auto alike; the
+	//     quota gate before a step up does not read node capacity.
 	//   - On GKE Autopilot without bursting the limit is clamped to the
 	//     request, so only the request buys CPU, and the broker requests 2 CPU
 	//     there (credentialProxyAutopilotCPURequest). The operator learns the

@@ -1328,10 +1328,11 @@ type DeploymentSpec struct {
 	// on one that did; set small first to restart it from small. A promotion
 	// is upward only, latched in that status field, so a count that falls
 	// never lowers the tier; and before each step up the operator checks
-	// every ResourceQuota in the
-	// namespace for the cpu, memory and ephemeral-storage the step adds,
-	// keeps the running tier and sets the SizingCappedByQuota condition when
-	// one is short, rather than rolling out pods the quota would refuse. An
+	// every ResourceQuota in the namespace that counts these pods for the
+	// cpu, memory and ephemeral-storage the step adds, takes the highest
+	// tier the quotas have room for (the running one when they have room for
+	// none) and sets the SizingCappedByQuota condition for the step refused,
+	// rather than rolling out pods the quota would refuse. An
 	// explicit tier is applied as written, without the quota check. The agent
 	// container's own resources are not part of a profile. A change of tier
 	// recreates the proxy pod once and rolls the gateway and the shell pod.
