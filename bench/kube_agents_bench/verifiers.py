@@ -87,6 +87,7 @@ from devops_bench.verification.verifiers import resource_property as _upstream_r
 
 from kube_agents_bench import (
     card_wake,
+    chat_shape,
     discovery,
     findings,
     forges,
@@ -1466,16 +1467,12 @@ class ReportManifestVerifier(BaseVerifier):
         )
 
 
-# The headers ``_append_delivered`` opens each card's result and each paused
-# card's question with in the final message (harness.py), and the one
-# ``_append_artifacts`` opens a file with. A delivered result runs from its
-# header to the next header of any kind.
-_DELIVERED_HEADER = re.compile(
-    r"^(?:Result of delegated task \S+|Question from delegated task \S+"
-    r"|Artifact [^\n]* produced by delegated task \S+):\n",
-    re.MULTILINE,
-)
-_RESULT_HEADER_PREFIX = "Result of delegated task "
+# The headers harness.py opens each delivered section of the final message
+# with, kept in chat_shape so the reply-shape measure and these checks agree
+# on what was delivered. A delivered result runs from its header to the next
+# header of any kind.
+_DELIVERED_HEADER = chat_shape.DELIVERED_HEADER
+_RESULT_HEADER_PREFIX = chat_shape.RESULT_HEADER_PREFIX
 # A bold span opening the text, closed on its own line.
 _BOLD_LEAD = re.compile(r"\A\*\*([^\n]+?)\*\*")
 _ATX_HEADING = re.compile(r"^ {0,3}#{1,6} ", re.MULTILINE)
