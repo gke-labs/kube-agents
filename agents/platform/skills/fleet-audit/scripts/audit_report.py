@@ -1870,6 +1870,16 @@ SHARED_ACCOUNT_SHIELD_NOTE = (
 )
 # How many declared workloads the note names before counting the rest.
 SHARED_ACCOUNT_SHIELD_NAMES = 3
+# How a remediation note that carries the shield starts: the note up to its
+# first clause. A finding listed on one line keeps the shield on the line under
+# it (`render_listed_finding`), since its full block, where the note is, is not
+# on the ledger.
+SHARED_ACCOUNT_SHIELD_PREFIX = SHARED_ACCOUNT_SHIELD_NOTE[: SHARED_ACCOUNT_SHIELD_NOTE.index(";")]
+# Where the shield note ends inside a remediation note it opens: the
+# template's closing `.)_` at the end of the note or before the worker's own
+# text. The declared names in between come from the repository, so a bare `)_`
+# in a path or object is not the end.
+SHARED_ACCOUNT_SHIELD_END_RE = re.compile(r"\.\)_(?=\s|$)")
 # The kinds a 2.7 declaration may name: collect.py's COMPLIANCE_WORKLOAD_KINDS,
 # the set `check_default_sa_automount` walks, folded as `_object_kind_segment`
 # folds them. An item naming anything else covers no workload's token.
@@ -11835,6 +11845,11 @@ def render_listed_finding(
     A state other than open, and its pull request, follow the id: the state
     index covers full rows only, so a listed row is the one place a reader
     finds them.
+
+    A finding the shared-account shield made manual keeps the shield on an
+    indented line under the bullet: it is the instruction not to apply the
+    namespace-wide fix, and without it the row reads like any other 2.7
+    finding. `LISTED_LINE_RE` reads the bullet line alone.
     """
     fid = str(finding.get("id", ""))
     suffix = ""
@@ -11843,11 +11858,32 @@ def render_listed_finding(
     namespace = _ident(str(finding.get("namespace", "")))
     where = f"`{_ident(str(finding.get('cluster', '')))}`"
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
-    return (
+    line = (
         f"- **{_cell(str(finding.get('severity', '')))}** — "
         f"{_cell(str(finding.get('title', '')))} — {where} — "
         f"`{_ident(str(finding.get('object', '')))}` (`{fid}`){suffix}"
     )
+    shield = _shared_account_shield(finding)
+    return line + (f"\n  {shield}" if shield else "")
+
+
+def _shared_account_shield(finding: dict) -> str:
+    """The shield note at the head of a 2.7 finding's remediation note, or "".
+
+    Through `clip_text` like every other note bound for the body, and on one
+    line: the note's text is the harness's, but the names in it come from the
+    repository, and a newline or comment opener in them must not reach the
+    listed section's brackets.
+    """
+    if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
+        return ""
+    note = str((finding.get("remediation") or {}).get("note", ""))
+    if not note.startswith(SHARED_ACCOUNT_SHIELD_PREFIX):
+        return ""
+    end = SHARED_ACCOUNT_SHIELD_END_RE.search(note)
+    if end is None:
+        return ""
+    return " ".join(clip_text(note[: end.end()], MAX_NOTE_CHARS).split())
 
 
 def _listed_header(count: int) -> list[str]:

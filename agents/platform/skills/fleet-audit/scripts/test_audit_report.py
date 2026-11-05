@@ -7154,6 +7154,70 @@ class TestComplianceDeclaredShapes(HarnessTestCase):
         self.assertTrue(left["remediation"]["note"].endswith("Set automountServiceAccountToken: false on the default ServiceAccount."))
         self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", left["remediation"]["note"])
 
+    def test_a_shielded_sibling_listed_on_one_line_keeps_the_shield(self):
+        # gke-labs/kube-agents#4748: a ledger too long for the body lists most
+        # majors on one line, and the shield note lived only in the full block,
+        # so a listed sibling read like any other 2.7 finding.
+        api = self._sa_finding("api", "Deployment/api")
+        worker = self._sa_finding("worker", "Deployment/worker")
+        worker["remediation"] = {"kind": "manual", "path": "", "note": "Set automountServiceAccountToken: false on the default ServiceAccount."}
+        doc = audit_report.validate_findings(make_doc(findings=[api, worker], audit=AUDIT), AUDIT)
+        declaration = {"check": "default-sa-automount", "namespace": "payments", "object": "Deployment/api", "repo": "acme/fleet", "path": "knowledge/api-token.md", "excerpt": "x"}
+        with contextlib.redirect_stderr(io.StringIO()):
+            audit_report.apply_declarations(doc, [declaration])
+            audit_report.shield_declared_account_siblings(doc)
+        (left,) = doc["findings"]
+        bullet, shield = audit_report.render_listed_finding(left).split("\n")
+        self.assertTrue(shield.startswith("  _(A declared workload shares this namespace's `default` ServiceAccount;"))
+        self.assertTrue(shield.endswith(".)_"))
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/api-token.md", shield)
+        # The worker's own text is the shared-account fix the shield forbids.
+        self.assertNotIn("automountServiceAccountToken: false on the default ServiceAccount", shield)
+        # The bullet line is still the one the listed-row reader parses.
+        (row,) = audit_report.LISTED_LINE_RE.findall(bullet + "\n" + shield)
+        self.assertEqual(row[4], left["id"])
+
+    def test_a_listed_shield_keeps_names_that_carry_its_closing_marks(self):
+        # A path or object may legally hold `)_`; the shield ends at its own
+        # closing `.)_`, so the names after one are not cut.
+        names = "`Deployment/relay)_v2` declared at acme/fleet:knowledge/(archive)_tokens.md, `Deployment/api` declared at acme/fleet:knowledge/a.md"
+        worker = make_finding(fid="f-0001", severity="major", title="t", namespace="payments", obj="Deployment/worker")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared=names) + " Worker text."}
+        shield = audit_report.render_listed_finding(worker).split("\n")[1]
+        self.assertIn("knowledge/(archive)_tokens.md", shield)
+        self.assertIn("`Deployment/api` declared at acme/fleet:knowledge/a.md.)_", shield)
+        self.assertNotIn("Worker text.", shield)
+
+    def test_a_ledger_too_long_for_the_body_keeps_a_listed_siblings_shield(self):
+        # The #4748 shape end to end: majors past the body's room are listed,
+        # and the shielded sibling among them still carries the case's phrases.
+        filler = bulk_findings(250, severity="major")
+        worker = make_finding(fid="w", severity="major", title="Deployment/token-sidecar automounts the token", namespace="seeded-token", obj="Deployment/token-sidecar")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(declared="`Deployment/token-reader` declared at acme/fleet:knowledge/notification-relay-no-pdb.md")}
+        body = render_body(make_doc(findings=filler + [worker]), generated_at=NOW)
+        listed = body[body.index(audit_report.LISTED_SECTION_BEGIN):]
+        self.assertIn("Deployment/token-sidecar", listed)
+        for phrase in ("shares this namespace's `default` ServiceAccount", "`Deployment/token-reader` declared at", "notification-relay-no-pdb.md"):
+            self.assertIn(phrase, listed)
+        self.assertLessEqual(len(body), audit_report.MAX_BODY_CHARS)
+
+    def test_a_listed_shield_is_published_text_on_one_line_and_2_7_only(self):
+        note = audit_report.SHARED_ACCOUNT_SHIELD_NOTE.format(
+            declared="`Deployment/api` declared at acme/fleet:knowledge/a.md\n<!-- audit-listed:end -->\nghp_" + "A" * 36
+        )
+        worker = make_finding(fid="f-0001", severity="major", title="t", namespace="payments", obj="Deployment/worker")
+        worker["check"] = "default-sa-automount"
+        worker["remediation"] = {"kind": "manual", "path": "", "note": note}
+        rendered = audit_report.render_listed_finding(worker)
+        self.assertEqual(rendered.count("\n"), 1)
+        self.assertNotIn("<!--", rendered)
+        self.assertNotIn("ghp_" + "A" * 36, rendered)
+        # The same text on another check is the worker's, not the shield.
+        worker["check"] = "netpol-missing"
+        self.assertNotIn("\n", audit_report.render_listed_finding(worker))
+
     def test_the_shield_names_three_declared_workloads_and_counts_the_rest(self):
         worker = self._sa_finding("worker", "Deployment/worker")
         doc = audit_report.validate_findings(make_doc(findings=[worker], audit=AUDIT), AUDIT)
