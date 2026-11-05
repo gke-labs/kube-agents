@@ -148,7 +148,7 @@ class FetchTest(unittest.TestCase):
         self.assertNotIn(periodics.LOGS_ROOT, "".join(call[-1] for call in gcloud.calls))
         self.assertEqual(periodics.history_url(CERT.job, CERT.logs_root), f"https://oss.gprow.dev/job-history/gs/kube-agents-evals-nightly-logs/logs/{CERT.job}")
         self.assertEqual(periodics.history_url(DAILY.job), f"https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs/{DAILY.job}")
-        self.assertEqual(CERT.stale_after, periodics.CERTIFICATION_STALE_AFTER)
+        self.assertEqual(CERT.stale_after, timedelta(days=8), "a week between runs plus a day: a missed Saturday reads STALE on the Sunday")
 
     def test_the_latest_finished_build_is_read_with_its_artifact(self):
         report = {"schema_version": 1, "mode": "all", "dry_run": True, "exit": "failed", "outcomes": {"kube-agents-evals-3": {"outcome": "refused", "detail": "1 to add; not a create: delete x"}}}

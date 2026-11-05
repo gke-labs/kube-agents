@@ -3,9 +3,10 @@
 
 The pull sweep and the seeded-fleet reconciles run on the build cluster and
 report nowhere but TestGrid. This module reads each one's latest finished build
-from the bucket they log to, gs://kube-agents-periodic-logs (`latest-build.txt`,
-then `finished.json`, then the report the job wrote and any extra report the
-entry names, on every finished build) and turns a failed or overdue run into
+from the bucket it logs to, gs://kube-agents-periodic-logs for the pool jobs and
+the nightlies' bucket for the certification slice, each entry's `logs_root`
+(`latest-build.txt`, then `finished.json`, then the report the job wrote and any
+extra report the entry names, on every finished build) and turns a failed or overdue run into
 a note health.py carries and post_health.py posts once, with the job's history
 link and the report's detail: for the reconcile the projects it refused or
 could not finish, for the sweep the projects whose sweep failed and what the run
