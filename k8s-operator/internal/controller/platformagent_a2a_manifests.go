@@ -3965,8 +3965,10 @@ func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
 
 // a2aStandingPods is every pod the operator keeps running for agent in next
 // mode, summed from the builders that render them, so a resized workload is
-// counted at its new size. A new standing workload has to be added here;
-// TestA2AStandingPodsMatchTheNextModeGolden fails until it is.
+// counted at its new size. A new standing workload has to be added here:
+// TestA2AStandingPodsMatchTheNextModeGolden fails until an unconditional one
+// is, and a conditional one needs a row in
+// TestA2AStandingPodsCountTheConditionalWorkloads.
 func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	agentReplicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
 	n := int64(agentReplicas)
@@ -3985,6 +3987,18 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 		buildA2ANATSStatefulSet(agent, ""),
 	} {
 		n += int64(ptr.Deref(sts.Spec.Replicas, 1))
+	}
+	// The workloads rendered on a condition, which the next-mode golden (the
+	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
+	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
+	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the MCP
+	// door and the dispatcher follow the operator's flags.
+	n += int64(credentialProxyExecTierReplicas(agent))
+	if a2aMCPDoorEnabled() {
+		n += int64(ptr.Deref(buildA2AMCPDeployment(agent).Spec.Replicas, 1))
+	}
+	if a2aDispatcherEnabled() {
+		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
 	}
 	return n
 }

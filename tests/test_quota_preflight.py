@@ -936,6 +936,7 @@ class PreflightDecisionTest(unittest.TestCase):
             ["operator.replicaCount=3", "litellm.replicaCount=1"],
             ["platformAgent.cleanupHook.enabled=false"],
             ["operator.enabled=false", "hindsight.enabled=true"],
+            ["webConsole.enabled=true"],
         ):
             with self.subTest(sets=sets):
                 chart_pods, required = self._chart_pods_and_requirements(sets)

@@ -8471,3 +8471,33 @@ func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
 	}
 }
+
+// Each workload the operator renders only on a condition is counted when it
+// runs, in agent.Namespace: the credential proxy's exec tier (a CR field), the
+// MCP door and the dispatcher (operator flags). The golden tie cannot see
+// these, so each has a row here, and a new conditional workload needs one.
+func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
+	base := a2aStandingPods(a2aTestAgent())
+	t.Run("the exec tier, at its replicas", func(t *testing.T) {
+		agent := a2aTestAgent()
+		if agent.Spec.Deployment == nil {
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+		}
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Exec: &agentv1alpha1.CredentialProxyExecSpec{Replicas: ptr.To(int32(3))}}
+		if got := a2aStandingPods(agent); got != base+3 {
+			t.Fatalf("standing pods with exec.replicas 3 = %d, want %d", got, base+3)
+		}
+	})
+	t.Run("the MCP door", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "true")
+		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
+		}
+	})
+	t.Run("the dispatcher", func(t *testing.T) {
+		t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:dev")
+		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
+		}
+	})
+}

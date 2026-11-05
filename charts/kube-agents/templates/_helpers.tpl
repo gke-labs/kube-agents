@@ -1957,6 +1957,9 @@ keeps the two counts equal.
 {{- if .Values.githubMinter.enabled -}}
   {{- $pods = add $pods (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) -}}
 {{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- $pods = add $pods 1 -}}
+{{- end -}}
 {{- $pods -}}
 {{- end }}
 
