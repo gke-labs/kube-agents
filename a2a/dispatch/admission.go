@@ -48,6 +48,15 @@ type refusal struct {
 	detail string
 }
 
+// errStopped marks a submission with a stop record (stop.go): ended
+// canceled, never run.
+var errStopped = errors.New("stopped before it started")
+
+// errHeldBack marks an admission that is neither a verdict nor a stop: the
+// submission stays queued, as over a cap, and comes back (an open breaker,
+// or a half-open one trying the oldest held task first).
+var errHeldBack = errors.New("held back at admission")
+
 // admit runs the admission checks in order, cheapest first: the tier, the
 // queue age, the parameters, then the verifier. A nil refusal admits; an
 // error is no verdict (errStopping, or a verifier that could not be reached,
@@ -66,6 +75,19 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
 			return &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
 		}
+	}
+	if d.stopRequested(ctx, d.log, prof.Name, hk.taskID) {
+		return nil, errStopped
+	}
+	// After the age check: a submission a breaker holds still ends at its
+	// queue timeout.
+	queued := del.Received()
+	if queued.IsZero() {
+		queued = now
+	}
+	if wait, _ := d.breakers.wait(prof.Name, tier, now, d.probing(prof.Name, tier),
+		d.olderWaiting(hk, queued)); wait {
+		return nil, errHeldBack
 	}
 	target, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {

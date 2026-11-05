@@ -389,6 +389,14 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
   admission, and `lease-expired` and `deadline-exceeded` while it holds.
+- **Breaker (#3655 PR 6).** A run of `breakerThreshold` lease expiries in a row on one
+  (profile, tier), default 3, opens its breaker. While it
+  is open, for `breakerCooldownSeconds` (default 300), new submissions there are held queued,
+  as over a cap, never refused: a refusal would let one input that keeps killing workers fail
+  every other user's task on that tier. They still end with `queue-timeout`. Then it is half
+  open: the oldest held task is admitted alone, the next expiry opens it again, and a task
+  that finishes closes it. The state is in memory, and the dispatcher's health lists open
+  breakers. A held task isn't told it is held yet (#4362).
 
 ### Execution
 
