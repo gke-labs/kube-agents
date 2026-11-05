@@ -146,19 +146,19 @@ verification_spec:
         # shipped gke- skill counts, not only gke-workload-troubleshooting:
         # what this grades is that the persona's skills reach the model and
         # it uses one, and gke-stall-detection first is a fair reading of
-        # "crashlooping". So do the four symptom skills the persona names
+        # "crashlooping". So do the five symptom skills the persona names
         # since #3181 split gke-workload-troubleshooting: pod-crashloop-oom
         # is the direct route for this question. The match is on the name,
         # so a skill Claude Code bundles (none is named gke-* or one of the
-        # four) cannot pass it.
+        # five) cannot pass it.
         - type: tool_called
           tool_names: ["Skill"]
           arguments:
-            skill: ".*(gke-[a-z-]+|pod-crashloop-oom|pod-pending-scheduling|pod-container-creating|service-connectivity).*"
+            skill: ".*(gke-[a-z-]+|workload-triage-scan|pod-crashloop-oom|pod-pending-scheduling|pod-container-creating|service-connectivity).*"
         - type: tool_called
           tool_names: ["Skill"]
           arguments:
-            command: ".*(gke-[a-z-]+|pod-crashloop-oom|pod-pending-scheduling|pod-container-creating|service-connectivity).*"
+            command: ".*(gke-[a-z-]+|workload-triage-scan|pod-crashloop-oom|pod-pending-scheduling|pod-container-creating|service-connectivity).*"
 
   - name: the-answer-names-the-oom
     role: objective

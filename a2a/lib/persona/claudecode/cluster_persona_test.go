@@ -396,7 +396,7 @@ When ` + "`" + `workload_triage.py` + "`" + ` ends with ` + "`" + `unhealthy: 0`
 `
 	reportingCannotProceed = `## Cannot proceed
 
-If an input is missing or the scope is ambiguous, say what you need in your final answer instead. Do the same when the cluster cannot be read: ` + "`" + `workload_triage.py` + "`" + ` exiting 2, or a kubectl read refused or unreachable. Quote the exact stderr line in your final answer.`
+If an input is missing or the scope is ambiguous, say what you need in your final answer instead. Do the same when nothing could be read from the cluster: ` + "`" + `workload_triage.py` + "`" + ` exiting 2, or the cluster API unreachable before any evidence is gathered. Quote the exact stderr line in your final answer. When an individual ` + "`" + `kubectl` + "`" + ` read mid-investigation is refused (` + "`" + `Error from server (Forbidden)` + "`" + `, HTTP 403), follow ` + "`" + `instructions.md` + "`" + ` §2 and §7 instead: treat the refusal as terminal for that query only, continue with what you can read, and complete your final answer naming that refusal as the gap.`
 	stallRecording = `## Recording the finding
 
 You work under a strict read-only boundary: no patches applied, no Pull Requests opened. Report in your final answer.

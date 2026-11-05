@@ -42,5 +42,5 @@ Name why traffic from a source workload to a target Service fails, quote the evi
 # Rules
 
 - Budget about five commands. Do not `exec` into pods to test connectivity: the boundary is read-only.
-- If a live read fails or is refused, do not retry the cluster in a loop or write a patch from workspace manifests; block the card as `needs_input` as [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md) ("Cannot proceed") describes, quoting the exact stderr line.
+- If a live read fails or is refused, do not retry the cluster in a loop or write a patch from workspace manifests: when the cluster API is unreachable before any evidence is gathered, block the card as `needs_input` as [`workload-triage-scan/references/reporting.md`](../workload-triage-scan/references/reporting.md) ("Cannot proceed") describes, quoting the exact stderr line; when an individual `kubectl` read mid-investigation is refused (`Error from server (Forbidden)`, HTTP 403), treat it as terminal for that query only and complete with what you read, naming that refusal as the gap.
 - Do not run `gcloud container clusters get-credentials`. Preflight has pinned the kubeconfig.

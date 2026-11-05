@@ -139,11 +139,20 @@ class SessionShippedWorkloadSkillsTest(unittest.TestCase):
             REPO_ROOT / "agents/cluster/skills/service-connectivity/SKILL.md"
         ).read_text(encoding="utf-8")
         self.assertIn("needs_input", connectivity)
+        self.assertIn("terminal for that query only", connectivity)
+        self.assertIn("naming that refusal as the gap", connectivity)
         self.assertNotIn("manifests in your workspace", connectivity)
+        reporting = (
+            REPO_ROOT / "agents/cluster/skills/workload-triage-scan/references/reporting.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("when nothing could be read from the cluster", reporting)
+        self.assertIn("treat the refusal as terminal for that query only", reporting)
+        self.assertNotIn("or a kubectl read refused or unreachable", reporting)
         creating = (
             REPO_ROOT / "agents/cluster/skills/pod-container-creating/SKILL.md"
         ).read_text(encoding="utf-8")
         self.assertIn("you have no GitOps repository", creating)
+        self.assertIn("10-minute startup grace period", creating)
         self.assertNotIn("repository is in your workspace", creating)
         self.assertNotIn("git log", creating)
 
@@ -250,15 +259,19 @@ class SessionShippedWorkloadSkillsTest(unittest.TestCase):
             "REASON:.status.reason",
             "TERM:.status.containerStatuses[*].state.terminated.reason",
             "TERM_EXIT:.status.containerStatuses[*].state.terminated.exitCode",
+            "TERM_FINISHED:.status.containerStatuses[*].state.terminated.finishedAt",
             "INIT:.status.initContainerStatuses[*].state.waiting.reason",
             "INIT_TERM:.status.initContainerStatuses[*].state.terminated.reason",
+            "INIT_TERM_FINISHED:.status.initContainerStatuses[*].state.terminated.finishedAt",
             "INIT_LAST:.status.initContainerStatuses[*].lastState.terminated.reason",
             "INIT_EXIT:.status.initContainerStatuses[*].lastState.terminated.exitCode",
             "FINISHED:.status.containerStatuses[*].lastState.terminated.finishedAt",
             "INIT_FINISHED:.status.initContainerStatuses[*].lastState.terminated.finishedAt",
+            "COND_TRANSITION:.status.conditions[*].lastTransitionTime",
             "AGE:.metadata.creationTimestamp",
             "DELETING:.metadata.deletionTimestamp",
             "OWNER:.metadata.ownerReferences[*].kind",
+            "under 10 minutes old by `AGE`",
             "retained history",
             "`PHASE=Failed`",
             "`REASON=Evicted`",
@@ -286,6 +299,7 @@ class SessionShippedWorkloadSkillsTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn(".spec.initContainers[]?", crashloop)
         self.assertIn(".status.initContainerStatuses[]?", crashloop)
+        self.assertIn("10-minute startup grace period", crashloop)
 
     def test_router_and_triage_scan_guard_podless_or_replica_failure_controllers(self):
         router = (

@@ -9,7 +9,7 @@ Answer a cluster-wide "what is failing / is it healthy" question from one batche
 
 # Workflow
 
-1. Run the scan once. It reads pods, Deployments, StatefulSets, DaemonSets, Jobs and Warning events across all namespaces in six paged single-kind `kubectl get -o json` reads (reading the four controller kinds concurrently) and prints only what needs attention:
+1. Run the scan once. It reads pods, Deployments, StatefulSets, DaemonSets, Jobs and Warning events across all namespaces in six paged single-kind `kubectl get -o json` reads and prints only what needs attention:
 
    ```bash
    python3 /opt/data/scripts/workload_triage.py

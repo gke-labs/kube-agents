@@ -53,4 +53,5 @@ For an OOM, tell an application leak or loop (unbounded growth in the log, a com
 # Rules
 
 - Budget about five commands. Do not `describe` or log every replica.
+- A pod under the scan's 10-minute startup grace period (`Running` not Ready or `PodInitializing` while under 10 minutes old with `restartCount: 0` and no non-zero container termination in the last 60 minutes) is initializing: report it with no proposed patch, do not wait.
 - Never `sleep` or `--watch` for the next restart.

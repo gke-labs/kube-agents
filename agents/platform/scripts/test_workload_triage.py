@@ -604,6 +604,15 @@ class EventsTest(unittest.TestCase):
         self.assertEqual(rows[0]["message"], "newest")
         self.assertEqual(report["summary"]["warning_events"], 5)
 
+    def test_long_running_event_whose_first_timestamp_precedes_window_clamps_count_to_one(self):
+        long_running = event("web", "BackOff", 2, count=4521, message="Back-off restarting failed container")
+        long_running["firstTimestamp"] = stamp(3 * 1440)
+        report = triage(events=[long_running])
+        self.assertEqual(len(report["warning_events"]), 1)
+        self.assertEqual(report["warning_events"][0]["count"], 1)
+        self.assertEqual(report["summary"]["warning_events"], 1)
+        self.assertIn("warning events (60m): 1", workload_triage.render_text(report))
+
     def test_node_events_are_folded_into_one_summary(self):
         report = triage(events=[event("n1", "KubeletStart", 5, namespace="default", kind="Node")])
         self.assertEqual(report["warning_events"], [])
@@ -1193,13 +1202,13 @@ class ProxyTruncationTest(unittest.TestCase):
     def test_per_namespace_fallback_aborts_queued_reads_on_fast_failure_and_preserves_order(self):
         cut = '{"items": ['
         namespaces = [f"ns-{i}" for i in range(workload_triage.FALLBACK_CONCURRENCY + 20)]
-        ns2_names = [f"pod/p-ns-2-{i}" for i in range(workload_triage.OBJECT_BATCH_SIZE * 3)]
+        ns0_names = [f"pod/p-ns-0-{i}" for i in range(workload_triage.OBJECT_BATCH_SIZE * 3)]
         real_event = threading.Event
-        ns2_in_batch1 = real_event()
+        ns0_in_batch1 = real_event()
         cancel_observed = real_event()
         dispatch_lock = threading.Lock()
         dispatched: list[str] = []
-        ns2_batches: list[tuple[str, ...]] = []
+        ns0_batches: list[tuple[str, ...]] = []
 
         class ObservableCancelEvent:
             def __init__(self) -> None:
@@ -1221,25 +1230,25 @@ class ProxyTruncationTest(unittest.TestCase):
                 ns = args[3]
                 with dispatch_lock:
                     dispatched.append(ns)
-                if ns == "ns-2":
+                if ns == "ns-0":
                     return 0, cut, "credential proxy output truncated\n"
                 if ns == "ns-1":
-                    self.assertTrue(ns2_in_batch1.wait(timeout=2.0))
+                    self.assertTrue(ns0_in_batch1.wait(timeout=2.0))
                     return 1, "", "Error from server (Forbidden): pods is forbidden"
                 self.assertTrue(cancel_observed.wait(timeout=2.0))
                 return 0, json.dumps({"items": [pod(f"p-{ns}", namespace=ns)]}), ""
-            if args == ("get", "pods", "-n", "ns-2", "-o", "name"):
-                return 0, "\n".join(ns2_names) + "\n", ""
+            if args == ("get", "pods", "-n", "ns-0", "-o", "name"):
+                return 0, "\n".join(ns0_names) + "\n", ""
             if (
                 len(args) > 6
                 and args[:2] == ("get", "--ignore-not-found")
-                and args[-4:] == ("-n", "ns-2", "-o", "json")
+                and args[-4:] == ("-n", "ns-0", "-o", "json")
             ):
                 with dispatch_lock:
-                    ns2_batches.append(args)
-                ns2_in_batch1.set()
+                    ns0_batches.append(args)
+                ns0_in_batch1.set()
                 self.assertTrue(cancel_observed.wait(timeout=2.0))
-                return 0, json.dumps({"items": [pod("p-ns-2-0", namespace="ns-2")]}), ""
+                return 0, json.dumps({"items": [pod("p-ns-0-0", namespace="ns-0")]}), ""
             raise AssertionError(f"unexpected kubectl call after fast ns-1 failure: {args}")
 
         with patch.object(
@@ -1253,7 +1262,7 @@ class ProxyTruncationTest(unittest.TestCase):
         self.assertIn("cannot read pods in ns-1: Error from server (Forbidden)", err)
         self.assertLessEqual(len(dispatched), workload_triage.FALLBACK_CONCURRENCY)
         self.assertTrue(set(dispatched).issubset({f"ns-{i}" for i in range(workload_triage.FALLBACK_CONCURRENCY)}))
-        self.assertEqual(len(ns2_batches), 1)
+        self.assertEqual(len(ns0_batches), 1)
 
         order_namespaces = [f"ns-{i}" for i in range(workload_triage.FALLBACK_CONCURRENCY)]
         later_finished = threading.Event()
@@ -1369,7 +1378,7 @@ class ProxyTruncationTest(unittest.TestCase):
             "--all-namespaces",
             *workload_triage.NAMESPACE_PROJECTION_ARGS,
         )
-        for bad_stdout in ('{"items":[{"metadata":', "[]"):
+        for bad_stdout in ('{"items":[{"metadata":', "[]", ""):
             with self.subTest(bad_stdout=bad_stdout, fallback="refused"):
                 def run_refused(args, payload=bad_stdout):
                     if args == workload_triage.PODS_ARGS:
@@ -1383,6 +1392,22 @@ class ProxyTruncationTest(unittest.TestCase):
                 self.assertEqual(out, "")
                 self.assertIn(
                     "cannot read pods: cannot parse output as JSON (namespace fallback failed: connection refused)",
+                    err,
+                )
+
+            with self.subTest(bad_stdout=bad_stdout, fallback="empty_projection"):
+                def run_empty_projection(args, payload=bad_stdout):
+                    if args == workload_triage.PODS_ARGS:
+                        return 0, payload, ""
+                    if args == pods_proj:
+                        return 0, "\n", ""
+                    return 0, '{"items":[]}', ""
+
+                code, out, err = self.run_main([], run_empty_projection)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertIn(
+                    "cannot read pods: cannot parse output as JSON (namespace projection returned no namespaces)",
                     err,
                 )
 
@@ -1441,6 +1466,20 @@ class SkillNamesTest(unittest.TestCase):
             workload_triage.BROKER_KUBECTL_RUN_SECONDS,
             declared(r"^DEFAULT_KUBECTL_TIMEOUT_SECONDS = (\d+)$", broker),
         )
+        import credential_proxy
+
+        self.assertLess(
+            workload_triage.FALLBACK_CONCURRENCY,
+            credential_proxy.DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS,
+        )
+        self.assertEqual(
+            credential_proxy.DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS,
+            declared(r"^DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS = (\d+)$", broker),
+        )
+        self.assertEqual(
+            credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS,
+            declared(r"^DEFAULT_MAX_CONCURRENT_COMMANDS = (\d+)$", broker),
+        )
         self.assertEqual(
             workload_triage.KUBECTL_CAP_SECONDS,
             workload_triage.BROKER_ADMISSION_WAIT_SECONDS
@@ -1477,8 +1516,10 @@ class MainTest(unittest.TestCase):
             self.assertEqual(call[-2:], ("-o", "json"), call)
             self.assertNotIn(",", call[1], call)
 
-    def test_controller_reads_run_concurrently_and_preserve_kind_order(self):
-        all_four = threading.Barrier(len(workload_triage.CONTROLLER_READS), timeout=5.0)
+    def test_controller_reads_run_sequentially_and_preserve_kind_order(self):
+        in_flight = [0]
+        peak_in_flight = [0]
+        flight_lock = threading.Lock()
         base = stub(
             pods=[pod("web")],
             controllers=[
@@ -1489,15 +1530,22 @@ class MainTest(unittest.TestCase):
             ],
         )
 
-        def concurrent_controllers_run(args):
+        def sequential_controllers_run(args):
             if args in workload_triage.CONTROLLER_ARGS:
-                all_four.wait()
-                if args == workload_triage.DEPLOYMENTS_ARGS:
-                    time.sleep(0.02)
+                with flight_lock:
+                    in_flight[0] += 1
+                    peak_in_flight[0] = max(peak_in_flight[0], in_flight[0])
+                try:
+                    return base(args)
+                finally:
+                    with flight_lock:
+                        in_flight[0] -= 1
             return base(args)
 
-        code, out, err = self.run_main(["--json"], concurrent_controllers_run)
+        code, out, err = self.run_main(["--json"], sequential_controllers_run)
         self.assertEqual(code, 0, err)
+        self.assertEqual(peak_in_flight[0], 1)
+        self.assertEqual(base.calls[1:5], list(workload_triage.CONTROLLER_ARGS))
         parsed = json.loads(out)
         self.assertEqual(
             [r["controller"] for r in parsed["controllers_below_desired"]],

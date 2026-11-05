@@ -9,7 +9,7 @@ Answer a cluster-wide "what is failing / is it healthy" question from one batche
 
 # Workflow
 
-1. Run the scan once, from this skill's directory (the base directory the harness gives when it loads the skill), where `scripts/workload_triage.py` is. It reads pods, Deployments, StatefulSets, DaemonSets, Jobs and Warning events across all namespaces in six paged single-kind `kubectl get -o json` reads (reading the four controller kinds concurrently) and prints only what needs attention:
+1. Run the scan once, from this skill's directory (the base directory the harness gives when it loads the skill), where `scripts/workload_triage.py` is. It reads pods, Deployments, StatefulSets, DaemonSets, Jobs and Warning events across all namespaces in six paged single-kind `kubectl get -o json` reads and prints only what needs attention:
 
    ```bash
    python3 scripts/workload_triage.py

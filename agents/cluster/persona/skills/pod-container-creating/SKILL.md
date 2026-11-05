@@ -50,4 +50,4 @@ For a wrong tag, find the last image tag that ran from the cluster (`kubectl rol
 
 - Budget about five commands.
 - When routed from a `WARNING EVENTS` row whose pod is `gone` or whose object is not a pod (such as `PersistentVolumeClaim/<name>` with `STATE` `-`), skip step 1 (`kubectl get pod`): start at step 2 (`events` filtered by `involvedObject.name` for that object) and step 3 (`configmap,pvc`) for the kind the event names, plus the owning workload's current pods for a `gone` pod if needed to confirm recovery.
-- A pod under the scan's grace period is initializing: report it, do not wait. No `sleep`, no `--watch`.
+- A pod under the scan's 10-minute startup grace period (under 10 minutes old with no non-zero container termination in the last 60 minutes) is initializing: report it, do not wait. No `sleep`, no `--watch`.

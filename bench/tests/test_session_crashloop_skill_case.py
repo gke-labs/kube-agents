@@ -133,7 +133,16 @@ def test_the_older_skill_key_counts():
     assert _status(SKILL, ANSWER, record) == "pass"
 
 
-@pytest.mark.parametrize("skill", ["pod-crashloop-oom", "pod-pending-scheduling", "pod-container-creating", "service-connectivity"])
+@pytest.mark.parametrize(
+    "skill",
+    [
+        "workload-triage-scan",
+        "pod-crashloop-oom",
+        "pod-pending-scheduling",
+        "pod-container-creating",
+        "service-connectivity",
+    ],
+)
 def test_the_symptom_skills_count(skill: str):
     record = _inject(_call("Skill", {"skill": skill}), KUBECTL)
     assert _status(SKILL, ANSWER, record) == "pass"

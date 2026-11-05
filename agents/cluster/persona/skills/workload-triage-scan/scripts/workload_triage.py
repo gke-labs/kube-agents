@@ -4,12 +4,11 @@
 The Cluster Agent's ``workload-triage-scan`` skill runs this once to answer
 "what is failing?" or "is this cluster healthy?" without composing a command per
 pod. It makes six paged single-kind ``kubectl get --all-namespaces --chunk-size=500 -o json``
-reads (reading the four controller kinds concurrently, and falling back to
-per-namespace and batched reads if the credential proxy cuts an all-namespaces
-reply at its output cap):
+reads (falling back to per-namespace and batched reads if the credential proxy
+cuts an all-namespaces reply at its output cap):
 
 1. pods,
-2. Deployments, StatefulSets, DaemonSets and Jobs (one kind per call, in parallel),
+2. Deployments, StatefulSets, DaemonSets and Jobs (one kind per call),
 3. Warning events.
 
 It prints only what needs attention:
@@ -100,9 +99,10 @@ CONTROLLER_READS: tuple[tuple[str, tuple[str, ...], str], ...] = (
 # and returns kubectl's exit code 0.
 PROXY_TRUNCATION_MARKER = "credential proxy output truncated"
 OBJECT_BATCH_SIZE = 200
-# Half of credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS (8), so one cluster's
-# truncation fallback leaves broker slots free for sibling Cluster Agents.
-FALLBACK_CONCURRENCY = 4
+# Half of credential_proxy.DEFAULT_PROFILE_MAX_CONCURRENT_COMMANDS (4) and a
+# quarter of DEFAULT_MAX_CONCURRENT_COMMANDS (8), so one cluster's truncation
+# fallback leaves profile and pool broker slots free for sibling scans.
+FALLBACK_CONCURRENCY = 2
 # Same wall-clock budget pattern as cluster_preflight.sh: Hermes' terminal tool
 # kills an unbudgeted call at TERMINAL_TOOL_TIMEOUT_SECONDS (180s) with no
 # output, so the scan enforces its own budget inside that ceiling and exits 2
@@ -466,6 +466,9 @@ def _recover_truncated_resource(
         errors.append(f"cannot read {what}: {reason} (namespace fallback failed: {ns_reason})")
         return None
     if not namespaces:
+        if reason != PROXY_TRUNCATION_MARKER:
+            errors.append(f"cannot read {what}: {reason} (namespace projection returned no namespaces)")
+            return None
         return []
     if len(namespaces) == 1:
         ns_items, ns_err = _read_namespace(run, resource, extra_args, what, namespaces[0])
@@ -556,52 +559,17 @@ def _read_controllers(
     errors: list[str],
     namespaces_cache: list[list[str] | None],
 ) -> list[dict] | None:
-    """Read Deployments, StatefulSets, DaemonSets and Jobs as four concurrent
-    paged single-kind calls, recovering any truncated kind sequentially so total
-    in-flight kubectl concurrency never exceeds `FALLBACK_CONCURRENCY`."""
-    cancel_event = threading.Event()
-    initial: dict[int, tuple[str, list[dict] | None, str]] = {}
-
-    def fetch_one(all_ns_args: tuple[str, ...]) -> tuple[str, list[dict] | None, str]:
-        if cancel_event.is_set():
-            return "cancelled", None, ""
-        code, out, err = run(all_ns_args)
-        state, items, reason = _parse_json_reply(code, out, err)
-        if state == "failed":
-            cancel_event.set()
-        return state, items, reason
-
-    workers = min(FALLBACK_CONCURRENCY, len(CONTROLLER_READS))
-    executor = ThreadPoolExecutor(max_workers=workers)
-    try:
-        future_to_idx = {
-            executor.submit(fetch_one, all_ns_args): idx
-            for idx, (_, all_ns_args, _) in enumerate(CONTROLLER_READS)
-        }
-        for fut in as_completed(future_to_idx):
-            initial[future_to_idx[fut]] = fut.result()
-    finally:
-        cancel_event.set()
-        executor.shutdown(wait=True, cancel_futures=True)
-
-    for idx, (resource, _, _) in enumerate(CONTROLLER_READS):
-        state, _, reason = initial[idx]
-        if state == "failed":
-            errors.append(f"cannot read {resource}: {reason}")
-            return None
-
+    """Read Deployments, StatefulSets, DaemonSets and Jobs sequentially as
+    paged single-kind calls, recovering any truncated kind via the bounded
+    per-namespace fallback."""
     collected: list[dict] = []
-    for idx, (resource, _, default_kind) in enumerate(CONTROLLER_READS):
-        state, items, reason = initial[idx]
-        if state == "ok":
-            collected.extend(_with_default_kind(items or [], default_kind))
-            continue
-        recovered = _recover_truncated_resource(
-            run, resource, (), resource, reason, errors, namespaces_cache
+    for resource, all_ns_args, default_kind in CONTROLLER_READS:
+        items = read_resource(
+            run, all_ns_args, resource, (), resource, errors, namespaces_cache
         )
-        if recovered is None:
+        if items is None:
             return None
-        collected.extend(_with_default_kind(recovered, default_kind))
+        collected.extend(_with_default_kind(items, default_kind))
     return collected
 
 
@@ -990,6 +958,15 @@ def event_time(ev: dict) -> datetime | None:
     )
 
 
+def event_first_time(ev: dict) -> datetime | None:
+    return (
+        parse_time(ev.get("firstTimestamp"))
+        or parse_time(ev.get("deprecatedFirstTimestamp"))
+        or parse_time(ev.get("eventTime"))
+        or parse_time(ev.get("metadata", {}).get("creationTimestamp"))
+    )
+
+
 def group_events(events: list[dict], now: datetime, window: timedelta) -> list[dict]:
     """Warning events inside the window, one row per (namespace, object, reason), newest first."""
     groups: dict[tuple[str, str, str], dict] = {}
@@ -1001,7 +978,11 @@ def group_events(events: list[dict], now: datetime, window: timedelta) -> list[d
         namespace = inv.get("namespace") or ev.get("metadata", {}).get("namespace", "")
         obj = f"{inv.get('kind', '')}/{inv.get('name', '')}"
         reason = ev.get("reason") or ""
-        count = int((ev.get("series") or {}).get("count") or ev.get("count") or 1)
+        first_seen = event_first_time(ev)
+        if first_seen is not None and now - first_seen > window:
+            count = 1
+        else:
+            count = int((ev.get("series") or {}).get("count") or ev.get("count") or 1)
         key = (namespace, obj, reason)
         row = groups.get(key)
         message = " ".join((ev.get("message") or ev.get("note") or "").split())[:EVENT_MESSAGE_CHARS]
