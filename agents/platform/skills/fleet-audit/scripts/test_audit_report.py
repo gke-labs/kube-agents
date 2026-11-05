@@ -609,6 +609,51 @@ def use_snapshot(case, files=None, *, error=None, calls=None, unreadable=(), rea
     return Snapshot
 
 
+def use_large_repository(case, files, *, too_large=(), calls=None):
+    """Make `audit_report.RepositorySnapshot` act for a repository over the snapshot ceiling.
+
+    A snapshot of the whole tree, or of a path in `too_large`, is refused with
+    `SNAPSHOT_TOO_LARGE`; a snapshot of a path that names nothing in `files`
+    (a file, or a directory holding some) is refused with `PATH_NOT_FOUND`;
+    any other narrow snapshot unpacks the files under that path. `calls`
+    collects the `paths` of each snapshot asked for.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix="large-repo-"))
+    case.addCleanup(shutil.rmtree, scratch, True)
+
+    def refused(code, message):
+        error = vcs_client.VcsError(message, code=code, revision=SNAPSHOT_TEST_REVISION)
+        return error
+
+    class Snapshot(audit_report.RepositorySnapshot):
+        def __init__(self, repo, ref=None, paths=None):
+            if calls is not None:
+                calls.append(paths)
+            if not paths or paths[0] in too_large:
+                raise refused("SNAPSHOT_TOO_LARGE", "over the ceiling")
+            under = paths[0].rstrip("/")
+            held = {p: t for p, t in files.items() if p == under or p.startswith(under + "/")}
+            if not held:
+                raise refused("PATH_NOT_FOUND", "a path in `paths` names nothing")
+            self._scratch = Path(tempfile.mkdtemp(dir=str(scratch)))
+            self.tree = self._scratch / "tree"
+            self.tree.mkdir()
+            for path, text in held.items():
+                target = self.tree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            self.revision = SNAPSHOT_TEST_REVISION
+
+    for target, name, value in (
+        (audit_report, "RepositorySnapshot", Snapshot),
+        (vcs_client, "LOCAL_GIT", shutil.which("git")),
+        (vcs_client, "ROOT", scratch / "vcs"),
+    ):
+        patcher = patch.object(target, name, value)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
 class _HistoryDirectoryForge(_DirectoryForge):
     """`_DirectoryForge` with a proposal history per branch, as
     `test_vcs_broker.HistoryLocalForge`: what the broker's `branch-delete`
@@ -4564,6 +4609,34 @@ class TestPublishedBodies(HarnessTestCase):
         self.assertEqual(self.harness.bodies_for("proposal-create"), [])
         published = [p["body"] for p in self.harness.payloads if p and "body" in p]
         self.assertTrue(any("## Awaiting `/remediate`" in b and f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), published)
+
+    def test_the_no_promote_flag_publishes_the_ledger_and_opens_no_pull_request(self):
+        """`finish --no-promote`, the per-run waiver a worker passes on a card that
+        says not to open a pull request: the ledger publishes, no proposal opens,
+        and the ledger says the sweep was withheld on this run, not on the install
+        (#4637). The same document without the flag opens the proposal, which is
+        today's behaviour and the test above."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+            self.assertEqual(self.run_finish(make_doc(), argv_extra=[audit_report.NO_PROMOTE_FLAG], scheduled=False), 0)
+        self.assertEqual(self.harness.bodies_for("proposal-create"), [])
+        published = [p["body"] for p in self.harness.payloads if p and "body" in p]
+        self.assertTrue(any("## Awaiting `/remediate`" in b and audit_report.SWEEP_WAIVED_REASON in b for b in published), published)
+        self.assertFalse(any(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), "the waiver names the run, not the install's switch")
+
+    def test_without_the_no_promote_flag_the_same_run_opens_the_pull_request(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+            self.assertEqual(self.run_finish(make_doc(), scheduled=False), 0)
+        self.assertEqual(len(self.harness.bodies_for("proposal-create")), 1)
 
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
@@ -19958,6 +20031,29 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(self.run_finish(make_doc()), 0, self.err)
         scan.assert_not_called()
 
+    def test_a_tree_still_over_the_ceiling_still_publishes_the_report(self):
+        # A narrow snapshot still over the ceiling does not stop `finish`: the
+        # ledger publishes.
+        self.start()
+        path = "clusters/prod-us-east/payments-netpol.yaml"
+        self.write_manifest(path, "kind: NetworkPolicy\n")
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        use_large_repository(self, {}, too_large={"clusters/prod-us-east", path})
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertNotIn("FATAL", self.err)
+        self.assertTrue(self.harness.forge_calls("issue-create"))
+
+    def test_the_kcc_scan_is_skipped_on_a_repository_over_the_ceiling(self):
+        self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
+        self.start()
+        use_large_repository(self, {"gcp/drift-peer-std-4.yaml": "kind: ContainerCluster\n"})
+        body = self.finish_kcc()
+        self.assertIn("the Config Connector scan was skipped", self.err)
+        self.assertIn(self.KCC_FIX, body)
+
     def test_a_broker_error_leaves_the_gcloud_fix_and_the_run_alone(self):
         self.seed_kcc("gcp/drift-peer-std-4.yaml", "drift-peer-std-4")
         self.start()
@@ -21885,6 +21981,110 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             self.assertTrue(probe.has_path("clusters/other.yaml"))
         self.assertIn("RuntimeError: second", probe.unavailable)
         self.assertEqual(len(calls), 2)
+
+    def in_cluster_tree(self):
+        """Point the candidate's declaration into `clusters/c1/`, the GitOps layout."""
+        manifest = self.manifest(declaration="clusters/c1/web/deploy.yaml")
+        manifest["clusters"][0]["candidates"][0]["declaration"]["directory"] = "clusters/c1/web"
+        self.manifest = lambda *args, **kwargs: copy.deepcopy(manifest)
+
+    def test_a_repository_over_the_ceiling_still_checks_a_generated_fix(self):
+        # The whole tree is refused as too large; each check takes a snapshot
+        # of only its own path or cluster tree, and the fix is checked and written.
+        self.in_cluster_tree()
+        calls = []
+        use_large_repository(self, {"clusters/c1/web/deploy.yaml": "kind: Deployment\n"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        written, finding = self.generate()
+        self.assertEqual(written, ["a"], self.generate_err)
+        self.assertEqual(finding["remediation"]["path"], "clusters/c1/web/a-pdb.yaml")
+        self.assertNotIn("could not be checked", self.generate_err)
+        # The whole tree once, then the cluster tree, which answers the fix, the
+        # markers in it and the name search, and the six markers above it one
+        # file each.
+        self.assertEqual(calls[0], None)
+        self.assertEqual(calls[1], ["clusters/c1"])
+        self.assertEqual(
+            sorted(c[0] for c in calls[2:]),
+            sorted([f"clusters/{m}" for m in audit_report.KUSTOMIZATION_FILE_NAMES]
+                   + list(audit_report.KUSTOMIZATION_FILE_NAMES)),
+        )
+
+    def test_a_name_search_outside_a_cluster_tree_still_needs_the_whole_tree(self):
+        # A declaration outside `clusters/<name>/` is searched across the whole
+        # repository for a name collision, which no narrow snapshot holds: the
+        # fix is declined, saying why.
+        use_large_repository(self, {"apps/a/deploy.yaml": "kind: Deployment\n"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("too large to search whole", self.generate_err)
+
+    def test_a_file_a_narrow_snapshot_finds_is_not_written_over(self):
+        self.in_cluster_tree()
+        use_large_repository(self, {"clusters/c1/web/a-pdb.yaml": "kind: PodDisruptionBudget\n"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("already exists", self.generate_err)
+
+    def test_a_generated_fix_in_a_tree_over_the_ceiling_costs_one_snapshot(self):
+        # The name search needs the whole cluster tree, so the planner asks for
+        # it first and declines the fix at once, naming the ceiling, without
+        # the per-file checks that would come before it.
+        self.in_cluster_tree()
+        calls = []
+        use_large_repository(self, {}, too_large={"clusters/c1"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertEqual(calls, [None, ["clusters/c1"]])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
+
+    def test_a_refused_path_is_not_asked_again(self):
+        # A tree or a file the broker refused as too large is answered from the
+        # refusal on every later question, a name search on the tree included.
+        calls = []
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/kustomization.yaml"}, calls=calls)
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(2):
+                probe.read_committed("clusters/c1/kustomization.yaml")
+                probe.mentions("a-pdb", "clusters/c1/")
+        self.assertEqual(calls.count(["clusters/c1"]), 1)
+        self.assertEqual(calls.count(["clusters/c1/kustomization.yaml"]), 1)
+        probe.close()
+
+    def test_a_path_still_over_the_ceiling_declines_the_fix_naming_the_limit(self):
+        self.in_cluster_tree()
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/web/a-pdb.yaml"})
+        self.patch_attr("content_mode", lambda: True)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("too large for one snapshot", self.generate_err)
+        self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", self.generate_err)
+
+    def test_past_the_cap_a_check_is_skipped_with_the_reason(self):
+        # The cap stops snapshots, not the run: the fix is declined as
+        # unchecked, naming the cap, as when no snapshot could be taken.
+        self.in_cluster_tree()
+        use_large_repository(self, {})
+        self.patch_attr("content_mode", lambda: True)
+        self.patch_attr("PROBE_NARROW_SNAPSHOT_CAP", 0)
+        self.assertEqual(self.generate()[0], [])
+        self.assertIn("could not be checked", self.generate_err)
+        self.assertIn("PROBE_NARROW_SNAPSHOT_CAP", self.generate_err)
+
+    def test_a_too_large_read_or_search_is_unanswered_naming_the_limit(self):
+        use_large_repository(self, {}, too_large={"clusters/c1", "clusters/c1/kustomization.yaml"})
+        self.patch_attr("content_mode", lambda: True)
+        probe = audit_report._RepositoryProbe("acme/fleet", self.workspace)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(probe.broker())
+            self.assertIsNone(probe.read_committed("clusters/c1/kustomization.yaml"))
+            self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", probe.take_unanswered())
+            self.assertTrue(probe.mentions("a-pdb", "clusters/c1/"))
+            self.assertIn("CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES", probe.take_unanswered())
+        probe.close()
 
     def test_a_snapshot_that_failed_is_named_not_called_a_collision(self):
         use_snapshot(self, error=RuntimeError("down"))
@@ -31059,6 +31259,23 @@ class TestUnlistedKustomizeAdditions(BaseTestCase):
         files = self.overlay("- deployment.yaml\n- checkout-gateway-pdb.yaml\n")
         self.assertEqual(self.degrade_via_broker(files, [finding]), [])
         self.assertEqual(finding["remediation"]["kind"], "manifest")
+
+    def test_a_refused_tree_is_asked_for_once(self):
+        # A tree over the ceiling is remembered: the later checks under it go
+        # straight to the file alone, and the refusal counts toward the cap.
+        calls = []
+        use_large_repository(self, self.overlay(), too_large={"clusters/prod"}, calls=calls)
+        finding = kustomize_fix(self.PDB)
+        self.degrade_in_content_mode([finding])
+        self.assertEqual(calls.count(["clusters/prod"]), 1)
+
+    def test_a_repository_over_the_ceiling_still_reads_the_kustomization(self):
+        # Narrow mode: the overlay's kustomization is read from a snapshot of
+        # its own directory, so an unlisted new file is still caught.
+        use_large_repository(self, self.overlay())
+        finding = kustomize_fix(self.PDB)
+        self.assertEqual(self.degrade_in_content_mode([finding]), ["pdb-fix"])
+        self.assertIn(f"`{self.KUSTOMIZATION}` does not list it", finding["remediation"]["note"])
 
     def test_content_mode_keeps_a_file_on_the_base(self):
         files = {**self.overlay(), self.PDB: "kind: PodDisruptionBudget\n"}
