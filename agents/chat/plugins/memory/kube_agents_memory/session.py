@@ -36,6 +36,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+from types import SimpleNamespace
 from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from agent.memory_provider import MemoryProvider
@@ -55,6 +56,7 @@ from .config_schema import (
 from .prompts import (
     NO_IDENTITY_NOTICE,
     NO_MATCH_GUIDANCE,
+    RECALL_PREAMBLE,
     SHARED_SESSION_NOTICE,
     UNREACHABLE_GUIDANCE,
     system_prompt_block,
@@ -300,7 +302,14 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         self._call("queue_prefetch", query, session_id=session_id)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        return self._call("prefetch", query, session_id=session_id) or ""
+        base = self._call("prefetch", query, session_id=session_id) or ""
+        decisions = client.recall_decisions(query)
+        if not decisions:
+            return base
+        section = "## Architecture Decisions & Operational Lessons\n" + "\n\n".join(decisions)
+        if base:
+            return f"{base.rstrip()}\n\n{section}"
+        return f"{RECALL_PREAMBLE}\n\n{section}"
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
         self._call("on_turn_start", turn_number, message, **kwargs)
@@ -415,6 +424,23 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         context = str(args.get("context") or "").strip()
         if context:
             item["context"] = context
+        if scope == "shared":
+            decision = client.emit_shared_decision(content, context)
+            if decision and decision.get("record_id"):
+                rec_id = decision["record_id"]
+                rel_path = decision.get("path") or f"knowledge/decisions/{rec_id}.md"
+                branch = decision.get("branch") or f"platform-agent/memory/{rec_id}"
+                return json.dumps({
+                    "result": (
+                        f"Stored in shared memory as proposed decision {rec_id} "
+                        f"({rel_path} on branch {branch}) and queued a pull request "
+                        "for team review."
+                    ),
+                    "record_id": rec_id,
+                    "status": "proposed",
+                    "path": rel_path,
+                    "branch": branch,
+                })
         try:
             client.retain(self._hindsight, item)
         except Exception as e:
@@ -453,7 +479,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
     def _recall(self, query: str, scope: str, tags: List[str]) -> str:
         searched = self._searched("memory_recall", query, scope, tags)
         try:
-            results = client.recall(self._hindsight, query, tags)
+            results = list(client.recall(self._hindsight, query, tags))
         except Exception as e:
             logger.warning("%s: recall failed (scope=%s): %s", PROVIDER_NAME, scope, e)
             return tool_error(
@@ -461,6 +487,10 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 status="unreachable",
                 searched=searched,
             )
+        if scope in ("shared", "both"):
+            for entry in client.recall_decisions(query):
+                if not any(entry in (getattr(r, "text", "") or "") for r in results):
+                    results.append(SimpleNamespace(text=entry))
         if not results:
             return json.dumps(
                 {"status": "no_match", "searched": searched, "matches": 0,
@@ -483,6 +513,11 @@ class KubeAgentsMemoryProvider(MemoryProvider):
                 status="unreachable",
                 searched=searched,
             )
+        if scope in ("shared", "both"):
+            decisions = client.recall_decisions(query)
+            if decisions:
+                dec_section = "## Architecture Decisions & Operational Lessons\n" + "\n\n".join(decisions)
+                text = f"{text}\n\n{dec_section}" if text else dec_section
         if not text:
             return json.dumps(
                 {"status": "no_match", "searched": searched, "result": NO_MATCH_GUIDANCE}

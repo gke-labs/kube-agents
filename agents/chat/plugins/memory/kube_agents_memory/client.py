@@ -17,7 +17,11 @@ something the model reads is `session.py`'s job — see `prompts.py` for why the
 three outcomes must stay distinguishable.
 """
 
+import json
 import logging
+import os
+import shutil
+import subprocess
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -247,3 +251,200 @@ def reflect(provider: MemoryProvider, query: str, tags: List[str]) -> str:
         )
     )
     return str(getattr(response, "text", "") or "").strip()
+
+
+def _resolve_curator_bin() -> str:
+    """Return the path to the ``curator`` CLI binary if installed, else ``""``."""
+    configured = os.environ.get("CURATOR_BIN", "").strip()
+    if configured:
+        return configured
+    if os.path.isfile("/usr/local/bin/curator") and os.access("/usr/local/bin/curator", os.X_OK):
+        return "/usr/local/bin/curator"
+    return shutil.which("curator") or ""
+
+
+def recall_decisions(query: str, max_results: int = 4) -> List[str]:
+    """Query structured DEC-*/LES-* records over NATS via ``curator recall``.
+
+    Returns an empty list when ``NATS_URL`` is unset or ``curator`` is not
+    installed so unit tests and environments without the NATS bus are
+    unaffected.
+    """
+    q = str(query or "").strip()
+    if not q or not os.environ.get("NATS_URL", "").strip():
+        return []
+    curator_bin = _resolve_curator_bin()
+    if not curator_bin:
+        return []
+    try:
+        proc = subprocess.run(
+            [curator_bin, "recall", q],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return []
+        payload = json.loads(proc.stdout)
+    except Exception as e:
+        logger.debug("%s: NATS decision recall failed: %s", PROVIDER_NAME, e)
+        return []
+
+    records_by_id = {
+        str(rec.get("id") or ""): rec
+        for rec in (payload.get("records") or [])
+        if isinstance(rec, dict) and rec.get("id")
+    }
+    formatted: List[str] = []
+    for item in payload.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        rec_id = str(item.get("id") or "").strip()
+        doc_id = str(item.get("document_id") or "").strip()
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        is_okf = (
+            rec_id.startswith(("DEC-", "LES-"))
+            or doc_id.startswith("okf:")
+            or rec_id in records_by_id
+        )
+        if not is_okf:
+            continue
+        rec_meta = records_by_id.get(rec_id) or {}
+        status = str(rec_meta.get("status") or "").strip().lower()
+        header = f"[{rec_id}]" if rec_id else "[Record]"
+        if status == "rejected":
+            reason = str(rec_meta.get("reviewer_reason") or "").strip()
+            note = f" (Reason: {reason})" if reason else ""
+            header = f"{header} [STATUS: REJECTED — do not enforce as active policy{note}]"
+        elif status == "proposed":
+            pr_ref = str(rec_meta.get("pull_request") or "").strip()
+            pr_note = f" in {pr_ref}" if pr_ref else ""
+            header = f"{header} [STATUS: PROPOSED — awaiting pull request review{pr_note}; not yet active policy]"
+        elif status:
+            header = f"{header} [status: {status}]"
+        formatted.append(f"{header}\n{text}")
+        if len(formatted) >= max_results:
+            break
+    return formatted
+
+
+def _file_memory_pr_card(
+    record_id: str,
+    title: str,
+    rel_path: str,
+    branch: str,
+    pr_markdown: str,
+    repo: str = "",
+) -> str | None:
+    """File an idempotent Kanban card instructing the ``platform`` agent to open the OKF PR.
+
+    The card uses ``submit-suggestion`` (``/v1/vcs/*`` + local ``/opt/vcs/bin/git``)
+    in the sandbox so ``curator`` never needs sandbox or VCS access.
+    """
+    if not record_id or not rel_path or not branch or not pr_markdown:
+        return None
+    try:
+        from hermes_cli.kanban import run_slash
+    except Exception:
+        return None
+
+    import re
+    import shlex
+
+    repo_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", repo or "default").strip("-").lower()
+    idem_key = f"memory-pr-{repo_slug}-{record_id}"
+    card_title = f"Open Decision Memory PR for {record_id}: {title}"[:200]
+    repo_flag = f" --repo {shlex.quote(repo)}" if repo else ""
+    body = (
+        f"Curator synthesized **{record_id}** (`{rel_path}`) with `status: active` "
+        "in its frontmatter for team review.\n\n"
+        "Open the pull request on the GitOps repository using the **submit-suggestion** "
+        "skill (`/v1/vcs/*` + local `git` in the sandbox):\n\n"
+        f"1. Run `python3 /opt/data/skills/submit-suggestion/scripts/submit_suggestion.py "
+        f"prepare{repo_flag} --branch {shlex.quote(branch)}` and read the `workspace` path.\n"
+        f"2. Write the exact Markdown below to `<workspace>/{rel_path}` (creating parent "
+        "directories if needed).\n"
+        f"3. Run `python3 /opt/data/skills/submit-suggestion/scripts/submit_suggestion.py "
+        f"submit{repo_flag} --branch {shlex.quote(branch)} "
+        f"--title {shlex.quote(f'docs(knowledge): record {record_id} ({title})')[:120]} "
+        f"--body {shlex.quote(f'Records {record_id} (`{rel_path}`) in Decision Memory with `status: active` upon merge.')}`.\n\n"
+        f"### `{rel_path}`\n\n"
+        f"```markdown\n{pr_markdown.strip()}\n```\n"
+    )
+    cmd = (
+        f"create --json --assignee platform "
+        f"--idempotency-key {shlex.quote(idem_key)} "
+        f"--body {shlex.quote(body)} "
+        f"{shlex.quote(card_title)}"
+    )
+    try:
+        out = str(run_slash(cmd)).strip()
+        start = out.find("{")
+        end = out.rfind("}")
+        if start != -1 and end > start:
+            return str(json.loads(out[start : end + 1]).get("id") or "") or None
+    except Exception as e:
+        logger.debug("%s: could not file memory PR card for %s: %s", PROVIDER_NAME, record_id, e)
+    return None
+
+
+def emit_shared_decision(content: str, context: str = "") -> Dict[str, Any] | None:
+    """Publish a proposed decision over NATS via ``curator emit`` and queue a PR card.
+
+    Returns the parsed ``curator emit`` JSON payload when ``curator`` succeeds
+    so the caller can report the allocated ``DEC-*`` ID and PR branch without
+    storing a duplicate unreviewed copy in ``kube-agents-memory``. Returns
+    ``None`` when ``NATS_URL`` is unset or ``curator`` is unavailable.
+    """
+    text = str(content or "").strip()
+    if not text or not os.environ.get("NATS_URL", "").strip():
+        return None
+    curator_bin = _resolve_curator_bin()
+    if not curator_bin:
+        return None
+    title = text.splitlines()[0][:80].strip()
+    cmd = [
+        curator_bin,
+        "emit",
+        "--kind",
+        "proposed",
+        "--type",
+        "decision",
+        "--title",
+        title,
+        "--summary",
+        f"{text} ({context})" if context else text,
+        "--rule",
+        text,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=25, check=False)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        payload = json.loads(proc.stdout)
+    except Exception as e:
+        logger.debug("%s: NATS decision emit failed: %s", PROVIDER_NAME, e)
+        return None
+
+    rec_id = str(payload.get("record_id") or "").strip()
+    rel_path = str(payload.get("path") or "").strip()
+    branch = str(payload.get("branch") or "").strip()
+    rec_title = str(payload.get("title") or title).strip()
+    pr_markdown = str(payload.get("pr_markdown") or "").strip()
+    event_obj = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+    repo = str(event_obj.get("repo") or "").strip()
+    if rec_id and rel_path and branch and pr_markdown:
+        card_id = _file_memory_pr_card(
+            record_id=rec_id,
+            title=rec_title,
+            rel_path=rel_path,
+            branch=branch,
+            pr_markdown=pr_markdown,
+            repo=repo,
+        )
+        if card_id:
+            payload["card_id"] = card_id
+    return payload
