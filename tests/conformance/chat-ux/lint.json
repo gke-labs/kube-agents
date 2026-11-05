@@ -1,5 +1,5 @@
 {
-  "notes": "The chat UX lint's shared cases (.agents/rules/chat_ux.md): each chat message passes the validator, and findings lists the rule ids the lint reports for it, in its order. a2a/lib/chatmsg/lint_test.go and agents/platform/scripts/test_chat_cases.py both read this file, so the Go and Python lints cannot drift.",
+  "notes": "The chat UX lint's shared cases (.agents/rules/chat_ux.md): each chat message passes the validator, and findings lists the rule ids the lint reports for it, in its order. a2a/lib/chatmsg/lint_test.go and agents/platform/scripts/test_chat_cases.py both read this file, so a case where the Go and Python lints disagree fails one side. A findings-free case may still break a rule the lint does not reach: only an opening apology is caught.",
   "cases": [
     {
       "name": "a-plain-answer",
@@ -27,10 +27,23 @@
       "findings": []
     },
     {
-      "name": "an-apology-mid-sentence",
+      "name": "only-an-opening-apology-is-caught",
       "chat": {
         "schema": "kube-agents.chat/v1",
         "headline": "The upgrade failed, and I'm sorry to say it rolled back."
+      },
+      "findings": []
+    },
+    {
+      "name": "a-tool-named-in-a-label-is-not-a-command",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "Where should I look next?",
+        "choices": [
+          { "text": "Git history" },
+          { "text": "Docker logs" },
+          { "text": "kubectl" }
+        ]
       },
       "findings": []
     },

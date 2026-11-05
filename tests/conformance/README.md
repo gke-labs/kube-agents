@@ -386,4 +386,4 @@ home, but they are wire-format rules rather than security invariants, so
 `a2a/hermes-bridge/chat_test.go`. Each of those also lints what it checks for
 the chat UX rules code can check (`chatmsg.Lint`, `chat_cases.lint`), and
 `chat-ux/lint.json` holds the lint's own cases, which the Go and Python lints
-both read so they cannot drift.
+both read, so a case they disagree on fails one side.

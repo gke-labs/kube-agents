@@ -69,14 +69,16 @@ LINT_HEADLINE_APOLOGY = "headline-apology"
 LINT_CHOICE_RAW_COMMAND = "choice-raw-command"
 #: A board card id as the kanban mints one; ASCII, as Go's RE2 reads ``\b``.
 CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b", re.ASCII)
-#: A markdown heading's opening; "#412" is a pull request, not a heading.
-HEADING = re.compile(r"^\s*#{1,6}(\s|$)", re.ASCII)
+#: A markdown heading's opening; "#412" is a pull request, not a heading. The
+#: classes are spelled out, as in Go, where ``\s`` excludes a vertical tab.
+HEADING = re.compile(r"^[ \t]*#{1,6}([ \t]|$)")
 #: An opening that apologises before saying what happened.
 APOLOGY = re.compile(r"^\W*(sorry|apologies|i apologi[sz]e|unfortunately)\b", re.ASCII | re.IGNORECASE)
 CODE_FENCES = ("```", "~~~")
 SLASH_MARK = "/"
 CODE_MARK = "`"
-#: Command-line tools whose name opening a choice's label makes it a command to paste.
+#: Command-line tools whose name, in lower case and followed by an argument, makes a
+#: choice's label a command to paste. "Git history" and "Docker logs" are labels.
 CLI_WORDS = frozenset({"kubectl", "gcloud", "helm", "git", "gh", "terraform", "tofu", "docker"})
 
 
@@ -170,8 +172,8 @@ def _raw_command(label: str) -> str:
     if CODE_MARK in trimmed:
         return "carries a code span"
     words = trimmed.split()
-    if words and words[0].lower() in CLI_WORDS:
-        return "opens with a command-line tool"
+    if len(words) > 1 and words[0] in CLI_WORDS:
+        return "is a command line"
     return ""
 
 

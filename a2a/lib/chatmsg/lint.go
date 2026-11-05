@@ -7,9 +7,13 @@ import (
 )
 
 // The chat UX rules code can check (.agents/rules/chat_ux.md), by the id a
-// Finding carries. The headline's length is not among them: Validate
-// already refuses one past headlineMax, and the emitters cut a long first
-// sentence at a clause to stay under it.
+// Finding carries: a card id or a raw command is "No plumbing in user
+// text", a heading or a fence breaks "The answer comes first, as one bold
+// line", and an apology "A failure is one plain line". The headline's
+// length is not among them: Validate already refuses one past headlineMax,
+// and the emitters cut a long first sentence at a clause to stay under it.
+// Nor is "At most 5 buttons share a row", which the renderer keeps by
+// wrapping (slackChatButtonsPerRow).
 const (
 	LintHeadlineCardID   = "headline-card-id"
 	LintHeadlineHeading  = "headline-heading"
@@ -22,9 +26,10 @@ const (
 // digits, which means nothing to the person reading the headline.
 var cardIDRE = regexp.MustCompile(`\bt_[0-9a-f]{8}\b`)
 
-// headingRE is a markdown heading's opening: one to six #, then a space or
-// the end. "#412" is a pull request, not a heading.
-var headingRE = regexp.MustCompile(`^\s*#{1,6}(\s|$)`)
+// headingRE is a markdown heading's opening: one to six #, then a space,
+// a tab or the end, the classes spelled out so Python's \s cannot differ.
+// "#412" is a pull request, not a heading.
+var headingRE = regexp.MustCompile(`^[ \t]*#{1,6}([ \t]|$)`)
 
 // apologyRE is an opening that apologises before saying what happened.
 var apologyRE = regexp.MustCompile(`(?i)^\W*(sorry|apologies|i apologi[sz]e|unfortunately)\b`)
@@ -38,8 +43,9 @@ const (
 	codeMark  = "`"
 )
 
-// cliWords are the command-line tools whose name opening a choice's label
-// makes it a command to paste, not a decision to click.
+// cliWords are the command-line tools whose name, typed in lower case and
+// followed by an argument, makes a choice's label a command to paste, not a
+// decision to click. "Git history" and "Docker logs" are labels.
 var cliWords = map[string]bool{
 	"kubectl": true, "gcloud": true, "helm": true, "git": true, "gh": true,
 	"terraform": true, "tofu": true, "docker": true,
@@ -98,8 +104,8 @@ func rawCommand(label string) string {
 	case strings.Contains(trimmed, codeMark):
 		return "carries a code span"
 	}
-	if fields := strings.Fields(trimmed); len(fields) > 0 && cliWords[strings.ToLower(fields[0])] {
-		return "opens with a command-line tool"
+	if fields := strings.Fields(trimmed); len(fields) > 1 && cliWords[fields[0]] {
+		return "is a command line"
 	}
 	return ""
 }
