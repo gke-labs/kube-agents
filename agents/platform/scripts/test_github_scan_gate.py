@@ -2098,12 +2098,20 @@ class MemoryProposalsSweepTest(unittest.TestCase):
                 }
             ],
         })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
         with mock.patch.dict(
             "os.environ",
             {"NATS_URL": "nats://localhost:4222", "DECISION_MEMORY_GITOPS_PRS": "false"},
         ), \
              mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
-             mock.patch("subprocess.run", return_value=_completed(pending_json)), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
              mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
              mock.patch.object(forge, "BrokerProvider") as bp_cls, \
              mock.patch.object(forge, "call") as forge_call_mock:
@@ -2112,6 +2120,9 @@ class MemoryProposalsSweepTest(unittest.TestCase):
 
         self.assertEqual(result.cards, [])
         forge_call_mock.assert_not_called()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("approved", calls[1])
+        self.assertIn("DEC-2026-014", calls[1])
 
 
 if __name__ == "__main__":

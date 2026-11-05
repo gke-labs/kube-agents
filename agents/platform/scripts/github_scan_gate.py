@@ -1261,6 +1261,23 @@ def sweep_memory_proposals(
 
         if pr_num is None:
             if not _gitops_prs_enabled():
+                if not dry_run:
+                    subprocess.run(
+                        [
+                            curator_bin,
+                            "emit",
+                            "--kind",
+                            "approved",
+                            "--id",
+                            rec_id,
+                            "--repo",
+                            repo,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=8,
+                        check=False,
+                    )
                 continue
             try:
                 ans = forge.call(

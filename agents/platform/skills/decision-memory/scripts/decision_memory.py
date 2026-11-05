@@ -55,7 +55,7 @@ DEFAULT_BANK_ID = "kube-agents-decisions"
 SHARED_TAG = "scope:shared"
 RECORD_DIRS = ("knowledge/decisions", "knowledge/lessons")
 RECORD_TYPES = ("decision", "lesson")
-STATUSES = ("proposed", "active", "superseded", "retired")
+STATUSES = ("proposed", "active", "rejected", "superseded", "retired")
 SEVERITIES = ("block", "warn", "info")
 VALID_OPS = ("==", "!=", ">=", ">", "<=", "<", "absent", "present", "regex")
 RECORD_STRATEGY = "record"
@@ -134,7 +134,7 @@ class Record:
         return self.meta.get("evidence") or {}
 
     def document_id(self, repo_id: str) -> str:
-        return f"{DOC_PREFIX}{repo_id}:{self.path}"
+        return f"{DOC_PREFIX}{repo_id}:{self.id or self.path}"
 
     def tags(self) -> List[str]:
         tags = [SHARED_TAG, f"kind:{self.type}", f"status:{self.status}", f"id:{self.id}"]
@@ -315,10 +315,10 @@ def compare(actual: Any, op: str, expected: Any) -> bool:
         return False
     if op == "regex":
         return bool(re.search(str(expected), str(actual), re.M | re.S))
-    if op in ("==", "!="):
-        eq = str(actual) == str(expected)
-        return eq if op == "==" else not eq
     a, e = quantity(actual), quantity(expected)
+    if op in ("==", "!="):
+        eq = (a == e) if (a is not None and e is not None) else (str(actual) == str(expected))
+        return eq if op == "==" else not eq
     if a is None or e is None:
         return False
     ops = {">=": a >= e, ">": a > e, "<=": a <= e, "<": a < e}
@@ -389,6 +389,10 @@ def _resources_in(content: str) -> List[str]:
     return out
 
 
+def _is_fleet_wide_clusters(clusters: List[str]) -> bool:
+    return not clusters or clusters == ["*"]
+
+
 def _select_precedence_winners(records: List[Record], target_files: Iterable[str]) -> List[Record]:
     """Apply Precedence Rules 3 and 4 when multiple active records guard the same YAML path on a file."""
     grouped: Dict[Tuple[str, str], List[Record]] = {}
@@ -409,12 +413,12 @@ def _select_precedence_winners(records: List[Record], target_files: Iterable[str
     for (_mf, _path), group in grouped.items():
         if len(group) <= 1:
             continue
-        # Rule 4: narrower cluster scope (non-empty clusters) outranks fleet-wide (empty clusters).
-        has_narrow = any(bool(r.scope["clusters"]) for r in group)
-        has_broad = any(not r.scope["clusters"] for r in group)
+        # Rule 4: narrower cluster scope (explicit non-wildcard clusters) outranks fleet-wide ([] or ["*"]).
+        has_narrow = any(not _is_fleet_wide_clusters(r.scope["clusters"]) for r in group)
+        has_broad = any(_is_fleet_wide_clusters(r.scope["clusters"]) for r in group)
         if has_narrow and has_broad:
             for r in group:
-                if not r.scope["clusters"]:
+                if _is_fleet_wide_clusters(r.scope["clusters"]):
                     suppressed_ids.add(r.id)
     return [r for r in records if r.id not in suppressed_ids]
 
@@ -450,7 +454,11 @@ def match_change(records: Iterable[Record], changed: Dict[str, Optional[str]]) -
                 detail += [{"file": p, "actual": None, "ok": False, "deleted": True} for p in deleted]
             elif detail:
                 verdict = "consistent"
-        severity = rec.guard.get("severity", "warn") if verdict == "violates" else "info"
+        if verdict == "violates":
+            raw_sev = rec.guard.get("severity", "warn")
+            severity = "warn" if (raw_sev == "block" and rec.status == "proposed") else raw_sev
+        else:
+            severity = "info"
         superseded_records = [by_id[oid].summary() for oid in (rec.meta.get("supersedes") or []) if oid in by_id]
         findings.append({**rec.summary(), "verdict": verdict, "severity": severity,
                          "files": sorted(hits), "guard_results": detail,
@@ -899,8 +907,18 @@ def cmd_index(a) -> Dict[str, Any]:
                 continue
         hs.retain(rec, repo_id)
         upserted.append(rec.id)
-    for doc_id in existing:
+    for doc_id, cur in existing.items():
         if doc_id not in wanted:
+            tags = set(cur.get("tags") or [])
+            meta_status = str((cur.get("document_metadata") or {}).get("status") or "")
+            is_ephemeral = (
+                "status:proposed" in tags
+                or "status:rejected" in tags
+                or meta_status in ("proposed", "rejected")
+            )
+            suffix = doc_id.split(f"{DOC_PREFIX}{repo_id}:", 1)[-1]
+            if is_ephemeral and not suffix.startswith("knowledge/"):
+                continue
             hs.delete_document(doc_id)
             deleted.append(doc_id)
     return {"bank": a.bank, "repo": repo_id, "upserted": upserted, "unchanged": unchanged, "deleted": deleted}

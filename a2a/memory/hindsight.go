@@ -80,7 +80,7 @@ func (h *HindsightClient) doJSON(ctx context.Context, method, path string, reqBo
 		return fmt.Errorf("hindsight %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	rawResp, err := io.ReadAll(resp.Body)
+	rawResp, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return fmt.Errorf("read hindsight response: %w", err)
 	}

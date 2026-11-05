@@ -628,7 +628,7 @@ class IndexTests(unittest.TestCase):
         item = retain[0][2]["items"][0]
         self.assertEqual(item["strategy"], "record")
         self.assertEqual(item["update_mode"], "replace")
-        self.assertTrue(item["document_id"].startswith("okf:acme/gitops:knowledge/"))
+        self.assertTrue(item["document_id"].startswith("okf:acme/gitops:DEC-") or item["document_id"].startswith("okf:acme/gitops:LES-"))
         self.assertIn("scope:shared", item["tags"])
         patch = [c for c in FakeHindsight.calls if c[0] == "PATCH"][0][2]
         self.assertFalse(patch["updates"]["enable_observations"])
@@ -638,10 +638,19 @@ class IndexTests(unittest.TestCase):
         rc, out = self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")
         self.assertEqual(out["upserted"], ["DEC-2026-001"])
         self.assertEqual(out["unchanged"], ["LES-2026-001"])
+        # Ephemeral Curator-retained proposed/rejected records without Git files must not be deleted
+        FakeHindsight.docs["okf:acme/gitops:DEC-2026-099"] = {
+            "id": "okf:acme/gitops:DEC-2026-099",
+            "text": "DEC-2026-099 (decision, proposed, 2026-11-05): Proposed rule",
+            "tags": ["scope:shared", "kind:decision", "status:proposed", "id:DEC-2026-099"],
+            "text_length": 58,
+            "document_metadata": {"status": "proposed"},
+        }
         os.remove(self.r.path / "knowledge/decisions/DEC-2026-001-payments-quota.md")
         self.r.commit("knowledge: retire DEC-2026-001")
         rc, out = self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")
-        self.assertEqual(out["deleted"], ["okf:acme/gitops:knowledge/decisions/DEC-2026-001-payments-quota.md"])
+        self.assertEqual(out["deleted"], ["okf:acme/gitops:DEC-2026-001"])
+        self.assertIn("okf:acme/gitops:DEC-2026-099", FakeHindsight.docs)
 
     def test_check_semantic_excludes_path_matches(self):
         self.r.run("--hindsight-url", self.url, "--repo-id", "acme/gitops", "index")
@@ -908,6 +917,102 @@ class LLMSynthesisTests(unittest.TestCase):
                 os.environ.pop("HERMES_HOME", None)
             else:
                 os.environ["HERMES_HOME"] = old_home
+
+    def test_from_outcome_refused_writes_valid_rejected_record(self):
+        outcome = {
+            "kind": "refused",
+            "pull_request": "https://github.com/acme/gitops/pull/46",
+            "title": "Raise payments quota to 64Gi",
+            "reviewer_reason": "Right-size audit-indexer instead of raising namespace quota.",
+            "files": ["clusters/prod-eu/payments/quota.yaml"],
+        }
+        f = self.r.path.parent / "outcome_refused.json"
+        f.write_text(json.dumps(outcome))
+        rc, out = self.r.run("from-outcome", str(f), "--no-llm", "--write")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out["valid"], out)
+        rec = dm.parse_record((self.r.path / out["path"]).read_text(), out["path"])
+        self.assertEqual(rec.status, "rejected")
+        self.assertEqual(dm.validate_record(rec), [])
+
+    def test_go_python_parity_on_wildcard_cluster_precedence_quantity_eq_and_proposed_severity(self):
+        # 1. Quantity equality on == and != (512Mi == 0.5Gi, 1000m == 1)
+        self.assertTrue(dm.compare("512Mi", "==", "0.5Gi"))
+        self.assertFalse(dm.compare("512Mi", "!=", "0.5Gi"))
+        self.assertTrue(dm.compare("1000m", "==", "1"))
+
+        # 2. Precedence Rule 4: clusters: ["*"] is fleet-wide and suppressed by narrow cluster override
+        fleet_rec = dm.Record(
+            path="knowledge/decisions/DEC-2026-010.md",
+            meta={
+                "type": "decision",
+                "id": "DEC-2026-010",
+                "title": "Fleet memory floor 256Mi",
+                "status": "active",
+                "scope": {"paths": ["clusters/*/payments/checkout.yaml"], "clusters": ["*"]},
+                "guard": {
+                    "rule": "Keep checkout >= 256Mi",
+                    "severity": "block",
+                    "expect": {
+                        "file": "clusters/*/payments/checkout.yaml",
+                        "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                        "op": ">=",
+                        "value": "256Mi",
+                    },
+                },
+            },
+            body="",
+        )
+        narrow_rec = dm.Record(
+            path="knowledge/decisions/DEC-2026-011.md",
+            meta={
+                "type": "decision",
+                "id": "DEC-2026-011",
+                "title": "Staging memory floor 128Mi",
+                "status": "active",
+                "scope": {"paths": ["clusters/staging/payments/checkout.yaml"], "clusters": ["staging"]},
+                "guard": {
+                    "rule": "Keep staging checkout >= 128Mi",
+                    "severity": "block",
+                    "expect": {
+                        "file": "clusters/staging/payments/checkout.yaml",
+                        "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                        "op": ">=",
+                        "value": "128Mi",
+                    },
+                },
+            },
+            body="",
+        )
+        winners = dm._select_precedence_winners([fleet_rec, narrow_rec], ["clusters/staging/payments/checkout.yaml"])
+        self.assertEqual([w.id for w in winners], ["DEC-2026-011"])
+
+        # 3. Proposed record with severity: block is downgraded to warn on violation
+        proposed_rec = dm.Record(
+            path="knowledge/decisions/DEC-2026-012.md",
+            meta={
+                "type": "decision",
+                "id": "DEC-2026-012",
+                "title": "Proposed 1Gi floor",
+                "status": "proposed",
+                "scope": {"paths": ["clusters/prod-eu/payments/checkout.yaml"]},
+                "guard": {
+                    "rule": "Keep checkout >= 1Gi",
+                    "severity": "block",
+                    "expect": {
+                        "file": "clusters/prod-eu/payments/checkout.yaml",
+                        "path": "spec.template.spec.containers[name=app].resources.requests.memory",
+                        "op": ">=",
+                        "value": "1Gi",
+                    },
+                },
+            },
+            body="",
+        )
+        findings = dm.match_change([proposed_rec], {"clusters/prod-eu/payments/checkout.yaml": DEPLOY.format(mem="256Mi")})
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["verdict"], "violates")
+        self.assertEqual(findings[0]["severity"], "warn")
 
 
 @unittest.skipUnless(os.environ.get("DECISION_MEMORY_LIVE_URL"), "set DECISION_MEMORY_LIVE_URL for a live run")

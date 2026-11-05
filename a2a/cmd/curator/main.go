@@ -153,7 +153,7 @@ func defaultRepoID() string {
 			}
 		}
 	}
-	return "dshnayder-org/infra"
+	return "default/infra"
 }
 
 func defaultRepoDir() string {
