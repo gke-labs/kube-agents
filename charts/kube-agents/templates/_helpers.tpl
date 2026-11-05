@@ -1162,6 +1162,19 @@ topologySpreadConstraints:
 {{- end }}
 {{- end }}
 
+{{/*
+The shadow-mode replay proxy's pod labels (litellm.replayShadow,
+templates/litellm.yaml), and so its Deployment's selector, the
+inference-gateway Service's selector while the proxy is on, and its egress
+policy's podSelector. app: litellm because the worker pods' egress policies
+admit only that label; the role tells the proxy from the LiteLLM pods, which
+carry kubeagents.x-k8s.io/inference-role: litellm while the proxy is on.
+*/}}
+{{- define "kube-agents.replayShadowSelectorLabels" -}}
+app: litellm
+kubeagents.x-k8s.io/inference-role: replay-shadow
+{{- end }}
+
 {{- /*
 The providers of the forges the install declares, comma-separated and
 deduplicated, folding the deprecated `integration.github` alias in as one
@@ -2444,6 +2457,12 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- end -}}
 {{- if .Values.litellm.enabled -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
+       beside LiteLLM and only with it. */ -}}
+{{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
+{{- if and .Values.litellm.enabled $replayShadow.enabled -}}
+  {{- $chartWorkloads = append $chartWorkloads (dict "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
 {{- end -}}
 {{- if include "kube-agents.hindsightEnabled" . -}}
   {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
