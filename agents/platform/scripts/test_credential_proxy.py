@@ -12274,6 +12274,28 @@ class SnapshotRouteTest(unittest.TestCase):
             credential_proxy.snapshot_bare_name_fallback("acme/infra.git", ()),
         )
 
+    def test_a_host_and_one_segment_is_not_a_slug_and_is_never_read_from_github(self):
+        """A dot in the owner slot is a host, so `www.github.com/acme` is a host
+        and one segment, which no forge serves. Read as a slug it would go to
+        `https://github.com/www.github.com/acme.git` with no credential. The
+        hosts below are outside `repo_ref.KNOWN_HOSTS`, so only the dot rule in
+        `is_bare_github_name` refuses them."""
+        for name in ("www.github.com/acme", "git.example.org/acme"):
+            with self.subTest(name=name):
+                self.assertFalse(credential_proxy.is_bare_github_name(name))
+                self.assertIsNone(credential_proxy.snapshot_bare_name_fallback(name, ()))
+
+    def test_the_two_roots_must_not_overlap_in_either_direction(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        agent = base / "opt" / "data"
+        agent.mkdir(parents=True)
+        for tree in (agent / "vcs", base / "opt", agent):
+            with self.subTest(tree=str(tree)), self.assertRaises(RuntimeError):
+                credential_proxy.assert_disjoint_roots(tree, agent, purpose="version-control scratch")
+        credential_proxy.assert_disjoint_roots(base / "var" / "lib" / "credential-proxy" / "vcs", agent, purpose="version-control scratch")
+
 
 class CredentialHelperClearTest(unittest.TestCase):
     """The claim the snapshot's helper clear rests on, proven with real git."""

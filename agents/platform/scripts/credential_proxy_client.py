@@ -1804,9 +1804,9 @@ class WorkspaceRequestError(RuntimeError):
     """The broker refused. `status` and `payload` carry its answer verbatim."""
 
     def __init__(self, status: int, payload: dict) -> None:
-        # Two spellings of the same field, because the broker has two error
-        # shapes: a refusal answers `{status, code, message}`, while a
-        # malformed body answers `{error}`. Reading
+        # Two spellings of the same field: the vcs routes answer `{error,
+        # code}`, and a broker policy refusal answers `{status, code,
+        # message}`. Reading
         # only one of them would render half the broker's refusals as the
         # generic fallback below, which is the sentence that tells a caller
         # nothing.

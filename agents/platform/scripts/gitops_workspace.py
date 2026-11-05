@@ -759,10 +759,9 @@ def ensure_scratch_workspace(
         write_lease(holder, lease, repo, owner=owner)
 
     # `reset` is the only thing that deletes, including when what is there is a
-    # clone left by the directory path. A stream whose broker was armed between
-    # `start` and `finish` finds one, and clearing it then would delete the
-    # manifests the agent wrote in between — the same data loss `reset=False`
-    # exists to prevent on the clone path. Nothing runs `git` here, so an
+    # clone left by the directory path. Clearing it on a later call would
+    # delete the manifests the agent wrote in between — the same data loss
+    # `reset=False` exists to prevent on the clone path. Nothing runs `git` here, so an
     # unwanted `.git` sitting in the directory for one run is inert; the next
     # `start` takes it away.
     if reset and target.exists():
