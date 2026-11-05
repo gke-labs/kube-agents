@@ -795,8 +795,14 @@ func (s *durableSub) consume(cons jetstream.Consumer) error {
 	s.mu.Unlock()
 	if stopped {
 		// A Stop landed while this (re)bind was in flight: it saw the old
-		// context, so this one is nobody's to stop but ours.
-		cc.Stop()
+		// context, so this one is nobody's to stop but ours. A held one
+		// drains, as Stop does, so what this context already pulled is given
+		// back rather than dropped (#4849).
+		if s.held != nil {
+			s.drainOrStop(cc)
+		} else {
+			cc.Stop()
+		}
 	}
 	if old != nil {
 		// Usually already dead with its connection; stopping is a no-op then,
@@ -858,8 +864,23 @@ func (s *durableSub) deliver(msg jetstream.Msg) {
 	_ = msg.Ack()
 }
 
-// Stop ends the subscription and removes it from the rebuild registry.
+// Stop ends the subscription and removes it from the rebuild registry (a
+// held one once its drain is done).
 func (s *durableSub) Stop() {
+	if s.held != nil {
+		// Held mode cancels its handlers only once the drain is done: a
+		// give-back sent while the consumer is still subscribed can come
+		// straight back to it and be dropped, leaving the task to wait out
+		// AckWait (#4849). Stop itself doesn't wait (callers hold their own
+		// locks); it stays registered meanwhile, so Close can still cancel.
+		s.drainIntake()
+		go func() {
+			s.awaitDrain(time.After(heldDrainTimeout))
+			s.held.cancel()
+			s.unregister()
+		}()
+		return
+	}
 	s.stopLocal()
 	s.unregister()
 }
@@ -909,6 +930,63 @@ func (s *durableSub) stopDeferred() {
 		}
 	}
 	s.deferred.giveBack()
+}
+
+// drainIntake stops a held subscription's intake the way stopDeferred does
+// a deferred one's, without waiting: intake closes first, so whatever
+// arrives from here on is given back as it is dispatched, then the consume
+// context drains, so the deliveries already buffered or in flight are
+// dispatched (and given back) rather than dropped. A rebind in flight drains
+// its own context once it sees the stop (consume).
+func (s *durableSub) drainIntake() {
+	s.stopped.Store(true)
+	s.held.stopIntake()
+	s.mu.Lock()
+	cc := s.cc
+	s.mu.Unlock()
+	if cc != nil {
+		s.drainOrStop(cc)
+	}
+}
+
+// drainOrStop drains a held consume context while the connection is up. While
+// it's reconnecting, the drain's unsubscribe can't go out, and the client
+// subscribes the draining inbox again on reconnect and later drops it without
+// an unsubscribe, so the server would go on sending to it. A plain stop
+// removes the subscription at once instead, and the reconnect leaves it out.
+// A disconnect between the check and the drain's cleanup still leaves a small
+// window.
+func (s *durableSub) drainOrStop(cc jetstream.ConsumeContext) {
+	if nc, _ := s.c.conn(); nc != nil && nc.Status() == nats.CONNECTED {
+		cc.Drain()
+		return
+	}
+	cc.Stop()
+}
+
+// awaitDrain returns once the current consume context has drained, and the
+// server has its unsubscribe, or when timeout fires. A rebind can swap the
+// context meanwhile, so it follows whichever is current. A connection
+// already gone never finishes a drain; the timeout covers that.
+func (s *durableSub) awaitDrain(timeout <-chan time.Time) {
+	s.mu.Lock()
+	cc := s.cc
+	s.mu.Unlock()
+	for cc != nil {
+		select {
+		case <-cc.Closed():
+		case <-timeout:
+			return
+		}
+		s.mu.Lock()
+		cur := s.cc
+		s.mu.Unlock()
+		if cur == cc {
+			return
+		}
+		cc = cur
+		s.drainOrStop(cc) // consume does too; a second call is a no-op
+	}
 }
 
 // stopIntake stops taking deliveries.
