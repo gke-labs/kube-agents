@@ -1585,6 +1585,26 @@ func TestHandlerCacheAuditRecordsResultAndDropsReplayedAuditID(t *testing.T) {
 	}
 }
 
+func TestHandlerCachePolicyRefusalReachesNeitherCacheNorUpstream(t *testing.T) {
+	h, upstream := newTestHandler(t, Config{Cache: &CacheConfig{DefaultResourceTTL: time.Minute}})
+	const target = "/api/v1/namespaces/default/pods/p1"
+
+	if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("warm-up Cache-Status = %q, want miss", rec.Header().Get(headerCacheStatus))
+	}
+	// Read-only-with-dry-run refuses a write without dryRun before the cache sees it.
+	rec := serve(h, httptest.NewRequest(http.MethodPatch, target, strings.NewReader(`{}`)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("PATCH without dryRun code = %d, want 403", rec.Code)
+	}
+	if cs := rec.Header().Get(headerCacheStatus); cs != "" {
+		t.Errorf("Cache-Status = %q on a refusal, want none", cs)
+	}
+	if upstream.calls != 1 {
+		t.Errorf("upstream calls = %d, want 1 (the warm-up miss)", upstream.calls)
+	}
+}
+
 func TestHandlerCacheServesNothingBeforeAuthentication(t *testing.T) {
 	auth := &switchAuthenticator{}
 	h, upstream := newTestHandler(t, Config{
