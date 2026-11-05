@@ -33,6 +33,28 @@ TEAMS_TRUNCATION_MARKER = "\n… (message truncated to fit Teams' size limit)"
 # Where the bot posts when an activity did not say: the public Bot Framework
 # endpoint. TEAMS_DEFAULT_SERVICE_URL overrides it in a hand-run gateway only.
 DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
+# How much of a broker error body the gateway reads to name the cause, and
+# how much of each field it keeps for the log and the delivery record.
+TEAMS_RELAY_ERROR_BODY_MAX_BYTES = 4096
+TEAMS_RELAY_ERROR_FIELD_MAX_CHARS = 256
+# One relay call can cost the broker an identity-provider round trip (20 s)
+# and then the Bot Framework post (30 s), so the gateway waits longer than
+# their sum; a shorter wait reports a post that then lands as a failure.
+TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS = 60
+# A typing indicator is fire-and-forget: the base abandons it after 1.5 s of
+# its 2 s tick, and a worker thread left blocking for the full relay timeout
+# on a stalled broker would hold an executor slot the reply itself needs.
+TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS = 5
+TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
+# Bot Framework `conversation.conversationType` -> gateway `chat_type`. The
+# memory providers treat only "dm" as single-person, so a Teams 1:1 chat
+# (`personal`) must arrive as "dm" for personal memory to stay on.
+TEAMS_CONVERSATION_TYPE_TO_CHAT_TYPE = {
+    "personal": "dm",
+    "groupchat": "group",
+    "channel": "channel",
+}
+TEAMS_DEFAULT_CHAT_TYPE = "channel"
 
 
 def default_service_url() -> str:
@@ -52,28 +74,6 @@ def encodable_text(text: str) -> str:
     except UnicodeEncodeError:
         return text.encode("utf-8", errors="replace").decode("utf-8")
     return text
-# How much of a broker error body the gateway reads to name the cause, and
-# how much of each field it keeps for the log and the delivery record.
-TEAMS_RELAY_ERROR_BODY_MAX_BYTES = 4096
-TEAMS_RELAY_ERROR_FIELD_MAX_CHARS = 256
-# One relay call can cost the broker an identity-provider round trip (20 s)
-# and then the Bot Framework post (30 s), so the gateway waits longer than
-# their sum; a shorter wait reports a post that then lands as a failure.
-TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS = 60
-# A typing indicator is fire-and-forget: the base abandons it after about a
-# second, and a worker thread left blocking for the full relay timeout on a
-# stalled broker would hold an executor slot the reply itself needs.
-TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS = 5
-TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
-# Bot Framework `conversation.conversationType` -> gateway `chat_type`. The
-# memory providers treat only "dm" as single-person, so a Teams 1:1 chat
-# (`personal`) must arrive as "dm" for personal memory to stay on.
-TEAMS_CONVERSATION_TYPE_TO_CHAT_TYPE = {
-    "personal": "dm",
-    "groupchat": "group",
-    "channel": "channel",
-}
-TEAMS_DEFAULT_CHAT_TYPE = "channel"
 
 
 def relay_enabled() -> bool:
@@ -625,30 +625,36 @@ def _build_teams_adapter_and_sender(
             service_url = meta.get("serviceUrl") or default_service_url()
             if not is_trusted_service_url(service_url):
                 return
-            # The base refreshes the indicator every two seconds and abandons
-            # each call after about one; one post in flight per conversation
-            # keeps a stalled broker from collecting a thread per tick.
+            # The base refreshes the indicator every 2 s and cancels each call
+            # after 1.5 s, which does not stop the worker thread. The mark is
+            # cleared by that thread when its post ends, so a tick that lands
+            # while the previous post is still running is skipped, and a
+            # stalled broker holds one worker per conversation, not one per tick.
             if chat_id in self._typing_in_flight:
                 return
             self._typing_in_flight.add(chat_id)
             endpoint = f"v3/conversations/{chat_id}/activities"
             payload = {"type": "typing"}
+
+            def post_typing() -> None:
+                try:
+                    request(
+                        "/v1/chat/teams/api",
+                        {
+                            "serviceUrl": service_url,
+                            "endpoint": endpoint,
+                            "method": "POST",
+                            "payload": payload,
+                        },
+                        timeout=TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS,
+                    )
+                finally:
+                    self._typing_in_flight.discard(chat_id)
+
             try:
-                await asyncio.to_thread(
-                    request,
-                    "/v1/chat/teams/api",
-                    {
-                        "serviceUrl": service_url,
-                        "endpoint": endpoint,
-                        "method": "POST",
-                        "payload": payload,
-                    },
-                    timeout=TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS,
-                )
+                await asyncio.to_thread(post_typing)
             except Exception:
                 LOGGER.debug("Failed to send typing indicator to Teams", exc_info=True)
-            finally:
-                self._typing_in_flight.discard(chat_id)
 
         async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
             """Teams channel ids end in ``@thread.<suffix>``; the rest are chats."""
@@ -834,11 +840,12 @@ def _build_teams_adapter_and_sender(
     ) -> dict[str, Any]:
         """The registry's standalone sender: a ``success`` or ``error`` dict, never a raise.
 
-        ``hermes send`` and the cron lane call this out of process, with the
-        Slack sender's contract: a file cannot ride the relay and says so; a
-        silent tick (the dressed ``[SILENT]`` marker upstream lets through) is
-        a logged success with nothing posted; a failure returns the cause so
-        the caller's record names it. No shipped cron job names Teams today.
+        ``hermes send`` and the send tool call this out of process; the cron
+        lane would too, but only for an entry that names a cron home-channel
+        variable, which neither Teams registration does. Same contract as the
+        Slack sender: a file cannot ride the relay and says so; a silent tick
+        (the dressed ``[SILENT]`` marker upstream lets through) is a logged
+        success with nothing posted; a failure returns the cause.
         """
         del force_document, caption
         if media_files:
