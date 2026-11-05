@@ -18,7 +18,7 @@ import (
 )
 
 // Per-task credentials (#3889, contract addendum 8). With a task-signing key
-// the dispatcher mints two credentials for the pod it confirms, once its
+// the dispatcher mints two credentials for the pod that accepted, before its
 // lease is recorded, and sends them on the confirm: a task credential for
 // the bus, and for a task that names a cluster a token for the credential
 // proxy carrying that cluster. Nothing else carries them, nothing else mints
