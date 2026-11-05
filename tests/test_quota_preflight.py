@@ -854,9 +854,9 @@ class PreflightDecisionTest(unittest.TestCase):
 
     def _flagged(self) -> dict:
         """files/flagged-pods.yaml by name; TestTheChartCountsEveryFlaggedPod holds it to the operator."""
-        pods = {p["name"]: p for p in yaml.safe_load(_FLAGGED_PODS.read_text())["pods"]}
-        self.assertEqual(set(pods), {"mcp", "dispatcher"})
-        return pods
+        # The tests index entries by name, so a missing one fails there; the names
+        # themselves are held to the operator by TestTheChartCountsEveryFlaggedPod.
+        return {p["name"]: p for p in yaml.safe_load(_FLAGGED_PODS.read_text())["pods"]}
 
     def _flagged_delta(self, env: list) -> dict:
         base = self._requirements(["platformAgent.mode=next"])
@@ -1731,6 +1731,8 @@ class QuotaPreflightTest(unittest.TestCase):
             ("missing", lambda f: f.unlink()),
             ("unreadable", lambda f: f.write_text("pods: [unclosed\n")),
             ("no pods list", lambda f: f.write_text("pod: []\n")),
+            ("an entry cut short", lambda f: f.write_text(
+                f.read_text().rsplit("    memoryBytesLimit", 1)[0])),
         ):
             with self.subTest(name):
                 tmp = tempfile.TemporaryDirectory()

@@ -2814,7 +2814,14 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          so it sizes no surge. */ -}}
   {{- if $next -}}
     {{- $flaggedFile := .Files.Get "files/flagged-pods.yaml" | fromYaml -}}
-    {{- if not (kindIs "slice" (index $flaggedFile "pods")) -}}
+    {{- $flaggedOK := kindIs "slice" (index $flaggedFile "pods") -}}
+    {{- range $w := (ternary (index $flaggedFile "pods") list $flaggedOK) -}}
+      {{- $flaggedOK = and $flaggedOK (kindIs "map" $w) (kindIs "string" (index ($w | default dict) "env")) (kindIs "string" (index ($w | default dict) "enabledWhen")) -}}
+      {{- range $key := list "replicas" "cpuMillisRequest" "cpuMillisLimit" "memoryBytesRequest" "memoryBytesLimit" "ephemeralStorageBytesRequest" "ephemeralStorageBytesLimit" -}}
+        {{- $flaggedOK = and $flaggedOK (or (kindIs "float64" (index ($w | default dict) $key)) (kindIs "int64" (index ($w | default dict) $key)) (kindIs "int" (index ($w | default dict) $key))) -}}
+      {{- end -}}
+    {{- end -}}
+    {{- if not $flaggedOK -}}
       {{- fail "quota preflight: flagged-pods.yaml is missing or unreadable in the chart, so the pods the operator renders behind a flag cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
     {{- $flagged := index $flaggedFile "pods" -}}
