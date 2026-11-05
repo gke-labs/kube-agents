@@ -39,8 +39,9 @@ import (
 const deferredDrainTimeout = 2 * time.Second
 
 // giveBackSpacing is the step between the delays a stop gives deliveries back
-// with, which is what orders their redelivery. A thousand held deliveries
-// come back within a second.
+// with. The server sorts the deliveries that fall due in one pending check,
+// so the step orders only those that fall due in different checks. A
+// thousand held deliveries come back within a second.
 const giveBackSpacing = time.Millisecond
 
 // DeferredDelivery is one delivery in the deferred-ack mode.
@@ -138,20 +139,22 @@ func (d *deferredState) giveBack() {
 		pending = append(pending, dd)
 	}
 	d.mu.Unlock()
-	// In stream order. The give-back falls due when the delays end and the
-	// server queues the deliveries for redelivery; a subscriber already bound
-	// to the durable then (its pull request waiting on the server) gets them
-	// back in the order they first came. A run of immediate naks comes back
-	// in no order the server promises (newest first, measured on 2.15), but a
-	// delayed one is redelivered when its delay ends, so the delays set the
-	// order. The order holds no further than that. With no subscriber bound
-	// when the give-back falls due, the server (2.15) takes the oldest
-	// delivery for the pull request this subscriber left waiting, finds
-	// nobody listening on it, and puts the delivery back at the end of its
-	// redelivery queue, so a subscriber that binds later gets it last. And
-	// only the deliveries given back here are ordered: a message the server
-	// hadn't sent this subscriber yet can reach a bound subscriber ahead of
-	// them, as new.
+	// In stream order. The server (2.15) re-arms its pending check to run
+	// 10ms after each delayed nak, and the check queues every delivery whose
+	// delay has ended for redelivery, sorted by stream sequence: that is when
+	// the give-back falls due. So within one check the server's sort sets the
+	// order, and the delay steps set it only across checks, as with more than
+	// about ten deliveries or a pause of more than 10ms between naks. A
+	// subscriber already bound to the durable when the give-back falls due
+	// (its pull request waiting on the server) gets the deliveries back in
+	// the order they first came. The order holds no further than that. With
+	// no subscriber bound, the server takes the oldest delivery due for the
+	// pull request this subscriber left waiting, finds nobody listening on
+	// it, and puts it back at the end of its redelivery queue, so a
+	// subscriber that binds later gets it after the others queued by then.
+	// And only the deliveries given back here are ordered: a message the
+	// server hadn't sent this subscriber yet can reach a bound subscriber
+	// ahead of them, as new.
 	sort.Slice(pending, func(i, j int) bool { return pending[i].seq < pending[j].seq })
 	for i, dd := range pending {
 		_ = dd.Nak(time.Duration(i+1) * giveBackSpacing)
