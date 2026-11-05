@@ -110,9 +110,10 @@ agent outage: the old pod stops before the new one starts. Once `BusProvisioned`
 **It has its own resources, sized for the `api` executor.** The rendered bridge requests 250m
 CPU and 512Mi, with limits of 1 CPU and 1Gi. The request is sized to live under on its
 own, since GKE Autopilot without Pod bursting sets every limit to its request: one answer at
-the 8 MiB response cap takes about 80Mi to read, decode and publish, so the ten workers of
-the default concurrency at once sit under 512Mi, where the 256Mi it used to request held
-three. The pair sits in the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged. On `api`, the default, it's a Go relay that
+the 8 MiB response cap takes about 80Mi to read, decode and publish, so 512Mi holds about
+six at-cap answers at once; the default concurrency of two sits well under it, where the
+256Mi it used to request held three, and a bridge given a higher `BRIDGE_CONCURRENCY` needs
+`A2A_BRIDGE_RESOURCES` raised in step. The pair sits in the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged. On `api`, the default, it's a Go relay that
 holds one HTTP request per task to the agent container's API server, and the turn itself
 runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
 ([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent
