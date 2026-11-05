@@ -4565,6 +4565,34 @@ class TestPublishedBodies(HarnessTestCase):
         published = [p["body"] for p in self.harness.payloads if p and "body" in p]
         self.assertTrue(any("## Awaiting `/remediate`" in b and f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), published)
 
+    def test_the_no_promote_flag_publishes_the_ledger_and_opens_no_pull_request(self):
+        """`finish --no-promote`, the per-run waiver a worker passes on a card that
+        says not to open a pull request: the ledger publishes, no proposal opens,
+        and the ledger says the sweep was withheld on this run, not on the install
+        (#4637). The same document without the flag opens the proposal, which is
+        today's behaviour and the test above."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+            self.assertEqual(self.run_finish(make_doc(), argv_extra=[audit_report.NO_PROMOTE_FLAG], scheduled=False), 0)
+        self.assertEqual(self.harness.bodies_for("proposal-create"), [])
+        published = [p["body"] for p in self.harness.payloads if p and "body" in p]
+        self.assertTrue(any("## Awaiting `/remediate`" in b and audit_report.SWEEP_WAIVED_REASON in b for b in published), published)
+        self.assertFalse(any(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`" in b for b in published), "the waiver names the run, not the install's switch")
+
+    def test_without_the_no_promote_flag_the_same_run_opens_the_pull_request(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        with patch.dict(os.environ, {audit_report.AUTO_PROMOTE_ENV: "true"}):
+            self.assertEqual(self.run_finish(make_doc(), scheduled=False), 0)
+        self.assertEqual(len(self.harness.bodies_for("proposal-create")), 1)
+
     def test_no_published_body_is_ever_empty(self):
         # The blanket form of the above, so an artifact added later is covered
         # by default rather than by somebody remembering to add a test.
