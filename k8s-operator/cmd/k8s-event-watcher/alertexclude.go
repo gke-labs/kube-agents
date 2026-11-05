@@ -30,15 +30,9 @@ import (
 const alertExcludeNameWildcard = "*"
 
 const (
-	// alertExcludeAnyClusterKey stands for a cluster key a rule leaves unset,
-	// which matches any value, in a rule's log form.
-	alertExcludeAnyClusterKey = "*"
-	// alertExcludeClusterKeySeparator joins a rule's projectId, location and
-	// clusterName in its log form.
-	alertExcludeClusterKeySeparator = "/"
-	alertExcludeRuleLogFormat       = "k8s-event-watcher: alert-exclude rule %d of %d: %s"
-	alertExcludeSummaryLogFormat    = "k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s"
-	alertExcludeRefusedLogFormat    = "k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident"
+	alertExcludeRuleLogFormat    = "k8s-event-watcher: alert-exclude rule %d of %d: %s"
+	alertExcludeSummaryLogFormat = "k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s"
+	alertExcludeRefusedLogFormat = "k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident"
 )
 
 // alertExcludeRule is one entry of --alert-exclude: events it matches open no
@@ -77,7 +71,7 @@ type alertExcludeCluster struct {
 }
 
 // parseAlertExclude reads --alert-exclude: a JSON list of rules, or empty for
-// none. A rule with no parts, or whose only part is a bare wildcard name, is
+// none. Its errors number the rules from 1, as the startup log does. A rule with no parts, or whose only part is a bare wildcard name, is
 // refused, since it would silence every alert; the operator's emergency stop
 // (spec.harness.eventWatcher.enabled) is the tool for that.
 func parseAlertExclude(raw string) ([]alertExcludeRule, error) {
@@ -95,13 +89,13 @@ func parseAlertExclude(raw string) ([]alertExcludeRule, error) {
 	}
 	for i, r := range rules {
 		if r.Cluster == nil && r.Namespace == "" && r.Reason == "" && r.Kind == "" && (r.Name == "" || r.Name == alertExcludeNameWildcard) {
-			return nil, fmt.Errorf("--alert-exclude rule %d sets no part, which would silence every alert", i)
+			return nil, fmt.Errorf("--alert-exclude rule %d sets no part, which would silence every alert", i+1)
 		}
 		if r.Cluster != nil && r.Cluster.ClusterName == "" {
-			return nil, fmt.Errorf("--alert-exclude rule %d: cluster needs clusterName", i)
+			return nil, fmt.Errorf("--alert-exclude rule %d: cluster needs clusterName", i+1)
 		}
 		if strings.Contains(strings.TrimSuffix(r.Name, alertExcludeNameWildcard), alertExcludeNameWildcard) {
-			return nil, fmt.Errorf("--alert-exclude rule %d: name takes %q only as its last character", i, alertExcludeNameWildcard)
+			return nil, fmt.Errorf("--alert-exclude rule %d: name takes %q only as its last character", i+1, alertExcludeNameWildcard)
 		}
 	}
 	return rules, nil
@@ -132,32 +126,34 @@ func loadAlertExclude(raw string, m *metrics) []alertExcludeRule {
 	return rules
 }
 
-// String is the rule as the startup log names it: each part it sets, values
-// quoted, and a cluster as projectId/location/clusterName with "*" for a key
-// it leaves unset.
+// String is the rule as the startup log names it: each part it sets, and in
+// a cluster each key it sets, with the values quoted. A key it leaves unset
+// is not printed, so it reads apart from a key set to a literal "*", which
+// matches only "*".
 func (r alertExcludeRule) String() string {
 	var parts []string
 	if r.Cluster != nil {
-		parts = append(parts, "cluster="+strconv.Quote(r.Cluster.String()))
+		parts = append(parts, "cluster={"+quotedParts([][2]string{
+			{"projectId", r.Cluster.ProjectID}, {"location", r.Cluster.Location}, {"clusterName", r.Cluster.ClusterName},
+		})+"}")
 	}
-	for _, p := range []struct{ key, value string }{
+	if rest := quotedParts([][2]string{
 		{"namespace", r.Namespace}, {"reason", r.Reason}, {"kind", r.Kind}, {"name", r.Name},
-	} {
-		if p.value != "" {
-			parts = append(parts, p.key+"="+strconv.Quote(p.value))
-		}
+	}); rest != "" {
+		parts = append(parts, rest)
 	}
 	return strings.Join(parts, " ")
 }
 
-func (c alertExcludeCluster) String() string {
-	keys := []string{c.ProjectID, c.Location, c.ClusterName}
-	for i, k := range keys {
-		if k == "" {
-			keys[i] = alertExcludeAnyClusterKey
+// quotedParts joins the key="value" pairs whose value is set.
+func quotedParts(pairs [][2]string) string {
+	var parts []string
+	for _, p := range pairs {
+		if p[1] != "" {
+			parts = append(parts, p[0]+"="+strconv.Quote(p[1]))
 		}
 	}
-	return strings.Join(keys, alertExcludeClusterKeySeparator)
+	return strings.Join(parts, " ")
 }
 
 // matches reports whether every part the rule sets matches ev.

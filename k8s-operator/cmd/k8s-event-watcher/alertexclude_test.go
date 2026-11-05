@@ -57,10 +57,10 @@ func TestParseAlertExcludeRefuses(t *testing.T) {
 		{"not JSON", `namespace=payments`, "not a JSON list"},
 		{"an object, not a list", `{"namespace": "payments"}`, "not a JSON list"},
 		{"an unknown key", `[{"namespaces": ["payments"]}]`, "not a JSON list"},
-		{"a rule with no part", `[{"namespace": "payments"}, {}]`, "rule 1 sets no part"},
+		{"a rule with no part", `[{"namespace": "payments"}, {}]`, "rule 2 sets no part"},
 		{"a cluster with no name", `[{"cluster": {"projectId": "p"}}]`, "cluster needs clusterName"},
 		{"a star inside a name", `[{"name": "api-*-x"}]`, `"*" only as its last character`},
-		{"a bare wildcard name", `[{"name": "*"}]`, "rule 0 sets no part"},
+		{"a bare wildcard name", `[{"name": "*"}]`, "rule 1 sets no part"},
 		{"text after the list", `[{"namespace": "a"}] [{"namespace": "b"}]`, "text follows the list"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -264,7 +264,7 @@ func TestRealMain_RunsWithNoRulesOnAMalformedAlertExclude(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
 		t.Fatalf("want realMain to go past --alert-exclude and stop on the kubeconfig, got err=%v", err)
 	}
-	if got := buf.String(); !strings.Contains(got, "ALERT --alert-exclude rule 0 sets no part") || !strings.Contains(got, "running with no alert-exclude rules") {
+	if got := buf.String(); !strings.Contains(got, "ALERT --alert-exclude rule 1 sets no part") || !strings.Contains(got, "running with no alert-exclude rules") {
 		t.Errorf("log does not carry the ALERT line:\n%s", got)
 	}
 }
@@ -282,7 +282,7 @@ func TestLoadAlertExclude(t *testing.T) {
 		log := buf.String()
 		for _, want := range []string{
 			`alert-exclude rule 1 of 2: namespace="payments"`,
-			`alert-exclude rule 2 of 2: cluster="*/*/seeded-capacity" reason="FailedScheduling"`,
+			`alert-exclude rule 2 of 2: cluster={clusterName="seeded-capacity"} reason="FailedScheduling"`,
 			"2 alert-exclude rules;",
 		} {
 			if !strings.Contains(log, want) {
@@ -330,8 +330,8 @@ func assertAlertExcludeGauges(t *testing.T, m *metrics, rules, refused float64) 
 	}
 }
 
-// A rule's log form names each part it sets, quoted, and a cluster key it
-// leaves unset as "*".
+// A rule's log form names each part it sets and each cluster key it sets,
+// quoted, so an unset key reads apart from one set to a literal "*".
 func TestAlertExcludeRuleString(t *testing.T) {
 	for _, tc := range []struct {
 		rule alertExcludeRule
@@ -340,9 +340,11 @@ func TestAlertExcludeRuleString(t *testing.T) {
 		{alertExcludeRule{Namespace: "payments"}, `namespace="payments"`},
 		{alertExcludeRule{Kind: "Pod", Name: "inventory-api-*"}, `kind="Pod" name="inventory-api-*"`},
 		{alertExcludeRule{Reason: "BackOff", Namespace: "shop"}, `namespace="shop" reason="BackOff"`},
-		{alertExcludeRule{Cluster: &alertExcludeCluster{ClusterName: "seeded-a"}}, `cluster="*/*/seeded-a"`},
-		{alertExcludeRule{Cluster: &alertExcludeCluster{ProjectID: "p", Location: "us-central1", ClusterName: "seeded-a"}}, `cluster="p/us-central1/seeded-a"`},
-		{alertExcludeRule{Cluster: &alertExcludeCluster{Location: "us-central1", ClusterName: "seeded-a"}}, `cluster="*/us-central1/seeded-a"`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{ClusterName: "seeded-a"}}, `cluster={clusterName="seeded-a"}`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{ProjectID: "p", Location: "us-central1", ClusterName: "seeded-a"}}, `cluster={projectId="p" location="us-central1" clusterName="seeded-a"}`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{Location: "us-central1", ClusterName: "seeded-a"}}, `cluster={location="us-central1" clusterName="seeded-a"}`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{ProjectID: "*", ClusterName: "seeded-a"}}, `cluster={projectId="*" clusterName="seeded-a"}`},
+		{alertExcludeRule{Cluster: &alertExcludeCluster{ClusterName: "seeded-a"}, Namespace: "shop"}, `cluster={clusterName="seeded-a"} namespace="shop"`},
 		{alertExcludeRule{Namespace: "a\nb"}, `namespace="a\nb"`},
 	} {
 		if got := tc.rule.String(); got != tc.want {
