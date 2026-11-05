@@ -109,11 +109,14 @@ def node(name, pool, labels=None):
 PINNED_TOLERATION = {"key": "seeded-role", "operator": "Equal", "value": "pinned-inference", "effect": "NoSchedule"}
 
 
-def pod(name, node_selector=None, *, phase="Pending", scheduled="False", reason="Unschedulable", owner=("ReplicaSet", "inference-server-7d9f8b6c4"), template_hash="7d9f8b6c4", tolerations=(PINNED_TOLERATION,), owners=None):
+REFUSED_FOR_CPU = "0/1 nodes are available: 1 Insufficient cpu. preemption: 0/1 nodes are available: 1 No preemption victims found for incoming pod."
+
+
+def pod(name, node_selector=None, *, phase="Pending", scheduled="False", reason="Unschedulable", message=REFUSED_FOR_CPU, owner=("ReplicaSet", "inference-server-7d9f8b6c4"), template_hash="7d9f8b6c4", tolerations=(PINNED_TOLERATION,), owners=None):
     """A pod as the paged read returns it: by default one the scheduler has
-    refused, owned by a Deployment's ReplicaSet, tolerating the pinned pool's
-    taint as the seeded workload does. `owners` replaces the one-owner shape
-    with a full ownerReferences list."""
+    refused for cpu, owned by a Deployment's ReplicaSet, tolerating the
+    pinned pool's taint as the seeded workload does. `owners` replaces the
+    one-owner shape with a full ownerReferences list."""
     labels = {"pod-template-hash": template_hash} if template_hash else {}
     meta = {"name": name, "namespace": "seeded-capacity", "labels": labels}
     if owners is not None:
@@ -123,6 +126,8 @@ def pod(name, node_selector=None, *, phase="Pending", scheduled="False", reason=
     condition = {"type": "PodScheduled", "status": scheduled}
     if reason:
         condition["reason"] = reason
+    if message:
+        condition["message"] = message
     return {
         "kind": "Pod",
         "metadata": meta,
@@ -1193,9 +1198,24 @@ class SingleZoneNodepoolTest(unittest.TestCase):
             # guard is what keeps it out.
             ("running-stale-refusal", {"phase": "Running", "scheduled": "False", "reason": "Unschedulable"}),
             ("other-reason", {"scheduled": "False", "reason": "SchedulerError"}),
+            # Refused, and no node change would lift it: not the pool's backlog.
+            ("unbound-claim", {"message": "0/3 nodes are available: pod has unbound immediate PersistentVolumeClaims. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."}),
+            ("volume-binding-wait", {"message": "0/3 nodes are available: 3 waiting for ephemeral volume controller to create the persistentvolumeclaim."}),
+            ("no-message", {"message": ""}),
         ):
             with self.subTest(name=name):
                 self.assertFalse(fs.is_unschedulable(pod(name, selector, **kwargs)))
+        # The scheduler's capacity and placement clauses all count.
+        for name, message in (
+            ("cpu", REFUSED_FOR_CPU),
+            ("taint", "0/3 nodes are available: 1 node(s) had untolerated taint {seeded-role: pinned-inference}, 2 Insufficient memory."),
+            ("affinity", "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."),
+            ("old-selector", "0/3 nodes are available: 3 node(s) didn't match node selector."),
+            ("pods-per-node", "0/1 nodes are available: 1 Too many pods."),
+            ("gpu", "0/2 nodes are available: 2 Insufficient nvidia.com/gpu."),
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(fs.is_unschedulable(pod(name, selector, message=message)))
 
     # Two pools in one zone, both e2-small: the pinned pool with its own label
     # and taint, and a default pool. Their nodes carry what GKE stamps.

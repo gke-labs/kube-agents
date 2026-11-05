@@ -199,6 +199,17 @@ PENDING_PHASE = "Pending"
 POD_SCHEDULED_CONDITION = "PodScheduled"
 CONDITION_FALSE = "False"
 UNSCHEDULABLE_REASON = "Unschedulable"
+# The scheduler's own clauses for a refusal that a node, more of them or a
+# different pool would lift: capacity and placement. A refusal that names
+# none of these (an unbound claim, a volume binding wait) is not the pool's
+# backlog, whatever the pod's selector says.
+CAPACITY_REFUSAL_CLAUSES = (
+    "Insufficient ",
+    "untolerated taint",
+    "didn't match Pod's node affinity/selector",
+    "didn't match node selector",
+    "Too many pods",
+)
 
 # §3.3's ">32 cores", §3.4's "> 10" rules, §3.7's 90%, and §3.10(c)'s idle
 # reservation: at most half in use with at least this many instances idle.
@@ -1319,17 +1330,30 @@ def _pool_ceiling(autoscaling: dict, locations: list) -> tuple[int | None, str]:
     return per_zone * zones, f"maxNodeCount {per_zone}/zone x {zones} zones"
 
 
+def refused_for_capacity(message: str) -> bool:
+    """Whether the scheduler's message names a capacity or placement clause
+    (`CAPACITY_REFUSAL_CLAUSES`)."""
+    return any(clause in message for clause in CAPACITY_REFUSAL_CLAUSES)
+
+
 def is_unschedulable(pod: dict) -> bool:
-    """A Pending pod the scheduler has refused: `PodScheduled` is `False` with
-    reason `Unschedulable`. A Pending pod whose `PodScheduled` is `True` is
-    placed and waiting on something else (an image, a volume), and a pod with
-    no such condition yet has not been looked at: neither is backlog."""
+    """A Pending pod the scheduler has refused for capacity or placement:
+    `PodScheduled` is `False` with reason `Unschedulable` and a message naming
+    one of the scheduler's capacity or placement clauses. A Pending pod whose
+    `PodScheduled` is `True` is placed and waiting on something else (an
+    image, a volume attach); a pod with no such condition yet has not been
+    looked at; a pod refused for an unbound claim or a volume binding wait
+    is not held by the pool. None of those is backlog."""
     status = pod.get("status") or {}
     if status.get("phase") != PENDING_PHASE:
         return False
     for condition in status.get("conditions") or []:
         if isinstance(condition, dict) and condition.get("type") == POD_SCHEDULED_CONDITION:
-            return condition.get("status") == CONDITION_FALSE and condition.get("reason") == UNSCHEDULABLE_REASON
+            return (
+                condition.get("status") == CONDITION_FALSE
+                and condition.get("reason") == UNSCHEDULABLE_REASON
+                and refused_for_capacity(str(condition.get("message") or ""))
+            )
     return False
 
 
