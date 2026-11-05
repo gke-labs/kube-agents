@@ -266,20 +266,15 @@ func TestDeskCountsACardAnswerAndAnUnknownOneApart(t *testing.T) {
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()
 	origin := completeTurn(t, r, "discord:g1/fb12", "d-1", "on it")
-	// Marked as the relay marks a chain that handed its ask to cards, until
-	// the mark survives the relay's own last writes of the record.
-	waitFor(t, "the chain marked as answered by cards", func() bool {
-		rec, err := r.g.reg.Get(context.Background(), "discord:g1/fb12")
-		if err != nil || rec == nil {
-			return false
-		}
-		if root, ok := rec.TaskRefFor(origin.TaskID); ok && root.CardsAnswer {
-			return true
-		}
-		rec.markCardsAnswer(origin.TaskID)
-		_ = r.g.reg.Put(context.Background(), rec)
-		return false
+	// Marked as the relay marks a chain that handed its ask to cards, once
+	// the relay's last write of the record has landed.
+	rec := waitForRecord(t, r, "discord:g1/fb12", "the turn to end", func(rec *SessionRecord) bool {
+		return rec.ActiveTask == nil
 	})
+	rec.markCardsAnswer(origin.TaskID)
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
 	card := FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001", Conversation: "discord:g1/fb12",
 		MessageID: "m1", TaskID: origin.TaskID, Rating: FeedbackDown, Answer: "the card's report"}
 	if _, err := desk.Rate(card); err != nil {
