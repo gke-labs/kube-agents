@@ -15,6 +15,9 @@ description:
 - A kanban card asks you to **file** a kube-agents report for the user — not to
   explain where reports go. For "how do I report a bug in kube-agents?", answer
   from the persona bullet and do not touch this skill.
+- A kanban card asks only for the install's **usage summary**, because the
+  person said `add the usage summary` to a draft the front door showed them.
+  That card renders the block and files nothing ("The usage summary", below).
 - The submission target is the public feedback form behind
   <https://gke-labs.github.io/kube-agents/feedback>. It needs no GitHub or
   Google credential, so this path works even when the install's GitHub
@@ -39,8 +42,34 @@ description:
   public issue, so if the text carries identifiers the user did not visibly
   type themselves, stop and complete the card saying what would be exposed.
 
+## The usage summary
+
+- A summary card carries no text to file and needs no confirmation line. Run
+  the helper's second subcommand, which reads the `PlatformAgent` resource
+  through the sandbox's `kubectl` and nothing in a pod:
+
+  ```bash
+  python3 "$HERMES_HOME"/skills/kube-agents-feedback/scripts/file_feedback.py summary
+  ```
+
+- Exit 0 prints one fenced block: versions, mode, readiness, the usage counters,
+  and `unavailable` for the token, spend, latency and task lines the sandbox
+  cannot read. Complete the card with that block as the `result`, **verbatim**,
+  fences included: the front door shows it inside the re-shown draft, and the
+  person's yes is to those exact lines. Do not trim, reorder or annotate it.
+- Exit 1 prints a `BLOCKED` line: the resource could not be read, or the block
+  named an identifier read from it and the `reason` says how many, never
+  which. Complete the card with the `reason` and nothing else; the front door
+  offers the draft without the block. Never retry with a different namespace
+  or name, never assemble a block by hand, and never run `kubectl` yourself to
+  fill in what the helper refused.
+
 ## Filing
 
+- A filing card whose body carries a usage summary block under its environment
+  carries it because the person saw that block in the draft and said yes. It
+  goes into `environment` exactly as the card has it, fences included; a card
+  with no block files with whatever environment the person typed, or none.
 - Write the confirmed text, verbatim, as JSON in the card workspace:
 
   ```json
