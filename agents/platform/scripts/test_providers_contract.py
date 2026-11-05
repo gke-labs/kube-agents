@@ -64,7 +64,9 @@ SHAPES: dict[str, frozenset[str]] = {
     # `mergeCommit` is null unless merged; then it is the merge or squash
     # commit, or after a rebase or fast-forward merge the target's tip, which
     # may not hold the whole change -- a revert must check. GitLab answers null
-    # for a fast-forward merge.
+    # for a fast-forward merge. Bitbucket Cloud answers a 12-character
+    # abbreviation, so compare it with git's full id as a prefix; Bitbucket Data
+    # Center may answer null for a merged pull request.
     "proposal": frozenset(
         {
             "number",
@@ -141,10 +143,10 @@ FORGES_WITHOUT_A_COUNT = frozenset({"bitbucket-datacenter"})
 # reads the repository's proposals and keeps the author's itself.
 FORGES_THAT_FILTER_THE_AUTHOR_HERE = frozenset({"bitbucket-datacenter"})
 # How a merged proposal's `mergeCommit` reads, per forge, where it is not the
-# full 40-character sha: Bitbucket Cloud abbreviates it to 12, and the recorded
-# Data Center listings leave it out, so it is None there.
+# full 40-character sha: Bitbucket Cloud abbreviates it to 12. Data Center may
+# leave it out -- the recorded listings do -- so None is allowed there too.
 MERGE_COMMIT_PATTERN = {"bitbucket": r"^[0-9a-f]{12}$"}
-FORGES_WITHOUT_A_MERGE_COMMIT = frozenset({"bitbucket-datacenter"})
+FORGES_THAT_MAY_OMIT_THE_MERGE_COMMIT = frozenset({"bitbucket-datacenter"})
 RECORDED_TALLY = {"open": 2, "merged": 5, "closed": 1}
 RECORDED_CLOSER = {"actor": "example-maintainer", "bot": False}
 # The address the broker stamps the install's proxied commits with. No forge
@@ -390,13 +392,13 @@ class ContractTest(unittest.TestCase):
                 states = {item["state"] for item in answer["proposals"]}
                 self.assertIn("merged", states)
                 for item in answer["proposals"]:
-                    if item["state"] == "merged" and name in FORGES_WITHOUT_A_MERGE_COMMIT:
+                    if item["state"] != "merged":
                         self.assertIsNone(item["mergeCommit"])
-                    elif item["state"] == "merged":
+                    elif item["mergeCommit"] is None and name in FORGES_THAT_MAY_OMIT_THE_MERGE_COMMIT:
+                        continue
+                    else:
                         pattern = MERGE_COMMIT_PATTERN.get(name, r"^[0-9a-f]{40}$")
                         self.assertRegex(item["mergeCommit"], pattern)
-                    else:
-                        self.assertIsNone(item["mergeCommit"])
 
     def test_an_unmerged_proposal_view_names_no_merge_commit(self):
         # The recorded open pull request carries GitHub's test-merge sha; the

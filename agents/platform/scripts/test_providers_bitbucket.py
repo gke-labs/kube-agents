@@ -1030,7 +1030,6 @@ class GitRefusedTest(CloudCase):
             broker.clone({"repository": "https://github.com/acme/infra"})
 
 
-
 class MergeCommitTest(unittest.TestCase):
     def test_only_a_merged_pull_request_names_its_merge_commit(self):
         merged = {"hash": "b7aec0d9a64b", "type": "commit"}
