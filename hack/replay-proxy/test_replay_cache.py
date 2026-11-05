@@ -1,5 +1,6 @@
 """The answer cache: normalizing and restoring answers, write-once files, the prefix index, served bodies."""
 
+import ast
 import calendar
 import json
 import os
@@ -8,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime
+from pathlib import Path
 
 import normalizer
 import replay_cache
@@ -111,6 +113,18 @@ class PrefixIndexTest(unittest.TestCase):
         self.assertEqual(index.closest("s", hashes[:200] + ["x"])[1], 200)
 
 
+class ModuleLayoutTest(unittest.TestCase):
+    def test_every_test_module_defines_its_tests_before_running_them(self):
+        # Run as a script, a module's tests defined after its __main__ block never run.
+        for path in Path(__file__).resolve().parent.glob("test_*.py"):
+            tree = ast.parse(path.read_text())
+            main = next((i for i, node in enumerate(tree.body) if isinstance(node, ast.If)
+                         and "__main__" in ast.dump(node.test)), None)
+            if main is not None:
+                later = [n.name for n in tree.body[main + 1:] if isinstance(n, (ast.ClassDef, ast.FunctionDef))]
+                self.assertEqual(later, [], path.name)
+
+
 class ServedBodyTest(unittest.TestCase):
     ENTRY = {"finish_reason": "tool_calls", "usage": {"prompt_tokens": 10, "completion_tokens": 2}}
 
@@ -135,8 +149,6 @@ class ServedBodyTest(unittest.TestCase):
         self.assertEqual(last["usage"]["completion_tokens"], 2)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class SimilarityTest(unittest.TestCase):
@@ -153,3 +165,6 @@ class SimilarityTest(unittest.TestCase):
         message = json.dumps({"role": "assistant", "tool_calls": [{"function": {"name": "kubectl", "arguments": "get pods"}}]})
         self.assertEqual(replay_cache.message_text(message), "kubectl\nget pods")
 
+
+if __name__ == "__main__":
+    unittest.main()
