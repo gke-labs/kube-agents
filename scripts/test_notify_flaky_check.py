@@ -15,6 +15,7 @@ fingerprint drifted; and doubling a row when the same event is handled twice.
 import io
 import json
 import sys
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -29,6 +30,10 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import notify_flaky_check as reporter
+
+CRAFTED_SEGMENTS = 10000
+CRAFTED_TAIL = 300000
+CRAFTED_LINE_BUDGET_SECONDS = 5.0
 
 REPO = "gke-labs/kube-agents"
 WORKFLOW_ID = 327115835
@@ -177,8 +182,30 @@ class FingerprintTest(unittest.TestCase):
         log = (
             "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_y - AssertionError: boom\n"
             "2026-09-09T01:04:59.4322202Z ERROR bench/tests/test_z.py::test_w - fixture 'tmp' errored\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_v[a parent that did not end in compression] - AssertionError: boom\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_u[cd /tmp && audit_report.py start --audit compliance-audit > start.json]\n"
+            "2026-09-09T01:04:59.4322202Z FAILED bench/tests/test_x.py::test_t[failed-reason: bridge-queue-overflow - detail-True] - AssertionError: Lists differ: [1] != [2]\n"
         )
-        self.assertEqual(reporter.extract_test_ids(log), ["bench/tests/test_x.py::test_y", "bench/tests/test_z.py::test_w"])
+        self.assertEqual(
+            reporter.extract_test_ids(log),
+            [
+                "bench/tests/test_x.py::test_t[failed-reason: bridge-queue-overflow - detail-True]",
+                "bench/tests/test_x.py::test_u[cd /tmp && audit_report.py start --audit compliance-audit > start.json]",
+                "bench/tests/test_x.py::test_v[a parent that did not end in compression]",
+                "bench/tests/test_x.py::test_y",
+                "bench/tests/test_z.py::test_w",
+            ],
+        )
+
+    def test_a_long_crafted_pytest_line_costs_linear_time(self):
+        """A log line is the pull request's own test output. One with thousands of
+        `::` and an unclosed `[` must not send the pattern into a retry at every
+        `::`; the bound is a hundred times what the linear match takes."""
+        line = "FAILED " + "a::" * CRAFTED_SEGMENTS + "[" + "x" * CRAFTED_TAIL
+        started = time.monotonic()
+        ids = reporter.extract_test_ids(line)
+        self.assertLess(time.monotonic() - started, CRAFTED_LINE_BUDGET_SECONDS)
+        self.assertEqual(ids, [])
 
     def test_a_subtest_failure_is_its_test_not_its_parameters(self):
         """unittest prints `FAIL: test_x (m.C.test_x) (conclusion='a')` per
@@ -279,6 +306,42 @@ class FingerprintTest(unittest.TestCase):
             {"name": "validate (ubuntu-22.04)", "steps": steps, "test_ids": ["test_1 (m.A.test_1)"]},
         ]
         self.assertEqual(reporter.keys(jobs), {"m.A": ["test_1 (m.A.test_1)"], "validate / step 2": []})
+
+    def test_a_join_that_names_no_test_drops_out_beside_the_shard_that_did(self):
+        """One flaky Python test fails its shard and the join over the shards.
+        The join's log names no test; filing it would open two more issues,
+        one per failed join step, on every Python flake (#4033)."""
+        shard_steps = job("x", "failure", ("success", "failure"))["steps"]
+        join_steps = job("x", "failure", ("failure", "failure"))["steps"]
+        jobs = [
+            {"name": "Run Python Unit Tests (shard 2/3)", "steps": shard_steps, "test_ids": ["test_1 (m.A.test_1)"]},
+            {"name": "Run Python Unit Tests", "steps": join_steps, "test_ids": []},
+        ]
+        self.assertEqual(reporter.keys(jobs), {"m.A": ["test_1 (m.A.test_1)"]})
+
+    def test_a_join_that_fails_alone_still_files_under_its_steps(self):
+        """A broken coverage merge with every shard green is the join's own failure."""
+        join_steps = job("x", "failure", ("success", "failure"))["steps"]
+        jobs = [{"name": "Run Python Unit Tests", "steps": join_steps, "test_ids": []}]
+        self.assertEqual(reporter.keys(jobs), {"Run Python Unit Tests / step 2": []})
+
+    def test_a_join_drops_out_beside_a_shard_that_failed_without_naming_a_test(self):
+        """A shard that died installing names no test; it files, and the join does not."""
+        shard_steps = job("x", "failure", ("failure",))["steps"]
+        join_steps = job("x", "failure", ("success", "failure", "failure"))["steps"]
+        jobs = [
+            {"name": "Run Python Unit Tests (shard 2/3)", "steps": shard_steps, "test_ids": []},
+            {"name": "Run Python Unit Tests", "steps": join_steps, "test_ids": []},
+        ]
+        self.assertEqual(reporter.keys(jobs), {"Run Python Unit Tests / step 1": []})
+
+    def test_a_job_of_another_name_that_names_no_test_still_files(self):
+        shard_steps = job("x", "failure", ("failure",))["steps"]
+        jobs = [
+            {"name": "Run Python Unit Tests (shard 1/3)", "steps": shard_steps, "test_ids": ["test_1 (m.A.test_1)"]},
+            {"name": "lint", "steps": shard_steps, "test_ids": []},
+        ]
+        self.assertEqual(reporter.keys(jobs), {"m.A": ["test_1 (m.A.test_1)"], "lint / step 1": []})
 
     def test_past_the_container_cap_the_job_keeps_the_ids_it_named(self):
         many = [f"test_x (m.C{i:03}.test_x)" for i in range(reporter.MAX_CONTAINERS_PER_ATTEMPT + 1)]

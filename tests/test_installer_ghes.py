@@ -859,7 +859,7 @@ class GhesForgeQuestionTest(_Tmp):
         body = (
             f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
             f"HOSTS=({answers}); CAS=({cas}); n=0; c=0\n"
-            f'prompt_menu() {{ local var="${{!#}}"; printf -v "$var" %s {shlex.quote(choice)}; echo "menu: $2|$3|$4"; }}\n'
+            f'prompt_menu() {{ local var="${{!#}}"; printf -v "$var" %s {shlex.quote(choice)}; echo "menu: $2|$3|$4|$5"; }}\n'
             "prompt_read() {\n"
             '  case "$1" in\n'
             '    *hostname*) printf -v "$2" %s "${HOSTS[$n]}"; n=$((n+1)) ;;\n'
@@ -874,10 +874,11 @@ class GhesForgeQuestionTest(_Tmp):
         return _run_installer_bash(body, get_isolated_test_env(overrides={
             "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}))
 
-    def test_the_menu_offers_three_forges(self):
+    def test_the_menu_offers_three_forges_and_no_repository(self):
         proc = self._ask("1", [])
         self.assertIn("menu: GitHub (github.com)|GitHub Enterprise Server (a GitHub host that you run)|"
-                      "GitLab (gitlab.com or self-managed)", proc.stdout, proc.stderr)
+                      "GitLab (gitlab.com or self-managed)|Nowhere yet: install without a GitOps repository",
+                      proc.stdout, proc.stderr)
 
     def test_github_com(self):
         proc = self._ask("1", [], extra=f"PARAM_GITOPS_HOST={_HOST}")

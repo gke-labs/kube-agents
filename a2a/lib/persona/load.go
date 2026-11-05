@@ -2,6 +2,7 @@ package persona
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -102,8 +103,21 @@ func (l *loader) load() *Persona {
 	}
 	p := &Persona{}
 	if data, ok := l.read(ManifestFile, true); ok {
-		if err := yaml.UnmarshalStrict(data, &p.Manifest); err != nil {
+		// A tier gets its own problem rather than the strict decoder's
+		// "unknown field": a tier is authority, which the AgentProfile
+		// grants, never the persona. It is decoded beside the manifest,
+		// from the file as written, so the rest is still checked and every
+		// other error keeps its place in the file.
+		var m struct {
+			Manifest
+			Tier json.RawMessage `json:"tier"`
+		}
+		if err := yaml.UnmarshalStrict(data, &m); err != nil {
 			l.add(ManifestFile, "", "%v", err)
+		}
+		p.Manifest = m.Manifest
+		if m.Tier != nil {
+			l.add(ManifestFile, "tier", "is not a persona field: which tiers a profile may run is decided by its AgentProfile, not its persona")
 		}
 	}
 	if data, ok := l.read(MCPFile, false); ok {

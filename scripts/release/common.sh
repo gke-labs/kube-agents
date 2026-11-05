@@ -65,16 +65,20 @@ export REQUIRED_RELEASE_IMAGES=(
   "k8s-operator"
   "platform-agent"
   "credential-proxy"
+  "kube-proxy"
   "agent-sandbox"
   "replay-proxy"
   "pubsub-platform"
   "gke-stockout-investigator"
   "a2a-gateway"
   "a2a-worker"
+  "persona-cluster"
   "a2a-authcallout"
   "a2a-verifier"
+  "a2a-dispatcher"
   "a2a-console"
   "hermes-bridge"
+  "web-console"
 )
 
 # Declarative registry of release bundle directories, root files, and Helm charts

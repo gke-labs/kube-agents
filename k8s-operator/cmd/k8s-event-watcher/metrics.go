@@ -93,6 +93,15 @@ type metrics struct {
 	followups      *prometheus.CounterVec
 	injectErrors   *prometheus.CounterVec
 	sessionCreates *prometheus.CounterVec
+	// sessionCreatesSuppressed counts the per-incident creates the
+	// dispatcher did not attempt because the session breaker was open
+	// (sessionBreaker in injector.go). Not a sessionCreates outcome: that
+	// series counts POSTs that were made, by what they got back
+	// (docs/designs/usage-counters-producer.md), and nothing was POSTed.
+	// Each one is an incident whose alert waits for its next sighting after
+	// the cooldown, so the labels name the workload it held, where the
+	// breaker itself, one per process, cannot.
+	sessionCreatesSuppressed *prometheus.CounterVec
 	// triageSessions counts the sessions this process opened whose event the
 	// daemon then delivered: one per injected event in per-incident mode,
 	// incremented after the inject returns delivered and never on the
@@ -111,10 +120,30 @@ type metrics struct {
 	// CAs), so watching only one of them leaves half the surface dark.
 	clusterDiscoveryErrors *prometheus.CounterVec
 	clusterUp              *prometheus.GaugeVec
+	// relists counts the backlog re-reads a cluster's reflector made after its
+	// initial delivery, paged lists and watch-list streams alike; before it
+	// nothing distinguished a relist loop from a quiet cluster.
+	relists *prometheus.CounterVec
 	// processStart is processStartTimeMetric, set once in newMetrics, which
 	// runs at process start, and constant for the life of the process by
 	// construction.
 	processStart prometheus.Gauge
+	// The fleet's shape, set by the fleet-shape probe (fleetshape.go) every
+	// --fleet-shape-interval and read between probes: plain gauges rather
+	// than per-cluster ones, because what they exist to answer is the size
+	// of the whole fleet (published for an automatic sizing profile the
+	// operator will read; nothing projects them yet), and
+	// per-cluster series would be one more family that grows with the
+	// fleet. fleetShapeClusters{outcome} says how many clusters the totals
+	// hold (counted) and how many they leave out (failed), so a total read
+	// beside a failed count above zero is read as partial. All six are 0
+	// until the first probe finishes, which counted=0 says.
+	fleetNodes           prometheus.Gauge
+	fleetMaxClusterNodes prometheus.Gauge
+	fleetControllers     prometheus.Gauge
+	fleetPods            prometheus.Gauge
+	fleetMaxClusterPods  prometheus.Gauge
+	fleetShapeClusters   *prometheus.GaugeVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
@@ -171,11 +200,11 @@ func newMetrics() *metrics {
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		settleOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_settle_outcomes_total",
-			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
+			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting in the family was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		followups: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_followups_total",
-			Help: "Quiet follow-ups for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome: sent (the daemon accepted it for the session's thread; it posts after answering, so a chat failure past that is invisible here), unrouted (it had no thread for the session and posted nothing), error (the inject failed).",
+			Help: "Quiet follow-ups for incidents whose alert went out and whose object was then unsighted for --quiet-after, by outcome: sent (the daemon accepted it: for a session with a thread it posts after answering, so a chat failure past that is invisible here; for one with a card but no thread the card line was already written), unrouted (the session had neither a thread nor a card the daemon could find within the hour, so it posted nothing), error (the inject failed, which includes the daemon's 503 for a card still to come on a session with no thread, retried each sweep for an hour).",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		injectErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_inject_errors_total",
@@ -185,6 +214,23 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_session_creates_total",
 			Help: "Total POST /sessions attempts, labeled by outcome.",
 		}, []string{"cluster", "project", "location", "outcome"}),
+		// namespace, kind and workload line up with the daemon's own
+		// incident key (workloadOf: a Deployment's pod on its Deployment as
+		// the daemon's _fold_key does, a Deployment, StatefulSet, DaemonSet
+		// or CronJob on its name, everything else empty), so a hold's rows
+		// line up with the incidents it delayed. The only watcher series with
+		// an object name in its labels: a child is minted the first time a
+		// workload is held and, like any counter child, lives until the
+		// process restarts, so the distinct values are the named workloads
+		// that failed during a hold over the process's life, not a snapshot
+		// of the current hold. A name minted per instance is never a value:
+		// a CronJob or Job pod is a new name per run, a Node a new name per
+		// node, and naming either would grow the vector by one child per run
+		// or per node for as long as the process lives.
+		sessionCreatesSuppressed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_session_creates_suppressed_total",
+			Help: "Total per-incident session creates the watcher did not attempt because the daemon had answered POST /sessions with 429 or 5xx three times running and the cooldown breaker was open. No HTTP call was made; the dedup entry is rolled back so the next sighting after the cooldown opens the incident. workload is the Deployment's name for a Deployment's pod, the object's own name for a Deployment, StatefulSet, DaemonSet or CronJob, and empty for everything else (a StatefulSet ordinal, a Job's, CronJob run's, DaemonSet's or bare pod, a Node, a ReplicaSet, a Job), which share one child per namespace and kind.",
+		}, []string{"cluster", "project", "location", "namespace", "kind", "workload"}),
 		triageSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_triage_sessions_total",
 			Help: "Total triage sessions opened: sessions this watcher created whose event the daemon then delivered (per-incident mode, one per injected event). A session whose inject was filtered, suppressed or failed is not counted.",
@@ -215,12 +261,44 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_cluster_up",
 			Help: "1 once this cluster's informer has completed its initial list and is delivering events; 0 while it has not synced (including a stuck informer retrying an unreachable API server), while the API server refuses its events list or watch with 403 Forbidden and the informer is held between attempts, or once it has stopped.",
 		}, []string{"cluster", "project", "location"}),
+		relists: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_relists_total",
+			Help: "Full re-reads of a cluster's Event backlog after its initial sync, as a paged list or a new watch-list stream: the watch could not be resumed or the stream failed.",
+		}, []string{"cluster", "project", "location"}),
 		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: processStartTimeMetric,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
 		}),
+		fleetNodes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_nodes",
+			Help: "Nodes across the clusters counted in the last fleet-shape probe: each cluster's currentNodeCount from its GKE description, summed. The direct cluster contributes 0 until a profile names it. 0 until the first probe finishes.",
+		}),
+		fleetMaxClusterNodes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_max_cluster_nodes",
+			Help: "The largest single cluster's node count in the last fleet-shape probe.",
+		}),
+		fleetControllers: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_controllers",
+			Help: "Deployments, StatefulSets, DaemonSets and CronJobs across the clusters counted in the last fleet-shape probe, read as one-item metadata-only lists plus the server's remainingItemCount.",
+		}),
+		fleetPods: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_pods",
+			Help: "Pods across the clusters counted in the last fleet-shape probe, read the same way.",
+		}),
+		fleetMaxClusterPods: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_max_cluster_pods",
+			Help: "The largest single cluster's pod count in the last fleet-shape probe.",
+		}),
+		fleetShapeClusters: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "k8s_event_watcher_fleet_shape_clusters",
+			Help: "Clusters in the last fleet-shape probe by outcome: counted (every read answered; in the totals) or failed (a describe or a list failed or timed out; left out of the totals, so a failed count above 0 means the totals are partial). counted=0 and failed=0 is no probe finished yet.",
+		}, []string{"outcome"}),
 	}
 	m.processStart.Set(processStartSeconds(time.Now()))
+	// Both children from the first scrape, so a reader finds counted=0
+	// before the first probe rather than an absent series.
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeCounted).Set(0)
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeFailed).Set(0)
 	reg.MustRegister(
 		m.eventsSeen,
 		m.eventsFiltered,
@@ -234,13 +312,57 @@ func newMetrics() *metrics {
 		m.followups,
 		m.injectErrors,
 		m.sessionCreates,
+		m.sessionCreatesSuppressed,
 		m.triageSessions,
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
 		m.clusterUp,
+		m.relists,
 		m.processStart,
+		m.fleetNodes,
+		m.fleetMaxClusterNodes,
+		m.fleetControllers,
+		m.fleetPods,
+		m.fleetMaxClusterPods,
+		m.fleetShapeClusters,
 	)
 	return m
+}
+
+// publishFleetShape sets the six fleet gauges from one probe's reading.
+func (m *metrics) publishFleetShape(shape fleetShape) {
+	m.fleetNodes.Set(float64(shape.nodes))
+	m.fleetMaxClusterNodes.Set(float64(shape.maxClusterNodes))
+	m.fleetControllers.Set(float64(shape.controllers))
+	m.fleetPods.Set(float64(shape.pods))
+	m.fleetMaxClusterPods.Set(float64(shape.maxClusterPods))
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeCounted).Set(float64(shape.counted))
+	m.fleetShapeClusters.WithLabelValues(fleetShapeOutcomeFailed).Set(float64(shape.failed))
+}
+
+// deleteClusterGauges drops the two gauge series labelled with one cluster's
+// triple, cluster_up and active_incidents, when the cluster's profile is
+// removed (clusterSet.stop) or the direct entry is restarted under its
+// profile's triple (clusterSet.restartDirect). Without it a torn-down cluster
+// would read as a cluster at cluster_up=0 for the life of the process, and the
+// operator's count of clustersRegistered, which is the number of cluster_up
+// series, would keep it.
+//
+// The cluster's counter series stay. The operator's usage poller sums the
+// pod's injected and triage families over every label set and refuses a sum
+// that falls under an unchanged process start time (usageBranch in
+// internal/controller/usage_counters_fold.go: a counter cannot fall inside
+// one process), advancing its baseline to the fallen sample. Deleting a
+// counter series would make the pod's sum fall by the cluster's lifetime
+// count on the next poll and lose up to a poll window of every other
+// cluster's increments. An idle counter series for a removed cluster costs
+// memory only, and no more than the cluster cost while it ran.
+// clusterDiscoveryErrors is labelled by profile, not cluster, and is a
+// counter too: what it counted happened.
+func (m *metrics) deleteClusterGauges(cluster, project, location string) {
+	labels := prometheus.Labels{"cluster": cluster, "project": project, "location": location}
+	m.activeIncidents.DeletePartialMatch(labels)
+	m.clusterUp.DeletePartialMatch(labels)
 }
 
 // processStartSeconds is t as the gauge exports it: seconds since the epoch,

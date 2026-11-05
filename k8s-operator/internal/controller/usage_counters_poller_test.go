@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr/funcr"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -157,7 +159,7 @@ type stubUsageSource struct {
 	hook func(addr string)
 }
 
-func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string) (usageReading, error) {
+func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, addr)
 	block := s.blocking[addr]
@@ -189,7 +191,8 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []st
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
 	// set's sample is the pod group's first counter; setSample names the rest.
-	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters}
+	out := usageReading{Samples: map[string]int64{}, StartTime: reading.StartTime, Clusters: reading.Clusters, DataVolume: reading.DataVolume}
+	out.Readings, out.ReadingsPresent = stubReadingsOf(reading, kinds)
 	for i, counter := range counters {
 		value, named := reading.Samples[counter]
 		if !named && i == 0 {
@@ -198,6 +201,28 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr string, counters []st
 		out.Samples[counter] = value
 	}
 	return out, nil
+}
+
+// stubReadingsOf is the planted readings of the kinds a scrape asked for, as
+// foldUsageBody reads only those: a reading the target's readings column does
+// not name never reaches the poll.
+func stubReadingsOf(reading usageReading, kinds []usageReadingKind) (map[string]int64, map[usageReadingKind]bool) {
+	if reading.Readings == nil && reading.ReadingsPresent == nil {
+		return nil, nil
+	}
+	values := map[string]int64{}
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, kinds...) {
+		if v, ok := reading.Readings[spec.field]; ok {
+			values[spec.field] = v
+		}
+	}
+	present := map[usageReadingKind]bool{}
+	for kind, ok := range reading.ReadingsPresent {
+		if slices.Contains(kinds, kind) {
+			present[kind] = ok
+		}
+	}
+	return values, present
 }
 
 // stubPrimarySample keys the sample set gives, handed out as the first counter
@@ -229,6 +254,27 @@ func (s *stubUsageSource) setSample(addr, counter string, sample int64) {
 	s.readings[addr] = reading
 }
 
+// setReadings gives addr's reading its readings, the broker's proposal readings
+// or, at a2aAddr(), the people reading: values by status field and the readings
+// present, as foldUsageBody would hand them out.
+// A value of a reading not named present is dropped, as the scrape drops it.
+func (s *stubUsageSource) setReadings(addr string, values map[string]int64, present ...usageReadingKind) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Readings = map[string]int64{}
+	reading.ReadingsPresent = map[usageReadingKind]bool{}
+	for _, kind := range present {
+		reading.ReadingsPresent[kind] = true
+	}
+	for _, spec := range usageReadingSpecs {
+		if v, ok := values[spec.field]; ok && reading.ReadingsPresent[spec.reading] {
+			reading.Readings[spec.field] = v
+		}
+	}
+	s.readings[addr] = reading
+}
+
 // podEntry is the document's entry for the pod uid, where the pod feeds one
 // counter; a pod feeding several is indexed by usagePodEntryKey.
 func podEntry(doc *usageDocument, uid string) *usagePodEntry {
@@ -251,6 +297,16 @@ func (s *stubUsageSource) setClusters(addr string, registered, monitored int64) 
 	defer s.mu.Unlock()
 	reading := s.readings[addr]
 	reading.Clusters = &usageClusterGauges{Registered: registered, Monitored: monitored}
+	s.readings[addr] = reading
+}
+
+// setDataVolume gives addr's reading the watcher's data volume series, which
+// set leaves in place.
+func (s *stubUsageSource) setDataVolume(addr string, total, free int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.DataVolume = &usageDataVolume{Total: total, Free: free}
 	s.readings[addr] = reading
 }
 
@@ -301,6 +357,13 @@ func (p *UsageCounterPoller) expireNewerFieldsRecordForTest(agent *agentv1alpha1
 	}
 }
 
+// usageTestReadingsNulls is the six reading fields as merge-patch deletions,
+// what a CRD without them strips from a stored status.
+const usageTestReadingsNulls = `"remediationsMergedTotal":null,"remediationsOpen":null,"proposalsAuthored":null,"remediationsClosedUnmergedTotal":null,"proposalHumanTouches":null,"proposalsMergedUntouched":null`
+
+// usageTestPeopleNulls is the two people readings as merge-patch deletions.
+const usageTestPeopleNulls = `"peopleSeen7d":null,"peopleSeen30d":null`
+
 // usageHarness is a poller over a fake client, with the writes it makes
 // counted.
 type usageHarness struct {
@@ -326,14 +389,15 @@ type usageHarness struct {
 	// pruningGauges makes the fake behave like a served CRD at a previous
 	// schema: status.usage with its first-schema counters, without the fields
 	// added later (the cluster gauges, the merged counter, the chat counter, the
-	// blocked counter). pruningMerged is the CRD from the release after that:
-	// the gauges served, the merged counter not; pruningChat the next: the
-	// gauges and the merged counter served, the chat counter not; pruningBlocked
-	// the one from the release before this: everything but the blocked counter
-	// served. Each strips its own field alone, so a test can tell which record
-	// held a patch back.
+	// blocked counter, the proposal readings). pruningReadings is the CRD from
+	// the release before the readings: everything served but the four new
+	// reading fields and the two kept ones, which an older CRD serves as
+	// integers and this test strips as the readings' one record would see
+	// them; pruningChat a CRD serving all but the chat counter;
+	// pruningBlocked one serving all but the blocked counter. Each strips its
+	// own field alone, so a test can tell which record held a patch back.
 	pruningGauges     bool
-	pruningMerged     bool
+	pruningReadings   bool
 	pruningChat       bool
 	pruningBlocked    bool
 	pruningFailures   bool
@@ -341,7 +405,13 @@ type usageHarness struct {
 	pruningErrored    bool
 	pruningBackground bool
 	pruningFeedback   bool
-	pruningClosed     bool
+	// pruningChatSessions is a CRD serving all but chatSessionsTotal.
+	pruningChatSessions bool
+	// pruningPeople is a CRD serving all but the two people readings.
+	pruningPeople bool
+	// pruningStorage makes the fake behave like a served CRD from before
+	// status.storageStatus carried its byte fields.
+	pruningStorage bool
 }
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
@@ -355,10 +425,10 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			// the echo, so the store is stripped with a second patch the poller
 			// never sees, and the echo the poller reads is stripped the same way.
 			pa, isAgent := obj.(*agentv1alpha1.PlatformAgent)
-			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningMerged || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningClosed) {
-				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,"remediationsMergedTotal":null,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"remediationsClosedUnmergedTotal":null}}}`
-				if h.pruningMerged {
-					strip = `{"status":{"usage":{"remediationsMergedTotal":null}}}`
+			if err == nil && isAgent && (h.pruning || h.pruningGauges || h.pruningReadings || h.pruningChat || h.pruningBlocked || h.pruningFailures || h.pruningHuman || h.pruningErrored || h.pruningBackground || h.pruningFeedback || h.pruningChatSessions || h.pruningPeople) {
+				strip := `{"status":{"usage":{"clustersRegistered":null,"clustersMonitored":null,` + usageTestReadingsNulls + `,"chatMessagesInboundTotal":null,"toolExecutionsBlockedTotal":null,"brokerFailuresTotal":null,"lastHumanActiveTime":null,"chatTurnsErroredTotal":null,"backgroundTasksGaveUpTotal":null,"negativeFeedbackTotal":null,"chatSessionsTotal":null,` + usageTestPeopleNulls + `}}}`
+				if h.pruningReadings {
+					strip = `{"status":{"usage":{` + usageTestReadingsNulls + `}}}`
 				}
 				if h.pruningChat {
 					strip = `{"status":{"usage":{"chatMessagesInboundTotal":null}}}`
@@ -381,8 +451,11 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				if h.pruningFeedback {
 					strip = `{"status":{"usage":{"negativeFeedbackTotal":null}}}`
 				}
-				if h.pruningClosed {
-					strip = `{"status":{"usage":{"remediationsClosedUnmergedTotal":null}}}`
+				if h.pruningChatSessions {
+					strip = `{"status":{"usage":{"chatSessionsTotal":null}}}`
+				}
+				if h.pruningPeople {
+					strip = `{"status":{"usage":{` + usageTestPeopleNulls + `}}}`
 				}
 				if h.pruning {
 					strip = `{"status":{"usage":null}}`
@@ -397,8 +470,13 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				pa.Status.Usage.ClustersRegistered = nil
 				pa.Status.Usage.ClustersMonitored = nil
 			}
-			if isAgent && (h.pruningGauges || h.pruningMerged) {
-				pa.Status.Usage.RemediationsMergedTotal = 0
+			if isAgent && (h.pruningGauges || h.pruningReadings) {
+				pa.Status.Usage.RemediationsMergedTotal = nil
+				pa.Status.Usage.RemediationsOpen = nil
+				pa.Status.Usage.ProposalsAuthored = nil
+				pa.Status.Usage.RemediationsClosedUnmergedTotal = nil
+				pa.Status.Usage.ProposalHumanTouches = nil
+				pa.Status.Usage.ProposalsMergedUntouched = nil
 			}
 			if isAgent && (h.pruningGauges || h.pruningChat) {
 				pa.Status.Usage.ChatMessagesInboundTotal = 0
@@ -421,8 +499,18 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 			if isAgent && (h.pruningGauges || h.pruningFeedback) {
 				pa.Status.Usage.NegativeFeedbackTotal = 0
 			}
-			if isAgent && (h.pruningGauges || h.pruningClosed) {
-				pa.Status.Usage.RemediationsClosedUnmergedTotal = 0
+			if isAgent && (h.pruningGauges || h.pruningChatSessions) {
+				pa.Status.Usage.ChatSessionsTotal = 0
+			}
+			if isAgent && (h.pruningGauges || h.pruningPeople) {
+				pa.Status.Usage.PeopleSeen7d = nil
+				pa.Status.Usage.PeopleSeen30d = nil
+			}
+			if err == nil && isAgent && h.pruningStorage {
+				stored := pa.DeepCopy()
+				err = c.SubResource(subResourceName).Patch(ctx, stored, client.RawPatch(types.MergePatchType, []byte(`{"status":{"storageStatus":{"capacityBytes":null,"freeBytes":null}}}`)))
+				pa.Status.StorageStatus.CapacityBytes, pa.Status.StorageStatus.FreeBytes = nil, nil
+				pa.ResourceVersion = stored.ResourceVersion
 			}
 			return err
 		},
@@ -717,22 +805,20 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 		Version:       usageDocumentVersion,
 		AgentUID:      usageTestAgentUID,
 		FirstRecorded: metav1.NewTime(usageClock(1)),
-		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0, usageCounterNegativeFeedback: 0, usageCounterRemediationsClosedUnmerged: 0},
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterChatMessagesInbound: 0, usageCounterSessionsTriage: 0, usageCounterSessionsChat: 0, usageCounterToolExecutionsBlocked: 0, usageCounterBrokerFailures: 0, usageCounterChatTurnsErrored: 0, usageCounterBackgroundTasksGaveUp: 0, usageCounterNegativeFeedback: 0},
 		LastMoved:     &moved,
 		Pods: map[string]*usagePodEntry{
-			usagePodEntryKey("gw-a", usageCounterEventsIngested):                 {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
-			usagePodEntryKey("gw-a", usageCounterSessionsTriage):                 {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterSessionsTriage, Sample: 0, Marker: moved},
-			usagePodEntryKey("broker-b", usageCounterToolExecutions):             {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 10, Marker: moved},
-			usagePodEntryKey("broker-b", usageCounterRemediationsProposed):       {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsProposed, Sample: 0, Marker: moved},
-			usagePodEntryKey("broker-b", usageCounterRemediationsMerged):         {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsMerged, Sample: 0, Marker: moved},
-			usagePodEntryKey("gw-a", usageCounterChatMessagesInbound):            {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterChatMessagesInbound, Sample: 0, Marker: moved},
-			usagePodEntryKey("gw-a", usageCounterSessionsChat):                   {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterSessionsChat, Sample: 0, Marker: moved},
-			usagePodEntryKey("broker-b", usageCounterToolExecutionsBlocked):      {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutionsBlocked, Sample: 0, Marker: moved},
-			usagePodEntryKey("broker-b", usageCounterBrokerFailures):             {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterBrokerFailures, Sample: 0, Marker: moved},
-			usagePodEntryKey("gw-a", usageCounterChatTurnsErrored):               {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterChatTurnsErrored, Sample: 0, Marker: moved},
-			usagePodEntryKey("gw-a", usageCounterBackgroundTasksGaveUp):          {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterBackgroundTasksGaveUp, Sample: 0, Marker: moved},
-			usagePodEntryKey("gw-a", usageCounterNegativeFeedback):               {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterNegativeFeedback, Sample: 0, Marker: moved},
-			usagePodEntryKey("broker-b", usageCounterRemediationsClosedUnmerged): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsClosedUnmerged, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterEventsIngested):            {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterSessionsTriage):            {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterSessionsTriage, Sample: 0, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterToolExecutions):        {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 10, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterRemediationsProposed):  {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsProposed, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterChatMessagesInbound):       {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterChatMessagesInbound, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterSessionsChat):              {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterSessionsChat, Sample: 0, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterToolExecutionsBlocked): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutionsBlocked, Sample: 0, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterBrokerFailures):        {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterBrokerFailures, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterChatTurnsErrored):          {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterChatTurnsErrored, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterBackgroundTasksGaveUp):     {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterBackgroundTasksGaveUp, Sample: 0, Marker: moved},
+			usagePodEntryKey("gw-a", usageCounterNegativeFeedback):          {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterNegativeFeedback, Sample: 0, Marker: moved},
 		},
 	})
 	h.stub.set(gatewayAddr(), 4, nil)
@@ -762,7 +848,7 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 			Version:       usageDocumentVersion,
 			AgentUID:      usageTestAgentUID,
 			FirstRecorded: stamp,
-			Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0, usageCounterChatMessagesInbound: 0, usageCounterToolExecutionsBlocked: 0},
+			Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterChatMessagesInbound: 0, usageCounterToolExecutionsBlocked: 0},
 			Pods: map[string]*usagePodEntry{
 				usagePodEntryKey("broker-b", usageCounterToolExecutions): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 10, Marker: stamp},
 			},
@@ -1166,7 +1252,7 @@ func TestUsagePoller_TwoGatewayReplicas(t *testing.T) {
 // The broker pod's counters come from one body. Each has its own baseline
 // entry under the pod; the two this test moves advance together and survive
 // the pod's restart, and the proposals move lastActiveTime as a brokered action
-// does. The merged counter's test beside it walks the same phases.
+// does.
 func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
@@ -1178,8 +1264,8 @@ func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 		t.Fatalf("the first poll wrote a counter: %+v", status)
 	}
 	doc := h.document()
-	if len(doc.Pods) != 13 {
-		t.Fatalf("the document holds %d entries, want 13 (gateway events, triage sessions, chat, chat sessions, turns errored and cards given up and thumbs-downs; broker tools, refusals, proposals, merged, failures and closes): %+v", len(doc.Pods), doc.Pods)
+	if len(doc.Pods) != 11 {
+		t.Fatalf("the document holds %d entries, want 11 (gateway events, triage sessions, chat, chat sessions, turns errored and cards given up and thumbs-downs; broker tools, refusals, proposals and failures): %+v", len(doc.Pods), doc.Pods)
 	}
 
 	// A proposal opened and no command run: the proposals counter moves alone.
@@ -1541,6 +1627,145 @@ func TestUsagePoller_TheSessionsStatusSeedsTheChatHalfAndFloorsTheSum(t *testing
 	}
 }
 
+// chatSessionsTotal is the chat half alone, beside the pair's sum, and
+// publishes as its own usage gauge row.
+func TestUsagePoller_ProjectsTheChatHalfAsChatSessionsTotal(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 10)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 20)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 13)
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 25)
+	h.poll(10)
+	status := h.status()
+	if status.SessionsTotal != 8 || status.ChatSessionsTotal != 5 {
+		t.Fatalf("after 3 triage and 5 chat sessions: sessionsTotal %d chatSessionsTotal %d, want 8 and 5", status.SessionsTotal, status.ChatSessionsTotal)
+	}
+	if status.LastHumanActiveTime != nil {
+		t.Fatalf("a chat session alone moved lastHumanActiveTime: %v", status.LastHumanActiveTime)
+	}
+	if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(10)) {
+		t.Fatalf("the sessions did not move lastActiveTime: %v", status.LastActiveTime)
+	}
+	agent := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: usageTestAgentName}, agent); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	g := newUsageGauges(prometheus.NewRegistry())
+	g.publishUsage(agent)
+	if got := testutil.ToFloat64(g.usage.WithLabelValues(agent.Namespace, agent.Name, usageStatusFieldChatSessions)); got != 5 {
+		t.Fatalf("usage gauge chatSessionsTotal = %v, want 5", got)
+	}
+	// The chat half alone moves lastActiveTime, as sessionsTotal does, and
+	// still not lastHumanActiveTime.
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 26)
+	h.poll(15)
+	status = h.status()
+	if status.ChatSessionsTotal != 6 || status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(15)) || status.LastHumanActiveTime != nil {
+		t.Fatalf("after one more chat session: chatSessionsTotal %d lastActiveTime %v lastHumanActiveTime %v, want 6, minute 15, nil", status.ChatSessionsTotal, status.LastActiveTime, status.LastHumanActiveTime)
+	}
+}
+
+// A status carrying chatSessionsTotal splits the seed: the chat half takes
+// it, clamped to the total, the triage half the rest. A status without it
+// seeds as before, the whole total in the chat half.
+func TestUsageStatusSeed_AStatusWithChatSessionsSplitsTheHalves(t *testing.T) {
+	for _, tc := range []struct{ total, chat, wantChat, wantTriage int64 }{
+		{8, 5, 5, 3}, {8, 9, 8, 0}, {8, 0, 8, 0}, {0, 3, 0, 0},
+	} {
+		agent := &agentv1alpha1.PlatformAgent{}
+		agent.Status.Usage.SessionsTotal, agent.Status.Usage.ChatSessionsTotal = tc.total, tc.chat
+		seed := usageStatusSeed(agent, time.Now()).Totals
+		if seed[usageCounterSessionsChat] != tc.wantChat || seed[usageCounterSessionsTriage] != tc.wantTriage {
+			t.Errorf("total %d chat %d: seed chat=%d triage=%d, want %d/%d", tc.total, tc.chat, seed[usageCounterSessionsChat], seed[usageCounterSessionsTriage], tc.wantChat, tc.wantTriage)
+		}
+	}
+	agent := &agentv1alpha1.PlatformAgent{}
+	agent.Status.Usage.SessionsTotal, agent.Status.Usage.ChatSessionsTotal = usageTotalCeiling+1, 3
+	if seed := usageStatusSeed(agent, time.Now()).Totals; seed[usageCounterSessionsChat] != 0 || seed[usageCounterSessionsTriage] != 0 {
+		t.Errorf("an absurd sessionsTotal seeded chat=%d triage=%d, want 0/0", seed[usageCounterSessionsChat], seed[usageCounterSessionsTriage])
+	}
+}
+
+// Under a split seed the read-back holds the chat half to its own status as
+// well as the pair's sum to the total; without chatSessionsTotal the sum
+// alone is held, as before.
+func TestUsageDocumentInvalid_TheChatHalfIsHeldToItsStatusUnderASplitSeed(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Status.Usage.SessionsTotal = 8
+	agent.Status.Usage.ChatSessionsTotal = 5
+	stamp := metav1.NewTime(usageClock(1))
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{UID: agent.UID}}}}
+	doc := func(chat, triage int64) *usageDocument {
+		totals := usageZeroTotals()
+		totals[usageCounterSessionsChat] = chat
+		totals[usageCounterSessionsTriage] = triage
+		return &usageDocument{Version: usageDocumentVersion, AgentUID: string(agent.UID), FirstRecorded: stamp, Totals: totals, Pods: map[string]*usagePodEntry{}}
+	}
+	if reason := usageDocumentInvalid(doc(4, 4), cm, agent, usageClock(2)); reason != "a total is below the status it projects to" {
+		t.Errorf("a chat half below chatSessionsTotal: reason %q, want the below-status refusal", reason)
+	}
+	if reason := usageDocumentInvalid(doc(5, 2), cm, agent, usageClock(2)); reason != "a total is below the status it projects to" {
+		t.Errorf("a pair summing below sessionsTotal: reason %q, want the below-status refusal", reason)
+	}
+	for _, d := range []struct{ chat, triage int64 }{{5, 3}, {6, 3}} {
+		if reason := usageDocumentInvalid(doc(d.chat, d.triage), cm, agent, usageClock(2)); reason != "" {
+			t.Errorf("doc chat %d triage %d was refused: %s", d.chat, d.triage, reason)
+		}
+	}
+	agent.Status.Usage.ChatSessionsTotal = 0
+	if reason := usageDocumentInvalid(doc(5, 3), cm, agent, usageClock(2)); reason != "" {
+		t.Errorf("without chatSessionsTotal a pair summing to the status was refused: %s", reason)
+	}
+}
+
+// A served CRD from before chatSessionsTotal prunes it alone: its absence is
+// its own record, named for the field, sessionsTotal keeps landing, the gauge
+// row is held back, and a poll with it alone behind does not re-patch while
+// the record is fresh.
+func TestUsagePoller_ChatSessionsTotalHasItsOwnPruningRecord(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.pruningChatSessions = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 1)
+	h.stub.set(chatAddr(), 0, ptr.To(1.0))
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 1)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	h.stub.setSample(gatewayAddr(), usageCounterSessionsTriage, 3)
+	h.stub.setSample(chatAddr(), usageCounterSessionsChat, 4)
+	h.poll(10)
+	if status := h.status(); status.SessionsTotal != 5 || status.ChatSessionsTotal != 0 {
+		t.Fatalf("status under a CRD without chatSessionsTotal: %+v, want sessionsTotal 5 and no chatSessionsTotal", status)
+	}
+	if !h.p.newerFieldPruned(agent, usageStatusFieldChatSessions) || h.p.newerFieldPruned(agent, usageCounterSessionsChat) {
+		t.Fatal("the absence of chatSessionsTotal was not recorded against its own field name")
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the absence of chatSessionsTotal was recorded as the counters' pruning")
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with chatSessionsTotal alone behind re-patched the status while its record was fresh")
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: usageTestAgentName}, stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	held := h.r.heldUsageFields(stored)
+	if !held[usageStatusFieldChatSessions] || held[usageStatusFieldSessions] {
+		t.Fatalf("held fields %v, want chatSessionsTotal held and sessionsTotal published", held)
+	}
+}
+
 func TestUsagePoller_ChatMessagesCountFromTheGatewaysSecondListener(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
@@ -1591,23 +1816,215 @@ func TestUsagePoller_ChatMessagesCountFromTheGatewaysSecondListener(t *testing.T
 	}
 }
 
-// The merged-proposals counter lands beside the proposals counter from the
-// same broker body, and moves lastActiveTime.
-func TestUsagePoller_MergedProposalsCount(t *testing.T) {
+// usageTestReadings is a broker's full proposal readings: every field, the
+// untouched count at zero so the zero is shown to land as a reading.
+func usageTestReadings(merged int64) map[string]int64 {
+	return map[string]int64{
+		usageExportRemediationsMerged:         merged,
+		usageExportRemediationsOpen:           2,
+		usageExportProposalsAuthored:          merged + 5,
+		usageExportRemediationsClosedUnmerged: 3,
+		usageExportProposalHumanTouches:       9,
+		usageExportProposalsMergedUntouched:   0,
+	}
+}
+
+// usageReadingValue reads a reading field as a test compares it: -1 for absent.
+func usageReadingValue(u agentv1alpha1.AgentUsageStatus, field string) int64 {
+	return gaugeValue(*usageReadingStatusField(&u, field))
+}
+
+// The broker's readings land as the six pointer fields, a zero as a zero,
+// beside the counters from the same body; neither a first reading nor a
+// changed one moves lastActiveTime or lastHumanActiveTime, and the document
+// keeps no total for any of them.
+func TestUsagePoller_ReadingsLandAsPointerFieldsAndNeverMoveLastActiveTime(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
 	h.stub.set(gatewayAddr(), 0, nil)
 	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 1)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
 	h.poll(5)
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 3)
+	status := h.status()
+	for field, want := range usageTestReadings(1) {
+		if got := usageReadingValue(status, field); got != want {
+			t.Errorf("after the first reading %s = %d, want %d", field, got, want)
+		}
+	}
+	h.stub.setReadings(brokerAddr(), usageTestReadings(4), usageReadingOutcomes, usageReadingDetails)
+	h.poll(10)
+	status = h.status()
+	for field, want := range usageTestReadings(4) {
+		if got := usageReadingValue(status, field); got != want {
+			t.Errorf("after the second reading %s = %d, want %d", field, got, want)
+		}
+	}
+	if status.LastActiveTime != nil || status.LastHumanActiveTime != nil {
+		t.Fatalf("a reading moved a time: lastActiveTime %v, lastHumanActiveTime %v", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+	doc := h.document()
+	for _, spec := range usageReadingSpecs {
+		if _, ok := doc.Totals[spec.field]; ok {
+			t.Errorf("the document keeps a total for the reading %s: %v", spec.field, doc.Totals)
+		}
+	}
+}
+
+// Each reading has its own miss streak: a body that serves the outcomes and
+// not the details keeps the details fields for one poll and clears them on
+// the second, while the outcomes fields keep landing; a broker that cannot be
+// read clears the outcomes the same way, one poll kept, the second cleared.
+func TestUsagePoller_ReadingsClearPerReading(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.poll(5)
+	details := []string{usageExportRemediationsClosedUnmerged, usageExportProposalHumanTouches, usageExportProposalsMergedUntouched}
+	h.stub.setReadings(brokerAddr(), usageTestReadings(2), usageReadingOutcomes)
 	h.poll(10)
 	status := h.status()
-	if status.RemediationsMergedTotal != 2 || status.RemediationsProposedTotal != 0 || status.ToolExecutionsTotal != 0 {
-		t.Fatalf("after two merges: %+v, want 2 merged and nothing else", status)
+	for _, field := range details {
+		if got := usageReadingValue(status, field); got != usageTestReadings(1)[field] {
+			t.Errorf("one poll without the details: %s = %d, want it kept at %d", field, got, usageTestReadings(1)[field])
+		}
 	}
-	if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(10)) {
-		t.Fatalf("a merge did not move lastActiveTime: %v", status.LastActiveTime)
+	if got := usageReadingValue(status, usageExportRemediationsMerged); got != 2 {
+		t.Errorf("merged = %d, want the outcomes reading's 2", got)
+	}
+	h.stub.setReadings(brokerAddr(), usageTestReadings(3), usageReadingOutcomes)
+	h.poll(15)
+	status = h.status()
+	for _, field := range details {
+		if got := usageReadingValue(status, field); got != -1 {
+			t.Errorf("two polls without the details: %s = %d, want absent", field, got)
+		}
+	}
+	for _, field := range []string{usageExportRemediationsMerged, usageExportRemediationsOpen, usageExportProposalsAuthored} {
+		if got := usageReadingValue(status, field); got != usageTestReadings(3)[field] {
+			t.Errorf("the outcomes field %s = %d, want %d", field, got, usageTestReadings(3)[field])
+		}
+	}
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	h.poll(20)
+	if got := usageReadingValue(h.status(), usageExportRemediationsMerged); got != 3 {
+		t.Errorf("one failed broker read: merged = %d, want it kept at 3", got)
+	}
+	h.poll(25)
+	status = h.status()
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got := usageReadingValue(status, spec.field); got != -1 {
+			t.Errorf("two failed broker reads: %s = %d, want absent", spec.field, got)
+		}
+	}
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(6), usageReadingOutcomes, usageReadingDetails)
+	h.poll(30)
+	if got := usageReadingValue(h.status(), usageExportProposalHumanTouches); got != 9 {
+		t.Errorf("the broker read again: touches = %d, want 9", got)
+	}
+}
+
+// A read in between resets a reading's miss streak: miss, read, miss keeps
+// the fields, where two misses in a row would clear them.
+func TestUsagePoller_AReadInBetweenResetsTheMissStreak(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.poll(5)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(2), usageReadingOutcomes)
+	h.poll(10)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(3), usageReadingOutcomes, usageReadingDetails)
+	h.poll(15)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(4), usageReadingOutcomes)
+	h.poll(20)
+	status := h.status()
+	for _, field := range []string{usageExportRemediationsClosedUnmerged, usageExportProposalHumanTouches, usageExportProposalsMergedUntouched} {
+		if got := usageReadingValue(status, field); got != usageTestReadings(3)[field] {
+			t.Errorf("miss, read, miss: %s = %d, want it kept at the read's %d", field, got, usageTestReadings(3)[field])
+		}
+	}
+}
+
+// A reading is the forge's count as it stands, not an accumulation: a fall,
+// a repository leaving the managed list, is projected as the fall.
+func TestUsagePoller_AReadingThatFallsIsProjectedAsItStands(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(5), usageReadingOutcomes, usageReadingDetails)
+	h.poll(5)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(3), usageReadingOutcomes, usageReadingDetails)
+	h.poll(10)
+	status := h.status()
+	if got := usageReadingValue(status, usageExportRemediationsMerged); got != 3 {
+		t.Fatalf("merged = %d after a fall from 5 to 3, want 3", got)
+	}
+	if got := usageReadingValue(status, usageExportProposalsAuthored); got != 8 {
+		t.Fatalf("authored = %d, want 8", got)
+	}
+}
+
+// A document an earlier release wrote, with the two event-counted totals and
+// their broker entries, is migrated in place on read: the two totals and
+// their pod entries go, an unfolded mark on either goes, every other total and
+// entry stays, the document is not re-seeded, and the migration is written
+// back once.
+func TestUsagePoller_MigrationDropsTheTwoOldTotalsAndTheirPodEntries(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	moved := metav1.NewTime(usageClock(3))
+	totals := usageZeroTotals()
+	totals[usageCounterToolExecutions] = 10
+	totals[usageCounterEventsIngested] = 4
+	totals[usageCounterRemediationsMerged] = 6
+	totals[usageCounterRemediationsClosedUnmerged] = 0
+	h.writeDocument(&usageDocument{
+		Version:       usageDocumentVersion,
+		AgentUID:      usageTestAgentUID,
+		FirstRecorded: metav1.NewTime(usageClock(1)),
+		Totals:        totals,
+		LastMoved:     &moved,
+		Unfolded:      []string{usageCounterRemediationsClosedUnmerged},
+		Pods: map[string]*usagePodEntry{
+			usagePodEntryKey("gw-a", usageCounterEventsIngested):                 {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterToolExecutions):             {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 10, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterRemediationsMerged):         {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsMerged, Sample: 6, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterRemediationsClosedUnmerged): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsClosedUnmerged, Sample: 0, Marker: moved},
+		},
+	})
+	h.cmWrites = 0
+	h.stub.set(gatewayAddr(), 4, nil)
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	h.poll(10)
+	doc := h.document()
+	if !doc.FirstRecorded.Time.Equal(usageClock(1)) {
+		t.Fatalf("the document was re-seeded: firstRecorded %v", doc.FirstRecorded)
+	}
+	for _, retired := range []string{usageCounterRemediationsMerged, usageCounterRemediationsClosedUnmerged} {
+		if _, ok := doc.Totals[retired]; ok {
+			t.Errorf("the retired total %s is still in the document: %v", retired, doc.Totals)
+		}
+		if doc.Pods[usagePodEntryKey("broker-b", retired)] != nil {
+			t.Errorf("the retired counter %s still has a pod entry", retired)
+		}
+		if slices.Contains(doc.Unfolded, retired) {
+			t.Errorf("the retired counter %s is still marked unfolded: %v", retired, doc.Unfolded)
+		}
+	}
+	if doc.Totals[usageCounterToolExecutions] != 10 || doc.Totals[usageCounterEventsIngested] != 4 || doc.Pods[usagePodEntryKey("broker-b", usageCounterToolExecutions)] == nil {
+		t.Fatalf("the other totals or entries moved: totals %v, pods %v", doc.Totals, doc.Pods)
+	}
+	if h.cmWrites != 1 {
+		t.Fatalf("%d ConfigMap writes on the migrating poll, want 1", h.cmWrites)
+	}
+	h.poll(15)
+	if h.cmWrites != 1 {
+		t.Fatalf("%d ConfigMap writes after a quiet poll, want 1: the document was migrated again", h.cmWrites)
 	}
 }
 
@@ -1686,7 +2103,7 @@ func TestUsagePoller_AChatServingCRDWithoutTheBlockedCounterKeepsTheOthersFlowin
 	defer mu.Unlock()
 	named := 0
 	for _, l := range lines {
-		if strings.Contains(l, "does not serve a status.usage field") {
+		if strings.Contains(l, "does not serve a status field") {
 			named++
 			if !strings.Contains(l, `"field"="toolExecutionsBlockedTotal"`) {
 				t.Fatalf("the log named the wrong field: %s", l)
@@ -2099,66 +2516,6 @@ func TestUsagePoller_AChatServingCRDWithoutTheFeedbackCounterKeepsTheOthersFlowi
 	}
 }
 
-// The broker's closed-unmerged series counts into remediationsClosedUnmergedTotal
-// and nowhere else, and a person closing a proposal is not activity: lastActiveTime stays.
-func TestUsagePoller_RemediationsClosedUnmergedCount(t *testing.T) {
-	created := usageClock(0).Add(-time.Hour)
-	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
-	h.stub.set(gatewayAddr(), 0, nil)
-	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsClosedUnmerged, 1)
-	h.poll(5)
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsClosedUnmerged, 4)
-	h.poll(10)
-	status := h.status()
-	if status.RemediationsClosedUnmergedTotal != 3 || status.ToolExecutionsTotal != 0 || status.RemediationsProposedTotal != 0 {
-		t.Fatalf("after three closes: %+v, want 3 closes and nothing else", status)
-	}
-	if status.LastActiveTime != nil {
-		t.Fatalf("a close alone moved lastActiveTime: %v", status.LastActiveTime)
-	}
-	if doc := h.document(); doc.Totals[usageCounterRemediationsClosedUnmerged] != 3 {
-		t.Fatalf("document totals = %v, want 3 closes", doc.Totals)
-	}
-}
-
-// A served CRD from the release before this one prunes remediationsClosedUnmergedTotal
-// alone: its absence is recorded against it, the others keep landing, and a
-// poll with it alone behind does not re-patch while the record is fresh.
-func TestUsagePoller_AChatServingCRDWithoutTheClosedCounterKeepsTheOthersFlowing(t *testing.T) {
-	created := usageClock(0).Add(-time.Hour)
-	agent := usageTestAgent(created)
-	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
-	h.pruningClosed = true
-	h.stub.set(gatewayAddr(), 0, nil)
-	h.stub.set(chatAddr(), 1, ptr.To(1.0))
-	h.stub.set(brokerAddr(), 10, nil)
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsClosedUnmerged, 1)
-	h.poll(5)
-	h.stub.set(chatAddr(), 3, ptr.To(1.0))
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsClosedUnmerged, 2)
-	h.poll(10)
-	if status := h.status(); status.ChatMessagesInboundTotal != 2 || status.RemediationsClosedUnmergedTotal != 0 {
-		t.Fatalf("after a message and a close: %+v, want 2 messages and no closed counter", status)
-	}
-	if h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) || !h.p.newerFieldPruned(agent, usageCounterRemediationsClosedUnmerged) {
-		t.Fatal("the closed counter's absence was not recorded against it alone")
-	}
-	patches := h.patches
-	h.poll(12)
-	if h.patches != patches {
-		t.Fatal("a poll with the closed counter alone behind re-patched the status while its record was fresh")
-	}
-	h.stub.set(chatAddr(), 5, ptr.To(1.0))
-	h.poll(14)
-	if got := h.status().ChatMessagesInboundTotal; got != 4 {
-		t.Fatalf("a message waited on the closed counter's record: %d, want 4", got)
-	}
-	if h.r.usageStatusPruned(agent) {
-		t.Fatal("the closed counter's absence was recorded as the counters' pruning")
-	}
-}
-
 // A current-layout document that predates a counter is written back with the
 // counter added even when the poll read nothing that changed it: the broker
 // unread, the gateway level. Otherwise it would be re-migrated and re-logged
@@ -2187,7 +2544,7 @@ func TestUsagePoller_ADocumentWithoutANewerCounterIsWrittenWhenNothingElseMoved(
 		t.Fatalf("%d ConfigMap writes on the migrating poll, want 1: the added counter was not written back", h.cmWrites)
 	}
 	doc := h.document()
-	if _, ok := doc.Totals[usageCounterRemediationsMerged]; !ok || !slices.Contains(doc.Unfolded, usageCounterRemediationsMerged) {
+	if _, ok := doc.Totals[usageCounterBrokerFailures]; !ok || !slices.Contains(doc.Unfolded, usageCounterBrokerFailures) {
 		t.Fatalf("the written document lacks the counter or its unfolded mark: totals %v, unfolded %v", doc.Totals, doc.Unfolded)
 	}
 	h.poll(15)
@@ -2218,7 +2575,7 @@ func TestUsagePoller_ADocumentWithoutANewerCounterKeepsItsTotals(t *testing.T) {
 	h.stub.set(gatewayAddr(), 44, nil)
 	h.stub.set(brokerAddr(), 100, nil)
 	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 1)
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 5)
+	h.stub.setSample(brokerAddr(), usageCounterBrokerFailures, 5)
 	h.poll(10)
 	doc := h.document()
 	if !doc.FirstRecorded.Time.Equal(usageClock(1)) {
@@ -2226,10 +2583,10 @@ func TestUsagePoller_ADocumentWithoutANewerCounterKeepsItsTotals(t *testing.T) {
 	}
 	// The counter the document predates, with nothing in the status, takes the
 	// broker's whole sample: no document and no status has seen any of it.
-	if doc.Totals[usageCounterToolExecutions] != 10 || doc.Totals[usageCounterEventsIngested] != 8 || doc.Totals[usageCounterRemediationsProposed] != 1 || doc.Totals[usageCounterRemediationsMerged] != 5 {
+	if doc.Totals[usageCounterToolExecutions] != 10 || doc.Totals[usageCounterEventsIngested] != 8 || doc.Totals[usageCounterRemediationsProposed] != 1 || doc.Totals[usageCounterBrokerFailures] != 5 {
 		t.Fatalf("totals: %v, want 10, 8, 1 and 5", doc.Totals)
 	}
-	if e := doc.Pods[usagePodEntryKey("broker-b", usageCounterRemediationsMerged)]; e == nil || e.Sample != 5 {
+	if e := doc.Pods[usagePodEntryKey("broker-b", usageCounterBrokerFailures)]; e == nil || e.Sample != 5 {
 		t.Fatalf("the new counter was not recorded at its sample: %+v", doc.Pods)
 	}
 }
@@ -2383,7 +2740,7 @@ func TestUsagePoller_WarningNamesEveryFieldOfAFailingBroker(t *testing.T) {
 	h.poll(10)
 	select {
 	case ev := <-h.recorder.Events:
-		want := "agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal, status.usage.remediationsMergedTotal, status.usage.toolExecutionsBlockedTotal, status.usage.brokerFailuresTotal, status.usage.remediationsClosedUnmergedTotal)"
+		want := "agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal, status.usage.toolExecutionsBlockedTotal, status.usage.brokerFailuresTotal)"
 		if !strings.Contains(ev, want) {
 			t.Fatalf("event = %q, want it to name the broker's fields as %q", ev, want)
 		}
@@ -2398,7 +2755,7 @@ func TestUsageScrapeFailureMessage_NamesEachStatusField(t *testing.T) {
 		name: "agent-credential-proxy-bbb", counter: usageStatusFieldList(usageBrokerCounters), detail: "connection refused",
 		err: &usageScrapeError{Kind: usageScrapeKindRefused},
 	}})
-	want := "pod agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal, status.usage.remediationsMergedTotal, status.usage.toolExecutionsBlockedTotal, status.usage.brokerFailuresTotal, status.usage.remediationsClosedUnmergedTotal): connection refused"
+	want := "pod agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal, status.usage.toolExecutionsBlockedTotal, status.usage.brokerFailuresTotal): connection refused"
 	if !strings.Contains(msg, want) {
 		t.Fatalf("message %q does not name both fields as %q", msg, want)
 	}
@@ -2604,21 +2961,14 @@ func TestUsagePoller_GaugeOnlyProbeUnderAPruningCRD(t *testing.T) {
 	}
 }
 
-// A served CRD at a previous schema prunes the newer fields, the gauges and
-// the merged counter, and keeps the first three (every CRD with status.usage
-// has carried remediationsProposedTotal): those keep landing every poll they
-// move, the shared record stays clear because the newer fields' absence is
-// their own condition, and the merged counter moving alone does not re-patch
-// every poll while that record is fresh.
-// A served CRD from between the gauges and the merged counter serves the
-// gauges and prunes the counter: the counter's absence stamps its own record,
-// the gauges keep landing every poll they move, and the log names the one
-// field that is pruned.
-func TestUsagePoller_AGaugeServingCRDWithoutTheMergedCounterKeepsTheGaugesFlowing(t *testing.T) {
+// A served CRD from before the readings serves the gauges and prunes the six
+// reading fields: their absence stamps the readings' one record, the gauges
+// keep landing every poll they move, and the log names the record once.
+func TestUsagePoller_AGaugeServingCRDWithoutTheReadingsKeepsTheGaugesFlowing(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
 	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
-	h.pruningMerged = true
+	h.pruningReadings = true
 	var mu sync.Mutex
 	var lines []string
 	ctx := logf.IntoContext(context.Background(), funcr.New(func(_, args string) {
@@ -2633,49 +2983,53 @@ func TestUsagePoller_AGaugeServingCRDWithoutTheMergedCounterKeepsTheGaugesFlowin
 	h.stub.set(gatewayAddr(), 0, nil)
 	h.stub.setClusters(gatewayAddr(), 3, 3)
 	h.stub.set(brokerAddr(), 10, nil)
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 1)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
 	pollAt(5)
-	// A merge is counted: the patch carries the merged total, the CRD drops
-	// it, and the counter's own record is stamped; the gauges came back.
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 2)
-	pollAt(10)
-	if status := h.status(); status.ClustersRegistered == nil || *status.ClustersRegistered != 3 || status.RemediationsMergedTotal != 0 {
-		t.Fatalf("after the merge: %+v, want the gauges at 3 and no merged counter", status)
+	// The patch carried the readings and the gauges; the CRD dropped the
+	// readings, and their record alone is stamped.
+	if status := h.status(); status.ClustersRegistered == nil || *status.ClustersRegistered != 3 || status.RemediationsMergedTotal != nil || status.ProposalsAuthored != nil {
+		t.Fatalf("after the first poll: %+v, want the gauges at 3 and no reading", status)
 	}
-	if h.p.newerFieldPruned(agent, usageNewerFieldGauges) || !h.p.newerFieldPruned(agent, usageCounterRemediationsMerged) {
-		t.Fatal("the merged counter's absence was recorded against the gauges")
+	if h.p.newerFieldPruned(agent, usageNewerFieldGauges) || !h.p.newerFieldPruned(agent, usageNewerFieldReadings) {
+		t.Fatal("the readings' absence was recorded against the gauges")
 	}
-	// The gauges move while the merged counter's record is fresh (inside the
-	// reprobe interval, so the counter is not re-probed): they land.
+	// A reading changes alone inside the reprobe interval: no patch.
+	patches := h.patches
+	h.stub.setReadings(brokerAddr(), usageTestReadings(2), usageReadingOutcomes, usageReadingDetails)
+	pollAt(7)
+	if h.patches != patches {
+		t.Fatal("a reading alone re-patched the status while its record was fresh")
+	}
+	// The gauges move while the readings' record is fresh: they land.
 	h.stub.setClusters(gatewayAddr(), 4, 4)
-	pollAt(14)
+	pollAt(9)
 	if status := h.status(); status.ClustersRegistered == nil || *status.ClustersRegistered != 4 {
-		t.Fatalf("a gauge change waited on the merged counter's record: %+v", status)
+		t.Fatalf("a gauge change waited on the readings' record: %+v", status)
 	}
 	if h.r.usageStatusPruned(agent) {
-		t.Fatal("the merged counter's absence was recorded as the counters' pruning")
+		t.Fatal("the readings' absence was recorded as the counters' pruning")
 	}
 	mu.Lock()
 	defer mu.Unlock()
 	named := 0
 	for _, l := range lines {
-		if strings.Contains(l, "does not serve a status.usage field") {
+		if strings.Contains(l, "does not serve a status field") {
 			named++
-			if !strings.Contains(l, `"field"="remediationsMergedTotal"`) || strings.Contains(l, "clustersRegistered") {
+			if !strings.Contains(l, `"field"="`+usageNewerFieldReadings+`"`) || strings.Contains(l, "clustersRegistered") {
 				t.Fatalf("the log named the wrong field: %s", l)
 			}
 		}
 	}
 	if named != 1 {
-		t.Fatalf("%d pruning log lines, want 1 naming remediationsMergedTotal", named)
+		t.Fatalf("%d pruning log lines, want 1 naming the readings", named)
 	}
 }
 
-// A served CRD from the release before this one serves the gauges and the
-// merged counter and prunes the chat counter: the chat counter's absence
-// stamps its own record, the merged counter keeps landing every poll it
-// moves, and the log names the one field that is pruned.
-func TestUsagePoller_AMergedServingCRDWithoutTheChatCounterKeepsTheOthersFlowing(t *testing.T) {
+// A served CRD that serves the gauges and the readings and prunes the chat
+// counter: the chat counter's absence stamps its own record, the readings
+// keep landing every poll they move, and the log names the one field that is
+// pruned.
+func TestUsagePoller_AReadingsServingCRDWithoutTheChatCounterKeepsTheOthersFlowing(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
 	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
@@ -2695,17 +3049,16 @@ func TestUsagePoller_AMergedServingCRDWithoutTheChatCounterKeepsTheOthersFlowing
 	h.stub.setClusters(gatewayAddr(), 3, 3)
 	h.stub.set(chatAddr(), 1, ptr.To(1.0))
 	h.stub.set(brokerAddr(), 10, nil)
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 1)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
 	pollAt(5)
-	// A message and a merge are counted: the patch carries both, the CRD
-	// drops the chat counter, and its record alone is stamped.
+	// A message: the patch carries it, the CRD drops the chat counter, and
+	// its record alone is stamped.
 	h.stub.set(chatAddr(), 3, ptr.To(1.0))
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 2)
 	pollAt(10)
-	if status := h.status(); status.RemediationsMergedTotal != 1 || status.ChatMessagesInboundTotal != 0 || status.ClustersRegistered == nil {
-		t.Fatalf("after a message and a merge: %+v, want 1 merged, no chat counter, the gauges", status)
+	if status := h.status(); usageReadingValue(status, usageExportRemediationsMerged) != 1 || status.ChatMessagesInboundTotal != 0 || status.ClustersRegistered == nil {
+		t.Fatalf("after a message: %+v, want the readings, no chat counter, the gauges", status)
 	}
-	if h.p.newerFieldPruned(agent, usageNewerFieldGauges) || h.p.newerFieldPruned(agent, usageCounterRemediationsMerged) || !h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) {
+	if h.p.newerFieldPruned(agent, usageNewerFieldGauges) || h.p.newerFieldPruned(agent, usageNewerFieldReadings) || !h.p.newerFieldPruned(agent, usageCounterChatMessagesInbound) {
 		t.Fatal("the chat counter's absence was not recorded against the chat counter alone")
 	}
 	// A quiet poll inside the interval: the chat counter alone is behind the
@@ -2715,11 +3068,11 @@ func TestUsagePoller_AMergedServingCRDWithoutTheChatCounterKeepsTheOthersFlowing
 	if h.patches != patches {
 		t.Fatalf("a poll with the chat counter alone behind re-patched the status while its record was fresh")
 	}
-	// The merged counter moves while the chat record is fresh: it lands.
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 3)
+	// A reading moves while the chat record is fresh: it lands.
+	h.stub.setReadings(brokerAddr(), usageTestReadings(2), usageReadingOutcomes, usageReadingDetails)
 	pollAt(14)
-	if got := h.status().RemediationsMergedTotal; got != 2 {
-		t.Fatalf("a merge waited on the chat counter's record: %d, want 2", got)
+	if got := usageReadingValue(h.status(), usageExportRemediationsMerged); got != 2 {
+		t.Fatalf("a reading waited on the chat counter's record: %d, want 2", got)
 	}
 	if h.r.usageStatusPruned(agent) {
 		t.Fatal("the chat counter's absence was recorded as the counters' pruning")
@@ -2728,7 +3081,7 @@ func TestUsagePoller_AMergedServingCRDWithoutTheChatCounterKeepsTheOthersFlowing
 	defer mu.Unlock()
 	named := 0
 	for _, l := range lines {
-		if strings.Contains(l, "does not serve a status.usage field") {
+		if strings.Contains(l, "does not serve a status field") {
 			named++
 			if !strings.Contains(l, `"field"="chatMessagesInboundTotal"`) {
 				t.Fatalf("the log named the wrong field: %s", l)
@@ -2740,6 +3093,12 @@ func TestUsagePoller_AMergedServingCRDWithoutTheChatCounterKeepsTheOthersFlowing
 	}
 }
 
+// A served CRD at a previous schema prunes the newer fields, the gauges and
+// the readings among them, and keeps the first three (every CRD with
+// status.usage has carried remediationsProposedTotal): those keep landing
+// every poll they move, the shared record stays clear because the newer
+// fields' absence is their own condition, and a reading moving alone does not
+// re-patch every poll while its record is fresh.
 func TestUsagePoller_APartialPruneKeepsTheCountersFlowing(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
@@ -2749,40 +3108,33 @@ func TestUsagePoller_APartialPruneKeepsTheCountersFlowing(t *testing.T) {
 	h.stub.setClusters(gatewayAddr(), 3, 3)
 	h.stub.set(brokerAddr(), 10, nil)
 	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 1)
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 1)
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
 	h.poll(5)
 	h.stub.set(brokerAddr(), 15, nil)
 	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 2)
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 2)
 	h.poll(10)
 	h.stub.set(brokerAddr(), 20, nil)
 	h.poll(15)
-	if status := h.status(); status.ToolExecutionsTotal != 10 || status.RemediationsProposedTotal != 1 || status.ClustersRegistered != nil || status.RemediationsMergedTotal != 0 {
+	if status := h.status(); status.ToolExecutionsTotal != 10 || status.RemediationsProposedTotal != 1 || status.ClustersRegistered != nil || status.RemediationsMergedTotal != nil {
 		t.Fatalf("status after three polls: %+v, want 10 tool executions, 1 proposal and no newer field", status)
 	}
 	if h.r.usageStatusPruned(agent) {
 		t.Fatal("the newer fields' absence was recorded as the counters' pruning")
 	}
 	if h.patches != 3 {
-		t.Fatalf("%d patches, want 3: the gauge probe on the first poll and one per counter movement", h.patches)
+		t.Fatalf("%d patches, want 3: the newer-field probe on the first poll and one per counter movement", h.patches)
 	}
 	// Each counter write re-probed the newer fields and found them absent again, so
 	// the record is still fresh, re-stamped rather than re-created.
-	if !h.p.newerFieldPruned(agent, usageNewerFieldGauges) || !h.p.newerFieldPruned(agent, usageCounterRemediationsMerged) {
+	if !h.p.newerFieldPruned(agent, usageNewerFieldGauges) || !h.p.newerFieldPruned(agent, usageNewerFieldReadings) {
 		t.Fatal("a newer field's record did not survive the counter writes that re-probed it")
 	}
-	// A merge alone, inside the reprobe interval: lastActiveTime, which the CRD
-	// serves, moves, and that is the one patch; the quiet poll after it, with
-	// the pruned counter still behind the document, writes nothing while the
-	// record is fresh.
-	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 3)
+	// A reading alone, inside the reprobe interval: it moves no time and its
+	// record is fresh, so nothing is written.
+	h.stub.setReadings(brokerAddr(), usageTestReadings(3), usageReadingOutcomes, usageReadingDetails)
 	h.poll(17)
-	if status := h.status(); h.patches != 4 || status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(17)) {
-		t.Fatalf("%d patches after a merge moved lastActiveTime, status %+v; want 4 and the time", h.patches, status)
-	}
-	h.poll(19)
-	if h.patches != 4 {
-		t.Fatalf("%d patches on a quiet poll with a pruned counter behind, want 4", h.patches)
+	if status := h.status(); h.patches != 3 || status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(15)) {
+		t.Fatalf("%d patches after a reading alone, status %+v; want 3 and lastActiveTime at the last command", h.patches, status)
 	}
 }
 
@@ -3613,4 +3965,264 @@ func TestUsagePoller_ARequestedHAInstallReadsItsOnePodsChatListener(t *testing.T
 		}
 	}
 	t.Fatalf("the one gateway pod's chat listener %s is not among the targets: %+v", chatAddr(), targets)
+}
+
+// Each target asks for the readings its listener serves: the A2A gateway the
+// people reading, the broker its two proposal readings, the gateway pod's
+// watcher and chat listeners none.
+func TestUsagePoller_EachTargetAsksForItsListenersReadings(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usagePeopleTestAgent(created, false)
+	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
+	targets, _, err := h.p.targets(context.Background(), agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]usageReadingKind{
+		gatewayAddr(): nil,
+		chatAddr():    nil,
+		a2aAddr():     {usageReadingPeople},
+		brokerAddr():  {usageReadingOutcomes, usageReadingDetails},
+	}
+	got := map[string][]usageReadingKind{}
+	for _, target := range targets {
+		got[target.addr] = target.readings
+	}
+	if len(got) != len(want) {
+		t.Fatalf("targets = %+v, want one at each of %v", targets, want)
+	}
+	for addr, kinds := range want {
+		readings, ok := got[addr]
+		if !ok || !slices.Equal(readings, kinds) {
+			t.Errorf("target %s readings = %v (present %v), want %v", addr, readings, ok, kinds)
+		}
+	}
+}
+
+// usagePeopleTestAgent is a next-mode CR with Chat on and, when slack is set,
+// Slack too; Slack then stays on its legacy consumer, served through Hermes.
+func usagePeopleTestAgent(created time.Time, slack bool) *agentv1alpha1.PlatformAgent {
+	agent := usageTestAgent(created)
+	agent.Spec.Mode = ptr.To(string(ModeNext))
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+	}
+	if slack {
+		agent.Spec.Integration.Slack = &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)}
+	}
+	return agent
+}
+
+// usagePeopleObjects is the default pods and the A2A gateway pod.
+func usagePeopleObjects(created time.Time) []client.Object {
+	return append(usageDefaultObjects(created), usageA2AGatewayPod("agent-a2a-gateway-ccc", "a2a-c", usageTestA2AIP, created))
+}
+
+// setPeople gives the A2A gateway's body the people reading.
+func (h *usageHarness) setPeople(short, long int64) {
+	h.stub.set(a2aAddr(), 0, ptr.To(1.0))
+	h.stub.setReadings(a2aAddr(), map[string]int64{usageExportPeopleSeen7d: short, usageExportPeopleSeen30d: long}, usageReadingPeople)
+}
+
+// peopleMisses is the CR's run of polls without a people reading, and whether
+// the poller keeps one at all.
+func (h *usageHarness) peopleMisses(agent *agentv1alpha1.PlatformAgent) (int, bool) {
+	h.p.mu.Lock()
+	defer h.p.mu.Unlock()
+	misses, ok := h.p.readingMisses[usagePollKey(agent)][usageReadingPeople]
+	return misses, ok
+}
+
+func TestUsagePoller_ThePeopleReadingsLandAsPointerFieldsAndNeverMoveLastActiveTime(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usagePeopleTestAgent(created, false), usagePeopleObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.setPeople(3, 11)
+	h.poll(5)
+	status := h.status()
+	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("people = %d/%d, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	if status.LastActiveTime != nil || status.LastHumanActiveTime != nil {
+		t.Fatalf("the people reading moved a time: lastActiveTime %v, lastHumanActiveTime %v", status.LastActiveTime, status.LastHumanActiveTime)
+	}
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got, want := usageReadingValue(status, spec.field), usageTestReadings(1)[spec.field]; got != want {
+			t.Errorf("broker reading %s = %d, want %d", spec.field, got, want)
+		}
+	}
+}
+
+func TestUsagePoller_ThePeopleReadingStaysAbsentWhileSlackIsOnHermes(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usagePeopleTestAgent(created, true)
+	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.setPeople(3, 11)
+	h.poll(5)
+	h.poll(10)
+	status := h.status()
+	if status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+		t.Fatalf("people = %d/%d with Slack on Hermes, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	if misses, _ := h.peopleMisses(agent); misses != 0 {
+		t.Fatalf("a closed gate recorded %d people misses, want 0", misses)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	stored.Spec.Integration.Slack.Enabled = ptr.To(false)
+	if err := h.cl.Update(context.Background(), stored); err != nil {
+		t.Fatalf("disabling Slack: %v", err)
+	}
+	h.poll(15)
+	status = h.status()
+	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("people = %d/%d after Slack left Hermes, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+}
+
+func TestUsagePoller_PeopleReadingsClearAfterTwoPollsWithoutASample(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usagePeopleTestAgent(created, false), usagePeopleObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.setPeople(3, 11)
+	h.poll(5)
+	h.stub.setReadings(a2aAddr(), nil)
+	h.poll(10)
+	if status := h.status(); gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("one poll without a sample: people = %d/%d, want 3/11 kept", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	h.poll(15)
+	if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+		t.Fatalf("two polls without a sample: people = %d/%d, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	h.setPeople(4, 12)
+	h.poll(20)
+	if status := h.status(); gaugeValue(status.PeopleSeen7d) != 4 || gaugeValue(status.PeopleSeen30d) != 12 {
+		t.Fatalf("the sample back: people = %d/%d, want 4/12", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+}
+
+func TestUsagePoller_ThePeopleReadingDoesNotShareTheBrokersStreak(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usagePeopleTestAgent(created, false), usagePeopleObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.setPeople(3, 11)
+	h.poll(5)
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	h.poll(10)
+	h.poll(15)
+	h.poll(20)
+	status := h.status()
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got := usageReadingValue(status, spec.field); got != -1 {
+			t.Errorf("three failed broker reads: %s = %d, want absent", spec.field, got)
+		}
+	}
+	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+		t.Fatalf("people = %d/%d with the broker down, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+}
+
+func TestUsagePoller_ThePeopleReadingsHaveTheirOwnPruningRecord(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usagePeopleTestAgent(created, false)
+	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
+	h.pruningPeople = true
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setReadings(brokerAddr(), usageTestReadings(1), usageReadingOutcomes, usageReadingDetails)
+	h.setPeople(3, 11)
+	h.poll(5)
+	status := h.status()
+	if status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+		t.Fatalf("people = %d/%d under a CRD without them, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+	}
+	if !h.p.newerFieldPruned(agent, usageNewerFieldPeople) || h.p.newerFieldPruned(agent, usageNewerFieldReadings) {
+		t.Fatal("the absence of the people readings was not recorded against their own record alone")
+	}
+	if h.r.usageStatusPruned(agent) {
+		t.Fatal("the absence of the people readings was recorded as the counters' pruning")
+	}
+	h.stub.setReadings(brokerAddr(), usageTestReadings(4), usageReadingOutcomes, usageReadingDetails)
+	h.poll(10)
+	status = h.status()
+	for _, spec := range usageReadingKindsOf(usageReadingSpecs, usageReadingOutcomes, usageReadingDetails) {
+		if got, want := usageReadingValue(status, spec.field), usageTestReadings(4)[spec.field]; got != want {
+			t.Errorf("broker reading %s = %d under a CRD without the people readings, want %d", spec.field, got, want)
+		}
+	}
+	patches := h.patches
+	h.poll(12)
+	if h.patches != patches {
+		t.Fatal("a poll with the people readings alone behind re-patched the status while their record was fresh")
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := h.cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatalf("reading the agent: %v", err)
+	}
+	held := h.r.heldUsageFields(stored)
+	if !held[usageExportPeopleSeen7d] || !held[usageExportPeopleSeen30d] || held[usageExportRemediationsMerged] {
+		t.Fatalf("held fields %v, want the people readings held and remediationsMergedTotal published", held)
+	}
+}
+
+// An install that renders no A2A stack has no people reading to take: the
+// pair stays absent and no miss is counted. A next install whose gateway pod
+// goes missing has a configured target with no body: one poll is a miss and
+// keeps the pair, the second clears it.
+func TestUsagePoller_NoA2AStackLeavesThePairAbsentWithoutAMissAndAMissingGatewayPodIsAMiss(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	t.Run("today", func(t *testing.T) {
+		agent := usageTestAgent(created)
+		h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+		h.stub.set(gatewayAddr(), 0, nil)
+		h.stub.set(brokerAddr(), 0, nil)
+		h.poll(5)
+		h.poll(10)
+		h.poll(15)
+		if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+			t.Fatalf("people = %d/%d with no A2A gateway, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		}
+		if misses, ok := h.peopleMisses(agent); ok {
+			t.Fatalf("no A2A gateway recorded a people miss streak of %d, want none", misses)
+		}
+	})
+	t.Run("next, the gateway pod gone", func(t *testing.T) {
+		agent := usagePeopleTestAgent(created, false)
+		objects := usagePeopleObjects(created)
+		h := newUsageHarness(t, agent, objects...)
+		h.stub.set(gatewayAddr(), 0, nil)
+		h.stub.set(brokerAddr(), 0, nil)
+		h.setPeople(3, 11)
+		h.poll(5)
+		if status := h.status(); gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+			t.Fatalf("people = %d/%d, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		}
+		if err := h.cl.Delete(context.Background(), objects[len(objects)-1]); err != nil {
+			t.Fatalf("deleting the A2A gateway pod: %v", err)
+		}
+		h.poll(10)
+		if status := h.status(); gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
+			t.Fatalf("one poll without the gateway pod: people = %d/%d, want 3/11 kept", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		}
+		if misses, _ := h.peopleMisses(agent); misses != 1 {
+			t.Fatalf("one poll without the gateway pod: %d people misses, want 1", misses)
+		}
+		h.poll(15)
+		if status := h.status(); status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
+			t.Fatalf("two polls without the gateway pod: people = %d/%d, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		}
+		if misses, _ := h.peopleMisses(agent); misses != 2 {
+			t.Fatalf("two polls without the gateway pod: %d people misses, want 2", misses)
+		}
+	})
 }

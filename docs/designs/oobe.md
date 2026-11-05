@@ -49,7 +49,9 @@ Chat Agent's home, and a job on another profile would gate itself on a different
 Stages this job takes over keep their `.bootstrap_*` markers, so an install upgraded mid-onboarding
 carries on from where it was. One whose `oobe` an earlier image already removed carries on through
 the old jobs, which the sync leaves enabled while no `oobe` job exists. New stages use `.oobe_*`. The `bootstrap_onboarding` plugin keeps the
-first message: it greets, and links the delivery to that chat.
+first message: it greets, links the delivery to that chat, and holds delivery until the greeting turn
+ends (`.bootstrap_greeting_pending.<turn>`, dropped by delivery itself after `GREETING_WAIT_SECONDS`),
+so the report follows the greeting.
 
 Order within a tick: delivery, then the scan, then the audits (§5 says why delivery is first). The
 audits wait for the scan rather than
@@ -64,8 +66,10 @@ summaries, which assume a fleet the operator has already seen.
 
 `bootstrap-inventory-scan` (`bootstrap_scan_gate.py`) files the sweep card to `platform`, which
 lists the fleet, and records it in `.bootstrap_scan_filed`. On the same job's ticks the hand-off
-(`bootstrap_handoff.py`) files one card per Cluster Agent and, once those settle or its deadline of
-an hour plus five minutes per cluster card passes (`deadline`), files the ranking card, key
+(`bootstrap_handoff.py`) files one card per Cluster Agent up to the first-run cap
+(`.first_run_cluster_cards`, default 6; the sweep audits the rest) and, once those settle or its
+deadline of an hour plus five minutes per cluster, carded or left to the sweep, passes
+(`deadline`), files the ranking card, key
 `bootstrap-inventory-prioritize`, recorded in `.bootstrap_handoff_filed`. It files one ranking card
 per sweep, and Hermes retries that card in place; a re-run by hand uses a suffixed key
 (`bootstrap_onboarding/README.md`). When no cluster was audited the hand-off writes the

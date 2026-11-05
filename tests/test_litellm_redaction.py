@@ -37,10 +37,15 @@ _CALLBACK_INSTANCE = "litellm_redaction_callback.proxy_handler_instance"
 _CONFIG_ENV_VAR = "KUBE_AGENTS_REDACTION_CONFIG"
 _SALT_ENV_VAR = "SESSION_KV_SALT"
 _CONFIGMAP_KEYS = ("redaction.yaml", "redactor.py", "litellm_redaction_callback.py")
-# What every render carries whether redaction is on or off: the config and the
-# thinking-replay hook (tests/test_litellm_thinking_replay.py).
-_ALWAYS_KEYS = ("config.yaml", "litellm_thinking_replay_callback.py")
-_ALWAYS_CALLBACKS = ["prometheus", "litellm_thinking_replay_callback.proxy_handler_instance"]
+# What every render carries whether redaction is on or off: the config, the
+# thinking-replay hook (tests/test_litellm_thinking_replay.py) and the
+# cache-marker hook (tests/test_litellm_cache_control_strip.py).
+_ALWAYS_KEYS = ("config.yaml", "litellm_thinking_replay_callback.py", "litellm_cache_control_strip_callback.py")
+_ALWAYS_CALLBACKS = [
+    "prometheus",
+    "litellm_thinking_replay_callback.proxy_handler_instance",
+    "litellm_cache_control_strip_callback.proxy_handler_instance",
+]
 _MOUNT_DIR = "/app"
 # The ConfigMap volume. The container also mounts an emptyDir scratch
 # directory that carries no subPath, so mounts are read by volume, not by

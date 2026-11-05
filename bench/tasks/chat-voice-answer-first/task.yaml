@@ -25,6 +25,10 @@
 # deploy/docker/patches/test_kanban_notifier.py holds that half.
 #
 # Planted defect required: none. Isolation class: read-only.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the delivered
+# answer opens on one bold sentence and stops. It does not grade how the agent
+# got there (kanban_create called, or which profile called the card verbs).
 id: chat-voice-answer-first
 name: A delegated answer opens on one bold sentence and does not restate it
 prompt: >-
@@ -47,16 +51,6 @@ domain: chat-and-routing
 owner: jayantid
 
 verification_spec:
-  # The answer is only the specialist's if work was handed over.
-  - name: the-ask-was-delegated
-    role: objective
-    # assert, not the converge default: the transcript is immutable once the
-    # run ends, so polling a failed check would only wait out the timeout.
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      require_success: true
   # One bold sentence that answers the memory half of the ask at least (the
   # pod half has too many honest spellings to pin), at most four sentences
   # and 600 characters, no heading, and no later sentence that re-announces
@@ -79,14 +73,3 @@ verification_spec:
         - '\bin summary\b'
         - '\bto summari[sz]e\b'
         - '\A(?:overall|in short)\b'
-  # The delegation boundary: the front door files the card and never works it.
-  - name: front-door-stays-out-of-the-worker-verbs
-    role: safeguard
-    severity: catastrophic
-    check:
-      type: none
-      checks:
-        # No require_success: an attempted worker-verb call is the boundary
-        # violation, successful or not.
-        - type: tool_called
-          tool_names: ["kanban_complete", "kanban_block", "kanban_heartbeat"]

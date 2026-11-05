@@ -105,6 +105,7 @@ from kube_agents_bench.scoring import (
     grade_suite,
     is_inject_record,
     load_run,
+    token_count,
 )
 
 __all__ = ["main"]
@@ -116,6 +117,14 @@ _DEFAULT_BASELINE_DIR = "baselines"
 #: dependencies in here -- ``test_gate.py`` asserts they agree).
 AGENT_TRANSPORT_ENV = "AGENT_TRANSPORT"
 TRANSPORT_INJECT = "inject"
+
+#: The commit whose ``bench/`` graded the run, which ``suite`` names in the
+#: verdict: hack/ci-eval-pr.sh exports it, as main's ``PULL_BASE_SHA`` on a
+#: pull request (the change's cases, main's grader) and HEAD elsewhere. An
+#: environment default rather than a flag the shell passes, so the script can
+#: set it while main's grader predates the flag. ``--grader-sha`` overrides.
+GRADER_SHA_ENV = "EVAL_GRADER_SHA"
+GRADER_SHA_KEY = "grader_sha"
 
 #: Rung 6 compares a run only with history from its own mode, because the
 #: mode is a component of the version key (``VersionKey.mode``). Before it
@@ -158,7 +167,7 @@ def graded_mode(env: dict[str, str] | None = None, *, inject_run: bool = False) 
 #: verdict. 0 green and 1 red are the literals they have always been.
 SUITE_EXIT_NOT_EVALUATED = 2
 
-#: The build-log word for a case the inject lane could not grade (rung
+#: The verdict word for a case the inject lane could not grade (rung
 #: NOT_GRADED_ON_TRANSPORT): every objective check set aside as not
 #: applicable on the record's transport. Beside PASSED, FAILED, UNSTABLE and
 #: RESOURCE_PREPARATION_FAILED, and distinct from all four on purpose.
@@ -213,6 +222,14 @@ REP_TIMING_TURN1_KEY = "turn1_s"
 # The line's precision. A value that rounds to zero at it is left out, as the
 # collector reads `0.0` as unknown.
 REP_TIMING_DECIMALS = 1
+# The keys of the `rep N tokens:` line, which the collector
+# (scripts/eval_dashboard/collect.py, _REP_TOKENS_KEYS) parses the same way:
+# the record's top-level counts, and the flag, printed only when set, that
+# says they are short of what the run billed.
+REP_TOKENS_INPUT_KEY = "input"
+REP_TOKENS_OUTPUT_KEY = "output"
+REP_TOKENS_TOTAL_KEY = "total"
+REP_TOKENS_PARTIAL_FIELD = "partial=1"
 
 # What must not reach the log line: C0 and C1 controls and DEL (a captured
 # kubectl colour code, a NUL, a stray 8-bit control), and lone surrogates,
@@ -340,7 +357,7 @@ def _bootstrap_admitted() -> frozenset[str]:
 
 
 def _label(case: dict[str, Any]) -> str:
-    """The build-log word for a case verdict.
+    """The verdict word printed for a case.
 
     Four labels, not two, because the rate rules create a state a two-label
     scheme cannot say. UNSTABLE is a case that failed repetitions -- but not
@@ -373,7 +390,7 @@ def _label(case: dict[str, Any]) -> str:
 
 
 def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> str:
-    """The agent's final report as one build-log line, or "" when it said nothing.
+    """The agent's final report as one grading line, or "" when it said nothing.
 
     Control characters and lone surrogates become spaces and whitespace is
     collapsed to single spaces, so the line is one printable line whatever
@@ -521,8 +538,23 @@ def _cmd_case(args: argparse.Namespace) -> int:
         )
         if timing:
             print(f"  rep {rep.index} timing: {timing}")
-        # The agent's own words, one line under the grading line of every
-        # repetition that did not pass, so the dashboard can quote the report
+        # The record's token counts, for the dashboard's per-repetition
+        # spend. A missing count is left out, and no line at all when every
+        # one is; zero is a count (a record that billed nothing) and is kept.
+        counts = " ".join(
+            f"{key}={value}"
+            for key, value in (
+                (REP_TOKENS_INPUT_KEY, rep.input_tokens),
+                (REP_TOKENS_OUTPUT_KEY, rep.output_tokens),
+                (REP_TOKENS_TOTAL_KEY, token_count(rep.total_tokens)),
+            )
+            if value is not None
+        )
+        if counts:
+            partial = f" {REP_TOKENS_PARTIAL_FIELD}" if rep.tokens_partial else ""
+            print(f"  rep {rep.index} tokens: {counts}{partial}")
+        # The agent's own words, one line under the grading line (after the
+        # timing and tokens lines) of every repetition that did not pass, so the dashboard can quote the report
         # beside the check that failed. A pass needs no quote; an empty
         # report (a transport failure's, typically) prints nothing rather
         # than an empty line. Its own shape -- `rep N report:` -- so nothing
@@ -562,7 +594,11 @@ def _record_says(case: dict[str, Any]) -> str:
 
 
 def _markdown(
-    verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
+    verdict: Any,
+    cases: list[dict[str, Any]],
+    *,
+    admission_column: bool = False,
+    grader_sha: str | None = None,
 ) -> str:
     not_evaluated = verdict.outcome == SUITE_OUTCOME_NOT_EVALUATED
     lines = [
@@ -571,6 +607,8 @@ def _markdown(
         f"**{SUITE_HEADLINES[verdict.outcome]}**",
         "",
     ]
+    if grader_sha:
+        lines += [f"Graded by `bench/` at `{grader_sha}`", ""]
     if not_evaluated:
         # The banner says what to do, because the headline alone invites the
         # wrong action: a pull request author who sees a red job debugs the
@@ -769,6 +807,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         verdict,
         cases,
         admission_column=_store_configured(args) or _record_decided(cases),
+        grader_sha=args.grader_sha,
     )
     # The banner goes in the markdown, not only in the log. A degraded read
     # silently loosens the gate, and the one thing that must not happen is a
@@ -829,6 +868,10 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         out.write_text(text, encoding="utf-8")
     if args.json_out:
         doc = verdict.to_dict()
+        # Only when known: a run that names no grader writes the document
+        # it always wrote (tests/test_store_unset_golden.py pins it).
+        if args.grader_sha:
+            doc[GRADER_SHA_KEY] = args.grader_sha
         if args.partial:
             doc["partial"] = True
             doc["partial_note"] = args.partial
@@ -988,9 +1031,10 @@ def _cmd_record(args: argparse.Namespace) -> int:
 
     if os.environ.get(ROLLBACK_LANE_ENV) == "1" and not args.force:
         # Third way in, mirrored from hack/ci-eval-pr.sh's recorder decision:
-        # the today lane's periodic on main has no PULL_NUMBER and grades an
-        # install rolled back from next over the api transport. Its key reads
-        # today, and today's window measures a fresh today install.
+        # a today-lane run on main (none runs today) would have no PULL_NUMBER
+        # and grade an install rolled back from next over the api transport.
+        # Its key would read today, and today's window measures a fresh today
+        # install.
         print(
             f"::error::refusing to record a baseline with {ROLLBACK_LANE_ENV}=1: "
             "the today lane grades a rolled-back install, which is not what "
@@ -1166,6 +1210,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "this is not the run's verdict: banner the markdown with NOTE and "
             "mark the JSON partial; for a run the deadline ended before its "
             "suite step"
+        ),
+    )
+    suite.add_argument(
+        "--grader-sha",
+        default=os.environ.get(GRADER_SHA_ENV) or None,
+        help=(
+            "the commit whose bench/ graded this run, named in the markdown "
+            f"and as {GRADER_SHA_KEY} in the JSON (default: ${GRADER_SHA_ENV})"
         ),
     )
     suite.set_defaults(func=_cmd_suite)

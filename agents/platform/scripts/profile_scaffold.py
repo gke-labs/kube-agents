@@ -15,14 +15,19 @@
 
 import argparse
 import contextlib
+import errno
+import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
+from typing import Callable
 
 try:
     import fcntl
@@ -47,23 +52,32 @@ DEFAULT_HERMES_HOME = "/opt/data"
 PROCESS_HOME = "home"
 NPM_HOME_CACHE = ".npm"
 NPM_SHARED_CACHE = Path(".cache", "npm")
-# Where the start-up sweep moves an old per-profile cache before it deletes it.
-NPM_RECLAIM_NAME = ".npm.reclaim"
+# The start-up sweep moves an old per-profile cache to a directory it names itself,
+# this stem and a random UUID's 32 hex digits, before it deletes it. It deletes every
+# such directory an earlier start-up left, and the bare prefix, the fixed name an
+# older image used, and nothing else under the prefix: a name a person picks, such as
+# ~/.npm.reclaimed or ~/.npm.reclaim.previous, does not have that shape.
+NPM_RECLAIM_PREFIX = ".npm.reclaim"
+NPM_RECLAIM_STEM = NPM_RECLAIM_PREFIX + "."
+NPM_RECLAIM_GLOB = NPM_RECLAIM_PREFIX + "*"
+NPM_RECLAIM_MOVED_RE = re.compile(re.escape(NPM_RECLAIM_STEM) + r"[0-9a-f]{32}")
 
 _jobs_lock_state = threading.local()
 
 
 @contextlib.contextmanager
-def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
+def cron_jobs_lock(cron_dir: Path, timeout: float | None = None, *, warn: Callable[[str], None] | None = None):
     """Serialize reads and writes to jobs.json against Hermes' own cron calls.
 
     Hermes (cron/jobs.py) protects load_jobs -> modify -> save_jobs with a
     cross-process advisory lock on <cron_dir>/.jobs.lock. Taking the same
     flock around the startup merge prevents racing with an in-pod `hermes cron`
-    command (such as `hermes cron pause` on restart).
+    command (such as `hermes cron pause` on restart). `warn` is where the
+    fail-open messages go; a caller in another script passes its own logger.
     """
     if timeout is None:
         timeout = DEFAULT_JOBS_LOCK_TIMEOUT_SECONDS
+    emit = warn or log
     held = getattr(_jobs_lock_state, "held", None)
     if held is None:
         held = {}
@@ -85,7 +99,7 @@ def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
     try:
         lock_fd = open(lock_path, "a+", encoding="utf-8-sig")
     except OSError as exc:
-        log(f"WARN: could not open cron jobs lock {lock_path} ({exc}); proceeding without lock")
+        emit(f"WARN: could not open cron jobs lock {lock_path} ({exc}); proceeding without lock")
         yield
         return
 
@@ -100,11 +114,11 @@ def cron_jobs_lock(cron_dir: Path, timeout: float | None = None):
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
-                        log(f"WARN: timed out after {timeout}s waiting for {lock_path}; proceeding without lock")
+                        emit(f"WARN: timed out after {timeout}s waiting for {lock_path}; proceeding without lock")
                         break
                     time.sleep(0.05)
                 except OSError as exc:
-                    log(f"WARN: could not acquire cron jobs lock {lock_path} ({exc}); proceeding without lock")
+                    emit(f"WARN: could not acquire cron jobs lock {lock_path} ({exc}); proceeding without lock")
                     break
         else:
             acquired = True
@@ -144,11 +158,62 @@ log = make_log("PROFILE-SCAFFOLD")
 # the entrypoint runs, so an unbuilt profile can already have a directory (see
 # deploy/shared/profile_plugins.py for the whole failure mode).
 PROFILE_MARKER = "profile.yaml"
+# One lock file per profile name, under the data root beside profiles/, held by
+# whatever creates, deletes or removes a profile's homes (#4389): create_profile,
+# delete_profile, and kanban_workspace_gc's stale-home sweep. A dot-directory, so
+# no lister takes it for a profile.
+PROFILE_LOCKS_DIRNAME = ".profile-locks"
+# Longer names get a hashed lock-file name, the same for every caller, so a name
+# the filesystem can hold as a directory (up to 255 bytes) can always be locked:
+# the name's first PROFILE_LOCK_NAME_KEEP characters, then PROFILE_LOCK_HASH_CHARS
+# of its sha256.
+PROFILE_LOCK_NAME_MAX = 200
+PROFILE_LOCK_NAME_KEEP = 64
+PROFILE_LOCK_HASH_CHARS = 16
 
 
 def profiles_base(hermes_home: Path) -> Path:
     # Hermes stores each named profile at $HERMES_HOME/profiles/<name>.
     return hermes_home / "profiles"
+
+
+def profile_lock_file(data_root: Path, name: str) -> Path:
+    """Where profile *name*'s lock lives under *data_root*."""
+    if len(name.encode("utf-8", "surrogateescape")) > PROFILE_LOCK_NAME_MAX:
+        import hashlib
+
+        digest = hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:PROFILE_LOCK_HASH_CHARS]
+        name = f"{name[:PROFILE_LOCK_NAME_KEEP]}-{digest}"
+    return data_root / PROFILE_LOCKS_DIRNAME / f"{name}.lock"
+
+
+@contextlib.contextmanager
+def profile_lock(data_root: Path, name: str, blocking: bool = True, on_error=None):
+    """Hold profile *name*'s lock under *data_root*; yield whether it is held.
+
+    *data_root* is the agent pod's data volume, the directory holding profiles/,
+    which every holder must pass alike for the lock to mean anything. Under the
+    chat roster that is HERMES_HOME; under the platform roster HERMES_HOME is
+    profiles/platform, and the data root is PLATFORM_AGENT_HOME (the entrypoint
+    sets the machine HERMES_HOME from it). An unopenable lock yields False, with
+    the error passed to *on_error*; so does a held one when *blocking* is False.
+    """
+    path = profile_lock_file(data_root, name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "w")  # noqa: SIM115 - closed below
+    except OSError as e:
+        if on_error is not None:
+            on_error(e)
+        yield False
+        return
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
 
 
 def is_scaffolded(home: Path) -> bool:
@@ -244,8 +309,13 @@ def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False
     over ~/.npm. A real ~/.npm directory is the old per-profile cache. With `reclaim`,
     it is moved aside, the link takes its place, and then the moved copy is deleted,
     so a delete that fails leaves an orphan directory, never a home with no link.
-    The next run with `reclaim` deletes an orphan that an earlier run left, before
-    anything else. Only the start-up sweep sets `reclaim`, because a process of the
+    Each move goes to a new name (NPM_RECLAIM_STEM and a random UUID), so an orphan,
+    or a file something else put at the old fixed name, never sits where the next
+    move lands. The next run with `reclaim` deletes every orphan directory with the
+    prefix, before anything else. One that another start-up is still moving into is
+    deleted too, which is harmless: that copy is deleted anyway, and a rename onto
+    a missing name still succeeds. With `reclaim`, a home left without the link
+    gets one log line naming what is at ~/.npm. Only the start-up sweep sets `reclaim`, because a process of the
     profile can be using the directory at any other time. On an install with more
     than one replica, a pod that has not restarted yet can still be using it during
     the sweep; no shipped agent runs an npx MCP server, and such a server starts
@@ -256,20 +326,28 @@ def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False
     if not process_home.is_dir():
         return
     link = process_home / NPM_HOME_CACHE
-    aside = process_home / NPM_RECLAIM_NAME
     shared = hermes_home / NPM_SHARED_CACHE
     try:
         # Also when the link exists: npm fails on every command when its cache is a dangling link.
         shared.mkdir(parents=True, exist_ok=True)
-        if reclaim and aside.is_dir() and not aside.is_symlink():
-            # Left by an earlier start-up whose delete failed or that stopped
-            # before the link; it would also block the rename below.
-            _delete_reclaimed_npm_cache(aside)
+        if reclaim:
+            for orphan in sorted(process_home.glob(NPM_RECLAIM_GLOB)):
+                # Left by an earlier start-up whose delete failed or that stopped
+                # before the link. A file or symlink with the prefix is not ours
+                # and no longer blocks anything, so it stays.
+                if _is_reclaim_dir(orphan):
+                    _delete_reclaimed_npm_cache(orphan)
         if link.is_symlink():
+            if reclaim and not _points_at(link, shared):
+                log(f"WARN: left npm in {process_home} as it is: ~/.npm is {_symlink_shape(link)} "
+                    f"({os.readlink(link)}), not the shared cache {shared}")
             return
         if link.exists():
             if not (reclaim and link.is_dir()):
+                if reclaim:
+                    log(f"WARN: left npm in {process_home} as it is: ~/.npm is not a directory, so it is not replaced by the shared cache {shared}")
                 return
+            aside = process_home / f"{NPM_RECLAIM_STEM}{uuid.uuid4().hex}"
             link.rename(aside)
             link.symlink_to(os.path.relpath(shared.resolve(), process_home.resolve()), target_is_directory=True)
             log(f"pointed npm in {process_home} at the shared cache {shared}")
@@ -279,6 +357,40 @@ def share_npm_cache(process_home: Path, hermes_home: Path, reclaim: bool = False
         log(f"pointed npm in {process_home} at the shared cache {shared}")
     except OSError as exc:
         log(f"WARN: could not point npm in {process_home} at the shared cache {shared} ({exc})")
+
+
+def _points_at(link: Path, target: Path) -> bool:
+    """Whether the symlink `link` resolves to `target`, which exists.
+
+    RuntimeError too: before Python 3.13, resolve(strict=True) raises it, not
+    OSError, for a symlink loop, and the sweep must not stop at one home.
+    """
+    try:
+        return link.resolve(strict=True) == target.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _symlink_shape(link: Path) -> str:
+    """How a ~/.npm symlink that is not the shared cache looks, for the sweep's log line."""
+    try:
+        link.stat()
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return "a symlink loop"
+        if exc.errno == errno.ENOENT:
+            return "a dangling symlink"
+        # ENOTDIR, EACCES and the rest: the target is there but cannot be reached.
+        return f"a symlink whose target cannot be reached ({exc.strerror})"
+    return "a symlink to somewhere other than the shared cache"
+
+
+def _is_reclaim_dir(path: Path) -> bool:
+    """Whether `path` is a directory the sweep named, or an older image's fixed name."""
+    name = path.name
+    if name != NPM_RECLAIM_PREFIX and not NPM_RECLAIM_MOVED_RE.fullmatch(name):
+        return False
+    return path.is_dir() and not path.is_symlink()
 
 
 def _delete_reclaimed_npm_cache(aside: Path) -> None:
@@ -418,15 +530,21 @@ def backfill_cron_store(store: object) -> object:
     return {**store, "jobs": out}
 
 
-def backfill_cron_file(path: Path) -> bool:
+def backfill_cron_file(path: Path) -> bool | None:
     """Backfill DEFAULT_LEGACY_CRON_RISK into a cron/jobs.json file if present.
 
     Atomic rewrite using a .tmp sibling and os.replace, matching _merge_after_overlay.
-    Returns True if the file was modified, False otherwise.
+    Returns True if the file was modified, False if it needed nothing, and None when
+    the store could not be read or rewritten: the entrypoint runs this on a pass it
+    stamps as finished only when every step finished, so "nothing to do" and "could
+    not" have to be told apart.
     """
     with cron_jobs_lock(path.parent):
         data = read_json(path)
         if data is None:
+            if path.exists():
+                log(f"WARN: could not read cron store {path}; its jobs were not backfilled")
+                return None
             return False
         backfilled = backfill_cron_store(data)
         if backfilled == data:
@@ -438,7 +556,7 @@ def backfill_cron_file(path: Path) -> bool:
             return True
         except OSError as exc:
             log(f"WARN: could not backfill cron store {path}: {exc}")
-            return False
+            return None
 
 
 def retire_cron_jobs(store: object, retire_ids: tuple[str, ...]) -> object:
@@ -652,7 +770,8 @@ def main() -> None:
         target = Path(args.backfill_cron)
         if not target.is_file():
             raise SystemExit(f"ERROR: --backfill-cron target not found: {target}")
-        backfill_cron_file(target)
+        if backfill_cron_file(target) is None:
+            raise SystemExit(f"ERROR: --backfill-cron could not read or rewrite {target}")
         return
 
     if not args.template:

@@ -26,10 +26,11 @@ reviewers:
       - stalhaali
       - Fuxiao-Gao
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
-    # change to hack/eval/presubmit-cases.txt or hack/eval/blocking-roster.txt
-    # (#1546; hack/OWNERS). Keep the two lists identical. A mixed pull request
-    # routes here alone, so a member who is not a root approver can clear the
-    # roster half and the rest still waits on a root approver's /approve.
+    # change to hack/eval/presubmit-cases.txt, hack/eval/blocking-roster.txt
+    # (#1546) or the inject lane's exclusions and safeguards (hack/OWNERS).
+    # Keep the two lists identical. A mixed pull request routes here alone, so
+    # a member who is not a root approver can clear the roster half and the
+    # rest still waits on a root approver's /approve.
     eval-crew:
       - jayantid
       - lapis2002
@@ -46,6 +47,10 @@ files:
   "hack/eval/presubmit-cases.txt":
     - eval-crew
   "hack/eval/blocking-roster.txt":
+    - eval-crew
+  "hack/eval/inject-lane-exclusions.txt":
+    - eval-crew
+  "hack/eval/inject-lane-safeguards.yaml":
     - eval-crew
 
 options:

@@ -98,6 +98,7 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         homes = {
             "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
             "nightly-cases.txt": set(eval_rosters.nightly_cases()),
+            "certification-cases.txt": set(eval_rosters.certification_cases()),
             "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
             "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
         }
@@ -436,6 +437,84 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_quoted_boolean_against_a_boolean_field_is_rejected(self):
+        """The verifier compares `value` raw and the API holds a bool, so a
+        quoted boolean never compares equal and the check asserts nothing; the
+        run would go red only after the lease. Judged by (parent, field) pair,
+        read as a JSONPath parser would: filters stripped, every other bracket
+        selector dropped (an index, a negative index, a slice, a union, a
+        wildcard), padding ignored, quoted keys whole, the object root as
+        parent ""."""
+        flagged = (
+            ("resource_property", "eq", "spec.suspend"),
+            ("fleet_resource_property", "ne", "spec.suspend"),
+            ("resource_property", "ne", "$.spec['suspend']"),
+            ("fleet_resource_property", "eq", "spec.template.spec.hostNetwork"),
+            ("resource_property", "eq", "spec.template.spec.containers[?(@.name=='app')].securityContext.privileged"),
+            ("resource_property", "eq", "spec.template.spec.volumes[?(@.name=='data')].configMap.optional"),
+            ("resource_property", "eq", "spec.template.spec.volumes[0].configMap.optional"),
+            ("resource_property", "ne", "spec.template.spec.containers[0].volumeMounts[?(@.name=='data')].readOnly"),
+            ("resource_property", "eq", "spec.template.spec.containers[0].volumeMounts[*].readOnly"),
+            ("fleet_resource_property", "eq", "$.immutable"),
+            ("resource_property", "eq", "spec.template.spec.containers[0].volumeMounts[-1].readOnly"),
+            ("resource_property", "eq", "spec.template.spec.containers[0:2].securityContext.privileged"),
+            ("resource_property", "eq", "spec.template.spec.volumes[0,1].configMap.optional"),
+            ("resource_property", "eq", "spec.template.spec.containers[*].securityContext.privileged"),
+            ("resource_property", "eq", "spec. suspend"),
+            ("fleet_resource_property", "eq", "automountServiceAccountToken"),
+            ("resource_property", "eq", "spec.nodePoolAutoCreation.enabled"),
+        )
+        for check_type, op, path in flagged:
+            problems = []
+            validator._check_assertions(
+                {"type": check_type, "path": path, "op": op, "value": " True "},
+                "check 'x'", problems,
+            )
+            self.assertEqual(len(problems), 1, (check_type, op, path, problems))
+            self.assertIn("asserts nothing", problems[0])
+            self.assertIn("value: true", problems[0])
+            self.assertIn("BOOLEAN_FIELD_PAIRS", problems[0])
+        problems = []
+        validator._check_assertions(
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": "true", "across_matches": "none"},
+            "check 'x'", problems,
+        )
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("asserts nothing", problems[0])
+
+    def test_string_fields_bare_booleans_and_other_shapes_pass_the_boolean_rule(self):
+        """Only a known (parent, field) pair is judged: a Service selector, a
+        label, a data key, a quoted dotted key, a CRD's own `spec.enabled`, an
+        unknown map and a condition status compared to "true" are correct
+        cases. A wrong parent is silent. A path the reader does not follow,
+        recursive descent, is a miss and never a wrong flag. A bare boolean,
+        `op: exists` and malformed shapes raise no problem from this rule and
+        must not crash."""
+        for node in (
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": True},
+            {"type": "fleet_resource_property", "path": "spec.suspend", "op": "ne", "value": False},
+            {"type": "resource_property", "path": "spec.selector.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "metadata.labels.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.template.metadata.annotations['safe-to-evict']", "op": "eq", "value": "false"},
+            {"type": "resource_property", "path": "data.enabled", "op": "eq", "value": "false"},
+            {"type": "resource_property", "path": "spec.hard['feature.enabled']", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "metadata.annotations['autoscaling.enabled']", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.foo.enabled", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.jobTemplate.suspend", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec..suspend", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "$..privileged", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "spec.taints[?(@.key=='seeded-role')].value", "op": "eq", "value": "true"},
+            {"type": "resource_property", "path": "status.conditions[?(@.type=='Ready')].status", "op": "eq", "value": "True"},
+            {"type": "resource_property", "path": "spec.suspend", "op": "exists", "value": "true"},
+            {"type": "resource_property", "path": "spec.suspend", "op": ["eq"], "value": "true"},
+            {"type": "resource_property", "path": "spec.suspend", "op": "eq", "value": ["true"]},
+            {"type": "resource_property", "path": None, "op": "eq", "value": "true"},
+        ):
+            problems = []
+            validator._check_assertions(node, "check 'x'", problems)
+            self.assertEqual(problems, [], node)
+
     def test_a_check_that_asserts_without_a_field_is_not_rejected(self):
         # An empty CHECK_ASSERTIONS tuple is the "no field can switch this off"
         # case, not a missing entry: pull_request_opened fails on a report
@@ -526,13 +605,15 @@ class TestTheRulesReject(unittest.TestCase):
         ],
     }
 
-    def _validate(self, *, registered=frozenset({"made-up-case"}), text=None, **overrides):
+    def _validate(self, *, registered=frozenset({"made-up-case"}), certification=None, text=None, **overrides):
         spec = {k: v for k, v in {**self.VALID, **overrides}.items() if v is not DELETE}
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
             path.write_text(text if text is not None else yaml.safe_dump(spec))
-            return validator.validate_case("made-up-case", path, registered=set(registered))
+            return validator.validate_case(
+                "made-up-case", path, registered=set(registered), certification=None if certification is None else set(certification)
+            )
 
     def _only(self, needle, **kwargs):
         """The one problem this mutation causes, and nothing else."""
@@ -547,6 +628,27 @@ class TestTheRulesReject(unittest.TestCase):
 
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
+
+    # -- the certification suite: the roster and the suite line agree --
+
+    def test_a_certification_case_with_its_line_in_the_roster_passes(self):
+        self.assertEqual(self._validate(suite="certification", certification={"made-up-case"}), [])
+
+    def test_a_rostered_certification_case_without_the_line_is_reported(self):
+        self._only("is in hack/eval/certification-cases.txt but declares no 'suite: certification'", certification={"made-up-case"})
+
+    def test_a_suite_line_outside_the_roster_is_reported_once(self):
+        # Registered nowhere at all: the suite finding names the right file,
+        # and the general registration finding (which would say
+        # nightly-cases.txt) stays quiet.
+        self._only("is not in hack/eval/certification-cases.txt", suite="certification", certification=set(), registered=set())
+
+    def test_a_parked_certification_case_may_carry_its_suite_line(self):
+        with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
+            self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
+
+    def test_an_unknown_suite_is_reported(self):
+        self._only("the only suite is 'certification'", suite="nightly")
 
     # -- the first-install-hello stack's phrase --
 
@@ -703,6 +805,30 @@ class TestTheRulesReject(unittest.TestCase):
             with self.subTest(value=value):
                 self._only("non-empty list", audit_streams=value)
 
+    # -- scope_exclude --
+
+    def test_a_declared_scope_exclusion_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"]}), [])
+
+    def test_a_scope_exclusion_with_absent_clusters_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"], "absent": 1}), [])
+
+    def test_an_absent_count_out_of_range_is_rejected(self):
+        for absent in (0, -1, 9, True, "1"):
+            with self.subTest(absent=absent):
+                self._only("must be {slots:", scope_exclude={"slots": ["b"], "absent": absent})
+
+    def test_a_slot_the_catalogue_does_not_declare_is_rejected(self):
+        self._only("does not declare", scope_exclude={"slots": ["b", "z"]})
+
+    def test_excluding_every_slot_is_rejected(self):
+        self._only("excludes every seeded slot", scope_exclude={"slots": ["a", "b", "c", "d"]})
+
+    def test_a_scope_exclusion_the_runner_cannot_read_is_rejected(self):
+        for value in (None, ["b"], {"slots": []}, {"slots": ["b", "b"]}, {"slots": ["seeded-b"]}, {"clusters": ["b"]}):
+            with self.subTest(value=value):
+                self._only("must be {slots:", scope_exclude=value)
+
     def test_an_unreadable_platform_roster_is_a_case_error_naming_it(self):
         # A CaseError, which the lint's per-case loop reports, not a traceback that hides every case.
         for text in ("{trailing,}", "null", '{"jobs": {"compliance-audit": {}}}'):
@@ -853,6 +979,45 @@ class TestTheRulesReject(unittest.TestCase):
             verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["orphan-disks"]}),
         )
         self.assertIn("'fixture_roles:' names 'orphan-disks'", problem)
+
+    def test_a_project_scoped_role_is_rejected_in_fixture_role(self):
+        # startup-fail-vm has cluster_slot null: the runner writes no
+        # kubeconfig for it, so a check cannot read its objects.
+        problem = self._only(
+            "a project-scoped role",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={
+                "type": "fleet_resource_property", "fixture_role": "startup-fail-vm", "kind": "deployment",
+                "resource_name": "x", "path": "spec.replicas", "op": "eq", "value": 1,
+            }),
+        )
+        self.assertIn("'fixture_role:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_rejected_in_fixture_roles(self):
+        problem = self._only(
+            "has no cluster slot in the fleet catalogue",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["startup-fail-vm"]}),
+        )
+        self.assertIn("'fixture_roles:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_accepted_in_fixtures(self):
+        self.assertEqual(self._validate(fixtures=["startup-fail-vm"]), [])
+
+    def test_a_project_scoped_catalogue_role_the_overlay_omits_is_a_disagreement(self):
+        roles = {**validator._catalog_roles(), "made-up-vm": {"cluster_slot": None, "probes": ["instance/made-up-*"]}}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-vm' is project-scoped", problems[0])
+
+    def test_a_catalogue_role_that_is_not_a_mapping_is_rejected_not_project_scoped(self):
+        roles = {**validator._catalog_roles(), "made-up-broken": "cluster_slot: a"}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            self.assertNotIn("made-up-broken", validator._catalog_project_roles())
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-broken' is not a mapping", problems[0])
 
     def test_a_scalar_fixture_roles_is_rejected_as_a_shape_not_as_letters(self):
         problem = self._only(

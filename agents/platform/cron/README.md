@@ -223,7 +223,9 @@ check didn't run today", why, and that an admin needs to fix it, since no retry
 resolves the number) with the reason and the remedy in
 `logs/upgrade_readiness_watch.log` under the agent home, which fluent-bit
 ships, and kept in `last-failure.txt` by the kind of failure until the next
-clean tick posts the recovery. A failure a retry may clear (a timeout, a
+clean tick posts the recovery. A roster spelling that is not a project, no GCP
+project at all, a ledger it refuses to overwrite, and an agent image missing the
+report script end the same way. A failure a retry may clear (a timeout, a
 sandbox that failed) says instead that it tries again tomorrow, or at its next
 scheduled run when its roster entry is not daily;
 beside projects that were keyed, the table is partial, posted once with the
@@ -411,8 +413,8 @@ list equal to `read_only_roles` in the full-install composition.
 It keeps a ledger at `profiles/platform/cron/sa_role_watch.json`, the way
 `stall-watch` does, so chat hears a role on the tick it first appears and again
 when it goes. A role still held is said again once a day, on the first tick from
-12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats: a
-grant said once in a busy channel can be missed, and nothing else would raise it
+12:00 UTC (`REMIND_HOUR_UTC`), for the reason `kanban-board-health` repeats a
+stuck card weekly: a grant said once in a busy channel can be missed, and nothing else would raise it
 again. Any other tick on an unchanged account prints nothing. That is why it can run
 hourly: a fresh install or a new grant is named within the hour, and a quiet
 hour costs one `kubectl` pair and one policy read per project, no model turn. A
@@ -424,6 +426,79 @@ one per project. It reads project-level bindings only: a role granted on a folde
 the organisation or a group is not in that answer, and reading those needs
 verbs the broker's allowlist does not carry. A `custom` set chosen on purpose
 is reported like any other grant, and repeated daily like one.
+
+## `leeway-watch` sweeps topology skew and priority-rank findings daily
+
+The `topology-drift` skill reads a `leeway report` on request and attributes
+the zonal skew it finds. `leeway_watch.py` (`no_agent: true`, `deliver:
+"chat"`, daily at 08:30 UTC) runs `leeway report --topology-tier-c-signals
+--clusters <project>/<location>/<cluster>,…` in `agent-sandbox` across the fleet
+(`LEEWAY_WATCH_CLUSTERS` when set, else `LEEWAY_WATCH_PROJECTS` or the
+management project plus every project a Cluster Agent profile's identity names;
+a project with no Cluster Agent profiles is enumerated with `gcloud container
+clusters list` first, since the sandbox relays that and not the GKE API route
+leeway's own `--clusters-from <project>` would take) and gates notifications
+through `<profile home>/leeway/ledger.json`. The report's topology findings
+(`leeway.contract_violated`, `leeway.placement_drift`,
+`leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
+key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
+`leeway.rank_degraded`, `leeway.rank_no_migration`, `leeway.rank_tier_unused`)
+by cluster, class, judging rule and kind. A finding earns a report under
+`<profile home>/leeway/reports/` (`<timestamp>.md` and `<timestamp>.json`, with
+`latest.md` and `latest.json` symlinks) and a chat summary line when it first
+appears, when its `suspectedCause` (a rank finding's `rule`) changes or its
+`severity` escalates, or when its 7-day refresh window
+(`LEEWAY_WATCH_REFRESH_DAYS`, with ten minutes of slack) comes round. Resolved
+findings on cleanly scanned (`status: "ok"`) clusters are retired with a single
+resolution line, while clusters whose scan failed retain their ledger entries so
+transient errors do not erase state and re-page tomorrow.
+
+## `session-retention` gives every profile's history an end
+
+Hermes already prunes session history: `sessions.auto_prune` deletes ended
+sessions inactive for `sessions.retention_days`, with their messages and
+transcript files, and VACUUMs when the prune freed more than a quarter of the
+file (`SessionDB.maybe_auto_prune_and_vacuum`). It does so when a CLI or the
+gateway starts, at most once a day per `state.db`. Two stores never get that
+start. One is the machine home's, which only the long-lived gateway opens, at
+construction. The other is a profile that has not run a process since its
+history aged out. So their history grew without bound.
+`session_retention.py` calls the same Hermes method on every profile's store
+once a day, so it keeps Hermes' guarantees: open, pinned and mid-turn sessions
+are never deleted, and there is one maintenance lock per store. Its throttle is
+20 hours rather than Hermes' 24, so a tick starting a few seconds earlier than
+yesterday's still runs. It never VACUUMs: the gateway (on the machine home, or on
+`profiles/platform` when the Platform Agent is the front door) and the workers
+hold these stores while it runs, and a VACUUM rewrites the whole file under them.
+Hermes VACUUMs each store when a process starts on it, and SQLite reuses the pages
+a prune frees in the meantime. It also removes rotated
+Hermes log backups (`<name>.log.<n>`) older than the period; the live log files keep Hermes' size cap, and
+`audit.jsonl` and its rotations are never touched.
+
+The period is the managed scope's `sessions.retention_days`, which the operator
+renders from `spec.harness.retention.sessionDays` (default 90, Hermes' own, so
+an upgrade deletes nothing it would not have deleted anyway, and for now also
+the minimum). It is in the managed scope so that one period covers every
+profile and a profile cannot lengthen its own.
+
+Before each prune it pins every session that another session still names as
+its parent, and unpins the ones it pinned whose children are gone. Some readers
+follow `parent_session_id` back to where a conversation started, a compression
+continuation to its origin among them, and a prune clears that link when it
+deletes the parent. A parent ages only on its own rows, so a conversation still
+going long after it was compressed would otherwise lose its origin. Hermes'
+prune skips pinned rows, the prunes it runs at process start included. The job
+sets the flag on the one row (Hermes' own pin command pins the whole lineage and
+unhides it), and keeps the ids it pinned in the store's `state_meta`, so a pin
+set by hand is never cleared. A chain unwinds one parent a day once its newest
+session is pruned. A store whose pins cannot be set is not pruned that day.
+
+A blocked kanban card needs no exemption: its worker starts a
+fresh session on every run and reads its context from the card. A chat thread
+whose session ended and then sat idle past the period starts a fresh session
+when someone replies. It runs at 05:50 UTC, after the workspace collector and
+before the morning audits, and prints nothing unless a store could not be
+maintained.
 
 ## `kanban-workspace-gc` is neither a watchdog nor a poller
 
@@ -482,24 +557,64 @@ engine's findings, and prints only when something is wrong. One finding is
 reported whatever the severity floor says: a card `blocked` for more than a day
 with no comment or unblock since. A worker's or operator's block is sticky by
 design, nothing retries it, and #656 was a finished report parked that way for
-weeks because nothing periodically asked. Cards are listed newest first, with
-their kind, reason, and age read from the board; where multiple cards share a
-title, they are grouped to keep the report readable, with task IDs and reasons
-retained. The `hermes kanban unblock` and `archive` commands appear once in a
-footer (using `<task_id>` when multiple cards are stuck) rather than repeated
-under every card, so the room knows how to move a card while long reports stay
-bounded within chat limits, summarizing any omitted cards by task ID up to
-the character budget (and falling back to a count and list command when omitted IDs
-exceed the limit).
+weeks because nothing periodically asked.
 
-Daily, and it repeats: the rule is stateless, so a card still blocked is named
-(directly, or by task ID in the omitted list up to the budget)
-every morning until someone unblocks, comments on, or archives it. That is the
-intended nag, the same rule `findings-morning-nudge` keeps for the top
-criticals it named, and the reason a finer cadence buys nothing: the engine's threshold is a
-day. It fires at 12:35 UTC, half an hour after that nudge's daily reminder, for
-the same reason the reminder waits for 12:00: an earlier UTC hour is the middle
-of the night in the US, not a morning.
+The stuck cards are said in plain words for whoever is in the channel: a
+headline counting them ("2 tasks are stuck and need someone to decide."), then
+one row per card, newest first, with the card's own title in bold and how long
+it has waited ("Stopped 3 days ago before finishing.", or "Paused 6 days ago."
+for a `needs_input` block, which waits on a person's answer). Cards sharing a
+title and whether they wait on a person are one row with their count, and past
+`MAX_STUCK_ROWS` rows the rest are counted. A card that holds back todo cards
+(a child waits until every parent is done) names the first of them under its
+row ("Holding back: Open GitOps PR for x."). No task ids, block reasons or
+`hermes kanban` commands are shown in chat; `hermes kanban list` and `show` on
+the agent pod have them.
+
+In Slack, with `KAGE_SLACK_UX` on, each row carries Retry and Drop. When the
+stuck cards are all a run says, the script leaves a card file beside its record
+(`kanban_board_health.card.json`): each row as printed, with the ids of the
+cards it stands for, and the text it printed. The relay posts that card in
+place of the text, and only for that text
+([cron-report-relay.md](../../../docs/designs/cron-report-relay.md)). The ids ride
+in the buttons' values, unseen. Retry unblocks the row's cards and Drop archives
+them, through session-kv's `POST /v1/board/actions`, which touches only a card
+`blocked` when pressed: a stale button leaves alone a card that has moved on,
+and acts on one that has blocked again. The row is edited in place
+to "✓ Retrying. <name>, <time>" or "Dropped. <name>, <time>" ("No longer
+stuck. <name>, <time>" when the cards had already moved). Whoever the gateway would answer may
+press: the Slack adapter's interactive authorization and channel gate under
+today, the Home tab's admission rule under `spec.mode: next`. A tap is never an
+agent turn. Google Chat, and a run that also reports the board's other
+findings, get the text.
+
+It runs daily but speaks about stuck cards only when one first gets stuck, then
+once a week while any stays stuck: a card said once in a busy channel can be
+missed, and a daily repeat of the same list is noise. The ids last said, and
+when, are kept in `profiles/platform/cron/kanban_board_health.json` under the
+agent home; a card that comes unstuck drops out of it, so it is new again if it
+sticks again, and a record that cannot be read says every stuck card again. The
+record is written before the scheduler delivers, so a run that finds a hard
+delivery failure (graded as `chat-delivery-watch` grades it) on this job's
+entry stamped after the last post says the cards again rather than leaving
+them unsaid for a week. A partial or degraded relay, or a note on a report that
+arrived, landed somewhere and is not said again. The
+board's other findings (invariant violations and the engine's other rules) are
+rare and still print on every run that finds them, under
+`kanban board health: attention required`. It fires at 12:35 UTC, half an hour
+after the findings-queue nudge's daily reminder, for the same reason the
+reminder waits for 12:00: an earlier UTC hour is the middle of the night in the
+US, not a morning.
+
+When the agent's data volume is at or past the Session KV server's warn line
+(90% used), a run that prints other findings leads them with that server's
+warning line, as their likely cause: every board write fails on a full volume.
+Alone the line is not printed, because the server's warning posts once per
+crossing and a daily repeat would be noise, and because it would turn a
+stuck-cards report into text without its buttons. A board that cannot be read
+for "database or disk is full" while the volume is past the line, or for "disk
+I/O error" with no space left at all, is said as a full disk, with the line,
+not as a bare read error.
 
 It sits here rather than on the Chat Agent's roster because that roster delivers
 `local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
@@ -702,7 +817,7 @@ repositories posts each finished repository's report, then a line naming any it
 did not finish. A failed run posts the scheduler's failure line in plain words,
 once until the job runs again ([the relay design](../../../docs/designs/cron-report-relay.md)),
 and a run that finished no repository without failing posts a one-line notice
-that it did not finish. On Slack the report is then replaced by a headline linking its
+that it did not finish. On Slack, and on Google Chat under `spec.mode: next`, the report is then replaced by a headline linking its
 ledger issue when the run covered one repository; a message with that line, or
 with several repositories' reports, is posted whole. It is a delivery mode, not a
 prompt contract: **the job's prompt says nothing about it**, because the
@@ -811,7 +926,7 @@ at `$HERMES_HOME` directly and the entrypoint seeds it with
 `cp -ru /opt/defaults/. "$TARGET_DIR/"` (`deploy/shared/docker-entrypoint.sh`,
 step 2). `cron/` is in neither force-sync list — step 2a covers `SOUL.md`,
 `AGENTS.md`, `CAPABILITIES.md` and `hindsight/config.json`, step 2b covers
-`scripts/` — and since the
+`scripts/` and `plugins/bootstrap_onboarding/` — and since the
 scheduler writes `last_run` into the volume's copy on every tick, that copy's
 timestamp is permanently ahead of the image's, and `cp -u` skips it for good.
 
@@ -892,6 +1007,20 @@ that skips regenerating fails there rather than at 06:20 in production. Run
 No prompt is quoted here on purpose. A copy in prose is one more place for the
 same numbers to go stale, and the test above checks the roster against the SOPs
 — not this file against the roster.
+
+## The `--scheduled` sentence in audit prompts
+
+Every fleet-audit prompt tells the worker to pass `--scheduled` to `finish`.
+Only a run with that flag can get `silent_ok: true`, so the sentence is what
+lets a quiet scheduled run answer `[SILENT]`. It is in the prompt and not in
+the SOP, because a scheduled run and an on-demand run read the same SOP: an SOP
+that passed the flag would let every on-demand run of its stream go silent.
+`test_every_audit_cron_prompt_passes_scheduled_to_finish` in
+`../skills/fleet-audit/scripts/test_audit_report.py` checks that each audit
+prompt has the phrase `pass --scheduled to finish` and that no SOP passes the
+flag. A prompt without it
+only makes its job noisier. The rule is in
+[ledger design §7.5](../../../docs/designs/fleet-audit-issue-ledger.md#75-silent_ok-and-who-is-listening).
 
 ## `risk` tier contract
 

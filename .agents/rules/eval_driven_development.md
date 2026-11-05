@@ -91,7 +91,8 @@ so that is the lane a case on its matrix goes red or green on. Against a next in
 two exports `hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN`
 from the `token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
 `hack/eval/inject-lane-exclusions.txt` is graded over the agent API instead (the today lane and
-the nightlies); run it without them. The lane also appends the GitHub-write safeguard in
+the nightlies); run it without them. A case on `hack/eval/api-lane-exclusions.txt` is the
+reverse: it runs only with them, and without them its run errors rather than going red. The lane also appends the GitHub-write safeguard in
 `hack/eval/inject-lane-safeguards.yaml` to every task, so a case that passes here can still trip
 it in CI.
 
@@ -121,7 +122,8 @@ run directories; the pull request cites them.
 
 **4. Register.** A new case is registered in `hack/eval/nightly-cases.txt` in the same pull
 request: in that file's sorted section, at its place in case-id order, with its reason as the
-`#` lines above it. The case has a `docs/designs/domains.yaml` slug (a new row there, with its
+`#` lines above it (a case with `suite: certification` registers in
+`hack/eval/certification-cases.txt` instead: [`bench/README.md`](../../bench/README.md#certification-suite)). The case has a `docs/designs/domains.yaml` slug (a new row there, with its
 owner, backup and meaning, when none describes the case); you may set `owner:` to yourself so
 the case's bugs reach you before the domain owner
 ([`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md#ownership)). The nightly is where a

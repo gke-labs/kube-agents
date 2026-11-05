@@ -37,6 +37,7 @@ import yaml
 REPO = Path(__file__).resolve().parents[2]
 STACK = REPO / "bench" / "tf" / "prebuilt" / "stale-audit-ledger"
 TASK = REPO / "bench" / "tasks" / "fleet-audit-clean-close-reads-clean" / "task.yaml"
+GAP_TASK = REPO / "bench" / "tasks" / "fleet-audit-on-demand-run-reports" / "task.yaml"
 AUDIT = "ai-security-audit"
 GITOPS = "acme/fleet"
 NOW = datetime(2026, 10, 11, 9, 0, tzinfo=timezone.utc)
@@ -79,7 +80,7 @@ def forge_with(monkeypatch, **replies):
     return forge
 
 
-def seeded_body(monkeypatch):
+def seeded_body(monkeypatch, gap=False):
     forge = forge_with(
         monkeypatch,
         **{
@@ -87,12 +88,12 @@ def seeded_body(monkeypatch):
             "issue-create": {"issue": {"number": 7, "url": "https://github.com/acme/fleet/issues/7"}},
         },
     )
-    ledger.seed(audit_report, AUDIT, GITOPS, NOW)
+    ledger.seed(audit_report, AUDIT, GITOPS, NOW, gap=gap)
     return forge, forge.payloads("issue-create")[0]["body"]
 
 
-def objective(name):
-    spec = yaml.safe_load(TASK.read_text(encoding="utf-8"))["verification_spec"]
+def objective(name, task=TASK):
+    spec = yaml.safe_load(task.read_text(encoding="utf-8"))["verification_spec"]
     return next(entry["check"] for entry in spec if entry["name"] == name)
 
 
@@ -184,8 +185,75 @@ def test_teardown_closes_only_the_ledger_this_case_opened(store, monkeypatch):
     assert [p["number"] for p in forge.payloads("issue-close")] == [7]
 
 
-def test_every_task_variable_is_declared_by_the_stack():
-    task = yaml.safe_load(TASK.read_text(encoding="utf-8"))
+def test_teardown_closes_the_seeded_ledger_after_the_run_rewrote_its_body(store, monkeypatch):
+    # A run with a coverage gap of its own rewrites the gap ledger from its
+    # own document, so the body no longer names the invented cluster.
+    seeded_body(monkeypatch, gap=True)
+    forge = forge_with(
+        monkeypatch,
+        **{
+            "issue-list": {
+                "issues": [
+                    {"number": 7, "body": "a body the run wrote for the real fleet"},
+                    {"number": 8, "body": "another stream run's ledger"},
+                ]
+            }
+        },
+    )
+    assert ledger.teardown(audit_report, AUDIT, GITOPS) == [7]
+    assert [p["number"] for p in forge.payloads("issue-close")] == [7]
+
+
+@pytest.mark.parametrize("path", [TASK, GAP_TASK])
+def test_every_task_variable_is_declared_by_the_stack(path):
+    task = yaml.safe_load(path.read_text(encoding="utf-8"))
     declared = set(re.findall(r'^variable "([^"]+)"', (STACK / "variables.tf").read_text(), re.M))
     assert set(task["infrastructure"]["variables"]) <= declared
     assert task["infrastructure"]["stack"] == "prebuilt/stale-audit-ledger"
+
+
+def test_the_gap_task_asks_the_stack_for_the_gap_ledger():
+    task = yaml.safe_load(GAP_TASK.read_text(encoding="utf-8"))
+    assert task["infrastructure"]["variables"]["ledger_kind"] == "gap"
+    main_tf = (STACK / "main.tf").read_text(encoding="utf-8")
+    assert f'var.ledger_kind == "gap" ? "{ledger.SEED_GAP_MODE}" : "{ledger.SEED_MODE}"' in main_tf
+
+
+def test_the_gap_seed_opens_a_coverage_ledger_with_a_record_finish_trusts(store, monkeypatch):
+    forge, body = seeded_body(monkeypatch, gap=True)
+    (created,) = forge.payloads("issue-create")
+    gaps = audit_report.coverage_gaps(ledger.stale_document(audit_report, AUDIT, gap=True))
+    assert len(gaps) == 1
+    assert created["title"] == audit_report.coverage_issue_title(AUDIT, gaps)
+    assert audit_report.parse_delta_block(body) == []
+    # The teardown finds the ledger by this name.
+    assert ledger.RETIRED_CLUSTER in body
+    memory = audit_report.previous_run_memory(AUDIT, 7, GITOPS, body)
+    assert memory is not None and not memory.get("seeded_from_ledger")
+    assert memory["coverage_gaps"] == gaps
+    assert memory["status"] == ledger.GAP_SEED_STATUS
+
+
+def test_the_gap_ledger_body_and_the_close_carry_the_graded_phrases(store, monkeypatch):
+    _, body = seeded_body(monkeypatch, gap=True)
+    check = objective("the-report-cites-the-closed-ledger", task=GAP_TASK)
+    forge = forge_with(monkeypatch, **{"issue-update": {"issue": {"number": 7}}})
+    assert audit_report.close_ledger_reads_clean(GITOPS, 7, AUDIT, body, NOW)
+    closed = forge.payloads("issue-update")[0]["body"]
+    for phrase in check["required_phrases"]:
+        assert phrase.lower() in closed.lower()
+
+
+def test_the_gap_that_cleared_is_not_news_to_the_clean_run(store, monkeypatch):
+    # What the case rests on: the clean run moves nothing, so only the run
+    # kind decides `silent_ok` (test_audit_report.py,
+    # TestOnDemandRunIsNeverSilent, runs `finish` over this shape).
+    _, body = seeded_body(monkeypatch, gap=True)
+    memory = audit_report.previous_run_memory(AUDIT, 7, GITOPS, body)
+    assert not audit_report.coverage_changed([], memory)
+    assert not audit_report.coverage_changed([], memory, scheduled=True)
+    # The record is the scheduled run that opened the ledger: the channel
+    # heard its gap and no finding, so a clean scheduled run moves no id.
+    assert memory[audit_report.RUN_SCHEDULED_KEY] is True
+    assert audit_report.scheduled_published_baseline(memory) == []
+    assert audit_report.scheduled_gaps_baseline(memory) == memory["coverage_gaps"]

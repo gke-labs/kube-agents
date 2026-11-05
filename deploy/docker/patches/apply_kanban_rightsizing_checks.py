@@ -1,9 +1,10 @@
 """Wire tools/kanban_rightsizing_checks.py into the kanban_complete gate.
 
-``tools/kanban_rightsizing_checks.py`` appends its rule to
-``tools.kanban_verified_claims.RULES`` when it is imported, so the one edit here
-is that import, placed right after the verified-claims patch's preamble in
-``tools/kanban_tools.py``. Run after ``apply_kanban_verified_claims.py``. Usage::
+``tools/kanban_rightsizing_checks.py`` puts its rule first in
+``tools.kanban_verified_claims.RULES`` when it is imported, so the edit here is
+that import and the call that adds its ``rightsizing`` parameter to
+``KANBAN_COMPLETE_SCHEMA``, placed right after the verified-claims patch's
+preamble in ``tools/kanban_tools.py``. Run after ``apply_kanban_verified_claims.py``. Usage::
 
     python3 apply_kanban_rightsizing_checks.py [HERMES_ROOT]   # default /opt/hermes
 """
@@ -28,7 +29,8 @@ ANCHOR = "_apply_verified_claims_schema(KANBAN_COMPLETE_SCHEMA)\n"
 REPLACEMENT = (
     f"{ANCHOR}"
     f"{MARKER}\n"
-    "import tools.kanban_rightsizing_checks  # noqa: E402,F401 - appends its rule to RULES\n"
+    "from tools import kanban_rightsizing_checks as _kanban_rightsizing_checks  # noqa: E402 - puts its rule first in RULES\n"
+    "_kanban_rightsizing_checks.apply_schema(KANBAN_COMPLETE_SCHEMA)\n"
 )
 
 

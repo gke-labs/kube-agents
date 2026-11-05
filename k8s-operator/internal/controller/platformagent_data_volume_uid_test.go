@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -89,27 +90,35 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	// The plugin-aware render the reconciler calls; the wrapper above is
 	// the same Deployment with no plugins. Both are pod-bearing builders,
 	// so both pods reach the assertion.
-	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil)
+	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, false)
+	credentialProxyExecTier := buildCredentialProxyExecTierDeployment(agent, credentialProxy)
+	kubeProxy := buildKubeProxyDeployment(agent, "", true, "t")
 	a2aGateway := buildA2AGatewayDeployment(agent)
-	a2aCallout := buildA2ACalloutDeployment(agent)
+	a2aCallout := buildA2ACalloutDeployment(agent, "", 1)
 	a2aVerifier := buildA2AVerifierDeployment(agent)
+	a2aDispatcher := buildA2ADispatcherDeployment(agent)
 	a2aConsole := buildA2AConsoleDeployment(agent)
 	a2aMCP := buildA2AMCPDeployment(agent)
 	gatewayStatefulSet := buildStatefulSet(agent, "c", "f", "s", "p", nil, opts)
 	sandbox := buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s")
 	nats := buildA2ANATSStatefulSet(agent, "c")
 	provision := buildA2AProvisionJob(agent)
+	scopePublisher := buildScopePublisherJob(agent, time.Time{}, scopeMemberHash(agent))
 
 	pods := []renderedPodTemplate{
 		{"buildDeployment", gatewayDeployment.Name, gatewayDeployment.Spec.Template.Spec},
 		{"buildCredentialProxyDeployment", credentialProxy.Name, credentialProxy.Spec.Template.Spec},
 		{"buildCredentialProxyDeploymentForPlugins", credentialProxyWithPlugins.Name, credentialProxyWithPlugins.Spec.Template.Spec},
+		{"buildCredentialProxyExecTierDeployment", credentialProxyExecTier.Name, credentialProxyExecTier.Spec.Template.Spec},
+		{"buildKubeProxyDeployment", kubeProxy.Name, kubeProxy.Spec.Template.Spec},
 		{"buildA2AGatewayDeployment", a2aGateway.Name, a2aGateway.Spec.Template.Spec},
 		{"buildA2ACalloutDeployment", a2aCallout.Name, a2aCallout.Spec.Template.Spec},
 		{"buildA2AVerifierDeployment", a2aVerifier.Name, a2aVerifier.Spec.Template.Spec},
+		{"buildA2ADispatcherDeployment", a2aDispatcher.Name, a2aDispatcher.Spec.Template.Spec},
 		{"buildA2AConsoleDeployment", a2aConsole.Name, a2aConsole.Spec.Template.Spec},
 		{"buildA2AMCPDeployment", a2aMCP.Name, a2aMCP.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},
+		{"buildScopePublisherJob", scopePublisher.Name, scopePublisher.Spec.Template.Spec},
 	}
 	for builder, statefulSet := range map[string]*appsv1.StatefulSet{
 		"buildStatefulSet":             gatewayStatefulSet,

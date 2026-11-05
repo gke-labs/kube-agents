@@ -262,3 +262,13 @@ A blocking rule declares what its mechanism holds (`HOLDS`): a control-plane mov
 Once per project is once per reporter process: the skill's fleet run and the daily watch grade a project in one process and make the lists once; the Monday audit runs the reporter once per behind cluster and makes them per cluster.
 
 A failed project or location read is an error row under the table (exit 1), and the rules that need it say `unknown`; a rule that can block then leaves the member `unknown`, one that cannot is reported in the note. The three list reads are projected to the fields the rules use, so a project of a few thousand instances stays under the credential proxy's output cap; a list the proxy cut is the same error, naming the cap. The three list reads need `roles/compute.viewer` (backend services, instances) and `roles/container.viewer` (operations) in each project the report reads; the default role list carries both. A custom list without them leaves the rules that need the read `unknown`, the member `unknown` where the rule can block, and the run at exit 1.
+
+## A per-rule answer
+
+A question that asks for one rule's entry per cluster (`<cluster>: <rule id>: <entry|none>`) is answered from the report's JSON, member by member, never from a summary of blockers and risks: the readiness table prints a rule's notes in its note column, but a summary that lists blockers and risks alone reads clear for a member the rule printed a note for. For each member, `readiness.rules.<rule id>` counts the rule's blocking, risk, unknown and note entries; the texts are in `rule_blocking[]`, `risks[]` and `unknown[]` (objects with `rule` and `text`; an unknown's `text` already carries the `<rule id>: ` prefix, which the command strips once) and in `notes[]` (strings prefixed `<rule id>: `). One command prints the line for every member:
+
+```bash
+jq -r --arg r <rule id> '.members[] | .cluster + ": " + $r + ": " + ([(.readiness.rule_blocking[], .readiness.risks[], .readiness.unknown[]) | select(.rule == $r) | .text | ltrimstr($r + ": ")] + [.readiness.notes[] | select(startswith($r + ": ")) | ltrimstr($r + ": ")] | if length == 0 then "none" else join("; ") end)' /opt/data/scratch/fleet_versions_<stamp>.json
+```
+
+Copy each entry as printed; several entries for one member stay on one line in the order printed, separated by `; `. `none` is the answer only where the rule's counts are all zero. A question for the rule's _risk or blocker_ (a finding, not an entry) leaves the notes term out: the `select(.rule == $r) | .text` list alone, and `none` where it is empty; the rule's notes (an add-on inventory, a client within the window) are not findings.

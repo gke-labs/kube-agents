@@ -27,6 +27,7 @@ import inspect
 import dataclasses
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -559,6 +560,58 @@ class ParseTaskIdTest(unittest.TestCase):
 
     def test_unreadable_response_is_none(self):
         self.assertIsNone(gate._parse_task_id("board is down"))
+
+
+class FileCardOriginTest(unittest.TestCase):
+    """The board stamp is the card's `origin`, set by the in-pod override, never an argument."""
+
+    def _stub(self, sent, origin_module):
+        import types
+
+        kanban = types.ModuleType("hermes_cli.kanban")
+        current = getattr(origin_module, "current", lambda: None)
+        kanban.run_slash = lambda cmd: sent.append((cmd, current())) or '{"id": "t_1"}'
+        pkg = types.ModuleType("hermes_cli")
+        pkg.kanban = kanban
+        modules = {"hermes_cli": pkg, "hermes_cli.kanban": kanban}
+        if origin_module is not None:
+            pkg.kanban_origin = origin_module
+            modules["hermes_cli.kanban_origin"] = origin_module
+        return mock.patch.dict(sys.modules, modules)
+
+    def test_each_card_files_under_a_freshly_minted_ticket_for_its_origin(self):
+        import contextlib
+        import types
+
+        sent, minted = [], []
+        origin = types.ModuleType("hermes_cli.kanban_origin")
+
+        held = []
+
+        @contextlib.contextmanager
+        def writer_ticket(value):
+            minted.append(value)
+            held.append(f"ticket-{len(minted)}")
+            try:
+                yield held[-1]
+            finally:
+                held.pop()
+
+        origin.writer_ticket = writer_ticket
+        origin.current = lambda: held[-1] if held else None
+        card = gate._issue_card({"repository": "o/r", "issue_number": 1, "title_plain": "t"})
+        with self._stub(sent, origin):
+            self.assertEqual(gate.file_card(card), "t_1")
+            self.assertEqual(gate.file_card(card), "t_1")
+        self.assertEqual(minted, ["issue", "issue"])
+        self.assertEqual([ticket for _, ticket in sent], ["ticket-1", "ticket-2"])
+        self.assertNotIn("--origin", sent[0][0])
+
+    def test_without_the_origin_module_the_card_still_files(self):
+        sent = []
+        with self._stub(sent, None), redirect_stdout(io.StringIO()):
+            self.assertEqual(gate.file_card(gate.Card(title="t", body="b", idempotency_key="k", origin="issue")), "t_1")
+        self.assertEqual(sent[0][1], None)
 
 
 class PostBodyTest(unittest.TestCase):
@@ -1416,10 +1469,45 @@ class PrCommentsSweepTest(unittest.TestCase):
             warnings,
             [
                 "**Comments on [toolkit#19](https://github.com/acme/toolkit/pull/19) aren't being answered.** "
-                "GitHub didn't respond when Kage tried to read the pull request. It keeps trying every 10 minutes."
+                "Kage couldn't reach GitHub to read its comments just now. It keeps trying every 10 minutes."
             ],
         )
         self.assertIn("acme/toolkit#19 (FORGE_CALL_FAILED)", stderr)
+
+    def test_each_reason_says_whether_retrying_helps(self):
+        """A 403 or 404 needs a person; a transient fault says it keeps trying."""
+        cases = {
+            "FORGE_FORBIDDEN": ("GitHub accepted Kage's credentials but refused", "an admin needs to"),
+            "FORGE_NOT_FOUND": ("GitHub couldn't find the repository", "an admin needs to"),
+            forge.REASON_SANDBOX_UNREACHABLE: ("Kage couldn't reach GitHub", "keeps trying"),
+        }
+        for reason, (opening, ending) in cases.items():
+            with self.subTest(reason=reason):
+                Path(self.home, gate.UNREADABLE_RECORD).unlink(missing_ok=True)
+                warnings, _ = self._unreadable_tick(reason=reason)
+                self.assertEqual(len(warnings), 1)
+                self.assertIn(opening, warnings[0])
+                self.assertIn(ending, warnings[0])
+                self.assertNotIn(reason, warnings[0], "the code is for the log, not the room")
+                self.assertNotIn("{forge}", warnings[0])
+                if ending == "an admin needs to":
+                    self.assertNotIn("keeps trying", warnings[0])
+
+    def test_the_sentence_names_the_forge_by_host(self):
+        for url, name in (
+            ("https://gitlab.com/acme/toolkit/-/merge_requests/12", "GitLab"),
+            ("https://git.corp.example/acme/toolkit/pulls/12", "git.corp.example"),
+            ("https://github.com/acme/toolkit/pull/12", "GitHub"),
+        ):
+            with self.subTest(url=url):
+                Path(self.home, gate.UNREADABLE_RECORD).unlink(missing_ok=True)
+                pr = dataclasses.replace(make_pr(12), url=url)
+                warnings, _ = self._unreadable_tick(prs=[pr], reason="FORGE_RATE_LIMITED")
+                self.assertIn(f"{name}'s rate limit was reached", warnings[0])
+        self.assertEqual(gate._forge_name("gitlab.com/group/sub/project"), "GitLab")
+        self.assertEqual(gate._forge_name("acme/toolkit"), "GitHub")
+        self.assertEqual(gate._forge_name("git.corp.example/acme/infra"), "git.corp.example")
+        self.assertEqual(gate._forge_name("ghe.example.com/acme/infra"), "ghe.example.com")
 
     def test_a_persisting_failure_posts_once(self):
         first, _ = self._unreadable_tick()
@@ -1430,11 +1518,20 @@ class PrCommentsSweepTest(unittest.TestCase):
 
     def test_two_codes_that_read_the_same_post_once(self):
         first, _ = self._unreadable_tick(reason="FORGE_CALL_FAILED")
-        for code in ("BROKER_UNREACHABLE", "FORGE_CALL_FAILED", "BROKER_UNREACHABLE"):
+        for code in ("BROKER_UNREACHABLE", "FORGE_CALL_FAILED", "SANDBOX_UNREACHABLE", "FORGE_UNAVAILABLE"):
             warnings, logged = self._unreadable_tick(reason=code)
             self.assertEqual(warnings, [], f"{code} reads the same sentence, so it is not news")
             self.assertIn(code, logged)
         self.assertEqual(len(first), 1)
+
+    def test_an_outage_that_spans_the_upgrade_posts_once(self):
+        """A record holding a sentence from before the forge was named reads as its replacement."""
+        record = Path(self.home, gate.UNREADABLE_RECORD)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        old = "GitHub didn't respond when Kage tried to read the pull request. It keeps trying every 10 minutes."
+        record.write_text(json.dumps({"acme/toolkit#12": old}), encoding="utf-8")
+        warnings, _ = self._unreadable_tick()
+        self.assertEqual(warnings, [])
 
     def test_a_new_reason_posts_again(self):
         self._unreadable_tick()
@@ -1477,7 +1574,7 @@ class PrCommentsSweepTest(unittest.TestCase):
 
         record = os.path.join(self.home, str(gate.UNREADABLE_RECORD))
         with open(record, encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle), {"acme/toolkit#12": gate.UNREADABLE_WHY_DEFAULT})
+            self.assertEqual(json.load(handle), {"acme/toolkit#12": gate.UNREADABLE_WHY_DEFAULT.format(forge="GitHub")})
         os.remove(record)
         self._unreadable_tick(dry_run=True)
         self.assertFalse(os.path.exists(record))

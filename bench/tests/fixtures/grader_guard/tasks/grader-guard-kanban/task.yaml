@@ -1,0 +1,37 @@
+# The grader guard's replay case (bench/tests/test_grader_guard.py), not an
+# eval: nothing under bench/tasks/ reads it and no lane runs it.
+#
+# The `agent-kanban-smoke` case exactly as the five captured runs under
+# fixtures/runs/kanban_* recorded it: the prompt of the three reds and the
+# verification_spec all five carry in their results.json, copied verbatim.
+# It is frozen with them on purpose. The live case has been redesigned twice
+# since the capture (#893, #4004), and grading a recorded answer against a
+# spec it was never written for would test the spec edit, not the grader.
+id: grader-guard-kanban
+name: Agent kanban smoke test (as captured)
+prompt: >-
+  Create a kanban task titled exactly "devops-bench smoke probe", then state in
+  one sentence the id that was assigned to it.
+expected_output: >-
+  A kanban task titled "devops-bench smoke probe" is created via the kanban
+  tooling, and the final message states the id assigned to it.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+
+verification_spec:
+  - name: report-states-the-probe-title
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["devops-bench smoke probe"]
+  - name: the-kanban-card-was-actually-filed
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true

@@ -383,11 +383,22 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 
+	// The session's origin and its conversation route are written side by
+	// side under one deadline, so a store that hangs delays the first turn
+	// by one timeout, not two.
+	recordCtx, cancelRecord := context.WithTimeout(taskCtx, routeTimeout)
+	originDone := make(chan struct{})
+	go func() {
+		defer close(originDone)
+		b.recordOrigin(recordCtx, sessionID, run.origin)
+	}()
 	// Recorded before the first turn, so a card any turn files finds it;
 	// every turn of the task is the same session and conversation. Best
 	// effort: the task runs either way, and a failure is said in the answer.
 	routeLost := false
-	routeErr := b.recordRoute(taskCtx, sessionID, run.origin)
+	routeErr := b.recordRoute(recordCtx, sessionID, run.origin)
+	<-originDone
+	cancelRecord()
 	if routeErr != nil && !errors.Is(routeErr, errNoChatConversation) && !errors.Is(routeErr, errRouteDisabled) {
 		b.cfg.Logger.Warn("conversation route not recorded; a card this task files cannot report back",
 			"task", taskID, "session", sessionID, "err", routeErr)
@@ -396,6 +407,10 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// Only a recorded route lets a card's post reach the conversation, so only
 	// then may the terminal keep the ask for those posts to settle (cardsMark).
 	run.routeRecorded.Store(routeErr == nil)
+	// The opening turn only: a follow-up runs in a session that has already
+	// read the report, and the hook this mirrors reads the thread once per
+	// message a person sends, which the opening turn is.
+	prompt = b.attachPushedReport(taskCtx, sessionID, run.origin, prompt)
 
 	// The door's side of this task: attributed by the session id the hook
 	// payload carries, signed with the pod's shared secret, and only while
@@ -515,19 +530,21 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	resp, connectedAt, err := b.sendAPI(taskCtx, req, body)
 	if err != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
+		b.stopCanceledTurn(run, sessionID, err)
 		return "", false
 	}
 	defer resp.Body.Close()
 	// taskCtx stays cancelable through the body read: the server can send
 	// its headers before the body, and a cancel or shutdown in between must
 	// still end the request.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(b.responseCap)+1))
 	// The turn's wall time: from the connection the server answered on to
 	// the end of the body, before any lock below adds to it, and without
 	// the refused dials sendAPI retried first.
 	took := time.Since(connectedAt)
 	if err != nil && taskCtx.Err() != nil {
 		b.finalizeAPIError(run, taskCtx, err, turn)
+		b.stopCanceledTurn(run, sessionID, err)
 		return "", false
 	}
 	if err != nil {
@@ -556,13 +573,13 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
 		return "", false
 	}
-	if len(raw) > apiResponseCap {
+	if len(raw) > b.responseCap {
 		// Refused, never truncated: a cut answer would fail to parse and
 		// read as a protocol fault, and a shortened one is worse than a
 		// loud failure.
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-oversize - HTTP %d; session: %s%s; "+
 			"the response body is over the %d-byte limit (apiResponseCap in api.go); the answer was refused rather than truncated",
-			resp.StatusCode, sessionID, turnNote(turn), apiResponseCap), nil)
+			resp.StatusCode, sessionID, turnNote(turn), b.responseCap), nil)
 		return "", false
 	}
 	var out apiChatResponse
@@ -581,6 +598,15 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 		b.publishTurnUsage(run, &out, took)
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: %s - HTTP %d, turn failed; session: %s%s; error: %s",
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(out.Hermes.Error, apiBodyTailBytes)), nil)
+		return "", false
+	}
+	if answer := out.Choices[0].Message.Content; opensWithUnstructuredReasoning(answer) {
+		// The model's reasoning, not an answer (#3206): withheld from the
+		// stream, final or turn answer alike. The turn ran and read tokens,
+		// so its usage goes out ahead of the terminal, as a failed turn's does.
+		b.withholdUnstructuredReasoning(run, sessionID, turn, answer)
+		b.publishTurnUsage(run, &out, took)
+		b.finalize(run, lib.StateFailed, unstructuredReasoningReason(sessionID, turn), nil)
 		return "", false
 	}
 	run.mu.Lock()

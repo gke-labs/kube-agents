@@ -31,6 +31,14 @@
 #
 # `fixtures: []`: the case plants and archives its own card and reads no
 # cluster.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: the reply to
+# the user's answer is silent, and the planted card carries the answer and is
+# unblocked. On next the reply to the wake itself is posted nowhere
+# (kanban_chat_notify.ConversationNotifyAdapter self-posts the wake into the
+# bridge's session), so it is not graded. It does not grade how the agent got
+# there (kanban_comment or kanban_unblock called; replay_card reads the card
+# itself).
 id: chat-question-wake-stays-silent
 name: Front door stays silent on a question already posted, then routes the answer to the card
 prompt: |-
@@ -56,21 +64,6 @@ domain: chat-and-routing
 owner: jayantid
 
 verification_spec:
-  # The wake turn's reply is the final message (card_wake.merge), graded by
-  # the gateway's own silence predicate: it passes only when the user would
-  # see nothing. A blank reply fails; the gateway posts a warning for it.
-  - name: the-wake-reply-is-silent
-    role: objective
-    mode: assert
-    check:
-      type: reply_is_silent
-  # Names the restatement for a readable reason when the reply is posted.
-  - name: the-wake-reply-does-not-restate-the-question
-    role: objective
-    mode: assert
-    check:
-      type: report_contains
-      forbidden_phrases: ["which should i look at", "seeded-a"]
   # The typed answer's reply: the question shows who answered and what once
   # the card moves on, so SOUL §1.5 Unblock answers it with [SILENT] too.
   - name: the-answer-reply-is-silent
@@ -79,20 +72,6 @@ verification_spec:
     check:
       type: reply_is_silent
       reply: answer
-  - name: the-answer-was-recorded-on-the-card
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_comment"]
-      require_success: true
-  - name: the-card-was-released
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_unblock"]
-      require_success: true
   - name: the-planted-card-carries-the-answer-and-is-unblocked
     role: objective
     mode: assert

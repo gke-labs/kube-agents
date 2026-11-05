@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
@@ -41,8 +42,8 @@ func TestTheProfileQuotaAndFenceLandInTheNamespace(t *testing.T) {
 		t.Fatalf("the profile quota: %v", err)
 	}
 	// No AgentProfiles, so no warm pools: the ceiling alone.
-	if pods := q.Spec.Hard[corev1.ResourcePods]; pods.Value() != agentv1alpha1.DefaultProfileCeiling {
-		t.Errorf("quota pods = %s, want %d", pods.String(), agentv1alpha1.DefaultProfileCeiling)
+	if pods := q.Spec.Hard[corev1.ResourcePods]; pods.Value() != defaultKanbanMaxInProgress {
+		t.Errorf("quota pods = %s, want %d", pods.String(), defaultKanbanMaxInProgress)
 	}
 	var np networkingv1.NetworkPolicy
 	if err := c.Get(ctx, types.NamespacedName{Namespace: "test-ns-profiles", Name: "test-agent-profile-netpol"}, &np); err != nil {
@@ -134,6 +135,52 @@ func TestTheAgentProfileCRDBoundsAllowedTiers(t *testing.T) {
 		}
 		if !tc.ok && (err == nil || !strings.Contains(err.Error(), "allowedTiers")) {
 			t.Errorf("allowedTiers %v = %v, want a refusal naming allowedTiers", tc.tiers, err)
+		}
+	}
+}
+
+// Each tier's bus identity, profile-<name>-<tier>, must fit one 63-character
+// label, so the name bound depends on the tiers: 50, or 44 with unattended.
+// And a named ServiceAccount is one identity, so it can serve one tier only.
+func TestTheAgentProfileCRDBoundsTheNameAndNamedServiceAccountByTier(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ns = "agentprofile-tier-bounds"
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	both := []string{"read", "unattended"}
+	for _, tc := range []struct {
+		name  string
+		tiers []string
+		sa    string
+		want  string // "" admits; otherwise a substring of the refusal
+	}{
+		{strings.Repeat("a", 50), nil, "", ""},
+		{strings.Repeat("b", 51), nil, "", "too long for its tiers"},
+		{strings.Repeat("c", 50), []string{"read"}, "", ""},
+		{strings.Repeat("d", 44), both, "", ""},
+		{strings.Repeat("e", 45), both, "", "too long for its tiers"},
+		{strings.Repeat("f", 45), []string{"unattended"}, "", "too long for its tiers"},
+		{"named-one", []string{"unattended"}, "mine", ""},
+		{"named-default", nil, "mine", ""},
+		{"named-two", both, "mine", "can serve only one tier"},
+	} {
+		p := testAgentProfile(ns, tc.name, func(p *agentv1alpha1.AgentProfile) {
+			p.Spec.AllowedTiers = tc.tiers
+			p.Spec.Identity.ServiceAccountName = tc.sa
+		})
+		p.ResourceVersion, p.Generation, p.UID = "", 0, ""
+		err := c.Create(ctx, &p)
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%s (%d chars, tiers %v, serviceAccountName %q) refused: %v", tc.name, len(tc.name), tc.tiers, tc.sa, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("%s (%d chars, tiers %v, serviceAccountName %q) = %v, want a refusal saying %q", tc.name, len(tc.name), tc.tiers, tc.sa, err, tc.want)
 		}
 	}
 }
@@ -467,7 +514,7 @@ func TestAProfileNamespaceRefusalDoesNotStopTheRender(t *testing.T) {
 		},
 	})
 	r := &PlatformAgentReconciler{Client: refusing, Scheme: scheme}
-	if _, err := r.reconcileA2A(ctx, agent); err != nil && strings.Contains(err.Error(), "refused by a policy in the profile namespace") {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil && strings.Contains(err.Error(), "refused by a policy in the profile namespace") {
 		t.Fatalf("reconcileA2A returned the profile namespace's refusal (%v); it is logged, not returned", err)
 	}
 	var q corev1.ResourceQuota
@@ -530,6 +577,178 @@ func TestLiteLLMWithholdsThePeerOnAProfileReadError(t *testing.T) {
 			if peer.NamespaceSelector != nil && peer.NamespaceSelector.MatchLabels[corev1.LabelMetadataName] == profileNamespaceName(agent) {
 				t.Error("LiteLLM admits the profile namespace though its fence couldn't be read")
 			}
+		}
+	}
+}
+
+// The identity map renders a profile's entries only once the profile
+// namespace, marked as the chart's, exists: its ServiceAccounts live there,
+// and whoever made a namespace of that name must not get them.
+func TestTheIdentityMapRendersProfilesOnlyWithTheProfileNamespace(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+	}
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Create(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	p := testAgentProfile(agent.Namespace, "auditor")
+	p.ResourceVersion, p.Generation, p.UID = "", 0, ""
+	if err := c.Create(ctx, &p); err != nil {
+		t.Fatal(err)
+	}
+	r := &PlatformAgentReconciler{Client: c, APIReader: c, Scheme: scheme}
+	mapHas := func() bool {
+		t.Helper()
+		_, _ = r.reconcileA2A(ctx, agent, homeChannelRecord{})
+		var cm corev1.ConfigMap
+		if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, &cm); err != nil {
+			t.Fatalf("the identity map was not rendered: %v", err)
+		}
+		for _, v := range cm.Data {
+			if strings.Contains(v, `"profile-auditor-read"`) {
+				return true
+			}
+		}
+		return false
+	}
+	if mapHas() {
+		t.Error("the map renders the profile with no profile namespace")
+	}
+	if err := c.Create(ctx, chartProfileNamespace(agent)); err != nil {
+		t.Fatal(err)
+	}
+	if !mapHas() {
+		t.Error("the map leaves the profile out with the profile namespace in place")
+	}
+
+	// A failed read of the namespace returns and leaves the applied map
+	// alone: dropping the entries would revoke the profile on a blip.
+	failing := interceptor.NewClient(c, interceptor.Funcs{
+		Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Namespace); ok && key.Name == profileNamespaceName(agent) {
+				return fmt.Errorf("the API server timed out")
+			}
+			return cl.Get(ctx, key, obj, opts...)
+		},
+	})
+	r.APIReader = failing
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("reconcileA2A = %v, want the namespace read's error", err)
+	}
+	var cm corev1.ConfigMap
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	kept := false
+	for _, v := range cm.Data {
+		kept = kept || strings.Contains(v, `"profile-auditor-read"`)
+	}
+	if !kept {
+		t.Error("a failed namespace read rewrote the map without the profile")
+	}
+}
+
+// The dispatcher's intervals are bounded against each other, each absent
+// field counting at its default, and the child reserve stays below the
+// ceiling.
+func TestThePlatformAgentCRDBoundsTheDispatchIntervals(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ns = "platformagent-intervals"
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	for i, tc := range []struct {
+		tuning        agentv1alpha1.ProfileTuning
+		want          string // "" admits
+		maxInProgress *int
+	}{
+		{agentv1alpha1.ProfileTuning{}, "", nil},
+		{agentv1alpha1.ProfileTuning{LeaseSeconds: ptr.To(60), RenewSeconds: ptr.To(20)}, "", nil},
+		{agentv1alpha1.ProfileTuning{LeaseSeconds: ptr.To(59)}, "leaseSeconds must be at least three renewSeconds", nil},
+		{agentv1alpha1.ProfileTuning{RenewSeconds: ptr.To(31)}, "leaseSeconds must be at least three renewSeconds", nil},
+		// The default grace (60) is short of two renewals of 31.
+		{agentv1alpha1.ProfileTuning{RenewSeconds: ptr.To(31), LeaseSeconds: ptr.To(100)}, "restartGraceSeconds must be at least two renewSeconds", nil},
+		{agentv1alpha1.ProfileTuning{RenewSeconds: ptr.To(31), LeaseSeconds: ptr.To(100), RestartGraceSeconds: ptr.To(62)}, "", nil},
+		{agentv1alpha1.ProfileTuning{RenewSeconds: ptr.To(30), LeaseSeconds: ptr.To(90)}, "", nil},
+		{agentv1alpha1.ProfileTuning{Ceiling: ptr.To(4), ChildReserve: ptr.To(3)}, "", nil},
+		{agentv1alpha1.ProfileTuning{Ceiling: ptr.To(4), ChildReserve: ptr.To(4)}, "childReserve must be below the profile ceiling", nil},
+		// With the ceiling unset, the reserve is held to maxInProgress's default (6).
+		{agentv1alpha1.ProfileTuning{ChildReserve: ptr.To(6)}, "childReserve must be below the profile ceiling", nil},
+		{agentv1alpha1.ProfileTuning{ChildReserve: ptr.To(5)}, "", nil},
+		// With the ceiling unset and maxInProgress set, the reserve is held to it.
+		{agentv1alpha1.ProfileTuning{ChildReserve: ptr.To(3)}, "childReserve must be below the profile ceiling", ptr.To(3)},
+		{agentv1alpha1.ProfileTuning{ChildReserve: ptr.To(2)}, "", ptr.To(3)},
+		// A set ceiling wins over maxInProgress.
+		{agentv1alpha1.ProfileTuning{Ceiling: ptr.To(8), ChildReserve: ptr.To(5)}, "", ptr.To(3)},
+		// The task deadline cap may only be lowered from 6h.
+		{agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)}, "", nil},
+		{agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(21601)}, "maxTaskDeadlineSeconds", nil},
+		{agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(59)}, "maxTaskDeadlineSeconds", nil},
+	} {
+		agent := a2aTestAgent()
+		agent.Name = fmt.Sprintf("agent-%d", i)
+		agent.Namespace = ns
+		tuning := tc.tuning
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+			ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
+			Tuning: &agentv1alpha1.TuningSpec{Profiles: &tuning, MaxInProgress: tc.maxInProgress},
+		}
+		err := c.Create(ctx, agent)
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("case %d (%+v) refused: %v", i, tc.tuning, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("case %d (%+v) = %v, want a refusal saying %q", i, tc.tuning, err, tc.want)
+		}
+	}
+}
+
+// A declared parameter is a lower-case identifier, named once.
+func TestTheAgentProfileCRDBoundsItsParameters(t *testing.T) {
+	cfg, scheme := startEnvtestConfig(t)
+	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	const ns = "agentprofile-parameters"
+	if err := c.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}); err != nil {
+		t.Fatal(err)
+	}
+	p := func(name string) agentv1alpha1.AgentProfileParameter {
+		return agentv1alpha1.AgentProfileParameter{Name: name, Required: true}
+	}
+	for i, tc := range []struct {
+		params []agentv1alpha1.AgentProfileParameter
+		ok     bool
+	}{
+		{[]agentv1alpha1.AgentProfileParameter{p("project"), p("location"), p("cluster")}, true},
+		{nil, true},
+		{[]agentv1alpha1.AgentProfileParameter{p("Project")}, false},
+		{[]agentv1alpha1.AgentProfileParameter{p("a-b")}, false},
+		{[]agentv1alpha1.AgentProfileParameter{p("project"), p("project")}, false},
+	} {
+		profile := testAgentProfile(ns, fmt.Sprintf("params-%d", i), func(prof *agentv1alpha1.AgentProfile) { prof.Spec.Parameters = tc.params })
+		profile.ResourceVersion, profile.Generation, profile.UID = "", 0, ""
+		err := c.Create(ctx, &profile)
+		if tc.ok != (err == nil) {
+			t.Errorf("parameters %+v: create = %v, want admitted %v", tc.params, err, tc.ok)
 		}
 	}
 }

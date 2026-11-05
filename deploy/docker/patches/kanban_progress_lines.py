@@ -558,7 +558,9 @@ async def _settle_reaction(adapter: Any, sub: dict, kind: str, board: Optional[s
 
 
 def _slack_quiet(sub: dict) -> Any:
-    """``kanban_notifier`` when ``KAGE_SLACK_UX`` is on for this Slack card, else None.
+    """``kanban_notifier`` when ``KAGE_SLACK_UX`` is on for this card's platform, else None:
+    a Slack card, or a Google Chat card under ``spec.mode: next``, where the gateway
+    lays the chat messages out (``kanban_notifier.chat_ux_on``).
 
     Imported when a delivery runs: ``gateway/kanban_notifier.py`` is copied into
     the image after this module, and this one's build-time check runs before it
@@ -572,7 +574,7 @@ def _slack_quiet(sub: dict) -> Any:
         except ImportError:
             return None
     try:
-        return kanban_notifier if kanban_notifier.slack_ux_on(sub.get("platform")) else None
+        return kanban_notifier if kanban_notifier.chat_ux_on(sub.get("platform")) else None
     except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
         logger.debug("kanban progress: reading KAGE_SLACK_UX failed: %s", exc)
         return None
@@ -888,18 +890,25 @@ def _chat_notify() -> Any:
     return kanban_chat_notify
 
 
-def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict]) -> Optional[dict]:
+def _with_answer(
+    adapter: Any, quiet: Any, kind: str, message: str, metadata: Optional[dict], answer_to: str = "",
+) -> Optional[dict]:
     """``metadata`` with a completed card's report, or a hard-wall block's reason, laid out as an answer, for the chat.notify stand-in.
 
     Under ``spec.mode: next`` the gateway lays the report out from a
     ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
     ``KAGE_SLACK_UX`` on for a Slack card, never for an actionable report,
     whose call to action stays in view as today, and never raises: anything
-    that goes wrong posts the text alone, as today.
+    that goes wrong posts the text alone, as today. ``answer_to`` is the update
+    key of the plan this report settles, when it does: the report is that ask's
+    answer and is flagged for the gateway's rating controls
+    (``kanban_chat_notify.ANSWER_METADATA_KEY``), laid out or not.
     """
     notify = _chat_notify()
     if quiet is None or kind != ANSWER_KIND or notify is None or not notify.chat_route(adapter):
         return metadata
+    if answer_to:
+        metadata = {**(metadata or {}), notify.ANSWER_METADATA_KEY: answer_to}
     try:
         import chat_message
 
@@ -912,6 +921,17 @@ def _with_answer(adapter: Any, quiet: Any, kind: str, message: str, metadata: Op
     if chat is None:
         return metadata
     return {**(metadata or {}), notify.CHAT_METADATA_KEY: chat}
+
+
+def _answer_key(plan: Any, sub: dict) -> str:
+    """The update key of the plan this card's settle finished, ``""`` for none, never raising."""
+    if plan is None:
+        return ""
+    try:
+        return str(plan.answer_key(sub) or "")
+    except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
+        logger.debug("kanban progress: reading whether %s answers its ask failed: %s", sub.get("task_id"), exc)
+        return ""
 
 
 def hard_wall_line(payload: object, message: str) -> str:
@@ -930,9 +950,9 @@ def _wake_reply_lost(adapter: Any) -> bool:
     Under ``spec.mode: next`` a conversation card's wake is self-posted into
     the bridge's session and its reply goes nowhere
     (``kanban_chat_notify.ConversationNotifyAdapter``), so a line held for it
-    would never be told. Only a hard-wall block is posted instead (see
-    :func:`deliver`): a give-up or crash on such a card is still held and
-    dropped, a gap this module leaves to the next-mode wake work.
+    would never be told: :func:`deliver` holds nothing for such a card and
+    posts the line, a hard-wall block's reason as the answer and a give-up,
+    crash or timeout as its own line.
     """
     notify = _chat_notify()
     stand_in = getattr(notify, "ConversationNotifyAdapter", None) if notify is not None else None
@@ -1105,14 +1125,17 @@ async def deliver(
             await _settle_reaction(adapter, sub, settled_as, board)
             await _pr_opened(moments, adapter, sub, _with_summary(ev, message), None)
             return None
-        if not (hard_wall and _wake_reply_lost(adapter)) and _explained_by_wake(quiet, sub, kind) and _hold(
+        if not _wake_reply_lost(adapter) and _explained_by_wake(quiet, sub, kind) and _hold(
             quiet, watcher, sub, kind, event_id, message, metadata,
         ):
             await _settle_reaction(adapter, sub, settled_as, board)
             return None
         laid_out = ANSWER_KIND if hard_wall else kind
+        # A report, or a hard-wall block's reason, is its ask's answer when
+        # this card's settle finished the ask's plan.
+        answer_to = _answer_key(plan, sub) if laid_out == ANSWER_KIND else ""
         result = await adapter.send(
-            chat_id, message, metadata=_with_answer(adapter, quiet, laid_out, message, metadata),
+            chat_id, message, metadata=_with_answer(adapter, quiet, laid_out, message, metadata, answer_to),
         )
         # A failed post raises in the notifier, which rewinds its claim so the
         # next tick posts again, and that post settles. After the notifier's

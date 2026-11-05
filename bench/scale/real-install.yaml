@@ -55,7 +55,6 @@ settings:
   trigger_reconcile: true
   cluster_create_parallelism: 10
   watcher_wait_seconds: 600
-  lease_ttl_minutes: 1440
 
 operations:
   # Step 3: the install's state volumes reset, so its first-run flow starts as on a new install, with
@@ -74,6 +73,72 @@ operations:
     timeout_seconds: 3600
     prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
     follow_up: Analyse my fleet's health. Which clusters and workloads carry the heaviest traffic, is the load skewed toward one zone, and what looks anomalous?
+  upgrade_report_long:
+    # One run with the harness's delegation wait raised: set AGENT_DELEGATION_TIMEOUT=5400 for this
+    # run only, so the report's full duration is measured instead of the default 1800 s wait.
+    kind: prompt
+    factors: [combined]
+    runs: 1
+    timeout_seconds: 7200
+    prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
+  upgrade_report_1:
+    # The report for one named cluster, with AGENT_DELEGATION_TIMEOUT=5400 as for upgrade_report_long:
+    # with the 1- and 10-cluster runs, shows whether the report's time is fixed or grows per cluster.
+    kind: prompt
+    factors: [combined]
+    runs: 2
+    timeout_seconds: 7200
+    prompt: Prepare an upgrade readiness report for the cluster scale-01 only. Is it behind, what blocks its upgrade, and when should it be upgraded?
+  upgrade_report_10:
+    kind: prompt
+    factors: [combined]
+    runs: 2
+    timeout_seconds: 7200
+    prompt: Prepare an upgrade readiness report for the clusters scale-01 to scale-10 only. Which of them are behind, what blocks their upgrade, and in what order should they be upgraded?
+  restart_recovery:
+    # Step 6: restart the gateway with every cluster registered; a poller outside the runner times
+    # how long the event watcher takes to report each cluster up again.
+    kind: restart_soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 1800
+  churn_500:
+    # Step 7: a Job on scale-01's tainted churn-fast pool creates and deletes Pods at about 500, 1,000 and 3,000
+    # per minute during the window; it is started before the run and deleted after.
+    kind: soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 900
+  churn_1000:
+    kind: soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 900
+  churn_3000:
+    kind: soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 900
+  soak_12h:
+    # Step 6: the overnight soak, run last, for the daily token cost and memory growth.
+    kind: soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 43200
+  first_run_s:
+    # Step 8, the red test: the same fleet with every sizable container at its request (agent 1 CPU
+    # and 2 GiB, credential proxy 0.5 CPU and 1 GiB, event watcher 0.15 CPU and 384 MiB), set on the
+    # PlatformAgent before the run; the sandbox shell keeps its fixed size. Restore the L size after.
+    kind: reset_soak
+    factors: [combined]
+    runs: 1
+    window_seconds: 7200
+  upgrade_report_s:
+    kind: prompt
+    factors: [combined]
+    runs: 1
+    timeout_seconds: 3600
+    prompt: Prepare an upgrade readiness report for my whole fleet. Which clusters are behind, what blocks their upgrade, and in what order should they be upgraded?
   # Step 5 (B): fleet health, alone (3 runs) on the first point.
   fleet_health:
     kind: prompt

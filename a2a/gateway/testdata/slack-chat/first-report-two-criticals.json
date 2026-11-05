@@ -1,0 +1,236 @@
+[
+  {
+    "expected": 0,
+    "carrier": "notify",
+    "blocks": [
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "bold": true
+                },
+                "text": "First look at your fleet: two things to fix first",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "1 cluster scanned in full · 9 configuration checks",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "text": "invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key",
+                "type": "text"
+              },
+              {
+                "text": "\n",
+                "type": "text"
+              },
+              {
+                "text": "Anyone who reads the Secret holds editor on the project. Move it to Workload Identity.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          },
+          {
+            "elements": [
+              {
+                "style": {
+                  "code": true
+                },
+                "text": "critical",
+                "type": "text"
+              },
+              {
+                "text": " ",
+                "type": "text"
+              },
+              {
+                "text": "log-shipper DaemonSet has 0 of 4 pods running: every pod is in ImagePullBackOff on a tag that no longer exists",
+                "type": "text"
+              },
+              {
+                "text": "\n",
+                "type": "text"
+              },
+              {
+                "text": "No node ships its logs. Point log-shipper at a published tag.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "type": "divider"
+      },
+      {
+        "elements": [
+          {
+            "elements": [
+              {
+                "text": "5 more items are queued, 2 of them critical. I'll bring up to 2 critical a day.",
+                "type": "text"
+              }
+            ],
+            "type": "rich_text_section"
+          }
+        ],
+        "type": "rich_text"
+      },
+      {
+        "child_blocks": [
+          {
+            "elements": [
+              {
+                "elements": [
+                  {
+                    "text": "startup probes",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "ResourceQuota and LimitRange",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "read-only root filesystems",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Shielded Nodes",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Dataplane V2",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "Managed Service for Prometheus",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "node auto-upgrade",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "static Google Cloud keys in pods",
+                    "type": "text"
+                  },
+                  {
+                    "text": "\n",
+                    "type": "text"
+                  },
+                  {
+                    "text": "added capabilities",
+                    "type": "text"
+                  }
+                ],
+                "type": "rich_text_section"
+              }
+            ],
+            "type": "rich_text"
+          }
+        ],
+        "default_collapsed": true,
+        "is_collapsible": true,
+        "title": {
+          "text": "What the scan checked",
+          "type": "plain_text"
+        },
+        "type": "container"
+      },
+      {
+        "elements": [
+          {
+            "action_id": "kage.choice.0",
+            "style": "primary",
+            "text": {
+              "emoji": true,
+              "text": "Fix the first one",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "Fix the first one: invoice-worker mounts a static project-editor service account key from the Secret invoice-gcp-key"
+          },
+          {
+            "action_id": "kage.choice.1",
+            "text": {
+              "emoji": true,
+              "text": "See all 7 items",
+              "type": "plain_text"
+            },
+            "type": "button",
+            "value": "See all 7 items"
+          }
+        ],
+        "type": "actions"
+      }
+    ],
+    "attachments": []
+  }
+]

@@ -359,6 +359,9 @@ def main() -> None:
     # fleet-audit record for an audit job. Each branch of the
     # summarizer is its own f-string, so drive every one, and the
     # blocked-config line, which _compose_run_delivery builds without it.
+    # That each line still carries the words the relay matches, and that the
+    # cron roster reads as daily, is verify_scheduler_failure_line.py's: it
+    # runs in the `platform` stage, the first with session_kv_server.py.
     import inspect
 
     import cron.scheduler as scheduler

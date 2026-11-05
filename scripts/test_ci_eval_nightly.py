@@ -1,11 +1,12 @@
 """The roster loading and the nightly tier switch are model-free shell, so they are testable here.
 
-`hack/ci-eval-pr.sh` builds its task matrix from three files under hack/eval/
+`hack/ci-eval-pr.sh` builds its task matrix from the files under hack/eval/
 (#1546): presubmit-cases.txt into TASKS, nightly-cases.txt into
-NIGHTLY_TASKS, blocking-roster.txt into BOOTSTRAP_ADMITTED's default. Then
+NIGHTLY_TASKS, certification-cases.txt into CERTIFICATION_TASKS,
+blocking-roster.txt into BOOTSTRAP_ADMITTED's default. Then
 EVAL_TIER selects the matrix: unset or "presubmit" runs exactly TASKS,
-"nightly" appends NIGHTLY_TASKS, and anything else stops the job before it
-spends a cluster. The properties below are exercised against the REAL text
+"nightly" appends NIGHTLY_TASKS, "certification" runs CERTIFICATION_TASKS
+alone, and anything else stops the job before it spends a cluster. The properties below are exercised against the REAL text
 lifted out of the script, run over the REAL files, in the same style as
 test_ci_eval_fanout.py:
 
@@ -52,7 +53,12 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import eval_rosters
+import validate_bench_cases
 from test_eval_rosters import INJECT_LANE_REQUESTING
+
+# The cases that declare `writes_alone: true`: the part step files them with
+# the writers, beside the requesting cases, on every transport.
+WRITES_ALONE = sorted(c for c in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases() if eval_rosters.declares_writes_alone(c))
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
@@ -89,7 +95,7 @@ def roster_block() -> str:
 # environment under every lifted-shell run, so a shell with one of them
 # exported (EVAL_FORGE=gitlab for a local GitLab eval, say) does not turn the
 # default-matrix assertions into the lane's.
-MATRIX_SHAPING = ("AGENT_TRANSPORT", "EVAL_TIER", "EVAL_NIGHTLY_PART", "BOOTSTRAP_ADMITTED", "EVAL_FORGE")
+MATRIX_SHAPING = ("AGENT_TRANSPORT", "EVAL_TIER", "EVAL_NIGHTLY_PART", "EVAL_CERTIFICATION_PART", "BOOTSTRAP_ADMITTED", "EVAL_FORGE")
 
 
 def clean_env(env: dict | None = None) -> dict:
@@ -245,6 +251,126 @@ class RefusalTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "NIGHTLY"), nightly_entries())
 
 
+# Three case directories that are in no roster (KNOWN_UNREGISTERED in
+# scripts/validate_bench_cases.py), so a scratch certification file can name
+# them without tripping the one-lane rule.
+CERTIFICATION_SCRATCH_CASES = tuple(sorted(validate_bench_cases.KNOWN_UNREGISTERED))[:3]
+CERTIFICATION_SCRATCH_FILE = (
+    "# header\n"
+    f"./tasks/{CERTIFICATION_SCRATCH_CASES[0]}/task.yaml\n"
+    "# part 2\n"
+    f"./tasks/{CERTIFICATION_SCRATCH_CASES[1]}/task.yaml  # trailing note\n"
+    f"./tasks/{CERTIFICATION_SCRATCH_CASES[2]}/task.yaml\n"
+)
+
+
+def certification_part_block() -> str:
+    """EVAL_CERTIFICATION_PART's validation and its cut of TASKS, after the
+    nightly part's check."""
+    return lifted_block(r"^# ─── The certification part.*?^esac$")
+
+
+def load_matrix_through_the_certification_part(env: dict | None = None, hack_dir: pathlib.Path = HACK_DIR) -> subprocess.CompletedProcess:
+    """The matrix section, the nightly part's check, the certification part
+    and the roster export, in the script's order."""
+    section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
+    body = "\n".join([f'SCRIPT_DIR="{hack_dir}"', roster_constants(), section, part_check(), certification_part_block(), roster_block(), PRINT_ARRAYS])
+    return run_bash(body, env)
+
+
+class CertificationTierTest(unittest.TestCase):
+    """EVAL_TIER=certification: the certification file alone, by part, and
+    never a case the presubmit or the nightly runs."""
+
+    def scratch(self, text: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "certification-cases.txt").write_text(text)
+            return load_matrix_through_the_certification_part({"EVAL_TIER": "certification", **(env or {})}, hack_dir=hack)
+
+    def entries(self, *names: str) -> list[str]:
+        return [f"./tasks/{name}/task.yaml" for name in names]
+
+    def test_the_tier_runs_the_certification_file_and_nothing_else(self):
+        result = self.scratch(CERTIFICATION_SCRATCH_FILE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), self.entries(*CERTIFICATION_SCRATCH_CASES))
+        self.assertIn("EVAL_TIER=certification: 3 certification case(s) make the matrix", result.stdout)
+        self.assertEqual(lines_tagged(result, "ROSTER"), [""], "no roster name is in the matrix, so none is exported: the gate's no-graded-case banner must not fire")
+        self.assertIn("rung 4 is disarmed on this lane", result.stdout)
+
+    def test_a_part_keeps_its_section_only(self):
+        result = self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_CERTIFICATION_PART": "2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), self.entries(*CERTIFICATION_SCRATCH_CASES[1:]))
+        self.assertIn("Certification part: 2 (2 of 3 cases)", result.stdout)
+        result = self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_CERTIFICATION_PART": "1"})
+        self.assertEqual(lines_tagged(result, "TASK"), self.entries(CERTIFICATION_SCRATCH_CASES[0]), "entries above the first marker are part 1")
+
+    def test_a_line_that_is_not_a_marker_is_a_comment_to_the_shell_too(self):
+        # The grammar scripts/eval_rosters.py's PART_MARKER_RE shares: `#part 2`,
+        # an indented marker and `# part 0` are comments, so their entries
+        # stay in the section above.
+        for not_a_marker in ("#part 2", "  # part 2", "# part 0"):
+            with self.subTest(line=not_a_marker):
+                text = f"./tasks/{CERTIFICATION_SCRATCH_CASES[0]}/task.yaml\n{not_a_marker}\n./tasks/{CERTIFICATION_SCRATCH_CASES[1]}/task.yaml\n"
+                result = self.scratch(text, {"EVAL_CERTIFICATION_PART": "1"})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(lines_tagged(result, "TASK"), self.entries(*CERTIFICATION_SCRATCH_CASES[:2]))
+
+    def test_the_other_tiers_do_not_read_the_file_into_the_matrix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "certification-cases.txt").write_text(CERTIFICATION_SCRATCH_FILE)
+            for tier, expected in (("presubmit", presubmit_entries()), ("nightly", presubmit_entries() + nightly_entries())):
+                result = load_matrix_through_the_certification_part({"EVAL_TIER": tier}, hack_dir=hack)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(lines_tagged(result, "TASK"), expected, tier)
+
+    def test_the_checked_in_file_is_accepted_empty_by_the_other_tiers(self):
+        # The file lands empty, before its first case; only the certification
+        # tier refuses an empty read.
+        result = load_matrix({"EVAL_TIER": "nightly"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def assert_refused(self, result, *needles):
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("TASK ", result.stdout, "the matrix must not be built past a bad file")
+        for needle in needles:
+            self.assertIn(needle, result.stderr)
+
+    def test_an_entry_in_another_roster_stops_the_job(self):
+        result = self.scratch("./tasks/agent-kanban-smoke/task.yaml\n")
+        self.assert_refused(result, "certification-cases.txt", "agent-kanban-smoke", "certification lane only")
+        result = self.scratch(f"./tasks/{eval_rosters.nightly_cases()[0]}/task.yaml\n")
+        self.assert_refused(result, "certification-cases.txt", "certification lane only")
+
+    def test_an_empty_file_stops_the_certification_tier(self):
+        result = self.scratch("# part 1\n")
+        self.assert_refused(result, "certification-cases.txt names no case")
+
+    def test_a_part_that_selects_nothing_stops_the_job(self):
+        result = self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_CERTIFICATION_PART": "3"})
+        self.assert_refused(result, "EVAL_CERTIFICATION_PART=3 selects no case")
+
+    def test_a_part_outside_the_tier_or_a_bad_part_stops_the_job(self):
+        result = load_matrix_through_the_certification_part({"EVAL_TIER": "nightly", "EVAL_CERTIFICATION_PART": "1"})
+        self.assert_refused(result, "EVAL_CERTIFICATION_PART=1", "EVAL_TIER=nightly")
+        for bad in ("0", "01", "one", "-1"):
+            with self.subTest(part=bad):
+                self.assert_refused(self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_CERTIFICATION_PART": bad}), "must be 'all' or a whole number")
+
+    def test_the_tier_refuses_a_forge_lane(self):
+        result = self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_FORGE": "gitlab"})
+        self.assert_refused(result, "grades GitHub only")
+
+    def test_the_unknown_tier_message_names_the_tier(self):
+        result = load_matrix({"EVAL_TIER": "certifcation"})
+        self.assert_refused(result, "EVAL_TIER must be 'presubmit', 'nightly' or 'certification'")
+
+
 class GitLabLaneTest(unittest.TestCase):
     """Under EVAL_FORGE=gitlab a presubmit runs the GitLab lane's file, a
     nightly the whole catalogue; the roster export keeps only the lane's
@@ -257,14 +383,15 @@ class GitLabLaneTest(unittest.TestCase):
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "presubmit"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn(f"EVAL_FORGE=gitlab: the GitLab lane runs {len(self.lane_entries())} case(s) on the presubmit tier", result.stdout)
+        self.assertIn(f"EVAL_FORGE=gitlab: the gitlab lane runs {len(self.lane_entries())} case(s) on the presubmit tier (eval/gitlab-cases.txt)", result.stdout)
         self.assertIn("presubmit cases left out: reliability-pdb-probe,", result.stdout)
         # pdb-remediation-pr was the lane's one roster case from 2026-10-14
         # (#2016) until its demotion to the nightly on 2026-10-17 (#3120),
         # and the lane held none until vcs-spent-branch-reuse's roster line
-        # of 2026-10-23: the roster intersected with the lane is that case,
-        # and rung 4 is armed for it.
-        self.assertEqual(lines_tagged(result, "ROSTER"), ["vcs-spent-branch-reuse"])
+        # of 2026-10-23; pdb-remediation-pr took its line back on 2026-10-26:
+        # the roster intersected with the lane is those two, in roster order,
+        # and rung 4 is armed for both.
+        self.assertEqual(lines_tagged(result, "ROSTER"), ["pdb-remediation-pr,vcs-spent-branch-reuse"])
         self.assertNotIn("rung 4 is disarmed", result.stdout)
 
     def test_a_roster_case_in_the_lane_arms_the_export(self):
@@ -272,7 +399,7 @@ class GitLabLaneTest(unittest.TestCase):
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
             # Two roster cases, listed out of roster order; the real lane holds
-            # one, vcs-spent-branch-reuse, since 2026-10-23.
+            # two since 2026-10-26 (pdb-remediation-pr, vcs-spent-branch-reuse).
             (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/reliability-pdb-probe/task.yaml\n")
             result = load_matrix({"EVAL_FORGE": "gitlab"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -286,9 +413,11 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            # agent-kanban-smoke is the lane's only roster case and is
-            # inject-excluded; vcs-review-feedback-read-back is held out.
+            # agent-kanban-smoke is the lane's only roster case, inject-excluded
+            # here by a scratch entry (the real list holds no roster case since
+            # #4004); vcs-review-feedback-read-back is held out.
             (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/agent-kanban-smoke/task.yaml\n./tasks/vcs-review-feedback-read-back/task.yaml\n")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\nagent-kanban-smoke\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("every blocking-roster case in eval/gitlab-cases.txt is excluded on the inject lane", result.stderr)
@@ -302,29 +431,60 @@ class GitLabLaneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             hack = pathlib.Path(tmp) / "hack"
             shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            # Built here rather than read from the real lane (which holds a
-            # roster case since 2026-10-23): two held-out seats, one of them
+            # Built here rather than read from the real lane (which holds
+            # roster cases since 2026-10-23): two held-out seats, one of them
             # inject-excluded.
-            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/vcs-review-feedback-read-back/task.yaml\n./tasks/pdb-remediation-pr/task.yaml\n")
-            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\npdb-remediation-pr\n")
+            (hack / "eval" / "gitlab-cases.txt").write_text("./tasks/vcs-review-feedback-read-back/task.yaml\n./tasks/rca-remediation-pr/task.yaml\n")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text("# #2039: a scratch exclusion for the test\nrca-remediation-pr\n")
             result = load_matrix_through_the_lane_step({"EVAL_FORGE": "gitlab", "AGENT_TRANSPORT": "inject"}, hack_dir=hack)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/vcs-review-feedback-read-back/task.yaml"])
         self.assertNotIn("excluded on the inject lane", result.stderr)
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
 
+    def test_a_forge_whose_list_the_checkout_lacks_is_refused_by_name(self):
+        """ghes maps to eval/ghes-cases.txt; a checkout without it (a branch
+        from before the lane, #3684) stops naming the list and the lane, not
+        with the roster reader's message for a missing file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "ghes-cases.txt").unlink()
+            result = load_matrix({"EVAL_FORGE": "ghes"}, hack_dir=hack)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("TASK ", result.stdout)
+        self.assertIn("EVAL_FORGE=ghes runs the lane list eval/ghes-cases.txt, which this checkout does not have", result.stderr)
+
+    def test_gitlab_ce_runs_the_gitlab_lanes_list(self):
+        """gitlab-ce maps to eval/gitlab-cases.txt, the gitlab.com lane's list:
+        the cases grade the forge and not where it is."""
+        result = load_matrix({"EVAL_FORGE": "gitlab-ce"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("EVAL_FORGE=gitlab-ce: the gitlab-ce lane runs", result.stdout + result.stderr)
+        self.assertIn("(eval/gitlab-cases.txt)", result.stdout + result.stderr)
+
+    def test_a_ghes_list_in_the_checkout_runs_as_the_ghes_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "ghes-cases.txt").write_text("./tasks/vcs-spent-branch-reuse/task.yaml\n")
+            result = load_matrix({"EVAL_FORGE": "ghes"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), ["./tasks/vcs-spent-branch-reuse/task.yaml"])
+        self.assertIn("EVAL_FORGE=ghes: the ghes lane runs 1 case(s) on the presubmit tier (eval/ghes-cases.txt)", result.stdout)
+
     def test_a_gitlab_nightly_runs_the_same_lane_list(self):
         """The GitLab nightly is the lane's list once a night, not the
         catalogue: nothing else grades the forge, and the roster export is
-        the lane's (vcs-spent-branch-reuse since its roster line of
-        2026-10-23; empty from pdb-remediation-pr's demotion of 2026-10-17,
-        #3120, until then)."""
+        the lane's (pdb-remediation-pr and vcs-spent-branch-reuse since
+        2026-10-26; vcs-spent-branch-reuse alone from 2026-10-23; empty from
+        pdb-remediation-pr's demotion of 2026-10-17, #3120, until then)."""
         result = load_matrix({"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.lane_entries())
-        self.assertIn(f"the GitLab lane runs {len(self.lane_entries())} case(s) on the nightly tier", result.stdout)
+        self.assertIn(f"the gitlab lane runs {len(self.lane_entries())} case(s) on the nightly tier (eval/gitlab-cases.txt)", result.stdout)
         self.assertNotIn("nightly-only task(s) join the matrix", result.stdout)
-        self.assertEqual(lines_tagged(result, "ROSTER"), ["vcs-spent-branch-reuse"])
+        self.assertEqual(lines_tagged(result, "ROSTER"), ["pdb-remediation-pr,vcs-spent-branch-reuse"])
         self.assertNotIn("rung 4 is disarmed", result.stdout)
 
     def test_the_github_nightlys_part_split_is_refused_on_the_gitlab_lane(self):
@@ -333,7 +493,7 @@ class GitLabLaneTest(unittest.TestCase):
         body = "\n".join([f'SCRIPT_DIR="{HACK_DIR}"', roster_constants(), section, part_switch, 'echo "PART_OK"'])
         refused = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
         self.assertNotEqual(refused.returncode, 0)
-        self.assertIn("is the GitHub nightly's split; the GitLab nightly runs eval/gitlab-cases.txt whole", refused.stderr)
+        self.assertIn("is the GitHub nightly's split; the gitlab nightly runs eval/gitlab-cases.txt whole", refused.stderr)
         allowed = run_bash(body, {"EVAL_FORGE": "gitlab", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "all"})
         self.assertIn("PART_OK", allowed.stdout, allowed.stderr)
         github = run_bash(body, {"EVAL_FORGE": "github", "EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
@@ -390,7 +550,7 @@ class GitLabLaneTest(unittest.TestCase):
 
     def test_an_empty_file_a_missing_file_and_a_bad_path_stop_the_job(self):
         self.refused("# nothing\n", "gitlab-cases.txt names no case")
-        self.refused(None, "gitlab-cases.txt is missing")
+        self.refused(None, "gitlab-cases.txt, which this checkout does not have")
         self.refused("./tasks/no-such-case/task.yaml\n", "gitlab-cases.txt", "registered cases only")
 
     def test_the_lane_file_does_not_change_the_github_run_when_broken(self):
@@ -533,16 +693,28 @@ class InjectLaneExclusionTest(unittest.TestCase):
         # A nightly-only exclusion has nothing to leave on the presubmit tier.
         for name in (n for n in eval_rosters.inject_lane_exclusions() if n in eval_rosters.presubmit_cases()):
             self.assertIn(f"AGENT_TRANSPORT=inject: {name} leaves the matrix", result.stdout)
+        # No roster case is excluded since #4004, so the export is the whole
+        # roster; test_an_excluded_roster_case_leaves_the_export covers a
+        # roster case on the list.
+        excluded_names = set(eval_rosters.inject_lane_exclusions())
+        self.assertFalse(excluded_names & set(eval_rosters.blocking_roster()))
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(eval_rosters.blocking_roster())])
+
+    def test_an_excluded_roster_case_leaves_the_export(self):
         # The roster FILE is untouched (an exclusion is not a demotion), but
         # the export leaves the dropped names out: a roster name the suite
         # never grades would trip bench-gate's misspelled-roster banner on
-        # every run of the lane.
-        excluded_names = set(eval_rosters.inject_lane_exclusions())
-        self.assertTrue(excluded_names & set(eval_rosters.blocking_roster()), "the pinned exclusion is a roster case, so the export must differ from the file")
-        self.assertEqual(
-            lines_tagged(result, "ROSTER"),
-            [",".join(c for c in eval_rosters.blocking_roster() if c not in excluded_names)],
-        )
+        # every run of the lane. A scratch exclusion of one roster case.
+        roster = eval_rosters.blocking_roster()
+        dropped = roster[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            hack = pathlib.Path(tmp) / "hack"
+            shutil.copytree(HACK_DIR / "eval", hack / "eval")
+            (hack / "eval" / "inject-lane-exclusions.txt").write_text(f"# #2039: a scratch exclusion for the test\n{dropped}\n")
+            result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "inject"}, hack_dir=hack)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"AGENT_TRANSPORT=inject: {dropped} leaves the matrix", result.stdout)
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in roster if c != dropped)])
 
     def test_the_api_lane_exports_the_whole_roster(self):
         result = load_matrix_through_the_lane_step({"AGENT_TRANSPORT": "api"})
@@ -668,7 +840,8 @@ def part_step() -> str:
 
 
 def load_matrix_through_the_part(
-    env: dict | None = None, requesting: list[str] | None = None, hack_dir: pathlib.Path = HACK_DIR
+    env: dict | None = None, requesting: list[str] | None = None, hack_dir: pathlib.Path = HACK_DIR,
+    writes_alone: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
     """The tier switch, the part check, the lane's exclusions, the part step
     and the roster export, in the script's order. The lane step between the
@@ -676,6 +849,7 @@ def load_matrix_through_the_part(
     sets what it computes: the pinned set of cases that request a pull
     request, which scripts/test_eval_rosters.py holds to the module."""
     requesting = INJECT_LANE_REQUESTING if requesting is None else requesting
+    writes_alone = WRITES_ALONE if writes_alone is None else writes_alone
     section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
     body = "\n".join(
         [
@@ -686,6 +860,7 @@ def load_matrix_through_the_part(
             part_check(),
             exclusions_block(),
             f'INJECT_LANE_REQUESTING="{",".join(requesting)}"',
+            f'WRITES_ALONE_CASES="{",".join(writes_alone)}"',
             half_constants(),
             part_step(),
             roster_block(),
@@ -703,7 +878,23 @@ class NightlyPartTest(unittest.TestCase):
         return presubmit_entries() + nightly_entries()
 
     def is_writer(self, entry: str) -> bool:
-        return pathlib.Path(entry).parent.name in INJECT_LANE_REQUESTING
+        name = pathlib.Path(entry).parent.name
+        return name in INJECT_LANE_REQUESTING or name in WRITES_ALONE
+
+    def test_a_writes_alone_case_is_filed_with_the_writers(self):
+        # The second-phase placement the docs and the roster reason blocks
+        # state: a writes_alone case leaves the main halves.
+        self.assertTrue(WRITES_ALONE, "no registered writes_alone case left to place")
+        main = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
+        writers = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
+        for result in (main, writers):
+            self.assertEqual(result.returncode, 0, result.stderr)
+        main_names = {pathlib.Path(t).parent.name for t in lines_tagged(main, "TASK")}
+        writer_names = {pathlib.Path(t).parent.name for t in lines_tagged(writers, "TASK")}
+        for case in WRITES_ALONE:
+            with self.subTest(case=case):
+                self.assertNotIn(case, main_names)
+                self.assertIn(case, writer_names)
 
     def test_unset_or_all_is_the_whole_nightly(self):
         for env in ({"EVAL_TIER": "nightly"}, {"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "all"}, {"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": ""}):
@@ -728,27 +919,29 @@ class NightlyPartTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = [e for e in self.nightly_matrix() if not self.is_writer(e)]
         self.assertEqual(lines_tagged(result, "TASK"), expected)
-        self.assertEqual(len(self.nightly_matrix()) - len(expected), len(INJECT_LANE_REQUESTING))
+        self.assertEqual(len(self.nightly_matrix()) - len(expected), len(INJECT_LANE_REQUESTING) + len(WRITES_ALONE))
         left_out = ",".join(pathlib.Path(e).parent.name for e in self.nightly_matrix() if self.is_writer(e))
         self.assertIn(f"Nightly part: main ({len(expected)} of {len(self.nightly_matrix())} cases); left out: {left_out}\n", result.stdout)
         # A roster case in the writers part (pdb-remediation-pr 2026-10-14 to
-        # 2026-10-17; vcs-spent-branch-reuse since 2026-10-23) leaves the main part's
+        # 2026-10-17 and since 2026-10-26; vcs-spent-branch-reuse since
+        # 2026-10-23) leaves the main part's
         # export: the other part grades it.
-        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c not in INJECT_LANE_REQUESTING)])
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c not in INJECT_LANE_REQUESTING and c not in WRITES_ALONE)])
 
     def test_writers_is_exactly_the_requesting_cases_in_matrix_order(self):
         result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"})
         self.assertEqual(result.returncode, 0, result.stderr)
         tasks = lines_tagged(result, "TASK")
         self.assertEqual(tasks, [e for e in self.nightly_matrix() if self.is_writer(e)])
-        self.assertEqual(sorted(pathlib.Path(t).parent.name for t in tasks), INJECT_LANE_REQUESTING)
+        self.assertEqual(sorted(pathlib.Path(t).parent.name for t in tasks), sorted(INJECT_LANE_REQUESTING + WRITES_ALONE))
         self.assertIn(f"Nightly part: writers ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
         # The export is the roster intersected with the part: a roster name
         # the suite never grades would trip bench-gate's misspelled-roster
         # banner, so only requesting cases on the roster are named
-        # (vcs-spent-branch-reuse since 2026-10-23; empty from
+        # (pdb-remediation-pr and vcs-spent-branch-reuse since 2026-10-26;
+        # vcs-spent-branch-reuse alone from 2026-10-23; empty from
         # pdb-remediation-pr's demotion of 2026-10-17, #3120, until then).
-        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in INJECT_LANE_REQUESTING)])
+        self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(c for c in eval_rosters.blocking_roster() if c in INJECT_LANE_REQUESTING or c in WRITES_ALONE)])
 
     def test_the_two_parts_cover_the_nightly_once(self):
         main = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "main"})
@@ -910,7 +1103,7 @@ class NightlyPartTest(unittest.TestCase):
                 self.assertIn(f"Nightly part: {part} ({len(tasks)} of {len(self.nightly_matrix())} cases); left out: ", result.stdout)
 
     def test_an_empty_part_is_refused(self):
-        result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"}, requesting=[])
+        result = load_matrix_through_the_part({"EVAL_TIER": "nightly", "EVAL_NIGHTLY_PART": "writers"}, requesting=[], writes_alone=[])
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("EVAL_NIGHTLY_PART=writers selects no case", result.stderr)
         self.assertNotIn("TASK ", result.stdout)
@@ -923,7 +1116,7 @@ class NightlyPartTest(unittest.TestCase):
         src = SCRIPT.read_text(encoding="utf-8")
         tier = src.index('EVAL_TIER="${EVAL_TIER:-presubmit}"')
         check = src.index('EVAL_NIGHTLY_PART="${EVAL_NIGHTLY_PART:-all}"')
-        lane = src.index("# ─── The inject lane's safeguards")
+        lane = src.index("# ─── The lanes' safeguards")
         step = src.index("# ─── The nightly part")
         roster = src.index("\nBLOCKING_ROSTER_ENTRIES=")
         names = src.index("\nTASK_NAMES=()")
@@ -932,6 +1125,59 @@ class NightlyPartTest(unittest.TestCase):
         self.assertLess(lane, step, "the lane step computes INJECT_LANE_REQUESTING, which the part reads")
         self.assertLess(step, roster)
         self.assertLess(step, names, "TASK_NAMES is built from TASKS; the part must come first")
+
+
+def api_lane_block() -> str:
+    """The api lane's exclusion step: the mirror of the inject lane's, applied
+    on every transport but inject."""
+    return lifted_block(r"^# The mirror \(#3263\).*?^fi$")
+
+
+def load_matrix_through_both_lane_steps(env: dict | None = None) -> subprocess.CompletedProcess:
+    section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
+    constants = lane_constants() + lifted_block(r"^readonly EVAL_API_LANE_EXCLUSIONS_FILE=[^\n]*\n")
+    body = "\n".join(
+        [
+            f'SCRIPT_DIR="{HACK_DIR}"',
+            roster_constants(),
+            constants,
+            section,
+            exclusions_block(),
+            api_lane_block(),
+            roster_block(),
+            PRINT_ARRAYS,
+        ]
+    )
+    return run_bash(body, env)
+
+
+class ApiLaneExclusionTest(unittest.TestCase):
+    """Every transport but inject drops the cases only the inject door can
+    carry; the inject lane keeps them."""
+
+    def excluded_entries(self) -> list[str]:
+        return [f"./tasks/{name}/task.yaml" for name in eval_rosters.api_lane_exclusions()]
+
+    def test_the_api_lane_drops_the_door_only_cases(self):
+        for env in ({"EVAL_TIER": "nightly"}, {"EVAL_TIER": "nightly", "AGENT_TRANSPORT": "api"}):
+            with self.subTest(env=env):
+                result = load_matrix_through_both_lane_steps(env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                excluded = self.excluded_entries()
+                self.assertTrue(excluded, "the api-lane file parsed to no entries")
+                tasks = lines_tagged(result, "TASK")
+                for entry in excluded:
+                    self.assertNotIn(entry, tasks)
+                for name in eval_rosters.api_lane_exclusions():
+                    self.assertIn(f"{name} leaves the matrix -- it runs on the inject lane only", result.stdout)
+
+    def test_the_inject_lane_keeps_them(self):
+        result = load_matrix_through_both_lane_steps({"EVAL_TIER": "nightly", "AGENT_TRANSPORT": "inject"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tasks = lines_tagged(result, "TASK")
+        for entry in self.excluded_entries():
+            self.assertIn(entry, tasks)
+        self.assertNotIn("runs on the inject lane only", result.stdout)
 
 
 if __name__ == "__main__":

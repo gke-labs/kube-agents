@@ -80,6 +80,13 @@ on:
         description: "Gemini API Key"
         required: true
 
+env:
+  # Cap @actions/cache's wait on one cache segment so a restore the service
+  # refuses costs a step about a minute, not the default ten. The rule, the
+  # trade-off and the test that holds it: .agents/rules/github_actions.md,
+  # "Cap the Actions cache segment download wait".
+  SEGMENT_DOWNLOAD_TIMEOUT_MINS: "1"
+
 jobs:
   deploy-environment:
     runs-on: ubuntu-latest
@@ -91,17 +98,20 @@ jobs:
     concurrency:
       group: ${{ inputs.github_environment }}-environment
       cancel-in-progress: false
-    # Sized to provision_environment.sh's stockout retry, not to one install.
-    # The long case is a stockout on the first two attempts and a success on
-    # the third: about five minutes of setup, a teardown of whatever last
-    # night left (ten), two failed creates that each take about ten minutes
-    # to be refused, two ten-minute waits, two teardowns of the half-built
-    # environment (ten each), and one full install (forty) -- about 115
-    # minutes, so 150 with margin. `next` adds the mode switch's wait on
-    # top: the agent rolls again, and Ready waits on the bus, the callout and
-    # the provisioning Job. A job stopped here reports `cancelled`, not
-    # `failure`, which the promotion pipeline's teardown condition names.
-    timeout-minutes: ${{ inputs.mode == 'next' && 180 || 150 }}
+    # Sized to provision_environment.sh's stockout retry and to
+    # teardown_common.sh's second run of a failed uninstall.sh, not to one
+    # install. The long case is a stockout on the first two attempts and a
+    # success on the third, with every teardown failing once: about five
+    # minutes of setup, a teardown of whatever last night left (ten, plus
+    # eleven for its second run), two failed creates that each take about ten
+    # minutes to be refused, two ten-minute waits, two teardowns of the
+    # half-built environment (ten each, plus eleven for each second run), and
+    # one full install (forty) -- about 150 minutes, so 170 with margin.
+    # `next` adds the mode switch's wait on top: the agent rolls again, and
+    # Ready waits on the bus, the callout and the provisioning Job. A job
+    # stopped here reports `cancelled`, not `failure`, which the promotion
+    # pipeline's teardown condition names.
+    timeout-minutes: ${{ inputs.mode == 'next' && 200 || 170 }}
     permissions:
       contents: read
       id-token: write
@@ -243,6 +253,7 @@ jobs:
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}
           ENABLE_STOCKOUT_INVESTIGATOR: ${{ vars.ENABLE_STOCKOUT_INVESTIGATOR }}
           ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
+          VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
         run: ./scripts/release/validate_and_log_deploy_summary.sh
 
       - name: Authenticate to GCP via Workload Identity Federation (WIF)
@@ -491,6 +502,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
           ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
+          HELM_UPGRADE_INSTALL: ${{ vars.HELM_UPGRADE_INSTALL }}
           PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
           MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
           USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
@@ -499,6 +511,9 @@ jobs:
           # Unset takes install.sh's default, which is on. Here so that a rebuilt
           # environment can decline it, matching what the reconcile path reads.
           ENABLE_DRIFT_DETECTOR: ${{ vars.ENABLE_DRIFT_DETECTOR }}
+          # Likewise on: a vertex_ai install manages the serving project unless
+          # this says false.
+          VERTEX_MANAGE_SERVING_PROJECT: ${{ vars.VERTEX_MANAGE_SERVING_PROJECT }}
           # The GitOps repository the agent targets, and the one the token minter
           # scopes its tokens to. Deliberately NOT vars.GH_ORG/vars.GH_REPO: that
           # pair names the RELEASE repository, so reusing it here would scope a
@@ -586,6 +601,7 @@ jobs:
           SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
           SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
           SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
+          SLACK_HOME_CHANNEL_POLICY: ${{ vars.SLACK_HOME_CHANNEL_POLICY }}
           CLUSTER_MODE: ${{ vars.CLUSTER_MODE }}
           VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
@@ -596,6 +612,7 @@ jobs:
           KMS_KEY: ${{ vars.KMS_KEY }}
           PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
           HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}
+          WEB_CONSOLE_ENABLED: ${{ vars.WEB_CONSOLE_ENABLED }}
           THIRD_PARTY_REGISTRY_PREFIX: ${{ vars.THIRD_PARTY_REGISTRY_PREFIX }}
           NAMESPACE: ${{ vars.NAMESPACE }}
         # provision_environment.sh is this change's name for what candidates up

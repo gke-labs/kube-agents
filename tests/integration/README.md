@@ -8,8 +8,8 @@ deterministic is what lets it block merges with no repetitions and no statistics
 
 ## Status: gating
 
-This directory is in `PYTHON_TEST_DIRS`. `make test-python` runs it, the `test` job
-in `python-tests.yml` runs it, and a red seam test is a red pull request. It spent
+This directory is in `PYTHON_TEST_DIRS`. `make test-python` runs it, the `test-shard` jobs
+in `python-tests.yml` run it (the `test` job joins them), and a red seam test is a red pull request. It spent
 its first weeks on probation in a job of its own so that a flake in a young suite
 could not red an already-gating check; it came through without a failure, and a
 tier nothing gates on is a tier people learn to merge around. The separate
@@ -21,8 +21,8 @@ Two things follow from that, and both bite people who do not know them:
   compiles and runs the real Go client from `k8s-operator/cmd/k8s-event-watcher`
   against the live Python server, and the whole class is `skipUnless(GO)`. Without
   `go` on `PATH` those four tests skip and the run still prints `OK`, which is
-  indistinguishable from having run them. CI's `test` job sets up Go for exactly
-  this reason.
+  indistinguishable from having run them. CI's `test-shard` jobs set up Go for
+  exactly this reason.
 - **An `expectedFailure` that starts passing now fails the build.** That is the
   design, not an accident: the pins below assert the contract we want, so the day
   the product code satisfies one, unittest reports an unexpected success and the

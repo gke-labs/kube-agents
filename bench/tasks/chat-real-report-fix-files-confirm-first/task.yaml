@@ -14,7 +14,8 @@
 # root labelled "[thread parent, posted by you earlier]". The workload is not
 # on the install under test, which is the point of the criterion: the card's
 # worker should come back with "I can't find …" rather than chase it. Only the
-# front door is graded; the worker's answer is not.
+# front door is graded, plus one read of the card as its worker saw it; the
+# worker's answer is not.
 #
 # Planted defect required: none. Isolation class: read-only (the card asks for
 # a fix, but its target does not exist, so a worker that confirms first changes
@@ -47,24 +48,81 @@ domain: chat-and-routing
 owner: bnaylor
 
 verification_spec:
-  # A real report gets a card, not a confirmation question. The body has to
-  # name the workload and ask the specialist to confirm it exists first.
+  # A real report gets a card, not a confirmation question. Two entries,
+  # because the two lanes see different things. The inject door sends the
+  # Planning Agent's arguments as shapes ("<string, 803 chars>",
+  # a2a/hermes-bridge/activity.go shapeOf), so no pattern over the router's
+  # `body` can read the criterion there, while the tool name survives on
+  # both transports. This entry reads that call alone: trace-blind (cases.py
+  # `trace_blind_checks`), so the scorer grades it on every record that shows
+  # the trace, the api lane's and the inject lane's alike, and a run that
+  # filed no card fails it on both.
+  - name: the-fix-is-filed
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      require_success: true
+  # The criterion: the body has to name the workload and ask the specialist
+  # to confirm it exists first. Read either way, in an `any`: the router's
+  # own call, whose `body` the api lane records readable, or a `kanban_show`
+  # by the platform worker whose result carries the criterion (any platform
+  # show in the run: tool_called has no card selector, #4572). Which leaf
+  # decides depends on the lane: on the api lane the router leaf reads the
+  # filed body and decides; on the inject lane the router's arguments are
+  # shapes, so only the worker read can decide, once the scorer grades
+  # worker entries there (#2619). Until then the workers-scope leaf makes
+  # the entry worker-blind (cases.py `worker_blind_checks`): set aside as
+  # not applicable on every inject record, graded on the api lane. Its own
+  # entry, not a leaf beside the bare call above: a compound with a
+  # workers-scope leaf is worker-blind as a whole, which would take the
+  # filing out of the inject lane's grading. An `any` admits a wrong-ask
+  # card whose worker later read a child card carrying the criterion; the
+  # filing is the claim on the api lane, where the router leaf reads it.
+  # The worker arm is a `sequence` behind a successful `kanban_create`: with
+  # no card filed, the workers scope has nothing to read and would answer
+  # error, which blocks the repetition instead of failing it; the bare call
+  # in front turns a never-filed run into a graded fail on both lanes and
+  # keeps an errored filing from passing on its worker's show.
   - name: the-fix-is-filed-with-confirm-first
     role: objective
     # assert, not the converge default: the transcript is immutable once the
     # run ends, so polling a failed check would only wait out the timeout.
     mode: assert
     check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      require_success: true
-      # tool_called matches each argument with re.fullmatch, so the pattern
-      # spans the whole body. Confirm-first, in any of the wordings a card
-      # takes: "verify if checkout-gateway exists", "verify checkout-gateway's
-      # current status", "confirming the workload ... first". Not "check":
-      # "check logs, events" is ordinary diagnosis.
-      arguments:
-        body: '(?is).*checkout-gateway.*\b(?:confirm|verify)\w*\b[^.\n]{0,80}\b(?:exists?|present|current status|the workload)\b.*'
+      type: any
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
+          require_success: true
+          # tool_called matches each argument with re.fullmatch, so the
+          # pattern spans the whole body. Confirm-first, in any of the
+          # wordings a card takes: "verify if checkout-gateway exists",
+          # "verify checkout-gateway's current status", "confirming the
+          # workload ... first". Not "check": "check logs, events" is
+          # ordinary diagnosis.
+          arguments:
+            body: '(?is).*checkout-gateway.*\b(?:confirm|verify)\w*\b[^.\n]{0,80}\b(?:exists?|present|current status|the workload)\b.*'
+        - type: sequence
+          checks:
+            - type: tool_called
+              tool_names: ["kanban_create"]
+              require_success: true
+            - type: tool_called
+              scope: workers
+              agent: "^platform$"
+              tool_names: ["kanban_show"]
+              require_success: true
+              # The card as the specialist read it: kanban_show returns the
+              # task with its body, recorded as one line of JSON. The window
+              # counts an escape pair (`\"`, `\u2019`) as one unit and
+              # refuses the `\n` escape the way the body pattern refuses a
+              # line break. The harness clips a worker result at 2,000
+              # characters (worker_trajectory.py MAX_RESULT_CHARS), so the
+              # criterion has to sit near the start of the body, as the
+              # recorded cards have it (under 800 characters in).
+              result: '(?is)checkout-gateway.*\b(?:confirm|verify)\w*\b(?:[^.\\]|\\[^n]){0,80}\b(?:exists?|present|current status|the workload)\b'
   # No question back to the user: the report is real, so the rule's ask does
   # not apply. The front door's own text is everything before the first
   # delivered section (harness.py _append_final).
@@ -74,8 +132,8 @@ verification_spec:
     check:
       type: report_contains
       forbidden_patterns:
-        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\?'
-        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task )[^\n]*\b(?:sample|demo)\b'
+        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task |question from delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task |question from delegated task )[^\n]*\?'
+        - '\A(?:(?!result of delegated task |artifact [^\n]* produced by delegated task |question from delegated task )[^\n]*\n)*?(?!result of delegated task |artifact [^\n]* produced by delegated task |question from delegated task )[^\n]*\b(?:sample|demo)\b'
   # The delegation boundary: the front door files cards and never works them.
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard

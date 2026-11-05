@@ -105,7 +105,7 @@ above does not cover: the candidate is a commit on `main`, and the run measuring
 it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 `RC_COMMIT_SHA` being set is the third condition, enforced in the same two
 places. `EVAL_ROLLBACK_LANE=1` is the fourth, also enforced in both: the today
-lane's periodic on `main` deploys `next` and rolls it back to `today` before its
+lane deploys `next` and rolls it back to `today` before its
 matrix, so its key reads `today`, but a rolled-back install is not the fresh
 `today` install that window measures. The third has to be enforced twice,
 because the mistake is not correctable afterwards:
@@ -115,12 +115,12 @@ candidate's record and `main`'s are the same record once written — and the
 candidate would then be judged non-inferior to a window it had just moved.
 
 A next-mode run on `main` does append. The main nightly
-(`ci-kube-agents-eval-nightly` and its `-writers` part) is a periodic with no
+(`ci-kube-agents-eval-nightly`, its `-main-b` half and its `-writers` part) is a periodic with no
 `PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
 reads as the key's `next` mode, so its lines file under a key of their own and
-never reach today's window. Today's window is appended by
-`ci-kube-agents-eval-nightly-today`, the today-mode nightly kept as the
-rollback check, which grades a fresh `today` install over the agent API. At a
+never reach today's window. No job appends today's window now: the
+rollback check is the today lane, which the fourth condition keeps out, and
+today's lines are the ones already in the store. At a
 `next` key a repetition graded with a check set
 aside as not applicable on the inject transport is recorded, because every
 next-mode run, on `main` or on a pull request, is graded under the same set-aside

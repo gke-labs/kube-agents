@@ -119,12 +119,16 @@ OUTCOME_FAILED = classify.OUTCOME_FAILED
 # "passed on the last N runs from other PRs" counts inside classify.py's
 # only-this-PR window.
 ONLY_PR_WINDOW = classify.ONLY_PR_WINDOW
-EXCERPT_CHARS = 160
 
 # Links. The run page and the brief are the dashboard's, written by
 # post_health.run_link and post_health.incident_link (post_health owns the
 # URL contract); the build log is Prow's Deck for this job.
 BUILD_LOG_URL = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/" + JOB_NAME + "/{build_id}"
+# For a run that records where it lives (runs[].gcs_base): the lanes' log
+# bucket is not Deck-readable, so Spyglass shows nothing for it, while a
+# project reader opens the build in the Console's bucket browser.
+GCS_BROWSER_URL = "https://console.cloud.google.com/storage/browser/"
+GS_SCHEME = "gs://"
 # "kube-agents-evals-23" reads as "evals-23".
 PROJECT_PREFIX = "kube-agents-"
 # GitHub REST paths, relative to the repository (`gh.path` prefixes it), and
@@ -157,7 +161,7 @@ SHARED_NO_INCIDENT = "{case} is also failing on {also} right now, so it may not 
 UNEXPLAINED = "{case} failed here and nothing on other PRs matches it yet; read the transcript."
 HARD_FAILURE = (
     "🔴 **The run failed without a gate case failing all of its repetitions.** An absolute check tripped"
-    " (a forbidden cluster change, a verifier that errored) or the log was cut short; the build log has the reason."
+    " (a forbidden cluster change, a verifier that errored; the run's artifacts/eval-grading.log has the reason) or the log was cut short (the build log says where)."
 )
 HELD_OUT_NOTE = " {n} held-out {cases} also failed; held-out cases do not block."
 LINK_RUN = "[Why this run failed →]({url})"
@@ -230,8 +234,6 @@ CONDITION_STORM = health.STORM
 TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"
 TABLE_ROW = "| `{case}`{note} | {result} | {also} |"
 HELD_OUT_CELL = " (held out)"
-REASON_LINE = "Reason: `{reason}`"
-REASON_LINE_NAMED = "Reason (`{case}`): `{reason}`"
 FOOTER = "{passed} {cases} passed. Run {minutes} min on {project} · [build log]({url})"
 NO_OTHER_PR = "no other PR"
 OTHER_PRS = "{n} other {prs}"
@@ -285,6 +287,14 @@ class Red:
 
     def unclear(self) -> list[dict]:
         return [c for c in self.failed if c.get("cls") not in (CLS_SHARED, CLS_STORM, CLS_ONLY_THIS_PR)]
+
+
+def build_url(run: health.Run) -> str:
+    """The build's link: the Console browser when the run says where it
+    lives, Spyglass for a document from before that field."""
+    if run.gcs_base:
+        return GCS_BROWSER_URL + run.gcs_base.removeprefix(GS_SCHEME).rstrip("/")
+    return BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)
 
 
 def is_red(run: health.Run) -> bool:
@@ -363,13 +373,15 @@ def also_text(count) -> str:
 
 def result_cell(case: dict) -> str:
     reps = case.get("reps") or {}
-    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0) + reps.get("ceiling", 0)
+    total = reps.get("pass", 0) + reps.get("fail", 0) + reps.get("infra", 0) + reps.get("ceiling", 0) + reps.get("fixture", 0)
     cell = f"{reps.get('pass', 0)} / {total} reps"
     notes = []
     if reps.get("infra"):
         notes.append(f"{reps['infra']} infra")
     if reps.get("ceiling"):
         notes.append(f"{reps['ceiling']} at the delegation ceiling")
+    if reps.get("fixture"):
+        notes.append(f"{reps['fixture']} not run, fixture drifted")
     if notes:
         cell += f" ({', '.join(notes)})"
     return cell
@@ -453,22 +465,16 @@ def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
             note = "" if case["admitted"] else HELD_OUT_CELL
             lines.append(TABLE_ROW.format(case=case["case"], note=note, result=result_cell(case), also=also_text(case.get("also_failing_prs"))))
         lines.append("")
-    # The Reason line is the grader's check (`reps[].reason`). The agent's own
-    # words (`reps[].excerpt`, the Brief's quote) stand in only when a rep
-    # carries no reason at all, so the comment never trades the check that
-    # failed for the report's opening boilerplate.
-    reasons = [c for c in red.yours() + red.unclear() if (c.get("reason") or c.get("excerpt"))]
-    for case in reasons:
-        text = (case.get("reason") or case.get("excerpt") or "").replace("`", "'")[:EXCERPT_CHARS]
-        lines.append((REASON_LINE if len(reasons) == 1 else REASON_LINE_NAMED).format(case=case["case"], reason=text))
-    if reasons:
-        lines.append("")
+    # No grading text: the check's reason (`reps[].reason`) and the agent's
+    # words (`reps[].excerpt`) are the detail the smoke keeps off the public
+    # record (docs/ci-health.md, "The smoke lanes log to"). The run link in
+    # the box carries both for a project reader.
     project = red.raw.get("project") or UNKNOWN_PROJECT
     project = project.removeprefix(PROJECT_PREFIX)
     wall = red.run.wall_clock
     minutes = int(wall.total_seconds() // 60) if wall else "?"
     passed = red.passed
-    lines.append(FOOTER.format(passed=passed, cases=plural(passed, "case"), minutes=minutes, project=project, url=BUILD_LOG_URL.format(pr=red.run.pr, build_id=red.run.build_id)))
+    lines.append(FOOTER.format(passed=passed, cases=plural(passed, "case"), minutes=minutes, project=project, url=build_url(red.run)))
     return "\n".join(lines) + "\n"
 
 
@@ -500,7 +506,7 @@ def render_deadline_comment(run: health.Run, health_doc: dict) -> str:
         "",
         f"> {box} {' · '.join(links)}",
         "",
-        FOOTER_DEADLINE.format(minutes=minutes, url=BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)),
+        FOOTER_DEADLINE.format(minutes=minutes, url=build_url(run)),
     ]
     return "\n".join(lines) + "\n"
 
@@ -525,7 +531,7 @@ def render_lost_comment(run: health.Run, health_doc: dict) -> str:
         "",
         f"> {box} {' · '.join(links)}",
         "",
-        FOOTER_LOST.format(minutes=minutes, url=BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)),
+        FOOTER_LOST.format(minutes=minutes, url=build_url(run)),
     ]
     return "\n".join(lines) + "\n"
 
@@ -559,7 +565,7 @@ def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dic
         "",
         f"> {box} {' · '.join(links)}",
         "",
-        FOOTER_NOT_EVALUATED.format(minutes=minutes, project=project, url=BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)),
+        FOOTER_NOT_EVALUATED.format(minutes=minutes, project=project, url=build_url(run)),
     ]
     return "\n".join(lines) + "\n"
 

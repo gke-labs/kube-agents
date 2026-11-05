@@ -1,13 +1,16 @@
 {
-  "version": "833877afadf6280e",
+  "version": "f0e8d8237ce63a35",
+  "shard": 0,
+  "shards": 1,
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
       "user": "provision",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
           "a2a.topics.shared.blueprint",
           "a2a.topics.shared.annotations",
           "$JS.API.INFO",
@@ -20,6 +23,11 @@
           "$JS.API.STREAM.CREATE.KV_runtime-state",
           "$JS.API.STREAM.CREATE.KV_session-state",
           "$JS.API.STREAM.CREATE.KV_cap",
+          "$JS.API.STREAM.CREATE.KV_feedback",
+          "$JS.API.STREAM.CREATE.KV_people",
+          "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
+          "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
           "$JS.API.STREAM.INFO.TASKS",
           "$JS.API.STREAM.INFO.DIRECTORY",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -27,6 +35,11 @@
           "$JS.API.STREAM.INFO.KV_runtime-state",
           "$JS.API.STREAM.INFO.KV_session-state",
           "$JS.API.STREAM.INFO.KV_cap",
+          "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.INFO.KV_people",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
+          "$JS.API.STREAM.INFO.DISPATCH_STOPS",
           "_INBOX.provision.>"
         ],
         "subscribe": [
@@ -52,6 +65,7 @@
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.agent.platform.topology-skew",
           "a2a.topics.shared.blueprint",
           "a2a.topics.shared.annotations",
           "$JS.API.STREAM.INFO.TOPICS-STATE",
@@ -73,7 +87,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
       "user": "verifier",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.cap.reply.>",

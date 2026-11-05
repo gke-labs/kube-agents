@@ -64,6 +64,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import time
 import tomllib
@@ -1033,9 +1034,25 @@ def test_every_probe_the_catalog_declares_is_something_the_terraform_plants():
     every one of that role's checks at `error` forever, and the reason would
     talk about an unready environment rather than about the typo."""
     fleet_dir = _BENCH / "tf" / "fleet"
-    main = (fleet_dir / "main.tf").read_text()
+    # main.tf and every stack file that is not a slot's defects file
+    # (config-connector.tf, which plants seeded-a's ConfigConnector object).
+    main = "".join(
+        path.read_text() for path in sorted(fleet_dir.glob("*.tf")) if not path.name.startswith("defects-")
+    )
     seen = 0
     for role, entry in _catalog()["roles"].items():
+        if entry["cluster_slot"] is None:
+            # A project-scoped probe, `<kind>/<name-prefix>*`: the Terraform
+            # names the object `<name-prefix>${var.cluster_prefix}`.
+            for probe in entry["probes"]:
+                seen += 1
+                prefix = probe.split("/", 1)[1].removesuffix("*")
+                assert re.search(rf'name\s*=\s*"{re.escape(prefix)}\$\{{var\.cluster_prefix\}}"', main), (
+                    f"project-scoped role {role!r} probes for {probe!r}, but no stack "
+                    f"file outside the defects files declares a name {prefix!r} followed "
+                    "by ${var.cluster_prefix}"
+                )
+            continue
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
         # Slot c carries GKE-level defects only, declared in main.tf, so it
         # has no defects file; a slot without one contributes no probes.
@@ -1060,7 +1077,11 @@ def test_every_catalog_role_is_a_legal_name_and_a_known_slot():
     assert slots == {"a", "b", "c", "d"}
     for role, entry in catalog["roles"].items():
         assert fleet.ROLE_PATTERN.fullmatch(role), role
-        assert entry["cluster_slot"] in slots, role
+        # None is a project-scoped role: a Compute Engine object no cluster
+        # carries, probed in the project and published with no kubeconfig.
+        assert entry["cluster_slot"] in slots or entry["cluster_slot"] is None, role
+        if entry["cluster_slot"] is None:
+            assert entry["namespace"] is None and entry["probes"], role
         assert "fixture" in entry and entry["fixture"], role
 
 
@@ -1396,6 +1417,18 @@ YAML
     fi
     [ -n "${STUB_TOKEN_WARNING:-}" ] && echo "$STUB_TOKEN_WARNING" >&2
     printf '%s\\n' "${STUB_TOKEN:-ya29.a0AfB_byTOKEN}"
+    ;;
+  "compute instances list"|"compute firewall-rules list")
+    # A project-scoped probe. Planted by default: prints one name with the
+    # filter's prefix. STUB_COMPUTE_ABSENT lists `<collection>:<prefix>` pairs
+    # that are not there; STUB_COMPUTE_FAIL fails every list.
+    [ -n "${STUB_COMPUTE_FAIL:-}" ] && { echo "$STUB_COMPUTE_FAIL" >&2; exit 1; }
+    prefix=""
+    for arg in "$@"; do
+      case "$arg" in --filter=*) prefix="${arg#--filter=name ~ ^}" ;; esac
+    done
+    case " ${STUB_COMPUTE_ABSENT:-} " in *" $2:${prefix} "*) exit 0 ;; esac
+    printf '%sseeded\n' "$prefix"
     ;;
   *) echo "unexpected gcloud call: $*" >&2; exit 64 ;;
 esac
@@ -1758,6 +1791,7 @@ def _provision(shell, tmp_path, **env) -> Path:
         "STUB_NAMESPACES": (
             "seeded-debug seeded-reliability seeded-security seeded-capacity seeded-deprecation seeded-intent"
             " seeded-token seeded-headroom seeded-qos seeded-stall seeded-upgrade seeded-topology seeded-shapes seeded-defaults"
+            " seeded-scaled-zero"
         ),
         # Most tests are about discovery and presence, not the credential, so
         # they run the way a laptop does; the credential tests override this.
@@ -1772,7 +1806,7 @@ def test_the_runner_writes_one_kubeconfig_per_catalog_role(shell, tmp_path):
     out = _provision(shell, tmp_path)
     done = _provision.last
     assert done.returncode == 0, done.stderr
-    roles = set(_catalog()["roles"])
+    roles = {role for role, entry in _catalog()["roles"].items() if entry["cluster_slot"] is not None}
     assert {p.stem for p in out.glob("*.kubeconfig")} == roles
     context = (out / ".fleet-context").read_text().splitlines()
     assert context[0] == "project=kube-agents-evals"
@@ -1782,9 +1816,66 @@ def test_the_runner_writes_one_kubeconfig_per_catalog_role(shell, tmp_path):
     # fixture destroyed, which is indistinguishable in a Prow log from a real
     # violation.
     for role, entry in _catalog()["roles"].items():
+        if entry["cluster_slot"] is None:
+            continue
         body = (out / f"{role}.kubeconfig").read_text()
         assert f"- name: seeded-{entry['cluster_slot']}\n" in body, role
         assert "server: https://10.0.0.1" in body
+
+
+def _project_roles() -> dict:
+    return {role: entry for role, entry in _catalog()["roles"].items() if entry["cluster_slot"] is None}
+
+
+def test_the_runner_publishes_a_project_role_as_its_confirmed_list_alone(shell, tmp_path):
+    """A project-scoped role is a Compute Engine object no cluster carries: the
+    runner lists it in the project with gcloud and publishes `<role>.confirmed`,
+    with no kubeconfig and no slot line."""
+    assert _project_roles(), "the catalog declares no project-scoped role; this test is vacuous"
+    out = _provision(shell, tmp_path)
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    total = len(_catalog()["roles"])
+    assert f"Seeded-fleet kubeconfigs: {total} role(s) written" in done.stderr
+    log = (tmp_path / "calls.log").read_text()
+    context = (out / ".fleet-context").read_text().splitlines()
+    for role, entry in _project_roles().items():
+        assert not (out / f"{role}.kubeconfig").exists(), role
+        assert (out / f"{role}.confirmed").read_text().splitlines() == entry["probes"], role
+        assert stat.S_IMODE((out / f"{role}.confirmed").stat().st_mode) == 0o600, role
+        assert not any(line.startswith(f"slot.{role}=") for line in context), role
+        for probe in entry["probes"]:
+            kind, prefix = probe.split("/", 1)
+            collection = {"instance": "instances", "firewall": "firewall-rules"}[kind]
+            assert f"compute {collection} list --project kube-agents-evals --filter=name ~ ^{prefix[:-1]} --format=value(name)" in log
+
+
+def test_a_missing_project_object_leaves_its_role_unplanted(shell, tmp_path):
+    out = _provision(shell, tmp_path, STUB_COMPUTE_ABSENT="instances:startup-fail-")
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    assert not (out / "startup-fail-vm.confirmed").exists()
+    assert "instance/startup-fail-* absent from project kube-agents-evals, so fixture role 'startup-fail-vm' was never planted" in done.stderr
+    assert (out / "world-open-ingress.confirmed").exists()
+    assert ", 1 whose fixtures were not present" in done.stderr
+
+
+def test_a_refused_project_list_leaves_the_role_unchecked_not_unplanted(shell, tmp_path):
+    out = _provision(shell, tmp_path, STUB_COMPUTE_FAIL="ERROR: Required 'compute.instances.list' permission")
+    done = _provision.last
+    assert done.returncode == 0, done.stderr
+    for role in _project_roles():
+        assert not (out / f"{role}.confirmed").exists()
+        assert f"so fixture role '{role}' could not be checked" in done.stderr
+    assert "could not be read from project kube-agents-evals (ERROR: Required 'compute.instances.list' permission)" in done.stderr
+    assert f"{len(_project_roles())} on clusters that could not be resolved or reached, 0 whose fixtures were not present" in done.stderr
+
+
+def test_project_roles_are_probed_when_the_project_has_no_seeded_cluster(shell, tmp_path):
+    out = _provision(shell, tmp_path, STUB_CLUSTERS="")
+    assert _provision.last.returncode == 0, _provision.last.stderr
+    for role in _project_roles():
+        assert (out / f"{role}.confirmed").exists(), role
 
 
 def test_a_read_only_service_account_reaches_every_role_file(shell, tmp_path):
@@ -1948,7 +2039,8 @@ def test_a_rewrite_that_fails_drops_the_cluster_rather_than_keeping_the_credenti
     assert done.returncode == 0, done.stderr
     assert list(out.glob("*.kubeconfig")) == []
     assert "dropped" in done.stderr
-    assert "0 role(s) written" in done.stderr
+    # Only the project-scoped roles, which need no kubeconfig.
+    assert f"kubeconfigs: {len(_project_roles())} role(s) written" in done.stderr
 
 
 def test_the_executed_form_exits_with_the_gate_code(tmp_path):
@@ -2215,8 +2307,9 @@ def test_the_runners_parser_reads_the_real_catalog_the_same_way_python_does():
     done = _catalog_rows(_CATALOG)
     assert done.returncode == 0, done.stderr
     parsed = {line.split()[0]: line.split()[1] for line in done.stdout.splitlines()}
+    # `-` is the runner's slot for a project-scoped role (`cluster_slot: null`).
     assert parsed == {
-        role: entry["cluster_slot"] for role, entry in _catalog()["roles"].items()
+        role: entry["cluster_slot"] or "-" for role, entry in _catalog()["roles"].items()
     }
 
 
@@ -2235,6 +2328,26 @@ def test_the_runners_parser_reads_the_real_catalog_the_same_way_python_does():
         (
             {"cluster_slots": {"a": ""}, "roles": {"r": {"cluster_slot": "z"}}},
             "unknown cluster slot",
+        ),
+        (
+            {"cluster_slots": {"a": ""}, "roles": {"r": {"cluster_slot": None, "probes": ["deployment/x"]}}},
+            "malformed probe",
+        ),
+        (
+            {"cluster_slots": {"a": ""}, "roles": {"r": {"cluster_slot": None, "probes": ["instance/x-*; rm -rf /*"]}}},
+            "malformed probe",
+        ),
+        (
+            {"cluster_slots": {"a": ""}, "roles": {"r": {"cluster_slot": None, "probes": []}}},
+            "declares no probe",
+        ),
+        (
+            {"cluster_slots": {"a": ""}, "roles": {"r": {"cluster_slot": None, "namespace": "n", "probes": ["instance/x-*"]}}},
+            "names a namespace",
+        ),
+        (
+            {"cluster_slots": {"a": ""}, "roles": {"r": {"cluster_slot": "a", "probes": ["instance/x-*"]}}},
+            "malformed probe",
         ),
     ],
 )
@@ -2307,6 +2420,10 @@ def test_the_runner_records_every_roles_slot_whether_or_not_it_was_reached(shell
     short = _provision(shell, tmp_path, STUB_CLUSTERS="seeded-a\tus-central1-a\n")
     context = (short / ".fleet-context").read_text().splitlines()
     for role, spec in _catalog()["roles"].items():
+        if spec["cluster_slot"] is None:
+            # A project-scoped role has no slot to record.
+            assert not any(line.startswith(f"slot.{role}=") for line in context), role
+            continue
         assert f"slot.{role}={spec['cluster_slot']}" in context
     # Written before any network call, so a run that stops partway leaves a
     # complete slot record: every slot. line precedes the first cluster. line.
@@ -2342,9 +2459,19 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
     would hold the role drifted forever, and the pool verifier would fail
     every project."""
     fleet_dir = _BENCH / "tf" / "fleet"
-    main = (fleet_dir / "main.tf").read_text()
+    # main.tf and every stack file that is not a slot's defects file.
+    main = "".join(
+        path.read_text() for path in sorted(fleet_dir.glob("*.tf")) if not path.name.startswith("defects-")
+    )
     seen = 0
     for role, entry in _catalog()["roles"].items():
+        if entry["cluster_slot"] is None:
+            # `<kind>/<name-prefix>*`: every subject must be one of the role's
+            # probes, which the probe test above ties to the Terraform.
+            for assertion in entry["state"]:
+                seen += 1
+                assert assertion["subject"] in entry["probes"], (role, assertion["subject"])
+            continue
         defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
         body = main + (defects.read_text() if defects.is_file() else "")
         for assertion in entry["state"]:
@@ -2367,3 +2494,179 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
             )
     assert seen, "no role asserts on a named subject; this test is vacuous"
 
+
+# ------------------------------------------- the planted-taint safeguards (#4037)
+#
+# Both cost cases guard the taint that keeps idle-batch-pool empty, across every
+# node the pool selector matches. The pool can have one node or several. These
+# tests parse each check from the shipped task YAML and run it over stubbed node
+# lists, pinning what `across_matches: every` does at one node and at two.
+# Upstream quantifies `every` over the taint filter's elements, so a node with
+# no seeded-role taint left would drop out; FleetResourcePropertyVerifier fails
+# it instead (#4038), so "removed on one of two" fails.
+
+_TAINT_CHECKS = [
+    ("cost-idle-pool-probe", "the-planted-taint-survived-the-probe"),
+    ("cost-chat-request-runs-collector", "the-planted-taint-survived"),
+]
+
+
+def _shipped_check(case: str, name: str):
+    spec = yaml.safe_load((_BENCH / "tasks" / case / "task.yaml").read_text())
+    for entry in spec["verification_spec"]:
+        if entry["name"] == name:
+            return parse_node({**entry["check"], "name": name})
+    raise AssertionError(f"{case} has no check named {name!r}")
+
+
+def _pool_node(i: int, tainted: bool) -> dict:
+    taints = [{"key": "seeded-role", "value": "idle-batch", "effect": "NoSchedule"}]
+    node = {"metadata": {"name": f"gke-seeded-a-idle-batch-pool-{i}"}, "spec": {}}
+    if tainted:
+        node["spec"]["taints"] = taints
+    return node
+
+
+def _stub_pool(monkeypatch, nodes: list[dict]):
+    """Both reads see the same pool: upstream's comparison (its own get_resource)
+    and the fleet verifier's (namespaces for classification, the node re-read
+    for object-level `every`)."""
+    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
+    return _fake_get_resource(
+        monkeypatch,
+        lambda k, n, kw: _ns_list("default") if k == "namespace" else {"items": nodes},
+    )
+
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+@pytest.mark.parametrize(
+    ("tainted", "expected"),
+    [
+        ([True], "pass"),
+        ([False], "fail"),
+        ([True, True], "pass"),  # #4037: failed before `every`, nothing changed
+        ([False, False], "fail"),
+        ([True, False], "fail"),  # #4038: a node with no taint left fails
+    ],
+    ids=["1-kept", "1-removed", "2-kept", "2-removed", "2-removed-on-one"],
+)
+def test_the_planted_taint_safeguard_across_pool_sizes(
+    monkeypatch, provisioned, case, name, tainted, expected
+):
+    provisioned("idle-nodepool")
+    nodes = [_pool_node(i, t) for i, t in enumerate(tainted)]
+    _stub_pool(monkeypatch, nodes)
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == expected, result.reason
+
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+def test_a_changed_taint_value_on_one_node_fails(monkeypatch, provisioned, case, name):
+    # A taint that is still there but rewritten is caught on any node, unlike
+    # one that was removed.
+    provisioned("idle-nodepool")
+    nodes = [_pool_node(0, True), _pool_node(1, True)]
+    nodes[1]["spec"]["taints"][0]["value"] = "anything-else"
+    _stub_pool(monkeypatch, nodes)
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == "fail", result.reason
+    assert "gke-seeded-a-idle-batch-pool-1" in result.reason
+
+
+# ------------------------------------------------ object-level `every` (#4038)
+
+
+def _node(name: str, labels: dict | None = None) -> dict:
+    return {"metadata": {"name": name, "labels": labels or {}}, "spec": {}}
+
+
+def test_every_fails_an_object_where_a_plain_path_resolves_nothing(monkeypatch, provisioned):
+    # No wildcard in the path: upstream flattens the values, so the node with
+    # no label at all dropped out and the check passed on the other.
+    provisioned("idle-nodepool")
+    nodes = [_node("a", {"tier": "batch"}), _node("b")]
+    _stub_pool(monkeypatch, nodes)
+    result = parse_node(
+        {
+            "type": "fleet_resource_property",
+            "name": "every-node-labelled",
+            "fixture_role": "idle-nodepool",
+            "kind": "node",
+            "selector": "cloud.google.com/gke-nodepool=idle-batch-pool",
+            "path": "metadata.labels.tier",
+            "op": "eq",
+            "value": "batch",
+            "across_matches": "every",
+        }
+    ).verify(0.0)
+    assert result.status == "fail", result.reason
+    assert "['b']" in result.reason
+
+
+def test_none_still_lets_an_object_with_nothing_conform(monkeypatch, provisioned):
+    provisioned("idle-nodepool")
+    nodes = [_pool_node(0, False), _pool_node(1, False)]
+    calls = _stub_pool(monkeypatch, nodes)
+    result = parse_node(
+        {
+            "type": "fleet_resource_property",
+            "name": "no-node-carries-the-taint",
+            "fixture_role": "idle-nodepool",
+            "kind": "node",
+            "selector": "cloud.google.com/gke-nodepool=idle-batch-pool",
+            "path": "spec.taints[?(@.key=='seeded-role')].value",
+            "op": "eq",
+            "value": "idle-batch",
+            "across_matches": "none",
+        }
+    ).verify(0.0)
+    assert result.status == "pass", result.reason
+    # `none` never takes the re-read.
+    assert [c for c in calls if c["kind"] == "node"] == []
+
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+def test_a_pool_that_changes_between_reads_is_an_error_not_a_verdict(
+    monkeypatch, provisioned, case, name
+):
+    provisioned("idle-nodepool")
+    first = [_pool_node(0, True), _pool_node(1, True)]
+    second = [_pool_node(0, True), _pool_node(2, False)]
+    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": first})
+    _fake_get_resource(
+        monkeypatch,
+        lambda k, n, kw: _ns_list("default") if k == "namespace" else {"items": second},
+    )
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == "error", result.reason
+    assert "changed between reads" in result.reason
+
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+def test_a_re_read_that_cannot_reach_the_cluster_is_an_error(
+    monkeypatch, provisioned, case, name
+):
+    provisioned("idle-nodepool")
+    nodes = [_pool_node(0, True), _pool_node(1, True)]
+    _delegate_get_resource(monkeypatch, lambda k, n, kw: {"items": nodes})
+
+    def handler(k, n, kw):
+        if k == "namespace":
+            return _ns_list("default")
+        raise RuntimeError("Unable to connect to the server")
+
+    _fake_get_resource(monkeypatch, handler)
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == "error", result.reason
+
+@pytest.mark.parametrize(("case", "name"), _TAINT_CHECKS)
+def test_the_re_read_uses_the_roles_kubeconfig(monkeypatch, provisioned, case, name):
+    # The re-read must look at the fixture's cluster: the ambient one has no
+    # such pool, so it would always disagree and every check would error.
+    root = provisioned("idle-nodepool")
+    calls = _stub_pool(monkeypatch, [_pool_node(0, True), _pool_node(1, True)])
+    result = _shipped_check(case, name).verify(0.0)
+    assert result.status == "pass", result.reason
+    reads = [c for c in calls if c["kind"] == "node"]
+    assert reads, "the object-level re-read did not run"
+    assert all(c["kubeconfig"] == str(root / "idle-nodepool.kubeconfig") for c in reads)

@@ -19,6 +19,9 @@ cached per distinct `(project, location)` pair, not re-issued per cluster --
 the SOP's own §2 instruction. The eleventh, `upgrade-blocked`, is the
 exception described below: it reads PodDisruptionBudgets through the
 fleet-upgrade-verification reporter, which fetches a kubeconfig per member.
+After the sweep, with `--config-connector`, `main` also fetches credentials for each collected cluster
+and makes one Config Connector read there (`kcc_health.py`), inside the
+collector's time budget, as `kcc_unready` or `kcc_unread` on its entry.
 
 Two GCP surfaces, so two manifest failure shapes:
 
@@ -72,12 +75,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import json
 import re
 import shlex
 import os
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -110,12 +114,9 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 
 AUDIT_ID = "security-patch-orchestrator"
 DEFAULT_TIMEOUT_S = 60
-# What `timeout(1)` exits with, so a timed-out gcloud reads the same in the
-# manifest whichever layer cut it off.
-TIMEOUT_RC = 124
-# The credential proxy's admitted count at the operator's default limit;
-# collect.py's MAX_WORKERS comment has the reasoning.
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 # How much of gcloud's stderr a `gate-failed` entry keeps: enough to carry the
 # API's error sentence, short enough not to dominate the manifest.
 ERROR_EXCERPT_CHARS = 300
@@ -160,6 +161,12 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
+# The Config Connector read that `main` adds to the manifest: this stream's
+# `manifest` fixes can edit Config Connector declarations, and `finish` says so
+# on a fix whose object Config Connector does not apply.
+import kcc_health  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -240,11 +247,15 @@ BEHIND_CHECKS = (MASTER_BEHIND_CHECK, "pool-skew")
 # 600 seconds (the SOP's §3 says to give it exactly that), after every
 # project's metadata reads, so the runs share a budget and each run's cap
 # has to leave room: a cluster whose run overruns it loses 3.11
-# (unevaluated, below) rather than the manifest.
+# (unevaluated, below) rather than the manifest. After the reporter runs,
+# `main` fetches credentials and makes one Config Connector read on each
+# collected cluster (`kcc_health.py`). Those reads end by
+# `kcc_health.RUN_DEADLINE_S` from the start of `main`, which leaves time to
+# print the manifest before the terminal call ends.
 READINESS_TIMEOUT_S = 240
-# The reporter runs sit on `MAX_WORKERS` threads, so a per-run cap bounds one
+# The reporter runs sit on `max_workers` threads, so a per-run cap bounds one
 # project and not the sum: a fleet with more behind projects than workers
-# queues the rest behind the first `MAX_WORKERS`. This is the budget for all of them
+# queues the rest behind the first `max_workers`. This is the budget for all of them
 # together, measured from the moment the fleet collection starts, and a
 # reporter that would start with less than the floor left is not started.
 READINESS_FLEET_BUDGET_S = 420
@@ -473,44 +484,14 @@ def log(msg: str) -> None:
     print(f"[patch_readiness] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+TIMEOUT_RC = collector_run.TIMEOUT_RC
+Discovery = collector_run.Discovery
+run_and_gate = collector_run.run_and_gate
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
-
-
-def _text(output: str | bytes | None) -> str:
-    if isinstance(output, bytes):
-        return output.decode(errors="replace")
-    return output or ""
-
-
-def default_run(argv: list[str], *, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
-        # or not, and every caller matches markers against a str.
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn = default_run) -> tuple[object | None, Run]:
-    result = run(argv)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def output_digest(text: str) -> str:
@@ -524,17 +505,6 @@ def _record(argv_str: str, result: Run) -> dict:
         "duration_s": round(result.duration_s, 2),
         "output_sha256": output_digest(result.stdout),
     }
-
-
-class Discovery(NamedTuple):
-    projects: list[str]
-    # Set when no project could be resolved at all: an empty fleet is then a
-    # failure to look, and the manifest says so with a top-level `error`.
-    error: str | None
-    # Set when the scope is provably short -- `projects list` failed or
-    # filtered out the active project, or `--project` narrowed it -- and
-    # turned into a `project/UNENUMERATED_PROJECTS` row by `collect_fleet`.
-    partial: str | None = None
 
 
 def _stderr_excerpt(result: Run) -> str:
@@ -2180,12 +2150,19 @@ def collect_project(project: str, *, run: RunFn, now: datetime) -> list[dict]:
             # reason `_master_version` is: the fact is fleet-wide and this
             # worker only ever sees one project.
             "_notification_topic": notification_topic(c),
+            # GKE's status, kept for the Config Connector read after the sweep
+            # (`_status` above is removed before the manifest prints).
+            kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
         }
+        if kcc_health.addon_enabled(c):
+            # Read first by the Config Connector read after the sweep.
+            entry[kcc_health.ADDON_FIELD] = True
         entries.append(entry)
     return entries + shortfall
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int = MAX_WORKERS, now: datetime | None = None) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_workers: int | None = None, now: datetime | None = None) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(TIMESTAMP_FORMAT, time.gmtime())
     # The clock for 3.11's budget starts here, before discovery: what the
@@ -2334,9 +2311,30 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
     fleet_scope_args.add_scope_arguments(parser)
+    kcc_health.add_flag(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
+    # The Config Connector reads below end inside a budget measured from here.
+    started = time.monotonic()
     manifest = collect_fleet(args.project)
+    # With `--config-connector` (`kcc_health.FLAG`), which the SOP command
+    # passes, or while an audit run of this stream is in flight, so the read
+    # does not depend on the model copying the flag; a chat fleet question
+    # with no run in flight does not read. The manifest says which
+    # (`kcc_health.READ_STAMP_FIELD`).
+    reason = kcc_health.read_reason(args.config_connector, AUDIT_ID)
+    manifest[kcc_health.READ_STAMP_FIELD] = reason
+    if reason:
+        # After the sweep, in a new pool of the sweep's size: a credential fetch
+        # and one Config Connector read per collected cluster (discovery, then paged
+        # list requests per container kind, `kcc_health.CONTAINER_KINDS`,
+        # `kcc_health.read_objects`), as `kcc_unready` or
+        # `kcc_unread` on its entry. The reads end inside the collector's time
+        # budget (`kcc_health.RUN_DEADLINE_S`), so the manifest always prints.
+        with ThreadPoolExecutor(max_workers=broker_admission.sweep_width()) as pool:
+            kcc_health.annotate_manifest(
+                manifest, deadline=kcc_health.run_deadline(started), mapper=pool.map, kinds=kcc_health.CONTAINER_KINDS
+            )
     print(json.dumps(manifest, indent=2))
     if manifest.get("error"):
         log(f"WARNING: {manifest['error']}")

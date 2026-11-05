@@ -15,11 +15,15 @@ The keyring follows `var.location`, which the full-install composition passes st
 When changing regions, the GitHub App private key must be re-imported into the new region's KMS key (either automatically via `install.sh --github-pem-path` or Ahead-Of-Time following the [upstream guide](https://github.com/abcxyz/github-token-minter#readme)).
 
 > **KMS resources cannot be deleted.** Cloud KMS key rings and keys are never actually
-> destroyed — `terraform destroy` only removes them from state, and a subsequent apply
-> with the same names fails with a 409. Recover by importing the existing resources
-> back into state
-> (`terraform import module.<name>.google_kms_key_ring.minter ...`) or by choosing new
-> `kms_keyring_name`/`kms_key_name` values.
+> deleted, and a raw `terraform destroy` does not leave the key usable: destroying the
+> crypto key schedules every version of it for destruction, so the imported GitHub App
+> key can no longer sign. Run `terraform state rm` on the key ring and key before a raw
+> destroy. A later apply with the same names fails with a 409 until you import the
+> existing resources back into state
+> (`terraform import module.<name>.google_kms_key_ring.minter ...`) or choose new
+> `kms_keyring_name`/`kms_key_name` values. The full-install composition's `lifecycle.sh`
+> does both for you; its README's [Teardown and re-apply](../../examples/full-install/README.md#teardown-and-re-apply) section says how, including how to restore
+> versions a raw destroy scheduled.
 
 ## Relationship to the install
 
@@ -42,4 +46,4 @@ module "github_minter" {
 }
 ```
 
-See the [Release versioning & promotion guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.
+See the [Release versioning guide](../../../docs/site/src/content/docs/deploy/release-versioning.md) for SemVer pinning instructions.

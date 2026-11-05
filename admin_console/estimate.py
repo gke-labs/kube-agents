@@ -259,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
     if not available:
         print(f"{hl.display_path(dataset.path)} has no records.", file=sys.stderr)
         return 1
-    commit = available[0]
+    commit = available[hl.default_commit_index(dataset.records, available)]
     if args.commit:
         matching = [item for item in available if item.startswith(args.commit)]
         if not matching:

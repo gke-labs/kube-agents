@@ -29,14 +29,108 @@ func gaugeTestAgent() *agentv1alpha1.PlatformAgent {
 	agent.Namespace = "ns"
 	agent.Status.Phase = "Ready"
 	agent.Status.Usage = agentv1alpha1.AgentUsageStatus{
-		ToolExecutionsTotal:      5,
-		ChatMessagesInboundTotal: 2,
-		NegativeFeedbackTotal:    1,
-		ClustersRegistered:       ptr.To(int64(3)),
-		ClustersMonitored:        ptr.To(int64(1)),
-		LastActiveTime:           &metav1.Time{Time: usageClock(10)},
+		ToolExecutionsTotal:             5,
+		ChatMessagesInboundTotal:        2,
+		NegativeFeedbackTotal:           1,
+		ClustersRegistered:              ptr.To(int64(3)),
+		ClustersMonitored:               ptr.To(int64(1)),
+		RemediationsMergedTotal:         ptr.To(int64(4)),
+		RemediationsOpen:                ptr.To(int64(2)),
+		ProposalsAuthored:               ptr.To(int64(7)),
+		RemediationsClosedUnmergedTotal: ptr.To(int64(1)),
+		ProposalHumanTouches:            ptr.To(int64(9)),
+		ProposalsMergedUntouched:        ptr.To(int64(0)),
+		PeopleSeen7d:                    ptr.To(int64(6)),
+		PeopleSeen30d:                   ptr.To(int64(8)),
+		LastActiveTime:                  &metav1.Time{Time: usageClock(10)},
 	}
 	return agent
+}
+
+// The six proposal readings are pointer rows: a reading at zero publishes a
+// zero sample and makes the block non-empty, an absent one publishes none,
+// and the one pruning record the poller keeps for them holds back all six.
+func TestUsageGauges_PointerRowsForTheSixReadings(t *testing.T) {
+	readings := []string{"remediationsMergedTotal", "remediationsOpen", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"}
+	rows := map[string]usageExportField{}
+	for _, f := range usageExportFields {
+		rows[f.name] = f
+	}
+	for _, name := range readings {
+		if f, ok := rows[name]; !ok || !f.pointer {
+			t.Errorf("%s: row %+v, want a pointer row", name, f)
+		}
+	}
+	if got := usageExportFieldsOfRecord(usageNewerFieldReadings); !slices.Equal(got, readings) {
+		t.Errorf("the readings record covers %v, want %v", got, readings)
+	}
+
+	reg := prometheus.NewRegistry()
+	g := newUsageGauges(reg)
+	agent := &agentv1alpha1.PlatformAgent{}
+	agent.Name = "pa"
+	agent.Namespace = "ns"
+	agent.Status.Usage.ProposalsMergedUntouched = ptr.To(int64(0))
+	if usageBlockEmpty(&agent.Status.Usage) {
+		t.Error("a block holding a reading at zero reads as empty")
+	}
+	g.publishUsage(agent)
+	if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", "proposalsMergedUntouched")); got != 0 {
+		t.Errorf("proposalsMergedUntouched = %v, want 0", got)
+	}
+	g.usage.Reset()
+	g.publishUsage(agent)
+	// One pointer row present: the counters' int rows always publish, the
+	// other nine pointer rows (two gauges, five readings, two people
+	// readings) publish nothing.
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-9 {
+		t.Errorf("%d usage samples, want %d: an absent reading has no sample", n, len(usageExportFields)-9)
+	}
+}
+
+// The two people readings are pointer rows under one pruning record: a
+// reading at zero is a sample, an absent one publishes none.
+func TestUsageGauges_PointerRowsForTheTwoPeopleReadings(t *testing.T) {
+	got := usageExportFieldsOfRecord(usageNewerFieldPeople)
+	if !reflect.DeepEqual(got, []string{usageExportPeopleSeen7d, usageExportPeopleSeen30d}) {
+		t.Fatalf("record fields = %v", got)
+	}
+	rows := map[string]usageExportField{}
+	for _, f := range usageExportFields {
+		rows[f.name] = f
+	}
+	for _, name := range got {
+		if f, ok := rows[name]; !ok || !f.pointer {
+			t.Errorf("%s: row %+v, want a pointer row", name, f)
+		}
+	}
+
+	reg := prometheus.NewRegistry()
+	g := newUsageGauges(reg)
+	agent := &agentv1alpha1.PlatformAgent{}
+	agent.Name = "pa"
+	agent.Namespace = "ns"
+	agent.Status.Usage.PeopleSeen7d = ptr.To(int64(3))
+	agent.Status.Usage.PeopleSeen30d = ptr.To(int64(0))
+	g.publishUsage(agent)
+	if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", "peopleSeen7d")); got != 3 {
+		t.Errorf("peopleSeen7d = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", "peopleSeen30d")); got != 0 {
+		t.Errorf("peopleSeen30d = %v, want 0", got)
+	}
+	// Both people rows present, the other eight pointer rows absent.
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-8 {
+		t.Errorf("%d usage samples, want %d: a people reading at 0 is a sample", n, len(usageExportFields)-8)
+	}
+
+	g.usage.Reset()
+	agent.Status.Usage.PeopleSeen7d = nil
+	agent.Status.Usage.PeopleSeen30d = nil
+	g.publishUsage(agent)
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-10 {
+		t.Errorf("%d usage samples, want %d: an absent people reading has no sample", n, len(usageExportFields)-10)
+	}
 }
 
 // Every counter and gauge of status.usage lands as one sample of the usage
@@ -123,8 +217,9 @@ func TestUsageGauges_ForgetDropsEveryFamilyOfTheAgent(t *testing.T) {
 	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields) {
 		t.Errorf("%d usage samples after forgetting one agent, want the other agent's %d", n, len(usageExportFields))
 	}
-	if n := testutil.CollectAndCount(g.times, usageTimeGaugeName); n != 1 {
-		t.Errorf("%d time samples after forgetting one agent, want 1", n)
+	// The other agent's lastActiveTime and its createdTime.
+	if n := testutil.CollectAndCount(g.times, usageTimeGaugeName); n != 2 {
+		t.Errorf("%d time samples after forgetting one agent, want the other agent's 2", n)
 	}
 	if n := testutil.CollectAndCount(g.phase, usagePhaseGaugeName); n != len(usagePhases) {
 		t.Errorf("%d phase samples after forgetting one agent, want %d", n, len(usagePhases))
@@ -320,8 +415,15 @@ func TestReconcile_PublishesAUsageBlockThatHoldsAnyValue(t *testing.T) {
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != len(usageExportFields)-1 {
-		t.Errorf("%d usage samples, want %d: a block with a gauge in it is published", n, len(usageExportFields)-1)
+	// Every int row publishes, and of the pointer rows the one gauge present.
+	pointers := 0
+	for _, f := range usageExportFields {
+		if f.pointer {
+			pointers++
+		}
+	}
+	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != len(usageExportFields)-pointers+1 {
+		t.Errorf("%d usage samples, want %d: a block with a gauge in it is published", n, len(usageExportFields)-pointers+1)
 	}
 }
 
@@ -337,6 +439,8 @@ func TestReconcile_HoldsBackTheFieldsTheServedCRDPrunesAndPublishesTheRest(t *te
 		Status: agentv1alpha1.AgentStatus{Phase: readyPhase, Usage: agentv1alpha1.AgentUsageStatus{
 			ActiveInterfaces:    []string{"dashboard"},
 			ToolExecutionsTotal: 7,
+			PeopleSeen7d:        ptr.To(int64(4)),
+			PeopleSeen30d:       ptr.To(int64(0)),
 		}},
 	}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
@@ -347,9 +451,12 @@ func TestReconcile_HoldsBackTheFieldsTheServedCRDPrunesAndPublishesTheRest(t *te
 	p.noteNewerFieldEcho(ctx, agent, usageCounterChatMessagesInbound, false)
 	p.noteNewerFieldEcho(ctx, agent, usageNewerFieldGauges, false)
 	p.noteNewerFieldEcho(ctx, agent, usageNewerFieldLastHumanActive, false)
+	p.noteNewerFieldEcho(ctx, agent, usageStatusFieldChatSessions, false)
+	p.noteNewerFieldEcho(ctx, agent, usageNewerFieldPeople, false)
 	// Samples from before the records, as a restart's first pass leaves them.
 	usageMetrics.usage.WithLabelValues(agent.Namespace, agent.Name, usageCounterChatMessagesInbound).Set(0)
 	usageMetrics.usage.WithLabelValues(agent.Namespace, agent.Name, "clustersMonitored").Set(0)
+	usageMetrics.usage.WithLabelValues(agent.Namespace, agent.Name, usageStatusFieldChatSessions).Set(0)
 	usageMetrics.times.WithLabelValues(agent.Namespace, agent.Name, usageNewerFieldLastHumanActive).Set(1)
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -372,7 +479,7 @@ func TestReconcile_HoldsBackTheFieldsTheServedCRDPrunesAndPublishesTheRest(t *te
 			}
 		}
 	}
-	for _, held := range []string{usageCounterChatMessagesInbound, "clustersRegistered", "clustersMonitored", usageNewerFieldLastHumanActive} {
+	for _, held := range []string{usageCounterChatMessagesInbound, "clustersRegistered", "clustersMonitored", usageNewerFieldLastHumanActive, usageStatusFieldChatSessions, "peopleSeen7d", "peopleSeen30d"} {
 		if _, ok := got[held]; ok {
 			t.Errorf("%s has a sample while the served CRD prunes it; a zero here reads as idle", held)
 		}
@@ -382,5 +489,47 @@ func TestReconcile_HoldsBackTheFieldsTheServedCRDPrunesAndPublishesTheRest(t *te
 	}
 	if _, ok := got[usageCounterBrokerFailures]; !ok {
 		t.Errorf("brokerFailuresTotal has no sample; a field with no record is published, zero included")
+	}
+}
+
+// The agent's creation time rides in the time family as createdTime, from the
+// CR's own timestamp rather than from status.usage: the stalled-onboarding
+// rule needs an install's age even when nobody has spoken to it, and the hold
+// on a pruned status.usage does not touch it.
+func TestReconcile_PublishesTheAgentsCreationTime(t *testing.T) {
+	scheme := setupScheme()
+	created := metav1.NewTime(time.Unix(1_700_000_000, 0))
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "aged", Namespace: "reconcile-created", CreationTimestamp: created},
+		Status:     agentv1alpha1.AgentStatus{Phase: readyPhase},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	// The whole block is held: an empty status.usage. createdTime is not part of it.
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := testutil.ToFloat64(usageMetrics.times.WithLabelValues(agent.Namespace, agent.Name, usageCreatedTimeField)); got != float64(created.Unix()) {
+		t.Errorf("createdTime = %v, want %v, the CR's creation timestamp, held back by nothing", got, created.Unix())
+	}
+	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != 0 {
+		t.Errorf("%d usage samples on an empty block, want 0", n)
+	}
+	if err := cl.Get(context.Background(), req.NamespacedName, agent); err != nil {
+		t.Fatal(err)
+	}
+	agent.Finalizers = nil
+	if err := cl.Update(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Delete(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile after delete: %v", err)
+	}
+	if n := samplesOfAgent(t, usageMetrics.times, agent.Namespace); n != 0 {
+		t.Errorf("%d time samples after the agent was deleted, want 0", n)
 	}
 }

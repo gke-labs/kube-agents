@@ -7,6 +7,8 @@ not shapes invented to match the parser. Both APIs were the reason those two
 checks stayed prose-only, so a hand-written fixture would re-create exactly the
 problem converting them was meant to solve."""
 
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -27,7 +29,38 @@ import fleet_stockout as fs  # noqa: E402
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URLs unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself pass a `--raw`-aware fake and bypass this by patching it back.
+_PAGED_DUMP = patch.object(fs, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -177,6 +210,23 @@ class EnumerateClustersTest(unittest.TestCase):
             clusters, not_running = fs.enumerate_clusters("acme", run=lambda argv, **kwargs: run_of(0, json.dumps(listing)))
         self.assertEqual([c["name"] for c in clusters], ["ka-today"])
         self.assertEqual(not_running, [])
+
+    def test_a_cluster_with_the_config_connector_add_on_is_marked_and_read_first(self):
+        """Stockout has the least time left of the three, so its add-on
+        clusters are read first, as drift and patch readiness mark theirs."""
+        listing = [
+            {"name": "hub", "location": "us-central1", "status": "RUNNING", "addonsConfig": {"configConnectorConfig": {"enabled": True}}},
+            {"name": "edge", "location": "us-central1", "status": "RUNNING"},
+        ]
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            return run_of(0, json.dumps(listing))
+
+        clusters, _ = fs.enumerate_clusters("acme", run=run)
+        self.assertIn("addonsConfig.configConnectorConfig.enabled", issued[0][-1])
+        self.assertEqual({c["name"]: c.get(fs.kcc_health.ADDON_FIELD) for c in clusters}, {"hub": True, "edge": False})
 
     def test_reads_the_control_plane_version(self):
         clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "currentMasterVersion": "1.35.3-gke.1200"}])
@@ -1528,6 +1578,58 @@ class CollectClusterTest(unittest.TestCase):
         "message=Autopilot node pools cannot be accessed or modified."
     )
 
+    def test_the_cluster_is_read_as_one_crd_read_and_four_paged_kinds(self):
+        """The real paging, not the adapter: ComputeClass keeps its one-shot
+        read (a CRD outside the paged collections), the four built-in kinds
+        are paged `kubectl get --raw` reads, and a cut page fails the cluster
+        closed with the shim's marker in the error."""
+        issued = []
+
+        def run(argv, cut=False, **kwargs):
+            issued.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "computeclasses"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                return run_of(0, json.dumps({"metadata": {}, "items": []}))
+            if argv[:2] == ["kubectl", "get"]:
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=run)
+        self.assertEqual(entry["outcome"], "collected", entry.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            ["/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+             "/apis/storage.k8s.io/v1/storageclasses?limit=500", "/api/v1/nodes?limit=100"],
+            raw,
+        )
+        self.assertEqual(1, len([a for a in issued if a[:3] == ["kubectl", "get", "computeclasses"]]))
+        command = next(c["command"] for c in entry["commands"] if c["check"] == "dangling-compute-class")
+        kubeconfig = next(part for part in command.split() if part.startswith("KUBECONFIG=")).removeprefix("KUBECONFIG=")
+        self.assertEqual(command.split("; ")[0], f"KUBECONFIG={kubeconfig} kubectl get computeclasses -A -o json")
+        # The one-shot read under the kubeconfig, then the paged chain with the
+        # kubeconfig exported once for every read in it: the line is recorded
+        # to be pasted unchanged.
+        self.assertEqual(command, f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}")
+        self.assertIn(f"; ( export KUBECONFIG={kubeconfig}; kubectl get --raw ", command)
+        self.assertEqual(2, command.count("KUBECONFIG="), command)
+
+        def cut_run(argv, **kwargs):
+            if argv[:3] == ["kubectl", "get", "--raw"] and argv[3].startswith("/api/v1/nodes"):
+                return run_of(74, '{"items": [{"metadata": {"name": "n', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")
+            return run(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=cut_run)
+        self.assertEqual(entry["outcome"], fs.GATE_FAILED_OUTCOME)
+        self.assertIn("rc=74", entry["error"])
+        self.assertIn("credential proxy output truncated", entry["error"])
+
     def run_with(
         self,
         dump_items=(),
@@ -1629,6 +1731,12 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(dump_items=[cc])
         self.assertEqual(entry["outcome"], "collected")
         self.assertEqual(entry["candidates"], [])
+
+    def test_a_collected_add_on_cluster_carries_the_marker(self):
+        entry = self.run_with(cluster={**self.CLUSTER, fs.kcc_health.ADDON_FIELD: True})
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertIs(entry[fs.kcc_health.ADDON_FIELD], True)
+        self.assertNotIn(fs.kcc_health.ADDON_FIELD, self.run_with())
 
     def test_get_credentials_failure_is_unreachable(self):
         def run(argv, **kwargs):
@@ -3576,6 +3684,14 @@ class PrepareKubeconfigTest(unittest.TestCase):
             self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 
 
+class NotRunningClusterStatusTest(unittest.TestCase):
+    def test_a_cluster_that_is_not_running_carries_its_status(self):
+        """`finish` must not count a STOPPING cluster as one that may run
+        Config Connector (`audit_report.kcc_health`)."""
+        entry = fs.not_running_entry({"name": "going", "location": "us-central1", "status": "STOPPING"}, "acme")
+        self.assertEqual(entry["cluster_status"], "STOPPING")
+
+
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
     """The declared scope the agent carries from the platform_control fleet_scope
     tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
@@ -3640,6 +3756,79 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertTrue(fs._only_a_scope_note(entry, None))
         self.assertFalse(fs._only_a_scope_note({"name": fs.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
 
+    def test_main_prints_the_sweep_when_the_time_budget_is_spent(self):
+        """The Config Connector reads stop at the collector's time budget, and
+        the manifest of the sweep prints with `kcc_unread` on each entry."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "RUN_DEADLINE_S", 0):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fs.main(["--config-connector"])
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("time budget", entry["kcc_unread"])
+
+    def test_main_reads_no_config_connector_without_the_flag(self):
+        """The chat route runs this collector without `--config-connector`:
+        only `finish` uses the read, so nothing reads it there."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest") as annotate:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fs.main([])
+        annotate.assert_not_called()
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertNotIn("kcc_unread", entry)
+        self.assertNotIn("kcc_unready", entry)
+
+    def test_main_reads_config_connector_while_an_audit_run_is_in_flight(self):
+        """The live run never passed `--config-connector`. The read must not
+        depend on the model copying the flag: while `start`'s in-flight note
+        of this stream is there, `main` reads without it, and the manifest
+        says why (`config_connector_read`)."""
+        import contextlib as _contextlib  # noqa: PLC0415
+        import io as _io  # noqa: PLC0415
+        import tempfile as _tempfile  # noqa: PLC0415
+        from unittest import mock as _mock  # noqa: PLC0415
+
+        def run(argv, scratch, note):
+            manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1",
+                                       "outcome": "collected", "candidates": []}]}
+            if note:
+                Path(scratch, f"inflight_{fs.AUDIT_ID}.json").write_text("{}", encoding="utf-8")
+            out = _io.StringIO()
+            with _mock.patch.dict(os.environ, {"FLEET_AUDIT_SCRATCH_DIR": scratch}), _mock.patch.object(
+                fs, "collect_fleet", return_value=manifest
+            ), _mock.patch.object(fs.kcc_health, "annotate_manifest") as annotate:
+                with _contextlib.redirect_stdout(out), _contextlib.redirect_stderr(_io.StringIO()):
+                    fs.main(argv)
+            return annotate.called, json.loads(out.getvalue())["config_connector_read"]
+
+        for argv, note, expected in (([], True, (True, "in-flight")), ([], False, (False, False)),
+                                     (["--config-connector"], False, (True, "flag"))):
+            with self.subTest(argv=argv, note=note), _tempfile.TemporaryDirectory() as scratch:
+                self.assertEqual(run(argv, scratch, note), expected)
+
+    def test_main_adds_the_config_connector_read_before_it_prints(self):
+        """A stockout fix can edit a `ContainerNodePool` declaration, so `main`
+        puts `kcc_health`'s keys on the manifest `finish` reads."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        def annotate(found, *, mapper, deadline, **kwargs):
+            self.assertGreater(deadline, 0)
+            # Only the kinds this stream's findings can own: from the agent, all
+            # ~230 kinds do not fit the time budget.
+            self.assertEqual(kwargs["kinds"], fs.kcc_health.CONTAINER_KINDS)
+            self.assertEqual(kwargs["kubeconfig_for"](found["clusters"][0]), fs.kubeconfig_path("acme", "hub", "us-central1"))
+            found["clusters"][0]["kcc_unread"] = "".join(mapper(lambda entry: entry["name"], found["clusters"]))
+
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest", side_effect=annotate):
+            with contextlib.redirect_stdout(out):
+                fs.main(["--config-connector"])
+        self.assertEqual(json.loads(out.getvalue())["clusters"][0]["kcc_unread"], "acme/us-central1/hub")
+
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
@@ -3661,6 +3850,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+
+class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
+    def test_the_recorded_chain_stays_under_the_published_command_cap(self):
+        """The compute-class read and the paged chain are recorded as one line and copied
+        verbatim into `checks_run`; held under `MAX_COMMAND_CHARS` at the longest kubeconfig
+        path the platform profile makes."""
+        with patch.object(fs, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fs.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        text = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}"
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
+
 
 if __name__ == "__main__":
     unittest.main()

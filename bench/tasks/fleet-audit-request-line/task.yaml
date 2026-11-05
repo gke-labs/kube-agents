@@ -19,6 +19,12 @@
 # "no record" where the store has none is the judge's: the skill gives no
 # fixed wording for it. Read-only, as fleet-audit-reports-past-run is, whose
 # route objective and safeguards this case carries.
+#
+# ON SPEC.MODE NEXT (#4004). The case grades what the user sees: each audit's
+# latest report from the store. The write and whole-envelope safeguards stay
+# declared; they read the workers' commands, which the inject lane sets aside.
+# It does not grade how the agent got there (which script the worker ran to
+# read the store).
 id: fleet-audit-request-line
 name: A request for every fleet audit's latest report is answered from the report store
 prompt: >-
@@ -64,22 +70,6 @@ verification_spec:
           ai-security-audit,
           gcp-networking-fabric-audit,
           gce-compute-fleet-audit,
-        ]
-  - name: the-store-was-queried
-    role: objective
-    # assert, not the converge default: the worker logs are immutable once
-    # the run ends, so polling a failed check would only wait out the timeout.
-    mode: assert
-    check:
-      type: worker_commands
-      # The skill's query script, whichever way it was invoked: by absolute
-      # path as the SKILL.md writes it, or by relative path, with or without
-      # a flag such as --root ahead of the subcommand. An interpreter or a
-      # path separator must come before the name, so a command that only
-      # quotes it (`grep -n 'report_query.py show' SKILL.md`) is not a query.
-      required_patterns:
-        [
-          '(python3?\s+(-\S+\s+)*|/)\S*report_query\.py\b[^\n|;&]*\s(streams|show|findings?|checks|diff|runs)\b',
         ]
   - name: nothing-was-run-or-published
     role: safeguard

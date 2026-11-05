@@ -335,6 +335,26 @@ func waitOutcome(t *testing.T, done <-chan runOutcome, within time.Duration) run
 // a slow failure.
 const waitDeadline = 90 * time.Second
 
+// waitPath polls until path exists, bounded by waitDeadline. The adapter
+// publishes Working before it starts the harness (Run subscribes to the
+// task's input, publishes Working, then spawns), so a test that publishes a
+// cancel straight after waitState(Working) can deliver the SIGTERM before
+// the stub has run its first line; on a loaded runner it does. A test that
+// needs the stub set up waits for a file the stub writes once it is.
+func waitPath(t *testing.T, path, otherwise string) {
+	t.Helper()
+	deadline := time.Now().Add(waitDeadline)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s (%s never appeared)", otherwise, path)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func waitState(t *testing.T, c *lib.Client, addressee, taskID string, state lib.TaskState) {
 	t.Helper()
 	deadline := time.Now().Add(waitDeadline)
@@ -603,16 +623,7 @@ sleep 10
 	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
 	waitState(t, c, session, taskID, lib.StateWorking)
 
-	deadline := time.Now().Add(waitDeadline)
-	for {
-		if _, err := os.Stat(marker); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("harness never emitted its deliverable")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	waitPath(t, marker, "harness never emitted its deliverable")
 	// The marker says the result is on the harness's stdout; give the adapter
 	// a beat to read it, so the steer below is genuinely late. If it were not
 	// late the harness would take another turn and the assertions fail - this
@@ -719,11 +730,12 @@ func TestLifecycle_Cancel(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "pid")
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"stub-cancel"}'
-echo "$$" > `+pidFile+`
+echo "$$" > `+pidFile+`.tmp && mv `+pidFile+`.tmp `+pidFile+`
 exec sleep 60
 `)
 	done := runAdapter(context.Background(), adapterConfig(url, taskID, session, harness))
 	waitState(t, c, session, taskID, lib.StateWorking)
+	waitPath(t, pidFile, "the stub never wrote its pid")
 
 	env, err := lib.NewCancelEnvelope(gatewayParty, taskID, origin.ContextID, origin.CorrelationID,
 		lib.WithTo(lib.Party{Session: session}))

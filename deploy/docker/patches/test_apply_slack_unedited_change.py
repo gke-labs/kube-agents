@@ -15,7 +15,13 @@ from pathlib import Path
 from unittest import mock
 
 import verify_slack_unedited_change as verify
-from apply_slack_unedited_change import GUARD_ANCHOR, MARKER, RELATIVE, apply
+from apply_slack_unedited_change import (
+    EDIT_WINDOW_SECONDS,
+    GUARD_ANCHOR,
+    MARKER,
+    RELATIVE,
+    apply,
+)
 
 # _normalize_changed_message as it stands at v2026.9.14, verbatim.
 ADAPTER_STUB = '''from typing import Optional
@@ -106,11 +112,68 @@ class VerifierTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertTrue(any("parent edited earlier" in f for f in failures), failures)
 
+    def test_a_guard_without_the_edit_window_is_refused_for_a_bare_change(self):
+        # With no previous_message, `edited` alone lets a once-edited parent replay (#3897).
+        root = stage()
+        apply(root)
+        path = root / RELATIVE
+        path.write_text(path.read_text().replace(f'if {EDIT_WINDOW_SECONDS} < _kage_age < float("inf"):', "if False:"))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("no previous_message on a parent edited earlier" in f for f in failures), failures)
+
+    def test_a_window_without_the_finite_bound_is_refused(self):
+        root = stage()
+        apply(root)
+        path = root / RELATIVE
+        path.write_text(path.read_text().replace(' < _kage_age < float("inf"):', " < _kage_age:"))
+        rc, failures = run_verifier(root)
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("non-finite ts" in f for f in failures), failures)
+
     def test_a_moved_method_is_reported_not_raised(self):
         root = stage(ADAPTER_STUB.replace("def _normalize_changed_message", "def _normalize_change"))
         rc, failures = run_verifier(root)
         self.assertEqual(rc, 1)
         self.assertTrue(any("the method moved" in f for f in failures), failures)
+
+
+class RestartedAdapterTest(unittest.TestCase):
+    """The patched method with an empty processed-ts map, as after a restart."""
+
+    def setUp(self):
+        root = stage()
+        apply(root)
+        self.method = verify.method_source((root / RELATIVE).read_text())
+
+    def normalize(self, event):
+        with mock.patch.object(verify, "FAILURES", []):
+            got = verify.run(self.method, event)
+            self.assertEqual(verify.FAILURES, [])
+        return got
+
+    def test_a_once_edited_parent_changed_without_previous_message_is_dropped(self):
+        self.assertIsNone(self.normalize(verify.EDITED_PARENT_BARE_METADATA_CHANGE))
+
+    def test_a_bot_update_of_a_reply_does_not_replay_the_parent(self):
+        self.assertIsNone(self.normalize(verify.PARENT_METADATA_CHANGE))
+        self.assertIsNone(self.normalize(verify.EDITED_PARENT_METADATA_CHANGE))
+
+    def test_a_first_edit_is_routed(self):
+        self.assertEqual(self.normalize(verify.USER_EDIT)["ts"], verify.ROOT_TS)
+        self.assertEqual(self.normalize(verify.BARE_EDIT)["ts"], verify.ROOT_TS)
+
+    def test_a_second_edit_is_routed(self):
+        self.assertEqual(self.normalize(verify.SECOND_EDIT)["ts"], verify.ROOT_TS)
+        self.assertEqual(self.normalize(verify.BARE_SECOND_EDIT)["ts"], verify.ROOT_TS)
+
+    def test_an_edit_with_a_non_finite_ts_is_routed(self):
+        for event in verify.NON_FINITE_EDITS:
+            self.assertEqual(self.normalize(event)["ts"], verify.ROOT_TS, event)
+
+    def test_an_edit_inside_the_window_is_routed(self):
+        late = {**verify.BARE_EDIT, "event_ts": f"{float(verify.EDIT_TS) + EDIT_WINDOW_SECONDS - 1:.6f}"}
+        self.assertEqual(self.normalize(late)["ts"], verify.ROOT_TS)
 
 
 if __name__ == "__main__":

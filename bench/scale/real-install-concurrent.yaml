@@ -59,7 +59,6 @@ settings:
   trigger_reconcile: true
   cluster_create_parallelism: 10
   watcher_wait_seconds: 600
-  lease_ttl_minutes: 1440
 
 operations:
   # (A) with (B) beside it: 2 at once on point 2, and (A) with two copies of (B) on point 3.

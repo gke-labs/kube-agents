@@ -22,7 +22,8 @@ import (
 // Two halves, for two principals:
 //   - EnsureHeldConsumer is the operator's: it creates (or updates) a
 //     profile's one shared durable with its MaxAckPending and AckWait.
-//   - SubscribeHeld is every worker's (and the Job dispatcher's): it binds to
+//   - SubscribeHeld is the profile dispatcher's (and, on the `.in` shape, a
+//     warm worker's): it binds to
 //     that durable and never creates, updates or deletes it, so one pod can
 //     never rewrite the consumer another pod is pulling from. Binding needs
 //     only $JS.API.CONSUMER.INFO and $JS.API.CONSUMER.MSG.NEXT on the
@@ -71,11 +72,22 @@ const (
 	heldMarkerValue = "v1"
 )
 
+// ErrHeldBindRefused marks a bind SubscribeHeld refused on what it read from
+// the durable's stored config: the wrong filter, an ack policy that is not
+// explicit, no MaxAckPending cap, no AckWait, or no EnsureHeldConsumer
+// marker. The verdict is the server's own record of the consumer, so waiting
+// cannot change it, and the first bind returns it at once instead of retrying
+// it for the bind window the way a missing durable is. errors.Is against it.
+var ErrHeldBindRefused = errors.New("held durable refused")
+
 // HeldConsumerConfig is a held durable as the operator creates it.
 type HeldConsumerConfig struct {
 	Stream  string
 	Durable string
-	// FilterSubject is the profile's intake, `a2a.tasks.<profile>.*.in`.
+	// FilterSubject is the intake: one (profile, tier, kind)'s submissions,
+	// `a2a.submit.<profile>.<tier>.<kind>.*` on ProfileSubmitStream, or a
+	// profile's
+	// `a2a.tasks.<profile>.*.in`.
 	FilterSubject string
 	// MaxAckPending is the most deliveries held unacknowledged at once.
 	// Required, at least 1. For a profile it is its effective concurrency.
@@ -127,6 +139,8 @@ func (c *Client) EnsureHeldConsumer(ctx context.Context, cfg HeldConsumerConfig)
 		case old.AckWait != cfg.ackWait():
 			return fmt.Errorf("held consumer %s has AckWait %v; refusing to change it to %v under bound workers, whose heartbeats keep the old pace (re-create it)",
 				cfg.Durable, old.AckWait, cfg.ackWait())
+		case old.Metadata[heldMarkerKey] != heldMarkerValue || heldConfigTampered(old) != "":
+			return fmt.Errorf("held consumer %s exists but this call didn't make it (no %s mark, or a setting it never sets); refusing to adopt it", cfg.Durable, heldMarkerKey)
 		}
 	}
 	_, err = js.CreateOrUpdateConsumer(ctx, cfg.Stream, jetstream.ConsumerConfig{
@@ -164,6 +178,13 @@ type Delivery interface {
 	// handler runs, so retry. Once the handler returns, the lib's fallback
 	// Nak is best effort and a redelivery is the caller's to recognise.
 	Ack() error
+	// AckSync is Ack that waits for the server to confirm it (a JetStream
+	// double ack): nil means the server has the ack, so nothing will
+	// redeliver the message. Use it before removing anything that only
+	// matters while the delivery could come back. An error means the
+	// server's answer didn't arrive within ctx, and the ack may or may not
+	// have landed: retry.
+	AckSync(ctx context.Context) error
 	// Nak gives the delivery back for redelivery after delay (0: at once).
 	Nak(delay time.Duration) error
 	// Term disposes of the delivery as one that must never be redelivered.
@@ -190,13 +211,21 @@ type HeldSubscription interface {
 // hands each delivery to handler on its own goroutine, with a context that is
 // cancelled by Stop or Close. It never creates, updates or deletes the
 // consumer: a missing durable, or one that isn't an explicit-ack consumer
-// filtering cfg.Subject with a real MaxAckPending, is an error (a missing
-// one is retried for the bind window first, in case the operator has not
-// created it yet). The heartbeat is paced from the durable's own AckWait.
-// The intake is one profile's, `a2a.tasks.<profile>.*.in`, the shape
-// ParseTaskSubject and the publisher know, so envelope-subject agreement and
-// the session filter apply as in SubscribeDurable; cfg.Session must be that
-// profile, so the filter can't silently drop every task. The envelopeId dedup
+// filtering cfg.Subject with a real MaxAckPending, is an error. The two are
+// told apart by what waiting can do: a missing durable (and any other lookup
+// error) is retried for the bind window first, in case the operator has not
+// created it yet, while a durable that exists and fails the checks is refused
+// on the first attempt, wrapped in ErrHeldBindRefused, because its stored
+// config is the verdict and a retry would read the same one. The heartbeat
+// is paced from the durable's own AckWait.
+// The intake is one profile's: either `a2a.tasks.<profile>.*.in`, the shape
+// ParseTaskSubject knows, or one (profile, tier, kind)'s submissions,
+// `a2a.submit.<profile>.<tier>.<top|child>.*` (ParseSubmitSubject) on
+// ProfileSubmitStream, which is the dispatcher's. Envelope-subject agreement and the session
+// filter apply as in SubscribeDurable; cfg.Session must be that profile, so
+// the filter can't silently drop every task. A submission intake also needs
+// the agreement policy's Submitter named (the gateway), so only the gateway's
+// submissions are held. The envelopeId dedup
 // does not apply: a redelivery is expected and is the caller's to recognise
 // by task id.
 //
@@ -214,12 +243,25 @@ func (c *Client) SubscribeHeld(ctx context.Context, cfg SubscribeConfig, handler
 	// away anything addressed elsewhere. On a durable every worker shares,
 	// that ack consumes the task for all of them, so the addressee must be a
 	// literal equal to Session.
-	addressee, task, class, ok := ParseTaskSubject(cfg.Subject)
-	if !ok || class != TaskClassIn || task != "*" || !validDNS1123Label(addressee) {
-		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.*.in)", cfg.Subject)
+	addressee, submit, ok := heldIntake(cfg.Subject)
+	if !ok {
+		return nil, fmt.Errorf("SubscribeHeld: %q is not one profile's intake (a2a.tasks.<profile>.*.in, or a2a.submit.<profile>.<tier>.<top|child>.*)", cfg.Subject)
 	}
 	if cfg.Session != addressee {
 		return nil, fmt.Errorf("SubscribeHeld: Session %q is not the intake's addressee %q; the session filter would ack every task away", cfg.Session, addressee)
+	}
+	if submit {
+		// A submission's only legitimate writer is the gateway, and a
+		// holder that doesn't name it falls back to "anyone but the
+		// profile", which lets any other principal with a publish grant on
+		// the subject start work the dispatcher then holds and hands out.
+		policy := c.opts.agreement
+		if cfg.Agreement != nil {
+			policy = *cfg.Agreement
+		}
+		if policy.Submitter == "" {
+			return nil, fmt.Errorf("SubscribeHeld: a submission intake needs AgreementPolicy.Submitter (the gateway) named")
+		}
 	}
 	hctx, cancel := context.WithCancel(context.Background())
 	h := &heldState{c: c, handler: handler, ctx: hctx, cancel: cancel, changed: make(chan struct{})}
@@ -228,6 +270,23 @@ func (c *Client) SubscribeHeld(ctx context.Context, cfg SubscribeConfig, handler
 		return nil, err
 	}
 	return &heldSubscription{s: sub.(*durableSub), h: h}, nil
+}
+
+// heldIntake reports the addressee a held intake subject is for, and
+// whether it is the submission shape. Two shapes are a held intake: one
+// profile's `.in` (`a2a.tasks.<profile>.*.in`, the warm-worker shape #3679
+// shipped) and one (profile, tier, kind)'s submissions
+// (`a2a.submit.<profile>.<tier>.<top|child>.*`, the dispatcher's, #3660).
+// Every token but the task's must be a literal.
+func heldIntake(subject string) (addressee string, submit, ok bool) {
+	if a, task, class, ok := ParseTaskSubject(subject); ok {
+		return a, false, class == TaskClassIn && task == "*" && validDNS1123Label(a)
+	}
+	profile, tier, _, task, ok := ParseSubmitSubject(subject)
+	if !ok || task != "*" || !validDNS1123Label(profile) || !validDNS1123Label(tier) {
+		return "", false, false
+	}
+	return profile, true, true
 }
 
 type heldSubscription struct {
@@ -260,23 +319,68 @@ func (h *heldState) bind(ctx context.Context, js jetstream.JetStream, cfg Subscr
 	if err != nil {
 		return nil, fmt.Errorf("bind held durable %s on %s (the operator creates it): %w", cfg.Durable, cfg.Stream, err)
 	}
+	// Each refusal below is read from the consumer's stored config, so it
+	// wraps ErrHeldBindRefused and startWithRetry returns it without a retry.
 	cc := cons.CachedInfo().Config
 	switch {
 	case len(cc.FilterSubjects) > 0 || cc.FilterSubject != cfg.Subject:
-		return nil, fmt.Errorf("held durable %s filters %q%v, not %q; refusing to bind", cfg.Durable, cc.FilterSubject, cc.FilterSubjects, cfg.Subject)
+		return nil, fmt.Errorf("%w: held durable %s filters %q%v, not %q; refusing to bind", ErrHeldBindRefused, cfg.Durable, cc.FilterSubject, cc.FilterSubjects, cfg.Subject)
 	case cc.AckPolicy != jetstream.AckExplicitPolicy:
-		return nil, fmt.Errorf("held durable %s is not explicit-ack; refusing to bind", cfg.Durable)
+		return nil, fmt.Errorf("%w: held durable %s is not explicit-ack; refusing to bind", ErrHeldBindRefused, cfg.Durable)
 	case cc.MaxAckPending < 1:
-		return nil, fmt.Errorf("held durable %s has no MaxAckPending cap (%d); refusing to bind", cfg.Durable, cc.MaxAckPending)
+		return nil, fmt.Errorf("%w: held durable %s has no MaxAckPending cap (%d); refusing to bind", ErrHeldBindRefused, cfg.Durable, cc.MaxAckPending)
 	case cc.AckWait <= 0:
-		return nil, fmt.Errorf("held durable %s has no AckWait; refusing to bind", cfg.Durable)
+		return nil, fmt.Errorf("%w: held durable %s has no AckWait; refusing to bind", ErrHeldBindRefused, cfg.Durable)
 	case cc.Metadata[heldMarkerKey] != heldMarkerValue:
-		return nil, fmt.Errorf("held durable %s was not made by EnsureHeldConsumer (no %s metadata); refusing to bind", cfg.Durable, heldMarkerKey)
+		return nil, fmt.Errorf("%w: held durable %s was not made by EnsureHeldConsumer (no %s metadata); refusing to bind", ErrHeldBindRefused, cfg.Durable, heldMarkerKey)
+	case heldConfigTampered(cc) != "":
+		return nil, fmt.Errorf("%w: held durable %s %s, which EnsureHeldConsumer never sets; refusing to bind", ErrHeldBindRefused, cfg.Durable, heldConfigTampered(cc))
 	}
 	h.mu.Lock()
 	h.ackWait = cc.AckWait
 	h.mu.Unlock()
 	return cons, nil
+}
+
+// heldConfigTampered names the first field of a held durable's stored config
+// that EnsureHeldConsumer leaves at its default and something else changed,
+// or "". The marker is a public constant, so a consumer created under a
+// durable's name with the marker, the filter and the caps right could still
+// carry a setting that quietly breaks held delivery: a push deliver subject,
+// headers-only deliveries with no envelope, an inactivity reaper that deletes
+// the durable during a dispatcher restart, a delivery limit that drops a task
+// after one failed offer, a start position or backoff that skips or delays
+// submissions, a pause, a priority pin, pull limits, or memory storage. Each
+// of these refuses the bind. MaxWaiting isn't checked: the server fills its
+// own default in, so a stored value can't tell an edit from that default.
+func heldConfigTampered(cc jetstream.ConsumerConfig) string {
+	switch {
+	case cc.DeliverSubject != "":
+		return "pushes to " + cc.DeliverSubject
+	case cc.HeadersOnly:
+		return "delivers headers only"
+	case cc.InactiveThreshold != 0:
+		return "is deleted after " + cc.InactiveThreshold.String() + " inactive"
+	case cc.MaxDeliver > 0:
+		return fmt.Sprintf("stops redelivering after %d deliveries", cc.MaxDeliver)
+	case cc.DeliverPolicy != jetstream.DeliverAllPolicy:
+		return "does not start at the first submission"
+	case cc.ReplayPolicy != jetstream.ReplayInstantPolicy:
+		return "replays at the original rate"
+	case len(cc.BackOff) > 0:
+		return "backs off redeliveries"
+	case cc.RateLimit != 0:
+		return "is rate limited"
+	case cc.PauseUntil != nil && !cc.PauseUntil.IsZero():
+		return "is paused until " + cc.PauseUntil.String()
+	case cc.PriorityPolicy != jetstream.PriorityPolicyNone || len(cc.PriorityGroups) > 0:
+		return "pins or overflows deliveries to a priority group"
+	case cc.MaxRequestBatch != 0 || cc.MaxRequestExpires != 0 || cc.MaxRequestMaxBytes != 0:
+		return "limits pull requests"
+	case cc.MemoryStorage:
+		return "keeps its state in memory, lost on a server restart"
+	}
+	return ""
 }
 
 func (h *heldState) beat() time.Duration {
@@ -367,12 +471,38 @@ type heldDelivery struct {
 	disposed bool // a disposition reached the connection
 }
 
-func (d *heldDelivery) Envelope() *Envelope { return d.env }
-func (d *heldDelivery) Subject() string     { return d.subject }
-func (d *heldDelivery) Received() time.Time { return d.received }
+func (d *heldDelivery) Envelope() *Envelope  { return d.env }
+func (d *heldDelivery) Subject() string      { return d.subject }
+func (d *heldDelivery) Received() time.Time  { return d.received }
 func (d *heldDelivery) NumDelivered() uint64 { return d.delivered }
-func (d *heldDelivery) Ack() error  { return d.dispose([]byte("+ACK")) }
-func (d *heldDelivery) Term() error { return d.dispose([]byte("+TERM")) }
+func (d *heldDelivery) Ack() error           { return d.dispose([]byte("+ACK")) }
+func (d *heldDelivery) Term() error          { return d.dispose([]byte("+TERM")) }
+
+// AckSync sends +ACK as a request and waits for the server's reply. The
+// lock is not held across the round trip, so the heartbeat isn't stalled by
+// it; a delivery an earlier Ack already disposed of is not acked again.
+func (d *heldDelivery) AckSync(ctx context.Context) error {
+	nc, _ := d.c.conn()
+	d.mu.Lock()
+	disposed := d.disposed
+	d.mu.Unlock()
+	if disposed {
+		return nil
+	}
+	if d.reply == "" {
+		return fmt.Errorf("held delivery has no reply subject")
+	}
+	if nc == nil {
+		return fmt.Errorf("held delivery: not connected")
+	}
+	if _, err := nc.RequestWithContext(ctx, d.reply, []byte("+ACK")); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.disposed = true
+	d.mu.Unlock()
+	return nil
+}
 func (d *heldDelivery) Nak(delay time.Duration) error {
 	if delay <= 0 {
 		return d.dispose([]byte("-NAK"))

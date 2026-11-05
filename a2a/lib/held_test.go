@@ -2,6 +2,8 @@ package lib
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -22,6 +24,7 @@ type heldHarness struct {
 	ctx     context.Context
 	req     *Client
 	profile string
+	url     string
 }
 
 func newHeldHarness(t *testing.T, profile string) (*heldHarness, *Client) {
@@ -39,7 +42,7 @@ func newHeldHarness(t *testing.T, profile string) (*heldHarness, *Client) {
 		t.Fatalf("Connect worker: %v", err)
 	}
 	t.Cleanup(worker.Close)
-	return &heldHarness{t: t, ctx: ctx, req: req, profile: profile}, worker
+	return &heldHarness{t: t, ctx: ctx, req: req, profile: profile, url: clientURL(s)}, worker
 }
 
 func (h *heldHarness) cfg() SubscribeConfig {
@@ -387,14 +390,93 @@ func TestSubscribeHeldLeavesTheConsumerAsTheOperatorMadeIt(t *testing.T) {
 			cc.MaxAckPending, cc.AckWait)
 	}
 
-	// Otherwise valid, so it is bind's filter check that refuses it.
+	// Otherwise valid, so it is bind's filter check that refuses it. The
+	// refusal is read from the durable's config and is not retried, so the
+	// call returns it at once under the harness's own context.
 	wrong := h.cfg()
 	wrong.Subject, wrong.Session = "a2a.tasks.someone-else.*.in", "someone-else"
-	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
-	defer cancel()
-	if _, err := worker.SubscribeHeld(short, wrong, func(context.Context, Delivery) {}); err == nil ||
-		!strings.Contains(err.Error(), "filters") {
-		t.Errorf("binding a durable whose filter is not the requested intake = %v, want it refused for its filter", err)
+	if _, err := worker.SubscribeHeld(h.ctx, wrong, func(context.Context, Delivery) {}); err == nil ||
+		!errors.Is(err, ErrHeldBindRefused) || !strings.Contains(err.Error(), "filters") {
+		t.Errorf("binding a durable whose filter is not the requested intake = %v, want ErrHeldBindRefused for its filter", err)
+	}
+}
+
+// A refusal read from the durable's stored config is final on the first
+// attempt: no retry, no "retrying" log line, and the caller gets the refusal
+// rather than whatever error the bind window happened to end on.
+func TestSubscribeHeldRefusalIsNotRetried(t *testing.T) {
+	h, _ := newHeldHarness(t, "norefusalretry")
+	h.ensure(1, 30*time.Second)
+	capture := &logCapture{}
+	nc, _ := h.req.conn()
+	worker, err := Connect(h.ctx, nc.ConnectedUrl(), WithName("worker-logged"), WithLogger(slog.New(capture)))
+	if err != nil {
+		t.Fatalf("Connect worker: %v", err)
+	}
+	t.Cleanup(worker.Close)
+
+	wrong := h.cfg()
+	wrong.Subject, wrong.Session = "a2a.tasks.someone-else.*.in", "someone-else"
+	started := time.Now()
+	_, err = worker.SubscribeHeld(h.ctx, wrong, func(context.Context, Delivery) {})
+	took := time.Since(started)
+	if err == nil || !errors.Is(err, ErrHeldBindRefused) {
+		t.Fatalf("SubscribeHeld on a mismatched filter = %v, want ErrHeldBindRefused", err)
+	}
+	if h.ctx.Err() != nil {
+		t.Fatalf("the refusal consumed the whole context (%v); it was retried for the bind window", took)
+	}
+	if capture.contains("durable bind failed; retrying") {
+		t.Errorf("a refusal was retried:\n%s", capture.String())
+	}
+}
+
+// The other half of the rule: a durable that does not exist yet is retried
+// for the bind window, so a worker that starts before the operator binds once
+// the operator has run EnsureHeldConsumer, instead of exiting at once.
+func TestSubscribeHeldWaitsForTheOperatorToCreateTheDurable(t *testing.T) {
+	h, _ := newHeldHarness(t, "waitsforop")
+	capture := &logCapture{}
+	nc, _ := h.req.conn()
+	worker, err := Connect(h.ctx, nc.ConnectedUrl(), WithName("worker-logged"), WithLogger(slog.New(capture)))
+	if err != nil {
+		t.Fatalf("Connect worker: %v", err)
+	}
+	t.Cleanup(worker.Close)
+
+	bound := make(chan error, 1)
+	go func() {
+		sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(context.Context, Delivery) {})
+		if err == nil {
+			sub.Stop()
+		}
+		bound <- err
+	}()
+	// The operator arrives only after the worker's first attempt has been
+	// refused for a missing durable and logged as a retry.
+	deadline := time.Now().Add(10 * time.Second)
+	for !capture.contains("durable bind failed; retrying") {
+		select {
+		case err := <-bound:
+			t.Fatalf("SubscribeHeld returned before the operator created the durable: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no retry of the missing durable was logged:\n%s", capture.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.ensure(1, 30*time.Second)
+	select {
+	case err := <-bound:
+		if err != nil {
+			t.Fatalf("SubscribeHeld after the operator created the durable = %v, want it bound", err)
+		}
+	case <-h.ctx.Done():
+		t.Fatalf("SubscribeHeld did not bind once the durable existed:\n%s", capture.String())
+	}
+	if !capture.contains("durable bound after retry") {
+		t.Errorf("the bind that followed the operator was not logged as a retry's success:\n%s", capture.String())
 	}
 }
 
@@ -625,10 +707,8 @@ func TestSubscribeHeldRefusesADurableItCannotGate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create uncapped consumer: %v", err)
 	}
-	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
-	defer cancel()
-	if _, err := worker.SubscribeHeld(short, c, func(context.Context, Delivery) {}); err == nil ||
-		!strings.Contains(err.Error(), "MaxAckPending") {
+	if _, err := worker.SubscribeHeld(h.ctx, c, func(context.Context, Delivery) {}); err == nil ||
+		!errors.Is(err, ErrHeldBindRefused) || !strings.Contains(err.Error(), "MaxAckPending") {
 		t.Errorf("bound a durable with no MaxAckPending cap: %v", err)
 	}
 
@@ -741,10 +821,8 @@ func TestSubscribeHeldRefusesAServerDefaultDurable(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create default consumer: %v", err)
 	}
-	short, cancel := context.WithTimeout(h.ctx, 2*time.Second)
-	defer cancel()
-	if _, err := worker.SubscribeHeld(short, c, func(context.Context, Delivery) {}); err == nil ||
-		!strings.Contains(err.Error(), "EnsureHeldConsumer") {
+	if _, err := worker.SubscribeHeld(h.ctx, c, func(context.Context, Delivery) {}); err == nil ||
+		!errors.Is(err, ErrHeldBindRefused) || !strings.Contains(err.Error(), "EnsureHeldConsumer") {
 		t.Errorf("bound a server-default durable: %v", err)
 	}
 }
@@ -858,5 +936,293 @@ func TestEnsureHeldConsumerRefusesWhenTheLookupFails(t *testing.T) {
 	}
 	if w := cons.CachedInfo().Config.AckWait; w != 90*time.Second {
 		t.Errorf("after a failed lookup the durable's AckWait is %v, want 90s unchanged", w)
+	}
+}
+
+// The dispatcher's intake (#3660): a held durable on one (profile, tier,
+// kind)'s submissions, the gateway named as submitter. The gateway's
+// submission is held; another writer's is refused by agreement and never
+// reaches the handler.
+func TestSubscribeHeldTakesASubmissionIntake(t *testing.T) {
+	s := startServer(t)
+	provisionProfileSubmitStream(t, clientURL(s))
+	ctx := testCtx(t)
+	gw, err := Connect(ctx, clientURL(s), WithName("gateway"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw.Close()
+	disp, err := Connect(ctx, clientURL(s), WithName("dispatcher"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disp.Close()
+	const profile = "cluster-agent"
+	cfg := SubscribeConfig{
+		Stream: ProfileSubmitStream, Durable: "profile-cluster-agent-read-top",
+		Subject:   TaskSubmitSubject(profile, "read", SubmitKindTop, "*"),
+		Session:   profile,
+		Agreement: &AgreementPolicy{Submitter: "gateway"},
+	}
+	if err := gw.EnsureHeldConsumer(ctx, HeldConsumerConfig{Stream: cfg.Stream, Durable: cfg.Durable,
+		FilterSubject: cfg.Subject, MaxAckPending: 2}); err != nil {
+		t.Fatalf("EnsureHeldConsumer: %v", err)
+	}
+	got := make(chan Delivery, 4)
+	sub, err := disp.SubscribeHeld(ctx, cfg, func(ctx context.Context, d Delivery) {
+		got <- d
+		_ = d.Ack()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld on the submission intake: %v", err)
+	}
+	defer sub.Stop()
+	// The other writer is published raw: the lib refuses it at the source
+	// only when the publisher names the submitter too.
+	intruder := submission(t, Party{Session: "chat-otter"}, "task-intruder", profile)
+	raw, err := json.Marshal(intruder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishRaw(t, clientURL(s), TaskSubmitSubject(profile, "read", SubmitKindTop, "task-intruder"), raw)
+	if err := gw.Publish(ctx, TaskSubmitSubject(profile, "read", SubmitKindTop, "task-1"),
+		submission(t, Party{Session: "gateway", AgentType: "a2a-gateway"}, "task-1", profile)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case d := <-got:
+		if d.Envelope().TaskID != "task-1" || d.Subject() != TaskSubmitSubject(profile, "read", SubmitKindTop, "task-1") {
+			t.Fatalf("held %q on %q, want the gateway's task-1", d.Envelope().TaskID, d.Subject())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gateway's submission was not held")
+	}
+	select {
+	case d := <-got:
+		t.Errorf("also held %q, want only the gateway's submission", d.Envelope().TaskID)
+	case <-time.After(time.Second):
+	}
+}
+
+// A submission intake without a named submitter is refused: the negative
+// form would hold any non-profile writer's submission.
+func TestSubscribeHeldRefusesASubmissionIntakeWithoutASubmitter(t *testing.T) {
+	h, worker := newHeldHarness(t, "subm")
+	cfg := h.cfg()
+	cfg.Subject = TaskSubmitSubject("subm", "read", SubmitKindTop, "*")
+	if _, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {}); err == nil ||
+		!strings.Contains(err.Error(), "Submitter") {
+		t.Errorf("SubscribeHeld on a submission intake with no submitter = %v, want refused", err)
+	}
+	for _, subject := range []string{
+		"a2a.submit.subm.*.top.*",  // wildcard tier
+		"a2a.submit.subm.read.*.*", // wildcard kind
+		"a2a.submit.*.read.top.*",  // wildcard profile
+		"a2a.submit.subm.read.top.task-1",
+		"a2a.submit.subm.read.top.>",
+		"a2a.tasks.subm.read.top.*.submit", // the old shape, gone (addendum 7)
+	} {
+		cfg := h.cfg()
+		cfg.Subject = subject
+		cfg.Agreement = &AgreementPolicy{Submitter: "gateway"}
+		if _, err := worker.SubscribeHeld(h.ctx, cfg, func(context.Context, Delivery) {}); err == nil ||
+			!strings.Contains(err.Error(), "not one profile's intake") {
+			t.Errorf("SubscribeHeld(%q) = %v, want it refused as not one profile's intake", subject, err)
+		}
+	}
+}
+
+// Reconnect swaps the connection for a fresh dial (new connect-time grants)
+// without giving back a held delivery: the task is still held afterwards,
+// never redelivered, its heartbeat on the new connection, and its Ack lands.
+// The durable is re-subscribed, so the next task is delivered too.
+func TestReconnectKeepsAHeldDelivery(t *testing.T) {
+	h, worker := newHeldHarness(t, "recon")
+	h.ensure(2, 3*time.Second)
+	got := make(chan Delivery, 4)
+	var starts atomic.Int32
+	sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		starts.Add(1)
+		got <- d
+		<-ctx.Done()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	defer sub.Stop()
+	h.submit("task-held")
+	first := <-got
+	old := worker.Conn()
+	rctx, cancel := context.WithTimeout(h.ctx, 10*time.Second)
+	defer cancel()
+	if err := worker.Reconnect(rctx); err != nil {
+		t.Fatalf("Reconnect: %v", err)
+	}
+	if worker.Conn() == old || !old.IsClosed() {
+		t.Fatal("Reconnect kept the old connection")
+	}
+	time.Sleep(7 * time.Second) // more than two AckWaits
+	if n := starts.Load(); n != 1 {
+		t.Fatalf("the held task was delivered %d times across a reconnect, want 1", n)
+	}
+	if err := first.Ack(); err != nil {
+		t.Fatalf("Ack after Reconnect: %v", err)
+	}
+	h.submit("task-next")
+	select {
+	case d := <-got:
+		if d.Envelope().TaskID != "task-next" {
+			t.Errorf("delivered %q, want task-next", d.Envelope().TaskID)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the durable was not re-subscribed after Reconnect")
+	}
+	cons, err := h.req.JetStream().Consumer(h.ctx, "TASKS", h.cfg().Durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := cons.Info(h.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.NumAckPending != 1 || info.NumRedelivered != 0 {
+		t.Errorf("ack pending %d, redelivered %d: want only task-next held and nothing redelivered", info.NumAckPending, info.NumRedelivered)
+	}
+}
+
+// AckSync returns once the server has the ack: the durable shows nothing
+// pending at that moment, with no wait, and the task is never redelivered.
+func TestHeldAckSyncIsConfirmedByTheServer(t *testing.T) {
+	h, worker := newHeldHarness(t, "acksync")
+	h.ensure(2, 2*time.Second)
+	got := make(chan Delivery, 2)
+	sub, err := worker.SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+		got <- d
+		<-ctx.Done()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeHeld: %v", err)
+	}
+	defer sub.Stop()
+	h.submit("task-sync")
+	d := <-got
+	actx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+	defer cancel()
+	if err := d.AckSync(actx); err != nil {
+		t.Fatalf("AckSync: %v", err)
+	}
+	cons, err := h.req.JetStream().Consumer(h.ctx, "TASKS", h.cfg().Durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, err := cons.Info(h.ctx); err != nil || info.NumAckPending != 0 {
+		t.Fatalf("ack pending right after AckSync: %+v (%v), want 0", info, err)
+	}
+	if err := d.AckSync(actx); err != nil {
+		t.Errorf("a repeat AckSync: %v", err)
+	}
+	select {
+	case d := <-got:
+		t.Errorf("redelivered after AckSync: %s", d.Envelope().TaskID)
+	case <-time.After(5 * time.Second): // two AckWaits
+	}
+}
+
+// Reconnect drains the old connection rather than closing it: messages it
+// had already received but not yet handed to a slow handler still reach the
+// handler. (A plain close drops them, and for the dispatcher that is a
+// worker's accept or final renewal lost to its own reconnect.)
+func TestReconnectHandsOnWhatTheOldConnectionHadReceived(t *testing.T) {
+	s := startServer(t)
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s), WithName("listener"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(c.Close)
+	pub, err := nats.Connect(clientURL(s))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pub.Close)
+	gate := make(chan struct{})
+	var mu sync.Mutex
+	var seen []string
+	sub, err := c.SubscribeCore("drain.test", func(m *nats.Msg) {
+		<-gate
+		mu.Lock()
+		seen = append(seen, string(m.Data))
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("SubscribeCore: %v", err)
+	}
+	defer sub.Stop()
+	const n = 5
+	for i := 0; i < n; i++ {
+		if err := pub.Publish("drain.test", []byte(fmt.Sprint(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := pub.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // all received; the handler holds the first
+	done := make(chan error, 1)
+	go func() {
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		done <- c.Reconnect(rctx)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatalf("Reconnect: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) != n {
+		t.Errorf("handled %v across the reconnect, want all %d received before it", seen, n)
+	}
+}
+
+// The held marker is a public constant, so a durable that carries it with the
+// filter and caps right is still refused when a setting EnsureHeldConsumer
+// never touches has been changed: each of these quietly breaks held delivery.
+func TestSubscribeHeldRefusesADurableWithAForgedMark(t *testing.T) {
+	for name, tc := range map[string]struct {
+		edit func(*jetstream.ConsumerConfig)
+		want string
+	}{
+		"headers only":       {func(c *jetstream.ConsumerConfig) { c.HeadersOnly = true }, "headers only"},
+		"inactivity reaper":  {func(c *jetstream.ConsumerConfig) { c.InactiveThreshold = 5 * time.Second }, "inactive"},
+		"one delivery":       {func(c *jetstream.ConsumerConfig) { c.MaxDeliver = 1 }, "stops redelivering"},
+		"starts at the tail": {func(c *jetstream.ConsumerConfig) { c.DeliverPolicy = jetstream.DeliverNewPolicy }, "first submission"},
+		"backoff":            {func(c *jetstream.ConsumerConfig) { c.BackOff = []time.Duration{time.Minute}; c.MaxDeliver = -1 }, "backs off"},
+		"paused":             {func(c *jetstream.ConsumerConfig) { u := time.Now().Add(time.Hour); c.PauseUntil = &u }, "paused"},
+		"pull limits":        {func(c *jetstream.ConsumerConfig) { c.MaxRequestBatch = 1 }, "limits pull requests"},
+		"memory":             {func(c *jetstream.ConsumerConfig) { c.MemoryStorage = true }, "in memory"},
+		"priority group": {func(c *jetstream.ConsumerConfig) {
+			c.PriorityPolicy = jetstream.PriorityPolicyOverflow
+			c.PriorityGroups = []string{"g"}
+		}, "priority group"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, worker := newHeldHarness(t, "forged")
+			_, js := h.req.conn()
+			c := h.cfg()
+			cfg := jetstream.ConsumerConfig{
+				Durable: c.Durable, FilterSubject: c.Subject, AckPolicy: jetstream.AckExplicitPolicy,
+				MaxAckPending: 1, AckWait: DefaultHeldAckWait, Metadata: map[string]string{heldMarkerKey: heldMarkerValue},
+			}
+			tc.edit(&cfg)
+			if _, err := js.CreateOrUpdateConsumer(h.ctx, c.Stream, cfg); err != nil {
+				t.Fatalf("create forged consumer: %v", err)
+			}
+			if _, err := worker.SubscribeHeld(h.ctx, c, func(context.Context, Delivery) {}); err == nil ||
+				!errors.Is(err, ErrHeldBindRefused) || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("bound a durable with a forged mark that %s: %v", name, err)
+			}
+		})
 	}
 }

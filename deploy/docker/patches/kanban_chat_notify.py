@@ -117,6 +117,11 @@ NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # (a2aNotifyConversationsEnvVar). Rendered whenever the gateway arms the route,
 # home channel or not; A2A_NOTIFY_PLATFORM above is home posts, and needs one.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# The operator's projection of the home channel, mounted in the agent pod
+# (agents/platform/scripts/chat_notify.py keeps the same three names).
+HOME_FILE_DIR = "/etc/kube-agents/chat-home"
+HOME_FILE_KEY = "slack_home"
+HOME_FILE_PLATFORM = "slack"
 # The bus CLI in the agent image, on PATH.
 A2A_CLI = "a2a"
 # `a2a notify` exit statuses (a2a/cmd/a2a/notify.go): the gateway took the
@@ -200,6 +205,15 @@ API_SERVER_KEY_ENV = "API_SERVER_KEY"
 # send()'s metadata (see "Chat messages" above), and the route record's ask.
 CHAT_METADATA_KEY = "kage_chat"
 UPDATE_METADATA_KEY = "kage_update"
+#: Metadata key marking a conversation post as an ask's answer: the delivered
+#: report of the card that settles every card of the ask's plan, its value that
+#: plan's update key. Sent as ``a2a notify --answer-to <key>``, so the gateway
+#: draws its rating controls on it, under the ask the plan is bound to.
+ANSWER_METADATA_KEY = "kage_answer"
+#: The ``a2a notify`` flags a conversation post and its answer ride on.
+CONVERSATION_FLAG = "--conversation"
+ANSWER_FLAG = "--answer-to"
+UPDATE_FLAG = "--update"
 CONVERSATION_ASK_KEY = "ask"
 # The chat message's file for `a2a notify --chat-file`: written mode 0600 by
 # tempfile, removed once the command returns.
@@ -218,9 +232,42 @@ def _on_event_loop() -> bool:
     return True
 
 
+def _chat_ux_platforms() -> tuple:
+    """The platforms whose cards the stand-in lays out (kanban_notifier.CHAT_UX_PLATFORMS).
+
+    A stand-in exists only where the gateway serves the platform, so a Google
+    Chat one is always under ``spec.mode: next``, where the gateway renders the
+    message. Read when a send runs, as the notifier module is elsewhere; an
+    image without it lays out Slack's alone, as before.
+    """
+    try:
+        try:
+            from gateway import kanban_notifier
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        return tuple(kanban_notifier.CHAT_UX_PLATFORMS)
+    except Exception:  # noqa: BLE001 - presentation must not fail a delivery
+        return (SLACK_PLATFORM,)
+
+
 def routed_platform() -> str:
-    """The platform name the gateway holds, or "" when none."""
-    return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    """The platform name the gateway holds, or "" when none.
+
+    The rendered env names it when the CR sets the home channel; a channel the
+    gateway learned is projected into a file instead (the operator's
+    ``slack_home`` mount), so with the env empty the answer is derived from the
+    platform the gateway holds and a non-empty file.
+    """
+    routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    if routed:
+        return routed
+    if conversation_platform() != HOME_FILE_PLATFORM:
+        return ""
+    try:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+            return HOME_FILE_PLATFORM if handle.read().strip() else ""
+    except (OSError, ValueError):
+        return ""
 
 
 def routes(platform: Any) -> bool:
@@ -569,7 +616,7 @@ def _folds_into_row(conn: Any, sub: dict) -> bool:
         except ImportError:  # Unit tests import the patch modules flat.
             import kanban_notifier
             import kanban_progress_lines
-        if not kanban_notifier.slack_ux_on(sub.get("platform")):
+        if not kanban_notifier.chat_ux_on(sub.get("platform")):
             return False
         params = (
             sub["task_id"], kanban_progress_lines.FOLD_ANCESTOR_DEPTH,
@@ -794,7 +841,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         """:meth:`send` laid out by ``chat``, a ``kube-agents.chat/v1`` object, with ``content`` its fallback.
 
         ``update`` names the message: a later send with the same key, in the
-        same conversation, edits it in place.
+        same conversation or home-channel thread, edits it in place.
         """
         extra = {CHAT_METADATA_KEY: chat, UPDATE_METADATA_KEY: update}
         return await self.send(chat_id, content, metadata={**(metadata or {}), **extra})
@@ -808,7 +855,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         meta = metadata or {}
         chat = meta.get(CHAT_METADATA_KEY)
         update = str(meta.get(UPDATE_METADATA_KEY) or "").strip()
-        if chat is None and self.platform.value == SLACK_PLATFORM:
+        if chat is None and self.platform.value in _chat_ux_platforms():
             chat = _failure_chat(content)
         argv, path = [], ""
         if isinstance(chat, dict) and str(content or "").strip():
@@ -823,7 +870,7 @@ class ChatNotifyAdapter(BasePlatformAdapter):
                 raise
             argv += ["--chat-file", path]
         if update:
-            argv += ["--update", update]
+            argv += [UPDATE_FLAG, update]
         return argv, path
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
@@ -842,6 +889,11 @@ class ChatNotifyAdapter(BasePlatformAdapter):
             logger.warning("chat.notify: the chat message is not sent (%s); posting the text", exc)
             chat_argv, chat_file = [], ""
         argv += chat_argv
+        # Only a conversation post answers an ask; the CLI refuses the flag on
+        # a home channel post, which would lose the report.
+        answer_to = str((metadata or {}).get(ANSWER_METADATA_KEY) or "").strip()
+        if answer_to and CONVERSATION_FLAG in argv and UPDATE_FLAG not in argv:
+            argv += [ANSWER_FLAG, answer_to]
         # The chat message above was laid out from the text as written; what a person reads has no step line.
         argv += ["--", _visible(content)]
         try:

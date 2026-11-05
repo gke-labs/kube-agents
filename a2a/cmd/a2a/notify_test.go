@@ -368,6 +368,17 @@ func TestNotifyCarriesAChatMessageAndAnUpdateKey(t *testing.T) {
 			t.Errorf("%s: err = %v, want a usage refusal", name, err)
 		}
 	}
+	// --answer-to rides a conversation post only, and is held to an update key's shape.
+	for name, args := range map[string][]string{
+		"answer without conversation": {"--answer-to", "plan-1"},
+		"spaced answer key":           {"--answer-to", " plan-1", "--conversation", "slack:C1/1.0", "--context", "x"},
+		"long answer key":             {"--answer-to", strings.Repeat("k", notifyUpdateMax+1), "--conversation", "slack:C1/1.0", "--context", "x"},
+	} {
+		argv := append([]string{"notify", "--platform", "slack", "--timeout", "200ms"}, append(args, "--", "x")...)
+		if err := run(argv); err == nil || !strings.Contains(err.Error(), "--answer-to") {
+			t.Errorf("%s: err = %v, want a refusal naming --answer-to", name, err)
+		}
+	}
 }
 
 // --reply-to rides a conversation request to the console's subject; it is

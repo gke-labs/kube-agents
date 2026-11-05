@@ -26,7 +26,7 @@ variable "create_cluster" {
 }
 
 variable "accept_no_network_policy" {
-  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's — is accepted by the API server and enforced by nothing. The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
+  description = "With create_cluster = false, install onto a cluster that enforces no NetworkPolicy instead of refusing the plan. The cluster is left as it is; every NetworkPolicy the install ships — the agent's ingress and egress confinement, the shell sandbox's deny-all, LiteLLM's, the minter's, Hindsight's, the web console's — is accepted by the API server and enforced by nothing (and web_console_enabled = true is refused when NetworkPolicy is not enforced). The choice is stamped onto the PlatformAgent as the kubeagents.x-k8s.io/network-policy-enforcement annotation so it outlives the run. install.sh sets this from --accept-no-network-policy. No effect on a created cluster or one that already enforces."
   type        = bool
   default     = false
 }
@@ -46,6 +46,66 @@ variable "gvisor_pool_name" {
   description = "Name of the gVisor node pool."
   type        = string
   default     = "gvisor-pool"
+}
+
+variable "sizing_profile" {
+  description = "Shape of the Standard cluster's node pools when no explicit machine type or disk size is given: \"small\" (today's rendering), \"medium\" or \"fleet\"; null (the default) and \"\" (a blanked TF_VAR_ line) are \"small\" in the module; the gke-cluster module's README, \"Sizing the node pools\", has each profile's machine types and disks. An explicit standard_* or gvisor_* value wins over the profile. Null rather than \"small\" here so lifecycle.sh's guard_node_pool_shape can tell a profile the operator named from a lost TF_VAR_ line. Passed through to the gke-cluster module; Standard mode only."
+  type        = string
+  default     = null
+}
+
+variable "standard_machine_type" {
+  description = "Machine type for the Standard cluster's default node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "standard_node_count" {
+  description = "Node count per zone the Standard cluster's default node pool is created with: the cluster's initial_node_count, ForceNew on the cluster itself, so a changed value on a live cluster plans the cluster's destruction and recreation, which lifecycle.sh's guard_standard_node_count refuses. Passed through to the gke-cluster module."
+  type        = number
+  default     = 1
+}
+
+variable "standard_disk_size_gb" {
+  description = "Boot disk size in GB for the Standard cluster's default node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = number
+  default     = null
+}
+
+variable "standard_disk_type" {
+  description = "Boot disk type for the Standard cluster's default node pool (pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced); null is pd-balanced. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "gvisor_machine_type" {
+  description = "Machine type for the gVisor node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
+}
+
+variable "gvisor_min_node_count" {
+  description = "Lower autoscaling bound of the gVisor node pool, per zone, and the size it is created at. Passed through to the gke-cluster module."
+  type        = number
+  default     = 1
+}
+
+variable "gvisor_max_node_count" {
+  description = "Upper autoscaling bound of the gVisor node pool, per zone; equal to gvisor_min_node_count keeps the pool at a fixed size. Passed through to the gke-cluster module."
+  type        = number
+  default     = 2
+}
+
+variable "gvisor_disk_size_gb" {
+  description = "Boot disk size in GB for the gVisor node pool; null takes the sizing_profile's. Passed through to the gke-cluster module."
+  type        = number
+  default     = null
+}
+
+variable "gvisor_disk_type" {
+  description = "Boot disk type for the gVisor node pool (pd-standard, pd-balanced, pd-ssd or hyperdisk-balanced); null is pd-balanced. Passed through to the gke-cluster module."
+  type        = string
+  default     = null
 }
 
 variable "agent_runtime_class" {
@@ -94,6 +154,12 @@ variable "namespace" {
   description = "Kubernetes namespace the kube-agents release is installed into and the Workload Identity binding targets. Leave at the default: the agent's model-gateway endpoint is hard-wired to kubeagents-system (see the chart's values.yaml), so a release in any other namespace leaves the agent unable to reach the gateway."
   type        = string
   default     = "kubeagents-system"
+}
+
+variable "helm_upgrade_install" {
+  description = "Install the kube-agents release with `helm upgrade --install` semantics (opt-in), so an apply whose state lost a live release adopts it instead of failing with \"cannot re-use a name that is still in use\" (#4108). It also silently takes over a release of the same name that another Terraform state or a manual `helm install` owns in the namespace, so set it only on a long-lived environment whose own state owns the release."
+  type        = bool
+  default     = false
 }
 
 # With one bundle left, this no longer selects between bundles: `read-only` takes
@@ -616,7 +682,7 @@ variable "slack_home_channel_name" {
 }
 
 variable "slack_home_channel_policy" {
-  description = "\"auto\" (also empty) or \"manual\". Accepted and recorded in this release but with no effect yet: the A2A gateway does not learn a home channel, so slack_home_channel alone decides. Only used when enable_slack is true."
+  description = "\"auto\" (also empty) or \"manual\". Under platform_agent_mode next with Slack on the gateway (Google Chat not enabled) and slack_home_channel empty, \"auto\" lets the A2A gateway make the channel of the first top-level mention of the agent the home channel; \"manual\" leaves slack_home_channel alone to decide. A set slack_home_channel wins under either. Only used when enable_slack is true."
   type        = string
   default     = ""
   validation {
@@ -641,6 +707,12 @@ variable "hermes_dashboard_enabled" {
   description = "Whether the Hermes Web UI dashboard is enabled on the agent. null leaves the field out of the CR so the CRD default (true) applies."
   type        = bool
   default     = null
+}
+
+variable "web_console_enabled" {
+  description = "Whether to deploy the in-cluster web console, a browser chat page for the Platform Agent reached by kubectl port-forward. Maps to the chart's webConsole.enabled."
+  type        = bool
+  default     = false
 }
 
 variable "memory_enabled" {

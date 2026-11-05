@@ -40,8 +40,8 @@ const (
 
 	defaultListen       = ":8089"
 	defaultTokenFile    = "/var/run/secrets/a2a-mcp/token"
-	defaultBusUser      = "console"
-	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-password" // #nosec G101 -- a path, not a credential
+	defaultBusUser      = "console-mcp"
+	defaultPasswordFile = "/var/run/secrets/a2a-mcp-bus/console-mcp-password" // #nosec G101 -- a path, not a credential
 
 	networkTCP = "tcp"
 	busScheme  = "tls://"
@@ -111,7 +111,7 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 	if url == "" {
 		return settings{}, fmt.Errorf("%s is required", envBusURL)
 	}
-	// TLS by construction: the server sends the console password at
+	// TLS by construction: the server sends its console-mcp password at
 	// connect, so a plaintext URL is refused rather than left to the bus to
 	// upgrade.
 	if !strings.HasPrefix(url, busScheme) {
@@ -121,14 +121,22 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 	if _, err := mcp.ReadToken(tokenFile); err != nil {
 		return settings{}, fmt.Errorf("%s: %w", envTokenFile, err)
 	}
-	passwordFile := or(envPasswordFile, defaultPasswordFile)
-	raw, err := os.ReadFile(passwordFile)
+	// busCredentialPath is where the bus password is read from, not the
+	// password: the errors below name it so the operator can find the mount,
+	// and realMain logs them. CodeQL's go/clear-text-logging takes any
+	// password-shaped identifier as a credential, path or not, so the path
+	// keeps a name outside that heuristic; password, the value, keeps its
+	// name and is never formatted into an error. mcp.BusConfig.PasswordFile
+	// keeps its name because nothing reads it into a log or an error; a
+	// log line that names it would refire the alert there.
+	busCredentialPath := or(envPasswordFile, defaultPasswordFile)
+	raw, err := os.ReadFile(busCredentialPath)
 	if err != nil {
 		return settings{}, fmt.Errorf("%s: %w", envPasswordFile, err)
 	}
 	password := strings.TrimRight(string(raw), lineEndings)
 	if password == "" {
-		return settings{}, fmt.Errorf("%s: %s is empty", envPasswordFile, passwordFile)
+		return settings{}, fmt.Errorf("%s: %s is empty", envPasswordFile, busCredentialPath)
 	}
 	var broker *mcp.BrokerClient
 	if brokerURL := strings.TrimSpace(getenv(envBrokerURL)); brokerURL != "" {
@@ -154,7 +162,7 @@ func configFromEnv(getenv func(string) string) (settings, error) {
 			URL:          url,
 			User:         or(envBusUser, defaultBusUser),
 			Password:     password,
-			PasswordFile: passwordFile,
+			PasswordFile: busCredentialPath,
 			Deployment: mcp.Deployment{
 				Agent:     getenv(envAgent),
 				Namespace: getenv(envNamespace),
@@ -187,8 +195,10 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		return err
 	}
 	defer bus.Close()
-	convs := mcp.NewConversations()
-	srv, err := mcp.NewServer(toolsFor(bus, convs, s.broker)...)
+	convs := mcp.NewConversations().WithEvents(bus.Events())
+	// poll_events reads the bus's listener, which toolsFor's bus-less
+	// callers (its tests) have none of.
+	srv, err := mcp.NewServer(append(toolsFor(bus, convs, s.broker), mcp.PollEventsTool(bus.Events(), convs))...)
 	if err != nil {
 		log.Error("mcp server", "err", err)
 		return err
@@ -198,7 +208,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 		log.Error("mcp listen", "addr", s.listen, "err", err)
 		return err
 	}
-	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log))
+	return serve(ctx, log, ln, mcp.Handler(srv, s.tokenFile, log, mcp.WithSwarm(bus, convs)))
 }
 
 // toolsFor is the tools this pod offers: inspect_pr only when it has a
@@ -208,6 +218,7 @@ func realMain(ctx context.Context, log *slog.Logger, getenv func(string) string)
 type toolBus interface {
 	mcp.Bus
 	mcp.TurnBus
+	mcp.TopicsBus
 }
 
 func toolsFor(bus toolBus, convs *mcp.Conversations, broker *mcp.BrokerClient) []mcp.Tool {
@@ -215,6 +226,8 @@ func toolsFor(bus toolBus, convs *mcp.Conversations, broker *mcp.BrokerClient) [
 		mcp.ConnectionStatusTool(bus),
 		mcp.SendMessageTool(bus, convs),
 		mcp.TaskControlTool(bus, convs),
+		mcp.ManageSessionTool(bus, convs),
+		mcp.ReadTopicsTool(bus),
 	}
 	if broker != nil {
 		tools = append(tools, mcp.InspectPRTool(broker))
@@ -237,7 +250,7 @@ func dialWithRetry[B any](ctx context.Context, log *slog.Logger, backoff time.Du
 		// log rather than retrying for minutes as "not reachable yet".
 		if mcp.DialRefused(err) {
 			var zero B
-			return zero, fmt.Errorf("the bus refused the connection (check the console credential and the bus CA): %w", err)
+			return zero, fmt.Errorf("the bus refused the connection (check the console-mcp credential and the bus CA): %w", err)
 		}
 		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
 		select {

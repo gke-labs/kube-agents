@@ -3,11 +3,19 @@
 # `google_monitoring_alert_policy` with `condition_prometheus_query_language`
 # (PromQL through Managed Service for Prometheus, never MQL), the
 # `created-with-google-skill` user label, and memory saturation measured
-# against the cAdvisor limit `container_spec_memory_limit_bytes` rather than
-# the kube-state-metrics `kube_pod_container_resource_limits`. Memory, not
+# against a native limit rather than the kube-state-metrics
+# `kube_pod_container_resource_limits`. The check grades the PromQL condition,
+# the label and a native memory limit; it does not grade the skill's exact
+# saturation formula. Three native spellings pass: the cAdvisor ratio over
+# `container_spec_memory_limit_bytes` the skill's examples use, the catalog's
+# Tier 1 `kubernetes_io:container_memory_limit_bytes`, and GKE's built-in
+# `kubernetes_io:container_memory_limit_utilization` (Tier 1 "GKE built-in
+# metrics"), which every repetition on three nightly nights took. The KSM half
+# is left to the judge: a forbid over the report would also fail a correct
+# answer that quotes the KSM selector to contrast it. Memory, not
 # CrashLoopBackOff: the skill body's crash-loop query is a kube-state-metrics
-# series, which its own guardrail says to stop and ask about first (the
-# footer adds a native one, but a run may still take the body's).
+# series, which its own guardrail says to stop and ask about first (the footer
+# adds a native one, but a run may still take the body's).
 #
 # Planted defect required: none. deployer: noop, no fixture.
 #
@@ -18,7 +26,7 @@
 # Isolation class: read-only fixture.
 # Tier: nightly (hack/eval/nightly-cases.txt).
 id: alert-config-terraform-promql-probe
-name: GKE memory alert in Terraform uses PromQL, the cAdvisor limit and the skill label
+name: GKE memory alert in Terraform uses PromQL, a native memory limit and the skill label
 domain: observability
 
 owner: GinnyJI
@@ -29,8 +37,11 @@ prompt: >-
   limit for more than 5 minutes. Give me the HCL only; do not apply anything.
 expected_output: >-
   A google_monitoring_alert_policy using condition_prometheus_query_language
-  with a PromQL query dividing container_memory_working_set_bytes by
-  container_spec_memory_limit_bytes for namespace checkout on cluster prod-1,
+  with a PromQL query on a native memory limit (container_memory_working_set_bytes
+  over container_spec_memory_limit_bytes, or GKE's
+  kubernetes_io:container_memory_limit_utilization or
+  kubernetes_io:container_memory_limit_bytes) for namespace checkout on
+  cluster prod-1,
   over 0.9 for 5 minutes, carrying the created-with-google-skill user label,
   with a note that the containers need memory limits set.
 infrastructure:
@@ -44,11 +55,10 @@ verification_spec:
     check:
       type: report_contains
       required_phrases:
-        [
-          "condition_prometheus_query_language",
-          "created-with-google-skill",
-          "container_spec_memory_limit_bytes",
-        ]
+        ["condition_prometheus_query_language", "created-with-google-skill"]
+      any_of_phrases: ["container_spec_memory_limit_bytes"]
+      # The GKE system metrics, normalized (underscores dropped).
+      any_of_patterns: ["kubernetesio:containermemorylimit(utilization|bytes)"]
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic

@@ -25,9 +25,13 @@ console's Harness limits page reads `harness-limits.json`.
   fan-out questions) from 40 clusters down. Its test clusters are created before the run, outside
   the runner, each with its own subnet and small Pod and Service ranges, so the project's default
   network does not cap their number.
-- `real-install-test-plan.md`, `real-install.yaml` and `real-install-concurrent.yaml`: the test of one
-  new install at the L container size on 40 clusters (first-run flow, heavy questions, churn, a red test
-  at the S size, cost), and the two plans its measured steps run.
+- [`real-install-test-plan.md`](real-install-test-plan.md) and its plan files: `real-install.yaml`
+  (the fleet point, first-run flow, questions, restart, churn, soak and S-size red test),
+  `real-install-concurrent.yaml` (questions at once), `real-install-failing.yaml` (20 failing Pods),
+  `real-install-stress.yaml` and `real-install-stress-load.yaml` (stress beyond fair use),
+  `real-install-scaling.yaml` (token cost at 80 and 20 clusters). Run each
+  with `--only-factor combined`. [`real-install-results.md`](real-install-results.md) holds the
+  results, and [`real-install-evidence.md`](real-install-evidence.md) the data behind them.
 - `broker.yaml`: the credential broker's load for its exec-tier design: the first-run audits at 2 and
   8 clusters, the command path with kubectl and with gcloud, and 8 to 15 questions at once at 8
   clusters.
@@ -76,9 +80,12 @@ deletes, and each run, marked where it makes model calls of its own. `run`, `app
 hold the experiment install's live-test lease while they work
 ([`docs/designs/live-test-lease.md`](../../docs/designs/live-test-lease.md)), so a second runner or
 an agent's live validation cannot change the install at the same time; a lease another holder has
-refuses the command. The lease lasts `lease_ttl_minutes` (default 720). A plan that measures the
-broker at limits set by hand names them in `expect_proxy_limits`; `run` and `apply` refuse to start
-while the live broker carries other limits, and `run --dry-run` says whether they match.
+refuses the command. The lease lasts `lease_ttl_minutes` (default 60) and the runner renews it
+every third of that while it works. After two failed renewals in a row it stops the run, so it never
+changes the install unleased; a runner that dies frees the lease within the TTL. A plan that
+measures the broker at limits set by hand names them in `expect_proxy_limits`; `run` and `apply`
+refuse to start while the live broker carries other limits, and `run --dry-run` says whether they
+match.
 
 An operation's `kind` says what a run does:
 
@@ -114,7 +121,7 @@ Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, 
 - `test_cluster_machine_type`: the machine type of new test clusters, for a zone short of the
   default one;
 - `cluster_registration_timeout_seconds`: how long to wait for a Cluster Agent profile.
-- `lease_ttl_minutes`: how long a run's live-test lease lasts before another holder can take it.
+- `lease_ttl_minutes`: the live-test lease's TTL; the runner renews it every third of that.
 - `expect_proxy_limits`: the credential broker's container limits the plan measures at, as in a pod
   spec (`cpu: "2"`, `memory: 2Gi`); `run` and `apply` refuse to start while the live pods differ.
 - `trigger_drain_seconds`: how long the run after a `trigger_soak` waits for its jobs to finish.
@@ -197,7 +204,7 @@ run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade
 before answers were kept, when its completion cannot be checked. The CPU, memory and proxy metrics,
 with the per-tool and throttle readings that split them, are left out too when work other than the run's own shared the broker: jobs an earlier `trigger_soak`
 started were still running; a prompt or boot-burst run started inside a Stall Watch read (2 minutes
-plus 30 seconds per cluster after :00 or :30) or held a tick; a proxy load run's broker ran a command its
+plus 50 seconds per cluster after :00 or :30) or held a tick; a proxy load run's broker ran a command its
 workers did not send (its throughput and tokens are left out as well). A prompt answered without its
 operation is left out of those and of the token metrics. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records whose operation the plan names, and warns how many it passed over; with a data file several plans wrote, run it once per plan. `remonitor` reads every stored record's Cloud
 Monitoring metrics again with the current queries, within Monitoring's retention, and writes its own

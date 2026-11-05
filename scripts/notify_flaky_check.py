@@ -138,7 +138,14 @@ TEST_ID_PATTERNS = (
     # pytest: `FAILED tests/test_x.py::test_y - AssertionError`, and
     # `ERROR tests/test_x.py::test_y - ...` for a fixture that failed to set
     # up, which is the shape a flaky fixture takes.
-    re.compile(r"^(?:FAILED|ERROR) (\S+::\S+)"),
+    # The id runs to the end of its `[...]` parameter part when it has one,
+    # so a parameter id holding a space, or ` - `, stays whole; the lazy
+    # bracket match stops at the first `]` that ` - ` or the line end
+    # follows, which is the id's own `]` rather than one in the message.
+    # The path and name segments exclude `:`, so each `::` is consumed
+    # where it stands and a long crafted line costs linear time, not the
+    # quadratic retry a `\S+::` prefix would pay at every `::`.
+    re.compile(r"^(?:FAILED|ERROR) ([^\s\[:]+(?:::[^\s\[:]+)+(?:\[.*?\])?)(?: - .*)?$"),
 )
 
 # Every line of a downloaded job log starts with an ISO timestamp, and the
@@ -276,8 +283,8 @@ WORKFLOW_FILE = ".github/workflows/flaky-check-notify.yml"
 # commit; `Security Scanning`, whose advisory database moves between attempts,
 # so a green re-run there is the database changing rather than the check
 # flaking; and the `pull_request_target` automations (`Risk Classification`,
-# `Hold Unresolved Threads`, `Auto Assign Milestone on Merge`, `Merge Gate`,
-# `Auto Enqueue`), which are not checks on the tree at all.
+# `Hold Unresolved Threads`, `Merge Gate`, `Auto Enqueue`), which are not checks
+# on the tree at all.
 # `test_integration_contracts.py` holds every pull-request check to this list
 # or to its exclusion list, and
 # `test_notify_flaky_check.py` checks that every name here is a workflow's.
@@ -298,6 +305,7 @@ WATCHED_WORKFLOWS = (
     "Python Unit Tests",
     "Step 0 on bash 3.2",
     "Validate Repo Structure",
+    "k8s-api-proxy Tests",
 )
 
 # How far back in run creation the sweep lists. A re-run keeps its run's
@@ -445,16 +453,26 @@ def keys(failed_jobs):
     """What one failed attempt files under, as key -> the test ids behind it.
     Each key is one issue.
 
-    `failed_jobs` is one attempt's failing jobs, dicts with `name`, `steps`
-    and `test_ids`. A job whose log names tests files under their containers
-    -- pooled across jobs, so two legs of a matrix failing the same test are
-    one flake, and two attempts failing different tests of one class are one
-    flake too. A job whose log names none files under its job and step, in
-    the same attempt as the others: a leg that died downloading is not the
-    same flake as the leg that failed a test. When one attempt names more
-    containers than MAX_CONTAINERS_PER_ATTEMPT the failure is the jobs', not
-    the tests', and every job files under its name with the ids it named.
+    `failed_jobs` is one attempt's failing jobs, dicts with `name`, `steps` and
+    `test_ids`. A job whose log names tests files under their containers --
+    pooled across jobs, so two legs of a matrix failing the same test are one
+    flake, and two attempts failing different tests of one class are one flake
+    too. A job whose log names none files under its job and step, in the same
+    attempt as the others: a leg that died downloading is not the same flake as
+    the leg that failed a test. One exception: a job with no matrix suffix that
+    names no test drops out when a matrix leg of the same name failed. That is
+    a join over its legs, such as `Run Python Unit Tests` over its `(shard k/3)`
+    shards, failing because a shard did; its log names no test, and filing it
+    would open an issue per failed join step on every shard failure. A failure
+    of the join's own, such as a coverage download, beside a failed shard drops
+    out with it: the tracker cannot tell it from the join steps that fail
+    because a shard did. A join that fails alone still files under its steps,
+    and so does a matrix leg that names no test beside one that does. When one
+    attempt names more containers than MAX_CONTAINERS_PER_ATTEMPT the failure
+    is the jobs', not the tests', and every job files under its name with the
+    ids it named.
     """
+
     with_ids = [job for job in failed_jobs if job["test_ids"]]
     without = [job for job in failed_jobs if not job["test_ids"]]
     ids = all_test_ids(with_ids)
@@ -465,6 +483,12 @@ def keys(failed_jobs):
     else:
         for key in containers:
             found[key] = [test_id for test_id in ids if container(test_id) == key]
+        failed_legs = {
+            MATRIX_SUFFIX.sub("", job["name"]) for job in failed_jobs if MATRIX_SUFFIX.search(job["name"])
+        }
+        without = [
+            job for job in without if MATRIX_SUFFIX.search(job["name"]) or job["name"] not in failed_legs
+        ]
     for job in without:
         for key in job_keys(job):
             found[key] = sorted(set(found.get(key, [])) | set(job["test_ids"]))

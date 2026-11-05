@@ -23,7 +23,38 @@ import fleet_waste as fw  # noqa: E402
 # would turn this suite's listing tests into refusals. The suite is about the
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
+# The sweep width is read from the credential broker (broker_admission); with its
+# URLs unset that read makes no request and the width is the fallback, four, so
+# no test here reaches the network or depends on the host's broker.
+os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself pass a `--raw`-aware fake and bypass this by patching it back.
+_PAGED_DUMP = patch.object(fw, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -5336,6 +5367,58 @@ class CollectClusterTest(unittest.TestCase):
         self.assertEqual(entry["outcome"], "unreachable")
         self.assertEqual(facts, {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()})
 
+    def test_the_cluster_is_read_one_kind_per_paged_raw_read(self):
+        """The real paging, not the adapter: every kind in CLUSTER_DUMP_KINDS
+        is one `kubectl get --raw` collection read with a page limit, a pod
+        page's continue token is followed, and the manifest records the first
+        page of each kind."""
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                path, _, query = argv[3].partition("?")
+                if path == "/api/v1/pods" and "continue=" not in query:
+                    return run_of(0, json.dumps({"metadata": {"continue": "more"}, "items": [{"metadata": {"name": "p1", "namespace": "ns", "managedFields": [{}]}, "status": {"phase": "Running"}}]}))
+                if path == "/api/v1/pods":
+                    return run_of(0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": "p2", "namespace": "ns"}, "status": {"phase": "Running"}}]}))
+                return run_of(0, json.dumps({"metadata": {}, "items": []}))
+            if argv[:2] == ["kubectl", "get"]:
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)), patch.object(fw, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry, _ = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+        self.assertEqual(entry["outcome"], "collected", entry.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(len(fw.CLUSTER_DUMP_KINDS.split(",")) + 1, len(raw))
+        self.assertIn("/api/v1/pods?limit=500", raw)
+        self.assertIn("/api/v1/pods?limit=500&continue=more", raw)
+        self.assertIn("/api/v1/nodes?limit=100", raw)
+        self.assertIn("/apis/networking.k8s.io/v1/ingresses?limit=500", raw)
+        command = next(c["command"] for c in entry["commands"] if c["check"] == "terminal-pods")
+        self.assertIn("kubectl get --raw '/api/v1/nodes?limit=100'", command)
+        self.assertIn("kubectl get --raw '/api/v1/pods?limit=500'", command)
+        # The kubeconfig exported once for the whole chain, in a subshell.
+        self.assertTrue(command.startswith("( export KUBECONFIG="), command)
+        self.assertTrue(command.endswith(" )"), command)
+        self.assertEqual(1, command.count("KUBECONFIG="), command)
+
+    def test_the_recorded_chain_stays_under_the_published_command_cap(self):
+        """The fifteen-kind dump is recorded once and copied verbatim into five checks'
+        `checks_run`; with the kubeconfig spelled per read, the longest legal names put it
+        over `MAX_COMMAND_CHARS` and `finish` refused the document."""
+        with patch.object(fw, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fw.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        text = fw.paged_command_text(fw.CLUSTER_DUMP_KINDS.split(","), kubeconfig=kubeconfig)
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "orphan-pv"))
+        self.assertEqual(text, audit_report.trim_command(text))
+
     def test_a_dump_with_no_items_list_is_gate_failed_not_empty(self):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
@@ -8034,6 +8117,7 @@ class ContentModeWorkspaceTest(unittest.TestCase):
         seen = {}
 
         def partial_mirror(repo, dest):
+            dest.mkdir(parents=True, exist_ok=True)
             (dest / "half.yaml").write_text("kind: Deployment\n")
             return False
 

@@ -15,12 +15,15 @@ import (
 // tree from them rather than from fixtures, so a change to a cluster skill
 // that breaks the session's copy fails here, not in an image build.
 const (
-	repoSkillsDir   = "../../../agents/cluster/skills"
-	repoPersona     = "../../persona/session/persona.md"
-	repoDockerfile  = "../../Dockerfile.worker"
-	harnessHomeEnv  = "CLAUDE_CONFIG_DIR"
-	buildOutFlag    = "-out"
-	sessionToolPath = "./cmd/session-persona"
+	repoSkillsDir = "../../../agents/cluster/skills"
+	// repoPersonaSkillsDir is the cluster agent's persona (#3656): the same
+	// skills, read by the profile worker, under the same read-only rule.
+	repoPersonaSkillsDir = "../../../agents/cluster/persona/skills"
+	repoPersona          = "../../persona/session/persona.md"
+	repoDockerfile       = "../../Dockerfile.worker"
+	harnessHomeEnv       = "CLAUDE_CONFIG_DIR"
+	buildOutFlag         = "-out"
+	sessionToolPath      = "./cmd/session-persona"
 )
 
 // writeCommandRE finds a command that changes a cluster or a project. It is a
@@ -30,8 +33,9 @@ var writeCommandRE = regexp.MustCompile(
 	`\bkubectl\s+(apply|create|delete|patch|edit|replace|scale|autoscale|annotate|label|set|rollout\s+(?:restart|undo|pause|resume)|cordon|uncordon|drain|taint|expose|run|cp|exec|debug|attach)\b` +
 		`|\bgcloud\b[^\n` + "`" + `]*\s(create|delete|update|upgrade|resize|add-iam-policy-binding|remove-iam-policy-binding|set-iam-policy|enable|disable|deploy)\b`)
 
-// otherProgramRE finds a command line that runs a program the worker image
-// does not ship. The build has already rewritten a ./scripts/ path to the
+// otherProgramRE finds a command line that runs a program a session does not
+// run (some, such as jq and python3, are in the worker image for the broker's
+// shim and the cluster persona, but not for a session's skills). The build has already rewritten a ./scripts/ path to the
 // not-shipped placeholder, so a line that starts with the placeholder is a
 // program too; the literal is spelled out rather than taken from
 // shippedFileArg so the check does not move with the constant.
@@ -189,7 +193,7 @@ func TestShippedSkillsMarkEveryWrite(t *testing.T) {
 				}
 			}
 			if inFence && otherProgramRE.MatchString(l) && lastNote != unavailableNote && lastNote != proposeOnlyNote {
-				t.Errorf("%s:%d: a program the image does not ship, unmarked: %s", name, i+1, trimmed)
+				t.Errorf("%s:%d: a program a session does not run, unmarked: %s", name, i+1, trimmed)
 			}
 		}
 	}
@@ -497,15 +501,24 @@ func TestConsoleTranscriptOfAReadIsNotMarked(t *testing.T) {
 // The cluster agent reads the source skills, not the session tree, and it is
 // read-only (agents/cluster/SOUL.md, Read-Only Boundary), so a source skill
 // that teaches a write fails here even though the session build would mark it.
+// The cluster persona's copies are read-only too and are checked the same
+// way. Both sides check the same skills: gke-load-bearing-change is left out of
+// each because its prose names `kubectl apply` while explaining managedFields.
 func TestSourceSkillsTeachNoWrites(t *testing.T) {
+	var files []string
 	for _, name := range sessionSkills {
-		body, err := os.ReadFile(filepath.Join(repoSkillsDir, name, skillFile))
+		files = append(files,
+			filepath.Join(repoSkillsDir, name, skillFile),
+			filepath.Join(repoPersonaSkillsDir, name, skillFile))
+	}
+	for _, file := range files {
+		body, err := os.ReadFile(file)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for i, l := range strings.Split(string(body), "\n") {
 			if writeCommandRE.MatchString(l) {
-				t.Errorf("%s:%d: teaches a write; propose the change instead: %s", name, i+1, strings.TrimSpace(l))
+				t.Errorf("%s:%d: teaches a write; propose the change instead: %s", file, i+1, strings.TrimSpace(l))
 			}
 		}
 	}

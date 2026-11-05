@@ -65,6 +65,22 @@ SINGLE = (
     "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
 )
 
+DRIFT = (
+    "## What's wrong\n\n"
+    "checkout-gateway's autoscaler on seeded-b was changed outside Git.\n\n"
+    "maxReplicas went from 10 to 3 at 13:38 (ops-oncall@). Nothing is failing yet, but it can't scale past 3 "
+    "under load.\n\n"
+    "## Why\n\n"
+    "- The live HPA has `maxReplicas: 3`; the GitOps manager last set 10.\n\n"
+    "## What to do\n\n"
+    "- **Option A (Put Git's version back):** Re-sync the HPA to the manifest in Git.\n"
+    "- **Option B (Keep it · update Git):** Change maxReplicas to 3 in the manifest.\n"
+    "- ✅ **Recommended: Option A** — 3 replicas cannot absorb peak load.\n"
+    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+    "or name one directly with **'apply Option A'** / **'apply Option B'**.\n"
+)
+DRIFT_DETAIL = "maxReplicas went from 10 to 3 at 13:38 (ops-oncall@). Nothing is failing yet, but it can't scale past 3 under load."
+
 NOTIFIER = '''\
 """Fixture standing in for gateway/kanban_watchers_notifier.py after apply_kanban_progress_lines."""
 calls = []
@@ -463,6 +479,31 @@ class RuntimeTest(unittest.TestCase):
         self.deliver(refused)
         self.assertEqual([e[0] for e in refused.log], ["send_chat", "send"])
 
+    def test_under_next_a_google_chat_alert_is_edited_too(self):
+        # The gateway lays the triage out on Google Chat under next, so the alert in a
+        # Chat space is edited by its key as a Slack one is; Hermes's own Chat adapter
+        # (today, no send_chat) is left alone.
+        class StandIn(_Adapter):
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                self.log.append(("send_chat", chat_id, content, chat, update))
+                return SimpleNamespace(success=True, error=None)
+
+        space, thread = "spaces/H", "spaces/H/threads/T"
+        self.route("k8s-evt-0000abcd", "google_chat", space, thread)
+        adapter = StandIn()
+        wrapped = runtime.adapter_for(adapter, "google_chat", SimpleNamespace(kind="completed"), SimpleNamespace(result=REPORT),
+                                      {"chat_id": space, "thread_id": thread})
+        self.assertIsNot(wrapped, adapter)
+        res = asyncio.run(wrapped.send(space, "the report", metadata={"thread_id": thread}))
+        self.assertTrue(res.success)
+        (kind, chat_id, _text, chat, update), = adapter.log
+        self.assertEqual((kind, chat_id, update), ("send_chat", space, "alert-k8s-evt-0000abcd"))
+        self.assertEqual(chat["headline"], runtime.parse_triage(REPORT)["headline"])
+        runtime._edited.clear()
+        plain = _Adapter()
+        self.assertIs(runtime.adapter_for(plain, "google_chat", SimpleNamespace(kind="completed"), SimpleNamespace(result=REPORT),
+                                          {"chat_id": space, "thread_id": thread}), plain)
+
     def test_an_alert_is_edited_once_even_when_no_row_is_stored(self):
         adapter = _Adapter()
         self.deliver(adapter)
@@ -476,12 +517,14 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual([e[0] for e in adapter.log], ["chat_update"])
 
     def test_not_recommended_is_not_the_recommendation(self):
-        report = REPORT.replace(
-            "- ✅ **Recommended: Option B**",
-            "- ❌ **Not Recommended: Option A** — it hides the cause.\n- ✅ **Recommended: Option B**",
-        )
-        triage = runtime.parse_triage(report)
-        self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
+        for not_recommended in ("- ❌ **Not Recommended: Option A**", "- ❌ __Not Recommended: Option A__"):
+            with self.subTest(line=not_recommended):
+                report = REPORT.replace(
+                    "- ✅ **Recommended: Option B**",
+                    f"{not_recommended} — it hides the cause.\n- ✅ **Recommended: Option B**",
+                )
+                triage = runtime.parse_triage(report)
+                self.assertEqual([rec for _label, _reply, rec in triage["choices"]], [False, True])
 
     def test_a_title_ending_in_the_suffix_clicks_through_to_its_apply_reply(self):
         for title in ("Roll back (recommended)", "Roll back (recommended) (recommended)"):
@@ -751,14 +794,107 @@ class RuntimeTest(unittest.TestCase):
             "  opened automatically, or reply **'apply Option A'** to open another option.",
         )
         self.assertEqual(len(runtime.parse_triage(wrapped_report)["choices"]), 1)
+        # Three other Markdown renderings of the same clause: underscore emphasis on the label, a
+        # wrapped bullet whose continuation line opens with bold, and underscore emphasis on the
+        # marker words. Each yields the same filtered choices and the same action block as the
+        # bold form above.
+        for label, rendering_multi, rendering_single in (
+            (
+                "underscore",
+                "- __To authorize__: a GitOps Pull Request for the recommended fix is being opened automatically, "
+                "or reply **'apply Option A'** / **'apply Option B'** to open a Pull Request for a different option.",
+                "- __To authorize__: a GitOps Pull Request for this fix is being opened automatically.",
+            ),
+            (
+                "wrapped bold",
+                "- **To authorize:** a GitOps Pull Request for the recommended fix\n"
+                "  **is being opened automatically**, or reply **'apply Option A'** / **'apply Option B'** "
+                "to open a Pull Request for a different option.",
+                "- **To authorize:** a GitOps Pull Request for this fix\n  **is being opened automatically**.",
+            ),
+            (
+                "underscore marker",
+                "- **To authorize:** a GitOps Pull Request for the recommended fix _is being opened automatically_, "
+                "or reply **'apply Option A'** / **'apply Option B'** to open a Pull Request for a different option.",
+                "- **To authorize:** a GitOps Pull Request for this fix __is being opened automatically__.",
+            ),
+        ):
+            with self.subTest(rendering=label):
+                rendered_report = REPORT.replace(
+                    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+                    "or name one directly with **'apply Option A'** / **'apply Option B'**.",
+                    rendering_multi,
+                )
+                self.assertEqual(
+                    runtime.parse_triage(rendered_report)["choices"],
+                    [("Roll back to 14:02", "apply Option A: Roll back to 14:02", False)],
+                )
+                runtime._edited.clear()
+                adapter_rendered = _Adapter()
+                self.deliver(adapter_rendered, result=rendered_report)
+                rendered_action_texts = [
+                    btn["text"]["text"]
+                    for block in adapter_rendered.log[0][1]["blocks"]
+                    if block.get("type") == "actions"
+                    for btn in block.get("elements", [])
+                ]
+                self.assertEqual(rendered_action_texts, ["Roll back to 14:02", "GKE Workloads ↗", "Cloud Logs ↗"])
+                rendered_single = SINGLE.replace(
+                    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.",
+                    rendering_single,
+                )
+                self.assertEqual(runtime.parse_triage(rendered_single)["choices"], [])
+                runtime._edited.clear()
+                adapter_rendered_single = _Adapter()
+                self.deliver(adapter_rendered_single, result=rendered_single)
+                self.assertEqual(
+                    [b["type"] for b in adapter_rendered_single.log[0][1]["blocks"]], ["rich_text", "container"]
+                )
+        # The recommendation line may carry underscore emphasis too. It names the choice the filter
+        # drops, so a miss there keeps both lettered buttons on an open-PR card, and the recommended
+        # one would open the same pull request again. On a reply-wanted report the same line marks
+        # the choice recommended.
+        for recommended_line in ("- ✅ __Recommended: Option B__", "- ✅ _Recommended: Option B_"):
+            with self.subTest(recommended_line=recommended_line):
+                underscored_open_pr = open_pr_report.replace("- ✅ **Recommended: Option B**", recommended_line)
+                self.assertEqual(
+                    runtime.parse_triage(underscored_open_pr)["choices"],
+                    [("Roll back to 14:02", "apply Option A: Roll back to 14:02", False)],
+                )
+                runtime._edited.clear()
+                adapter_underscored = _Adapter()
+                self.deliver(adapter_underscored, result=underscored_open_pr)
+                underscored_action_texts = [
+                    btn["text"]["text"]
+                    for block in adapter_underscored.log[0][1]["blocks"]
+                    if block.get("type") == "actions"
+                    for btn in block.get("elements", [])
+                ]
+                self.assertEqual(underscored_action_texts, ["Roll back to 14:02", "GKE Workloads ↗", "Cloud Logs ↗"])
+                underscored_report = REPORT.replace("- ✅ **Recommended: Option B**", recommended_line)
+                self.assertEqual(
+                    [rec for _label, _reply, rec in runtime.parse_triage(underscored_report)["choices"]], [False, True]
+                )
         # Only the marker words count. A restatement of the reply-wanted clause, in the passive or on a
         # continuation line, keeps every button: stripping one would leave a report that asks for
-        # `apply` with no button for it, on an install that is not opening anything.
+        # `apply` with no button for it, on an install that is not opening anything. Nor do the
+        # marker words count once the bullet has ended: on a sibling bullet, after a blank line, on an
+        # unindented line opening with `*` or `-` (a `**Note:**` paragraph, not a wrapped bold run,
+        # which is indented), or past a thematic break, a CRLF one included (a heading line never
+        # reaches the pattern; `_sections` drops it).
         for clause in (
             "- **To authorize:** reply **'apply'** and a GitOps Pull Request will be opened with this fix.",
             "- **To authorize:** reply **'apply'** and a GitOps Pull Request is being opened for review.",
             "- **To authorize:** reply **'apply'** to choose a fix.\n  Once you reply, a Pull Request will be opened for review.",
             "- **To authorize:** a GitOps Pull Request for the recommended fix will be opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n- **Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n* **Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n**Note:** a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n*Note:* a Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n---\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\n***\nA Pull Request for the drift finding is being opened automatically.",
+            "- **To authorize:** reply **'apply'** to choose a fix.\r\n---\r\nA Pull Request for the drift finding is being opened automatically.",
         ):
             with self.subTest(clause=clause):
                 off_report = REPORT.replace(
@@ -806,6 +942,89 @@ class RuntimeTest(unittest.TestCase):
             conn.execute("INSERT INTO session_metadata VALUES (?, ?)", ("cron-daily-audit", json.dumps(meta)))
             conn.commit()
         self.assertEqual(runtime.alert_title(CHANNEL, "1700000000.000777", self.db), "")
+
+    def mark_drift(self, session_id="k8s-evt-0000abcd"):
+        meta = {"platform": "slack", "chat_id": CHANNEL, "thread_id": ALERT_TS,
+                "title": "checkout-gateway HPA drift in seeded-b", "alert_kind": "drift"}
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT OR REPLACE INTO session_metadata VALUES (?, ?)", (session_id, json.dumps(meta)))
+            conn.commit()
+
+    def test_only_an_alert_marked_drift_is_one(self):
+        self.assertFalse(runtime.is_drift_alert(CHANNEL, ALERT_TS, self.db))
+        self.mark_drift()
+        self.assertTrue(runtime.is_drift_alert(CHANNEL, ALERT_TS, self.db))
+        self.assertFalse(runtime.is_drift_alert(CHANNEL, "1700000000.000777", self.db))
+
+    def test_a_drift_triage_says_what_changed_under_the_headline_and_suffixes_no_button(self):
+        triage = runtime.drift_triage(runtime.parse_triage(DRIFT), DRIFT)
+        self.assertEqual(triage["headline"], "checkout-gateway's autoscaler on seeded-b was changed outside Git.")
+        self.assertEqual(triage["detail"], DRIFT_DETAIL)
+        self.assertEqual(triage["choices"], [
+            ("Put Git's version back", "apply Option A: Put Git's version back", True),
+            ("Keep it · update Git", "apply Option B: Keep it · update Git", False),
+        ])
+
+    def test_a_detail_stops_at_a_list_or_fence_under_the_sentence(self):
+        report = DRIFT.replace("under load.\n\n", "under load.\n- first bullet\n```\nraw\n```\n\n")
+        triage = runtime.drift_triage(runtime.parse_triage(report), report)
+        self.assertEqual(triage["detail"], DRIFT_DETAIL)
+
+    def test_a_long_recommended_title_keeps_the_room_its_suffix_had(self):
+        title = "Put Git's version back and roll the checkout gateway autoscaler to ten"
+        report = DRIFT.replace("Put Git's version back", title)
+        parsed = runtime.parse_triage(report)
+        self.assertTrue(parsed["choices"][0][0].endswith("…" + runtime.RECOMMENDED_SUFFIX))
+        self.assertEqual(runtime.drift_triage(parsed, report)["choices"][0][0], title)
+
+    def test_the_fallback_puts_the_detail_under_the_headline_unbolded(self):
+        text = runtime.fallback_text(runtime.drift_triage(runtime.parse_triage(DRIFT), DRIFT))
+        head, detail = text.split("\n")[:2]
+        self.assertEqual(head, "*checkout-gateway's autoscaler on seeded-b was changed outside Git.*")
+        self.assertIn("maxReplicas went from 10 to 3", detail)
+        self.assertFalse(detail.startswith("*"))
+
+    def test_a_one_sentence_whats_wrong_gives_no_detail(self):
+        report = REPORT.replace(" Nothing else changed.", "")
+        triage = runtime.drift_triage(runtime.parse_triage(report), report)
+        self.assertEqual(triage["detail"], "")
+
+    def test_a_drift_alert_is_edited_into_one_message_with_its_detail(self):
+        self.mark_drift()
+        adapter = _Adapter()
+        self.deliver(adapter, result=DRIFT)
+        (kind, update), = adapter.log
+        self.assertEqual(kind, "chat_update")
+        head, actions = update["blocks"][0], update["blocks"][1]
+        self.assertEqual([_texts({"elements": [s]}) for s in head["elements"]],
+                         ["checkout-gateway's autoscaler on seeded-b was changed outside Git.", DRIFT_DETAIL])
+        buttons = actions["elements"]
+        self.assertEqual([b["text"]["text"] for b in buttons], ["Put Git's version back", "Keep it · update Git"])
+        self.assertEqual([b.get("style") for b in buttons], ["primary", None])
+        self.assertIn(DRIFT_DETAIL, update["text"])
+
+    def test_an_event_alert_keeps_its_layout(self):
+        adapter = _Adapter()
+        self.deliver(adapter, result=DRIFT)
+        head, actions = adapter.log[0][1]["blocks"][:2]
+        self.assertEqual(len(head["elements"]), 1)
+        self.assertEqual(actions["elements"][0]["text"]["text"], "Put Git's version back (recommended)")
+
+    def test_under_next_a_drift_alert_is_edited_with_its_detail(self):
+        class StandIn(_Adapter):
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                self.log.append(("send_chat", chat_id, content, chat, update))
+                return SimpleNamespace(success=True, error=None)
+
+        self.mark_drift()
+        adapter = StandIn()
+        self.deliver(adapter, result=DRIFT)
+        (_kind, _chat_id, text, chat, update), = adapter.log
+        self.assertEqual(update, "alert-k8s-evt-0000abcd")
+        self.assertEqual(chat["detail"], DRIFT_DETAIL)
+        self.assertEqual([(c["text"], c.get("primary", False)) for c in chat["choices"]],
+                         [("Put Git's version back", True), ("Keep it · update Git", False)])
+        self.assertIn(DRIFT_DETAIL, text)
 
 
 class ApplierTest(unittest.TestCase):

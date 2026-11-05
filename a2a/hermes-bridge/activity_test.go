@@ -64,10 +64,35 @@ def call(tool, args, call_id, status="ok", error_type=None, ms=12):
 	return []string{path}
 }
 
+// stubMarkerEnv and stubBarrierEnv carry a test's paths to its stub through
+// the environment the child inherits, not through the stub's source, where a
+// Go-quoted path is not always a Python string with the same bytes.
+const (
+	stubMarkerEnv  = "HERMES_STUB_TEST_MARKER"
+	stubBarrierEnv = "HERMES_STUB_TEST_BARRIER"
+)
+
+// waitForFile returns once path exists or d has passed. It runs off the test
+// goroutine, so it reports nothing: the caller's assertions fail instead.
+func waitForFile(path string, d time.Duration) {
+	for give := time.Now().Add(d); time.Now().Before(give); time.Sleep(50 * time.Millisecond) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+	}
+}
+
 // startBridgeCfg is startBridge with the caller's Config; the door is opened
 // on an ephemeral port unless the caller says otherwise. The lifecycle and
 // the consumer wait are startBridgeConfig's.
 func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Config)) *Bridge {
+	t.Helper()
+	return startBridgeCfgHooked(t, url, command, mutate, nil)
+}
+
+// startBridgeCfgHooked is startBridgeCfg plus a hook that sees the bridge
+// between New and Run.
+func startBridgeCfgHooked(t *testing.T, url string, command []string, mutate func(*Config), hook func(*Bridge)) *Bridge {
 	t.Helper()
 	cfg := Config{
 		NATSURL:        url,
@@ -86,7 +111,7 @@ func startBridgeCfg(t *testing.T, url string, command []string, mutate func(*Con
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	b, _ := startBridgeConfig(t, cfg, nil)
+	b, _ := startBridgeConfig(t, cfg, hook)
 	return b
 }
 
@@ -228,14 +253,31 @@ print("done")
 	}
 }
 
+// The deadline kills the stub only once its pre_tool_call is in: the
+// bridge records the open call before it answers the post, and the stub
+// writes its marker after the answer. Without the hold, the 2 s deadline
+// raced the stub's start, and a stub that had not posted yet left nothing
+// open to report.
 func TestActivity_AnOpenCallIsReportedInterruptedAtTheDeadline(t *testing.T) {
 	_, url := startServer(t)
-	startBridgeCfg(t, url, hermesStub(t, `
+	posted := filepath.Join(t.TempDir(), "posted")
+	t.Setenv(stubMarkerEnv, posted)
+	startBridgeCfgHooked(t, url, hermesStub(t, `
 post("pre_tool_call", "terminal", {"cmd": "sleep 60", "secret": "x"}, {"tool_call_id": "c-open", "task_id": ""})
+open(os.environ["`+stubMarkerEnv+`"], "w").close()
 time.sleep(30)
 `), func(c *Config) {
 		c.TaskDeadline = 2 * time.Second
 		c.KillGrace = 200 * time.Millisecond
+	}, func(b *Bridge) {
+		b.afterDeadline = func(d time.Duration, f func()) *time.Timer {
+			return time.AfterFunc(d, func() {
+				// Half of waitTerminal's budget, so a stub that never posts
+				// fails on the entry assertion below, not on the terminal wait.
+				waitForFile(posted, terminalWait/2)
+				f()
+			})
+		}
 	})
 	c := gatewayClient(t, url)
 
@@ -549,30 +591,45 @@ func TestActivityStatus(t *testing.T) {
 	}
 }
 
+// concurrentBarrierWait is how long each stub in the concurrency test waits
+// at the barrier for the other stub. It is under the task deadline, so a
+// stub that waits in vain exits on its own and its task ends failed.
+const concurrentBarrierWait = 10 * time.Second
+
 // Two tasks at once: each delivery lands on the task whose key signed it,
-// never on the other. The stubs overlap by sleeping after their calls.
+// never on the other. The stubs meet at a barrier between their two calls:
+// each writes its marker after its first call and waits for the other's, so
+// both tasks complete only when both stubs run at the same time. The test
+// used to time the two terminals against twice a stub's sleep, which a
+// loaded runner crossed with the tasks running at once.
 func TestActivity_ConcurrentTasksKeepTheirOwnTraces(t *testing.T) {
 	_, url := startServer(t)
-	startBridgeCfg(t, url, hermesStub(t, `
+	t.Setenv(stubBarrierEnv, t.TempDir())
+	startBridgeCfg(t, url, hermesStub(t, fmt.Sprintf(`
 prompt = sys.argv[-1]
 tool = "tool-for-" + prompt
 call(tool, {"which": ord(prompt)}, "call-" + prompt)
-time.sleep(1.5)
+barrier = os.environ["`+stubBarrierEnv+`"]
+open(os.path.join(barrier, prompt), "w").close()
+give_up = time.monotonic() + %g
+while not all(os.path.exists(os.path.join(barrier, p)) for p in ("A", "B")):
+    if time.monotonic() > give_up:
+        sys.exit("the other task's stub never started: the two tasks did not run at once")
+    time.sleep(0.05)
 call(tool + "-again", {"which": ord(prompt)}, "call2-" + prompt)
 print("answer for " + prompt)
-`), func(c *Config) { c.Concurrency = 2 })
+`, concurrentBarrierWait.Seconds())), func(c *Config) { c.Concurrency = 2 })
 	c := gatewayClient(t, url)
 
-	// The two stubs each sleep 1.5 s between their calls; run together both
-	// terminals land well inside twice that, run one after the other they
-	// cannot. The bound is what makes "at once" a tested claim.
-	started := time.Now()
 	submit(t, c, "task-a", "A")
 	submit(t, c, "task-b", "B")
 	ta := waitTerminal(t, c, "task-a")
 	tb := waitTerminal(t, c, "task-b")
-	if elapsed := time.Since(started); elapsed > 3*time.Second {
-		t.Fatalf("the two tasks did not overlap: both terminals took %s, serial runs would", elapsed)
+	for _, task := range []*lib.Task{ta, tb} {
+		if task.State != lib.StateCompleted {
+			t.Fatalf("task %s: state = %s (%v), want completed: the two tasks did not run at once",
+				task.ID, task.State, task.FinalMessage)
+		}
 	}
 	// The input carries the prompt as a number, since no string value rides
 	// the trace: "A" is 65, "B" is 66.

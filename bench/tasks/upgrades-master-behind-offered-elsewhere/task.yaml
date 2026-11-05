@@ -73,18 +73,32 @@ verification_spec:
       # The findings table renders each row as
       # "| [`<id>`](#user-content-finding-<id>) | <severity> | ...", and every
       # id on the lagging cluster's own object ends "cluster-<name>", so
-      # "seeded-b) | <severity>" is that cluster's cluster-scoped findings'
-      # severity cell. Node-pool findings end in the pool name and never
-      # match. Of the checks the fixture trips, only master-behind can be
-      # major there; the collector files no-notifications at minor.
+      # "cluster-seeded-b) | major" is a major severity cell on one of that
+      # cluster's cluster-scoped findings. Node-pool findings end in
+      # "nodepool-<pool>" and never match, whatever the pool is called. On
+      # this fixture that cell is master-behind's: of the
+      # checks the collector grades major on a Cluster object, no-channel
+      # (3.4) needs a cluster off every channel, and seeded-b is enrolled in
+      # REGULAR; blocking-exclusion (3.8) needs a NO_UPGRADES or
+      # NO_MINOR_OR_NODE_UPGRADES scope (a scope-less exclusion reads as
+      # NO_UPGRADES), and the fixture's exclusion is NO_MINOR_UPGRADES
+      # (bench/tf/fleet/main.tf). upgrade-blocked (3.11) is always critical,
+      # no-notifications (3.10) and fleet-spread (3.3) minor. A master-behind
+      # graded critical therefore leaves no major row on seeded-b and fails
+      # here. No phrase forbids "seeded-b) | critical": the cluster's correct
+      # upgrade-blocked finding renders exactly that cell beside the major
+      # one, and the project name between the check slug and the cell leaves
+      # no fixed phrase that binds the two. If seeded-b leaves its channel or
+      # its exclusion scope changes, a critical master-behind can pass here
+      # beside the other check's major row; the pin test reads the fixture
+      # and the collector's severity table so that drift fails loudly.
       # The table is the only place the body puts a severity beside an id,
       # and it stops at MAX_DELTA_ROWS (50) rows, criticals first, then majors
       # by qualified cluster name. The measured runs published 26 findings on
       # 13 clusters; a project carrying enough extra clusters to push this row
       # past 50 fails the required phrase with "_…and N more below_" in the
       # table, which is the row cut off, not the grade wrong.
-      required_phrases: ["seeded-b) | major"]
-      forbidden_phrases: ["seeded-b) | critical"]
+      required_phrases: ["cluster-seeded-b) | major"]
   - name: no-invented-cves
     role: objective
     mode: assert

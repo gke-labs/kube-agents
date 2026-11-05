@@ -101,20 +101,45 @@ INSTALLER_HELP_BANNER = "kube-agents Zero-Friction Installer"
 UPGRADER_HELP_BANNER = "Lifecycle Upgrade Engine"
 
 
+# Installer configuration keys that install.sh and installer_common.sh read from
+# the environment when seeding PARAM_* defaults. Stripped by default in
+# get_isolated_test_env so a developer's shell exports cannot steer hermetic
+# unit tests; tests that want a specific value pass it via `overrides`.
+SEEDED_INSTALLER_ENV_KEYS = (
+    "ACCEPT_NO_NETWORK_POLICY",
+    "ENABLE_NETWORK_POLICY",
+    "MIGRATE_NODE_POOLS",
+    "GOOGLE_CHAT_ENABLED",
+    "SLACK_ENABLED",
+    "ENABLE_GKE_BACKUP_PLAN",
+    "HELM_UPGRADE_INSTALL",
+    "ENABLE_PUBSUB_PLATFORM",
+    "ENABLE_STOCKOUT_INVESTIGATOR",
+    "ENABLE_DRIFT_DETECTOR",
+    "WEB_CONSOLE_ENABLED",
+    "LITELLM_REDACTION_ENABLED",
+    "LITELLM_REDACTION_IP_ACTION",
+    "LITELLM_REDACTION_IP_ALLOW_CIDRS",
+    "LITELLM_REDACTION_RULES",
+    "SCOPED_SA_POOL_ENABLED",
+)
+
+
 def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     """Returns a sanitized environment for hermetic script execution, free of CI runner pollution.
 
-    `absent` names variables the child must not see even when the developer's
-    shell exports them: a test that relies on a variable being unset has to say
-    so here, because the copy starts from os.environ and an override of None is
-    not the same as no entry. Popped before the overrides, so a caller can name
-    a key in both and the override wins.
+    `SEEDED_INSTALLER_ENV_KEYS` and `absent` name variables the child must not
+    see even when the developer's shell exports them: a test that relies on a
+    variable being unset has to be insulated from os.environ. Popped before the
+    overrides, so a caller can name a key in `overrides` and the override wins.
     """
     env = {
         k: v
         for k, v in os.environ.items()
         if not k.startswith(("GITHUB_", "RUNNER_")) and k not in ("CI", "CONTINUOUS_INTEGRATION", "GH_TOKEN")
     }
+    for key in SEEDED_INSTALLER_ENV_KEYS:
+        env.pop(key, None)
     for key in absent:
         env.pop(key, None)
     if bin_dir:
@@ -122,6 +147,33 @@ def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     if overrides:
         env.update(overrides)
     return env
+
+
+NOTES_PROBE_DEFINE = "notes-under-test"
+NOTES_PROBE_CONFIGMAP = "notes-under-test"
+NOTES_PROBE_TEMPLATE = "templates/notes-under-test.yaml"
+
+
+def chart_with_notes_probe(chart_src, chart_dst):
+    """Copies the chart to `chart_dst` with its NOTES.txt captured into a ConfigMap.
+
+    `helm template` renders no notes, so a test that reads them wraps NOTES.txt in a
+    define and renders it as the `notes` key of a ConfigMap named NOTES_PROBE_CONFIGMAP
+    (`--show-only NOTES_PROBE_TEMPLATE` selects it). Returns the copied chart's path.
+    """
+    chart_dst = pathlib.Path(chart_dst)
+    shutil.copytree(chart_src, chart_dst)
+    templates = chart_dst / "templates"
+    notes = (templates / "NOTES.txt").read_text()
+    (templates / "NOTES.txt").unlink()
+    (templates / "_notes_under_test.tpl").write_text(
+        '{{- define "' + NOTES_PROBE_DEFINE + '" -}}\n' + notes + "\n{{- end -}}\n"
+    )
+    (chart_dst / NOTES_PROBE_TEMPLATE).write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + NOTES_PROBE_CONFIGMAP + "\n"
+        'data:\n  notes: {{ include "' + NOTES_PROBE_DEFINE + '" . | toJson }}\n'
+    )
+    return chart_dst
 
 
 def create_minimal_tools_bin(temp_dir_path, exclude=()):

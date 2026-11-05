@@ -3,25 +3,9 @@
 {{- if eq $provider "chatgpt" }}
 {{- fail "litellm.modelProvider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store this chart does not ship. Use 'openai' with an API key, or see examples/litellm-chatgpt-subscription for a hand-applied subscription proxy." }}
 {{- end }}
-{{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
-       a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
-{{- /*
-  openai_compatible has no default model, so it is allowed beside the table
-  rather than in it. Any other value is taken as a LiteLLM provider slug
-  (azure, bedrock, databricks, ...) whose credentials arrive through
-  envFromSecret: the chart knows no default model for it, so modelDefaultName
-  is required, and the slug's shape is checked here so a typo fails the render
-  rather than the first model call.
-*/}}
-{{- $litellmSlugPattern := "^[a-z][a-z0-9_]*$" }}
-{{- $tableProvider := or (hasKey $defaultModels $provider) (eq $provider "openai_compatible") }}
-{{- if and (not $tableProvider) (not (regexMatch $litellmSlugPattern $provider)) }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, openai_compatible, sap, nor a LiteLLM provider slug (lowercase letters, digits and underscores) — a typo here would otherwise fail only at runtime" $provider) }}
-{{- end }}
-{{- if and (not $tableProvider) (empty .Values.litellm.modelDefaultName) }}
-{{- fail (printf "litellm.modelProvider %q is a LiteLLM provider slug outside the chart's table, so litellm.modelDefaultName must name the model it serves (there is no default); its credentials go in the Secret litellm.envFromSecret names." $provider) }}
-{{- end }}
+{{- /* The model resolution, and the per-provider defaults it falls back to, live in
+       kube-agents.litellmModel so the web console shows the model this serves. */}}
+{{- $model := include "kube-agents.litellmModel" . }}
 {{- /*
   A Secret the operator creates, mounted whole into the gateway container as
   environment variables (envFrom, below). Its name is checked here so a typo
@@ -34,7 +18,6 @@
 {{- fail (printf "litellm.envFromSecret %q is not a valid Secret name (a lowercase DNS subdomain of at most %d characters)." $envFromSecret $secretNameMaxLength) }}
 {{- end }}
 {{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.litellm.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 1 "scope" "litellm.rollingUpdate") | fromYaml }}
-{{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
 {{- $vertex := .Values.litellm.vertex | default dict }}
 {{- $vertexSA := $vertex.serviceAccountName | default "kubeagents-litellm" }}
 {{- $vertexProject := $vertex.projectId | default .Values.platformAgent.harness.projectId }}
@@ -45,9 +28,32 @@
   scripts/installer/installer_common.sh.
 */}}
 {{- $vertexLocation := $vertex.location | default "global" }}
+{{- /*
+  A service-account key and the project id, each read from a Secret, for an
+  install that cannot use Workload Identity or must not show the project in
+  the pod spec. Both off unless named. The key is mounted read-only and named
+  by GOOGLE_APPLICATION_CREDENTIALS, which google.auth.default prefers over
+  the metadata server, so it wins over the KSA's Workload Identity binding.
+*/}}
+{{- $vertexCredentials := $vertex.credentialsSecretRef | default dict }}
+{{- $vertexProjectRef := $vertex.projectSecretRef | default dict }}
+{{- $vertexCredentialsDir := "/var/run/secrets/vertex" }}
+{{- $vertexCredentialsFile := "sa.json" }}
+{{- $vertexCredentialsMode := 288 }}{{- /* 0440 */}}
+{{- range $field, $ref := dict "credentialsSecretRef" $vertexCredentials "projectSecretRef" $vertexProjectRef }}
+{{- if and (or $ref.name $ref.key) (ne $provider "vertex_ai") }}
+{{- fail (printf "litellm.vertex.%s is set but litellm.modelProvider is %q; it is read only for vertex_ai" $field $provider) }}
+{{- end }}
+{{- if and $ref.name (empty $ref.key) }}
+{{- fail (printf "litellm.vertex.%s.name is set without a key" $field) }}
+{{- end }}
+{{- if and $ref.key (empty $ref.name) }}
+{{- fail (printf "litellm.vertex.%s.key is set without a name" $field) }}
+{{- end }}
+{{- end }}
 {{- if eq $provider "vertex_ai" }}
-{{- if empty $vertexProject }}
-{{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId (or platformAgent.harness.projectId): Vertex AI is addressed as projects/<project>/locations/<location> and the project has no usable default." }}
+{{- if and (empty $vertexProject) (empty $vertexProjectRef.name) }}
+{{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId, litellm.vertex.projectSecretRef, or platformAgent.harness.projectId: Vertex AI is addressed as projects/<project>/locations/<location> and the project has no usable default." }}
 {{- end }}
 {{- end }}
 {{- /*
@@ -137,8 +143,9 @@
 {{- end }}
 {{- end }}
 {{- /*
-  Rendered as the flow list LiteLLM's config expects, the same callbacks the
-  kustomize base names when otel is on. The redaction callback is a module
+  Rendered as the flow list LiteLLM's config expects, seeded with the
+  exporters the kustomize base names when otel is on; the hooks below are
+  appended to the seed. The redaction callback is a module
   path relative to the config directory, which is why its two files are
   mounted beside config.yaml below.
 */}}
@@ -153,6 +160,17 @@
 {{- fail "the chart's files/litellm_thinking_replay_callback.py is missing" }}
 {{- end }}
 {{- $callbackList = append $callbackList "litellm_thinking_replay_callback.proxy_handler_instance" }}
+{{- /*
+  The cache-marker hook runs on every install too: it drops a caller's own
+  cache_control markers from a request bound for a Gemini model, which LiteLLM
+  would otherwise turn into a Vertex explicit-caching create (a 400 on
+  gemini-4-argon, which has none). Its header says which caller sends them.
+*/}}
+{{- $cacheControlStripSource := .Files.Get "files/litellm_cache_control_strip_callback.py" }}
+{{- if empty $cacheControlStripSource }}
+{{- fail "the chart's files/litellm_cache_control_strip_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "litellm_cache_control_strip_callback.proxy_handler_instance" }}
 {{- if $redactionEnabled }}
 {{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
 {{- end }}
@@ -172,6 +190,27 @@
 {{- fail "the chart's files/litellm_oauth2_callback.py is missing" }}
 {{- end }}
 {{- $callbackList = append $callbackList "litellm_oauth2_callback.proxy_handler_instance" }}
+{{- end }}
+{{- /*
+  The session-affinity hook gives each Gemini conversation a Vertex session_id
+  so turn 1 can read another conversation's warm prefix cache. Off by default,
+  and vertex_ai only: session_id is a Vertex field, honoured on a project with
+  Vertex's LLM_SESSION_ID label and ignored elsewhere. Registered after the
+  redaction hook, so the id is a hash of redacted text only: hashed before
+  redaction, it would let anyone holding the request recover a short value
+  redaction removed by guessing. Redaction's pseudonyms then have to match on
+  every replica, which needs SESSION_KV_SALT set; without it each pod salts
+  its own and one conversation can get two ids.
+*/}}
+{{- $sessionAffinity := $vertex.sessionAffinity | default dict }}
+{{- $sessionAffinityEnabled := and (eq $provider "vertex_ai") (default false $sessionAffinity.enabled) }}
+{{- $sessionAffinitySource := "" }}
+{{- if $sessionAffinityEnabled }}
+{{- $sessionAffinitySource = .Files.Get "files/litellm_session_affinity_callback.py" }}
+{{- if empty $sessionAffinitySource }}
+{{- fail "litellm.vertex.sessionAffinity is enabled but the chart's files/litellm_session_affinity_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "litellm_session_affinity_callback.proxy_handler_instance" }}
 {{- end }}
 {{- $traceLogEnabled := default false .Values.litellm.traceLogEnabled }}
 {{- $traceLogPath := .Values.litellm.traceLogPath | default "/tmp/litellm_traces.jsonl" }}
@@ -205,21 +244,25 @@
 {{- include "kube-agents.litellmOTLPPortCheck" . }}
 {{- /*
   Rendered once here and used twice below — as the ConfigMap body and as the
-  input to the Deployment's checksum. Three aliases for one upstream model,
+  input to the Deployment's checksum. Three aliases by default (four with
+  fallback) for one upstream model,
   mirroring the kustomize base: the agent configs only ever request
   "model-default", but a caller that names the harness ("hermes-agent") or the
   concrete model gets routed rather than a 404 from the gateway.
 */}}
-{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort) $configEndpoint) }}
+{{- $fallback := .Values.litellm.fallback | default dict }}
+{{- $config := include "kube-agents.litellmConfig" (merge (dict "provider" $provider "model" $model "callbacks" $callbacks "maxTokens" .Values.litellm.maxTokens "reasoningEffort" .Values.litellm.reasoningEffort "dropParams" .Values.litellm.dropParams "fallback" $fallback "timeoutSeconds" $fallback.timeoutSeconds "numRetries" $fallback.numRetries "retryAfterSeconds" $fallback.retryAfterSeconds) $configEndpoint) }}
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
-  hook, the rule file, the two redaction modules, the OAuth2 hook and the
-  optional trace logger are subPath mounts too, so an edit to any of them has
-  to roll the pods the same way an edit to config.yaml does. With redaction or
-  trace logging off their extras are empty strings, as is the OAuth2 hook's
-  source while the hook is not shipped.
+  and cache-marker hooks, the rule file, the two redaction modules, the OAuth2
+  hook, the session-affinity hook and the optional trace logger are subPath
+  mounts too, so an edit to any of them has to roll the pods the same way an
+  edit to config.yaml does. With redaction or trace logging off their extras
+  are empty strings, as are the OAuth2 and session-affinity hooks' sources
+  while those hooks are not shipped. The slot count reaches the pod as an env
+  var, which rolls it by itself.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s%s%s" $config $thinkingReplaySource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource $sessionAffinitySource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -233,6 +276,8 @@ data:
     {{- $config | nindent 4 }}
   litellm_thinking_replay_callback.py: |
     {{- $thinkingReplaySource | nindent 4 }}
+  litellm_cache_control_strip_callback.py: |
+    {{- $cacheControlStripSource | nindent 4 }}
   {{- if $redactionEnabled }}
   redaction.yaml: |
     {{- $redactionConfig | nindent 4 }}
@@ -251,6 +296,10 @@ data:
   {{- if $oauthHookEnabled }}
   litellm_oauth2_callback.py: |
     {{- $oauthHookSource | nindent 4 }}
+  {{- end }}
+  {{- if $sessionAffinityEnabled }}
+  litellm_session_affinity_callback.py: |
+    {{- $sessionAffinitySource | nindent 4 }}
   {{- end }}
 {{- if eq $provider "vertex_ai" }}
 ---
@@ -307,8 +356,15 @@ spec:
       {{- with (include "kube-agents.topologySpreadConstraints" (dict "enabled" (.Values.litellm.topologySpread | default dict).enabled "replicas" .Values.litellm.replicaCount "selectorLabels" "app: litellm")) }}
       {{- . | nindent 6 }}
       {{- end }}
+      {{- /* Point at "default" when not on vertex_ai: omitting the field lets
+             Helm's three-way merge drop serviceAccountName on a switch away from
+             vertex_ai while Kubernetes back-fills it from the deprecated
+             serviceAccount twin, leaving the live pod template naming the
+             deleted KSA (#3878). */}}
       {{- if eq $provider "vertex_ai" }}
       serviceAccountName: {{ $vertexSA | quote }}
+      {{- else }}
+      serviceAccountName: "default"
       {{- end }}
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}
@@ -367,11 +423,36 @@ spec:
             # transport boundary rather than via LiteLLM's user-auth layer.
             - name: LITELLM_DANGEROUSLY_PERMIT_WEAK_OR_UNSET_MASTER_KEY
               value: "true"
+            {{- $retryAfter := int ($fallback.retryAfterSeconds | default 0) }}
+            {{- if gt $retryAfter 8 }}
+            # LiteLLM applies router_settings.retry_after as the floor of its pause
+            # before a retry and then clamps the pause to MAX_RETRY_DELAY, 8s by
+            # default (litellm/constants.py reads it from the environment at
+            # import). A floor above 8s is a no-op without the ceiling raised
+            # with it; this is the one retry pause the gateway has.
+            - name: MAX_RETRY_DELAY
+              value: {{ $retryAfter | quote }}
+            {{- end }}
             {{- if eq $provider "vertex_ai" }}
             - name: VERTEXAI_PROJECT
+              {{- if $vertexProjectRef.name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $vertexProjectRef.name | quote }}
+                  key: {{ $vertexProjectRef.key | quote }}
+              {{- else }}
               value: {{ $vertexProject | quote }}
+              {{- end }}
             - name: VERTEXAI_LOCATION
               value: {{ $vertexLocation | quote }}
+            {{- if $sessionAffinityEnabled }}
+            - name: KUBE_AGENTS_SESSION_AFFINITY_SLOTS
+              value: {{ $sessionAffinity.slots | default 2 | quote }}
+            {{- end }}
+            {{- if $vertexCredentials.name }}
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: {{ printf "%s/%s" $vertexCredentialsDir $vertexCredentialsFile | quote }}
+            {{- end }}
             {{- end }}
             {{- if eq $provider "openai_compatible" }}
             # Optional: a server that checks no key needs none, and LiteLLM then
@@ -480,10 +561,18 @@ spec:
             - name: config-volume
               mountPath: /app/litellm_thinking_replay_callback.py
               subPath: litellm_thinking_replay_callback.py
+            - name: config-volume
+              mountPath: /app/litellm_cache_control_strip_callback.py
+              subPath: litellm_cache_control_strip_callback.py
             {{- if $oauthHookEnabled }}
             - name: config-volume
               mountPath: /app/litellm_oauth2_callback.py
               subPath: litellm_oauth2_callback.py
+            {{- end }}
+            {{- if $sessionAffinityEnabled }}
+            - name: config-volume
+              mountPath: /app/litellm_session_affinity_callback.py
+              subPath: litellm_session_affinity_callback.py
             {{- end }}
             {{- if $redactionEnabled }}
             # Beside config.yaml, because LiteLLM resolves a custom callback
@@ -517,6 +606,11 @@ spec:
             {{- end }}
             - name: tmp
               mountPath: /tmp
+            {{- if $vertexCredentials.name }}
+            - name: vertex-sa-vol
+              mountPath: {{ $vertexCredentialsDir }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config-volume
           configMap:
@@ -537,6 +631,15 @@ spec:
         - name: tmp
           emptyDir:
             sizeLimit: 1Gi
+        {{- if $vertexCredentials.name }}
+        - name: vertex-sa-vol
+          secret:
+            secretName: {{ $vertexCredentials.name | quote }}
+            defaultMode: {{ $vertexCredentialsMode }}
+            items:
+              - key: {{ $vertexCredentials.key | quote }}
+                path: {{ $vertexCredentialsFile }}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

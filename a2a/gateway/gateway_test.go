@@ -201,6 +201,10 @@ type fakeAdapter struct {
 	reactions []string
 	// verified records InboundVerified calls (verifiedCalls).
 	verified []string
+	// feedbacks records every PostMessage's feedback mark, when it has one,
+	// and markedTexts the text each marked post carried.
+	feedbacks   []string
+	markedTexts []string
 	// takesTerminals makes PostTerminal record the terminal in terminals, as
 	// the console adapter publishes a terminal frame; without it the fake
 	// answers errNoTerminalFrames, as a chat backend would.
@@ -256,6 +260,12 @@ func (a *fakeAdapter) Edit(conversation, messageID, text string) error {
 }
 
 func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Feedback != "" {
+		a.mu.Lock()
+		a.feedbacks = append(a.feedbacks, m.Feedback)
+		a.markedTexts = append(a.markedTexts, m.Text)
+		a.mu.Unlock()
+	}
 	if m.Chat == nil {
 		return a.Post(conversation, m.Text)
 	}
@@ -401,6 +411,10 @@ type rig struct {
 	// stop cancels the gateway's context, on the rigs restartRig can
 	// replace (startRigWithSpawnerCap); nil elsewhere.
 	stop context.CancelFunc
+	// ran is closed when the gateway's Run returns, on the same rigs: a
+	// gateway is stopped once Run has returned, the order cmd/gateway keeps
+	// before it closes the client. nil elsewhere.
+	ran chan struct{}
 }
 
 // startRig assembles a gateway on an embedded server, with user 1001 mapped
@@ -1446,9 +1460,10 @@ func startRigWithSpawnerAdapter(t *testing.T, defaultAddressee string, maxSessio
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
+	ran := make(chan struct{})
+	go func() { _ = g.Run(ctx); close(ran) }()
 
-	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel}, spawn
+	return &rig{g: g, adapter: adapter, client: client, bus: bus, url: url, logs: logs, stop: cancel, ran: ran}, spawn
 }
 
 // restartRig stops r's gateway and starts a second one over the same server,
@@ -1468,9 +1483,16 @@ func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) 
 // by wrap, as startRigWithSpawnerAdapter chooses the first's.
 func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, whileDown ...func()) (*rig, *fakeSpawner) {
 	t.Helper()
+	return restartRigWith(t, r, wrap, RunOptions{}, whileDown...)
+}
+
+// restartRigWith is restartRigWrapped with the second gateway run under opts,
+// as an elected gateway runs (RunWith).
+func restartRigWith(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, opts RunOptions, whileDown ...func()) (*rig, *fakeSpawner) {
+	t.Helper()
 	r.stop()
 	select {
-	case <-r.adapter.stopped:
+	case <-r.ran:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the first gateway did not stop")
 	}
@@ -1499,8 +1521,9 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _ = g.Run(ctx) }()
-	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel}, spawn
+	ran := make(chan struct{})
+	go func() { _ = g.RunWith(ctx, opts); close(ran) }()
+	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel, ran: ran}, spawn
 }
 
 // TestDelegatePrefixSpawnsSessionWorker: the W4 amendment's flow - a
@@ -1896,13 +1919,11 @@ func TestNoTaskTurnDoesNotReadmitAThread(t *testing.T) {
 		}
 		return false
 	})
-	after, err := r.g.reg.Get(ctx, conv)
-	if err != nil || after == nil {
-		t.Fatal(err)
-	}
-	if !after.LastActivity.After(stale) {
-		t.Fatalf("a verified turn must still count for the reap: LastActivity %v not after %v", after.LastActivity, stale)
-	}
+	// The gateway writes the record after it posts the answer, so the
+	// reap's clock is polled for rather than read once (see waitForRecord).
+	after := waitForRecord(t, r, conv, "a verified turn to count for the reap", func(rec *SessionRecord) bool {
+		return rec.LastActivity.After(stale)
+	})
 	if !after.LastTaskActivity.Equal(stale) {
 		t.Fatalf("a turn that started nothing moved the task clock: %v, want %v", after.LastTaskActivity, stale)
 	}
@@ -2551,26 +2572,76 @@ func TestSessionWithTextOnARunningSessionSteers(t *testing.T) {
 // unmentioned thread reply only once a task has started there, so the ack
 // after a bare /session in a Slack channel must not promise that the next
 // message opens the pod - it asks for the mention. DMs and every other
-// backend keep the plain promise. A Slack DM is told to reply in the thread:
-// each top-level DM is a conversation of its own, so the binding holds only
-// there.
+// backend keep the plain promise. A threaded Slack DM is told to reply in the
+// thread: each top-level DM is a conversation of its own, so the binding
+// holds only there.
 func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
-	slackChannel := sessionOnAck("slack", "group", "platform")
+	slackChannel := sessionOnAck("slack", "group", true, "platform")
 	if !strings.Contains(slackChannel, "mention") || strings.Contains(slackChannel, "your next message opens") {
 		t.Fatalf("slack channel ack = %q", slackChannel)
 	}
-	slackDM := sessionOnAck("slack", "dm", "platform")
+	slackDM := sessionOnAck("slack", "dm", true, "platform")
 	if !strings.Contains(slackDM, "reply in this thread") || strings.Contains(slackDM, "mention") || strings.Contains(slackDM, "your next message opens") {
 		t.Fatalf("slack dm ack = %q", slackDM)
 	}
 	for _, c := range [][2]string{{"discord", "dm"}, {"discord", "group"}, {"gchat", "group"}, {"inject", "group"}} {
-		ack := sessionOnAck(c[0], c[1], "platform")
+		ack := sessionOnAck(c[0], c[1], false, "platform")
 		if !strings.Contains(ack, "your next message opens a session pod") || strings.Contains(ack, "mention") {
 			t.Fatalf("%s/%s ack = %q", c[0], c[1], ack)
 		}
 	}
-	if !strings.Contains(sessionOnAck("discord", "group", "platform"), "`platform`") {
+	if !strings.Contains(sessionOnAck("discord", "group", false, "platform"), "`platform`") {
 		t.Fatal("the ack does not name the default addressee")
+	}
+}
+
+// TestSessionOnAckTellsThreadedDMsToReplyInThread: a Google Chat DM roots
+// each top-level message in a conversation of its own, as a Slack DM does,
+// so a DM record keyed by its thread gets Slack's DM wording. A DM record
+// with no thread (a thread-less Google Chat key, a legacy Slack key) shares
+// its key with every later message, and a Discord DM has no threads: both
+// keep the generic wording.
+func TestSessionOnAckTellsThreadedDMsToReplyInThread(t *testing.T) {
+	ack := func(backend, key string) string {
+		return sessionOnAck(backend, sessionKindDM, conversationIsOwnThread(backend, key), "bridge")
+	}
+	want := ack(slackBackend, "slack:dm/D1/200.1")
+	if !strings.Contains(want, "reply in this thread") {
+		t.Fatalf("threaded Slack DM ack = %q, want the thread wording", want)
+	}
+	if got := ack(gchatBackend, "gchat:dm/spaces/D1/threads/T1"); got != want {
+		t.Fatalf("threaded gchat DM ack = %q, want Slack's DM wording %q", got, want)
+	}
+	generic := sessionOnAck(discordBackend, sessionKindGroup, false, "bridge")
+	for _, c := range [][2]string{{gchatBackend, "gchat:dm/spaces/D1"}, {slackBackend, "slack:dm/D1"}, {discordBackend, "discord:dm/1001"}} {
+		if got := ack(c[0], c[1]); got != generic {
+			t.Errorf("%s DM ack = %q, want the generic wording %q", c[1], got, generic)
+		}
+	}
+}
+
+// TestConversationIsOwnThreadReadsTheKeyShape: only a key that names a
+// thread is its own thread; a whole-space key, a thread-less DM key, a key
+// that does not parse and a backend without threads are not.
+func TestConversationIsOwnThreadReadsTheKeyShape(t *testing.T) {
+	for _, c := range []struct {
+		backend, key string
+		want         bool
+	}{
+		{gchatBackend, "gchat:dm/spaces/D1/threads/T1", true},
+		{gchatBackend, "gchat:spaces/S1/threads/T1", true},
+		{gchatBackend, "gchat:dm/spaces/D1", false},
+		{gchatBackend, "gchat:space/spaces/S1", false},
+		{gchatBackend, "not-a-key", false},
+		{slackBackend, "slack:dm/D1/200.1", true},
+		{slackBackend, "slack:C1/200.1", true},
+		{slackBackend, "slack:dm/D1", false},
+		{slackBackend, "not-a-key", false},
+		{discordBackend, "discord:g1/thread-s1", false},
+	} {
+		if got := conversationIsOwnThread(c.backend, c.key); got != c.want {
+			t.Errorf("conversationIsOwnThread(%s, %s) = %v, want %v", c.backend, c.key, got, c.want)
+		}
 	}
 }
 

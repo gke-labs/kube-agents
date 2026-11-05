@@ -54,9 +54,16 @@ def parse_domain_owners(text: str) -> dict[str, str]:
     """Domain slug to its `owner:` login, from domains.yaml text."""
     owners: dict[str, str] = {}
     slug = None
+    in_domains = False
     for line in text.splitlines():
-        if _TOP_LEVEL_KEY.match(line):
+        top = _TOP_LEVEL_KEY.match(line)
+        if top:
             slug = None  # a new top-level key ends the domains list
+            # Only rows under `domains:` count: the allowlist's records also
+            # start `- slug:` and may name an `owner:` who is not the domain's.
+            in_domains = top.group(1) == "domains"
+            continue
+        if not in_domains:
             continue
         found = _DOMAIN_SLUG.match(line)
         if found:
