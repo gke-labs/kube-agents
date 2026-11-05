@@ -64,9 +64,11 @@ if head == ["services", "api-keys", "list"]:
         out(os.environ["FAKE_KEY_NAME"] + "\n")
     log(); sys.exit(0)
 if head == ["services", "api-keys", "create"]:
-    key_created.touch()
     # Real gcloud prints the operation result, key string included, on create.
     sys.stderr.write('Operation [operations/akmf.x] complete. Result: {"keyString":"%s"}\n' % os.environ["FAKE_KEY_STRING"])
+    if os.environ.get("FAKE_CREATE_FAILS") == "1":
+        fail("ERROR: (gcloud.services.api-keys.create) PERMISSION_DENIED: create refused.")
+    key_created.touch()
     log(); sys.exit(0)
 if head == ["services", "api-keys", "get-key-string"]:
     out(os.environ["FAKE_KEY_STRING"] + "\n")
@@ -108,7 +110,8 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
         fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
         self.log = root / "gcloud.log"
 
-    def _run(self, *args, key_exists=False, secret_exists=False, key_string="k1", current_value=None):
+    def _run(self, *args, key_exists=False, secret_exists=False, key_string="k1", current_value=None,
+             create_fails=False, bash_flags=()):
         overrides = {
             "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
             "FAKE_GCLOUD_LOG": str(self.log),
@@ -117,6 +120,7 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
             "FAKE_SECRET_EXISTS": "1" if secret_exists else "0",
             "FAKE_KEY_NAME": _KEY_NAME,
             "FAKE_KEY_STRING": key_string,
+            "FAKE_CREATE_FAILS": "1" if create_fails else "0",
         }
         absent = ()
         if current_value is None:
@@ -124,7 +128,7 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
         else:
             overrides["FAKE_CURRENT_VALUE"] = current_value
         env = get_isolated_test_env(overrides=overrides, absent=absent)
-        proc = subprocess.run(["bash", str(_SCRIPT), *args], capture_output=True, text=True, env=env)
+        proc = subprocess.run(["bash", *bash_flags, str(_SCRIPT), *args], capture_output=True, text=True, env=env)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return proc, calls
 
@@ -220,6 +224,27 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
             self.assertNotIn(key, " ".join(call["argv"]))
         adds = [c for c in calls if c["argv"][:3] == ["secrets", "versions", "add"]]
         self.assertEqual(key, adds[0]["stdin"])
+
+    def test_the_key_string_never_reaches_a_bash_x_trace(self):
+        key = "AIzaFAKE-traced-never-printed"
+        proc, calls = self._run(_PROJECT, key_string=key, current_value="k1", bash_flags=("-x",))
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("+ set -euo pipefail", proc.stderr)  # the trace was on
+        self.assertNotIn(key, proc.stdout)
+        self.assertNotIn(key, proc.stderr)
+        adds = [c for c in calls if c["argv"][:3] == ["secrets", "versions", "add"]]
+        self.assertEqual(key, adds[0]["stdin"])
+
+    def test_a_failed_create_shows_the_error_without_the_key_string(self):
+        key = "AIzaFAKE-create-failed-never-printed"
+        proc, calls = self._run(_PROJECT, key_string=key, create_fails=True)
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("PERMISSION_DENIED: create refused.", proc.stderr)
+        self.assertIn("could not create API key kube-agents-eval-gemini", proc.stderr)
+        self.assertNotIn(key, proc.stderr)
+        self.assertNotIn(key, proc.stdout)
+        argvs = [c["argv"] for c in calls]
+        self.assertFalse([a for a in argvs if a[:2] == ["secrets", "create"]], argvs)
 
     def test_a_project_argument_is_required(self):
         proc, calls = self._run()

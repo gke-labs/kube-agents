@@ -7,8 +7,10 @@
 # project. Re-runs converge: an existing key is reused, and a secret version is
 # added only when the stored value differs from the key string.
 #
-# The key string never reaches stdout, stderr or a command line: it moves from
-# gcloud to Secret Manager through a variable and stdin.
+# The key string never reaches stdout, stderr, a command line or an xtrace: it
+# moves from gcloud to Secret Manager through a variable and stdin, and the
+# script turns xtrace off first, so `bash -x` or an exported SHELLOPTS with
+# xtrace cannot print it.
 #
 # Other files read the constants below with
 #   sed -n 's/^readonly NAME="\(.*\)"$/\1/p' scripts/provision_ci_pool_gemini_key.sh
@@ -19,6 +21,7 @@
 # ==============================================================================
 
 set -euo pipefail
+{ set +x; } 2>/dev/null
 
 readonly GEMINI_KEY_DISPLAY_NAME="kube-agents-eval-gemini"
 readonly GEMINI_KEY_SECRET_NAME="kube-agents-eval-gemini-api-key"
