@@ -875,12 +875,16 @@ report_partial_verdict() {
 profile_and_dump_on_exit() {
   local exit_code=$?
   set +e
+  # First, so the shadow proxy collector's last pass runs alongside the
+  # captures below; waited for after them (hack/ci-env.sh). No-ops without one.
+  signal_replay_shadow_collector
   collect_bench_results
   report_partial_verdict
   collect_gateway_log
   collect_agent_pod_diagnostics
   collect_litellm_log
   collect_credential_proxy_evidence
+  wait_replay_shadow_collector
   # Defined further down; a run that died before then paused nothing.
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
@@ -1150,6 +1154,9 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
+# Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
+# to the private bucket from here on, while the eval runs (hack/ci-env.sh).
+start_replay_shadow_collector
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
