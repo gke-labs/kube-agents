@@ -62,8 +62,7 @@ below say where violations hide; the paragraph is the test.
   participant can satisfy.
 - **Renderers never compose**: Flag a renderer that writes words of its own, reads text to fill a
   field or rewords; flag an invalid message rendered clipped or repaired instead of posting its
-  text fallback whole. Allow what the rule's paragraph and the spec it
-  names list as the backend's own.
+  text fallback whole. Allow what the rule's paragraph names as the backend's own.
 
 ## 3. Verify every candidate
 
