@@ -377,6 +377,8 @@ def unstorable_reasons(
     texts = [str(view["content"] or "")] + [str(c["arguments"] or "") for c in view["tool_calls"]]
     if any(mapping.answer_repeats_bare_number(t) for t in texts):
         reasons.append(F.UNSTORABLE_REPEATS_NUMBER)
+    if any(mapping.answer_repeats_date(t) for t in texts):
+        reasons.append(F.UNSTORABLE_REPEATS_DATE)
     if not scrubber.available:
         reasons.append(F.UNSTORABLE_SCRUBBERS_UNAVAILABLE)
         return reasons
