@@ -47,6 +47,15 @@ const (
 	profileWorkerScratchPath      = "/scratch"
 	profileWorkerScratchSizeLimit = "4Gi"
 
+	// The root filesystem is read-only, so what the harness and its tools
+	// write outside the volumes above needs a volume of its own: $HOME (the
+	// image user's, for tool caches and config) and /tmp.
+	profileWorkerHomeVolume       = "home"
+	profileWorkerHomePath         = "/home/node"
+	profileWorkerTmpVolume        = "tmp"
+	profileWorkerTmpPath          = "/tmp"
+	profileWorkerHomeTmpSizeLimit = "1Gi"
+
 	// The proxy token the confirm carries (addendum 8), written by the
 	// worker for the task's lifetime. Memory-backed, so it never lands on a
 	// node disk.
@@ -103,6 +112,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		{Name: "A2A_PROFILE_WORKER", Value: "true"},
 		{Name: "A2A_PROFILE_TIER", Value: tier},
 		{Name: "A2A_WORKDIR", Value: profileWorkerScratchPath},
+		{Name: "HOME", Value: profileWorkerHomePath},
 		{Name: "A2A_PROFILE_CONFIG_ROOT", Value: profileWorkerConfigPath},
 		// Children of a profile task go through the gateway, which a later
 		// change wires; until then the worker has no delegate tool.
@@ -133,6 +143,8 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 
 	mounts := []corev1.VolumeMount{
 		{Name: profileWorkerScratchVolume, MountPath: profileWorkerScratchPath},
+		{Name: profileWorkerHomeVolume, MountPath: profileWorkerHomePath},
+		{Name: profileWorkerTmpVolume, MountPath: profileWorkerTmpPath},
 		{Name: profileWorkerConfigVolume, MountPath: profileWorkerConfigPath},
 		{Name: profileWorkerTaskTokenVolume, MountPath: profileWorkerTaskTokenPath},
 		a2aBusTokenVolumeMount(),
@@ -143,6 +155,12 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 	volumes := []corev1.Volume{
 		{Name: profileWorkerScratchVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 			SizeLimit: ptr.To(resource.MustParse(profileWorkerScratchSizeLimit)),
+		}}},
+		{Name: profileWorkerHomeVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: ptr.To(resource.MustParse(profileWorkerHomeTmpSizeLimit)),
+		}}},
+		{Name: profileWorkerTmpVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+			SizeLimit: ptr.To(resource.MustParse(profileWorkerHomeTmpSizeLimit)),
 		}}},
 		{Name: profileWorkerConfigVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
 			SizeLimit: ptr.To(resource.MustParse("256Mi")),
@@ -201,6 +219,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+				ReadOnlyRootFilesystem:   ptr.To(true),
 			},
 		}},
 	}

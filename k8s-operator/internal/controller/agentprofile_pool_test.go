@@ -66,6 +66,29 @@ func TestTheWorkerPodIsTheContractsShape(t *testing.T) {
 	if _, ok := env["PROFILE_WORKER_ONE_SHOT"]; ok {
 		t.Error("a pool pod is one-shot")
 	}
+	// The root filesystem is read-only, so every place the worker and its
+	// harness write is an emptyDir: the working directory, $HOME, /tmp, the
+	// harness config root and the task token.
+	if sc := c.SecurityContext; sc == nil || sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+		t.Errorf("the worker container's root filesystem is writable: %+v", c.SecurityContext)
+	}
+	emptyDirs := map[string]bool{}
+	for _, v := range spec.Volumes {
+		if v.EmptyDir != nil {
+			emptyDirs[v.Name] = true
+		}
+	}
+	for _, path := range []string{env["A2A_WORKDIR"], env["HOME"], "/tmp", env["A2A_PROFILE_CONFIG_ROOT"], strings.TrimSuffix(env["CREDENTIAL_PROXY_TASK_TOKEN_FILE"], "/token")} {
+		var writable bool
+		for _, m := range c.VolumeMounts {
+			if m.MountPath == path && !m.ReadOnly && emptyDirs[m.Name] {
+				writable = true
+			}
+		}
+		if path == "" || !writable {
+			t.Errorf("%q is not a writable emptyDir mount under the read-only root", path)
+		}
+	}
 	if !strings.HasSuffix(env["ANTHROPIC_BASE_URL"], ".svc.cluster.local") {
 		t.Errorf("the model endpoint %q isn't fully qualified; the profile namespace can't resolve the short name", env["ANTHROPIC_BASE_URL"])
 	}
