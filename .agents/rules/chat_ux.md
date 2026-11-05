@@ -79,7 +79,9 @@ one message per thread (`agents/platform/scripts/slack_status.py`), and `kanban_
 User-facing text carries no task id, card id, session key, file path, tool name, JSON, CLI flag,
 exit code, or roster id used as a name (`cluster-foo` where "the foo cluster agent" is meant). An
 identifier the user can act on — a cluster, a workload, a pull request as a link — is content, not
-plumbing, and so is a specialist's name where `SOUL.md` asks for attribution.
+plumbing, and so is a specialist's name where `SOUL.md` asks for attribution. A board read is the
+exception for ids: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.5 gives each card a short
+task id, because the user asked about the board and may name a card back.
 
 Why: plumbing is noise to the person who asked, and an internal name tells them nothing they can
 use.
@@ -105,8 +107,10 @@ in [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 step 5.
 
 ## A failure is one plain line
 
-A failure says what did not happen and what would work instead, in one plain line, in the agent's
-own voice. No apology. No promise to retry unless something really retries it: a `crashed` or
+A failure leads with one plain line saying what did not happen, in the agent's own voice, and says
+what would work instead. A gateway's own failure notice is that one line; the Planning Agent's reply
+to a blocked or failed card adds why, what the specialist needs, and the retry as a question, at the
+length [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 step 5 sets. No apology. No promise to retry unless something really retries it: a `crashed` or
 `timed_out` card is re-run by the dispatcher, a `blocked` or `gave_up` card is not. The retry or
 re-route, when there is one, is a button.
 
