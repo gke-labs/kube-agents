@@ -1,11 +1,13 @@
 # Inference replay for evals
 
-> **STATUS — proposal; measured; part of shadow mode built, not deployed.** A prototype proxy was
-> run against a dev install on 2026-10-31 to 2026-11-02. [`hack/replay-proxy/`](../../hack/replay-proxy/README.md)
-> has the shadow-mode proxy, its fingerprint log, the scrubbed request store and the hit-rate
-> script; the join with run verdicts and the collision report (Rollout step 1) are not built yet.
-> Nothing here is wired into `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or the chart. Shadow mode
-> changes no verdict.
+> **STATUS — proposal; measured; shadow mode and the replay lane's record and replay modes built,
+> not deployed.** A prototype proxy was run against a dev install on 2026-10-31 to 2026-11-02, and
+> the replay lane's modes on 2026-11-04 and 05 (see "Replay lane trials").
+> [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the proxy with its shadow, record
+> and replay modes, its fingerprint log, the scrubbed request store, the hit-rate script and the
+> lane's report; the join with run verdicts and the collision report (Rollout step 1) are not built
+> yet. Nothing here is wired into `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or the chart. Shadow
+> mode changes no verdict.
 
 **Scope:** serving recorded model answers to eval runs whose model input has not changed, so a
 presubmit pays for inference only from the first point where a run differs from one already graded.
@@ -159,11 +161,10 @@ The rules that keep this safe:
   card read differs between otherwise identical runs. The same block leaks earlier repetitions'
   answers into later ones, live or replayed (#1730). Stripping it is a stopgap; fixing #1730 removes
   the need.
-- **Where a gcloud warning lands doesn't change the key.** The shell tool mixes a command's errors
+- **Where a warning line lands doesn't change the key.** The shell tool mixes a command's errors
   and its normal output in whatever order they arrive. So the same `gcloud` command, with the same
   output, put its `WARNING:` line before the JSON in one run and after it in the next, and that one
-  difference cost the obtainability case the rest of its conversation in the replay lane. The key
-  treats warning lines as if they were at the end. The text the agent sees isn't touched.
+  difference cost the obtainability case the rest of its conversation in the replay lane. The key treats any line starting `WARNING: ` as if it were at the end of its text. The text the agent sees isn't touched.
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
@@ -213,7 +214,7 @@ We also checked that replay stops reusing recorded answers when something real h
 Editing a skill only matters for runs that open that skill (with `skill_view`); in our test the
 agent never opened the edited skill, so that edit showed nothing.
 
-Wall clock barely moved (1–2 minutes a run): sandboxed tool calls, the dispatcher, the fan-out
+In those minutes-later replays, wall clock barely moved (1–2 minutes a run): sandboxed tool calls, the dispatcher, the fan-out
 `sleep` loop and the judge are not model calls. The win is tokens, model time and rate-limit
 pressure.
 
@@ -229,7 +230,7 @@ inject door, as the presubmit runs). Four cases were recorded once, the way the 
 then each was replayed three times. "Reused" is the share of prompt tokens served from saved
 answers instead of the model.
 
-| Case                                         | First trial | After the answer-variant fix |
+| Case (share reused)                          | First trial | After the answer-variant fix |
 | -------------------------------------------- | ----------- | ---------------------------- |
 | `chat-routing-own-cluster-namespaces`        | 88%         | 85%                          |
 | `obtainability-design-quota-vs-capacity`     | 32–45%      | 31%                          |
@@ -240,9 +241,11 @@ answers instead of the model.
 The second column is the first replay pass of the second trial. Its other two passes reused
 nothing, for the midnight reason below.
 
-Every run passed, recordings and replays, and every replayed conversation got the same pass or fail
-as the run it reused answers from: 33 of 33 in the first trial and 11 of 11 in the second. Replay
-runs also finished faster, about 24 minutes for a pass of the four cases against 42 for recording.
+Every run passed, recordings and replays. And every replayed conversation that was served saved
+answers got the same pass or fail as the run it reused them from: 33 of 33 conversations in the
+first trial and 11 of 11 in the second (the second counts only its first pass, the one before
+midnight). A run holds several conversations, one per agent. A pass of the four cases also took about 24 minutes replayed against 42 recorded. That includes
+the trial's own waits between cases, so it's an upper bound on the time saved, not a measurement.
 
 What the trials taught us:
 
@@ -252,14 +255,15 @@ What the trials taught us:
 - **The model answers the same request in different words.** Every worker's opening request is the
   same once IDs are swapped ("work kanban task ⟦TASK⟧"), and the model sometimes looked its card up
   with no arguments and sometimes with the task id. The cache kept the first answer and served it to
-  every worker, so a case recorded after the other answer never matched again. Treating recorded
+  every worker, so a case whose recording took the other answer never matched again. Treating recorded
   answers to the same request as interchangeable ("What goes into the cache key") took the fleet
   case from 10% to 80%.
 - **The day changes the key.** Every system prompt says which day the conversation started. The
   second trial's last two passes ran after midnight UTC and reused nothing, because every request
   now said Thursday where the recording said Wednesday. In CI the nightly records one day and
-  presubmits run the next, so this would have stopped almost every hit. The date now becomes how
-  many days it is from the request's own day.
+  presubmits run the next, so this would have stopped almost every hit. The fix is to key the date
+  by how many days it is from the request's own day, not by its name; that rule comes with the
+  date fix, not this change.
 - **Small output differences matter.** A `gcloud` warning that landed before the JSON in one run and
   after it in the next ended a conversation (fixed in "Normalization").
 
@@ -449,8 +453,7 @@ didn't check these headers, so this part hasn't been tested yet.
 
 **Different words for the same answer.** The model doesn't always answer the same request the same
 way. A worker opening its card might call `kanban_show()` in one run and `kanban_show(task_id=…)` in
-the next. Both fetch the same card. The cache keeps one answer per request, so if a case was
-recorded after the other answer, the next request (which includes that answer) never matches its
+the next. Both fetch the same card. The cache keeps one answer per request, so if a case's recording took the other answer, the next request (which includes that answer) never matches its
 recording, and the agents after it miss too.
 
 So the proxy also files each saved answer under a second key, where the model's own earlier
@@ -635,8 +638,8 @@ before stage 3 of the rollout (turning replay on):
    The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
    two builds of one pull request and a second pull request) showed how big the gap is: the
    simulated estimate was 12%, ignoring other agents' kanban text as well raised it to 22%, and most
-   of the remaining misses were tool results after a differently chosen action. Real record and
-   replay of the same cases, in "Measurements", reused 46–100%. So the deciding measurement comes
+   of the remaining misses were tool results after a differently chosen action. Real record and replay, in "Measurements", reused 46–100% when replayed minutes later and 23% then
+   63% in the replay lane trials. So the deciding measurement comes
    from real replay, in the replay lane below. Shadow mode stays for what only it can measure: how
    often pull requests start on a saved recording at all (prompt changes, project rotation), and the
    stored text for normalizer work.
@@ -655,9 +658,8 @@ before stage 3 of the rollout (turning replay on):
    don't block anything and aren't written to the evidence store. For this the nightly saves its
    answers, keyed by fingerprint, as the trusted writer in "Who can write to the cache"; the lane
    only reads them. For each conversation it records
-   how many messages and tokens were replayed before the first miss, what caused that miss (the
-   proxy has the cache, so it logs the closest saved request and the message and field that
-   differed), and whether the run's verdict matched the live nightly's. Every miss here is real: a
+   how many messages and tokens were replayed before the first miss, what caused that miss (the proxy has the cache, so it logs the closest saved request, which message first differed, and
+   short cleaned-up snippets of both sides), and whether the run's verdict matched the live nightly's. Every miss here is real: a
    normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation
    runs live after its first miss, each one tells us its first miss only, which is what replay would
    actually save.
@@ -691,8 +693,7 @@ rest live, and compare the two groups.
     needs (the shared cache, who can write to it, and the gate rules).
 
 Our staged plan answers the same questions without touching anyone's pull request until we know:
-shadow mode measures how often pull requests could hit, at no risk; the replay lane runs the same
-cases with and without replay on the same code, which is the like-for-like comparison an A/B test
+shadow mode measures how often pull requests could hit, at no risk; the replay lane replays the nightly's own recordings of the same cases on `main`'s code, which is the like-for-like comparison an A/B test
 can't give; and only then do presubmits turn on. Its weakness is that the lane isn't real pull
 request traffic, and stage 3 turns replay on for everyone at once. If we want a ramp at stage 3, we
 would turn replay on case by case rather than by coin flip: the same cases replay for every pull

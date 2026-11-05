@@ -509,7 +509,15 @@ class ShadowProxy:
         except queue.Full:
             self.metrics.add("analysis_dropped")
             self.log({F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
-                      F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: F.ERROR_ANALYSIS_DROPPED})
+                      F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: F.ERROR_ANALYSIS_DROPPED,
+                      **self.served_fields(served)})
+
+    def served_fields(self, served: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The mode and served fields every request line carries, even one whose analysis was lost."""
+        fields: Dict[str, Any] = {F.MODE: self.config.mode, F.SERVED: served is not None}
+        if served is not None:
+            fields[F.SERVED_FROM] = served.get(replay_cache.ENTRY_RECORDED_BY)
+        return fields
 
     def drain(self) -> None:
         """Wait until every queued analysis has been logged (tests, shutdown)."""
@@ -534,7 +542,8 @@ class ShadowProxy:
                     self.metrics.add("analysis_errors")
                     # The type name only: an exception's message can quote request text.
                     entry = {F.EVENT: F.REQUEST_EVENT, F.SCHEMA: F.LOG_SCHEMA_VERSION, F.TS: received,
-                             F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: type(exc).__name__}
+                             F.JOB: self.job(), F.STATUS: upstream["status"], F.ERROR: type(exc).__name__,
+                             **self.served_fields(served)}
                 self.log(entry)
             except Exception:  # a failed write to stdout loses this line, not the worker
                 self.metrics.add("analysis_errors")

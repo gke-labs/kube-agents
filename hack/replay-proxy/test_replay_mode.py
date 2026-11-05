@@ -114,6 +114,34 @@ class AnswerSlotGuardTest(unittest.TestCase):
         self.assertEqual(hit[3], "answer_slots")
 
 
+class LostAnalysisLinesTest(unittest.TestCase):
+    """A request line whose analysis was dropped or failed still says whether it was served."""
+
+    def proxy(self):
+        out = io.StringIO()
+        cache = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, cache, ignore_errors=True)
+        proxy = replay_proxy.ShadowProxy(replay_proxy.Config(mode="replay", allow_serve=True, cache_dir=cache), out=out)
+        self.addCleanup(proxy.close)
+        return proxy, out
+
+    def test_a_failed_analysis_line_carries_mode_and_served(self):
+        proxy, out = self.proxy()
+        proxy.analyze = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
+        proxy.submit({"messages": []}, time.time(), {"status": 200}, 0, served={"recorded_by": {"build": "7"}})
+        proxy.drain()
+        line = [json.loads(l) for l in out.getvalue().splitlines() if '"error"' in l][-1]
+        self.assertEqual((line["mode"], line["served"], line["served_from"]), ("replay", True, {"build": "7"}))
+
+    def test_a_dropped_analysis_line_carries_mode_and_served(self):
+        proxy, out = self.proxy()
+        # The real queue, refusing new work as a full one does; close() still stops the worker.
+        proxy._queue.put_nowait = lambda item: (_ for _ in ()).throw(replay_proxy.queue.Full())
+        proxy.submit({"messages": []}, time.time(), {"status": 200}, 0, served=None)
+        line = [json.loads(l) for l in out.getvalue().splitlines() if '"error"' in l][-1]
+        self.assertEqual((line["mode"], line["served"]), ("replay", False))
+
+
 class RecordTest(ProxyTestCase):
     mode = "record"
 
