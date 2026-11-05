@@ -149,8 +149,9 @@ LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):
 # Wednesday and a presubmit on Thursday both read `today`. The weekday name is
 # dropped with it; the parenthesised zone (Hermes writes zone names, then
 # `UTC±HH:MM`) stays as written. A date-only ISO value and an `ls -l` date
-# with a year are day-counted the same way. Any of them with a time of day near
-# it (TIME_OF_DAY_RE) is left alone: day counting would lose its time.
+# with a year are day-counted the same way. Any of them with a time of day
+# beside it (time_near, Normalizer.time_beside) is left alone: day counting
+# would lose its time.
 LONG_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
                "October", "November", "December")
 LONG_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
@@ -159,12 +160,27 @@ LONG_DATE_RE = re.compile(
     r"(?=\s*\((?:[\w/+-]+,\s*)*UTC([+-])(\d{2}):(\d{2})\))?"
 )
 DATE_TODAY = "today"
-# A time of day near a date (`10:42`, `10:42:01`, `10 PM`, `10pm`, `10h42`),
-# anywhere within TIME_NEAR_DATE_CHARS on either side: then the date is left
-# alone, since day counting would drop what the time says. Digits right after
-# `+` or `-` are a zone offset (Hermes's `UTC+00:00`), not a time of day.
-TIME_OF_DAY_RE = re.compile(r"(?<![\w:+-])\d{1,2}(?::\d{2}(?::\d{2})?|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)")
+# A time of day (`10:42`, `10:42:01`, `10 PM`, `10pm`, `10h42`) on a date's
+# line, or overlapping TIME_NEAR_DATE_CHARS on either side of it across line
+# breaks: then the date is left alone, since day counting would drop what the
+# time says. Leaving a date as written only costs a match; day-counting one
+# with a time gives two moments a day apart one key. Three digit runs are not
+# a time of day: a zone offset (Hermes's `UTC+00:00`, a timestamp's
+# `10:42:00+05:30`), the time inside an ISO timestamp (after its `T`, which
+# the timestamp rule buckets itself), and the minutes or seconds of a time. A
+# `-` alone does not stop one: `2026-11-05-10:42` has a time. Dotted and
+# compact shapes (`10.42.01`, `1042Z`) are not read: they collide with
+# versions (`v1.31.2`) and other numbers.
+TIME_OF_DAY_RE = re.compile(
+    r"(?<![\w:])(?<!UTC[+-])(?<!\d{2}:\d{2}[+-])\d{1,2}(?::\d{2}(?::\d{2})?|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)"
+)
 TIME_NEAR_DATE_CHARS = 30
+# The longest time of day TIME_OF_DAY_RE matches (`10:42:01`, `10 p.m`): the
+# search starts and ends this far outside the window so a time overlapping its
+# edge is read whole, not cut.
+TIME_OF_DAY_MAX_CHARS = 8
+# Line breaks, real and JSON-escaped (a tool result can carry `\n` as text).
+LINE_BREAKS = ("\n", "\\n")
 # The shapes an answer may name a date in, read case-insensitively and
 # compared as dates (Mapping.answer_repeats_date), so a new spelling is a new
 # shape here, not a missed string. A letter or digit touching a shape stops
@@ -296,10 +312,39 @@ def time_bucket(when: float, now: float) -> str:
 
 
 def time_near(text: str, start: int, end: int) -> bool:
-    """Whether a time of day sits within TIME_NEAR_DATE_CHARS before `start` or after `end`."""
-    before = text[max(0, start - TIME_NEAR_DATE_CHARS):start]
-    after = text[end:end + TIME_NEAR_DATE_CHARS]
-    return bool(TIME_OF_DAY_RE.search(before) or TIME_OF_DAY_RE.search(after))
+    """Whether a time of day is on the line of text[start:end], or overlaps TIME_NEAR_DATE_CHARS either side of it.
+
+    The text is searched in place, not sliced, so the lookbehinds see what is
+    before the window and a time running past its edge still matches.
+    """
+    line_start, line_end = 0, len(text)
+    for brk in LINE_BREAKS:
+        before = text.rfind(brk, 0, start)
+        if before >= 0:
+            line_start = max(line_start, before + len(brk))
+        after = text.find(brk, end)
+        if after >= 0:
+            line_end = min(line_end, after)
+    window_start, window_end = start - TIME_NEAR_DATE_CHARS, end + TIME_NEAR_DATE_CHARS
+    pos = max(0, min(line_start, window_start) - TIME_OF_DAY_MAX_CHARS)
+    endpos = min(len(text), max(line_end, window_end) + TIME_OF_DAY_MAX_CHARS)
+    for m in TIME_OF_DAY_RE.finditer(text, pos, endpos):
+        on_line = m.start() >= line_start and m.end() <= line_end
+        if on_line or (m.end() > window_start and m.start() < window_end):
+            return True
+    return False
+
+
+def time_beside(values: List[Any]) -> List[bool]:
+    """For each value, whether another string among `values` holds a time of day.
+
+    A date's own string is read by time_near; this is for a date and its time
+    in sibling JSON fields (`{"date": "2026-11-05", "time": "10:42:01"}`), which
+    the walk normalizes one string at a time.
+    """
+    timed = [isinstance(v, str) and bool(TIME_OF_DAY_RE.search(v)) for v in values]
+    count = sum(timed)
+    return [count - own > 0 for own in timed]
 
 
 def answer_dates(text: str) -> List[Tuple[Optional[int], int, int]]:
@@ -429,6 +474,9 @@ class Normalizer:
         self.now = now
         self.keep_ips = keep_ips
         self.mapping = Mapping()
+        # Whether the string being normalized has a sibling holding a time of
+        # day (time_beside): then no date in it is day-counted.
+        self.time_beside = False
 
     # -- structure ---------------------------------------------------------
 
@@ -446,13 +494,26 @@ class Normalizer:
         if isinstance(obj, list):
             if key == EVENTS_KEY:
                 obj = [v for v in obj if not (isinstance(v, dict) and v.get(EVENT_KIND_KEY) == HEARTBEAT_KIND)]
-            return [self.walk_dict(v, True) if key == TOOL_CALLS_KEY and isinstance(v, dict) else self.walk(v) for v in obj]
+            beside = time_beside(obj)
+            return [self.beside(flag, lambda v=v: self.walk_dict(v, True)
+                                if key == TOOL_CALLS_KEY and isinstance(v, dict) else self.walk(v))
+                    for v, flag in zip(obj, beside)]
         if isinstance(obj, dict):
             return self.walk_dict(obj, False)
         return obj
 
     def walk_dict(self, obj: Dict[str, Any], in_tool_call: bool) -> Dict[str, Any]:
-        return {k: self.walk(obj[k], k, in_tool_call) for k in sorted(obj)}
+        keys = sorted(obj)
+        beside = time_beside([obj[k] for k in keys])
+        return {k: self.beside(flag, lambda k=k: self.walk(obj[k], k, in_tool_call)) for k, flag in zip(keys, beside)}
+
+    def beside(self, flag: bool, walk: Callable[[], Any]) -> Any:
+        """Run `walk` with time_beside set to `flag`, then restore the enclosing value."""
+        outer, self.time_beside = self.time_beside, flag
+        try:
+            return walk()
+        finally:
+            self.time_beside = outer
 
     @staticmethod
     def is_opaque(key: str, in_tool_call: bool) -> bool:
@@ -570,10 +631,11 @@ class Normalizer:
     def date_token(self, m: "re.Match[str]", when: "date", offset: int = 0) -> str:
         """The date `m` matched: days from the request's day (at `offset` from UTC), noted as unrestorable.
 
-        Left as written when a time of day is near it: day counting would drop
-        what the time says. The check is here so no date rule can skip it.
+        Left as written when a time of day is beside it, in its own string
+        (time_near) or a sibling JSON value (time_beside): day counting would
+        drop what the time says. The check is here so no date rule can skip it.
         """
-        if time_near(m.string, m.start(), m.end()):
+        if self.time_beside or time_near(m.string, m.start(), m.end()):
             return m.group(0)
         days = (when - datetime.fromtimestamp(self.now + offset, timezone.utc).date()).days
         self.mapping.add_date(when, today=days == 0)
@@ -618,8 +680,7 @@ class Normalizer:
         try:
             if year:
                 # Old files show a year and no time. date_token keeps the date
-                # as written when a time is within TIME_NEAR_DATE_CHARS of it
-                # (`Nov  5 2026 10:42:01`), even across a line break.
+                # as written when a time is beside it (`Nov  5 2026 10:42:01`).
                 return self.date_token(m, datetime(int(year), MONTHS.index(month) + 1, int(day)).date())
             else:
                 when = calendar.timegm(

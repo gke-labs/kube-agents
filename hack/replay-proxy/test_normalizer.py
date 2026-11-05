@@ -263,6 +263,50 @@ class LongDateTest(unittest.TestCase):
         self.assertEqual(self.norm_at(listing, self.at(2026, 11, 5)),
                          "-rw-r--r-- 1 root root  4096 ⟦TIME_past_days⟧ new.conf\n"
                          "-rw-r--r-- 1 root root 12288 ⟦TIME_past_months⟧ old.conf\n")
+        # With a timed line below as well, at realistic widths.
+        listing += "-rw-r--r-- 1 root root   220 Nov  3 09:15 b\n"
+        self.assertIn("⟦TIME_past_months⟧ old.conf", self.norm_at(listing, self.at(2026, 11, 5)))
+
+    def assert_moments_apart(self, on_5th, on_6th):
+        """The same text a day later, each read on its own day, must not share a key."""
+        self.assertNotEqual(fp(request(on_5th), now=self.at(2026, 11, 5)),
+                            fp(request(on_6th), now=self.at(2026, 11, 6)), on_5th)
+
+    def test_a_time_in_a_sibling_json_field_keeps_two_moments_apart(self):
+        for on_5th, on_6th in (({"date": "2026-11-05", "time": "10:42:01"}, {"date": "2026-11-06", "time": "10:42:01"}),
+                               ({"built": "Nov  5 2026", "at": "10:42:01"}, {"built": "Nov  6 2026", "at": "10:42:01"}),
+                               (["2026-11-05", "10:42:01"], ["2026-11-06", "10:42:01"])):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
+
+    def test_a_json_date_with_no_time_beside_it_still_counts_days(self):
+        self.assertEqual(self.norm_at(json.dumps({"date": "2026-11-05", "status": "ok"}), self.at(2026, 11, 5)),
+                         json.dumps({"date": "⟦TIME_today⟧", "status": "ok"}, ensure_ascii=False))
+        # A time in a nested object is not beside it.
+        self.assertEqual(self.norm_at(json.dumps({"date": "2026-11-05", "run": {"at": "10:42"}}), self.at(2026, 11, 5)),
+                         json.dumps({"date": "⟦TIME_today⟧", "run": {"at": "10:42"}}, ensure_ascii=False))
+
+    def test_a_time_just_before_the_window_is_read_with_what_precedes_it(self):
+        # Sliced, the window began at `10:42` and lost the `T` before it.
+        self.assertEqual(self.norm_at("seen 2026-11-05T10:42:00Z, next check due on: 2026-11-06", self.at(2026, 11, 5)),
+                         "seen ⟦TIME_past_hours⟧, next check due on: ⟦TIME_future_day⟧")
+        # A timestamp's zone offset is not a time of day either.
+        self.assertEqual(self.norm_at("seen 2026-11-05T10:42:00+05:30, due 2026-11-06", self.at(2026, 11, 5)),
+                         "seen ⟦TIME_past_hours⟧, due ⟦TIME_future_day⟧")
+
+    def test_a_time_on_the_line_or_past_the_window_edge_keeps_two_moments_apart(self):
+        for on_5th in ("2026-11-05 | provisioning-cluster-request-never-creates | 10:42:01",
+                       # On the next line, starting inside TIME_NEAR_DATE_CHARS and ending outside it.
+                       "2026-11-05\n" + "x" * 25 + " 10:42:01",
+                       # On the line before, starting outside the window and ending inside it.
+                       "10:42:01" + " " * 24 + "\n2026-11-05",
+                       # A `-` before the time.
+                       "2026-11-05-10:42", "Nov  5 2026-10:42"):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(on_5th, on_5th.replace("11-05", "11-06").replace("Nov  5", "Nov  6"))
+
+    def test_a_time_on_the_next_line_still_keeps_the_date(self):
+        self.assertEqual(self.norm_at("Date: 2026-11-05\nTime: 10:42", self.at(2026, 11, 5)), "Date: 2026-11-05\nTime: 10:42")
 
     def test_a_date_with_a_time_of_day_is_left_alone(self):
         now = self.at(2026, 11, 5)
@@ -282,6 +326,9 @@ class LongDateTest(unittest.TestCase):
             self.assertEqual(self.norm_at(text, now), text)
         # Hermes's zone suffix is not a time of day.
         self.assertEqual(self.norm_at("November 05, 2026 (UTC, UTC+00:00)", now), "⟦TIME_today⟧ (UTC, UTC+00:00)")
+        self.assertEqual(self.norm_at("Conversation started: Thursday, November 05, 2026 (America/New_York, EST, UTC-05:00)",
+                                      self.at(2026, 11, 5, 3)),
+                         "Conversation started: ⟦TIME_future_day⟧ (America/New_York, EST, UTC-05:00)")
 
 
 class TimeTest(unittest.TestCase):
