@@ -2678,7 +2678,11 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         with patch.dict(sys.modules, {"forge": forge}):
             self.assertEqual(session_kv_server._proposal_state(self.FIX_URL, 5), "open")
             forge.call.assert_called_once_with(
-                "proposal-view", {"number": 7}, "https://github.com/acme/fleet", retry_transient=True
+                "proposal-view",
+                {"number": 7},
+                "https://github.com/acme/fleet",
+                retry_transient=True,
+                timeout_s=session_kv_server.FIX_PR_LOOKUP_TIMEOUT_S,
             )
             forge.call.reset_mock()
             mr = "https://gitlab.example.com/acme/fleet/-/merge_requests/12"
@@ -2978,6 +2982,39 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         self.assertNotIn(stale_url.rsplit("/pull/", 1)[0], urls_read)
         self.assertIn(fresh_url.rsplit("/pull/", 1)[0], urls_read)
         self.assertNotIn(stale_url, pool._in_flight)
+
+    def test_a_hung_forge_frees_its_worker_at_the_lookup_budget(self):
+        # One worker and a forge that never answers for URL A. The worker's
+        # read carries FIX_PR_LOOKUP_TIMEOUT_S to forge.call, which bounds the
+        # hop by it, so the hop gives up when A's caller does and the worker
+        # is free for URL B; unbounded, it sat on A for forge's
+        # FORWARD_TIMEOUT_S (90 s) while every other caller waited out its
+        # budget behind it and read None.
+        budget = 0.05
+        hung = threading.Event()
+        self.addCleanup(hung.set)
+        hung_url, next_url = self._lookup_url("hung-a"), self._lookup_url("next-b")
+        hung_repo = hung_url.rsplit("/pull/", 1)[0]
+        bounds = []
+
+        def hop(verb, payload, repo, *, retry_transient=False, timeout_s=None):
+            if repo != hung_repo:
+                return {"proposal": {"state": "open"}}
+            bounds.append(timeout_s)
+            hung.wait(timeout_s)  # the hop honours its bound; None would be forge's 90 s
+            raise RuntimeError(f"{verb} on {repo} did not answer within {timeout_s}s")
+
+        forge = MagicMock()
+        forge.call.side_effect = hop
+        pool = session_kv_server._FixPullRequestLookupPool(workers=1, queue_max=4, ttl_s=60)
+        with patch.dict(sys.modules, {"forge": forge}), \
+                patch.object(session_kv_server, "_FIX_PR_LOOKUP_POOL", pool), \
+                patch.object(session_kv_server, "FIX_PR_LOOKUP_TIMEOUT_S", budget):
+            self.assertIsNone(session_kv_server._proposal_state(hung_url, budget))
+            before = time.monotonic()
+            self.assertEqual(session_kv_server._proposal_state(next_url, 5), "open")
+            self.assertLess(time.monotonic() - before, 1)
+        self.assertEqual(bounds, [budget])
 
     def test_the_pull_request_constants_match_the_plugin_that_writes_them(self):
         plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"

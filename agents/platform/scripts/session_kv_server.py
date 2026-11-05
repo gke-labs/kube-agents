@@ -1035,8 +1035,12 @@ FIX_PR_INCIDENTS_SCANNED = 5
 FIX_PR_LOOKUP_TIMEOUT_S = 8.0
 # The forge calls run on this many daemon workers (_FixPullRequestLookupPool)
 # rather than on a thread per call: a burst of events for workloads with a
-# fix in review would otherwise start one thread each, every one of them held
-# on the forge for up to FIX_PR_LOOKUP_TIMEOUT_S.
+# fix in review would otherwise start one thread each. A worker's read is
+# bounded by FIX_PR_LOOKUP_TIMEOUT_S as well (forge.call's `timeout_s`, which
+# shortens the sandbox hop and skips the retry once the budget is spent), so a
+# forge that hangs holds a worker for the search budget rather than for the
+# hop's own FORWARD_TIMEOUT_S, and four workers clear a burst of hung reads at
+# the same pace their callers give up on them.
 FIX_PR_LOOKUP_WORKERS = 4
 # How many lookups may wait for a worker. A call that finds the queue full
 # answers None, which announces the event: the same fail-open answer as a
@@ -2206,9 +2210,15 @@ class _FixPullRequestLookupPool:
 
     Daemon threads, not a ThreadPoolExecutor: a forge call that outlives a
     caller's budget is abandoned by that caller, and an executor's worker would
-    hold a restart until it ends (forge's own hop allows FORWARD_TIMEOUT_S an
-    attempt). The queue is bounded (FIX_PR_LOOKUP_QUEUE_MAX), so a forge that
-    stops answering cannot pile up lookups behind the four workers.
+    hold a restart until it ends. The worker's own read is bounded by
+    FIX_PR_LOOKUP_TIMEOUT_S (_read_proposal_state passes it to forge.call,
+    which shortens the sandbox hop from FORWARD_TIMEOUT_S and does not retry a
+    transient failure once that budget is spent), so a forge that hangs frees
+    its worker when its callers' budget ends rather than ninety seconds later;
+    with the sandbox off the direct broker request is bounded by the broker
+    client's connect timeout alone. The queue is bounded
+    (FIX_PR_LOOKUP_QUEUE_MAX), so a forge that stops answering cannot pile up
+    lookups behind the four workers.
 
     A URL is asked of the forge once per FIX_PR_STATE_CACHE_TTL_S: a state read
     within the window is answered from the cache, and callers that arrive while
@@ -2303,14 +2313,24 @@ def _fix_pr_lookup_pool() -> _FixPullRequestLookupPool:
 
 
 def _read_proposal_state(url: str) -> Optional[str]:
-    """Ask the forge for the state of the pull request at `url`; None when it has none to give."""
+    """Ask the forge for the state of the pull request at `url`; None when it has none to give.
+
+    Bounded by FIX_PR_LOOKUP_TIMEOUT_S for the call as a whole, retry
+    included: the pool's worker is held no longer than the callers it answers.
+    """
     match = PROPOSAL_URL_RE.match(url)
     if match is None:
         return None
     try:
         import forge
 
-        view = forge.call("proposal-view", {"number": int(match.group(2))}, match.group(1), retry_transient=True)
+        view = forge.call(
+            "proposal-view",
+            {"number": int(match.group(2))},
+            match.group(1),
+            retry_transient=True,
+            timeout_s=FIX_PR_LOOKUP_TIMEOUT_S,
+        )
     except Exception as exc:
         logger.warning(f"Could not read the state of {url}: {exc!r}")
         return None
