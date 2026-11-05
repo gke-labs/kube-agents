@@ -944,7 +944,19 @@ boolean. A duration that the watcher cannot read keeps its default, and the cont
 An entry with the same name in `platformAgent.deployment.env` wins over the key, a `valueFrom`
 entry included. A change rolls the agent pod and the credential-proxy pod. The
 [watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
-gives each setting's meaning and default.
+gives each setting's meaning and default. Alert excludes are under
+`platformAgent.harness.eventWatcher.alertExclude`.
+
+`platformAgent.harness.eventWatcher.alertExclude` is a list of rules for events that open no
+incident, while their clusters stay in scope for reads. The list is forwarded to the CR's
+`spec.harness.eventWatcher.alertExclude` when it has a rule, and an empty list omits it. The schema
+holds the CRD's bounds (at most 64 rules, a length limit and a pattern on each part), so a rule the
+API server would refuse fails the render. A change rolls the agent pod. On an existing install,
+apply the chart's `crds/` first: against a CRD that predates the field, the chart fails the upgrade
+instead of letting the API server prune the rules. A `helm upgrade` that removes the last rule also
+removes an `enabled: false` set on the CR by hand. The
+[`spec.harness.eventWatcher` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specharnesseventwatcher)
+gives the rule parts, how they match, and an example.
 
 #### PlatformAgent annotations
 
