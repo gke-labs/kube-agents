@@ -153,10 +153,14 @@ DASH_RULE_RE = re.compile(r"^[\s-]+$")
 # Timestamps become how far they are from the request time, unnumbered:
 # whether a certificate expired is what matters, not which second it did.
 TIME_CLASS = "TIME"
-# The literal text of each bucketed timestamp is also bound, numbered by first
-# appearance, but only for answers: the key keeps the bucket. A served answer
-# that quotes a timestamp from the request then gets this run's (Mapping.restore).
+# The literal text of each bucketed timestamp outside assistant messages is
+# also kept, in order, but only for answers: the key keeps the bucket. An
+# answer quoting one stores `⟦TIMEVAL_<positions>⟧`, every position its text
+# held, and is served with this run's text there, provided the run has the
+# same text at all of them (Mapping.restore). Keys that match have the same
+# buckets at the same positions, so a position names the same field in both.
 TIME_LITERAL_CLASS = "TIMEVAL"
+TIME_POSITION_SEPARATOR = "."
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
@@ -341,6 +345,11 @@ def token_class(token: str) -> str:
     return token[len(OPEN):-len(CLOSE)].rsplit("_", 1)[0]
 
 
+def token_number(token: str) -> str:
+    """What a placeholder carries after its class: `2` for `⟦POD_2⟧`."""
+    return token[len(OPEN):-len(CLOSE)].rsplit("_", 1)[-1]
+
+
 def stable_hash(value: Any) -> str:
     """SHA-256 of a value's canonical JSON."""
     data = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
@@ -454,6 +463,8 @@ class Mapping:
     # which an answer may also name without the year or by weekday.
     dates: set = field(default_factory=set)
     today_dates: set = field(default_factory=set)
+    # Each bucketed timestamp's text outside assistant messages, in order (TIME_LITERAL_CLASS).
+    time_occurrences: List[str] = field(default_factory=list)
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -473,7 +484,8 @@ class Mapping:
         return self.to_placeholder[key]
 
     def copy(self) -> "Mapping":
-        return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers))
+        return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
+                       set(self.dates), set(self.today_dates), list(self.time_occurrences))
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -490,8 +502,20 @@ class Mapping:
         return self.to_placeholder.get(MAPPING_KEY_SEPARATOR + value)
 
     def bound_time(self, literal: str) -> Optional[str]:
-        """The placeholder a timestamp's literal text is bound to, if any."""
-        return self.to_placeholder.get(TIME_LITERAL_CLASS + MAPPING_KEY_SEPARATOR + literal)
+        """The placeholder for a timestamp's text: every position it held outside assistant messages, if any."""
+        positions = [str(i + 1) for i, seen in enumerate(self.time_occurrences) if seen == literal]
+        return f"{OPEN}{TIME_LITERAL_CLASS}_{TIME_POSITION_SEPARATOR.join(positions)}{CLOSE}" if positions else None
+
+    def time_at(self, token: str) -> Optional[str]:
+        """This request's text for a `⟦TIMEVAL_…⟧`: its one text at every position named, else None."""
+        try:
+            positions = [int(p) for p in token_number(token).split(TIME_POSITION_SEPARATOR)]
+        except ValueError:
+            return None
+        if any(not 1 <= p <= len(self.time_occurrences) for p in positions):
+            return None
+        texts = {self.time_occurrences[p - 1] for p in positions}
+        return texts.pop() if len(texts) == 1 else None
 
     def apply_to_answer(self, text: str) -> str:
         """Swap bound values in an answer for their placeholders.
@@ -536,10 +560,11 @@ class Mapping:
 
         def sub(match: "re.Match[str]") -> str:
             token = match.group(0)
-            if token not in self.to_value:
+            value = self.time_at(token) if token_class(token) == TIME_LITERAL_CLASS else self.to_value.get(token)
+            if value is None:
                 missing.append(token)
                 return token
-            return self.to_value[token]
+            return value
 
         return PLACEHOLDER_RE.sub(sub, text), missing
 
@@ -628,8 +653,8 @@ class Normalizer:
         self.now = now
         self.keep_ips = keep_ips
         self.mapping = Mapping()
-        # The time-literal placeholders walked since the caller last cleared this.
-        self.time_literals: Set[str] = set()
+        # The timestamp texts walked since the caller last cleared this, in order.
+        self.time_literals: List[str] = []
 
     # -- structure ---------------------------------------------------------
 
@@ -778,8 +803,8 @@ class Normalizer:
         return day_bucket(days)
 
     def timestamp(self, literal: str, when: float) -> str:
-        """A timestamp's key token; its literal text is bound for answers (TIME_LITERAL_CLASS)."""
-        self.time_literals.add(self.mapping.placeholder(TIME_LITERAL_CLASS, literal))
+        """A timestamp's key token; its text is noted for answers (TIME_LITERAL_CLASS)."""
+        self.time_literals.append(literal)
         return time_bucket(when, self.now)
 
     def iso(self, m: "re.Match[str]") -> str:
@@ -889,7 +914,6 @@ class NormalizedRequest:
     now: float = 0.0
     keep_ips: bool = False
     history_mapping: Mapping = field(default_factory=Mapping)
-    time_outside_answers: Set[str] = field(default_factory=set)
 
     @property
     def message_hashes(self) -> List[str]:
@@ -920,21 +944,19 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     normalizer = Normalizer(now, keep_ips)
     raw_messages = kept.pop(MESSAGES_FIELD, None)
     messages = []
-    # Timestamp literals outside assistant messages: bucketed in the key, so
-    # placeholders_outside_answers cannot read them off the normalized text.
-    time_outside_answers: Set[str] = set()
+    # Timestamp texts outside assistant messages, in order (TIME_LITERAL_CLASS):
+    # a slot blanks an answer's words, so a position counted there could shift.
     for message in raw_messages if isinstance(raw_messages, list) else []:
-        normalizer.time_literals = set()
+        normalizer.time_literals = []
         messages.append(normalizer.walk(message))
         if not (isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE):
-            time_outside_answers |= normalizer.time_literals
+            normalizer.mapping.time_occurrences += normalizer.time_literals
     history_mapping = normalizer.mapping.copy()
     settings = {k: normalizer.walk(kept[k], k) for k in sorted(kept)}
     if raw_messages is not None and not isinstance(raw_messages, list):
         settings[MESSAGES_FIELD] = normalizer.walk(raw_messages)
     return NormalizedRequest(messages=messages, settings=settings, mapping=normalizer.mapping,
-                             now=now, keep_ips=keep_ips, history_mapping=history_mapping,
-                             time_outside_answers=time_outside_answers)
+                             now=now, keep_ips=keep_ips, history_mapping=history_mapping)
 
 
 @dataclass(frozen=True)
@@ -1061,7 +1083,7 @@ def placeholders_outside_answers(normalized: NormalizedRequest) -> Set[str]:
     these binds it: a value only an assistant message named can carry a
     different number when the answers differ.
     """
-    found: Set[str] = set(normalized.time_outside_answers)
+    found: Set[str] = set()
     for message, role in zip(normalized.messages, normalized.roles()):
         if role != ASSISTANT_ROLE:
             found.update(PLACEHOLDER_RE.findall(json.dumps(message, ensure_ascii=False)))

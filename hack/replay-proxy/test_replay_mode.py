@@ -401,6 +401,32 @@ class TimestampTest(AnalyzeCase):
         self.assertIsNone(refused)
         self.assertEqual((hit[0]["content"], hit[3]), ("Done.", "exact"))
 
+    def job(self, start, transition, deadline):
+        shown = (f"Start Time: {self.stamp(start)}\nLast Transition: {self.stamp(transition)}\n"
+                 f"Deadline: {self.stamp(deadline)}")
+        return {"model": "m", "messages": [{"role": "user", "content": "describe job backup"},
+                                           {"role": "tool", "tool_call_id": "call_1", "content": shown}]}
+
+    def test_a_quoted_timestamp_is_restored_from_the_same_field(self):
+        # Recorded: the start time equals the last transition. A replay whose
+        # transition is a second later keys the same. Numbered by distinct value,
+        # the deadline (recorded as the second distinct timestamp) would be
+        # served as the replay's transition; by position it is the deadline.
+        start, deadline = CLOCK - 40 * MINUTE, CLOCK + 20 * MINUTE
+        self.recorded(self.job(start, start, deadline),
+                      {"role": "assistant", "content": f"Deadline is {self.stamp(deadline)}."}, at=CLOCK)
+        hit, _ = self.proxy().lookup(self.job(start, start + 1, deadline + 5), CLOCK)
+        self.assertEqual(hit[0]["content"], f"Deadline is {self.stamp(deadline + 5)}.")
+
+    def test_a_quoted_timestamp_whose_fields_disagree_in_the_replay_is_not_served(self):
+        # Recorded, the start time was also the last transition, so the answer's
+        # timestamp names both fields; in the replay they differ, so neither is safe.
+        start, deadline = CLOCK - 40 * MINUTE, CLOCK + 20 * MINUTE
+        self.recorded(self.job(start, start, deadline),
+                      {"role": "assistant", "content": f"Started {self.stamp(start)}."}, at=CLOCK)
+        self.assertEqual(self.proxy().lookup(self.job(start, start + 1, deadline), CLOCK),
+                         (None, {"via": "exact", "guard": "unbound_placeholder"}))
+
     def test_a_timestamp_the_model_made_is_not_stored(self):
         made = {"role": "assistant", "content": f"Checked at {self.stamp(CLOCK + 5)}."}
         self.assertEqual(self.recorded(self.card(CLOCK), made, at=CLOCK)["unstorable"], ["unbound_timestamp"])

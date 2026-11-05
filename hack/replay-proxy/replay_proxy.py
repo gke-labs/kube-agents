@@ -527,6 +527,8 @@ class ShadowProxy:
             return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
         if via == F.VIA_ANSWER_SLOTS:
             named = set(normalizer.PLACEHOLDER_RE.findall(json.dumps(entry[replay_cache.ENTRY_ANSWER], ensure_ascii=False)))
+            # A timestamp's positions only ever count non-assistant messages.
+            named = {t for t in named if normalizer.token_class(t) != normalizer.TIME_LITERAL_CLASS}
             if not named <= normalizer.placeholders_outside_answers(normalized):
                 # A value only an answer named could carry another number here.
                 return None, refusal(via, F.GUARD_VALUE_ONLY_IN_ANSWERS)

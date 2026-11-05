@@ -161,6 +161,18 @@ class AgeColumnTest(unittest.TestCase):
         self.assertRegex(out, r"⟦AGEm_\d+⟧")
 
 
+class TimeOccurrenceTest(unittest.TestCase):
+    def test_only_timestamps_outside_assistant_messages_take_a_position(self):
+        # A slot blanks an answer's words, so a timestamp counted there could
+        # shift every later position between two requests that share a slot key.
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "assistant", "content": "as of 2026-11-03T11:00:00Z"},
+            {"role": "tool", "tool_call_id": "c", "content": "created 2026-11-03T11:30:00Z"},
+        ]}, NOW)
+        self.assertEqual(n.mapping.time_occurrences, ["2026-11-03T11:30:00Z"])
+        self.assertEqual(n.mapping.apply_to_answer("created 2026-11-03T11:30:00Z"), "created ⟦TIMEVAL_1⟧")
+
+
 class StderrOrderTest(unittest.TestCase):
     def test_a_warning_before_or_after_the_output_gives_one_key(self):
         warning = "WARNING: --filter : operator evaluation is changing for consistency across Google APIs."
