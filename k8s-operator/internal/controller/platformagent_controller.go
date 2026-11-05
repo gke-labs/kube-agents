@@ -620,14 +620,16 @@ type PlatformAgentReconciler struct {
 // buildMinimalPlatformRole's escalation-prevention requirement.
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
 // `secrets` and full `jobs` verbs exist for the mode-next A2A stack (the
-// generated NATS credentials/config Secrets and the provisioning Job) and
-// `ensureKubeProxyTLSSecret`. `list` and `watch` are held so the operator
-// satisfies Kubernetes RBAC escalation prevention when reconciling
-// `buildMinimalPlatformRole`, which grants `get`/`list`/`watch` on `secrets`
-// to `<agent>-kube-proxy` (where `KUBE_PROXY_REDACT_SECRETS=true` strips
-// `.data`, `.stringData`, and `last-applied-configuration`). The operator
-// itself still reads Secrets by name through `r.APIReader` and `r.a2aReader()`
-// rather than the manager's informer cache.
+// generated NATS credentials/config Secrets and the provisioning Job),
+// `ensureKubeProxyTLSSecret`, `checkShellSandboxKeys`, and `stampSecretEnvHash`.
+// `list` and `watch` are held so the operator satisfies Kubernetes RBAC
+// escalation prevention when reconciling `buildMinimalPlatformRole`, which
+// grants `get`/`list`/`watch` on `secrets` to `<agent>-kube-proxy` (where
+// `KUBE_PROXY_REDACT_SECRETS=true` strips `.data`, `.stringData`, and
+// `last-applied-configuration`). The operator itself still reads Secrets by
+// name through `r.APIReader` and `r.a2aReader()` rather than the manager's
+// informer cache, so it never caches every Secret in memory or blocks
+// `WaitForCacheSync` when `list`/`watch` is trimmed.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
@@ -668,16 +670,6 @@ type PlatformAgentReconciler struct {
 // `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
 // confers none of its permissions on the operator itself.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
-// `get` and nothing else on secrets, for two callers. checkShellSandboxKeys asks whether
-// the sandbox's authorized-keys Secret exists so the status can say so; it never reads a
-// value out of one, and the operator creates that Secret nowhere. stampSecretEnvHash does
-// read values: it digests the Secret keys a pod consumes as environment onto that pod's
-// template, so rotating one rolls the pod (platformagent_secret_hash.go). Both read by
-// name. Both go through r.APIReader rather than the cached client on purpose: a cached Get
-// of a type the manager does not already watch starts a cluster-wide Secret informer, which
-// would both hold every Secret in the cluster in the operator's memory and, on any cluster
-// where this grant is trimmed, block WaitForCacheSync forever behind a forbidden LIST.
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // The GitOps reconcilers' objects, read-only, for the same escalation-prevention reason
 // as `nodes` above: buildMinimalPlatformRole grants them to the agent, so the operator
@@ -3819,8 +3811,9 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 
 	crbMinimal := buildClusterRoleBinding(agent, minimalBindingName, minimalRole.Name)
 	// The gateway's own ServiceAccount takes the same read-only grant: its
-	// agent-api-auth container watches and joins the management cluster with
-	// an in-cluster token. Same rules, a second principal; no new permission.
+	// operator-rendered agent-api-auth container watches and joins the
+	// management cluster with an in-cluster token, while the agent container
+	// mounts no Kubernetes token (AutomountServiceAccountToken is false).
 	crbMinimal.Subjects = append(crbMinimal.Subjects, gatewaySubject(agent))
 	if err := r.applyManaged(ctx, agent, crbMinimal); err != nil {
 		return fmt.Errorf("failed to reconcile minimal ClusterRoleBinding: %w", err)
@@ -5563,11 +5556,9 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 // healthy agent Degraded on a claim this function could not check.
 //
 // The read goes through r.APIReader. Secrets are the one type the manager's cache does not
-// already hold, and a cached Get of an unwatched type starts a cluster-wide informer and
-// blocks in WaitForCacheSync until it syncs. On the RBAC this operator ships that LIST is
-// forbidden, so it never syncs: the call does not fail, it hangs, and with one reconcile
-// worker that is the whole controller stopped on an install that reports success. Reading
-// live also keeps every Secret in the cluster out of the operator's memory.
+// already hold, and a cached Get of an unwatched type starts a cluster-wide informer that
+// holds every Secret in the cluster in operator memory and blocks in WaitForCacheSync
+// wherever list/watch on secrets is trimmed from manager-role.
 func (r *PlatformAgentReconciler) checkShellSandboxKeys(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, string) {
 	reader := r.APIReader
 	if reader == nil {

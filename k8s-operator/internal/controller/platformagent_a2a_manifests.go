@@ -6162,12 +6162,13 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 // next install is the standing cost. Three are cached: Service, ConfigMap
 // and NetworkPolicy are Owns() kinds (see SetupWithManager), so their
 // informers exist. The Secret is NOT read through the cache, and this is
-// load-bearing rather than tidy: the operator ships secrets with get only,
-// and a cached Get of an unwatched kind starts a cluster-wide informer
-// whose LIST is then forbidden -- the call does not fail, it blocks in
-// WaitForCacheSync, and with one reconcile worker that is every
-// PlatformAgent in the cluster stopped (the same trap documented on the
-// gateway's own credential reads below). So the Secret goes through
+// load-bearing rather than tidy: the manager does not watch Secrets, and a
+// cached Get of an unwatched kind starts a cluster-wide Secret informer that
+// holds every Secret in the cluster in operator memory and blocks in
+// WaitForCacheSync wherever list/watch on secrets is trimmed -- with one
+// reconcile worker that stops every PlatformAgent in the cluster (the same
+// trap documented on the gateway's own credential reads below). So the Secret
+// goes through
 // a2aReader, the same uncached client the other A2A Secrets use, and the
 // entry list carries the reader beside each object so the choice is made
 // once, next to the object it is made for.

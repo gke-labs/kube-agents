@@ -234,8 +234,8 @@ func podSpecSecretEnvRefs(spec *corev1.PodSpec) []secretEnvRef {
 //
 // The read goes through r.APIReader for the reason checkShellSandboxKeys gives:
 // a cached Get of a type the manager does not watch starts a cluster-wide
-// Secret informer and blocks in WaitForCacheSync behind a LIST this operator's
-// RBAC forbids.
+// Secret informer that holds every Secret in the cluster in operator memory and
+// blocks in WaitForCacheSync wherever list/watch on secrets is trimmed.
 func (r *PlatformAgentReconciler) secretEnvHash(ctx context.Context, agent *agentv1alpha1.PlatformAgent, spec *corev1.PodSpec) (string, error) {
 	refs := podSpecSecretEnvRefs(spec)
 	if len(refs) == 0 {

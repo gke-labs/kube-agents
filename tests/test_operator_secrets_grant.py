@@ -35,10 +35,12 @@ forbids `&corev1.SecretList`, `Owns(&corev1.Secret`, and
 
 Trivy's KSV-0041 flags any Secret verb on a ClusterRole as CRITICAL, and its
 ignore file has no way to scope an exemption to one rule -- `paths` globs are
-the whole vocabulary -- so exempting this grant exempts the whole of
-`k8s-operator/config/rbac/`. That is the check this file replaces: it pins the
-verb set and `+kubebuilder:rbac` marker, forbids controller `Secret` list/watch
-calls, and fails if the Trivy exemption widens past the `rbac` directory.
+the whole vocabulary -- so exempting this grant exempts `k8s-operator/config/rbac/`
+and the rendered golden fixtures in
+`k8s-operator/internal/testing/testdata/platform/expected/`. That is the check
+this file replaces: it pins the verb set and `+kubebuilder:rbac` marker, forbids
+controller `Secret` list/watch calls, and fails if the Trivy exemption widens
+past those two directories.
 
 `charts/kube-agents/templates/operator-rbac.yaml` is not read here: it is
 spliced from `role.yaml` by `hack/sync-chart-manifests.sh`, and `make
@@ -133,11 +135,11 @@ class OperatorSecretsGrantTest(unittest.TestCase):
             for line in controller_src.splitlines()
             if "+kubebuilder:rbac:" in line and "secrets" in line
         ]
-        self.assertGreaterEqual(len(secret_markers), 1)
+        self.assertEqual(len(secret_markers), 1)
         for marker in secret_markers:
             self.assertIn("resources=secrets,", marker, f"secrets marker shares resources: {marker}")
 
-    def test_the_trivy_exemption_stays_scoped_to_the_rbac_directory(self):
+    def test_the_trivy_exemption_stays_scoped_to_the_expected_directories(self):
         ignores = yaml.safe_load(IGNORE_PATH.read_text(encoding="utf-8"))
         entries = [
             entry
