@@ -596,9 +596,11 @@ class SecondReview(unittest.TestCase):
         ], runs=[eval_run("b1", [task("c", {"result": "pass"})])])
         total = r["scopes"]["total"]
         self.assertEqual((total["builds"], total["requests"], total["prompt_tokens"]), (1, 3, 900))
-        self.assertEqual(total["requests_per_build"], 3.0)
-        self.assertEqual(total["prompt_tokens_per_build"], 900.0)
-        self.assertEqual(total["model_time_per_build_s"], 9.0)
+        # Per-build figures count only the one build's own line.
+        self.assertEqual(total["requests_per_build"], 1.0)
+        self.assertEqual(total["prompt_tokens_per_build"], 100.0)
+        self.assertEqual(total["model_time_per_build_s"], 1.0)
+        self.assertEqual(total["model_time_s"], 9.0)
         self.assertEqual(r["data_quality"]["lines_without_build"], 2)
         self.assertEqual(r["data_quality"]["builds_without_eval_run"], 0)
         listing = {b["build"]: b["metrics"] for b in r["builds"]}
@@ -621,6 +623,60 @@ class SecondReview(unittest.TestCase):
         self.assertEqual(br.parse_time("2026-11-05T01:00:00Z"), 1793836800.0 + 3600)
 
 
+class ThirdReview(unittest.TestCase):
+    def test_cost_per_build_counts_only_lines_with_a_build(self):
+        total = report([
+            line("a", 1, build="b1", group="m2", prompt=1_000_000, completion=0),
+            line("b", 2, build="", group="m2", prompt=1_000_000, completion=0),
+            line("c", 3, build="", litellm_cost_usd=5.0),
+        ])["scopes"]["total"]
+        self.assertAlmostEqual(total["cost_usd"], 1.0 + 1.0 + 5.0)
+        self.assertAlmostEqual(total["cost_per_build_usd"], 1.0)
+
+    def test_prompt_tokens_per_build_counts_ok_lines_only(self):
+        total = report([line("a", 1, build="b1", prompt=100),
+                        line("b", 2, build="b1", status=429, prompt=9999, estimated=True)])["scopes"]["total"]
+        self.assertEqual(total["prompt_tokens_per_build"], 100.0)
+
+    def test_a_21_digit_since_is_refused(self):
+        code, _, err = run_main([write([line("a", 1_700_000_000)]), "--since", "1" * 21])
+        self.assertEqual(code, 2)
+        self.assertIn("baseline_report: ", err)
+        self.assertIn("at most", err)
+        with self.assertRaises(ValueError):
+            br.parse_time(str(br.MAX_EPOCH_SECONDS + 1))
+        self.assertEqual(br.parse_time(str(br.MAX_EPOCH_SECONDS)), float(br.MAX_EPOCH_SECONDS))
+
+    def test_an_absurd_ts_is_counted_bad_and_both_reports_render(self):
+        logs = write([line("a", 1_700_000_000), line("b", 1e300), line("c", br.MAX_EPOCH_SECONDS)])
+        code, out, err = run_main([logs, "--json"])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        self.assertEqual(doc["data_quality"]["bad_field_values"], {"ts": 1})
+        self.assertEqual(doc["data_quality"]["skipped_lines"], {"bad_ts": 1})
+        self.assertEqual(doc["scopes"]["total"]["requests"], 2)
+        code, out, err = run_main([logs])
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("9999-12-31", out)
+
+    def test_a_400_digit_latency_is_counted_bad(self):
+        r = report([line("a", 1, latency_ms=int("9" * 400)), line("b", 2, latency_ms=br.MAX_LATENCY_MS),
+                    line("c", 3, latency_ms=br.MAX_LATENCY_MS + 1)])
+        self.assertEqual(r["data_quality"]["bad_field_values"], {"latency_ms": 2})
+        self.assertEqual(r["scopes"]["total"]["model_time_s"], br.MAX_LATENCY_MS / 1000)
+
+    def test_huge_counts_and_costs_are_bad_values_not_overflows(self):
+        r = report([line("a", 1, prompt=int("9" * 400), litellm_cost_usd=1e300),
+                    line("b", 2, prompt=br.MAX_COUNT, completion=0, group="m2")])
+        self.assertEqual(r["data_quality"]["bad_field_values"], {"prompt_tokens": 1, "litellm_cost_usd": 1})
+        self.assertEqual(r["scopes"]["total"]["prompt_tokens"], br.MAX_COUNT)
+
+    def test_an_overflow_is_a_clean_error(self):
+        code, _, err = run_main([write([line("a", 1_700_000_000)]), "--until", "9999-12-31"])
+        self.assertEqual(code, 2)
+        self.assertTrue(err.startswith("baseline_report: "), err)
+
+
 class MalformedInput(unittest.TestCase):
     def test_skips_and_bad_values_are_counted_not_fatal(self):
         r = report([
@@ -640,7 +696,7 @@ class MalformedInput(unittest.TestCase):
             "not_json": 1, "other_event": 2, "duplicate_request_id": 1, "untagged": 2, "bad_ts": 2,
         })
         self.assertEqual(quality["bad_field_values"],
-                         {"prompt_tokens": 1, "cached_tokens": 1, "completion_tokens": 1, "latency_ms": 1})
+                         {"prompt_tokens": 1, "cached_tokens": 1, "completion_tokens": 1, "latency_ms": 1, "ts": 2})
         total = r["scopes"]["total"]
         self.assertEqual(total["requests"], 2)
         self.assertEqual(total["prompt_tokens"], 1000)

@@ -101,6 +101,15 @@ DATE_FORMAT = "%Y-%m-%d"
 # (20261105 would be August 1970), so it is refused.
 EPOCH_SECONDS = re.compile(r"^\d+(\.\d+)?$")
 EPOCH_MIN_DIGITS = 9
+# Upper bounds on what a line or an option may say, so an absurd value is a
+# bad value rather than an overflow: the last second of year 9999 (the largest
+# time datetime can show), a day of model time for one request (an eval job's
+# deadline is 14 hours), a trillion for any token or other count, and a
+# million dollars for one request's cost.
+MAX_EPOCH_SECONDS = 253402300799
+MAX_LATENCY_MS = 24 * 60 * 60 * 1000
+MAX_COUNT = 10 ** 12
+MAX_REQUEST_COST_USD = 1_000_000.0
 DECIMAL_POINT = "."
 # What a date or an ISO time starts with; anything else (nan, inf) is refused.
 ISO_START = re.compile(r"^\d{4}-\d{2}-\d{2}")
@@ -190,7 +199,7 @@ METRICS: Tuple[Metric, ...] = (
     Metric("requests", COUNT,
            "Request lines, any status, including lines whose analysis failed or was dropped (each was a model "
            "request).", True),
-    Metric("requests_per_build", COUNT, "requests / builds.", True),
+    Metric("requests_per_build", COUNT, "requests from lines with a build id / builds.", True),
     Metric("ok_requests", COUNT, "Request lines with status 200."),
     Metric("prompt_tokens", TOKENS,
            "Sum of prompt_tokens over status-200 lines, estimated ones included (tokens_estimated: the response "
@@ -208,7 +217,7 @@ METRICS: Tuple[Metric, ...] = (
     Metric("cache_write_tokens", TOKENS,
            "Sum of cache_write_tokens (usage.cache_creation_input_tokens, Anthropic-style cache writes) over "
            "status-200 lines."),
-    Metric("prompt_tokens_per_build", TOKENS, "prompt_tokens / builds.", True),
+    Metric("prompt_tokens_per_build", TOKENS, "prompt_tokens from lines with a build id / builds.", True),
     Metric("cache_hit_rate", FRACTION,
            "cached / prompt tokens, token-weighted, over status-200 lines whose usage was reported (not "
            "estimated): an estimated line has no cached count and would read as a miss.", True),
@@ -219,7 +228,7 @@ METRICS: Tuple[Metric, ...] = (
            "price-table estimate (see table_cost_usd); cost_from_table_requests says how many lines took the "
            "table. Lines with neither are left out, and so are lines with estimated tokens and no LiteLLM cost: "
            "a partial figure when unpriced_requests or estimated_unpriced_requests > 0.", True),
-    Metric("cost_per_build_usd", USD, "cost_usd / builds.", True),
+    Metric("cost_per_build_usd", USD, "cost_usd from lines with a build id / builds.", True),
     Metric("litellm_cost_usd", USD, "Sum of litellm_cost_usd over the status-200 lines that carry it."),
     Metric("litellm_costed_requests", COUNT, "Status-200 lines that carry litellm_cost_usd."),
     Metric("table_cost_usd", USD,
@@ -242,7 +251,7 @@ METRICS: Tuple[Metric, ...] = (
     Metric("model_time_s", SECONDS,
            "Sum of latency_ms over lines that carry one, any status, in seconds. Concurrent requests add up, so "
            "this can exceed wall clock.", True),
-    Metric("model_time_per_build_s", SECONDS, "model_time_s / builds.", True),
+    Metric("model_time_per_build_s", SECONDS, "model_time_s from lines with a build id / builds.", True),
     Metric("latency_p50_ms", MS, "Median latency_ms (nearest rank) over lines that carry one.", True),
     Metric("latency_p95_ms", MS, "95th percentile latency_ms (nearest rank) over lines that carry one.", True),
     Metric("non_200_requests", COUNT, "Lines whose status is not 200 (status_counts breaks them down).", True),
@@ -456,25 +465,29 @@ def _is_price(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
 
 
-def _as_count(value: Any) -> Optional[int]:
-    """A whole number at or above zero, else None (a bool is not a count)."""
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+def _as_count(value: Any, maximum: int = MAX_COUNT) -> Optional[int]:
+    """A whole number from zero to maximum, else None (a bool is not a count)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > maximum:
         return None
     return value
 
 
-def _as_seconds(value: Any) -> Optional[float]:
+def _as_seconds(value: Any, maximum: Optional[float] = None) -> Optional[float]:
+    """A finite number from zero to maximum (no upper bound when None), else None."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    if maximum is not None and value > maximum:
         return None
     return float(value)
 
 
-def _field(entry: Dict[str, Any], name: str, quality: Quality) -> Optional[int]:
-    """A count field: None when absent or null, and counted as bad when present with another type."""
+def _field(entry: Dict[str, Any], name: str, quality: Quality, maximum: int = MAX_COUNT) -> Optional[int]:
+    """A count field: None when absent or null, and counted as bad when present with another type or out of
+    range."""
     value = entry.get(name)
     if value is None:
         return None
-    count = _as_count(value)
+    count = _as_count(value, maximum)
     if count is None:
         quality.bad(name)
     return count
@@ -507,8 +520,12 @@ def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
     if not isinstance(job, dict) or job.get(F.JOB_KIND) not in JOB_KINDS:
         quality.skip(SKIP_UNTAGGED)
         return None
-    ts = _as_seconds(entry.get(F.TS))
+    ts = _as_seconds(entry.get(F.TS), MAX_EPOCH_SECONDS)
     if ts is None:
+        # A line without a usable time cannot be windowed or ordered: skipped, and
+        # its value counted bad when it had one.
+        if entry.get(F.TS) is not None:
+            quality.bad(F.TS)
         quality.skip(SKIP_BAD_TS)
         return None
     error = entry.get(F.ERROR)
@@ -521,7 +538,7 @@ def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
     model = entry.get(F.MODEL)
     model_name = entry.get(F.LITELLM_MODEL_NAME)
     cost = entry.get(F.LITELLM_COST_USD)
-    litellm_cost_usd = _as_seconds(cost)
+    litellm_cost_usd = _as_seconds(cost, MAX_REQUEST_COST_USD)
     if cost is not None and litellm_cost_usd is None:
         quality.bad(F.LITELLM_COST_USD)
     return Line(
@@ -531,7 +548,7 @@ def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
         pr=str(job.get(F.JOB_PR) or ""),
         ts=ts,
         status=_field(entry, F.STATUS, quality),
-        latency_ms=_field(entry, F.LATENCY_MS, quality),
+        latency_ms=_field(entry, F.LATENCY_MS, quality, MAX_LATENCY_MS),
         prompt_tokens=_field(entry, F.PROMPT_TOKENS, quality),
         cached_tokens=_field(entry, F.CACHED_TOKENS, quality),
         completion_tokens=_field(entry, F.COMPLETION_TOKENS, quality),
@@ -596,8 +613,9 @@ def parse_time(value: str, end_of_day: bool = False) -> float:
             raise ValueError(f"{value!r}: write a date as YYYY-MM-DD; epoch seconds need at least"
                              f" {EPOCH_MIN_DIGITS} digits")
         seconds = float(value)
-        if not math.isfinite(seconds):
-            raise ValueError(f"{value!r}: not a finite number of epoch seconds")
+        if not math.isfinite(seconds) or seconds > MAX_EPOCH_SECONDS:
+            raise ValueError(f"{value!r}: epoch seconds must be finite and at most {MAX_EPOCH_SECONDS}"
+                             " (the end of year 9999)")
         return seconds
     if not ISO_START.match(value):
         raise ValueError(f"{value!r}: expected epoch seconds, YYYY-MM-DD or an ISO 8601 time")
@@ -709,13 +727,14 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
     """Every metric in METRICS for one scope, plus status_counts and unpriced (by model label)."""
     # Lines without a build id count in every sum but are no build.
     builds = {line.key for line in lines if line.build}
+    built = [line for line in lines if line.build]
     ok = [line for line in lines if line.ok]
     prompt = sum(line.prompt_tokens or 0 for line in ok)
     cached = sum(min(line.cached_tokens or 0, line.prompt_tokens or 0) for line in ok)
     measured = [line for line in ok if not line.tokens_estimated and line.prompt_tokens is not None]
     measured_prompt = sum(line.prompt_tokens or 0 for line in measured)
     measured_cached = sum(min(line.cached_tokens or 0, line.prompt_tokens or 0) for line in measured)
-    cost = litellm_cost = table_cost = both_litellm = both_table = 0.0
+    cost = built_cost = litellm_cost = table_cost = both_litellm = both_table = 0.0
     litellm_costed = table_priced = from_table = estimated_unpriced = 0
     unpriced: Dict[str, int] = {}
     for line in ok:
@@ -725,6 +744,9 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
         if estimate is not None:
             table_cost += estimate
             table_priced += 1
+        line_cost = line.litellm_cost_usd if line.litellm_cost_usd is not None else estimate
+        if line_cost is not None and line.build:
+            built_cost += line_cost
         if line.litellm_cost_usd is not None:
             cost += line.litellm_cost_usd
             litellm_cost += line.litellm_cost_usd
@@ -742,6 +764,9 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
     with_reasoning = [line for line in ok if line.reasoning_tokens is not None]
     latencies = [line.latency_ms for line in lines if line.latency_ms is not None]
     model_s = sum(latencies) / MS_PER_SECOND
+    # Per-build figures divide what lines with a build id add up to by the builds.
+    built_prompt = sum(line.prompt_tokens or 0 for line in built if line.ok)
+    built_model_s = sum(line.latency_ms or 0 for line in built) / MS_PER_SECOND
     statuses: Dict[str, int] = {}
     for line in lines:
         if not line.ok:
@@ -770,7 +795,7 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
     values: Dict[str, Any] = {
         "builds": len(builds),
         "requests": len(lines),
-        "requests_per_build": ratio(len(lines), len(builds), PER_BUILD_DECIMALS),
+        "requests_per_build": ratio(len(built), len(builds), PER_BUILD_DECIMALS),
         "ok_requests": len(ok),
         "prompt_tokens": prompt,
         "cached_prompt_tokens": cached,
@@ -780,12 +805,12 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
         "reasoning_token_share": ratio(sum(line.reasoning_tokens or 0 for line in with_reasoning),
                                        sum(line.completion_tokens or 0 for line in with_reasoning)),
         "cache_write_tokens": sum(line.cache_write_tokens or 0 for line in ok),
-        "prompt_tokens_per_build": ratio(prompt, len(builds), PER_BUILD_DECIMALS),
+        "prompt_tokens_per_build": ratio(built_prompt, len(builds), PER_BUILD_DECIMALS),
         "cache_hit_rate": ratio(measured_cached, measured_prompt),
         "estimated_prompt_token_share": ratio(sum(line.prompt_tokens or 0 for line in ok if line.tokens_estimated),
                                               prompt),
         "cost_usd": round(cost, USD_DECIMALS),
-        "cost_per_build_usd": ratio(cost, len(builds), USD_DECIMALS),
+        "cost_per_build_usd": ratio(built_cost, len(builds), USD_DECIMALS),
         "litellm_cost_usd": round(litellm_cost, USD_DECIMALS),
         "litellm_costed_requests": litellm_costed,
         "table_cost_usd": round(table_cost, USD_DECIMALS),
@@ -796,7 +821,7 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
         "estimated_token_requests": sum(1 for line in ok if line.tokens_estimated),
         "estimated_unpriced_requests": estimated_unpriced,
         "model_time_s": round(model_s, SECONDS_DECIMALS),
-        "model_time_per_build_s": ratio(model_s, len(builds), PER_BUILD_DECIMALS),
+        "model_time_per_build_s": ratio(built_model_s, len(builds), PER_BUILD_DECIMALS),
         "latency_p50_ms": percentile(latencies, P50),
         "latency_p95_ms": percentile(latencies, P95),
         "non_200_requests": sum(statuses.values()),
@@ -1118,7 +1143,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps(result, indent=2, sort_keys=True) if args.json else render_compare(result))
         else:
             print(json.dumps(report, indent=2, sort_keys=True) if args.json else render(report))
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, OverflowError) as exc:
         print(f"baseline_report: {exc}", file=sys.stderr)
         return 2
     return 0
