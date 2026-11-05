@@ -359,9 +359,9 @@ line for as long as it lasts:
 ⏱ Close to the deadline since 12:00 PM ET: slowest run 327 min, 33 min of headroom.
 ```
 
-A run killed at the deadline counts here too: one or two kills below the
-`deadline_kill` OUTAGE's threshold show only in this digest line, and the
-OUTAGE is the message for a wave of them. Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
+A run killed at the deadline counts here too: kills below the `deadline_kill`
+OUTAGE's threshold (3 kills on 2 pull requests within 2 hours) show only in this
+digest line, and the OUTAGE is the message for a wave of them. Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
 floored at 0 (or overrun minutes past the timeout).
 
 The timeout itself lives in `GoogleCloudPlatform/oss-test-infra` (`timeout: 360m`
