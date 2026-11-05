@@ -73,6 +73,7 @@ _A2A_CALLOUT = _CONTROLLER / "platformagent_a2a_callout.go"
 _A2A_VERIFIER = _CONTROLLER / "platformagent_a2a_verifier.go"
 _A2A_CONSOLE = _CONTROLLER / "platformagent_a2a_console.go"
 _A2A_BRIDGE = _CONTROLLER / "platformagent_a2a_bridge.go"
+_A2A_GATEWAY_LEASE = _CONTROLLER / "platformagent_a2a_gateway_lease.go"
 _A2A_DISPATCHER = _CONTROLLER / "platformagent_a2a_dispatcher.go"
 _AGENT_MANIFESTS = _CONTROLLER / "platformagent_manifests.go"
 _API_TYPES = _REPO_ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
@@ -413,6 +414,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             "operator.extraEnv[8].value=true",
         ]
+        # The gateway's election, off for installs and on for the lane, under
+        # the name the operator reads it by, which opens it only on "true".
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[9].name={go_constant(_A2A_GATEWAY_LEASE, 'a2aGatewayElectionEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[9].value=true",
+        ]
         # Nothing turns the AgentProfile dispatcher on: it is off by default,
         # and the lane installs what a default install does.
         self.assertNotIn(go_constant(_A2A_DISPATCHER, "a2aDispatcherImageEnvVar"), " ".join(args))
@@ -568,7 +577,9 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[6], f"operator.extraEnv[6].value={_RC_REGISTRY_PREFIX}/hermes-bridge:{_RC_COMMIT_SHA}")
         self.assertEqual(values[7], f"operator.extraEnv[7].value={_BRIDGE_CONCURRENCY}")
         self.assertEqual(values[8], "operator.extraEnv[8].value=true")
-        self.assertEqual(len(values), 9, values)
+        # The gateway's election, on for the lane on this path too.
+        self.assertEqual(values[9], "operator.extraEnv[9].value=true")
+        self.assertEqual(len(values), 10, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
