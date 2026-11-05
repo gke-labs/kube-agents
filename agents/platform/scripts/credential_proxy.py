@@ -15103,7 +15103,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             answer: dict[str, Any] = {"error": "Teams operation failed", "detail": safe_detail}
             if getattr(exc, "fields", None):
-                answer["teams"] = exc.fields
+                # Microsoft's own words, bounded, under the same rule as the detail.
+                answer["teams"] = {
+                    key: redact_credentials(value) if isinstance(value, str) else value
+                    for key, value in exc.fields.items()
+                }
             self._json(HTTPStatus.BAD_GATEWAY, answer)
 
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
