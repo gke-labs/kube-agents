@@ -111,6 +111,8 @@ VIA_ANSWER_SLOTS = "answer_slots"
 # In record mode: whether this request's answer was saved (false when the key
 # was already there, or the answer was unstorable).
 RECORDED = "recorded"
+# In record mode, when writing the cache failed: the exception's type name.
+RECORD_ERROR = "record_error"
 # On a replay miss: the closest saved request and where this one differed.
 MISS = "miss"
 MISS_CLOSEST_FINGERPRINT = "closest_fingerprint"

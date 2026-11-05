@@ -659,9 +659,24 @@ class ShadowProxy:
         self, entry: Dict[str, Any], upstream: Dict[str, Any], normalized: normalizer.NormalizedRequest,
         stored: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any], received: float,
     ) -> bool:
-        """Record mode: save a storable answer under its fingerprint; True when this call saved it."""
+        """Record mode: save a storable answer under its fingerprint; True when this call saved it.
+
+        A cache that cannot be written costs the recording, never the log line
+        or the stored request: the line says `recorded: false` and why
+        (`record_error`), as RequestStore.write reports its own failures.
+        """
         if entry[F.UNSTORABLE]:
             return False
+        try:
+            return self._record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
+        except OSError as exc:
+            entry[F.RECORD_ERROR] = type(exc).__name__
+            return False
+
+    def _record(
+        self, entry: Dict[str, Any], upstream: Dict[str, Any], normalized: normalizer.NormalizedRequest,
+        stored: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any], received: float,
+    ) -> bool:
         # The entry first and the slot pointer last, so a failure in between
         # never leaves a pointer to an entry that was not written.
         saved = self.cache.save(entry[F.FINGERPRINT], {

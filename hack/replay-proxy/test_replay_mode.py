@@ -149,11 +149,11 @@ class SlotPointerTest(SlotCacheCase):
                                        {"role": "user", "content": "ticket Latte"}]}
     ANSWER = {"role": "assistant", "content": "done"}
 
-    def test_a_failed_entry_write_leaves_no_slot(self):
+    def test_a_failed_entry_write_leaves_no_slot_and_still_logs(self):
         recorder = self.proxy("record", "x")
         recorder.cache.save = lambda *args: (_ for _ in ()).throw(OSError("disk full"))
-        with self.assertRaises(OSError):
-            recorder.analyze(self.BODY, time.time(), self.upstream(self.ANSWER))
+        line = recorder.analyze(self.BODY, time.time(), self.upstream(self.ANSWER))
+        self.assertEqual((line["recorded"], line["record_error"], line["stored"]), (False, "OSError", True))
         self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.SLOTS_DIR)))
 
     def test_a_dangling_slot_heals(self):
