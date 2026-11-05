@@ -683,6 +683,12 @@ func (n *Notifier) post(job notifyJob) {
 		have, err := n.conv.ConversationContext(ctx, job.req.Conversation)
 		if err != nil {
 			n.log.Warn("notify: session record unreadable", "conversation", job.req.Conversation, "err", err)
+			if errors.Is(err, errRecordUndecodable) {
+				// One key's fault, which waiting won't fix and which the
+				// sender learns nothing from: the one refusal.
+				n.reply(job, n.refuse(notifyConversationRefused))
+				return
+			}
 			n.reply(job, n.refuseRetry(notifyRecordUnreadable))
 			return
 		}

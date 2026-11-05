@@ -699,6 +699,12 @@ func TestATransientRefusalAsksTheSenderToWait(t *testing.T) {
 	if got.Retry || got.Error != notifyConversationRefused {
 		t.Fatalf("no record: reply = %+v, want the one refusal and no retry", got)
 	}
+	n = newTestNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(&fakeConversations{err: fmt.Errorf("session x: %w: bad json", errRecordUndecodable)})
+	got = serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: testConversation, ContextID: testContext})
+	if got.Retry || got.Error != notifyConversationRefused {
+		t.Fatalf("a record that doesn't decode: reply = %+v, want the one refusal and no retry", got)
+	}
 	if r := n.refuseRetry(notifyStoppingRefusal); !r.Retry {
 		t.Fatal("the stopping refusal isn't a retry")
 	}
@@ -911,5 +917,24 @@ func TestConversationLookupDoesNotPostWhenStopping(t *testing.T) {
 	defer conv.mu.Unlock()
 	if len(conv.posts) != 0 {
 		t.Fatalf("conv.posts = %v, want 0 posts after Stop", conv.posts)
+	}
+}
+
+// TestARecordThatDoesntDecodeIsMarkedAsSuch: the registry marks a record that
+// exists and doesn't decode, so the notify route can tell it from an
+// unreachable bucket.
+func TestARecordThatDoesntDecodeIsMarkedAsSuch(t *testing.T) {
+	r := startRig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	kv, err := r.client.KV(ctx, lib.SessionStateBucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kv.Put(ctx, kvKey(testConversation), []byte("not json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.g.reg.Get(ctx, testConversation); !errors.Is(err, errRecordUndecodable) {
+		t.Fatalf("Get = %v, want errRecordUndecodable", err)
 	}
 }
