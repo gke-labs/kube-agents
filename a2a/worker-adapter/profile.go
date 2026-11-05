@@ -400,16 +400,16 @@ func (w *profileWorker) loop(ctx context.Context) error {
 					}
 					continue
 				}
-				// The dispatcher writes this task's terminal. Stop the
-				// harness and wait for execute to return without one. If the
-				// task finished first, its terminal is out, so the final
-				// renewal still follows.
-				cur.abandon <- m.Reason
-				if out := <-taskDone; !out.res.Abandoned {
-					w.finish(cur, out)
-				}
-				if release() {
-					return nil
+				// The dispatcher writes this task's terminal. Pass the abandon
+				// to the task, which stops its harness and returns without
+				// one, and go back to the loop: the taskDone arm finishes and
+				// releases it (finish sends nothing for an abandoned task, and
+				// the final renewal if the task finished first). Meanwhile an
+				// offer is declined as busy rather than left waiting out the
+				// drain.
+				select {
+				case cur.abandon <- m.Reason:
+				default:
 				}
 			}
 		}

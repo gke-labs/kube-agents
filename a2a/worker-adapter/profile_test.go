@@ -1213,3 +1213,40 @@ echo '{"type":"result","subtype":"success","result":"done"}'
 		t.Errorf("the log doesn't show the failed reset: %s", logBuf.String())
 	}
 }
+
+// While an abandoned task drains, the worker still answers: an offer that
+// arrives meanwhile is declined as busy at once, not left waiting out the
+// drain, and once the task is released the next offer is accepted.
+func TestAnOfferDuringAnAbandonedDrainIsAnsweredAtOnce(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"pw-drain-offer"}'
+read first || exit 1
+case "$first" in
+  *SLOWDRAIN*) perl -e 'setpgrp(0,0); sleep 4' & sleep 30 ;;
+esac
+echo '{"type":"result","subtype":"success","result":"done"}'
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startProfileWorker(t, ctx, profileWorkerConfig(t, url, harness), false)
+
+	d.offer("task-slow", profileSubmission(t, "task-slow", "SLOWDRAIN", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-slow"})
+	waitState(t, testClient(t, url), pwProfile, "task-slow", lib.StateWorking)
+	d.send(lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: "task-slow", Reason: "lease-expired - test"})
+	time.Sleep(100 * time.Millisecond)
+
+	d.offer("task-during", profileSubmission(t, "task-during", "during", nil), 5)
+	if a := d.nextAccept(time.Second); a.TaskID != "task-during" || a.Accepted || a.Reason != declineBusy {
+		t.Errorf("an offer during the drain = %+v, want a prompt busy decline", a)
+	}
+	// After the drain (the child holds stdout for about 4s), the pod is free.
+	time.Sleep(5 * time.Second)
+	d.offer("task-after", profileSubmission(t, "task-after", "after", nil), 5)
+	if a := d.nextAccept(5 * time.Second); a.TaskID != "task-after" || !a.Accepted {
+		t.Errorf("an offer after the drain = %+v, want an accept", a)
+	}
+}
