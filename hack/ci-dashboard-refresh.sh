@@ -52,6 +52,12 @@
 #   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  the GitLab lane's nightly periodic's
 #                              log prefix (tier gitlab, no pull request, its
 #                              own watermark); empty disables it
+#   EVAL_DASHBOARD_LANE_PR_GLOBS  the other forge lanes' build-dir globs,
+#                              space-separated TIER=GLOB (collect.py
+#                              --lane-pr-glob); empty disables them
+#   EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES  the forge lanes' other nightlies,
+#                              space-separated TIER=PREFIX (collect.py
+#                              --lane-nightly-prefix); empty disables them
 #   EVAL_DASHBOARD_NIGHTLY_PREFIX  the nightly periodic's Prow log prefix,
 #                              collected beside the presubmit as tier
 #                              "nightly" (default below: the live job's).
@@ -160,6 +166,11 @@ EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-
 EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/}"
 EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/}"
 EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/}"
+# The self-managed forge lanes (kube-agents#3682) with their weekly jobs,
+# and the GitLab lane's next-mode nightly, as .github/workflows/ci-health.yml
+# lists them.
+EVAL_DASHBOARD_LANE_PR_GLOBS="${EVAL_DASHBOARD_LANE_PR_GLOBS-ghes=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/* gitlab-ce=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*}"
+EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES-gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/ ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/ gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/}"
 # The release-candidate archive, which feeds the Brief's release-candidate table.
 # post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
 # rather than pr-logs/. Set to the empty string to leave the section on its
@@ -231,11 +242,12 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..${16} are the child bash's own positionals, so
+# Single quotes on purpose: $1..${18} are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself. The nightly prefixes and the
-# GitLab glob ride only with the GCS source: the from-dir path is the offline one.
+# forge lanes' globs and prefixes ride only with the GCS source: the from-dir
+# path is the offline one.
 rc=0
 # shellcheck disable=SC2016
 ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
@@ -251,6 +263,11 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     [ -n "${16}" ] && src_args+=(--gitlab-pr-glob "${16}")
     [ -n "${13}" ] && src_args+=(--gitlab-nightly-prefix "${13}")
     [ -n "${14}" ] && src_args+=(--nightly-main-b-prefix "${14}")
+    # Split on blanks by read, which expands no glob in the values.
+    read -r -a lane_globs <<<"${17}"
+    for g in ${lane_globs[@]+"${lane_globs[@]}"}; do src_args+=(--lane-pr-glob "$g"); done
+    read -r -a lane_prefixes <<<"${18}"
+    for p in ${lane_prefixes[@]+"${lane_prefixes[@]}"}; do src_args+=(--lane-nightly-prefix "$p"); done
   fi
   # The RC source. ${10} is the offline one and wins outright; the bucket glob
   # in $9 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
@@ -291,6 +308,8 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   "${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX}" \
   "${EVAL_DASHBOARD_PR_GLOB_PREVIOUS}" \
   "${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS}" \
+  "${EVAL_DASHBOARD_LANE_PR_GLOBS}" \
+  "${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log
