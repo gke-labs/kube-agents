@@ -1670,10 +1670,7 @@ class NearDeadline(unittest.TestCase):
             "close to deadline: slowest run 360 min in the last 24h (at the 360-minute Prow timeout; 2 runs)",
             result["evidence"],
         )
-        post = post_health.render_near_deadline(result)
-        self.assertIn("slowest run 360 min in the last 24h, at the 360-minute Prow timeout.", post)
-        self.assertNotIn("killed at the deadline", post)
-        self.assertNotIn("Not a break", post)
+        self.assertEqual(post_health.near_deadline_digest_line(result["near_deadline"]), "slowest run 360 min, at the timeout")
 
 
 # --------------------------------------------------------------------------- #
