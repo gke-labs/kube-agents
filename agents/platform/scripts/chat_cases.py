@@ -17,6 +17,7 @@ under next the gateway escapes it, so the emitter decides it.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,34 @@ ITEM_FIELDS = {
     "id": str, "title": str, "status": str, "steps": list, "stepCount": int, "note": str, "result": str,
 }
 MARK_FIELDS = {"ask": str, "settle": str}
+
+#: The chat UX lint's shared cases, which ``a2a/lib/chatmsg/lint_test.go`` reads too.
+LINT_CASES = REPO_ROOT / "tests" / "conformance" / "chat-ux" / "lint.json"
+#: The chat UX rules code can check (``.agents/rules/chat_ux.md``), as
+#: ``chatmsg.Lint`` names them. The headline's length is not among them: the
+#: validator refuses one past its cap, and the emitters cut at a clause under it.
+LINT_HEADLINE_CARD_ID = "headline-card-id"
+LINT_HEADLINE_HEADING = "headline-heading"
+LINT_HEADLINE_FENCE = "headline-code-fence"
+LINT_HEADLINE_APOLOGY = "headline-apology"
+LINT_CHOICE_RAW_COMMAND = "choice-raw-command"
+#: A board card id as the kanban mints one; ASCII, as Go's RE2 reads ``\b``.
+CARD_ID = re.compile(r"\bt_[0-9a-f]{8}\b", re.ASCII)
+#: A markdown heading's opening; "#412" is a pull request, not a heading. The
+#: classes are spelled out, as in Go, where ``\s`` excludes a vertical tab.
+HEADING = re.compile(r"^[ \t]*#{1,6}([ \t]|$)")
+#: An opening that apologises before saying what happened.
+APOLOGY = re.compile(
+    r"^\W*(((i|we)(['’](m|re)|[ \t]+(am|are))[ \t]+)?((so|very|truly)[ \t]+)?sorry"
+    r"|(my[ \t]+)?apologies|(i|we)[ \t]+apologi[sz]e|unfortunately)\b",
+    re.ASCII | re.IGNORECASE,
+)
+CODE_FENCES = ("```", "~~~")
+SLASH_MARK = "/"
+CODE_MARK = "`"
+#: Command-line tools whose name, in lower case and followed by an argument, makes a
+#: choice's label a command to paste. "Git history" and "Docker logs" are labels.
+CLI_WORDS = frozenset({"kubectl", "gcloud", "helm", "git", "gh", "terraform", "tofu", "docker"})
 
 
 class CaseError(ValueError):
@@ -137,6 +166,44 @@ def check_case(case: Any, stem: str, root: Path = REPO_ROOT) -> None:
         if "update" in out and out["carrier"] != UPDATE_CARRIER:
             raise CaseError(f"{where}.update: only a {UPDATE_CARRIER} has an update key")
         check_chat(out["chat"], f"{where}.chat")
+
+
+def _raw_command(label: str) -> str:
+    """Why ``label`` reads as a command rather than a choice, or ""."""
+    trimmed = label.strip()
+    if trimmed.startswith(SLASH_MARK):
+        return "is a slash command"
+    if CODE_MARK in trimmed:
+        return "carries a code span"
+    words = trimmed.split()
+    if len(words) > 1 and words[0] in CLI_WORDS:
+        return "is a command line"
+    return ""
+
+
+def lint(chat: dict) -> list[tuple[str, str, str]]:
+    """``(rule, field, what)`` for each chat UX rule ``chat`` breaks, in ``chatmsg.Lint``'s order.
+
+    Nothing in production calls it: refusing a message for its wording would drop
+    the user's answer, so the emitters' tests and the shared cases hold them to it.
+    """
+    out = []
+    headline = chat.get("headline", "")
+    card = CARD_ID.search(headline)
+    if card:
+        out.append((LINT_HEADLINE_CARD_ID, "headline", f"names card {card.group()}"))
+    if HEADING.match(headline):
+        out.append((LINT_HEADLINE_HEADING, "headline", "opens with a markdown heading"))
+    fence = next((f for f in CODE_FENCES if f in headline), None)
+    if fence:
+        out.append((LINT_HEADLINE_FENCE, "headline", f"carries a code fence {fence}"))
+    if APOLOGY.match(headline):
+        out.append((LINT_HEADLINE_APOLOGY, "headline", "opens with an apology"))
+    for i, choice in enumerate(chat.get("choices", [])):
+        why = _raw_command(choice["text"])
+        if why:
+            out.append((LINT_CHOICE_RAW_COMMAND, f"choices[{i}].text", f"{choice['text']!r} {why}"))
+    return out
 
 
 def load(cases_dir: Path = CASES_DIR) -> list[dict]:

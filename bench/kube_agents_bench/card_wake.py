@@ -773,6 +773,24 @@ def archive(shell: Callable[[str, float], str], key: str, timeout: float) -> Set
 # Metadata ``KubeAgentsHarness._settle`` writes on every turn, ``None`` on a
 # turn that delegated nothing; the merged run keeps both turns' captures.
 _WORKER_KEYS = ("worker_commands", "worker_trajectory")
+# A turn's own token buckets, kept under ``front_door`` when the other turn's
+# workers are folded in (as ``harness._fold_worker_tokens`` does for one turn).
+_FRONT_DOOR_BUCKETS = ("input", "cached", "cache_write", "reasoning", "output", "total")
+_TOKENS_CACHED = "cached"
+_TOKENS_FRONT_DOOR = "front_door"
+_TOKENS_WORKERS = "workers"
+
+
+def _count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _prompt_split(tokens: dict) -> bool:
+    """Whether a turn's ``input`` excludes its cache reads: ``cached`` is a count,
+    and so is its front door's when it has one."""
+    front_door = tokens.get(_TOKENS_FRONT_DOOR)
+    return _count(tokens.get(_TOKENS_CACHED)) and (
+        not isinstance(front_door, dict) or _count(front_door.get(_TOKENS_CACHED)))
 
 
 def _add_tokens(base: dict, extra: dict) -> None:
@@ -859,11 +877,24 @@ def merge(
     tokens = dict(answer.tokens if same_session else wake.tokens)
     if not same_session:
         _add_tokens(tokens, answer.tokens)
-    elif isinstance(wake.tokens.get("workers"), dict):
-        # As ``harness._fold_worker_tokens`` folded them into that turn's totals.
-        workers = wake.tokens["workers"]
-        _add_tokens(tokens, {"workers": workers})
-        _add_tokens(tokens, {k: v for k, v in workers.items() if isinstance(v, int) and not isinstance(v, bool)})
+        # A summed split is only a split when both turns had one: otherwise
+        # ``cached`` is one turn's cache reads beside an ``input`` that still
+        # counts the other's.
+        if not (_prompt_split(wake.tokens) and _prompt_split(answer.tokens)):
+            if _TOKENS_CACHED in tokens:
+                tokens[_TOKENS_CACHED] = None
+            if isinstance(tokens.get(_TOKENS_FRONT_DOOR), dict):
+                tokens[_TOKENS_FRONT_DOOR] = {**tokens[_TOKENS_FRONT_DOOR], _TOKENS_CACHED: None}
+    elif isinstance(wake.tokens.get(_TOKENS_WORKERS), dict):
+        # As ``harness._fold_worker_tokens`` folded them into that turn's totals,
+        # keeping the session row's own numbers under ``front_door`` first.
+        # Only for an answer turn that delegated nothing itself: one that did
+        # already has its own front_door from the harness's fold.
+        if not isinstance(answer.tokens.get(_TOKENS_WORKERS), dict):
+            tokens[_TOKENS_FRONT_DOOR] = {bucket: tokens.get(bucket) for bucket in _FRONT_DOOR_BUCKETS}
+        workers = wake.tokens[_TOKENS_WORKERS]
+        _add_tokens(tokens, {_TOKENS_WORKERS: workers})
+        _add_tokens(tokens, {k: v for k, v in workers.items() if _count(v)})
     metadata = {**answer.metadata, **wake.metadata}
     for key in _WORKER_KEYS:
         if key in wake.metadata or key in answer.metadata:

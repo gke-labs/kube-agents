@@ -369,7 +369,7 @@ data:
       admission:
         fail_closed: true
         memory_budget_mib: 4096
-        queue_bound_seconds: 120
+        queue_bound_seconds: 600
         worker_rss_cap_mib: 1536
       max_in_progress: 6
     model:

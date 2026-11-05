@@ -223,12 +223,18 @@ REP_TIMING_TURN1_KEY = "turn1_s"
 # collector reads `0.0` as unknown.
 REP_TIMING_DECIMALS = 1
 # The keys of the `rep N tokens:` line, which the collector
-# (scripts/eval_dashboard/collect.py, _REP_TOKENS_KEYS) parses the same way:
-# the record's top-level counts, and the flag, printed only when set, that
-# says they are short of what the run billed.
+# (scripts/eval_dashboard/collect.py, _REP_TOKENS_KEYS and
+# _REP_TOKENS_SPLIT_KEYS) parses the same way: the record's top-level counts,
+# then its prompt split (cache reads, cache writes, reasoning) when its
+# `input` excludes cache reads, and the flag, printed only when set, that
+# says they are short of what the run billed. The split keys come after
+# `total`, so a line without them reads as it always did.
 REP_TOKENS_INPUT_KEY = "input"
 REP_TOKENS_OUTPUT_KEY = "output"
 REP_TOKENS_TOTAL_KEY = "total"
+REP_TOKENS_CACHED_KEY = "cached"
+REP_TOKENS_CACHE_WRITE_KEY = "cache_write"
+REP_TOKENS_REASONING_KEY = "reasoning"
 REP_TOKENS_PARTIAL_FIELD = "partial=1"
 
 # What must not reach the log line: C0 and C1 controls and DEL (a captured
@@ -547,6 +553,9 @@ def _cmd_case(args: argparse.Namespace) -> int:
                 (REP_TOKENS_INPUT_KEY, rep.input_tokens),
                 (REP_TOKENS_OUTPUT_KEY, rep.output_tokens),
                 (REP_TOKENS_TOTAL_KEY, token_count(rep.total_tokens)),
+                (REP_TOKENS_CACHED_KEY, rep.cached_tokens),
+                (REP_TOKENS_CACHE_WRITE_KEY, rep.cache_write_tokens),
+                (REP_TOKENS_REASONING_KEY, rep.reasoning_tokens),
             )
             if value is not None
         )

@@ -268,6 +268,9 @@ const (
 	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// watcherAlertExcludeEnv carries spec.harness.eventWatcher.alertExclude to
+	// the watcher as JSON; start-services.sh passes it as --alert-exclude.
+	watcherAlertExcludeEnv = "WATCHER_ALERT_EXCLUDE"
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
@@ -4614,10 +4617,30 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
+	// Managed, so reserved by the merge below, only when the list is set: an
+	// install with no rules here keeps a WATCHER_ALERT_EXCLUDE it set through
+	// spec.deployment.env, which the watcher read before this field existed.
+	if rules := eventWatcherAlertExclude(agent); len(rules) > 0 {
+		envVars = append(envVars, corev1.EnvVar{Name: watcherAlertExcludeEnv, Value: rules})
+	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// eventWatcherAlertExclude renders spec.harness.eventWatcher.alertExclude as
+// the JSON list the watcher's --alert-exclude reads, or "" when it is empty.
+// The CRD's JSON keys are the watcher's, so the list is passed as it is.
+func eventWatcherAlertExclude(agent *agentv1alpha1.PlatformAgent) string {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.EventWatcher == nil || len(harness.EventWatcher.AlertExclude) == 0 {
+		return ""
+	}
+	// A list of plain strings and one pointer to a struct of strings cannot
+	// fail to marshal.
+	rules, _ := json.Marshal(harness.EventWatcher.AlertExclude)
+	return string(rules)
 }
 
 // sessionKVApiKeySecretRef resolves the Secret key holding the bearer token for
@@ -5024,6 +5047,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyProfileIdentitiesEnvVar,
 		credentialProxyTaskSigningKeysEnvVar,
 		credentialProxyTaskCredentialMaxLifetimeEnvVar,
+		// The dispatcher's seed path, which no broker-side container
+		// reads; reserved so a CR can't hand one a seed file of its choosing.
+		a2aTaskSigningSeedFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;

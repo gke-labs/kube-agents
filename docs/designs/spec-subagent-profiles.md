@@ -365,11 +365,12 @@ What the operator renders per profile, as built (amended 10/6):
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
-  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves four names against `spec.deployment.env`:
+  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves five names against `spec.deployment.env`:
   `CREDENTIAL_PROXY_PROFILE_AUDIENCE`, `CREDENTIAL_PROXY_PROFILE_IDENTITIES`,
-  `A2A_TASK_SIGNING_PUBLIC_KEYS` and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`;
-  `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already. The operator doesn't render the
-  max lifetime yet. The broker's fence admits the profile namespace and
+  `A2A_TASK_SIGNING_PUBLIC_KEYS`, `A2A_TASK_CREDENTIAL_MAX_LIFETIME` and
+  `A2A_TASK_SIGNING_SEED_FILE`; `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already.
+  **Amended 11/5 (#4471):** the operator renders the max lifetime, one value for the callout,
+  the broker and the dispatcher. The broker's fence admits the profile namespace and
   the profile namespace's fence lets it out to the broker's credentialed port.
   - The shim reads the dispatcher's `proxyToken` from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` on
     every call and sends it in `X-Kube-Agents-Task-Credential`, never in the body. The

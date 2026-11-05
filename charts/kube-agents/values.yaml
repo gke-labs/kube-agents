@@ -999,6 +999,26 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The k8s event watcher. alertExclude lists events that open no incident:
+    # no alert, no triage card, no share of the daily alert ceiling. Their
+    # clusters stay in scope, so the agent still reads them when asked. A rule
+    # sets one or more of cluster ({projectId, location, clusterName}, only
+    # clusterName required), namespace, reason, kind and name (a trailing *
+    # is a prefix), and matches when every part it sets matches; an event is
+    # excluded when any rule matches. At most 64 rules. Empty omits the block.
+    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
+    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
+    # removes the CR's whole eventWatcher block, so an enabled: false set there
+    # with kubectl patch is lost too; set it again afterwards. The watcher's
+    # tuning settings are under platformAgent.deployment.eventWatcher.
+    eventWatcher:
+      alertExclude: []
+        # - namespace: payments
+        # - reason: FailedScheduling
+        #   cluster: { clusterName: batch }
+        # - namespace: shop
+        #   kind: Pod
+        #   name: inventory-api-*
     # The controller stall watch, the stall-watch cron job that alerts on
     # controllers that stopped making progress. Empty omits the block and
     # keeps the watch's defaults. A change rolls the agent pod. The
@@ -1242,6 +1262,7 @@ platformAgent:
     # each setting does. A duration that the watcher cannot read keeps its
     # default, and the container log names it. A change rolls the agent pod
     # and the credential-proxy pod, which also gets spec.deployment.env.
+    # Alert excludes are under platformAgent.harness.eventWatcher.alertExclude.
     eventWatcher: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key

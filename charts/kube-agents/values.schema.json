@@ -824,6 +824,74 @@
                 }
               }
             },
+            "eventWatcher": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "alertExclude": {
+                  "type": ["array", "null"],
+                  "maxItems": 64,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "cluster": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["clusterName"],
+                        "properties": {
+                          "projectId": {
+                            "type": "string",
+                            "maxLength": 128,
+                            "pattern": "^([a-z0-9.-]+:)?[a-z]([-a-z0-9]*[a-z0-9])?$"
+                          },
+                          "location": {
+                            "type": "string",
+                            "maxLength": 63,
+                            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                          },
+                          "clusterName": {
+                            "type": "string",
+                            "maxLength": 63,
+                            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                          }
+                        }
+                      },
+                      "namespace": {
+                        "type": "string",
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "reason": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "pattern": "^[A-Za-z][-_.A-Za-z0-9]*$"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "maxLength": 63,
+                        "pattern": "^[A-Za-z][A-Za-z0-9]*$"
+                      },
+                      "name": {
+                        "type": "string",
+                        "maxLength": 253,
+                        "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|[a-z0-9][-.a-z0-9]*\\*)$"
+                      }
+                    },
+                    "anyOf": [
+                      { "required": ["cluster"] },
+                      { "required": ["namespace"] },
+                      { "required": ["reason"] },
+                      { "required": ["kind"] },
+                      {
+                        "required": ["name"],
+                        "properties": { "name": { "not": { "const": "*" } } }
+                      }
+                    ]
+                  }
+                }
+              }
+            },
             "stallWatch": {
               "type": "object",
               "additionalProperties": false,

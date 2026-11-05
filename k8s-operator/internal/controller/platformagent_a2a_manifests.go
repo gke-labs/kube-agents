@@ -53,6 +53,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -124,6 +125,19 @@ const (
 	// lib.SubmitSubjectPrefix). Its consumers are the operator's alone.
 	a2aProfileSubmitStream = "PROFILE_SUBMITS"
 	a2aProfileSubmitPrefix = "a2a.submit."
+	// a2aProfileSubmitMaxAge is PROFILE_SUBMITS' max age. The dispatch
+	// config carries it too (SubmitRetentionSeconds), so the dispatcher
+	// keeps finished tasks' tombstones at least as long as a re-created
+	// durable could replay them.
+	a2aProfileSubmitMaxAge = 72 * time.Hour
+
+	// a2aDispatchStopStream holds the gateway's stop records, one per task
+	// on a2aDispatchStopPrefix<profile>.<task> (contract addendum 9; lib's
+	// names for them arrive with the gateway's stop, #4127). The gateway is its only
+	// writer, once its grant lands with #4127 (until then nothing writes it),
+	// and the dispatcher its only reader.
+	a2aDispatchStopStream = "DISPATCH_STOPS"
+	a2aDispatchStopPrefix = "a2a.stop."
 
 	// a2aNATSConfGrantLine renders one allow-list entry at the depth
 	// renderA2APermission puts them: the subject-list indent, two more for
@@ -1664,7 +1678,7 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
-	"KV_PROFILE_LEASES", "PROFILE_SUBMITS",
+	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -2990,7 +3004,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the five streams, six KV
+// a2aProvisionScript is the provisioning payload: the six streams, six KV
 // buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
@@ -3325,9 +3339,21 @@ $NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --hi
 # profiles; nothing else makes a consumer here.
 $NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SUBMITS --allow-direct \
   --subjects='a2a.submit.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=1073741824 --discard=old --replicas=1 \
+  --max-age=` + strconv.Itoa(int(a2aProfileSubmitMaxAge.Hours())) + `h --max-bytes=1073741824 --discard=old --replicas=1 \
   --max-msgs-per-subject=1 --dupe-window=2m \
   --max-consumers=` + strconv.Itoa(a2aProfileDurablesAllowed) + ` --defaults
+
+# DISPATCH_STOPS: the gateway's stop records for AgentProfile tasks, one per
+# task (a2a.stop.<profile>.<task>), read by the dispatcher by subject (contract
+# addendum 9). It is outside a2a.dispatch. on purpose: the dispatcher publishes
+# there, and a stop must have one writer, the gateway (granted with #4127). A
+# record outlives any task (24h against the 6h deadline cap). Nothing makes a
+# consumer here; --max-consumers=1 is the tightest cap JetStream has, since 0
+# means unlimited.
+$NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream add DISPATCH_STOPS --allow-direct \
+  --subjects='a2a.stop.>' --storage=file --retention=limits \
+  --max-age=24h --max-bytes=67108864 --discard=old --replicas=1 \
+  --max-msgs-per-subject=1 --max-consumers=1 --defaults
 
 # TASKS older than this render: the limits the create above could not apply.
 #
@@ -3913,8 +3939,9 @@ const defaultA2AMaxSessions = 10
 // finished pod counts against no quota), rollout surge doubling a
 // Deployment for a moment, and the gateway's count-then-create overshoot. Fifteen covered roughly ten standing pods plus
 // surge; the console server made it eleven, hence sixteen, and the
-// kube-proxy's second replica seventeen. If the base install grows again,
-// raise this before anything user-visible starts failing admission.
+// kube-proxy's second replica seventeen. The MCP server, rendered only under
+// A2A_MCP_DOOR, is counted apart (a2aMCPStandingPods). If the base install grows
+// again, raise this before anything user-visible starts failing admission.
 const a2aQuotaHeadroom = 17
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
@@ -4383,7 +4410,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AMaxSessions(agent) + a2aQuotaHeadroom)
+	limit := int64(resolveA2AMaxSessions(agent)+a2aQuotaHeadroom) + a2aMCPStandingPods(agent)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -4482,6 +4509,18 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 				Verbs:         []string{"get", "patch"},
 			},
 		},
+	}
+	// The election's Lease, one named object, with the election on: the
+	// gateway reads and renews it (a2a/gateway/election.go). No create,
+	// which RBAC can't scope to a name, so the operator creates it
+	// (ensureA2AGatewayLease); no delete and no list.
+	if a2aGatewayElectionEnabled() {
+		role.Rules = append(role.Rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"coordination.k8s.io"},
+			Resources:     []string{"leases"},
+			ResourceNames: []string{a2aGatewayLeaseName(agent)},
+			Verbs:         []string{"get", "update"},
+		})
 	}
 	// The resolved scope under mode next, one named ConfigMap, read only:
 	// the scope publisher writes it, for the gateway's admission check to
@@ -4906,6 +4945,7 @@ func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *cor
 // on the console door alone: every next install renders it at one replica.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
+	leaseEnv := a2aGatewayLeaseEnv(agent)
 	labels := a2aLabels(agent, "gateway")
 	selector := map[string]string{"app": name}
 	podLabels := map[string]string{"app": name}
@@ -5232,6 +5272,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
 	}
+	// The election (a2a/gateway/election.go): the Lease the gateway
+	// campaigns for and its identity there, with the election on.
+	env = append(env, leaseEnv...)
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -5365,6 +5408,9 @@ type a2aProvisionState struct {
 	// the document goes stale, whichever is first; zero for no deadline.
 	scopeCondition *metav1.Condition
 	scopeRequeue   time.Duration
+	// leaseRequeue is how long until a held-back recreate of the gateway's
+	// Lease is due (ensureA2AGatewayLease); zero when none is held.
+	leaseRequeue time.Duration
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5917,6 +5963,17 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
 			return state, fmt.Errorf("failed to apply A2A gateway %T: %w", obj, err)
 		}
+	}
+	// The election's Lease, before the Deployment whose pods campaign for
+	// it, beside the Role that grants them it. Only with the election on;
+	// off, a Lease left from when it was on is the teardown's, and the
+	// gateway ignores it.
+	if a2aGatewayElectionEnabled() {
+		leaseWait, err := r.ensureA2AGatewayLease(ctx, agent)
+		if err != nil {
+			return state, err
+		}
+		state.leaseRequeue = leaseWait
 	}
 
 	// The inject backend's principal map, BEFORE the Deployment that mounts
@@ -6668,6 +6725,8 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The election's Lease, after the gateway that held it.
+		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
@@ -6907,6 +6966,9 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 // operator exception to the ownership rule below: the walk deletes only
 // what this CR controls and leaves the rest alone.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	// The Lease goes below with the stack; a flip back to next is a first
+	// install for it, not a deletion to hold back.
+	r.forgetA2AGatewayLease(agent)
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing

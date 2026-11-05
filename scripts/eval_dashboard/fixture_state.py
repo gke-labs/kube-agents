@@ -281,9 +281,18 @@ def runner_warnings(stderr: str) -> list[str]:
     return [line[len(RUNNER_WARNING_PREFIX):].strip() for line in (stderr or "").splitlines() if line.startswith(RUNNER_WARNING_PREFIX)]
 
 
+def _needles(role: str, slot: str) -> tuple[str, ...]:
+    """The warning texts that can explain `role`, most specific last. A
+    project-scoped role (slot "") is probed in the project with gcloud, not on
+    a cluster, so no cluster or slot warning explains it: only its own."""
+    if not slot:
+        return (RUNNER_ROLE_WARNING.format(role=role),)
+    return (RUNNER_LIST_WARNING, RUNNER_ROLE_WARNING.format(role=role), RUNNER_SLOT_WARNING.format(slot=slot))
+
+
 def unpublished_reason(role: str, slot: str, warnings: list[str]) -> str:
-    """Why the runner wrote no kubeconfig for `role`, from its own warnings."""
-    for needle in (RUNNER_LIST_WARNING, RUNNER_ROLE_WARNING.format(role=role), RUNNER_SLOT_WARNING.format(slot=slot)):
+    """Why the runner published nothing for `role`, from its own warnings."""
+    for needle in _needles(role, slot):
         for warning in warnings:
             if needle in warning:
                 return warning
@@ -298,6 +307,11 @@ def unpublished_state(role: str, slot: str, warnings: list[str]) -> tuple[str, s
     reason = unpublished_reason(role, slot, warnings)
     role_needle, slot_needle = RUNNER_ROLE_WARNING.format(role=role), RUNNER_SLOT_WARNING.format(slot=slot)
     for warning in warnings:
+        if not slot:
+            # A project-scoped role: only a warning that names it decides.
+            if role_needle in warning and RUNNER_ABSENT_PHRASES[0] in warning:
+                return ROLE_ABSENT, warning
+            continue
         if RUNNER_LIST_WARNING in warning:
             break
         names_this = role_needle in warning or slot_needle in warning or RUNNER_ABSENT_PHRASES[2] in warning
