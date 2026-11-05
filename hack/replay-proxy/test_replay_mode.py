@@ -21,6 +21,8 @@ HERE = Path(__file__).resolve().parent
 CLOCK = 1_800_000_000
 MINUTE = 60
 DAY = 86400
+# How late the first request's analysis is queued in the ordering test.
+LATE_SUBMIT_SECONDS = 0.3
 COMPLETIONS = "/v1/chat/completions"
 SUBPROCESS_TIMEOUT_SECONDS = 30
 
@@ -425,7 +427,19 @@ class RecordTest(ProxyTestCase):
     mode = "record"
 
     def test_storable_answer_is_saved_once_in_normalized_form(self):
+        # The first request's analysis is queued late, as a slow handler thread
+        # could; waiting for its line keeps the second from being analysed first.
+        submit, delayed = self.proxy.submit, []
+
+        def late_first(*args, **kwargs):
+            if not delayed:
+                delayed.append(True)
+                time.sleep(LATE_SUBMIT_SECONDS)
+            submit(*args, **kwargs)
+
+        self.proxy.submit = late_first
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=True))
+        self.lines(1)
         self.request("POST", COMPLETIONS, chat("t_22222222", stream=True))
         first, second = self.lines(2)
         self.assertEqual(first["mode"], "record")
@@ -530,9 +544,12 @@ class ReplayTest(ProxyTestCase):
         _, self.record_port, self.record_out = self.start_proxy(mode="record", job_kind="nightly", job_build="7")
 
     def record(self, *bodies):
+        """Record each body in turn, waiting for its line, so the first write is the first body's."""
+        done = len(self.record_out.getvalue().splitlines())
         for body in bodies:
             self.request("POST", COMPLETIONS, body, port=self.record_port)
-        self.lines(len(bodies), self.record_out)
+            done += 1
+            self.lines(done, self.record_out)
 
     def replay(self):
         proxy, port, out = self.start_proxy(mode="replay", allow_serve=True, job_build="99")
