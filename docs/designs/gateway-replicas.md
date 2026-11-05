@@ -261,7 +261,8 @@ ingress gap above.
 
 ## Operator changes
 
-- **Replicas from the CR,** default two on `next` installs, one allowed. More replicas add
+- **Replicas from the CR** (`spec.deployment.availability.a2aGateway.replicas`), default two on
+  `next` installs, one allowed. More replicas add
   standbys and nothing else in phase one.
 - **A readiness probe** that holds the pod not Ready until it has a NATS connection and has read
   the Lease. Readiness means "healthy", active or not, so a rollout's new pod becomes Ready as a
@@ -349,7 +350,8 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    each, including the held-back recreate, the first roll across the election, and a pin to a
    pre-election image and back. It lands in two parts: first the Lease, its Role grant and the
    gateway's election env, at one replica with `Recreate`, behind an operator flag
-   (`A2A_GATEWAY_ELECTION`) that CI and the live runs turn on; then the replicas, the strategy and
+   (`A2A_GATEWAY_ELECTION`) that CI and the live runs turn on; then the flag on by default
+   (`false` turns it off), the replicas, the strategy and
    their guard, the readiness probe, the PDB and the spread.
 5. **The cards-pending mark on the record** (planned separately).
 6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod
