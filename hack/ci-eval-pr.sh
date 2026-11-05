@@ -2587,7 +2587,7 @@ export JUDGE_MODEL="${JUDGE_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
 # compare ToolInvocation, ChecklistScore or OutcomeScore (which falls back to
 # ChecklistScore) keeps both too, or rung 6 would compare nothing for it. The
 # harness that reads this is the pinned grader's (GRADER_BENCH_DIR), so it
-# logs whether the switch took effect.
+# prints to each unit log whether the switch took effect.
 if [ -n "${PULL_NUMBER:-}" ] && ! grep -qwE 'ToolInvocation|ChecklistScore|OutcomeScore' <<< "${EVAL_JUDGED_METRICS:-}"; then
   export KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES=1
 fi

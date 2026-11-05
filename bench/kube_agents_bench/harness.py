@@ -151,6 +151,7 @@ import re
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -2614,9 +2615,12 @@ def _skip_report_only_judges() -> None:
 
     for evaluator in (ToolInvocationMetric, ChecklistMetric):
         evaluator.applies = _never_applies  # type: ignore[method-assign]
-    _log.info(
-        "%s=1: ToolInvocation and Checklist judge scores are off for this run",
-        SKIP_REPORT_ONLY_JUDGES_ENV,
+    # stderr, not ``_log``: nothing configures a handler that shows INFO here
+    # (devops-bench attaches only a NullHandler), and the unit log the
+    # presubmit keeps (eval_<case>_rep<n>.log) captures stderr.
+    print(
+        f"{SKIP_REPORT_ONLY_JUDGES_ENV}=1: ToolInvocation and Checklist judge scores are off for this run",
+        file=sys.stderr,
     )
 
 

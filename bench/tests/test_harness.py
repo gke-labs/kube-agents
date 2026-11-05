@@ -6356,7 +6356,7 @@ def test_report_only_judges_run_when_the_switch_is_unset(
 
 
 def test_a_pull_request_run_skips_the_report_only_judges(
-    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type]
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type], capsys: pytest.CaptureFixture[str]
 ) -> None:
     """hack/ci-eval-pr.sh sets the switch on a pull request; OutcomeValidity, which rung 6 reads, still runs."""
     from devops_bench.metrics.base import METRICS
@@ -6367,3 +6367,4 @@ def test_a_pull_request_run_skips_the_report_only_judges(
     assert not any(evaluator().applies(ctx) for evaluator in report_only_judges)
     assert METRICS["outcome_validity"]().applies(ctx)
     assert {"tool_invocation", "checklist"} <= set(METRICS)
+    assert "judge scores are off for this run" in capsys.readouterr().err
