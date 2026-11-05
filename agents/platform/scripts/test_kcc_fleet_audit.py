@@ -6,10 +6,12 @@ from __future__ import annotations
 import http.server
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -339,7 +341,15 @@ class KccFleetAuditTest(unittest.TestCase):
                 rc = kcc.audit_kcc(namespace="prod")
         self.assertEqual(rc, 0)
         out = buf.getvalue()
+        self.assertIn(
+            f"3 `*.cnrm.cloud.google.com` CRDs (2 served: {kcc.CONFIG_CONNECTOR_CRD}, {crd_ok}; 1 unserved/unestablished)",
+            out,
+        )
         self.assertIn(f"Unserved or unestablished KCC CRD `{crd_unserved}`", out)
+        self.assertIn(
+            "CLEAN_AUDIT_STOP: NO — Report any unverified namespace, unread CRDs, or unserved/unestablished CRDs",
+            out,
+        )
         self.assertIn("StaleGeneration", out)
         self.assertIn("UpdateFailed", out)
         self.assertIn(kcc.REDACTED_STOP_MARKER, out)
@@ -786,8 +796,10 @@ class KccFleetAuditTest(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
+            kubectl_bin = shutil.which("kubectl")
+            self.assertIsNotNone(kubectl_bin)
             server_flags = [f"--server=http://127.0.0.1:{server.server_address[1]}", "--token=test"]
-            env = {"PATH": "/usr/bin:/bin", "HOME": "/tmp"}
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": "/tmp"}
 
             # 1. Multi-CRD namespaced batch with multiline messages, missing/null status, and 1 empty CRD.
             ns_cmd = kcc._build_get_cmd(
@@ -800,7 +812,7 @@ class KccFleetAuditTest(unittest.TestCase):
                 None,
             )
             code, ns_items, err = kcc.run_kubectl_projected(
-                [ns_cmd[0], *server_flags, *ns_cmd[1:]], env
+                [kubectl_bin, *server_flags, *ns_cmd[1:]], env
             )
             self.assertEqual((code, err), (0, ""))
             self.assertEqual(len(ns_items), 3)
@@ -817,7 +829,7 @@ class KccFleetAuditTest(unittest.TestCase):
                 [kcc.CONFIG_CONNECTOR_CRD], kcc.CRD_SCOPE_CLUSTER, None
             )
             cc_code, cc_items, cc_err = kcc.run_kubectl_projected(
-                [cc_cmd[0], *server_flags, *cc_cmd[1:]], env
+                [kubectl_bin, *server_flags, *cc_cmd[1:]], env
             )
             self.assertEqual((cc_code, cc_err), (0, ""))
             self.assertEqual(len(cc_items), 1)
@@ -833,12 +845,34 @@ class KccFleetAuditTest(unittest.TestCase):
                 None,
             )
             empty_code, empty_items, empty_err = kcc.run_kubectl_projected(
-                [empty_cmd[0], *server_flags, *empty_cmd[1:]], env
+                [kubectl_bin, *server_flags, *empty_cmd[1:]], env
             )
             self.assertEqual((empty_code, empty_items, empty_err), (0, [], ""))
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_kubeconfig_current_context_and_unserved_only_summary(self) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, encoding="utf-8") as kc:
+            kc.write("apiVersion: v1\nkind: Config\ncurrent-context: gke_proj_us-central1_target-a\n")
+            kc_path = kc.name
+        try:
+            crd_table = "broken.compute.cnrm.cloud.google.com Namespaced false False\n"
+            with mock.patch("subprocess.run", return_value=_completed(0, stdout=crd_table)):
+                buf = io.StringIO()
+                with mock.patch("sys.stdout", buf):
+                    rc = kcc.audit_kcc(kubeconfig=kc_path)
+            self.assertEqual(rc, 0)
+            out = buf.getvalue()
+            self.assertIn("- **Target Context:** `gke_proj_us-central1_target-a`", out)
+            self.assertIn("1 `*.cnrm.cloud.google.com` CRDs (0 served, 1 unserved/unestablished)", out)
+            self.assertIn("Unserved or unestablished KCC CRD `broken.compute.cnrm.cloud.google.com`", out)
+            self.assertIn(
+                "CLEAN_AUDIT_STOP: NO — Report any unverified namespace, unread CRDs, or unserved/unestablished CRDs",
+                out,
+            )
+        finally:
+            Path(kc_path).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

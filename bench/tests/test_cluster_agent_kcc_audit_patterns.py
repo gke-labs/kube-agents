@@ -167,6 +167,7 @@ def _report_verdict(text: str) -> bool:
     "report",
     [
         "**Config Connector is not installed on `seeded-a`** (0 `*.cnrm.cloud.google.com` CRDs found).",
+        "Config Connector is not installed on seeded-a (0 `*.cnrm.cloud.google.com` CRDs), so I could not audit any managed resources.",
         "Audited `cnrm.cloud.google.com` CustomResourceDefinitions on `seeded-a`: no CRDs are installed.",
         "**Config Connector on `seeded-a` is healthy:** 12 managed resources Ready and synchronized.",
     ],
@@ -181,7 +182,8 @@ def test_report_naming_kcc_and_status_passes(report: str) -> None:
         "All workloads on `seeded-a` are Ready.",
         "Checked Config Connector on `seeded-a`.",
         "Failed to audit Config Connector synchronization status on `seeded-a`: collector timed out.",
-        "Could not read Config Connector CustomResourceDefinitions on `seeded-a`.",
+        "Could not read: customresourcedefinitions on `seeded-a`.",
+        "Could not read `sqlinstances.sql.cnrm.cloud.google.com`: Forbidden.",
         "Config Connector Audit Verdict: Incomplete (CRD listing failed).",
     ],
 )

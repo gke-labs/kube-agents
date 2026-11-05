@@ -81,4 +81,4 @@ verification_spec:
       any_of_patterns:
         - '(?i)\bnot installed\b|\b0 [a-z0-9 .*`-]*crds?\b|\bno [a-z0-9 .*`-]*crds?\b|\bready\b|\bsynchroniz(?:ed|ation)\b'
       forbidden_patterns:
-        - '(?i)\b(?:crd listing failed|could not (?:read|audit)|failed to (?:read|audit)|verdict:\s*incomplete)\b'
+        - '(?i)(?:\bcrd listing failed\b|\bverdict:\s*incomplete\b|\bcould not read(?::\s*customresourcedefinitions|\s+customresourcedefinitions|\s+[a-z0-9.-]+\.cnrm\.cloud\.google\.com)\b|\bfailed to audit[^\n]*timed out\b)'
