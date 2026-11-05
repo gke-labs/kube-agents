@@ -4438,10 +4438,7 @@ def _trigger_agent_troubleshooter(
             if alert_title and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
                 # The title heads the plan the cards draw: on Slack, and on the
                 # platform the gateway lays the plan out for under spec.mode: next.
-                if alert_kind:
-                    _record_alert_title(session_id, alert_title, alert_kind)
-                else:
-                    _record_alert_title(session_id, alert_title)
+                _record_alert_title(session_id, alert_title, alert_kind)
             # Armed here, before the gateway is contacted: an alert whose turn
             # never starts (session creation refused, the turn's POST failing)
             # is the case the watchdog exists for, and the steps below return
@@ -6142,8 +6139,8 @@ def _drift_session_title(payload: Dict[str, Any]) -> str | None:
         return None
     recorded = _defang_drift_field(resource.get("resource")) or DRIFT_UNKNOWN_FIELD
     title = DRIFT_ALERT_TITLE.format(name=name, kind=DRIFT_TITLE_KINDS.get(recorded.lower(), recorded))
-    cluster = _defang_drift_field(payload.get("cluster"))
-    return title + DRIFT_ALERT_TITLE_CLUSTER.format(cluster=cluster) if cluster else title
+    cluster = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    return title + DRIFT_ALERT_TITLE_CLUSTER.format(cluster=cluster)
 
 
 def _drift_alert_message(summary: str) -> str:

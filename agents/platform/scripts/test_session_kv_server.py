@@ -1188,11 +1188,11 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args for c in alert.call_args_list],
                          [("google_chat", "alert", "s1"), ("slack", "slack alert", "s1")])
-        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
 
     def test_the_title_is_recorded_before_the_turn_starts(self):
         def start(*_args):
-            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
             return STARTED
 
         session_kv_server._start_agent_turn.side_effect = start
@@ -7040,7 +7040,8 @@ class TestDriftInject(unittest.TestCase):
         with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
             self.assertEqual(session_kv_server._drift_session_title(payload), "checkout-gateway HPA drift · seeded-b")
             unlisted = {**payload, "cluster": "", "resource": {"resource": "leases", "name": "l1"}}
-            self.assertEqual(session_kv_server._drift_session_title(unlisted), "l1 leases drift")
+            with patch.dict(os.environ, {"GKE_CLUSTER_NAME": "host-a"}):
+                self.assertEqual(session_kv_server._drift_session_title(unlisted), "l1 leases drift · host-a")
             self.assertIsNone(session_kv_server._drift_session_title({**payload, "resource": {"resource": "pods"}}))
         with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
             self.assertIsNone(session_kv_server._drift_session_title(payload))
