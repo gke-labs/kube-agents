@@ -241,14 +241,24 @@ class InjectorKVSeamTest(unittest.TestCase):
             timeout=300,
         )
         combined = completed.stdout + completed.stderr
+        # Every assertion message carries both streams. A run that never
+        # reached the Go test, such as a module download that failed before
+        # the package could load, prints only `FAIL ... [setup failed]` on
+        # stdout and the cause on stderr, and the last assertion below is the
+        # one it fails; without stderr in its message the job log shows the
+        # verdict and not the error.
+        output = (
+            f"go test TestLiveKVCreateAndInject exited {completed.returncode}\n"
+            f"--- stdout ---\n{completed.stdout}\n--- stderr ---\n{completed.stderr}"
+        )
         # No transport/decode error from the client (its error strings all
         # carry the "injector:" prefix)...
-        self.assertNotIn("injector: POST inject", combined)
-        self.assertNotIn("injector: decode", combined)
+        self.assertNotIn("injector: POST inject", combined, output)
+        self.assertNotIn("injector: decode", combined, output)
         # ...and the run failed only on the Go test's own status expectation,
         # which proves the empty body was read as a status, not an error.
-        self.assertNotEqual(0, completed.returncode)
-        self.assertIn("expected status injected", completed.stdout)
+        self.assertNotEqual(0, completed.returncode, output)
+        self.assertIn("expected status injected", completed.stdout, output)
 
 
 if __name__ == "__main__":
