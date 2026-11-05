@@ -102,6 +102,15 @@ class PrefixIndexTest(unittest.TestCase):
         self.assertEqual(index.closest("other", ["m1"]), (None, 0))
 
 
+    def test_a_long_conversation_costs_one_fixed_size_key_per_prefix(self):
+        hashes = [f"m{i}" for i in range(500)]
+        index = replay_cache.PrefixIndex(iter([{"fingerprint": "a", "diag_settings_hash": "s",
+                                                "diag_message_hashes": hashes}]))
+        self.assertEqual(len(index.by_prefix), 501)
+        self.assertEqual({len(key) for key in index.by_prefix}, {64})
+        self.assertEqual(index.closest("s", hashes[:200] + ["x"])[1], 200)
+
+
 class ServedBodyTest(unittest.TestCase):
     ENTRY = {"finish_reason": "tool_calls", "usage": {"prompt_tokens": 10, "completion_tokens": 2}}
 
