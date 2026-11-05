@@ -244,7 +244,8 @@ readonly EVAL_LITELLM_RETRY_AFTER_SECONDS="${EVAL_LITELLM_RETRY_AFTER_SECONDS:-2
 # the broker's 60s refusal: Cluster Agents' commands timed out and the judge
 # graded the answers as regressions on pull requests that never touched the
 # path. #2455's live test ran this figure: the broker's startup line read
-# "admits 9 requests at once beside the slot cap of 8". Set on this install
+# "admits 9 requests at once beside the slot cap of 8", before the 128 MiB
+# workspace term left the budget (it reads 10 now). Set on this install
 # only, through spec.deployment.credentialProxy.resources. A string, because
 # the CRD's quantity is int-or-string.
 # Limits only: the pool's host clusters are Autopilot with bursting, where a

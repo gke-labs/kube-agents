@@ -6742,7 +6742,7 @@ class CommandExecutorTest(unittest.TestCase):
         # The degenerate case (§2.3): a budget so small that nothing fits must
         # not refuse every command forever. A limit that small is under the
         # floor and disables the budget at construction, so this branch is
-        # defensive, reachable only if the fixed terms or the cost move at
+        # defensive, reachable only if the resident reserve or the cost move at
         # runtime; the test lowers the budget after construction to reach it.
         executor = self.budgeted(admits=2)
         executor.children_budget_bytes = executor._request_cost_bytes(takes_slot=True) - 1
