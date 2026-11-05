@@ -950,7 +950,7 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 		corev1.EnvVar{Name: shellSandboxHomeRootsEnvVar, Value: shellSandboxHomeRoots()},
 	)
 	container := corev1.Container{
-		Name:  "shell",
+		Name:  shellSandboxContainerName,
 		Image: resolveShellSandboxImage(agent),
 		// No command or args: the image's entrypoint does the
 		// volume-dependent setup and execs sshd. An earlier prototype

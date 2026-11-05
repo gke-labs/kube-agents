@@ -23,10 +23,12 @@ import (
 	"strings"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -121,6 +123,25 @@ const (
 	sizingTierChangedReason        = "SizingTierChanged"
 	sizingCappedByQuotaEventReason = "SizingCappedByQuota"
 	sizingTierChangedMessageFormat = "sizing tier %s -> %s (spec.deployment.sizingProfile %s)"
+
+	// The three sized workloads the step-up check reads back: the gateway
+	// workload (a Deployment, or a StatefulSet under useStatefulSet) named
+	// with this suffix carries the agent-api-auth sidecar, the credential
+	// proxy Deployment (credentialProxyName) the broker, and the shell
+	// StatefulSet (shellSandboxName) the shell container, which
+	// shell_sandbox_manifests.go renders under this name.
+	gatewayWorkloadNameSuffix = "-gateway"
+	shellSandboxContainerName = "shell"
+)
+
+// sizingLandedRequests and sizingLandedLimits are the resource names the
+// landed check (sizedContainerCarries) compares on a sized container's
+// template: the figures the tier rows move. The proxy's ephemeral-storage is
+// a limit alone, so it is read on that side only; an ephemeral-storage
+// request is what GKE Autopilot adds to a template and no row sets.
+var (
+	sizingLandedRequests = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory}
+	sizingLandedLimits   = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
 )
 
 // sizingShortfall is one ResourceQuota dimension without room for a step up:
@@ -443,16 +464,22 @@ func addResourceDelta(total, from, to corev1.ResourceList) {
 
 // sizingScopeSelectsThePods reports whether one scope requirement of a
 // ResourceQuota selects the three sized pods, as the quota admission plugin
-// evaluates it against a pod. The answer is fixed per scope, because the three
-// pods have one shape: a request on every sized container, so never
-// BestEffort; no activeDeadlineSeconds, so never Terminating; no
-// priorityClassName (nothing in the controller sets one), so the PriorityClass
-// label admission matches against is absent, which In and Exists miss and
-// NotIn and DoesNotExist match; no cross-namespace affinity term; and
-// VolumeAttributesClass tracks claims, never a pod's cpu or memory. A scope
-// this operator does not know is read as selecting them, the side that holds
-// the tier rather than promotes past a quota that binds.
-func sizingScopeSelectsThePods(req corev1.ScopedResourceSelectorRequirement) bool {
+// evaluates it against a pod. Every scope but PriorityClass has a fixed
+// answer, because the three pods have one shape: a request on every sized
+// container, so never BestEffort; no activeDeadlineSeconds, so never
+// Terminating; no cross-namespace affinity term; and VolumeAttributesClass
+// tracks claims, never a pod's cpu or memory. PriorityClass is read against
+// classes, the priorityClassName values the live sized pods carry
+// (sizedPodPriorityClasses): the controller sets none, but the API server's
+// Priority admission fills in the cluster's globalDefault PriorityClass when
+// one exists, and the quota plugin, which runs after it, matches the scope
+// against the filled-in name, so a fixed answer would skip a quota scoped
+// `In` that default, which binds the pods, and read a `DoesNotExist` one,
+// which does not. The requirement selects the pods when it selects any class
+// they carry; with no pod to read (classes empty) it is read as selecting
+// them, as is a scope this operator does not know: the side that holds the
+// tier rather than promotes past a quota that binds.
+func sizingScopeSelectsThePods(req corev1.ScopedResourceSelectorRequirement, classes []string) bool {
 	switch req.ScopeName {
 	case corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeNotBestEffort:
 		return true
@@ -460,24 +487,64 @@ func sizingScopeSelectsThePods(req corev1.ScopedResourceSelectorRequirement) boo
 		corev1.ResourceQuotaScopeCrossNamespacePodAffinity, corev1.ResourceQuotaScopeVolumeAttributesClass:
 		return false
 	case corev1.ResourceQuotaScopePriorityClass:
-		return req.Operator == corev1.ScopeSelectorOpNotIn || req.Operator == corev1.ScopeSelectorOpDoesNotExist
+		if len(classes) == 0 {
+			return true
+		}
+		return slices.ContainsFunc(classes, func(class string) bool { return priorityClassRequirementSelects(req, class) })
 	default:
 		return true
 	}
 }
 
+// priorityClassRequirementSelects evaluates a PriorityClass scope requirement
+// against one pod's priorityClassName the way the quota admission plugin
+// does: a pod with no class has no PriorityClass label to match, so In and
+// Exists miss it and NotIn and DoesNotExist match it; a pod with one matches
+// In and NotIn on the value and Exists outright. An operator this operator
+// does not know selects, the holding side.
+func priorityClassRequirementSelects(req corev1.ScopedResourceSelectorRequirement, class string) bool {
+	switch req.Operator {
+	case corev1.ScopeSelectorOpIn:
+		return class != "" && slices.Contains(req.Values, class)
+	case corev1.ScopeSelectorOpNotIn:
+		return !slices.Contains(req.Values, class)
+	case corev1.ScopeSelectorOpExists:
+		return class != ""
+	case corev1.ScopeSelectorOpDoesNotExist:
+		return class == ""
+	default:
+		return true
+	}
+}
+
+// sizingQuotaScopesPriorityClass reports whether a ResourceQuota has a
+// PriorityClass scope in spec.scopes or spec.scopeSelector, the one scope
+// whose answer needs the live pods read.
+func sizingQuotaScopesPriorityClass(quota *corev1.ResourceQuota) bool {
+	if slices.Contains(quota.Spec.Scopes, corev1.ResourceQuotaScopePriorityClass) {
+		return true
+	}
+	if quota.Spec.ScopeSelector == nil {
+		return false
+	}
+	return slices.ContainsFunc(quota.Spec.ScopeSelector.MatchExpressions, func(req corev1.ScopedResourceSelectorRequirement) bool {
+		return req.ScopeName == corev1.ResourceQuotaScopePriorityClass
+	})
+}
+
 // sizingQuotaBindsThePods reports whether a ResourceQuota counts the three
 // sized pods at all: an unscoped quota does, and a scoped one does when every
 // entry of spec.scopes (each an Exists requirement, as the API server reads
-// them) and every requirement of spec.scopeSelector selects them. A quota
-// that cannot count these pods cannot refuse them either, so the step-up
-// check does not read it; the chart's quota preflight skips every scoped
-// quota for the same reason, and this is the same call made per scope so a
-// NotTerminating or NotBestEffort quota, which does bind them, still holds
-// the tier.
-func sizingQuotaBindsThePods(quota *corev1.ResourceQuota) bool {
+// them) and every requirement of spec.scopeSelector selects them, a
+// PriorityClass requirement read against classes (sizingScopeSelectsThePods).
+// A quota that cannot count these pods cannot refuse them either, so the
+// step-up check does not read it; the chart's quota preflight skips every
+// scoped quota for the same reason, and this is the same call made per scope
+// so a NotTerminating or NotBestEffort quota, which does bind them, still
+// holds the tier.
+func sizingQuotaBindsThePods(quota *corev1.ResourceQuota, classes []string) bool {
 	for _, scope := range quota.Spec.Scopes {
-		if !sizingScopeSelectsThePods(corev1.ScopedResourceSelectorRequirement{ScopeName: scope, Operator: corev1.ScopeSelectorOpExists}) {
+		if !sizingScopeSelectsThePods(corev1.ScopedResourceSelectorRequirement{ScopeName: scope, Operator: corev1.ScopeSelectorOpExists}, classes) {
 			return false
 		}
 	}
@@ -485,11 +552,141 @@ func sizingQuotaBindsThePods(quota *corev1.ResourceQuota) bool {
 		return true
 	}
 	for _, req := range quota.Spec.ScopeSelector.MatchExpressions {
-		if !sizingScopeSelectsThePods(req) {
+		if !sizingScopeSelectsThePods(req, classes) {
 			return false
 		}
 	}
 	return true
+}
+
+// sizedWorkloadSelectors are the pod selectors of the three sized workloads,
+// the labels their pods carry.
+func sizedWorkloadSelectors(agent *agentv1alpha1.PlatformAgent) []map[string]string {
+	return []map[string]string{
+		credentialProxySelector(agent),
+		{"app": agent.Name + gatewayWorkloadNameSuffix},
+		shellSandboxSelector(agent),
+	}
+}
+
+// sizedPodPriorityClasses is the set of spec.priorityClassName values the
+// live pods of the three sized workloads carry, "" for a pod with none,
+// sorted; empty when no pod is found. Pods are not a cached kind here
+// (manager_cache.go), so the lists go through the API reader, as the
+// ResourceQuota list does, and only when a quota has a PriorityClass scope.
+func (r *PlatformAgentReconciler) sizedPodPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
+	var classes []string
+	for _, selector := range sizedWorkloadSelectors(agent) {
+		pods := &corev1.PodList{}
+		if err := r.a2aReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
+			return nil, fmt.Errorf("listing the sized pods for the quota scopes: %w", err)
+		}
+		for _, pod := range pods.Items {
+			if !slices.Contains(classes, pod.Spec.PriorityClassName) {
+				classes = append(classes, pod.Spec.PriorityClassName)
+			}
+		}
+	}
+	slices.Sort(classes)
+	return classes, nil
+}
+
+// sizingWorkloadRolledOut reports whether a workload's controller has created
+// every replica of the template the workload now carries: its status is for
+// the current generation and its updated replicas reach the spec's. That is
+// the point at which quota admission has charged the new pods, which is what
+// the step-up check waits for; readiness is not part of it, and the old pods
+// still draining only add to the used total.
+func sizingWorkloadRolledOut(generation, observedGeneration int64, desired *int32, updated int32) bool {
+	return observedGeneration >= generation && updated >= ptr.Deref(desired, 1)
+}
+
+// sizedContainerCarries reports whether the container named name in a pod
+// template (its containers or, for the native sidecar, its init containers)
+// carries at least rendered's figures on the names sizingLandedRequests and
+// sizingLandedLimits list, or is not in the template at all, in which case
+// nothing of it is charged. At least rather than equal, because GKE
+// Autopilot's admission rewrites a workload's template (an ephemeral-storage
+// request added, a request raised to a minimum) and only ever upward. A
+// template rendered at a lower tier falls short on a figure the step raises;
+// one whose override has since been lowered reads as landed with the quota
+// charged more than the step assumes, the safe side.
+func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendered corev1.ResourceRequirements) bool {
+	var found *corev1.Container
+	for _, list := range [][]corev1.Container{template.Spec.Containers, template.Spec.InitContainers} {
+		for i := range list {
+			if list[i].Name == name {
+				found = &list[i]
+			}
+		}
+	}
+	if found == nil {
+		return true
+	}
+	carries := func(have, want corev1.ResourceList, names []corev1.ResourceName) bool {
+		for _, resourceName := range names {
+			wanted, moved := want[resourceName]
+			if !moved {
+				continue
+			}
+			got, set := have[resourceName]
+			if !set || got.Cmp(wanted) < 0 {
+				return false
+			}
+		}
+		return true
+	}
+	return carries(found.Resources.Requests, rendered.Requests, sizingLandedRequests) &&
+		carries(found.Resources.Limits, rendered.Limits, sizingLandedLimits)
+}
+
+// sizingTierLanded reports whether the three sized workloads carry tier's
+// render and their controllers have created every replica of it, so that
+// every ResourceQuota's used total includes the pods the tier runs. The
+// step-up check measures each candidate step from the running tier against
+// those totals, and the latch runs ahead of the pods: resolveSizingTier
+// writes status.effectiveSizingTier before the workloads are re-rendered,
+// the write re-enqueues the CR at once, and the proxy's Recreate rollout
+// admits its new pod only after the old one has gone. A pass in that window
+// that measured the next step from the latch would count the admitted step
+// as already charged and could promote past the quota; it measures nothing
+// until the pods have landed instead. The reads are cache hits (both kinds
+// are Owns()'d), and a workload that cannot be read, or is not there yet,
+// has not landed.
+func (r *PlatformAgentReconciler) sizingTierLanded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) bool {
+	autopilot := r.clusterAutopilot()
+	proxy := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, proxy); err != nil {
+		return false
+	}
+	if !sizingWorkloadRolledOut(proxy.Generation, proxy.Status.ObservedGeneration, proxy.Spec.Replicas, proxy.Status.UpdatedReplicas) ||
+		!sizedContainerCarries(proxy.Spec.Template, credentialProxyContainerName, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier)) {
+		return false
+	}
+	shell := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: shellSandboxName(agent)}, shell); err != nil {
+		return false
+	}
+	if !sizingWorkloadRolledOut(shell.Generation, shell.Status.ObservedGeneration, shell.Spec.Replicas, shell.Status.UpdatedReplicas) ||
+		!sizedContainerCarries(shell.Spec.Template, shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, tier)) {
+		return false
+	}
+	gatewayKey := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}
+	sidecar := renderedAgentAPIAuthResourcesAt(agent.Spec.Deployment, tier)
+	if useStatefulSet(agent) {
+		gateway := &appsv1.StatefulSet{}
+		if err := r.Get(ctx, gatewayKey, gateway); err != nil {
+			return false
+		}
+		return sizingWorkloadRolledOut(gateway.Generation, gateway.Status.ObservedGeneration, gateway.Spec.Replicas, gateway.Status.UpdatedReplicas) &&
+			sizedContainerCarries(gateway.Spec.Template, agentAPIAuthContainerName, sidecar)
+	}
+	gateway := &appsv1.Deployment{}
+	if err := r.Get(ctx, gatewayKey, gateway); err != nil {
+		return false
+	}
+	return sizingWorkloadRolledOut(gateway.Generation, gateway.Status.ObservedGeneration, gateway.Spec.Replicas, gateway.Status.UpdatedReplicas) &&
+		sizedContainerCarries(gateway.Spec.Template, agentAPIAuthContainerName, sidecar)
 }
 
 // sizingQuotaShortfall is nil when every ResourceQuota in the agent's
@@ -513,8 +710,19 @@ func (r *PlatformAgentReconciler) sizingQuotaShortfall(ctx context.Context, agen
 	}
 	step := sizingStepBetween(agent, r.clusterAutopilot(), from, to)
 	slices.SortFunc(quotas.Items, func(a, b corev1.ResourceQuota) int { return strings.Compare(a.Name, b.Name) })
+	// The live pods' priority classes, read once, and only when a quota's
+	// scope asks for them.
+	var classes []string
+	classesRead := false
 	for _, quota := range quotas.Items {
-		if !sizingQuotaBindsThePods(&quota) {
+		if !classesRead && sizingQuotaScopesPriorityClass(&quota) {
+			var err error
+			if classes, err = r.sizedPodPriorityClasses(ctx, agent); err != nil {
+				return nil, err
+			}
+			classesRead = true
+		}
+		if !sizingQuotaBindsThePods(&quota, classes) {
 			continue
 		}
 		for _, dim := range sizingQuotaDimensions {
@@ -591,7 +799,10 @@ func sizingCappedConditionMessage(agent *agentv1alpha1.PlatformAgent) string {
 // the highest tier, at or under what the cluster count earns, whose step from
 // the running tier every ResourceQuota that counts the pods has room for; a
 // quota short on every step keeps the running tier, and any refused step sets
-// the condition. A count that falls leaves the latch where it is and clears the
+// the condition. A step is measured only once the running tier's pods have
+// landed (sizingTierLanded), since the used totals it is measured against do
+// not charge a step whose pods admission has not yet created; until then the
+// latch and the condition stay where they are. A count that falls leaves the latch where it is and clears the
 // condition, since it no longer earns the step; a pass with no reading (the
 // gauges absent before the first poll, or cleared after two polls that read
 // no gateway) leaves the latch and the condition both where they are, so a
@@ -617,7 +828,16 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 		tier = latched
 		if observed, ok := observedClusterCount(agent); ok {
 			count = observed
-			if earned := sizingTierForClusterCount(count); earned > tier {
+			if earned := sizingTierForClusterCount(count); earned > tier && !r.sizingTierLanded(ctx, agent, tier) {
+				// The running tier's pods have not all been admitted yet (the
+				// pass after a promotion, while the proxy recreates), so the
+				// quotas' used totals do not yet charge the step just taken
+				// and a step measured from the latch would count it as free.
+				// Nothing is measured: the cap stands as written, and the
+				// workloads' status updates re-enqueue the CR when the pods
+				// have landed.
+				capped = sizingCappedConditionMessage(agent)
+			} else if earned > tier {
 				// The earned tier first, then each tier between it and the
 				// running one, every step measured from the running tier
 				// against the same used totals: the highest step the quotas

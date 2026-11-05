@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -66,13 +67,69 @@ func sizingQuota(name, hard, used string) *corev1.ResourceQuota {
 	}
 }
 
-// resolveSizing runs resolveSizingTier against a fake client holding the CR
-// and objs, and returns the CR as the client stores it afterwards.
+// sizedWorkloadsAt are the three sized workloads as a pass at tier leaves
+// them once its rollout has landed: each template's sized container at the
+// tier's Standard render (the sidecar as the native init container it is),
+// the controller's status at the current generation with the one replica
+// updated.
+func sizedWorkloadsAt(agent *agentv1alpha1.PlatformAgent, tier sizingTier) []client.Object {
+	meta := func(name string) metav1.ObjectMeta {
+		return metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Generation: 1}
+	}
+	proxy := &appsv1.Deployment{
+		ObjectMeta: meta(credentialProxyName(agent)),
+		Spec: appsv1.DeploymentSpec{Replicas: ptr.To[int32](1), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: credentialProxyContainerName, Resources: renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, tier)},
+		}}}},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1},
+	}
+	gateway := &appsv1.Deployment{
+		ObjectMeta: meta(agent.Name + gatewayWorkloadNameSuffix),
+		Spec: appsv1.DeploymentSpec{Replicas: ptr.To[int32](1), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			InitContainers: []corev1.Container{{Name: agentAPIAuthContainerName, Resources: renderedAgentAPIAuthResourcesAt(agent.Spec.Deployment, tier)}},
+			Containers:     []corev1.Container{{Name: platformAgentContainerName}},
+		}}},
+		Status: appsv1.DeploymentStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1},
+	}
+	shell := &appsv1.StatefulSet{
+		ObjectMeta: meta(shellSandboxName(agent)),
+		Spec: appsv1.StatefulSetSpec{Replicas: ptr.To[int32](1), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+			{Name: shellSandboxContainerName, Resources: renderedShellSandboxResourcesAt(agent, tier)},
+		}}}},
+		Status: appsv1.StatefulSetStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1},
+	}
+	return []client.Object{proxy, gateway, shell}
+}
+
+// sizedPodsWithClass are one live pod per sized workload, each carrying class
+// as its priorityClassName ("" for a cluster with no globalDefault class).
+func sizedPodsWithClass(agent *agentv1alpha1.PlatformAgent, class string) []client.Object {
+	var pods []client.Object
+	for i, selector := range sizedWorkloadSelectors(agent) {
+		pods = append(pods, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "sized-pod-" + string(rune('a'+i)), Namespace: agent.Namespace, Labels: selector},
+			Spec:       corev1.PodSpec{PriorityClassName: class},
+		})
+	}
+	return pods
+}
+
+// sizingFixtures is the CR with its three workloads landed at the tier it
+// renders and their pods carrying no priority class, plus objs.
+func sizingFixtures(agent *agentv1alpha1.PlatformAgent, objs ...client.Object) []client.Object {
+	fixtures := append([]client.Object{agent}, sizedWorkloadsAt(agent, renderedSizingTier(agent))...)
+	fixtures = append(fixtures, sizedPodsWithClass(agent, "")...)
+	return append(fixtures, objs...)
+}
+
+// resolveSizing runs resolveSizingTier against a fake client holding the CR,
+// its landed workloads and pods (sizingFixtures) and objs, and returns the CR
+// as the client stores it afterwards.
 func resolveSizing(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) (*agentv1alpha1.PlatformAgent, *record.FakeRecorder) {
 	t.Helper()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(append([]client.Object{agent}, objs...)...).
+		WithObjects(sizingFixtures(agent, objs...)...).
 		WithStatusSubresource(agent).Build()
 	recorder := record.NewFakeRecorder(8)
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
@@ -174,7 +231,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		quota := sizingQuota("platform-baseline-quota", "10Gi", "8Gi")
 		scheme := setupScheme()
 		writes := 0
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithStatusSubresource(agent).
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sizingFixtures(agent, quota)...).WithStatusSubresource(agent).
 			WithInterceptorFuncs(interceptor.Funcs{
 				SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 					writes++
@@ -212,7 +269,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		quota := sizingQuota("platform-baseline-quota", "10Gi", "8Gi")
 		scheme := setupScheme()
 		writes := 0
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithStatusSubresource(agent).
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sizingFixtures(agent, quota)...).WithStatusSubresource(agent).
 			WithInterceptorFuncs(interceptor.Funcs{
 				SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 					writes++
@@ -298,7 +355,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
 		quota := sizingQuota("platform-baseline-quota", "10Gi", "8Gi")
 		scheme := setupScheme()
-		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, quota).WithStatusSubresource(agent).Build()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sizingFixtures(agent, quota)...).WithStatusSubresource(agent).Build()
 		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
 		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
 			t.Fatalf("first pass: %v", err)
@@ -456,7 +513,7 @@ func TestResolveSizingTierWritesOnlyOnChange(t *testing.T) {
 	agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
 	scheme := setupScheme()
 	writes := 0
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sizingFixtures(agent)...).WithStatusSubresource(agent).
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 				writes++
@@ -673,7 +730,7 @@ func TestResolveSizingTierUnderAPruningCRDWritesOncePerInterval(t *testing.T) {
 	scheme := setupScheme()
 	writes := 0
 	pruning := true
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sizingFixtures(agent)...).WithStatusSubresource(agent).
 		WithInterceptorFuncs(interceptor.Funcs{
 			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
 				writes++
@@ -731,7 +788,10 @@ func TestResolveSizingTierUnderAPruningCRDWritesOncePerInterval(t *testing.T) {
 func TestSizingQuotaBindsThePods(t *testing.T) {
 	t.Parallel()
 	// The fixed answer per scope: the sized pods are long-running, have
-	// requests, carry no priority class and no cross-namespace affinity.
+	// requests and no cross-namespace affinity. PriorityClass is read against
+	// the class the live pods carry: none on a cluster without a
+	// globalDefault PriorityClass, the default's name on one with it, and
+	// with no pod to read the quota is taken as binding.
 	scoped := func(scopes ...corev1.ResourceQuotaScope) *corev1.ResourceQuota {
 		return &corev1.ResourceQuota{Spec: corev1.ResourceQuotaSpec{Scopes: scopes}}
 	}
@@ -741,34 +801,321 @@ func TestSizingQuotaBindsThePods(t *testing.T) {
 	priority := func(op corev1.ScopeSelectorOperator, values ...string) corev1.ScopedResourceSelectorRequirement {
 		return corev1.ScopedResourceSelectorRequirement{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: op, Values: values}
 	}
+	noClass := []string{""}
+	defaultClass := []string{"cluster-default"}
 	cases := []struct {
-		name  string
-		quota *corev1.ResourceQuota
-		want  bool
+		name    string
+		quota   *corev1.ResourceQuota
+		classes []string
+		want    bool
 	}{
-		{"unscoped", &corev1.ResourceQuota{}, true},
-		{"NotTerminating", scoped(corev1.ResourceQuotaScopeNotTerminating), true},
-		{"NotBestEffort", scoped(corev1.ResourceQuotaScopeNotBestEffort), true},
-		{"both of them", scoped(corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeNotBestEffort), true},
-		{"Terminating", scoped(corev1.ResourceQuotaScopeTerminating), false},
-		{"BestEffort", scoped(corev1.ResourceQuotaScopeBestEffort), false},
-		{"CrossNamespacePodAffinity", scoped(corev1.ResourceQuotaScopeCrossNamespacePodAffinity), false},
-		{"VolumeAttributesClass", scoped(corev1.ResourceQuotaScopeVolumeAttributesClass), false},
-		{"PriorityClass in scopes is Exists", scoped(corev1.ResourceQuotaScopePriorityClass), false},
-		{"NotTerminating beside Terminating", scoped(corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeTerminating), false},
-		{"priorityClass In", selected(priority(corev1.ScopeSelectorOpIn, "cluster-services")), false},
-		{"priorityClass Exists", selected(priority(corev1.ScopeSelectorOpExists)), false},
-		{"priorityClass NotIn", selected(priority(corev1.ScopeSelectorOpNotIn, "cluster-services")), true},
-		{"priorityClass DoesNotExist", selected(priority(corev1.ScopeSelectorOpDoesNotExist)), true},
-		{"a selector with a NotTerminating requirement", selected(corev1.ScopedResourceSelectorRequirement{ScopeName: corev1.ResourceQuotaScopeNotTerminating, Operator: corev1.ScopeSelectorOpExists}), true},
-		{"a scope this operator does not know", scoped(corev1.ResourceQuotaScope("SomethingNewer")), true},
+		{"unscoped", &corev1.ResourceQuota{}, noClass, true},
+		{"NotTerminating", scoped(corev1.ResourceQuotaScopeNotTerminating), noClass, true},
+		{"NotBestEffort", scoped(corev1.ResourceQuotaScopeNotBestEffort), noClass, true},
+		{"both of them", scoped(corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeNotBestEffort), noClass, true},
+		{"Terminating", scoped(corev1.ResourceQuotaScopeTerminating), noClass, false},
+		{"BestEffort", scoped(corev1.ResourceQuotaScopeBestEffort), noClass, false},
+		{"CrossNamespacePodAffinity", scoped(corev1.ResourceQuotaScopeCrossNamespacePodAffinity), noClass, false},
+		{"VolumeAttributesClass", scoped(corev1.ResourceQuotaScopeVolumeAttributesClass), noClass, false},
+		{"PriorityClass in scopes is Exists", scoped(corev1.ResourceQuotaScopePriorityClass), noClass, false},
+		{"NotTerminating beside Terminating", scoped(corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopeTerminating), noClass, false},
+		{"priorityClass In", selected(priority(corev1.ScopeSelectorOpIn, "cluster-services")), noClass, false},
+		{"priorityClass Exists", selected(priority(corev1.ScopeSelectorOpExists)), noClass, false},
+		{"priorityClass NotIn", selected(priority(corev1.ScopeSelectorOpNotIn, "cluster-services")), noClass, true},
+		{"priorityClass DoesNotExist", selected(priority(corev1.ScopeSelectorOpDoesNotExist)), noClass, true},
+		{"a selector with a NotTerminating requirement", selected(corev1.ScopedResourceSelectorRequirement{ScopeName: corev1.ResourceQuotaScopeNotTerminating, Operator: corev1.ScopeSelectorOpExists}), noClass, true},
+		{"a scope this operator does not know", scoped(corev1.ResourceQuotaScope("SomethingNewer")), noClass, true},
+		// The pods carry the cluster's globalDefault class: In and Exists
+		// on it bind, DoesNotExist and NotIn on it do not, In on another
+		// class still does not.
+		{"the default class: PriorityClass in scopes", scoped(corev1.ResourceQuotaScopePriorityClass), defaultClass, true},
+		{"the default class: In it", selected(priority(corev1.ScopeSelectorOpIn, "cluster-default")), defaultClass, true},
+		{"the default class: In another", selected(priority(corev1.ScopeSelectorOpIn, "cluster-services")), defaultClass, false},
+		{"the default class: Exists", selected(priority(corev1.ScopeSelectorOpExists)), defaultClass, true},
+		{"the default class: NotIn it", selected(priority(corev1.ScopeSelectorOpNotIn, "cluster-default")), defaultClass, false},
+		{"the default class: NotIn another", selected(priority(corev1.ScopeSelectorOpNotIn, "cluster-services")), defaultClass, true},
+		{"the default class: DoesNotExist", selected(priority(corev1.ScopeSelectorOpDoesNotExist)), defaultClass, false},
+		// Pods from before and after the default was created: a requirement
+		// that selects either binds.
+		{"mixed classes: In the default", selected(priority(corev1.ScopeSelectorOpIn, "cluster-default")), []string{"", "cluster-default"}, true},
+		{"mixed classes: DoesNotExist", selected(priority(corev1.ScopeSelectorOpDoesNotExist)), []string{"", "cluster-default"}, true},
+		// No pod to read: every PriorityClass requirement binds, the side
+		// that holds the tier; the fixed scopes keep their answers.
+		{"no pod: In", selected(priority(corev1.ScopeSelectorOpIn, "cluster-services")), nil, true},
+		{"no pod: Exists", selected(priority(corev1.ScopeSelectorOpExists)), nil, true},
+		{"no pod: DoesNotExist", selected(priority(corev1.ScopeSelectorOpDoesNotExist)), nil, true},
+		{"no pod: Terminating", scoped(corev1.ResourceQuotaScopeTerminating), nil, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := sizingQuotaBindsThePods(tc.quota); got != tc.want {
+			if got := sizingQuotaBindsThePods(tc.quota, tc.classes); got != tc.want {
 				t.Fatalf("sizingQuotaBindsThePods = %v, want %v", got, tc.want)
 			}
 		})
 	}
+}
+
+func TestSizingQuotaScopesPriorityClass(t *testing.T) {
+	t.Parallel()
+	inScopes := &corev1.ResourceQuota{Spec: corev1.ResourceQuotaSpec{Scopes: []corev1.ResourceQuotaScope{corev1.ResourceQuotaScopeNotTerminating, corev1.ResourceQuotaScopePriorityClass}}}
+	inSelector := &corev1.ResourceQuota{Spec: corev1.ResourceQuotaSpec{ScopeSelector: &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
+		{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: corev1.ScopeSelectorOpIn, Values: []string{"cluster-default"}},
+	}}}}
+	other := &corev1.ResourceQuota{Spec: corev1.ResourceQuotaSpec{Scopes: []corev1.ResourceQuotaScope{corev1.ResourceQuotaScopeNotTerminating}}}
+	for name, tc := range map[string]struct {
+		quota *corev1.ResourceQuota
+		want  bool
+	}{"in scopes": {inScopes, true}, "in the selector": {inSelector, true}, "another scope": {other, false}, "unscoped": {&corev1.ResourceQuota{}, false}} {
+		if got := sizingQuotaScopesPriorityClass(tc.quota); got != tc.want {
+			t.Errorf("%s: sizingQuotaScopesPriorityClass = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestResolveSizingTierReadsThePriorityClassThePodsCarry(t *testing.T) {
+	t.Parallel()
+	// A cluster with a globalDefault PriorityClass: the API server fills it
+	// in on every sized pod, so a quota scoped In that class binds them and
+	// a short one caps the tier, and a DoesNotExist quota does not bind them
+	// and is not read. Each quota is short of the medium step on its own.
+	inDefault := sizingQuota("default-class", "10Gi", "8Gi")
+	inDefault.Spec.ScopeSelector = &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
+		{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: corev1.ScopeSelectorOpIn, Values: []string{"cluster-default"}},
+	}}
+	noClass := sizingQuota("no-class", "10Gi", "8Gi")
+	noClass.Spec.ScopeSelector = &corev1.ScopeSelector{MatchExpressions: []corev1.ScopedResourceSelectorRequirement{
+		{ScopeName: corev1.ResourceQuotaScopePriorityClass, Operator: corev1.ScopeSelectorOpDoesNotExist},
+	}}
+	run := func(t *testing.T, quota *corev1.ResourceQuota) *agentv1alpha1.PlatformAgent {
+		t.Helper()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+		objs := append([]client.Object{agent, quota}, sizedWorkloadsAt(agent, sizingTierSmall)...)
+		objs = append(objs, sizedPodsWithClass(agent, "cluster-default")...)
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).WithStatusSubresource(agent).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8)}
+		if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+			t.Fatalf("resolveSizingTier: %v", err)
+		}
+		return agent
+	}
+	t.Run("a quota In the default class binds the pods and caps the tier", func(t *testing.T) {
+		t.Parallel()
+		agent := run(t, inDefault)
+		if agent.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small: a quota scoped to the class the pods carry was skipped", agent.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || !strings.Contains(cond.Message, "ResourceQuota default-class has no room on requests.memory") {
+			t.Fatalf("SizingCappedByQuota = %+v", cond)
+		}
+	})
+	t.Run("a DoesNotExist quota does not bind pods carrying the default class", func(t *testing.T) {
+		t.Parallel()
+		agent := run(t, noClass)
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: a quota that cannot count pods carrying a class capped the tier", agent.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota set by a quota whose scope does not select the pods: %+v", cond)
+		}
+	})
+}
+
+func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierLands(t *testing.T) {
+	t.Parallel()
+	// The walk a partial promotion takes. Latched small at 25 clusters with
+	// one requests.memory quota, 10Gi hard and 5Gi used, the broker's 1Gi
+	// inside it: the fleet step (7Gi) is refused, the medium step (3Gi)
+	// admitted, so the first pass latches medium and caps fleet. The status
+	// write re-enqueues the CR at once, while the proxy's Recreate rollout
+	// has deleted the old pod and not yet created the new one, so the quota
+	// charges 4Gi and nothing of the medium step: a second pass measuring
+	// medium->fleet (4Gi) from the latch against 6Gi free would promote to
+	// fleet, and admission would then refuse the 8Gi pod with the 1Gi one
+	// gone. The pass measures nothing until the medium pods have landed;
+	// once they have, and the quota charges them, the fleet step is short
+	// by the right figure, and a raised quota admits it.
+	agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+	quota := sizingQuota("platform-baseline-quota", "10Gi", "5Gi")
+	scheme := setupScheme()
+	writes := 0
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sizingFixtures(agent, quota)...).WithStatusSubresource(agent).
+		WithInterceptorFuncs(interceptor.Funcs{
+			SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+				// The CR's writes alone: the test moves the workloads' status
+				// through the same writer.
+				if _, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+					writes++
+				}
+				return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+			},
+		}).Build()
+	recorder := record.NewFakeRecorder(8)
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
+	ctx := context.Background()
+	pass := func(what string) {
+		t.Helper()
+		if err := r.resolveSizingTier(ctx, agent); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	capped := func(what string) {
+		t.Helper()
+		cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
+		if agent.Status.EffectiveSizingTier != sizingProfileMedium || cond == nil || !strings.Contains(cond.Message, "earns the fleet tier") || !strings.Contains(cond.Message, "the medium tier stays") {
+			t.Fatalf("%s: status.effectiveSizingTier = %q, SizingCappedByQuota = %+v; want medium with the cap naming fleet", what, agent.Status.EffectiveSizingTier, cond)
+		}
+	}
+	pass("first pass")
+	capped("after the first pass")
+	if writes != 1 {
+		t.Fatalf("%d status writes after the first pass, want 1", writes)
+	}
+
+	// Step 11 of the same pass re-rendered the proxy at medium and the
+	// gateway's sidecar with it; the Deployment controller has observed
+	// both, deleted the old proxy pod and not yet created the new one; the
+	// quota controller has released the old pod's 1Gi.
+	proxy := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, proxy); err != nil {
+		t.Fatal(err)
+	}
+	proxy.Generation = 2
+	proxy.Spec.Template.Spec.Containers[0].Resources = renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, sizingTierMedium)
+	if err := cl.Update(ctx, proxy); err != nil {
+		t.Fatal(err)
+	}
+	proxy.Status = appsv1.DeploymentStatus{ObservedGeneration: 2}
+	if err := cl.Status().Update(ctx, proxy); err != nil {
+		t.Fatal(err)
+	}
+	gateway := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}, gateway); err != nil {
+		t.Fatal(err)
+	}
+	gateway.Generation = 2
+	gateway.Spec.Template.Spec.InitContainers[0].Resources = renderedAgentAPIAuthResourcesAt(agent.Spec.Deployment, sizingTierMedium)
+	if err := cl.Update(ctx, gateway); err != nil {
+		t.Fatal(err)
+	}
+	gateway.Status = appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1}
+	if err := cl.Status().Update(ctx, gateway); err != nil {
+		t.Fatal(err)
+	}
+	quota.Status.Used[corev1.ResourceRequestsMemory] = resource.MustParse("4Gi")
+	if err := cl.Update(ctx, quota); err != nil {
+		t.Fatal(err)
+	}
+	pass("second pass, the status write's echo, mid-rollout")
+	capped("mid-rollout")
+	if writes != 1 || len(recorder.Events) != 2 {
+		t.Fatalf("mid-rollout: %d status writes and %d events, want the first pass's 1 and 2: the pass measured a step from the latch", writes, len(recorder.Events))
+	}
+
+	// The medium pod is admitted: the quota charges its 4Gi, 2Gi stay free,
+	// and the fleet step from medium adds 4Gi. Still short, as written.
+	proxy.Status = appsv1.DeploymentStatus{ObservedGeneration: 2, Replicas: 1, UpdatedReplicas: 1}
+	if err := cl.Status().Update(ctx, proxy); err != nil {
+		t.Fatal(err)
+	}
+	quota.Status.Used[corev1.ResourceRequestsMemory] = resource.MustParse("8Gi")
+	if err := cl.Update(ctx, quota); err != nil {
+		t.Fatal(err)
+	}
+	pass("third pass, the medium pods landed")
+	capped("after the medium pods landed")
+	if writes != 1 {
+		t.Fatalf("%d status writes after the medium pods landed, want 1: the cap stood as written", writes)
+	}
+
+	// The quota is raised by the fleet step: the pass takes it.
+	quota.Spec.Hard[corev1.ResourceRequestsMemory] = resource.MustParse("12Gi")
+	if err := cl.Update(ctx, quota); err != nil {
+		t.Fatal(err)
+	}
+	pass("fourth pass, the quota raised")
+	if agent.Status.EffectiveSizingTier != sizingProfileFleet || writes != 2 {
+		t.Fatalf("after the quota was raised: tier %q, %d writes; want fleet and 2", agent.Status.EffectiveSizingTier, writes)
+	}
+	if cond := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+		t.Fatalf("SizingCappedByQuota kept after the fleet step was admitted: %+v", cond)
+	}
+}
+
+func TestSizingTierLanded(t *testing.T) {
+	t.Parallel()
+	// The three sized workloads at the small render, as the fixtures leave
+	// them, and each way one of them has not landed; the Autopilot rewrite
+	// of a template reads as landed, and a container the template does not
+	// carry is not compared.
+	type mutate func(proxy, gateway *appsv1.Deployment, shell *appsv1.StatefulSet) []client.Object
+	cases := []struct {
+		name string
+		mut  mutate
+		want bool
+	}{
+		{"all three landed", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, g, s} }, true},
+		{"the proxy Deployment is not there", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{g, s} }, false},
+		{"the shell StatefulSet is not there", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, g} }, false},
+		{"the gateway is not there", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, s} }, false},
+		{"the proxy's controller has not observed the generation", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			p.Generation = 2
+			return []client.Object{p, g, s}
+		}, false},
+		{"the proxy's new pod is not created yet", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			p.Status.UpdatedReplicas, p.Status.Replicas = 0, 0
+			return []client.Object{p, g, s}
+		}, false},
+		{"the shell's new pod is not created yet", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			s.Status.UpdatedReplicas = 0
+			return []client.Object{p, g, s}
+		}, false},
+		{"the proxy scaled to zero has nothing to land", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			p.Spec.Replicas = ptr.To[int32](0)
+			p.Status.UpdatedReplicas, p.Status.Replicas = 0, 0
+			return []client.Object{p, g, s}
+		}, true},
+		{"the gateway without the sidecar is not compared", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			g.Spec.Template.Spec.InitContainers = nil
+			return []client.Object{p, g, s}
+		}, true},
+		{"the template Autopilot rewrote upward", func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			rr := &p.Spec.Template.Spec.Containers[0].Resources
+			rr.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("2Gi")
+			rr.Requests[corev1.ResourceCPU] = resource.MustParse("2")
+			rr.Requests[corev1.ResourceMemory] = resource.MustParse("2Gi")
+			return []client.Object{p, g, s}
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
+			workloads := sizedWorkloadsAt(agent, sizingTierSmall)
+			objs := tc.mut(workloads[0].(*appsv1.Deployment), workloads[1].(*appsv1.Deployment), workloads[2].(*appsv1.StatefulSet))
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, objs...)...).Build()
+			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+			if got := r.sizingTierLanded(context.Background(), agent, sizingTierSmall); got != tc.want {
+				t.Fatalf("sizingTierLanded = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	t.Run("a template at the lower tier has not landed the higher one", func(t *testing.T) {
+		t.Parallel()
+		// The latch moved to medium and the pass parked before the proxy was
+		// re-rendered: the template is the small render, rolled out.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](25), nil)
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, sizedWorkloadsAt(agent, sizingTierSmall)...)...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+		if r.sizingTierLanded(context.Background(), agent, sizingTierMedium) {
+			t.Fatal("sizingTierLanded = true for a template rendered at small")
+		}
+		if !r.sizingTierLanded(context.Background(), agent, sizingTierSmall) {
+			t.Fatal("sizingTierLanded = false for the tier the template carries")
+		}
+	})
 }
