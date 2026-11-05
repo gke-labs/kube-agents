@@ -68,8 +68,13 @@ def _share(value: float) -> str:
     return f"{_points(value)}%"
 
 
+def _rounded(value: float) -> int:
+    """A count rounded half up, as the line prints it."""
+    return math.floor(value + 0.5)
+
+
 def _whole(value: float) -> str:
-    return f"{value:.0f}"
+    return str(_rounded(value))
 
 
 def _count(value) -> float | None:
@@ -116,7 +121,10 @@ def regressions(nights: list[dict]) -> list[str]:
     if now[APOLOGY_SHARE] is not None and base[APOLOGY_SHARE] is not None and _points(now[APOLOGY_SHARE]) >= _points(base[APOLOGY_SHARE]) + SHARE_DROP_POINTS:
         out.append(APOLOGY_SHARE)
     for key in (ANSWER_P50, MESSAGES_P50):
-        if now[key] is not None and base[key] and now[key] >= GROWTH_RATIO * base[key]:
+        # Against the typical as the line prints it, so a mark never
+        # disagrees with the two numbers the reader is shown.
+        typical = _rounded(base[key]) if base[key] is not None else None
+        if now[key] is not None and typical and now[key] >= GROWTH_RATIO * typical:
             out.append(key)
     return out
 

@@ -55,6 +55,14 @@ class NightLineTest(unittest.TestCase):
     def test_a_half_point_rounds_up_as_the_page_does(self):
         self.assertIn("13% of 40 reps", nt.night_line([night(verdict=5)] + steady(2)))
 
+    def test_a_count_is_judged_against_its_typical_as_printed(self):
+        # Six baseline nights at 2, 2, 2, 3, 3, 3 messages: the median 2.5
+        # prints as 3, so 3 messages tonight is no regression, and 5 is.
+        base = steady(3, messages=2) + steady(3, messages=3)
+        self.assertIn("messages p50 3 (typical 3)", nt.night_line([night(messages=3)] + base))
+        self.assertEqual(nt.regressions([night(messages=4)] + base), [])
+        self.assertEqual(nt.regressions([night(messages=5)] + base), [nt.MESSAGES_P50])
+
     def test_just_short_of_the_threshold_is_not_marked(self):
         nights = [night(verdict=33, apology=3, words=89)] + steady(7)
         self.assertEqual(nt.regressions(nights), [])
