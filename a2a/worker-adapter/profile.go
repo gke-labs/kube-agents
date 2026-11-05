@@ -340,12 +340,17 @@ func (w *profileWorker) loop(ctx context.Context) error {
 
 		case out := <-taskDone:
 			w.finish(cur, out)
+			// The workspace is emptied after the terminal and the final
+			// renewal are out, so the reset never eats into the deadline
+			// margin, and before the task is released, so no offer is
+			// taken until it's done.
+			resetErr := w.resetWorkspace("after-task", cur.offer.TaskID)
 			oneShot := release()
 			// A pod that can't run a harness, or whose workspace couldn't be
 			// emptied, ends rather than taking another task: the kubelet
 			// restarts it (and the startup reset runs again).
-			if out.resetErr != nil {
-				return out.resetErr
+			if resetErr != nil {
+				return resetErr
 			}
 			if out.podBroken {
 				return fmt.Errorf("this pod can't run a harness (%v); ending so it restarts", out.err)
@@ -545,7 +550,9 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		if err != nil {
 			closeTaskBus()
 			w.cfg.Logger.Error("could not write the task's persona config; not running the task", "task", cfg.TaskID, "err", err)
-			h.done <- turnOutcome{err: err}
+			// The config root is the pod's: every task would fail the same
+			// way, so the pod ends rather than taking the next.
+			h.done <- turnOutcome{err: err, podBroken: true}
 			return h.done
 		}
 		removeConfig = remove
@@ -574,7 +581,6 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		removeConfig()
 		removeToken()
 		closeTaskBus()
-		out.resetErr = w.resetWorkspace("after-task", h.offer.TaskID)
 		h.done <- out
 	}()
 	return h.done

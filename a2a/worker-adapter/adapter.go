@@ -636,9 +636,6 @@ type turnPlan struct {
 type turnOutcome struct {
 	res Result
 	err error
-	// resetErr is a profile worker's failure to empty its reset paths after
-	// the task (profile.go), which ends the worker.
-	resetErr error
 	// launched is true once a harness process started for this task.
 	launched bool
 	// harnessSession is the session id the harness reported at init, or ""
@@ -701,6 +698,12 @@ func (a *adapter) run(ctx context.Context, origin *lib.Envelope, originSeq uint6
 	a.exec = exec
 	a.taskID, a.contextID, a.correlationID = origin.TaskID, origin.ContextID, origin.CorrelationID
 
+	// An abandon already here ends the task before anything of it is
+	// published (the dispatcher writes its terminal); the check before
+	// working below catches one that lands during setup.
+	if a.abandoned() {
+		return done(Result{Abandoned: true}, nil)
+	}
 	if !skipSubmitted {
 		if err := exec.PublishStatus(ctx, lib.StateSubmitted, false); err != nil {
 			return done(Result{}, fmt.Errorf("publish submitted: %w", err))

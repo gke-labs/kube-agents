@@ -324,11 +324,12 @@ sleep 30
 // worker is told to stop while it is still holding the pipe.
 func TestAnAbandonedTaskPublishesNothingWhileItDrains(t *testing.T) {
 	url := startServer(t)
+	mark := detachedChildMark(t)
 	d := newFakeDispatcher(t, url)
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"pw-drain"}'
 read first || exit 1
-perl -e '$|=1; setpgrp(0,0); sleep 1; print qq({"type":"assistant","message":{"content":[{"type":"text","text":"late-text"}]}}\n); sleep 4' &
+perl -e '$|=1; setpgrp(0,0); open(my $m, ">", $ENV{PGRP_MARK}) and close($m); sleep 1; print qq({"type":"assistant","message":{"content":[{"type":"text","text":"late-text"}]}}\n); sleep 4' &
 sleep 30
 `)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -341,6 +342,7 @@ sleep 30
 	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
 	waitState(t, testClient(t, url), pwProfile, task, lib.StateWorking)
 	before := len(replayEvents(t, url, pwProfile, task))
+	waitDetached(t, mark)
 	d.send(lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: task, Reason: "lease-expired - test"})
 
 	// The late line lands about a second after the abandon; the SIGTERM
@@ -949,7 +951,7 @@ echo '{"type":"result","subtype":"success","result":"should never run"}'
 	for _, e := range replayEvents(t, url, pwProfile, task) {
 		if e.Kind == lib.KindStatusUpdate {
 			var u lib.StatusUpdate
-			if json.Unmarshal(e.Payload, &u) == nil && (u.Status.State == lib.StateWorking || u.Final) {
+			if json.Unmarshal(e.Payload, &u) == nil {
 				t.Errorf("published %s (final=%v) for a task abandoned before it started", u.Status.State, u.Final)
 			}
 		}
@@ -967,11 +969,12 @@ func TestAnAbandonBesideASigtermPublishesNoTerminal(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			url := startServer(t)
+			mark := detachedChildMark(t)
 			d := newFakeDispatcher(t, url)
 			harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"pw-both"}'
 read first || exit 1
-perl -e 'setpgrp(0,0); sleep 4' &
+perl -e 'setpgrp(0,0); open(my $m, ">", $ENV{PGRP_MARK}) and close($m); sleep 4' &
 sleep 30
 `)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -983,6 +986,7 @@ sleep 30
 			d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
 			waitState(t, testClient(t, url), pwProfile, task, lib.StateWorking)
 			// The abandon, then the SIGTERM as soon as it has arrived.
+			waitDetached(t, mark)
 			d.send(lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: task, Reason: "stop - test"})
 			time.Sleep(50 * time.Millisecond)
 			cancel()
@@ -1294,6 +1298,45 @@ func TestAPodThatCantRunAHarnessEnds(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("a pod that can't run a harness kept running")
 	}
+	// It ends after the task's terminal and final renewal are out, so the
+	// dispatcher doesn't wait for the lease to lapse.
+	if got := foldTask(t, testClient(t, url), pwProfile, "task-cant"); !got.Final || got.State != lib.StateFailed {
+		t.Errorf("the task the broken pod couldn't start = %s (final %v), want a failed terminal", got.State, got.Final)
+	}
+	if _, final := drainLeases(d, "task-cant", 2*time.Second); !final {
+		t.Error("no final renewal for the task the broken pod couldn't start")
+	}
+}
+
+// A config root the worker can't write ends the pod after the task it
+// couldn't set up, like a harness it can't start: every task would fail
+// the same way.
+func TestABrokenConfigRootEndsTheWorker(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	harness := stub(t, `
+read first || exit 1
+echo '{"type":"result","subtype":"success","result":"done"}'
+`)
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logBuf syncBuffer
+	_, done := startWorkerWithReset(t, context.Background(), url, harness, ProfileWorkerConfig{
+		PersonaDir: "../lib/persona/testdata/example", Harness: persona.ClaudeCode, ConfigRoot: notADir,
+	}, &logBuf, true)
+	d.offer("task-noconf", profileSubmission(t, "task-noconf", "anything", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-noconf"})
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "can't run a harness") {
+			t.Errorf("the worker ended with %v, want the broken-pod error", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("a pod with a broken config root kept running")
+	}
 }
 
 // Liveness fails once the bus connection is closed for good, so the kubelet
@@ -1333,12 +1376,13 @@ func TestHealthzFailsOnceTheBusConnectionIsClosed(t *testing.T) {
 // drain, and once the task is released the next offer is accepted.
 func TestAnOfferDuringAnAbandonedDrainIsAnsweredAtOnce(t *testing.T) {
 	url := startServer(t)
+	mark := detachedChildMark(t)
 	d := newFakeDispatcher(t, url)
 	harness := stub(t, `
 echo '{"type":"system","subtype":"init","session_id":"pw-drain-offer"}'
 read first || exit 1
 case "$first" in
-  *SLOWDRAIN*) perl -e 'setpgrp(0,0); sleep 4' & sleep 30 ;;
+  *SLOWDRAIN*) perl -e 'setpgrp(0,0); open(my $m, ">", $ENV{PGRP_MARK}) and close($m); sleep 4' & sleep 30 ;;
 esac
 echo '{"type":"result","subtype":"success","result":"done"}'
 `)
@@ -1350,6 +1394,7 @@ echo '{"type":"result","subtype":"success","result":"done"}'
 	d.nextAccept(5 * time.Second)
 	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-slow"})
 	waitState(t, testClient(t, url), pwProfile, "task-slow", lib.StateWorking)
+	waitDetached(t, mark)
 	d.send(lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: "task-slow", Reason: "lease-expired - test"})
 	time.Sleep(100 * time.Millisecond)
 
@@ -1363,4 +1408,24 @@ echo '{"type":"result","subtype":"success","result":"done"}'
 	if a := d.nextAccept(5 * time.Second); a.TaskID != "task-after" || !a.Accepted {
 		t.Errorf("an offer after the drain = %+v, want an accept", a)
 	}
+}
+
+// detachedChildMark is the file the drain tests' perl child writes once it
+// has its own process group, and waitDetached waits for it, so an abandon
+// is never sent before the child is out of the harness's group.
+func detachedChildMark(t *testing.T) string {
+	t.Helper()
+	mark := filepath.Join(t.TempDir(), "pgrp")
+	t.Setenv("PGRP_MARK", mark)
+	return mark
+}
+
+func waitDetached(t *testing.T, mark string) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if _, err := os.Stat(mark); err == nil {
+			return
+		}
+	}
+	t.Fatal("the harness's child never left its process group")
 }
