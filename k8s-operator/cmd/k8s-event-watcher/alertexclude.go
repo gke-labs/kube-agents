@@ -20,12 +20,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"strconv"
 	"strings"
 )
 
 // alertExcludeNameWildcard, as the last character of a rule's name, makes the
 // rest of the name a prefix.
 const alertExcludeNameWildcard = "*"
+
+const (
+	// alertExcludeAnyClusterKey stands for a cluster key a rule leaves unset,
+	// which matches any value, in a rule's log form.
+	alertExcludeAnyClusterKey = "*"
+	// alertExcludeClusterKeySeparator joins a rule's projectId, location and
+	// clusterName in its log form.
+	alertExcludeClusterKeySeparator = "/"
+	alertExcludeRuleLogFormat       = "k8s-event-watcher: alert-exclude rule %d of %d: %s"
+	alertExcludeSummaryLogFormat    = "k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s"
+	alertExcludeRefusedLogFormat    = "k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident"
+)
 
 // alertExcludeRule is one entry of --alert-exclude: events it matches open no
 // incident, while their cluster stays in scope for reads. Every part is
@@ -91,6 +105,59 @@ func parseAlertExclude(raw string) ([]alertExcludeRule, error) {
 		}
 	}
 	return rules, nil
+}
+
+// loadAlertExclude parses --alert-exclude, logs each rule in force and sets
+// the two alert-exclude gauges. A malformed list fails open, as the
+// entrypoint's tunables do: stopping would end incident detection for every
+// cluster to silence a few. It returns no rules then, so a parse error can
+// never leave a partial list in force while the log says none is, and the
+// refused gauge is 1 so an alert can see it.
+func loadAlertExclude(raw string, m *metrics) []alertExcludeRule {
+	rules, err := parseAlertExclude(raw)
+	if err != nil {
+		log.Printf(alertExcludeRefusedLogFormat, err)
+		m.alertExcludeRules.Set(0)
+		m.alertExcludeRefused.Set(1)
+		return nil
+	}
+	m.alertExcludeRules.Set(float64(len(rules)))
+	m.alertExcludeRefused.Set(0)
+	for i, r := range rules {
+		log.Printf(alertExcludeRuleLogFormat, i+1, len(rules), r)
+	}
+	if len(rules) > 0 {
+		log.Printf(alertExcludeSummaryLogFormat, len(rules), gateAlertExcluded)
+	}
+	return rules
+}
+
+// String is the rule as the startup log names it: each part it sets, values
+// quoted, and a cluster as projectId/location/clusterName with "*" for a key
+// it leaves unset.
+func (r alertExcludeRule) String() string {
+	var parts []string
+	if r.Cluster != nil {
+		parts = append(parts, "cluster="+strconv.Quote(r.Cluster.String()))
+	}
+	for _, p := range []struct{ key, value string }{
+		{"namespace", r.Namespace}, {"reason", r.Reason}, {"kind", r.Kind}, {"name", r.Name},
+	} {
+		if p.value != "" {
+			parts = append(parts, p.key+"="+strconv.Quote(p.value))
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func (c alertExcludeCluster) String() string {
+	keys := []string{c.ProjectID, c.Location, c.ClusterName}
+	for i, k := range keys {
+		if k == "" {
+			keys[i] = alertExcludeAnyClusterKey
+		}
+	}
+	return strings.Join(keys, alertExcludeClusterKeySeparator)
 }
 
 // matches reports whether every part the rule sets matches ev.
