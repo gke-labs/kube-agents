@@ -720,9 +720,9 @@ hindsight:
     # volumeClaimTemplate size. Immutable once the StatefulSet exists.
     storage: 8Gi
   # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
-  # hindsight-api's NetworkPolicy also requires litellm.enabled=true (because its
-  # gateway egress rule selects app: litellm / app: standalone-replay pods in the
-  # release namespace); hindsight-postgresql renders whenever networkPolicy=true.
+  # When litellm.enabled=false, hindsight-api's NetworkPolicy renders as
+  # Ingress-only (because its gateway egress rule selects app: litellm /
+  # app: standalone-replay pods in the release namespace).
   networkPolicy: true
   podMonitoring: true
   podDisruptionBudget:

@@ -225,13 +225,19 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
         self.assertEqual([], disabled_netpols)
 
         byo_gateway_docs = _render_chart("--set", "litellm.enabled=false")
-        byo_gateway_netpols = [
-            d["metadata"]["name"]
+        byo_gateway_netpols = {
+            d["metadata"]["name"]: d
             for d in byo_gateway_docs
             if d.get("kind") == "NetworkPolicy"
             and d["metadata"]["name"] in self.kustomize
-        ]
-        self.assertEqual([_HINDSIGHT_POSTGRESQL_POLICY], byo_gateway_netpols)
+        }
+        self.assertEqual(set(self.kustomize), set(byo_gateway_netpols))
+        self.assertEqual(["Ingress"], byo_gateway_netpols[_HINDSIGHT_API_POLICY]["spec"]["policyTypes"])
+        self.assertNotIn("egress", byo_gateway_netpols[_HINDSIGHT_API_POLICY]["spec"])
+        self.assertEqual(
+            self.kustomize[_HINDSIGHT_API_POLICY]["spec"]["ingress"],
+            byo_gateway_netpols[_HINDSIGHT_API_POLICY]["spec"]["ingress"],
+        )
 
 
 if __name__ == "__main__":
