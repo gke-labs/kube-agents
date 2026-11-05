@@ -403,6 +403,17 @@ including:
   cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
   caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
   `Retry-After`; the session role keeps one slot up to a higher ceiling.
+- more commands in one session than its budget allows. The wrapper sends the card or
+  session id it runs under (`HERMES_KANBAN_TASK`, else `HERMES_SESSION_ID`) as the
+  request's `sessionId`, and the broker counts per key: a session of the shell, profile
+  or scope role is refused past `BROKER_SESSION_MAX_TOOL_CALLS` commands (1500) with
+  `403 BROKER_SESSION_BUDGET_EXCEEDED`, and any session is refused the same command,
+  on the same cluster, after it failed or was blocked `BROKER_SESSION_MAX_IDENTICAL_FAILURES`
+  times running (5) with `403 BROKER_LOOP_BREAKER`; `0` turns either off. The key is
+  a loop guard, never an identity: it comes from the body, which the model composes, so
+  no policy decision reads it, a request without one (a `no_agent` collector) is
+  uncounted, and the authenticated principal stays the only input to who may do what.
+  Each broker process counts alone, in an LRU of 1024 sessions.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.

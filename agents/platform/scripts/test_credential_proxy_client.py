@@ -2963,5 +2963,99 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         self.assertEqual([], self.sleeps)
 
 
+class TestSessionIdInTheExecBody(SubmittedPayloadTestCase):
+    """The exec body carries the card or session id the shim runs under, so the
+    broker can count the run's commands; absent when there is none."""
+
+    ENV = {"KUBECONFIG": "", "HERMES_KANBAN_TASK": "", "HERMES_SESSION_ID": ""}
+
+    def test_the_card_comes_first(self):
+        payload = self.submit(
+            ["gcloud", "projects", "list"],
+            {**self.ENV, "HERMES_KANBAN_TASK": "t_f660e9c5", "HERMES_SESSION_ID": "20260925_001944_b09c64"},
+        )
+        self.assertEqual("t_f660e9c5", payload["sessionId"])
+
+    def test_the_session_otherwise(self):
+        payload = self.submit(["gcloud", "projects", "list"], {**self.ENV, "HERMES_SESSION_ID": "20260925_001944_b09c64"})
+        self.assertEqual("20260925_001944_b09c64", payload["sessionId"])
+
+    def test_absent_when_neither_is_set(self):
+        payload = self.submit(["gcloud", "projects", "list"], self.ENV)
+        self.assertNotIn("sessionId", payload)
+
+    def test_a_value_outside_the_grammar_is_dropped_not_sent(self):
+        payload = self.submit(["gcloud", "projects", "list"], {**self.ENV, "HERMES_SESSION_ID": "not a token"})
+        self.assertNotIn("sessionId", payload)
+        # A malformed card falls through to the session.
+        payload = self.submit(
+            ["gcloud", "projects", "list"],
+            {**self.ENV, "HERMES_KANBAN_TASK": "not a token", "HERMES_SESSION_ID": "20260925_001944_b09c64"},
+        )
+        self.assertEqual("20260925_001944_b09c64", payload["sessionId"])
+
+
+class TestSessionRefusalsReadAsAPolicyBlock(unittest.TestCase):
+    """The broker's two per-session refusals print like a policy block and exit
+    EXIT_SECURITY_POLICY_BLOCKED, so the runtime's refusal stop reads them."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.token_path = self.tmp / "token"
+        self.token_path.write_text("valid-token\n")
+
+    def _refused_with(self, payload):
+        body = json.dumps(payload).encode("utf-8")
+        opened = []
+
+        def fake_open(req, *args, **kwargs):
+            opened.append(req)
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", http.client.HTTPMessage(), io.BytesIO(body))
+
+        stderr = io.StringIO()
+        environ = {
+            "CREDENTIAL_PROXY_TOKEN_FILE": str(self.token_path),
+            "KUBECONFIG": "",
+            "HERMES_HOME": str(self.tmp),
+            "HERMES_SESSION_ID": "robot-4726-a",
+        }
+        with patch.dict("os.environ", environ, clear=False), patch.object(credential_proxy_client, "open_broker_request", fake_open):
+            with patch("sys.stderr", new=stderr):
+                code = credential_proxy_client.execute("http://proxy", ["gcloud", "projects", "list"])
+        return code, stderr.getvalue(), opened
+
+    def test_the_loop_breaker(self):
+        message = (
+            "BROKER_LOOP_BREAKER: identical command failed or was blocked 5 consecutive times in this "
+            "session; stop retrying this command and report the refusal/error."
+        )
+        code, err, opened = self._refused_with(
+            {"status": "blocked", "code": "BROKER_LOOP_BREAKER", "rule": "session.loop-breaker", "message": message}
+        )
+        self.assertEqual(credential_proxy_client.EXIT_SECURITY_POLICY_BLOCKED, code)
+        self.assertEqual(f"{message}\npolicy rule: session.loop-breaker\n", err)
+        # Refused, not retried: one request was sent, and it carried the id.
+        self.assertEqual(1, len(opened))
+        self.assertEqual("robot-4726-a", json.loads(opened[0].data)["sessionId"])
+
+    def test_the_ceiling(self):
+        message = (
+            "BROKER_SESSION_BUDGET_EXCEEDED: session exceeded 1500 tool invocations; "
+            "summarize current findings and finish the turn."
+        )
+        code, err, opened = self._refused_with(
+            {"status": "blocked", "code": "BROKER_SESSION_BUDGET_EXCEEDED", "rule": "session.tool-budget", "message": message}
+        )
+        self.assertEqual(77, code)
+        self.assertEqual(f"{message}\npolicy rule: session.tool-budget\n", err)
+        self.assertEqual(1, len(opened))
+
+    def test_an_unknown_code_is_still_a_plain_error(self):
+        code, err, _ = self._refused_with({"status": "blocked", "code": "SOMETHING_ELSE", "error": "no"})
+        self.assertEqual(1, code)
+        self.assertEqual("no\n", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
