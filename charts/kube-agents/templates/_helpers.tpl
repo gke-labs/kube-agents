@@ -2927,13 +2927,18 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          starts one every 15 minutes, never two at once, where the gateway pod policy is on
          and the scope names something to resolve. No golden declares such a scope, so
          footprint.yaml has no entry for it. The policy is on where the chart renders it, or
-         where operator.extraEnv sets A2A_GATEWAY_POD_POLICY, which overrides the chart's
-         entry: "true", or a setting the chart cannot read, counts as on. A list declared on
+         where operator.extraEnv sets A2A_GATEWAY_POD_POLICY to "true" or in a form the chart
+         cannot read. extraEnv overrides the chart's entry, so one setting it off would turn the
+         publisher off; this counts the pod anyway, an over-count by design. A list declared on
          the PlatformAgent by hand, outside platformAgent.scope, is not seen here. */ -}}
   {{- if $next -}}
     {{- $transientFile := .Files.Get "files/transient-pods.yaml" | fromYaml -}}
     {{- $sp := index $transientFile "scopePublisher" -}}
-    {{- if not (and (kindIs "map" $sp) (kindIs "slice" (index $sp "scopeMembers"))) -}}
+    {{- $spOK := and (kindIs "map" $sp) (kindIs "slice" (index $sp "scopeMembers")) -}}
+    {{- range $key := list "pods" "cpuMillisRequest" "cpuMillisLimit" "memoryBytesRequest" "memoryBytesLimit" "ephemeralStorageBytesRequest" "ephemeralStorageBytesLimit" -}}
+      {{- $spOK = and $spOK (or (kindIs "float64" (index ($sp | default dict) $key)) (kindIs "int64" (index ($sp | default dict) $key)) (kindIs "int" (index ($sp | default dict) $key))) -}}
+    {{- end -}}
+    {{- if not $spOK -}}
       {{- fail "quota preflight: transient-pods.yaml is missing or unreadable in the chart, so the scope publisher's Job pod cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
     {{- $policy := not (empty (include "kube-agents.a2aGatewayPodPolicyEnabled" .)) -}}

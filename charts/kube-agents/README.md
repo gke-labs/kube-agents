@@ -1214,7 +1214,8 @@ scope publisher's Job pod, sized in `files/transient-pods.yaml`, which the opera
 15 minutes, one at a time, where the gateway pod admission policy is on (rendered by the chart,
 or `A2A_GATEWAY_POD_POLICY` set through `operator.extraEnv`) and `platformAgent.scope` names a
 folder, organization, Shared VPC host or Metrics Scope. A list added to the `PlatformAgent` by
-hand is not seen. The mode is read from the values, so a mode set
+hand is not seen. The footprint summary prices that pod as if it ran all month, as it does the
+provisioning Job, so it overstates both. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
@@ -1275,7 +1276,7 @@ does nothing under `helm template` and nothing in a namespace with no ResourceQu
 clean render in either case is not evidence that a quota fits. Its sum still runs there: the
 footprint summary below calls the same template on every render while `quotaPreflight.enabled`
 is on, so an input the sum refuses (an empty `hindsight.postgresql.storage`, a quantity it
-cannot parse, a damaged `footprint.yaml`) stops a quota-less render and `helm template` too,
+cannot parse, a damaged `footprint.yaml`, `flagged-pods.yaml` or `transient-pods.yaml`) stops a quota-less render and `helm template` too,
 and `--set quotaPreflight.enabled=false` lifts the summary with the check.
 
 It reads ResourceQuota and nothing else, so a `LimitRange` in the namespace is invisible

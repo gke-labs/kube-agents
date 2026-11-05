@@ -1000,6 +1000,8 @@ class PreflightDecisionTest(unittest.TestCase):
             ("missing", lambda f: f.unlink()),
             ("unreadable", lambda f: f.write_text("scopePublisher: [unclosed\n")),
             ("no scopeMembers list", lambda f: f.write_text("scopePublisher: {pods: 1}\n")),
+            ("cut short after scopeMembers", lambda f: f.write_text(
+                f.read_text().split("  cpuMillisRequest")[0])),
         ):
             with self.subTest(name):
                 tmp = tempfile.TemporaryDirectory()

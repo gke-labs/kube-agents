@@ -107,18 +107,28 @@ func TestTheChartCountsTheScopePublishersJobPod(t *testing.T) {
 		}
 	}
 
-	// The scope fields: every list in ScopeSpec, set alone, gives the Job
-	// something to resolve exactly when the chart lists it.
+	// The scope fields: every list in ScopeSpec, of any element type, set
+	// alone to one entry, gives the Job something to resolve exactly when the
+	// chart lists it. A field that is neither a list nor one of the known
+	// non-list settings fails here, so a new kind of field gets classified.
+	notLists := []string{"maxProjects", "exclude"}
 	scopeType := reflect.TypeOf(agentv1alpha1.ScopeSpec{})
 	seen := 0
 	for i := 0; i < scopeType.NumField(); i++ {
 		field := scopeType.Field(i)
-		if field.Type != reflect.TypeOf([]string(nil)) {
+		jsonName := strings.Split(field.Tag.Get("json"), ",")[0]
+		if field.Type.Kind() != reflect.Slice {
+			if !slices.Contains(notLists, jsonName) {
+				t.Errorf("scope.%s is a %s this test doesn't classify: say whether it gives the publisher something to resolve", jsonName, field.Type)
+			}
 			continue
 		}
-		jsonName := strings.Split(field.Tag.Get("json"), ",")[0]
 		scope := agentv1alpha1.ScopeSpec{}
-		reflect.ValueOf(&scope).Elem().Field(i).Set(reflect.ValueOf([]string{"x"}))
+		one := reflect.MakeSlice(field.Type, 1, 1)
+		if field.Type.Elem().Kind() == reflect.String {
+			one.Index(0).SetString("x")
+		}
+		reflect.ValueOf(&scope).Elem().Field(i).Set(one)
 		agent := scopePublisherAgent()
 		agent.Spec.Scope = &scope
 		listed := slices.Contains(c.ScopeMembers, jsonName)
