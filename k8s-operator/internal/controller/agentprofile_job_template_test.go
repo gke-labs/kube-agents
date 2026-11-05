@@ -632,3 +632,84 @@ func TestAProfileOutsideAutopilotsRatioIsFlagged(t *testing.T) {
 		t.Errorf("events %v, want a %s Warning naming tse", events, reasonProfileJobResources)
 	}
 }
+
+// A read of the policy or its binding that fails for any reason but
+// NotFound or Forbidden (a timeout, throttling, an upgrade) says nothing
+// either way: the operator changes nothing, rather than tear down Job mode
+// and the unattended tasks running on it, and reports the error.
+func TestATransientPolicyReadChangesNothing(t *testing.T) {
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	policy, binding := shippedDispatcherJobPolicy(t)
+	ca := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace}, Data: map[string]string{"ca.crt": "x"}}
+	var failing error
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent), policy, binding, ca).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Patch: fakeServerSideApplyInterceptors().Patch,
+			Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if _, isBinding := obj.(*admissionregistrationv1.ValidatingAdmissionPolicyBinding); isBinding && failing != nil {
+					return failing
+				}
+				return cl.Get(ctx, key, obj, opts...)
+			},
+		}).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	pns := profileNamespaceName(agent)
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("render: %v / %v", err, profileErr)
+	}
+	failing = apierrors.NewServerTimeout(admissionregistrationv1.Resource("validatingadmissionpolicybindings"), "get", 1)
+	if _, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err == nil {
+		t.Error("a timed-out read of the binding was swallowed; want it reported")
+	}
+	for _, o := range []struct {
+		obj  client.Object
+		name string
+	}{
+		{&rbacv1.RoleBinding{}, a2aDispatcherJobsRoleName(agent)},
+		{&agentv1alpha1.DispatchJobTemplate{}, dispatchJobTemplatePrefix + "tse"},
+	} {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: o.name}, o.obj); err != nil {
+			t.Errorf("%T %s went on a transient read failure: %v", o.obj, o.name, err)
+		}
+	}
+
+	// Forbidden is no transient: the operator's role lacks the get grant,
+	// so the policy can't be checked, and Job mode goes.
+	failing = apierrors.NewForbidden(admissionregistrationv1.Resource("validatingadmissionpolicybindings"), dispatcherJobPolicyName, errors.New("no grant"))
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("forbidden: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the Jobs RoleBinding outlived a Forbidden read of the binding: %v", err)
+	}
+}
+
+// The binding selects profile namespaces by the label whose absence makes
+// the profile namespace not ready, so Job mode can't stand there: the
+// dispatcher's Jobs Role goes, rather than outlive the policy's scope.
+func TestANotReadyProfileNamespaceRevokesJobMode(t *testing.T) {
+	agent := a2aTestAgent()
+	r, c := jobTemplateTestReconciler(t, agent)
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	pns := profileNamespaceName(agent)
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("render: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}); err != nil {
+		t.Fatalf("precondition: no Jobs RoleBinding: %v", err)
+	}
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, false); err != nil || profileErr != nil {
+		t.Fatalf("not ready: %v / %v", err, profileErr)
+	}
+	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, obj); !apierrors.IsNotFound(err) {
+			t.Errorf("the Jobs %T outlived the profile namespace's readiness: %v", obj, err)
+		}
+	}
+}

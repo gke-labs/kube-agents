@@ -644,6 +644,16 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 
 	h, why := d.reserve(snap, prof, tier, kind, taskID)
+	if h != nil {
+		// A stop heard since admission read the stream (onStop marks only
+		// the holdings it finds, and this one is new): mark it, so the
+		// hand-off sends no offer.
+		d.mu.Lock()
+		if _, heard := d.stopped[h.profile+"/"+h.taskID]; heard {
+			h.stopRequested = true
+		}
+		d.mu.Unlock()
+	}
 	if h == nil {
 		if why == capHeld {
 			if h := d.holder(hk); h != nil {

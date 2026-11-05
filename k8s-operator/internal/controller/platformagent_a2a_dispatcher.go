@@ -588,7 +588,13 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// the dispatcher gets Job mode: no templates and no Jobs Role otherwise.
 	jobMode := dispatcherJobPolicyRendered()
 	if jobMode {
-		if ok, why := r.dispatcherJobPolicyInPlace(ctx); !ok {
+		ok, why, err := r.dispatcherJobPolicyInPlace(ctx)
+		if err != nil {
+			// Neither in place nor gone: change nothing until a read
+			// answers.
+			return nil, fmt.Errorf("check the dispatcher Job admission policy: %w", err)
+		}
+		if !ok {
 			jobMode, jobTemplates = false, nil
 			r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
 				"A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), so unattended profile tasks run on the worker pool", why))
@@ -636,7 +642,10 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 		}
 	}
 	if !profileNamespaceReady {
-		return nil, nil
+		// The admission policy's binding selects profile namespaces by the
+		// label whose absence makes this one not ready, so Job mode can't
+		// stand here: revoke what an earlier pass rendered.
+		return r.deleteDispatcherJobResources(ctx, agent), nil
 	}
 	for _, obj := range []client.Object{buildA2ADispatcherPodsRole(agent), buildA2ADispatcherPodsRoleBinding(agent)} {
 		if err := r.applyManaged(ctx, agent, obj); err != nil {

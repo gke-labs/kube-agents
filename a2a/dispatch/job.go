@@ -163,10 +163,8 @@ func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, pro
 }
 
 // jobRefusedHint is what the dispatcher says when the Job admission policy
-// refuses a Job built from the operator's own template: the likeliest cause
-// is an upstream Kubernetes bug that freezes a policy's params after its
-// binding is deleted and recreated.
-const jobRefusedHint = "the Job admission policy refused a Job built from the operator's template. If the template changed since the policy's binding was last deleted and recreated, the API server's param cache is frozen (kubernetes/kubernetes#141015) until it restarts: on GKE, a control-plane upgrade or repair. The task stays queued."
+// refuses a Job built from the operator's own template.
+const jobRefusedHint = "the Job admission policy refused a Job built from the operator's template: the policy's DispatchJobTemplate params and the dispatch config disagree (an operator pass may be under way, or a param was edited or removed), or a mutating webhook changed the Job (check the operator's events). The task stays queued."
 
 // jobRefused records a Job the admission policy refused: reported in Health
 // and logged once as an error until a Job is admitted.

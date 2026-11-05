@@ -47,47 +47,53 @@ const reasonDispatcherJobPolicyMissing = "DispatcherJobPolicyMissing"
 // the parts the policy's guarantee rests on: the binding denies, finds params
 // only by the operator's labels with no params denied, is scoped to profile
 // namespaces, and names the policy; the policy fails closed and reads
-// PodTemplate params. A read that fails, including Forbidden on an install
-// whose operator role predates the grant, is not in place.
-func (r *PlatformAgentReconciler) dispatcherJobPolicyInPlace(ctx context.Context) (bool, string) {
+// DispatchJobTemplate params. Gone (NotFound), unreadable for want of the
+// grant (Forbidden), or loosened is not in place. Any other read error (a
+// timeout, throttling, a control-plane upgrade) says nothing either way and
+// comes back as err: the caller changes nothing, rather than tear down Job
+// mode, running Jobs included, on a transient failure.
+func (r *PlatformAgentReconciler) dispatcherJobPolicyInPlace(ctx context.Context) (bool, string, error) {
 	var policy admissionregistrationv1.ValidatingAdmissionPolicy
 	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: dispatcherJobPolicyName}, &policy); err != nil {
-		return false, policyReadFailure("ValidatingAdmissionPolicy", err)
+		return policyReadFailure("ValidatingAdmissionPolicy", err)
 	}
 	var binding admissionregistrationv1.ValidatingAdmissionPolicyBinding
 	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: dispatcherJobPolicyName}, &binding); err != nil {
-		return false, policyReadFailure("ValidatingAdmissionPolicyBinding", err)
+		return policyReadFailure("ValidatingAdmissionPolicyBinding", err)
 	}
 	ps := policy.Spec
 	switch {
 	case ps.FailurePolicy == nil || *ps.FailurePolicy != admissionregistrationv1.Fail:
-		return false, "its failurePolicy is not Fail"
+		return false, "its failurePolicy is not Fail", nil
 	case ps.ParamKind == nil || ps.ParamKind.APIVersion != agentv1alpha1.GroupVersion.String() || ps.ParamKind.Kind != "DispatchJobTemplate":
-		return false, "its params are not the operator's DispatchJobTemplates"
+		return false, "its params are not the operator's DispatchJobTemplates", nil
 	}
 	bs := binding.Spec
 	ref := bs.ParamRef
 	switch {
 	case bs.PolicyName != dispatcherJobPolicyName:
-		return false, fmt.Sprintf("its binding names policy %q", bs.PolicyName)
+		return false, fmt.Sprintf("its binding names policy %q", bs.PolicyName), nil
 	case !slices.Contains(bs.ValidationActions, admissionregistrationv1.Deny):
-		return false, "its binding does not deny"
+		return false, "its binding does not deny", nil
 	case ref == nil || ref.Name != "" || ref.Selector == nil || ref.ParameterNotFoundAction == nil ||
 		*ref.ParameterNotFoundAction != admissionregistrationv1.DenyAction:
-		return false, "its binding does not select params by label with no params denied"
+		return false, "its binding does not select params by label with no params denied", nil
 	case ref.Selector.MatchLabels[labelManagedBy] != fieldOwner || ref.Selector.MatchLabels[dispatchJobTemplateLabel] != "true" ||
 		len(ref.Selector.MatchExpressions) != 0:
-		return false, "its binding's params are not the operator's labelled PodTemplates alone"
+		return false, "its binding's params are not the operator's labelled PodTemplates alone", nil
 	case bs.MatchResources == nil || bs.MatchResources.NamespaceSelector == nil ||
 		bs.MatchResources.NamespaceSelector.MatchLabels[profileNamespaceComponentLabel] != profileNamespaceComponent:
-		return false, "its binding is not scoped to profile namespaces"
+		return false, "its binding is not scoped to profile namespaces", nil
 	}
-	return true, ""
+	return true, "", nil
 }
 
-func policyReadFailure(kind string, err error) string {
-	if apierrors.IsNotFound(err) {
-		return fmt.Sprintf("the %s %s is not in the cluster", kind, dispatcherJobPolicyName)
+func policyReadFailure(kind string, err error) (bool, string, error) {
+	switch {
+	case apierrors.IsNotFound(err):
+		return false, fmt.Sprintf("the %s %s is not in the cluster", kind, dispatcherJobPolicyName), nil
+	case apierrors.IsForbidden(err):
+		return false, fmt.Sprintf("the operator can't read the %s %s (its role lacks the get grant): %v", kind, dispatcherJobPolicyName, err), nil
 	}
-	return fmt.Sprintf("reading the %s %s: %v", kind, dispatcherJobPolicyName, err)
+	return false, "", fmt.Errorf("read the %s %s: %w", kind, dispatcherJobPolicyName, err)
 }

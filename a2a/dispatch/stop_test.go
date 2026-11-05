@@ -1,6 +1,7 @@
 package dispatch
 
 import (
+	"context"
 	"encoding/json"
 	"sync/atomic"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/nats-io/nats.go"
 )
@@ -378,5 +380,44 @@ func TestAFailedStopReadBacksOff(t *testing.T) {
 	}
 	if d.Health().StopStream == "" {
 		t.Error("Health doesn't report the failed read")
+	}
+}
+
+// stopDuringVerify is a verifier that publishes the task's stop live while
+// it is asked: a stop heard after admission read the stream, before the
+// task is reserved.
+type stopDuringVerify struct {
+	b *bus
+}
+
+func (v *stopDuringVerify) CheckProfileRun(_ context.Context, _ capability.Ref, profile string, _ capability.Tier, _ capability.Scope) error {
+	body, err := json.Marshal(lib.DispatchStop{V: 1, TaskID: "task-1"})
+	if err != nil {
+		return err
+	}
+	if err := v.b.admin.Publish(lib.DispatchStopSubject(profile, "task-1"), body); err != nil {
+		return err
+	}
+	_ = v.b.admin.Flush()
+	time.Sleep(300 * time.Millisecond) // the dispatcher hears it
+	return nil
+}
+
+// A stop heard between admission's read of the stream and the task's
+// reservation still counts: the new holding is marked from what was heard,
+// so no offer goes out and the task ends canceled.
+func TestAStopHeardDuringAdmissionIsNotLost(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 1, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0"), &stopDuringVerify{b: b})
+	time.Sleep(500 * time.Millisecond) // the stop subscription
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	ts := b.waitTerminal("task-1", 10*time.Second)
+	if ts.state != lib.StateCanceled || !hasReason(ts, ReasonStopped) {
+		t.Errorf("terminal %+v, want canceled stopped", ts)
+	}
+	if w.offerCount() != 0 || w.startedCount() != 0 {
+		t.Errorf("a task stopped during admission was offered %d times, started %d", w.offerCount(), w.startedCount())
 	}
 }
