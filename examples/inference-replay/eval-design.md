@@ -157,17 +157,37 @@ The rules that keep this safe:
   `--id=t_…` or `~/.hermes/sessions/<session>/` in an answer is swapped wherever the key swapped
   it. A tool call's JSON arguments are read as the key reads them, parsed first. Anything else the
   request bound is swapped only where it is a whole token, and an unrelated `99` in an answer
-  never becomes this run's row id.
+  never becomes this run's row id. Ages are never swapped into an answer (below).
 - **An answer that would keep an identifier isn't saved.** After the rewrite, if the answer still
   holds an identifier or IP the request bound, anywhere, it isn't saved, because a replay would act
-  on the recording's card or pod. In the lane trials' 351 answers this refused none.
+  on the recording's card or pod. Nor is one that names an identifier the request never bound, like
+  a card that appears only in the recent-work digest the key drops: no placeholder could bring it
+  up to date. In the lane trials' 351 answers the first rule refused none and the second refused 8
+  (7 cards named only in the digest, 1 pod name no request held).
 - **A timestamp an answer copies is restored; one the model made isn't saved.** The key buckets
-  timestamps (below), but the mapping also numbers each timestamp's exact text. An answer quoting a
-  timestamp the request holds verbatim, usually from a tool's output, keeps a placeholder there and
-  gets this run's timestamp when served, so the next request, which echoes it, buckets the same as
-  in the recording. An answer quoting a timestamp found nowhere in the request isn't saved. In the
+  timestamps (below), but the mapping also keeps each timestamp's exact text and where it sat, in
+  order, outside the model's own messages. An answer quoting a timestamp the request holds
+  verbatim, usually from a tool's output, keeps a placeholder naming every place that text sat,
+  and is served with this run's timestamp from the same places, so the next request, which echoes
+  it, buckets the same as in the recording. Two requests with the same key have the same buckets
+  in the same places, so a place is the same field in both runs. If this run has different
+  timestamps in those places (the recording's start time equalled its last transition, this run's
+  are a second apart), the answer isn't served. An answer quoting a timestamp found nowhere in the
+  request isn't saved. In the
   lane trials' 351 answers, 33 quoted a timestamp and are now restored, and 2 quoted one the
   request doesn't hold (a date written on its own, and a reformatted time) and are refused.
+- **Ages are never put back, and an answer that repeats one isn't saved.** An age is a reading of
+  the clock: served as this run's, `--since 5m` after a pod aged `5m` would become `--since 3m`, and
+  a fixed "last 24h" that happened to equal an age would change too. In the lane trials' 351
+  answers this refused 20.
+- **An answer to a request that holds a secret read isn't saved.** If a tool call earlier in the
+  conversation printed a secret's value (`kubectl get secret … | base64 -d`), the answer could
+  repeat it in a form no scrubber recognises, so the conversation runs live from the read on. In
+  the lane trials 73 of 829 requests (10% of prompt tokens) came after a secret read.
+- **An answer's reasoning is checked and not kept.** Its reasoning text and thinking blocks are
+  scrubbed for credentials like the rest of the answer, and an answer whose reasoning holds one
+  isn't saved. `reasoning_content` isn't saved at all: the client never sends it back, so no later
+  key needs it. Thinking blocks are kept, since a client that sends them back keys on them.
 - **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
   request but can't safely be put back in an answer: bare numbers like a `pid`, a row `id`,
   `resourceVersion` or `generation`, and epoch timestamps, which become an unnumbered
