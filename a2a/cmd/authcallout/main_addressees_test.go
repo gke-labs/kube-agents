@@ -22,6 +22,7 @@ func setEnvBeforeAddressees(t *testing.T) {
 	seed, _ := kp.Seed()
 	t.Setenv(envNamespace, "kubeagents-system")
 	t.Setenv(envAuthMapName, "agent-a2a-authmap")
+	t.Setenv(envAuthMapShards, "1")
 	t.Setenv(envAudience, "kube-agents-bus")
 	t.Setenv(envIssuerSeed, string(seed))
 	t.Setenv(envReservedPrincipals, "callout,gateway,bridge,seed,web,console,sys")

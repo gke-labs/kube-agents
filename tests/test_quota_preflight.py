@@ -62,14 +62,14 @@ data:
 # Totals for a stock install, re-derived by hand from values.yaml and footprint.yaml. These
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
-_DEFAULT_PODS = 7
-_DEFAULT_REQUESTS_CPU_MILLIS = 2506
-_DEFAULT_LIMITS_CPU_MILLIS = 10200
+_DEFAULT_PODS = 9
+_DEFAULT_REQUESTS_CPU_MILLIS = 2706
+_DEFAULT_LIMITS_CPU_MILLIS = 13200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 9408 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 24448 * 1024**2
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
 # replicas, and the cleanup hook's 1088Mi.
@@ -131,17 +131,24 @@ _MILLICORES_PER_CORE = 1000
 # entry per key, as the operator does, so only the overridden number moves.
 _PROXY_MEMORY_LIMIT_BYTES = 2 * 1024**3
 _PROXY_MEMORY_REQUEST_BYTES = 1024**3
-_PROXY_CPU_LIMIT_MILLIS = 1000
+_PROXY_CPU_LIMIT_MILLIS = 2000
 _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 3 * 1024**3
-_PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
-_PROXY_FLOAT_CPU_LIMIT = 1.5
-_PROXY_FLOAT_CPU_LIMIT_MILLIS = 1500
+_PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 4000
+# A request between the 1Gi default and the 2Gi limit, so the override moves the total.
+_PROXY_OVERRIDE_MEMORY_REQUEST_BYTES = 1536 * 1024**2
+_PROXY_FLOAT_CPU_LIMIT = 2.5
+_PROXY_FLOAT_CPU_LIMIT_MILLIS = 2500
 # The operator renders no ephemeral-storage request on the proxy, so the API server sets it
 # to the limit: footprint.yaml's 8Gi request is that defaulting, and it follows an override
 # of the limit alone.
 _PROXY_EPHEMERAL_LIMIT_BYTES = 8 * 1024**3
 _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
+# The API kube-agents.gkeAutopilot reads: the resource the operator's isGKEAutopilot probes,
+# at any served version.
+_AUTOPILOT_API = "auto.gke.io/v1/AllowlistedWorkload"
+_AUTOPILOT_API_V1BETA1 = "auto.gke.io/v1beta1/AllowlistedWorkload"
+_AUTOPILOT_API_V2 = "auto.gke.io/v2/AllowlistedWorkload"
 
 # The agent-api-auth sidecar's defaults (agentAPIAuth* in platformagent_manifests.go);
 # it is one container of the agent pod, so these are already in agentPod.base and an
@@ -225,8 +232,8 @@ class PreflightDecisionTest(unittest.TestCase):
         finally:
             pathlib.Path(values_path).unlink(missing_ok=True)
 
-    def _requirements(self, sets: list[str] | None = None, values: dict | None = None) -> dict:
-        res = self._render({"probe": {"emitRequirements": True}, **(values or {})}, sets)
+    def _requirements(self, sets: list[str] | None = None, values: dict | None = None, extra_args: list[str] | None = None) -> dict:
+        res = self._render({"probe": {"emitRequirements": True}, **(values or {})}, sets, extra_args)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
         for doc in yaml.safe_load_all(res.stdout):
             if doc and doc.get("metadata", {}).get("name") == "probe-requirements":
@@ -308,12 +315,12 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_credential_proxy_request_and_cpu_overrides_are_each_counted(self) -> None:
         base = self._requirements()
         raised = self._requirements([
-            f"{_PROXY_VALUE}.requests.memory={_PROXY_MEMORY_LIMIT_BYTES}",
+            f"{_PROXY_VALUE}.requests.memory={_PROXY_OVERRIDE_MEMORY_REQUEST_BYTES}",
             f"{_PROXY_VALUE}.limits.cpu={_PROXY_OVERRIDE_CPU_LIMIT_MILLIS}m",
         ])
         self.assertEqual(
             raised["requestsMemory"] - base["requestsMemory"],
-            _PROXY_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_REQUEST_BYTES,
+            _PROXY_OVERRIDE_MEMORY_REQUEST_BYTES - _PROXY_MEMORY_REQUEST_BYTES,
         )
         self.assertEqual(
             raised["limitsCpu"] - base["limitsCpu"],
@@ -322,6 +329,46 @@ class PreflightDecisionTest(unittest.TestCase):
         # A request the override does not name keeps the footprint's, not the new limit.
         self.assertEqual(raised["requestsCpu"], base["requestsCpu"])
         self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
+
+    def test_a_credential_proxy_limit_alone_below_the_default_request_lowers_it(self) -> None:
+        # The operator lowers a cpu or memory request the override does not set to a
+        # limit set below it (resolveCredentialProxyResources); the preflight counts that.
+        base = self._requirements()
+        for sets, key, delta in (
+            ([f"{_PROXY_VALUE}.limits.cpu=200m"], "requestsCpu", 200 - 500),
+            ([f"{_PROXY_VALUE}.limits.memory=768Mi"], "requestsMemory", (768 - 1024) * 1024**2),
+            ([f"{_PROXY_VALUE}.limits.cpu=4"], "requestsCpu", 0),
+        ):
+            with self.subTest(sets=sets):
+                self.assertEqual(self._requirements(sets)[key] - base[key], delta)
+
+    def test_credential_proxy_on_autopilot_counts_the_autopilot_requests(self) -> None:
+        # On Autopilot the operator requests 2 CPU and 2Gi (credentialProxyAutopilot*), and a
+        # CPU request the override does not set stays at one CPU per GiB of memory or under.
+        autopilot = ["--api-versions", _AUTOPILOT_API]
+        base = self._requirements()
+        on = self._requirements(extra_args=autopilot)
+        self.assertEqual(on["requestsCpu"] - base["requestsCpu"], 2000 - 500)
+        self.assertEqual(on["requestsMemory"] - base["requestsMemory"], (2048 - 1024) * 1024**2)
+        self.assertEqual(on["limitsCpu"], base["limitsCpu"])
+        lowered = self._requirements([f"{_PROXY_VALUE}.limits.memory=1536Mi"], extra_args=autopilot)
+        self.assertEqual(lowered["requestsMemory"] - base["requestsMemory"], (1536 - 1024) * 1024**2)
+        self.assertEqual(lowered["requestsCpu"] - base["requestsCpu"], 1500 - 500)
+        # Standard does not hold the CPU request to the band.
+        small = self._requirements([f"{_PROXY_VALUE}.requests.memory=256Mi"])
+        self.assertEqual(small["requestsCpu"], base["requestsCpu"])
+        small_on = self._requirements([f"{_PROXY_VALUE}.requests.memory=256Mi"], extra_args=autopilot)
+        self.assertEqual(small_on["requestsCpu"] - base["requestsCpu"], 250 - 500)
+        # A cluster serving the resource at v1beta1 only is Autopilot to the operator too.
+        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V1BETA1]), on)
+        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V2]), on)
+        # Another resource in the group is not Autopilot: Standard serves auto.gke.io too.
+        self.assertEqual(self._requirements(extra_args=["--api-versions", "auto.gke.io/v1/WorkloadAllowlist"]), base)
+        # Just under 2Gi rounds the CPU request down to the 250m step, as the operator does.
+        under = self._requirements([f"{_PROXY_VALUE}.limits.memory=2147483647"], extra_args=autopilot)
+        self.assertEqual(under["requestsCpu"] - base["requestsCpu"], 1750 - 500)
+        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=672Mi"], extra_args=autopilot)
+        self.assertEqual(at_floor["requestsCpu"] - base["requestsCpu"], 500 - 500)
 
     def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:
         # A values file's `cpu: 1.5` arrives as a YAML float, not the string `--set` gives.
@@ -879,6 +926,7 @@ class PreflightDecisionTest(unittest.TestCase):
         op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
         operator_pods = (
             op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]
+            + op["kubeProxy"]["pods"]
         )
         for sets in (
             [],
@@ -1420,7 +1468,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"10700m"', res.stderr)
+        self.assertIn('"limits.cpu":"13700m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -1429,7 +1477,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"26496Mi"', res.stderr)
+        self.assertIn('"limits.memory":"27520Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1450,8 +1498,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        # The release's 2506m plus one LiteLLM surge Pod's 100m.
-        self.assertIn('"cpu":"2606m"', res.stderr)
+        # The release's 2706m plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"2806m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -1460,7 +1508,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10944Mi"', res.stderr)
+        self.assertIn('"memory":"11456Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -1515,6 +1563,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertIn("dashboard", op["agentPod"])
         self.assertIn("shellSandbox", op)
         self.assertIn("credentialProxy", op)
+        self.assertIn("kubeProxy", op)
         self.assertIn("storage", op)
 
         # Verify agent-api-auth CPU limit cut to 1 core is reflected in footprint
@@ -1522,16 +1571,19 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["base"]["cpuMillisLimit"], 4500)
         self.assertEqual(op["agentPod"]["dashboard"]["cpuMillisLimit"], 1000)
         self.assertEqual(op["shellSandbox"]["cpuMillisLimit"], 2000)
-        self.assertEqual(op["credentialProxy"]["cpuMillisLimit"], 1000)
+        self.assertEqual(op["credentialProxy"]["cpuMillisLimit"], 2000)
+        self.assertEqual(op["kubeProxy"]["cpuMillisLimit"], 2000)
 
-        # Total operator limits on default install: 4500 + 1000 + 2000 + 1000 = 8500m (8.5 CPU)
+        # Total operator limits on default install: 4500 + 1000 + 2000 + 2000 + 2000 = 11500m (11.5 CPU);
+        # the kube-proxy runs two replicas of 1000m each.
         total_op_cpu_limit = (
             op["agentPod"]["base"]["cpuMillisLimit"]
             + op["agentPod"]["dashboard"]["cpuMillisLimit"]
             + op["shellSandbox"]["cpuMillisLimit"]
             + op["credentialProxy"]["cpuMillisLimit"]
+            + op["kubeProxy"]["cpuMillisLimit"]
         )
-        self.assertEqual(total_op_cpu_limit, 8500)
+        self.assertEqual(total_op_cpu_limit, 11500)
 
         # Memory, in the same shape. A generator that stopped parsing memory would emit 0
         # here; `--check` alone would not catch that if the regenerated file were committed
@@ -1540,6 +1592,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["shellSandbox"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["credentialProxy"]["memoryBytesLimit"], 2 * 1024**3)
+        self.assertEqual(op["kubeProxy"]["memoryBytesLimit"], 1024 * 1024**2)
 
         # Ephemeral storage is set on two of the four and deliberately 0 on the others;
         # asserting the zeroes is the point, since an unparsed value looks identical.
@@ -1966,6 +2019,7 @@ class DocumentedFootprintTest(unittest.TestCase):
             today["agentPod"]["base"]["pods"]
             + today["shellSandbox"]["pods"]
             + today["credentialProxy"]["pods"]
+            + today["kubeProxy"]["pods"]
             + sum(
                 w["pods"] for k, w in following.items()
                 if k not in ("agentPod", "storage", "a2aProvision")

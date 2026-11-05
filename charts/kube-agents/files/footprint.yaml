@@ -60,16 +60,32 @@ operatorRendered:
       memory: 1Gi
       ephemeral-storage: 8Gi
     limits:
-      cpu: "1"
+      cpu: "2"
       memory: 2Gi
       ephemeral-storage: 8Gi
     cpuMillisRequest: 500
-    cpuMillisLimit: 1000
+    cpuMillisLimit: 2000
     memoryBytesRequest: 1073741824
     memoryBytesLimit: 2147483648
     ephemeralStorageBytesRequest: 8589934592
     ephemeralStorageBytesLimit: 8589934592
     pods: 1
+  kubeProxy:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+      ephemeral-storage: "0"
+    limits:
+      cpu: "2"
+      memory: 1Gi
+      ephemeral-storage: "0"
+    cpuMillisRequest: 200
+    cpuMillisLimit: 2000
+    memoryBytesRequest: 536870912
+    memoryBytesLimit: 1073741824
+    ephemeralStorageBytesRequest: 0
+    ephemeralStorageBytesLimit: 0
+    pods: 2
   storage:
     persistentVolumeClaims: 4
     storageRequest: 102Gi
@@ -168,11 +184,11 @@ nextMode:
       memory: 64Mi
       ephemeral-storage: "0"
     limits:
-      cpu: 0m
+      cpu: 500m
       memory: 128Mi
       ephemeral-storage: "0"
     cpuMillisRequest: 50
-    cpuMillisLimit: 0
+    cpuMillisLimit: 500
     memoryBytesRequest: 67108864
     memoryBytesLimit: 134217728
     ephemeralStorageBytesRequest: 0

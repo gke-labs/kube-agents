@@ -45,7 +45,7 @@ import (
 // install with the operator flag below, like the inject backend and the
 // agent door, and while it is off nothing of it is rendered. It runs in its
 // own pod, not the gateway's, so the only bus credential within its reach is
-// the console password, and the only way in is a kubectl port-forward and
+// its own console-mcp password, and the only way in is a kubectl port-forward and
 // the server's own bearer token. A CR field can replace the flag if the
 // server becomes a supported, documented feature.
 const (
@@ -73,8 +73,8 @@ const (
 	a2aMCPAccessKey      = "token"
 	a2aMCPAccessVolume   = "mcp-token"
 	a2aMCPAccessMountDir = "/var/run/secrets/a2a-mcp"
-	// The console password, one key of the creds Secret, mounted the way the
-	// console server mounts it.
+	// The console-mcp password, one key of the creds Secret, mounted the way
+	// the console server mounts its own.
 	a2aMCPBusKeyVolume   = "bus-key"
 	a2aMCPBusKeyMountDir = "/var/run/secrets/a2a-mcp-bus"
 
@@ -191,16 +191,17 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Volumes: []corev1.Volume{{
-						// The console password and nothing else from the creds
-						// Secret. Not optional, unlike the console's: without
-						// it the server cannot reach the bus and refuses to
-						// start, which is the honest failure.
+						// The MCP server's own bus password and nothing else
+						// from the creds Secret. Not optional, unlike the
+						// console's: without it the server cannot reach the
+						// bus and refuses to start, which is the honest
+						// failure.
 						Name: a2aMCPBusKeyVolume,
 						VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 							SecretName: a2aCredsSecretName(agent),
 							Items: []corev1.KeyToPath{{
-								Key:  a2aConsolePasswordKey,
-								Path: a2aConsolePasswordKey,
+								Key:  a2aConsoleMCPPasswordKey,
+								Path: a2aConsoleMCPPasswordKey,
 								Mode: ptr.To(a2aConsoleCredsFileMode),
 							}},
 						}},
@@ -224,8 +225,8 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							a2aNATSCAFileEnvVar(),
-							{Name: a2aMCPEnvBusUser, Value: a2aConsoleConfUser},
-							{Name: a2aMCPEnvPasswordFile, Value: path.Join(a2aMCPBusKeyMountDir, a2aConsolePasswordKey)},
+							{Name: a2aMCPEnvBusUser, Value: a2aConsoleMCPUser},
+							{Name: a2aMCPEnvPasswordFile, Value: path.Join(a2aMCPBusKeyMountDir, a2aConsoleMCPPasswordKey)},
 							{Name: a2aMCPEnvAccessFile, Value: path.Join(a2aMCPAccessMountDir, a2aMCPAccessKey)},
 							{Name: a2aMCPEnvListen, Value: fmt.Sprintf(":%d", a2aMCPPort)},
 							{Name: a2aMCPEnvAgent, Value: agent.Name},
@@ -381,7 +382,13 @@ func a2aMCPTokenUsable(v []byte) bool {
 // it here would create and delete it on each pass, each an event that
 // wakes the next (NetworkPolicy is an Owns() kind). A fence over nothing
 // denies nothing.
-func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+//
+// busHeld is a2aProvisionState.busHeld: the bus is still on its previous
+// config, which may not have the user a new render of the server dials as.
+// An existing Deployment is left as it is until the bus moves, so the pod
+// that is connected keeps running; a server rendered for the first time is
+// applied as usual.
+func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *agentv1alpha1.PlatformAgent, busHeld bool) (string, error) {
 	if !a2aMCPDoorEnabled() {
 		return "", r.removeA2AMCP(ctx, agent)
 	}
@@ -392,10 +399,16 @@ func (r *PlatformAgentReconciler) reconcileA2AMCP(ctx context.Context, agent *ag
 	if !tokenOwned {
 		return a2aMCPTokenUnownedReason, r.removeA2AMCPServer(ctx, agent)
 	}
-	for _, obj := range []client.Object{
-		buildA2AMCPDeployment(agent),
-		buildA2AMCPService(agent),
-	} {
+	objs := []client.Object{buildA2AMCPService(agent)}
+	dep := buildA2AMCPDeployment(agent)
+	if !busHeld {
+		objs = append([]client.Object{dep}, objs...)
+	} else if err := r.Get(ctx, client.ObjectKeyFromObject(dep), &appsv1.Deployment{}); errors.IsNotFound(err) {
+		objs = append([]client.Object{dep}, objs...)
+	} else if err != nil {
+		return "", err
+	}
+	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return "", err
 		}

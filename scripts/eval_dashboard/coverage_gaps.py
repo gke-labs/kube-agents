@@ -327,17 +327,12 @@ def rank_key(c: dict):
     return (not store_admits, not c["meets_bar"], -(c["rate"] or 0), -c["graded"], c["case"])
 
 
-def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: datetime.datetime) -> list[dict]:
-    """Every domain with no blocking seat, oldest gap first, each with its
-    owner, how long, why, and its ranked candidates (None when ``data``
-    holds no cases to rank). Raises ValueError when domains.yaml gives no
-    domains (an unreadable file must not read as every domain covered), and
-    BadRead when a gap is off the allowlist (a bad roster or task read must
-    not file or close anything)."""
-    rows, allowlist = load_domains(repo_root)
-    if not rows:
-        raise ValueError(f"{repo_root / case_owner.DOMAINS_PATH} gave no domains")
-    claims = domain_coverage.domain_claims(repo_root)
+def domain_candidates(repo_root: pathlib.Path, data: dict, store: dict | None) -> dict[str, list[dict]] | None:
+    """``{domain slug: its candidates, best first}`` for every domain with
+    one, covered or not (the understudies, ``understudies.py``); None when
+    ``data`` holds no cases to rank."""
+    if not data.get("cases"):
+        return None
     roster = set(eval_rosters.blocking_roster(repo_root / BLOCKING_ROSTER_PATH))
     try:
         presubmit = set(eval_rosters.presubmit_cases(repo_root / PRESUBMIT_CASES_PATH))
@@ -346,10 +341,6 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
     nights = nightly_bugs.graded_nights(data)
     records = store_records(store, data)
     matrix = set(nightly.expected_cases(data))
-    # One calendar for both day counts in the body, UTC, the one expiry is
-    # read on: they roll over on the same tick.
-    today = now.astimezone(datetime.timezone.utc).date()
-    past = expired(repo_root, today)
     # A case with no verification_spec would cover nothing once seated.
     specced = {case_of(path) for path, _, has_spec in domain_coverage.task_claims(repo_root) if has_spec}
     by_domain: dict[str, list[str]] = {}
@@ -357,6 +348,29 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
         fields = nightly_bugs.task_fields(case, repo_root)
         if fields and fields.get("domain") and not fields["expected_fail"]:
             by_domain.setdefault(fields["domain"], []).append(case)
+    return {slug: sorted((candidate(c, nights.get(c, []), records, c in presubmit) for c in cases), key=rank_key)
+            for slug, cases in by_domain.items()}
+
+
+def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: datetime.datetime,
+              candidates: dict[str, list[dict]] | None = None) -> list[dict]:
+    """Every domain with no blocking seat, oldest gap first, each with its
+    owner, how long, why, and its ranked candidates (None when ``data``
+    holds no cases to rank; ``candidates`` is ``domain_candidates``' result
+    when the caller already has it). Raises ValueError when domains.yaml gives no
+    domains (an unreadable file must not read as every domain covered), and
+    BadRead when a gap is off the allowlist (a bad roster or task read must
+    not file or close anything)."""
+    rows, allowlist = load_domains(repo_root)
+    if not rows:
+        raise ValueError(f"{repo_root / case_owner.DOMAINS_PATH} gave no domains")
+    claims = domain_coverage.domain_claims(repo_root)
+    if candidates is None:
+        candidates = domain_candidates(repo_root, data, store)
+    # One calendar for both day counts in the body, UTC, the one expiry is
+    # read on: they roll over on the same tick.
+    today = now.astimezone(datetime.timezone.utc).date()
+    past = expired(repo_root, today)
     gaps = []
     for row in rows:
         slug = row["slug"]
@@ -367,7 +381,7 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
         if since and since > today:
             log(f"warning: the allowlist entry for {slug} has since {since}, after today; read as not recorded")
             since = None
-        cands = sorted((candidate(c, nights.get(c, []), records, c in presubmit) for c in by_domain.get(slug, [])), key=rank_key) if data.get("cases") else None
+        cands = None if candidates is None else candidates.get(slug, [])
         gaps.append({
             "slug": slug, "name": row.get("name") or slug, "meaning": row.get("meaning") or "",
             "owner": (entry or {}).get("owner") or row.get("owner"), "owner_from_record": bool((entry or {}).get("owner")), "backup": row.get("backup"),

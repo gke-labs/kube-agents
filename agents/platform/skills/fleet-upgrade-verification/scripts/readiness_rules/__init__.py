@@ -121,8 +121,9 @@ WHITESPACE_JOIN = " "
 # table, no `--output` and no rollout record.
 NOT_A_RULE_DEFECT = (KeyboardInterrupt, GeneratorExit)
 # What the credential proxy prints on stderr when it cut a brokered command's stdout at its
-# output cap, with the command's own exit code; every read through the shims (the report's
-# kubectl reads, the audit-log reader's gcloud reads) checks it before parsing.
+# output cap; the shim then exits 74 (an older shim returned the command's own exit code), so
+# every read through the shims (the report's kubectl reads, the audit-log reader's gcloud
+# reads) checks it before the exit code and before parsing.
 PROXY_TRUNCATION_MARKER = "credential proxy output truncated"
 GRADE_BLOCKING = "blocking"
 GRADE_RISK = "risk"

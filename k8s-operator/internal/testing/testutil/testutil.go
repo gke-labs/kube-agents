@@ -441,6 +441,16 @@ func CleanAndMarshalResources(t *testing.T, resources []client.Object) string {
 				}
 			}
 		case *corev1.Secret:
+			// The kube-proxy's TLS Secret, on every install: its own
+			// redaction, as main writes it, so the today goldens hold.
+			if strings.HasSuffix(obj.Name, "-kube-proxy-tls") {
+				for _, key := range []string{"ca.crt", "tls.crt", "tls.key"} {
+					if _, exists := obj.Data[key]; exists {
+						obj.Data[key] = []byte("<REDACTED_FOR_TESTS>")
+					}
+				}
+				break
+			}
 			// Next mode generates its bus credentials, keys and CA on first
 			// reconcile: random on every run, and key material either way.
 			// The golden pins which keys each Secret carries, not their values,

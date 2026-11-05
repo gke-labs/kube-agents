@@ -31,9 +31,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ENTRYPOINT = REPO_ROOT / "deploy" / "shared" / "docker-entrypoint.sh"
 START_SERVICES = REPO_ROOT / "deploy" / "shared" / "start-services.sh"
+ENVOY_CONFIG = REPO_ROOT / "deploy" / "shared" / "envoy-credential-proxy.yaml"
 DOCKERFILE = REPO_ROOT / "deploy" / "docker" / "Dockerfile"
 SANDBOX_DOCKERFILE = REPO_ROOT / "deploy" / "sandbox" / "Dockerfile"
 MANIFESTS_GO = (
@@ -454,6 +457,101 @@ class EventWatcherMetricsPortContractTest(unittest.TestCase):
             f"{const} is not reserved in mergeCredentialProxyEnv, so a CR can "
             "move the listener off the declared port",
         )
+
+
+class EnvoyListenerRewriteContractTest(unittest.TestCase):
+    """Every Envoy listener moves off loopback, or Envoy does not start.
+
+    The baked config binds loopback; in a Pod of its own the broker's listeners
+    have to accept the Pod IP (the operator passes 0.0.0.0), so start-services.sh
+    rewrites every loopback listener address before launching Envoy. There are two listeners now, the
+    credentialed one and the readiness probe's, and a render that moved one
+    and not the other starts an Envoy whose callers, or whose probe, reach a
+    port bound to loopback: a hang, or a pod that is never Ready, with nothing
+    in any log. So the render counts: as many listener addresses name the Pod
+    IP afterwards as named loopback before, and at least one did. The real
+    functions are extracted from the script and run, as the gates above are.
+    """
+
+    ADDRESS = "10.8.0.21"
+
+    def setUp(self):
+        script = START_SERVICES.read_text()
+        parts = []
+        for pattern, what in (
+            (r"^readonly ENVOY_LOOPBACK_ADDRESS=[^\n]*$", "the loopback constant"),
+            (r"^count_listener_addresses\(\) \{.*?^\}$", "count_listener_addresses"),
+            (r"^render_envoy_config\(\) \{.*?^\}$", "render_envoy_config"),
+        ):
+            found = re.search(pattern, script, flags=re.M | re.S)
+            self.assertIsNotNone(found, f"start-services.sh no longer defines {what}")
+            parts.append(found.group(0))
+        self.functions = "\n".join(parts)
+        self.assertIn(
+            "render_envoy_config",
+            re.search(r"^start_envoy\(\) \{.*?^\}$", script, flags=re.M | re.S).group(0),
+            "start_envoy no longer renders through render_envoy_config",
+        )
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.rendered = Path(self.directory.name) / "rendered.yaml"
+
+    def render(self, source, address):
+        """Run the real render for `source`; return (returncode, stderr)."""
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'set -euo pipefail\n{self.functions}\nrender_envoy_config "$1" "$2" "$3"',
+                "_",
+                str(source),
+                str(self.rendered),
+                address,
+            ],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode, result.stderr
+
+    def test_the_shipped_config_moves_every_listener(self):
+        code, log = self.render(ENVOY_CONFIG, self.ADDRESS)
+        self.assertEqual(code, 0, log)
+        rendered = self.rendered.read_text()
+        self.assertNotIn("127.0.0.1", rendered)
+        listeners = yaml.safe_load(rendered)["static_resources"]["listeners"]
+        self.assertGreaterEqual(len(listeners), 2, "the shipped config no longer carries both listeners")
+        for listener in listeners:
+            with self.subTest(listener=listener["name"]):
+                self.assertEqual(listener["address"]["socket_address"]["address"], self.ADDRESS)
+
+    def test_loopback_as_the_address_is_a_render_that_changes_nothing(self):
+        code, log = self.render(ENVOY_CONFIG, "127.0.0.1")
+        self.assertEqual(code, 0, log)
+        self.assertEqual(self.rendered.read_text(), ENVOY_CONFIG.read_text())
+
+    def test_a_render_that_leaves_a_listener_on_loopback_is_refused(self):
+        # The one shape the substitution leaves behind: two listeners on one
+        # line, of which it rewrites the first. The guard, not the substitution,
+        # is what refuses it.
+        source = Path(self.directory.name) / "flow.yaml"
+        source.write_text(
+            "static_resources:\n"
+            "  listeners: ["
+            "{name: a, address: {socket_address: {address: 127.0.0.1, port_value: 8765}}}, "
+            "{name: b, address: {socket_address: {address: 127.0.0.1, port_value: 8768}}}]\n"
+        )
+        code, log = self.render(source, self.ADDRESS)
+        self.assertNotEqual(code, 0, "a partial rewrite started Envoy")
+        self.assertIn("rewrote 1 of 2", log)
+        self.assertIn("still bound to loopback", log)
+
+    def test_a_config_with_no_loopback_listener_is_refused(self):
+        source = Path(self.directory.name) / "none.yaml"
+        source.write_text("admin:\n  address:\n    pipe:\n      path: /var/run/x.sock\n")
+        code, log = self.render(source, self.ADDRESS)
+        self.assertNotEqual(code, 0, "a config the substitution never touched started Envoy")
+        self.assertIn("rewrote 0 of 0", log)
 
 
 class DriftDetectorStartGateTest(unittest.TestCase):

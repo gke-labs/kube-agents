@@ -39,6 +39,8 @@ _LIFTED_FUNCTIONS = ("fail", "normalise", "check_literal_from")
 _CALL_SITES = (
     "check_literal_from busybox agentplugins/pubsub-platform/Dockerfile files/platforms/pubsub/",
     "check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile files/",
+    # A persona image: the persona directory is the context, the payload /files/.
+    "check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/",
 )
 
 # The sweep after the call sites: a plugin Dockerfile the fence never saw is
@@ -58,7 +60,7 @@ _SRC = "files/"
 _SHAPE = "must be exactly two lines"
 
 
-def _run_check(dockerfile: str, pin: str = _PIN) -> subprocess.CompletedProcess:
+def _run_check(dockerfile: str, pin: str = _PIN, src: str = _SRC, dest: str = "") -> subprocess.CompletedProcess:
     text = _SCRIPT.read_text()
     functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS)
     with tempfile.TemporaryDirectory() as tmp:
@@ -69,7 +71,29 @@ def _run_check(dockerfile: str, pin: str = _PIN) -> subprocess.CompletedProcess:
             f'repo_of() {{ echo "{_REPOSITORY}"; }}\n'
             f'pin_of() {{ echo "{pin}"; }}\n'
             + functions
-            + f"check_literal_from {_NAME} Dockerfile {_SRC}\nexit $status\n"
+            + f"check_literal_from {_NAME} Dockerfile {src} {dest}\nexit $status\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script], cwd=root, capture_output=True, text=True, check=False
+        )
+
+
+def _run_persona_sweep(fenced: bool) -> subprocess.CompletedProcess:
+    """Plant a2a/Dockerfile.persona-x in the shape, fence it or not, then sweep."""
+    text = _SCRIPT.read_text()
+    functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS + (_SWEEP,))
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        (root / "a2a").mkdir()
+        (root / "a2a" / "Dockerfile.persona-x").write_text(f"FROM busybox:{_PIN}\nCOPY . /files/\n", encoding="utf-8")
+        call = f"check_literal_from {_NAME} a2a/Dockerfile.persona-x . /files/\n" if fenced else ""
+        script = (
+            f"set -u\nstatus=0\nINVENTORY=images.json\n{_PLUGIN_DIR_DECLARATION}\n"
+            f'repo_of() {{ echo "{_REPOSITORY}"; }}\n'
+            f'pin_of() {{ echo "{_PIN}"; }}\n'
+            + functions
+            + call
+            + f"{_SWEEP}\nexit $status\n"
         )
         return subprocess.run(
             ["bash", "-c", script], cwd=root, capture_output=True, text=True, check=False
@@ -235,6 +259,29 @@ class CheckLiteralFromTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(reported, result.stderr)
                 self.assertNotIn(_UNFENCED, result.stderr)
+
+
+    def test_a_persona_dockerfile_takes_its_copy_destination(self):
+        # A persona image copies its context to /files/, where profilepod
+        # mounts it; the call names that destination, and the plugin shape's
+        # `/` is refused for it, as is a persona shape under a plugin call.
+        persona = f"FROM busybox:{_PIN}\nCOPY . /files/\n"
+        result = _run_check(persona, src=".", dest="/files/")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for body, dest in (
+            (f"FROM busybox:{_PIN}\nCOPY . /\n", "/files/"),
+            (persona, ""),
+        ):
+            with self.subTest(body=body, dest=dest):
+                result = _run_check(body, src=".", dest=dest)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(_SHAPE, result.stderr)
+
+    def test_an_unfenced_persona_dockerfile_fails_naming_it(self):
+        result = _run_persona_sweep(fenced=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"a2a/Dockerfile.persona-x {_UNFENCED}", result.stderr)
+        self.assertEqual(_run_persona_sweep(fenced=True).returncode, 0)
 
 
 if __name__ == "__main__":

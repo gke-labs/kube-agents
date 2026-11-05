@@ -1,0 +1,271 @@
+{
+  "payload": {
+    "title": "Raise the replica floor on the ingest deployment",
+    "body": "The floor of one meant a single eviction took ingest offline.\n",
+    "source": "platform-agent/replicas-1793644373",
+    "target": "main",
+    "draft": true
+  },
+  "responses": [
+    {
+      "comment_count": 0,
+      "task_count": 0,
+      "type": "pullrequest",
+      "id": 11,
+      "title": "Raise the replica floor on the ingest deployment",
+      "description": "The floor of one meant a single eviction took ingest offline.",
+      "rendered": {
+        "title": {
+          "type": "rendered",
+          "raw": "Raise the replica floor on the ingest deployment",
+          "markup": "markdown",
+          "html": "<p>Raise the replica floor on the ingest deployment</p>"
+        },
+        "description": {
+          "type": "rendered",
+          "raw": "The floor of one meant a single eviction took ingest offline.",
+          "markup": "markdown",
+          "html": "<p>The floor of one meant a single eviction took ingest offline.</p>"
+        }
+      },
+      "state": "OPEN",
+      "draft": true,
+      "merge_commit": null,
+      "close_source_branch": false,
+      "closed_by": null,
+      "author": {
+        "type": "app_user",
+        "links": {
+          "avatar": {
+            "href": "https://bitbucket.org/account/example/avatar/"
+          }
+        },
+        "created_on": "2026-11-02T15:08:55.432081+00:00",
+        "display_name": "kube-agents",
+        "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+        "account_id": "712020:00000000-0000-0000-0000-000000000001",
+        "account_status": "active",
+        "kind": "repository_access_token"
+      },
+      "reason": "",
+      "created_on": "2026-11-02T18:33:16.036861+00:00",
+      "updated_on": "2026-11-02T18:33:16.471901+00:00",
+      "destination": {
+        "branch": {
+          "name": "main"
+        },
+        "commit": {
+          "hash": "d613b799d16e",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/d613b799d16e"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/d613b799d16e"
+            }
+          },
+          "type": "commit"
+        },
+        "repository": {
+          "type": "repository",
+          "full_name": "acme/infra",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra"
+            },
+            "avatar": {
+              "href": "https://bitbucket.org/account/example/avatar/"
+            }
+          },
+          "name": "infra",
+          "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+        }
+      },
+      "source": {
+        "branch": {
+          "name": "platform-agent/replicas-1793644373",
+          "links": {},
+          "sync_strategies": [
+            "merge_commit",
+            "rebase"
+          ]
+        },
+        "commit": {
+          "hash": "5615ea33d336",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/5615ea33d336"
+            }
+          },
+          "type": "commit"
+        },
+        "repository": {
+          "type": "repository",
+          "full_name": "acme/infra",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra"
+            },
+            "avatar": {
+              "href": "https://bitbucket.org/account/example/avatar/"
+            }
+          },
+          "name": "infra",
+          "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+        }
+      },
+      "reviewers": [],
+      "participants": [],
+      "links": {
+        "self": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11"
+        },
+        "html": {
+          "href": "https://bitbucket.org/acme/infra/pull-requests/11"
+        },
+        "commits": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/commits"
+        },
+        "approve": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/approve"
+        },
+        "request-changes": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/request-changes"
+        },
+        "diff": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/acme/infra:5615ea33d336%0Dd613b799d16e?from_pullrequest_id=11&topic=true"
+        },
+        "diffstat": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diffstat/acme/infra:5615ea33d336%0Dd613b799d16e?from_pullrequest_id=11&topic=true"
+        },
+        "comments": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/comments"
+        },
+        "activity": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/activity"
+        },
+        "merge": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/merge"
+        },
+        "decline": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/decline"
+        },
+        "statuses": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/statuses"
+        },
+        "mergeability_checks": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/mergeability/checks"
+        }
+      },
+      "summary": {
+        "type": "rendered",
+        "raw": "The floor of one meant a single eviction took ingest offline.",
+        "markup": "markdown",
+        "html": "<p>The floor of one meant a single eviction took ingest offline.</p>"
+      },
+      "queued": false
+    },
+    {
+      "type": "commit",
+      "hash": "5615ea33d336d318f1891b7fed5dcac0a819884f",
+      "date": "2026-11-02T18:33:01+00:00",
+      "author": {
+        "type": "author",
+        "raw": "kube-agents <kube-agents@bots.bitbucket.org>",
+        "user": {
+          "type": "app_user",
+          "links": {
+            "avatar": {
+              "href": "https://bitbucket.org/account/example/avatar/"
+            }
+          },
+          "created_on": "2026-11-02T15:08:55.432081+00:00",
+          "display_name": "kube-agents",
+          "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+          "account_id": "712020:00000000-0000-0000-0000-000000000001",
+          "account_status": "active",
+          "kind": "repository_access_token"
+        }
+      },
+      "message": "Keep one replica through an eviction\n",
+      "summary": {
+        "type": "rendered",
+        "raw": "Keep one replica through an eviction\n",
+        "markup": "markdown",
+        "html": "<p>Keep one replica through an eviction</p>"
+      },
+      "links": {
+        "self": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f"
+        },
+        "html": {
+          "href": "https://bitbucket.org/acme/infra/commits/5615ea33d336d318f1891b7fed5dcac0a819884f"
+        },
+        "diff": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/diff/5615ea33d336d318f1891b7fed5dcac0a819884f"
+        },
+        "approve": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/approve"
+        },
+        "comments": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/comments"
+        },
+        "statuses": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/5615ea33d336d318f1891b7fed5dcac0a819884f/statuses"
+        },
+        "patch": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/patch/5615ea33d336d318f1891b7fed5dcac0a819884f"
+        }
+      },
+      "parents": [
+        {
+          "hash": "a2469319b1eaeaec4ac27c63a4f08363d2641265",
+          "links": {
+            "self": {
+              "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/commit/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+            },
+            "html": {
+              "href": "https://bitbucket.org/acme/infra/commits/a2469319b1eaeaec4ac27c63a4f08363d2641265"
+            }
+          },
+          "type": "commit"
+        }
+      ],
+      "rendered": {
+        "message": {
+          "type": "rendered",
+          "raw": "Keep one replica through an eviction\n",
+          "markup": "markdown",
+          "html": "<p>Keep one replica through an eviction</p>"
+        }
+      },
+      "repository": {
+        "type": "repository",
+        "full_name": "acme/infra",
+        "links": {
+          "self": {
+            "href": "https://api.bitbucket.org/2.0/repositories/acme/infra"
+          },
+          "html": {
+            "href": "https://bitbucket.org/acme/infra"
+          },
+          "avatar": {
+            "href": "https://bitbucket.org/account/example/avatar/"
+          }
+        },
+        "name": "infra",
+        "uuid": "{fe192881-dd56-4eaa-a161-acf404666c59}"
+      },
+      "participants": []
+    }
+  ]
+}

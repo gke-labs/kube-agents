@@ -116,6 +116,28 @@ def test_a_stopped_ask_gets_an_exclusive_window_and_no_allowance(tmp_path):
     assert errors == []
 
 
+WRITES_ALONE_CASE = "provisioning-cluster-request-never-creates"
+
+
+def test_a_writes_alone_case_gets_an_exclusive_window_and_no_allowance(tmp_path):
+    # It requests nothing and its prompt is an ordinary ask, but it declares
+    # `writes_alone`, so the lane marks its window exclusive and the stop-hook
+    # listing places it in the second phase.
+    source = TASKS / WRITES_ALONE_CASE / "task.yaml"
+    doc = load(source)
+    assert doc[lane.WRITES_ALONE_KEY] is True
+    assert not stop_hook.is_stopped_ask(doc["prompt"])
+    assert lane.requested_pull_requests(doc["verification_spec"]) == 0
+    assert lane.runs_alone(doc)
+    copy, requested = lane.copy_task(source, lane.load_lane_safeguards(LANE_FILE), tmp_path)
+    assert requested == 0
+    leaf = lane._leaves(load(copy)["verification_spec"][-1]["check"])[0]
+    assert leaf[lane.EXCLUSIVE_WINDOW_FIELD] is True
+    assert lane.REQUESTED_FIELD not in leaf
+    # Only a bare `true` places a case: a string is not a declaration.
+    assert not lane.runs_alone({**doc, lane.WRITES_ALONE_KEY: "true"})
+
+
 def test_requested_counts_nested_leaves_of_both_requesting_types():
     spec = [
         {"name": "a", "check": {"type": "any", "checks": [{"type": "pull_request_opened"}, {"type": "report_contains"}]}},

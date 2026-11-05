@@ -116,7 +116,7 @@ Do not run `--reset-ledger` yourself: it is an operator's remedy, the second aft
 ```json
 {
   "check": "upgrade-broke-workload",
-  "command": "KUBECONFIG=/opt/data/.kubeconfigs/kubeconfig_acme-prod_prod-usc1_us-central1-a.yaml kubectl get pods -A -o json"
+  "command": "KUBECONFIG=/opt/data/.kubeconfigs/kubeconfig_acme-prod_prod-usc1_us-central1-a.yaml kubectl get --raw '/api/v1/pods?limit=500'"
 }
 ```
 

@@ -161,6 +161,15 @@ CLUSTERS_FORMAT = "--format=json(name,location,subnetwork,networkConfig,ipAlloca
 ADDRESSES_FILTER = "--filter=addressType=INTERNAL"
 ADDRESSES_FORMAT = "--format=json(address,subnetwork)"
 FORWARDING_RULES_FORMAT = "--format=json(IPAddress,subnetwork)"
+# The project target's control-plane lists, projected to the fields their
+# checks read (`check_router_nat`, `check_mtu_mismatch`, `check_cloud_armor`)
+# so a project with many of them costs the credential proxy's reply and this
+# process a few fields per object. The forwarding-rule and firewall-rule
+# lists stay whole: the world-open-ingress check walks most of their fields.
+ROUTERS_FORMAT = "--format=json(name,region,nats)"
+NETWORKS_FORMAT = "--format=json(name,selfLink,mtu,peerings)"
+SECURITY_POLICIES_FORMAT = "--format=json(name,rules)"
+BACKEND_SERVICES_FORMAT = "--format=json(name,securityPolicy)"
 # A gcloud list (clusters, subnets, instances, addresses, forwarding rules)
 # exits 0 when some zones or regions time out and names them on stderr, so the
 # listing is partial. Same markers as stall_watch.py's
@@ -1848,11 +1857,11 @@ def project_commands(project: str) -> dict[str, list[str]]:
     """The project target's list reads, by role."""
     flag, fmt = f"{PROJECT_FLAG}={project}", JSON_FORMAT
     return {
-        "routers": [GCLOUD, "compute", "routers", "list", flag, fmt],
+        "routers": [GCLOUD, "compute", "routers", "list", flag, ROUTERS_FORMAT],
         "forwarding_rules": [GCLOUD, "compute", "forwarding-rules", "list", flag, fmt],
-        "networks": [GCLOUD, "compute", "networks", "list", flag, fmt],
-        "security_policies": [GCLOUD, "compute", "security-policies", "list", flag, fmt],
-        "backend_services": [GCLOUD, "compute", "backend-services", "list", flag, fmt],
+        "networks": [GCLOUD, "compute", "networks", "list", flag, NETWORKS_FORMAT],
+        "security_policies": [GCLOUD, "compute", "security-policies", "list", flag, SECURITY_POLICIES_FORMAT],
+        "backend_services": [GCLOUD, "compute", "backend-services", "list", flag, BACKEND_SERVICES_FORMAT],
         "firewall_rules": [GCLOUD, "compute", "firewall-rules", "list", flag, fmt],
         "instances": [GCLOUD, "compute", "instances", "list", flag, FIREWALL_INSTANCES_FORMAT],
     }

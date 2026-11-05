@@ -43,7 +43,7 @@ slots:
     carries: The held-back control plane, and the upgrade-readiness drain defects
   - slot: c
     suffix: c
-    carries: The configuration outlier, and no workloads
+    carries: The configuration outlier, on the control plane and its default pool, and no workloads
   - slot: d
     suffix: d
     carries: Nodes in two zones, and the zonal-skew workloads
@@ -236,11 +236,12 @@ fixtures:
       enrolled in REGULAR, which is what makes the lag visible to the upgrade
       SOP's master-behind check at all. Held between reconciles by a
       NO_MINOR_UPGRADES maintenance exclusion. The pin is drawn from REGULAR's
-      own list and held when the running patch is one REGULAR does not carry,
-      so the held version can be absent from REGULAR; while another roster or
-      validMasterVersions still offers it (so on 2026-10-14; nothing in the
-      stack keeps it) upgrade check 3.1 branch (a) does not fire and the
-      cluster carries branch (b) at major. A held version newer than every
+      own list on a create and is the running version inside the lag minor,
+      so once REGULAR moves past the running patch the version stays absent
+      from REGULAR until GKE's own patch auto-upgrade moves it; while another
+      roster or validMasterVersions still offers it (so on 2026-10-14; nothing
+      in the stack keeps it) upgrade check 3.1 branch (a) does not fire and
+      the cluster carries branch (b) at major. A held version newer than every
       REGULAR patch of its minor is drift (`not_ahead_of_channel` in
       fixtures.json): agents read it as current or ahead, not behind. See
       docs/designs/bench-fleet-catalog.md.
@@ -257,6 +258,20 @@ fixtures:
       clusters: replacing c silences the finding for a day, and so does
       replacing any cluster on a project whose fleet predates slot d. The
       hourly scan reports a c under a day old as drift.
+
+  - role: drift-pool-outlier
+    slot: c
+    available_from_day: 1
+    objects:
+      - cluster/self
+    defect: >-
+      Slot c's default pool on a 50 GB boot disk with kubeletConfig.cpuCfsQuota
+      false, where every other pool in the fleet runs a 20 GB disk and no
+      kubelet block, planted ahead of the boot-disk and kubelet-config drift
+      facets, which the drift SOP does not read yet. Day 1 as for drift-outlier,
+      the cohort's 24-hour age gate. A separate role, so this half drifting
+      excuses nothing from the case that lists drift-outlier; until the
+      reconcile rolls the change every project reads it drifted.
 
   - role: drift-peer-a
     slot: a

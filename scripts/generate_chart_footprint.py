@@ -80,6 +80,8 @@ _SHELL_WORKLOAD = "platformagent-shell"
 _SHELL_CONTAINER = "shell"
 _CRED_PROXY_WORKLOAD = "platformagent-credential-proxy"
 _CRED_PROXY_CONTAINER = "envoy-credential-proxy"
+_KUBE_PROXY_WORKLOAD = "platformagent-kube-proxy"
+_KUBE_PROXY_CONTAINER = "kube-proxy"
 _GATEWAY_WORKLOAD = "platformagent-gateway"
 _AGENT_CONTAINER = "platform-agent"
 _DASHBOARD_CONTAINER = "platform-agent-dashboard"
@@ -214,6 +216,7 @@ _BASE = "base"
 _DASHBOARD = "dashboard"
 _SHELL_SANDBOX = "shellSandbox"
 _CREDENTIAL_PROXY = "credentialProxy"
+_KUBE_PROXY = "kubeProxy"
 _STORAGE_SECTION = "storage"
 _PERSISTENT_VOLUME_CLAIMS = "persistentVolumeClaims"
 _STORAGE_REQUEST = "storageRequest"
@@ -243,6 +246,7 @@ def _container_key(workload_key: str, container: str) -> str:
 
 _SHELL_WORKLOAD_KEY = _workload_key(_KIND_STATEFULSET, _SHELL_WORKLOAD)
 _CRED_PROXY_WORKLOAD_KEY = _workload_key(_KIND_DEPLOYMENT, _CRED_PROXY_WORKLOAD)
+_KUBE_PROXY_WORKLOAD_KEY = _workload_key(_KIND_DEPLOYMENT, _KUBE_PROXY_WORKLOAD)
 _GATEWAY_WORKLOAD_KEY = _workload_key(_KIND_DEPLOYMENT, _GATEWAY_WORKLOAD)
 
 # Pod-bearing workloads the footprint deliberately leaves out, and why. Empty today: every
@@ -540,6 +544,34 @@ def _check_completeness(pod_workloads: dict, summed_containers: set) -> None:
         )
 
 
+def _check_limits(pod_workloads: dict, summed_containers: set) -> None:
+    """Fail on a summed container that declares no CPU or memory limit.
+
+    A namespace ResourceQuota on limits.cpu or limits.memory refuses a pod with any
+    container that declares no such limit, unless a LimitRange supplies a default. The
+    preflight sums an undeclared limit as zero, so it can't see the refusal coming: the
+    install passes the render and the pod is then never admitted (#3847, the next-mode
+    console). Every container the footprint counts has to declare both.
+    """
+    missing = []
+    for workload_key, spec in sorted(pod_workloads.items()):
+        for container in _pod_containers(spec):
+            if _container_key(workload_key, container.get(_NAME_FIELD)) not in summed_containers:
+                continue
+            limits = (container.get(_RESOURCES_FIELD) or {}).get(_LIMITS) or {}
+            for key in (_CPU, _MEMORY):
+                if not _declared(limits.get(key)):
+                    missing.append(f"container {container.get(_NAME_FIELD)!r} in {workload_key} declares no {key} limit")
+    if missing:
+        found = "\n".join(f"  - {item}" for item in missing)
+        raise ValueError(
+            "the golden renders containers a limits quota would refuse:\n"
+            f"{found}\n"
+            "Give each a limit in the operator: a namespace ResourceQuota on limits.cpu or"
+            " limits.memory refuses a pod with a container that declares none."
+        )
+
+
 def extract_footprint() -> dict:
     """Extract operator-rendered resource requirements from both goldens."""
     today = _extract(_GOLDEN_MANIFEST, next_mode=False)
@@ -571,10 +603,12 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
 
     shell_containers = {}
     cred_proxy_containers = {}
+    kube_proxy_containers = {}
     gateway_containers = {}
     gateway_init_containers = {}
     shell_replicas = 1
     cred_proxy_replicas = 1
+    kube_proxy_replicas = 1
     gateway_replicas = 1
     # Every pod-bearing document, summed or not, for _check_completeness below.
     pod_workloads = {}
@@ -637,6 +671,11 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])
             }
             cred_proxy_replicas = _replicas(doc)
+        elif kind == _KIND_DEPLOYMENT and name == _KUBE_PROXY_WORKLOAD:
+            kube_proxy_containers = {
+                c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])
+            }
+            kube_proxy_replicas = _replicas(doc)
         elif kind == _KIND_DEPLOYMENT and name == _GATEWAY_WORKLOAD:
             gateway_containers = {
                 c.get(_NAME_FIELD): c for c in spec.get(_CONTAINERS_FIELD, [])
@@ -665,6 +704,7 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
     required = [
         (shell_containers, _SHELL_CONTAINER, _SHELL_WORKLOAD),
         (cred_proxy_containers, _CRED_PROXY_CONTAINER, _CRED_PROXY_WORKLOAD),
+        (kube_proxy_containers, _KUBE_PROXY_CONTAINER, _KUBE_PROXY_WORKLOAD),
         (gateway_containers, _AGENT_CONTAINER, _GATEWAY_WORKLOAD),
         (gateway_containers, _DASHBOARD_CONTAINER, _GATEWAY_WORKLOAD),
         (gateway_containers, _FLUENT_BIT_CONTAINER, _GATEWAY_WORKLOAD),
@@ -706,6 +746,7 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
     summed_containers = {
         _container_key(_SHELL_WORKLOAD_KEY, _SHELL_CONTAINER),
         _container_key(_CRED_PROXY_WORKLOAD_KEY, _CRED_PROXY_CONTAINER),
+        _container_key(_KUBE_PROXY_WORKLOAD_KEY, _KUBE_PROXY_CONTAINER),
         _container_key(_GATEWAY_WORKLOAD_KEY, _AGENT_CONTAINER),
         _container_key(_GATEWAY_WORKLOAD_KEY, _DASHBOARD_CONTAINER),
         _container_key(_GATEWAY_WORKLOAD_KEY, _FLUENT_BIT_CONTAINER),
@@ -738,6 +779,7 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 f"no volumeClaimTemplate on {_A2A_NATS_WORKLOAD} in the next-mode golden"
             )
     _check_completeness(pod_workloads, summed_containers)
+    _check_limits(pod_workloads, summed_containers)
 
     # The agent pod's base is everything always present: the agent, its log shipper, and the
     # agent-api-auth native sidecar (declared as an init container with restartPolicy:
@@ -765,6 +807,11 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 [cred_proxy_containers[_CRED_PROXY_CONTAINER]],
                 pods=1,
                 replicas=cred_proxy_replicas,
+            ),
+            _KUBE_PROXY: _workload_entry(
+                [kube_proxy_containers[_KUBE_PROXY_CONTAINER]],
+                pods=1,
+                replicas=kube_proxy_replicas,
             ),
             # Claims are release-scoped rather than per-agent-replica: scaling the agent does
             # not create more of them, so the preflight must not multiply these.

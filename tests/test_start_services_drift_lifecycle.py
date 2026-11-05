@@ -101,6 +101,11 @@ _DRAIN_CEILING_SECONDS = 8.0
 # inside _run_bash's timeout, so it fails on the assertion rather than by hanging.
 _LONG_DRAIN_SECONDS = 20
 
+# The broker role's runtime budget in the test that proves the role picks it:
+# longer than _SHORT_DRAIN_SECONDS by more than a poll, so the clock tells the
+# two apart, and inside _DRAIN_CEILING_SECONDS.
+_BROKER_RUNTIME_DRAIN_SECONDS = 5
+
 # How long to give bash to reap a supervisor the drain has just killed. The wait
 # is what makes the check deterministic: SIGKILL is delivered synchronously but
 # the reap that makes `kill -0` fail is a SIGCHLD the shell handles when it next
@@ -248,7 +253,12 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
     """The three shutdown edges, exercised as bash rather than read as text."""
 
     def _harness(
-        self, body: str, drain: int = _SHORT_DRAIN_SECONDS, runtime_drain: int = _SHORT_DRAIN_SECONDS
+        self,
+        body: str,
+        drain: int = _SHORT_DRAIN_SECONDS,
+        runtime_drain: int = _SHORT_DRAIN_SECONDS,
+        role: str = "combined",
+        broker_runtime_drain: int = _LONG_DRAIN_SECONDS,
     ) -> str:
         """The shipped drain functions, wired to a fake supervisor.
 
@@ -260,6 +270,8 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
         readonly SHUTDOWN_DRAIN_SECONDS={drain}
         readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
         readonly RUNTIME_DRAIN_SECONDS={runtime_drain}
+        readonly BROKER_RUNTIME_DRAIN_SECONDS={broker_runtime_drain}
+        CREDENTIAL_PROXY_ROLE={role}
         {self.lift("drain_supervised")}
         {self.lift("wait_for_exit")}
         {self.lift("drain_runtime")}
@@ -512,6 +524,42 @@ class TerminateShutsTheProcessDownRatherThanJustSignallingIt(_ScriptCase):
                 "terminate() waited on the runtime for the supervisors' budget rather "
                 "than RUNTIME_DRAIN_SECONDS",
             )
+
+    def test_the_broker_role_waits_on_its_own_longer_budget(self) -> None:
+        """The standalone broker drains its requests in flight on SIGTERM, so its
+        runtime gets BROKER_RUNTIME_DRAIN_SECONDS; the sidecar roles keep
+        RUNTIME_DRAIN_SECONDS, which their pods' grace periods hold.
+        """
+        for role, floor, ceiling in (
+            ("broker", _BROKER_RUNTIME_DRAIN_SECONDS - 1, _DRAIN_CEILING_SECONDS),
+            ("combined", 0, _BROKER_RUNTIME_DRAIN_SECONDS - 1),
+        ):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
+                tmpdir = pathlib.Path(tmp)
+                ready = tmpdir / "ready"
+                runtime = tmpdir / "runtime"
+                child = f"""trap '' TERM
+                            touch {ready}
+                            for _ in $(seq 1 {_CHILD_LIFETIME_SECONDS * 10}); do sleep 0.1; done"""
+                body = f"""
+                {self._runtime(child, runtime)}
+                while [ ! -e {ready} ]; do sleep {_MARKER_POLL_SECONDS}; done
+                terminate
+                echo "terminate-returned"
+                """
+                try:
+                    started = time.monotonic()
+                    result = _run_bash(self._harness(
+                        body, runtime_drain=_SHORT_DRAIN_SECONDS, role=role,
+                        broker_runtime_drain=_BROKER_RUNTIME_DRAIN_SECONDS,
+                    ))
+                    elapsed = time.monotonic() - started
+                finally:
+                    _kill_recorded(runtime)
+
+                self.assertIn("terminate-returned", result.stdout)
+                self.assertGreaterEqual(elapsed, floor, f"the {role} role cut the runtime's drain short")
+                self.assertLess(elapsed, ceiling, f"the {role} role waited past its own budget")
 
     def test_it_gives_up_on_a_process_that_ignores_sigterm(self) -> None:
         """The drain is bounded: the pod's grace period is not ours to spend."""
@@ -1353,8 +1401,19 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
         covered = set(_WATCHER_DURATION_KNOBS) | set(_WATCHER_COUNT_KNOBS)
         self.assertEqual(
             set(),
-            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD"},
+            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD", "WATCHER_ALERT_EXCLUDE"},
             "a WATCHER_* value reaches the watcher without a normaliser",
+        )
+
+    def test_the_alert_exclude_list_reaches_the_watcher_as_it_is(self) -> None:
+        """A JSON list, so the watcher parses it, and fails open on a bad one.
+
+        Quoted whole: the list carries spaces and double quotes.
+        """
+        self.assertIn('WATCHER_ALERT_EXCLUDE="${WATCHER_ALERT_EXCLUDE:-}"', self.text)
+        self.assertIn(
+            '--alert-exclude="${WATCHER_ALERT_EXCLUDE}"',
+            self.lift("start_event_watcher"),
         )
 
 

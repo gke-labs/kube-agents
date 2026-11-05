@@ -29,7 +29,7 @@ Your deliverable is your final answer: a grounded Root Cause Analysis plus, wher
 
 ## 3. Working efficiently
 
-- **Filter at the source.** Large outputs (`kubectl get pods -A -o json`, `gcloud container get-server-config`) are filtered with `jq`, `-o custom-columns`, `--field-selector`, or `--flatten`/`--format`. If a script needs to parse one, redirect it to a file of this run's own: create it with `mktemp /tmp/out.XXXXXX.json` and use the path it prints.
+- **Filter at the source.** Large outputs (`kubectl get pods -A -o json`, `gcloud container get-server-config`) are filtered with `jq`, `-o custom-columns`, `--field-selector`, or `--flatten`/`--format`. If a script needs to parse one, redirect it to a file of this run's own: create it with `mktemp /tmp/out.XXXXXX.json` and use the path it prints. <!-- cluster-reads-check: warning -->
 - **Prefer MCP tools and batch reads.** Use the `gke` and `developer_knowledge` MCP tools when they provide the resource or data you need. When running read-only `kubectl` or `gcloud` diagnostics, batch independent queries (pod status, events, deployment spec, container logs) into one compound shell call, or emit parallel tool calls in one turn, instead of one command per turn.
 
 ## 4. Grounded, current knowledge

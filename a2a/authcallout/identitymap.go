@@ -25,14 +25,19 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// AccountControl and AccountApp are the two NATS accounts the callout will
+// issue a user into: control-plane writers in TRUSTED and runtime workloads in
+// APP. Narrowed identities (session and profile workers) may only be minted
+// into AccountApp.
+const (
+	AccountControl = "TRUSTED"
+	AccountApp     = "APP"
+)
+
 // mintableAccounts is every NATS account the callout will issue a user into.
 //
-// The deployment renders exactly one application account, and the callout's own
-// account holds nothing but the callout. Anything else - $SYS above all - is
-// either a mistake or an attempt, and both are worth refusing at the point the
-// map is parsed rather than at the point a connection lands somewhere it should
-// not be.
-var mintableAccounts = []string{"APP"}
+// Anything outside this list - $SYS above all - is refused at parse time.
+var mintableAccounts = []string{AccountControl, AccountApp}
 
 const (
 	// ServiceAccountPrefix is how the Kubernetes TokenReview API spells a
@@ -114,8 +119,17 @@ type Identity struct {
 // the operator's content hash of the entries; the callout reports the version
 // it is serving so "the map says X" is checkable against the running system
 // rather than against the rendered object.
+//
+// The operator cuts a map into numbered ConfigMaps when it would not fit one
+// (the API server refuses an object past 1 MiB), so a parsed document is one
+// shard: Shard of Shards, carrying the version of the whole map. The callout
+// is told the count and watches each name, and AssembleIdentityMap joins the
+// shards of one version back into the map it serves. A map that fits is shard
+// 0 of 1.
 type IdentityMap struct {
 	Version    string     `json:"version"`
+	Shard      int        `json:"shard"`
+	Shards     int        `json:"shards"`
 	Identities []Identity `json:"identities"`
 
 	// users is the set of names Users returns, built by ParseIdentityMap.
@@ -152,18 +166,34 @@ func (m *IdentityMap) validate() error {
 	if m.Version == "" {
 		return fmt.Errorf("identity map has no version")
 	}
+	// The stamps. A document from before sharding carries none, which
+	// decodes as 0 of 0 and is accepted here as a whole map; whether the
+	// store takes it depends on how many shards it was told to expect
+	// (Store.UpdateShard). A stamped document names its place in a count.
+	if m.Shard < 0 || m.Shards < 0 || (m.Shards == 0 && m.Shard != 0) || (m.Shards > 0 && m.Shard >= m.Shards) {
+		return fmt.Errorf("identity map is stamped shard %d of %d, which is not a place in a count", m.Shard, m.Shards)
+	}
 	// An empty map is never intentional. The operator always renders at
 	// least the provisioner and the session principal, so zero entries
 	// means the render
 	// produced nothing — and serving it would refuse every
 	// connection on a callout that reports itself perfectly healthy. Refuse
 	// it here so the previous map keeps serving and the reason is logged.
+	// A shard is never empty either: the operator cuts by size and puts at
+	// least one identity in each.
 	if len(m.Identities) == 0 {
 		return fmt.Errorf("identity map serves no identities; every connection would be refused")
 	}
-	seenSA := make(map[string]bool, len(m.Identities))
-	seenUser := make(map[string]bool, len(m.Identities))
-	for i, id := range m.Identities {
+	return validateIdentities(m.Identities)
+}
+
+// validateIdentities checks every entry and the set: once per shard at parse,
+// and once more over the joined shards at assembly, since two shards can each
+// be sound and still name one ServiceAccount between them.
+func validateIdentities(identities []Identity) error {
+	seenSA := make(map[string]bool, len(identities))
+	seenUser := make(map[string]bool, len(identities))
+	for i, id := range identities {
 		if err := id.validate(); err != nil {
 			return fmt.Errorf("identity %d: %w", i, err)
 		}
@@ -212,6 +242,10 @@ func (id Identity) validate() error {
 	if !slices.Contains(mintableAccounts, id.Account) {
 		return fmt.Errorf("user %q names account %q, which this callout will not mint into (allowed: %v)",
 			id.User, id.Account, mintableAccounts)
+	}
+	if id.Narrowing != "" && id.Account != AccountApp {
+		return fmt.Errorf("user %q narrows on %q and must land in account %q, not %q",
+			id.User, id.Narrowing, AccountApp, id.Account)
 	}
 	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 	// The profile fields mean something only under NarrowingProfile. On any
@@ -266,6 +300,42 @@ func (id Identity) validate() error {
 		return fmt.Errorf("user %q names narrowing %q, which this callout does not implement", id.User, id.Narrowing)
 	}
 	return nil
+}
+
+// AssembleIdentityMap joins the shards of one render into the map the callout
+// serves: every shard present, in index order, each stamped with its index and
+// the count, all carrying one version. The joined entries are validated as a
+// set, because a duplicate across two shards is invisible to either shard's
+// parse. The result is stamped as the whole, 0 of 1, since that is what it is.
+func AssembleIdentityMap(shards []*IdentityMap) (*IdentityMap, error) {
+	if len(shards) == 0 {
+		return nil, fmt.Errorf("no identity map shards to assemble")
+	}
+	version := ""
+	var identities []Identity
+	for i, shard := range shards {
+		if shard == nil {
+			return nil, fmt.Errorf("identity map shard %d of %d has not arrived", i, len(shards))
+		}
+		if shard.Shards != len(shards) || shard.Shard != i {
+			return nil, fmt.Errorf("identity map shard %d of %d is stamped shard %d of %d", i, len(shards), shard.Shard, shard.Shards)
+		}
+		if version == "" {
+			version = shard.Version
+		} else if shard.Version != version {
+			return nil, fmt.Errorf("identity map shard %d carries version %s where shard 0 carries %s", i, shard.Version, version)
+		}
+		identities = append(identities, shard.Identities...)
+	}
+	if err := validateIdentities(identities); err != nil {
+		return nil, fmt.Errorf("the assembled identity map: %w", err)
+	}
+	m := &IdentityMap{Version: version, Shard: 0, Shards: 1, Identities: identities}
+	m.users = make(map[string]struct{}, len(m.Identities))
+	for _, u := range m.Users() {
+		m.users[u] = struct{}{}
+	}
+	return m, nil
 }
 
 // Lookup returns the identity mapped to a TokenReview username. The bool

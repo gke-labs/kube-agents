@@ -5,7 +5,7 @@ The validator was reachable from tests only through
 `content_workspace.repo_relative`, and `content_workspace` is the one module
 the sandbox image does not carry -- so the end that turns a name into a write
 was covered by exercising the end that does not. These import
-`workspace_paths` on its own, the way `inspect_repository` does.
+`workspace_paths` on its own, the way `audit_report` does.
 
 Names travel both ways through this validator, which is the property most of
 these are about: `list` answers with names read out of a repository nobody
