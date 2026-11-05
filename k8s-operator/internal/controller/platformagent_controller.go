@@ -1314,6 +1314,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if a2aNext && a2aState.leaseRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.leaseRequeue)
 	}
+	// An exec tier short of its count: the scheduler's verdict lands on a pod,
+	// which is not watched, so the pass that reads it has to be asked for.
+	if credentialProxyExecShort(instance) {
+		requeueAfter = min(requeueAfter, credentialProxyExecShortRequeue)
+	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
 
@@ -4635,6 +4640,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// its message so a changed count is one write.
 	replicasLimitedMsg := replicasLimitedMessage(agent)
 	replicasLimitedUnchanged := replicasLimitedConditionCurrent(agent, replicasLimitedMsg)
+	execReady := r.readCredentialProxyExecReady(ctx, agent)
+	execReadyUnchanged := credentialProxyExecReadyCurrent(agent, execReady)
 
 	// The home-channel advisory, from the spec and the record this pass read,
 	// compared on its message for the same reason EventWatcher's is.
@@ -4730,6 +4737,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		noChatPlatformUnchanged &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
+		execReadyUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
 		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && scopeResolvedUnchanged &&
@@ -4808,6 +4816,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setNoChatPlatformCondition(agent, noChatPlatformMsgNow, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
+	setCredentialProxyExecReadyCondition(agent, execReady, now)
 
 	setA2AGatewayCondition(agent, a2aGatewayMsg, now)
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
