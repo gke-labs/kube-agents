@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,6 +294,133 @@ func TestSubscribeDurable_WaitForStreamSurvivesARebuild(t *testing.T) {
 		t.Fatalf("publish: %v", err)
 	}
 	waitFor(t, 15e9, "delivery on the rebuilt connection", func() bool { return col.count() == 1 })
+}
+
+// A first bind that lands on a connection a rebuild replaces before the bind
+// is recorded is tried again on the new one. The rebuild skipped the durable,
+// which was not bound yet; marked bound on the old connection, it would
+// consume from a drained one and never deliver.
+func TestSubscribeDurable_ABindOnAReplacedConnectionIsRetried(t *testing.T) {
+	s := runJetStreamServer(t, -1, t.TempDir(), nil)
+	provisionTasksStream(t, clientURL(s))
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s), WithName("relay"))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	var once sync.Once
+	afterBind = func() {
+		once.Do(func() {
+			if err := c.Reconnect(ctx); err != nil {
+				t.Errorf("Reconnect: %v", err)
+			}
+		})
+	}
+	t.Cleanup(func() { afterBind = nil })
+
+	col := &collector{}
+	if _, err := c.SubscribeDurable(ctx, SubscribeConfig{
+		Stream: TasksStream, Subject: TaskInSubject("chatops", "task-swap"),
+		Durable: "relay-swap", Session: "chatops",
+	}, col.handle); err != nil {
+		t.Fatalf("SubscribeDurable: %v", err)
+	}
+	if got := c.rebuilds.Load(); got != 1 {
+		t.Fatalf("rebuilds = %d, want the one the hook asked for", got)
+	}
+	pub, err := Connect(ctx, clientURL(s), WithName("pub"))
+	if err != nil {
+		t.Fatalf("Connect publisher: %v", err)
+	}
+	defer pub.Close()
+	env, err := NewMessageEnvelope(Party{Session: "w"}, "task-swap", "ctx-1", "corr-1", validMessagePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Publish(ctx, TaskInSubject("chatops", "task-swap"), env); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	waitFor(t, 10e9, "delivery on the rebuilt connection", func() bool { return col.count() == 1 })
+}
+
+// The production dial reconnects forever (MaxReconnects(-1)), so an outage
+// never closes the connection: each attempt fails on jetstream's own API
+// timeout while nats.go reconnects. Those attempts do not count against the
+// window either, because the connection is not connected.
+func TestSubscribeDurable_WaitForStreamOutlastsAnOutageWhileReconnecting(t *testing.T) {
+	shortenStreamWait(t, 50*time.Millisecond, time.Hour, time.Hour)
+	fixBindBackoff(50 * time.Millisecond)
+	dir := t.TempDir()
+	s1 := runJetStreamServer(t, -1, dir, nil)
+	port := serverPort(s1)
+
+	capture := &logCapture{}
+	ctx := testCtx(t)
+	c, err := Connect(ctx, clientURL(s1), WithName("relay"), WithLogger(slog.New(capture)),
+		WithNATSOptions(nats.ReconnectWait(50*time.Millisecond)))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer c.Close()
+
+	// The gateway's run context has no deadline, so jetstream bounds each
+	// attempt with its own API timeout; testCtx's deadline would bound it
+	// instead and hide that form.
+	runCtx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	col := &collector{}
+	bound := make(chan error, 1)
+	go func() {
+		_, err := c.SubscribeDurable(runCtx, SubscribeConfig{
+			Stream: TasksStream, Subject: TaskInSubject("chatops", "task-wait"),
+			Durable: "relay-reconnecting", Session: "chatops", WaitForStream: true,
+		}, col.handle)
+		bound <- err
+	}()
+	waitFor(t, 10e9, "the wait to start", func() bool { return capture.contains("waiting for the stream to be created") })
+
+	s1.Shutdown()
+	s1.WaitForShutdown()
+	// Past one jetstream API timeout (5s), so at least one attempt fails on
+	// it while the connection reconnects.
+	time.Sleep(7 * time.Second)
+	select {
+	case err := <-bound:
+		t.Fatalf("the wait returned during the outage: %v", err)
+	default:
+	}
+	if c.rebuilds.Load() != 0 {
+		t.Fatalf("the connection was rebuilt (%d); this test is for an outage it reconnects across", c.rebuilds.Load())
+	}
+	if !capture.contains("durable bind failed; retrying") {
+		t.Fatalf("no attempt failed during the outage, so the test did not reach the reconnecting form:\n%s", strings.Join(capture.lines, "\n"))
+	}
+	s2 := runJetStreamServer(t, port, dir, nil)
+	t.Cleanup(s2.Shutdown)
+	provisionTasksStream(t, clientURL(s2))
+	select {
+	case err := <-bound:
+		if err != nil {
+			t.Fatalf("the wait after the outage: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the wait never bound the stream after the outage")
+	}
+	pub, err := Connect(ctx, clientURL(s2), WithName("pub"))
+	if err != nil {
+		t.Fatalf("Connect publisher: %v", err)
+	}
+	defer pub.Close()
+	env, err := NewMessageEnvelope(Party{Session: "w"}, "task-wait", "ctx-1", "corr-1", validMessagePayload())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Publish(ctx, TaskInSubject("chatops", "task-wait"), env); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	waitFor(t, 15e9, "delivery after the outage", func() bool { return col.count() == 1 })
 }
 
 // An outage several times the bind window, mid-wait, ends the wait no more

@@ -163,6 +163,10 @@ var (
 	bindBackoff = fullJitterBackoff
 	// reconnectPoll paces Reconnect's wait for the rebuild to complete.
 	reconnectPoll = 20 * time.Millisecond
+	// afterBind, when set, runs between a first-bind attempt succeeding and
+	// startWithRetry checking that it landed on the current connection, so a
+	// test can replace the connection in that window. Nil outside tests.
+	afterBind func()
 )
 
 // fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
@@ -746,8 +750,9 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // mid-retry) in place of the refusal. A missing durable keeps the window.
 //
 // With cfg.WaitForStream, a missing stream does not count against the
-// window, and neither does a lost connection (connectionLost), across which
-// the client rebuilds: the bind retries until the stream appears or ctx
+// window, and neither does a lost connection (connectionLost, or the
+// connection not connected when the attempt failed), across which nats.go
+// reconnects or the client rebuilds: the bind retries until the stream appears or ctx
 // ends, and the window restarts from the first attempt that finds it. The wait logs its
 // first attempt and then at most once per streamWaitLogInterval, and warns
 // once per streamWaitWarnEvery, so a stream that never comes is loud, not
@@ -768,6 +773,9 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 	for attempt := 1; ; attempt++ {
 		err := s.start(ctx, js)
 		if err == nil {
+			if afterBind != nil {
+				afterBind()
+			}
 			s.c.mu.RLock()
 			current := s.c.js
 			if current == js {
@@ -813,10 +821,13 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 			js = s.c.currentJS()
 			continue
 		}
-		if s.cfg.WaitForStream && connectionLost(err) {
+		if s.cfg.WaitForStream && (connectionLost(err) || !s.c.connected()) {
 			// Whether the stream exists is unknown while the connection is
-			// down, so the outage does not count against the window either:
-			// the client rebuilds the connection, and the wait goes on there.
+			// down, so the outage does not count against the window either.
+			// The state is read as well as the error: a connection that
+			// reconnects forever (Connect's MaxReconnects(-1)) never closes,
+			// and an attempt on it fails on jetstream's own API timeout, a
+			// context.DeadlineExceeded no error check can tell apart.
 			deadline = time.Now().Add(subscribeBindWindow)
 		}
 		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
@@ -831,6 +842,14 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		}
 		js = s.c.currentJS()
 	}
+}
+
+// connected is whether the client's current connection is connected, rather
+// than reconnecting, closed or being rebuilt.
+func (c *Client) connected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.nc != nil && c.nc.IsConnected()
 }
 
 // connectionLost is whether err says the attempt never reached a server
