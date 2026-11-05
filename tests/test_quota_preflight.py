@@ -943,6 +943,19 @@ class PreflightDecisionTest(unittest.TestCase):
                 hook = 0 if "platformAgent.cleanupHook.enabled=false" in sets else 1
                 self.assertEqual(chart_pods, required["pods"] - operator_pods - hook)
 
+    def test_a_chart_count_past_the_operators_cap_fails_the_render(self) -> None:
+        """The operator discards a chart-pods annotation past a2aMaxChartPods for its
+        default, which would size the quota below what the namespace runs, so the chart
+        refuses to stamp one: 64 renders (the operator's two LiteLLM replicas' default
+        plus 62 operator replicas), 65 fails naming the cap."""
+        cap = int(re.search(r"a2aMaxChartPods\s*=\s*(\d+)", _A2A_MANIFESTS.read_text()).group(1))
+        self.assertEqual(cap, 64)
+        ok = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 2}"])
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        refused = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 1}"])
+        self.assertNotEqual(refused.returncode, 0, "a chart count past the cap rendered")
+        self.assertIn("past the operator's cap of 64", refused.stderr)
+
     def test_the_operators_fallback_is_the_charts_default(self) -> None:
         """An install without the chart gets a2aDefaultChartPods, which must be what a
         default chart render says."""

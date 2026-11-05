@@ -503,6 +503,12 @@ type PlatformAgentReconciler struct {
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
 
+	// a2aChartPodsWarned records, per CR, the spec generation whose discarded
+	// chart-pods annotation was last reported (a2aChartPodsDiscard), so each
+	// generation warns once. Keyed by ObjectKey, value int64; cleared when the
+	// CR is deleted.
+	a2aChartPodsWarned sync.Map
+
 	// replicasLimitedLogged records, per CR, the spec generation whose replica
 	// cap reconcileWorkload last logged, so each generation logs it once
 	// rather than on every requeue. Keyed by ObjectKey, value int64; cleared
@@ -1401,6 +1407,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)

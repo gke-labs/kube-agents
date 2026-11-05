@@ -52,6 +52,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"k8s.io/client-go/tools/record"
 )
 
 func a2aTestAgent() *agentv1alpha1.PlatformAgent {
@@ -8500,4 +8501,66 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
 		}
 	})
+}
+
+// A chart-pods annotation the operator discards is reported, once per spec
+// generation, as a Warning event; an absent one (a CR written without the
+// chart) and a usable one are not.
+func TestA2AChartPodsDiscardWarnsOncePerGeneration(t *testing.T) {
+	warnings := func(rec *record.FakeRecorder) int {
+		n := 0
+		for {
+			select {
+			case e := <-rec.Events:
+				if strings.Contains(e, a2aChartPodsDiscardedReason) {
+					n++
+				}
+			default:
+				return n
+			}
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		want       int
+	}{
+		{"past the cap", ptr.To("70"), 1},
+		{"unreadable", ptr.To("seven"), 1},
+		{"negative", ptr.To("-3"), 1},
+		{"usable", ptr.To("5"), 0},
+		{"absent", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			if why := a2aChartPodsDiscard(agent); (why != "") != (tc.want > 0) {
+				t.Fatalf("a2aChartPodsDiscard = %q", why)
+			}
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec}
+			ctx := context.Background()
+			for range 2 {
+				if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := warnings(rec); got != tc.want {
+				t.Fatalf("%d %s events over two passes of one generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+			agent.Generation++
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := warnings(rec); got != tc.want {
+				t.Fatalf("%d %s events after a new generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+		})
+	}
 }

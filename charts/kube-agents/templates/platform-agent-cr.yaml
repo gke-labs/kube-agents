@@ -65,6 +65,12 @@ metadata:
   */}}
   {{- $chartPodsKey := "kubeagents.x-k8s.io/a2a-quota-chart-pods" }}
   {{- $chartPods := include "kube-agents.chartStandingPods" $ }}
+  {{- /* The operator discards a count past its cap (a2aMaxChartPods) for its
+         default of 3, which would size the session quota below what the
+         namespace runs; refuse to stamp one rather than let it be dropped. */}}
+  {{- if gt (int $chartPods) 64 }}
+  {{- fail (printf "the chart would run %s standing pods in this namespace, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to 3 and refuse pods the release needs. Lower the replica counts, or run some of these components in another namespace." $chartPods) }}
+  {{- end }}
   {{- with get $annotations $chartPodsKey }}
   {{- if ne (toString . | trim) $chartPods }}
   {{- fail (printf "platformAgent.annotations[%q]=%q contradicts the chart's own pods, %s. Drop the annotation; the chart stamps it." $chartPodsKey (toString .) $chartPods) }}

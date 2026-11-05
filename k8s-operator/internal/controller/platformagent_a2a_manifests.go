@@ -3936,6 +3936,11 @@ const (
 	// chart's own count is a handful of pods, so a figure past this is not one
 	// it wrote, and the default stands in for it.
 	a2aMaxChartPods = 64
+	// a2aChartPodsDiscardedReason is the Warning event a CR carrying an
+	// annotation the operator will not use gets, once per spec generation
+	// (a2aChartPodsDiscard): the quota then counts a2aDefaultChartPods, which
+	// can sit below what the namespace runs.
+	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
 	// a2aQuotaTransientMargin is room for pods that come and go beside the
 	// standing ones, at their worst moment, a helm upgrade: three rollout
 	// surge pods at once (the callouts and verifiers roll together on the new
@@ -3950,6 +3955,27 @@ const (
 // cap for agent.
 func a2aQuotaHeadroom(agent *agentv1alpha1.PlatformAgent) int64 {
 	return a2aStandingPods(agent) + a2aChartPods(agent) + a2aQuotaTransientMargin
+}
+
+// a2aChartPodsDiscard says why the CR's chart-pods annotation is not used,
+// or "" when it is used or absent. An absent one is a CR written without the
+// chart, which the default is for; a present one the operator discards is a
+// figure the chart did not write (the chart refuses to render one past the
+// cap) or one it cannot read, and the default may then sit below what the
+// namespace runs, so the discard is reported rather than silent.
+func a2aChartPodsDiscard(agent *agentv1alpha1.PlatformAgent) string {
+	raw, present := agent.GetAnnotations()[a2aChartPodsAnnotation]
+	if !present {
+		return ""
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("annotation %s=%q is not a number; the session quota counts the default of %d chart pods instead", a2aChartPodsAnnotation, raw, a2aDefaultChartPods)
+	case v < 0 || v > a2aMaxChartPods:
+		return fmt.Sprintf("annotation %s=%q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", a2aChartPodsAnnotation, raw, a2aMaxChartPods, a2aDefaultChartPods)
+	}
+	return ""
 }
 
 // a2aChartPods is the chart's standing pods in agent's namespace, as the chart
@@ -5791,6 +5817,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
 	// why both exist and why the quota sits above the cap).
 	quota := buildA2ASessionQuota(agent)
+	if why := a2aChartPodsDiscard(agent); why != "" {
+		key := client.ObjectKeyFromObject(agent)
+		if warned, ok := r.a2aChartPodsWarned.Load(key); !ok || warned.(int64) != agent.Generation {
+			r.recordEvent(agent, corev1.EventTypeWarning, a2aChartPodsDiscardedReason, why)
+			r.a2aChartPodsWarned.Store(key, agent.Generation)
+		}
+	}
 	if err := ctrl.SetControllerReference(agent, quota, r.Scheme); err != nil {
 		return state, err
 	}
