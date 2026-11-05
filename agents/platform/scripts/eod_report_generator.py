@@ -429,15 +429,15 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         ns = event.get("namespace", "")
         reason = event.get("reason", "Unknown")
         if event.get("alert_excluded"):
-            # Out of the 🔇 line entirely in an excluded namespace, as in the
+            # Its cluster is in the scope the header names, excluded
+            # namespaces included, as for every other row.
+            if event.get("cluster"):
+                clusters_seen.add(event["cluster"])
+            # Out of the 🔇 line in an excluded namespace, as in the
             # breakdown: the scope line says those namespaces are outside the
             # recap, and the rules most often mute exactly that noise.
             if ns and ns in exclude_ns:
                 continue
-            # Its cluster is in the scope the header names: the 🔇 count
-            # covers it.
-            if event.get("cluster"):
-                clusters_seen.add(event["cluster"])
             sightings = int(event.get("occurrences", 1))
             alert_excluded_events += sightings
             stored_workload = event.get("workload", "") or ""

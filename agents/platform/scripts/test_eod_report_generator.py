@@ -1949,10 +1949,6 @@ class TestTheNamespaceFilterReadsItsValue(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestAlertExcludedEventsAreCountedApart(unittest.TestCase):
     """Rows an alert-exclude rule held back in the watcher (`excluded = 1`).
 
@@ -2030,6 +2026,13 @@ class TestAlertExcludedEventsAreCountedApart(unittest.TestCase):
         self.assertNotIn(eod_report_generator.ALERT_EXCLUDED_EMOJI, report)
         self.assertNotIn("kube-dns", report)
 
+    def test_an_excluded_namespace_keeps_its_cluster_in_the_scope(self):
+        with exclude("kube-system"):
+            summary, _ = recap([event(cluster="host"),
+                                self._excluded(cluster="seeded-a", namespace="kube-system", object_uid="u1")])
+
+        self.assertIn("seeded-a", summary["clusters"])
+
     def test_a_row_with_no_name_is_listed_by_its_uid_or_as_unknown(self):
         _, report = recap([
             self._excluded(namespace="ns", workload="", object_uid="uid-9", occurrences=2),
@@ -2097,3 +2100,7 @@ class TestTheLoaderReadsTheExcludedMarker(unittest.TestCase):
     def test_the_column_name_matches_the_writer(self):
         source = (Path(__file__).resolve().parent / "session_kv_server.py").read_text()
         self.assertIn('("excluded", "excluded INTEGER NOT NULL DEFAULT 0")', source)
+
+
+if __name__ == "__main__":
+    unittest.main()

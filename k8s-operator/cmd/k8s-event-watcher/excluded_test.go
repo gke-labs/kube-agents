@@ -240,6 +240,87 @@ func TestExcludedRecorderKeepsOneEntryPerKey(t *testing.T) {
 	}
 }
 
+// Events whose involved object has no UID are told apart by namespace, kind
+// and name, as the daemon folds them, rather than merged into one key.
+func TestExcludedRecorderKeysUIDLessEventsByObject(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	r, fake := newTestExcludedRecorder(&now)
+
+	a := excludedSighting("", now)
+	a.Name = "api-1"
+	b := excludedSighting("", now.Add(-time.Second))
+	b.Name = "billing"
+	r.Note(a)
+	r.Note(b)
+	r.Sweep(context.Background())
+
+	if got := fake.occurrences(); len(got) != 2 {
+		t.Fatalf("sent %v; want one record per nameless object", got)
+	}
+	names := map[string]bool{fake.sent[0].Name: true, fake.sent[1].Name: true}
+	if !names["api-1"] || !names["billing"] {
+		t.Errorf("records name %v; want api-1 and billing", names)
+	}
+}
+
+// One sweep stops sending once excludedSweepBudget has passed; the keys it
+// did not reach keep their sightings for the next sweep.
+func TestExcludedRecorderSweepKeepsToItsBudget(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	fake := &fakeExcludedPost{}
+	r := newExcludedRecorder(func(ctx context.Context, rec excludedRecord) error {
+		now = now.Add(excludedSweepBudget / 2)
+		return fake.post(ctx, rec)
+	})
+	r.now = func() time.Time { return now }
+	ctx := context.Background()
+
+	for i := range 5 {
+		r.Note(excludedSighting(fmt.Sprintf("pod-%d", i), now))
+	}
+	r.Sweep(ctx)
+	if got := len(fake.occurrences()); got != 2 {
+		t.Fatalf("one sweep sent %d records; want 2 inside the budget", got)
+	}
+	r.Sweep(ctx)
+	r.Sweep(ctx)
+	if got := len(fake.occurrences()); got != 5 {
+		t.Fatalf("three sweeps sent %d records; want all 5", got)
+	}
+}
+
+// Flush sends every key's pending sightings, due or not.
+func TestExcludedRecorderFlushSendsEverythingPending(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	r, fake := newTestExcludedRecorder(&now)
+	ctx := context.Background()
+
+	r.Note(excludedSighting("pod-1", now))
+	r.Sweep(ctx)
+	now = now.Add(time.Minute)
+	r.Note(excludedSighting("pod-1", now))
+	r.Note(excludedSighting("pod-2", now))
+	r.Flush(ctx)
+
+	if got := fake.occurrences(); len(got) != 3 {
+		t.Fatalf("sent %v; want the first record and both pending ones", got)
+	}
+}
+
+// A cluster that stops sends its pending sightings before the memo goes.
+func TestAStoppedClusterFlushesItsExcludedSightings(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	r, fake := newTestExcludedRecorder(&now)
+	r.Note(excludedSighting("pod-1", now))
+
+	(&clusterRun{excluded: r}).flushExcluded()
+	(&clusterRun{}).flushExcluded()
+
+	if got := fake.occurrences(); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("sent %v; want the pending sighting", got)
+	}
+}
+
 func TestExcludedRecorderDropsNewKeysPastTheBound(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	r, fake := newTestExcludedRecorder(&now)
@@ -387,9 +468,12 @@ func TestDispatcherRecordsOnlyAlertExcludedEvents(t *testing.T) {
 }
 
 func TestADryRunDispatcherRecordsNothing(t *testing.T) {
-	f := &flags{dryRun: true, dedupWindow: time.Minute}
-	disp := newDispatcher(f, newFilter(newFilterConfig(nil, nil, nil, filterThresholds{})), nil, nil, newMetrics())
-	if disp.excluded != nil {
+	inj := (&excludedDaemon{}).start(t)
+	filter := newFilter(newFilterConfig(nil, nil, nil, filterThresholds{}))
+	if disp := newDispatcher(&flags{dryRun: true, dedupWindow: time.Minute}, filter, nil, inj, newMetrics()); disp.excluded != nil {
 		t.Error("a dry-run dispatcher has an excluded-event recorder")
+	}
+	if disp := newDispatcher(&flags{dedupWindow: time.Minute}, filter, nil, inj, newMetrics()); disp.excluded == nil {
+		t.Error("a live dispatcher has no excluded-event recorder")
 	}
 }

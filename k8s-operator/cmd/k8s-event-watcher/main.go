@@ -1107,8 +1107,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
+	// Last, after the settle expiry and the follow-ups, whichever way the
+	// rest returns: they are what a reader sees, and the excluded records
+	// only feed the daily recap.
 	if d.excluded != nil {
-		d.excluded.Sweep(ctx)
+		defer d.excluded.Sweep(ctx)
 	}
 	now := d.clock()
 	quiet := d.filter.cfg.settle + settleQuietSlack

@@ -11498,6 +11498,11 @@ class TestExcludedEvents(unittest.TestCase):
         self._post()
         self.assertEqual(len(self._rows()), 2)
 
+    def test_the_route_prunes_the_ledger(self):
+        with patch.object(session_kv_server, "cleanup_old_records", wraps=session_kv_server.cleanup_old_records) as cleanup:
+            self._post()
+        cleanup.assert_called_once()
+
     def test_the_feed_reads_the_row_as_excluded(self):
         self._post()
         feed = self.client.get("/v1/intercepted-events").json()

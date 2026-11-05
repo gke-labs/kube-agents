@@ -6398,6 +6398,11 @@ def post_excluded_event(payload: Dict[str, Any]) -> Dict[str, str]:
                             occurrences,
                         ),
                     )
+                # This route writes at the cluster's rate and creates no
+                # session, so it prunes here too: otherwise a quiet install
+                # whose rules mute the noise would never reach the TTL and the
+                # row cap.
+                cleanup_old_records(conn)
     except sqlite3.Error as exc:
         # A 5xx, as the drift backlog route answers: the row is all this route
         # does. The watcher keeps the sightings and sends them with its next

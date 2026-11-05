@@ -26,7 +26,7 @@ const (
 	// excludedFlushInterval is the least time between two records for one key.
 	// A chronic failure is sighted every few minutes for days; one record per
 	// key per interval, carrying the sightings since the last, keeps that to
-	// a few calls an hour while the daemon folds them into one row a day.
+	// a few calls an hour while the daemon folds them into one row an hour.
 	excludedFlushInterval = 15 * time.Minute
 	// excludedFeatureRecheck is how long the daemon's answer to "do you take
 	// excluded events?" is trusted before /healthz is asked again, so an agent
@@ -40,9 +40,16 @@ const (
 	// same Event inside the API server's default Event TTL is not counted
 	// twice.
 	excludedEntryTTL = time.Hour
-	// excludedPostTimeout bounds each call to the daemon: Dispatch makes it on
-	// the cluster's delivery path, and an excluded event used to cost no I/O.
+	// excludedPostTimeout bounds each call to the daemon, so one slow call
+	// cannot hold the cluster's sweep for long.
 	excludedPostTimeout = 2 * time.Second
+	// excludedSweepBudget bounds the calls one sweep makes, so a memo full of
+	// keys after a restart is sent over several sweeps instead of holding the
+	// sweep goroutine. A key not reached keeps its sightings for the next.
+	excludedSweepBudget = 5 * time.Second
+	// excludedFinalFlushTimeout bounds the flush made when a cluster stops or
+	// the process shuts down, which sends every key's pending sightings.
+	excludedFinalFlushTimeout = 5 * time.Second
 	// excludedFailureBackoff is how long the poster refuses at once after a
 	// failed call, so a daemon that hangs costs one timeout a minute rather
 	// than one per excluded event. The refused sightings are kept.
@@ -59,6 +66,22 @@ var errExcludedUnsupported = errors.New("the daemon does not take excluded event
 // errExcludedBackoff is what the poster returns inside excludedFailureBackoff
 // after a failed call: the sightings are kept for the next record.
 var errExcludedBackoff = errors.New("backing off after a failed call to the daemon")
+
+// excludedKey is a memo key: the event's own dedup key, or, for an event whose
+// involved object has no UID, the object's namespace, kind and name too, so
+// two nameless objects are not counted as one (the daemon folds such rows the
+// same way).
+type excludedKey struct {
+	EventKey
+	Namespace, Kind, Name string
+}
+
+func excludedKeyFor(ev TriageEvent) excludedKey {
+	if ev.Key.UID != "" {
+		return excludedKey{EventKey: ev.Key}
+	}
+	return excludedKey{EventKey: ev.Key, Namespace: ev.Namespace, Kind: ev.KindOfObject, Name: ev.Name}
+}
 
 // excludedRecord is the body of POST /v1/excluded-events: the event fields
 // the daemon's ledger row keeps, and how many sightings it stands for.
@@ -111,12 +134,12 @@ type excludedRecorder struct {
 	now  func() time.Time
 
 	mu      sync.Mutex
-	entries map[EventKey]*excludedEntry
+	entries map[excludedKey]*excludedEntry
 	dropped int
 }
 
 func newExcludedRecorder(post func(context.Context, excludedRecord) error) *excludedRecorder {
-	return &excludedRecorder{post: post, entries: map[EventKey]*excludedEntry{}}
+	return &excludedRecorder{post: post, entries: map[excludedKey]*excludedEntry{}}
 }
 
 func (r *excludedRecorder) clock() time.Time {
@@ -134,7 +157,8 @@ func (r *excludedRecorder) Note(ev TriageEvent) {
 	now := r.clock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e := r.entries[ev.Key]
+	key := excludedKeyFor(ev)
+	e := r.entries[key]
 	if e != nil && !ev.LastSeen.After(e.lastSeen) {
 		return
 	}
@@ -144,7 +168,7 @@ func (r *excludedRecorder) Note(ev TriageEvent) {
 			return
 		}
 		e = &excludedEntry{}
-		r.entries[ev.Key] = e
+		r.entries[key] = e
 	}
 	e.last, e.lastSeen, e.notedAt = ev, ev.LastSeen, now
 	e.pending++
@@ -152,43 +176,67 @@ func (r *excludedRecorder) Note(ev TriageEvent) {
 
 // Sweep sends each key's sightings since its last record: at once for a key
 // never sent, and otherwise once excludedFlushInterval has passed since the
-// last. It forgets a key with nothing left to send once excludedEntryTTL has
-// passed since its last sighting.
+// last, within excludedSweepBudget. It forgets a key with nothing left to send
+// once excludedEntryTTL has passed since its last sighting.
 func (r *excludedRecorder) Sweep(ctx context.Context) {
-	now := r.clock()
+	r.flush(ctx, false, excludedSweepBudget)
+}
+
+// Flush sends every key's pending sightings, due or not, until ctx ends: the
+// last chance when the cluster's dispatcher stops or the process shuts down,
+// since the memo is in memory only.
+func (r *excludedRecorder) Flush(ctx context.Context) {
+	r.flush(ctx, true, 0)
+}
+
+// flush sends the keys that are due (every key with sightings when all is
+// set), stopping once budget has passed (no limit at 0) or ctx ends. A key
+// it does not reach keeps its sightings and its place.
+func (r *excludedRecorder) flush(ctx context.Context, all bool, budget time.Duration) {
+	start := r.clock()
 	type due struct {
-		key EventKey
-		rec excludedRecord
+		key excludedKey
 	}
-	var sends []due
+	var keys []due
 	r.mu.Lock()
 	dropped := r.dropped
 	r.dropped = 0
 	for key, e := range r.entries {
-		if !e.sentAt.IsZero() && now.Sub(e.sentAt) < excludedFlushInterval {
-			continue
-		}
 		if e.pending == 0 {
-			if now.Sub(e.notedAt) >= excludedEntryTTL {
+			if !all && start.Sub(e.notedAt) >= excludedEntryTTL && start.Sub(e.sentAt) >= excludedFlushInterval {
 				delete(r.entries, key)
 			}
 			continue
 		}
-		sends = append(sends, due{key, excludedRecordFor(e.last, e.pending)})
-		e.pending, e.sentAt = 0, now
+		if !all && !e.sentAt.IsZero() && start.Sub(e.sentAt) < excludedFlushInterval {
+			continue
+		}
+		keys = append(keys, due{key})
 	}
 	r.mu.Unlock()
 	if dropped > 0 {
 		log.Printf("k8s-event-watcher: dropped %d excluded sighting(s) of new keys: %d keys are already held", dropped, excludedMaxEntries)
 	}
-	for _, s := range sends {
-		r.send(ctx, s.key, s.rec)
+	for _, k := range keys {
+		if ctx.Err() != nil || (budget > 0 && r.clock().Sub(start) >= budget) {
+			return
+		}
+		r.mu.Lock()
+		e := r.entries[k.key]
+		if e == nil || e.pending == 0 {
+			r.mu.Unlock()
+			continue
+		}
+		rec := excludedRecordFor(e.last, e.pending)
+		e.pending, e.sentAt = 0, r.clock()
+		r.mu.Unlock()
+		r.send(ctx, k.key, rec)
 	}
 }
 
 // send posts rec, and on a failure puts its sightings back on the key so the
 // next record carries them. A daemon without the route drops them.
-func (r *excludedRecorder) send(ctx context.Context, key EventKey, rec excludedRecord) {
+func (r *excludedRecorder) send(ctx context.Context, key excludedKey, rec excludedRecord) {
 	err := r.post(ctx, rec)
 	if err == nil || errors.Is(err, errExcludedUnsupported) {
 		return
