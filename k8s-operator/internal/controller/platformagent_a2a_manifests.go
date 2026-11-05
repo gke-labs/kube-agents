@@ -5297,17 +5297,13 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(int32(1)),
-			// Recreate, as the credential proxy is, rather than the
-			// RollingUpdate default: at one replica that default resolves
-			// maxUnavailable to 0, so a roll needs a surge Pod and stalls
-			// for good under a namespace ResourceQuota with no headroom
-			// (#977, #1267). maxUnavailable: 1 is not the fix here --
-			// gateway.FromEnv refuses a second backend because two gateways
-			// on one relay durable split event deliveries, so two instances
-			// overlapping during a roll is the wrong shape. Recreate stops
-			// the old one before the new one starts; the gap is the one
-			// the single-backend rule already implies.
+			// One replica and Recreate until the operator knows the image
+			// runs the election (scaleOutA2AGateway): an unelected gateway
+			// beside another would split the relay durable's deliveries, so
+			// two must never overlap. Recreate stops the old one before the
+			// new one starts. Elected replicas take turns on the Lease, and
+			// scaleOutA2AGateway rolls them with a surge pod instead.
+			Replicas:                ptr.To(int32(1)),
 			Strategy:                appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			ProgressDeadlineSeconds: ptr.To(a2aGatewayProgressDeadlineSeconds),
 			Selector:                &metav1.LabelSelector{MatchLabels: selector},
@@ -5319,6 +5315,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 					// exactly that grant, nothing ambient.
 					ServiceAccountName:           a2aGatewayName(agent),
 					AutomountServiceAccountToken: ptr.To(true),
+					// Over zones, so a zone outage leaves a standby.
+					TopologySpreadConstraints: a2aGatewayTopologySpread(agent),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
 						RunAsUser:      ptr.To(int64(1000)),
@@ -5441,6 +5439,11 @@ type a2aProvisionState struct {
 	// leaseRequeue is how long until a held-back recreate of the gateway's
 	// Lease is due (ensureA2AGatewayLease); zero when none is held.
 	leaseRequeue time.Duration
+	// gatewayElected is the image the pod holding the gateway's Lease runs,
+	// as this pass read it, or nil when it couldn't tell
+	// (observeA2AGatewayElection). The status writers carry it as the
+	// GatewayElected condition (gatewayElectedImage).
+	gatewayElected *string
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -6004,6 +6007,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		state.leaseRequeue = leaseWait
+		state.gatewayElected = r.observeA2AGatewayElection(ctx, agent)
 	}
 
 	// The inject backend's principal map, BEFORE the Deployment that mounts
@@ -6061,6 +6065,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// applied (calloutGeneration, below) its only error direction is a false
 	// negative that gatewayHeld's requeue clears.
 	dep := buildA2AGatewayDeployment(agent)
+	// More than one replica only once a gateway that runs the election on
+	// this image has taken the Lease (scaleOutA2AGateway).
+	scaleOutA2AGateway(dep, agent, gatewayElectedImage(agent, state.gatewayElected))
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
 	}
@@ -6157,6 +6164,15 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
+	}
+	// Its budget, after the Deployment it selects, so a drain takes one
+	// replica at a time.
+	pdb := buildA2AGatewayPDB(agent)
+	if err := ctrl.SetControllerReference(agent, pdb, r.Scheme); err != nil {
+		return state, err
+	}
+	if err := r.applyManaged(ctx, agent, pdb); err != nil {
+		return state, fmt.Errorf("failed to apply A2A gateway PodDisruptionBudget: %w", err)
 	}
 
 	// And the removal AFTER it, the other half of the same ordering
@@ -6755,6 +6771,8 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// Its budget, after the Deployment, as the callout's is.
+		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The election's Lease, after the gateway that held it.
 		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},

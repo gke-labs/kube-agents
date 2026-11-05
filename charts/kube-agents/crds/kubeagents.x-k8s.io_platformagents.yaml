@@ -143,6 +143,23 @@ spec:
                         Availability configures high availability and scheduling
                         settings for the agent pod.
                       properties:
+                        a2aGateway:
+                          description:
+                            A2AGateway is the A2A gateway's availability,
+                            under mode next.
+                          properties:
+                            replicas:
+                              description: |-
+                                Replicas is how many A2A gateway pods run. One holds the gateway's Lease
+                                and does the work, and the others stand by to take over. Defaults to 2.
+                                Set 1 where the namespace's quota has no room for the extra pod a
+                                rolling update starts. The operator renders more than one replica only
+                                once a gateway on the image it renders has taken the Lease (the
+                                GatewayElected condition), and one replica until then.
+                              format: int32
+                              minimum: 1
+                              type: integer
+                          type: object
                         affinity:
                           description: Affinity specifies affinity scheduling rules
                           properties:

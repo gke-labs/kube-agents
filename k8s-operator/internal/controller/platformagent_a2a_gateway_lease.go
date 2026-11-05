@@ -70,10 +70,13 @@ var a2aGatewayLeaseEvents = predicate.Funcs{
 	GenericFunc: func(event.GenericEvent) bool { return false },
 }
 
-// a2aGatewayElectionEnabled reports whether the operator was deployed with
-// the election switched on. Anything but an explicit "true" is off.
+// a2aGatewayElectionEnabled reports whether the gateway's election is on:
+// by default, and off only for an explicit "false". An elected gateway
+// steps down while the API server is unreachable
+// (docs/designs/gateway-replicas.md, "What it costs"); "false" is the way
+// back to one unelected replica.
 func a2aGatewayElectionEnabled() bool {
-	return os.Getenv(a2aGatewayElectionEnvVar) == "true"
+	return os.Getenv(a2aGatewayElectionEnvVar) != "false"
 }
 
 // a2aGatewayLeaseName is the Lease's fixed name, the gateway's own: the eval

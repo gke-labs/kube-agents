@@ -843,6 +843,8 @@ func TestBuildA2ANATSStatefulSetRollsOnConfigChange(t *testing.T) {
 // worker PR arms spawning. Anything more here is a finding; the pod-lifecycle
 // verbs land with their consumer in the worker PR.
 func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
+	// The unelected Role; the Lease grant is pinned in the lease tests.
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	agent := a2aTestAgent()
 
 	dep := buildA2AGatewayDeployment(agent)
