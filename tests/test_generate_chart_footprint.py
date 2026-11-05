@@ -572,13 +572,15 @@ class NextModeFootprintTest(unittest.TestCase):
 
     def test_the_jetstream_claim_is_next_modes_alone(self):
         storage = self.following["storage"]
-        self.assertEqual(storage["persistentVolumeClaims"], 1)
-        self.assertEqual(storage["storageBytesRequest"], 40 * _GIB)
+        # One 40Gi JetStream claim per NATS server, three by default.
+        self.assertEqual(storage["persistentVolumeClaims"], 3)
+        self.assertEqual(storage["storageBytesRequest"], 3 * 40 * _GIB)
         # And operatorRendered.storage is the today-mode figure, not the next-mode total.
         self.assertEqual(self.data["operatorRendered"]["storage"]["persistentVolumeClaims"], 4)
 
     def test_the_standing_delta_is_the_documented_figure(self):
-        """The A2A stack's standing requests, provisioning Job aside: 650m and 1152Mi."""
+        """The A2A stack's standing requests, provisioning Job aside: 1150m and 2176Mi,
+        with the default three NATS servers (650m and 1152Mi with one)."""
         standing = [k for k in self.following if k not in ("storage", "a2aProvision")]
         cpu = sum(
             self.following[k]["hermesBridge"]["cpuMillisRequest"] if k == "agentPod"
@@ -590,7 +592,7 @@ class NextModeFootprintTest(unittest.TestCase):
             else self.following[k]["memoryBytesRequest"]
             for k in standing
         )
-        self.assertEqual((cpu, memory), (650, 1152 * _MIB))
+        self.assertEqual((cpu, memory), (1150, 2176 * _MIB))
 
     def test_replicas_scale_a_workload(self):
         with _goldens_with(following=_scale_callout_deployment):

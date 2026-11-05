@@ -37,6 +37,7 @@ _SCHEMA = _CHART / "values.schema.json"
 _PREFLIGHT_TPL = _CHART / "templates" / "quota-preflight.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
+_COMMON_TYPES = _ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 
 _HELM = shutil.which("helm")
@@ -775,7 +776,8 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(following[key] - base[key], value)
         # Not a vacuous zero: the stack is several pods and a JetStream claim.
         self.assertGreaterEqual(following["pods"] - base["pods"], 7)
-        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 1)
+        # One JetStream claim per NATS server, three by default.
+        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 3)
 
     def test_mode_today_counts_what_an_unset_mode_does(self) -> None:
         self.assertEqual(self._requirements(["platformAgent.mode=today"]), self._requirements())
@@ -1981,7 +1983,11 @@ class DocumentedFootprintTest(unittest.TestCase):
         standing_mem_gib = math.floor((standing_mem_bytes / gib) * 10 + 0.5) / 10
 
         # Assert individual workload clauses:
-        self.assertIn(f"NATS ({nats_cpu} CPU, {nats_mem} memory)", page)
+        number_words = {1: "one", 2: "two", 3: "three"}
+        self.assertIn(
+            f"NATS ({number_words[nats_replicas]} servers by default, {nats_cpu} CPU and {nats_mem} memory each",
+            page,
+        )
         self.assertIn(
             f"two auth callout replicas ({callout_cpu} CPU, {callout_mem} memory each)",
             page,
@@ -2029,7 +2035,7 @@ class DocumentedFootprintTest(unittest.TestCase):
         nats_claim_prose = (
             f"a {jetstream_gib} GiB JetStream persistent volume claim"
             if nats_replicas == 1
-            else f"{nats_replicas} {jetstream_gib} GiB JetStream persistent volume claims"
+            else f"{number_words[nats_replicas]} {jetstream_gib} GiB JetStream persistent volume claims"
         )
         self.assertIn(nats_claim_prose, page)
 
@@ -2049,7 +2055,8 @@ class DocumentedFootprintTest(unittest.TestCase):
         # Assert namespace-wide ResourceQuota capping pods:
         quota_clause = (
             rf"renders a namespace-wide `ResourceQuota` on `pods` of "
-            rf"`maxSessions \+ {headroom}` \({max_sessions + headroom} pods by default"
+            rf"`maxSessions \+ {headroom}`, plus one for each NATS server past the first "
+            rf"\({max_sessions + headroom + nats_replicas - 1} pods by default"
         )
         self.assertRegex(page, quota_clause)
 

@@ -88,7 +88,7 @@ const (
 func renderA2AStaticUsers(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, account string) string {
 	var b strings.Builder
 	for _, id := range staticIdentities(agent) {
-		if id.account != account {
+		if id.account != account || frozenOut(agent, id) {
 			continue
 		}
 		b.WriteString(renderA2AStaticUser(id, pw))
@@ -231,7 +231,25 @@ func renderA2ASubjectList(indent, kind string, subjects []string) string {
 // block is the quiet one: the server accepts the config, and the exemption
 // simply covers nothing.
 func renderA2AAuthUsers(agent *agentv1alpha1.PlatformAgent) string {
-	return strings.Join(a2aStaticPrincipalNames(agent), a2aAuthUsersSeparator)
+	names := []string{a2aCalloutConfUser}
+	for _, id := range staticIdentities(agent) {
+		if !frozenOut(agent, id) {
+			names = append(names, id.user)
+		}
+	}
+	return strings.Join(names, a2aAuthUsersSeparator)
+}
+
+// frozenOut reports a static user the bus migration's write freeze removes
+// from nats.conf: every static user outside SYS, whichever application
+// account it is in (TRUSTED's gateway and seed, APP's bridge and web,
+// CONSOLE's console and console-mcp), once the bus is rendered for the
+// freeze. The callout's own user (AUTH) and SYS stay, and so does the
+// callout's list of reserved principal names, which this does not touch.
+// Keyed on SYS rather than on a list of application accounts, so an account
+// added later is frozen too.
+func frozenOut(agent *agentv1alpha1.PlatformAgent, id a2aIdentity) bool {
+	return id.account != a2aAccountSys && busMigrationFreezeConfigured(agent)
 }
 
 // a2aStaticPrincipalNames is every user nats.conf authenticates by password,

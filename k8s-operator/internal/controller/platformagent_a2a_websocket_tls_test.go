@@ -85,7 +85,7 @@ func a2aStartRenderedWebsocket(t *testing.T) (string, *x509.CertPool) {
 	if !strings.Contains(conf, mount) {
 		t.Fatalf("the rendered nats.conf no longer names %s; the substitution below would be inert", mount)
 	}
-	conf = strings.ReplaceAll(conf, mount, dir+"/")
+	conf = strings.ReplaceAll(a2aSingleServerTestConf(t, conf), mount, dir+"/")
 
 	path := filepath.Join(t.TempDir(), "nats.conf")
 	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {

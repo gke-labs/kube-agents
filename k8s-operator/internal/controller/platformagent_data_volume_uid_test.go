@@ -103,6 +103,13 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	sandbox := buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s")
 	nats := buildA2ANATSStatefulSet(agent, "c")
 	provision := buildA2AProvisionJob(agent)
+	// The bus migration's pin and unpin Jobs share one builder, its
+	// snapshot, restore and rollback pods another, and its hashing pod a
+	// third; none mounts the agent's claim.
+	busRun := &agentv1alpha1.BusMigrationStatus{RunID: "1-1", Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	busPin := buildBusMigrationJob(agent, busRun, "pin", time.Now())
+	busRestore := buildBusStreamPod(agent, busRun, "restore", time.Now())
+	busHash := buildBusHashPod(agent, busRun)
 	scopePublisher := buildScopePublisherJob(agent, time.Time{}, scopeMemberHash(agent))
 
 	pods := []renderedPodTemplate{
@@ -118,6 +125,9 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildA2AConsoleDeployment", a2aConsole.Name, a2aConsole.Spec.Template.Spec},
 		{"buildA2AMCPDeployment", a2aMCP.Name, a2aMCP.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},
+		{"buildBusMigrationJob", busPin.Name, busPin.Spec.Template.Spec},
+		{"buildBusStreamPod", busRestore.Name, busRestore.Spec},
+		{"buildBusHashPod", busHash.Name, busHash.Spec},
 		{"buildScopePublisherJob", scopePublisher.Name, scopePublisher.Spec.Template.Spec},
 	}
 	for builder, statefulSet := range map[string]*appsv1.StatefulSet{
