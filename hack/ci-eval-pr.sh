@@ -2935,8 +2935,12 @@ while IFS= read -r ENTRY; do
   if [ -n "${ENTRY}" ]; then CERTIFICATION_TASKS+=("${ENTRY}"); fi
 done <<< "${CERTIFICATION_ENTRIES}"
 check_case_entries "${CERTIFICATION_CASES_FILE}" ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}
+# A here-string, not `printf ... | grep -q`: under pipefail the pipe form can
+# read a registered entry as absent (the rule and why, at the GitLab lane's
+# registration check in gitlab_lane_matrix), which here would let a case
+# graded on two lanes through.
 for ENTRY in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do
-  if printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+  if grep -qxF -- "${ENTRY}" <<< "${PRESUBMIT_ENTRIES}"$'\n'"${NIGHTLY_ENTRIES}"; then
     echo "ERROR: ${CERTIFICATION_CASES_FILE}: '${ENTRY}' is also in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; a certification case runs on the certification lane only, or it holds two records under one name." >&2
     exit 1
   fi
