@@ -108,12 +108,18 @@ agent outage: the old pod stops before the new one starts. Once `BusProvisioned`
 `True` the bridge stays in the pod on later renders.
 
 **It has its own resources, sized for the `api` executor.** The rendered bridge requests 250m
-CPU and 512Mi, with limits of 1 CPU and 1Gi. The request is sized to live under on its
-own, since GKE Autopilot without Pod bursting sets every limit to its request: one answer at
-the 8 MiB response cap takes about 80Mi to read, decode and publish, so 512Mi holds about
-six at-cap answers at once; the default concurrency of two sits well under it, where the
-256Mi it used to request held three, and a bridge given a higher `BRIDGE_CONCURRENCY` needs
-`A2A_BRIDGE_RESOURCES` raised in step. The pair sits in the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged. On `api`, the default, it's a Go relay that
+CPU and 512Mi, with limits of 1 CPU and 1Gi. This paragraph is the one statement of that
+sizing; the operator's `a2aRenderedBridgeDefaultResources` comment points here rather than
+restating it. The request is sized to live under on its own, since GKE Autopilot without Pod
+bursting sets every limit to its request. Measured, one answer at the 8 MiB response cap takes
+about 80Mi to read, decode and publish, and three at once about 113Mi, not three times 80Mi:
+the first answer carries the fixed cost and each further one adds about 17Mi. Extrapolated
+along that line, ten at-cap answers at once, the rendered default of ten workers
+(`a2aRenderedBridgeDefaultConcurrency`) all busy, come to about 230Mi, under the 512Mi request,
+where the 256Mi it used to request held three and little else. The limit gives the same ten
+room twice over where bursting is on. A bridge given a `BRIDGE_CONCURRENCY` well above ten
+needs `A2A_BRIDGE_RESOURCES` raised with it. The pair sits in the 1 to 6.5 GiB per vCPU band
+Autopilot admits unchanged. On `api`, the default, it's a Go relay that
 holds one HTTP request per task to the agent container's API server, and the turn itself
 runs in the agent container. Measured idle it uses about 1m CPU and 5Mi
 ([#2748](https://github.com/gke-labs/kube-agents/issues/2748)). It used to copy the agent

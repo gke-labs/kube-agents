@@ -425,15 +425,14 @@ func buildA2ABridgeContainer(agent *agentv1alpha1.PlatformAgent, agentContainer 
 // a2aRenderedBridgeDefaultResources sizes the rendered bridge for the api
 // executor, the default: a Go relay to the agent container's API server, where
 // the turn itself runs. Measured idle at 1m CPU and 4-5Mi on three next
-// installs (gke-labs#2748). The request is sized to be livable as a ceiling,
-// because GKE Autopilot without Pod bursting sets each limit to its request:
-// one answer at the bridge's 8 MiB response cap takes about 80MiB to read,
-// decode and publish, and three at once about 113MiB, so the 256Mi it used
-// to request held three answers at once and nothing else, and at ten
-// workers (a2aRenderedBridgeDefaultConcurrency) ten answers at once sit
-// under 512Mi. The limit gives the same ten room twice over where bursting
-// is on, and the bridge sets its Go soft memory limit from whichever of the
-// two the cluster admitted (a2aBridgeMemoryLimitEnvVar). The pair sits in
+// installs (gke-labs#2748). The request is sized to be livable as a ceiling
+// at the rendered default concurrency (a2aRenderedBridgeDefaultConcurrency),
+// because GKE Autopilot without Pod bursting sets each limit to its request.
+// The measured figures behind the pair, and what the request holds at that
+// concurrency, are stated once in a2a/docs/hermes-bridge.md ("It has its own
+// resources") and not repeated here. The bridge sets its Go soft memory limit
+// from whichever of the two the cluster admitted (a2aBridgeMemoryLimitEnvVar).
+// The pair sits in
 // the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged, so adding it
 // to the agent pod, whose total requests Autopilot evaluates, does not pull
 // the pod out of the band on its own. The cli
