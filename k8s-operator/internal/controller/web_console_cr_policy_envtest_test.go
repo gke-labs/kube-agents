@@ -96,8 +96,10 @@ func TestTheWebConsoleCRPolicyHoldsTheConsoleToItsOwnFields(t *testing.T) {
 			Harness: &agentv1alpha1.HarnessSpec{
 				ProjectID: envtestHarnessProject, Location: envtestHarnessLocation, ClusterName: envtestHarnessCluster,
 			},
+			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{Tag: ptr.To("v1")}},
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				IntegrationSpec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "gke-labs/kube-agents"}},
+				Slack:           &agentv1alpha1.SlackSpec{AllowedUsers: []string{"U0123456"}},
 			},
 		},
 	})
@@ -120,7 +122,7 @@ func TestTheWebConsoleCRPolicyHoldsTheConsoleToItsOwnFields(t *testing.T) {
 			break
 		}
 		if err == nil {
-			if err := patch(admin, `{"spec":{"deployment":null}}`); err != nil {
+			if err := patch(admin, `{"spec":{"deployment":{"env":null}}}`); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -151,20 +153,27 @@ func TestTheWebConsoleCRPolicyHoldsTheConsoleToItsOwnFields(t *testing.T) {
 	}
 
 	const (
-		specRule   = "may change only spec.integration"
-		annotRule  = "may change only its own annotations"
-		labelsRule = "labels, finalizers or owner references"
+		specRule        = "may change only spec.integration on"
+		integrationRule = "may change only spec.integration.forges, repositories and github"
+		annotRule       = "may change only its own annotations"
+		labelsRule      = "labels, finalizers or owner references"
 	)
 	refused := map[string]struct{ body, rule string }{
 		"spec.deployment.env":               {envPatch, specRule},
 		"an image tag":                      {`{"spec":{"deployment":{"tag":"evil"}}}`, specRule},
 		"spec.harness.eventWatcher.enabled": {`{"spec":{"harness":{"eventWatcher":{"enabled":false}}}}`, specRule},
 		"spec.scope":                        {`{"spec":{"scope":{"projects":["another-project"]}}}`, specRule},
+		"a spec field removed":              {`{"spec":{"deployment":null}}`, specRule},
+		"the Slack allowlist cleared":       {`{"spec":{"integration":{"slack":{"allowedUsers":null}}}}`, integrationRule},
+		"a Teams integration added":         {`{"spec":{"integration":{"teams":{"allowAllUsers":true}}}}`, integrationRule},
+		"spec.integration removed":          {`{"spec":{"integration":null}}`, integrationRule},
 		"a foreign annotation changed":      {`{"metadata":{"annotations":{"example.com/owner":"me"}}}`, annotRule},
 		"a foreign annotation added":        {`{"metadata":{"annotations":{"example.com/new":"x"}}}`, annotRule},
 		"a foreign annotation removed":      {`{"metadata":{"annotations":{"example.com/owner":null}}}`, annotRule},
 		"a label":                           {`{"metadata":{"labels":{"team":"other"}}}`, labelsRule},
 		"a finalizer":                       {`{"metadata":{"finalizers":["example.com/hold"]}}`, labelsRule},
+		"an owner reference": {`{"metadata":{"ownerReferences":[` +
+			`{"apiVersion":"v1","kind":"ConfigMap","name":"owner","uid":"0b8f2e4c-1a2b-4c3d-9e8f-123456789abc"}]}}`, labelsRule},
 	}
 	for name, tc := range refused {
 		err := patch(console, tc.body)

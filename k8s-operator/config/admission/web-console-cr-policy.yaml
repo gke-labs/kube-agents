@@ -11,20 +11,28 @@
 # `patch` on this install's PlatformAgent, and RBAC cannot limit a verb to fields, so that `patch`
 # reaches the whole spec: `spec.deployment.env` (which reaches the gateway's sidecars, including the
 # event watcher's alert-exclude setting), `spec.harness.eventWatcher`, `spec.scope`, images and
-# tags. Whatever drives the console, or takes over its pod, could change any of them. This policy
-# holds the console to what a2a/cmd/web-console writes: its own annotations and `spec.integration`.
+# tags, or the chat integrations' user allowlists. Whatever drives the console, or takes over its
+# pod, could change any of them. This policy holds the console to what a2a/cmd/web-console writes:
+# its own annotations and three keys of `spec.integration` (`forges`, `repositories`, `github`).
 #
 # WHAT IT CHECKS, for an UPDATE of a PlatformAgent whose requester is a ServiceAccount named
 # `<release>-web-console` in the CR's own namespace (the console's identity):
 #
-#   1. Every `spec` field except `integration` is unchanged: none added, removed or changed.
+#   1. Every `spec` field except `integration` is unchanged: none added, removed or changed. Under
+#      `integration`, every key except `forges`, `repositories` and `github` is unchanged, so the
+#      Slack, Google Chat and Teams settings (their user allowlists among them) are out of reach.
 #   2. Every annotation except the console's own keys (the list below, the constants in
 #      a2a/cmd/web-console models.go, patches.go and repositories.go) is unchanged.
 #   3. Labels, finalizers and owner references are unchanged.
 #
-# Server-set fields (resourceVersion, generation, managedFields) are not compared. The status
+# resourceVersion, generation and managedFields are not compared: the API server sets the first
+# two and rewrites managedFields on every write, and none of them grants anything. The status
 # subresource is a separate resource, which the console's Role does not grant and this policy does
 # not match. Helm, the operator and people are other requesters and are not selected.
+#
+# A limit to know: with the operator's webhooks on (operator.webhooks.enabled, off by default), its
+# defaulting webhook can add a spec field during the console's write, and this policy then refuses
+# that write. A later update by anyone else persists the default.
 #
 # A test in k8s-operator (web_console_cr_policy_envtest_test.go) runs this file in a real API
 # server, and tests/test_web_console_cr_policy_shipped.py holds the key list to the console's
@@ -64,6 +72,13 @@ spec:
       expression: "has(oldObject.spec) ? oldObject.spec : {}"
     - name: newSpec
       expression: "has(object.spec) ? object.spec : {}"
+    # The spec.integration keys a2a/cmd/web-console writes (repositories.go).
+    - name: consoleIntegrationKeys
+      expression: "['forges', 'repositories', 'github']"
+    - name: oldIntegration
+      expression: "'integration' in variables.oldSpec ? variables.oldSpec.integration : {}"
+    - name: newIntegration
+      expression: "'integration' in variables.newSpec ? variables.newSpec.integration : {}"
     - name: oldAnnotations
       expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
     - name: newAnnotations
@@ -74,6 +89,12 @@ spec:
           (k in variables.oldSpec && variables.newSpec[k] == variables.oldSpec[k])) &&
         variables.oldSpec.all(k, k == 'integration' || k in variables.newSpec)
       message: "the web console may change only spec.integration on a PlatformAgent"
+      reason: Forbidden
+    - expression: >-
+        variables.newIntegration.all(k, k in variables.consoleIntegrationKeys ||
+          (k in variables.oldIntegration && variables.newIntegration[k] == variables.oldIntegration[k])) &&
+        variables.oldIntegration.all(k, k in variables.consoleIntegrationKeys || k in variables.newIntegration)
+      message: "the web console may change only spec.integration.forges, repositories and github on a PlatformAgent"
       reason: Forbidden
     - expression: >-
         variables.newAnnotations.all(k, k in variables.consoleAnnotations ||

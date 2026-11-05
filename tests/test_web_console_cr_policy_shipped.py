@@ -120,6 +120,14 @@ class PolicyContentTest(unittest.TestCase):
         self.assertEqual(allowed, console_keys())
         self.assertEqual(len(allowed), 6)
 
+    def test_the_allowed_integration_keys_are_the_ones_the_console_writes(self):
+        variable = next(v for v in self.policy["spec"]["variables"] if v["name"] == "consoleIntegrationKeys")
+        allowed = set(re.findall(r"'([^']+)'", variable["expression"]))
+        self.assertEqual(allowed, {"forges", "repositories", "github"})
+        text = (CONSOLE_DIR / "repositories.go").read_text(encoding="utf-8")
+        for key in allowed:
+            self.assertIn(f'"{key}"', text)
+
     def test_it_selects_the_chart_s_console_service_account(self):
         (condition,) = self.policy["spec"]["matchConditions"]
         self.assertIn("endsWith('-web-console')", condition["expression"])
