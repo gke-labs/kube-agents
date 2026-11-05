@@ -63,6 +63,37 @@ Pick exactly one class, by the first rule that matches, and write the rule you u
 | Infrastructure  | A 429, a timeout, a lost lease, a missing token, a forge-less install for a ledger check                                                                                                         | Not a red; fix the environment and re-run                                                                                         |
 
 Write the class with three evidence quotes and one sentence on why the next-nearest class does not apply. If two classes apply to different checks of the same case, split: one loop per class.
+Then, for any class but Infrastructure, write the Step 3b card; no code and no run beyond the record before it. An Infrastructure red is fixed and re-run first, with no card.
+
+## Step 3b: the decision card
+
+One card per loop, written from the record after Step 3. It goes to the human first; code starts on the human's word. Fixed headings, this order, each within the size its text names.
+
+1. **The case in customer terms.** Two sentences: who asks, and what they should get back.
+2. **What the agent does.** One verbatim line per failing shape, its count over the record, and the `file:line` of the code that produced the text.
+3. **Root cause.** One paragraph: the Step 3 class, the evidence line that selects it, and why the next-nearest class does not apply.
+4. **Behaviour or case.** In two sentences, say whether the case's bar is the product's own stated rule, and quote the rule. If the case is loose or unbound, give the one-line tweak: bind the claim to the planted object, or require the thing the customer must see.
+5. **What the customer wants to see.** Before and after, real text, each under 10 lines. The after carries the verdict, the one proving number, and the one thing they did not ask but should know.
+6. **The fix, one lever per cause.** One paragraph per lever. Prose for a prompt contradiction, code for a code behaviour, a fixture change for a fixture gap; never prose to cover code. Give the size in lines, the resource cost in requests and objects, and where it lives; name a Hermes patch as one, with the note that it moves when Hermes goes. When one root cause takes two levers, both halves ship in one pull request.
+7. **Do less.** The one-line option, and what it would certify falsely.
+8. **Live run needs.** One line each: install, forge, fixture, model, minutes.
+9. **Not covered.** At most three bullets.
+10. **Rec and principle.** One line each.
+
+The card and the fix it proposes obey these rules:
+
+| Do                                                                           | Do not                                                     |
+| ---------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Name the model of every red and every green.                                 | Report a green on one model as a green on another.         |
+| Bind every check to the planted object.                                      | Grade a sibling finding as the planted one.                |
+| Keep to one lever per cause.                                                 | Use prose to cover a code behaviour.                       |
+| State a limit as a ceiling ("stays under").                                  | State a limit as a target ("aim for").                     |
+| Show the customer the verdict, the proving number and the one unasked thing. | Patch wording round after round when a state check exists. |
+| Count server-side, with a field or label selector.                           | List everything and filter locally.                        |
+| Put numbers in a table and link every pull request and issue.                | Add a constant or a mechanism for its own sake.            |
+| Keep every claim on the record, with its run directory or line.              | Widen the fix mid-loop without a new card.                 |
+| Stop after the card and wait for the word.                                   | Take a review clear as push authority.                     |
+| Let the review check's green or the third round assign the human reviewer.   | Request a human reviewer by hand.                          |
 
 ## Step 4: red
 

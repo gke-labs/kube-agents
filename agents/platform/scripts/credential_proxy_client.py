@@ -196,6 +196,13 @@ BROKER_URL_ENV = "CREDENTIAL_PROXY_URL"
 # shim's own (cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE) or a broker
 # refusal look like the cluster's (CONNECTIVITY_FAILURE_RE).
 EXEC_FALLBACK_NOTICE = "exec tier not reachable; this command went to the stateful broker"
+# The broker route `execute` sends a command to, under the broker's URL.
+EXEC_ROUTE = "/v1/exec"
+# The line a malformed exec URL writes, once per process, when the stateful
+# broker takes its place. No "credential proxy" prefix, for the same reason as
+# EXEC_FALLBACK_NOTICE; the reason names the shape, never a network cause.
+EXEC_URL_IGNORED_NOTICE = "{name} ignored ({reason}); commands go to the stateful broker"
+_exec_url_notice_written = False
 # A connection that closed once the request was sent: the command may have run,
 # so it is never sent again. The `credential proxy error` prefix marks the line
 # as the shim's own for kubectl's failure classifiers.
@@ -290,10 +297,11 @@ class BrokerConnection(http.client.HTTPConnection):
         self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
         try:
             super().connect()
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             # The one point where "nothing was sent" is certain. urllib wraps
             # this in a URLError as before, so a caller that reads only that
-            # sees no change.
+            # sees no change. UnicodeError is the resolver's IDNA step refusing
+            # the host (an empty or over-long label), before any lookup.
             raise BrokerUnreachable(str(exc)) from exc
         self.sock.settimeout(None)
 
@@ -305,12 +313,14 @@ class BrokerUnreachable(OSError):
 def exec_endpoints() -> tuple[str | None, str | None]:
     """The broker an exec-role call goes to, and the one it falls back on.
 
-    The exec tier when the operator set its URL, with the stateful broker as
-    the fallback; else the stateful broker alone, as before the exec tier.
-    `execute` falls back only when no connection to the exec tier could be
-    made (`BrokerUnreachable`): then no request reached a broker, and nothing
-    ran. `ApiSession` also falls back after a dropped connection, because its
-    relay calls are GETs, which are safe to send again.
+    The exec tier when the operator set a well-formed URL, with the stateful
+    broker as the fallback; else the stateful broker alone, as before the exec
+    tier. A malformed URL is ignored with one stderr line (`_exec_url_fault`).
+    `execute` falls back only on a failure before a byte was sent (no
+    connection to the exec tier, or a URL it could not build a request from):
+    then no request reached a broker, and nothing ran. `ApiSession` also falls
+    back after a dropped connection, because its relay calls are GETs, which
+    are safe to send again.
     """
     # Spelled out, not BROKER_URL_ENV: tests/conformance/test_C_enforcement.py
     # (C1) pins that the shim reads this name, across the module boundary to
@@ -318,8 +328,57 @@ def exec_endpoints() -> tuple[str | None, str | None]:
     stateful = os.getenv("CREDENTIAL_PROXY_URL")
     exec_url = os.getenv(EXEC_URL_ENV, "").strip()
     if exec_url:
-        return exec_url, stateful or None
+        reason = _exec_url_fault(exec_url)
+        if reason is None or not stateful:
+            # With no stateful broker to use instead, a malformed URL is
+            # reported when the call is made, as before this check.
+            return exec_url, stateful or None
+        global _exec_url_notice_written
+        if not _exec_url_notice_written:
+            print(EXEC_URL_IGNORED_NOTICE.format(name=EXEC_URL_ENV, reason=reason), file=sys.stderr)
+            _exec_url_notice_written = True
+        return stateful, None
     return stateful, None
+
+
+def _exec_url_fault(url: str) -> str | None:
+    """Why the exec URL can't be used, or None.
+
+    The broker opener's connect bound and its `BrokerUnreachable` signal are on
+    plain http only, so an https URL would get neither the bound nor the
+    fallback. A bad port or a missing scheme fails before any socket opens.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        # A bracketed host that is not an IPv6 address, such as `http://[::1`.
+        return "not a valid URL"
+    if parts.scheme != "http":
+        return "not an http:// URL"
+    if not parts.hostname:
+        return "no host"
+    try:
+        parts.port
+    except ValueError:
+        return "the port is not a number from 0 to 65535"
+    if "?" in url or "#" in url:
+        # The route is appended to the URL, so it would land in the query or
+        # be cut off with the fragment.
+        return "it has a query or a fragment"
+    try:
+        # What execute() builds from the raw string, short of a socket: the
+        # resolver's IDNA step, the connection's host check and the request
+        # line's path check. urlsplit's view drops a tab or newline and keeps
+        # a %-escape, so it can't answer for them.
+        parts.hostname.encode("idna")
+        request = urllib.request.Request(url.rstrip("/") + EXEC_ROUTE)
+        connection = http.client.HTTPConnection(request.host)
+        # urllib sends its own Host header, which http.client encodes as latin-1.
+        connection.putrequest("POST", request.selector, skip_host=True)
+        connection.putheader("Host", request.host)
+    except (ValueError, http.client.InvalidURL):
+        return "not a valid URL"
+    return None
 
 
 class _BrokerHTTPHandler(urllib.request.HTTPHandler):
@@ -1612,13 +1671,18 @@ def execute(
     while True:
         try:
             request = urllib.request.Request(
-                targets[0].rstrip("/") + "/v1/exec",
+                targets[0].rstrip("/") + EXEC_ROUTE,
                 data=body,
                 headers=headers,
                 method="POST",
             )
         except ValueError as exc:
-            # A URL with no scheme, such as a bare Service name: nothing was sent.
+            # A URL with no scheme, such as a bare Service name: nothing was
+            # sent, so a fallback is safe.
+            if len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
             print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
         try:
@@ -1657,9 +1721,15 @@ def execute(
                 continue
             print(f"credential proxy unavailable: {exc.reason}", file=sys.stderr)
             return 1
-        except http.client.InvalidURL as exc:
-            # Raised while the connection is built, before a socket opens:
-            # nothing was sent.
+        except (http.client.InvalidURL, UnicodeEncodeError) as exc:
+            # Raised while the connection, the request line or the Host header
+            # is built, before a socket opens: nothing was sent, so a fallback
+            # is safe. A reply is decoded, never encoded, so a UnicodeEncodeError
+            # here is the request's own.
+            if len(targets) > 1:
+                print(EXEC_FALLBACK_NOTICE, file=sys.stderr)
+                targets = targets[1:]
+                continue
             print(f"credential proxy unavailable: {exc}", file=sys.stderr)
             return 1
         except (http.client.HTTPException, OSError) as exc:
@@ -2318,7 +2388,15 @@ def _connection_errors() -> tuple[type[BaseException], ...]:
         import requests
     except ImportError:
         return (ConnectionError,)
-    return (requests.exceptions.ConnectionError, ConnectionError)
+    # The URL errors are raised while the request is prepared, before a byte is
+    # sent, so moving to the fallback is as safe as for a connection error.
+    return (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.InvalidURL,
+        requests.exceptions.MissingSchema,
+        requests.exceptions.InvalidSchema,
+        ConnectionError,
+    )
 
 
 def read_stdin_if_requested(argv: list[str]) -> str | None:
@@ -2341,11 +2419,13 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     # No default: a named endpoint is used as given, with no exec routing and
-    # no fallback, and an unnamed one is resolved by `exec_endpoints`.
+    # no fallback, and an unnamed one is resolved by `exec_endpoints`. Read from
+    # the environment here, not through `exec_endpoints`, which would write its
+    # malformed-URL line even when an endpoint is named.
     parser.add_argument(
         "--endpoint",
         default=None,
-        required=exec_endpoints()[0] is None,
+        required=not os.getenv(EXEC_URL_ENV, "").strip() and os.getenv(BROKER_URL_ENV) is None,
     )
     parser.add_argument(
         "executable",

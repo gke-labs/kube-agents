@@ -150,6 +150,8 @@ type flags struct {
 	reasons           string
 	namespaces        string
 	excludeNamespaces string
+	// alertExclude is the --alert-exclude JSON; see alertexclude.go.
+	alertExclude      string
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
@@ -217,6 +219,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.reasons, "reason", "", "Comma-separated allow-list of Event.Reason values. Empty = shipped default set.")
 	fs.StringVar(&f.namespaces, "namespace", "", "Comma-separated allow-list of namespaces. Empty = all namespaces.")
 	fs.StringVar(&f.excludeNamespaces, "exclude-namespace", "", "Comma-separated deny-list of namespaces.")
+	fs.StringVar(&f.alertExclude, "alert-exclude", "", `JSON list of alert-exclude rules. An event any rule matches opens no incident; its cluster stays in scope for reads. Each rule sets one or more of cluster ({"projectId","location","clusterName"}, clusterName required), namespace, reason (the event's or its canonical reason), kind, and name (a trailing "*" is a prefix match); a rule matches when every part it sets matches. Empty = none.`)
 
 	// Dedup.
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
@@ -1248,6 +1251,18 @@ func realMain(argv []string) error {
 
 	// Build components.
 	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.filterThresholds())
+	// A malformed list fails open, as the entrypoint's tunables do: stopping
+	// here would end incident detection for every cluster to silence a few.
+	// Assigned only on success, so a parse error can never leave a partial
+	// list in force while the log says none is.
+	rules, err := parseAlertExclude(f.alertExclude)
+	switch {
+	case err != nil:
+		log.Printf("k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident", err)
+	case len(rules) > 0:
+		filterCfg.alertExclude = rules
+		log.Printf("k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s", len(rules), gateAlertExcluded)
+	}
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()

@@ -18,6 +18,7 @@ hop replaced by `sh -c`.
 """
 
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -340,7 +341,8 @@ class RemoveProfile(unittest.TestCase):
     def test_a_deleted_profile_s_home_is_removed_and_nothing_is_pushed(self):
         code = self.drive("--skeleton-only", "--remove-profile", "cluster-gone")
         self.assertEqual(code, sm.EXIT_OK)
-        self.assertEqual(self.removals(), ["rm -rf -- /opt/data/profiles/cluster-gone"])
+        self.assertEqual(len(self.removals()), 1)
+        self.assertTrue(self.removals()[0].startswith("rm -rf -- /opt/data/profiles/cluster-gone; "), self.removals())
         self.assertEqual(self.pushed, [])
 
     def test_a_profile_that_still_exists_keeps_its_sandbox_home(self):
@@ -435,6 +437,80 @@ class RemoveProfileOnDisk(unittest.TestCase):
         self.assertFalse(os.path.lexists(self.sandbox / "profiles" / "cluster-b"))
         self.assertTrue((self.sandbox / "profiles" / "cluster-a" / "workspace").is_dir())
         self.assertTrue((self.sandbox / "profiles" / "platform" / "workspace").is_dir())
+
+    def result(self, out):
+        lines = [line for line in out.splitlines() if line.startswith(sm.REMOVE_RESULT_PREFIX)]
+        self.assertEqual(len(lines), 1, out)
+        return json.loads(lines[0][len(sm.REMOVE_RESULT_PREFIX):])
+
+    def batch(self, *names):
+        args = [a for n in names for a in ("--remove-profile", n)]
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = self.mirror(*args)
+        return code, self.result(out.getvalue())
+
+    def test_a_batch_removes_every_deleted_home_in_one_call_and_says_so_by_name(self):
+        # #4574: one mirror start and one hop for a prune's worth of names.
+        self.assertEqual(self.mirror(), sm.EXIT_OK)
+        import shutil
+
+        for name in ("cluster-a", "cluster-b"):
+            shutil.rmtree(self.agent / "profiles" / name)
+        code, result = self.batch("cluster-a", "cluster-b")
+        self.assertEqual(code, sm.EXIT_OK)
+        self.assertEqual(result, {"removed": ["cluster-a", "cluster-b"], "left": [], "refused": []})
+        for name in ("cluster-a", "cluster-b"):
+            self.assertFalse(os.path.lexists(self.sandbox / "profiles" / name))
+
+    def test_a_home_the_rm_cannot_take_is_left_and_named_and_the_rest_go(self):
+        if os.geteuid() == 0:
+            self.skipTest("root removes a read-only directory's contents anyway")
+        self.assertEqual(self.mirror(), sm.EXIT_OK)
+        import shutil
+
+        for name in ("cluster-a", "cluster-b"):
+            shutil.rmtree(self.agent / "profiles" / name)
+        stuck = self.sandbox / "profiles" / "cluster-a" / "sealed"
+        stuck.mkdir()
+        (stuck / "file").write_text("x")
+        stuck.chmod(0o500)
+        self.addCleanup(stuck.chmod, 0o700)
+        code, result = self.batch("cluster-a", "cluster-b")
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(result, {"removed": ["cluster-b"], "left": ["cluster-a"], "refused": []})
+        self.assertFalse(os.path.lexists(self.sandbox / "profiles" / "cluster-b"))
+
+    def test_a_home_whose_name_holds_a_line_break_is_still_reported_left(self):
+        # Reported by position, not by path: a \r or \n in a name cannot split the
+        # reply into rows that match nothing and so read as removed.
+        if os.geteuid() == 0:
+            self.skipTest("root removes a read-only directory's contents anyway")
+        odd = "cluster-odd\rname"
+        home = self.sandbox / "profiles" / odd
+        sealed = home / "sealed"
+        sealed.mkdir(parents=True)
+        (sealed / "file").write_text("x")
+        sealed.chmod(0o500)
+        self.addCleanup(sealed.chmod, 0o700)
+        code, result = self.batch(odd)
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(result, {"removed": [], "left": [odd], "refused": []})
+        self.assertTrue(home.is_dir())
+
+    def test_a_name_still_on_the_agent_side_is_refused_by_name_and_the_rest_go(self):
+        self.assertEqual(self.mirror(), sm.EXIT_OK)
+        import shutil
+
+        shutil.rmtree(self.agent / "profiles" / "cluster-b")
+        code, result = self.batch("cluster-a", "cluster-b")
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(result, {"removed": ["cluster-b"], "left": [], "refused": ["cluster-a"]})
+        self.assertTrue((self.sandbox / "profiles" / "cluster-a" / "workspace").is_dir())
+
+    def test_a_batch_with_nothing_removable_still_reports_the_refusals(self):
+        code, result = self.batch("cluster-a")
+        self.assertEqual(code, sm.EXIT_RETRY)
+        self.assertEqual(result, {"removed": [], "left": [], "refused": ["cluster-a"]})
 
     def test_a_home_the_model_swapped_for_a_symlink_is_unlinked_not_followed(self):
         precious = self.sandbox / "profiles" / "cluster-a"

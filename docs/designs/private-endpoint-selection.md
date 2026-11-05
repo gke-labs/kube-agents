@@ -186,9 +186,9 @@ included) or a message the credential-proxy shim itself produced (its `credentia
 `credential proxy unavailable`, `credential proxy token unavailable`, `credential proxy
 error` and `credential proxy throttled` prefixes; a connection that drops after the request was
 sent is reported under `credential proxy error`, and its `credential proxy busy … retrying` line is
-not one, since the retried attempt's kubectl writes after it). The shim's exec-tier fallback line
-names no cause and carries none of these prefixes, so a cluster failure that follows it is still
-classified. When the probe itself does not finish inside its outer bound,
+not one, since the retried attempt's kubectl writes after it). The shim's exec-tier fallback line,
+and its line for an ignored malformed exec URL, name no network cause and carry none of these
+prefixes, so a cluster failure that follows either is still classified. When the probe itself does not finish inside its outer bound,
 or cannot run, the log says that and nothing about the endpoint. The scaffold still returns
 normally: a cluster that is unreachable now may be reachable after the operator acts, and a
 scaffold that failed would only be retried on the next reconcile tick with the same result.
