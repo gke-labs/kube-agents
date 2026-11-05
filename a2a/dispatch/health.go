@@ -30,8 +30,10 @@ type Health struct {
 	// had no free pod, or none accepted), by durable.
 	NoWorker map[string]int
 	// Breaker is the part of Waiting a breaker holds, open or half open,
-	// by durable.
-	Breaker map[string]int
+	// by durable, and HandOffFailed the part whose hand-off errored (a
+	// lease that couldn't be written), retried each delay.
+	Breaker       map[string]int
+	HandOffFailed map[string]int
 	// OldestWait is the longest a waiting submission has been queued, by
 	// durable.
 	OldestWait map[string]time.Duration
@@ -93,7 +95,7 @@ func (d *Dispatcher) Health() Health {
 	now := d.now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	h := Health{Running: map[string]int{}, Offering: map[string]int{}, Waiting: map[string]int{}, NoWorker: map[string]int{}, Breaker: map[string]int{},
+	h := Health{Running: map[string]int{}, Offering: map[string]int{}, Waiting: map[string]int{}, NoWorker: map[string]int{}, Breaker: map[string]int{}, HandOffFailed: map[string]int{},
 		OldestWait: map[string]time.Duration{}, DroppedAnswers: d.droppedAnswers.Load()}
 	// offering is the tasks out on offer: a waiting entry for one is not
 	// forgotten while its offer round runs, however long the accept
@@ -119,6 +121,8 @@ func (d *Dispatcher) Health() Health {
 			h.NoWorker[w.durable]++
 		case waitBreaker:
 			h.Breaker[w.durable]++
+		case waitHandOffFailed:
+			h.HandOffFailed[w.durable]++
 		}
 		if age := now.Sub(w.queued); age > h.OldestWait[w.durable] {
 			h.OldestWait[w.durable] = age
@@ -142,13 +146,15 @@ func (d *Dispatcher) logHealth() {
 	if h.StopStream != "" {
 		d.log.Warn("the stop stream can't be read; a stop counts only if heard live", "err", h.StopStream)
 	}
-	var overCap, noWorker, held []string
+	var overCap, noWorker, held, failing []string
 	for _, durable := range h.Stalled {
 		switch h.Waiting[durable] {
 		case h.NoWorker[durable]:
 			noWorker = append(noWorker, durable)
 		case h.Breaker[durable]:
 			held = append(held, durable)
+		case h.HandOffFailed[durable]:
+			failing = append(failing, durable)
 		default:
 			overCap = append(overCap, durable)
 		}
@@ -160,6 +166,10 @@ func (d *Dispatcher) logHealth() {
 	if len(noWorker) > 0 {
 		d.log.Warn("admission stalled: no ready worker took a submission; check the pool's pods",
 			"durables", noWorker, "stallAfter", d.cfg.StallAfter)
+	}
+	if len(failing) > 0 {
+		d.log.Warn("admission stalled: every waiting submission's hand-off keeps failing (the lease can't be written); check the bus and the lease bucket",
+			"durables", failing, "stallAfter", d.cfg.StallAfter)
 	}
 	if len(held) > 0 {
 		d.log.Warn("admission stalled: a breaker holds every waiting submission", "durables", held, "stallAfter", d.cfg.StallAfter)

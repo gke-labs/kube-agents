@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -174,6 +175,15 @@ func (d *Dispatcher) pruneStoppedLocked(now time.Time) {
 	}
 }
 
+// stopRequestedOn reports whether h has a stop. A stopped task is neutral
+// to the breaker however it ends: its own end, its worker's loss, or the
+// grace running out.
+func (d *Dispatcher) stopRequestedOn(h *holding) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return h.stopRequested
+}
+
 // requestStopLocked marks h stopped and wakes its hold. d.mu must be held.
 func (d *Dispatcher) requestStopLocked(h *holding) {
 	h.stopRequested = true
@@ -210,6 +220,12 @@ func (d *Dispatcher) stopRequested(ctx context.Context, log *slog.Logger, profil
 	subject := lib.DispatchStopSubject(profile, taskID)
 	msg, err := d.bus.Conn().RequestWithContext(rctx, directGetPrefix+lib.DispatchStopStream+"."+subject, nil)
 	switch {
+	case errors.Is(err, nats.ErrConnectionClosed), errors.Is(err, nats.ErrConnectionDraining),
+		errors.Is(err, nats.ErrInvalidConnection), errors.Is(err, nats.ErrConnectionReconnecting):
+		// The connection, not the stream: mid-reconnect or regrant. No
+		// backoff and no report; the next admission or refresh reads again.
+		log.Debug("the stop stream read found the connection unready; reading again next time", "err", err)
+		return false
 	case err != nil:
 		d.stopStreamFailed(log, err.Error())
 		return false

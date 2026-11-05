@@ -297,6 +297,17 @@ func (b *bus) submit(profile, tier, kind, taskID string) {
 	b.submitWith(profile, tier, kind, taskID, "cap-ok", map[string]string{})
 }
 
+// submitCorr submits with a given correlationId (the user interaction a task
+// serves, which a child carries from its parent).
+func (b *bus) submitCorr(profile, tier, kind, taskID, correlation string) {
+	b.t.Helper()
+	env := submissionEnv(b.t, profile, taskID, "cap-ok", map[string]string{})
+	env.CorrelationID = correlation
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject(profile, tier, kind, taskID), env); err != nil {
+		b.t.Fatalf("submit %s: %v", taskID, err)
+	}
+}
+
 func (b *bus) submitWith(profile, tier, kind, taskID, capKey string, params map[string]string) {
 	b.t.Helper()
 	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject(profile, tier, kind, taskID),

@@ -115,6 +115,9 @@ type holding struct {
 	// probe is the epoch of the half-open breaker this task was reserved
 	// under, as the one task tried at a time, or 0 (breaker.go).
 	probe int
+	// correlation is the submission's correlationId: the user interaction
+	// it serves, which its children carry too (breaker.go's probe family).
+	correlation string
 	// stopRequested is a stop record for the task (stop.go); stopc, made
 	// when hold starts, wakes hold for it.
 	stopRequested bool
@@ -658,6 +661,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		if _, heard := d.stopped[h.profile+"/"+h.taskID]; heard {
 			h.stopRequested = true
 		}
+		h.correlation = del.Envelope().CorrelationID
 		d.mu.Unlock()
 	}
 	if h == nil {
@@ -1157,7 +1161,9 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			}
 			if r.final {
 				log.Info("task finished", "pod", rec.Pod)
-				d.breakers.finished(h.profile, h.tier)
+				if !d.stopRequestedOn(h) {
+					d.breakers.finished(h.profile, h.tier)
+				}
 				d.settle(ctx, log, del, h, key, rec)
 				return
 			}
@@ -1177,8 +1183,11 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				log.Warn("task passed its deadline; failing it", "pod", rec.Pod, "deadline", rec.Deadline)
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonDeadline})
 				// Its worker renewed to the end, so it was no worker loss:
-				// a half-open breaker closes as on a finish.
-				d.breakers.finished(h.profile, h.tier)
+				// a half-open breaker closes as on a finish. A stopped one is
+				// neutral (stopHeld).
+				if !d.stopRequestedOn(h) {
+					d.breakers.finished(h.profile, h.tier)
+				}
 				d.fail(ctx, log, del, h, key, rec, ReasonDeadlineExceeded,
 					fmt.Sprintf("ran past the profile's %s limit", deadlineLimit(rec)))
 				return
@@ -1188,7 +1197,9 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// A worker that is alive but unheard must not go on with a
 				// task that has failed.
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonLeaseExpired})
-				d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
+				if !d.stopRequestedOn(h) {
+					d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
+				}
 				d.fail(ctx, log, del, h, key, rec, ReasonLeaseExpired,
 					fmt.Sprintf("worker %s stopped renewing at %s", rec.Pod, rec.RenewedAt.UTC().Format(time.RFC3339)))
 				return

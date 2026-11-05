@@ -186,10 +186,36 @@ func (d *Dispatcher) probing(profile, tier string) bool {
 // waiting over a cap doesn't count: the breaker isn't what holds it, and a
 // child must not wait behind a top task the caps hold.
 func (d *Dispatcher) olderWaiting(hk holdKey, queued time.Time) bool {
+	if d.breakers.epoch(hk.profile, hk.tier) == 0 {
+		return false // no breaker: nothing is held, so nothing is older
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for k, w := range d.waiting {
 		if k != hk && k.profile == hk.profile && k.tier == hk.tier && w.why == waitBreaker && w.queued.Before(queued) {
+			return true
+		}
+	}
+	return false
+}
+
+// probesChild reports whether a submission of kind with correlation is a
+// child of the current half-open probe of profile at tier: a probe of this
+// opening held here whose correlationId it carries. A correlationId is the
+// user interaction a task serves, which its children inherit, so this is
+// the probe's family; a child of any other task is not exempt.
+func (d *Dispatcher) probesChild(profile, tier, kind, correlation string) bool {
+	if kind != lib.SubmitKindChild || correlation == "" {
+		return false
+	}
+	epoch := d.breakers.probeEpoch(profile, tier, d.now())
+	if epoch == 0 {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for k, h := range d.active {
+		if k.profile == profile && k.tier == tier && h.probe == epoch && h.correlation == correlation {
 			return true
 		}
 	}

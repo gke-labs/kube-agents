@@ -108,7 +108,9 @@ func TestAHalfOpenBreakerIsNotHeldByATaskRunningBeforeItOpened(t *testing.T) {
 // doesn't hold a child that would fit.
 func TestAnOlderSubmissionWaitingOverACapDoesNotHoldAHalfOpenBreaker(t *testing.T) {
 	d := bareDispatcher()
+	d.breakers = newBreakers()
 	t0 := time.Now()
+	d.breakers.expired(lib.DispatchConfig{BreakerThreshold: 1, BreakerCooldownSeconds: 1}, "tse", "read", t0.Add(-2*time.Second))
 	top := holdKey{"tse", "read", lib.SubmitKindTop, "task-top"}
 	child := holdKey{"tse", "read", lib.SubmitKindChild, "task-child"}
 	d.waiting[top] = waiting{queued: t0, lastSeen: t0, why: "profile concurrency"}
@@ -204,6 +206,108 @@ func TestAStoppedProbeLeavesTheBreakerAsItWas(t *testing.T) {
 	b.submit("tse", "read", lib.SubmitKindTop, "task-next")
 	if ts := b.waitTerminal("task-next", 15*time.Second); ts.state != lib.StateCompleted {
 		t.Errorf("task-next terminal %+v, want it tried as the next probe and completed", ts)
+	}
+}
+
+// With no breaker on a (profile, tier), nothing is held there, so no
+// waiting entry is "older" (and the scan isn't paid on every admission).
+func TestNoBreakerMeansNothingIsOlder(t *testing.T) {
+	d := bareDispatcher()
+	d.breakers = newBreakers()
+	t0 := time.Now()
+	d.waiting[holdKey{"tse", "read", lib.SubmitKindTop, "task-old"}] = waiting{queued: t0, lastSeen: t0, why: waitBreaker}
+	if d.olderWaiting(holdKey{"tse", "read", lib.SubmitKindTop, "task-new"}, t0.Add(time.Second)) {
+		t.Error("an older submission counted with no breaker on the tier")
+	}
+}
+
+// Half open, a child of the probe is part of the probe's attempt and is
+// admitted; a child of any other task (here one serving another user
+// interaction) is held as a top task is.
+func TestAHalfOpenProbesChildRunsAndAStrangersChildWaits(t *testing.T) {
+	b := newBus(t, "tse-0", "tse-1", "tse-2")
+	b.ensure("tse", 3, 0, "read")
+	dead := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	dead.noRenew = true
+	parent := b.worker("tse", "read", "tse-1", answerAccept, time.Hour)
+	b.worker("tse", "read", "tse-2", answerAccept, 300*time.Millisecond)
+	ti := oneProfile("tse", 3, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.BreakerThreshold, c.BreakerCooldownSeconds = 1, 1 })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-dead")
+	if ts := b.waitTerminal("task-dead", 20*time.Second); !hasReason(ts, ReasonLeaseExpired) {
+		t.Fatalf("task-dead terminal %+v, want lease-expired", ts)
+	}
+	ti.pool.Set("tse", "read", "tse-1")
+	b.submitCorr("tse", "read", lib.SubmitKindTop, "task-parent", "corr-P")
+	waitFor(t, 15*time.Second, "the probe running", func() bool { return parent.startedTask("task-parent") })
+	ti.pool.Set("tse", "read", "tse-1", "tse-2")
+	// First a child serving another interaction: held while the probe runs.
+	b.submitCorr("tse", "read", lib.SubmitKindChild, "task-stranger", "corr-X")
+	durable := lib.ProfileDurableName("tse", "read", lib.SubmitKindChild)
+	waitFor(t, 10*time.Second, "the stranger's child held", func() bool { return d.Health().Breaker[durable] == 1 })
+	time.Sleep(time.Second)
+	if ts := b.terminalsOf("task-stranger"); len(ts) != 0 {
+		t.Fatalf("another task's child ended %+v while the probe runs; want it held", ts)
+	}
+	// Then the probe's own child: admitted at once, though the stranger is
+	// older and still held.
+	b.submitCorr("tse", "read", lib.SubmitKindChild, "task-child", "corr-P")
+	if ts := b.waitTerminal("task-child", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Errorf("the probe's child: terminal %+v, want completed while the probe runs", ts)
+	}
+}
+
+// A stopped task is neutral to the breaker however it ends: the executor
+// ending it within the grace (a final renewal) doesn't close a half-open
+// breaker, and its worker dying after the stop doesn't count as an expiry.
+func TestAStoppedTaskEndingOnItsOwnLeavesTheBreakerAsItWas(t *testing.T) {
+	for name, end := range map[string]func(w *fakeWorker){
+		"ends itself": func(w *fakeWorker) { w.finish("task-probe", lib.StateCanceled) },
+		"worker dies": func(w *fakeWorker) { w.kill() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "tse-0", "tse-1")
+			withStopStream(t, b)
+			b.ensure("tse", 2, 0, "read")
+			dead := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+			dead.noRenew = true
+			probe := b.worker("tse", "read", "tse-1", answerAccept, time.Hour)
+			ti := oneProfile("tse", 2, "tse-0")
+			ti.update(func(c *lib.DispatchConfig) {
+				c.BreakerThreshold, c.BreakerCooldownSeconds, c.StopGraceSeconds = 1, 1, 3600
+			})
+			d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+
+			b.submit("tse", "read", lib.SubmitKindTop, "task-dead")
+			if ts := b.waitTerminal("task-dead", 20*time.Second); !hasReason(ts, ReasonLeaseExpired) {
+				t.Fatalf("task-dead terminal %+v, want lease-expired", ts)
+			}
+			ti.pool.Set("tse", "read", "tse-1")
+			b.submit("tse", "read", lib.SubmitKindTop, "task-probe")
+			waitFor(t, 15*time.Second, "the probe running", func() bool { return probe.startedTask("task-probe") })
+			epoch := d.breakers.epoch("tse", "read")
+			b.stop("tse", "task-probe")
+			waitFor(t, 5*time.Second, "the stop heard", func() bool {
+				d.mu.Lock()
+				defer d.mu.Unlock()
+				for _, h := range d.active {
+					if h.taskID == "task-probe" {
+						return h.stopRequested
+					}
+				}
+				return false
+			})
+			end(probe)
+			waitFor(t, 20*time.Second, "task-probe settled", func() bool {
+				_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", "tse-1", "task-probe")]
+				return ok
+			})
+			if got := d.breakers.epoch("tse", "read"); got != epoch {
+				t.Errorf("breaker epoch %d after the stopped probe ended, want %d (neither closed nor re-opened)", got, epoch)
+			}
+		})
 	}
 }
 
