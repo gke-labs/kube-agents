@@ -558,6 +558,23 @@ class ReplayTest(ProxyTestCase):
         self.assertEqual(line["served_from"]["build"], "7")
         self.assertNotIn("miss", line)
 
+    def test_a_replay_request_is_normalized_once(self):
+        self.record(chat("t_11111111", stream=False))
+        replay, port, out = self.replay()
+        for body in (chat("t_22222222", stream=False), chat("t_33333333", stream=False, extra_messages=(
+                {"role": "user", "content": "a turn never recorded"},))):
+            calls = []
+            original = normalizer.normalize_request
+            normalizer.normalize_request = lambda *args: calls.append(args) or original(*args)
+            try:
+                self.request("POST", COMPLETIONS, body, port=port)
+                replay.drain()
+            finally:
+                normalizer.normalize_request = original
+            self.assertEqual(len(calls), 1, "a hit and a miss are each normalized once")
+            out.truncate(0)
+            out.seek(0)
+
     def test_a_non_streamed_hit(self):
         self.record(chat("t_11111111", stream=False))
         _, port, out = self.replay()
