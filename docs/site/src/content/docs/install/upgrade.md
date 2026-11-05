@@ -452,9 +452,11 @@ connection depends on `spec.mode` (the third command under [Before you start](#b
   (a DNS error or a timeout, say) is the gateway not reaching Slack. The gateway retries either
   way.
 
-  No output means the gateway has not tried Slack yet: it first joins the bus, retrying for up to
-  45 seconds, and exits if that fails. Wait a minute and run the command again. If the pod's
-  restart count is climbing, `kubectl logs ... --previous` shows why the last run exited.
+  No output means the gateway has not tried Slack yet: it first joins the bus and binds its event
+  relay, and until the provisioning Job has created the `TASKS` stream it waits, logging `waiting
+for the stream to be created`, with the pod reading `0/1` ready. Wait a minute and run the
+  command again. If the pod's restart count is climbing instead, `kubectl logs ... --previous`
+  shows why the last run exited.
 
 Either way, DM the app a question such as `what clusters can you see?` and wait for the answer (an
 AI agent asks a person to do this): the log line does not prove that messages reach the agent. If
@@ -595,9 +597,10 @@ The operator moves Slack in three steps:
 2. It creates the NATS bus and the auth callout. It creates the A2A gateway once a callout
    replica is ready, which needs the bus to be running. The provisioning Job, started at the same
    point, creates the bus's streams.
-3. The gateway joins the bus, retrying for up to 45 seconds while the streams do not exist and
-   restarting after that. It then checks the bot token with Slack, logs `slack connected`, and
-   opens the Socket Mode connection.
+3. The gateway joins the bus and waits for the provisioning Job to create the `TASKS` stream;
+   until then the pod is running but not ready, and the `PlatformAgent` reads `Provisioning`
+   naming it. It then checks the bot token with Slack, logs `slack connected`, and opens the
+   Socket Mode connection.
 
 The broker's connection stops when the switch starts, and the gateway exists only once the bus is
 up, so in practice the two never take the same message. How long Slack goes unanswered depends on
