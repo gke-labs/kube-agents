@@ -27,14 +27,13 @@ import (
 // Role gets only get and update on that one object; because the gateway can't
 // recreate it, the operator watches it and recreates it after a deletion.
 const (
-	// a2aGatewayElectionEnvVar, set to "true" in the operator's own
-	// environment, switches the election on: the Lease, the gateway's grant
-	// on it and the gateway's election env. Off by default. With the
+	// a2aGatewayElectionEnvVar, set to "false" in the operator's own
+	// environment, switches the election off: no Lease, no grant on it, no
+	// election env, and one unelected gateway. On by default. With the
 	// election on, the gateway needs the API server to keep leading, so a
 	// control-plane outage longer than its renew deadline (a zonal
 	// cluster's control-plane upgrade) stops it until the API server is
-	// back; the default flips once that trade-off is decided. CI and the
-	// live runs turn it on.
+	// back, a trade-off accepted on #4206.
 	a2aGatewayElectionEnvVar = "A2A_GATEWAY_ELECTION"
 
 	// a2aGatewayLeaseEnvVar names the Lease to the gateway, and

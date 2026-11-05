@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"os"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -42,6 +43,11 @@ const (
 	// as the callout's spread does, so a rollout's surge pod isn't placed
 	// against the pods it replaces.
 	a2aGatewaySpreadMatchLabelKey = "pod-template-hash"
+	// a2aGatewayElectionRecheck is how soon a pass comes back to look for an
+	// election while the gateway is held at one replica. Longer than the
+	// pending stack's 30s requeue, so a pass waiting on a roll still comes
+	// back sooner than a settled one.
+	a2aGatewayElectionRecheck = 60 * time.Second
 )
 
 // a2aGatewayReplicas is the replica count the CR asks for under next:
@@ -141,6 +147,43 @@ func setGatewayElectedCondition(agent *agentv1alpha1.PlatformAgent, image string
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	})
+}
+
+// a2aGatewayScaleOutAllowed reports whether elected may scale the gateway
+// out this pass. An election read this pass on that image may. A record
+// carried from an earlier pass only keeps a gateway already scaled out with
+// the election's env: it proves the image can elect, not that the running
+// pods do, and an operator rolled back and forward again leaves a record
+// over a gateway running unelected.
+func a2aGatewayScaleOutAllowed(observed *string, elected string, live *appsv1.Deployment, exists bool) bool {
+	if elected == "" {
+		return false
+	}
+	if observed != nil && *observed == elected {
+		return true
+	}
+	if !exists || live.Spec.Strategy.Type != appsv1.RollingUpdateDeploymentStrategyType {
+		return false
+	}
+	for _, c := range live.Spec.Template.Spec.Containers {
+		if c.Name != a2aGatewayContainerName {
+			continue
+		}
+		for _, e := range c.Env {
+			if e.Name == a2aGatewayLeaseEnvVar {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// minPositive is the smaller of two durations, ignoring a zero.
+func minPositive(a, b time.Duration) time.Duration {
+	if a <= 0 || b < a {
+		return b
+	}
+	return a
 }
 
 // scaleOutA2AGateway renders the CR's replica count and a rolling update

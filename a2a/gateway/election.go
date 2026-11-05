@@ -298,19 +298,26 @@ func (l *observingLock) Get(ctx context.Context) (*resourcelock.LeaderElectionRe
 
 func (l *observingLock) Create(ctx context.Context, rec resourcelock.LeaderElectionRecord) error {
 	err := l.Interface.Create(ctx, rec)
-	l.wrote(err)
+	l.wrote(err, rec.HolderIdentity)
 	return err
 }
 
 func (l *observingLock) Update(ctx context.Context, rec resourcelock.LeaderElectionRecord) error {
 	err := l.Interface.Update(ctx, rec)
-	l.wrote(err)
+	l.wrote(err, rec.HolderIdentity)
 	return err
 }
 
-func (l *observingLock) wrote(err error) {
+// wrote records a write. A successful one also updates the view: client-go
+// renews by writing without reading first, so a replica that has just taken
+// the lease would otherwise keep the holder it read before taking it, and
+// answer readiness as a standby (ElectedReadiness).
+func (l *observingLock) wrote(err error, holder string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if err == nil && l.view != nil {
+		l.view.set(holder)
+	}
 	if err != nil || l.took {
 		return
 	}

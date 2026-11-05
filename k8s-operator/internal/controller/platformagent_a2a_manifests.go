@@ -6065,9 +6065,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// applied (calloutGeneration, below) its only error direction is a false
 	// negative that gatewayHeld's requeue clears.
 	dep := buildA2AGatewayDeployment(agent)
-	// More than one replica only once a gateway that runs the election on
-	// this image has taken the Lease (scaleOutA2AGateway).
-	scaleOutA2AGateway(dep, agent, gatewayElectedImage(agent, state.gatewayElected))
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
 	}
@@ -6100,6 +6097,19 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 	}
 	gatewayExists := getErr == nil
+	// More than one replica only once a gateway that runs the election on
+	// this image has taken the Lease (scaleOutA2AGateway,
+	// a2aGatewayScaleOutAllowed).
+	elected := gatewayElectedImage(agent, state.gatewayElected)
+	if !a2aGatewayScaleOutAllowed(state.gatewayElected, elected, liveGateway, gatewayExists) {
+		elected = ""
+	}
+	scaleOutA2AGateway(dep, agent, elected)
+	if elected == "" && a2aGatewayElectionEnabled() && a2aGatewayReplicas(agent) > 1 {
+		// Nothing wakes the pass that sees the election: Lease updates are
+		// filtered out and pods aren't watched.
+		state.leaseRequeue = minPositive(state.leaseRequeue, a2aGatewayElectionRecheck)
+	}
 	if gatewayExists && liveGateway.Status.ReadyReplicas < 1 && a2aGatewayConditionStands(agent) {
 		state.gatewayWaking = true
 	}

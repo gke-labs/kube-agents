@@ -285,7 +285,10 @@ ingress gap above.
   and removing the pin rolls once at one replica again. A deleted Lease or its held-back recreate
   doesn't change the running image, so it leaves the condition, and the two replicas, in place. A status condition doesn't
   survive most restores, so a restored install starts at one replica until a
-  gateway takes the Lease again. A CI install, which always pins the image, spends its first roll
+  gateway takes the Lease again. The condition can outlive the gateway it describes when an older
+  operator, which doesn't know it, runs the gateway unelected in between. So the operator scales out
+  from one replica only on an election it reads that pass, and uses a recorded condition only to
+  keep a gateway already rolling with the election's env. A CI install, which always pins the image, spends its first roll
   at one replica and runs two after that. A gateway from before the election never takes the
   Lease, so a pin to one stays at one replica. The same check covers an install upgrading across
   the election in one roll: its old gateway holds no

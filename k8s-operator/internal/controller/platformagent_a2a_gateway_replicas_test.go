@@ -330,3 +330,118 @@ func TestTheElectionReachesTheCRStatusWhileParked(t *testing.T) {
 		t.Fatalf("GatewayElected = %+v, want the holder's image", c)
 	}
 }
+
+// TestARecordAloneDoesntScaleOutAnUnelectedGateway: a GatewayElected record
+// carried from an earlier operator (rolled back, then forward) over a
+// gateway running unelected with Recreate doesn't scale it out; an election
+// read this pass does, and a record keeps a gateway already scaled out with
+// the election's env.
+func TestARecordAloneDoesntScaleOutAnUnelectedGateway(t *testing.T) {
+	const image = "example.com/a2a-gateway:v1"
+	unelected := buildA2AGatewayDeployment(a2aTestAgent())
+	unelected.Spec.Template.Spec.Containers[0].Env = nil
+	if a2aGatewayScaleOutAllowed(nil, image, unelected, true) {
+		t.Error("a carried record scaled out a Recreate gateway with no election env")
+	}
+	firstRoll := buildA2AGatewayDeployment(a2aTestAgent())
+	firstRoll.Spec.Template.Spec.Containers[0].Env = append(firstRoll.Spec.Template.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: a2aGatewayLeaseEnvVar, Value: "x"})
+	if a2aGatewayScaleOutAllowed(nil, image, firstRoll, true) {
+		t.Error("a carried record scaled out a gateway still on Recreate")
+	}
+	if !a2aGatewayScaleOutAllowed(ptr.To(image), image, unelected, true) {
+		t.Error("an election read this pass didn't scale out")
+	}
+	if a2aGatewayScaleOutAllowed(ptr.To("example.com/a2a-gateway:v0"), image, unelected, true) {
+		t.Error("an election read on another image scaled out")
+	}
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := a2aTestAgent()
+	scaled := buildA2AGatewayDeployment(agent)
+	scaleOutA2AGateway(scaled, agent, image)
+	if !a2aGatewayScaleOutAllowed(nil, image, scaled, true) {
+		t.Error("a carried record didn't keep a scaled-out elected gateway")
+	}
+	noEnv := scaled.DeepCopy()
+	var kept []corev1.EnvVar
+	for _, e := range noEnv.Spec.Template.Spec.Containers[0].Env {
+		if e.Name != a2aGatewayLeaseEnvVar {
+			kept = append(kept, e)
+		}
+	}
+	noEnv.Spec.Template.Spec.Containers[0].Env = kept
+	if a2aGatewayScaleOutAllowed(nil, image, noEnv, true) {
+		t.Error("a carried record kept a rolling gateway with no election env")
+	}
+	if a2aGatewayScaleOutAllowed(nil, image, scaled, false) {
+		t.Error("a carried record scaled out with no gateway to keep")
+	}
+}
+
+// TestAHeldGatewayLooksForItsElectionAgain: while the gateway is held at one
+// replica with more asked for, the pass comes back to look for the election,
+// which no watch reports.
+func TestAHeldGatewayLooksForItsElectionAgain(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.leaseRequeue <= 0 || state.leaseRequeue > a2aGatewayElectionRecheck {
+		t.Fatalf("requeue while held = %s, want within %s", state.leaseRequeue, a2aGatewayElectionRecheck)
+	}
+	one := withGatewayReplicas(a2aTestAgent(), 1)
+	cl = fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(one).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r = &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	theCalloutIsServing(t, ctx, cl, r, one)
+	if state, err = r.reconcileA2A(ctx, one, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if state.leaseRequeue != 0 {
+		t.Fatalf("one replica asked, requeue = %s, want none", state.leaseRequeue)
+	}
+}
+
+// TestACarriedRecordDoesntScaleOutAFreshRender: the CR records an election
+// (an operator rolled back and forward), but no pod holds the Lease and the
+// gateway isn't scaled out, so the render stays at one replica.
+func TestACarriedRecordDoesntScaleOutAFreshRender(t *testing.T) {
+	const image = "example.com/a2a-gateway:elected"
+	t.Setenv(a2aGatewayImageEnvVar, image)
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := withGatewayElected(a2aTestAgent(), image)
+	cl := fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, dep); err != nil {
+		t.Fatal(err)
+	}
+	if *dep.Spec.Replicas != 1 || dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Fatalf("a carried record scaled out: %d replicas, %s", *dep.Spec.Replicas, dep.Spec.Strategy.Type)
+	}
+}
