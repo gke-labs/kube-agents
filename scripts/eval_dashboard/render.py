@@ -5,7 +5,7 @@ Usage::
 
     python3 scripts/eval_dashboard/render.py --data data.json --out-dir out/ \\
         [--health health.json] [--health-history health-history.jsonl] \\
-        [--store store.json] [--public-url [BASE]]
+        [--store store.json] [--scorecard scorecard.json] [--public-url [BASE]]
 
 writes six pages and two data files into ``out/``:
 
@@ -35,6 +35,11 @@ writes six pages and two data files into ``out/``:
   current version key (Proven, Proving, In development), the first-reply
   and task-finished medians over that window's nightly reps, the roster
   status and the newest passing transcript.
+  ``cases.html#view=domains`` is its third, **the domain view**: one row
+  per domain with its presubmit seat, days uncovered, open ``nightly-red``
+  issues, whether an understudy is ready and the best two, from the
+  scorecard ``understudies.py`` writes (``--scorecard``). Without one the
+  view says the scorecard was not computed.
 * ``nightly.html[#build=<prow build id>&cases=a,b]`` (either key may be left out) -- **the Nightly
   report**: last night's run of the nightly tier (or the night ``build``
   names), its cases by domain with pass / partial / fail and the grader's
@@ -247,7 +252,7 @@ STATUS_BLOCKING = "blocking"  # active and in hack/eval/blocking-roster.txt
 STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record): pdb-remediation-pr while seated, 2026-09-28 to 10-14, #2016
 # Off the roster with a demotion date on the roster page -- nightly-only
 # since 2026-09-22 (#1023: the presubmit runs the roster only), or active as
-# a held-out presubmit seat (the compliance canary since 2026-09-29, #2013).
+# a held-out presubmit seat (the compliance canary 2026-09-29 to 11-02, #2013).
 STATUS_DEMOTED = "demoted"
 STATUS_NIGHTLY_ONLY = "nightly_only"  # in hack/eval/nightly-cases.txt only, no demotion date
 STATUS_RETIRED = "retired"  # in neither matrix on this checkout
@@ -680,6 +685,18 @@ def load_store(path: pathlib.Path | None) -> dict | None:
     return doc if isinstance(doc, dict) and isinstance(doc.get("records"), list) else None
 
 
+def load_scorecard(path: pathlib.Path | None) -> dict | None:
+    """scorecard.json as ``understudies.py`` wrote it, or None when absent
+    or unreadable: the domain view then says it was not computed."""
+    if path is None or not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) and isinstance(doc.get("domains"), list) else None
+
+
 def load_health_history(path: pathlib.Path | None) -> list[dict] | None:
     """health-history.jsonl: one JSON object per line, each the health.json
     published at that tick plus ``"tick": "<ISO UTC>"``. Returns the
@@ -1075,6 +1092,9 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
     out = {
         "build": verdict["build"],
         "pr": run.get("pr"),
+        # Where the build lives (SCHEMA.md, runs[].gcs_base); the pages link
+        # it there, Spyglass for a record without it.
+        "gcs_base": run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None,
         "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
         "project": run.get("project") if isinstance(run.get("project"), str) else None,
         "started": run.get("started") if iso_ms(run.get("started")) is not None else None,
@@ -1325,7 +1345,7 @@ def pending_builds(data: dict) -> list[dict]:
 def brief_document(data: dict, health: dict | None, history: list[dict] | None, merges: list[dict] | None,
                    notes: dict | None = None, events: dict | None = None,
                    admitted: frozenset | None = None, demoted: dict[str, str] | None = None,
-                   store: dict | None = None, repo_root: pathlib.Path | None = None) -> dict:
+                   store: dict | None = None, repo_root: pathlib.Path | None = None, scorecard: dict | None = None) -> dict:
     """The document every page reads. Runs are the presubmit's last
     RUN_VIEW_DAYS of data.json, oldest first, each classified against every
     run on record with the verdict in force when it finished. The nightly's
@@ -1338,7 +1358,8 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
     Trend page (``load_store``), None when there was none; the scenarios
     view reads its confidence from it too. ``repo_root`` is the checkout
     whose bench/tasks and domains.yaml the scenarios view summarises (the
-    one the roster is read from when None)."""
+    one the roster is read from when None). ``scorecard`` is the domain
+    view's (``load_scorecard``), None when there was none."""
     if repo_root is None:
         repo_root = classify.REPO_ROOT
     anchor = reference_ms(data)
@@ -1383,6 +1404,7 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
         "merges": merges,
         "catches": (events or {}).get("catches"),
         "domains": domain_rows(repo_root),
+        "scorecard": scorecard,
         "confidence_bar": {"rate": trend.ADMISSION_RATE, "min_runs": CONFIDENCE_MIN_RUNS, "window_days": CONFIDENCE_WINDOW_DAYS, "proving_min_rate": PROVING_MIN_RATE},
         "cases": case_documents(data, notes or {}, admitted, demoted, classified, store, repo_root),
         "runs": out_runs,
@@ -1529,6 +1551,11 @@ def main(argv: list[str] | None = None) -> int:
         help=f"{STORE_JSON} from store.py, the evidence-store read the Trend page draws (optional; absent or malformed renders the page as 'store not read' and copies nothing)",
     )
     parser.add_argument(
+        "--scorecard",
+        default=None,
+        help="scorecard.json from understudies.py, the Cases page's domain view (optional; absent or malformed renders the view as 'not computed')",
+    )
+    parser.add_argument(
         "--repo-root",
         default=str(classify.REPO_ROOT),
         help="checkout whose git log lists the merges to main (a shallow checkout omits the block) and whose bench/tasks and docs/designs/domains.yaml the Cases page's scenarios view summarises",
@@ -1550,7 +1577,8 @@ def main(argv: list[str] | None = None) -> int:
     history = load_health_history(pathlib.Path(args.health_history)) if args.health_history else None
     merges = recent_merges(pathlib.Path(args.repo_root), reference_ms(data))
     store = load_store(pathlib.Path(args.store)) if args.store else None
-    brief = brief_document(data, health, history, merges, notes=notes, events=events, store=store, repo_root=pathlib.Path(args.repo_root))
+    scorecard = load_scorecard(pathlib.Path(args.scorecard)) if args.scorecard else None
+    brief = brief_document(data, health, history, merges, notes=notes, events=events, store=store, repo_root=pathlib.Path(args.repo_root), scorecard=scorecard)
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

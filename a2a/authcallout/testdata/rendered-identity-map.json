@@ -1,10 +1,12 @@
 {
-  "version": "6074b7a0d5a0e7b6",
+  "version": "f0e8d8237ce63a35",
+  "shard": 0,
+  "shards": 1,
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
       "user": "provision",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
@@ -22,6 +24,7 @@
           "$JS.API.STREAM.CREATE.KV_session-state",
           "$JS.API.STREAM.CREATE.KV_cap",
           "$JS.API.STREAM.CREATE.KV_feedback",
+          "$JS.API.STREAM.CREATE.KV_people",
           "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
           "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
           "$JS.API.STREAM.CREATE.DISPATCH_STOPS",
@@ -33,6 +36,7 @@
           "$JS.API.STREAM.INFO.KV_session-state",
           "$JS.API.STREAM.INFO.KV_cap",
           "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.INFO.KV_people",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
           "$JS.API.STREAM.INFO.DISPATCH_STOPS",
@@ -83,7 +87,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
       "user": "verifier",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.cap.reply.>",

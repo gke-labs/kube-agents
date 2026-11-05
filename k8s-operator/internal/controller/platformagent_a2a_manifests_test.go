@@ -26,6 +26,7 @@ import (
 	"net"
 	"path"
 	"reflect"
+	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"slices"
@@ -60,13 +61,14 @@ func a2aTestCreds() *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"},
 		Data: map[string][]byte{
-			"gateway-password": []byte("pw-gateway"),
-			"bridge-password":  []byte("pw-bridge"),
-			"seed-password":    []byte("pw-seed"),
-			"web-password":     []byte("pw-web"),
-			"console-password": []byte("pw-console"),
-			"sys-password":     []byte("pw-sys"),
-			"callout-password": []byte("pw-callout"),
+			"gateway-password":     []byte("pw-gateway"),
+			"bridge-password":      []byte("pw-bridge"),
+			"seed-password":        []byte("pw-seed"),
+			"web-password":         []byte("pw-web"),
+			"console-password":     []byte("pw-console"),
+			"console-mcp-password": []byte("pw-console-mcp"),
+			"sys-password":         []byte("pw-sys"),
+			"callout-password":     []byte("pw-callout"),
 		},
 	}
 }
@@ -244,11 +246,12 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		// ack to hold — and a consumer on KV_cap is precisely the thing its
 		// grants are shaped to forbid, because one would be a live feed of
 		// every capability in flight.
-		"verifier": nil,
-		"seed":     nil,
-		"web":      nil,
-		"console":  nil,
-		"sys":      nil,
+		"verifier":        nil,
+		"seed":            nil,
+		"web":             nil,
+		"console":         nil,
+		a2aConsoleMCPUser: nil,
+		"sys":             nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {
@@ -304,7 +307,7 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	}
 }
 
-// The provisioning payload: five streams, five KV buckets, four starter
+// The provisioning payload: five streams, six KV buckets, four starter
 // topics, the deployment spec's retention numbers verbatim.
 func TestBuildA2AProvisionJob(t *testing.T) {
 	agent := a2aTestAgent()
@@ -340,6 +343,8 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		"runtime-state", "session-state", "--max-bucket-size",
 		// feedback: user content, so a max age is its retention
 		"kv add feedback", "--ttl=720h",
+		// people: one hashed key per chat person, so a max age is its retention
+		"kv add people", "--ttl=720h",
 		// Every stream/kv call is a $JS.API request answered on an inbox, and
 		// this principal may only subscribe under _INBOX.provision.> — without
 		// the prefix override every CLI call times out and the Job can never
@@ -759,6 +764,7 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
 		"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 		"chat.console.*.in",
+		"chat.console.*.confirm",
 		"_INBOX.console.>",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -768,8 +774,7 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
 	}
-	// web's subtractions: `a2a.>` covers the verifier's queue group, the
-	// dispatcher's hand-off and the stop records.
+	// web's subtractions: `a2a.>` covers the verifier's queue group, dispatch offers and the stop records.
 	if want := []string{"a2a.cap.>", "a2a.dispatch.>", "a2a.stop.>"}; !reflect.DeepEqual(gotSubDeny, want) {
 		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
@@ -781,8 +786,8 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		}
 	}
 
-	// The other half of the door: the gateway can hear the inbound subject
-	// and answer on the outbound one.
+	// The other half of the door: the gateway can hear the inbound and
+	// confirm subjects and answer on the outbound one.
 	gw := conf[strings.Index(conf, "user: gateway"):]
 	gw = gw[:strings.Index(gw[1:], "user: ")+1]
 	if !strings.Contains(gw, `"chat.console.*.out"`) {
@@ -790,6 +795,9 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 	if !strings.Contains(gw, `"chat.console.*.in"`) {
 		t.Error("gateway cannot subscribe the console inbound subject")
+	}
+	if !strings.Contains(gw, `"chat.console.*.confirm"`) {
+		t.Error("gateway cannot subscribe the console confirm subject")
 	}
 }
 
@@ -873,8 +881,8 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	}
 
 	role := buildA2AGatewayRole(agent)
-	if len(role.Rules) != 4 {
-		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get, the pinned PlatformAgent get and the pinned home-channel record", len(role.Rules))
+	if len(role.Rules) != 5 {
+		t.Fatalf("gateway Role has %d rules, want the session-pod rule, the pinned owner get, the pinned PlatformAgent get, the pinned home-channel record and the pinned resolved scope", len(role.Rules))
 	}
 	// The owner rule is one verb on one named object — a deployments read
 	// would be a finding.
@@ -1221,7 +1229,7 @@ func TestNextRenderFollowsTheAgentImageMirror(t *testing.T) {
 	if workerEnv != mirror+"/a2a-worker:0.3.0" {
 		t.Errorf("A2A_WORKER_IMAGE %q does not follow the agent image's mirror (or is not rendered)", workerEnv)
 	}
-	callout := buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0]
+	callout := buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0]
 	if callout.Image != mirror+"/a2a-authcallout:0.3.0" {
 		t.Errorf("callout image %q does not follow the agent image's mirror", callout.Image)
 	}
@@ -1552,15 +1560,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
 	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 26 {
-		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
+	if pods.Value() != 27 {
+		t.Fatalf("default quota = %d, want 27 (cap 10 + headroom 17)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 18 {
-		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
+	if pods.Value() != 19 {
+		t.Fatalf("tuned quota = %d, want 19 (cap 2 + headroom 17)", pods.Value())
 	}
 }
 
@@ -1684,7 +1692,7 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent, "")
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
@@ -1771,7 +1779,7 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
-	callout := buildA2ACalloutDeployment(agent, "")
+	callout := buildA2ACalloutDeployment(agent, "", 1)
 	verifier := buildA2AVerifierDeployment(agent)
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	console := buildA2AConsoleDeployment(agent)
@@ -1973,7 +1981,7 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 				Build()
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
-			state, err := r.reconcileA2A(context.Background(), agent)
+			state, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{})
 			if err != nil {
 				t.Fatalf("reconcileA2A: %v", err)
 			}
@@ -2193,7 +2201,7 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	t.Setenv(a2aAgentDoorEnvVar, "true")
 	t.Setenv(a2aMCPDoorEnvVar, "true")
 
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	// Precondition: the profile namespace's half rendered, so its delete
@@ -2307,7 +2315,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 	countR := &PlatformAgentReconciler{Client: countCl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, countCl, countR, next)
-	if _, err := countR.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := countR.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	if err := countR.cleanupA2A(ctx, today.DeepCopy()); err != nil {
@@ -2340,7 +2348,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnFullRender(t *testing.T) {
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
 			theCalloutIsServing(t, ctx, cl, r, next)
-			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 				t.Fatalf("render: %v", err)
 			}
 
@@ -2408,12 +2416,12 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err == nil {
 		t.Fatal("render: want injected error, got nil")
 	}
 
 	authMap := &corev1.ConfigMap{}
-	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapName(next), Namespace: next.Namespace}, authMap); err != nil {
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aAuthMapShardName(next, 0), Namespace: next.Namespace}, authMap); err != nil {
 		t.Fatalf("authMap was not created: %v", err)
 	}
 
@@ -2425,7 +2433,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: fakeServerSideApplyInterceptors().Patch,
 			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapName(next) && failAuthMap {
+				if _, isCM := obj.(*corev1.ConfigMap); isCM && obj.GetName() == a2aAuthMapShardName(next, 0) && failAuthMap {
 					return fmt.Errorf("injected: API server error deleting authmap")
 				}
 				return c.Delete(ctx, obj, opts...)
@@ -2436,7 +2444,7 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	for _, obj := range []client.Object{
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: next.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(next), Namespace: next.Namespace}},
-		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(next), Namespace: next.Namespace}},
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(next, 0), Namespace: next.Namespace}},
 	} {
 		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), obj); err == nil {
 			obj.SetResourceVersion("")
@@ -2505,7 +2513,7 @@ func TestCleanupA2AHaltsBeforeStatefulSetOnPersistentClusterRoleBindingError(t *
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -2615,7 +2623,7 @@ func TestCleanupA2ASkipsUnownedClusterRoleBindingAndDeletesStatefulSet(t *testin
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 
@@ -2698,7 +2706,7 @@ func TestAFlipToTodayCompletesAroundAnUnownedDoorObject(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, next)
-	if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err != nil {
+	if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	stsKey := types.NamespacedName{Name: a2aNATSName(next), Namespace: next.Namespace}
@@ -2942,7 +2950,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 
 	full := 0
 	unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &full), Scheme: scheme}
-	if _, err := unobstructed.reconcileA2A(context.Background(), next.DeepCopy()); err != nil {
+	if _, err := unobstructed.reconcileA2A(context.Background(), next.DeepCopy(), homeChannelRecord{}); err != nil {
 		t.Fatalf("unobstructed render: %v", err)
 	}
 	if full == 0 {
@@ -2956,7 +2964,7 @@ func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
 			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 			ctx := context.Background()
 
-			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy(), homeChannelRecord{}); err == nil {
 				t.Fatal("want the injected error, got nil: the render did not die where this case says it did")
 			}
 
@@ -4024,6 +4032,8 @@ func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
 	if before == "" {
 		t.Fatal("pod template carries no config hash")
 	}
+	// A changed config moves a running bus only behind a rolled-out callout.
+	theCalloutIsRolledOut(t, ctx, cl, agent)
 
 	// A reconcile that changes nothing must not roll the bus.
 	if _, err := r.Reconcile(ctx, req); err != nil {
@@ -4661,6 +4671,27 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 			}
 		}
 	}
+
+	// The third spelling: provisionIdentity, which the Job authenticates as
+	// since the callout armed, enumerates its CREATE and INFO grants by hand.
+	// Held to the list in both directions, or the Job's create is refused.
+	provisionPublish := provisionIdentity(a2aTestAgent(), a2aTestAgent().Namespace).publish
+	for _, s := range a2aProvisionedStreams {
+		for _, verb := range []string{"CREATE", "INFO"} {
+			want := "$JS.API.STREAM." + verb + "." + s
+			if !slices.Contains(provisionPublish, want) {
+				t.Errorf("provision identity's publish list is missing %q; the Job's %s on %s is refused", want, verb, s)
+			}
+		}
+	}
+	for _, grant := range provisionPublish {
+		for _, verb := range []string{"CREATE", "INFO"} {
+			stream, ok := strings.CutPrefix(grant, "$JS.API.STREAM."+verb+".")
+			if ok && !slices.Contains(a2aProvisionedStreams, stream) {
+				t.Errorf("provision identity holds %q for %q, which a2aProvisionedStreams does not name", grant, stream)
+			}
+		}
+	}
 }
 
 // TestSeedHoldsNoWholesaleJetStreamAPI is a shape check, and only that — it reads
@@ -4859,7 +4890,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Verbs no bridge path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
-	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"}
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"}
 	forbiddenVerbs := []string{
 		"$JS.API.STREAM.CREATE.",
 		"$JS.API.STREAM.UPDATE.",
@@ -4883,7 +4914,7 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// consumer, not a direct get. The directory is the identity plane; the
 	// session registry is the gateway's; cap is the capability envelope's;
 	// and the two topic streams are the agent's since A5.
-	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap", "KV_feedback", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap", "KV_feedback", "KV_people", "TOPICS-STATE", "TOPICS-JOURNAL"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -5008,7 +5039,7 @@ func TestAgentHoldsOnlyTheBlackboard(t *testing.T) {
 			"$JS.ACK.TASKS.1.2.3",
 		)
 	}
-	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"} {
+	for _, s := range []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"} {
 		forbidden = append(forbidden,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
 			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
@@ -5119,7 +5150,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
+		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
 		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -5130,6 +5161,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"a2a.tasks.*.*.supervisor",
 		"$KV.session-state.>",
 		"$KV.feedback.>",
+		"$KV.people.>",
 		"chat.console.*.out",
 		"chat.notify.reply.agent.>",
 		// The mint, and the whole of it: one token under `root`, which is
@@ -5173,7 +5205,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// Verbs no gateway path uses, against every stream the provision script
 	// creates. A named grant only widens the stream it names, so a verb
 	// sampled on TASKS says nothing about the same verb on DIRECTORY.
-	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback"}
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people"}
 	forbiddenVerbs := []string{
 		"$JS.API.STREAM.CREATE.",
 		"$JS.API.STREAM.UPDATE.",
@@ -5245,6 +5277,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	// comment rather than added quietly.
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
+	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	allowedShapes := map[string]bool{
 		"$JS.API.STREAM.INFO." + a2aTasksStream:              true,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>":   true,
@@ -5258,6 +5291,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvFeedback + ".>":            true,
 		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>":       true,
 		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*":       true,
+		"$JS.API.STREAM.INFO." + kvPeople:                    true,
+		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
+		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
+		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5319,6 +5356,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"feedbackDesk kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aFeedbackBucket + ".$KV." + a2aFeedbackBucket + ".t1.U1"},
 		{"ExportFeedback ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		{"ExportFeedback watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
+		// gateway people count, over the people bucket.
+		{"tryPeople js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aPeopleBucket},
+		{"peopleDesk.follow WatchAll", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
+		{"peopleDesk.follow watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
+		{"purgePeople ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aPeopleBucket + "." + kvWatcherName},
 		// The ack the relay's explicit-ack durable publishes, granted
 		// beside the API list rather than in it.
 		{"relay msg.Ack", "$JS.ACK." + a2aTasksStream + ".gateway-relay.1.1.1.1.1"},
@@ -5354,7 +5396,7 @@ func TestGatewayGrantNamesTheBucketItsDataPlaneWritesTo(t *testing.T) {
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	known := []string{a2aTasksStream}
-	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket} {
+	for _, bucket := range []string{a2aSessionStateBucket, a2aFeedbackBucket, a2aPeopleBucket} {
 		dataPlane := "$KV." + bucket + ".>"
 		if !slices.Contains(grants, dataPlane) {
 			t.Errorf("the gateway's publish list has no %q; its JetStream grants name bucket %q, so the two no longer describe one bucket",
@@ -5840,6 +5882,8 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 				// The kept answer ratings: the registry's four verbs, for
 				// the same four calls (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// The people count: the same four verbs (a2aGatewayJetStreamGrants).
+				a2aKVStreamPrefix + a2aPeopleBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// Minting, and only minting. The grant is
 				// `$KV.cap.root.*` -- the root namespace, one token
 				// deep, so one request id and no reach into the hop
@@ -5881,6 +5925,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			accountLevel: []string{"$JS.API.INFO"},
 		},
 		"console": {
+			streams:      consoleStreams,
+			accountLevel: []string{"$JS.API.INFO"},
+		},
+		a2aConsoleMCPUser: {
 			streams:      consoleStreams,
 			accountLevel: []string{"$JS.API.INFO"},
 		},
@@ -5973,7 +6021,7 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		"gateway Deployment": buildA2AGatewayDeployment(agent).Spec.Template.Spec,
 		"NATS StatefulSet":   buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec,
 		"provision Job":      buildA2AProvisionJob(agent).Spec.Template.Spec,
-		"callout Deployment": buildA2ACalloutDeployment(agent, "").Spec.Template.Spec,
+		"callout Deployment": buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec,
 		"agent pod":          buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec,
 		"console Deployment": buildA2AConsoleDeployment(agent).Spec.Template.Spec,
 		"MCP Deployment":     buildA2AMCPDeployment(agent).Spec.Template.Spec,
@@ -6145,6 +6193,7 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 // namespace wholesale in rule 2 would be wider than the thing being held.
 const (
 	consoleInbound  = "chat.console.*.in"
+	consoleConfirm  = "chat.console.*.confirm"
 	consoleOutbound = "chat.console.*.out"
 )
 
@@ -6165,7 +6214,7 @@ const (
 
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
+var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
@@ -6198,6 +6247,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		allowed bool
 	}{
 		{consoleInbound, true},
+		{consoleConfirm, true},
 		{consoleOutbound, true},
 		{notifyRequest, true},
 		{notifyRequestSlack, true},
@@ -6239,28 +6289,31 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 
 // consoleDoorViolations returns one line per grant, across ids, that
 // overlaps a console door subject pattern on a principal other than that
-// side's one intended holder: publish on chat.console.*.in is console's
-// alone, subscribe there is gateway's alone, and the reverse for
-// chat.console.*.out.
+// side's intended holders: publish on chat.console.*.in is console and
+// console-mcp's alone, publish on chat.console.*.confirm is console's alone,
+// subscribe on both is gateway's alone, and the reverse for chat.console.*.out.
 func consoleDoorViolations(ids []a2aIdentity) []string {
 	rules := []struct {
-		verb, pattern, owner string
-		grants               func(a2aIdentity) []string
+		verb, pattern string
+		owners        []string
+		grants        func(a2aIdentity) []string
 	}{
-		{"publish", consoleInbound, "console", func(id a2aIdentity) []string { return id.publish }},
-		{"publish", consoleOutbound, "gateway", func(id a2aIdentity) []string { return id.publish }},
-		{"subscribe", consoleInbound, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
-		{"subscribe", consoleOutbound, "console", func(id a2aIdentity) []string { return id.subscribe }},
+		{"publish", consoleInbound, []string{"console", a2aConsoleMCPUser}, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", consoleConfirm, []string{"console"}, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", consoleOutbound, []string{"gateway"}, func(id a2aIdentity) []string { return id.publish }},
+		{"subscribe", consoleInbound, []string{"gateway"}, func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", consoleConfirm, []string{"gateway"}, func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", consoleOutbound, []string{"console", a2aConsoleMCPUser}, func(id a2aIdentity) []string { return id.subscribe }},
 	}
 	var out []string
 	for _, id := range ids {
 		for _, r := range rules {
-			if id.user == r.owner {
+			if slices.Contains(r.owners, id.user) {
 				continue
 			}
 			for _, g := range r.grants(id) {
 				if subjectPatternsOverlap(g, r.pattern) {
-					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %s may %s it", id.user, r.verb, g, r.pattern, r.owner, r.verb))
+					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %v may %s it", id.user, r.verb, g, r.pattern, r.owners, r.verb))
 				}
 			}
 		}
@@ -7258,7 +7311,7 @@ func TestA2ANextStackPodsCarryRequestsAndLimits(t *testing.T) {
 	}
 	// The callout too: it is the provision Job's authentication path, and a
 	// quota that refused it would leave the Job's creation held for good.
-	for _, c := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers {
+	for _, c := range buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers {
 		containers = append(containers, container{"callout Deployment", c})
 	}
 	// The verifier too, and it is the one with the sharpest consequence: an
@@ -7320,7 +7373,7 @@ func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		state, err := r.reconcileA2A(ctx, agent)
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		if err != nil {
 			t.Fatalf("reconcileA2A %d: %v", i+1, err)
 		}
@@ -7345,7 +7398,7 @@ func TestA2AProvisionJobWaitsForTheCallout(t *testing.T) {
 	}
 
 	reportCalloutServing(t, ctx, cl, agent)
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A after the callout came up: %v", err)
 	}
@@ -7381,13 +7434,13 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	// Two pods, one ready, none on the current template: a roll in progress
 	// or wedged at maxUnavailable 0.
 	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -8149,5 +8202,173 @@ func TestTheGatewayAlwaysArmsTheConsoleDoor(t *testing.T) {
 				t.Errorf("the render asks for %d replicas, want 1", *dep.Spec.Replicas)
 			}
 		})
+	}
+}
+
+// a2aJetStreamCapMargin is the store room the provisioned caps must leave
+// unreserved (#4476). NATS reserves every stream's and bucket's max_bytes against
+// max_file_store when it creates the stream and refuses a create past it, so
+// this is the room a new stream, a raised cap or a recreate has before
+// provisioning starts failing with "insufficient storage".
+const a2aJetStreamCapMargin = int64(2) << 30
+
+// TestProvisionedJetStreamCapsFitTheStore holds the provision script's byte caps,
+// summed, under the server's max_file_store less a2aJetStreamCapMargin, and the
+// store under the bus's claim (#4476). Every create must carry a cap: one without
+// reserves nothing, and then grows into the room every other stream's reservation
+// counted on. Lines the script only prints (an `echo` naming an edit for an
+// operator) are not commands and are skipped; an executed edit that raises a cap
+// re-reserves, so it counts.
+func TestProvisionedJetStreamCapsFitTheStore(t *testing.T) {
+	agent := a2aTestAgent()
+	// Comment lines go first: bash doesn't continue a comment that ends in `\`, so
+	// joining before dropping them would fold the next command into the comment.
+	// Then one logical line per command line (the creates wrap with `\`), split at
+	// && || ; and | so each create's flags stop at the next command.
+	var kept []string
+	for _, line := range strings.Split(a2aProvisionScript(agent), "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), "#") {
+			kept = append(kept, line)
+		}
+	}
+	script := strings.ReplaceAll(strings.Join(kept, "\n"), "\\\n", " ")
+	separators := regexp.MustCompile(`&&|\|\||;|\|`)
+	var commands []string
+	for _, line := range strings.Split(script, "\n") {
+		commands = append(commands, separators.Split(line, -1)...)
+	}
+
+	// natscli's create spellings, aliases included, and the edits that can raise a cap.
+	// Not `kv create`: that puts a key if it is new, and reserves nothing.
+	creates := regexp.MustCompile(`\b(stream (?:add|create|new)|kv (?:add|new))\s+(\S+)(.*)$`)
+	// Every edit or update, stream or bucket: one this test can't read fails rather
+	// than raising a cap it never sees.
+	edits := regexp.MustCompile(`\b((?:stream|kv) (?:edit|update))\b\s*(\S*)(.*)$`)
+	capOf := func(name, flag, rest string) (int64, bool) {
+		for _, f := range strings.Fields(rest) {
+			if v, ok := strings.CutPrefix(f, flag); ok {
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil || n <= 0 {
+					t.Fatalf("%s: %s%s is not a positive byte count", name, flag, v)
+				}
+				return n, true
+			}
+		}
+		return 0, false
+	}
+	caps := map[string]int64{}
+	created := map[string]bool{}
+	for _, line := range commands {
+		if strings.HasPrefix(strings.TrimSpace(line), "echo ") {
+			continue
+		}
+		if m := creates.FindStringSubmatch(line); m != nil {
+			name, flag := m[2], "--max-bytes="
+			if strings.HasPrefix(m[1], "kv ") {
+				name, flag = "KV_"+name, "--max-bucket-size="
+			}
+			if created[name] {
+				t.Fatalf("%s is created twice in the provision script; which cap holds is not a question this test answers", name)
+			}
+			created[name] = true
+			n, found := capOf(name, flag, m[3])
+			if !found {
+				t.Errorf("%s is created without %s: it reserves nothing, and grows into the room the other caps count on", name, flag)
+			}
+			caps[name] = max(caps[name], n)
+		}
+		if m := edits.FindStringSubmatch(line); m != nil {
+			n, found := capOf(m[2], "--max-bytes=", m[3])
+			if !strings.HasPrefix(m[1], "stream ") || !found {
+				t.Fatalf("unparsed cap-changing command; teach the test: %q", strings.TrimSpace(line))
+			}
+			if n > caps[m[2]] {
+				caps[m[2]] = n
+			}
+		}
+	}
+	// Not vacuous: every provisioned stream and bucket was found and counted.
+	for _, s := range a2aProvisionedStreams {
+		if !created[s] {
+			t.Errorf("no capped create found for %s; the sum below would leave it out", s)
+		}
+	}
+
+	conf := renderA2ANATSConf(agent, func(string) string { return "pw" }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
+	m := regexp.MustCompile(`(?m)^\s*max_file_store:\s*(\d+)\s*$`).FindStringSubmatch(conf)
+	if m == nil {
+		t.Fatal("nats.conf renders no max_file_store")
+	}
+	store, _ := strconv.ParseInt(m[1], 10, 64)
+	// The store has to fit the volume it is on, or the caps' arithmetic is about room
+	// the disk does not have.
+	claim := buildA2ANATSStatefulSet(agent, "").Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]
+	if store > claim.Value() {
+		t.Errorf("max_file_store is %d bytes, more than the bus's %s claim", store, claim.String())
+	}
+
+	var sum int64
+	names := make([]string, 0, len(caps))
+	for name, n := range caps {
+		sum += n
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	if sum > store-a2aJetStreamCapMargin {
+		var b strings.Builder
+		for _, name := range names {
+			fmt.Fprintf(&b, "\n  %-18s %8.3f GiB", name, float64(caps[name])/(1<<30))
+		}
+		t.Errorf("the provisioned caps reserve %.3f GiB of a %.3f GiB store, leaving %.3f GiB, under the %d GiB margin (#4476):%s",
+			float64(sum)/(1<<30), float64(store)/(1<<30), float64(store-sum)/(1<<30), a2aJetStreamCapMargin>>30, b.String())
+	}
+}
+
+// The people reading is read only while the install renders the A2A stack
+// and no chat platform it enables is served through Hermes: Chat or Slack on
+// its legacy consumer, or Teams, which only Hermes serves. The today rows are
+// false through the render gate alone, since a today install has no gateway
+// to read; the Slack and Teams rows test the Hermes reason by itself.
+func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
+	on := ptr.To(true)
+	agent := func(mode string, chat, slack, teams bool) *agentv1alpha1.PlatformAgent {
+		a := a2aTestAgent()
+		a.Spec.Mode = ptr.To(mode)
+		integration := &agentv1alpha1.PlatformAgentIntegrationSpec{}
+		if chat {
+			integration.GoogleChat = &agentv1alpha1.GoogleChatSpec{Enabled: on}
+		}
+		if slack {
+			integration.Slack = &agentv1alpha1.SlackSpec{Enabled: on}
+		}
+		if teams {
+			integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: on}
+		}
+		a.Spec.Integration = integration
+		return a
+	}
+	next, today := string(ModeNext), string(ModeToday)
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  bool
+	}{
+		{"next, Chat only", agent(next, true, false, false), true},
+		{"next, Slack only", agent(next, false, true, false), true},
+		{"next, Chat and Slack: Slack on Hermes", agent(next, true, true, false), false},
+		{"next, Teams", agent(next, false, false, true), false},
+		{"next, no platform", agent(next, false, false, false), true},
+		{"today, Chat", agent(today, true, false, false), false},
+		{"today, no platform: no A2A stack", agent(today, false, false, false), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := peopleReadingEnabled(tc.agent); got != tc.want {
+				t.Fatalf("peopleReadingEnabled = %v, want %v", got, tc.want)
+			}
+		})
+	}
+	noIntegration := a2aTestAgent()
+	if teamsEnabled(noIntegration) || !peopleReadingEnabled(noIntegration) {
+		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
 	}
 }

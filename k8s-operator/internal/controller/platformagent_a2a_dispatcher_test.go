@@ -35,11 +35,17 @@ func withDispatcher(t *testing.T) {
 	t.Setenv(a2aDispatcherImageEnvVar, testDispatcherImage)
 }
 
-// Without an image the operator renders no dispatcher, not even its bus
-// identity: the image isn't in the release set yet.
+// The dispatcher is off by default until profiles dispatch end to end:
+// with A2A_DISPATCHER_IMAGE unset the operator renders none of it, even
+// where the release set would resolve its image (OPERATOR_IMAGE set). No
+// Deployment, no dispatch ConfigMap, no identity-map entry (and none of
+// the operator's own grants for the profile durables). TASKS is the same
+// size either way: the durables are on PROFILE_SUBMITS (contract addendum
+// 7). Setting the image turns all of it on.
 func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
-	hasDispatcher := func() bool {
-		doc, err := renderA2AAuthMap(a2aTestAgent(), nil)
+	agent := a2aTestAgent()
+	hasIdentity := func() bool {
+		doc, err := renderA2AAuthMap(agent, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -51,12 +57,59 @@ func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
 		return false
 	}
 	t.Setenv(a2aDispatcherImageEnvVar, "")
-	if hasDispatcher() {
-		t.Fatal("the identity map carries the dispatcher with no image to run it")
+	t.Setenv(operatorImageEnvVar, "registry.example/kube-agents/k8s-operator:1.2.3")
+	// The release set knows the image; the default doesn't use it yet.
+	if got, want := a2aDispatcherReleaseImage(), "registry.example/kube-agents/a2a-dispatcher:1.2.3"; got != want {
+		t.Errorf("the release image resolves to %q, want %q", got, want)
 	}
+	if a2aDispatcherEnabled() || a2aDispatcherImage() != "" {
+		t.Fatalf("the dispatcher is on with A2A_DISPATCHER_IMAGE unset (image %q)", a2aDispatcherImage())
+	}
+	if hasIdentity() {
+		t.Error("the identity map carries the dispatcher with A2A_DISPATCHER_IMAGE unset")
+	}
+	tasksWithout := a2aTasksMaxConsumers(agent)
+	if want := max(a2aTasksConsumerBudget(agent), a2aTasksMaxConsumersFloor); tasksWithout != want {
+		t.Errorf("TASKS is created at %d, want %d with no dispatcher", tasksWithout, want)
+	}
+	if got := a2aTasksMaxConsumers(&agentv1alpha1.PlatformAgent{}); got != a2aTasksMaxConsumersFloor {
+		t.Errorf("a default install's TASKS is created at %d, want the floor %d", got, a2aTasksMaxConsumersFloor)
+	}
+
+	scheme := setupScheme()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent)).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
+		t.Fatalf("reconcile: %v / %v", err, profileErr)
+	}
+	name := a2aDispatcherName(agent)
+	for _, check := range []struct {
+		obj client.Object
+		key types.NamespacedName
+	}{
+		{&appsv1.Deployment{}, types.NamespacedName{Namespace: agent.Namespace, Name: name}},
+		{&corev1.ConfigMap{}, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}},
+		{&corev1.ServiceAccount{}, types.NamespacedName{Namespace: agent.Namespace, Name: name}},
+	} {
+		if err := c.Get(ctx, check.key, check.obj); !apierrors.IsNotFound(err) {
+			t.Errorf("%T %s rendered with A2A_DISPATCHER_IMAGE unset: %v", check.obj, check.key, err)
+		}
+	}
+
 	withDispatcher(t)
-	if !hasDispatcher() {
+	if !hasIdentity() {
 		t.Error("with an image, the identity map has no dispatcher")
+	}
+	if got := a2aTasksMaxConsumers(agent); got != tasksWithout {
+		t.Errorf("with an image, TASKS is created at %d, want %d: the profile durables take no TASKS slot", got, tasksWithout)
+	}
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
+		t.Fatalf("reconcile with an image: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: name}, &appsv1.Deployment{}); err != nil {
+		t.Errorf("with an image, no Deployment: %v", err)
 	}
 }
 
@@ -183,10 +236,7 @@ func TestRenderedDispatcherFixtures(t *testing.T) {
 	tse := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
 	})
-	cm, _, err := buildA2AAuthMapConfigMap(agent, []agentv1alpha1.AgentProfile{tse})
-	if err != nil {
-		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
-	}
+	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{tse})
 	checkFixture(t, dispatcherMapFixturePath, cm.Data[a2aAuthMapKey])
 	cfgMap, err := buildA2ADispatchConfigMap(agent, []agentv1alpha1.AgentProfile{tse})
 	if err != nil {
@@ -387,7 +437,7 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 		}
 	}
 	env := map[string]string{}
-	for _, e := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0].Env {
+	for _, e := range buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0].Env {
 		env[e.Name] = e.Value
 	}
 	if env["A2A_TASK_CREDENTIAL_MAX_LIFETIME"] != "6h0m0s" {
@@ -398,7 +448,7 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 	lowered.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{Profiles: &agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)}}}
 	cfg, _ = desiredDispatchConfig(lowered, []agentv1alpha1.AgentProfile{short})
 	env = map[string]string{}
-	for _, e := range buildA2ACalloutDeployment(lowered, "").Spec.Template.Spec.Containers[0].Env {
+	for _, e := range buildA2ACalloutDeployment(lowered, "", 1).Spec.Template.Spec.Containers[0].Env {
 		env[e.Name] = e.Value
 	}
 	lifetime, err := time.ParseDuration(env["A2A_TASK_CREDENTIAL_MAX_LIFETIME"])
@@ -531,7 +581,7 @@ func TestTheCredentialLifetimeIsOneValueForMinterAndVerifiers(t *testing.T) {
 		return "(absent)"
 	}
 	got := map[string]string{
-		"callout":    lifetime(buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0].Env),
+		"callout":    lifetime(buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0].Env),
 		"broker":     lifetime(credentialProxyProfileEnv(cfg)),
 		"dispatcher": lifetime(buildA2ADispatcherDeployment(agent).Spec.Template.Spec.Containers[0].Env),
 	}

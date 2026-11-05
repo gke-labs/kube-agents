@@ -131,3 +131,7 @@ LiteLLM unselected until the operator has reconciled:
 
 Chart README, "Upgrade notes: static to dynamic NetworkPolicy".
 {{- end }}
+{{- if .Values.quotaPreflight.enabled }}
+
+{{ include "kube-agents.footprintSummary" . }}
+{{- end }}

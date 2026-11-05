@@ -338,16 +338,18 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         unit_cost_hint() { echo 200; }
         profile_begin() { :; }
         run_one_unit() { echo "START $2 rep $3"; sleep 1; echo "END $2 rep $3"; }
+        fence_live_cards() { echo "FENCE $1"; }
         """
     )
 
-    def run_fanout(self, requesting: str, stopped: str = "") -> list[str]:
+    def run_fanout(self, requesting: str, stopped: str = "", alone: str = "") -> list[str]:
         body = "\n".join(
             [
                 "set -euo pipefail",
                 self.STUBS,
                 f'INJECT_LANE_REQUESTING="{requesting}"',
                 f'STOPPED_ASK_CASES="{stopped}"',
+                f'WRITES_ALONE_CASES="{alone}"',
                 lifted_block(r"^# Two phases on both lanes.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]
@@ -372,6 +374,16 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         for start, end in zip(writer_lines[0::2], writer_lines[1::2]):
             self.assertTrue(start.startswith("START ") and end.startswith("END "), writer_lines)
             self.assertEqual(start.split(" ", 1)[1], end.split(" ", 1)[1], writer_lines)
+        # #4425: each second-phase launch fences the cards an earlier unit
+        # left live, once the unit before it has ended; no first-phase one does.
+        fences = [i for i, line in enumerate(lines) if line.startswith("FENCE ")]
+        self.assertEqual([lines[i] for i in fences], ["FENCE " + lines[i].split(" ", 1)[1] for i in writers[0::2]])
+        for fence, start in zip(fences, writers[0::2]):
+            self.assertLess(fence, start)
+        # Fence k comes after writer k-1 has ended, and the first after phase 1.
+        for prev_end, fence in zip(writers[1::2], fences[1:]):
+            self.assertLess(prev_end, fence)
+        self.assertLess(max(others_ended), min(fences))
 
     def test_with_no_requesting_case_there_is_one_phase(self):
         lines = self.run_fanout("")
@@ -390,6 +402,17 @@ class TwoPhaseFanOutTest(unittest.TestCase):
         self.assertEqual(len(v_starts), 2)
         self.assertLess(max(others_ended), min(v_starts))
         self.assertTrue(any("the stopped asks (v)" in line for line in lines))
+
+    def test_a_writes_alone_case_runs_in_the_second_phase_without_requesting(self):
+        """A case that declares writes_alone requests nothing, but its window
+        is exclusive, so it must run alone after every other unit."""
+        lines = self.run_fanout("", alone="v")
+        self.assertIn("TOTAL=8", lines)
+        v_starts = [i for i, line in enumerate(lines) if line.startswith("START v")]
+        others_ended = [i for i, line in enumerate(lines) if line.startswith("END ") and not line.startswith("END v")]
+        self.assertEqual(len(v_starts), 2)
+        self.assertLess(max(others_ended), min(v_starts))
+        self.assertTrue(any("the writes_alone cases (v)" in line for line in lines))
 
     def test_the_settle_equals_the_lane_safeguards_clock_skew(self):
         """The settle exists so a write in the last seconds of the unit before
@@ -452,6 +475,33 @@ class StoppedAsksTest(unittest.TestCase):
     def test_another_lane_names_none(self):
         self.assertEqual(self.run_block("api"), "STOPPED=")
 
+    ALONE_CASE = "./tasks/provisioning-cluster-request-never-creates/task.yaml"
+
+    def run_writes_alone_block(self, transport: str) -> str:
+        body = "\n".join(
+            [
+                "set -euo pipefail",
+                UV_STUB,
+                f'BENCH_DIR="{BENCH_DIR}"',
+                'EVAL_INJECT_TRANSPORT="inject"',
+                f'AGENT_TRANSPORT="{transport}"',
+                f'TASKS=("{self.STOP_CASE}" "{self.ALONE_CASE}" "{self.OTHER_CASE}")',
+                lifted_block(r'^WRITES_ALONE_CASES="".*?^fi$'),
+                'echo "ALONE=${WRITES_ALONE_CASES}"',
+            ]
+        )
+        result = subprocess.run(["bash", "-c", body], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return next(line for line in result.stdout.splitlines() if line.startswith("ALONE="))
+
+    def test_a_writes_alone_case_is_listed_on_every_transport_and_a_stopped_ask_is_not(self):
+        # The stopped ask's premise needs the inject door; a writes_alone case
+        # is placed in the second phase wherever it runs, since the lane marks
+        # its window exclusive.
+        for transport in ("inject", "api"):
+            with self.subTest(transport=transport):
+                self.assertEqual(self.run_writes_alone_block(transport), "ALONE=provisioning-cluster-request-never-creates")
+
     def test_the_unit_hands_the_bench_the_resolved_path(self):
         src = SCRIPT.read_text(encoding="utf-8")
         unit = re.search(r"^run_one_unit\(\) \{.*?^\}$", src, re.DOTALL | re.MULTILINE).group(0)
@@ -474,7 +524,7 @@ class StoppedAsksTest(unittest.TestCase):
         self.assertIn("closes none of them", report)
         call = src.index("\nreport_github_leftovers\n")
         # After both phases of the fan-out have been waited for.
-        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}"\n  wait\nfi\n'), call)
+        self.assertLess(src.index('launch_units "${UNIT_QUEUE_WRITERS}" 1 "${WRITER_LAUNCH_PAUSE:-${EVAL_GITHUB_WRITE_SETTLE_SECONDS}}" fence\n  wait\nfi\n'), call)
         self.assertLess(call, src.index("# ─── Per-case verdicts"))
         self.assertLess(src.index("EVAL_RUN_STARTED_AT=\"$(date"), src.index("# 2. Cluster Auth"))
 

@@ -175,7 +175,7 @@ func TestTheSlackIntegrationRendersTheGateway(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	dep := &appsv1.Deployment{}
@@ -426,7 +426,7 @@ func TestNoRenderedRoleReachesASecret(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{
 		"a2a gateway":        buildA2AGatewayRole(agent).Rules,
-		"a2a callout":        buildA2ACalloutRole(agent).Rules,
+		"a2a callout":        buildA2ACalloutRole(agent, 1).Rules,
 		"broker tokenreview": buildCredentialBrokerTokenReviewRole(agent).Rules,
 		"platform minimal":   buildMinimalPlatformRole(agent).Rules,
 		"platform local":     buildPlatformLocalRole(agent).Rules,
@@ -590,6 +590,43 @@ func TestAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
 	}
 }
 
+// TestPeopleSeenOffIsTheOnlyRenderedState: telemetry.peopleSeen=false
+// reaches the gateway as its off switch on a gateway with Slack not armed,
+// so the env does not hang off a backend; unset or true renders nothing.
+func TestPeopleSeenOffIsTheOnlyRenderedState(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	for _, tc := range []struct {
+		name    string
+		value   *bool
+		want    string
+		present bool
+	}{
+		{"unset", nil, "", false},
+		{"true", ptr.To(true), "", false},
+		{"false", ptr.To(false), "false", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := slackTestAgent("next", false)
+			if tc.value != nil {
+				agent.Spec.Telemetry = &agentv1alpha1.TelemetrySpec{PeopleSeen: tc.value}
+			}
+			env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aPeopleSeenEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aPeopleSeenEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
+	t.Run("false with Slack armed", func(t *testing.T) {
+		agent := slackTestAgent("next", true)
+		agent.Spec.Telemetry = &agentv1alpha1.TelemetrySpec{PeopleSeen: ptr.To(false)}
+		env := envMapOf(buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env)
+		if got, ok := env[a2aPeopleSeenEnvVar]; !ok || got.Value != "false" {
+			t.Errorf("%s = %q (rendered %v), want \"false\" (rendered true)", a2aPeopleSeenEnvVar, got.Value, ok)
+		}
+	})
+}
+
 // TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer
 // to "is every Slack member allowed", whichever consumer the mode renders.
 func TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {
@@ -627,7 +664,7 @@ func TestAnUnarmedGatewayCarriesNoSlackAllowlist(t *testing.T) {
 // digest read off an absent Deployment is "" and would pass on absence.
 func gatewayDigestAfterPass(t *testing.T, ctx context.Context, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) string {
 	t.Helper()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	dep := &appsv1.Deployment{}
@@ -823,7 +860,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("precondition: a Slack-armed gateway renders: %v", err)
 	}
 	armed := &appsv1.Deployment{}
@@ -832,7 +869,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	}
 
 	agent.Spec.Integration.Slack.Enabled = ptr.To(false)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A with Slack disabled: %v", err)
 	}
 	off := &appsv1.Deployment{}
@@ -854,7 +891,7 @@ func TestDisablingSlackLeavesTheGatewayRunning(t *testing.T) {
 	}
 
 	agent.Spec.Integration.Slack.Enabled = ptr.To(true)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("re-enabling Slack: %v", err)
 	}
 	back := &appsv1.Deployment{}

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -21,6 +22,16 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
+
+// holdReservedPorts says whether reservePort keeps the port it picks bound
+// for the whole test. The hold rests on Linux's reuse-address rule, under
+// which two SO_REUSEADDR sockets share an exact address and port as long as
+// neither is listening; BSD-derived kernels, macOS among them, let an exact
+// duplicate in only when both sockets carry SO_REUSEPORT, which Go's listeners
+// do not, so there the bus could never bind a held port and reservePort picks
+// and releases instead, as it did before the hold. CI runs the module on
+// Linux, which is where the sibling-package collision the hold removes occurs.
+const holdReservedPorts = runtime.GOOS == "linux"
 
 // The verifier has to survive starting before the things it depends on.
 //
@@ -152,7 +163,7 @@ func TestTheBindWaitEndsWhenTheBusEndsForGood(t *testing.T) {
 	}
 	go srv.Start()
 	if !srv.ReadyForConnections(10 * time.Second) {
-		t.Fatal("nats server did not come up")
+		failBusNotUp(t, srv, port)
 	}
 	t.Cleanup(srv.Shutdown)
 
@@ -233,6 +244,54 @@ func TestReadinessIsFalseUntilTheBucketIsBound(t *testing.T) {
 	}
 }
 
+// TestAReservedPortIsHeldAndStillRefusesConnections pins the three properties
+// the other tests here rest on without saying so. The port is held, so a bind
+// to it without the reuse-address option is refused, which a picked-and-
+// released port would accept: this is the assertion that goes red if the hold
+// is ever simplified away, and the flake it removes comes back silently. The
+// verifier is pointed at the port while nothing answers, so a connection to it
+// has to be refused, not accepted or left hanging. And the bus is started on
+// the same port without the hold being released, so a listener has to be able
+// to come up on it while it is held. A kernel that broke the last two would
+// fail the tests above in ways that look like the verifier's fault; this one
+// names the hold.
+func TestAReservedPortIsHeldAndStillRefusesConnections(t *testing.T) {
+	if !holdReservedPorts {
+		t.Skipf("reservePort does not hold ports on %s", runtime.GOOS)
+	}
+	port := reservePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	err = syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}, Port: port})
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("bind %s without SO_REUSEADDR = %v, want EADDRINUSE: the port is not held, so "+
+			"another test process can be handed it while the verifier is parked against it", addr, err)
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatalf("a connection to the reserved port %s was accepted, want it refused: the hold is "+
+			"listening, and the verifier would connect to it instead of waiting", addr)
+	}
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("dial %s = %v, want a refused connection: the verifier would see a different "+
+			"failure from the one these tests put it in", addr, err)
+	}
+
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("listen on the reserved port %s = %v, want a listener: a bus started on a reserved "+
+			"port could never bind it", addr, err)
+	}
+	_ = l.Close()
+}
+
 // probeListener asks the real listener on readyPort, the way the kubelet
 // does. The retry is for the listener's own goroutine getting scheduled, not
 // for the bind it is being asked about.
@@ -261,20 +320,52 @@ func probe(mux *http.ServeMux, path string) int {
 	return rec.Code
 }
 
-// reservePort picks a port and gives it straight back, so a bus can be started
-// on it later in the test. The gap is the point: the verifier is pointed at it
-// while nothing is listening.
+// reservePort picks a port for a bus that is started later in the test and,
+// where holdReservedPorts allows, holds it until the test ends. The gap is the
+// point: the verifier is pointed at the port while nothing is listening on it.
+//
+// The hold is a TCP socket bound to the port with the reuse-address option and
+// never put into the listening state. Picking a port and closing the socket
+// left the port unheld for the whole wait, and `go test ./...` runs every
+// package's tests alongside this one: a sibling asking the kernel for any free
+// port could be handed this one, and the bus then failed to start with its
+// listen error swallowed. Linux's free-port search skips a port with any bound
+// socket on it, so the sibling is never handed this one; a connection to it is
+// refused at once, exactly as with nothing bound, so the verifier sees what
+// the tests mean it to see; and a listener with the reuse-address option
+// (every net.Listen, the bus included) still binds and listens on it while the
+// hold is in place, so nothing has to be released before startBus.
+// TestAReservedPortIsHeldAndStillRefusesConnections pins all three.
 func reservePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if !holdReservedPorts {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("reserve a port: %v", err)
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		if err := l.Close(); err != nil {
+			t.Fatalf("release the reserved port: %v", err)
+		}
+		return port
+	}
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
 	if err != nil {
-		t.Fatalf("reserve a port: %v", err)
+		t.Fatalf("reserve a port: socket: %v", err)
 	}
-	port := l.Addr().(*net.TCPAddr).Port
-	if err := l.Close(); err != nil {
-		t.Fatalf("release the reserved port: %v", err)
+	t.Cleanup(func() { _ = syscall.Close(fd) })
+	syscall.CloseOnExec(fd)
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		t.Fatalf("reserve a port: set SO_REUSEADDR: %v", err)
 	}
-	return port
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}, Port: 0}); err != nil {
+		t.Fatalf("reserve a port: bind: %v", err)
+	}
+	sa, err := syscall.Getsockname(fd)
+	if err != nil {
+		t.Fatalf("reserve a port: getsockname: %v", err)
+	}
+	return sa.(*syscall.SockaddrInet4).Port
 }
 
 func startBus(t *testing.T, port int) *natsserver.Server {
@@ -288,10 +379,33 @@ func startBus(t *testing.T, port int) *natsserver.Server {
 	}
 	go srv.Start()
 	if !srv.ReadyForConnections(10 * time.Second) {
-		t.Fatal("nats server did not come up")
+		failBusNotUp(t, srv, port)
 	}
 	t.Cleanup(srv.Shutdown)
 	return srv
+}
+
+// failBusNotUp ends the test when a bus did not report ready, and says why.
+// The server runs unlogged, so the error its listener returned is never
+// printed and a bare timeout is all that reached the log when another test
+// process held the port. Shutting the server down first releases whatever it
+// did bind, so a plain listen on the port then either names what else holds
+// it or shows that the port was not the problem. The test's own hold is one
+// candidate: a kernel that refused a listener beside it would fail here too,
+// and TestAReservedPortIsHeldAndStillRefusesConnections says whether it does.
+func failBusNotUp(t *testing.T, srv *natsserver.Server, port int) {
+	t.Helper()
+	srv.Shutdown()
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatalf("nats server did not come up on %s, and a plain listen on it fails too: %v; "+
+			"something else holds the port, or this kernel does not let a listener in beside the "+
+			"test's own hold on it (held: %t)", addr, err, holdReservedPorts)
+	}
+	_ = l.Close()
+	t.Fatalf("nats server did not come up on %s, and the port is free now that the server is shut "+
+		"down: the failure was not the bind, or whatever took the port has released it since", addr)
 }
 
 func createBucket(t *testing.T, srv *natsserver.Server) {

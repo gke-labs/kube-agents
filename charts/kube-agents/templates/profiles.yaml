@@ -41,3 +41,55 @@ spec:
   resources:
     {{- toYaml $tse.resources | nindent 4 }}
 {{- end }}
+{{- /*
+The generic cluster agent (#3658): one AgentProfile for every cluster in scope,
+with the target named per task by the project, location and cluster
+parameters. Its persona is agents/cluster/persona, published as the
+persona-cluster image, and its worker pods come from the profile dispatcher,
+so no pod runs it until the dispatcher, the worker and the pool land (#4148,
+#4483, #4484) and the operator runs them (A2A_DISPATCHER_IMAGE). The parameters
+are the persona's own (agents/cluster/persona/persona.yaml), in its order, and
+not values: the design has the worker refuse a task when the two lists differ
+(docs/designs/spec-subagent-profiles.md), and tests/test_optional_profiles.py
+holds them equal until it does.
+*/}}
+{{- if and .Values.platformAgent.enabled .Values.profiles .Values.profiles.cluster .Values.profiles.cluster.enabled }}
+{{- $cluster := .Values.profiles.cluster -}}
+{{- $defaultTag := (.Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | toString -}}
+{{- $personaRepo := include "kube-agents.imageRepository" (dict "repository" $cluster.persona.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
+{{- $personaTag := ($cluster.persona.image.tag | default $defaultTag) | toString -}}
+{{- $harnessRepo := include "kube-agents.imageRepository" (dict "repository" $cluster.harness.image.repository "registry" (include "kube-agents.imageRegistry" .)) -}}
+{{- $harnessTag := ($cluster.harness.image.tag | default $defaultTag) | toString -}}
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentProfile
+metadata:
+  name: {{ "cluster" | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  description: {{ $cluster.description | quote }}
+  persona:
+    image: {{ printf "%s:%s" $personaRepo $personaTag | quote }}
+  harness:
+    image: {{ printf "%s:%s" $harnessRepo $harnessTag | quote }}
+    model: {{ $cluster.harness.model | quote }}
+    maxTurns: {{ $cluster.harness.maxTurns }}
+  identity: {}
+  allowedTiers:
+    {{- toYaml $cluster.allowedTiers | nindent 4 }}
+  parameters:
+    - name: project
+      required: true
+    - name: cluster
+      required: true
+    - name: location
+      required: true
+  lifecycle:
+    activeDeadlineSeconds: {{ $cluster.lifecycle.activeDeadlineSeconds }}
+    ttlSecondsAfterFinished: {{ $cluster.lifecycle.ttlSecondsAfterFinished }}
+  concurrency: {{ $cluster.concurrency }}
+  resources:
+    {{- toYaml $cluster.resources | nindent 4 }}
+{{- end }}

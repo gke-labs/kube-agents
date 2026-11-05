@@ -15,6 +15,7 @@
 
 import argparse
 import contextlib
+import fcntl
 import json
 import os
 import shutil
@@ -147,11 +148,62 @@ log = make_log("PROFILE-SCAFFOLD")
 # the entrypoint runs, so an unbuilt profile can already have a directory (see
 # deploy/shared/profile_plugins.py for the whole failure mode).
 PROFILE_MARKER = "profile.yaml"
+# One lock file per profile name, under the data root beside profiles/, held by
+# whatever creates, deletes or removes a profile's homes (#4389): create_profile,
+# delete_profile, and kanban_workspace_gc's stale-home sweep. A dot-directory, so
+# no lister takes it for a profile.
+PROFILE_LOCKS_DIRNAME = ".profile-locks"
+# Longer names get a hashed lock-file name, the same for every caller, so a name
+# the filesystem can hold as a directory (up to 255 bytes) can always be locked:
+# the name's first PROFILE_LOCK_NAME_KEEP characters, then PROFILE_LOCK_HASH_CHARS
+# of its sha256.
+PROFILE_LOCK_NAME_MAX = 200
+PROFILE_LOCK_NAME_KEEP = 64
+PROFILE_LOCK_HASH_CHARS = 16
 
 
 def profiles_base(hermes_home: Path) -> Path:
     # Hermes stores each named profile at $HERMES_HOME/profiles/<name>.
     return hermes_home / "profiles"
+
+
+def profile_lock_file(data_root: Path, name: str) -> Path:
+    """Where profile *name*'s lock lives under *data_root*."""
+    if len(name.encode("utf-8", "surrogateescape")) > PROFILE_LOCK_NAME_MAX:
+        import hashlib
+
+        digest = hashlib.sha256(name.encode("utf-8", "surrogateescape")).hexdigest()[:PROFILE_LOCK_HASH_CHARS]
+        name = f"{name[:PROFILE_LOCK_NAME_KEEP]}-{digest}"
+    return data_root / PROFILE_LOCKS_DIRNAME / f"{name}.lock"
+
+
+@contextlib.contextmanager
+def profile_lock(data_root: Path, name: str, blocking: bool = True, on_error=None):
+    """Hold profile *name*'s lock under *data_root*; yield whether it is held.
+
+    *data_root* is the agent pod's data volume, the directory holding profiles/,
+    which every holder must pass alike for the lock to mean anything. Under the
+    chat roster that is HERMES_HOME; under the platform roster HERMES_HOME is
+    profiles/platform, and the data root is PLATFORM_AGENT_HOME (the entrypoint
+    sets the machine HERMES_HOME from it). An unopenable lock yields False, with
+    the error passed to *on_error*; so does a held one when *blocking* is False.
+    """
+    path = profile_lock_file(data_root, name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(path, "w")  # noqa: SIM115 - closed below
+    except OSError as e:
+        if on_error is not None:
+            on_error(e)
+        yield False
+        return
+    with handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
 
 
 def is_scaffolded(home: Path) -> bool:
@@ -421,15 +473,21 @@ def backfill_cron_store(store: object) -> object:
     return {**store, "jobs": out}
 
 
-def backfill_cron_file(path: Path) -> bool:
+def backfill_cron_file(path: Path) -> bool | None:
     """Backfill DEFAULT_LEGACY_CRON_RISK into a cron/jobs.json file if present.
 
     Atomic rewrite using a .tmp sibling and os.replace, matching _merge_after_overlay.
-    Returns True if the file was modified, False otherwise.
+    Returns True if the file was modified, False if it needed nothing, and None when
+    the store could not be read or rewritten: the entrypoint runs this on a pass it
+    stamps as finished only when every step finished, so "nothing to do" and "could
+    not" have to be told apart.
     """
     with cron_jobs_lock(path.parent):
         data = read_json(path)
         if data is None:
+            if path.exists():
+                log(f"WARN: could not read cron store {path}; its jobs were not backfilled")
+                return None
             return False
         backfilled = backfill_cron_store(data)
         if backfilled == data:
@@ -441,7 +499,7 @@ def backfill_cron_file(path: Path) -> bool:
             return True
         except OSError as exc:
             log(f"WARN: could not backfill cron store {path}: {exc}")
-            return False
+            return None
 
 
 def retire_cron_jobs(store: object, retire_ids: tuple[str, ...]) -> object:
@@ -655,7 +713,8 @@ def main() -> None:
         target = Path(args.backfill_cron)
         if not target.is_file():
             raise SystemExit(f"ERROR: --backfill-cron target not found: {target}")
-        backfill_cron_file(target)
+        if backfill_cron_file(target) is None:
+            raise SystemExit(f"ERROR: --backfill-cron could not read or rewrite {target}")
         return
 
     if not args.template:

@@ -112,6 +112,7 @@ SEEDED_INSTALLER_ENV_KEYS = (
     "GOOGLE_CHAT_ENABLED",
     "SLACK_ENABLED",
     "ENABLE_GKE_BACKUP_PLAN",
+    "HELM_UPGRADE_INSTALL",
     "ENABLE_PUBSUB_PLATFORM",
     "ENABLE_STOCKOUT_INVESTIGATOR",
     "ENABLE_DRIFT_DETECTOR",
@@ -146,6 +147,33 @@ def get_isolated_test_env(overrides=None, bin_dir=None, absent=()):
     if overrides:
         env.update(overrides)
     return env
+
+
+NOTES_PROBE_DEFINE = "notes-under-test"
+NOTES_PROBE_CONFIGMAP = "notes-under-test"
+NOTES_PROBE_TEMPLATE = "templates/notes-under-test.yaml"
+
+
+def chart_with_notes_probe(chart_src, chart_dst):
+    """Copies the chart to `chart_dst` with its NOTES.txt captured into a ConfigMap.
+
+    `helm template` renders no notes, so a test that reads them wraps NOTES.txt in a
+    define and renders it as the `notes` key of a ConfigMap named NOTES_PROBE_CONFIGMAP
+    (`--show-only NOTES_PROBE_TEMPLATE` selects it). Returns the copied chart's path.
+    """
+    chart_dst = pathlib.Path(chart_dst)
+    shutil.copytree(chart_src, chart_dst)
+    templates = chart_dst / "templates"
+    notes = (templates / "NOTES.txt").read_text()
+    (templates / "NOTES.txt").unlink()
+    (templates / "_notes_under_test.tpl").write_text(
+        '{{- define "' + NOTES_PROBE_DEFINE + '" -}}\n' + notes + "\n{{- end -}}\n"
+    )
+    (chart_dst / NOTES_PROBE_TEMPLATE).write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + NOTES_PROBE_CONFIGMAP + "\n"
+        'data:\n  notes: {{ include "' + NOTES_PROBE_DEFINE + '" . | toJson }}\n'
+    )
+    return chart_dst
 
 
 def create_minimal_tools_bin(temp_dir_path, exclude=()):

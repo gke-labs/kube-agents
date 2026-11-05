@@ -381,7 +381,7 @@ class ResetStepTest(unittest.TestCase):
                 'EVAL_FORGE="github"',  # the GitHub path, whatever the shell exports
                 f'EVAL_LEDGER_APP_ID=4739812; EVAL_LEDGER_APP_KEY_FILE="{key_file}"',
                 f'EVAL_LEDGER_REPO="{repo}"; PROJECT_ID="{PROJECT}"; BUILD_ID=2102186223282950144',
-                f'SCRIPT_DIR="{self.dir}"',
+                f'SCRIPT_DIR="{self.dir}"; EVAL_GRADING_LOG="{self.dir}/eval-grading.log"',
                 mint,
                 lifted("ledger_reset_token"),
                 lifted("forge_write_token"),
@@ -395,6 +395,12 @@ class ResetStepTest(unittest.TestCase):
     def mints(self):
         return int(self.count_file.read_text().strip())
 
+    def grading(self):
+        """What the step appended to the grading artifact, "" when nothing:
+        the helper's lines quote ledger titles, so they never reach the job log."""
+        path = self.dir / "eval-grading.log"
+        return path.read_text() if path.exists() else ""
+
     def test_the_unit_reset_narrows_the_token_and_names_its_stream(self):
         result = self.run_step('"compliance-rbac-overgrant rep 2" compliance-audit')
         self.assertIn("RC=0", result.stdout, result.stderr)
@@ -402,19 +408,20 @@ class ResetStepTest(unittest.TestCase):
             json.loads(self.body_file.read_text()),
             {"repositories": ["kube-agents-evals-2-infra"], "permissions": {"issues": "write"}},
         )
-        argv = json.loads(re.search(r"HELPER argv=(.*)", result.stdout).group(1))
+        argv = json.loads(re.search(r"HELPER argv=(.*)", self.grading()).group(1))
         self.assertEqual(
             argv,
             ["--repo", REPO, "--project", PROJECT, "--build", "2102186223282950144", "--audit", "compliance-audit"],
         )
         self.assertNotIn("tok-write", " ".join(argv))
-        self.assertIn("HELPER token=tok-write", result.stdout)
-        self.assertIn("Ledger reset (compliance-rbac-overgrant rep 2): HELPER argv=", result.stdout)
+        self.assertIn("HELPER token=tok-write", self.grading())
+        self.assertIn("Ledger reset (compliance-rbac-overgrant rep 2): HELPER argv=", self.grading())
+        self.assertNotIn("HELPER", result.stdout, "the helper's lines go to the artifact, not the job log")
         self.assertNotIn("BENCH_GITHUB_TOKEN", lifted("reset_audit_ledgers") + lifted("ledger_reset_token"))
 
     def test_the_lease_reset_names_no_stream(self):
-        result = self.run_step('"lease"')
-        argv = json.loads(re.search(r"HELPER argv=(.*)", result.stdout).group(1))
+        self.run_step('"lease"')
+        argv = json.loads(re.search(r"HELPER argv=(.*)", self.grading()).group(1))
         self.assertNotIn("--audit", argv)
         self.assertEqual(argv[:2], ["--repo", REPO])
 

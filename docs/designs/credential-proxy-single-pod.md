@@ -30,9 +30,16 @@ one pod (§4). The single point of failure is the same one the agent pod already
 ## 2. State that lives in the pod
 
 The exec route (brokered `kubectl`, `gcloud` and the Cloud API relay) needs nothing beyond
-caches: the managed kubeconfigs and the forge refresh coalesce cache are per process, so more pods
-would fill them more than once, and every cold path would run its `gcloud` more than once. The
-other routes keep state in the process or in the pod's emptyDir:
+caches for the shell and session roles: the managed kubeconfigs and the forge refresh coalesce
+cache are per process, so more pods would fill them more than once, and every cold path would run
+its `gcloud` more than once. The scope role is the exception on that route, and the other routes
+keep state in the process or in the pod's emptyDir:
+
+- The scope member window. The scope publisher's probe (`container clusters list --project`) and
+  its `projects describe` are admitted only for a value an earlier lookup by the same role
+  returned, and `scope_policy.MemberWindow` records those values in the process that ran the
+  lookup. A probe that reaches another pod finds an empty window and is refused, so the
+  publisher's run fails closed.
 
 - The content workspace. Handles live under `<state-dir>/workspace` in the pod's own
   emptyDir; `CREDENTIAL_PROXY_WORKSPACE_ROOT` is deliberately unset, because the sandbox's data
@@ -57,7 +64,13 @@ What one pod costs is a gap on every eviction, drain and rollout, and the gap is
 than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few
 seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled
 back to Pub/Sub, and exits; without that the message waits out its 60 s ack deadline on the
-replacement. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
+replacement. The standalone broker also drains: it keeps the health probe, the event pulls, the
+settle routes and the Chat reply routes open for the whole drain, answers every other new request `503` with the `draining`
+bound, stops taking Slack events, and gives the requests in flight up to 30 s to finish.
+It then ends the commands still running, which answer exit 143 with a line that says why, waits a
+few seconds for those answers, and stops. Its pod's `terminationGracePeriodSeconds` of 45 s holds
+the drain and the entrypoint's stop of Envoy after it. The drain is bounded because `Recreate`
+leaves no other broker serving while it runs. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
 AlwaysAllow`, which on one replica refuses no eviction and holds no drain; a budget that would
 protect the pod is the one the obtainability audit reports as blocking. While the pod is away the
 `PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message
@@ -88,7 +101,7 @@ fleet sweeps and was OOM-killed. Since then:
 
 - The child memory budget stops the OOM. On Standard the default limit is 2Gi: the budget
   admits nine requests, and the slot cap holds it to eight. On Autopilot without bursting the limit
-  is clamped to the 1Gi request, and the budget admits four.
+  is clamped to the 2Gi Autopilot request, so the budget admits the same nine there.
 - The Controller Stall Watch reuses kubeconfigs across ticks, which removed about 290
   `get-credentials` calls per tick; each cluster's credentials are now fetched about once a day.
 - The reconciler's and the stall watch's listing pools are four wide, sized to the four requests
@@ -105,7 +118,8 @@ proxy's memory request was raised to 1Gi had no waits in 783 commands.
    Service, with a replica count on the CR, while the relays and the content workspace stay on
    one pod. (A variant keeps one Deployment and has Envoy route the stateful verbs to one stable
    pod.) The load is all on the exec route, and that route already works
-   across pods (§3). The cost is a second footprint entry, a second NetworkPolicy target, and
+   across pods (§3) for every role but `scope`, which stays on the stateful pod with its member
+   window (§2). The cost is a second footprint entry, a second NetworkPolicy target, and
    the shim learning a second address. This is the shape to build if the question reopens (§6).
 2. Sticky routing by workspace or receipt. One Deployment with N replicas and the calls
    that need state routed to the same pod. Rejected: neither the shim nor the gateway's chat

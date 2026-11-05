@@ -61,7 +61,7 @@ func brokerEnvCount(env []corev1.EnvVar, name string) int {
 // map, the task-signing public key, and the identities on its callers list.
 func TestCredentialProxyProfileEnvIsRendered(t *testing.T) {
 	agent := a2aTestAgent()
-	env := buildCredentialProxyEnvForPlugins(agent, nil, true, profileBrokerConfig())
+	env := buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, profileBrokerConfig())
 
 	if got, _ := brokerEnvValue(env, credentialProxyProfileAudienceEnvVar); got != credentialProxyProfileAudience {
 		t.Errorf("%s = %q, want %q", credentialProxyProfileAudienceEnvVar, got, credentialProxyProfileAudience)
@@ -97,22 +97,22 @@ func TestCredentialProxyProfileEnvIsRendered(t *testing.T) {
 // list is what it was.
 func TestCredentialProxyProfileEnvIsAbsentWithoutProfiles(t *testing.T) {
 	agent := a2aTestAgent()
-	env := buildCredentialProxyEnvForPlugins(agent, nil, true, credentialProxyProfileConfig{TaskSigningPublic: testTaskSigningPublic})
+	env := buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, credentialProxyProfileConfig{TaskSigningPublic: testTaskSigningPublic})
 	for _, name := range []string{credentialProxyProfileAudienceEnvVar, credentialProxyProfileIdentitiesEnvVar, "A2A_TASK_SIGNING_PUBLIC_KEYS"} {
 		if _, ok := brokerEnvValue(env, name); ok {
 			t.Errorf("%s is rendered with no profile caller", name)
 		}
 	}
 	callers, _ := brokerEnvValue(env, "CREDENTIAL_PROXY_ALLOWED_CALLERS")
-	if callers != allowedBrokerCallers(agent, true) {
-		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the unchanged %q", callers, allowedBrokerCallers(agent, true))
+	if callers != allowedBrokerCallers(agent, allBrokerCallersOwned) {
+		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want the unchanged %q", callers, allowedBrokerCallers(agent, allBrokerCallersOwned))
 	}
 }
 
 // The broker Deployment carries the key: the threading from the Deployment
 // builder to the env builder.
 func TestCredentialProxyDeploymentCarriesTheTaskSigningKey(t *testing.T) {
-	dep := buildCredentialProxyDeploymentForPlugins(a2aTestAgent(), "hash", nil, true, profileBrokerConfig())
+	dep := buildCredentialProxyDeploymentForPlugins(a2aTestAgent(), "hash", nil, allBrokerCallersOwned, profileBrokerConfig(), false)
 	env := dep.Spec.Template.Spec.Containers[0].Env
 	if got, _ := brokerEnvValue(env, "A2A_TASK_SIGNING_PUBLIC_KEYS"); got != testTaskSigningPublic {
 		t.Errorf("the broker Deployment's A2A_TASK_SIGNING_PUBLIC_KEYS = %q, want the task-signing public key", got)
@@ -135,7 +135,7 @@ func TestCredentialProxyProfileEnvCannotBeOverridden(t *testing.T) {
 		for _, name := range names {
 			agent.Spec.Deployment.Env = append(agent.Spec.Deployment.Env, corev1.EnvVar{Name: name, Value: "from-the-cr"})
 		}
-		env := buildCredentialProxyEnvForPlugins(agent, nil, true, cfg)
+		env := buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, cfg)
 		for _, name := range names {
 			if got, ok := brokerEnvValue(env, name); ok && got == "from-the-cr" {
 				t.Errorf("profiles enabled=%v: spec.deployment.env set %s", cfg.enabled(), name)
@@ -307,5 +307,22 @@ func TestTheFlipToTodayRemovesALoneTaskSigningKey(t *testing.T) {
 	}
 	if err := cl.Get(ctx, key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the task-signing key Secret survived the flip to today (err=%v): the early exit stepped over it", err)
+	}
+}
+
+// The eval lanes turn the broker's proposal readings sweep off through
+// spec.deployment.env (hack/ci-deploy.sh, #4611), so the name has to stay out
+// of the reserved set and reach the broker as the CR wrote it.
+func TestTheReadingsSweepSwitchReachesTheBrokerFromTheCR(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_VCS_READINGS", Value: "off"}},
+	}
+	env := buildCredentialProxyEnvForPlugins(agent, nil, allBrokerCallersOwned, credentialProxyProfileConfig{})
+	if got, ok := brokerEnvValue(env, "CREDENTIAL_PROXY_VCS_READINGS"); !ok || got != "off" {
+		t.Errorf("CREDENTIAL_PROXY_VCS_READINGS = %q (present %v), want off from spec.deployment.env", got, ok)
+	}
+	if n := brokerEnvCount(env, "CREDENTIAL_PROXY_VCS_READINGS"); n != 1 {
+		t.Errorf("CREDENTIAL_PROXY_VCS_READINGS rendered %d times, want 1", n)
 	}
 }

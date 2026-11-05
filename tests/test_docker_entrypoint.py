@@ -1201,6 +1201,230 @@ class RemoteMcpUserAgentRepairTest(unittest.TestCase):
         # container, and must not choose where the audit plugin code comes from.
         self.assertEqual(shipped["CLUSTER_SHARED_PLUGINS"], f'CLUSTER_SHARED_PLUGINS="{default}"')
 
+    def _cluster_loop_fixture(self, root):
+        """A cluster template, the scripts the loop runs, one scaffolded profile, and the loop's script.
+
+        The scaffold scripts land where the loop's fallback looks for them, the boot
+        stamp script included, so the stamp runs as it does in the pod.
+        """
+        template_dir = root / "cluster-template"
+        template_dir.mkdir()
+        shutil.copy(self._CLUSTER_TEMPLATE, template_dir / "config.yaml")
+        (template_dir / "SOUL.md").write_text("persona\n", encoding="utf-8")
+        scripts_dir = root / "data" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        for script_name in (
+            "cluster_agent_profile.py",
+            "sandbox_exec.py",
+            "gke_endpoint.py",
+            "profile_scaffold.py",
+            "cluster_boot_stamp.py",
+        ):
+            shutil.copy(_REPO / "agents" / "platform" / "scripts" / script_name, scripts_dir / script_name)
+        profile = root / "data" / "profiles" / "cluster-p-c-us-central1"
+        profile.mkdir(parents=True)
+        (profile / "config.yaml").write_text(
+            yaml.safe_dump(self._scaffolded_cluster_profile(self._OLD_HEADER), sort_keys=False),
+            encoding="utf-8",
+        )
+        venv = root / "install" / ".venv" / "bin"
+        venv.mkdir(parents=True)
+        wrapper = venv / "python3"
+        wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+        wrapper.chmod(0o755)
+        script = "set -e\n" + _extract_readonly("OLD_SHIPPED_STALE_TIMEOUT_SECONDS") + "\n"
+        script += _extract_readonly("CLUSTER_BOOT_STAMP_FILE") + "\n"
+        for name in _CLUSTER_LOOP_FUNCTIONS:
+            script += _extract_shell_function(name) + "\n"
+        script += _extract_shell_block('if [ -d "$CLUSTER_TEMPLATE" ]; then')
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "CLUSTER_TEMPLATE": str(template_dir),
+            "TARGET_DIR": str(root / "data"),
+            "INSTALL_DIR": str(root / "install"),
+            "SCAFFOLD": str(scripts_dir / "profile_scaffold.py"),
+        }
+        return template_dir, profile, script, env
+
+    def test_the_cluster_loop_skips_a_home_it_stamped_until_the_image_changes(self):
+        """The boot stamp: one full pass per image per home, not one per start.
+
+        The first start runs the whole pass and leaves the stamp. The second start on
+        the same inputs skips the home, which a hand edit to SOUL.md proves: the loop
+        would have overwritten it. A change to any input the loop reads, here the
+        template, makes the home stale again, and the pass repairs the edit.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            template_dir, profile, script, env = self._cluster_loop_fixture(root)
+            stamp = profile / ".scaffold-stamp"
+
+            def start():
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn("WARN", proc.stderr)
+                return proc
+
+            first = start()
+            self.assertIn("1 refreshed from the image, 0 current", first.stdout)
+            self.assertTrue(stamp.is_file(), "a clean pass left no stamp")
+            digest = stamp.read_text(encoding="utf-8").strip()
+            self.assertTrue(digest, "the stamp is empty")
+            persona = (profile / "SOUL.md").read_text(encoding="utf-8")
+            self.assertIn("## Target Cluster Identity", persona)
+            self.assertEqual(sorted(p.name for p in profile.glob(".scaffold-stamp*")), [".scaffold-stamp"],
+                             "the stamp's temporary file was left behind")
+
+            (profile / "SOUL.md").write_text("hand edit\n", encoding="utf-8")
+            second = start()
+            self.assertIn("0 refreshed from the image, 1 current", second.stdout)
+            self.assertEqual((profile / "SOUL.md").read_text(encoding="utf-8"), "hand edit\n",
+                             "a current home was refreshed anyway")
+            self.assertEqual(stamp.read_text(encoding="utf-8").strip(), digest)
+
+            (template_dir / "SOUL.md").write_text("persona v2\n", encoding="utf-8")
+            third = start()
+            self.assertIn("1 refreshed from the image, 0 current", third.stdout)
+            self.assertIn("persona v2", (profile / "SOUL.md").read_text(encoding="utf-8"))
+            self.assertNotEqual(stamp.read_text(encoding="utf-8").strip(), digest,
+                                "the stamp did not follow the template")
+
+    def test_a_pass_that_warned_is_not_stamped(self):
+        """A home one step could not finish is refreshed again next start.
+
+        The cron back-fill is made to fail: the scaffold script the loop is pointed at
+        exits non-zero. The rest of the pass still runs, the WARN is still printed, and
+        no stamp is written, so the next start does not read the home as current.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "cron").mkdir()
+            (profile / "cron" / "jobs.json").write_text("[]\n", encoding="utf-8")
+            failing = root / "failing_scaffold.py"
+            failing.write_text("raise SystemExit(1)\n", encoding="utf-8")
+            env["SCAFFOLD"] = str(failing)
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("WARN: failed to backfill risk tier", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a pass that warned was stamped")
+            self.assertEqual([p.name for p in profile.glob(".scaffold-stamp*")], [])
+            self.assertIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"),
+                          "the failed step stopped the rest of the pass")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
+    def test_a_home_the_loop_cannot_write_into_warns_and_is_not_stamped(self):
+        """The persona copy used to fail silently; with the stamp, silence would mean current.
+
+        A read-only SOUL.md in a directory this user cannot write into (`cp -f` can
+        neither truncate it nor replace it) fails the first step of the pass and leaves
+        the identity stamp nothing to write into. Both have to be said and have to keep
+        the home off the stamp, or the home would not be revisited until the image changed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "SOUL.md").write_text("old persona\n", encoding="utf-8")
+            (profile / "SOUL.md").chmod(0o444)
+            profile.chmod(0o555)
+            try:
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            finally:
+                profile.chmod(0o755)
+                (profile / "SOUL.md").chmod(0o644)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("WARN: could not copy SOUL.md from the image", proc.stderr)
+            self.assertIn("SOUL.md is not writable; its cluster identity was not stamped", proc.stderr)
+            self.assertEqual((profile / "SOUL.md").read_text(encoding="utf-8"), "old persona\n")
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a home the pass could not refresh was stamped")
+
+    def test_a_cron_store_the_back_fill_cannot_read_is_not_stamped(self):
+        """The shipped back-fill, not a stand-in: a store it cannot parse fails the step.
+
+        `profile_scaffold.py --backfill-cron` used to exit zero whatever it could do;
+        with the stamp that read a malformed `jobs.json` as back-filled. The step now
+        exits non-zero for a store it could not read or rewrite, the loop's WARN names
+        it, and the home is refreshed again next start.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "cron").mkdir()
+            (profile / "cron" / "jobs.json").write_text("{not json", encoding="utf-8")
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("WARN: could not read cron store", proc.stderr)
+            self.assertIn("WARN: failed to backfill risk tier", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a store the back-fill could not read was stamped")
+            self.assertEqual((profile / "cron" / "jobs.json").read_text(encoding="utf-8"), "{not json")
+
+    def test_a_profile_whose_config_has_no_identity_is_not_stamped(self):
+        """The persona copy blanks SOUL.md; a profile the stamp cannot re-identify must not read as current.
+
+        `stamp-soul` used to return quietly when `config.yaml` carried no readable
+        `cluster_identity`, leaving the blank template in place. It exits non-zero now,
+        the loop says so, and the home stays off the stamp until the identity is back.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            config = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+            del config["cluster_identity"]
+            (profile / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+            proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("no readable cluster_identity", proc.stderr)
+            self.assertIn("WARN: failed to stamp cluster identity", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertNotIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"))
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a profile with no identity was stamped")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
+    def test_read_only_config_and_cron_files_inside_a_writable_home_are_not_stamped(self):
+        """A repair stepped over is said, not stamped.
+
+        The config repairs and the cron back-fill are each gated on the file being
+        writable and used to skip it in silence; the persona copy beside them still
+        succeeds, so without a word the pass would look clean. Both files are named,
+        the rest of the pass runs, and no stamp is written.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (profile / "cron").mkdir()
+            (profile / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{"id": "job1"}]}), encoding="utf-8")
+            before = (profile / "config.yaml").read_text(encoding="utf-8")
+            (profile / "config.yaml").chmod(0o444)
+            (profile / "cron" / "jobs.json").chmod(0o444)
+            try:
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+            finally:
+                (profile / "config.yaml").chmod(0o644)
+                (profile / "cron" / "jobs.json").chmod(0o644)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("config.yaml is not writable; its config repairs were skipped", proc.stderr)
+            self.assertIn("cron/jobs.json is not writable; its risk tier back-fill was skipped", proc.stderr)
+            self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertIn("## Target Cluster Identity", (profile / "SOUL.md").read_text(encoding="utf-8"),
+                          "the skipped repairs stopped the rest of the pass")
+            self.assertEqual((profile / "config.yaml").read_text(encoding="utf-8"), before)
+            self.assertFalse((profile / ".scaffold-stamp").exists(), "a home with a repair skipped was stamped")
+
+    def test_without_the_stamp_script_every_home_is_refreshed_and_none_is_stamped(self):
+        """The fallback is the loop as it always ran: no digest, no skip, no stamp."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, profile, script, env = self._cluster_loop_fixture(root)
+            (root / "data" / "scripts" / "cluster_boot_stamp.py").unlink()
+            for _ in range(2):
+                proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=120, env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("cluster boot stamp unavailable", proc.stdout)
+                self.assertIn("1 refreshed from the image, 0 current", proc.stdout)
+            self.assertFalse((profile / ".scaffold-stamp").exists())
+
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores the read-only fixture")
     def test_a_failed_plugin_refresh_leaves_the_old_file_whole(self):
         """A copy that cannot finish keeps the profile's old module intact, and says so.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,6 +68,9 @@ func newTestHandler(t *testing.T, cfg Config) (http.Handler, *recordingTransport
 	}
 	if cfg.Policy.Mode == "" {
 		cfg.Policy = Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true}
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
 	h, err := NewHandler(cfg)
 	if err != nil {

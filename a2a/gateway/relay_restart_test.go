@@ -137,14 +137,15 @@ type fakeDelivery struct {
 	acks int
 }
 
-func (f *fakeDelivery) Envelope() *lib.Envelope { return f.env }
-func (f *fakeDelivery) Subject() string         { return f.subj }
-func (f *fakeDelivery) Received() time.Time     { return time.Time{} }
-func (f *fakeDelivery) NumDelivered() uint64    { return 1 }
-func (f *fakeDelivery) Sequence() uint64        { return f.seq }
-func (f *fakeDelivery) Ack() error              { f.acks++; return nil }
-func (f *fakeDelivery) Nak(time.Duration) error { return nil }
-func (f *fakeDelivery) Term() error             { return nil }
+func (f *fakeDelivery) Envelope() *lib.Envelope       { return f.env }
+func (f *fakeDelivery) Subject() string               { return f.subj }
+func (f *fakeDelivery) Received() time.Time           { return time.Time{} }
+func (f *fakeDelivery) NumDelivered() uint64          { return 1 }
+func (f *fakeDelivery) Sequence() uint64              { return f.seq }
+func (f *fakeDelivery) Ack() error                    { f.acks++; return nil }
+func (f *fakeDelivery) AckSync(context.Context) error { f.acks++; return nil }
+func (f *fakeDelivery) Nak(time.Duration) error       { return nil }
+func (f *fakeDelivery) Term() error                   { return nil }
 
 // TestTheRelayRendersADeliveryItAlreadyRenderedOnce: a question a task
 // posts while it runs, redelivered to the next gateway after the first one
@@ -335,9 +336,12 @@ func TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing(t *testing.T) {
 	}
 	subject := lib.TaskEventsSubject(targetPlatform, origin.TaskID)
 	d := &fakeDelivery{env: env, subj: subject, seq: 4242}
+	// A redelivery of the same event in the same batch: acked before its
+	// original rendered, it would take the original's pending entry with it.
+	dup := &fakeDelivery{env: env, subj: subject, seq: 4242}
 	done := make(chan struct{})
 	go func() {
-		r.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: d}})
+		r.g.relayBatch(conv, []relayItem{{env: env, subject: subject, d: d}, {env: env, subject: subject, d: dup}})
 		close(done)
 	}()
 	select {
@@ -355,8 +359,8 @@ func TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the batch never returned")
 	}
-	if d.acks != 0 {
-		t.Fatalf("acked %d times; a batch the stop gave up on must leave its deliveries given back", d.acks)
+	if d.acks != 0 || dup.acks != 0 {
+		t.Fatalf("acks: original %d, duplicate %d; a batch the stop gave up on must leave its deliveries given back", d.acks, dup.acks)
 	}
 	rec, err := r.g.reg.Get(context.Background(), conv)
 	if err != nil || rec == nil {
