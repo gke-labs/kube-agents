@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -594,6 +595,7 @@ func (c *Conversations) runningTask(token string) (TaskRef, bool) {
 
 type taskStepState struct {
 	mu                sync.Mutex
+	active            atomic.Bool
 	ref               TaskRef
 	token             string
 	alias             string
@@ -617,19 +619,39 @@ func (s *taskStepState) isUnsubmittedRootLocked(ref TaskRef) bool {
 	return ref == s.ref && s.watch == nil && s.lastReportedSteps == 0 && s.lastReportedActs == 0 && s.finalTasks[ref] == nil && s.failedTasks[ref] == nil
 }
 
-func (s *taskStepState) hasFollowedTaskID(wantIDs map[string]bool) bool {
+func (s *taskStepState) followedTasks() []TaskRef {
 	s.mu.Lock()
 	w := s.watch
 	s.mu.Unlock()
 	if w == nil {
-		return false
+		return nil
 	}
-	for _, f := range w.followedTasks() {
+	return w.followedTasks()
+}
+
+func (s *taskStepState) hasFollowedTaskID(wantIDs map[string]bool) bool {
+	for _, f := range s.followedTasks() {
 		if wantIDs[f.TaskID] {
 			return true
 		}
 	}
 	return false
+}
+
+func (s *taskStepState) attachWatch(w *turnWatch) {
+	if w == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.watch == nil {
+		if w.release != nil {
+			w.release()
+		}
+		s.watch = w
+		s.active.Store(true)
+		s.watchTimer = time.AfterFunc(MaxTurnWait, s.closeAll)
+	}
+	s.mu.Unlock()
 }
 
 func (s *taskStepState) closeTaskWatchesLocked() {
@@ -644,6 +666,7 @@ func (s *taskStepState) closeTaskWatchesLocked() {
 }
 
 func (s *taskStepState) closeAllLocked() {
+	s.active.Store(false)
 	s.closeTaskWatchesLocked()
 	if s.watchTimer != nil {
 		s.watchTimer.Stop()
@@ -661,26 +684,67 @@ func (s *taskStepState) closeAll() {
 	s.closeAllLocked()
 }
 
+func (c *Conversations) removeStepStateKeysLocked(target *taskStepState) {
+	if target == nil {
+		return
+	}
+	for k, cur := range c.steps {
+		if cur == target {
+			delete(c.steps, k)
+		}
+	}
+}
+
+func (c *Conversations) evictStepStateLocked(keep *taskStepState) *taskStepState {
+	for k, old := range c.steps {
+		if old == nil {
+			delete(c.steps, k)
+			return nil
+		}
+		if old != keep && !old.active.Load() {
+			c.removeStepStateKeysLocked(old)
+			return old
+		}
+	}
+	for k, old := range c.steps {
+		if old != keep {
+			if old != nil {
+				c.removeStepStateKeysLocked(old)
+			} else {
+				delete(c.steps, k)
+			}
+			return old
+		}
+	}
+	return nil
+}
+
 func (c *Conversations) initTaskStepState(ref TaskRef, token, alias string, byToken bool, notices []string, w *turnWatch) *taskStepState {
 	if w != nil && w.release != nil {
 		// Release the submission-matching sendLock now that ownSubmission has
 		// matched and c.setRunning(token, &ref) is recorded.
 		w.release()
 	}
+	var toClose []*taskStepState
+	defer func() {
+		for _, s := range toClose {
+			s.closeAll()
+		}
+	}()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.steps == nil {
 		c.steps = map[string]*taskStepState{}
 	}
 	if old, ok := c.steps[ref.TaskID]; ok && old != nil {
-		old.closeAll()
+		c.removeStepStateKeysLocked(old)
+		toClose = append(toClose, old)
 	}
-	if len(c.steps) >= maxConversations {
-		for k, old := range c.steps {
-			if old != nil {
-				old.closeAll()
-			}
-			delete(c.steps, k)
+	for len(c.steps) >= maxConversations {
+		evicted := c.evictStepStateLocked(nil)
+		if evicted != nil {
+			toClose = append(toClose, evicted)
+		} else if len(c.steps) >= maxConversations {
 			break
 		}
 	}
@@ -701,6 +765,7 @@ func (c *Conversations) initTaskStepState(ref TaskRef, token, alias string, byTo
 		failedTasks: map[TaskRef]error{},
 	}
 	if w != nil {
+		st.active.Store(true)
 		st.watchTimer = time.AfterFunc(MaxTurnWait, st.closeAll)
 	}
 	c.steps[ref.TaskID] = st
@@ -709,19 +774,22 @@ func (c *Conversations) initTaskStepState(ref TaskRef, token, alias string, byTo
 
 func (c *Conversations) getOrCreateTaskStepState(ref TaskRef, w *turnWatch) *taskStepState {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.steps == nil {
 		c.steps = map[string]*taskStepState{}
 	}
 	if st, ok := c.steps[ref.TaskID]; ok && st != nil {
-		if w != nil && st.watch == nil {
-			if w.release != nil {
-				w.release()
-			}
-			st.watch = w
-			st.watchTimer = time.AfterFunc(MaxTurnWait, st.closeAll)
-		}
+		c.mu.Unlock()
+		st.attachWatch(w)
 		return st
+	}
+	var toClose []*taskStepState
+	for len(c.steps) >= maxConversations {
+		evicted := c.evictStepStateLocked(nil)
+		if evicted != nil {
+			toClose = append(toClose, evicted)
+		} else if len(c.steps) >= maxConversations {
+			break
+		}
 	}
 	now := time.Now()
 	if c.now != nil {
@@ -739,9 +807,14 @@ func (c *Conversations) getOrCreateTaskStepState(ref TaskRef, w *turnWatch) *tas
 		failedTasks: map[TaskRef]error{},
 	}
 	if w != nil {
+		st.active.Store(true)
 		st.watchTimer = time.AfterFunc(MaxTurnWait, st.closeAll)
 	}
 	c.steps[ref.TaskID] = st
+	c.mu.Unlock()
+	for _, s := range toClose {
+		s.closeAll()
+	}
 	return st
 }
 
@@ -749,12 +822,30 @@ func (c *Conversations) aliasTaskStepState(child TaskRef, st *taskStepState) {
 	if c == nil || st == nil || child.TaskID == "" {
 		return
 	}
+	var toClose []*taskStepState
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.steps == nil {
 		c.steps = map[string]*taskStepState{}
 	}
-	c.steps[child.TaskID] = st
+	if c.steps[child.TaskID] != st {
+		if old := c.steps[child.TaskID]; old != nil {
+			c.removeStepStateKeysLocked(old)
+			toClose = append(toClose, old)
+		}
+		for len(c.steps) >= maxConversations {
+			evicted := c.evictStepStateLocked(st)
+			if evicted != nil {
+				toClose = append(toClose, evicted)
+			} else {
+				break
+			}
+		}
+		c.steps[child.TaskID] = st
+	}
+	c.mu.Unlock()
+	for _, s := range toClose {
+		s.closeAll()
+	}
 }
 
 func (c *Conversations) knownTaskRef(taskID string) (TaskRef, bool) {
@@ -762,23 +853,30 @@ func (c *Conversations) knownTaskRef(taskID string) (TaskRef, bool) {
 		return TaskRef{}, false
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if st, ok := c.steps[taskID]; ok && st != nil {
-		if st.ref.TaskID == taskID && st.ref.Addressee != "" {
-			return st.ref, true
+	st := c.steps[taskID]
+	if st != nil && st.ref.TaskID == taskID && st.ref.Addressee != "" {
+		c.mu.Unlock()
+		return st.ref, true
+	}
+	var runningRef TaskRef
+	hasRunning := false
+	for _, ref := range c.running {
+		if ref.TaskID == taskID && ref.Addressee != "" {
+			runningRef = ref
+			hasRunning = true
+			break
 		}
-		if st.watch != nil {
-			for _, f := range st.watch.followedTasks() {
-				if f.TaskID == taskID && f.Addressee != "" {
-					return f, true
-				}
+	}
+	c.mu.Unlock()
+	if st != nil {
+		for _, f := range st.followedTasks() {
+			if f.TaskID == taskID && f.Addressee != "" {
+				return f, true
 			}
 		}
 	}
-	for _, ref := range c.running {
-		if ref.TaskID == taskID && ref.Addressee != "" {
-			return ref, true
-		}
+	if hasRunning {
+		return runningRef, true
 	}
 	return TaskRef{}, false
 }
@@ -795,14 +893,29 @@ func (c *Conversations) stopTaskStepState(token string, refs ...TaskRef) {
 	}
 	c.mu.Lock()
 	matched := map[*taskStepState]bool{}
+	seenUnmatched := map[*taskStepState]bool{}
+	var unmatched []*taskStepState
 	for k, st := range c.steps {
 		if st == nil || (token != "" && st.token != token) {
 			continue
 		}
-		if len(wantIDs) == 0 || wantIDs[k] || wantIDs[st.ref.TaskID] || st.hasFollowedTaskID(wantIDs) {
+		if len(wantIDs) == 0 || wantIDs[k] || wantIDs[st.ref.TaskID] {
+			matched[st] = true
+		} else if !seenUnmatched[st] {
+			seenUnmatched[st] = true
+			unmatched = append(unmatched, st)
+		}
+	}
+	c.mu.Unlock()
+	for _, st := range unmatched {
+		if !matched[st] && st.hasFollowedTaskID(wantIDs) {
 			matched[st] = true
 		}
 	}
+	if len(matched) == 0 {
+		return
+	}
+	c.mu.Lock()
 	for k, st := range c.steps {
 		if matched[st] {
 			delete(c.steps, k)
@@ -825,6 +938,15 @@ func (c *Conversations) deleteTaskStepState(ref TaskRef, st *taskStepState) {
 	c.mu.Unlock()
 }
 
+func (c *Conversations) removeTaskStepState(st *taskStepState) {
+	if c == nil || st == nil {
+		return
+	}
+	c.mu.Lock()
+	c.removeStepStateKeysLocked(st)
+	c.mu.Unlock()
+}
+
 func (c *Conversations) activeStepFollowedTasks(token string, ref TaskRef) []TaskRef {
 	if c == nil || (token == "" && ref.TaskID == "") {
 		return nil
@@ -835,12 +957,16 @@ func (c *Conversations) activeStepFollowedTasks(token string, ref TaskRef) []Tas
 	}
 	c.mu.Lock()
 	seenState := map[*taskStepState]bool{}
+	directMatch := map[*taskStepState]bool{}
 	var candidates []*taskStepState
 	for k, st := range c.steps {
-		if st == nil || seenState[st] || (token != "" && st.token != token) {
+		if st == nil || (token != "" && st.token != token) {
 			continue
 		}
-		if ref.TaskID == "" || k == ref.TaskID || st.ref.TaskID == ref.TaskID || c.steps[ref.TaskID] == st || st.hasFollowedTaskID(wantRef) {
+		if ref.TaskID == "" || k == ref.TaskID || st.ref.TaskID == ref.TaskID || c.steps[ref.TaskID] == st {
+			directMatch[st] = true
+		}
+		if !seenState[st] {
 			seenState[st] = true
 			candidates = append(candidates, st)
 		}
@@ -858,15 +984,26 @@ func (c *Conversations) activeStepFollowedTasks(token string, ref TaskRef) []Tas
 		if w != nil {
 			followed = w.followedTasks()
 		}
-		for _, f := range followed {
-			if f.TaskID == "" || seenRef[f.TaskID] {
-				continue
+		matched := directMatch[st]
+		if !matched && len(wantRef) > 0 {
+			for _, f := range followed {
+				if wantRef[f.TaskID] {
+					matched = true
+					break
+				}
 			}
-			if st.finalTasks[f] != nil || st.failedTasks[f] != nil {
-				continue
+		}
+		if matched {
+			for _, f := range followed {
+				if f.TaskID == "" || seenRef[f.TaskID] {
+					continue
+				}
+				if st.finalTasks[f] != nil || st.failedTasks[f] != nil {
+					continue
+				}
+				seenRef[f.TaskID] = true
+				out = append(out, f)
 			}
-			seenRef[f.TaskID] = true
-			out = append(out, f)
 		}
 		st.mu.Unlock()
 	}
@@ -1725,6 +1862,7 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 			convs.setRunning(st.token, nil)
 		}
 		st.closeAllLocked()
+		convs.removeTaskStepState(st)
 	} else if st.token != "" {
 		if unf := out.Unfinished(); unf != nil {
 			convs.setRunning(st.token, unf)

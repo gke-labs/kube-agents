@@ -20,10 +20,12 @@ var (
 	cmdClusterFlagRe     = regexp.MustCompile(`(?:--cluster|--context)[=\s]+['"]?([A-Za-z0-9_.:-]+)['"]?`)
 	kanbanCardIDPattern  = regexp.MustCompile(`\b(t_[A-Za-z0-9_-]{2,32})\b`)
 
-	inlineTokenValuePattern = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
-	inlineAuthHeaderPattern = regexp.MustCompile(`(?i)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
-	inlineURLCredPattern    = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s/]+(@)`)
-	inlineKVSecretPattern   = regexp.MustCompile(`(?:\\?["'])?([A-Za-z0-9_.-]+)(?:\\?["'])?\s*[=:]\s*`)
+	inlineTokenValuePattern   = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
+	inlineAuthHeaderPattern   = regexp.MustCompile(`(?i)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
+	inlineURLCredPattern      = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s/]+(@)`)
+	inlineKVSecretPattern     = regexp.MustCompile(`(?:\\?["'])?([A-Za-z0-9_.-]+)(?:\\?["'])?[ \t]*[=:][ \t]*`)
+	leadingKVTokenPattern     = regexp.MustCompile(`^(?:\\?["'])?[A-Za-z0-9_.-]+(?:\\?["'])?[ \t]*[=:]`)
+	base64PaddingTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_+/.-]+=+(?:[\s"',;)\]}>]|$)`)
 
 	// envFlagsWithValue are flags to `env` that consume the following
 	// argument before the command name.
@@ -947,11 +949,20 @@ func scrubInlineKVSecrets(s string) string {
 		}
 		sb.WriteString(s[pos:matchEnd])
 		rest := s[matchEnd:]
+		if rest == "" || rest[0] == '\r' || rest[0] == '\n' {
+			pos = matchEnd
+			continue
+		}
+		hadPostSepSpace := matchEnd > 0 && (s[matchEnd-1] == ' ' || s[matchEnd-1] == '\t')
+		if leadingKVTokenPattern.MatchString(rest) && (hadPostSepSpace || !base64PaddingTokenPattern.MatchString(rest)) {
+			pos = matchEnd
+			continue
+		}
 		switch {
 		case strings.HasPrefix(rest, `\"`), strings.HasPrefix(rest, `\'`):
 			q := rest[:2]
 			afterOpen := rest[2:]
-			if closeIdx := strings.Index(afterOpen, q); closeIdx >= 0 {
+			if closeIdx := findUnescapedEscapedQuote(afterOpen, q[1]); closeIdx >= 0 {
 				sb.WriteString(q + redactedValue + q)
 				pos = matchEnd + 2 + closeIdx + 2
 			} else {
@@ -1013,6 +1024,22 @@ func findUnescapedQuote(s string, q byte) int {
 		}
 		if s[i] == q {
 			return i
+		}
+	}
+	return -1
+}
+
+func findUnescapedEscapedQuote(s string, q byte) int {
+	for i := 1; i < len(s); i++ {
+		if s[i] != q || s[i-1] != '\\' {
+			continue
+		}
+		bs := 0
+		for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+			bs++
+		}
+		if bs%4 == 1 {
+			return i - 1
 		}
 	}
 	return -1

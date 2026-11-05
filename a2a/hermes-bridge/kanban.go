@@ -70,17 +70,17 @@ sess_col = "creator_session_id" if "creator_session_id" in cols else "session_id
 err_col = "last_failure_error" if "last_failure_error" in cols else "''"
 assignee_col = "assignee" if "assignee" in cols else "''"
 select_sql = f"SELECT id, title, status, COALESCE({assignee_col}, '') AS assignee, COALESCE({sess_col}, '') AS session_id, COALESCE(result, '') AS result, COALESCE({err_col}, '') AS err FROM tasks"
+conds, params = [f"created_at >= ? OR LOWER(COALESCE(status, '')) NOT IN ({settled_sql})"], [since_ts]
+if "updated_at" in cols:
+    conds.append("COALESCE(updated_at, 0) >= ?")
+    params.append(since_ts)
 if session_id == "*":
-    rows = conn.execute(f"{select_sql} WHERE {sess_col} LIKE 'a2a-%' AND (created_at >= ? OR LOWER(COALESCE(status, '')) NOT IN ({settled_sql})) ORDER BY created_at ASC, id ASC", (since_ts,)).fetchall()
+    rows = conn.execute(f"{select_sql} WHERE {sess_col} LIKE 'a2a-%' AND ({' OR '.join(conds)}) ORDER BY created_at ASC, id ASC", params).fetchall()
 else:
-    conds, params = [f"created_at >= ? OR LOWER(COALESCE(status, '')) NOT IN ({settled_sql})"], [session_id, since_ts]
-    if "updated_at" in cols:
-        conds.append("COALESCE(updated_at, 0) >= ?")
-        params.append(since_ts)
     if tracked:
         conds.append(f"id IN ({','.join('?' for _ in tracked)})")
         params.extend(tracked)
-    rows = conn.execute(f"{select_sql} WHERE {sess_col} = ? AND ({' OR '.join(conds)}) ORDER BY created_at ASC, id ASC", params).fetchall()
+    rows = conn.execute(f"{select_sql} WHERE {sess_col} = ? AND ({' OR '.join(conds)}) ORDER BY created_at ASC, id ASC", [session_id] + params).fetchall()
 
 run_cols = set()
 try:
@@ -120,9 +120,16 @@ for r in rows:
         except Exception:
             pass
     try:
-        ev = conn.execute("SELECT payload FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'gave_up') ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
-        if ev and ev[0]:
-            item["block_payload"] = ev[0]
+        ev = conn.execute("SELECT id, kind, COALESCE(payload, '') AS payload FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'gave_up') ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+        if ev:
+            ev_kind = (ev["kind"] or "").strip().lower()
+            if ev_kind == "gave_up" and (item.get("status") or "").strip().lower() == "blocked":
+                item["status"] = "gave_up"
+            if ev_kind in ("blocked", "gave_up"):
+                if ev["payload"]:
+                    item["block_payload"] = ev["payload"]
+                if ev["id"] is not None:
+                    item["block_event_id"] = int(ev["id"])
     except Exception:
         pass
     out.append(item)
@@ -165,6 +172,7 @@ type kanbanCardRow struct {
 	Result          string `json:"result"`
 	Err             string `json:"err"`
 	BlockPayload    string `json:"block_payload"`
+	BlockEventID    int64  `json:"block_event_id,omitempty"`
 }
 
 type consoleSessionMeta struct {
@@ -496,8 +504,8 @@ func (b *Bridge) markKanbanCardDelivered(cardID string) {
 	b.markKanbanCardDeliveredForStatus(cardID, "")
 }
 
-func (b *Bridge) markKanbanCardDeliveredForStatus(cardID, status string) {
-	key := kanbanDeliveryKey(cardID, status)
+func (b *Bridge) markKanbanCardDeliveredForStatus(cardID, status string, blockEventID ...int64) {
+	key := kanbanDeliveryKey(cardID, status, blockEventID...)
 	if key == "" {
 		return
 	}
@@ -514,15 +522,27 @@ func (b *Bridge) markKanbanCardDeliveredForStatus(cardID, status string) {
 	pruneKanbanTimestampMap(b.kanban.deliveredIDs, &b.kanban.deliveredOrder, now-kanbanTrackedRetentionSecs)
 }
 
+func (b *Bridge) clearBlockedKanbanCardDelivery(cardID string) {
+	if cardID == "" {
+		return
+	}
+	key := kanbanBlockedDeliveryPrefix + cardID
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	b.kanban.ensureMapsLocked()
+	delete(b.kanban.deliveredIDs, key)
+	delete(b.kanban.pendingSettle, key)
+}
+
 func (b *Bridge) isKanbanCardDelivered(cardID string) bool {
 	return b.isKanbanCardDeliveredForStatus(cardID, "")
 }
 
-func (b *Bridge) isKanbanCardDeliveredForStatus(cardID, status string) bool {
+func (b *Bridge) isKanbanCardDeliveredForStatus(cardID, status string, blockEventID ...int64) bool {
 	if cardID == "" {
 		return false
 	}
-	key := kanbanDeliveryKey(cardID, status)
+	key := kanbanDeliveryKey(cardID, status, blockEventID...)
 	b.kanban.mu.Lock()
 	defer b.kanban.mu.Unlock()
 	b.kanban.ensureMapsLocked()
@@ -537,8 +557,8 @@ func (b *Bridge) shouldDeliverOutOfTurnKanbanCard(cardID, sessionID string) (con
 	return b.shouldDeliverOutOfTurnKanbanCardForStatus(cardID, "", sessionID)
 }
 
-func (b *Bridge) shouldDeliverOutOfTurnKanbanCardForStatus(cardID, status, sessionID string) (consoleSessionMeta, bool) {
-	key := kanbanDeliveryKey(cardID, status)
+func (b *Bridge) shouldDeliverOutOfTurnKanbanCardForStatus(cardID, status, sessionID string, blockEventID ...int64) (consoleSessionMeta, bool) {
+	key := kanbanDeliveryKey(cardID, status, blockEventID...)
 	if key == "" {
 		return consoleSessionMeta{}, false
 	}
@@ -629,11 +649,14 @@ func isKanbanStatusSettled(status string) bool {
 	return isKanbanStatusBlocked(status) || isKanbanStatusTerminal(status)
 }
 
-func kanbanDeliveryKey(cardID, status string) string {
+func kanbanDeliveryKey(cardID, status string, blockEventID ...int64) string {
 	if cardID == "" {
 		return ""
 	}
 	if isKanbanStatusBlocked(status) {
+		if len(blockEventID) > 0 && blockEventID[0] > 0 {
+			return fmt.Sprintf("%s%s:%d", kanbanBlockedDeliveryPrefix, cardID, blockEventID[0])
+		}
 		return kanbanBlockedDeliveryPrefix + cardID
 	}
 	return cardID
@@ -653,16 +676,26 @@ func formatKanbanCardOutput(c kanbanCardRow) string {
 	if res := strings.TrimSpace(c.Result); res != "" {
 		return res
 	}
+	if !isKanbanStatusBlocked(c.Status) {
+		if errText := strings.TrimSpace(c.Err); errText != "" {
+			return errText
+		}
+	}
 	if bp := strings.TrimSpace(c.BlockPayload); bp != "" {
 		var parsed map[string]any
 		if json.Unmarshal([]byte(bp), &parsed) == nil {
-			for _, k := range []string{"question", "reason", "message", "summary"} {
+			for _, k := range []string{"question", "reason", "message", "summary", "error"} {
 				if v, ok := parsed[k].(string); ok && strings.TrimSpace(v) != "" {
 					return strings.TrimSpace(v)
 				}
 			}
+			if errText := strings.TrimSpace(c.Err); errText != "" {
+				return errText
+			}
 		}
-		return bp
+		if isKanbanStatusBlocked(c.Status) {
+			return bp
+		}
 	}
 	return strings.TrimSpace(c.Err)
 }
@@ -730,7 +763,10 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 		if err == nil {
 			var relevant []kanbanCardRow
 			for _, c := range cards {
-				if isKanbanStatusSettled(c.Status) && !trackedSet[c.ID] && b.isKanbanCardDeliveredForStatus(c.ID, c.Status) {
+				if !isKanbanStatusBlocked(c.Status) {
+					b.clearBlockedKanbanCardDelivery(c.ID)
+				}
+				if isKanbanStatusSettled(c.Status) && !trackedSet[c.ID] && b.isKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID) {
 					continue
 				}
 				if !trackedSet[c.ID] {
@@ -762,7 +798,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 					sawUnsettled = true
 				}
 				for _, c := range relevant {
-					if !isKanbanStatusSettled(c.Status) || (act != nil && !act.markCardSettledReported(kanbanDeliveryKey(c.ID, c.Status))) {
+					if !isKanbanStatusSettled(c.Status) || (act != nil && !act.markCardSettledReported(kanbanDeliveryKey(c.ID, c.Status, c.BlockEventID))) {
 						continue
 					}
 					st := cardStep(c, settledCount, totalCount, "")
@@ -784,7 +820,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 					}
 					var parts []string
 					for _, c := range relevant {
-						b.markKanbanCardDeliveredForStatus(c.ID, c.Status)
+						b.markKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID)
 						if isKanbanStatusTerminal(c.Status) {
 							if openMeta, wasOpen := b.takeOutOfTurnOpenCard(c.ID); wasOpen {
 								b.publishOutOfTurnKanbanCardLifecycle(taskCtx, c, openMeta, true)
@@ -1054,7 +1090,7 @@ func (b *Bridge) watchOutOfTurnKanbanCards(ctx context.Context) {
 		if initial, err := querySessionKanbanCards(ctx, pythonBin, dbPath, "*", sinceUnix, nil); err == nil {
 			for _, c := range initial {
 				if isKanbanStatusSettled(c.Status) {
-					b.markKanbanCardDeliveredForStatus(c.ID, c.Status)
+					b.markKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID)
 				}
 			}
 		}
@@ -1079,14 +1115,17 @@ func (b *Bridge) watchOutOfTurnKanbanCards(ctx context.Context) {
 			continue
 		}
 		for _, c := range cards {
+			if !isKanbanStatusBlocked(c.Status) {
+				b.clearBlockedKanbanCardDelivery(c.ID)
+			}
 			if !isKanbanStatusSettled(c.Status) || c.SessionID == "" {
 				continue
 			}
 			if p := b.recordedRoute(c.SessionID).Platform; p != "" && p != lib.NotifyPlatformConsole {
-				b.markKanbanCardDeliveredForStatus(c.ID, c.Status)
+				b.markKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID)
 				continue
 			}
-			if meta, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(c.ID, c.Status, c.SessionID); ok {
+			if meta, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(c.ID, c.Status, c.SessionID, c.BlockEventID); ok {
 				b.publishOutOfTurnKanbanCard(ctx, c, meta)
 			}
 		}

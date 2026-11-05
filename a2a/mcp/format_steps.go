@@ -771,7 +771,24 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 
 	activeRef := out.Root
 	activeTask := out.Task
-	if out.AnswerFrom != nil && out.Answer != nil && *out.AnswerFrom != out.Root {
+	if stepOut.StillRunning {
+		foundUnfinished := false
+		for i := len(out.Followed) - 1; i >= 0; i-- {
+			if t := out.Followed[i].Task; t != nil && !t.Final {
+				activeRef = out.Followed[i].Ref
+				activeTask = t
+				foundUnfinished = true
+				break
+			}
+		}
+		if !foundUnfinished && out.Task != nil && !out.Task.Final {
+			activeRef = out.Root
+			activeTask = out.Task
+		} else if !foundUnfinished && out.AnswerFrom != nil && out.Answer != nil {
+			activeRef = *out.AnswerFrom
+			activeTask = out.Answer
+		}
+	} else if out.AnswerFrom != nil && out.Answer != nil && *out.AnswerFrom != out.Root {
 		activeRef = *out.AnswerFrom
 		activeTask = out.Answer
 	} else if len(out.Followed) > 0 {

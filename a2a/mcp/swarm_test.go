@@ -1306,12 +1306,22 @@ func TestBuildSwarmStateInputRequiredMemberShowsQuestion(t *testing.T) {
 }
 
 func TestDeriveSessionMemberNamePreservesSessionPrefixedSlug(t *testing.T) {
-	got := deriveSessionMemberName("session-fleet-explorer-session", "", "tok-fleet")
-	want := "session-fleet-explorer-session"
-	if got != want {
-		t.Errorf("deriveSessionMemberName(%q) = %q, want %q", "session-fleet-explorer-session", got, want)
+	cases := []struct {
+		alias string
+		want  string
+	}{
+		{alias: "session-fleet-explorer-session", want: "session-fleet-explorer-session"},
+		{alias: "fleet-explorer-session", want: "session-fleet-explorer-session"},
+		{alias: "session_fleet_explorer_session", want: "session-fleet-explorer-session"},
+		{alias: "kube-agents-session-fleet-explorer-session", want: "session-fleet-explorer-session"},
+		{alias: "session-default", want: "session-default"},
+		{alias: "session-s-fleet", want: "session-s-fleet"},
+		{alias: "s-fleet", want: "s-fleet"},
+		{alias: "default", want: "session-tok-flee"},
 	}
-	if unprefixed := deriveSessionMemberName("fleet-explorer-session", "", "tok-fleet"); unprefixed != want {
-		t.Errorf("deriveSessionMemberName(%q) = %q, want %q", "fleet-explorer-session", unprefixed, want)
+	for _, tc := range cases {
+		if got := deriveSessionMemberName(tc.alias, "", "tok-fleet"); got != tc.want {
+			t.Errorf("deriveSessionMemberName(%q) = %q, want %q", tc.alias, got, tc.want)
+		}
 	}
 }

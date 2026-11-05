@@ -729,3 +729,128 @@ func TestWaitForKanbanCards_CompletedTurnWithNoCardsWinsCancelRace(t *testing.T)
 		t.Fatalf("task state = %s, want completed", task.State)
 	}
 }
+
+func TestKanbanQuery_WildcardUpdatedAtGaveUpAndRepeatBlockAfterUnblock(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	now := time.Now().Unix()
+	since := now - kanbanOutOfTurnWindowSecs
+	oldCreated := since - 3600
+	db := filepath.Join(t.TempDir(), "kanban.db")
+	initScript := `
+import sqlite3, sys
+db, old_created, now_ts = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+# 1. Card created before the 2-hour window that recently settled (updated_at >= since).
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_old_settled", "Long-lived card", "done", "cluster-a", "a2a-ctx-1", "Finally done", "", old_created, now_ts, None))
+# 2. Card parked in status='blocked' by a breaker trip whose newest event is kind='gave_up'.
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_breaker", "Poison card", "blocked", "cluster-b", "a2a-ctx-1", "", "worker crashed 3 times", old_created, now_ts, None))
+c.execute("INSERT INTO task_events (id, task_id, kind, payload) VALUES (?,?,?,?)",
+  (10, "t_breaker", "gave_up", '{"failures":3,"effective_limit":3,"limit_source":"dispatcher","error":"breaker tripped after 3 crashes","trigger_outcome":"crashed"}'))
+# 3. Card that blocked, was unblocked, and then failed without a new block_payload.
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_unblocked_err", "Unblocked then failed", "failed", "cluster-c", "a2a-ctx-1", "", "post-unblock failure", now_ts, now_ts, None))
+c.execute("INSERT INTO task_events (id, task_id, kind, payload) VALUES (?,?,?,?)",
+  (20, "t_unblocked_err", "blocked", '{"question":"Stale question before unblock?"}'))
+c.execute("INSERT INTO task_events (id, task_id, kind, payload) VALUES (?,?,?,?)",
+  (21, "t_unblocked_err", "unblocked", '{}'))
+# 4. Card that blocked (id=30), was unblocked (id=31), and blocked a second time (id=32).
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_reblock", "Re-blocked card", "blocked", "cluster-d", "a2a-ctx-1", "", "", now_ts, now_ts, None))
+c.execute("INSERT INTO task_events (id, task_id, kind, payload) VALUES (?,?,?,?)",
+  (30, "t_reblock", "blocked", '{"question":"First question?"}'))
+c.commit()
+`
+	if out, err := exec.Command("python3", "-c", initScript, db, strconv.FormatInt(oldCreated, 10), strconv.FormatInt(now, 10)).CombinedOutput(); err != nil {
+		t.Fatalf("init db: %v\n%s", err, out)
+	}
+
+	rows, err := querySessionKanbanCards(context.Background(), "python3", db, "*", since, nil)
+	if err != nil {
+		t.Fatalf("wildcard querySessionKanbanCards: %v", err)
+	}
+	byID := map[string]kanbanCardRow{}
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+
+	// 1. Wildcard query includes t_old_settled via updated_at >= since.
+	if _, ok := byID["t_old_settled"]; !ok {
+		t.Fatal("wildcard query omitted t_old_settled whose created_at < since but updated_at >= since")
+	}
+
+	// 2. Breaker trip with newest event 'gave_up' reclassifies status to "gave_up" (terminal) and formats error text instead of raw JSON.
+	breaker, ok := byID["t_breaker"]
+	if !ok {
+		t.Fatal("wildcard query omitted t_breaker")
+	}
+	if breaker.Status != "gave_up" || !isKanbanStatusTerminal(breaker.Status) || isKanbanStatusBlocked(breaker.Status) {
+		t.Fatalf("t_breaker status = %q (terminal=%v, blocked=%v), want status=\"gave_up\" terminal=true blocked=false",
+			breaker.Status, isKanbanStatusTerminal(breaker.Status), isKanbanStatusBlocked(breaker.Status))
+	}
+	if gotOut := formatKanbanCardOutput(breaker); gotOut != "worker crashed 3 times" {
+		t.Fatalf("formatKanbanCardOutput(t_breaker) = %q, want %q", gotOut, "worker crashed 3 times")
+	}
+
+	// 3. Unblocked card drops stale block_payload and surfaces c.Err.
+	unblockedErr, ok := byID["t_unblocked_err"]
+	if !ok {
+		t.Fatal("wildcard query omitted t_unblocked_err")
+	}
+	if unblockedErr.BlockPayload != "" {
+		t.Fatalf("t_unblocked_err BlockPayload = %q after unblocked event, want empty", unblockedErr.BlockPayload)
+	}
+	if gotOut := formatKanbanCardOutput(unblockedErr); gotOut != "post-unblock failure" {
+		t.Fatalf("formatKanbanCardOutput(t_unblocked_err) = %q, want %q", gotOut, "post-unblock failure")
+	}
+
+	// 4. Repeat block after unblock has a distinct delivery key and is not suppressed by the first block's delivery.
+	reblock1 := byID["t_reblock"]
+	if reblock1.BlockEventID != 30 {
+		t.Fatalf("reblock1 BlockEventID = %d, want 30", reblock1.BlockEventID)
+	}
+	b := &Bridge{}
+	b.markKanbanCardDeliveredForStatus(reblock1.ID, reblock1.Status, reblock1.BlockEventID)
+	if !b.isKanbanCardDeliveredForStatus(reblock1.ID, reblock1.Status, reblock1.BlockEventID) {
+		t.Fatal("expected first block event (id=30) to be marked delivered")
+	}
+
+	reblockScript := `
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("INSERT INTO task_events (id, task_id, kind, payload) VALUES (31, 't_reblock', 'unblocked', '{}')")
+c.execute("INSERT INTO task_events (id, task_id, kind, payload) VALUES (32, 't_reblock', 'blocked', '{\"question\":\"Second question?\"}')")
+c.commit()
+`
+	if out, err := exec.Command("python3", "-c", reblockScript, db).CombinedOutput(); err != nil {
+		t.Fatalf("reblock script: %v\n%s", err, out)
+	}
+	rows2, err := querySessionKanbanCards(context.Background(), "python3", db, "*", since, nil)
+	if err != nil {
+		t.Fatalf("second wildcard query: %v", err)
+	}
+	var reblock2 kanbanCardRow
+	for _, r := range rows2 {
+		if r.ID == "t_reblock" {
+			reblock2 = r
+		}
+	}
+	if reblock2.BlockEventID != 32 {
+		t.Fatalf("reblock2 BlockEventID = %d, want 32", reblock2.BlockEventID)
+	}
+	if b.isKanbanCardDeliveredForStatus(reblock2.ID, reblock2.Status, reblock2.BlockEventID) {
+		t.Fatal("second block event (id=32) after unblock was treated as already delivered")
+	}
+	if gotOut := formatKanbanCardOutput(reblock2); gotOut != "Second question?" {
+		t.Fatalf("formatKanbanCardOutput(reblock2) = %q, want %q", gotOut, "Second question?")
+	}
+}

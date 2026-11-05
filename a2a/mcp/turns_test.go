@@ -1298,3 +1298,76 @@ func TestAwaitRunningTurnStopsAliasedDelegatedStepState(t *testing.T) {
 		t.Errorf("len(convs.steps) after awaitRunningTurn = %d, want 0", remainingSteps)
 	}
 }
+
+func TestStepStateEvictionPrefersInactiveAndRemovesAllAliasedKeys(t *testing.T) {
+	convs := NewConversations()
+	activeWatch := &turnWatch{stop: make(chan struct{})}
+	activeRoot := TaskRef{Addressee: fakeAddressee, TaskID: "task-active-root"}
+	activeState := convs.initTaskStepState(activeRoot, "tok-active", "active", false, nil, activeWatch)
+	convs.aliasTaskStepState(TaskRef{Addressee: "cluster-a", TaskID: "task-active-child"}, activeState)
+
+	// Fill remaining slots with inactive (closed) step states, including one with multiple aliased keys.
+	aliasedInactive := convs.initTaskStepState(TaskRef{Addressee: fakeAddressee, TaskID: "task-inactive-0"}, "tok-0", "s0", false, nil, nil)
+	convs.aliasTaskStepState(TaskRef{Addressee: "cluster-a", TaskID: "task-inactive-0-child1"}, aliasedInactive)
+	convs.aliasTaskStepState(TaskRef{Addressee: "cluster-b", TaskID: "task-inactive-0-child2"}, aliasedInactive)
+
+	for i := 1; len(convs.steps) < maxConversations; i++ {
+		convs.initTaskStepState(TaskRef{Addressee: fakeAddressee, TaskID: fmt.Sprintf("task-inactive-%d", i)}, fmt.Sprintf("tok-%d", i), "", true, nil, nil)
+	}
+
+	// Inserting additional entries at capacity must evict inactive entries (removing all aliased keys)
+	// and never evict or close the active turn.
+	for i := 0; i < 64; i++ {
+		w := &turnWatch{stop: make(chan struct{})}
+		st := convs.initTaskStepState(TaskRef{Addressee: fakeAddressee, TaskID: fmt.Sprintf("task-new-%d", i)}, fmt.Sprintf("tok-new-%d", i), "", true, nil, w)
+		st.closeAll()
+	}
+
+	if !activeState.active.Load() {
+		t.Fatal("active taskStepState was evicted/closed while inactive entries were present")
+	}
+	convs.mu.Lock()
+	_, hasRoot := convs.steps[activeRoot.TaskID]
+	_, hasChild := convs.steps["task-active-child"]
+	totalKeys := len(convs.steps)
+	convs.mu.Unlock()
+	if !hasRoot || !hasChild {
+		t.Fatalf("active step state keys missing from convs.steps (hasRoot=%v, hasChild=%v)", hasRoot, hasChild)
+	}
+	if totalKeys > maxConversations {
+		t.Fatalf("len(convs.steps) = %d, exceeded maxConversations (%d)", totalKeys, maxConversations)
+	}
+}
+
+func TestConcurrentStepStateOperationsNoDeadlockOrRace(t *testing.T) {
+	convs := NewConversations()
+	const workers = 8
+	const iterations = 100
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(id int) {
+			defer wg.Done()
+			token := fmt.Sprintf("tok-%d", id%2)
+			for i := 0; i < iterations; i++ {
+				root := TaskRef{Addressee: fakeAddressee, TaskID: fmt.Sprintf("task-r-%d-%d", id, i%4)}
+				child := TaskRef{Addressee: "cluster-a", TaskID: fmt.Sprintf("task-c-%d-%d", id, i%4)}
+				tw := &turnWatch{
+					stop:     make(chan struct{}),
+					followed: []TaskRef{child},
+				}
+				st := convs.getOrCreateTaskStepState(root, tw)
+				st.mu.Lock()
+				convs.aliasTaskStepState(child, st)
+				convs.setRunning(token, &child)
+				st.mu.Unlock()
+
+				_, _ = convs.knownTaskRef(child.TaskID)
+				_ = convs.activeStepFollowedTasks(token, root)
+				_, _ = convs.hasActiveStepState(token)
+				convs.stopTaskStepState(token, child)
+			}
+		}(w)
+	}
+	wg.Wait()
+}

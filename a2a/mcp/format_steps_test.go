@@ -595,3 +595,41 @@ func TestSummarizeThoughtTitlePreservesDottedTokensAndAbbreviations(t *testing.T
 		}
 	}
 }
+
+func TestFormatTurnCustomToolEnvelopePrefersUnfinishedFollowedTaskWhileRunning(t *testing.T) {
+	rootRef := TaskRef{Addressee: "platform", TaskID: "t-root"}
+	child1Ref := TaskRef{Addressee: "cluster-a", TaskID: "t-child1"}
+	child2Ref := TaskRef{Addressee: "cluster-b", TaskID: "t-child2"}
+	rootTask := &lib.Task{ID: rootRef.TaskID, State: lib.StateCompleted, Final: true}
+	child1Done := &lib.Task{
+		ID:    child1Ref.TaskID,
+		State: lib.StateCompleted,
+		Final: true,
+		Artifacts: []lib.Artifact{
+			{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "child 1 done"}}},
+		},
+	}
+	child2Running := &lib.Task{
+		ID:    child2Ref.TaskID,
+		State: lib.StateWorking,
+		Final: false,
+	}
+
+	_, md, _ := FormatTurnCustomToolEnvelope(TurnStepOutcome{
+		Outcome: TurnOutcome{
+			Root:       rootRef,
+			Task:       rootTask,
+			AnswerFrom: &child1Ref,
+			Answer:     child1Done,
+			Followed: []FollowedTask{
+				{Ref: child1Ref, Task: child1Done},
+				{Ref: child2Ref, Task: child2Running},
+			},
+		},
+		StillRunning: true,
+		Elapsed:      2 * time.Second,
+	})
+	if !strings.Contains(md, "cluster-b/t-child2") {
+		t.Errorf("in-progress wait card did not attribute to running child cluster-b/t-child2:\n%s", md)
+	}
+}

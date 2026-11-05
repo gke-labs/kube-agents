@@ -473,6 +473,18 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 			forbidden: []string{"multi word secret", "truncated"},
 			wantSub:   []string{`password="[redacted]`},
 		},
+		{
+			name:      "empty assignment before secret and yaml mapping header",
+			in:        "PASSWORD= API_KEY=\"my_val\" ./run.sh\nsecrets:\n  password: hunter2",
+			forbidden: []string{"my_val", "hunter2"},
+			wantSub:   []string{`PASSWORD= API_KEY="[redacted]" ./run.sh`, "secrets:\n  password: [redacted]"},
+		},
+		{
+			name:      "escaped quote inside escaped-quote value",
+			in:        `\"password\": \"abc\\\"def\"`,
+			forbidden: []string{"abc", "def"},
+			wantSub:   []string{`\"password\": \"[redacted]\"`},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
