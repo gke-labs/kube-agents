@@ -133,6 +133,9 @@ type faultyCacheStore struct {
 	deleteErr   error
 	// forget makes Get miss, as a store that drops entries without telling the scope index.
 	forget bool
+	// setEntered and setRelease, when set, park Set until the test releases it.
+	setEntered chan struct{}
+	setRelease chan struct{}
 }
 
 func (s *faultyCacheStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
@@ -152,10 +155,17 @@ func (s *faultyCacheStore) Get(ctx context.Context, key string) ([]byte, bool, e
 func (s *faultyCacheStore) Set(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	s.mu.Lock()
 	s.setCalls++
-	err := s.setErr
+	err, entered, release := s.setErr, s.setEntered, s.setRelease
 	s.mu.Unlock()
 	if err != nil {
 		return err
+	}
+	if release != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
 	}
 	return s.inner.Set(ctx, key, value, ttl)
 }
@@ -1487,6 +1497,58 @@ func TestHandlerCacheInvalidationSkipsEntriesTheStoreDropped(t *testing.T) {
 	}
 }
 
+func TestHandlerCacheWriteDuringStoreEvictsOlderFlightResult(t *testing.T) {
+	custom := &faultyCacheStore{
+		inner:      NewMemoryCacheStore(DefaultCacheMaxBytes),
+		setEntered: make(chan struct{}, 1),
+		setRelease: make(chan struct{}),
+	}
+	h, _ := newTestHandler(t, Config{
+		Policy: Policy{Mode: ModeReadWrite, RedactSecrets: true},
+		Cache:  &CacheConfig{Store: custom, DefaultResourceTTL: time.Minute},
+	})
+	const target = "/api/v1/namespaces/default/pods"
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+	}()
+	// The flight has passed its epoch check and is storing; the write lands before the key
+	// joins the scope index.
+	<-custom.setEntered
+	if rec := serve(h, httptest.NewRequest(http.MethodDelete, target+"/p1", nil)); rec.Code != http.StatusOK {
+		t.Fatalf("DELETE code = %d, want 200", rec.Code)
+	}
+	close(custom.setRelease)
+	<-done
+
+	if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("GET after the write Cache-Status = %q, want miss: the pre-write result was stored", rec.Header().Get(headerCacheStatus))
+	}
+}
+
+func TestHandlerCacheWriteInvalidatesOtherAPIVersions(t *testing.T) {
+	h, _ := newTestHandler(t, Config{
+		Policy: Policy{Mode: ModeReadWrite, RedactSecrets: true},
+		Cache:  &CacheConfig{DefaultResourceTTL: time.Minute},
+	})
+	const v1 = "/apis/autoscaling/v1/namespaces/default/horizontalpodautoscalers/web"
+	const v2 = "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers/web"
+
+	for i, want := range []string{cacheStatusMiss, cacheStatusHit} {
+		if rec := serve(h, httptest.NewRequest(http.MethodGet, v1, nil)); rec.Header().Get(headerCacheStatus) != want {
+			t.Fatalf("warm-up %d Cache-Status = %q, want %q", i, rec.Header().Get(headerCacheStatus), want)
+		}
+	}
+	if rec := serve(h, httptest.NewRequest(http.MethodDelete, v2, nil)); rec.Code != http.StatusOK {
+		t.Fatalf("DELETE via v2 code = %d, want 200", rec.Code)
+	}
+	if rec := serve(h, httptest.NewRequest(http.MethodGet, v1, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		t.Fatalf("GET via v1 after a v2 write Cache-Status = %q, want miss", rec.Header().Get(headerCacheStatus))
+	}
+}
+
 func TestHandlerCacheAuditRecordsResultAndDropsReplayedAuditID(t *testing.T) {
 	const auditID = "upstream-audit-id"
 	sink := &auditRecordingSink{}
@@ -1650,7 +1712,7 @@ func TestHandlerCacheScopeKeysPrunedOnExpiryAndEviction(t *testing.T) {
 	serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns-b/pods", nil))
 
 	rc.scopeMu.Lock()
-	if _, exists := rc.scopeKeys[resourceScopeID(InClusterID, "", "v1", "pods", "ns-a")]; exists {
+	if _, exists := rc.scopeKeys[resourceScopeID(InClusterID, "", "pods", "ns-a")]; exists {
 		t.Errorf("capacity-evicted ns-a scope should have been removed from scopeKeys")
 	}
 	rc.scopeMu.Unlock()
@@ -1660,7 +1722,7 @@ func TestHandlerCacheScopeKeysPrunedOnExpiryAndEviction(t *testing.T) {
 	serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns-c/pods", nil))
 
 	rc.scopeMu.Lock()
-	if _, exists := rc.scopeKeys[resourceScopeID(InClusterID, "", "v1", "pods", "ns-b")]; exists {
+	if _, exists := rc.scopeKeys[resourceScopeID(InClusterID, "", "pods", "ns-b")]; exists {
 		t.Errorf("expired ns-b scope should have been pruned from scopeKeys")
 	}
 	if len(rc.keyScope) != 1 {

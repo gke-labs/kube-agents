@@ -553,7 +553,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 
 	statusHeader := out.cacheStatus
 	metricResult := out.metric
-	if call.shared && out.cacheStatus == cacheStatusMiss && !out.claimLeader() {
+	if call.shared && !out.claimLeader() {
 		statusHeader = cacheStatusCoalesced
 		metricResult = CacheResultCoalesced
 	}
@@ -566,7 +566,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 	if statusHeader == cacheStatusCoalesced {
 		hdr.Set(headerAge, "0")
 	}
-	if statusHeader == cacheStatusMiss && out.auditID != "" {
+	if statusHeader != cacheStatusCoalesced && out.auditID != "" {
 		hdr.Set(headerAuditID, out.auditID)
 	}
 	hdr.Set(headerContentLength, strconv.Itoa(len(out.body)))
@@ -775,6 +775,11 @@ func (c *responseCache) fetchAndPopulate(
 				if info != nil && info.IsResourceRequest {
 					c.recordScopeKey(clusterID, info, key, now, storeTTL)
 				}
+				// A write that bumped the epoch after the check above may have collected the
+				// scope before this key joined it.
+				if c.epoch.Load() != epoch {
+					c.evictKey(req.Context(), key)
+				}
 			}
 		}
 	}
@@ -853,8 +858,9 @@ func isAuthFailureStatus(statusCode int) bool {
 	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden
 }
 
-func resourceScopeID(clusterID, group, version, resource, namespace string) string {
-	return clusterID + "|" + group + "|" + version + "|" + resource + "|" + namespace
+// resourceScopeID leaves out the API version: every served version reads the same stored object.
+func resourceScopeID(clusterID, group, resource, namespace string) string {
+	return clusterID + "|" + group + "|" + resource + "|" + namespace
 }
 
 func (c *responseCache) recordScopeKey(clusterID string, info *request.RequestInfo, key string, now time.Time, ttl time.Duration) {
@@ -862,7 +868,7 @@ func (c *responseCache) recordScopeKey(clusterID string, info *request.RequestIn
 	defer c.scopeMu.Unlock()
 
 	c.pruneExpiredScopeKeysLocked(now)
-	nsScope := resourceScopeID(clusterID, info.APIGroup, info.APIVersion, info.Resource, info.Namespace)
+	nsScope := resourceScopeID(clusterID, info.APIGroup, info.Resource, info.Namespace)
 	if prevScope, ok := c.keyScope[key]; ok && prevScope != nsScope {
 		if prevKeys, exists := c.scopeKeys[prevScope]; exists {
 			delete(prevKeys, key)
@@ -930,15 +936,15 @@ func (c *responseCache) invalidateResourceScope(ctx context.Context, clusterID s
 	}
 
 	if info.Namespace == "" {
-		prefix := clusterID + "|" + info.APIGroup + "|" + info.APIVersion + "|" + info.Resource + "|"
+		prefix := resourceScopeID(clusterID, info.APIGroup, info.Resource, "")
 		for scope := range c.scopeKeys {
 			if strings.HasPrefix(scope, prefix) {
 				collect(scope)
 			}
 		}
 	} else {
-		collect(resourceScopeID(clusterID, info.APIGroup, info.APIVersion, info.Resource, info.Namespace))
-		collect(resourceScopeID(clusterID, info.APIGroup, info.APIVersion, info.Resource, ""))
+		collect(resourceScopeID(clusterID, info.APIGroup, info.Resource, info.Namespace))
+		collect(resourceScopeID(clusterID, info.APIGroup, info.Resource, ""))
 	}
 	c.scopeMu.Unlock()
 

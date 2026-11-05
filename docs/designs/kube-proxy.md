@@ -383,8 +383,8 @@ When `Config.Cache` is non-nil (`--cache-max-bytes` / `KUBE_PROXY_CACHE_MAX_BYTE
    - A coalesced fetch, including the streamed body of a response over `MaxEntryBytes`, is bounded by a 60-second upstream deadline independent of any one caller.
    - Responses set `Cache-Status` (`k8s-api-proxy; hit`, `k8s-api-proxy; hit; coalesced`, `k8s-api-proxy; miss`, or `k8s-api-proxy; bypass`) and `Age`. A hit or a coalesced response carries no `Audit-Id`, because the API server's ID names the request that filled the entry.
 5. **Write and auth-failure scope invalidation**:
-   - Non-dry-run mutating requests (`create`, `update`, `patch`, `delete`, `deletecollection`) that return `2xx` or `401`/`403`, and read requests that return `401`/`403`, invalidate cached entries for that cluster, API group/version/resource, and namespace (plus cluster-wide list entries).
-   - A request arriving after an invalidation never joins a fetch that started before it, and such a fetch does not store its result.
+   - Non-dry-run mutating requests (`create`, `update`, `patch`, `delete`, `deletecollection`) that return `2xx` or `401`/`403`, and read requests that return `401`/`403`, invalidate cached entries for that cluster, API group and resource (every served version), and namespace (plus cluster-wide list entries).
+   - A request arriving after an invalidation never joins a fetch that started before it, and such a fetch does not keep its result: it skips the store, or evicts what it stored if the invalidation landed while it was storing.
    - Invalidation is per replica: the scope index lives in the process, and `CacheStore` has no prefix delete. A shared `CacheStore` across replicas keeps entries another replica stored after a write it did not see, so resource TTLs above `0s` stay correct only with `sessionAffinity` routing a caller to one replica.
 
 ### 9. Pluggable GKE HTTPS transport (`pkg/upstream`)
