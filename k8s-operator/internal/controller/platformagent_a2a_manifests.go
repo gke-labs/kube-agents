@@ -3914,22 +3914,26 @@ const defaultA2AMaxSessions = 10
 // a2aQuotaHeadroom is the sum of three parts:
 //
 //   - a2aStandingPods: what this operator keeps running for the agent;
-//   - the chart's standing pods (the operator, LiteLLM, Hindsight, the GitHub
-//     minter), which only the chart knows: it stamps them on the PlatformAgent
-//     as a2aChartPodsAnnotation. The CR is in the namespace those pods run in,
-//     and the chart renders it whether or not it renders the operator;
-//   - a2aQuotaTransientMargin for what comes and goes.
+//   - the chart's pods (the operator, LiteLLM, Hindsight, the GitHub minter and
+//     the web console, plus one surge pod for each that rolls surge-first,
+//     since a chart bump rolls several in one upgrade), which only the chart
+//     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation.
+//     The CR is in the namespace those pods run in, and the chart renders it
+//     whether or not it renders the operator;
+//   - a2aQuotaTransientMargin for what this operator starts beside the
+//     standing pods, and the gateway's overshoot.
 const (
-	// a2aChartPodsAnnotation carries the chart's standing-pod count
-	// (charts/kube-agents/templates/platform-agent-cr.yaml, from
-	// kube-agents.chartStandingPods).
+	// a2aChartPodsAnnotation carries the chart's pod count, standing pods
+	// plus their surges (charts/kube-agents/templates/platform-agent-cr.yaml,
+	// from kube-agents.chartQuotaPods).
 	a2aChartPodsAnnotation = "kubeagents.x-k8s.io/a2a-quota-chart-pods"
 	// a2aDefaultChartPods stands in when that annotation is absent (a
 	// PlatformAgent written without the chart) or unreadable: the chart's
-	// default release, the operator and two LiteLLM replicas. It errs high for
+	// default release, the operator and two LiteLLM replicas, and a surge pod
+	// for each of the two Deployments. It errs high for
 	// a CR in a namespace with no chart pods, which only loosens the bound.
 	// tests/test_quota_preflight.py ties it to a default chart render.
-	a2aDefaultChartPods = 3
+	a2aDefaultChartPods = 5
 	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
 	// enforcement half of the session bound, and anyone who can annotate the
 	// CR could otherwise lift it as far as an int64 goes (or wrap it); the
@@ -3937,24 +3941,33 @@ const (
 	// it wrote, and the default stands in for it.
 	a2aMaxChartPods = 64
 	// a2aChartPodsDiscardedReason is the Warning event a CR carrying an
-	// annotation the operator will not use gets, once per spec generation
-	// (a2aChartPodsDiscard): the quota then counts a2aDefaultChartPods, which
+	// annotation the operator will not use gets, once per spec generation and
+	// annotation value (a2aChartPodsDiscard): the quota then counts a2aDefaultChartPods, which
 	// can sit below what the namespace runs.
 	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
-	// a2aQuotaTransientMargin is room for pods that come and go beside the
-	// standing ones, at their worst moment, a helm upgrade: three rollout
-	// surge pods at once (the callouts and verifiers roll together on the new
-	// operator's reconcile while LiteLLM rolls on the chart's side; each rolls
-	// surge-first), one provisioning Job pod (at install, on any spec change
-	// and about daily after its TTL), and three for the gateway's
+	// a2aQuotaTransientMargin is room for pods this operator starts beside the
+	// standing ones, at their worst moment, a helm upgrade: two rollout surge
+	// pods (the callouts and verifiers roll together on the new operator's
+	// reconcile, each surge-first; the chart's own surges are in its count),
+	// one provisioning Job pod (at install, on any spec change and about daily
+	// after its TTL), one scope publisher Job pod (started every
+	// scopePublishInterval, never while another is active; it renders in next
+	// mode, the only mode this quota renders in), and three for the gateway's
 	// count-then-create overshoot (a2a/gateway/spawn.go, refuseAtSessionCap).
-	a2aQuotaTransientMargin = 3 + 1 + 3
+	a2aQuotaTransientMargin = 2 + 1 + 1 + 3
 )
 
 // a2aQuotaHeadroom is what the namespace pod quota adds above the gateway's
 // cap for agent.
 func a2aQuotaHeadroom(agent *agentv1alpha1.PlatformAgent) int64 {
 	return a2aStandingPods(agent) + a2aChartPods(agent) + a2aQuotaTransientMargin
+}
+
+// a2aChartPodsWarning is what a2aChartPodsWarned last reported for a CR: the
+// spec generation and the discarded annotation value.
+type a2aChartPodsWarning struct {
+	generation int64
+	value      string
 }
 
 // a2aChartPodsDiscard says why the CR's chart-pods annotation is not used,
@@ -3978,7 +3991,7 @@ func a2aChartPodsDiscard(agent *agentv1alpha1.PlatformAgent) string {
 	return ""
 }
 
-// a2aChartPods is the chart's standing pods in agent's namespace, as the chart
+// a2aChartPods is the chart's pods in agent's namespace, surges included, as the chart
 // stamped them on the CR, or the default when it did not or stamped a figure
 // outside [0, a2aMaxChartPods].
 func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
@@ -5819,9 +5832,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	quota := buildA2ASessionQuota(agent)
 	if why := a2aChartPodsDiscard(agent); why != "" {
 		key := client.ObjectKeyFromObject(agent)
-		if warned, ok := r.a2aChartPodsWarned.Load(key); !ok || warned.(int64) != agent.Generation {
+		// An annotation edit does not bump the generation, so the value is
+		// part of what was reported: a second bad value warns too.
+		seen := a2aChartPodsWarning{generation: agent.Generation, value: agent.Annotations[a2aChartPodsAnnotation]}
+		if warned, ok := r.a2aChartPodsWarned.Load(key); !ok || warned.(a2aChartPodsWarning) != seen {
 			r.recordEvent(agent, corev1.EventTypeWarning, a2aChartPodsDiscardedReason, why)
-			r.a2aChartPodsWarned.Store(key, agent.Generation)
+			r.a2aChartPodsWarned.Store(key, seen)
 		}
 	}
 	if err := ctrl.SetControllerReference(agent, quota, r.Scheme); err != nil {

@@ -8506,7 +8506,7 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 // A chart-pods annotation the operator discards is reported, once per spec
 // generation, as a Warning event; an absent one (a CR written without the
 // chart) and a usable one are not.
-func TestA2AChartPodsDiscardWarnsOncePerGeneration(t *testing.T) {
+func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 	warnings := func(rec *record.FakeRecorder) int {
 		n := 0
 		for {
@@ -8560,6 +8560,17 @@ func TestA2AChartPodsDiscardWarnsOncePerGeneration(t *testing.T) {
 			}
 			if got := warnings(rec); got != tc.want {
 				t.Fatalf("%d %s events after a new generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+			// An annotation edit leaves the generation alone; a new bad value
+			// still warns, once.
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "99"}
+			for range 2 {
+				if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := warnings(rec); got != 1 {
+				t.Fatalf("%d %s events after a new bad value at the same generation, want 1", got, a2aChartPodsDiscardedReason)
 			}
 		})
 	}

@@ -919,10 +919,11 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertIsNotNone(required, "probe ConfigMap not found")
         return chart_pods, required
 
-    def test_the_operator_is_told_the_charts_standing_pods(self) -> None:
+    def test_the_operator_is_told_the_charts_pods_and_their_surges(self) -> None:
         """The chart-pods annotation is the preflight's pod total less what the operator
-        renders and the uninstall-only cleanup hook, so the two counts cannot drift (#3848).
-        With operator.enabled=false the operator runs elsewhere, and neither counts it."""
+        renders and the uninstall-only cleanup hook, plus one surge pod for each workload the
+        preflight's own list marks as surging, so the counts cannot drift (#3848). With
+        operator.enabled=false the operator runs elsewhere, and neither counts it."""
         op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
         operator_pods = (
             op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]
@@ -941,18 +942,19 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(sets=sets):
                 chart_pods, required = self._chart_pods_and_requirements(sets)
                 hook = 0 if "platformAgent.cleanupHook.enabled=false" in sets else 1
-                self.assertEqual(chart_pods, required["pods"] - operator_pods - hook)
+                self.assertGreater(required["chartSurgePods"], 0)
+                self.assertEqual(chart_pods, required["pods"] - operator_pods - hook + required["chartSurgePods"])
 
     def test_a_chart_count_past_the_operators_cap_fails_the_render(self) -> None:
         """The operator discards a chart-pods annotation past a2aMaxChartPods for its
         default, which would size the quota below what the namespace runs, so the chart
-        refuses to stamp one: 64 renders (the operator's two LiteLLM replicas' default
-        plus 62 operator replicas), 65 fails naming the cap."""
+        refuses to stamp one: 64 renders (60 operator replicas, LiteLLM's default two,
+        and a surge pod for each), 65 fails naming the cap."""
         cap = int(re.search(r"a2aMaxChartPods\s*=\s*(\d+)", _A2A_MANIFESTS.read_text()).group(1))
         self.assertEqual(cap, 64)
-        ok = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 2}"])
+        ok = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 4}"])
         self.assertEqual(ok.returncode, 0, ok.stderr)
-        refused = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 1}"])
+        refused = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 3}"])
         self.assertNotEqual(refused.returncode, 0, "a chart count past the cap rendered")
         self.assertIn("past the operator's cap of 64", refused.stderr)
 
@@ -2020,9 +2022,10 @@ class DocumentedFootprintTest(unittest.TestCase):
                 flags=re.MULTILINE,
             ).split("+")
         )
-        # Hindsight's two pods and the minter at its default replicas.
+        # Hindsight's two pods and the minter at its default replicas, plus a surge pod each
+        # for Hindsight's API and the minter (kube-agents.chartQuotaPods).
         values = yaml.safe_load(_VALUES.read_text())
-        extras = 2 + int(values["githubMinter"]["replicaCount"])
+        extras = 2 + int(values["githubMinter"]["replicaCount"]) + 2
         chart_default = int(
             self._extract_match(
                 r'a2aDefaultChartPods\s*=\s*(\d+)', manifests_src, "a2aDefaultChartPods"

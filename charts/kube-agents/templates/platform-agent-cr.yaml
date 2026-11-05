@@ -12,11 +12,11 @@ metadata:
   {{- $annotations = deepCopy . }}
   {{- end }}
   {{- /*
-    Three keys the operator reads are also derived from chart values, and the value
+    Four keys the operator reads are also derived from chart values, and the value
     wins because it drives the rest of the release too: litellm.networkPolicy is
     the static render gate, telemetry.collectorNamespace the static policy's
-    egress namespace, and litellm.openaiCompatible the static policy's rule to
-    the model server. A platformAgent.annotations entry that disagrees with the
+    egress namespace, litellm.openaiCompatible the static policy's rule to
+    the model server, and the chart's pods (standing plus one surge pod per surging workload) the session quota's count. A platformAgent.annotations entry that disagrees with the
     value it duplicates fails the render rather than being overwritten in silence.
   */}}
   {{- $litellmPolicyKey := "kubeagents.x-k8s.io/enable-litellm-network-policy" }}
@@ -56,7 +56,8 @@ metadata:
   {{- end }}
   {{- end }}
   {{- /*
-    The chart's standing pods in this namespace, which share the next-mode
+    The chart's pods in this namespace, with a surge pod for each that rolls
+    with one (kube-agents.chartQuotaPods), which share the next-mode
     namespace pod quota with the session pods; the operator sizes that quota's
     headroom from it (#3848). Stamped on the CR rather than the operator, because
     the CR is in the namespace those pods run in and the chart renders it even
@@ -64,12 +65,12 @@ metadata:
     keys above, so an entry in platformAgent.annotations that disagrees fails.
   */}}
   {{- $chartPodsKey := "kubeagents.x-k8s.io/a2a-quota-chart-pods" }}
-  {{- $chartPods := include "kube-agents.chartStandingPods" $ }}
+  {{- $chartPods := include "kube-agents.chartQuotaPods" $ }}
   {{- /* The operator discards a count past its cap (a2aMaxChartPods) for its
          default of 3, which would size the session quota below what the
          namespace runs; refuse to stamp one rather than let it be dropped. */}}
   {{- if gt (int $chartPods) 64 }}
-  {{- fail (printf "the chart would run %s standing pods in this namespace, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to 3 and refuse pods the release needs. Lower the replica counts, or run some of these components in another namespace." $chartPods) }}
+  {{- fail (printf "the chart would run %s pods at once in this namespace, counting a surge pod for each workload that rolls with one, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts, or run some of these components in another namespace." $chartPods) }}
   {{- end }}
   {{- with get $annotations $chartPodsKey }}
   {{- if ne (toString . | trim) $chartPods }}

@@ -862,8 +862,9 @@ type TuningSpec struct {
 	// carries many non-session pods can see unrelated pod creation refused at
 	// admission before sessions reach this cap. The headroom is derived,
 	// not a CR field: the pods the operator renders for the agent, the chart's
-	// standing pods (stamped on the CR by the chart), and a fixed margin for
-	// surges, the provisioning Job and the gateway's overshoot. The third is the bus: the TASKS
+	// pods and their rollout surges (stamped on the CR by the chart), and a
+	// fixed margin for the operator's surges, its Jobs and the gateway's
+	// overshoot. The third is the bus: the TASKS
 	// stream's max_consumers is provisioned from this number, because each
 	// session pod creates three named consumers there and a stream that
 	// cannot hold the configured concurrency refuses a legitimate session's

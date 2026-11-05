@@ -114,10 +114,12 @@ a `LimitRange` to default it), as the chart README explains. Under `spec.mode: n
 NATS adds a 40 GiB JetStream persistent volume claim (bringing the total to 5 claims
 totalling 142 GiB of `requests.storage`), and the operator renders a namespace-wide
 `ResourceQuota` on `pods` of `maxSessions` plus a headroom it derives: the pods it
-runs for the agent, the chart's own pods in the namespace (the chart stamps them
-on the `PlatformAgent`; 3 without the chart), and 7 for rollout surges, the
-provisioning Job and the gateway's count-then-create overshoot (32 pods by default,
-from `spec.harness.tuning.maxSessions: 10`, 36 with Hindsight and the GitHub minter),
+runs for the agent, the chart's own pods in the namespace with a rollout surge pod
+for each that rolls with one (the chart stamps them on the `PlatformAgent`; 5
+without the chart), and 7 for the operator's rollout surges, the provisioning and
+scope-publishing Jobs and the gateway's count-then-create overshoot (34 pods by
+default, from `spec.harness.tuning.maxSessions: 10`, 40 with Hindsight and the
+GitHub minter),
 sized for the session pods plus the rest of the release; anything else you run in
 the namespace counts against it. The claims
 are also disks: on GKE's default `standard-rwo` class they are balanced persistent

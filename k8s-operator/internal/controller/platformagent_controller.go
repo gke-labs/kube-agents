@@ -503,10 +503,10 @@ type PlatformAgentReconciler struct {
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
 
-	// a2aChartPodsWarned records, per CR, the spec generation whose discarded
-	// chart-pods annotation was last reported (a2aChartPodsDiscard), so each
-	// generation warns once. Keyed by ObjectKey, value int64; cleared when the
-	// CR is deleted.
+	// a2aChartPodsWarned records, per CR, the spec generation and discarded
+	// chart-pods annotation value last reported (a2aChartPodsDiscard), so each
+	// generation and value warns once. Keyed by ObjectKey, value
+	// a2aChartPodsWarning; cleared when the CR is deleted.
 	a2aChartPodsWarned sync.Map
 
 	// replicasLimitedLogged records, per CR, the spec generation whose replica
