@@ -48,6 +48,13 @@ class NightLineTest(unittest.TestCase):
         nights = [night(n=10, verdict=9, apology=3)] + steady(7, n=10, verdict=9, apology=2)
         self.assertEqual(nt.regressions(nights), [nt.APOLOGY_SHARE])
 
+    def test_the_verdict_share_mark_at_and_just_short_of_ten_points(self):
+        self.assertEqual(nt.regressions([night(verdict=32)] + steady(7)), [nt.VERDICT_SHARE])
+        self.assertEqual(nt.regressions([night(verdict=33)] + steady(7)), [])
+
+    def test_a_half_point_rounds_up_as_the_page_does(self):
+        self.assertIn("13% of 40 reps", nt.night_line([night(verdict=5)] + steady(2)))
+
     def test_just_short_of_the_threshold_is_not_marked(self):
         nights = [night(verdict=33, apology=3, words=89)] + steady(7)
         self.assertEqual(nt.regressions(nights), [])

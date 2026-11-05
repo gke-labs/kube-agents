@@ -283,14 +283,11 @@ class Builder:
             if not ok:
                 raise Skipped(SKIP_BAD_LINK.format(url=url or "empty"))
 
-    def latency_block(self, fields: dict, nights: list[dict] | None = None) -> list[str]:
+    def latency_block(self, fields: dict, nights: list[dict]) -> list[str]:
         """The night line and the slow cases (``nightly_latency.py``), or
         nothing when last night carried no timing. ``nights`` is
-        ``nightly.night_reports``, built here when not passed."""
-        # ``last_night``'s night is the newest of these: the same reports,
-        # read further back for the typicals.
-        if nights is None:
-            nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
+        ``nightly.night_reports``: ``last_night``'s night is the newest of
+        them, read further back for the typicals."""
         line = nightly_latency.night_line(nights)
         if not line:
             return []

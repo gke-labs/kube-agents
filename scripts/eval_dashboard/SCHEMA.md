@@ -1079,7 +1079,7 @@ the chat-turn target, p95 under 10 s (`TURN1_P95_TARGET_S`, from
 night on it. A case's `shape` is `nightly.shape_rollup` over its reps'
 `shape` that are not `infra`, `{n, opens_on_verdict, apology,
 bot_messages_p50, words_before_answer_p50, answer_words_p50}`: `n` the reps
-that carried one, each flag the number of them it was true on, and each
+that carried one with both flags, each flag the number of them it was true on, and each
 count's nearest-rank median (`null` when no rep carried it); `null` when no
 rep carried a shape. The night's `shape` is the same over every such rep of
 the night's `cases[]`. Reported, never a verdict. `expected` counts the cases `nightly_active` on this checkout,

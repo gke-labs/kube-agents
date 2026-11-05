@@ -59,7 +59,9 @@ PARTIAL_NOTE = nightly_latency.PARTIAL_NOTE
 
 
 def _points(value: float) -> int:
-    return round(value * 100)
+    """Whole percentage points, a half rounded up as the Nightly page's
+    ``pct`` (``Math.round``) does, so the line and the tile agree."""
+    return math.floor(value * 100 + 0.5)
 
 
 def _share(value: float) -> str:
