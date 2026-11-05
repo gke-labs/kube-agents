@@ -1322,6 +1322,13 @@ class OperatorModuleDownloadRetryTest(unittest.TestCase):
                     "the download runs outside the operator module the seam test builds in",
                 )
 
+    def test_no_job_skips_its_download_or_runs_on_past_a_failed_one(self):
+        for name, steps in self.go_jobs.items():
+            with self.subTest(job=name):
+                step = self._download_step(steps)
+                self.assertNotIn("if", step, "a job that skips the download can save a cache entry with no modules")
+                self.assertNotIn("continue-on-error", step, "a failed download must fail its job, not leave the fetch to the seam test")
+
     def test_a_failing_download_stops_at_the_makefile_ceiling_with_its_doubling_delay(self):
         attempts, delay = _declared_retry_schedule()
         for name, steps in self.go_jobs.items():
