@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import types
@@ -100,6 +101,7 @@ class _Broker:
         self.title, self.fail, self.refuse = title, fail, refuse
         self.live = {}
         self.asked = []
+        self.timeouts = []
 
     def mint(self, url=URL):
         token = f"tok{len(self.live) + len(self.asked)}-{url.rsplit('/', 1)[-1]}"
@@ -113,8 +115,9 @@ class _Broker:
         forge = types.ModuleType("forge")
         test = self
 
-        def call(verb, payload, repo, *, retry_transient=False):
+        def call(verb, payload, repo, *, retry_transient=False, timeout_s=None):
             test.asked.append((verb, repo, dict(payload), retry_transient))
+            test.timeouts.append(timeout_s)
             if test.fail:
                 raise test.fail
             url = test.live.pop(payload.get("claim"), None)
@@ -226,9 +229,9 @@ class PrOpenedTest(unittest.TestCase):
             forge = broker.module()
             claim = forge.call
 
-            def slow(verb, payload, repo, *, retry_transient=False):
+            def slow(verb, payload, repo, **kwargs):
                 clock[0] += plugin.CLAIMS_BUDGET_SECONDS + 1  # the broker sleeps past the budget
-                return claim(verb, payload, repo, retry_transient=retry_transient)
+                return claim(verb, payload, repo, **kwargs)
 
             forge.call = slow
             output = "".join(broker.line(url=url, number=n) for n, url in zip((1, 2, 3), urls))
@@ -252,6 +255,59 @@ class PrOpenedTest(unittest.TestCase):
             out = self.run_hook(output, kanban, task="", broker=broker)
         self.assertEqual([payload["url"] for _, _, payload, _ in broker.asked], urls)
         self.assertEqual(_tokens(out), [])
+
+    def test_each_claim_is_bounded_by_what_is_left_of_the_budget(self):
+        # A ceiling of its own would let one slow claim outlast the budget, and Hermes' 30 s.
+        clock = [1000.0]
+        kanban, broker = _Kanban(), _Broker()
+        forge = broker.module()
+        claim = forge.call
+        elapsed = 4.0
+
+        def timed(verb, payload, repo, **kwargs):
+            clock[0] += elapsed
+            return claim(verb, payload, repo, **kwargs)
+
+        forge.call = timed
+        urls = [f"{REPOSITORY}/pull/{n}" for n in (1, 2, 3)]
+        output = "".join(broker.line(url=url, number=n) for n, url in zip((1, 2, 3), urls))
+        with mock.patch.object(plugin, "_forge", lambda: forge), \
+                mock.patch.object(plugin.time, "monotonic", lambda: clock[0]):
+            self.run_hook(output, kanban, task="", broker=broker)
+        self.assertEqual([verb for verb, *_ in broker.asked], [plugin.PROPOSAL_CLAIM_VERB] * 3)
+        ceiling = plugin.HOOK_CALLBACK_SECONDS - plugin.CLAIM_RESERVE_SECONDS
+        for timeout_s in broker.timeouts:
+            self.assertIsNotNone(timeout_s)
+            self.assertGreater(timeout_s, 0)
+            self.assertLessEqual(timeout_s, ceiling)
+        self.assertEqual(broker.timeouts, [ceiling, ceiling - elapsed, ceiling - 2 * elapsed])
+
+    def test_a_claim_started_at_the_end_of_the_budget_keeps_the_headroom_before_the_callback_timeout(self):
+        # The budget says when the last claim may start; the ceiling says when
+        # the hook must answer. A claim started at the budget's end is not
+        # squeezed to nothing, and the next one is not started at all.
+        clock = [1000.0]
+        kanban, broker = _Kanban(), _Broker()
+        forge = broker.module()
+        claim = forge.call
+        elapsed = plugin.CLAIMS_BUDGET_SECONDS - 1
+
+        def timed(verb, payload, repo, **kwargs):
+            clock[0] += elapsed
+            return claim(verb, payload, repo, **kwargs)
+
+        forge.call = timed
+        urls = [f"{REPOSITORY}/pull/{n}" for n in (1, 2, 3)]
+        output = "".join(broker.line(url=url, number=n) for n, url in zip((1, 2, 3), urls))
+        with mock.patch.object(plugin, "_forge", lambda: forge), \
+                mock.patch.object(plugin.time, "monotonic", lambda: clock[0]), \
+                self.assertNoLogs(plugin.logger, "WARNING"):
+            out = self.run_hook(output, kanban, task="", broker=broker)
+        ceiling = plugin.HOOK_CALLBACK_SECONDS - plugin.CLAIM_RESERVE_SECONDS
+        self.assertEqual(broker.timeouts, [ceiling, ceiling - elapsed], "the third record came after the budget")
+        self.assertGreaterEqual(broker.timeouts[-1], plugin.CLAIM_RESERVE_SECONDS, "the last claim keeps real headroom")
+        self.assertEqual(_tokens(out), [], "the unclaimed record's token is stripped all the same")
+        self.assertEqual([plugin.opened(line)["url"] for line in out.splitlines()], urls)
 
     def test_a_repeat_of_a_url_whose_claim_failed_stays_without_its_token(self):
         kanban, broker = _Kanban(), _Broker(refuse="CLAIM_NOT_CONFIRMED")
@@ -692,6 +748,41 @@ class RealForgeTest(unittest.TestCase):
 
         with self.assertRaises(plugin.ClaimUnanswered):
             self.claim(down)
+
+
+class SandboxClaimTimeoutTest(unittest.TestCase):
+    """The hook through the real ``forge.py`` on the sandbox hop, with ``sandbox_exec.run`` stubbed."""
+
+    def run_claims(self, run):
+        import forge
+        import sandbox_exec
+
+        broker, kanban, ledger = _Broker(), _Kanban(), []
+        output = "".join(broker.line(url=f"{REPOSITORY}/pull/{n}", number=n) for n in (1, 2))
+
+        def post(path, payload):
+            ledger.append((path, payload))
+            return {"recorded": True}
+
+        with mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=True), \
+                mock.patch.object(sandbox_exec, "run", run), \
+                mock.patch.dict(sys.modules, {**kanban.modules(), "forge": forge}), \
+                mock.patch.dict(os.environ, {plugin.TASK_ENV: TASK}, clear=True), \
+                mock.patch.object(plugin, "_session_kv_post", post), \
+                self.assertLogs(plugin.logger, "WARNING"):
+            out = plugin.on_terminal_output(output=output)
+        return out, kanban, ledger
+
+    def test_the_hop_is_given_the_remaining_budget_and_a_timeout_is_an_unanswered_claim(self):
+        run = mock.Mock(side_effect=subprocess.TimeoutExpired(cmd="ssh", timeout=1))
+        out, kanban, ledger = self.run_claims(run)
+        self.assertEqual(run.call_count, 1, "a timed-out hop ends the asking")
+        ceiling = run.call_args.kwargs["timeout"]
+        self.assertGreater(ceiling, 0)
+        self.assertLessEqual(ceiling, plugin.HOOK_CALLBACK_SECONDS - plugin.CLAIM_RESERVE_SECONDS)
+        self.assertEqual(_tokens(out), [])
+        self.assertEqual(len(out.splitlines()), 2)
+        self.assertEqual((kanban.events, ledger), ([], []))
 
 
 def _hermes_importable():

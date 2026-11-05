@@ -12854,6 +12854,34 @@ def closing_state(path):
     return closing(conn)
 
 
+class TestKeptRefusals(unittest.TestCase):
+    """`a2a notify` exit 5: the gateway kept a home post for its digest. The
+    re-senders treat it as handled, so the keep is not filled with retries."""
+
+    def test_drift_backlog_digest_kept_by_the_gateway_counts_as_sent(self):
+        exc = session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        with patch.object(session_kv_server.subprocess, "run", side_effect=exc), \
+                patch.object(session_kv_server.chat_notify, "routes", return_value=True):
+            self.assertTrue(session_kv_server._send_drift_backlog_digest("slack", "Drift backlog: 3 changes"))
+
+    def test_initial_alert_kept_by_the_gateway_returns_the_kept_marker(self):
+        exc = session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        with patch.object(session_kv_server, "_run_alert_send", side_effect=exc):
+            self.assertEqual(session_kv_server._post_initial_alert("slack", "an alert"), session_kv_server.ALERT_KEPT_FOR_DIGEST)
+
+    def test_report_card_kept_by_the_gateway_posts_no_text(self):
+        res = MagicMock(returncode=chat_notify.NOTIFY_KEPT, stdout="", stderr="kept")
+        with patch.object(session_kv_server.subprocess, "run", return_value=res), \
+                patch.object(session_kv_server.chat_notify, "chat_command", return_value=["a2a"]):
+            posted = session_kv_server._post_audit_chat_via_gateway("slack", "platform", "audit", {"kind": "card"}, "text", "", 30)
+        self.assertIs(posted, session_kv_server.AUDIT_POST_KEPT)
+
+    def test_data_volume_warning_kept_by_the_gateway_stops_retrying(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=False), \
+                patch.object(session_kv_server, "_post_initial_alert", return_value=session_kv_server.ALERT_KEPT_FOR_DIGEST):
+            self.assertTrue(session_kv_server._post_data_volume_warning("data volume at 90%"))
+
 
 if __name__ == "__main__":
     # Clean up temp database file on exit

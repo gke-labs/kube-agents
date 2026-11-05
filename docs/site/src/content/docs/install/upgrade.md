@@ -529,7 +529,7 @@ gateway.
      profile and does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
      notify route, and with it the reports of board cards
      ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
-     channel those posts are dropped while conversations keep working: the run warns, and the
+     channel those posts are refused while conversations keep working: the run warns, and the
      `PlatformAgent` carries the `HomeChannelUnset` condition.
    - Keep the agent image at the operator's release. A learned home channel reaches the agent through
      a file the operator mounts; an older agent image reads env only and never sees it, while the CR
