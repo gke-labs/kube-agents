@@ -261,19 +261,26 @@ class SettleTest(unittest.TestCase):
     """scope_exclude_settle waits for the operator, the rollout and the mounted
     file, then runs one reconcile and waits out a run that holds its lock."""
 
-    def settle(self, file_clusters: list, reconcile_rcs: str, seconds: int = 5, failure_pause: int = 0) -> tuple[subprocess.CompletedProcess, str]:
+    def settle(self, file_clusters: list, reconcile_rcs: str, seconds: int = 5, failure_pause: int = 0, tick_before_first_call: bool = False) -> tuple[subprocess.CompletedProcess, str]:
         cr = {"metadata": {"generation": 3}, "status": {"observedGeneration": 3}, "spec": {"scope": {"exclude": {"clusters": [SEEDED_B]}}}}
         rendered = {"present": True, "exclude": {"projects": [], "clusters": file_clusters}}
+        # A tick landing between the deadline's computation and the stub's first
+        # read, the gap a spin from the stub's own baseline would mistake for a
+        # phase it still has to wait out.
+        gap_tick = 'local tick=$SECONDS; while [ "$SECONDS" -eq "$tick" ]; do sleep 0.01; done' if tick_before_first_call else ""
         stub = textwrap.dedent(
             f"""\
             echo {reconcile_rcs} > rcs
             kubectl() {{
               case " $* " in
                 *" jsonpath="*)
-                  # The first call spins to the next whole second, so the steps
-                  # before the rollout wait always run at the clock phase that
-                  # left a budget of 1 with no time (see the short-budget cases).
-                  local tick=$SECONDS; while [ "$SECONDS" -eq "$tick" ]; do sleep 0.01; done
+                  {gap_tick}
+                  # The first call spins until SECONDS is past the second the
+                  # deadline was computed in (the settle's local, which this
+                  # subshell inherits), so the steps before the rollout wait
+                  # always run exactly one tick in, whether or not the clock
+                  # turned between the function's entry and this call.
+                  while [ "$SECONDS" -le "$((deadline - EVAL_SCOPE_SETTLE_SECONDS))" ]; do sleep 0.01; done
                   printf '3 3' ;;
                 *" get platformagent "*) printf '%s' '{json.dumps(cr)}' ;;
                 *" get deployment/"*) echo deployment/platform-agent-gateway ;;
@@ -317,9 +324,10 @@ class SettleTest(unittest.TestCase):
 
     # The settle's deadline is bash's SECONDS, which ticks on whole wall-clock
     # seconds, so a budget of N leaves between N-1 and N seconds. The stub's
-    # forced tick puts the rollout wait at the worst phase on every run: the two
-    # short budgets below are 2, not 1, because 1 then leaves no time there and
-    # the settle fails with "no time left" instead of the message asserted on.
+    # forced tick puts the rollout wait exactly one tick in on every run, the
+    # worst phase: the two short budgets below are 2, not 1, because 1 then
+    # leaves no time there and the settle fails with "no time left" instead of
+    # the message asserted on.
     def test_a_file_that_never_matches_fails_without_a_reconcile(self):
         result, reconciles = self.settle([], "0", seconds=2)
         self.assertIn("rc=1", result.stdout)
@@ -332,6 +340,17 @@ class SettleTest(unittest.TestCase):
         self.assertIn("rc=1", result.stdout)
         self.assertIn("settle bound", result.stderr)
         self.assertEqual(len(reconciles.splitlines()), 1)
+
+    def test_a_tick_before_the_first_call_still_leaves_the_budget_a_second(self):
+        # The clock turns between the settle's entry and its first kubectl call,
+        # as it does when bash starts in the last milliseconds of a second. The
+        # stub's forced tick is measured from the deadline, not from that call,
+        # so the rollout wait still sees one second of the two and the settle
+        # reaches the message asserted on rather than "no time left".
+        result, reconciles = self.settle([], "0", seconds=2, tick_before_first_call=True)
+        self.assertIn("rc=1", result.stdout)
+        self.assertIn("still reads []", result.stderr)
+        self.assertEqual(reconciles, "")
 
     def test_a_reconcile_that_keeps_failing_fails_the_settle(self):
         result, reconciles = self.settle([SEEDED_B], "3 3 3")
