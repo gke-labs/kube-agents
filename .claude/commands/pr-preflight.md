@@ -1,5 +1,5 @@
 ---
-description: Run the required pre-PR review passes — adversarial and docs-drift — each in its own subagent
+description: Run the required pre-PR review passes — adversarial, docs-drift, and chat UX when chat output changes — each in its own subagent
 argument-hint: [base-branch]
 ---
 
