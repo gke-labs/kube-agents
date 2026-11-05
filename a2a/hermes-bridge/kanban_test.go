@@ -886,3 +886,76 @@ func TestCardStepScrubsTheTitle(t *testing.T) {
 		t.Errorf("a card title's secret reached the step: %s", raw)
 	}
 }
+
+// What of a settled card stands in a task's answer with no synthesis: a
+// completed card's report, a blocked card's question, and for a failed card a
+// line naming it and its status, its error text only with the debug switch.
+func TestCardAnswerTextKeepsErrorTextBehindTheDebugSwitch(t *testing.T) {
+	const errSecret = "tok_card_error_text_canary"
+	done := kanbanCardRow{ID: "t_1", Title: "Check prod-a", Status: "done", Result: "prod-a is healthy"}
+	failed := kanbanCardRow{ID: "t_2", Title: "Check prod-b", Status: "failed", Err: "psql: FATAL " + errSecret}
+	blocked := kanbanCardRow{ID: "t_3", Title: "Check prod-c", Status: "blocked", BlockPayload: `{"question":"May I restart prod-c?"}`}
+	if got := cardAnswerText(done); got != "prod-a is healthy" {
+		t.Errorf("completed card answer = %q, want its report", got)
+	}
+	if got := cardAnswerText(blocked); got != "May I restart prod-c?" {
+		t.Errorf("blocked card answer = %q, want its question", got)
+	}
+	got := cardAnswerText(failed)
+	if strings.Contains(got, errSecret) || !strings.Contains(got, "t_2") || !strings.Contains(got, "failed") {
+		t.Errorf("failed card answer = %q, want a status line without the error text", got)
+	}
+	if got := cardAnswerText(kanbanCardRow{ID: "t_4", Title: "x", Status: "done", Err: errSecret}); strings.Contains(got, errSecret) {
+		t.Errorf("a completed card with no report answered with its error text: %q", got)
+	}
+	t.Setenv(debugErrorTextEnv, "true")
+	if got := cardAnswerText(failed); !strings.Contains(got, "psql: FATAL") {
+		t.Errorf("failed card answer with the debug switch on = %q, want its error text", got)
+	}
+}
+
+// End to end through the in-turn wait: a turn's one card fails with an error
+// that repeats a value, and the task's answer names the card and how it
+// ended, without the error text (that is the debugging switch's to add).
+func TestWaitForKanbanCards_AFailedCardsAnswerOmitsItsErrorText(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	const canary = "tok_failed_card_canary_51c2"
+	since := time.Now().Unix() - 10
+	db := filepath.Join(t.TempDir(), "kanban.db")
+	initScript := `
+import sqlite3, sys
+db, since, canary = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_fail", "Check prod-b", "failed", "cluster-diagnostics", "a2a-ctx-fail", "", "psql: FATAL " + canary, since + 1, since + 2, None))
+c.execute("INSERT INTO task_runs (task_id, summary, error, session_id) VALUES (?,?,?,?)", ("t_fail", "", "psql: FATAL " + canary, "w-1"))
+c.commit()
+`
+	if out, err := exec.Command("python3", "-c", initScript, db, strconv.FormatInt(since, 10), canary).CombinedOutput(); err != nil {
+		t.Fatalf("init db: %v\n%s", err, out)
+	}
+	t.Setenv(hermesKanbanDBEnv, db)
+	_, url := startServer(t)
+	b := startAPIBridge(t, url, newAPIStub(t, nil), nil)
+	sessionID := "a2a-ctx-fail"
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-fail", ContextID: "ctx-fail", CorrelationID: "corr-fail"}, state: stateRunning}
+	act := newSessionActivityState(sessionID, false)
+	act.cardsFiled.Store(true)
+	run.act.Store(act)
+
+	got, ok := b.waitForKanbanCards(run, context.Background(), act, sessionID, since, 1, "Dispatched a card.")
+	if !ok {
+		t.Fatal("waitForKanbanCards returned ok = false")
+	}
+	if strings.Contains(got, canary) || !strings.Contains(got, "t_fail") || !strings.Contains(got, "failed") {
+		t.Errorf("answer = %q, want a line naming t_fail and its failure, without the error text", got)
+	}
+}

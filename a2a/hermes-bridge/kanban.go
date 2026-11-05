@@ -557,6 +557,42 @@ func inferKanbanCardVerdict(c kanbanCardRow) string {
 	return "completed"
 }
 
+// cardAnswerText is what of a settled card may stand in a task's answer when
+// no synthesis turn rewrites it (one card, or a failed synthesis): a blocked
+// card's question, which the user has to answer; a completed card's report,
+// which is the answer the user asked for; and for any other end, a line
+// naming the card and how it ended. Its error text is the debugging switch's
+// to add (BRIDGE_DEBUG_ERROR_TEXT), as for a tool call's.
+func cardAnswerText(c kanbanCardRow) string {
+	st := strings.ToLower(strings.TrimSpace(c.Status))
+	switch {
+	case isKanbanStatusBlocked(st):
+		return formatKanbanCardOutput(c)
+	case kanbanStatusSucceeded(st):
+		if res := strings.TrimSpace(c.Result); res != "" {
+			return res
+		}
+	case debugErrorTextOn():
+		if out := strings.TrimSpace(formatKanbanCardOutput(c)); out != "" {
+			return out
+		}
+	}
+	title := shortCardClusterOrTitle(scrubInlineSecrets(strings.TrimSpace(c.Title)))
+	if title == "" {
+		return fmt.Sprintf("Kanban card `%s` finished with status `%s`.", c.ID, st)
+	}
+	return fmt.Sprintf("Kanban card `%s` (%s) finished with status `%s`.", c.ID, title, st)
+}
+
+// kanbanStatusSucceeded reports whether a card's status is a successful end.
+func kanbanStatusSucceeded(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "done", "completed", "archived":
+		return true
+	}
+	return false
+}
+
 func formatKanbanCardOutput(c kanbanCardRow) string {
 	if isKanbanStatusBlocked(c.Status) {
 		if bp := strings.TrimSpace(c.BlockPayload); bp != "" {
@@ -713,7 +749,7 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 					var parts []string
 					for _, c := range relevant {
 						b.markKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID)
-						if out := formatKanbanCardOutput(c); out != "" {
+						if out := cardAnswerText(c); out != "" {
 							parts = append(parts, out)
 						}
 					}

@@ -845,7 +845,7 @@ const debugErrorTextCap = 320
 // error_message (or of the result, when hermes gave none), run through
 // scrubInlineSecrets and capped.
 func debugErrorText(d hookDelivery) string {
-	if on, _ := strconv.ParseBool(os.Getenv(debugErrorTextEnv)); !on {
+	if !debugErrorTextOn() {
 		return ""
 	}
 	text := d.Extra.ErrorMessage
@@ -858,6 +858,12 @@ func debugErrorText(d hookDelivery) string {
 		}
 	}
 	return oneLinePreview(scrubInlineSecrets(text), debugErrorTextCap)
+}
+
+// debugErrorTextOn reports whether the BRIDGE_DEBUG_ERROR_TEXT switch is on.
+func debugErrorTextOn() bool {
+	on, _ := strconv.ParseBool(os.Getenv(debugErrorTextEnv))
+	return on
 }
 
 // activityErrorType is hermes's own verdict for a failed call: its status
