@@ -356,7 +356,11 @@ class PullRequestUrlPatternTest(unittest.TestCase):
         for provider, url in shapes.items():
             with self.subTest(provider=provider):
                 self.assertTrue(pattern.search(f"Opened {url} for review."))
-        for issue in ("https://gitea.example.com/acme/infra/issues/12", "https://bitbucket.org/acme/infra/issues/12"):
+        for issue in (
+            "https://gitea.example.com/acme/infra/issues/12",
+            "https://bitbucket.org/acme/infra/issues/12",
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
             with self.subTest(url=issue):
                 self.assertFalse(pattern.search(f"Filed {issue}."))
 

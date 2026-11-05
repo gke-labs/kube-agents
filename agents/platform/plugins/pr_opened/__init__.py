@@ -162,11 +162,13 @@ SCRIPTS_DIRS = ("/opt/defaults/scripts", "/opt/data/scripts")
 #: ``http`` is a forge the broker serves too: an in-cluster Gitea (a ``.svc``
 #: host). The repository is greedy, so a GitLab subgroup named ``pulls`` or
 #: ``pull-requests`` before a numeric subgroup stays in the repository and
-#: the last marker before the number is the pull request. Read only for a
+#: the last marker before the number is the pull request. The tail after the
+#: number carries no further marker, ``/-/`` or ``/issues/``, so an issue under
+#: such a subgroup is not a pull request either. Read only for a
 #: record with no ``repo`` (one an older client wrote), and for the card
 #: event's number when the broker's answer has none. The Session KV server
 #: pins its own pattern equal to this one.
-PROPOSAL_URL = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#]\S*)?$")
+PROPOSAL_URL = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 
 #: A ``"claim": "<token>"`` member wherever it sits on a line, for a record that
 #: does not parse as a whole line (one ``2>&1`` merged after other text). Its

@@ -2751,6 +2751,8 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             "https://gitea.example.com/acme/fleet/pulls",
             "https://bitbucket.org/acme/fleet/pull-requests/",
             "https://gitea.example.com/acme/fleet/pulls?state=open&id=7",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
         ):
             with self.subTest(url=not_a_proposal):
                 self.assertIsNone(session_kv_server.PROPOSAL_URL_RE.match(not_a_proposal))

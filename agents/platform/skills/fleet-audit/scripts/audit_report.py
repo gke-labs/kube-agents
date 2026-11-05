@@ -2005,8 +2005,12 @@ GENERATED_FIX_NOTE = (
 # PodDisruptionBudget `finish` would write still takes.
 # A proposal's URL on every forge the broker serves: GitHub's `/pull/<n>`,
 # GitLab's `/-/merge_requests/<n>` (the `-/` is optional), Gitea's `/pulls/<n>`,
-# and Bitbucket Cloud's and Data Center's `/pull-requests/<n>`.
-PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|pulls|pull-requests|(?:-/)?merge_requests)/\d+")
+# and Bitbucket Cloud's and Data Center's `/pull-requests/<n>`. The tail after
+# the number carries no further marker, `/-/` or `/issues/`, so an issue under a
+# GitLab subgroup named like a marker is not a pull request.
+PULL_REQUEST_URL_PATTERN = re.compile(
+    r"https?://\S+/(?:pull|pulls|pull-requests|(?:-/)?merge_requests)/\d+(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?(?![/?#\w])"
+)
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"

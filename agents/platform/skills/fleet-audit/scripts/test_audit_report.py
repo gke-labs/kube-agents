@@ -21768,7 +21768,12 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         ):
             with self.subTest(url=carried):
                 self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {carried}"))
-        for issue in ("https://gitea.example.com/acme/fleet/issues/12", "https://bitbucket.org/acme/fleet/issues/12"):
+        for issue in (
+            "https://gitea.example.com/acme/fleet/issues/12",
+            "https://bitbucket.org/acme/fleet/issues/12",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
             with self.subTest(url=issue):
                 self.assertFalse(audit_report.decline_names_a_pull_request(f"see {issue}"))
 
