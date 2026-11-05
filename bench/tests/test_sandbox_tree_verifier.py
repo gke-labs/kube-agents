@@ -90,7 +90,7 @@ def kubectl(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_KUBECTL_LOG", str(log))
     monkeypatch.setenv("FAKE_KUBECTL_MODE", "run")
     monkeypatch.setenv("FAKE_ROOT", str(tmp_path / "pod"))
-    for name in ("AGENT_SERVICE_NAME", "AGENT_NAMESPACE", "AGENT_CLUSTER_CONTEXT", "EVAL_SANDBOX_POD"):
+    for name in ("AGENT_SERVICE_NAME", "AGENT_NAMESPACE", "AGENT_CLUSTER_CONTEXT", "AGENT_CONTAINER", "EVAL_SANDBOX_POD"):
         monkeypatch.delenv(name, raising=False)
 
     def calls() -> list[list[str]]:
