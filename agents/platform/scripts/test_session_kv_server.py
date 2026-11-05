@@ -1213,6 +1213,15 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
             pool.run()
         session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", session_kv_server.ALERT_KIND_DRIFT)
 
+    def test_a_drift_kind_is_recorded_without_a_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title=None, alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", None, session_kv_server.ALERT_KIND_DRIFT)
+
     def test_under_next_a_google_chat_thread_gets_the_title(self):
         # The title heads the plan the cards draw, which the gateway lays out on
         # Google Chat under next.
@@ -1250,14 +1259,24 @@ class TestAlertTitleRecord(unittest.TestCase):
     def test_a_kind_joins_the_routing_row_beside_the_title(self):
         import sqlite3
 
-        session_kv_server._record_alert_title("k8s-evt-t1", "checkout HPA drift · seeded-b", "drift")
+        session_kv_server._record_alert_title("k8s-evt-t1", "checkout HPA drift in seeded-b", "drift")
         with sqlite3.connect(temp_db_path) as conn:
             meta = json.loads(conn.execute(
                 "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
             ).fetchone()[0])
         self.assertEqual(meta, {
-            "platform": "slack", "thread_id": "1.0", "title": "checkout HPA drift · seeded-b", "alert_kind": "drift",
+            "platform": "slack", "thread_id": "1.0", "title": "checkout HPA drift in seeded-b", "alert_kind": "drift",
         })
+
+    def test_a_kind_without_a_title_is_still_recorded(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", None, "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {"platform": "slack", "thread_id": "1.0", "alert_kind": "drift"})
 
     def test_the_gateway_reads_the_title_recorded(self):
         import importlib.util
@@ -7030,7 +7049,7 @@ class TestDriftInject(unittest.TestCase):
         with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
             self._inject()
         self.assertEqual(trigger.call_args.kwargs, {
-            "alert_title": "checkout Deployment drift · prod-us-east1",
+            "alert_title": "checkout Deployment drift in prod-us-east1",
             "alert_kind": session_kv_server.ALERT_KIND_DRIFT,
         })
 
@@ -7038,10 +7057,10 @@ class TestDriftInject(unittest.TestCase):
         payload = {**self.DRIFT_PAYLOAD, "cluster": "seeded-b", "resource": {
             "group": "autoscaling", "namespace": "shop", "resource": "horizontalpodautoscalers", "name": "checkout-gateway"}}
         with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
-            self.assertEqual(session_kv_server._drift_session_title(payload), "checkout-gateway HPA drift · seeded-b")
+            self.assertEqual(session_kv_server._drift_session_title(payload), "checkout-gateway HPA drift in seeded-b")
             unlisted = {**payload, "cluster": "", "resource": {"resource": "leases", "name": "l1"}}
             with patch.dict(os.environ, {"GKE_CLUSTER_NAME": "host-a"}):
-                self.assertEqual(session_kv_server._drift_session_title(unlisted), "l1 leases drift · host-a")
+                self.assertEqual(session_kv_server._drift_session_title(unlisted), "l1 leases drift in host-a")
             self.assertIsNone(session_kv_server._drift_session_title({**payload, "resource": {"resource": "pods"}}))
         with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
             self.assertIsNone(session_kv_server._drift_session_title(payload))

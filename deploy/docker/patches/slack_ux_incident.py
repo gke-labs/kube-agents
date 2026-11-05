@@ -42,7 +42,7 @@ thread, and the report text is untouched, only laid out.
 The event watcher's crashloop alert, posted to a Slack thread with the flag
 on, also records the thread's session title on its routing row, read back by
 :func:`alert_title`. A drift alert records one too ("checkout-gateway HPA
-drift · seeded-b") and marks the row as drift (:func:`is_drift_alert`), and its
+drift in seeded-b") and marks the row as drift (:func:`is_drift_alert`), and its
 triage is laid out by :func:`drift_triage`: the rest of the "What's wrong"
 paragraph, which says what changed, who changed it and when, goes on a line
 under the headline, no button carries the `` (recommended)`` suffix, the
@@ -139,6 +139,8 @@ OPTION_REPLY = "apply Option {letter}: {title}"
 SINGLE_REPLY = "apply: {title}"
 #: Where ``session_kv_server._record_alert_title`` puts the thread's session title.
 ALERT_TITLE_KEY = "title"
+#: The lines that end a drift triage's detail: a list item, a fence or a heading.
+DETAIL_STOP = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s|`{3}|~{3}|#)")
 #: Where it marks a drift alert (``session_kv_server.ALERT_KIND_KEY`` / ``ALERT_KIND_DRIFT``).
 ALERT_KIND_KEY = "alert_kind"
 ALERT_KIND_DRIFT = "drift"
@@ -420,13 +422,19 @@ def drift_triage(triage: dict, report: str) -> dict:
     "Why" opens on a diff of the field that changed.
     """
     _headline, body = _presenter.split_answer(_section(_sections(report), WHATS_WRONG))
-    detail = _presenter._plain(body[0]).strip() if body else ""
+    prose = []
+    for line in (body[0].split("\n") if body else []):
+        if DETAIL_STOP.match(line):
+            break
+        prose.append(line)
+    detail = _presenter._plain(" ".join(" ".join(prose).split())).strip()
     return {
         **triage,
         "fold_title": FOLD_TITLE_DRIFT,
-        "detail": _presenter._clip(" ".join(detail.split()), _presenter.ROW_TEXT_MAX) if detail else "",
-        "choices": [(label.removesuffix(RECOMMENDED_SUFFIX), reply, recommended)
-                    for label, reply, recommended in triage["choices"]],
+        "detail": _presenter._clip(detail, _presenter.ROW_TEXT_MAX) if detail else "",
+        # Rebuilt from the reply's title: the recommended label was clipped short to fit the suffix.
+        "choices": [(_presenter._clip(reply.split(": ", 1)[-1], _presenter.BUTTON_TEXT_MAX), reply, recommended)
+                    for _label, reply, recommended in triage["choices"]],
     }
 
 
@@ -460,9 +468,9 @@ def blocks_triage(triage: dict, fold_blocks: list[dict]) -> list[dict]:
 
 def fallback_text(triage: dict) -> str:
     """The headline, any detail, the links and the replies, as mrkdwn; :func:`message_text` starts with it."""
-    headline = f"{triage['headline']} {triage['detail']}" if triage.get("detail") else triage["headline"]
     return _presenter.fallback_text(
-        headline, links=triage["links"], choices=[reply for _label, reply, _rec in triage["choices"]]
+        triage["headline"], links=triage["links"], choices=[reply for _label, reply, _rec in triage["choices"]],
+        after_rows=triage.get("detail") or "",
     )
 
 
