@@ -47,14 +47,25 @@ reach it, an entry in `gaps` saying so.
 **A cluster with no Cluster Agent has no card, and you audit it here yourself.** Those are the
 clusters Step 1 kept, after dropping the excluded ones, that the list on your card does not name: all of them when the card
 lists none, and usually none otherwise, because the reconcile gives every listed cluster a profile.
-The card can also name clusters past the first-run cap: they have a Cluster Agent but no card this sweep. Audit them here too, and do not report them as lacking an agent. Take the set from the card's list, not from a roster you look up. Follow Steps 2 to 4 of
-`cluster_inventory_audit_sop.md` for each, and record what you find in that SOP's Step 5 `metadata`
-shape: Step 2 is the control-plane topology, and Steps 3 and 4 are the workload list, startup
-probe, read-only root filesystem, added capabilities, namespace quota, addons, observability and
-hardening checks the Cluster Agents run. Checks the first-run audits own (liveness and readiness probes, requests and
+The card can also name clusters past the first-run cap: they have a Cluster Agent but no card this sweep. Audit them here too, and do not report them as lacking an agent. Take the set from the card's list, not from a roster you look up. For each one, run once, with the
+terminal's `timeout` set to 600:
+
+```bash
+/opt/data/profiles/platform/skills/fleet-audit/scripts/cluster_inventory_collect.py \
+  --project <project> --location <location> --cluster <cluster>
+```
+
+and put the object it prints into `clusters` unchanged. It reads Steps 2 to 4 of
+`cluster_inventory_audit_sop.md` in three reads (one `gcloud` describe through the credential proxy,
+two paged `kubectl` dumps through the sandbox's kube-proxy kubeconfig) and prints that SOP's Step 5
+`metadata` shape:
+Step 2 is the control-plane topology, and Steps 3 and 4 are the workload list, startup probe,
+read-only root filesystem, added capabilities, namespace quota, addons, observability and hardening
+checks the Cluster Agents run. A read that failed is in the object's `gaps`, never guessed. Walk the
+SOP by hand only for a cluster the script itself cannot run against. Checks the first-run audits own (liveness and readiness probes, requests and
 limits, HPA, NetworkPolicy and pod security among them) are not part of this scan.
 
-**Pin `kubectl` to each cluster before you run a single command against it.** That SOP is written
+**On a by-hand walk, pin `kubectl` to each cluster before you run a single command against it** (the script does this itself). That SOP is written
 for a Cluster Agent whose `KUBECONFIG` already points at one cluster; yours does not. Bare
 `kubectl` from this profile resolves to the credential proxy's own context — the management cluster
 — so an audit run unpinned files the management cluster's workloads under someone else's name, and
@@ -65,10 +76,11 @@ Cluster Agent's own cluster and not one you are auditing on its behalf. A cluste
 uncovered precisely because credentials for it could not be minted; if that happens to you too,
 record it as unaudited and why, and audit nothing on it.
 
-For the clusters you audit here, one check reads a resource only this cluster has: before you
-record an observability gap, read `.status.telemetry` on the PlatformAgent to see which collector
-the agents are actually exporting to. Report it as `telemetry` in Step 4 as well: the hand-off puts
-it in the raw report beside the Cluster Agents' observability findings, which could not see it.
+For the clusters you audit here, one check reads a resource only this cluster has: the script sets
+`observability` and raises `no-otel-collector` from the workloads it saw on that cluster alone, so
+read `.status.telemetry` on the PlatformAgent as well, to see which collector the agents are
+actually exporting to. Report it as `telemetry` in Step 4: the hand-off puts it in the raw report
+beside the observability findings, which could not see it.
 
 ---
 

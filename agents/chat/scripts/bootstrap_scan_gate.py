@@ -122,6 +122,11 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
     "/opt/data/profiles/platform/governance/cluster_inventory_audit_sop.md",
     "/opt/platform-template/governance/cluster_inventory_audit_sop.md",
 )
+# The sweep worker's Step 3 as one command per cluster: reads Steps 2 to 4 of
+# the single-cluster SOP and prints its Step 5 `metadata` object. It lives in
+# the fleet-audit skill tree the shell sandbox stages from its image, beside
+# the other collectors, and runs where the worker's terminal does.
+CLUSTER_INVENTORY_COLLECTOR_PATH = "/opt/data/profiles/platform/skills/fleet-audit/scripts/cluster_inventory_collect.py"
 # Present only where per-cluster agents are deployed. When absent, the sweep degrades to
 # a single-agent walk of the fleet; when present, the gate files one audit card per Cluster
 # Agent up to the first-run cap, and the sweep audits the rest.
@@ -688,10 +693,16 @@ def _task_body(cap: int | None = None, ready: list[dict] | None = None) -> str:
         "list above is `(none)`, there are no Cluster Agents: audit every cluster yourself in "
         "Step 3.** That is the normal case for a single-cluster install and it is not an "
         "error.\n\n"
-        "**Step 3 — audit the clusters the list does not cover**, following Steps 2 to 4 of the "
-        "single-cluster audit SOP (its own numbering) for each, reading whichever of these "
-        f"exists:\n{cluster_audit_list}\n\n"
-        f"and record each in that SOP's `metadata` shape. {step3_count}\n\n"
+        "**Step 3 — audit the clusters the list does not cover.** For each one run, once, with the "
+        "terminal's `timeout` set to 600:\n\n"
+        f"    {CLUSTER_INVENTORY_COLLECTOR_PATH} --project <project> --location <location> --cluster <cluster>\n\n"
+        "and put the object it prints into `clusters` unchanged. It reads Steps 2 to 4 of the "
+        "single-cluster audit SOP in three reads (one gcloud describe through the credential proxy, "
+        "two paged kubectl dumps through the sandbox's kube-proxy kubeconfig) and prints that SOP's "
+        "`metadata` shape, with any read that failed in its `gaps`. Do not walk the SOP by hand for "
+        "a cluster the script answered; walk it (its own numbering, reading whichever of these "
+        f"exists) only where the script itself cannot run:\n{cluster_audit_list}\n\n"
+        f"{step3_count}\n\n"
         "**Step 4 — complete this card now. Do not wait for the per-cluster cards, do not write "
         f"`{RAW_INVENTORY_PATH}` or `{INVENTORY_PATH}`, and do not file a ranking card.** The "
         "onboarding gate waits for the per-cluster cards, writes the raw findings from their "
