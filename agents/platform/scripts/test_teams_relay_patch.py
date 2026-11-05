@@ -532,7 +532,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res.raw_response, {"response": {"id": "msg-1"}})
 
             await adapter.send_typing(
-                "conv-123", "https://smba.trafficmanager.net/teams/"
+                "conv-123", metadata={"serviceUrl": "https://smba.trafficmanager.net/teams/"}
             )
             self.assertEqual(
                 await adapter.get_chat_info("19:abc@thread.tacv2"),
@@ -834,6 +834,87 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(adapter._running)
             await adapter.disconnect()
             self.assertFalse(adapter._running)
+
+    async def test_standalone_send_returns_the_cause_and_never_raises(self):
+        """The registry's cron path expects ``success`` or ``error`` back; the
+        broker's ``teams`` object is what names the cause."""
+        import io
+        from gateway.platform_registry import platform_registry
+
+        teams_relay_patch.install()
+        sender = platform_registry.get("teams").standalone_sender_fn
+        body = json.dumps({"error": "Teams operation failed", "detail": "HTTP 403: BotNotInConversationRoster",
+                           "teams": {"status": 403, "code": "BotNotInConversationRoster", "message": "not in roster"}}).encode()
+        err = urllib.error.HTTPError("http://127.0.0.1:8642/v1/chat/teams/api", 502, "Bad Gateway", {}, io.BytesIO(body))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            res = await sender(None, "conv-1", "hello")
+        self.assertIn("BotNotInConversationRoster", res["error"])
+        self.assertNotIn("success", res)
+
+        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            self.assertEqual(await sender(None, "conv-1", "   "), {"success": True, "platform": "teams", "skipped": "empty_text"})
+            self.assertIn("error", await sender(None, "conv-1", "report", media_files=["/tmp/a.png"]))
+            mock_urlopen.assert_not_called()
+
+    async def test_send_drops_to_plain_text_when_the_card_is_over_the_byte_cap(self):
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        self.assertEqual(adapter.MAX_MESSAGE_LENGTH, 16000)
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data))
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        # 16000 characters as 20-character lines: a card several times the text.
+        long_text = "\n".join(["- item %05d x" % i for i in range(1000)])
+        self.assertLessEqual(len(long_text), 16000)
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter.send("conv-1", long_text)
+            await adapter.send("conv-1", "# short\n- one line")
+        big, small = sent[0]["payload"], sent[1]["payload"]
+        self.assertNotIn("attachments", big)
+        self.assertEqual(big["text"], long_text)
+        self.assertLessEqual(len(json.dumps(big, ensure_ascii=False).encode("utf-8")), 28 * 1024)
+        self.assertIn("attachments", small)
+
+    async def test_send_truncates_non_ascii_text_that_no_form_can_fit(self):
+        """16,000 CJK characters are 48 KB of UTF-8: over the cap as a card and
+        as plain text, so the text is cut to fit and says so."""
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data))
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        # Newlines and quotes cost two bytes each once serialized, and the
+        # reply id rides along: the cap is measured on exactly what is posted.
+        cjk = "\n".join(['集群"状态"报告。' * 5 for _ in range(460)])  # 16,100+ characters
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter.send("conv-1", cjk, reply_to="1697000000000")
+        payload = sent[0]["payload"]
+        self.assertNotIn("attachments", payload)
+        self.assertEqual(payload["replyToId"], "1697000000000")
+        self.assertTrue(payload["text"].endswith(teams_relay_patch.TEAMS_TRUNCATION_MARKER))
+        self.assertTrue(cjk.startswith(payload["text"][: -len(teams_relay_patch.TEAMS_TRUNCATION_MARKER)]))
+        self.assertLessEqual(
+            len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), 28 * 1024
+        )
+        self.assertGreater(len(payload["text"]), 9000)  # cut to fit, not emptied
 
 
 if __name__ == "__main__":

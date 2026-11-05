@@ -14,11 +14,32 @@ from collections.abc import Callable
 from typing import Any
 
 from credential_proxy_client import authorization_headers
+from slack_relay_patch import is_silent_text
 
 LOGGER = logging.getLogger("teams-relay-patch")
 DEFAULT_RELAY_READY_TIMEOUT = 120.0
-# Bot Framework caps an activity near 28 KB; both registrations use this.
-TEAMS_MAX_MESSAGE_LENGTH = 28000
+# Bot Framework caps one activity at about 28 KB of serialized JSON. The send
+# tool chunks text at the registry entry's ``max_message_length`` and the
+# gateway's reply path at the adapter's ``MAX_MESSAGE_LENGTH``, both character
+# counts, and a character is one to four bytes once serialized (the broker
+# writes UTF-8, not ``\uXXXX`` escapes). So the character cap is a first cut
+# only: ``send`` measures the activity it is about to post, drops a card to
+# plain text, and truncates the text with a marker when even that is over.
+TEAMS_MAX_MESSAGE_LENGTH = 16000
+TEAMS_MAX_ACTIVITY_BYTES = 28 * 1024
+TEAMS_TRUNCATION_MARKER = "\n… (message truncated to fit Teams' size limit)"
+# Each pass cuts at least the overshoot in raw bytes, and a raw byte is at least
+# one serialized byte, so two passes are the norm; the bound is a safety stop.
+TEAMS_FIT_ATTEMPTS = 8
+# Where the bot posts when an activity did not say: the public Bot Framework
+# endpoint. TEAMS_DEFAULT_SERVICE_URL overrides it in a hand-run gateway only.
+DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
+# How much of a broker error body the gateway reads to name the cause.
+TEAMS_RELAY_ERROR_BODY_MAX_BYTES = 4096
+# One relay call can cost the broker an identity-provider round trip (20 s)
+# and then the Bot Framework post (30 s), so the gateway waits longer than
+# their sum; a shorter wait reports a post that then lands as a failure.
+TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS = 60
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
 # Bot Framework `conversation.conversationType` -> gateway `chat_type`. The
 # memory providers treat only "dm" as single-person, so a Teams 1:1 chat
@@ -218,6 +239,92 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
     }
 
 
+class TeamsRelayError(RuntimeError):
+    """The broker refused or Microsoft rejected a relayed call.
+
+    Carries the broker's answer so the gateway log and a cron delivery record
+    name the cause (``BotNotInConversationRoster``, ``ConversationNotFound``,
+    ``invalid_client``) instead of the bare ``HTTP Error 502`` ``urlopen``
+    raises with the body unread. ``fields`` is the broker's ``teams`` object
+    when Microsoft was the one refusing, else its ``error``/``detail``.
+    """
+
+    def __init__(self, message: str, status: int, fields: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.status = status
+        self.fields = fields
+
+
+def relayed_teams_error(exc: urllib.error.HTTPError) -> TeamsRelayError:
+    """Read the broker's error body once and turn it into a ``TeamsRelayError``."""
+    body: Any = {}
+    try:
+        raw = exc.read(TEAMS_RELAY_ERROR_BODY_MAX_BYTES)
+        body = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    fields = body.get("teams") if isinstance(body.get("teams"), dict) else {}
+    if not fields:
+        fields = {k: str(body[k])[:256] for k in ("error", "detail") if body.get(k)}
+    detail = " ".join(str(v) for v in fields.values() if v) or str(exc.reason)
+    return TeamsRelayError(f"HTTP {exc.code}: {detail}", exc.code, fields)
+
+
+def activity_size_bytes(payload: dict[str, Any]) -> int:
+    """The bytes the broker puts on the wire for ``payload`` (UTF-8 JSON)."""
+    return len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+
+def fit_activity_to_cap(
+    message: str,
+    *,
+    use_adaptive_cards: bool,
+    title: str | None,
+    actions: list[dict[str, Any]] | None,
+    extra: dict[str, Any] | None = None,
+    cap: int = TEAMS_MAX_ACTIVITY_BYTES,
+) -> dict[str, Any]:
+    """Build the outbound activity and keep it under ``cap`` bytes.
+
+    Order: the card as asked; plain text of the same message (a card adds a
+    TextBlock per line, so short lines inflate it several times); then plain
+    text cut to fit, ending in ``TEAMS_TRUNCATION_MARKER``. Every candidate
+    carries ``extra`` (``replyToId`` and the like) and is measured in its
+    serialized form, the one the broker puts on the wire.
+    """
+    fields = dict(extra or {})
+
+    def build(text: str, cards: bool, with_title: bool) -> dict[str, Any]:
+        payload = format_teams_activity_payload(
+            text,
+            use_adaptive_cards=cards,
+            title=title if with_title else None,
+            actions=actions if with_title else None,
+        )
+        payload.update(fields)
+        return payload
+
+    payload = build(message, use_adaptive_cards, True)
+    if activity_size_bytes(payload) <= cap:
+        return payload
+    if use_adaptive_cards:
+        LOGGER.info("Teams card over the activity size cap; sending plain text")
+        payload = build(message, False, False)
+        if activity_size_bytes(payload) <= cap:
+            return payload
+    LOGGER.warning("Teams message over the activity size cap; truncated to fit")
+    cut = message
+    for _ in range(TEAMS_FIT_ATTEMPTS):
+        payload = build(cut + TEAMS_TRUNCATION_MARKER, False, False)
+        over = activity_size_bytes(payload) - cap
+        if over <= 0:
+            return payload
+        raw = cut.encode("utf-8")
+        cut = raw[: max(len(raw) - over, 0)].decode("utf-8", errors="ignore")
+    return build(TEAMS_TRUNCATION_MARKER.strip(), False, False)
+
+
 def format_teams_activity_payload(
     message: str,
     *,
@@ -289,8 +396,11 @@ def _build_teams_adapter_and_sender(
             headers=headers,
             method="GET" if body is None else "POST",
         )
-        with urllib.request.urlopen(req, timeout=35) as response:
-            return json.load(response)
+        try:
+            with urllib.request.urlopen(req, timeout=TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            raise relayed_teams_error(exc) from exc
 
     async def bootstrap_relay() -> None:
         """Wait for the credential-proxy sidecar Teams relay to become reachable."""
@@ -313,11 +423,11 @@ def _build_teams_adapter_and_sender(
                     request, "/v1/chat/teams/events/ack", {"receipt": ""}
                 )
                 return
-            except urllib.error.HTTPError as exc:
-                if exc.code == 404:
+            except TeamsRelayError as exc:
+                if exc.status == 404:
                     # 404 from /events/ack means TeamsRelay is initialized and answered.
                     return
-                if exc.code != 503:
+                if exc.status != 503:
                     raise
             except (urllib.error.URLError, OSError):
                 pass
@@ -328,6 +438,9 @@ def _build_teams_adapter_and_sender(
 
     class TeamsRelayAdapter(base_adapter_cls):  # type: ignore[misc,valid-type]
         """Hermes platform adapter connecting to Microsoft Teams via credential proxy."""
+
+        # The gateway's own reply chunker reads this; the base default is 4096.
+        MAX_MESSAGE_LENGTH = TEAMS_MAX_MESSAGE_LENGTH
 
         def __init__(self, config: Any = None) -> None:
             plat = platform_factory("teams")
@@ -400,9 +513,7 @@ def _build_teams_adapter_and_sender(
             del kwargs
             text = content if content is not None else message
             meta = metadata if isinstance(metadata, dict) else {}
-            default_service_url = os.getenv(
-                "TEAMS_DEFAULT_SERVICE_URL", "https://smba.trafficmanager.net/teams/"
-            )
+            default_service_url = os.getenv("TEAMS_DEFAULT_SERVICE_URL", DEFAULT_TEAMS_SERVICE_URL)
             candidate_url = meta.get("serviceUrl") or default_service_url
             service_url = (
                 candidate_url
@@ -411,12 +522,6 @@ def _build_teams_adapter_and_sender(
             )
             conversation_id = str(chat_id or "").strip()
 
-            payload = format_teams_activity_payload(
-                text,
-                use_adaptive_cards=self.adaptive_cards,
-                title=meta.get("title"),
-                actions=meta.get("actions"),
-            )
             effective_thread = (
                 thread_id
                 or reply_to
@@ -426,8 +531,13 @@ def _build_teams_adapter_and_sender(
                     else None
                 )
             )
-            if effective_thread:
-                payload["replyToId"] = effective_thread
+            payload = fit_activity_to_cap(
+                text,
+                use_adaptive_cards=self.adaptive_cards,
+                title=meta.get("title"),
+                actions=meta.get("actions"),
+                extra={"replyToId": effective_thread} if effective_thread else None,
+            )
 
             endpoint = f"v3/conversations/{conversation_id}/activities"
             try:
@@ -441,9 +551,10 @@ def _build_teams_adapter_and_sender(
                         "payload": payload,
                     },
                 )
-            except (urllib.error.URLError, OSError, ValueError) as error:
-                # HTTPError is a URLError. The gateway's send and standalone
-                # paths expect a failed SendResult, not an exception.
+            except (TeamsRelayError, urllib.error.URLError, OSError, ValueError) as error:
+                # A broker refusal arrives as TeamsRelayError with the cause
+                # read from its body. The gateway's send and standalone paths
+                # expect a failed SendResult, not an exception.
                 LOGGER.warning("Teams send to %r failed: %s", conversation_id, error)
                 return send_result_cls(success=False, error=str(error))
             raw_dict = raw if isinstance(raw, dict) else {}
@@ -463,8 +574,14 @@ def _build_teams_adapter_and_sender(
                 raw_response=raw_dict,
             )
 
-        async def send_typing(self, chat_id: str, service_url: str) -> None:
-            """Send a typing indicator activity to Teams."""
+        async def send_typing(
+            self, chat_id: str, metadata: dict[str, Any] | None = None
+        ) -> None:
+            """Send a typing indicator activity to Teams (the base's signature)."""
+            meta = metadata if isinstance(metadata, dict) else {}
+            service_url = meta.get("serviceUrl") or os.getenv(
+                "TEAMS_DEFAULT_SERVICE_URL", DEFAULT_TEAMS_SERVICE_URL
+            )
             if not is_trusted_service_url(service_url):
                 return
             endpoint = f"v3/conversations/{chat_id}/activities"
@@ -515,9 +632,7 @@ def _build_teams_adapter_and_sender(
                 return
 
             raw_service_url = activity.get("serviceUrl")
-            default_service_url = os.getenv(
-                "TEAMS_DEFAULT_SERVICE_URL", "https://smba.trafficmanager.net/teams/"
-            )
+            default_service_url = os.getenv("TEAMS_DEFAULT_SERVICE_URL", DEFAULT_TEAMS_SERVICE_URL)
             if raw_service_url is not None and not is_trusted_service_url(raw_service_url):
                 LOGGER.warning(
                     "Rejected Teams activity with untrusted serviceUrl: %r",
@@ -585,7 +700,7 @@ def _build_teams_adapter_and_sender(
             text = (raw_text or "").strip()
             activity_id = str(activity.get("id") or "").strip()
 
-            await self.send_typing(conv_id, service_url)
+            await self.send_typing(conv_id, metadata={"serviceUrl": service_url})
 
             metadata = {
                 "serviceUrl": service_url,
@@ -667,15 +782,38 @@ def _build_teams_adapter_and_sender(
         caption: str | None = None,
         metadata: dict[str, Any] | None = None,
         **_kwargs: Any,
-    ) -> Any:
-        del media_files, force_document, caption
-        adapter = TeamsRelayAdapter(pconfig)
-        return await adapter.send(
-            chat_id,
-            message,
-            thread_id=thread_id,
-            metadata=metadata,
-        )
+    ) -> dict[str, Any]:
+        """Out-of-process delivery (cron): a ``success`` or ``error`` dict, never a raise.
+
+        Same contract as the Slack sender: a file cannot ride the relay and
+        says so; a silent cron tick (the dressed ``[SILENT]`` marker upstream
+        lets through) is a logged success with nothing posted; a failure
+        returns the cause so the scheduler's delivery record names it.
+        """
+        del force_document, caption
+        if media_files:
+            return {"error": "Teams media delivery is not supported through the credential relay"}
+        if is_silent_text(message):
+            LOGGER.info(
+                "teams relay: dropped a %d-character message as a silent tick",
+                len(str(message or "")),
+            )
+            return {"success": True, "platform": "teams", "skipped": "empty_text"}
+        try:
+            adapter = TeamsRelayAdapter(pconfig)
+            result = await adapter.send(
+                chat_id,
+                message,
+                thread_id=thread_id,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            LOGGER.warning("teams relay: standalone send failed: %s", exc)
+            return {"error": f"Teams send failed: {exc}"}
+        if not result.success:
+            LOGGER.warning("teams relay: standalone send failed: %s", result.error)
+            return {"error": f"Teams send failed: {result.error}"}
+        return {"success": True, "message_id": result.message_id}
 
     return TeamsRelayAdapter, _standalone_send
 
