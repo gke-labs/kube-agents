@@ -192,6 +192,7 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 	env = append(env, corev1.EnvVar{Name: profileWorkerResetPathsEnv, Value: strings.Join(profileWorkerResetPaths(mounts, volumes), ":")})
 
 	res := profile.Spec.Resources
+	ephemeral := profileWorkerEphemeralStorage(volumes)
 	return corev1.PodSpec{
 		ServiceAccountName:           serviceAccount,
 		AutomountServiceAccountToken: ptr.To(false),
@@ -223,8 +224,8 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 				PeriodSeconds: 20, FailureThreshold: 3,
 			},
 			Resources: corev1.ResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceCPU: res.Requests.CPU, corev1.ResourceMemory: res.Requests.Memory},
-				Limits:   corev1.ResourceList{corev1.ResourceCPU: res.Limits.CPU, corev1.ResourceMemory: res.Limits.Memory},
+				Requests: corev1.ResourceList{corev1.ResourceCPU: res.Requests.CPU, corev1.ResourceMemory: res.Requests.Memory, corev1.ResourceEphemeralStorage: ephemeral},
+				Limits:   corev1.ResourceList{corev1.ResourceCPU: res.Limits.CPU, corev1.ResourceMemory: res.Limits.Memory, corev1.ResourceEphemeralStorage: ephemeral},
 			},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
@@ -234,6 +235,22 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 			},
 		}},
 	}
+}
+
+// profileWorkerEphemeralStorage is the worker's ephemeral-storage request and
+// limit: the sizeLimits of every disk-backed emptyDir in the pod, which the
+// pod's usage is charged against while it runs (the staged persona and tools
+// included), plus emptyDirLogsAllowance, as emptydir_limits.go has it for
+// every writing container. Without it Autopilot defaults the container to
+// 1Gi, well under the volumes it mounts.
+func profileWorkerEphemeralStorage(volumes []corev1.Volume) resource.Quantity {
+	total := resource.MustParse(emptyDirLogsAllowance)
+	for _, v := range volumes {
+		if v.EmptyDir != nil && v.EmptyDir.Medium != corev1.StorageMediumMemory && v.EmptyDir.SizeLimit != nil {
+			total.Add(*v.EmptyDir.SizeLimit)
+		}
+	}
+	return total
 }
 
 // profileWorkerResetPaths is every mount of the worker that is writable and

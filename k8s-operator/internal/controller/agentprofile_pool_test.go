@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"slices"
 	"strings"
 	"testing"
@@ -443,5 +444,76 @@ func TestEveryWritableWorkerMountIsResetBetweenTasks(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The worker asks for the ephemeral storage its pod's disk-backed emptyDirs
+// can hold, plus the logs allowance, with the limit equal to the request, so
+// Autopilot's 1Gi default doesn't cap it below its own volumes. With image
+// volumes off, the staged persona and tools are counted too.
+func TestTheWorkerRequestsTheEphemeralStorageItsVolumesHold(t *testing.T) {
+	agent := a2aTestAgent()
+	profile := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.Tools = []agentv1alpha1.AgentProfileTool{{Name: "jq", Image: "registry.example/jq:1"}}
+	})
+	for _, imageVolumes := range []bool{true, false} {
+		spec := buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, imageVolumes)
+		want := resource.MustParse(emptyDirLogsAllowance)
+		for _, v := range spec.Volumes {
+			if v.EmptyDir != nil && v.EmptyDir.Medium != corev1.StorageMediumMemory && v.EmptyDir.SizeLimit != nil {
+				want.Add(*v.EmptyDir.SizeLimit)
+			}
+		}
+		r := spec.Containers[0].Resources
+		req, lim := r.Requests[corev1.ResourceEphemeralStorage], r.Limits[corev1.ResourceEphemeralStorage]
+		if req.Cmp(want) != 0 || lim.Cmp(want) != 0 {
+			t.Errorf("imageVolumes=%v: ephemeral-storage request %s limit %s, want both %s", imageVolumes, req.String(), lim.String(), want.String())
+		}
+		if floor := resource.MustParse("6Gi"); req.Cmp(floor) < 0 {
+			t.Errorf("imageVolumes=%v: ephemeral-storage %s is under the workspace volumes alone (6Gi+)", imageVolumes, req.String())
+		}
+	}
+}
+
+// Turning the dispatcher off removes the pools first: a refused delete of
+// the dispatcher's own Deployment doesn't keep them running.
+func TestGateOffRemovesThePoolsWhateverElseFails(t *testing.T) {
+	withDispatcher(t)
+	agent := a2aTestAgent()
+	pns := profileNamespaceName(agent)
+	scheme := setupScheme()
+	bundle := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace},
+		Data:       map[string]string{a2aNATSCACertKey: "pem"},
+	}
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.Delete = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		if _, isDep := obj.(*appsv1.Deployment); isDep && obj.GetName() == a2aDispatcherName(agent) {
+			return apierrors.NewForbidden(appsv1.Resource("deployments"), obj.GetName(), nil)
+		}
+		return cl.Delete(ctx, obj, opts...)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(agent, chartProfileNamespace(agent), bundle).WithInterceptorFuncs(funcs).Build()
+	r := &PlatformAgentReconciler{Client: c, Scheme: scheme}
+	ctx := context.Background()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, []agentv1alpha1.AgentProfile{p}, true); err != nil || profileErr != nil {
+		t.Fatalf("setup: %v / %v", err, profileErr)
+	}
+	poolKey := types.NamespacedName{Namespace: pns, Name: profilePoolName("auditor", "read")}
+	if err := c.Get(ctx, poolKey, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("setup: no pool: %v", err)
+	}
+
+	t.Setenv(a2aDispatcherImageEnvVar, "")
+	if _, err := r.reconcileA2ADispatcher(ctx, agent, []agentv1alpha1.AgentProfile{p}, true); err == nil {
+		t.Error("the refused dispatcher delete wasn't reported")
+	}
+	if err := c.Get(ctx, poolKey, &appsv1.Deployment{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the pool survived the dispatcher being turned off: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aNATSCABundleName(agent)}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the bundle copy survived the dispatcher being turned off: %v", err)
 	}
 }

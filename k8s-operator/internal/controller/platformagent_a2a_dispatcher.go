@@ -609,18 +609,23 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 // owned objects only if this agent controls them, and the profile namespace's
 // Role and binding only if they carry this agent's labels.
 func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (profileErr error, err error) {
+	// The pools and their bundle go first, whatever the deletes after them
+	// do: their pods hold bus and broker tokens, and nothing dispatches to
+	// them once the dispatcher is off.
+	profileErr = r.deleteDispatcherPodsRBAC(ctx, agent)
 	name := a2aDispatcherName(agent)
+	var errs []error
 	for _, obj := range []client.Object{
 		&appsv1.Deployment{}, &rbacv1.RoleBinding{}, &rbacv1.Role{}, &corev1.ServiceAccount{},
 	} {
 		if err := r.deleteIfControlled(ctx, agent, obj, types.NamespacedName{Namespace: agent.Namespace, Name: name}); err != nil {
-			return nil, err
+			errs = append(errs, err)
 		}
 	}
 	if err := r.deleteIfControlled(ctx, agent, &corev1.ConfigMap{}, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}); err != nil {
-		return nil, err
+		errs = append(errs, err)
 	}
-	return r.deleteDispatcherPodsRBAC(ctx, agent), nil
+	return profileErr, goerrors.Join(errs...)
 }
 
 // deleteDispatcherPodsRBAC removes what the dispatcher left in the profile
