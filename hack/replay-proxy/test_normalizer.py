@@ -149,6 +149,52 @@ class AgeTest(unittest.TestCase):
         self.assertNotEqual(fp(request("cpu: 120m")), fp(request("cpu: 250m")))
 
 
+class LongDateTest(unittest.TestCase):
+    """The date Hermes writes into every system prompt, with no time of day."""
+
+    PROMPT = "Conversation started: {} (UTC, UTC+00:00)\nModel: model-default"
+
+    @staticmethod
+    def at(year, month, day, hour=12):
+        return calendar.timegm(datetime(year, month, day, hour, 0, 0).timetuple())
+
+    def norm_at(self, text, now):
+        return normalizer.Normalizer(now, keep_ips=False).text(text)
+
+    def test_a_run_on_the_next_day_gets_the_same_key(self):
+        # The nightly recorded on Wednesday; the presubmit replays on Thursday.
+        recorded = self.norm_at(self.PROMPT.format("Wednesday, November 04, 2026"), self.at(2026, 11, 4, 23))
+        replayed = self.norm_at(self.PROMPT.format("Thursday, November 05, 2026"), self.at(2026, 11, 5, 0))
+        self.assertEqual(recorded, replayed)
+        self.assertEqual(recorded, "Conversation started: ⟦TIME_today⟧ (UTC, UTC+00:00)\nModel: model-default")
+
+    def test_how_many_days_and_which_way(self):
+        now = self.at(2026, 11, 5)
+        cases = {
+            "November 04, 2026": "⟦TIME_past_day⟧",
+            "October 20, 2026": "⟦TIME_past_days⟧",
+            "March 01, 2026": "⟦TIME_past_months⟧",
+            "January 05, 2020": "⟦TIME_past_years⟧",
+            "November 06, 2026": "⟦TIME_future_day⟧",
+            "December 25, 2026": "⟦TIME_future_months⟧",
+        }
+        for date, token in cases.items():
+            self.assertEqual(self.norm_at("renew by " + date, now), "renew by " + token, date)
+
+    def test_the_offset_after_it_picks_the_day(self):
+        # 00:20 UTC on the 5th is still the 4th in New York.
+        now = calendar.timegm(datetime(2026, 11, 5, 0, 20).timetuple())
+        text = "Thursday, November 05, 2026 (America/New_York, UTC-05:00)"
+        self.assertEqual(self.norm_at(text, now), "⟦TIME_future_day⟧ (America/New_York, UTC-05:00)")
+        self.assertEqual(self.norm_at("Thursday, November 05, 2026 (UTC, UTC+00:00)", now),
+                         "⟦TIME_today⟧ (UTC, UTC+00:00)")
+
+    def test_what_is_not_a_date_stays(self):
+        now = self.at(2026, 11, 5)
+        for text in ("February 30, 2026", "May 2026", "November 5th", "Mayday, November 05, 2026x"):
+            self.assertNotIn("⟦TIME", self.norm_at(text, now), text)
+
+
 class TimeTest(unittest.TestCase):
     def test_iso_buckets(self):
         self.assertEqual(norm("2026-11-03T11:58:00Z"), "⟦TIME_past_within_hour⟧")

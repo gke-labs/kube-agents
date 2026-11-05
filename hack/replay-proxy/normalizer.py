@@ -142,6 +142,27 @@ RFC1123_RE = re.compile(
 OPENSSL_TS_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})(?: GMT)?\b")
 # `Nov  2 04:13` and `Nov  2  2025` (ls -l).
 LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):(\d{2})|(\d{4}))\b")
+# `Thursday, November 05, 2026 (UTC, UTC+00:00)`: the date Hermes writes into
+# every system prompt as "Conversation started". It has no time of day, so it
+# becomes how many calendar days it is from the request's own day (in the
+# offset after it, when one is given): a nightly recorded on Wednesday and a
+# presubmit on Thursday both read `today`. The weekday name is dropped with
+# it; the parenthesised zone stays as written.
+LONG_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+               "October", "November", "December")
+LONG_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+LONG_DATE_RE = re.compile(
+    r"\b(?:(?:" + "|".join(LONG_DAYS) + r"),\s+)?(" + "|".join(LONG_MONTHS) + r")\s+(\d{1,2}),\s+(\d{4})\b"
+    r"(?=\s*\([^()]*?UTC([+-])(\d{2}):?(\d{2})\))?"
+)
+DATE_TODAY = "today"
+DAYS_PER_DAY_BUCKET = 1
+# Whole days from the request's day -> bucket, the same spans as TIME_BUCKETS.
+DAY_BUCKETS = (
+    (DAYS_PER_DAY_BUCKET, "day"),
+    (DAYS_PER_MONTH_BUCKET, "days"),
+    (DAYS_PER_YEAR_BUCKET, "months"),
+)
 # Epoch seconds 2020-2033, and the same in milliseconds, bucketed only under a
 # key that names a time: a free-text 10-digit number (`memory: 1717986918
 # bytes`) stays literal.
@@ -234,6 +255,16 @@ def time_bucket(when: float, now: float) -> str:
     else:
         span = next((label for limit, label in TIME_BUCKETS if distance < limit), TIME_BUCKET_BEYOND)
     name = (TIME_PAST_PREFIX if delta >= 0 else TIME_FUTURE_PREFIX) + span
+    return f"{OPEN}{TIME_CLASS}_{name}{CLOSE}"
+
+
+def day_bucket(days: int) -> str:
+    """The placeholder for a date with no time of day: how many calendar days from the request's, and which way."""
+    if days == 0:
+        name = DATE_TODAY
+    else:
+        span = next((label for limit, label in DAY_BUCKETS if abs(days) <= limit), TIME_BUCKET_BEYOND)
+        name = (TIME_FUTURE_PREFIX if days > 0 else TIME_PAST_PREFIX) + span
     return f"{OPEN}{TIME_CLASS}_{name}{CLOSE}"
 
 
@@ -426,7 +457,19 @@ class Normalizer:
         text = ISO_TS_RE.sub(self.iso, text)
         text = RFC1123_RE.sub(self.rfc1123, text)
         text = OPENSSL_TS_RE.sub(self.openssl, text)
-        return LS_DATE_RE.sub(self.ls_date, text)
+        text = LS_DATE_RE.sub(self.ls_date, text)
+        return LONG_DATE_RE.sub(self.long_date, text)
+
+    def long_date(self, m: "re.Match[str]") -> str:
+        month, day, year, sign, hours, minutes = m.groups()
+        try:
+            when = datetime(int(year), LONG_MONTHS.index(month) + 1, int(day)).date()
+        except ValueError:
+            return m.group(0)
+        offset = 0
+        if sign:
+            offset = (-1 if sign == ZONE_NEGATIVE else 1) * (int(hours) * SECONDS_PER_HOUR + int(minutes) * SECONDS_PER_MINUTE)
+        return day_bucket((when - datetime.fromtimestamp(self.now + offset, timezone.utc).date()).days)
 
     def iso(self, m: "re.Match[str]") -> str:
         year, month, day, hour, minute, second, zone = m.groups()

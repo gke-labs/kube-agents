@@ -128,7 +128,10 @@ The rules that keep this safe:
   they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
   matches a valid one. Anything in the last hour is one token and anything in the next hour
   another, so run-to-run timing jitter (a card read 50 or 70 seconds after it was claimed) doesn't change the
-  key. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
+  key. A date with no time of day, like the "Conversation started: Thursday, November 05, 2026"
+  line in every system prompt, becomes how many calendar days it is from the request's own day
+  instead ("today", "yesterday", "days ago", ...), so a nightly recorded on Wednesday still
+  matches a presubmit on Thursday. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
   `timestamp`); any other 10-digit number, like `memory: 1717986918`, isn't read as a time. IP
   addresses stay as they are whenever the request mentions a network range (like `10.0.0.0/16`),
   because then which range an IP falls in can matter.
