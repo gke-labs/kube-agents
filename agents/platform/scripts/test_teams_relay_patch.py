@@ -534,6 +534,11 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             await adapter.send_typing(
                 "conv-123", metadata={"serviceUrl": "https://smba.trafficmanager.net/teams/"}
             )
+            # Fire-and-forget: its worker must not block for the relay timeout.
+            self.assertEqual(
+                mock_urlopen.call_args.kwargs["timeout"],
+                teams_relay_patch.TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS,
+            )
             self.assertEqual(
                 await adapter.get_chat_info("19:abc@thread.tacv2"),
                 {
@@ -835,6 +840,26 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             await adapter.disconnect()
             self.assertFalse(adapter._running)
 
+        # The broker answers the empty-receipt probe 404 once its relay is up:
+        # that is the ready signal, read off the converted error's status.
+        import io
+
+        ready = urllib.error.HTTPError(
+            "http://127.0.0.1:8642/v1/chat/teams/events/ack",
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(b'{"settled": false}'),
+        )
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=ready) as probe,
+            mock.patch("asyncio.sleep", new=mock.AsyncMock()) as slept,
+        ):
+            self.assertTrue(await adapter.connect())
+            self.assertEqual(probe.call_count, 1)
+            slept.assert_not_awaited()
+            await adapter.disconnect()
+
     async def test_standalone_send_returns_the_cause_and_never_raises(self):
         """The registry's cron path expects ``success`` or ``error`` back; the
         broker's ``teams`` object is what names the cause."""
@@ -861,7 +886,7 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
         teams_relay_patch.install()
         adapter = PlatformRegistry().create_adapter("teams")
-        self.assertEqual(adapter.MAX_MESSAGE_LENGTH, 16000)
+        self.assertEqual(adapter.MAX_MESSAGE_LENGTH, teams_relay_patch.TEAMS_MAX_MESSAGE_LENGTH)
         sent = []
 
         def fake_urlopen(req, timeout=None):
@@ -874,7 +899,6 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
         # 16000 characters as 20-character lines: a card several times the text.
         long_text = "\n".join(["- item %05d x" % i for i in range(1000)])
-        self.assertLessEqual(len(long_text), 16000)
         with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
             await adapter.send("conv-1", long_text)
             await adapter.send("conv-1", "# short\n- one line")
@@ -915,6 +939,38 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             len(json.dumps(payload, ensure_ascii=False).encode("utf-8")), 28 * 1024
         )
         self.assertGreater(len(payload["text"]), 9000)  # cut to fit, not emptied
+
+    async def test_a_full_chunk_of_four_byte_characters_is_posted_whole(self):
+        """The chunkers count characters and the cap counts bytes: a chunk of
+        ``MAX_MESSAGE_LENGTH`` four-byte characters, with a reply id, must fit
+        as plain text, or a multi-chunk non-Latin reply loses the tail of
+        every chunk."""
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        sent = []
+
+        def fake_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data))
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        chunk = "\U0001F600" * adapter.MAX_MESSAGE_LENGTH
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter.send("conv-1", chunk, reply_to="1697000000000")
+        payload = sent[0]["payload"]
+        wire = json.dumps(payload, ensure_ascii=False)
+        self.assertIn(chunk, wire)  # whole, as a card or as text
+        self.assertNotIn(teams_relay_patch.TEAMS_TRUNCATION_MARKER, wire)
+        self.assertEqual(payload["replyToId"], "1697000000000")
+        self.assertLessEqual(
+            teams_relay_patch.activity_size_bytes(payload),
+            teams_relay_patch.TEAMS_MAX_ACTIVITY_BYTES,
+        )
 
 
 if __name__ == "__main__":
