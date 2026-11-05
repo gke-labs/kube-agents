@@ -53,6 +53,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -4608,6 +4609,18 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 			},
 		},
 	}
+	// The election's Lease, one named object, with the election on: the
+	// gateway reads and renews it (a2a/gateway/election.go). No create,
+	// which RBAC can't scope to a name, so the operator creates it
+	// (ensureA2AGatewayLease); no delete and no list.
+	if a2aGatewayElectionEnabled() {
+		role.Rules = append(role.Rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"coordination.k8s.io"},
+			Resources:     []string{"leases"},
+			ResourceNames: []string{a2aGatewayLeaseName(agent)},
+			Verbs:         []string{"get", "update"},
+		})
+	}
 	// The resolved scope under mode next, one named ConfigMap, read only:
 	// the scope publisher writes it, for the gateway's admission check to
 	// read under the name in A2A_RESOLVED_SCOPE_CONFIGMAP. Rendered with the
@@ -5031,6 +5044,7 @@ func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *cor
 // on the console door alone: every next install renders it at one replica.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
+	leaseEnv := a2aGatewayLeaseEnv(agent)
 	labels := a2aLabels(agent, "gateway")
 	selector := map[string]string{"app": name}
 	podLabels := map[string]string{"app": name}
@@ -5357,6 +5371,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	if scopePublisherRendered(agent) {
 		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
 	}
+	// The election (a2a/gateway/election.go): the Lease the gateway
+	// campaigns for and its identity there, with the election on.
+	env = append(env, leaseEnv...)
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -5490,6 +5507,9 @@ type a2aProvisionState struct {
 	// the document goes stale, whichever is first; zero for no deadline.
 	scopeCondition *metav1.Condition
 	scopeRequeue   time.Duration
+	// leaseRequeue is how long until a held-back recreate of the gateway's
+	// Lease is due (ensureA2AGatewayLease); zero when none is held.
+	leaseRequeue time.Duration
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -6056,6 +6076,17 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
 			return state, fmt.Errorf("failed to apply A2A gateway %T: %w", obj, err)
 		}
+	}
+	// The election's Lease, before the Deployment whose pods campaign for
+	// it, beside the Role that grants them it. Only with the election on;
+	// off, a Lease left from when it was on is the teardown's, and the
+	// gateway ignores it.
+	if a2aGatewayElectionEnabled() {
+		leaseWait, err := r.ensureA2AGatewayLease(ctx, agent)
+		if err != nil {
+			return state, err
+		}
+		state.leaseRequeue = leaseWait
 	}
 
 	// The inject backend's principal map, BEFORE the Deployment that mounts
@@ -6807,6 +6838,8 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The election's Lease, after the gateway that held it.
+		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
@@ -7046,6 +7079,9 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 // operator exception to the ownership rule below: the walk deletes only
 // what this CR controls and leaves the rest alone.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	// The Lease goes below with the stack; a flip back to next is a first
+	// install for it, not a deletion to hold back.
+	r.forgetA2AGatewayLease(agent)
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing

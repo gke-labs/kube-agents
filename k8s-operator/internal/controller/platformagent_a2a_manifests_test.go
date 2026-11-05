@@ -2269,9 +2269,10 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 // clean pass run, and require the tree to be empty at the end rather than
 // merely error-free.
 func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
-	// With the dispatcher on, so its objects are rendered and the cleanup
-	// is held to deleting them too.
+	// With the dispatcher and the gateway's election on, so their objects
+	// are rendered and the cleanup is held to deleting them too.
 	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	t.Setenv(a2aGatewayElectionEnvVar, "true")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
