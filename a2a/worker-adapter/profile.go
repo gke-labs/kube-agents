@@ -75,6 +75,9 @@ type ProfileWorkerConfig struct {
 	ResetPaths []string
 	// resetTimeout replaces resetTimeout in tests.
 	resetTimeout time.Duration
+	// resetHook, when set, runs at the start of each reset, inside its
+	// bound. Tests use it to hold a reset open.
+	resetHook func(phase string)
 	// readyListener, when set, is a listener already bound to ReadyAddr,
 	// which serveReadiness uses instead of binding one. Tests set it, so no
 	// other process can take the port between choosing it and listening.
@@ -302,6 +305,10 @@ func (w *profileWorker) loop(ctx context.Context) error {
 		cur         *held
 		acceptTimer <-chan time.Time
 		taskDone    <-chan turnOutcome
+		// resetDone carries the after-task reset's result. While it runs
+		// the task is still held, so an offer is declined as busy.
+		resetDone <-chan error
+		finished  turnOutcome
 	)
 	// release ends the held task's renewals and forgets it. It reports
 	// whether the worker is done (OneShot).
@@ -310,13 +317,17 @@ func (w *profileWorker) loop(ctx context.Context) error {
 			cur.stopRenew()
 			<-cur.renewDone
 		}
-		cur, acceptTimer, taskDone = nil, nil, nil
+		cur, acceptTimer, taskDone, resetDone = nil, nil, nil, nil
 		return w.pw.OneShot
 	}
 	for {
 		select {
 		case <-ctx.Done():
-			if cur != nil && cur.running {
+			if resetDone != nil {
+				// The task is finished; its reset is bounded by
+				// resetTimeout, and a restart would rerun it anyway.
+				<-resetDone
+			} else if cur != nil && cur.running {
 				// An abandon for this task that's already here goes to it
 				// first: the dispatcher writes that terminal, and the
 				// eviction mustn't write another.
@@ -343,8 +354,15 @@ func (w *profileWorker) loop(ctx context.Context) error {
 			// The workspace is emptied after the terminal and the final
 			// renewal are out, so the reset never eats into the deadline
 			// margin, and before the task is released, so no offer is
-			// taken until it's done.
-			resetErr := w.resetWorkspace("after-task", cur.offer.TaskID)
+			// taken until it's done. It runs beside the loop, which keeps
+			// answering offers (busy) meanwhile.
+			taskDone, finished = nil, out
+			rd := make(chan error, 1)
+			go func(task string) { rd <- w.resetWorkspace("after-task", task) }(cur.offer.TaskID)
+			resetDone = rd
+
+		case resetErr := <-resetDone:
+			out := finished
 			oneShot := release()
 			// A pod that can't run a harness, or whose workspace couldn't be
 			// emptied, ends rather than taking another task: the kubelet
@@ -545,22 +563,23 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		bus, closeTaskBus = tb, closeTB
 	}
 	removeConfig := func() {}
+	var plan turnPlan
 	if w.persona != nil {
 		dir, remove, err := w.taskConfigDir(cfg.TaskID)
 		if err != nil {
-			closeTaskBus()
-			w.cfg.Logger.Error("could not write the task's persona config; not running the task", "task", cfg.TaskID, "err", err)
 			// The config root is the pod's: every task would fail the same
-			// way, so the pod ends rather than taking the next.
-			h.done <- turnOutcome{err: err, podBroken: true}
-			return h.done
+			// way. The run publishes this task's failed terminal and runs
+			// nothing, and the pod then ends rather than taking the next.
+			w.cfg.Logger.Error("could not write the task's persona config; not running the task", "task", cfg.TaskID, "err", err)
+			plan.setupErr = err
+		} else {
+			removeConfig = remove
+			// The persona's flags (its tool allowlist and denylist, MCP and
+			// setting sources) after the base argv, which carries none.
+			cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
+			cfg.HarnessCommandNoDelegate = nil
+			cfg.HarnessEnv = append(cfg.HarnessEnv, "CLAUDE_CONFIG_DIR="+dir)
 		}
-		removeConfig = remove
-		// The persona's flags (its tool allowlist and denylist, MCP and
-		// setting sources) after the base argv, which carries none.
-		cfg.HarnessCommand = append(append([]string(nil), cfg.HarnessCommand...), w.persona.Args...)
-		cfg.HarnessCommandNoDelegate = nil
-		cfg.HarnessEnv = append(cfg.HarnessEnv, "CLAUDE_CONFIG_DIR="+dir)
 	}
 	removeToken := w.writeTaskToken(h.creds.ProxyToken)
 	// The worker stops short of the dispatcher's deadline, so its own
@@ -574,7 +593,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		// Follow-ups and cancels arrive on the task's own .in; the
 		// submission isn't there (it's on PROFILE_SUBMITS), so the reader
 		// opens at the subject's start.
-		out := a.execute(ctx, h.origin, 0, turnPlan{})
+		out := a.execute(ctx, h.origin, 0, plan)
 		// Cleaned up before the outcome is reported, so the final renewal,
 		// and with it the next task, never overlaps this task's token or
 		// config.
@@ -599,6 +618,9 @@ func (w *profileWorker) resetWorkspace(phase, task string) error {
 	}
 	done := make(chan error, 1)
 	go func() {
+		if w.pw.resetHook != nil {
+			w.pw.resetHook(phase)
+		}
 		var errs []error
 		for _, dir := range w.pw.ResetPaths {
 			entries, err := os.ReadDir(dir)
