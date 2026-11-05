@@ -377,7 +377,9 @@ func slackActionRows(t *testing.T, layout slackChatLayout) []int {
 
 // The chat UX rule of at most five buttons a row (.agents/rules/chat_ux.md)
 // is the renderer's to keep: the most choices and links the validator
-// admits wrap into rows of slackChatButtonsPerRow, every button drawn.
+// admits wrap into four rows of five, every button drawn. The five is a
+// literal, so a change to slackChatButtonsPerRow fails here, as a change
+// to the presenter's BUTTONS_PER_ROW fails test_buttons_wrap_at_five.
 func TestSlackChatButtonsWrapFiveToARow(t *testing.T) {
 	m := chatmsg.Message{Schema: chatmsg.Schema, Headline: "h", Tone: chatmsg.ToneAttention}
 	for i := range 10 {
@@ -391,15 +393,7 @@ func TestSlackChatButtonsWrapFiveToARow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows := slackActionRows(t, layout)
-	total := 0
-	for _, n := range rows {
-		if n > slackChatButtonsPerRow {
-			t.Fatalf("a row of %d buttons, want at most %d: %v", n, slackChatButtonsPerRow, rows)
-		}
-		total += n
-	}
-	if total != 20 {
-		t.Fatalf("%d buttons drawn in rows %v, want all 20", total, rows)
+	if rows := slackActionRows(t, layout); !reflect.DeepEqual(rows, []int{5, 5, 5, 5}) {
+		t.Fatalf("button rows = %v, want [5 5 5 5]", rows)
 	}
 }
