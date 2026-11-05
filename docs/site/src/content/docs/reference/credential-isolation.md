@@ -39,7 +39,7 @@ Under `spec.mode: next` the operator also renders the A2A stack ([Architecture �
 - **`<name>-a2a-console`**: the console server, which hands the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page the shared `console` bus password and proxies its websocket. Reachable only through `kubectl port-forward`.
 - **`<name>-a2a-provision-<hash>`**: the Job that provisions the streams, once per change.
 - **Session pods** (`<profile>-<animal>-<hex>`): one per `/session` conversation, all on one session ServiceAccount distinct from the gateway's, fenced by an egress NetworkPolicy and a ResourceQuota. They read a cluster only under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, through the broker, as the next paragraph says. [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) covers their bus identity.
-- **`<name>-a2a-mcp`**, opt-in: the [MCP server](/kube-agents/reference/a2a-mcp/), holding the `console` password and its own bearer token.
+- **`<name>-a2a-mcp`**, opt-in: the [MCP server](/kube-agents/reference/a2a-mcp/), holding its own `console-mcp` bus password and its own bearer token.
 
 Under `today` none of them is rendered, and the gateway Pod has no `hermes-bridge` container. Switching back removes them and keeps the bus volume and its credentials Secret ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
 
@@ -274,6 +274,8 @@ If the endpoint is there and the broker is healthy, the sandbox Pod is the next 
 kubectl get pods -n kubeagents-system -l app=platform-agent-shell
 kubectl logs -n kubeagents-system platform-agent-shell-0
 ```
+
+**A proxied command prints `CREDENTIAL_PROXY_EXEC_URL ignored (…); commands go to the stateful broker`.** The sandbox has an exec-tier URL that the shim cannot use: it is not a valid `http://` URL, it has no host, its port is not a number from 0 to 65535, or it has a query or a fragment. The shim ignores it, and the command runs on the stateful broker as on an install without the exec tier. The operator sets this variable, so check the operator version and the sandbox's environment.
 
 **A proxied command fails with `credential proxy error: the connection dropped after the request was sent …; the command may have run`.** The connection to the broker closed after the command was sent and before its answer came back, for example because the broker Pod restarted. The shim does not send the command again, because the broker may have run it. Check what the command changed before you run it again: a `kubectl get` is safe to repeat, but an `apply` or a `delete` may already have taken effect.
 

@@ -27,7 +27,10 @@ them over once.
 profile delete_profile has just removed from the agent pod (#4389): its home
 in the sandbox goes too, and the name is refused while anything of it is left
 on the agent side. Unlike the two steps below, no later start redoes a
-removal that missed the sandbox, so it exits non-zero instead.
+removal that missed the sandbox, so it exits non-zero instead. Several names
+in one call are removed with one ``rm``, and a ``remove-result:`` line says
+which went, which were left and which were refused, for a prune's batch
+(#4574).
 
 Neither step is fatal on its own. The sandbox is a separate pod with no ordering
 against this one, so "not up yet" is an ordinary outcome; both steps are
@@ -661,17 +664,49 @@ def removable_profile_homes(agent_home: Path, names: list[str]) -> tuple[list[st
     return homes, rejected
 
 
-def remove_profile_homes(ssh: list[str], remote_root: str, homes: list[str]) -> None:
-    """Remove each deleted profile's home from the sandbox, in one remote call.
+# The line --remove-profile prints for a caller that removes several names at once
+# and needs each one's outcome (#4574). A prefix rather than all of stdout, because
+# log() writes there too.
+REMOVE_RESULT_PREFIX = "remove-result: "
+
+
+def remove_profile_homes(ssh: list[str], remote_root: str, homes: list[str]) -> list[str]:
+    """Remove each deleted profile's home from the sandbox, in one remote call;
+    return the homes still there afterwards.
 
     Over the same SSH hop and account the skeleton push uses, so the sandbox
     side gains no new route and this can remove nothing the model in the
     sandbox could not remove itself. No trailing slash on any path: a home the
     model replaced with a symlink is unlinked, and what it points at is left.
+    One rm for every home, then each path checked: a home the rm could not
+    take is reported by name rather than failing the rest (#4574). The remote
+    script ends 0 itself, so only the hop failing raises.
     """
-    targets = " ".join(shlex.quote(f"{remote_root}/{home}") for home in homes)
-    remote(ssh, f"rm -rf -- {targets}")
-    log(f"removed {len(homes)} deleted profile home(s) from the sandbox: {', '.join(homes)}")
+    paths = [f"{remote_root}/{home}" for home in homes]
+    targets = " ".join(shlex.quote(p) for p in paths)
+    # Survivors come back as their 1-based position in the argument list, never
+    # as their path: a name holding a line break would otherwise split into rows
+    # that match nothing and read as removed.
+    result = remote(
+        ssh,
+        f"rm -rf -- {targets}; i=0; for t in {targets}; do i=$((i+1)); "
+        "if [ -e \"$t\" ] || [ -L \"$t\" ]; then printf 'left %d\\n' \"$i\"; fi; done; exit 0",
+    )
+    left_at = {int(line[len("left "):]) for line in result.stdout.split("\n")
+               if line.startswith("left ") and line[len("left "):].isdigit()}
+    left = [home for n, home in enumerate(homes, start=1) if n in left_at]
+    removed = [home for home in homes if home not in left]
+    if removed:
+        log(f"removed {len(removed)} deleted profile home(s) from the sandbox: {', '.join(removed)}")
+    if left:
+        log(f"could not remove {len(left)} deleted profile home(s) from the sandbox: {', '.join(left)}")
+    return left
+
+
+def _print_remove_result(removed: list[str], left: list[str], refused: list[str]) -> None:
+    names = lambda homes: [home.split("/", 1)[-1] for home in homes]  # noqa: E731
+    print(REMOVE_RESULT_PREFIX + json.dumps(
+        {"removed": names(removed), "left": names(left), "refused": list(refused)}), flush=True)
 
 
 def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
@@ -1091,21 +1126,24 @@ def main(argv: list[str] | None = None) -> int:
 
     ssh = ssh_base_command(terminal)
     removing: list[str] = []
+    refused: list[str] = []
     if args.remove_profile:
         # Its own mode: a removal that also pushed or migrated would be two
         # decisions in one call. EXIT_RETRY on every refusal, as for --profile:
-        # only delete_profile passes this, and it reads non-zero as "not removed".
+        # delete_profile passes one name and reads non-zero as "not removed";
+        # delete_profiles passes a prune's batch and reads the remove-result line.
         if args.profile or not args.skeleton_only:
             log("--remove-profile needs --skeleton-only and no --profile; refusing")
             return EXIT_RETRY
-        removing, rejected = removable_profile_homes(agent_home, args.remove_profile)
-        if rejected:
+        removing, refused = removable_profile_homes(agent_home, args.remove_profile)
+        if refused:
             log(
                 f"not a deleted profile (one path component, no leading dot, not a fixed "
                 f"home, and nothing left under {agent_home / PROFILES_DIR}): "
-                f"{', '.join(rejected)}; left in place"
+                f"{', '.join(refused)}; left in place"
             )
         if not removing:
+            _print_remove_result([], [], refused)
             return EXIT_RETRY
         homes = []
     elif args.profile:
@@ -1180,11 +1218,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if removing:
         try:
-            remove_profile_homes(ssh, args.remote_root, removing)
+            left = remove_profile_homes(ssh, args.remote_root, removing)
         except RuntimeError as exc:
             log(f"could not remove {', '.join(removing)} from the sandbox: {exc}; left in place")
             return EXIT_RETRY
-        return EXIT_OK
+        _print_remove_result([h for h in removing if h not in left], left, refused)
+        # Zero only when every name asked for went: a caller of one name reads
+        # non-zero as "not removed", the way it always has.
+        return EXIT_OK if not left and not refused else EXIT_RETRY
 
     # Not fatal, and this is the one call where that distinction earns its keep.
     # The sandbox has no start ordering against this pod, so it can be

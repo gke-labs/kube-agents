@@ -1051,7 +1051,7 @@ if grader_pin_applies; then
   fi
   GRADER_BENCH_DIR="${GRADER_ROOT}/${EVAL_GRADER_TREE}"
   # Set, not defaulted: a catalog from the job's environment would be one the
-  # change did not have to get past eval-crew.
+  # change did not have to get past review.
   export FLEET_CATALOG="${GRADER_BENCH_DIR}/${EVAL_FLEET_CATALOG}"
 fi
 # shellcheck source=hack/fleet-kubeconfigs.sh
@@ -2607,7 +2607,7 @@ fi
 # checks (#2079). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
 # under the eval-crew alias and lets the nightly file fall through to the
-# root approvers (this script is under eval-crew too, for the grader pin). Each file's header says what belongs in it;
+# root approvers, as this script does. Each file's header says what belongs in it;
 # docs/designs/bench-case-format.md "Registration" is the rule.
 #
 # Paths in the files are relative to BENCH_DIR, which is where devops-bench
@@ -2944,9 +2944,11 @@ fi
 # which may name a nightly case. A case only the nightly runs is graded from
 # HEAD and is not held to that order.
 #
-# hack/OWNERS puts this script, and the hack/ files it sources, evals or runs
-# before the verdict, under the eval-crew alias, so an edit that would take
-# the pin out needs an eval-crew approval. EVAL_GRADER_SHA names the commit
+# An edit that would take the pin out is caught by review: this script takes
+# the root approvers like any file, so a root approver's own edit waits on one
+# lgtm from anyone OWNERS lists. bench/tests/test_grader_pin.py catches an
+# accidental removal, not a deliberate one, since the same change can edit it.
+# EVAL_GRADER_SHA names the commit
 # that graded the run; `bench-gate suite` writes it into eval-verdict.json
 # and the verdict markdown, and a grader that predates it ignores the
 # variable. The extraction itself (grader_pin_applies,

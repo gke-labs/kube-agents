@@ -5,6 +5,7 @@
     python -m kube_agents_bench.scale.runner apply <plan.yaml> --factor F --level L
     python -m kube_agents_bench.scale.runner teardown <plan.yaml> [--delete-fleet]
     python -m kube_agents_bench.scale.runner reclassify <plan.yaml>
+    python -m kube_agents_bench.scale.runner remonitor <plan.yaml>
 
 ``run`` skips every run whose key is already in the data file, so an
 interrupted run resumes where it stopped; ``--force`` re-runs and replaces.
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import itertools
 import json
 import logging
@@ -23,15 +25,20 @@ import math
 import os
 import re
 import signal
+import subprocess
 import sys
+import _thread
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
 from kube_agents_bench.scale import collect, fixtures, kube, operations, records
-from kube_agents_bench.scale.config import BASE_FACTOR, Plan, RunSpec, load_plan
+from kube_agents_bench.scale.config import (
+    BASE_FACTOR, COMBINED_FACTOR, PROXY_LOAD_KIND, TRIGGER_SOAK_KIND, Operation, Plan, RunSpec, load_plan,
+)
 
 LOG = logging.getLogger("harness-scale")
 
@@ -44,19 +51,74 @@ MONITORING_DELAY_SECONDS = 240
 REGISTRATION_POLL_SECONDS = 60
 # Time for a restarted watcher to list and sync every cluster before it is asked what it watches.
 WATCHER_START_SECONDS = 180
+WATCHER_POLL_SECONDS = 30
+# How long the runner waits after a trigger_soak for the jobs it started, and how often it looks.
+TRIGGER_DRAIN_SECONDS = 1800
+# The commands that change the test clusters or the install, and so hold the live-test lease.
+MUTATING_COMMANDS = ("run", "apply", "teardown")
+LEASE_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "live_test_lease.py"
+LEASE_ENVS_VAR = "KUBE_AGENTS_LIVE_TEST_ENVS"
+LEASE_SESSION_VAR = "KUBE_AGENTS_LEASE_SESSION"
+LEASE_SESSION_PREFIX = "harness-scale-"
+LEASE_ENV_NAME = "harness-scale-host"
+LEASE_ENVS_NAME = "live-test-envs.json"
+LEASE_DIRECTORY_PREFIX = "harness-scale-lease-"
+# Short, and renewed while the runner works: a runner that dies without releasing holds the lease
+# this long at most, and a run of any length stays leased.
+LEASE_TTL_MINUTES = 60
+# Renewals per TTL, so one failed renewal still leaves time for the next.
+LEASE_RENEWALS_PER_TTL = 3
+# Consecutive failed renewals after which the run stops: the lease then has a third of its TTL left.
+LEASE_RENEWAL_FAILURES_TO_STOP = 2
+# The lease script discovers a checkout's install.env from this variable or its working directory.
+LEASE_CWD_VAR = "CLAUDE_CWD"
+# Operation kinds whose runs make model calls of their own: prompts, triggered jobs, an onboarding.
+MODEL_CALL_KINDS = ("prompt", "trigger_soak", "reset_soak")
+DRAIN_POLL_SECONDS = 60
+# The fits a run leaves out when work other than its own loaded the harness during it.
+RESOURCE_FITS = ("cpu_peak_cores", "cpu_seconds", "memory_peak_bytes", "proxy_command_seconds", "proxy_commands",
+                 "proxy_wait_max_seconds", "proxy_wait_p50_seconds")
+# A proxy load run that shared the broker also leaves out its throughput and command times.
+PROXY_LOAD_FITS = ("proxy_load_per_second", "proxy_load_p50_seconds", "proxy_load_p95_seconds", "proxy_load_max_seconds")
+# A prompt answered without its operation measures none of the operation's cost.
+TOKEN_FITS = ("tokens_input", "tokens_output", "tokens_cached", "run_tokens_input", "run_tokens_output",
+              "run_tokens_cached")
+# The Platform Agent's Stall Watch reads every cluster through the broker, one at a time, at
+# :00 and :30 (agents/platform/cron/jobs.json), and stops at its budget (TICK_BUDGET_SECONDS in
+# agents/platform/scripts/stall_watch.py), which it checks only between reads, so a pass can run
+# past it: Phase 4's 32-cluster pass was still running 1,753 s after its tick. How long a tick keeps
+# the broker busy: Phase 4 measured passes of 120 s at 2 clusters and 418 s at 8 (job_seconds),
+# about 50 s per cluster, with no cap; the base is kept from the earlier rule, so the window is
+# never narrower than before.
+STALL_WATCH_PERIOD_SECONDS = 1800
+STALL_WATCH_BASE_SECONDS = 120
+STALL_WATCH_SECONDS_PER_CLUSTER = 50
+# A trigger_soak's jobs: the slowest one's run time and how many completed, both read after the drain.
+JOB_SECONDS_METRIC = "job_seconds"
+JOBS_COMPLETED_METRIC = "jobs_completed"
+STALL_WATCH_NOTE = "the Stall Watch's half-hourly read of every cluster overlapped the run"
+# The operation kinds whose windows are shorter than the period; an hour-long soak holds two ticks every time.
+STALL_WATCH_KINDS = ("prompt", "restart_soak")
+OUTSIDE_COMMANDS_NOTE = "brokered commands from outside the load ran during it"
 RESPONSE_FITS = ["response_seconds"]
 LEVEL_LABEL = "harness-scale/level"
 ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 DEFAULT_DATA_FILE = "harness-limits.json"
 SECONDS_PER_MINUTE = 60
 FIXTURES = ("objects", "listing", "warning", "churn")
+# The values that shape the fleet; a level that changes none of them needs no settle time.
+FLEET_VALUES = ("clusters", "nodes", "objects", "churn_per_minute", "failing_pods", "listing_pods")
+FIXTURE_PARALLELISM = 8
 # The tag of an image pinned by commit is the commit; anything else is recorded as the image only.
 COMMIT_LENGTH = 40
 HEX_DIGITS = set("0123456789abcdef")
 PREFLIGHT_SHELL = "/bin/sh"
 PREFLIGHT_TIMEOUT_SECONDS = 600
 TERMINATED_EXIT_CODE = 143
+STOPPED_EXIT_CODE = 2
 PEAK_METRIC = "memory_peak_bytes"
+# What add_peaks reads from Cloud Monitoring; remonitor replaces exactly these.
+MONITORING_METRICS = ("memory_peak_bytes", "cpu_peak_cores", "cpu_seconds")
 PROJECT_PLACEHOLDER = "<project>"
 MONITORING_ERROR = "monitoring:"
 REVISION_LENGTH = 12
@@ -67,6 +129,9 @@ KUBECONFIG_SUFFIX = ".kubeconfig"
 # cancelled (they need a GitOps repository; they honour the scope's exclusions).
 NEEDS_ANSWER_CHECK = ("fleet_audit", "upgrade_readiness")
 UNFINISHED_METRIC = "unfinished_prompts"
+PROXY_CONCURRENCY = "proxy_concurrency"
+# A Cluster Agent profile's kubeconfig in the sandbox shell, which proxy_load points its commands at.
+PROFILE_KUBECONFIG_GLOB = "/opt/data/profiles/cluster-{project}-{cluster}-*/kubeconfig.yaml"
 PROFILES_METRIC = "profiles"
 CLUSTERS_TOTAL = "clusters"
 STALE_PROFILES_NOTE = "profiles of deleted test clusters still present"
@@ -105,6 +170,14 @@ def commit_of(image: str) -> str:
     return tag if len(tag) == COMMIT_LENGTH and set(tag) <= HEX_DIGITS else ""
 
 
+
+def _overlaps_stall_watch(started: str, ended: str, clusters: float) -> bool:
+    """Whether the window shares the broker with a Stall Watch tick: starts inside one, or holds one."""
+    start, end = _epoch(started), _epoch(ended)
+    tick = start - start % STALL_WATCH_PERIOD_SECONDS
+    busy = STALL_WATCH_BASE_SECONDS + STALL_WATCH_SECONDS_PER_CLUSTER * clusters
+    return start < tick + busy or end > tick + STALL_WATCH_PERIOD_SECONDS
+
 class Runner:
     def __init__(self, plan: Plan, data_file: Path) -> None:
         self.plan = plan
@@ -122,8 +195,19 @@ class Runner:
         # What the latest watcher check found; replaced at each check, so a record carries only its own.
         self.watch_errors: list[str] = []
         self.relay_port = 0
+        # The fleet values of the level applied last, so a level that keeps them skips the settle.
+        self.applied_fleet: dict[str, float] | None = None
+        # The latest trigger_soak's operation and start, until every job it started has finished.
+        self.triggered: tuple[Operation, str] | None = None
 
     # --- the fleet ----------------------------------------------------------------------------
+
+    def parallelism(self, jobs: int) -> int:
+        """How many GKE operations to run at once: ``cluster_create_parallelism``, or all of them.
+
+        A bound keeps a large level from opening dozens of cluster or node-pool operations at once.
+        """
+        return int(self.settings.get("cluster_create_parallelism", 0)) or jobs
 
     def cluster_names(self, count: int) -> list[str]:
         return [TEST_CLUSTER_FORMAT.format(prefix=self.prefix, index=index) for index in range(1, count + 1)]
@@ -144,15 +228,17 @@ class Runner:
         missing = [name for name in wanted if name not in existing]
         extra = [name for name in existing if name not in wanted]
         if missing or extra:
-            with ThreadPoolExecutor(max_workers=len(missing) + len(extra)) as pool:
+            changes = len(missing) + len(extra)
+            with ThreadPoolExecutor(max_workers=min(self.parallelism(changes), changes)) as pool:
                 jobs = [pool.submit(self._create_cluster, name) for name in missing]
                 jobs += [pool.submit(kube.delete_cluster, self.project, self.zone, name) for name in extra]
                 for job in jobs:
                     job.result()
-        # One at a time: gcloud writes the kubeconfig without a lock.
+        # One at a time: gcloud writes the kubeconfig without a lock. Every cluster, not only one
+        # without a context: a cluster deleted and created again under its name has a new endpoint,
+        # and the old context would keep dialling the address the deleted cluster had.
         for name in wanted:
-            if not kube.has_context(kube.context_name(self.project, self.zone, name)):
-                kube.get_credentials(self.project, self.zone, name)
+            kube.get_credentials(self.project, self.zone, name)
         self.wait_registered(count)
 
     def _create_cluster(self, name: str) -> None:
@@ -160,8 +246,9 @@ class Runner:
         for attempt in range(1, CLUSTER_CREATE_ATTEMPTS + 1):
             LOG.info("creating test cluster %s (attempt %s)", name, attempt)
             try:
-                kube.create_cluster(self.project, self.zone, name, TEST_CLUSTER_MACHINE_TYPE,
-                                    DEFAULT_POOL_NODES, self.label)
+                # A plan can name another machine type, for a zone that runs out of the default one.
+                machine_type = self.settings.get("test_cluster_machine_type", TEST_CLUSTER_MACHINE_TYPE)
+                kube.create_cluster(self.project, self.zone, name, machine_type, DEFAULT_POOL_NODES, self.label)
                 return
             except kube.CommandError:
                 if attempt == CLUSTER_CREATE_ATTEMPTS:
@@ -179,12 +266,22 @@ class Runner:
         profiles match, a watch set that differs from the test fleet is fixed by
         restarting the gateway pod, which is what an operator would have to do.
         Whatever is still wrong after that is recorded on every run of the level.
+        With ``trigger_reconcile`` set, a profile set that differs from the fleet
+        runs the reconcile at once instead of waiting for its hourly tick.
         """
         names = set(self.cluster_names(count))
         self.watch_errors = []
         timeout = float(self.settings.get("cluster_registration_timeout_seconds", 0))
         deadline = time.monotonic() + timeout
         profiles = self.install.profile_clusters()
+        if self.settings.get("trigger_reconcile") and self.test_clusters(profiles) != names:
+            LOG.info("profiles for %s of %s test clusters; running the Cluster Agent reconcile",
+                     len(profiles & names), count)
+            try:
+                operations.reconcile_profiles(self.install.context, self.install.namespace)
+            except kube.CommandError as exc:
+                LOG.warning("the reconcile failed; waiting for its hourly run instead: %s", exc)
+            profiles = self.install.profile_clusters()
         stale = self.test_clusters(profiles) - names
         if stale:
             # A deleted test cluster's profile stays until the reconcile prunes it; the run says so.
@@ -202,47 +299,70 @@ class Runner:
                         sorted(test_watched), sorted(names))
             operations.restart(self.install.context, self.install.namespace)
             time.sleep(WATCHER_START_SECONDS)
-            test_watched = self.test_clusters(self.install.watched_clusters())
+            test_watched = self._wait_watched(names)
             if test_watched != names:
                 self.watch_errors.append(f"event watcher watches {sorted(test_watched)}, test fleet is {sorted(names)}")
+
+    def _wait_watched(self, names: set[str]) -> set[str]:
+        """The test clusters the watcher reports as up, polled until they are ``names`` or
+        ``watcher_wait_seconds`` (default 0: one look) runs out; a large fleet takes longer to sync."""
+        deadline = time.monotonic() + float(self.settings.get("watcher_wait_seconds", 0))
+        while True:
+            watched = self.test_clusters(self.install.watched_clusters())
+            if watched == names or time.monotonic() >= deadline:
+                return watched
+            time.sleep(WATCHER_POLL_SECONDS)
 
     def ensure_nodes(self, values: dict[str, float]) -> None:
         """Size each test cluster's fixture pool for the level's node count and the Pods it must hold."""
         names = self.cluster_names(int(values["clusters"]))
         lifetime = int(self.settings["churn_pod_lifetime_seconds"])
         per_node = int(self.settings["pods_per_node"])
+        # Fixture Pods the default pool holds before a fixture pool is needed; 0 puts every one there.
+        on_default = int(self.settings.get("default_pool_pods", 0))
         sizes = {}
         for index, name in enumerate(names):
-            pods = fixtures.fixture_pods(values, lifetime, first=index == 0)
-            sizes[name] = max(int(values["nodes"]), DEFAULT_POOL_NODES + math.ceil(pods / per_node)) - DEFAULT_POOL_NODES
+            spill = max(0, fixtures.fixture_pods(values, lifetime, first=index == 0) - on_default)
+            sizes[name] = max(int(values["nodes"]) - DEFAULT_POOL_NODES, math.ceil(spill / per_node))
         if not names:
             return
-        with ThreadPoolExecutor(max_workers=len(names)) as pool:
+        with ThreadPoolExecutor(max_workers=min(self.parallelism(len(names)), len(names))) as pool:
             jobs = [
-                pool.submit(kube.ensure_node_pool, self.project, self.zone, name, self.settings["fixture_pool"],
-                            self.settings["fixture_machine_type"], size)
+                (name, size, pool.submit(kube.ensure_node_pool, self.project, self.zone, name,
+                                         self.settings["fixture_pool"], self.settings["fixture_machine_type"], size))
                 for name, size in sizes.items()
             ]
-            for job in jobs:
-                job.result()
+            for name, size, job in jobs:
+                try:
+                    job.result()
+                except kube.CommandError as exc:
+                    if size:
+                        raise
+                    # A pool the level does not need, mid-operation or failed: its nodes, if any come,
+                    # are in the run's totals, and the level goes on without it.
+                    LOG.warning("could not empty the fixture pool on %s; leaving it: %s", name, exc)
 
     # --- fixtures -----------------------------------------------------------------------------
 
     def ensure_fixtures(self, values: dict[str, float]) -> None:
         contexts = self.contexts(int(values["clusters"]))
         objects = int(values["objects"])
-        for context in contexts:
-            if self._applied_level(context, "objects") not in (None, objects):
-                fixtures.delete_fixture(context, "objects")
-                self._wait_fixture_gone(context, "objects")
-            manifests = fixtures.objects_manifests(objects)
-            for manifest in manifests:
-                if manifest["kind"] == "Namespace":
-                    manifest["metadata"]["labels"][LEVEL_LABEL] = str(objects)
-            kube.apply(context, manifests)
+        with ThreadPoolExecutor(max_workers=min(FIXTURE_PARALLELISM, len(contexts))) as pool:
+            for job in [pool.submit(self._ensure_objects, context, objects) for context in contexts]:
+                job.result()
         first = contexts[0]
         kube.apply(first, fixtures.listing_manifests(int(values["listing_pods"])))
         kube.apply(first, fixtures.warning_manifests(int(values["failing_pods"])))
+
+    def _ensure_objects(self, context: str, objects: int) -> None:
+        if self._applied_level(context, "objects") not in (None, objects):
+            fixtures.delete_fixture(context, "objects")
+            self._wait_fixture_gone(context, "objects")
+        manifests = fixtures.objects_manifests(objects)
+        for manifest in manifests:
+            if manifest["kind"] == "Namespace":
+                manifest["metadata"]["labels"][LEVEL_LABEL] = str(objects)
+        kube.apply(context, manifests)
 
     def _applied_level(self, context: str, fixture: str) -> int | None:
         items = kube.kubectl_json(context, "get", "namespaces", "-l", f"{fixtures.FIXTURE_LABEL}={fixture}")["items"]
@@ -274,6 +394,8 @@ class Runner:
     def apply_level(self, factor: str, level: float) -> dict[str, float]:
         values = self.plan.level_values(factor, level)
         LOG.info("applying %s=%s: %s", factor, level, values)
+        # Forgotten until the level is in place, so a level that fails half-way is settled after.
+        previous, self.applied_fleet = self.applied_fleet, None
         self.preflight()
         self.stop_churn()
         self.ensure_clusters(int(values["clusters"]))
@@ -282,14 +404,40 @@ class Runner:
         self.churner = fixtures.Churner(self.contexts(int(values["clusters"])), values["churn_per_minute"],
                                         int(self.settings["churn_pod_lifetime_seconds"]))
         self.churner.start()
-        settle = int(self.settings.get("settle_seconds", 0))
-        LOG.info("settling for %ss", settle)
-        time.sleep(settle)
+        fleet = {key: values[key] for key in FLEET_VALUES if key in values}
+        if fleet != previous:
+            settle = int(self.settings.get("settle_seconds", 0))
+            LOG.info("settling for %ss", settle)
+            time.sleep(settle)
+        self.applied_fleet = fleet
         return values
 
     def scrub(self, text: str) -> str:
         """Replace the target project's ID in recorded text, so the committed data names no project."""
         return text.replace(self.project, PROJECT_PLACEHOLDER)
+
+    @staticmethod
+    def mark_shared(record: records.Record, kind: str) -> None:
+        """Leave a short run out of the fits that work other than its own loaded.
+
+        A prompt or boot-burst run, shorter than the Stall Watch's period, is marked when it
+        overlaps a tick; a proxy load run when the broker ran a command its workers did not send.
+        """
+        fits: tuple[str, ...] = ()
+        if kind in STALL_WATCH_KINDS and _overlaps_stall_watch(record.started, record.ended, record.totals.get(CLUSTERS_TOTAL, 0)):
+            note, fits = STALL_WATCH_NOTE, RESOURCE_FITS
+        elif kind == PROXY_LOAD_KIND:
+            readings = {m.name: m.value for m in record.metrics if m.container is None}
+            issued = readings.get("proxy_load_completed", 0.0) + readings.get("proxy_load_errors", 0.0)
+            outside = readings.get("proxy_commands", 0.0) - issued
+            if outside > 0:
+                # The run makes no model call, so tokens in its window are the other work's too.
+                note, fits = f"{OUTSIDE_COMMANDS_NOTE}: {outside:.0f}", RESOURCE_FITS + PROXY_LOAD_FITS + TOKEN_FITS
+        if not fits:
+            return
+        if not any(e.startswith(note.split(":")[0]) for e in record.errors):
+            record.errors.append(note)
+        record.excluded_from += [fit for fit in fits if fit not in record.excluded_from]
 
     def reclassify(self) -> int:
         """Apply the current rules to every stored record; returns how many changed.
@@ -301,6 +449,7 @@ class Runner:
         """
         data = records.load(self.data_file)
         changed = []
+        unnamed = 0
         for raw in data["records"]:
             record = records.Record.from_dict(raw)
             before = json.dumps(record.to_dict(), sort_keys=True)
@@ -314,6 +463,7 @@ class Runner:
                 if note not in record.errors:
                     record.errors.append(note)
             operation = next((o for o in self.plan.operations if o.name == record.operation), None)
+            unnamed += operation is None
             if operation and operation.kind == "prompt":
                 # Each answer is judged on its own text; a delegation-wait marker in the run's errors
                 # counts once, not once per answer.
@@ -336,8 +486,15 @@ class Runner:
                     for fit in RESPONSE_FITS:
                         if fit not in record.excluded_from:
                             record.excluded_from.append(fit)
+                if any(reason and reason != UNCHECKED_ANSWER for reason in reasons):
+                    record.excluded_from += [f for f in RESOURCE_FITS + TOKEN_FITS if f not in record.excluded_from]
+            if operation:
+                self.mark_shared(record, operation.kind)
             if json.dumps(record.to_dict(), sort_keys=True) != before:
                 changed.append(record)
+        if unnamed:
+            # The operation's kind decides its rules, and only the plan holds it.
+            LOG.warning("%s records name an operation this plan lacks; run reclassify with their plans too", unnamed)
         records.merge(self.data_file, changed)
         return len(changed)
 
@@ -367,13 +524,15 @@ class Runner:
         contexts = self.contexts(count)
         totals = kube.totals(contexts)
         limits = self.install.limits()
+        requests = self.install.requests()
         replicas = self.install.replicas()
         image = self.install.image()
         mode = self.install.mode() or self.plan.target["mode"]
         if mode != self.plan.target["mode"]:
             self.watch_errors.append(f"install runs mode {mode!r}, plan says {self.plan.target['mode']!r}")
         commit = commit_of(image)
-        errors = list(self.watch_errors)
+        carried, carried_fits = self.carried_work()
+        errors = list(self.watch_errors) + carried
         if not commit:
             errors.append(f"image {image!r} is not pinned by commit; the record is keyed by its tag")
             commit = image.rsplit(":", 1)[-1] or "unknown"
@@ -389,6 +548,18 @@ class Runner:
         elif op.kind == "restart_soak":
             operations.restart(self.install.context, self.install.namespace)
             outcome = operations.soak(op.window_seconds)
+        elif op.kind == PROXY_LOAD_KIND:
+            concurrency = int(values.get(PROXY_CONCURRENCY, 1))
+            kubeconfig_glob = PROFILE_KUBECONFIG_GLOB.format(project=self.project, cluster=self.cluster_names(count)[0])
+            outcome = operations.proxy_load(self.install.context, self.install.namespace, op, concurrency, kubeconfig_glob)
+        elif op.kind == TRIGGER_SOAK_KIND:
+            # Work the install would start later (the OOBE first-run audits) is started now, so a
+            # short window holds its peak; jobs still running at the window's end are noted.
+            outcome = operations.OperationResult()
+            outcome.errors += operations.trigger_jobs(self.install.context, self.install.namespace, op.jobs_home, op.jobs)
+            outcome.errors += operations.soak(op.window_seconds).errors
+            outcome.errors += operations.unfinished_jobs(self.install.context, self.install.namespace, op.jobs_home,
+                                                         op.jobs, started_iso)
         elif op.kind == "reset_soak":
             self.check_resettable()
             operations.reset(self.install.context, self.install.namespace)
@@ -416,6 +587,8 @@ class Runner:
             metrics.append(records.Metric("unfinished_prompts", float(outcome.unfinished_prompts)))
         if outcome.response_seconds:
             metrics.append(records.Metric("response_seconds", max(outcome.response_seconds)))
+        for name, value in outcome.metrics.items():
+            metrics.append(records.Metric(name, value))
         # tokens_* (from LiteLLM) count every model call in the window, background jobs included, and
         # their input counts the whole prompt; run_tokens_* (from the harness) count the sessions this
         # run's prompts opened, and their input is the non-cached part alone.
@@ -425,32 +598,61 @@ class Runner:
         # LiteLLM logs every retry of one refusal; the client sees one per prompt. Take the larger.
         provider_429s = max(logs["provider_429s"], outcome.provider_429s)
         excluded = RESPONSE_FITS if op.kind == "prompt" and (provider_429s or outcome.unfinished_prompts) else []
+        if op.kind == "prompt" and outcome.unfinished_prompts:
+            excluded = excluded + list(RESOURCE_FITS + TOKEN_FITS)
         errors = [self.scrub(e) for e in errors]
-        return records.Record(
+        record = records.Record(
             commit=commit, mode=mode, phase=self.plan.phase, runner=RUNNER_REVISION,
             factor=spec.factor, level=spec.level, operation=op.name, run=spec.run,
             started=started_iso, ended=ended_iso, image=image, values=values, totals=totals,
-            limits=limits, replicas=replicas, metrics=metrics,
+            limits=limits, requests=requests, replicas=replicas, metrics=metrics,
             provider_429s=provider_429s, answers=[self.scrub(a) for a in outcome.previews],
-            excluded_from=list(excluded), errors=errors,
+            excluded_from=list(excluded) + [f for f in carried_fits if f not in excluded], errors=errors,
         )
+        self.mark_shared(record, op.kind)
+        return record
 
     def pending(self, specs: list[RunSpec]) -> list[RunSpec]:
         """The runs whose key is not in the data file yet, for the build the install runs now."""
-        done = records.existing_keys(self.data_file)
+        stored = records.load(self.data_file)["records"]
+        done = {record["key"]: record.get("values", {}) for record in stored}
+        phases = {record["key"]: record.get("phase", "") for record in stored}
         operations.wait_gateway_ready(self.install.context, self.install.namespace)
         image = self.install.image()
         commit = commit_of(image) or image.rsplit(":", 1)[-1] or "unknown"
         mode = self.install.mode() or self.plan.target["mode"]
-        return [s for s in specs
-                if records.record_key(commit, mode, s.factor, s.level, s.operation.name, s.run) not in done]
+        pending = []
+        for spec in specs:
+            key = records.record_key(commit, mode, spec.factor, spec.level, spec.operation.name, spec.run)
+            if key in done and not self.same_point(done[key], spec) and phases[key] != self.plan.phase:
+                # Another plan's point under the same key: running would replace its record in the file.
+                raise SystemExit(f"{key} holds {phases[key]}'s record of another point; give this plan's "
+                                 "combined point a new level, or run with --force to replace it")
+            if key not in done or not self.same_point(done[key], spec):
+                pending.append(spec)
+            elif phases[key] != self.plan.phase:
+                # A key carries the operation's name, not the plan's phase: say when another phase's
+                # record stands for this run, so a reused name does not skip it unnoticed.
+                LOG.warning("%s is already recorded by %s; not running it again", key, phases[key])
+        return pending
 
-    def run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> None:
+    def same_point(self, stored: dict[str, float], spec: RunSpec) -> bool:
+        """Whether a stored combined run measured this plan's point: a combined level is only an
+        index, so another plan's (or an edited) Nth point has the same key."""
+        if spec.factor != COMBINED_FACTOR:
+            return True
+        point = self.plan.combined[int(spec.level) - 1]
+        return all(stored.get(name) == value for name, value in point.items())
+
+    def run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> bool:
+        """Run the specs; False when it stopped at a level it could not apply."""
         self.backfill_peaks()
+        self.triggered = self.last_trigger()
         pending = specs if force else self.pending(specs)
         todo = pending[:limit] if limit else pending
         LOG.info("%s runs to do (%s pending of %s)", len(todo), len(pending), len(specs))
         awaiting: list[tuple[float, records.Record]] = []
+        stopped = False
         relay = operations.Relay(self.install.context, self.install.namespace)
         try:
             relay.start()
@@ -458,9 +660,13 @@ class Runner:
             for (factor, level), group in itertools.groupby(todo, key=lambda s: (s.factor, s.level)):
                 try:
                     values = self.apply_level(factor, level)
-                except Exception:  # a level that cannot be applied is skipped; a resume retries it
-                    LOG.exception("could not apply %s=%s; skipping its runs", factor, level)
-                    continue
+                except Exception:
+                    # Stop: the next level would reshape the fleet on top of a half-applied one (delete
+                    # the clusters this level made, or create more in a zone that just refused some).
+                    # A resume starts again at this level.
+                    LOG.exception("could not apply %s=%s; stopping the run", factor, level)
+                    stopped = True
+                    break
                 for spec in group:
                     try:
                         self.preflight()
@@ -474,6 +680,11 @@ class Runner:
                         continue
                     # Merged at once without its peaks, so a crash loses nothing; merged again with them.
                     records.merge(self.data_file, [record])
+                    if spec.operation.kind == TRIGGER_SOAK_KIND:
+                        self.drain_jobs(spec.operation, record.started)
+                        record.metrics += self.job_metrics(spec.operation, record.started)
+                        # Written now: the Monitoring wait below can outlast the process.
+                        records.merge(self.data_file, [record])
                     awaiting.append((time.time(), record))
                     awaiting = self.flush_peaks(awaiting, wait=False)
                     self.backfill_peaks(skip={pending.key for _, pending in awaiting})
@@ -481,6 +692,90 @@ class Runner:
             self.stop_churn()
             relay.stop()
             self.flush_peaks(awaiting, wait=True)
+        return not stopped
+
+    def dry_run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> list[str]:
+        """What ``run`` would do, as lines: each level's cluster creates and deletes, and each run.
+
+        Reads the project's clusters and, unless ``force``, the data file and the install's build to
+        leave out runs already recorded; changes nothing.
+        """
+        pending = specs if force else self.pending(specs)
+        todo = pending[:limit] if limit else pending
+        current = set(kube.clusters_with_prefix(self.project, self.zone, self.prefix, self.label))
+        lines = [f"{len(todo)} runs to do (of {len(specs)}); test clusters now: {len(current)}"]
+        for (factor, level), group in itertools.groupby(todo, key=lambda s: (s.factor, s.level)):
+            values = self.plan.level_values(factor, level)
+            wanted = set(self.cluster_names(int(values[CLUSTERS_TOTAL])))
+            create, delete = sorted(wanted - current), sorted(current - wanted)
+            lines.append(f"level {factor}={level:g}: {dict(values)}")
+            lines.append(f"  create {len(create)} clusters: {' '.join(create) or '-'}")
+            lines.append(f"  delete {len(delete)} clusters: {' '.join(delete) or '-'}")
+            for spec in group:
+                calls = "model calls" if spec.operation.kind in MODEL_CALL_KINDS else "no model call of its own"
+                lines.append(f"  run {spec.operation.name} #{spec.run} ({spec.operation.kind}, {calls})")
+            current = wanted
+        return lines
+
+    def drain_jobs(self, op: Operation, since: str) -> None:
+        """Wait up to ``trigger_drain_seconds`` for the jobs a trigger_soak started, so they do not load the next run.
+
+        Every later run checks them again (``carried_work``) until they have finished.
+        """
+        self.triggered = (op, since)
+        deadline = time.monotonic() + float(self.settings.get("trigger_drain_seconds", TRIGGER_DRAIN_SECONDS))
+        while time.monotonic() < deadline:
+            try:
+                statuses = operations.job_statuses(self.install.context, self.install.namespace, op.jobs_home,
+                                                   op.jobs, since)
+            except kube.CommandError:
+                return
+            active = [job for job, status in statuses.items() if status in operations.JOB_ACTIVE]
+            if not active:
+                return
+            LOG.info("waiting for %s to finish before the next run", ", ".join(active))
+            time.sleep(DRAIN_POLL_SECONDS)
+
+    def job_metrics(self, op: Operation, since: str) -> list[records.Metric]:
+        """How long the slowest job the run started took, and how many completed, read after the drain."""
+        try:
+            durations = operations.job_seconds(self.install.context, self.install.namespace, op.jobs_home, op.jobs, since)
+        except (kube.CommandError, ValueError, TypeError) as exc:
+            # A run log the read cannot parse costs this run its job metrics, not the whole campaign.
+            LOG.warning("could not read how long the jobs took: %s", exc)
+            return []
+        metrics = [records.Metric(JOBS_COMPLETED_METRIC, float(len(durations)))]
+        if durations:
+            metrics.append(records.Metric(JOB_SECONDS_METRIC, max(durations.values())))
+        return metrics
+
+    def carried_work(self) -> tuple[list[str], list[str]]:
+        """Notes and fit exclusions for a run that jobs the latest trigger_soak started are still loading.
+
+        A job marked due is claimed at the next cron tick, within a minute, so a job with no run
+        after the window was never marked (it is not on the roster) and is not waited for.
+        """
+        if not self.triggered:
+            return [], []
+        op, since = self.triggered
+        try:
+            statuses = operations.job_statuses(self.install.context, self.install.namespace, op.jobs_home, op.jobs, since)
+        except kube.CommandError as exc:
+            return [f"could not tell whether the jobs an earlier run started had finished: {exc}"], list(RESOURCE_FITS)
+        active = [job for job, status in statuses.items() if status in operations.JOB_ACTIVE]
+        if not active:
+            self.triggered = None
+            return [], []
+        return [f"{job}, started by an earlier run, was {statuses[job]}" for job in active], list(RESOURCE_FITS)
+
+    def last_trigger(self) -> tuple[Operation, str] | None:
+        """The latest stored trigger_soak run of this plan, so a resumed runner still checks its jobs."""
+        kinds = {op.name: op for op in self.plan.operations if op.kind == TRIGGER_SOAK_KIND}
+        runs = [r for r in records.load(self.data_file)["records"] if r["operation"] in kinds]
+        if not runs:
+            return None
+        latest = max(runs, key=lambda r: r["started"])
+        return kinds[latest["operation"]], latest["started"]
 
     def flush_peaks(self, awaiting: list[tuple[float, records.Record]], wait: bool) -> list[tuple[float, records.Record]]:
         """Add Cloud Monitoring peaks to the records whose window is old enough, and merge them again.
@@ -534,6 +829,34 @@ class Runner:
             for name, value in values.items():
                 record.metrics.append(records.Metric(name, value, container))
 
+    def remonitor(self) -> int:
+        """Read every stored record's Cloud Monitoring metrics again, with the current queries.
+
+        A change in what the runner reads from Monitoring then reaches the stored records,
+        within Monitoring's retention; a record it cannot read keeps what it has. Returns how
+        many records changed.
+        """
+        data = records.load(self.data_file)
+        changed = []
+        for raw in data["records"]:
+            record = records.Record.from_dict(raw)
+            try:
+                peaks = self.install.container_peaks(_epoch(record.started), _epoch(record.ended))
+            except Exception as exc:  # one unreadable window keeps its record as it is
+                LOG.warning("could not read Monitoring for %s: %s", record.key, exc)
+                continue
+            if not peaks:
+                continue
+            record.metrics = [m for m in record.metrics if m.name not in MONITORING_METRICS] + [
+                records.Metric(name, value, container)
+                for container, values in peaks.items() for name, value in values.items()
+            ]
+            record.errors = [e for e in record.errors if not e.startswith(MONITORING_ERROR)]
+            record.remonitored = RUNNER_REVISION
+            changed.append(record)
+        records.merge(self.data_file, changed)
+        return len(changed)
+
     def teardown(self, delete_fleet: bool) -> None:
         """Remove every fixture and shrink the pools; ``delete_fleet`` deletes the test clusters too."""
         self.stop_churn()
@@ -557,9 +880,71 @@ class Runner:
                                       self.settings["fixture_machine_type"], 0)
 
 
+@contextlib.contextmanager
+def hold_lease(plan: Plan, note: str):
+    """Hold the experiment install's live-test lease for as long as the block runs.
+
+    The lease is the repository's (scripts/live_test_lease.py, docs/designs/live-test-lease.md): a
+    ConfigMap in the install's namespace that another runner, an agent's live validation or a
+    person's work also takes before changing the install, so two of them cannot apply at once.
+    A lease another holder has refuses the run.
+    """
+    target = plan.target
+    with tempfile.TemporaryDirectory(prefix=LEASE_DIRECTORY_PREFIX) as directory:
+        envs = Path(directory) / LEASE_ENVS_NAME
+        envs.write_text(json.dumps({"installs": [
+            {"name": LEASE_ENV_NAME, "context": target["host_context"], "namespace": target["namespace"]}
+        ]}))
+        # Run the script from the empty directory with no checkout named, so it finds no install.env:
+        # a checkout's own install.env naming the same host would replace this entry and its name.
+        env = {key: value for key, value in os.environ.items() if key != LEASE_CWD_VAR}
+        env.update({LEASE_ENVS_VAR: str(envs), LEASE_SESSION_VAR: f"{LEASE_SESSION_PREFIX}{os.getpid()}"})
+        ttl = str(int(plan.settings.get("lease_ttl_minutes", LEASE_TTL_MINUTES)))
+
+        def lease(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run([sys.executable, str(LEASE_SCRIPT), *args, "--env", LEASE_ENV_NAME],
+                                  env=env, cwd=directory, capture_output=True, text=True, check=False)
+
+        acquired = lease("acquire", "--ttl", ttl, "--note", note)
+        if acquired.returncode != 0:
+            # Held by another holder, or not resolvable at all (a checkout's install.env naming the same
+            # context, a kubectl failure): the script's own output says which.
+            raise SystemExit(f"could not take the install's live-test lease (exit {acquired.returncode}); "
+                             f"not running:\n{acquired.stdout}{acquired.stderr}")
+        LOG.info("holding the live-test lease on %s, renewed every %s minutes", target["host_cluster"],
+                 int(ttl) // LEASE_RENEWALS_PER_TTL)
+        stop = threading.Event()
+
+        def renew() -> None:
+            # A soak sleeps for hours inside one run, so the renewal runs beside the work, not between runs.
+            failures = 0
+            while not stop.wait(int(ttl) * SECONDS_PER_MINUTE / LEASE_RENEWALS_PER_TTL):
+                renewed = lease("renew", "--ttl", ttl)
+                failures = 0 if renewed.returncode == 0 else failures + 1
+                if failures:
+                    LOG.warning("could not renew the live-test lease: %s", renewed.stdout + renewed.stderr)
+                if failures >= LEASE_RENEWAL_FAILURES_TO_STOP:
+                    # Stop the run before the lease lapses, so it never changes the install unleased.
+                    LOG.error("stopping: the live-test lease could not be renewed %s times", failures)
+                    _thread.interrupt_main()
+                    return
+
+        renewer = threading.Thread(target=renew, name="lease-renewer", daemon=True)
+        renewer.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            renewer.join()
+            released = lease("release")
+            if released.returncode != 0:
+                LOG.warning("could not release the live-test lease; it expires on its own after %s minutes: %s",
+                            ttl, released.stdout + released.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["plan", "run", "apply", "teardown", "reclassify"])
+    parser.add_argument("command", choices=["plan", "run", "apply", "teardown", "reclassify", "remonitor"])
     parser.add_argument("config", type=Path)
     parser.add_argument("--only-factor")
     parser.add_argument("--only-operation")
@@ -568,7 +953,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--limit", type=int, default=0, help="stop after this many runs (0: all)")
     parser.add_argument("--delete-fleet", action="store_true", help="teardown: delete the test clusters")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="run: print each level's cluster creates and deletes and each run, and change nothing")
     args = parser.parse_args(argv)
+    if args.dry_run and args.command != "run":
+        parser.error("--dry-run applies to run only")
     # SIGTERM ends the run like Ctrl-C does, so the churner, the relay and pending peaks are cleaned up.
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(TERMINATED_EXIT_CODE))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -594,17 +983,31 @@ def main(argv: list[str] | None = None) -> int:
     kube.use_private_kubeconfig(private)
     atexit.register(private.unlink, missing_ok=True)
     runner = Runner(plan, data_file)
-    if args.command == "run":
-        runner.run(specs, args.force, args.limit)
-    elif args.command == "reclassify":
+    if args.command == "run" and args.dry_run:
+        print("\n".join(runner.dry_run(specs, args.force, args.limit)))
+        return 0
+    if args.command in MUTATING_COMMANDS:
+        with hold_lease(plan, f"harness scale {args.command} {args.config.name}"):
+            return _mutate(runner, args, specs)
+    if args.command == "reclassify":
         print(f"{runner.reclassify()} records changed")
-    elif args.command == "apply":
+    elif args.command == "remonitor":
+        print(f"{runner.remonitor()} records changed")
+    return 0
+
+
+def _mutate(runner: Runner, args: argparse.Namespace, specs: list[RunSpec]) -> int:
+    """The commands that change the test clusters or the install, run under the lease."""
+    if args.command == "run":
+        # Non-zero when the run stopped at a level, so a script does not go on to its next step.
+        return 0 if runner.run(specs, args.force, args.limit) else STOPPED_EXIT_CODE
+    if args.command == "apply":
         try:
             runner.apply_level(args.factor, args.level)
         finally:
             runner.stop_churn()
-    else:
-        runner.teardown(args.delete_fleet)
+        return 0
+    runner.teardown(args.delete_fleet)
     return 0
 
 

@@ -12207,7 +12207,7 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "issue-list", "issue-view", "branch-view"},
+             "proposal-commits", "proposal-claim", "issue-list", "issue-view", "branch-view"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -15212,7 +15212,14 @@ class MCPVcsVerbGateTest(unittest.TestCase):
             for verb in sorted(vcs_broker.VCS_VERBS):
                 with self.subTest(role=role, verb=verb):
                     self.assertTrue(credential_proxy.vcs_verb_permitted(role, verb))
-                    handler = self._handler(verb, role)
+                    body = None
+                    tokens = credential_proxy.ClaimTokens()
+                    if verb == credential_proxy.PROPOSAL_CLAIM_VERB:
+                        # A claim reaches its route only with a token a create minted.
+                        url = "https://github.com/acme/infra/pull/7"
+                        body = {"url": url, "claim": tokens.mint(url, self.PAYLOAD["repository"], 7)}
+                    handler = self._handler(verb, role, body)
+                    handler.claim_tokens = tokens
                     route = mock.Mock(return_value={})
                     with mock.patch.object(
                         credential_proxy.vcs_broker, "route_table", return_value={verb: route}
@@ -15220,6 +15227,206 @@ class MCPVcsVerbGateTest(unittest.TestCase):
                         handler._handle_vcs_post()
                     self.assertEqual(HTTPStatus.OK, handler.replies[0][0], handler.replies)
                     route.assert_called_once()
+
+
+class ProposalClaimRouteTest(unittest.TestCase):
+    """`proposal-create` mints a one-time claim token; `proposal-claim` burns it."""
+
+    REPOSITORY = "https://github.com/acme/infra"
+    URL = "https://github.com/acme/infra/pull/7"
+    TOKEN_SHAPE = re.compile(r"^[0-9a-f]{64}$")
+
+    def setUp(self):
+        self.clock = [1000.0]
+        self.tokens = credential_proxy.ClaimTokens(clock=lambda: self.clock[0])
+        self.metrics = credential_proxy.ProxyMetrics()
+        self.claimed = []
+        self.refuse = False
+        self.create_fails = False
+        self.nameless = False
+
+    def _create(self, payload):
+        if self.create_fails:
+            raise providers.WorkspaceError("the forge refused the proposal", status=422, code="FORGE_REFUSED")
+        return {
+            "proposal": {"number": 7, "url": self.URL, "title": "Bump replicas", "state": "open"},
+            "forge": "github",
+            "repo": "acme/infra",
+        }
+
+    def _claim(self, payload):
+        self.claimed.append(dict(payload))
+        if self.nameless:
+            raise providers.IdentityUnknown("bitbucket")
+        if self.refuse:
+            raise providers.WorkspaceError(
+                "the forge does not say this install just opened it", status=409, code="CLAIM_NOT_CONFIRMED"
+            )
+        return {"url": payload["url"], "number": payload["number"], "title": "Bump replicas"}
+
+    def _post(self, verb, body, role=credential_proxy.CALLER_ROLE_SHELL, managed=True):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/vcs/" + verb
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role
+        )
+        handler.metrics = self.metrics
+        handler.claim_tokens = self.tokens
+        handler.max_request_bytes = 1 << 20
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        encoded = json.dumps(body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.vcs = mock.Mock()
+        forge = mock.Mock()
+        forge.name = "github"
+        handler.vcs.registry.resolve.return_value = (forge, "acme/infra")
+        routes = {"proposal-create": self._create, "proposal-claim": self._claim}
+        with mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value=routes), \
+                mock.patch.object(credential_proxy, "repository_is_managed", return_value=managed):
+            handler._handle_vcs_post()
+        self.assertEqual(1, len(replies), replies)
+        return replies[0]
+
+    def _created_token(self):
+        status, answer = self._post(
+            "proposal-create",
+            {"repository": self.REPOSITORY, "source": "fix/a", "target": "main", "title": "t"},
+        )
+        self.assertEqual(HTTPStatus.OK, status, answer)
+        return answer[credential_proxy.CLAIM_TOKEN_FIELD]
+
+    def test_proposal_create_answers_with_a_claim_token(self):
+        first = self._created_token()
+        second = self._created_token()
+        self.assertEqual("claim", credential_proxy.CLAIM_TOKEN_FIELD)
+        self.assertRegex(first, self.TOKEN_SHAPE)
+        # One token per answer, never the same one twice.
+        self.assertNotEqual(first, second)
+        # Counted under the verb like any other, and no label carries the token.
+        self.assertEqual(
+            {("proposal-create", credential_proxy.TOOL_STATUS_SUCCESS, "github"): 2}, self.metrics._vcs
+        )
+        for key in self.metrics._vcs:
+            self.assertNotIn(first, key)
+            self.assertNotIn(second, key)
+
+    def test_a_claim_is_accepted_once(self):
+        token = self._created_token()
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.OK, status, answer)
+        self.assertEqual({"url": self.URL, "number": 7, "title": "Bump replicas"}, answer)
+        # The broker checks the url it kept with the token, on the repository
+        # the create resolved, never a repository the claim names.
+        self.assertEqual(
+            [{"repository": self.REPOSITORY, "url": self.URL, "number": 7}], self.claimed
+        )
+        self.assertIn(
+            ("proposal-claim", credential_proxy.TOOL_STATUS_SUCCESS, "github"), self.metrics._vcs
+        )
+        for key in self.metrics._vcs:
+            self.assertNotIn(token, key)
+
+    def test_a_second_claim_is_404(self):
+        token = self._created_token()
+        self.assertEqual(HTTPStatus.OK, self._post("proposal-claim", {"url": self.URL, "claim": token})[0])
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("CLAIM_UNKNOWN", answer["code"])
+        self.assertNotIn(token, json.dumps(answer))
+        self.assertEqual(1, len(self.claimed))
+        # An unknown token, and one presented for another url, are the same 404;
+        # the second burns the token too.
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": "0" * 64})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        other = self._created_token()
+        status, _ = self._post("proposal-claim", {"url": self.URL + "0", "claim": other})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": other})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual(1, len(self.claimed))
+
+    def test_a_claim_after_the_window_is_404(self):
+        token = self._created_token()
+        self.clock[0] += credential_proxy.CLAIM_TOKEN_TTL_SECONDS
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("CLAIM_UNKNOWN", answer["code"])
+        self.assertEqual([], self.claimed)
+        self.assertEqual(900, credential_proxy.CLAIM_TOKEN_TTL_SECONDS)
+
+    def test_an_expired_claim_is_pruned_on_the_next_mint(self):
+        # A token nobody claims leaves only by the prune, not by a burn.
+        self._created_token()
+        self.assertEqual(1, len(self.tokens))
+        self.clock[0] += credential_proxy.CLAIM_TOKEN_TTL_SECONDS
+        self._created_token()
+        self.assertEqual(1, len(self.tokens))
+
+    def test_a_claim_on_a_repository_no_longer_managed_is_403_and_burned(self):
+        token = self._created_token()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token}, managed=False)
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", answer["code"])
+        self.assertEqual([], self.claimed)
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual([], self.claimed)
+
+    def test_a_failed_proposal_create_mints_no_claim(self):
+        self.create_fails = True
+        status, answer = self._post(
+            "proposal-create",
+            {"repository": self.REPOSITORY, "source": "fix/a", "target": "main", "title": "t"},
+        )
+        self.assertEqual(422, status)
+        self.assertNotIn(credential_proxy.CLAIM_TOKEN_FIELD, answer)
+        self.assertEqual(0, len(self.tokens))
+
+    def test_a_claim_whose_forge_check_fails_is_409_and_burned(self):
+        token = self._created_token()
+        self.refuse = True
+        with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+            credential_proxy.LOGGER.debug("marker")
+            status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("CLAIM_NOT_CONFIRMED", answer["code"])
+        self.assertFalse(any(token in line for line in logs.output), logs.output)
+        self.refuse = False
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual(1, len(self.claimed))
+
+    def test_a_claim_on_a_forge_that_cannot_name_its_account_answers_its_own_code(self):
+        token = self._created_token()
+        self.nameless = True
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("FORGE_IDENTITY_UNKNOWN", answer["code"])
+        self.assertIn("Configure the forge's identity", answer["error"])
+        self.assertIn(
+            ("proposal-claim", credential_proxy.TOOL_STATUS_ERROR, "github"), self.metrics._vcs
+        )
+        # Burned before the check, as every claim is.
+        self.nameless = False
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual(1, len(self.claimed))
+
+    def test_the_mcp_role_cannot_claim(self):
+        token = self._created_token()
+        status, answer = self._post(
+            "proposal-claim", {"url": self.URL, "claim": token}, role=credential_proxy.CALLER_ROLE_MCP
+        )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("CALLER_VERB_FORBIDDEN", answer["code"])
+        self.assertFalse(credential_proxy.vcs_verb_permitted(credential_proxy.CALLER_ROLE_MCP, "proposal-claim"))
+        self.assertTrue(credential_proxy.vcs_verb_permitted(credential_proxy.CALLER_ROLE_SHELL, "proposal-claim"))
+        # Refused before the token is looked at: the shell can still claim it.
+        self.assertEqual([], self.claimed)
+        self.assertEqual(HTTPStatus.OK, self._post("proposal-claim", {"url": self.URL, "claim": token})[0])
 
 
 class RoleVcsVerbsTableTest(unittest.TestCase):
