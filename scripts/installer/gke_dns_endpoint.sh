@@ -45,7 +45,7 @@ _GKE_DNS_ENDPOINT_SUPPORTED=""
 
 gke_supports_dns_endpoint() {
   if [ -z "$_GKE_DNS_ENDPOINT_SUPPORTED" ]; then
-    if gcloud container clusters get-credentials --help 2>/dev/null | grep -q -- '--dns-endpoint'; then
+    if grep -q -- '--dns-endpoint' <<<"$(trap - ERR; gcloud container clusters get-credentials --help 2>/dev/null)"; then
       _GKE_DNS_ENDPOINT_SUPPORTED=1
     else
       _GKE_DNS_ENDPOINT_SUPPORTED=0
