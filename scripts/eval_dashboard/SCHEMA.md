@@ -260,8 +260,8 @@ layout and are collected from the moment they start running.
       writes) and `reasoning` (counted inside `output`, not beside it) are
       `results.json`'s buckets of the same names, printed only when `input`
       excludes cache reads: on the api transport with the front door's
-      session row read (and, on a delegated run, `tokens.front_door.cached`
-      a count). They are absent on the inject transport, on an api run whose
+      session row read (and, when workers were folded in,
+      `tokens.front_door.cached` a count). They are absent on the inject transport, on an api run whose
       session row could not be read, and on every line printed before
       they existed; one that is not a whole number at or above zero is
       absent too. The prompt is then `input + cached + cache_write`, and

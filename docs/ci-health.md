@@ -1155,7 +1155,8 @@ the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
 per graded repetition and, when the week has a trend, its change from last
 week on the same scenarios, which the text says because it is not measured
-against that median), a "Needs attention" box, one row per area with
+against that median; and its cache hit rate when repetitions carry the prompt
+split), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).

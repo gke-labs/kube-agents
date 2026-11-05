@@ -110,6 +110,7 @@ _TOKENS_CACHED_KEY = "cached"
 _TOKENS_CACHE_WRITE_KEY = "cache_write"
 _TOKENS_REASONING_KEY = "reasoning"
 _TOKENS_FRONT_DOOR_KEY = "front_door"
+_TOKENS_WORKERS_KEY = "workers"
 
 #: ``VerificationCorrectness`` at or above this is a passing repetition. The
 #: existing presubmit floor, unchanged; the CLI reads it from the environment.
@@ -653,7 +654,13 @@ def _tokens_split(tokens: dict[str, Any]) -> bool:
     if token_count(tokens.get(_TOKENS_CACHED_KEY)) is None:
         return False
     front_door = tokens.get(_TOKENS_FRONT_DOOR_KEY)
-    return not isinstance(front_door, dict) or token_count(front_door.get(_TOKENS_CACHED_KEY)) is not None
+    if isinstance(front_door, dict):
+        return token_count(front_door.get(_TOKENS_CACHED_KEY)) is not None
+    # Workers folded in with no front-door split to vouch for the rest: a
+    # card-wake merge (card_wake.merge) adds the wake turn's workers to an
+    # answer turn whose row lookup failed, so ``cached`` is the workers' alone
+    # while ``input`` still counts the answer's cache reads.
+    return not isinstance(tokens.get(_TOKENS_WORKERS_KEY), dict)
 
 
 def _split_count(tokens: dict[str, Any] | None, key: str) -> int | None:
