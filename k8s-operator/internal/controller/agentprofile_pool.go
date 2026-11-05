@@ -80,12 +80,12 @@ const (
 	// worker for the task's lifetime. Memory-backed, so it never lands on a
 	// node disk.
 	profileWorkerTaskTokenVolume = "task-token"
-	profileWorkerTaskTokenPath   = "/var/run/kube-agents/task-token"
+	profileWorkerTaskTokenPath   = "/var/run/kube-agents/task-token" // #nosec G101 -- Mount path, not a credential
 
 	// The worker's broker token: a projected ServiceAccount token for the
 	// broker's profile audience (#4257).
-	profileWorkerBrokerTokenVolume = "credential-proxy-token"
-	profileWorkerBrokerTokenPath   = "/var/run/secrets/credential-proxy"
+	profileWorkerBrokerTokenVolume = "credential-proxy-token"            // #nosec G101 -- Volume name, not a credential
+	profileWorkerBrokerTokenPath   = "/var/run/secrets/credential-proxy" // #nosec G101 -- Mount path, not a credential
 	profileWorkerBrokerTokenFile   = "token"
 	profileWorkerBrokerTokenExpiry = 3600
 
@@ -302,7 +302,7 @@ func buildProfilePool(agent *agentv1alpha1.PlatformAgent, profile *agentv1alpha1
 			Labels:    labels,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(int32(resolveProfileWarmReplicas(agent))),
+			Replicas: ptr.To(int32(resolveProfileWarmReplicas(agent))), // #nosec G115 -- the CRD bounds warmReplicas to 0-100
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
 				a2aComponentLabel:     agentProfileWorkerComponent,
 				agentProfileNameLabel: profile.Name,
