@@ -1771,6 +1771,11 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 		}
 	}
 	s.mu.Unlock()
+	if callErr == nil && convAlias != "" && s.store != nil {
+		if wid := extractTaskSessionWorkerID(responseText); wid != "" {
+			s.store.SetConversationSessionWorkerID(convAlias, wid)
+		}
+	}
 }
 
 // taskOwnerConversation is the conversation alias a tracked streaming task was started on (a
@@ -1812,7 +1817,17 @@ func (s *Server) taskOwnerConversation(taskID string) string {
 // (a2a/mcp writeTask or FormatTurnCustomToolEnvelope):
 // "Task `<addressee>/<id>`: **<state>** (still running; ..." or
 // "...Task `<addressee>/<id>` is actively running...".
-var runningTaskRefRegex = regexp.MustCompile("(?m)(?:^Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running|Task `([^`\\s]+)` is actively running)")
+var (
+	runningTaskRefRegex       = regexp.MustCompile("(?m)(?:^Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running|Task `([^`\\s]+)` is actively running)")
+	taskSessionWorkerRefRegex = regexp.MustCompile("(?m)Task `((?:chat|s)-[A-Za-z0-9_-]+)/task-[A-Za-z0-9_-]+`")
+)
+
+func extractTaskSessionWorkerID(text string) string {
+	if m := taskSessionWorkerRefRegex.FindStringSubmatch(text); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
 
 // runningTaskRef is the task reference of the first task the server reports still running in
 // text, or "".

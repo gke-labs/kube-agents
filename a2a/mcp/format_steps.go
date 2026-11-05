@@ -511,6 +511,18 @@ func truncateInlineText(s string, maxLen int) string {
 	return strings.TrimSpace(s[:maxLen-3]) + "..."
 }
 
+func canonicalStepAgent(agent, convAlias string) string {
+	a := strings.TrimSpace(strings.TrimPrefix(agent, "@"))
+	alias := strings.TrimSpace(strings.TrimPrefix(convAlias, "@"))
+	if alias != "" && alias != DefaultConversation && (a == "" || strings.HasPrefix(a, "chat-") || strings.HasPrefix(a, "s-")) {
+		return alias
+	}
+	if a == "" {
+		return "platform"
+	}
+	return a
+}
+
 func formatAgentBadge(agent string) string {
 	a := strings.TrimSpace(strings.TrimPrefix(agent, "@"))
 	if a == "" {
@@ -708,7 +720,11 @@ func FormatStepDetailMarkdownWithOptions(d StepDetail, includeHeader bool) strin
 // model-facing result text for a TurnStepOutcome.
 func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, result string) {
 	out := stepOut.Outcome
-	details := stepOut.StepDetails
+	details := make([]StepDetail, len(stepOut.StepDetails))
+	for i, d := range stepOut.StepDetails {
+		d.Agent = canonicalStepAgent(d.Agent, stepOut.Alias)
+		details[i] = d
+	}
 	totalSteps := len(details)
 	prevSteps := stepOut.PrevReportedSteps
 	lastSteps := stepOut.LastReportedSteps
@@ -738,6 +754,7 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 			}
 		}
 	}
+	activeAgent := canonicalStepAgent(activeRef.Addressee, stepOut.Alias)
 
 	answerText := taskResultText(activeTask)
 	if answerText == "" && out.Task != nil {
@@ -781,7 +798,7 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 			if answerText != "" {
 				markdown = truncateInlineText(collapseInlineWhitespace(answerText), maxAnswerPreviewLen)
 			} else {
-				markdown = fmt.Sprintf("- **Agent**: %s\n- **Status**: `%s`", formatAgentBadge(activeRef.Addressee), state)
+				markdown = fmt.Sprintf("- **Agent**: %s\n- **Status**: `%s`", formatAgentBadge(activeAgent), state)
 			}
 		}
 	default:
@@ -792,12 +809,12 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 			} else if totalSteps > 0 {
 				waitTitle = humanizeStepTitle(details[totalSteps-1])
 			} else {
-				waitTitle = fmt.Sprintf("Waiting for @%s response", activeRef.Addressee)
+				waitTitle = fmt.Sprintf("Waiting for @%s response", activeAgent)
 			}
 		}
 		title = waitTitle
 		var md strings.Builder
-		fmt.Fprintf(&md, "- **Agent**: %s\n", formatAgentBadge(activeRef.Addressee))
+		fmt.Fprintf(&md, "- **Agent**: %s\n", formatAgentBadge(activeAgent))
 		if progressText != "" {
 			fmt.Fprintf(&md, "- **Progress**: *%s*\n", sanitizeInlineItalic(lastLine(progressText)))
 		} else {
