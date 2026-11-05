@@ -730,6 +730,12 @@ class LogLineTest(ProxyTestCase):
         self.assertEqual(line["litellm_attempted_fallbacks"], "1")
         self.assertIn("fallback_attempted", line["unstorable"])
 
+    def test_an_answer_from_another_model_group_is_marked_unstorable(self):
+        FakeLiteLLM.model_group = "model-backup"
+        self.addCleanup(setattr, FakeLiteLLM, "model_group", "model-default")
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertIn("answered_by_other_model_group", self.lines(1)[0]["unstorable"])
+
     def test_scrubbed_text_is_stored(self):
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
         line = self.lines(1)[0]

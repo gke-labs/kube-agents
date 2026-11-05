@@ -475,8 +475,9 @@ model fails. The backup is the same model with less thinking, so the model name 
 the same either way. But LiteLLM adds headers to each reply saying what happened:
 `x-litellm-model-group` says which setup answered, and `x-litellm-attempted-fallbacks` says whether
 it fell back (see [the gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)).
-The proxy only saves an answer when it came from the main setup with no fallback. Our prototype
-didn't check these headers, so this part hasn't been tested yet.
+The proxy only saves an answer when it came from the main setup with no fallback, and never counts
+a fallback's answer as one a recording gave (see the next section). Its tests cover a reply that
+fell back and one from another setup; no live run has fallen back yet.
 
 **Different words for the same answer.** The model doesn't always word an answer the same way: one
 run says "Let me check the card" before a tool call and the next says nothing. The cache keeps one
