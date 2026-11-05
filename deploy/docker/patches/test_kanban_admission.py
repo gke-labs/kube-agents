@@ -388,7 +388,7 @@ class SettingsTest(unittest.TestCase):
                 got = admission.settings_from(config)
                 self.assertIsNone(got.memory_budget_mib)
                 self.assertEqual(got.worker_rss_cap_mib, 1536)
-                self.assertEqual(got.queue_bound_seconds, 120)
+                self.assertEqual(got.queue_bound_seconds, 600)
                 self.assertTrue(got.fail_closed)
 
     def test_the_four_keys_are_read(self):
@@ -409,7 +409,7 @@ class SettingsTest(unittest.TestCase):
                 }}})
                 self.assertIsNone(got.memory_budget_mib)
                 self.assertEqual(got.worker_rss_cap_mib, 1536)
-                self.assertEqual(got.queue_bound_seconds, 120)
+                self.assertEqual(got.queue_bound_seconds, 600)
 
     def test_numeric_strings_and_integral_floats_count(self):
         got = admission.settings_from({"kanban": {"admission": {
@@ -439,7 +439,7 @@ class SettingsTest(unittest.TestCase):
 
     def test_an_explicit_config_is_not_loaded(self):
         engine = FakeEngine(config=RuntimeError("must not be called"))
-        self.assertEqual(admission.load_settings({}, engine=engine).queue_bound_seconds, 120)
+        self.assertEqual(admission.load_settings({}, engine=engine).queue_bound_seconds, 600)
 
 
 # ---------------------------------------------------------------------------
@@ -704,9 +704,21 @@ class TickWasLimitedTest(unittest.TestCase):
         setattr(res, admission.RESULT_ATTR, {"limited": False})
         self.assertFalse(admission.tick_was_limited(res, spawn_budget=None, spawned=3))
 
-    def test_the_siblings_reservation_limits(self):
-        self.assertTrue(admission.tick_was_limited(result(skipped_reserved=["t_1"]), spawn_budget=None, spawned=0))
-        self.assertFalse(admission.tick_was_limited(result(skipped_reserved=[]), spawn_budget=None, spawned=0))
+    def test_the_siblings_reservation_is_a_quota_hold_not_a_limit(self):
+        """A row the per-class slot reservation held back waits for its class's
+        slot; the tick is not capacity-limited by it, and the row is excluded
+        from the refusal rather than refused."""
+        res = result(skipped_reserved=["t_held"])
+        self.assertFalse(admission.tick_was_limited(res, spawn_budget=4, spawned=1))
+        conn = board()
+        ready(conn, "t_held", age=6000)
+        ready(conn, "t_waiting", age=6000)
+        got = admission.refuse_overdue_ready(
+            conn, res, limited_by_capacity=True, settings=settings(queue_bound_seconds=600), now=NOW,
+            engine=FakeEngine(),
+        )
+        self.assertEqual((got, status(conn, "t_held")), (["t_waiting"], "ready"))
+
 
 
 # ---------------------------------------------------------------------------

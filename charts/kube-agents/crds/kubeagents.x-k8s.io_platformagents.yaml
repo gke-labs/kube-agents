@@ -9854,18 +9854,20 @@ spec:
                             queueBoundSeconds:
                               description: |-
                                 QueueBoundSeconds is how long a ready card may wait, in seconds, on ticks
-                                that could not spawn it because of memory pressure, an exhausted slot
-                                budget or a slot held for the other class of card, before it is blocked
-                                with kind "capacity" instead of left in the queue. A card that waits for another reason is not touched: one that is
-                                unassigned, not spawnable, held by the respawn guard or by a per-profile
-                                cap stays ready, and so does a child of a request already running (a
-                                fan-out's per-cluster cards), whose wait belongs to the coordinator the
-                                thread is subscribed to. Absent means 120.
+                                that could not spawn it because of memory pressure or an exhausted slot
+                                budget, before it is blocked with kind "capacity" instead of left in the
+                                queue. A card that waits for another reason is not touched: one that is
+                                unassigned, not spawnable, held by the respawn guard, by a per-profile
+                                cap or by the per-class slot reservation stays ready, and so does a child
+                                of a request already running (a fan-out's per-cluster cards), whose wait
+                                belongs to the coordinator the thread is subscribed to. Absent means 600.
 
-                                Two minutes is 24 ticks at the 5s dispatch interval: long enough for a
-                                worker that is finishing to give its slot back, short enough that the
-                                thread that filed the card hears it is throttled, with its options,
-                                before it would have given up waiting for an answer.
+                                Ten minutes is 120 ticks at the 5s dispatch interval. On a board busy
+                                with other work a card waits minutes for a slot in ordinary operation:
+                                the presubmit install showed two to four while memory was healthy, and a
+                                two-minute bound refused eighteen ordinary cards in one run. The thread
+                                has read the queued line since the first wait; ten minutes is past any
+                                answer it was still waiting for, and a strategy change serves it better.
                               format: int32
                               maximum: 3600
                               minimum: 10

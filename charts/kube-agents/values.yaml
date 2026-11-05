@@ -1101,12 +1101,12 @@ platformAgent:
       # spawn a worker, blocking the card with kind "capacity" and telling its
       # thread. memoryBudgetMiB defaults to the agent container's memory request
       # in MiB (4096 at the default 4Gi), workerRssCapMiB to 1536,
-      # queueBoundSeconds to 120 and failClosed to true; the operator renders
+      # queueBoundSeconds to 600 and failClosed to true; the operator renders
       # the block with those defaults when nothing is set here.
       # admission:
       #   memoryBudgetMiB: 3072
       #   workerRssCapMiB: 1536
-      #   queueBoundSeconds: 120
+      #   queueBoundSeconds: 600
       #   failClosed: true
       # profiles sizes AgentProfile work on a "next" install: ceiling is the most
       # profile tasks running at once across every profile (default: maxInProgress,

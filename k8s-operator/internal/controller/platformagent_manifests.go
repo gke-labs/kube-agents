@@ -1246,7 +1246,7 @@ const defaultKanbanMaxInProgress = 6
 // the budget was meant to prevent.
 const (
 	defaultAdmissionWorkerRssCapMiB   = 1536
-	defaultAdmissionQueueBoundSeconds = 120
+	defaultAdmissionQueueBoundSeconds = 600
 	defaultAdmissionFailClosed        = true
 	// admissionMemoryBudgetFloorMiB is the least budget the operator renders, the
 	// CRD's Minimum on memoryBudgetMiB (common_types.go) applied to the derived

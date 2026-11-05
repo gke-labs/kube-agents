@@ -399,7 +399,7 @@ cgroup's, so Hermes' own `/proc/meminfo` guard never fires there.
 Unset, `memoryBudgetMiB` is the agent container's memory request in MiB (`spec.deployment.resources`,
 `4096` at the default `4Gi`), so raising the request raises the budget. `workerRssCapMiB` (`1536`)
 stops a running worker whose process tree passes it and blocks its card the same way.
-`queueBoundSeconds` (`120`) refuses a ready card that memory pressure or a full board has held for
+`queueBoundSeconds` (`600`) refuses a ready card that memory pressure or a full board has held for
 that long. `failClosed` (`true`) makes a tick that cannot read the memory counters spawn nothing.
 [PlatformAgent fields](/kube-agents/operator/platformagent-fields/) lists the bounds.
 
@@ -547,7 +547,7 @@ part of a request already running (a worker's child, or a card with a parent lin
 one.
 
 The wait is bounded. A card that memory pressure or a full board has held past
-`tuning.admission.queueBoundSeconds` (120 s by default) is blocked with kind `capacity`. The queued
+`tuning.admission.queueBoundSeconds` (600 s by default) is blocked with kind `capacity`. The queued
 line settles as stopped, and the Planning Agent answers the thread with the reason and the
 alternatives ([`admission`](#specharnesstuning)).
 

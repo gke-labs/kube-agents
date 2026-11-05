@@ -30,13 +30,13 @@ Three admission decisions, each a function the dispatcher patch
   over ``worker_rss_cap_mib`` (SIGTERM, grace, SIGKILL, then the descendants
   that outlived it) and blocks its card with kind ``capacity``.
 * :func:`refuse_overdue_ready` blocks a ready card that has waited past
-  ``queue_bound_seconds`` for a slot the tick could not give it, for memory,
-  for an exhausted slot budget or for a slot held for the other class of
-  card, with the same kind. Never a card the tick
+  ``queue_bound_seconds`` for a slot the tick could not give it, for memory
+  or for an exhausted slot budget, with the same kind. Never a card the tick
   skipped for a reason of its own: unassigned, not a profile, respawn-guarded,
-  per-profile capped; a row the ready loop never reached is asked all four.
-  Nor a child of a request already running: its wait belongs to the
-  coordinator the thread is subscribed to.
+  per-profile capped, or held back by the per-class slot reservation; a row
+  the ready loop never reached is asked the first four. Nor a child of a
+  request already running: its wait belongs to the coordinator the thread is
+  subscribed to.
 
 A ``capacity`` block carries one sentence of cause and the options, so the
 front door can answer with the alternatives instead of retrying. Every log
@@ -72,7 +72,7 @@ FAIL_CLOSED_KEY = "fail_closed"
 #: Defaults for a missing or malformed key. The budget has none: without one
 #: the tick keeps upstream's classifier over ``/proc/meminfo``.
 DEFAULT_WORKER_RSS_CAP_MIB = 1536
-DEFAULT_QUEUE_BOUND_SECONDS = 120
+DEFAULT_QUEUE_BOUND_SECONDS = 600
 DEFAULT_FAIL_CLOSED = True
 
 #: The words a YAML or environment value may spell a boolean with.
@@ -171,15 +171,19 @@ WORKER_RESERVE_MIB = 512
 #: the sibling kanban_priority patch's list of the cards it told they are
 #: queued this tick: at the end of a tick that notice has already been posted,
 #: so a card on it is refused no earlier than the next limited tick and its
-#: thread reads the queued line before the refusal.
-EXCLUDED_ID_FIELDS = ("skipped_unassigned", "skipped_nonspawnable", "queued_noticed")
+#: thread reads the queued line before the refusal. ``skipped_reserved`` is
+#: the same patch's list of rows its per-class slot reservation held back:
+#: such a row waits for its class's slot, a quota, not for capacity the
+#: install lacks, so it is never refused.
+EXCLUDED_ID_FIELDS = ("skipped_unassigned", "skipped_nonspawnable", "queued_noticed", "skipped_reserved")
 EXCLUDED_TUPLE_FIELDS = ("respawn_guarded", "skipped_per_profile_capped", "spawned")
 #: The lane the respawn guard is asked about.
 READY_LANE = "ready"
 #: Upstream's list of ids the tick blocked, which the two refusals extend.
 AUTO_BLOCKED_FIELD = "auto_blocked"
 #: The sibling kanban_priority patch's field: ready rows its per-class slot
-#: reservation held back this tick. Read here, never written.
+#: reservation held back this tick. Read here through EXCLUDED_ID_FIELDS, never
+#: written.
 RESERVED_FIELD = "skipped_reserved"
 
 #: The keys of the dict ``_stop_worker`` returns, and the two it reads from
@@ -787,16 +791,15 @@ def cap_spawn_budget(result: Any, spawn_budget: Optional[int]) -> Optional[int]:
 def tick_was_limited(result: Any, *, spawn_budget: Optional[int], spawned: int) -> bool:
     """Whether this tick held a ready card back for capacity.
 
-    True when memory limited it (recorded by :func:`pressure_level_for_tick`),
-    when its slot budget ran out, or when the sibling kanban_priority patch's
-    per-class reservation held a row back.
+    True when memory limited it (recorded by :func:`pressure_level_for_tick`)
+    or when its slot budget ran out. A row the sibling kanban_priority patch's
+    per-class reservation held back is a quota case, excluded from the
+    refusal rather than a cause of it.
     """
     record = getattr(result, RESULT_ATTR, None)
     if isinstance(record, Mapping) and record.get(RECORD_LIMITED):
         return True
-    if spawn_budget is not None and spawned >= spawn_budget:
-        return True
-    return bool(getattr(result, RESERVED_FIELD, None))
+    return spawn_budget is not None and spawned >= spawn_budget
 
 
 def _excluded_ids(result: Any) -> set:
@@ -848,9 +851,8 @@ def refuse_overdue_ready(conn, result: Any, *, limited_by_capacity: bool,
                          now: Optional[float] = None, engine=None, per_profile_cap: Any = None) -> list:
     """Block, with kind ``capacity``, the ready cards this tick left waiting past the bound.
 
-    Only when ``limited_by_capacity`` holds: the tick was memory-limited, its
-    slot budget was exhausted, or the sibling kanban_priority patch's per-class
-    reservation held a row back. A card the tick skipped for a reason of its own
+    Only when ``limited_by_capacity`` holds: the tick was memory-limited or its
+    slot budget was exhausted. A card the tick skipped for a reason of its own
     (``EXCLUDED_ID_FIELDS``, ``EXCLUDED_TUPLE_FIELDS``, or :func:`_own_reason`
     for a row the loop never reached) is never refused; ``per_profile_cap`` is
     the dispatcher's ``kanban.max_in_progress_per_profile``, so that question

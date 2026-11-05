@@ -286,18 +286,20 @@ its children are workers of their own, spawned by the dispatcher, not descendant
 A card that waits for a slot costs nothing while it waits, and it starts eventually. What it costs
 is the user's time. The success criteria ask for a simple question answered under one minute and
 a first acknowledgement within ten seconds
-([`kube-agents-success-criteria.md`](../kube-agents-success-criteria.md), SC3 and SC4). A card
-still queued at two minutes is past any answer the user is waiting for, and a strategy change, the
-scheduled report or a smaller scope, serves the
-user better than an answer twenty minutes later. Two minutes is 24 ticks at the 5 s dispatch
-interval: 24 chances to spawn before the refusal.
+([`kube-agents-success-criteria.md`](../kube-agents-success-criteria.md), SC3 and SC4), and the
+queued line tells the person they wait from the first tick. The bound is ten minutes, 120 ticks at
+the 5 s dispatch interval. A two-minute bound was tried first: on the presubmit install a board busy
+with other work made ordinary cards wait two to four minutes for a slot while memory was healthy,
+and eighteen of them were refused in one run, each answered "too busy" where waiting would have
+answered the question. A card still queued at ten minutes is past any answer the person was
+waiting for, and a strategy change, the scheduled report or a smaller scope, serves them better.
 
 After the ready and review loops, before the tick returns, the dispatcher walks the ready rows it
 did not spawn and blocks, with kind `capacity`, each one older than `queue_bound_seconds` whose
-reason for waiting was memory (the tick's early return, or the headroom cap on its spawns), an
-exhausted slot budget (the loop's break) or the scheduling patch's per-class reservation holding it
-back. It never refuses a card it skipped as unassigned, non-spawnable, respawn-guarded or
-per-profile capped: those are routing and quota states, and a `capacity` reason would name the
+reason for waiting was memory (the tick's early return, or the headroom cap on its spawns) or an
+exhausted slot budget (the loop's break). It never refuses a card it skipped as unassigned,
+non-spawnable, respawn-guarded or per-profile capped, nor one the scheduling patch's per-class slot
+reservation held back for the other class's slot: those are routing and quota states, and a `capacity` reason would name the
 wrong cause and send the user the wrong alternatives; a row the ready loop never reached is asked
 the same four questions, the per-profile cap from the running counts. Nor does it refuse a child of
 a request already running (a card with a dependency parent in `task_links`, or one a worker filed,
@@ -307,7 +309,7 @@ user to narrow a scope they did not exceed. The age is the time since the card l
 entered the ready lane: the latest of its creation, the end of its last run, and the event that
 returned it to the lane (a promotion, an unblock, an assignment, a reviewer's changes request, a
 review reopened, a reclaim). The reason follows the same shape:
-`capacity: the card waited 300 s for a worker slot against the 120 s bound; the install cannot take this now. Options: ...`.
+`capacity: the card waited 700 s for a worker slot against the 600 s bound; the install cannot take this now. Options: ...`.
 
 A card refused this way is not retried on its own. `kanban_unblock` returns it to `ready` and its
 wait starts again. The `⏳ Queued` line of the scheduling patch is the first thing a waiting user
@@ -352,7 +354,7 @@ spec:
       admission:
         memoryBudgetMiB: 2048 # default: the agent container's resolved memory request
         workerRssCapMiB: 1536
-        queueBoundSeconds: 120
+        queueBoundSeconds: 600
         failClosed: true
 ```
 
@@ -372,7 +374,7 @@ spec:
 | ---------------------------- | ------------------- | ----------------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `memory_budget_mib`          | `memoryBudgetMiB`   | the agent container's resolved memory request in MiB; 4,096 today | 512 to 65,536 | on Autopilot the request is where the eviction fires, and a budget at the limit admits 8 GiB of work into a pod evicted at its request; the operator's default request is 4 GiB from this change, because a `spec.mode: next` gateway idles at about 1.5 GiB of working set and the 2 GiB default admitted no worker on the presubmit install (every tick capped at zero, every card refused after the bound); following the resolved request means a raise of it, through `spec.deployment.resources` or a new operator default, moves the budget with it; the floor is the least value the schema and the operator admit, and a derived budget under it (a request the operator cannot read as one) is clamped to it and logged: at the floor the dispatcher still admits nothing, because every measured container idles above 512 MiB, and refuses every card after the bound, which is what the clamp buys over a silent fall-back to the meminfo guard, a refusal that names its figures; the ceiling is above any node the install runs on |
 | `worker_rss_cap_mib`         | `workerRssCapMiB`   | 1,536                                                             | 256 to 65,536 | an idle worker is about 430 MiB and a long poll loop grows past 1 GiB; 1.5 GiB leaves a fleet-sized card room and stops a runaway before it alone carries the pod from its 1.8 GiB idle set past a 4 GiB request; under a 2 GiB request the pressure guard acts first; the floor is below an idle worker on purpose, for a test install, and a value under 430 stops every worker as its proxies start                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `queue_bound_seconds`        | `queueBoundSeconds` | 120                                                               | 10 to 3,600   | two minutes is 24 ticks at the 5 s dispatch interval, and a card still queued then is past the one-minute answer the success criteria set for a simple question, so a strategy change serves the user better; the floor is two ticks, so no card is refused before the dispatcher has tried twice; the ceiling is an hour, past which a refusal tells the user nothing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `queue_bound_seconds`        | `queueBoundSeconds` | 600                                                               | 10 to 3,600   | ten minutes is 120 ticks at the 5 s dispatch interval; a two-minute bound refused eighteen ordinary cards in one presubmit run, each waiting behind other work while memory was healthy, so the bound sits past the waits a busy board produces and the queued line carries the feedback until then; the floor is two ticks, so no card is refused before the dispatcher has tried twice; the ceiling is an hour, past which a refusal tells the user nothing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `fail_closed`                | `failClosed`        | `true`                                                            |               | a dispatcher that cannot read memory and spawns anyway is the one that evicted the pod; the chain of sources ends at `/proc/self/status`, so the closed state marks a real fault, which the log names; `false` is the way out where the fault is permanent and accepted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ## What later stages add
