@@ -173,7 +173,7 @@ func TestGchatStopClickIsACancel(t *testing.T) {
 		t.Fatalf("stop click dropped: %s", reason)
 	}
 	if msg.Intent != IntentCancel || msg.Text != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != sessionKindDM ||
-		msg.AuthorID != "sender@example.com" || msg.MessageID != gchatClickID(ev.Message.Name, ev.click.EventTime) || msg.Click || msg.TaskID != "" {
+		msg.AuthorID != "sender@example.com" || msg.MessageID != gchatClickID(ev.Message.Name, ev.click.EventTime) || !msg.Click || msg.TaskID != "" {
 		t.Errorf("stop turn = %+v", msg)
 	}
 	if _, reason := a.classify(ev); !strings.HasPrefix(reason, gchatStopDuplicate) {

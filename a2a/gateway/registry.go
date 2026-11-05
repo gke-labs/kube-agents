@@ -63,6 +63,11 @@ type ActiveTask struct {
 	// StatusMsgID is the backend message the relay edits — the rolling
 	// progress line.
 	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// LineClosed marks a live message a Stop press closed: it reads "cancel
+	// sent" with no Stop control, and the relay leaves it so until the
+	// terminal edit (updateRollingLine, showBusy). False for a typed stop,
+	// whose line keeps moving until the terminal.
+	LineClosed bool `json:"lineClosed,omitempty"`
 	// Capability pins this task's root entry in the `cap` bucket: the key
 	// and the revision the mint returned. Every envelope the gateway sends
 	// toward this task carries it, and it is on the record rather than in

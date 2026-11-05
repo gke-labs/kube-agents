@@ -101,6 +101,15 @@ const relayDurable = "gateway-relay"
 // task that produced no first event inside FirstEventGrace: the task id,
 // the grace, and what happens to the message that triggered it. It states
 // the evidence (nothing on the stream in that long), not the inference.
+// cancelSentNotice is the gateway's answer to a stop with a task running:
+// posted for a typed stop, and edited onto the task's line for a Google
+// Chat Stop press (chatStopPress). cancelNotSentNotice is the answer when the
+// cancel did not reach the bus.
+const (
+	cancelSentNotice    = "🛑 cancel sent — the task ends when the executor confirms"
+	cancelNotSentNotice = "⚠️ could not send the stop; the task is still running — try again"
+)
+
 const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event stream in %s, so this conversation is released and this message is handled as a new turn"
 
 // steerNoFirstEventAck is the steer acknowledgement for a task with nothing
@@ -1180,6 +1189,11 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
+	case stopping && isChatStopPress(msg, backend) && active != nil && !g.cardStopWanted(rec, msg):
+		// Google Chat's Stop button answers on the task's own line, and
+		// posts nothing (gchat_stop.go). With the card stop armed it takes
+		// the typed stop's path below, cards and replies included.
+		g.chatStopPress(ctx, rec, authority)
 	case stopping && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// A cancel that names a task the conversation no longer holds as
 		// active -- the heal a few lines up may just have released it.
@@ -3016,7 +3030,7 @@ func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, auth
 	if err := g.client.Publish(ctx, lib.TaskInSubject(rec.Addressee, active.TaskID), env); err != nil {
 		g.log.Error("cancel publish failed", "taskId", active.TaskID, "err", err)
 		if !quiet {
-			g.post(rec.Key, "⚠️ could not send the stop; the task is still running — try again")
+			g.post(rec.Key, cancelNotSentNotice)
 		}
 		return false
 	}
@@ -3036,7 +3050,7 @@ func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, auth
 		// The post before the signal: a waiter woken by the signal snapshots
 		// the conversation's entries, and the line saying the cancel went
 		// belongs in what it reads.
-		g.post(rec.Key, "🛑 cancel sent — the task ends when the executor confirms")
+		g.post(rec.Key, cancelSentNotice)
 	}
 	g.observeCancel(rec, active.TaskID)
 	return true

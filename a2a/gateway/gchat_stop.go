@@ -13,10 +13,11 @@ import (
 // Stop button under it: after every button the message carries when it is
 // laid out (a progress message's links), alone under the text otherwise. The
 // terminal edit arrives without Stop and takes the button off, as Edit does.
-// A click on it is the typed `stop` in every way: it lands on the gateway as
-// IntentCancel with no text, bound to the conversation the button carries,
-// and the gateway's stop path answers it as it answers the word, in the
-// conversation, for anyone the allowlist admits. Slack's Stop is native to
+// A click on it sends the cancel a typed `stop` sends: it lands on the
+// gateway as IntentCancel with no text, bound to the conversation the button
+// carries, for anyone the allowlist admits, and the gateway answers it on
+// the line itself rather than with the typed stop's posts
+// (chat_stop_press.go). Slack's Stop is native to
 // its Agent Sessions (slack_stop.go); this one is drawn, since Chat has no
 // such control, and a text line Chat refuses with it is posted or patched
 // once more without it, so the line itself never fails for the button (a
@@ -120,5 +121,6 @@ func (a *GoogleChatAdapter) classifyStop(ev *gchatEvent) (InboundMessage, string
 		AuthorID:     click.User.Email,
 		MessageID:    id,
 		Intent:       IntentCancel,
+		Click:        true,
 	}, ""
 }

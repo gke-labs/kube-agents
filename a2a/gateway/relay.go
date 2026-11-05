@@ -1076,7 +1076,7 @@ func isReasonTokenByte(c byte) bool {
 // split, honoured here rather than reinvented.
 func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relayState) {
 	active := rec.ActiveTask
-	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" {
+	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" || active.LineClosed {
 		return
 	}
 	if rs.busyShown && lineStillSubmitted(rs) {

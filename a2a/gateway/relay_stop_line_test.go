@@ -116,3 +116,60 @@ func TestANewTurnClosesASupersededStoppedLine(t *testing.T) {
 		}
 	}
 }
+
+// A Stop press on Google Chat answers on the task's own line: the cancel a
+// typed stop sends, no "cancel sent" post, the line edited to "cancel sent"
+// with no Stop, left so by later progress, and the terminal edit making it
+// "canceled" with no "canceled" notice posted. A second press changes
+// nothing.
+func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-press"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
+	})
+	line := r.adapter.stopLinesCopy()[0].MessageID
+	press := func(id string) {
+		r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: id, Intent: IntentCancel, Click: true}
+	}
+	press("spaces/S1/messages/" + line + "#t1")
+	waitFor(t, "the line closed on cancel sent", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, "cancel sent") {
+				return true
+			}
+		}
+		return false
+	})
+	edits := len(r.adapter.editTexts())
+	press("spaces/S1/messages/" + line + "#t2")
+	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "still going"}}, false, false)
+	if err := exec.PublishStatus(context.Background(), lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the terminal edit", func() bool {
+		texts := r.adapter.editTexts()
+		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "canceled")
+	})
+	texts := r.adapter.editTexts()
+	if len(texts) != edits+1 {
+		t.Errorf("edits after the press = %q; want the terminal edit alone", texts[edits:])
+	}
+	for _, l := range r.adapter.stopLinesCopy() {
+		if strings.Contains(l.Text, "cancel sent") || strings.Contains(l.Text, "canceled") {
+			t.Errorf("a closed line carried Stop: %+v", l)
+		}
+	}
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "🛑") {
+			t.Errorf("a press posted %q; the line is the reply", p)
+		}
+	}
+}

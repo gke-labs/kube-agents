@@ -82,7 +82,7 @@ func busyNotice(ahead int) string {
 // render this replaces.
 func (g *Gateway) showBusy(rec *SessionRecord, taskID string, ahead int) {
 	active := rec.ActiveTask
-	if active == nil || active.TaskID != taskID {
+	if active == nil || active.TaskID != taskID || active.LineClosed {
 		return
 	}
 	line := withLineNote(busyNotice(ahead), active.LineNote)
