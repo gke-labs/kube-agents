@@ -26,11 +26,12 @@ TF_VAR_extra_helm_values='{operator={extraEnv=[{name="A2A_MCP_DOOR",value="true"
 
 The variable applies to every `PlatformAgent` the operator manages. If the line already carries other `extraEnv` entries, add this one to the same list, since there is one such line. On a bare Helm install, add the entry to `operator.extraEnv` in your values file.
 
-Once the operator has restarted and reconciled, the install's namespace holds three objects named after the `PlatformAgent` (`platform-agent` on a default install):
+Once the operator has restarted and reconciled, the install's namespace holds four objects named after the `PlatformAgent` (`platform-agent` on a default install): the server's Deployment and Service, its token Secret, and a NetworkPolicy that limits who can reach it:
 
 ```bash
 kubectl -n kubeagents-system get deployment,service platform-agent-a2a-mcp
 kubectl -n kubeagents-system get secret platform-agent-a2a-mcp-token
+kubectl -n kubeagents-system get networkpolicy platform-agent-a2a-mcp-netpol
 ```
 
 If they do not appear, read the `A2AMCPServer` condition on the `PlatformAgent` ([status conditions](/kube-agents/operator/platformagent-crd/#status)). It is set when a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it.
@@ -155,7 +156,7 @@ Use the kube-agents send_message tool to ask: Which GKE clusters do you manage, 
 
 The answer names the conversation and its token, quotes any gateway notices, and gives the turn's task and its answer. If the turn filed cards, the reports they posted while the call waited follow under **Card reports on this turn**. Each is quoted as the reporting agent's text. A later message on the same `conversation` continues it; the default conversation is `default`.
 
-`wait_timeout_seconds` (default 150, at most 300) bounds the wait for the turn itself. When the wait ends first, the answer says the turn is still running and gives its task as `<addressee>/<task-id>`. Once the turn ends, the call waits about 15 seconds more for card reports and then returns, whatever the wait setting, so a card that takes longer is not in the answer.
+`wait_timeout_seconds` (default 150, at most 300) bounds the wait for the turn itself. When the wait ends first, the answer says the turn is still running and gives its task as `<addressee>/<task-id>`. Once the turn ends, the call keeps collecting card reports until none has arrived for 15 seconds or the wait runs out, whichever comes first, and returns at once when the turn handed no work to cards. A card that takes longer than that is not in the answer.
 
 **`task_control`** follows that task. `get` with `task_id` reads its state and answer, and `wait_timeout_seconds` waits for it to finish. `stop` stops a conversation's running task: pass `conversation`, or a `task_id` the bridge started in this session and is still running. A stop ends the turn; a card the turn already filed can still finish. If the host cancels a running `send_message` call, the bridge sends the stop for you.
 
