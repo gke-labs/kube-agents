@@ -54,6 +54,7 @@ const (
 	abandonLeaseExpired = "lease expired: the dispatcher heard no renewal in time"
 	abandonStopping     = "offer withdrawn: the dispatcher is stopping"
 	abandonUnrecorded   = "offer withdrawn: the dispatcher could not record the lease"
+	abandonNoCredential = "offer withdrawn: the dispatcher could not mint the task's credentials"
 
 	// Answers a worker sends for a task this dispatcher doesn't hold for it
 	// (an accept no offer waits on, a renewal for a task not confirmed to
@@ -839,8 +840,9 @@ func (d *Dispatcher) release(h *holding, settled bool) {
 // is abandoned on its pod before the task is offered to anyone else, and any
 // accept that comes after (onAccept) is answered with an abandon too, so a
 // lost or late accept never leaves two workers running the task. On an
-// accept the lease record is written, which starts the lease clock, and then
-// the confirm is sent: a record whose confirm is lost costs the task (no
+// accept the task's credentials are minted (with a key; a failed mint
+// withdraws the offer), the lease record is written, which starts the lease
+// clock, and then the confirm is sent: a record whose confirm is lost costs the task (no
 // renewal comes, and it fails lease-expired), never a second run. An empty
 // key with a nil error means no pod took the task.
 func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Delivery, snap lib.DispatchConfig,
@@ -930,6 +932,22 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 		timer.Stop()
 		switch {
 		case answered && acc.Accepted:
+			// The task's credentials are minted here and only here: for
+			// the one pod that accepted, before anything is recorded. With
+			// a key, a confirm never goes out without them, and one that
+			// can't be minted (the pod's UID changed, or the signer failed)
+			// is an offer withdrawn, as a declined one is: nothing is
+			// written, and the next pod is tried.
+			confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}
+			if d.mint != nil {
+				var err error
+				confirm.TaskCredential, confirm.ProxyToken, err = d.taskCredentials(log, h, pod, uid, deadline)
+				if err != nil {
+					log.Warn("task credentials not minted; withdrawing the offer", "pod", pod, "err", err)
+					giveUp(abandonNoCredential)
+					continue
+				}
+			}
 			now := d.now()
 			key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
 			rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
@@ -945,19 +963,6 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 			delete(d.offers, ok)
 			h.confirmed = true
 			d.mu.Unlock()
-			// The task's credentials are minted here and only here: for
-			// the one pod being confirmed, once its lease is recorded.
-			// With a key, a confirm never goes out without them: a
-			// credential that can't be minted is a confirm not sent.
-			confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}
-			if d.mint != nil {
-				var err error
-				confirm.TaskCredential, confirm.ProxyToken, err = d.taskCredentials(log, h, pod, uid, deadline)
-				if err != nil {
-					log.Error("task credentials not minted, so no confirm was sent; the task fails when its lease runs out", "pod", pod, "err", err)
-					return rec, key, nil
-				}
-			}
 			if err := d.send(subject, confirm); err != nil {
 				// The lease is running; with no confirm the worker never
 				// starts, no renewal comes, and the task fails

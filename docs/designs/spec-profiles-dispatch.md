@@ -354,8 +354,9 @@ leave open:
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
   never carries either, and renewals mint nothing. A pod with no UID in the pool isn't
-  offered the task. A pod whose UID changed by the confirm isn't confirmed, and the task
-  fails `lease-expired`. With the variable unset, confirms carry neither, workers keep their
+  offered the task. The credentials are minted on the accept, before the lease is recorded.
+  If the pod's UID changed since the offer, or the mint fails, the offer is withdrawn as a
+  declined one is, and the task is offered again. With the variable unset, confirms carry neither, workers keep their
   pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
   or holds another key type stops the dispatcher at startup. The dispatcher logs a
   credential's `jti`, never the token.
