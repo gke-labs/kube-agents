@@ -932,9 +932,10 @@ on: the sandbox restarts with the variable before an exec replica is ready.
 ## 11. Open questions
 
 1. Closed: no `/v1/exec` call used a content-workspace handle, and the content workspace is
-   retired (#4243). `/v1/exec` accepts only `gcloud` and `kubectl` (`EXEC_ROUTE_EXECUTABLES`,
-   `credential_proxy.py:5439`, enforced at `:9533-9547`). The broker's own `git` runs through
-   `execute_vcs_git`, a separate door that `/v1/exec` cannot reach.
+   retired (#4243). `/v1/exec` accepts only `gcloud` and `kubectl` (`EXEC_ROUTE_EXECUTABLES`
+   in `credential_proxy.py`, enforced by the executable allowlist check in `do_POST`). The
+   broker's own `git` runs through `execute_vcs_git`, a separate door that `/v1/exec` cannot
+   reach.
 2. Are a reserve of `R = 2` and an interactive cap of `admitted − 1` right? The measured mix
    (§8.1) decides them.
 3. Do the dispatcher's profile workers reach the broker through the sandbox shim as the shell role?

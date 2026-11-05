@@ -463,7 +463,7 @@ def _tree_bytes(root: Path, stop_past: int) -> int:
 def _snapshot_paths(raw: Any) -> list[str]:
     """`paths` of a snapshot request: literal repository-relative names, or none.
 
-    Each is checked as the content routes check a name (`validate_path`):
+    Each is checked with `validate_path`:
     no absolute path, no `.` or `..` segment, no `.git` segment, no control
     character.
     """

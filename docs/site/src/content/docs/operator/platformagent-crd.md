@@ -795,7 +795,7 @@ Default image: derived dynamically from the operator's container image at runtim
 
 ### `spec.deployment.credentialProxy.resources`
 
-`credentialProxy.resources` is merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory`, at or above the default memory request, keeps the default requests, the 2 CPU limit and the 8Gi ephemeral-storage limit, which bounds the content workspace. The proxy's state emptyDir (size limit 5Gi) grows by whatever that limit is raised above the 8Gi default, and its `/tmp` emptyDir keeps its 2Gi, so the kubelet does not evict the pod at the smaller figure.
+`credentialProxy.resources` is merged over the operator's defaults per key, unlike `resources`: a CR that sets only `limits.memory`, at or above the default memory request, keeps the default requests, the 2 CPU limit and the 8Gi ephemeral-storage limit, which bounds the broker's scratch clones. The proxy's state emptyDir (size limit 5Gi) grows by whatever that limit is raised above the 8Gi default, and its `/tmp` emptyDir keeps its 2Gi, so the kubelet does not evict the pod at the smaller figure.
 
 The default requests are 500m CPU and 1Gi of memory, and on GKE Autopilot 2 CPU and 2Gi, because Autopilot without bursting clamps the limits to the requests. A `cpu` or `memory` limit set without its request, below the default request, lowers that request to the limit. On Autopilot a CPU request the CR does not set is held to at most one CPU per GiB of the memory request, so the pair does not fall under the band's 1 GiB per vCPU floor.
 

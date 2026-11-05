@@ -16224,48 +16224,6 @@ class SweepTransportTest(unittest.TestCase):
             self.assertFalse(credential_proxy.sweep_app_credential(static))
 
 
-class ReadCredentialSelectionTest(unittest.TestCase):
-    """What credential a read is handed per role."""
-
-    def test_a_name_that_resolves_to_no_forge_is_not_logged_as_unreadable_lists(self):
-        # Review finding: a resolution refusal was logged as "the repository
-        # lists could not be read", sending an operator to the ConfigMap.
-        registry = mock.Mock()
-        registry.resolve.side_effect = providers.ForgeUnsupported("names no host")
-        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-            credential = credential_proxy.read_credential_for(registry, "acme/infra")
-        self.assertIsInstance(credential, providers.NoCredential)
-        joined = "\n".join(logs.output)
-        self.assertIn("does not resolve to a forge", joined)
-        self.assertNotIn("could not be read", joined)
-
-    def test_only_a_context_repository_gets_a_credential(self):
-        registry = providers.Registry({"mint": lambda provider, repo: "token"})
-        with mock.patch.object(credential_proxy, "repository_role", return_value="context"):
-            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
-                credential = credential_proxy.read_credential_for(registry, "acme/tf-live")
-        self.assertIsInstance(credential, providers.MintedReadCredential)
-        self.assertIn("repo=acme/tf-live role=context", logs.output[0])
-        for role in ("managed", "unregistered"):
-            with self.subTest(role=role):
-                with mock.patch.object(credential_proxy, "repository_role", return_value=role):
-                    with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
-                        credential = credential_proxy.read_credential_for(registry, "acme/x")
-                self.assertIsInstance(credential, providers.NoCredential)
-                self.assertIn(f"role={role}", logs.output[0])
-
-    def test_an_unreadable_list_means_no_credential_not_a_refusal(self):
-        # A read has no gate by design; a ConfigMap read that failed must not
-        # take `inspect-repository` away from every public repository.
-        registry = providers.Registry({"mint": lambda provider, repo: "token"})
-        with mock.patch.object(
-            credential_proxy, "repository_role", side_effect=RuntimeError("kubectl exited 1")
-        ):
-            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-                credential = credential_proxy.read_credential_for(registry, "acme/tf-live")
-        self.assertIsInstance(credential, providers.NoCredential)
-        self.assertIn("role=unknown", logs.output[0])
-
 class ApiRelayOverTheSocketTest(unittest.TestCase):
     """The read-only Cloud API relay, driven over a real socket.
 

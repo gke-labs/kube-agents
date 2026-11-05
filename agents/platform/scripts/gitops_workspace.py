@@ -731,8 +731,8 @@ def ensure_scratch_workspace(
     """The same leased path as `ensure_workspace`, with no clone in it.
 
     What a caller gets is a directory and nothing else: no `.git`, no remote, no
-    checkout. It is for the content-passing path, where the repository lives in
-    the broker and the agent's side of the exchange is a pile of files it wrote.
+    checkout. It is for the broker paths, where the repository lives in the
+    broker and the agent's side of the exchange is a pile of files it wrote.
     Removing the clone is the point — a `.git` the agent can write is where a
     filter driver, an alias or a hook path would have to be defined for the
     known code-execution routes through the credential container to work, and

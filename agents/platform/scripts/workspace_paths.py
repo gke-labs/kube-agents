@@ -146,7 +146,7 @@ def validate_path(raw: Any) -> str:
             raise WorkspaceError(
                 f"path {raw!r} names a git directory. Nothing the agent authors "
                 "belongs there: `.git/config` is where a filter driver, an alias "
-                "or a hook path would be defined, and content-passing exists so "
+                "or a hook path would be defined, and the broker routes exist so "
                 "that the agent cannot define one."
             )
     return str(PurePosixPath(*parts))

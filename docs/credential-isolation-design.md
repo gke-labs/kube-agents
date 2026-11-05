@@ -704,9 +704,9 @@ ceilings.
 
 Be precise about what this does and does not do. It does not change what `git`
 executes: a repository-local `.git/config` in the runtime's own tree would still
-run what it names. What changes is who can write that file. The scratch
-repository is never checked out, so nothing the sandbox sends lands in a working
-tree on the runtime's side.
+run what it names. What changes is who can write that file: the sandbox sends
+file contents and names, never a `.git` path, so nothing it sends can define a
+key in the scratch repository's configuration.
 
 ### Agent-supplied kubeconfigs
 

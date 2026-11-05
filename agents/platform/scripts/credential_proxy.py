@@ -2122,73 +2122,6 @@ def _provider_forge(provider: str) -> providers.Forge:
     raise PermissionError(f"{provider} is not a forge this install serves")
 
 
-def read_credential_for(registry: providers.Registry, repository: str) -> providers.Credential:
-    """The credential the broker's clone, fetch or push of ``repository`` presents.
-
-    Asked at `open`, and again before every fetch and push of a handle whose
-    credential is a stored token, so a repository unregistered meanwhile stops
-    getting it. By role:
-
-    - managed: on a forge whose credential is a token an administrator stored
-      (GitLab), that token, through the forge's helper; on GitHub, nothing --
-      the clone and push ride the ambient write credential the CLI installed,
-      as they always have;
-    - context: the forge's read-only credential, and never the write token
-      (on GitLab, the optional `read-token` key beside the write token); a
-      forge that offers none clones with no credential;
-    - unregistered: no credential at all, a public upstream read.
-
-    An unreadable list is logged and answered with no credential rather than
-    raised: this is not an authorization check -- `open` has none by design --
-    and refusing the clone would take `inspect-repository` away from every
-    public repository for the sake of a private one that would have failed
-    anyway.
-    """
-    try:
-        forge, repo = registry.resolve(repository)
-    except providers.WorkspaceError as exc:
-        # Not the lists: the name does not resolve to a forge this install
-        # serves (a bare name with more than one forge, or none built).
-        LOGGER.warning(
-            "read credential repo=%s role=unknown: the repository does not "
-            "resolve to a forge this install serves code=%s; cloning without a credential",
-            repository,
-            exc.fields.get("code"),
-        )
-        return providers.NoCredential()
-    try:
-        role = repository_role(repo, forge)
-    except Exception as exc:  # noqa: BLE001 - the clone proceeds without it
-        LOGGER.warning(
-            "read credential repo=%s role=unknown: the repository lists "
-            "could not be read type=%s; cloning without a credential",
-            repository,
-            type(exc).__name__,
-        )
-        return providers.NoCredential()
-    LOGGER.info("read credential repo=%s role=%s", repository, role)
-    if role == ROLE_MANAGED and _holds_stored_token(forge):
-        # A forge whose credential is a token an administrator stored has no
-        # ambient helper behind it, so a managed repository's clone, fetch and
-        # push present the token themselves, through the forge's helper.
-        return forge.credential
-    if role != ROLE_CONTEXT:
-        return providers.NoCredential()
-    # A context repository gets the forge's read-only credential, and never
-    # the write token: a forge that offers none -- GitLab without a
-    # `read-token` key in its credentials Secret -- clones it with no
-    # credential, which reads a public repository and refuses a private one
-    # at the clone.
-    credential = forge.read_credential(repo)
-    vcs_broker.warn_without_read_token(forge, credential, f"read credential repo={repository}")
-    return credential
-
-
-def _holds_stored_token(forge: providers.Forge) -> bool:
-    """Whether ``forge`` presents a stored token rather than a minted one."""
-    return vcs_broker.holds_stored_token(forge)
-
-
 #: The forge a bare `owner/name` means. A host-qualified name is read from the
 #: forge that serves its host.
 BARE_NAME_PROVIDER = "github"
@@ -2256,7 +2189,7 @@ def snapshot_bare_name_fallback(
 
     - the name has a host, or is not GitHub-shaped: None, for the registry;
     - the install has a GitHub forge: the name on that forge's host, for the
-      registry to resolve, lifted by `_hosted`.
+      registry to resolve, composed on that forge's host.
       With a second forge the registry refuses a hostless name;
     - no GitHub forge, and a forge of the install lists the name as managed
       or context: the name on that forge's host, read on the install's forge,
