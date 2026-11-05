@@ -888,6 +888,10 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
 
         with mock.patch("urllib.request.urlopen") as mock_urlopen:
             self.assertEqual(await sender(None, "conv-1", "   "), {"success": True, "platform": "teams", "skipped": "empty_text"})
+            self.assertEqual(
+                await sender(None, "conv-1", "", media_files=["/tmp/a.png"]),
+                {"success": True, "platform": "teams", "skipped": "empty_text", "media_omitted": 1},
+            )
             mock_urlopen.assert_not_called()
 
         # The send tool hands the files over with the last chunk after warning
@@ -1149,6 +1153,75 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             teams_relay_patch.activity_size_bytes(payload),
             teams_relay_patch.TEAMS_MAX_ACTIVITY_BYTES,
         )
+
+    async def test_a_typing_post_that_outlives_its_deadline_clears_only_its_own_mark(self):
+        """A dribbling broker lets a post end after its deadline; by then a
+        later tick holds the mark, and the old worker must not clear it."""
+        import threading
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        releases = [threading.Event(), threading.Event()]
+        calls = []
+
+        def slow_urlopen(req, timeout=None):
+            del timeout
+            index = len(calls)
+            calls.append(req.full_url)
+            releases[index].wait(5)
+            resp = mock.MagicMock()
+            resp.read.return_value = b"{}"
+            resp.__enter__.return_value = resp
+            return resp
+
+        meta = {"serviceUrl": "https://smba.trafficmanager.net/teams/"}
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=slow_urlopen),
+            mock.patch.object(teams_relay_patch, "TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS", 0.05),
+        ):
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.02)
+            await asyncio.sleep(0.1)  # tick A's mark expires while its worker still posts
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(adapter.send_typing("conv-1", metadata=meta), timeout=0.02)
+            self.assertEqual(len(calls), 2)  # tick B posted
+            releases[0].set()  # worker A ends after its deadline
+            await asyncio.sleep(0.02)
+            self.assertIn("conv-1", adapter._typing_in_flight)  # B's mark survives A's finally
+            await adapter.send_typing("conv-1", metadata=meta)  # tick C: skipped, B still posting
+            self.assertEqual(len(calls), 2)
+            releases[1].set()
+            for _ in range(100):
+                if not adapter._typing_in_flight:
+                    break
+                await asyncio.sleep(0.01)
+        self.assertEqual(adapter._typing_in_flight, {})
+
+    async def test_send_reports_a_failure_on_a_later_chunk_without_hiding_the_earlier_posts(self):
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams")
+        adapter.adaptive_cards = False
+        sent = []
+
+        def flaky_urlopen(req, timeout=None):
+            del timeout
+            sent.append(json.loads(req.data)["payload"]["text"])
+            if len(sent) == 2:
+                raise urllib.error.URLError("connection refused")
+            resp = mock.MagicMock()
+            resp.read.return_value = json.dumps({"id": "m-%d" % len(sent)}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        report = "\n".join(["line %05d" % i for i in range(2000)])  # three chunks
+        with mock.patch("urllib.request.urlopen", side_effect=flaky_urlopen):
+            res = await adapter.send("conv-1", report)
+        self.assertFalse(res.success)
+        self.assertIn("connection refused", res.error)
+        self.assertEqual(len(sent), 2)  # the first chunk posted, the second failed, the third never went
 
 
 if __name__ == "__main__":

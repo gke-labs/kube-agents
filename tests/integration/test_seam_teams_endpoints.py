@@ -261,6 +261,27 @@ class TeamsEndpointsSeamTest(unittest.TestCase):
         )
         self.assertTrue(any("BotNotInConversationRoster" in line for line in logs.output), logs.output)
 
+        # Microsoft's words go through the same redaction as the detail.
+        token = "ghp_" + "a" * 36
+        body = json.dumps({"error": {"code": "Forbidden", "message": f"token {token} rejected"}}).encode()
+        err = urllib.error.HTTPError("https://smba.trafficmanager.net/teams/v3/x", 403, "Forbidden", {}, io.BytesIO(body))
+        with mock.patch.object(_TEAMS_OPENER, "open", side_effect=err), self.assertLogs(
+            "credential-proxy", level="WARNING"
+        ):
+            status, answer = self._call(
+                "/v1/chat/teams/api",
+                {
+                    "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                    "endpoint": "v3/conversations/123/activities",
+                    "method": "POST",
+                    "payload": {"type": "message", "text": "reply"},
+                },
+                method="POST",
+            )
+        self.assertEqual(status, 502)
+        self.assertEqual(answer["teams"]["message"], "token [REDACTED] rejected")
+        self.assertNotIn(token, json.dumps(answer))
+
     def test_refused_redirect_is_a_502_with_its_reason_logged(self):
         """Any ``TeamsUpstreamError`` raised under ``api_call`` reaches the 502
         branch and its warning line; the handler itself is covered by the

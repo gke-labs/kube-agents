@@ -632,9 +632,12 @@ def _build_teams_adapter_and_sender(
             # its worker ever ran (queued behind a busy executor) cannot leave
             # the conversation without an indicator.
             now = time.monotonic()
-            if self._typing_in_flight.get(chat_id, 0.0) > now:
+            for stale in [c for c, d in self._typing_in_flight.items() if d <= now]:
+                self._typing_in_flight.pop(stale, None)
+            if chat_id in self._typing_in_flight:
                 return
-            self._typing_in_flight[chat_id] = now + TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS
+            deadline = now + TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS
+            self._typing_in_flight[chat_id] = deadline
             endpoint = f"v3/conversations/{chat_id}/activities"
             payload = {"type": "typing"}
 
@@ -651,7 +654,10 @@ def _build_teams_adapter_and_sender(
                         timeout=TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS,
                     )
                 finally:
-                    self._typing_in_flight.pop(chat_id, None)
+                    # Only this tick's own mark: a post that outlives its
+                    # deadline must not clear the mark a later tick set.
+                    if self._typing_in_flight.get(chat_id) == deadline:
+                        self._typing_in_flight.pop(chat_id, None)
 
             try:
                 await asyncio.to_thread(post_typing)
@@ -859,7 +865,10 @@ def _build_teams_adapter_and_sender(
                 "teams relay: dropped a %d-character message as a silent tick",
                 len(str(message or "")),
             )
-            return {"success": True, "platform": "teams", "skipped": "empty_text"}
+            skipped: dict[str, Any] = {"success": True, "platform": "teams", "skipped": "empty_text"}
+            if media_files:
+                skipped["media_omitted"] = len(media_files)
+            return skipped
         try:
             adapter = TeamsRelayAdapter(pconfig)
             result = await adapter.send(
