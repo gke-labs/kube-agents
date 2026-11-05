@@ -122,6 +122,19 @@ func TestMemoryCacheStoreLRUEvictionAndFrequency(t *testing.T) {
 	}
 }
 
+// testClusterPrefix routes a test request to the in-cluster API server: the handler refuses a
+// path that names no cluster.
+const testClusterPrefix = "/clusters/" + InClusterID
+
+// newClusterRequest builds a request for the in-cluster API server unless target already names a
+// cluster.
+func newClusterRequest(method, target string, body io.Reader) *http.Request {
+	if !strings.HasPrefix(target, "/clusters/") {
+		target = testClusterPrefix + target
+	}
+	return httptest.NewRequest(method, target, body)
+}
+
 type faultyCacheStore struct {
 	mu          sync.Mutex
 	inner       *MemoryCacheStore
@@ -189,11 +202,11 @@ func TestHandlerCustomCacheStoreAndFailOpen(t *testing.T) {
 	})
 
 	// Healthy custom store caches on miss and serves from cache on hit.
-	rec1 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	rec1 := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 	if rec1.Code != http.StatusOK || rec1.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("first GET code=%d Cache-Status=%q", rec1.Code, rec1.Header().Get(headerCacheStatus))
 	}
-	rec2 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	rec2 := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 	if rec2.Code != http.StatusOK || rec2.Header().Get(headerCacheStatus) != cacheStatusHit {
 		t.Fatalf("second GET code=%d Cache-Status=%q", rec2.Code, rec2.Header().Get(headerCacheStatus))
 	}
@@ -208,7 +221,7 @@ func TestHandlerCustomCacheStoreAndFailOpen(t *testing.T) {
 	custom.deleteErr = errors.New("redis delete timeout")
 	custom.mu.Unlock()
 
-	rec3 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	rec3 := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 	if rec3.Code != http.StatusOK {
 		t.Fatalf("GET with failing store code = %d, want 200: %s", rec3.Code, rec3.Body.String())
 	}
@@ -216,7 +229,7 @@ func TestHandlerCustomCacheStoreAndFailOpen(t *testing.T) {
 		t.Fatalf("upstream.calls = %d, want 2 after fail-open Get", upstream.calls)
 	}
 
-	recDel := serve(h, httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/p1", nil))
+	recDel := serve(h, newClusterRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/p1", nil))
 	if recDel.Code != http.StatusOK {
 		t.Fatalf("DELETE with failing store code = %d, want 200: %s", recDel.Code, recDel.Body.String())
 	}
@@ -287,7 +300,7 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 		"/openapi/v2",
 		"/apis",
 	} {
-		recMiss := serve(h, httptest.NewRequest(http.MethodGet, path, nil))
+		recMiss := serve(h, newClusterRequest(http.MethodGet, path, nil))
 		if recMiss.Code != http.StatusOK {
 			t.Fatalf("GET %s miss code = %d: %s", path, recMiss.Code, recMiss.Body.String())
 		}
@@ -296,7 +309,7 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 		}
 
 		advance(2 * time.Second)
-		recHit := serve(h, httptest.NewRequest(http.MethodGet, path, nil))
+		recHit := serve(h, newClusterRequest(http.MethodGet, path, nil))
 		if recHit.Code != http.StatusOK {
 			t.Fatalf("GET %s hit code = %d: %s", path, recHit.Code, recHit.Body.String())
 		}
@@ -331,7 +344,7 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 			if tc.body != "" {
 				bodyReader = strings.NewReader(tc.body)
 			}
-			rec := serve(h, httptest.NewRequest(tc.method, tc.path, bodyReader))
+			rec := serve(h, newClusterRequest(tc.method, tc.path, bodyReader))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("%s %s code = %d: %s", tc.method, tc.path, rec.Code, rec.Body.String())
 			}
@@ -345,7 +358,7 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 	}
 
 	// 3. Trigger a bypass metric via Cache-Control: no-store.
-	bypassReq := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	bypassReq := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	bypassReq.Header.Set(headerCacheControl, "no-store")
 	if rec := serve(h, bypassReq); rec.Header().Get(headerCacheStatus) != cacheStatusBypass {
 		t.Errorf("no-store Cache-Status = %q, want %q", rec.Header().Get(headerCacheStatus), cacheStatusBypass)
@@ -358,7 +371,7 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		go func() {
 			defer wg.Done()
-			serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/services", nil))
+			serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/services", nil))
 		}()
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -387,14 +400,14 @@ func TestHandlerCacheHitMissAndObservability(t *testing.T) {
 	if !nonCachedDiscoveryPaths.Has("/metrics") {
 		t.Fatalf("nonCachedDiscoveryPaths must include /metrics so live Prometheus scrapes are not cached")
 	}
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods/pod-a", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods/pod-a", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("expired pod-a status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
 	// Tightening maxBytes forces Set to evict the remaining expired pods entry and one cold entry by capacity.
 	store.mu.Lock()
 	store.maxBytes = store.usedBytes - 10
 	store.mu.Unlock()
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/configmaps", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/configmaps", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("configmaps miss status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
 
@@ -450,7 +463,7 @@ func TestHandlerCacheControlDirectives(t *testing.T) {
 	const podsPath = "/api/v1/namespaces/default/pods"
 
 	// 1. Request Cache-Control: no-store bypasses read and write.
-	reqNoStore := httptest.NewRequest(http.MethodGet, podsPath, nil)
+	reqNoStore := newClusterRequest(http.MethodGet, podsPath, nil)
 	reqNoStore.Header.Set(headerCacheControl, "no-store")
 	rec := serve(h, reqNoStore)
 	if got := rec.Header().Get(headerCacheStatus); got != cacheStatusBypass {
@@ -461,42 +474,42 @@ func TestHandlerCacheControlDirectives(t *testing.T) {
 	}
 
 	// Populate cache (seq 2).
-	rec = serve(h, httptest.NewRequest(http.MethodGet, podsPath, nil))
+	rec = serve(h, newClusterRequest(http.MethodGet, podsPath, nil))
 	if rec.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec.Body.String(), `"seq":2`) {
 		t.Fatalf("populate got status=%q body=%s", rec.Header().Get(headerCacheStatus), rec.Body.String())
 	}
 
 	// 2. Request Cache-Control: no-cache forces upstream refresh (seq 3) and updates cache.
-	reqNoCache := httptest.NewRequest(http.MethodGet, podsPath, nil)
+	reqNoCache := newClusterRequest(http.MethodGet, podsPath, nil)
 	reqNoCache.Header.Set(headerCacheControl, "no-cache")
 	rec = serve(h, reqNoCache)
 	if rec.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec.Body.String(), `"seq":3`) {
 		t.Fatalf("no-cache got status=%q body=%s", rec.Header().Get(headerCacheStatus), rec.Body.String())
 	}
-	rec = serve(h, httptest.NewRequest(http.MethodGet, podsPath, nil))
+	rec = serve(h, newClusterRequest(http.MethodGet, podsPath, nil))
 	if rec.Header().Get(headerCacheStatus) != cacheStatusHit || !strings.Contains(rec.Body.String(), `"seq":3`) {
 		t.Fatalf("after no-cache, hit got status=%q body=%s", rec.Header().Get(headerCacheStatus), rec.Body.String())
 	}
 
 	// 3. Request Cache-Control: max-age=0 forces upstream refresh (seq 4) and updates cache.
-	reqZeroMaxAge := httptest.NewRequest(http.MethodGet, podsPath, nil)
+	reqZeroMaxAge := newClusterRequest(http.MethodGet, podsPath, nil)
 	reqZeroMaxAge.Header.Set(headerCacheControl, "max-age=0")
 	rec = serve(h, reqZeroMaxAge)
 	if rec.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec.Body.String(), `"seq":4`) {
 		t.Fatalf("max-age=0 got status=%q body=%s", rec.Header().Get(headerCacheStatus), rec.Body.String())
 	}
-	rec = serve(h, httptest.NewRequest(http.MethodGet, podsPath, nil))
+	rec = serve(h, newClusterRequest(http.MethodGet, podsPath, nil))
 	if rec.Header().Get(headerCacheStatus) != cacheStatusHit || !strings.Contains(rec.Body.String(), `"seq":4`) {
 		t.Fatalf("after max-age=0, hit got status=%q body=%s", rec.Header().Get(headerCacheStatus), rec.Body.String())
 	}
 
 	// 4. Request Cache-Control: max-age=2 rejects a 3-second-old entry, whereas normal GET accepts it.
 	now = now.Add(3 * time.Second)
-	rec = serve(h, httptest.NewRequest(http.MethodGet, podsPath, nil))
+	rec = serve(h, newClusterRequest(http.MethodGet, podsPath, nil))
 	if rec.Header().Get(headerCacheStatus) != cacheStatusHit || rec.Header().Get(headerAge) != "3" {
 		t.Fatalf("at age 3s normal GET got status=%q age=%q", rec.Header().Get(headerCacheStatus), rec.Header().Get(headerAge))
 	}
-	reqMaxAge2 := httptest.NewRequest(http.MethodGet, podsPath, nil)
+	reqMaxAge2 := newClusterRequest(http.MethodGet, podsPath, nil)
 	reqMaxAge2.Header.Set(headerCacheControl, "max-age=2")
 	rec = serve(h, reqMaxAge2)
 	if rec.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec.Body.String(), `"seq":5`) {
@@ -506,7 +519,7 @@ func TestHandlerCacheControlDirectives(t *testing.T) {
 	// 5. Request Cache-Control: max-stale=5 accepts an entry past its FreshTTL when stored TTL permits.
 	// Set upstream Cache-Control: max-age=2 so FreshTTL is 2s while storeTTL remains 5s.
 	respCacheControl = "max-age=2"
-	reqRefresh := httptest.NewRequest(http.MethodGet, podsPath, nil)
+	reqRefresh := newClusterRequest(http.MethodGet, podsPath, nil)
 	reqRefresh.Header.Set(headerCacheControl, "no-cache")
 	rec = serve(h, reqRefresh)
 	if rec.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec.Body.String(), `"seq":6`) {
@@ -516,7 +529,7 @@ func TestHandlerCacheControlDirectives(t *testing.T) {
 
 	// Advance 4s: entry is still in MemoryCacheStore (storeTTL=5s), but age (4s) > FreshTTL (2s).
 	now = now.Add(4 * time.Second)
-	reqMaxStale := httptest.NewRequest(http.MethodGet, podsPath, nil)
+	reqMaxStale := newClusterRequest(http.MethodGet, podsPath, nil)
 	reqMaxStale.Header.Set(headerCacheControl, "max-stale=5")
 	rec = serve(h, reqMaxStale)
 	if rec.Header().Get(headerCacheStatus) != cacheStatusHit || rec.Header().Get(headerAge) != "4" {
@@ -524,7 +537,7 @@ func TestHandlerCacheControlDirectives(t *testing.T) {
 	}
 
 	// Without max-stale, the 4s-old entry (FreshTTL=2s) is stale and triggers a miss (seq 7).
-	rec = serve(h, httptest.NewRequest(http.MethodGet, podsPath, nil))
+	rec = serve(h, newClusterRequest(http.MethodGet, podsPath, nil))
 	if rec.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec.Body.String(), `"seq":7`) {
 		t.Fatalf("without max-stale at age 4s got status=%q body=%s", rec.Header().Get(headerCacheStatus), rec.Body.String())
 	}
@@ -535,11 +548,11 @@ func TestHandlerCacheControlDirectives(t *testing.T) {
 		respCacheControl = directive
 		target := "/api/v1/namespaces/default/services?mode=" + directive
 		beforeCalls := callCount
-		rec1 := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+		rec1 := serve(h, newClusterRequest(http.MethodGet, target, nil))
 		if got := rec1.Header().Get(headerCacheStatus); got != cacheStatusBypass {
 			t.Errorf("upstream %s first Cache-Status = %q, want %q", directive, got, cacheStatusBypass)
 		}
-		rec2 := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+		rec2 := serve(h, newClusterRequest(http.MethodGet, target, nil))
 		if got := rec2.Header().Get(headerCacheStatus); got != cacheStatusBypass {
 			t.Errorf("upstream %s second Cache-Status = %q, want %q", directive, got, cacheStatusBypass)
 		}
@@ -551,11 +564,11 @@ func TestHandlerCacheControlDirectives(t *testing.T) {
 	respCacheControl = "no-cache, private"
 	const apiserverDefaultTarget = "/api/v1/namespaces/default/services?mode=apiserver-default"
 	beforeCalls := callCount
-	rec1 := serve(h, httptest.NewRequest(http.MethodGet, apiserverDefaultTarget, nil))
+	rec1 := serve(h, newClusterRequest(http.MethodGet, apiserverDefaultTarget, nil))
 	if got := rec1.Header().Get(headerCacheStatus); got != cacheStatusMiss {
 		t.Errorf("upstream no-cache, private first Cache-Status = %q, want %q", got, cacheStatusMiss)
 	}
-	rec2 := serve(h, httptest.NewRequest(http.MethodGet, apiserverDefaultTarget, nil))
+	rec2 := serve(h, newClusterRequest(http.MethodGet, apiserverDefaultTarget, nil))
 	if got := rec2.Header().Get(headerCacheStatus); got != cacheStatusHit {
 		t.Errorf("upstream no-cache, private second Cache-Status = %q, want %q", got, cacheStatusHit)
 	}
@@ -588,14 +601,14 @@ func TestHandlerCacheAcceptAndClusterIsolation(t *testing.T) {
 	})
 
 	// 1. Accept: Table vs Accept: application/json do not collide.
-	reqJSON := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	reqJSON := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	reqJSON.Header.Set(headerAccept, contentTypeJSON)
 	recJSON1 := serve(h, reqJSON)
 	if recJSON1.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("JSON first request status = %q, want miss", recJSON1.Header().Get(headerCacheStatus))
 	}
 
-	reqTable := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	reqTable := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	reqTable.Header.Set(headerAccept, acceptTable)
 	recTable1 := serve(h, reqTable)
 	if recTable1.Header().Get(headerCacheStatus) != cacheStatusMiss {
@@ -606,7 +619,7 @@ func TestHandlerCacheAcceptAndClusterIsolation(t *testing.T) {
 	}
 
 	// 2. Accept-Encoding: gzip vs identity do not collide.
-	reqGzip := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	reqGzip := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	reqGzip.Header.Set(headerAccept, contentTypeJSON)
 	reqGzip.Header.Set(headerAcceptEncoding, encodingGzip)
 	recGzip := serve(h, reqGzip)
@@ -615,25 +628,25 @@ func TestHandlerCacheAcceptAndClusterIsolation(t *testing.T) {
 	}
 
 	// 3. Different /clusters/{id} prefixes do not collide.
-	recClusterA := serve(h, httptest.NewRequest(http.MethodGet, "/clusters/kind-alpha/api/v1/namespaces/default/pods", nil))
+	recClusterA := serve(h, newClusterRequest(http.MethodGet, "/clusters/kind-alpha/api/v1/namespaces/default/pods", nil))
 	if recClusterA.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("kind-alpha first request status = %q, want miss", recClusterA.Header().Get(headerCacheStatus))
 	}
-	recClusterB := serve(h, httptest.NewRequest(http.MethodGet, "/clusters/kind-beta/api/v1/namespaces/default/pods", nil))
+	recClusterB := serve(h, newClusterRequest(http.MethodGet, "/clusters/kind-beta/api/v1/namespaces/default/pods", nil))
 	if recClusterB.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("kind-beta first request status = %q, want miss", recClusterB.Header().Get(headerCacheStatus))
 	}
-	recClusterAHit := serve(h, httptest.NewRequest(http.MethodGet, "/clusters/kind-alpha/api/v1/namespaces/default/pods", nil))
+	recClusterAHit := serve(h, newClusterRequest(http.MethodGet, "/clusters/kind-alpha/api/v1/namespaces/default/pods", nil))
 	if recClusterAHit.Header().Get(headerCacheStatus) != cacheStatusHit || recClusterAHit.Body.String() != recClusterA.Body.String() {
 		t.Fatalf("kind-alpha second request status = %q, want hit matching first response", recClusterAHit.Header().Get(headerCacheStatus))
 	}
 
 	// 4. Query parameter canonicalization: ?b=2&a=1 hits cache populated by ?a=1&b=2.
-	recQuery1 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods?a=1&b=2", nil))
+	recQuery1 := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods?a=1&b=2", nil))
 	if recQuery1.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("?a=1&b=2 status = %q, want miss", recQuery1.Header().Get(headerCacheStatus))
 	}
-	recQuery2 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods?b=2&a=1", nil))
+	recQuery2 := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods?b=2&a=1", nil))
 	if recQuery2.Header().Get(headerCacheStatus) != cacheStatusHit || recQuery2.Body.String() != recQuery1.Body.String() {
 		t.Fatalf("?b=2&a=1 status = %q, want hit matching ?a=1&b=2", recQuery2.Header().Get(headerCacheStatus))
 	}
@@ -687,7 +700,7 @@ func TestHandlerCacheSingleflightCoalescing(t *testing.T) {
 	for i := 0; i < workers; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			recorders[idx] = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+			recorders[idx] = serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 		}(i)
 	}
 
@@ -760,7 +773,7 @@ func TestHandlerCacheStreamingBypassOverMaxEntryBytes(t *testing.T) {
 				},
 			})
 
-			rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+			rec := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("code = %d, want 200", rec.Code)
 			}
@@ -850,7 +863,7 @@ func TestHandlerCacheSecretRedactionAndMutationInvalidation(t *testing.T) {
 		{"Table view", acceptTable, asTable, true},
 	}
 	for _, sv := range secretViews {
-		req1 := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/s1", nil)
+		req1 := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/s1", nil)
 		req1.Header.Set(headerAccept, sv.accept)
 		rec1 := serve(h, req1)
 		if rec1.Code != http.StatusOK || rec1.Header().Get(headerCacheStatus) != cacheStatusMiss {
@@ -864,7 +877,7 @@ func TestHandlerCacheSecretRedactionAndMutationInvalidation(t *testing.T) {
 			t.Errorf("%s body missing redacted placeholder %q: %s", sv.name, redactedValue, rec1.Body.String())
 		}
 
-		req2 := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/s1", nil)
+		req2 := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/s1", nil)
 		req2.Header.Set(headerAccept, sv.accept)
 		rec2 := serve(h, req2)
 		if rec2.Code != http.StatusOK || rec2.Header().Get(headerCacheStatus) != cacheStatusHit {
@@ -893,23 +906,23 @@ func TestHandlerCacheSecretRedactionAndMutationInvalidation(t *testing.T) {
 		"/api/v1/namespaces/kube-system/pods",
 	}
 	for _, p := range pathsToWarm {
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, p, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		if rec := serve(h, newClusterRequest(http.MethodGet, p, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 			t.Fatalf("warm %s status = %q, want miss", p, rec.Header().Get(headerCacheStatus))
 		}
 	}
 
 	// A dryRun=All write does not invalidate cached entries.
-	dryRunPost := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/pods?dryRun=All", strings.NewReader(`{"apiVersion":"v1","kind":"Pod"}`))
+	dryRunPost := newClusterRequest(http.MethodPost, "/api/v1/namespaces/default/pods?dryRun=All", strings.NewReader(`{"apiVersion":"v1","kind":"Pod"}`))
 	if rec := serve(h, dryRunPost); rec.Code != http.StatusOK {
 		t.Fatalf("dryRun POST code = %d", rec.Code)
 	}
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+	if rec := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
 		t.Fatalf("after dryRun POST, default/pods status = %q, want hit", rec.Header().Get(headerCacheStatus))
 	}
 
 	// A non-dry-run POST on default/pods invalidates default/pods GET, default/pods LIST, and cluster-wide /api/v1/pods,
 	// while leaving kube-system/pods cached.
-	realPost := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/pods", strings.NewReader(`{"apiVersion":"v1","kind":"Pod"}`))
+	realPost := newClusterRequest(http.MethodPost, "/api/v1/namespaces/default/pods", strings.NewReader(`{"apiVersion":"v1","kind":"Pod"}`))
 	if rec := serve(h, realPost); rec.Code != http.StatusOK {
 		t.Fatalf("POST default/pods code = %d", rec.Code)
 	}
@@ -918,16 +931,16 @@ func TestHandlerCacheSecretRedactionAndMutationInvalidation(t *testing.T) {
 		"/api/v1/namespaces/default/pods",
 		"/api/v1/pods",
 	} {
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, invalidated, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		if rec := serve(h, newClusterRequest(http.MethodGet, invalidated, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 			t.Errorf("after POST default/pods, %s status = %q, want miss", invalidated, rec.Header().Get(headerCacheStatus))
 		}
 	}
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/kube-system/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+	if rec := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/kube-system/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
 		t.Errorf("after POST default/pods, kube-system/pods status = %q, want hit", rec.Header().Get(headerCacheStatus))
 	}
 
 	// Non-dry-run DELETE on default/pods/p1 also invalidates default/pods and /api/v1/pods.
-	if rec := serve(h, httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/p1", nil)); rec.Code != http.StatusOK {
+	if rec := serve(h, newClusterRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/p1", nil)); rec.Code != http.StatusOK {
 		t.Fatalf("DELETE default/pods/p1 code = %d", rec.Code)
 	}
 	for _, invalidated := range []string{
@@ -935,7 +948,7 @@ func TestHandlerCacheSecretRedactionAndMutationInvalidation(t *testing.T) {
 		"/api/v1/namespaces/default/pods",
 		"/api/v1/pods",
 	} {
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, invalidated, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		if rec := serve(h, newClusterRequest(http.MethodGet, invalidated, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 			t.Errorf("after DELETE default/pods/p1, %s status = %q, want miss", invalidated, rec.Header().Get(headerCacheStatus))
 		}
 	}
@@ -943,21 +956,21 @@ func TestHandlerCacheSecretRedactionAndMutationInvalidation(t *testing.T) {
 	// 3. Upstream 403 Forbidden and 401 Unauthorized on a resource invalidate cached entries for that resource scope.
 	for _, authCode := range []int{http.StatusForbidden, http.StatusUnauthorized} {
 		// Ensure default/pods is cached.
-		_ = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+		_ = serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+		if rec := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
 			t.Fatalf("before %d test, default/pods status = %q, want hit", authCode, rec.Header().Get(headerCacheStatus))
 		}
 
 		// Trigger upstream 403/401 on another pod in the same namespace resource scope.
 		statusOverride = authCode
-		recAuth := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods/forbidden-pod", nil))
+		recAuth := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods/forbidden-pod", nil))
 		if recAuth.Code != authCode {
 			t.Fatalf("expected %d, got %d", authCode, recAuth.Code)
 		}
 		statusOverride = 0
 
 		// Verify default/pods was invalidated by the auth failure.
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		if rec := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 			t.Errorf("after upstream %d, default/pods status = %q, want miss", authCode, rec.Header().Get(headerCacheStatus))
 		}
 	}
@@ -1049,8 +1062,8 @@ func TestHandlerCacheLeaderCancelRefreshEvictionAndExpiredInvalidation(t *testin
 
 	// 1. Singleflight leader context cancellation does not fail coalesced follower.
 	ctxLeader, cancelLeader := context.WithCancel(context.Background())
-	reqLeader := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/services", nil).WithContext(ctxLeader)
-	reqFollower := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/services", nil)
+	reqLeader := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/services", nil).WithContext(ctxLeader)
+	reqFollower := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/services", nil)
 
 	var recLeader, recFollower *httptest.ResponseRecorder
 	var wg sync.WaitGroup
@@ -1079,15 +1092,15 @@ func TestHandlerCacheLeaderCancelRefreshEvictionAndExpiredInvalidation(t *testin
 
 	// 2. Forced refresh (no-cache / max-age=0) receiving non-200 or no-store evicts older entry.
 	const podPath = "/api/v1/namespaces/default/pods/p1"
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, podPath, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, podPath, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("initial GET status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, podPath, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+	if rec := serve(h, newClusterRequest(http.MethodGet, podPath, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
 		t.Fatalf("second GET status = %q, want hit", rec.Header().Get(headerCacheStatus))
 	}
 
 	statusOverride.Store(http.StatusNotFound)
-	reqRefresh404 := httptest.NewRequest(http.MethodGet, podPath, nil)
+	reqRefresh404 := newClusterRequest(http.MethodGet, podPath, nil)
 	reqRefresh404.Header.Set(headerCacheControl, "no-cache")
 	if rec := serve(h, reqRefresh404); rec.Code != http.StatusNotFound {
 		t.Fatalf("refresh 404 code = %d, want 404", rec.Code)
@@ -1095,25 +1108,25 @@ func TestHandlerCacheLeaderCancelRefreshEvictionAndExpiredInvalidation(t *testin
 	statusOverride.Store(0)
 
 	// Subsequent normal GET must miss because the 404 refresh evicted the stale 200 entry.
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, podPath, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, podPath, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("GET after 404 refresh status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
 
 	// Force refresh that returns 200 with upstream Cache-Control: no-store also evicts the older entry.
 	respCCOverride.Store("no-store")
-	reqRefreshNoStore := httptest.NewRequest(http.MethodGet, podPath, nil)
+	reqRefreshNoStore := newClusterRequest(http.MethodGet, podPath, nil)
 	reqRefreshNoStore.Header.Set(headerCacheControl, "max-age=0")
 	if rec := serve(h, reqRefreshNoStore); rec.Header().Get(headerCacheStatus) != cacheStatusBypass {
 		t.Fatalf("refresh no-store status = %q, want bypass", rec.Header().Get(headerCacheStatus))
 	}
 	respCCOverride.Store("")
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, podPath, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, podPath, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("GET after no-store refresh status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
 
 	// 3. Scope invalidation does not double-count entries that already expired before the mutation.
 	advance(15 * time.Second)
-	if rec := serve(h, httptest.NewRequest(http.MethodDelete, podPath, nil)); rec.Code != http.StatusOK {
+	if rec := serve(h, newClusterRequest(http.MethodDelete, podPath, nil)); rec.Code != http.StatusOK {
 		t.Fatalf("DELETE after TTL expiration code = %d, want 200", rec.Code)
 	}
 	exposition := scrapeMetricsText(t, metrics)
@@ -1179,11 +1192,11 @@ func TestHandlerCacheSecretRefusalAuditAndLeaderCancelRace(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		rec1 = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/bad", nil))
+		rec1 = serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/bad", nil))
 	}()
 	go func() {
 		defer wg.Done()
-		rec2 = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/bad", nil))
+		rec2 = serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/bad", nil))
 	}()
 
 	<-store.allSeen
@@ -1239,11 +1252,11 @@ func TestHandlerCacheSecretRefusalAuditAndLeaderCancelRace(t *testing.T) {
 	wgRace.Add(2)
 	go func() {
 		defer wgRace.Done()
-		serve(hRace, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/race", nil).WithContext(ctxCancel))
+		serve(hRace, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/race", nil).WithContext(ctxCancel))
 	}()
 	go func() {
 		defer wgRace.Done()
-		serve(hRace, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/race", nil))
+		serve(hRace, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/race", nil))
 	}()
 	<-storeRace.allSeen
 	cancel()
@@ -1289,7 +1302,7 @@ func TestHandlerCacheFlightCancelTimeoutAndTooLargeCleanup(t *testing.T) {
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	done1 := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		done1 <- serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil).WithContext(ctx1))
+		done1 <- serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil).WithContext(ctx1))
 	}()
 	<-entered
 	cancel1()
@@ -1298,7 +1311,7 @@ func TestHandlerCacheFlightCancelTimeoutAndTooLargeCleanup(t *testing.T) {
 		t.Fatalf("canceled sole waiter code = %d, want 502", rec1.Code)
 	}
 
-	rec2 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	rec2 := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("subsequent GET after canceled flight code = %d, want 200", rec2.Code)
 	}
@@ -1314,7 +1327,7 @@ func TestHandlerCacheFlightCancelTimeoutAndTooLargeCleanup(t *testing.T) {
 		Cache: &CacheConfig{},
 	})
 	hTimeout.(*handler).cache.fetchTimeout = 30 * time.Millisecond
-	recTimeout := serve(hTimeout, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	recTimeout := serve(hTimeout, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 	if recTimeout.Code != http.StatusBadGateway {
 		t.Fatalf("stalled upstream code = %d, want 502", recTimeout.Code)
 	}
@@ -1345,7 +1358,7 @@ func TestHandlerCacheFlightCancelTimeoutAndTooLargeCleanup(t *testing.T) {
 	doneLarge := make(chan struct{})
 	go func() {
 		defer close(doneLarge)
-		serve(hLarge, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil).WithContext(ctxLarge))
+		serve(hLarge, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil).WithContext(ctxLarge))
 	}()
 	<-enteredLarge
 	cancelLarge()
@@ -1393,13 +1406,13 @@ func TestHandlerCacheConditionalRequestBypassesFlightWithHeadersIntact(t *testin
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		recUncond = serve(h, httptest.NewRequest(http.MethodGet, "/openapi/v2", nil))
+		recUncond = serve(h, newClusterRequest(http.MethodGet, "/openapi/v2", nil))
 	}()
 	<-leaderArrived
 
 	// A conditional request arriving mid-flight neither joins it nor waits on it:
 	// it reaches the upstream with its validator and gets the 304 meant for it.
-	reqCond := httptest.NewRequest(http.MethodGet, "/openapi/v2", nil)
+	reqCond := newClusterRequest(http.MethodGet, "/openapi/v2", nil)
 	reqCond.Header.Set(headerIfNoneMatch, `"v1"`)
 	recCond := serve(h, reqCond)
 	close(releaseLeader)
@@ -1435,7 +1448,7 @@ func TestHandlerCacheConditionalRequestReachesUpstreamPastStoredDiscovery(t *tes
 	h, _ := newTestHandler(t, Config{Upstream: upstream, Cache: &CacheConfig{}})
 
 	get := func(header, value string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodGet, "/apis", nil)
+		req := newClusterRequest(http.MethodGet, "/apis", nil)
 		if header != "" {
 			req.Header.Set(header, value)
 		}
@@ -1483,13 +1496,13 @@ func TestHandlerCacheInvalidationSkipsEntriesTheStoreDropped(t *testing.T) {
 	})
 	const target = "/api/v1/namespaces/default/pods"
 
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("warm-up Cache-Status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
 	custom.mu.Lock()
 	custom.forget = true
 	custom.mu.Unlock()
-	if rec := serve(h, httptest.NewRequest(http.MethodDelete, target+"/p1", nil)); rec.Code != http.StatusOK {
+	if rec := serve(h, newClusterRequest(http.MethodDelete, target+"/p1", nil)); rec.Code != http.StatusOK {
 		t.Fatalf("DELETE code = %d, want 200", rec.Code)
 	}
 	if exposition := scrapeMetricsText(t, metrics); strings.Contains(exposition, `kubeagents_kube_proxy_cache_evictions_total{reason="invalidated"}`) {
@@ -1512,18 +1525,18 @@ func TestHandlerCacheWriteDuringStoreEvictsOlderFlightResult(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+		serve(h, newClusterRequest(http.MethodGet, target, nil))
 	}()
 	// The flight has passed its epoch check and is storing; the write lands before the key
 	// joins the scope index.
 	<-custom.setEntered
-	if rec := serve(h, httptest.NewRequest(http.MethodDelete, target+"/p1", nil)); rec.Code != http.StatusOK {
+	if rec := serve(h, newClusterRequest(http.MethodDelete, target+"/p1", nil)); rec.Code != http.StatusOK {
 		t.Fatalf("DELETE code = %d, want 200", rec.Code)
 	}
 	close(custom.setRelease)
 	<-done
 
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("GET after the write Cache-Status = %q, want miss: the pre-write result was stored", rec.Header().Get(headerCacheStatus))
 	}
 }
@@ -1537,14 +1550,14 @@ func TestHandlerCacheWriteInvalidatesOtherAPIVersions(t *testing.T) {
 	const v2 = "/apis/autoscaling/v2/namespaces/default/horizontalpodautoscalers/web"
 
 	for i, want := range []string{cacheStatusMiss, cacheStatusHit} {
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, v1, nil)); rec.Header().Get(headerCacheStatus) != want {
+		if rec := serve(h, newClusterRequest(http.MethodGet, v1, nil)); rec.Header().Get(headerCacheStatus) != want {
 			t.Fatalf("warm-up %d Cache-Status = %q, want %q", i, rec.Header().Get(headerCacheStatus), want)
 		}
 	}
-	if rec := serve(h, httptest.NewRequest(http.MethodDelete, v2, nil)); rec.Code != http.StatusOK {
+	if rec := serve(h, newClusterRequest(http.MethodDelete, v2, nil)); rec.Code != http.StatusOK {
 		t.Fatalf("DELETE via v2 code = %d, want 200", rec.Code)
 	}
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, v1, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, v1, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("GET via v1 after a v2 write Cache-Status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
 }
@@ -1569,7 +1582,7 @@ func TestHandlerCacheAuditRecordsResultAndDropsReplayedAuditID(t *testing.T) {
 	const target = "/api/v1/namespaces/default/pods"
 
 	for _, want := range []struct{ result, auditID string }{{CacheResultMiss, auditID}, {CacheResultHit, ""}} {
-		rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+		rec := serve(h, newClusterRequest(http.MethodGet, target, nil))
 		if got := rec.Header().Get(headerAuditID); got != want.auditID {
 			t.Errorf("%s: Audit-Id = %q, want %q", want.result, got, want.auditID)
 		}
@@ -1589,11 +1602,11 @@ func TestHandlerCachePolicyRefusalReachesNeitherCacheNorUpstream(t *testing.T) {
 	h, upstream := newTestHandler(t, Config{Cache: &CacheConfig{DefaultResourceTTL: time.Minute}})
 	const target = "/api/v1/namespaces/default/pods/p1"
 
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+	if rec := serve(h, newClusterRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("warm-up Cache-Status = %q, want miss", rec.Header().Get(headerCacheStatus))
 	}
 	// Read-only-with-dry-run refuses a write without dryRun before the cache sees it.
-	rec := serve(h, httptest.NewRequest(http.MethodPatch, target, strings.NewReader(`{}`)))
+	rec := serve(h, newClusterRequest(http.MethodPatch, target, strings.NewReader(`{}`)))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("PATCH without dryRun code = %d, want 403", rec.Code)
 	}
@@ -1614,13 +1627,13 @@ func TestHandlerCacheServesNothingBeforeAuthentication(t *testing.T) {
 	const target = "/api/v1/namespaces/default/pods"
 
 	for i, want := range []string{cacheStatusMiss, cacheStatusHit} {
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != want {
+		if rec := serve(h, newClusterRequest(http.MethodGet, target, nil)); rec.Header().Get(headerCacheStatus) != want {
 			t.Fatalf("warm-up %d Cache-Status = %q, want %q", i, rec.Header().Get(headerCacheStatus), want)
 		}
 	}
 
 	auth.reject.Store(true)
-	rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+	rec := serve(h, newClusterRequest(http.MethodGet, target, nil))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("code = %d with a warm entry, want 401", rec.Code)
 	}
@@ -1674,11 +1687,11 @@ func TestHandlerCacheReadAfterWriteDoesNotJoinOlderFlight(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		recOld = serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+		recOld = serve(h, newClusterRequest(http.MethodGet, target, nil))
 	}()
 	<-firstArrived
 
-	patch := httptest.NewRequest(http.MethodPatch, target+"/p", strings.NewReader(`{}`))
+	patch := newClusterRequest(http.MethodPatch, target+"/p", strings.NewReader(`{}`))
 	patch.Header.Set(headerContentType, "application/merge-patch+json")
 	if rec := serve(h, patch); rec.Code != http.StatusOK {
 		t.Fatalf("patch code = %d: %s", rec.Code, rec.Body.String())
@@ -1686,7 +1699,7 @@ func TestHandlerCacheReadAfterWriteDoesNotJoinOlderFlight(t *testing.T) {
 
 	// The read after the write starts its own flight rather than taking the
 	// pre-write result of the one still running.
-	if rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil)); rec.Body.String() != `{"gen":2}` {
+	if rec := serve(h, newClusterRequest(http.MethodGet, target, nil)); rec.Body.String() != `{"gen":2}` {
 		t.Fatalf("read after write = %q %q, want gen 2", rec.Body.String(), rec.Header().Get(headerCacheStatus))
 	}
 	close(releaseFirst)
@@ -1696,7 +1709,7 @@ func TestHandlerCacheReadAfterWriteDoesNotJoinOlderFlight(t *testing.T) {
 	}
 
 	// The older flight finished after the write, so its result was not stored.
-	rec := serve(h, httptest.NewRequest(http.MethodGet, target, nil))
+	rec := serve(h, newClusterRequest(http.MethodGet, target, nil))
 	if rec.Body.String() != `{"gen":2}` || rec.Header().Get(headerCacheStatus) != cacheStatusHit {
 		t.Errorf("next read = %q %q, want the stored gen 2", rec.Body.String(), rec.Header().Get(headerCacheStatus))
 	}
@@ -1728,8 +1741,8 @@ func TestHandlerCacheScopeKeysPrunedOnExpiryAndEviction(t *testing.T) {
 	rc := h.(*handler).cache
 
 	// Insert two entries in ns-a and ns-b; tight store capacity evicts ns-a when ns-b is stored.
-	serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns-a/pods", nil))
-	serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns-b/pods", nil))
+	serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/ns-a/pods", nil))
+	serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/ns-b/pods", nil))
 
 	rc.scopeMu.Lock()
 	if _, exists := rc.scopeKeys[resourceScopeID(InClusterID, "", "pods", "ns-a")]; exists {
@@ -1739,7 +1752,7 @@ func TestHandlerCacheScopeKeysPrunedOnExpiryAndEviction(t *testing.T) {
 
 	// Advance past TTL and record a new key in ns-c; expired ns-b scope must be pruned.
 	advance(6 * time.Second)
-	serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/ns-c/pods", nil))
+	serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/ns-c/pods", nil))
 
 	rc.scopeMu.Lock()
 	if _, exists := rc.scopeKeys[resourceScopeID(InClusterID, "", "pods", "ns-b")]; exists {
@@ -1796,16 +1809,16 @@ func TestHandlerCacheForcedRefreshTooLargeEvictsStaleEntry(t *testing.T) {
 		})
 
 		const path = "/api/v1/namespaces/default/pods"
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, path, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
+		if rec := serve(h, newClusterRequest(http.MethodGet, path, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusMiss {
 			t.Fatalf("chunked=%v initial GET status = %q, want miss", chunked, rec.Header().Get(headerCacheStatus))
 		}
-		if rec := serve(h, httptest.NewRequest(http.MethodGet, path, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
+		if rec := serve(h, newClusterRequest(http.MethodGet, path, nil)); rec.Header().Get(headerCacheStatus) != cacheStatusHit {
 			t.Fatalf("chunked=%v second GET status = %q, want hit", chunked, rec.Header().Get(headerCacheStatus))
 		}
 
 		// Force refresh when upstream response now exceeds MaxEntryBytes.
 		returnLarge.Store(true)
-		reqRefresh := httptest.NewRequest(http.MethodGet, path, nil)
+		reqRefresh := newClusterRequest(http.MethodGet, path, nil)
 		reqRefresh.Header.Set(headerCacheControl, "no-cache")
 		recRefresh := serve(h, reqRefresh)
 		if recRefresh.Header().Get(headerCacheStatus) != cacheStatusBypass || recRefresh.Body.String() != largeBody {
@@ -1814,7 +1827,7 @@ func TestHandlerCacheForcedRefreshTooLargeEvictsStaleEntry(t *testing.T) {
 
 		// Return to small responses and verify the stale pre-refresh entry was evicted.
 		returnLarge.Store(false)
-		recAfter := serve(h, httptest.NewRequest(http.MethodGet, path, nil))
+		recAfter := serve(h, newClusterRequest(http.MethodGet, path, nil))
 		if recAfter.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(recAfter.Body.String(), `"seq":3`) {
 			t.Errorf("chunked=%v GET after tooLarge refresh got status=%q body=%s, want miss with seq 3", chunked, recAfter.Header().Get(headerCacheStatus), recAfter.Body.String())
 		}
@@ -1902,14 +1915,14 @@ func TestNormalizeAcceptEncodingQualityAndOutboundHeader(t *testing.T) {
 		Cache:    &CacheConfig{},
 	})
 
-	reqBrGzip := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	reqBrGzip := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	reqBrGzip.Header.Set(headerAcceptEncoding, "br, gzip")
 	rec1 := serve(h, reqBrGzip)
 	if rec1.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec1.Body.String(), `"enc":"gzip"`) {
 		t.Fatalf("br, gzip got status=%q body=%s", rec1.Header().Get(headerCacheStatus), rec1.Body.String())
 	}
 
-	reqRejectGzip := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+	reqRejectGzip := newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
 	reqRejectGzip.Header.Set(headerAcceptEncoding, "gzip;q=0, identity;q=1")
 	rec2 := serve(h, reqRejectGzip)
 	if rec2.Header().Get(headerCacheStatus) != cacheStatusMiss || !strings.Contains(rec2.Body.String(), `"enc":""`) {
@@ -1964,11 +1977,11 @@ func TestHandlerDefaultConfigZeroResourceTTLCoalescesAndCachesDiscovery(t *testi
 	})
 
 	// 1. Discovery GET /api caches in MemoryCacheStore for 30s (1st call miss, 2nd call hit).
-	recDisc1 := serve(h, httptest.NewRequest(http.MethodGet, "/api", nil))
+	recDisc1 := serve(h, newClusterRequest(http.MethodGet, "/api", nil))
 	if recDisc1.Code != http.StatusOK || recDisc1.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("first GET /api code=%d status=%q, want 200 and miss", recDisc1.Code, recDisc1.Header().Get(headerCacheStatus))
 	}
-	recDisc2 := serve(h, httptest.NewRequest(http.MethodGet, "/api", nil))
+	recDisc2 := serve(h, newClusterRequest(http.MethodGet, "/api", nil))
 	if recDisc2.Code != http.StatusOK || recDisc2.Header().Get(headerCacheStatus) != cacheStatusHit {
 		t.Fatalf("second GET /api code=%d status=%q, want 200 and hit", recDisc2.Code, recDisc2.Header().Get(headerCacheStatus))
 	}
@@ -1985,11 +1998,11 @@ func TestHandlerDefaultConfigZeroResourceTTLCoalescesAndCachesDiscovery(t *testi
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		recPod1 = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+		recPod1 = serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 	}()
 	go func() {
 		defer wg.Done()
-		recPod2 = serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+		recPod2 = serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 	}()
 
 	<-store.allSeen
@@ -2022,7 +2035,7 @@ func TestHandlerDefaultConfigZeroResourceTTLCoalescesAndCachesDiscovery(t *testi
 	}
 
 	// 3. Subsequent sequential GET /api/v1/namespaces/default/pods goes upstream and is not stored.
-	recPod3 := serve(h, httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
+	recPod3 := serve(h, newClusterRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil))
 	if recPod3.Code != http.StatusOK || recPod3.Header().Get(headerCacheStatus) != cacheStatusMiss {
 		t.Fatalf("sequential pod GET code=%d status=%q, want 200 and miss", recPod3.Code, recPod3.Header().Get(headerCacheStatus))
 	}
