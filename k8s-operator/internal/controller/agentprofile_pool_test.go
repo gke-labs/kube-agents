@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"slices"
 	"strings"
@@ -469,8 +470,8 @@ func TestTheWorkerRequestsTheEphemeralStorageItsVolumesHold(t *testing.T) {
 		if req.Cmp(want) != 0 || lim.Cmp(want) != 0 {
 			t.Errorf("imageVolumes=%v: ephemeral-storage request %s limit %s, want both %s", imageVolumes, req.String(), lim.String(), want.String())
 		}
-		if floor := resource.MustParse("6Gi"); req.Cmp(floor) < 0 {
-			t.Errorf("imageVolumes=%v: ephemeral-storage %s is under the workspace volumes alone (6Gi+)", imageVolumes, req.String())
+		if floor := resource.MustParse("4Gi"); req.Cmp(floor) < 0 {
+			t.Errorf("imageVolumes=%v: ephemeral-storage %s is under the writable volumes alone (4Gi+)", imageVolumes, req.String())
 		}
 	}
 }
@@ -515,5 +516,23 @@ func TestGateOffRemovesThePoolsWhateverElseFails(t *testing.T) {
 	}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aNATSCABundleName(agent)}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the bundle copy survived the dispatcher being turned off: %v", err)
+	}
+}
+
+// With image volumes off (Autopilot's case) each tool is staged into its own
+// emptyDir, so the worker's ephemeral request grows with the tools. Up to the
+// documented limit it stays inside Autopilot's 10Gi per pod, so a profile at
+// the limit still schedules.
+func TestTheWorkerFitsAutopilotUpToTheToolLimit(t *testing.T) {
+	agent := a2aTestAgent()
+	profile := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+		for i := 0; i < profileWorkerAutopilotToolLimit; i++ {
+			p.Spec.Tools = append(p.Spec.Tools, agentv1alpha1.AgentProfileTool{Name: fmt.Sprintf("tool%d", i), Image: fmt.Sprintf("registry.example/tool%d:1", i)})
+		}
+	})
+	spec := buildProfileWorkerPodSpec(agent, &profile, "read", "agentprofile-auditor-read", profileWorkerPool, false)
+	req := spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage]
+	if ceiling := resource.MustParse("10Gi"); req.Cmp(ceiling) > 0 {
+		t.Errorf("with %d tools the worker requests %s of ephemeral storage, past Autopilot's 10Gi per pod", profileWorkerAutopilotToolLimit, req.String())
 	}
 }

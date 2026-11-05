@@ -51,14 +51,16 @@ const (
 // payload is over the limit fails at the pod's first start, never mid-task. A
 // persona's payload is skills and a persona file: sixteen times the largest such
 // tree in the repository (agents/platform, 20 MiB), rounded up. No tools image
-// ships yet to measure, so each takes the 1Gi floor for a workspace a process
-// writes into; each tools image has its own volume. stagingLogsAllowance is what
+// ships yet to measure, so each takes the persona's 512Mi too: a tool is a
+// binary or a small tree, and 512Mi keeps a pool pod's whole ephemeral request
+// inside Autopilot's 10Gi per pod with up to ten tools (agentprofile_pool.go's
+// profileWorkerAutopilotToolLimit). Each tools image has its own volume. stagingLogsAllowance is what
 // a staging container requests as ephemeral storage on top of its volume, for
 // its own logs (its root filesystem is read-only), with the limit equal: a
 // LimitRange defaulting a smaller limit would refuse a request with none.
 const (
 	personaStagingSizeLimit = "512Mi"
-	toolStagingSizeLimit    = "1Gi"
+	toolStagingSizeLimit    = "512Mi"
 	stagingLogsAllowance    = "64Mi"
 )
 
