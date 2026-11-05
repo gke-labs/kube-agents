@@ -371,7 +371,7 @@ suite once at the end: a run that ends red says so and exits non-zero.
    invariant and the document that records the finding — and give its class a
    `..._precondition_...` test, which the self-check requires.
 
-## `chat/` holds data, not tests
+## `chat/` and `chat-ux/` hold data, not tests
 
 Each file in `chat/` pairs an input, lifted from a `today` presenter test or
 built to show a rule one pins, with the `kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload

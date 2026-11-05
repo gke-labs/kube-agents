@@ -942,7 +942,7 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   span, or command line opening on a CLI's name (`kubectl`, `gcloud`, `git` and the like). Breaking one is an emitter bug, but not one a renderer acts on:
   dropping the message for its wording would lose the answer. `chatmsg.Lint` and
   `chat_cases.lint` check them, and the emitters' tests and the shared cases hold the
-  emitters to them. The renderer keeps the buttons to five a row by wrapping.
+  emitters to them. The Slack renderer keeps the buttons to five a row by wrapping.
 
 `a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above but
 the wording one, which `Lint` checks, the
