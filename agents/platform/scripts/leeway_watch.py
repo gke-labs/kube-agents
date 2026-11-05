@@ -36,23 +36,42 @@ Which clusters. Target clusters are resolved on the agent pod:
 Where it runs. `leeway` is baked into `agent-sandbox` at `/usr/local/bin/leeway`
 and routes Kubernetes object reads through the sandbox's `kubectl`
 `credential-proxy` shim (`CREDENTIAL_PROXY_URL`). `leeway_watch.py` invokes
-`leeway report` in the sandbox through `sandbox_exec.run` and parses the
-`leeway.report/v1alpha1` JSON document from stdout.
+`leeway report --topology-tier-c-signals --parallelism 2` in the sandbox
+through `sandbox_exec.run` and parses the `leeway.report/v1alpha1` JSON
+document from stdout.
 
-State ledger and 7-day reminder gate. Under `<profile home>/leeway/`:
+Threshold filtering and environment knobs. Before ledger gating,
+`filter_report_findings` drops `unknown`-cause topology findings at their
+pigeonhole floor (`observedSkew - minAchievableSkew < 1`, e.g. `[0, 1, 1]` or
+`[1, 1, 2]` across three zones) by default while keeping attributed findings,
+`selector_confined` single-zone pool confinement, `leeway.domain_unavailable`,
+and stackable skews above the floor (`[4, 0]`). `LEEWAY_WATCH_MIN_SEVERITY`,
+`LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE` (topology
+findings), `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and
+`LEEWAY_WATCH_REFRESH_DAYS` — together with `LEEWAY_WATCH_CLUSTERS`,
+`LEEWAY_WATCH_PROJECTS`, and `LEEWAY_WATCH_HOME` — are optional overrides for
+runs started by hand in the pod; the operator's `spec.deployment.env` allowlist
+does not carry them.
+
+State ledger, blackboard topic, and 7-day reminder gate. Under
+`<profile home>/leeway/`:
 - `ledger.json`: tracks each active finding by its six-part key
   (`<cluster>/<namespace>/<subject_kind>/<subject_name>/<topology_key>/<finding_kind>`)
   with `first_seen`, `last_report_at`, `suspected_cause`, `severity`, `tier`,
   `max_domain_share`, and `observed_skew`.
 - `reports/<timestamp>.md` and `reports/<timestamp>.json` (with `latest.md` and
   `latest.json` symlinks, keeping the newest 10 pairs): written whenever at
-  least one finding is due.
+  least one finding is due or when retired findings refresh a clean sweep. When
+  `NATS_URL` is set, the JSON report is also published to the A2A blackboard
+  topic `topology-skew` (`a2a.topics.agent.platform.topology-skew`), warning
+  once in chat on failure and retrying on later clean ticks.
 A finding is due for reporting when:
 1. It is **new** (not present in `ledger.json`),
 2. Its **suspected cause changed or severity escalated** since the last report,
    or
 3. Its **7-day scheduled refresh** window has elapsed (`now - last_report_at >=
    7 days - 10m`).
+Chat report lines name up to six due subjects with their cause and share.
 Findings on clusters whose scan succeeded (`status == "ok"`) and that are no
 longer present are retired from `ledger.json` with a single resolution line.
 Clusters whose scan failed (`status == "error"`) or whose project could not be
@@ -105,6 +124,22 @@ REFRESH_DAYS_DEFAULT = 7
 REFRESH_DAYS_MAX = 365
 REFRESH_SLACK_SECONDS = 10 * 60
 
+# Alert filtering thresholds (optional environment overrides).
+MIN_SEVERITY_ENV = "LEEWAY_WATCH_MIN_SEVERITY"
+MIN_SEVERITY_DEFAULT = "info"
+MIN_DRIFT_ENV = "LEEWAY_WATCH_MIN_DRIFT"
+MIN_DRIFT_DEFAULT = 0.0
+MIN_DRIFT_MAX = 1.0
+MIN_MAX_DOMAIN_SHARE_ENV = "LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE"
+MIN_MAX_DOMAIN_SHARE_DEFAULT = 0.0
+MIN_MAX_DOMAIN_SHARE_MAX = 1.0
+MIN_EXCESS_OVER_FLOOR_ENV = "LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR"
+MIN_EXCESS_OVER_FLOOR_DEFAULT = 1
+MIN_EXCESS_OVER_FLOOR_MAX = 10000
+ZERO_FLOAT = 0.0
+SCORE_ROUND_DECIMALS = 4
+PERCENT_SCALE = 100
+
 # Cluster and project discovery.
 CLUSTERS_ENV = "LEEWAY_WATCH_CLUSTERS"
 PROJECTS_ENV = "LEEWAY_WATCH_PROJECTS"
@@ -133,6 +168,8 @@ NO_PROJECT_DETAIL = (
 LEEWAY_EXECUTABLE = "leeway"
 LEEWAY_REPORT_SUBCOMMAND = "report"
 TIER_C_FLAG = "--topology-tier-c-signals"
+PARALLELISM_FLAG = "--parallelism"
+PARALLELISM_VALUE = "2"
 CLUSTERS_FLAG = "--clusters"
 LIST_CLUSTERS_ARGV = ("gcloud", "container", "clusters", "list", "--format=value(name,location)", "--project")
 LIST_CLUSTERS_FAILED_DETAIL = "gcloud container clusters list --project {project} exited {code}: {error}"
@@ -171,18 +208,60 @@ DEFAULT_DOMAIN_UNKNOWN = "?"
 # rank_no_migration / rank_tier_unused (pkg/leeway/finding.go).
 DEFAULT_FINDING_KIND_DRIFT = DEFAULT_UNKNOWN
 DEFAULT_FINDING_KIND_RANK = DEFAULT_UNKNOWN
+FINDING_KIND_DOMAIN_UNAVAILABLE = "leeway.domain_unavailable"
+CAUSE_SELECTOR_CONFINED = "selector_confined"
 # A rank finding's axis for the ledger key: its judging `rule` (`last-rank`,
 # `rank0-floor`, ...), which is what distinguishes two findings on one class.
 DEFAULT_TOPOLOGY_KEY_COMPUTE_CLASS = "compute-class"
 DEFAULT_SEVERITY = "warning"
 DEFAULT_DISPLAY_NA = "n/a"
 DEFAULT_CLUSTER_SCAN_FAILED = "cluster scan failed"
+DEFAULT_NO_OUTPUT = "no output"
+CLUSTERS_FIELD = "clusters"
+STATUS_FIELD = "status"
+ERROR_FIELD = "error"
+TOPOLOGY_FINDINGS_FIELD = "topology_findings"
+RANK_FINDINGS_FIELD = "rank_findings"
+SUMMARY_FIELD = "summary"
+CLUSTERS_TOTAL_FIELD = "clusters_total"
+CLUSTERS_SUCCEEDED_FIELD = "clusters_succeeded"
+CLUSTERS_FAILED_FIELD = "clusters_failed"
+BY_SEVERITY_FIELD = "by_severity"
+BY_TIER_FIELD = "by_tier"
+SCORE_FIELD = "score"
+MIN_ACHIEVABLE_SKEW_FIELD = "minAchievableSkew"
+DRIFT_FIELD = "drift"
+KEY_FIELD = "key"
+CLUSTER_FIELD = "cluster"
+KIND_FIELD = "kind"
+NAMESPACE_FIELD = "namespace"
+SUBJECT_KIND_FIELD = "subject_kind"
+SUBJECT_NAME_FIELD = "subject_name"
+SEVERITY_FIELD = "severity"
+TIER_FIELD = "tier"
+SUSPECTED_CAUSE_FIELD = "suspected_cause"
+OBSERVED_SKEW_FIELD = "observed_skew"
+MIN_ACHIEVABLE_SKEW_KEY = "min_achievable_skew"
+DRIFT_KEY = "drift"
+MAX_DOMAIN_SHARE_KEY = "max_domain_share"
 
 # A2A blackboard topic (`a2a.topics.agent.platform.topology-skew`).
 NATS_URL_ENV = "NATS_URL"
 A2A_EXECUTABLE = "a2a"
+A2A_TOPICS_SUBCOMMAND = "topics"
+A2A_WRITE_VERB = "write"
+A2A_TEXT_FLAG = "--text"
+A2A_DATA_FLAG = "--data"
+A2A_DATA_FILE_PREFIX = "@"
 A2A_TOPIC_NAME = "topology-skew"
+A2A_TOPIC_SUBJECT = "a2a.topics.agent.platform.topology-skew"
 A2A_PUBLISH_TIMEOUT_SECONDS = 30
+A2A_PUBLISH_FAILED_DETAIL = "a2a topics write {topic} exited {code}: {error}"
+A2A_RETRY_SUMMARY = "{prefix}: topology-skew blackboard report refreshed"
+ERROR_KIND_TOPIC_PUBLISH = "topic_publish_failed"
+SPACE_CHAR = " "
+BACKTICK_CHAR = "`"
+SINGLE_QUOTE_CHAR = "'"
 
 # Severity ordering for escalation detection.
 SEVERITY_RANKS: dict[str, int] = {
@@ -206,6 +285,8 @@ PROJECT_RUNS_KEY = "project_runs"
 SCAN_ERRORS_KEY = "scan_errors"
 ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
+ANNOUNCED_TOPIC_PUBLISH_KEY = "topic_publish"
+ANNOUNCED_DEFERRED_REFRESH_KEY = "deferred_report_refresh"
 FAILURE_MARKER_FILE_NAME = "last-failure.txt"
 
 # Output lines (stdout is `deliver: "chat"`).
@@ -216,9 +297,15 @@ FAILED_WHAT_TICK = "the tick"
 FAILED_WHAT_WRITE = "writing the ledger or the report"
 RETIRED_LINE = "{prefix}: {count} finding(s) resolved ({names}); retired from the watch"
 REPORT_LINE = (
-    "{prefix}: {due_count} finding(s) due ({reasons}) across {cluster_count} cluster(s) ({clusters}); "
+    "{prefix}: {due_count} finding(s) due ({reasons}) across {cluster_count} cluster(s) ({clusters}): {names}; "
     "report on the gateway pod at {path}; next refresh after {next_date}"
 )
+TOPIC_PUBLISH_FAILED_LINE = (
+    "{prefix} watch: publishing to blackboard topic {topic} failed ({detail}); "
+    "on upgraded installs, check `kubectl describe platformagent` for TopicsStateSubjectMissing "
+    "and append {subject} with `nats stream edit TOPICS-STATE`"
+)
+TOPIC_PUBLISH_CLEARED_LINE = "{prefix} watch: publishing to blackboard topic {topic} succeeded again"
 PARTIAL_LINE = (
     "{prefix} watch: the fleet scan was partial ({errors} error(s)): {reasons}; "
     "findings on unreadable clusters are retained until read again"
@@ -227,6 +314,13 @@ PARTIAL_CLEARED_LINE = "{prefix} watch: the fleet scan reads every target again"
 DRY_RUN_WOULD_REPORT = "dry run: would report {count} finding(s) ({reasons}) across {clusters}: {names}"
 DRY_RUN_WOULD_RETIRE = "dry run: would retire {count} resolved finding(s) ({names})"
 DRY_RUN_NOTHING_DUE = "dry run: nothing due; active findings: {count}"
+DUE_SUBJECT_NAMESPACED = "{kind}/{namespace}/{name}"
+DUE_SUBJECT_CLUSTER = "{kind}/{name}"
+DUE_SUMMARY_WITH_SHARE = "{subject} [{cause}, {pct}%]"
+DUE_SUMMARY_NO_SHARE = "{subject} [{cause}]"
+DUE_CLUSTER_PREFIX = "{cluster}:{summary}"
+REASON_COUNT_FORMAT = "{count} {reason}"
+LIST_SEPARATOR = ", "
 MAX_NAMES_IN_LINE = 6
 NAMES_OVERFLOW = ", +{more} more"
 WRITE_FAILED_EXIT = 2
@@ -266,6 +360,48 @@ def refresh_days() -> int:
     except ValueError:
         return REFRESH_DAYS_DEFAULT
     return value if 0 < value <= REFRESH_DAYS_MAX else REFRESH_DAYS_DEFAULT
+
+
+def min_severity_rank() -> int:
+    raw = os.environ.get(MIN_SEVERITY_ENV, "").strip().lower()
+    return SEVERITY_RANKS.get(raw, SEVERITY_RANKS[MIN_SEVERITY_DEFAULT])
+
+
+def min_drift() -> float:
+    raw = os.environ.get(MIN_DRIFT_ENV, "").strip()
+    if not raw:
+        return MIN_DRIFT_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return MIN_DRIFT_DEFAULT
+    return value if math.isfinite(value) and ZERO_FLOAT <= value <= MIN_DRIFT_MAX else MIN_DRIFT_DEFAULT
+
+
+def min_max_domain_share() -> float:
+    raw = os.environ.get(MIN_MAX_DOMAIN_SHARE_ENV, "").strip()
+    if not raw:
+        return MIN_MAX_DOMAIN_SHARE_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return MIN_MAX_DOMAIN_SHARE_DEFAULT
+    return (
+        value
+        if math.isfinite(value) and ZERO_FLOAT <= value <= MIN_MAX_DOMAIN_SHARE_MAX
+        else MIN_MAX_DOMAIN_SHARE_DEFAULT
+    )
+
+
+def min_excess_over_floor() -> int:
+    raw = os.environ.get(MIN_EXCESS_OVER_FLOOR_ENV, "").strip()
+    if not raw:
+        return MIN_EXCESS_OVER_FLOOR_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return MIN_EXCESS_OVER_FLOOR_DEFAULT
+    return value if 0 <= value <= MIN_EXCESS_OVER_FLOOR_MAX else MIN_EXCESS_OVER_FLOOR_DEFAULT
 
 
 def profile_home() -> Path:
@@ -379,8 +515,8 @@ def order_by_least_recent(items: list[str], stamps: dict[str, Any]) -> list[str]
 
 
 def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_SECONDS) -> dict[str, Any]:
-    """Run `leeway report --topology-tier-c-signals <flag> <value>` in the sandbox."""
-    argv = [LEEWAY_EXECUTABLE, LEEWAY_REPORT_SUBCOMMAND, TIER_C_FLAG, flag, value]
+    """Run `leeway report --topology-tier-c-signals --parallelism 2 <flag> <value>` in the sandbox."""
+    argv = [LEEWAY_EXECUTABLE, LEEWAY_REPORT_SUBCOMMAND, TIER_C_FLAG, PARALLELISM_FLAG, PARALLELISM_VALUE, flag, value]
     try:
         completed = sandbox_exec.run(argv, timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
@@ -388,7 +524,7 @@ def run_leeway_report(flag: str, value: str, *, timeout: int = PROJECT_TIMEOUT_S
     stdout = (completed.stdout or "").strip()
     if not stdout:
         stderr = (completed.stderr or "").strip()
-        excerpt = stderr[-STDERR_EXCERPT_CHARS:] if stderr else "no output"
+        excerpt = stderr[-STDERR_EXCERPT_CHARS:] if stderr else DEFAULT_NO_OUTPUT
         raise RuntimeError(f"leeway exited {completed.returncode} without a report: {excerpt}")
     try:
         report = json.loads(stdout)
@@ -571,7 +707,9 @@ def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[st
         "suspected_cause": str(finding.get("suspectedCause") or DEFAULT_UNKNOWN),
         "contributing_factors": _str_list(finding.get("contributingFactors")),
         "observed_skew": _int(score.get("observedSkew"), 0),
-        "max_domain_share": round(max_share, 4),
+        MIN_ACHIEVABLE_SKEW_KEY: _int(score.get(MIN_ACHIEVABLE_SKEW_FIELD), 0),
+        DRIFT_KEY: round(_float(score.get(DRIFT_FIELD), ZERO_FLOAT), SCORE_ROUND_DECIMALS),
+        MAX_DOMAIN_SHARE_KEY: round(max_share, SCORE_ROUND_DECIMALS),
         "distribution_display": ", ".join(domain_parts) if domain_parts else DEFAULT_DISPLAY_NA,
         "blast_radius_display": blast_radius,
         "remediation": {
@@ -639,29 +777,151 @@ def normalize_rank_finding(cluster: str, finding: dict[str, Any]) -> dict[str, A
     }
 
 
-def extract_findings(report: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, str]]:
+def passes_topology_thresholds(
+    norm: dict[str, Any],
+    *,
+    min_sev_rank: int | None = None,
+    min_d: float | None = None,
+    min_share: float | None = None,
+    min_excess: int | None = None,
+) -> bool:
+    """Return True when a normalized topology finding passes configured alert thresholds."""
+    sev_floor = min_severity_rank() if min_sev_rank is None else min_sev_rank
+    if SEVERITY_RANKS.get(norm[SEVERITY_FIELD], 0) < sev_floor:
+        return False
+    if norm[KIND_FIELD] == FINDING_KIND_DOMAIN_UNAVAILABLE:
+        return True
+    excess_floor = min_excess_over_floor() if min_excess is None else min_excess
+    if (
+        norm[SUSPECTED_CAUSE_FIELD] == DEFAULT_UNKNOWN
+        and norm[OBSERVED_SKEW_FIELD] - norm[MIN_ACHIEVABLE_SKEW_KEY] < excess_floor
+    ):
+        return False
+    drift_floor = min_drift() if min_d is None else min_d
+    if norm[SUSPECTED_CAUSE_FIELD] != CAUSE_SELECTOR_CONFINED and norm[DRIFT_KEY] < drift_floor:
+        return False
+    share_floor = min_max_domain_share() if min_share is None else min_share
+    return norm[MAX_DOMAIN_SHARE_KEY] >= share_floor
+
+
+def passes_rank_thresholds(norm: dict[str, Any], *, min_sev_rank: int | None = None) -> bool:
+    """Return True when a normalized rank finding passes configured alert thresholds.
+
+    ComputeClass rank findings (`rank_wedged`, `rank0-share` on >=3-tier classes,
+    `rank_no_migration`) can legitimately have `lastRankShare == 0.0`, so
+    `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE` applies to topology findings only.
+    """
+    sev_floor = min_severity_rank() if min_sev_rank is None else min_sev_rank
+    return SEVERITY_RANKS.get(norm[SEVERITY_FIELD], 0) >= sev_floor
+
+
+def filter_report_findings(report: dict[str, Any]) -> dict[str, Any]:
+    """Filter a merged report's findings and summary through the active alert thresholds."""
+    min_sev_rank = min_severity_rank()
+    min_d = min_drift()
+    min_share = min_max_domain_share()
+    min_excess = min_excess_over_floor()
+    filtered_clusters: list[dict[str, Any]] = []
+    succeeded = 0
+    failed = 0
+    topo_total = 0
+    rank_total = 0
+    by_severity: dict[str, int] = {}
+    by_tier: dict[str, int] = {}
+    for cr in report.get(CLUSTERS_FIELD, []):
+        if not isinstance(cr, dict):
+            continue
+        cluster = canonical_cluster_name(cr)
+        entry = dict(cr)
+        if entry.get(STATUS_FIELD) == STATUS_OK:
+            succeeded += 1
+            kept_topo: list[dict[str, Any]] = []
+            for tf in entry.get(TOPOLOGY_FINDINGS_FIELD) or []:
+                if isinstance(tf, dict) and passes_topology_thresholds(
+                    normalize_topology_finding(cluster, tf),
+                    min_sev_rank=min_sev_rank,
+                    min_d=min_d,
+                    min_share=min_share,
+                    min_excess=min_excess,
+                ):
+                    kept_topo.append(tf)
+            kept_rank: list[dict[str, Any]] = []
+            for rf in entry.get(RANK_FINDINGS_FIELD) or []:
+                if isinstance(rf, dict) and passes_rank_thresholds(
+                    normalize_rank_finding(cluster, rf),
+                    min_sev_rank=min_sev_rank,
+                ):
+                    kept_rank.append(rf)
+            entry[TOPOLOGY_FINDINGS_FIELD] = kept_topo
+            entry[RANK_FINDINGS_FIELD] = kept_rank
+            topo_total += len(kept_topo)
+            rank_total += len(kept_rank)
+            for item in kept_topo + kept_rank:
+                sev = str(item.get(SEVERITY_FIELD) or "")
+                tier = str(item.get(TIER_FIELD) or "")
+                if sev:
+                    by_severity[sev] = by_severity.get(sev, 0) + 1
+                if tier:
+                    by_tier[tier] = by_tier.get(tier, 0) + 1
+        else:
+            failed += 1
+        filtered_clusters.append(entry)
+    summary: dict[str, Any] = {
+        CLUSTERS_TOTAL_FIELD: len(filtered_clusters),
+        CLUSTERS_SUCCEEDED_FIELD: succeeded,
+        CLUSTERS_FAILED_FIELD: failed,
+        TOPOLOGY_FINDINGS_FIELD: topo_total,
+        RANK_FINDINGS_FIELD: rank_total,
+    }
+    if by_severity:
+        summary[BY_SEVERITY_FIELD] = by_severity
+    if by_tier:
+        summary[BY_TIER_FIELD] = by_tier
+    updated = dict(report)
+    updated[CLUSTERS_FIELD] = filtered_clusters
+    updated[SUMMARY_FIELD] = summary
+    return updated
+
+
+def extract_findings(
+    report: dict[str, Any],
+    *,
+    already_filtered: bool = False,
+) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, str]]:
     """Extract normalized findings, ok clusters, and per-cluster errors from a report."""
+    min_sev_rank = min_severity_rank() if not already_filtered else 0
+    min_d = min_drift() if not already_filtered else ZERO_FLOAT
+    min_share = min_max_domain_share() if not already_filtered else ZERO_FLOAT
+    min_excess = min_excess_over_floor() if not already_filtered else 0
     findings: dict[str, dict[str, Any]] = {}
     ok_clusters: set[str] = set()
     cluster_errors: dict[str, str] = {}
-    for cr in report.get("clusters", []):
+    for cr in report.get(CLUSTERS_FIELD, []):
         if not isinstance(cr, dict):
             continue
         cluster = canonical_cluster_name(cr)
         if not cluster:
             continue
-        if cr.get("status") == STATUS_OK:
+        if cr.get(STATUS_FIELD) == STATUS_OK:
             ok_clusters.add(cluster)
-            for tf in cr.get("topology_findings") or []:
+            for tf in cr.get(TOPOLOGY_FINDINGS_FIELD) or []:
                 if isinstance(tf, dict):
                     norm = normalize_topology_finding(cluster, tf)
-                    findings[norm["key"]] = norm
-            for rf in cr.get("rank_findings") or []:
+                    if already_filtered or passes_topology_thresholds(
+                        norm,
+                        min_sev_rank=min_sev_rank,
+                        min_d=min_d,
+                        min_share=min_share,
+                        min_excess=min_excess,
+                    ):
+                        findings[norm[KEY_FIELD]] = norm
+            for rf in cr.get(RANK_FINDINGS_FIELD) or []:
                 if isinstance(rf, dict):
                     norm = normalize_rank_finding(cluster, rf)
-                    findings[norm["key"]] = norm
+                    if already_filtered or passes_rank_thresholds(norm, min_sev_rank=min_sev_rank):
+                        findings[norm[KEY_FIELD]] = norm
         else:
-            cluster_errors[cluster] = str(cr.get("error") or DEFAULT_CLUSTER_SCAN_FAILED)
+            cluster_errors[cluster] = str(cr.get(ERROR_FIELD) or DEFAULT_CLUSTER_SCAN_FAILED)
     return findings, ok_clusters, cluster_errors
 
 
@@ -697,6 +957,27 @@ def short_finding_label(item: dict[str, Any]) -> str:
     if ns and ns != CLUSTER_WIDE_NAMESPACE:
         return f"{cluster_short}:{ns}/{name}"
     return f"{cluster_short}:{name}"
+
+
+def due_finding_summary(item: dict[str, Any], *, include_cluster: bool) -> str:
+    """Concise workload summary (`Kind/ns/name [cause, share%]`) for due chat alerts."""
+    ns = str(item.get(NAMESPACE_FIELD) or "")
+    s_kind = str(item.get(SUBJECT_KIND_FIELD) or DEFAULT_SUBJECT_KIND_CLUSTER)
+    s_name = str(item.get(SUBJECT_NAME_FIELD) or DEFAULT_UNKNOWN)
+    if ns and ns != CLUSTER_WIDE_NAMESPACE:
+        subject = DUE_SUBJECT_NAMESPACED.format(kind=s_kind, namespace=ns, name=s_name)
+    else:
+        subject = DUE_SUBJECT_CLUSTER.format(kind=s_kind, name=s_name)
+    cause = str(item.get(SUSPECTED_CAUSE_FIELD) or DEFAULT_UNKNOWN)
+    if str(item.get(KIND_FIELD) or "") == FINDING_KIND_DOMAIN_UNAVAILABLE:
+        summary = DUE_SUMMARY_NO_SHARE.format(subject=subject, cause=cause)
+    else:
+        pct = round(_float(item.get(MAX_DOMAIN_SHARE_KEY), ZERO_FLOAT) * PERCENT_SCALE)
+        summary = DUE_SUMMARY_WITH_SHARE.format(subject=subject, cause=cause, pct=pct)
+    if include_cluster:
+        cluster_short = str(item.get(CLUSTER_FIELD) or "").rsplit(CLUSTER_KEY_SEPARATOR, 1)[-1]
+        return DUE_CLUSTER_PREFIX.format(cluster=cluster_short, summary=summary)
+    return summary
 
 
 def format_name_list(names: list[str], limit: int = MAX_NAMES_IN_LINE) -> str:
@@ -886,19 +1167,19 @@ def write_report_files(
     return md_path
 
 
-def publish_blackboard_topic(summary_text: str, json_path: Path) -> bool:
+def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, str | None]:
     """Publish the latest leeway report to `agent.platform.topology-skew` when the A2A bus is configured."""
     if not os.environ.get(NATS_URL_ENV, "").strip() or not shutil.which(A2A_EXECUTABLE):
-        return False
+        return False, None
     argv = [
         A2A_EXECUTABLE,
-        "topics",
-        "write",
+        A2A_TOPICS_SUBCOMMAND,
+        A2A_WRITE_VERB,
         A2A_TOPIC_NAME,
-        "--text",
+        A2A_TEXT_FLAG,
         summary_text,
-        "--data",
-        f"@{json_path}",
+        A2A_DATA_FLAG,
+        f"{A2A_DATA_FILE_PREFIX}{json_path}",
     ]
     try:
         completed = subprocess.run(
@@ -908,9 +1189,43 @@ def publish_blackboard_topic(summary_text: str, json_path: Path) -> bool:
             timeout=A2A_PUBLISH_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if completed.returncode == 0:
+        return True, None
+    err_raw = SPACE_CHAR.join((completed.stderr or completed.stdout or "").split()).replace(
+        BACKTICK_CHAR, SINGLE_QUOTE_CHAR
+    )
+    excerpt = err_raw[-STDERR_EXCERPT_CHARS:] if err_raw else DEFAULT_NO_OUTPUT
+    detail = A2A_PUBLISH_FAILED_DETAIL.format(
+        topic=A2A_TOPIC_NAME,
+        code=completed.returncode,
+        error=excerpt,
+    )
+    return False, detail
+
+
+def record_topic_publish_result(
+    published: bool,
+    err_detail: str | None,
+    announced: dict[str, Any],
+    lines: list[str],
+) -> None:
+    """Announce blackboard topic publish failure or recovery once via the ledger's announced map."""
+    if err_detail is not None:
+        if announced.get(ANNOUNCED_TOPIC_PUBLISH_KEY) != ERROR_KIND_TOPIC_PUBLISH:
+            lines.append(
+                TOPIC_PUBLISH_FAILED_LINE.format(
+                    prefix=LINE_PREFIX,
+                    topic=A2A_TOPIC_NAME,
+                    detail=err_detail,
+                    subject=A2A_TOPIC_SUBJECT,
+                )
+            )
+        announced[ANNOUNCED_TOPIC_PUBLISH_KEY] = ERROR_KIND_TOPIC_PUBLISH
+    elif published and ANNOUNCED_TOPIC_PUBLISH_KEY in announced:
+        del announced[ANNOUNCED_TOPIC_PUBLISH_KEY]
+        lines.append(TOPIC_PUBLISH_CLEARED_LINE.format(prefix=LINE_PREFIX, topic=A2A_TOPIC_NAME))
 
 
 # --- failure marker ----------------------------------------------------------
@@ -1079,7 +1394,8 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
 
     lines: list[str] = []
 
-    active_findings, ok_clusters, cluster_errors = extract_findings(report)
+    report = filter_report_findings(report)
+    active_findings, ok_clusters, cluster_errors = extract_findings(report, already_filtered=True)
     all_errors: dict[str, str] = {**scan_errors, **cluster_errors}
     all_error_kinds: dict[str, str] = {
         **error_kinds,
@@ -1173,17 +1489,20 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             )
         if due_reasons:
             due_items = [active_findings[k] for k in sorted(due_reasons)]
-            due_clusters = sorted({item["cluster"] for item in due_items})
+            due_clusters = sorted({item[CLUSTER_FIELD] for item in due_items})
+            multi_cluster = len(due_clusters) > 1
             reasons_counts: dict[str, int] = {}
             for r in due_reasons.values():
                 reasons_counts[r] = reasons_counts.get(r, 0) + 1
-            reasons_str = ", ".join(f"{c} {r}" for r, c in sorted(reasons_counts.items()))
+            reasons_str = LIST_SEPARATOR.join(
+                REASON_COUNT_FORMAT.format(count=c, reason=r) for r, c in sorted(reasons_counts.items())
+            )
             print(
                 DRY_RUN_WOULD_REPORT.format(
                     count=len(due_reasons),
                     reasons=reasons_str,
                     clusters=format_name_list(due_clusters),
-                    names=format_name_list([short_finding_label(i) for i in due_items]),
+                    names=format_name_list([due_finding_summary(i, include_cluster=multi_cluster) for i in due_items]),
                 )
             )
         if not retired_labels and not due_reasons:
@@ -1199,14 +1518,18 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             )
             lines.append(retired_line)
         if due_reasons:
+            announced.pop(ANNOUNCED_DEFERRED_REFRESH_KEY, None)
             markdown = render_markdown_report(report, active_findings, due_reasons, all_errors, moment, days)
             md_path = write_report_files(home, report, markdown, moment)
             due_items = [active_findings[k] for k in sorted(due_reasons)]
-            due_clusters = sorted({item["cluster"] for item in due_items})
+            due_clusters = sorted({item[CLUSTER_FIELD] for item in due_items})
+            multi_cluster = len(due_clusters) > 1
             reasons_counts = {}
             for r in due_reasons.values():
                 reasons_counts[r] = reasons_counts.get(r, 0) + 1
-            reasons_str = ", ".join(f"{c} {r}" for r, c in sorted(reasons_counts.items()))
+            reasons_str = LIST_SEPARATOR.join(
+                REASON_COUNT_FORMAT.format(count=c, reason=r) for r, c in sorted(reasons_counts.items())
+            )
             next_date = (moment + timedelta(days=days)).strftime(DATE_FORMAT)
             report_line = REPORT_LINE.format(
                 prefix=LINE_PREFIX,
@@ -1214,15 +1537,31 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
                 reasons=reasons_str,
                 cluster_count=len(due_clusters),
                 clusters=format_name_list(due_clusters),
+                names=format_name_list([due_finding_summary(i, include_cluster=multi_cluster) for i in due_items]),
                 path=md_path,
                 next_date=next_date,
             )
             lines.append(report_line)
-            publish_blackboard_topic(report_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
-        elif retired_labels and not all_errors:
+            published, err_detail = publish_blackboard_topic(report_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
+            record_topic_publish_result(published, err_detail, announced, lines)
+        elif retired_labels and all_errors:
+            # A finding retired on a readable cluster during a partial scan makes
+            # `latest.json` stale; defer refreshing and re-publishing until the scan is clean.
+            announced[ANNOUNCED_DEFERRED_REFRESH_KEY] = REASON_ALL_RESOLVED
+        elif (retired_labels or ANNOUNCED_DEFERRED_REFRESH_KEY in announced) and not all_errors:
+            announced.pop(ANNOUNCED_DEFERRED_REFRESH_KEY, None)
             markdown = render_markdown_report(report, active_findings, due_reasons, all_errors, moment, days)
             md_path = write_report_files(home, report, markdown, moment)
-            publish_blackboard_topic(retired_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
+            summary_line = retired_line if retired_labels else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
+            published, err_detail = publish_blackboard_topic(summary_line, md_path.with_suffix(REPORT_JSON_SUFFIX))
+            record_topic_publish_result(published, err_detail, announced, lines)
+        elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced and not all_errors:
+            latest_json = home / REPORTS_DIR_NAME / LATEST_JSON_LINK_NAME
+            if latest_json.is_file():
+                published, err_detail = publish_blackboard_topic(
+                    A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX), latest_json
+                )
+                record_topic_publish_result(published, err_detail, announced, lines)
 
         updated_ledger: dict[str, Any] = {
             LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION,
