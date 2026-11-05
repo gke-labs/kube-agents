@@ -441,6 +441,9 @@ def unstorable_reasons(
     try:
         if scrubber.answer_masks_credential(message):
             reasons.append(F.UNSTORABLE_SCRUB_MASKS_CREDENTIAL)
+        messages = body.get(request_store.MESSAGES_KEY)
+        if scrubber.secret_read_call_ids(messages if isinstance(messages, list) else []):
+            reasons.append(F.UNSTORABLE_FOLLOWS_SECRET_READ)
     except Exception:
         reasons.append(F.UNSTORABLE_SCRUB_FAILED)
     return reasons

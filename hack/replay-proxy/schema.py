@@ -82,6 +82,10 @@ UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
 UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"
 UNSTORABLE_REPEATS_DATE = "repeats_swapped_date"
 UNSTORABLE_SCRUB_MASKS_CREDENTIAL = "scrub_masks_credential"
+# The request holds the result of a tool call that printed a secret's value,
+# which the answer may repeat in a form no scrubber recognises; the
+# conversation runs live from the read on.
+UNSTORABLE_FOLLOWS_SECRET_READ = "follows_secret_read"
 UNSTORABLE_SCRUBBERS_UNAVAILABLE = "scrubbers_unavailable"
 UNSTORABLE_SCRUB_FAILED = "scrub_failed"
 

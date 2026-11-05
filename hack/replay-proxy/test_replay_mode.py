@@ -578,7 +578,24 @@ class SecretReadTest(ProxyTestCase):
             {"role": "user", "content": f"work kanban task {task}"},
         ]}
 
+    def test_an_answer_after_a_secret_read_is_not_stored(self):
+        # The answer repeats the decoded value, which no scrubber can recognise.
+        FakeLiteLLM.custom_body = json.dumps({"choices": [{"index": 0, "finish_reason": "stop", "message": {
+            "role": "assistant", "content": "The password is plain looking value hunter2."}}]}).encode()
+        _, record_port, record_out = self.start_proxy(mode="record")
+        self.request("POST", COMPLETIONS, self.body("hunter2", "t_11111111"), port=record_port)
+        line = self.lines(1, record_out)[0]
+        self.assertIn("follows_secret_read", line["unstorable"])
+        self.assertFalse(line["recorded"])
+        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
+
     def test_a_secret_read_result_is_withheld_in_the_cache_and_in_a_miss(self):
+        # Record mode refuses such a request (follows_secret_read); the scrubbing
+        # below is the second line, met by lifting that refusal for this test.
+        original = replay_proxy.unstorable_reasons
+        replay_proxy.unstorable_reasons = lambda *args, **kwargs: [
+            r for r in original(*args, **kwargs) if r != "follows_secret_read"]
+        self.addCleanup(setattr, replay_proxy, "unstorable_reasons", original)
         _, record_port, record_out = self.start_proxy(mode="record")
         self.request("POST", COMPLETIONS, self.body("hunter2", "t_11111111"), port=record_port)
         self.lines(1, record_out)
