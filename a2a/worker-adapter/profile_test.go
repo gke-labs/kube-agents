@@ -1083,22 +1083,34 @@ func TestAQueuedAbandonReachesTheTaskOnEviction(t *testing.T) {
 // its log captured, and waits for it to be Ready.
 func runWorkerWithReset(t *testing.T, ctx context.Context, url string, harness []string, reset []string, logBuf *syncBuffer) string {
 	t.Helper()
+	addr, _ := startWorkerWithReset(t, ctx, url, harness, ProfileWorkerConfig{ResetPaths: reset}, logBuf, true)
+	return addr
+}
+
+// startWorkerWithReset starts a profile worker with the given ResetPaths (and
+// resetTimeout), its log captured. With waitReady it returns once /readyz
+// answers 200; either way it returns the worker's result channel.
+func startWorkerWithReset(t *testing.T, ctx context.Context, url string, harness []string, pw ProfileWorkerConfig, logBuf *syncBuffer, waitReady bool) (string, <-chan error) {
+	t.Helper()
 	cfg := profileWorkerConfig(t, url, harness)
 	cfg.Logger = slog.New(slog.NewTextHandler(logBuf, nil))
 	ln, addr := readyListener(t)
-	go func() {
-		_ = RunProfileWorker(ctx, cfg, ProfileWorkerConfig{Tier: pwTier, ReadyAddr: addr, readyListener: ln, deadlineMargin: time.Second, ResetPaths: reset})
-	}()
+	pw.Tier, pw.ReadyAddr, pw.readyListener, pw.deadlineMargin = pwTier, addr, ln, time.Second
+	done := make(chan error, 1)
+	go func() { done <- RunProfileWorker(ctx, cfg, pw) }()
+	if !waitReady {
+		return addr, done
+	}
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
 		if resp, err := http.Get("http://" + addr + "/readyz"); err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return addr
+				return addr, done
 			}
 		}
 	}
 	t.Fatal("the worker never became ready")
-	return ""
+	return "", done
 }
 
 // syncBuffer is a bytes.Buffer safe for the logger's goroutines and the
@@ -1174,42 +1186,181 @@ esac
 	}
 }
 
-// A reset that fails takes the pod out of service for good: /readyz stops
-// answering 200 and every later offer is declined, so nothing the last task
-// left can reach another.
-func TestAFailedResetTakesThePodOutOfService(t *testing.T) {
+// A reset that fails ends the worker, at startup before it ever goes Ready,
+// and after a task once that task's terminal is out, so the kubelet restarts
+// it rather than leaving a pod that's alive and useless. A startup reset that
+// runs past its bound ends it the same way.
+func TestAFailedResetEndsTheWorker(t *testing.T) {
+	harness := stub(t, `
+read first || exit 1
+case "$first" in *RMWORD*) rm -rf "$RESETDIR" ;; esac
+echo '{"type":"result","subtype":"success","result":"done"}'
+`)
+	waitEnd := func(t *testing.T, done <-chan error, want string) {
+		t.Helper()
+		select {
+		case err := <-done:
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("the worker ended with %v, want an error naming %q", err, want)
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("the worker didn't end")
+		}
+	}
+	t.Run("at startup", func(t *testing.T) {
+		url := startServer(t)
+		var logBuf syncBuffer
+		_, done := startWorkerWithReset(t, context.Background(), url, harness, ProfileWorkerConfig{ResetPaths: []string{filepath.Join(t.TempDir(), "missing")}}, &logBuf, false)
+		waitEnd(t, done, "workspace reset (startup)")
+	})
+	t.Run("past its bound", func(t *testing.T) {
+		url := startServer(t)
+		dir := t.TempDir()
+		for i := 0; i < 200; i++ {
+			if err := os.WriteFile(filepath.Join(dir, fmt.Sprint(i)), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var logBuf syncBuffer
+		_, done := startWorkerWithReset(t, context.Background(), url, harness, ProfileWorkerConfig{ResetPaths: []string{dir}, resetTimeout: time.Nanosecond}, &logBuf, false)
+		waitEnd(t, done, "took longer")
+	})
+	t.Run("after a task", func(t *testing.T) {
+		url := startServer(t)
+		d := newFakeDispatcher(t, url)
+		dir := filepath.Join(t.TempDir(), "work")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("RESETDIR", dir)
+		var logBuf syncBuffer
+		_, done := startWorkerWithReset(t, context.Background(), url, harness, ProfileWorkerConfig{ResetPaths: []string{dir}}, &logBuf, true)
+		d.offer("task-rm", profileSubmission(t, "task-rm", "RMWORD", nil), 5)
+		d.nextAccept(5 * time.Second)
+		d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-rm"})
+		waitEnd(t, done, "workspace reset (after-task)")
+		if got := foldTask(t, testClient(t, url), pwProfile, "task-rm"); !got.Final || got.State != lib.StateCompleted {
+			t.Errorf("the task before the failed reset = %s (final %v), want its own completed terminal", got.State, got.Final)
+		}
+	})
+}
+
+// A restarted worker starts on what the last process left in its emptyDirs,
+// so the startup reset empties them before the first offer.
+func TestTheStartupResetClearsWhatALastProcessLeft(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "left-by-the-last-process"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness := stub(t, fmt.Sprintf(`
+read first || exit 1
+found=$(find %s -mindepth 1 | tr '\n' ' ')
+printf '{"type":"result","subtype":"success","result":"found: %%s"}\n' "$found"
+`, dir))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var logBuf syncBuffer
+	startWorkerWithReset(t, ctx, url, harness, ProfileWorkerConfig{ResetPaths: []string{dir}}, &logBuf, true)
+	c := testClient(t, url)
+	d.offer("task-first", profileSubmission(t, "task-first", "look", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-first"})
+	waitState(t, c, pwProfile, "task-first", lib.StateCompleted)
+	if got := artifactText(foldTask(t, c, pwProfile, "task-first"), lib.ArtifactResult); got != "found: " {
+		t.Errorf("the first task after a restart found %q", got)
+	}
+	if !strings.Contains(logBuf.String(), "phase=startup") {
+		t.Errorf("the log doesn't show the startup reset: %s", logBuf.String())
+	}
+}
+
+// A pod that can't run a harness ends after the task it couldn't start,
+// rather than staying Ready and failing every offer the same way.
+func TestAPodThatCantRunAHarnessEnds(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	var logBuf syncBuffer
+	_, done := startWorkerWithReset(t, context.Background(), url, []string{filepath.Join(t.TempDir(), "no-such-harness")}, ProfileWorkerConfig{}, &logBuf, true)
+	d.offer("task-cant", profileSubmission(t, "task-cant", "anything", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-cant"})
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "can't run a harness") {
+			t.Errorf("the worker ended with %v, want the broken-pod error", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("a pod that can't run a harness kept running")
+	}
+}
+
+// Liveness fails once the bus connection is closed for good, so the kubelet
+// restarts the worker instead of keeping a pod that can't take a task.
+func TestHealthzFailsOnceTheBusConnectionIsClosed(t *testing.T) {
+	url := startServer(t)
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &profileWorker{cfg: Config{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}, b: &busConns{nc: nc}}
+	ln, addr := readyListener(t)
+	stop, err := w.serveReadiness(addr, ln)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	get := func() int {
+		resp, err := http.Get("http://" + addr + "/healthz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := get(); code != http.StatusOK {
+		t.Fatalf("/healthz with the connection open = %d", code)
+	}
+	nc.Close()
+	if code := get(); code != http.StatusServiceUnavailable {
+		t.Errorf("/healthz with the connection closed = %d, want 503", code)
+	}
+}
+
+// While an abandoned task drains, the worker still answers: an offer that
+// arrives meanwhile is declined as busy at once, not left waiting out the
+// drain, and once the task is released the next offer is accepted.
+func TestAnOfferDuringAnAbandonedDrainIsAnsweredAtOnce(t *testing.T) {
 	url := startServer(t)
 	d := newFakeDispatcher(t, url)
 	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"pw-drain-offer"}'
 read first || exit 1
+case "$first" in
+  *SLOWDRAIN*) perl -e 'setpgrp(0,0); sleep 4' & sleep 30 ;;
+esac
 echo '{"type":"result","subtype":"success","result":"done"}'
 `)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var logBuf syncBuffer
-	// A reset path that isn't there can't be emptied.
-	addr := runWorkerWithReset(t, ctx, url, harness, []string{filepath.Join(t.TempDir(), "missing")}, &logBuf)
-	c := testClient(t, url)
+	startProfileWorker(t, ctx, profileWorkerConfig(t, url, harness), false)
 
-	d.offer("task-one", profileSubmission(t, "task-one", "one", nil), 5)
+	d.offer("task-slow", profileSubmission(t, "task-slow", "SLOWDRAIN", nil), 5)
 	d.nextAccept(5 * time.Second)
-	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-one"})
-	waitState(t, c, pwProfile, "task-one", lib.StateCompleted)
-	drainLeases(d, "task-one", time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-slow"})
+	waitState(t, testClient(t, url), pwProfile, "task-slow", lib.StateWorking)
+	d.send(lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: "task-slow", Reason: "lease-expired - test"})
+	time.Sleep(100 * time.Millisecond)
 
-	resp, err := http.Get("http://" + addr + "/readyz")
-	if err != nil {
-		t.Fatal(err)
+	d.offer("task-during", profileSubmission(t, "task-during", "during", nil), 5)
+	if a := d.nextAccept(time.Second); a.TaskID != "task-during" || a.Accepted || a.Reason != declineBusy {
+		t.Errorf("an offer during the drain = %+v, want a prompt busy decline", a)
 	}
-	resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		t.Error("/readyz answers 200 after a failed reset")
-	}
-	d.offer("task-two", profileSubmission(t, "task-two", "two", nil), 5)
-	if a := d.nextAccept(5 * time.Second); a.Accepted || a.Reason != declineUnreset {
-		t.Errorf("an offer after a failed reset = %+v, want a decline (%s)", a, declineUnreset)
-	}
-	if !strings.Contains(logBuf.String(), "workspace reset failed") {
-		t.Errorf("the log doesn't show the failed reset: %s", logBuf.String())
+	// After the drain (the child holds stdout for about 4s), the pod is free.
+	time.Sleep(5 * time.Second)
+	d.offer("task-after", profileSubmission(t, "task-after", "after", nil), 5)
+	if a := d.nextAccept(5 * time.Second); a.TaskID != "task-after" || !a.Accepted {
+		t.Errorf("an offer after the drain = %+v, want an accept", a)
 	}
 }

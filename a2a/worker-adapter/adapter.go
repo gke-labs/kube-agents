@@ -581,6 +581,12 @@ func dialBusWith(ctx context.Context, cfg Config, auth []nats.Option) (*busConns
 	// handshake (spec-nats-deployment.md); what the longer value buys is
 	// the dial, TLS and scheduling share of an attempt on a loaded host.
 	rawOpts := append(natsOpts, nats.Timeout(lib.DialTimeout))
+	// A profile worker's pod lives for days and takes task after task on
+	// this connection, so it rides out a bus outage of any length rather
+	// than closing after nats.go's default sixty attempts.
+	if cfg.ProfileExecutor {
+		rawOpts = append(rawOpts, nats.MaxReconnects(-1))
+	}
 	nc, err := nats.Connect(cfg.NATSURL, append(rawOpts, lib.TLSOptions()...)...)
 	if err != nil {
 		c.Close()
@@ -630,6 +636,9 @@ type turnPlan struct {
 type turnOutcome struct {
 	res Result
 	err error
+	// resetErr is a profile worker's failure to empty its reset paths after
+	// the task (profile.go), which ends the worker.
+	resetErr error
 	// launched is true once a harness process started for this task.
 	launched bool
 	// harnessSession is the session id the harness reported at init, or ""
