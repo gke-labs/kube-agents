@@ -394,8 +394,16 @@ func TestSubscribeDurable_WaitForStreamOutlastsAnOutageWhileReconnecting(t *test
 	if c.rebuilds.Load() != 0 {
 		t.Fatalf("the connection was rebuilt (%d); this test is for an outage it reconnects across", c.rebuilds.Load())
 	}
-	if !capture.contains("durable bind failed; retrying") {
-		t.Fatalf("no attempt failed during the outage, so the test did not reach the reconnecting form:\n%s", strings.Join(capture.lines, "\n"))
+	// The wait names the outage once (the log interval is an hour here)
+	// rather than warning on every attempt.
+	if n := capture.count("waiting for the bus connection to return"); n != 1 {
+		t.Fatalf("logged the connection wait %d times, want once:\n%s", n, strings.Join(capture.lines, "\n"))
+	}
+	if capture.contains("durable bind failed; retrying") {
+		t.Fatalf("warned per attempt during the outage:\n%s", strings.Join(capture.lines, "\n"))
+	}
+	if c.Connected() {
+		t.Fatal("Connected() is true during the outage")
 	}
 	s2 := runJetStreamServer(t, port, dir, nil)
 	t.Cleanup(s2.Shutdown)

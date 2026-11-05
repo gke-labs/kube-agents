@@ -183,3 +183,40 @@ func runGateway(t *testing.T, ctx context.Context, run func(context.Context) err
 	go func() { defer close(ran); _ = run(ctx) }()
 	t.Cleanup(func() { cancel(); <-ran })
 }
+
+// While the bus is unreachable the relay's wait cannot tell whether TASKS
+// exists, so the reason names the bus, not the stream.
+func TestReadinessNamesABusOutage(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	mapFile := filepath.Join(t.TempDir(), "principal-map")
+	if err := os.WriteFile(mapFile, []byte("1001 test:bnaylor\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatalf("gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	g, err := New(Options{Client: client, Adapter: newFakeAdapter(), Backend: "discord", Config: &Config{
+		NATSURL: url, PrincipalMapPath: mapFile, DefaultAddressee: "platform",
+		IdleTTL: 30 * time.Minute, AttributionSalt: []byte("test-salt"),
+	}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if ready, why := g.Readiness(); ready || !strings.Contains(why, "waiting for stream TASKS") {
+		t.Fatalf("Readiness on a reachable bus = %v %q, want the stream wait", ready, why)
+	}
+	s.Shutdown()
+	s.WaitForShutdown()
+	deadline := time.Now().Add(10 * time.Second)
+	for client.Connected() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if ready, why := g.Readiness(); ready || !strings.Contains(why, "waiting for the bus") {
+		t.Fatalf("Readiness with the bus down = %v %q, want the bus named", ready, why)
+	}
+}

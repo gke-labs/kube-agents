@@ -752,11 +752,12 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // With cfg.WaitForStream, a missing stream does not count against the
 // window, and neither does a lost connection (connectionLost, or the
 // connection not connected when the attempt failed), across which nats.go
-// reconnects or the client rebuilds: the bind retries until the stream appears or ctx
-// ends, and the window restarts from the first attempt that finds it. The wait logs its
-// first attempt and then at most once per streamWaitLogInterval, and warns
-// once per streamWaitWarnEvery, so a stream that never comes is loud, not
-// silent; the caller reports itself not ready meanwhile.
+// reconnects or the client rebuilds: the bind retries until the stream
+// appears or ctx ends, and the window restarts from the first attempt that
+// finds it. Either wait logs its first attempt, again when what it waits for
+// changes, and then at most once per streamWaitLogInterval, and warns once
+// per streamWaitWarnEvery, so a wait that never ends is loud, not silent; the
+// caller reports itself not ready meanwhile (Connected tells it which).
 //
 // Until it returns, this loop is the durable's only binder: a rebuild skips a
 // durable that is not yet bound (resubscribe). So each attempt reads the
@@ -769,6 +770,7 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
 	deadline := time.Now().Add(subscribeBindWindow)
 	var waitStart, lastLog time.Time
+	var lastWaitingFor string
 	warned := 0
 	for attempt := 1; ; attempt++ {
 		err := s.start(ctx, js)
@@ -794,8 +796,23 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		if errors.Is(err, ErrHeldBindRefused) {
 			return err
 		}
-		if s.cfg.WaitForStream && errors.Is(err, jetstream.ErrStreamNotFound) &&
-			ctx.Err() == nil && !s.c.closing.Load() && !s.stopped.Load() {
+		// What a WaitForStream bind is waiting for, if anything: the stream,
+		// or the connection. Whether the stream exists is unknown while the
+		// connection is down, so an outage does not count against the window
+		// either. The state is read as well as the error: a connection that
+		// reconnects forever (Connect's MaxReconnects(-1)) never closes, and
+		// an attempt on it fails on jetstream's own API timeout, a
+		// context.DeadlineExceeded no error check can tell apart.
+		waitingFor := ""
+		if s.cfg.WaitForStream && ctx.Err() == nil && !s.c.closing.Load() && !s.stopped.Load() {
+			switch {
+			case errors.Is(err, jetstream.ErrStreamNotFound):
+				waitingFor = "stream"
+			case connectionLost(err) || !s.c.Connected():
+				waitingFor = "connection"
+			}
+		}
+		if waitingFor != "" {
 			now := time.Now()
 			if waitStart.IsZero() {
 				waitStart = now
@@ -806,13 +823,24 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 			case waited >= time.Duration(warned+1)*streamWaitWarnEvery:
 				warned++
 				lastLog = now
-				s.c.log.Warn("still waiting for the stream; nothing has created it",
-					"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
-			case lastLog.IsZero() || now.Sub(lastLog) >= streamWaitLogInterval:
+				if waitingFor == "stream" {
+					s.c.log.Warn("still waiting for the stream; nothing has created it",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else {
+					s.c.log.Warn("still waiting for the bus connection to return",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt, "err", err)
+				}
+			case lastLog.IsZero() || now.Sub(lastLog) >= streamWaitLogInterval || waitingFor != lastWaitingFor:
 				lastLog = now
-				s.c.log.Info("waiting for the stream to be created",
-					"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				if waitingFor == "stream" {
+					s.c.log.Info("waiting for the stream to be created",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt)
+				} else {
+					s.c.log.Info("waiting for the bus connection to return",
+						"stream", s.cfg.Stream, "durable", s.cfg.Durable, "waited", waited.Round(time.Second).String(), "attempt", attempt, "err", err)
+				}
 			}
+			lastWaitingFor = waitingFor
 			select {
 			case <-ctx.Done():
 				return err
@@ -820,15 +848,6 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 			}
 			js = s.c.currentJS()
 			continue
-		}
-		if s.cfg.WaitForStream && (connectionLost(err) || !s.c.connected()) {
-			// Whether the stream exists is unknown while the connection is
-			// down, so the outage does not count against the window either.
-			// The state is read as well as the error: a connection that
-			// reconnects forever (Connect's MaxReconnects(-1)) never closes,
-			// and an attempt on it fails on jetstream's own API timeout, a
-			// context.DeadlineExceeded no error check can tell apart.
-			deadline = time.Now().Add(subscribeBindWindow)
 		}
 		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
 			return err
@@ -844,9 +863,10 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 	}
 }
 
-// connected is whether the client's current connection is connected, rather
-// than reconnecting, closed or being rebuilt.
-func (c *Client) connected() bool {
+// Connected is whether the client's current connection is connected, rather
+// than reconnecting, closed or being rebuilt. A caller reporting readiness
+// reads it to tell a bus outage from a wait on its own streams.
+func (c *Client) Connected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.nc != nil && c.nc.IsConnected()

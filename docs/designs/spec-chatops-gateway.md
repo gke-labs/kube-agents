@@ -2634,11 +2634,13 @@ with neither door armed; it renders on every `next` install now so that it is no
 
 `/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
 once the gateway has bound its event relay and 503 until then, with the reason as the body
-(`waiting for stream TASKS: ...`). The relay binds before the adapters and doors start, and on an install
+(`waiting for stream TASKS: ...`, or `waiting for the bus: ...` while the NATS connection is down).
+The relay binds before the adapters and doors start, and on an install
 whose provision Job has not created TASKS yet (a three-server bus can take longer to form than
 lib's 45-second bind window) the relay waits for the stream rather than exiting
-(`SubscribeConfig.WaitForStream`, set on the relay alone, and only a missing stream waits). It logs
-the wait every 30 seconds and warns every 10 minutes. So a gateway waiting on provisioning reads
+(`SubscribeConfig.WaitForStream`, set on the relay alone). A lost connection during that wait does
+not end it either: nats.go reconnects (or lib rebuilds the connection), and the wait goes on there.
+Each wait logs when it starts or changes, then every 30 seconds, and warns every 10 minutes. So a gateway waiting on provisioning reads
 not Ready, and the CR `Provisioning` naming it, instead of crash-looping. The Deployment is
 Recreate, so the probe opens no gap in a roll; it shows the one Recreate already has. Its progress
 deadline is 1800 seconds rather than Kubernetes' 600, so a wait on a slow provision Job does not

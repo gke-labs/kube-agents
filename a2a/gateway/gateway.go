@@ -634,6 +634,11 @@ func (g *Gateway) Readiness() (bool, string) {
 	if g.relayHeldBack.Load() {
 		return false, fmt.Sprintf("the event relay durable %s is held back after a crash start, so the previous process's held events render first", g.relayDurable)
 	}
+	if g.client != nil && !g.client.Connected() {
+		// The relay's wait cannot tell whether the stream exists while the
+		// bus is unreachable, so this, not the stream, is the reason.
+		return false, fmt.Sprintf("waiting for the bus: the NATS connection is down, so the event relay durable %s cannot bind", g.relayDurable)
+	}
 	return false, fmt.Sprintf("waiting for stream %s: the event relay durable %s has not bound yet", lib.TasksStream, g.relayDurable)
 }
 
