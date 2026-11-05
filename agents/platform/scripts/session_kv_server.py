@@ -1126,6 +1126,21 @@ SLACK_CRASHLOOP_ALERT = "🚨 **{workload} in {cluster} keeps crashing.** Lookin
 ALERT_TITLE = "{workload} crashloop"
 ALERT_TITLE_CLUSTER = " in {cluster}"
 ALERT_TITLE_KEY = "title"
+# A drift alert's thread title, and the mark slack_ux_incident lays its triage out by.
+DRIFT_ALERT_TITLE = "{name} {kind} drift"
+DRIFT_ALERT_TITLE_CLUSTER = " · {cluster}"
+ALERT_KIND_KEY = "alert_kind"
+ALERT_KIND_DRIFT = "drift"
+# The kind a drift title names, by the audit record's resource; any other resource is named as recorded.
+DRIFT_TITLE_KINDS = {
+    "horizontalpodautoscalers": "HPA",
+    "deployments": "Deployment",
+    "statefulsets": "StatefulSet",
+    "daemonsets": "DaemonSet",
+    "services": "Service",
+    "configmaps": "ConfigMap",
+    "networkpolicies": "NetworkPolicy",
+}
 
 # The cluster name a drift card falls back to when the payload names none and
 # GKE_CLUSTER_NAME is unset -- the cluster the agent itself runs on. The event
@@ -2828,8 +2843,8 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
         logger.error(f"Failed to update session metadata with thread_id: {exc}")
 
 
-def _record_alert_title(session_id: str, title: str) -> None:
-    """Add the Slack session title to the alert's routing row, for gateway/slack_ux_incident.py.
+def _record_alert_title(session_id: str, title: str, kind: str = "") -> None:
+    """Add the Slack session title, and any ``kind`` of alert, to the alert's routing row, for gateway/slack_ux_incident.py.
 
     Cosmetic, so a failure is logged and the triage goes on without it.
     """
@@ -2843,6 +2858,8 @@ def _record_alert_title(session_id: str, title: str) -> None:
                 if row:
                     meta = json.loads(row[0])
                     meta[ALERT_TITLE_KEY] = title
+                    if kind:
+                        meta[ALERT_KIND_KEY] = kind
                     conn.execute(
                         "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
                         (json.dumps(meta), session_id),
@@ -4310,12 +4327,13 @@ def trigger_agent_troubleshooter(
     event_row_id: Optional[int] = None,
     slack_alert_msg: Optional[str] = None,
     alert_title: Optional[str] = None,
+    alert_kind: str = "",
 ) -> None:
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background.
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
     ``alert_title`` is recorded for a thread on a card platform: Slack, or Google
-    Chat under ``spec.mode: next``.
+    Chat under ``spec.mode: next``, with ``alert_kind`` beside it.
 
     An exception releases the row's fold anchor before it propagates: the
     ledger row was written as admitted before this task was queued, and a task
@@ -4326,7 +4344,8 @@ def trigger_agent_troubleshooter(
     """
     try:
         _trigger_agent_troubleshooter(
-            session_id, alert_msg, payload, event_row_id, slack_alert_msg=slack_alert_msg, alert_title=alert_title
+            session_id, alert_msg, payload, event_row_id, slack_alert_msg=slack_alert_msg, alert_title=alert_title,
+            alert_kind=alert_kind,
         )
     except Exception:
         mark_triage_not_started(event_row_id)
@@ -4340,6 +4359,7 @@ def _trigger_agent_troubleshooter(
     event_row_id: Optional[int] = None,
     slack_alert_msg: Optional[str] = None,
     alert_title: Optional[str] = None,
+    alert_kind: str = "",
 ) -> None:
     """trigger_agent_troubleshooter's work, without the release on an exception."""
     # 1. Post initial warning notification to Google Chat or Slack.
@@ -4403,7 +4423,10 @@ def _trigger_agent_troubleshooter(
             if alert_title and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
                 # The title heads the plan the cards draw: on Slack, and on the
                 # platform the gateway lays the plan out for under spec.mode: next.
-                _record_alert_title(session_id, alert_title)
+                if alert_kind:
+                    _record_alert_title(session_id, alert_title, alert_kind)
+                else:
+                    _record_alert_title(session_id, alert_title)
             # Armed here, before the gateway is contacted: an alert whose turn
             # never starts (session creation refused, the turn's POST failing)
             # is the case the watchdog exists for, and the steps below return
@@ -6080,9 +6103,32 @@ def _inject_drift(
             "suppressed_today": str(suppressed_today),
         }
 
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, _drift_alert_message(summary), payload, event_row_id)
+    background_tasks.add_task(
+        trigger_agent_troubleshooter,
+        session_id,
+        _drift_alert_message(summary),
+        payload,
+        event_row_id,
+        alert_title=_drift_session_title(payload),
+        alert_kind=ALERT_KIND_DRIFT,
+    )
 
     return {"status": "injected"}
+
+
+def _drift_session_title(payload: Dict[str, Any]) -> str | None:
+    """The session title for a drift alert's thread with KAGE_SLACK_UX on, else None.
+
+    "checkout-gateway HPA drift · seeded-b": the object, its kind, and the cluster it changed on.
+    """
+    resource = _drift_resource(payload)
+    name = _defang_drift_field(resource.get("name"))
+    if not (slack_presenter.enabled() and name):
+        return None
+    recorded = _defang_drift_field(resource.get("resource")) or DRIFT_UNKNOWN_FIELD
+    title = DRIFT_ALERT_TITLE.format(name=name, kind=DRIFT_TITLE_KINDS.get(recorded.lower(), recorded))
+    cluster = _defang_drift_field(payload.get("cluster"))
+    return title + DRIFT_ALERT_TITLE_CLUSTER.format(cluster=cluster) if cluster else title
 
 
 def _drift_alert_message(summary: str) -> str:
@@ -6485,6 +6531,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
         threading.Thread(
             target=trigger_agent_troubleshooter,
             args=(session_id, _drift_alert_message(_drift_summary(payload)), payload, row["id"]),
+            kwargs={"alert_title": _drift_session_title(payload), "alert_kind": ALERT_KIND_DRIFT},
             name=f"drift-backlog-card-{row['id']}",
             daemon=True,
         ).start()
