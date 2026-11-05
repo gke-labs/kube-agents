@@ -991,13 +991,14 @@ Nightly report's.
   covering only the cases or parts on record. It is advisory and moves no
   state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
 - **🗣 Reply shape:** how last night's answers read, over every repetition that
-  delivered one: the share opening on the answer rather than a lead-in or a heading,
+  delivered one and was not lost to infra: the share opening on the answer rather than a lead-in or a heading,
   the answer's median length, the median messages posted for the ask, and the share
   that apologized, each against its typical, worked out as the latency line's are. A
   number gets a ⚠ mark when the share opening on the answer drops 10 points or more,
   the share apologizing rises as much, or the answer or the message count reaches
-  1.5× its typical. It is advisory and moves no state, verdict or gate; making it gate
-  is a later change once its record is clean. `scripts/eval_dashboard/nightly_tone.py`
+  1.5× its typical. A night cut off at the deadline, or with a part missing or still
+  running, carries the line too, labelled as the latency block is. It is advisory and
+  moves no state, verdict or gate. `scripts/eval_dashboard/nightly_tone.py`
   holds the rules, and `bench/kube_agents_bench/chat_shape.py` measures each reply.
 - A footer asking owners to reply in the thread.
 

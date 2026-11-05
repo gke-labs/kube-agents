@@ -14,8 +14,8 @@ Each number's typical is the median of the same number over the last
 ``nightly_latency.BASELINE_NIGHTS`` earlier whole nights that carry it, with
 at least ``nightly_latency.MIN_BASELINE_NIGHTS`` of them, as the latency
 line's are. A number gets the ⚠ mark when it moved the wrong way by the
-threshold: the share opening on the answer down SHARE_DROP or more, the
-share apologizing up as much, or the answer or the message count at
+threshold: the share opening on the answer down SHARE_DROP_POINTS or more,
+the share apologizing up as much, or the answer or the message count at
 GROWTH_RATIO times its typical or more.
 
 All of it is advisory: no verdict, state or gate reads it. Making it gate is
@@ -36,8 +36,9 @@ except ImportError:  # imported with scripts/eval_dashboard/ on sys.path
     from eval_dashboard import nightly, nightly_latency
 
 # A share move of ten points is about four of the forty-odd repetitions the
-# chat-voice and delegated cases give a night.
-SHARE_DROP = 0.10
+# chat-voice and delegated cases give a night. Compared in whole points, the
+# unit the line prints, so 30% against a typical 20% is a rise of ten.
+SHARE_DROP_POINTS = 10
 GROWTH_RATIO = 1.5
 
 VERDICT_SHARE = "verdict_share"
@@ -57,8 +58,12 @@ CUT_NOTE = nightly_latency.CUT_NOTE
 PARTIAL_NOTE = nightly_latency.PARTIAL_NOTE
 
 
+def _points(value: float) -> int:
+    return round(value * 100)
+
+
 def _share(value: float) -> str:
-    return f"{round(value * 100)}%"
+    return f"{_points(value)}%"
 
 
 def _whole(value: float) -> str:
@@ -104,9 +109,9 @@ def regressions(nights: list[dict]) -> list[str]:
         return []
     base = baselines(nights)
     out = []
-    if now[VERDICT_SHARE] is not None and base[VERDICT_SHARE] is not None and now[VERDICT_SHARE] <= base[VERDICT_SHARE] - SHARE_DROP:
+    if now[VERDICT_SHARE] is not None and base[VERDICT_SHARE] is not None and _points(now[VERDICT_SHARE]) <= _points(base[VERDICT_SHARE]) - SHARE_DROP_POINTS:
         out.append(VERDICT_SHARE)
-    if now[APOLOGY_SHARE] is not None and base[APOLOGY_SHARE] is not None and now[APOLOGY_SHARE] >= base[APOLOGY_SHARE] + SHARE_DROP:
+    if now[APOLOGY_SHARE] is not None and base[APOLOGY_SHARE] is not None and _points(now[APOLOGY_SHARE]) >= _points(base[APOLOGY_SHARE]) + SHARE_DROP_POINTS:
         out.append(APOLOGY_SHARE)
     for key in (ANSWER_P50, MESSAGES_P50):
         if now[key] is not None and base[key] and now[key] >= GROWTH_RATIO * base[key]:

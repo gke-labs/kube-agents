@@ -43,6 +43,11 @@ class NightLineTest(unittest.TestCase):
         self.assertIn("messages p50 3 ⚠ (typical 2)", line)
         self.assertIn("10% apologize ⚠ (typical 0%)", line)
 
+    def test_an_exact_ten_point_rise_from_a_nonzero_typical_is_marked(self):
+        # 0.2 + 0.1 is 0.30000000000000004 in floats; the points are whole.
+        nights = [night(n=10, verdict=9, apology=3)] + steady(7, n=10, verdict=9, apology=2)
+        self.assertEqual(nt.regressions(nights), [nt.APOLOGY_SHARE])
+
     def test_just_short_of_the_threshold_is_not_marked(self):
         nights = [night(verdict=33, apology=3, words=89)] + steady(7)
         self.assertEqual(nt.regressions(nights), [])

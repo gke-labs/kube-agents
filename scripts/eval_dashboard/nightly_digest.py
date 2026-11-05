@@ -27,7 +27,7 @@ Each list holds at most LIST_MAX_LINES lines, the rest behind a link to the
 Nightly page. A night with no new or newly owed bug, no first-night red, no
 recovery, no infra item and no part cut off is one summary line
 (QUIET_LINE), which counts what is still red, followed by the latency
-block. Every form of the section, a night cut off at the deadline included,
+block and the reply-shape line. Every form of the section, a night cut off at the deadline included,
 carries the latency block after the infra list when the night carried
 timing, and the reply-shape line after it when the night measured a reply.
 
@@ -283,12 +283,14 @@ class Builder:
             if not ok:
                 raise Skipped(SKIP_BAD_LINK.format(url=url or "empty"))
 
-    def latency_block(self, fields: dict) -> list[str]:
+    def latency_block(self, fields: dict, nights: list[dict] | None = None) -> list[str]:
         """The night line and the slow cases (``nightly_latency.py``), or
-        nothing when last night carried no timing."""
+        nothing when last night carried no timing. ``nights`` is
+        ``nightly.night_reports``, built here when not passed."""
         # ``last_night``'s night is the newest of these: the same reports,
         # read further back for the typicals.
-        nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
+        if nights is None:
+            nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
         line = nightly_latency.night_line(nights)
         if not line:
             return []
@@ -315,16 +317,12 @@ class Builder:
             items.append(((-entry["ratio"], case), nightly_latency.slow_text(entry, name, self.who(owner))))
         return [line, *self.capped(nightly_latency.SLOW_HEADING, items)]
 
-    def tone_block(self) -> list[str]:
-        """The reply-shape line (``nightly_tone.py``), or nothing when last
-        night measured no reply."""
-        nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
-        line = nightly_tone.night_line(nights)
-        return [line] if line else []
-
     def trend_blocks(self, fields: dict) -> list[str]:
-        """The latency block, then the reply-shape line."""
-        return [*self.latency_block(fields), *self.tone_block()]
+        """The latency block, then the reply-shape line (``nightly_tone.py``)
+        when last night measured a reply, over one build of the reports."""
+        nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
+        tone = nightly_tone.night_line(nights)
+        return [*self.latency_block(fields, nights), *([tone] if tone else [])]
 
     # ---- the night
 

@@ -194,8 +194,8 @@ layout and are collected from the moment they start running.
       when nothing remains.
     - `excerpt` — **optional, additive**: the agent's own words — the text
       of the `rep N report: <text>` line `bench-gate case` prints under the
-      grading line of a repetition that did not pass, after its timing and
-      tokens lines (since
+      grading line of a repetition that did not pass, after its timing,
+      tokens and shape lines (since
       2026-09-15): the first 300 characters of the agent's final report
       (`results.json`'s `output`, the "Actual Output" the judge grades),
       whitespace collapsed to single spaces, `<` dropped, an ellipsis in the
@@ -218,8 +218,8 @@ layout and are collected from the moment they start running.
     - `agent_s`, `turn1_s` — **optional, additive**: how long the
       repetition took, in seconds, from the
       `rep N timing: agent_s=<x> turn1_s=<y>` line `bench-gate case` prints
-      right under the grading line (before any `rep N tokens:` or
-      `rep N report:` line), one
+      right under the grading line (before any `rep N tokens:`,
+      `rep N shape:` or `rep N report:` line), one
       decimal each. `agent_s`
       is the agent run's wall clock (`results.json`'s `latency`, which
       devops-bench takes around the harness run: the delegation wait is in
@@ -268,8 +268,8 @@ layout and are collected from the moment they start running.
       line `bench-gate case` prints under the tokens line, measured by
       `bench/kube_agents_bench/chat_shape.py` on every case whatever its
       own checks, as `{"opens_on_verdict": <bool>, "apology": <bool>,
-      "bot_messages": <int>, "words_before_answer": <int>,
-      "answer_words": <int>}`. The answer is the last delivered card result
+"bot_messages": <int>, "words_before_answer": <int>,
+"answer_words": <int>}`. The answer is the last delivered card result
       of a delegated ask and the whole reply otherwise; `opens_on_verdict`
       is false when its first line is a heading, ends on a colon, or opens
       on a lead-in phrase ("Let me", "Sure", "Here's"), `apology` reads the

@@ -516,6 +516,9 @@ _REP_TOKENS_PARTIAL = "partial=1"
 _REP_SHAPE_LINE = re.compile(r"^\s+rep (?P<n>\d+) shape: (?P<fields>.*)$")
 _REP_SHAPE_FLAGS = ("opens_on_verdict", "apology")
 _REP_SHAPE_COUNTS = ("bot_messages", "words_before_answer", "answer_words")
+# Longer than any real count, and far inside int()'s digit limit, which a
+# forged line would otherwise trip.
+_REP_SHAPE_MAX_DIGITS = 9
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
 _REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
@@ -700,11 +703,8 @@ def _attach_shape(task: dict, n: int, fields: str) -> None:
         key, _, raw = pair.partition("=")
         if key in _REP_SHAPE_FLAGS and raw in ("0", "1"):
             shape[key] = raw == "1"
-        elif key in _REP_SHAPE_COUNTS and raw.isascii() and raw.isdigit():
-            try:
-                shape[key] = int(raw)
-            except ValueError:
-                pass
+        elif key in _REP_SHAPE_COUNTS and raw.isascii() and raw.isdigit() and len(raw) <= _REP_SHAPE_MAX_DIGITS:
+            shape[key] = int(raw)
     if not shape:
         return
     for rep in reversed(task.get("reps") or []):

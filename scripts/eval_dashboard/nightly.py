@@ -295,12 +295,13 @@ def latency_rollup(reps) -> dict:
 
 
 def rep_shapes(reps) -> list[dict]:
-    """The ``shape`` of every rep that is not ``infra`` and carries one; a
-    rep without it is unknown, not a reply that read badly."""
+    """The ``shape`` of every rep that is not ``infra`` and carries both
+    flags; a rep without one is unknown, not a reply that read badly, and
+    counting it would pull a flag's share toward zero."""
     out = []
     for rep in reps if isinstance(reps, list) else []:
         shape = rep.get(REP_SHAPE) if isinstance(rep, dict) and rep.get("result") != "infra" else None
-        if isinstance(shape, dict) and shape:
+        if isinstance(shape, dict) and all(isinstance(shape.get(flag), bool) for flag in SHAPE_FLAGS):
             out.append(shape)
     return out
 
@@ -309,7 +310,7 @@ def shape_rollup(reps) -> dict | None:
     """The reps' reply shape as the Nightly page reads it (SCHEMA.md):
     ``{n, opens_on_verdict, apology, bot_messages_p50,
     words_before_answer_p50, answer_words_p50}``, ``n`` the reps that
-    carried a shape, each flag how many of them it was true on, and each
+    carried a shape with both flags (``rep_shapes``), each flag how many of them it was true on, and each
     count's median over the reps that carried it (``null`` when none did);
     None when no rep carried a shape. Reported, never a verdict."""
     shapes = rep_shapes(reps)

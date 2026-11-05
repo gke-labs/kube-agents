@@ -226,8 +226,9 @@ class ShapeRollupTest(unittest.TestCase):
             "bot_messages_p50": 2, "words_before_answer_p50": 0, "answer_words_p50": 40,
         })
 
-    def test_an_infra_rep_and_a_missing_count_are_unknown(self):
-        reps = [dict(rep(1, "infra"), shape=self.BAD), dict(rep(2, "pass"), shape={"opens_on_verdict": True})]
+    def test_an_infra_rep_a_missing_flag_and_a_missing_count_are_unknown(self):
+        reps = [dict(rep(1, "infra"), shape=self.BAD), dict(rep(2, "pass"), shape={"opens_on_verdict": True, "apology": False}),
+                dict(rep(3, "fail"), shape={"apology": True, "answer_words": 900})]
         self.assertEqual(nightly.shape_rollup(reps), {
             "n": 1, "opens_on_verdict": 1, "apology": 0,
             "bot_messages_p50": None, "words_before_answer_p50": None, "answer_words_p50": None,
