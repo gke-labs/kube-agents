@@ -877,16 +877,48 @@ class Digest(RunHarness):
 
 class DigestOnlyNotes(RunHarness):
     def test_neither_note_posts_on_its_own(self):
-        # Morning ticks, clear of the 12:40-13:20Z digest window. A note with
-        # a kill under the deadline_kill threshold included: three kills on
-        # two PRs is the OUTAGE, which is posted.
-        docs = (slow(), near_deadline(), near_deadline(max_s=365 * 60, kills=1, max_killed=True))
+        # Morning ticks, clear of the 12:40-13:20Z digest window.
+        docs = (slow(), near_deadline(), near_deadline(max_s=327 * 60))
         for minute, doc in zip((0, 15, 30), docs):
             rc, err = self.tick(doc, self.at(10, minute))
             self.assertEqual(rc, 0)
             self.assertIn("posted nothing", err)
         self.assertEqual(self.opener.requests, [])
         self.assertEqual(self.recorded()["state"], "GREEN", "the note moves no state")
+
+    def test_a_near_deadline_note_with_a_kill_posts_once_with_its_advice(self):
+        # A killed run reached no verdict, so the message drops "Not a break"
+        # and keeps the one thing to do; the digest line does not carry it.
+        self.tick(near_deadline(), self.at(10))
+        self.assertEqual(self.opener.requests, [], "no kill, no message")
+        self.tick(near_deadline(max_s=365 * 60, kills=1, max_killed=True), self.at(10, 15))
+        self.assertEqual(
+            self.opener.texts,
+            [
+                "⏱ *Smoke gate: close to the deadline* — slowest run 365 min in the last 24h, 5 min past the 360-minute Prow timeout."
+                " Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.\n"
+                f"{URL}#view=agent"
+            ],
+        )
+        self.assertTrue(self.recorded()["near_deadline"])
+        self.tick(near_deadline(max_s=360 * 60, kills=2, max_killed=True), self.at(10, 30))
+        self.assertEqual(len(self.opener.texts), 1, "once per episode")
+        self.tick(health(), self.at(10, 45))
+        self.assertFalse(self.recorded()["near_deadline"], "the note clears silently")
+        self.tick(near_deadline(max_s=360 * 60, kills=1, max_killed=False), self.at(11))
+        self.assertEqual(len(self.opener.texts), 2, "a new episode is told again")
+        self.assertIn("slowest run 360 min in the last 24h, at the 360-minute Prow timeout. Check the run cost", self.opener.texts[1])
+        self.assertNotIn("Not a break", self.opener.texts[1])
+
+    def test_a_failed_kill_message_is_retried_next_tick(self):
+        self.tick(health(), self.at(10))
+        rc, err = self.tick(near_deadline(kills=1), self.at(10, 15), opener=FakeOpener(statuses=[500]))
+        self.assertEqual(rc, 1)
+        self.assertIn("failed to post: near_deadline", err)
+        self.assertFalse(self.recorded()["near_deadline"], "not told yet")
+        self.tick(near_deadline(kills=1), self.at(10, 30))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertTrue(self.recorded()["near_deadline"])
 
     def test_an_outage_recovery_is_not_followed_by_the_note(self):
         self.tick(slow(), self.at(10))

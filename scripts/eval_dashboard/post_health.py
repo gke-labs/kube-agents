@@ -34,9 +34,11 @@ is never a drift. The digest carries one line on the latest scan. The
 pool-state scan (`pool_state.unknown`, #1967) is told the same way.
 
 The `slow` note (the gate's green runs are taking far longer than usual,
-#1586) and the `near_deadline` note have no message of their own: neither is
-a break and /retest helps neither, so only the digest carries them, while
-they last. A seventh pair, the pool note: once when the pool-pressure
+#1586) and the `near_deadline` note are not breaks and /retest helps
+neither, so the digest carries them while they last. The one message of
+their own: a `near_deadline` note whose window holds a deadline kill, once
+per episode, since that run reached no verdict and the note says what to
+check before adding a case. A seventh pair, the pool note: once when the pool-pressure
 periodic reports runs waiting to be scheduled and once when they stop
 (KIND_POOL, KIND_POOL_CLEAR). An eighth pair, the watched Prow periodics
 (KIND_PERIODIC, KIND_PERIODIC_CLEAR): a failed run or a stopped job once per
@@ -113,6 +115,7 @@ try:
         fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
+        near_deadline_margin,
         pool_drift_split,
         pool_span,
         wait_text,
@@ -130,6 +133,7 @@ except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
         fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
+        near_deadline_margin,
         pool_drift_split,
         pool_span,
         wait_text,
@@ -202,6 +206,7 @@ CAUSE_UNKNOWN = "UNKNOWN"
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
+KIND_NEAR_DEADLINE = "near_deadline"  # a near_deadline note with a deadline kill; once per episode
 KIND_POOL = "pool"  # runs are waiting to start; once per episode
 KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
@@ -524,7 +529,12 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
 
     # The slow and near_deadline notes have no message of their own: neither
     # is a break nor moves the state, so the digest carries them while they
-    # last and nothing else does.
+    # last. The exception is a near_deadline note with a deadline kill in its
+    # window: that run reached no verdict, and the note's advice (check the
+    # run cost before adding a case) is said nowhere else. Once per episode;
+    # a kill below the deadline_kill OUTAGE's threshold is otherwise silent.
+    if ((health.get("near_deadline") or {}).get("kills") or 0) > 0 and not (prev or {}).get("near_deadline"):
+        kinds.append(KIND_NEAR_DEADLINE)
 
     # Rule 8, once per episode, plus a re-post on a verdict change or a cause
     # not yet named this episode. A breach message also needs a live queue or
@@ -918,6 +928,20 @@ def slow_text(slow: dict) -> str:
         f"the last {slow.get('runs', 0)} full runs took {minutes_text(slow.get('min_s'))}–{minutes_text(slow.get('max_s'))} min"
         f" (median {minutes_text(slow.get('median_s'))}) against a {slow.get('baseline_days', DEFAULT_SLOW_BASELINE_DAYS)}-day typical"
         f" of {minutes_text(slow.get('baseline_p50_s'))} min (p90 {minutes_text(slow.get('baseline_p90_s'))}); {lost}"
+    )
+
+
+def render_near_deadline(health: dict) -> str:
+    """The message for a near_deadline note with a deadline kill in its window:
+    no "Not a break", because that run was killed without a verdict."""
+    nd = health.get("near_deadline") or {}
+    max_min = minutes_text(nd.get("max_s"))
+    return "\n".join(
+        [
+            f"⏱ *Smoke gate: close to the deadline* — slowest run {max_min} min in the last 24h, {near_deadline_margin(nd)}."
+            " Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.",
+            dashboard_link(DASHBOARD_VIEW_AGENT),
+        ]
     )
 
 
@@ -1674,6 +1698,8 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_fixture_scan(health)
     if kind == KIND_POOL_SCAN:
         return render_pool_scan(health)
+    if kind == KIND_NEAR_DEADLINE:
+        return render_near_deadline(health)
     if kind == KIND_POOL:
         return render_pool(health)
     if kind == KIND_POOL_CLEAR:
@@ -1993,6 +2019,9 @@ def run(
         "issue": issue if source.get("state") not in (None, GREEN) else None,
         "issues": carried if source.get("state") not in (None, GREEN) else [each for each in carried if each.get(UNSETTLED_KEY)],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
+        # Whether this note's episode has had its kill message: set by the
+        # send (a failed one is retried), dropped silently with the note.
+        "near_deadline": bool(health.get("near_deadline")) and (KIND_NEAR_DEADLINE in sent or bool(before.get("near_deadline"))),
         "fixture_unknown": fixture_unknown(health) if told_fixture else bool(before.get("fixture_unknown")),
         "pool_state_unknown": (
             pool_state_unknown(health) if told_pool_scan and pool_state_unknown(health) is not None else bool(before.get("pool_state_unknown"))

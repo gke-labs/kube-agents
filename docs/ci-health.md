@@ -22,7 +22,9 @@ repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages s
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
 which also carries the slow-gate and close-to-the-deadline notes
-([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
+([below](#a-slow-gate)), plus one line, once per episode, when a
+close-to-the-deadline note's window holds a run killed at the deadline
+([below](#close-to-the-deadline)), plus one when runs start waiting to be scheduled or
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
@@ -341,16 +343,24 @@ recorded (`run.deadline_kill and run.full`); a kill finished at or before the
 current GREEN episode began does not count. If the window has no qualifying runs
 (such as over a quiet weekend), the note holds its previous value across ticks.
 
-Like the slow note it has no message of its own; the daily digest carries one
-line for as long as it lasts:
+The daily digest carries one line for as long as it lasts:
 
 ```text
 ⏱ Close to the deadline since 12:00 PM ET: slowest run 327 min, 33 min of headroom.
 ```
 
-A run killed at the deadline counts here too: kills below the `deadline_kill`
-OUTAGE's threshold (3 kills on 2 pull requests within 2 hours) show only in this
-digest line, and the OUTAGE is the message for a wave of them. Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
+Without a kill in the window it has no message of its own, like the slow note.
+A run killed at the deadline counts here too, and it reached no verdict, so the
+first tick a note's window holds one, the poster sends one line, and not again
+until the note has cleared and come back:
+
+```text
+⏱ *Smoke gate: close to the deadline* — slowest run 365 min in the last 24h, 5 min past the 360-minute Prow timeout. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.
+```
+
+That covers kills below the `deadline_kill` OUTAGE's threshold (3 kills on 2
+pull requests within 2 hours); the OUTAGE is the message for a wave of them.
+Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
 floored at 0 (or overrun minutes past the timeout).
 
 The timeout itself lives in `GoogleCloudPlatform/oss-test-infra` (`timeout: 360m`
