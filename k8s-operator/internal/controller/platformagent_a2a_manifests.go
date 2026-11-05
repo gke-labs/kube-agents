@@ -4023,11 +4023,18 @@ const (
 	// pods (the callouts and verifiers roll together on the new operator's
 	// reconcile, each surge-first; the chart's own surges are in its count),
 	// one provisioning Job pod (at install, on any spec change and about daily
-	// after its TTL), one scope publisher Job pod (started every
-	// scopePublishInterval, never while another is active; it renders in next
-	// mode, the only mode this quota renders in), and three for the gateway's
-	// count-then-create overshoot (a2a/gateway/spawn.go, refuseAtSessionCap).
-	a2aQuotaTransientMargin = 2 + 1 + 1 + 3
+	// after its TTL), the scope publisher's Job pods, and three for the
+	// gateway's count-then-create overshoot (a2a/gateway/spawn.go,
+	// refuseAtSessionCap).
+	a2aQuotaTransientMargin = 2 + 1 + a2aScopePublisherJobPods + 3
+	// a2aScopePublisherJobPods is the scope publisher's Job pods at once: one,
+	// started every scopePublishInterval and never while another is active
+	// (decideScopePublish). The margin counts it in next mode, the only mode
+	// this quota renders in, whether or not a scope gives the Job anything to
+	// resolve. The chart's quota preflight counts the same pod only when one
+	// does (files/transient-pods.yaml), so this may not count fewer:
+	// TestTheChartCountsTheScopePublishersJobPod.
+	a2aScopePublisherJobPods = 1
 )
 
 // a2aQuotaHeadroom is what the namespace pod quota adds above the gateway's

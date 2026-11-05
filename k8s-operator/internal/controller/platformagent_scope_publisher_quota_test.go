@@ -68,6 +68,12 @@ func TestTheChartCountsTheScopePublishersJobPod(t *testing.T) {
 	if c.Pods != 1 {
 		t.Errorf("the chart counts %d scope publisher pods; the operator runs one at a time", c.Pods)
 	}
+	// The operator's session quota margin counts the pod wherever the quota
+	// renders; the chart only where the Job can run. So the margin's term may
+	// exceed the chart's count, never fall short of it.
+	if a2aScopePublisherJobPods < c.Pods {
+		t.Errorf("a2aQuotaTransientMargin counts %d scope publisher pods, fewer than the chart's %d", a2aScopePublisherJobPods, c.Pods)
+	}
 	if p := job.Spec.Parallelism; p != nil && *p != 1 {
 		t.Errorf("parallelism = %d; the chart counts one pod", *p)
 	}

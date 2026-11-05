@@ -2220,16 +2220,30 @@ class DocumentedFootprintTest(unittest.TestCase):
         # The quota's headroom is derived (#3848): the operator's standing pods,
         # summed here from the footprint for both modes, plus the chart's pods (the
         # operator's default stands in for a chart that says nothing) and the margin.
-        # Written as its named parts (surges + Job + overshoot), so sum them.
-        margin = sum(
-            int(part)
+        # Written as its parts (surges + provisioning Job + the scope publisher's Job pods
+        # + overshoot), each a number or a named constant; resolve the names and sum them.
+        parts = [
+            part.strip()
             for part in self._extract_match(
-                r'a2aQuotaTransientMargin\s*=\s*(\d+(?:\s*\+\s*\d+)*)\s*$',
+                r'a2aQuotaTransientMargin\s*=\s*(\w+(?:\s*\+\s*\w+)*)\s*$',
                 manifests_src,
                 "a2aQuotaTransientMargin",
                 flags=re.MULTILINE,
             ).split("+")
+        ]
+        named = {
+            part: int(self._extract_match(rf'\b{part}\s*=\s*(\d+)\s*$', manifests_src, part, flags=re.MULTILINE))
+            for part in parts
+            if not part.isdigit()
+        }
+        # The scope publisher's term (#4816): the chart counts that pod from
+        # files/transient-pods.yaml, and the margin may not count fewer.
+        self.assertIn("a2aScopePublisherJobPods", named, "the margin no longer counts the scope publisher's Job pods")
+        self.assertGreaterEqual(
+            named["a2aScopePublisherJobPods"],
+            yaml.safe_load(_TRANSIENT_PODS.read_text())["scopePublisher"]["pods"],
         )
+        margin = sum(int(part) if part.isdigit() else named[part] for part in parts)
         # Hindsight's two pods and the minter at its default replicas, plus a surge pod each
         # for Hindsight's API and the minter (kube-agents.chartQuotaPods).
         values = yaml.safe_load(_VALUES.read_text())
