@@ -47,9 +47,9 @@ class FakeAPI:
         self.got = []
         self.posted = []
 
-    def get(self, path):
+    def get(self, path, tolerate=()):
         self.got.append(path)
-        return self.issues[int(path.rsplit("/", 1)[1])]
+        return self.issues.get(int(path.rsplit("/", 1)[1]))
 
     def post(self, path, payload=None, tolerate=()):
         self.posted.append((path, payload))
@@ -65,6 +65,7 @@ class FakeAPI:
 def issue(number, state="open", labels=(cq.LABEL,), assignees=("someone",), body=GOOD_BODY):
     return {
         "number": number,
+        "user": {"login": "filer"},
         "state": state,
         "labels": [{"name": name} for name in labels],
         "assignees": [{"login": login} for login in assignees],
@@ -135,6 +136,12 @@ class GitHubTest(unittest.TestCase):
         self.assertEqual({4357: 3}, report.ages)
         self.assertIn("oldest 3 days; 0 over 14 days", cq.render(report, True))
 
+    def test_an_issue_that_does_not_exist_fails_without_crashing(self):
+        report = self.run_check(FakeAPI({}))
+        self.assertEqual(1, len(report.failures))
+        self.assertIn("does not exist", report.failures[0])
+        self.assertEqual(0, cq.notify(FakeAPI({}), report))
+
     def test_a_closed_issue_fails(self):
         report = self.run_check(FakeAPI({4357: issue(4357, state="closed")}))
         self.assertEqual(1, len(report.failures))
@@ -179,7 +186,7 @@ class GitHubTest(unittest.TestCase):
         self.assertEqual([f"/repos/{cq.REPO}/issues/4357"], api.got)
 
     def test_a_protected_test_needs_an_approvers_comment(self):
-        approval = {"user": {"login": sorted(cq.APPROVERS)[0]}, "body": "Quarantine approved, flake is in the fake."}
+        approval = {"user": {"login": min(cq.APPROVERS)}, "body": "Quarantine approved, flake is in the fake."}
         stranger = {"user": {"login": "someone-else"}, "body": "Quarantine approved"}
         go = ("a2a/authcallout/grant_test.go", GO_GATED)
         cases = (([], 1), ([stranger], 1), ([approval], 0))
@@ -203,11 +210,23 @@ class NotifyTest(unittest.TestCase):
         self.assertIn(cq.COMMENT_MARKER.format(kind=cq.KIND_STALE), bodies[1])
 
     def test_a_problem_already_told_is_not_told_again(self):
-        told = {"body": cq.COMMENT_MARKER.format(kind=cq.KIND_CLOSED) + "\nearlier"}
+        told = {"user": {"login": cq.BOT_LOGIN}, "body": cq.COMMENT_MARKER.format(kind=cq.KIND_CLOSED) + "\nearlier"}
         api = FakeAPI({4357: issue(4357, state="closed")}, comments={4357: [told]})
         report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
         self.assertEqual(1, len(report.failures))
         self.assertEqual(0, cq.notify(api, report))
+
+    def test_a_marker_posted_by_anyone_else_does_not_silence_it(self):
+        forged = {"user": {"login": "someone"}, "body": cq.COMMENT_MARKER.format(kind=cq.KIND_CLOSED)}
+        api = FakeAPI({4357: issue(4357, state="closed")}, comments={4357: [forged]})
+        report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
+        self.assertEqual(1, cq.notify(api, report))
+
+    def test_an_unassigned_issue_tells_whoever_filed_it(self):
+        api = FakeAPI({4357: issue(4357, assignees=())})
+        report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
+        self.assertEqual(1, cq.notify(api, report))
+        self.assertIn("@filer", api.posted[-1][1]["body"])
 
     def test_nothing_wrong_posts_nothing(self):
         api = FakeAPI({4357: issue(4357)})

@@ -34,7 +34,9 @@ in the tree.
 `--notify` tells the people who can act: it comments on each issue with a
 problem, naming its assignees, once per issue per kind of problem (closed,
 incomplete, stale), so a standing problem is not re-told every day. It creates
-the label the first time it needs one.
+the label the first time it needs one. Once per kind means a second, different
+incomplete problem on an already-told issue is not commented again; the red run
+and its summary still carry it.
 """
 
 from __future__ import annotations
@@ -81,6 +83,8 @@ APPROVERS = frozenset({"bnaylor"})
 APPROVAL_RE = re.compile(r"^\s*quarantine approved\b", re.IGNORECASE | re.MULTILINE)
 #: Opens each comment the daily run posts; one per issue per kind, so a standing problem is told once.
 COMMENT_MARKER = "<!-- quarantine-check:{kind} -->"
+#: The login a workflow's GITHUB_TOKEN posts as.
+BOT_LOGIN = "github-actions[bot]"
 KIND_CLOSED = "closed"
 KIND_INCOMPLETE = "incomplete"
 KIND_STALE = "stale"
@@ -92,6 +96,8 @@ RACE_RE = re.compile(r"^\s*product race ruled out:\s*yes\b", re.IGNORECASE | re.
 USER_AGENT = "kube-agents-check-quarantine"
 TIMELINE_LABELED = "labeled"
 SECONDS_PER_DAY = 86400
+#: An issue number that was never filed, or was deleted.
+MISSING_STATUSES = (404, 410)
 
 
 @dataclass
@@ -175,9 +181,16 @@ def labeled_at(api, number: int) -> datetime | None:
 
 def check_issue(api, number: int, sites: list[Quarantine], report: Report, now: datetime) -> None:
     where = ", ".join(f"{q.path}:{q.line}" for q in sites)
-    issue = api.get(f"/repos/{api.repo}/issues/{number}")
+    issue = api.get(f"/repos/{api.repo}/issues/{number}", tolerate=MISSING_STATUSES)
+    if not issue:
+        report.failures.append(f"#{number} does not exist but is cited by {where}; fix the citation")
+        return
     comments = api.get_all(f"/repos/{api.repo}/issues/{number}/comments")
-    report.issues[number] = {"assignees": issue.get("assignees") or [], "comments": comments}
+    report.issues[number] = {
+        "assignees": issue.get("assignees") or [],
+        "author": (issue.get("user") or {}).get("login"),
+        "comments": comments,
+    }
     if issue.get("state") == "closed":
         report.fail(number, KIND_CLOSED, f"#{number} is closed but still quarantines {where}; remove the skip")
         return
@@ -246,13 +259,19 @@ def notify(api, report: Report) -> int:
         )
     for number, kinds in sorted(report.notices.items()):
         read = report.issues.get(number, {})
-        bodies = [c.get("body") or "" for c in read.get("comments", [])]
-        owners = " ".join(f"@{a['login']}" for a in read.get("assignees", []) if a.get("login"))
+        # Only this workflow's own comments count: anyone can post the marker text.
+        bodies = [
+            c.get("body") or "" for c in read.get("comments", []) if (c.get("user") or {}).get("login") == BOT_LOGIN
+        ]
+        logins = [a["login"] for a in read.get("assignees", []) if a.get("login")]
+        if not logins and read.get("author"):
+            logins = [read["author"]]  # nobody owns it yet: tell whoever filed it
+        owners = " ".join(f"@{login}" for login in logins)
         for kind, items in sorted(kinds.items()):
             marker = COMMENT_MARKER.format(kind=kind)
             if any(marker in body for body in bodies):
                 continue
-            lines = [marker, f"{owners}".strip() or "Unassigned.", "", "The daily quarantine check found:", ""]
+            lines = [marker, owners or "Unassigned.", "", "The daily quarantine check found:", ""]
             lines += [f"- {item}" for item in items]
             lines += ["", "Policy: `docs/pull-request-workflow.md`, \"Quarantining a flaky test\"."]
             api.post(f"/repos/{api.repo}/issues/{number}/comments", {"body": "\n".join(lines)})
