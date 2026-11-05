@@ -1670,10 +1670,7 @@ class NearDeadline(unittest.TestCase):
             "close to deadline: slowest run 360 min in the last 24h (at the 360-minute Prow timeout; 2 runs)",
             result["evidence"],
         )
-        post = post_health.render_near_deadline(result)
-        self.assertIn("slowest run 360 min in the last 24h, at the 360-minute Prow timeout.", post)
-        self.assertNotIn("killed at the deadline", post)
-        self.assertNotIn("Not a break", post)
+        self.assertEqual(post_health.near_deadline_digest_line(result["near_deadline"]), "slowest run 360 min, at the timeout")
 
 
 # --------------------------------------------------------------------------- #
@@ -1816,11 +1813,14 @@ class PeriodicNote(unittest.TestCase):
         self.assertEqual(first["periodics"], {}, "one failed sweep run is not news")
         self.assertEqual(first["periodics_streaks"][self.SWEEP], {"build": "100", "projects": {"kube-agents-evals-3": 1}, "runs": 1})
         second = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=5), passed=False, build="101", artifact=fail)}, prev=first, now=T0 + timedelta(minutes=15))
-        self.assertIn(self.SWEEP, second["periodics"], "two in a row is")
+        self.assertEqual(second["periodics"], {}, "nor two in a row")
         self.assertEqual(second["periodics_streaks"][self.SWEEP]["runs"], 2)
-        third = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=20), passed=True, build="102")}, prev=second, now=T0 + timedelta(minutes=30))
-        self.assertEqual(third["periodics_streaks"][self.SWEEP], {"build": "102", "projects": {}, "runs": 0}, "a clean build clears every count")
-        self.assertEqual(third["periodics"], {})
+        third = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=20), passed=False, build="102", artifact=fail)}, prev=second, now=T0 + timedelta(minutes=30))
+        self.assertIn(self.SWEEP, third["periodics"], "three in a row is")
+        self.assertEqual(third["periodics_streaks"][self.SWEEP]["runs"], 3)
+        fourth = self.judge({self.SWEEP: periodic_reading(self.SWEEP, T0 + timedelta(minutes=35), passed=True, build="103")}, prev=third, now=T0 + timedelta(minutes=45))
+        self.assertEqual(fourth["periodics_streaks"][self.SWEEP], {"build": "103", "projects": {}, "runs": 0}, "a clean build clears every count")
+        self.assertEqual(fourth["periodics"], {})
 
     def test_a_tick_without_the_previous_health_json_does_not_hide_a_failing_sweep(self):
         # The counts live in the previous health.json; without it they start

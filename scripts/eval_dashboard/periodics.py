@@ -147,15 +147,18 @@ REPORT_EXIT_FAILED = "failed"
 RUNBOOK_ROOT = "https://github.com/gke-labs/kube-agents/blob/main/"
 # The scope line every message carries: none of this reaches a user cluster.
 SCOPE_LINE = "CI eval infrastructure only."
-# When a failing job is news. The sweep runs hourly and the bot reads its
-# latest finished build every fifteen minutes, so every build is read and
-# counted once, and one failed build followed by a clean one is a flap: the
-# sweep is said once it has failed this many consecutive checks. The
-# reconciles run daily and on every merge: their first failed build is the
-# news. Any project's failure fails a run, so a per-project threshold could
-# never fire before the run's; the per-project counts name the projects that
-# have failed in every one of those checks.
-SWEEP_RUN_ALERT_AFTER = 2
+# When a failing job is news. The bot reads the sweep's latest finished build
+# every fifteen minutes and counts each build it reads once. The sweep's
+# builds land faster than that (ten minutes apart on 2026-11-03), so two
+# failed reads can be ten minutes of failing: that morning it failed two
+# reads and passed the next four times over. The sweep is said once it has
+# failed this many consecutive checks, about half an hour. The reconciles run
+# daily and on every merge, where a second failure would hold the message a
+# day: their first failed build is the news. Any project's failure fails a
+# run, so a per-project threshold could never fire before the run's; the
+# per-project counts name the projects that have failed in every one of
+# those checks.
+SWEEP_RUN_ALERT_AFTER = 3
 FIRST_FAILURE = 1
 # A project named as persisting in the message: failed in this many consecutive
 # checks, this check included.

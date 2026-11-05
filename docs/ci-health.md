@@ -20,9 +20,10 @@ In the same way, a `rep N timing:` line under each grading line carries the
 repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
-Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
-plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
+Chat — only when the state changes (the end of a DEGRADED episode is
+recorded, not posted: [Hysteresis](#hysteresis)), plus one digest a day at
+11 AM Toronto time, which also carries the slow-gate and close-to-the-deadline
+notes ([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
@@ -103,7 +104,7 @@ project reader; a run in the old bucket keeps its Prow link, which still renders
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
-digest, and the bare `index.html#view=agent` for the slow-gate and pool notes,
+digest, and the bare `index.html#view=agent` for the pool notes,
 which report no incident and so have no window to scope a link to. The two
 that say the pool check itself is not reporting — `wait unknown` and `pool
 check stopped` — link to the periodic's job history instead, the one place
@@ -215,7 +216,7 @@ what keeps the replay fixtures cut before the field valid. A run without the
 recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
-announces it; the daily digest carries the last 24 hours' runs, greens,
+announces the end of an OUTAGE ([Hysteresis](#hysteresis)); the daily digest carries the last 24 hours' runs, greens,
 PR-caused reds (by rule 4's test, below, less its storm silence: a two-hour
 storm cannot blank a 24-hour count) and infra reds (setup deaths, lost
 pods and deadline kills that graded nothing are folded into the infra count),
@@ -273,6 +274,14 @@ advice says a retest is reasonable, and nothing is posted. The adjudicator's
 only state between ticks is the previous `health.json`; the poster keeps what
 it last told the space in `health-state.json` beside it.
 
+The return to GREEN is posted only after an OUTAGE, whose recovery is the
+"retest now" after its "don't retest". After a DEGRADED episode, including an
+OUTAGE that eased to DEGRADED before it cleared, the poster records the
+recovery without posting it: every yellow message already said when to retest.
+It still comments on and closes the episode's tracking issues
+([The tracking issue](#the-tracking-issue)), and the next DEGRADED change is
+posted as a new episode.
+
 Inside an OUTAGE the message is repeated when a new case joins the set, at most
 every 2 hours. A case dropping off is not news until the state changes. A
 change of condition inside DEGRADED (a storm giving way to setup deaths) is
@@ -297,20 +306,21 @@ clock of the last 5 full runs — a concluded run of at least one case fewer tha
 finished in the last 6 hours — is at least 1.2× the median of the trailing 7
 days' full runs (at least 20 of them), and stays set until that median is back
 under 1.1×. Wall clock is a run's finish minus its start, the digest's
-measure. The poster sends one line the first tick the note appears:
+measure. The note is not a break and /retest does not help, so the poster
+sends no message of its own for it; the digest carries one line while it
+lasts:
 
 ```text
-🐢 Smoke gate: slow — the last 5 full runs took 152–213 min (median 183)
+🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183)
 against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty
-records. Not a break, and /retest won't make yours faster.
+records.
 ```
 
-and not again until the note has cleared and come back. The digest repeats
-the line while it lasts, the Brief's healthy headline carries the same
-sentence, and the state, the advice and the gate comment do not move. The
+The Brief's healthy headline carries the same sentence, and the state, the
+advice and the gate comment do not move. The
 note reads finished runs, so it trails the slowdown by about one run's
 length: on 2026-09-14 the pod count rose from 11:30 AM ET and the note
-would have gone out at 2:00 PM ET. The ages of the running pods would show
+would have appeared at 2:00 PM ET. The ages of the running pods would show
 it sooner and are not read: the adjudicate step runs as the dashboard
 publisher, which holds nothing on the Prow build cluster, and the tick
 carries no `kubectl`. The rule the issue proposed — three consecutive full
@@ -340,21 +350,15 @@ recorded (`run.deadline_kill and run.full`); a kill finished at or before the
 current GREEN episode began does not count. If the window has no qualifying runs
 (such as over a quiet weekend), the note holds its previous value across ticks.
 
-The poster sends one line when the note appears:
-
-```text
-⏱ *Smoke gate: close to the deadline* — slowest run 327 min in the last 24h, 33 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.
-```
-
-and repeats it in the daily digest for as long as it lasts:
+Like the slow note it has no message of its own; the daily digest carries one
+line for as long as it lasts:
 
 ```text
 ⏱ Close to the deadline since 12:00 PM ET: slowest run 327 min, 33 min of headroom.
 ```
 
-When qualifying runs in the window include a deadline kill, the alert omits the
-"Not a break" assurance since a run was killed without an evaluation verdict.
-Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
+A run killed at the deadline counts here too; the message for kills is the
+`deadline_kill` OUTAGE. Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
 floored at 0 (or overrun minutes past the timeout).
 
 The timeout itself lives in `GoogleCloudPlatform/oss-test-infra` (`timeout: 360m`
@@ -525,11 +529,15 @@ episode, and cleared by the first passed build whose report was read and
 names none.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
-latest finished build failed is a `FAILED` note, once it is news: the sweep runs
-hourly and this tick reads its latest finished build every fifteen minutes, so
-every build is read and counted once, and one failed build followed by a clean
-one is a flap. The sweep's note waits until two consecutive checks have failed;
-the reconciles' first failed build is the news. Any project's failure fails a
+latest finished build failed is a `FAILED` note, once it is news. This tick
+reads the sweep's latest finished build every fifteen minutes and counts each
+build it reads once; the sweep's builds land faster than that (ten minutes
+apart in the history of 2026-11-03), so some go unread. That morning the sweep
+failed two reads in a row and passed the next one four times, each a message
+and its recovery 15 minutes apart. The sweep's note therefore waits until
+three consecutive reads have failed, about half an hour of failing. The
+reconciles run once a day or on a merge, where a second failure would hold the
+message a day: their first failed build is the news. Any project's failure fails a
 sweep run, so a per-project threshold could never fire before the run's; the
 per-project counts name, in the message, the projects that failed in this check
 and the ones before it.
@@ -749,7 +757,8 @@ on an adopted one. `issue` is the current condition's; every issue the
 incident filed or adopted rides in `health-state.json`'s `issues` list until
 the recovery or until the bot settles it below, so an outage that gives way
 to a storm or to lost pods before it clears still gets its recovery comment,
-and the recovery message names the ones still carried. A recovery comment or
+and the recovery message, when one is posted ([Hysteresis](#hysteresis)),
+names the ones still carried. A recovery comment or
 close that did not land, or an issue the bot could not read that tick, rides
 on past GREEN and is retried each tick until it does.
 

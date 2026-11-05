@@ -7,7 +7,8 @@ time. It reads the current health.json and the state it last posted, and
 sends a message only when:
 
     the state changed                       -> "CI health: DEGRADED (was GREEN)"
-    the state returned to GREEN             -> the recovery, with how long it lasted
+    the state returned to GREEN from OUTAGE -> the recovery, with how long it lasted
+                                               (from DEGRADED: recorded, not posted)
     an OUTAGE grew to name a new case       -> the same shape, rate-limited
     it is the digest hour and none went out -> the daily digest with the 24h numbers,
                                                plus a section on last night's
@@ -33,16 +34,14 @@ space is told once, and once more when the scan sees the fleet again. That
 is never a drift. The digest carries one line on the latest scan. The
 pool-state scan (`pool_state.unknown`, #1967) is told the same way.
 
-A seventh, one line and once per episode: when health.json carries a `slow`
-note (the gate's green runs are taking far longer than usual, #1586), the
-space hears it the first tick it appears and not again until it has cleared
-and come back; the digest repeats the line while it lasts. It is not a state
-change -- nothing is broken and /retest does not help -- so it moves nothing
-else. An eighth pair, the pool note: once when the pool-pressure periodic
-reports runs waiting to be scheduled and once when they stop (KIND_POOL,
-KIND_POOL_CLEAR). A ninth pair, the watched Prow periodics (KIND_PERIODIC,
-KIND_PERIODIC_CLEAR): a failed run or a stopped job once per episode and
-verdict, and once when a told job passes again.
+The `slow` note (the gate's green runs are taking far longer than usual,
+#1586) and the `near_deadline` note have no message of their own: neither is
+a break and /retest helps neither, so only the digest carries them, while
+they last. A seventh pair, the pool note: once when the pool-pressure
+periodic reports runs waiting to be scheduled and once when they stop
+(KIND_POOL, KIND_POOL_CLEAR). An eighth pair, the watched Prow periodics
+(KIND_PERIODIC, KIND_PERIODIC_CLEAR): a failed run or a stopped job once per
+episode and verdict, and once when a told job passes again.
 
 Every time a reader sees is on the reader's clock: America/Toronto, written
 "7:30 AM ET", never UTC (the deep links and the state file keep ISO UTC).
@@ -115,7 +114,6 @@ try:
         fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
-        near_deadline_margin,
         pool_drift_split,
         pool_span,
         wait_text,
@@ -133,7 +131,6 @@ except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
         fixture_no_reapply,
         minutes_text,
         near_deadline_headroom_text,
-        near_deadline_margin,
         pool_drift_split,
         pool_span,
         wait_text,
@@ -206,8 +203,6 @@ CAUSE_UNKNOWN = "UNKNOWN"
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
-KIND_SLOW = "slow"  # the gate's runs are far longer than usual; once per episode
-KIND_NEAR_DEADLINE = "near_deadline"  # qualifying runs approach the Prow job timeout; once per episode
 KIND_POOL = "pool"  # runs are waiting to start; once per episode
 KIND_POOL_CLEAR = "pool_clear"  # ... and once when they stop
 KIND_DIGEST = "digest"  # the daily numbers
@@ -528,15 +523,9 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     if periodic_clears(health, prev):
         kinds.append(KIND_PERIODIC_CLEAR)
 
-    # The slow note goes out when the note appears, not when it clears: the
-    # digest carries it while it lasts, and "back to normal" is not news.
-    if health.get("slow") and not (prev or {}).get("slow"):
-        kinds.append(KIND_SLOW)
-
-    # The near_deadline note goes out when the note appears, not when it clears: the
-    # digest carries it while it lasts, and "back to normal" is not news.
-    if health.get("near_deadline") and not (prev or {}).get("near_deadline"):
-        kinds.append(KIND_NEAR_DEADLINE)
+    # The slow and near_deadline notes have no message of their own: neither
+    # is a break nor moves the state, so the digest carries them while they
+    # last and nothing else does.
 
     # Rule 8, once per episode, plus a re-post on a verdict change or a cause
     # not yet named this episode. A breach message also needs a live queue or
@@ -933,42 +922,6 @@ def slow_text(slow: dict) -> str:
     )
 
 
-def render_slow(health: dict) -> str:
-    slow = health.get("slow") or {}
-    return "\n".join(
-        [
-            f"🐢 *Smoke gate: slow* — {slow_text(slow)}. Not a break, and /retest won't make yours faster.",
-            # No `since`: the Brief resolves a `since` to an incident, and the
-            # note's start is a GREEN tick that names none, so the page would
-            # show a synthetic past incident. The bare agent view is the
-            # healthy headline, which carries the same sentence.
-            dashboard_link(DASHBOARD_VIEW_AGENT),
-        ]
-    )
-
-
-def near_deadline_text(nd: dict) -> str:
-    max_min = minutes_text(nd.get("max_s"))
-    return f"slowest run {max_min} min in the last 24h, {near_deadline_margin(nd)}"
-
-
-def render_near_deadline(health: dict) -> str:
-    nd = health.get("near_deadline") or {}
-    tail = (
-        " Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
-        if nd.get("kills", 0) > 0
-        else (
-            " Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`."
-        )
-    )
-    return "\n".join(
-        [
-            f"⏱ *Smoke gate: close to the deadline* — {near_deadline_text(nd)}.{tail}",
-            dashboard_link(DASHBOARD_VIEW_AGENT),
-        ]
-    )
-
-
 def near_deadline_digest_line(nd: dict) -> str:
     max_min = minutes_text(nd.get("max_s"))
     return f"slowest run {max_min} min, {near_deadline_headroom_text(nd)}"
@@ -1161,7 +1114,7 @@ def told_key(job: str, note: dict) -> str:
 
 
 def told_job(key: str) -> str:
-    return key[: -len(TOKEN_TOLD_SUFFIX)] if key.endswith(TOKEN_TOLD_SUFFIX) else key
+    return key.removesuffix(TOKEN_TOLD_SUFFIX)
 
 
 def periodic_news(health: dict, prev: dict | None) -> dict[str, dict]:
@@ -1722,10 +1675,6 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_fixture_scan(health)
     if kind == KIND_POOL_SCAN:
         return render_pool_scan(health)
-    if kind == KIND_SLOW:
-        return render_slow(health)
-    if kind == KIND_NEAR_DEADLINE:
-        return render_near_deadline(health)
     if kind == KIND_POOL:
         return render_pool(health)
     if kind == KIND_POOL_CLEAR:
@@ -1920,7 +1869,15 @@ def run(
             carried.append(issue)
     section = nightly_section() if nightly_section is not None and data is not None and KIND_DIGEST in kinds else None
     coverage = coverage_lines() if coverage_lines is not None and KIND_DIGEST in kinds else []
-    messages = [(kind, render(kind, health, told, now, issue, data, section, coverage)) for kind in kinds]
+    # The end of a DEGRADED episode is recorded, not posted: every yellow
+    # message carries its own retest time, so "healthy again" asks nothing of
+    # anyone. An OUTAGE's recovery is the "retest now" after a "don't retest"
+    # and still goes out. The quiet one counts as sent below, so the state
+    # and the tracking issues' comments and closes move as if it had.
+    quiet = {KIND_RECOVERY} if KIND_RECOVERY in kinds and before.get("state") != OUTAGE else set()
+    if quiet:
+        log(f"recovery from {before.get('state')} recorded, not posted")
+    messages = [(kind, render(kind, health, told, now, issue, data, section, coverage)) for kind in kinds if kind not in quiet]
     failed = []
     for kind, text in messages:
         if dry_run:
@@ -1949,9 +1906,7 @@ def run(
     # leaves its part where it was, so the next tick re-asks exactly that
     # question: a change that failed beside a stale notice that succeeded is
     # posted next tick, and a stale flip posted mid-OUTAGE does not swallow a
-    # case that joined inside OUTAGE_REPOST_INTERVAL. The slow bit follows
-    # the note down silently (a cleared note is not posted) and up only once
-    # the note has gone out, so a failed one is retried. The tracking issues
+    # case that joined inside OUTAGE_REPOST_INTERVAL. The tracking issues
     # ride along while the recorded state is not GREEN -- `issue` for the
     # current condition, `issues` for every one this episode filed or
     # adopted -- and are dropped by the recovery; health.py reads them back
@@ -1960,8 +1915,6 @@ def run(
     told_stale = KIND_STALE in sent
     told_fixture = KIND_FIXTURE_SCAN in sent
     told_pool_scan = KIND_POOL_SCAN in sent
-    told_slow = KIND_SLOW in sent or KIND_SLOW not in kinds
-    told_near_deadline = KIND_NEAR_DEADLINE in sent or KIND_NEAR_DEADLINE not in kinds
     # The pool note records its verdict rather than a bit, because a verdict
     # change inside one episode is its own message (see decide). The clear is
     # held to the same bar: dropping the verdict on a send that failed would
@@ -2053,8 +2006,6 @@ def run(
         "pool_state_unknown": (
             pool_state_unknown(health) if told_pool_scan and pool_state_unknown(health) is not None else bool(before.get("pool_state_unknown"))
         ),
-        "slow": bool(health.get("slow")) if told_slow else bool(before.get("slow")),
-        "near_deadline": bool(health.get("near_deadline")) if told_near_deadline else bool(before.get("near_deadline")),
         # No artifact is not a reading: clearing the verdict on a blind tick
         # re-posts the same breach once the fetch recovers.
         "pool_verdict": (
