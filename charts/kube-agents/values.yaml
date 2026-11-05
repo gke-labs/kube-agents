@@ -651,10 +651,12 @@ litellm:
   # each one unchanged to LiteLLM through the inference-gateway-upstream
   # Service. It never serves a saved answer. Off on every install;
   # hack/ci-deploy.sh turns it on for an eval run under EVAL_REPLAY_SHADOW=true.
-  # On, the LiteLLM pods also carry kubeagents.x-k8s.io/inference-role: litellm
-  # (and roll once to gain it), and the proxy pods keep app: litellm, so the
-  # LiteLLM PodDisruptionBudget, PodMonitoring and the operator's litellm-policy
-  # select them too.
+  # On, the LiteLLM pods also carry kubeagents.x-k8s.io/inference-role: litellm,
+  # and the proxy pods keep app: litellm, so the LiteLLM PodDisruptionBudget,
+  # PodMonitoring and the operator's litellm-policy select them too. Turned on
+  # in an upgrade rather than at install, inference-gateway moves to the proxy
+  # at once while LiteLLM still has to roll to gain the label, so model calls
+  # fail until it has; CI turns it on at install.
   replayShadow:
     enabled: false
     # The image hack/ci-deploy.sh builds from hack/replay-proxy/Dockerfile into
