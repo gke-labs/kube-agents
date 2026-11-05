@@ -1,11 +1,14 @@
 # Inference replay for evals
 
-> **STATUS — proposal; measured; part of shadow mode built, not deployed.** A prototype proxy was
-> run against a dev install on 2026-10-31 to 2026-11-02. [`hack/replay-proxy/`](../../hack/replay-proxy/README.md)
-> has the shadow-mode proxy, its fingerprint log, the scrubbed request store and the hit-rate
-> script; the join with run verdicts and the collision report (Rollout step 1) are not built yet.
-> Nothing here is wired into `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or the chart. Shadow mode
-> changes no verdict.
+> **STATUS — proposal; measured; shadow mode built and wired into CI behind a switch, not yet
+> turned on.** A prototype proxy was run against a dev install on 2026-10-31 to 2026-11-02.
+> [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the shadow-mode proxy, its
+> fingerprint log, the scrubbed request store, the hit-rate script and the CI collector; the chart
+> carries the proxy behind `litellm.replayShadow`, and `hack/ci-deploy.sh` and `hack/ci-eval-pr.sh`
+> deploy it and copy its output to a private bucket under `EVAL_REPLAY_SHADOW=true`. No job sets
+> that yet: the bucket, its grants and the Prow configuration do not exist. The join with run
+> verdicts and the collision report (Rollout step 1) are not built yet. Shadow mode changes no
+> verdict.
 
 **Scope:** serving recorded model answers to eval runs whose model input has not changed, so a
 presubmit pays for inference only from the first point where a run differs from one already graded.
@@ -220,27 +223,27 @@ replace it.
 
 ### Where the proxy runs
 
-The proxy runs only on eval installs; customer installs never get it. `hack/ci-deploy.sh` adds it
-after its last Helm upgrade (the switch to next mode), because a Helm upgrade can undo the change
-to the `inference-gateway` Service.
+The proxy runs only on eval installs; customer installs never get it. The chart renders it behind
+`litellm.replayShadow`, off by default, and `hack/ci-deploy.sh` turns that on in its Helm install;
+the switch to next mode keeps it through `--reuse-values`.
 
 How traffic reaches it:
 
 - **Agents → proxy.** The worker pods (A2A sessions and Cluster Agents) are only allowed to talk to
   pods labelled `app: litellm`. (The Platform Agent's own pod is also allowed to talk to the older
-  `app: standalone-replay` label.) So the proxy pod gets the `app: litellm` label too, plus a second
-  label, `replay: proxy`. The `inference-gateway` Service is pointed at pods with both labels, which
-  means only the proxy.
+  `app: standalone-replay` label.) So the proxy pod gets the `app: litellm` label too, plus
+  `kubeagents.x-k8s.io/inference-role: replay-shadow`. The `inference-gateway` Service is pointed at
+  pods with both labels, which means only the proxy.
 - **Proxy → LiteLLM.** A second Service, `inference-gateway-upstream`, points at the real LiteLLM
   pods, and one extra network policy lets the proxy reach them.
 
 ```mermaid
 flowchart LR
     agents["Agent pods<br/>egress admits app: litellm"]
-    svc["Service inference-gateway<br/>selects app=litellm, replay=proxy"]
-    proxy["Replay proxy pod<br/>app=litellm, replay=proxy"]
-    up["Service inference-gateway-upstream<br/>selects a LiteLLM-only label"]
-    lite["LiteLLM pods<br/>app=litellm + LiteLLM-only label"]
+    svc["Service inference-gateway<br/>selects app=litellm, inference-role=replay-shadow"]
+    proxy["Replay proxy pods<br/>app=litellm, inference-role=replay-shadow"]
+    up["Service inference-gateway-upstream<br/>selects app=litellm, inference-role=litellm"]
+    lite["LiteLLM pods<br/>app=litellm, inference-role=litellm"]
     agents --> svc --> proxy --> up --> lite
 ```
 
@@ -248,17 +251,21 @@ flowchart LR
 same label the proxy has. A Service that picks pods by that label would pick the proxy too, and
 the proxy would end up sending requests to itself. The prototype got around this with a label that
 only the current LiteLLM pods have (`pod-template-hash`), but that label changes whenever LiteLLM
-restarts with a new version. CI needs a fixed label on the LiteLLM pods (set through the chart)
-that the proxy doesn't have.
+restarts with a new version. So the chart gives the LiteLLM pods
+`kubeagents.x-k8s.io/inference-role: litellm`, only while the proxy is on, and the upstream Service
+selects that.
 
 **Side effects of sharing the `app: litellm` label.** The proxy also gets counted as a LiteLLM pod
-by LiteLLM's disruption budget, its pod spreading rule, its metrics scraping, and the console's
-metrics. The metrics matter most: those tools add up `/metrics` from every `app: litellm` pod. If
-the proxy forwarded `/metrics` to LiteLLM, one LiteLLM pod's numbers would be counted twice. So the
-proxy answers `/metrics` itself, with its own numbers or nothing. Two more: the LiteLLM Deployment
+by LiteLLM's disruption budget, its metrics scraping, and the console's metrics (not by its pod
+spreading rule, which counts one ReplicaSet's pods). The metrics matter most: those tools add up
+`/metrics` from every `app: litellm` pod. If the proxy forwarded `/metrics` to LiteLLM, one LiteLLM
+pod's numbers would be counted twice. So the proxy answers `/metrics` itself, with its own numbers
+or nothing. Two more: the LiteLLM Deployment
 picks its pods by `app: litellm` alone, so it overlaps with the proxy pod, and the operator's
-LiteLLM network policy applies to the proxy too (which is why the proxy needs its own extra policy
-to reach LiteLLM).
+LiteLLM network policy applies to the proxy too. That policy gives every `app: litellm` pod egress
+on port 443, so the proxy's own policy, which adds DNS and LiteLLM's port, cannot confine it to
+LiteLLM alone without an operator change. The Deployment overlap is harmless: its controller
+manages only the ReplicaSets it owns.
 
 ### One shared cache for all eval projects
 
