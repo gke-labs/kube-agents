@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Answer feedback on Google Chat (feedback.go): two rating buttons, 👍 then
@@ -56,6 +57,12 @@ const (
 	gchatRatingDuplicate  = "duplicate delivery of rating tap "
 	gchatRatingUnverified = "a rating tap from an unverified sender"
 	gchatRatingTaken      = "a rating tap, recorded off the pull loop: "
+	// gchatRatingSuperseded is logged for a tap dropped because the same
+	// rater tapped the same message later.
+	gchatRatingSuperseded = "gchat: a rating tap was superseded by a later tap from the same rater; dropped"
+	// gchatTapKeySep joins a message name and a rater's email in a
+	// gchatTapKey; neither contains it.
+	gchatTapKeySep = "\x00"
 
 	// The note card a 👎 posts: a cardsV2 message with one text box, in
 	// the rater's thread, private to the rater outside a one-to-one DM.
@@ -106,9 +113,10 @@ const (
 )
 
 // gchatRating is the rating buttons a message carries: task is the rated
-// answer's task id, empty for no buttons, and chosen the rating drawn
-// filled (FeedbackUp, FeedbackDown, or empty for none).
-type gchatRating struct{ task, chosen string }
+// answer's task id, empty for no buttons, chosen the rating drawn filled
+// (FeedbackUp, FeedbackDown, or empty for none), and at the event time of
+// the tap that filled it, empty when none had one.
+type gchatRating struct{ task, chosen, at string }
 
 var _ FeedbackSink = (*GoogleChatAdapter)(nil)
 
@@ -163,28 +171,28 @@ func gchatWithRating(widgets []map[string]any, r gchatRating) []map[string]any {
 	out := make([]map[string]any, 0, len(widgets)+1)
 	added := false
 	for _, w := range widgets {
-		list, ok := w["buttonList"].(map[string]any)
+		list, ok := w[gchatButtonListKey].(map[string]any)
 		if !ok || added {
 			out = append(out, w)
 			continue
 		}
-		existing, _ := list["buttons"].([]map[string]any)
+		existing, _ := list[gchatButtonsKey].([]map[string]any)
 		buttons := append(append([]map[string]any{}, existing...), gchatRatingButtons(r)...)
 		newList := make(map[string]any, len(list))
 		for k, v := range list {
 			newList[k] = v
 		}
-		newList["buttons"] = buttons
+		newList[gchatButtonsKey] = buttons
 		newWidget := make(map[string]any, len(w))
 		for k, v := range w {
 			newWidget[k] = v
 		}
-		newWidget["buttonList"] = newList
+		newWidget[gchatButtonListKey] = newList
 		out = append(out, newWidget)
 		added = true
 	}
 	if !added {
-		out = append(out, map[string]any{"buttonList": map[string]any{"buttons": gchatRatingButtons(r)}})
+		out = append(out, map[string]any{gchatButtonListKey: map[string]any{gchatButtonsKey: gchatRatingButtons(r)}})
 	}
 	return out
 }
@@ -293,6 +301,67 @@ func (a *GoogleChatAdapter) rememberRating(message string, r gchatRating) {
 	remember(&ux.ratedOrder, message, func(k string) { delete(ux.rated, k) })
 }
 
+// gchatTapKey keys a rater's taps on a message in ux.tapped.
+func gchatTapKey(message, rater string) string {
+	return message + gchatTapKeySep + rater
+}
+
+// gchatTapOlder reports whether event time at is before recorded. A missing
+// or unreadable time is never older.
+func gchatTapOlder(at, recorded string) bool {
+	if at == "" || recorded == "" {
+		return false
+	}
+	t, terr := time.Parse(time.RFC3339Nano, at)
+	r, rerr := time.Parse(time.RFC3339Nano, recorded)
+	return terr == nil && rerr == nil && t.Before(r)
+}
+
+// takeTap records at as rater's newest tap on message, unless a newer one
+// is on record. A tap with no event time records nothing.
+func (a *GoogleChatAdapter) takeTap(message, rater, at string) {
+	if at == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ux := a.uxLocked()
+	key := gchatTapKey(message, rater)
+	if recorded, ok := ux.tapped[key]; ok && !gchatTapOlder(recorded, at) {
+		return
+	}
+	ux.tapped[key] = at
+	remember(&ux.tappedOrder, key, func(k string) { delete(ux.tapped, k) })
+}
+
+// tapSuperseded reports whether rater has tapped message after event time
+// at.
+func (a *GoogleChatAdapter) tapSuperseded(message, rater, at string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return gchatTapOlder(at, a.uxLocked().tapped[gchatTapKey(message, rater)])
+}
+
+// rememberTap records r, a recorded tap, as the rating buttons message
+// carries, and reports whether it did: a tap older than the one that filled
+// the buttons on record, another rater's, leaves them. A tap with no event
+// time keeps the time on record.
+func (a *GoogleChatAdapter) rememberTap(message string, r gchatRating) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	ux := a.uxLocked()
+	current := ux.rated[message]
+	if gchatTapOlder(r.at, current.at) {
+		return false
+	}
+	if r.at == "" {
+		r.at = current.at
+	}
+	ux.rated[message] = r
+	remember(&ux.ratedOrder, message, func(k string) { delete(ux.rated, k) })
+	return true
+}
+
 // rememberRatingIfAbsent is the rating buttons on record for message, or r,
 // recorded in the same lock section, when none is and r has a task.
 func (a *GoogleChatAdapter) rememberRatingIfAbsent(message string, r gchatRating) gchatRating {
@@ -333,10 +402,13 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 // changes nothing. Otherwise the rating is recorded off the pull loop
 // (Rate carries its own deadline, the relay calls theirs), and then the
 // message is patched with the tapped button filled. A failed write logs and
-// leaves the message as it was. The layout is computed and patched under the
-// message's rewrite lock (lockRewrite). A kept 👎 then asks for a note
-// (askForNote). The tap claims no question: a choice click on the message is
-// still a turn.
+// leaves the message as it was. Rate, the layout and the patch run under the
+// message's rewrite lock (lockRewrite), so taps on one message take effect
+// in turn. A tap older than one the same rater made on the same message is
+// superseded: dropped before Rate, or, when the later tap was taken while
+// Rate ran, after it with no patch and no note card. A tap with no event
+// time is never superseded. A kept 👎 then asks for a note (askForNote). The
+// tap claims no question: a choice click on the message is still a turn.
 func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 	click := ev.click
 	recorder := a.feedbackRecorder()
@@ -369,24 +441,40 @@ func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 	}
 	rating := FeedbackRating{Platform: platformGoogleChat, Backend: gchatBackend, Rater: click.User.Email,
 		Conversation: conversation, MessageID: message, TaskID: task, Rating: value, Answer: ev.Message.Text}
-	chosen := gchatRating{task: task, chosen: value}
+	rater, at := click.User.Email, click.EventTime
+	a.takeTap(message, rater, at)
+	chosen := gchatRating{task: task, chosen: value, at: at}
 	// The rewrite runs after this returns: it reads its own copy of the
 	// message, its space and the rater, never the event the caller holds.
 	snapshot := &gchatEvent{Space: ev.Space, Message: gchatMessage{Name: message, Text: ev.Message.Text,
 		Thread: ev.Message.Thread, AccessoryWidgets: cloneGchatWidgets(ev.Message.AccessoryWidgets)},
 		click: &gchatClick{User: click.User}}
 	a.goRewrite(func() {
+		// Under the message's rewrite lock from Rate to the patch, so taps
+		// on one message are recorded in turn, the layout reads what the
+		// previous patch left, and this patch never lands over a later one.
+		unlock := a.lockRewrite(message)
+		if a.tapSuperseded(message, rater, at) {
+			unlock()
+			a.log.Info(gchatRatingSuperseded, "message", message, "taskId", task, "rating", value)
+			return
+		}
 		askKept, err := recorder.Rate(rating)
 		if err != nil {
+			unlock()
 			a.log.Warn("gchat: recording a rating failed", "message", message, "taskId", task, "err", err)
 			return
 		}
-		// Under the message's rewrite lock, so the layout reads what the
-		// previous patch left and this patch never lands over a later one.
-		unlock := a.lockRewrite(message)
-		a.rememberRating(message, chosen)
-		if err := a.patchRating(message, a.ratedLayout(snapshot, chosen)); err != nil {
-			a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
+		// A later tap taken while Rate ran records over this one next.
+		if a.tapSuperseded(message, rater, at) {
+			unlock()
+			a.log.Info(gchatRatingSuperseded, "message", message, "taskId", task, "rating", value)
+			return
+		}
+		if a.rememberTap(message, chosen) {
+			if err := a.patchRating(message, a.ratedLayout(snapshot, chosen)); err != nil {
+				a.log.Warn("gchat: filling the tapped rating button failed; the rating is kept", "message", message, "err", err)
+			}
 		}
 		unlock()
 		// The 👎 is kept whether or not its button filled: ask for a note.

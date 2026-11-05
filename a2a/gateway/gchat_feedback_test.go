@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -578,6 +579,102 @@ func TestGchatReRatingReplacesTheFilledButton(t *testing.T) {
 	if got := recordedRatings(rec); len(got) != 2 {
 		t.Errorf("ratings = %+v, want two", got)
 	}
+}
+
+// Two taps by one rater on one message, taken back to back with the first
+// Rate held until both are taken, end with the later tap's rating in the
+// bucket, on record and filled, whichever goroutine runs first; the older
+// tap is superseded, and a 👎 it replaced posts no note card.
+func TestGchatRapidTapsOnOneMessageKeepTheLastOne(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		first, second string
+		cards         int
+	}{
+		{"down then up", "down", "up", 0},
+		{"up then down", "up", "down", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, f, rec := newFeedbackGchatAdapter(t)
+			logs := &lockedBuffer{}
+			a.log = slog.New(slog.NewTextHandler(logs, nil))
+			a.syncRewrites = false
+			taken := make(chan struct{})
+			var rates atomic.Int32
+			rec.onRate = func() {
+				if rates.Add(1) == 1 {
+					<-taken
+				}
+			}
+			older := gchatRatingEvent(t, tc.first)
+			older.click.EventTime = "2026-10-29T20:03:00.100000Z"
+			newer := gchatRatingEvent(t, tc.second)
+			newer.click.EventTime = "2026-10-29T20:03:00.2Z"
+			a.classify(older)
+			a.classify(newer)
+			close(taken)
+
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				a.mu.Lock()
+				_, rewriting := a.uxLocked().rewriting[gchatRatedMessage]
+				a.mu.Unlock()
+				creates := 0
+				for i := range relayCallCount(f) {
+					if f.call(i).method == "create" {
+						creates++
+					}
+				}
+				if !rewriting && creates == tc.cards && a.ratingOf(gchatRatedMessage).chosen == tc.second &&
+					strings.Contains(logs.String(), "superseded") {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("taps never settled: rating %+v, creates %d, logs:\n%s", a.ratingOf(gchatRatedMessage), creates, logs.String())
+				}
+				time.Sleep(time.Millisecond)
+			}
+			got := recordedRatings(rec)
+			if len(got) == 0 || got[len(got)-1].Rating != tc.second {
+				t.Errorf("ratings = %+v, want %s last", got, tc.second)
+			}
+			if r := a.ratingOf(gchatRatedMessage); r.task != "t-root" || r.chosen != tc.second {
+				t.Errorf("ratingOf = %+v, want t-root %s", r, tc.second)
+			}
+			last := -1
+			creates := 0
+			for i := range relayCallCount(f) {
+				switch f.call(i).method {
+				case "patch":
+					last = i
+				case "create":
+					creates++
+				}
+			}
+			if last < 0 {
+				t.Fatal("no patch")
+			}
+			checkFilled(t, bodyButtons(t, checkPatch(t, f, last, gchatRatedMessage)), tc.second)
+			if creates != tc.cards {
+				t.Errorf("note cards = %d, want %d", creates, tc.cards)
+			}
+		})
+	}
+}
+
+// A tap with no event time is never superseded.
+func TestGchatTapWithoutEventTimeIsNeverSuperseded(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	newer := gchatRatingEvent(t, "up")
+	newer.click.EventTime = "2026-10-29T20:04:00Z"
+	a.classify(newer)
+	timeless := gchatRatingEvent(t, "down")
+	timeless.click.EventTime = ""
+	a.classify(timeless)
+	if got := recordedRatings(rec); len(got) != 2 || got[1].Rating != "down" {
+		t.Fatalf("ratings = %+v, want up then down", got)
+	}
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 1, gchatRatedMessage)), "down")
 }
 
 func TestGchatRatingFromAnUnverifiedSenderChangesNothing(t *testing.T) {
@@ -1312,10 +1409,10 @@ func TestGchatMessageButtonsTellTheKindsApartByFunction(t *testing.T) {
 	if label != "Skip" {
 		t.Errorf("label = %q, want the choice at index 1", label)
 	}
-	if rating != (gchatRating{"t-root", ""}) {
+	if rating != (gchatRating{task: "t-root"}) {
 		t.Errorf("rating = %+v, want t-root unchosen", rating)
 	}
-	if _, _, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root", chosen: "down"}), 1, "fallback"); rating != (gchatRating{"t-root", "down"}) {
+	if _, _, rating := gchatMessageButtons(withRating(gchatRating{task: "t-root", chosen: "down"}), 1, "fallback"); rating != (gchatRating{task: "t-root", chosen: "down"}) {
 		t.Errorf("rating with 👎 FILLED = %+v, want chosen down", rating)
 	}
 }

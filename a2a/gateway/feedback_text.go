@@ -1,6 +1,10 @@
 package gateway
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
+)
 
 // The words answer feedback shows on every chat backend (the approved mock,
 // phase2/feedback). A backend supplies only its own markup: the link around
@@ -23,7 +27,8 @@ const (
 	// with nothing pre-filled: the install never files anything itself. Its
 	// %s is the backend's own link markup around feedbackFormURL.
 	feedbackFormLine = "To tell the kube-agents maintainers as well, use %s. It opens a public issue, so leave out cluster names and other details from your install."
-	feedbackFormURL  = "https://gke-labs.github.io/kube-agents/feedback"
+	// feedbackFormURL is the form the chat commands name too.
+	feedbackFormURL = chattext.FeedbackFormURL
 )
 
 // feedbackKeptText is the line under the note a 👎 asks for: how long the

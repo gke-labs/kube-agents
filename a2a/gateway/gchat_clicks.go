@@ -195,6 +195,11 @@ type gchatUX struct {
 	// name (gchat_feedback.go), and ratedOrder its ring.
 	rated      map[string]gchatRating
 	ratedOrder []string
+	// tapped is the newest event time of a rating tap taken from each rater
+	// on each message (gchatTapKey), set when the tap is taken, before it
+	// is recorded, and tappedOrder its ring (gchat_feedback.go).
+	tapped      map[string]string
+	tappedOrder []string
 	// rewriting is the lock each message's rewrite holds from computing
 	// its layout to patching it (lockRewrite), by message name, held only
 	// while a rewrite holds or waits on it, so it needs no ring.
@@ -216,7 +221,7 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 		a.ux = &gchatUX{questions: map[string]gchatQuestion{}, open: map[string]string{}, pending: map[string]gchatPendingClick{},
 			waiting: map[string]bool{}, answered: map[string]bool{}, lines: map[string]string{},
 			shown: map[string]gchatChatLayout{}, rated: map[string]gchatRating{},
-			rewriting: map[string]*gchatRewriteLock{}}
+			tapped: map[string]string{}, rewriting: map[string]*gchatRewriteLock{}}
 	}
 	return a.ux
 }
