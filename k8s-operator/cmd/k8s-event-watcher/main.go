@@ -150,6 +150,8 @@ type flags struct {
 	reasons           string
 	namespaces        string
 	excludeNamespaces string
+	// alertExclude is the --alert-exclude JSON; see alertexclude.go.
+	alertExclude      string
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
@@ -193,6 +195,10 @@ type flags struct {
 	snapshotInterval       time.Duration
 	gatewayURL             string
 	gatewayWait            time.Duration
+	// fleetShapeInterval is how often the fleet's shape (nodes, controllers,
+	// pods) is measured and published as the fleet gauges (fleetshape.go);
+	// 0 measures nothing and leaves the gauges at 0.
+	fleetShapeInterval time.Duration
 }
 
 // parseFlags reads command-line arguments into the flags struct.
@@ -213,6 +219,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.reasons, "reason", "", "Comma-separated allow-list of Event.Reason values. Empty = shipped default set.")
 	fs.StringVar(&f.namespaces, "namespace", "", "Comma-separated allow-list of namespaces. Empty = all namespaces.")
 	fs.StringVar(&f.excludeNamespaces, "exclude-namespace", "", "Comma-separated deny-list of namespaces.")
+	fs.StringVar(&f.alertExclude, "alert-exclude", "", `JSON list of alert-exclude rules. An event any rule matches opens no incident; its cluster stays in scope for reads. Each rule sets one or more of cluster ({"projectId","location","clusterName"}, clusterName required), namespace, reason (the event's or its canonical reason), kind, and name (a trailing "*" is a prefix match); a rule matches when every part it sets matches. Empty = none.`)
 
 	// Dedup.
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
@@ -232,7 +239,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
 	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, addressed by asking the GKE API about that profile's cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
 	fs.DurationVar(&f.profilesRescan, "profiles-rescan", defaultProfilesRescan, "How often --profiles-dir is read again after startup. A Cluster Agent profile written since the last read starts a watcher, one skipped on an earlier read (a GKE lookup refused with 429 or 5xx) is tried again, and one removed stops its watcher and snapshots its dedup cache. 0 = read the directory once, at startup.")
-	fs.IntVar(&f.initialListConcurrency, "initial-list-concurrency", defaultInitialListConcurrency, "How many clusters may receive their initial Event state at once: the reflector's first list, or the initial events of its watch-list stream, and the relist after a 410 or a hold. Bounds the startup burst a fleet of large clusters makes on this container's memory; the rest wait their turn. 0 = no bound.")
+	fs.IntVar(&f.initialListConcurrency, "initial-list-concurrency", defaultInitialListConcurrency, "How many clusters may receive their initial Event state at once: the reflector's first list (every page of it, on a control plane without watch-list), or the initial events of its watch-list stream, and the relist after a 410 or a hold. Bounds the startup burst a fleet of large clusters makes on this container's memory; the rest wait their turn. 0 = no bound.")
 	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; with --profiles-dir the name comes from each profile's cluster_identity).")
 
 	// Operational.
@@ -243,6 +250,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.DurationVar(&f.snapshotInterval, "snapshot-interval", 30*time.Second, "How often to persist the dedup cache when --dedup-persist is set. 0 = only on shutdown.")
 	fs.StringVar(&f.gatewayURL, "gateway-url", "", "Base URL of the agent gateway the daemon starts triage turns on. When set, events are not watched until it answers or --gateway-wait passes. Empty = do not wait.")
 	fs.DurationVar(&f.gatewayWait, "gateway-wait", defaultGatewayWait, "Longest time to wait for --gateway-url to answer before watching events anyway.")
+	fs.DurationVar(&f.fleetShapeInterval, "fleet-shape-interval", defaultFleetShapeInterval, "How often the fleet's shape is measured and published as the k8s_event_watcher_fleet_* gauges: every watched cluster's node count from its GKE description, and its pods, Deployments, StatefulSets, DaemonSets and CronJobs counted as one-item metadata-only lists (limit=1, Accept PartialObjectMetadataList) plus the server's remainingItemCount. Eight clusters at a time, 5s per call. 0 = off (the gauges stay at 0).")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -351,6 +359,9 @@ func (f *flags) validate() error {
 	}
 	if f.initialListConcurrency < 0 {
 		return errors.New("--initial-list-concurrency must be >= 0 (0 = no bound)")
+	}
+	if f.fleetShapeInterval < 0 {
+		return errors.New("--fleet-shape-interval must be >= 0 (0 = off)")
 	}
 	if strings.HasSuffix(f.gatewayURL, "/") {
 		return fmt.Errorf("--gateway-url must not end with '/' (got %q)", f.gatewayURL)
@@ -1240,6 +1251,18 @@ func realMain(argv []string) error {
 
 	// Build components.
 	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.filterThresholds())
+	// A malformed list fails open, as the entrypoint's tunables do: stopping
+	// here would end incident detection for every cluster to silence a few.
+	// Assigned only on success, so a parse error can never leave a partial
+	// list in force while the log says none is.
+	rules, err := parseAlertExclude(f.alertExclude)
+	switch {
+	case err != nil:
+		log.Printf("k8s-event-watcher: ALERT %v — running with no alert-exclude rules, so every event they would match opens an incident", err)
+	case len(rules) > 0:
+		filterCfg.alertExclude = rules
+		log.Printf("k8s-event-watcher: %d alert-exclude rules; events they match open no incident and count as gate=%s", len(rules), gateAlertExcluded)
+	}
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()
@@ -1362,6 +1385,17 @@ func realMain(argv []string) error {
 	if f.profilesDir != "" && f.profilesRescan > 0 {
 		log.Printf("k8s-event-watcher: re-reading %s every %s for profiles added, retried or removed (--profiles-rescan)", f.profilesDir, f.profilesRescan)
 		go runProfileReload(ctx, set, f.profilesDir, f.profilesRescan)
+	}
+
+	// The fleet's shape, measured now and every --fleet-shape-interval over
+	// the running set, so a cluster a rescan adds or removes is in or out of
+	// the next reading (see fleetshape.go). After the clusters are started
+	// and not before the gateway wait: the gauges are a reading of the fleet,
+	// not of the watcher's readiness, and a standby's reading is as true as
+	// the leader's.
+	if f.fleetShapeInterval > 0 {
+		log.Printf("k8s-event-watcher: measuring the fleet's shape now and every %s (--fleet-shape-interval)", f.fleetShapeInterval)
+		go runFleetShapeLoop(ctx, newFleetShapeProbe(set.clusters, m), f.fleetShapeInterval)
 	}
 
 	// Refuse to sit there watching nothing. Individual informers deliberately

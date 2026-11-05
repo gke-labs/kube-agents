@@ -21,6 +21,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -155,6 +156,12 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 		}
 		w := newWatcher(tc.Client, delivery, tc)
 		w.gate = s.gate
+		// A relist after the sync is the loop a slow batch can fall into (a
+		// watch the API server would not resume, a watch-list stream that
+		// failed); the counter makes it visible beside cluster_up.
+		w.onRelist = func() {
+			s.m.relists.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Inc()
+		}
 		log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
 			tc.Name, tc.Profile, tc.ProjectID, tc.Location)
 		// The gauge follows every transition the watcher reports: 1 on the
@@ -282,6 +289,24 @@ func (s *clusterSet) profiles() []string {
 	out := make([]string, 0, len(s.running))
 	for p := range s.running {
 		out = append(out, p)
+	}
+	return out
+}
+
+// clusters is the running set as a slice, in profile order, for the
+// fleet-shape probe: a copy, so the probe reads the clusters as they stood
+// when it began and holds no lock while it reads them.
+func (s *clusterSet) clusters() []targetCluster {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	profiles := make([]string, 0, len(s.running))
+	for p := range s.running {
+		profiles = append(profiles, p)
+	}
+	sort.Strings(profiles)
+	out := make([]targetCluster, 0, len(profiles))
+	for _, p := range profiles {
+		out = append(out, s.running[p].cluster)
 	}
 	return out
 }

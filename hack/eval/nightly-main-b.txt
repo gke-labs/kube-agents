@@ -57,7 +57,9 @@ triage-start-burst
 # monitoring-alert-policy-read joined the nightly on 2026-10-23 as a stack
 # case at the script's default hint. In main-a it put the halves 1850s apart
 # (11450s against 9600s), over the one-case tolerance; here they are 1450s
-# apart. Placed on the arithmetic alone, like the line above.
+# apart. Placed on the arithmetic alone, like the line above. On the
+# blocking roster since 2026-11-02, so the nightly reads it from the
+# presubmit file; it is still a stack case of the main part and stays here.
 monitoring-alert-policy-read
 
 # The two recorded-weeks cases of #3535 (upgrades-retrospective-log-volume-gate

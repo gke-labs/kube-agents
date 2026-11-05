@@ -42,8 +42,13 @@
 #                              dormant. (Live: gs://kube-agents-dashboards/evals/)
 #   EVAL_DASHBOARD_PR_GLOB     Prow build-dir glob(s) for collect.py; default
 #                              below is the smoke-test presubmit's archive.
+#   EVAL_DASHBOARD_PR_GLOB_PREVIOUS  the archive the presubmit wrote before it
+#                              moved buckets, read alongside until its runs
+#                              leave the window; empty disables it
 #   EVAL_DASHBOARD_GITLAB_PR_GLOB  the GitLab lane's build-dir glob (tier
 #                              gitlab, its own watermark); empty disables it
+#   EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS  that lane's archive before the
+#                              move, read alongside; empty disables it
 #   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  the GitLab lane's nightly periodic's
 #                              log prefix (tier gitlab, no pull request, its
 #                              own watermark); empty disables it
@@ -143,8 +148,14 @@ trap cleanup EXIT
 # own; converting it to an exit is what preserves the log above.
 trap 'exit 143' TERM INT
 
-EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
-EVAL_DASHBOARD_GITLAB_PR_GLOB="${EVAL_DASHBOARD_GITLAB_PR_GLOB-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*}"
+EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
+# The archive the presubmit wrote before it moved buckets (2026-11); its last
+# runs there stay in the window for EVAL_DASHBOARD_SINCE_DAYS, so both
+# archives are read (collect.py keeps one watermark across them). Delete it
+# that many days after the move.
+EVAL_DASHBOARD_PR_GLOB_PREVIOUS="${EVAL_DASHBOARD_PR_GLOB_PREVIOUS-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
+EVAL_DASHBOARD_GITLAB_PR_GLOB="${EVAL_DASHBOARD_GITLAB_PR_GLOB-gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*}"
+EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS="${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*}"
 EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/}"
 EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/}"
 EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/}"
@@ -220,7 +231,7 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..${14} are the child bash's own positionals, so
+# Single quotes on purpose: $1..${16} are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself. The nightly prefixes and the
@@ -233,9 +244,11 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     src_args=(--from-dir "$6")
   else
     src_args=(--pr-glob "$4")
+    [ -n "${15}" ] && src_args+=(--pr-glob "${15}")
     [ -n "$8" ] && src_args+=(--nightly-prefix "$8")
     [ -n "${11}" ] && src_args+=(--nightly-writers-prefix "${11}")
     [ -n "${12}" ] && src_args+=(--gitlab-pr-glob "${12}")
+    [ -n "${16}" ] && src_args+=(--gitlab-pr-glob "${16}")
     [ -n "${13}" ] && src_args+=(--gitlab-nightly-prefix "${13}")
     [ -n "${14}" ] && src_args+=(--nightly-main-b-prefix "${14}")
   fi
@@ -276,6 +289,8 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   "${EVAL_DASHBOARD_GITLAB_PR_GLOB}" \
   "${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX}" \
   "${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX}" \
+  "${EVAL_DASHBOARD_PR_GLOB_PREVIOUS}" \
+  "${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

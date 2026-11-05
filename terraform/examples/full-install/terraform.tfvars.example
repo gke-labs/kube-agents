@@ -83,6 +83,13 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # outside the VPC, for a cluster a Platform Agent running elsewhere has to
 # reach. Off by default; see the README before turning it on.
 # allow_external_dns_traffic = true
+#
+# Create the kube-agents release with `helm upgrade --install`, so an apply
+# whose state lost a live release (#4108) adopts it rather than failing with
+# "cannot re-use a name that is still in use". Off by default: it also takes
+# over a release another state or a manual `helm install` owns in the
+# namespace. Only for a long-lived install whose own state owns the release.
+# helm_upgrade_install = true
 
 # The PlatformAgent's spec.mode: "today" (the default, which renders no mode
 # field) or "next", which puts the NATS bus and the A2A gateway in front of
@@ -192,7 +199,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # slack_allowed_users     = ["U01234567"]
 # slack_home_channel      = "C01234567"
 # slack_home_channel_name = "#kube-agents"
-# slack_home_channel_policy = "auto"   # or "manual"; accepted but with no effect yet
+# slack_home_channel_policy = "auto"   # or "manual": under next with Slack on the gateway and no slack_home_channel, "auto" learns it from the first mention in a channel
 
 # Optional AgentPlugins.
 # enable_pubsub_platform       = true

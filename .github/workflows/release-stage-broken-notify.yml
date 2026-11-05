@@ -2,7 +2,9 @@ name: Notify on Broken Release Stage
 
 # Open a `ci:release-stage-broken` issue when a release pipeline run fails,
 # keep it current while the pipeline stays red, close it when the next run
-# passes, and tell the CI-health Chat space on the open and the close.
+# passes, and tell the CI-health Chat space on the open and the close. The
+# same sweep opens a `ci:release-stalled` issue when the release-candidate
+# eval has rejected the promotion pipeline's candidate night after night.
 # `scripts/release/notify_release_stage_broken.py` holds the reasoning, the
 # watched list and the issue and message formats; this file is the schedule,
 # the guards and the Chat credential.
@@ -37,7 +39,7 @@ name: Notify on Broken Release Stage
 # writing.
 #
 # No other setup: it writes to this repository with its own GITHUB_TOKEN and
-# creates the label the first time it needs one. Issues opened with
+# creates the labels the first time it needs each. Issues opened with
 # GITHUB_TOKEN do not trigger further workflows, so this cannot start a loop.
 
 on:

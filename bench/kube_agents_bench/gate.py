@@ -167,7 +167,7 @@ def graded_mode(env: dict[str, str] | None = None, *, inject_run: bool = False) 
 #: verdict. 0 green and 1 red are the literals they have always been.
 SUITE_EXIT_NOT_EVALUATED = 2
 
-#: The build-log word for a case the inject lane could not grade (rung
+#: The verdict word for a case the inject lane could not grade (rung
 #: NOT_GRADED_ON_TRANSPORT): every objective check set aside as not
 #: applicable on the record's transport. Beside PASSED, FAILED, UNSTABLE and
 #: RESOURCE_PREPARATION_FAILED, and distinct from all four on purpose.
@@ -357,7 +357,7 @@ def _bootstrap_admitted() -> frozenset[str]:
 
 
 def _label(case: dict[str, Any]) -> str:
-    """The build-log word for a case verdict.
+    """The verdict word printed for a case.
 
     Four labels, not two, because the rate rules create a state a two-label
     scheme cannot say. UNSTABLE is a case that failed repetitions -- but not
@@ -390,7 +390,7 @@ def _label(case: dict[str, Any]) -> str:
 
 
 def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> str:
-    """The agent's final report as one build-log line, or "" when it said nothing.
+    """The agent's final report as one grading line, or "" when it said nothing.
 
     Control characters and lone surrogates become spaces and whitespace is
     collapsed to single spaces, so the line is one printable line whatever
@@ -1031,9 +1031,10 @@ def _cmd_record(args: argparse.Namespace) -> int:
 
     if os.environ.get(ROLLBACK_LANE_ENV) == "1" and not args.force:
         # Third way in, mirrored from hack/ci-eval-pr.sh's recorder decision:
-        # the today lane's periodic on main has no PULL_NUMBER and grades an
-        # install rolled back from next over the api transport. Its key reads
-        # today, and today's window measures a fresh today install.
+        # a today-lane run on main (none runs today) would have no PULL_NUMBER
+        # and grade an install rolled back from next over the api transport.
+        # Its key would read today, and today's window measures a fresh today
+        # install.
         print(
             f"::error::refusing to record a baseline with {ROLLBACK_LANE_ENV}=1: "
             "the today lane grades a rolled-back install, which is not what "

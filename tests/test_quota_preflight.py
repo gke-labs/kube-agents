@@ -39,10 +39,6 @@ _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _SPAWN_GO = _ROOT / "a2a" / "gateway" / "spawn.go"
 _COMMON_TYPES = _ROOT / "k8s-operator" / "api" / "v1alpha1" / "common_types.go"
 _A2A_MANIFESTS = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
-_A2A_BRIDGE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_bridge.go"
-_A2A_CONSOLE = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_console.go"
-_A2A_CALLOUT = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_callout.go"
-_A2A_VERIFIER = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_verifier.go"
 
 _HELM = shutil.which("helm")
 
@@ -67,14 +63,14 @@ data:
 # Totals for a stock install, re-derived by hand from values.yaml and footprint.yaml. These
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
-_DEFAULT_PODS = 7
-_DEFAULT_REQUESTS_CPU_MILLIS = 2506
-_DEFAULT_LIMITS_CPU_MILLIS = 10200
+_DEFAULT_PODS = 9
+_DEFAULT_REQUESTS_CPU_MILLIS = 2706
+_DEFAULT_LIMITS_CPU_MILLIS = 13200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 8896 * 1024**2
-_DEFAULT_LIMITS_MEMORY_BYTES = 23424 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 9408 * 1024**2
+_DEFAULT_LIMITS_MEMORY_BYTES = 24448 * 1024**2
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
 # replicas, and the cleanup hook's 1088Mi.
@@ -136,17 +132,24 @@ _MILLICORES_PER_CORE = 1000
 # entry per key, as the operator does, so only the overridden number moves.
 _PROXY_MEMORY_LIMIT_BYTES = 2 * 1024**3
 _PROXY_MEMORY_REQUEST_BYTES = 1024**3
-_PROXY_CPU_LIMIT_MILLIS = 1000
+_PROXY_CPU_LIMIT_MILLIS = 2000
 _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 3 * 1024**3
-_PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
-_PROXY_FLOAT_CPU_LIMIT = 1.5
-_PROXY_FLOAT_CPU_LIMIT_MILLIS = 1500
+_PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 4000
+# A request between the 1Gi default and the 2Gi limit, so the override moves the total.
+_PROXY_OVERRIDE_MEMORY_REQUEST_BYTES = 1536 * 1024**2
+_PROXY_FLOAT_CPU_LIMIT = 2.5
+_PROXY_FLOAT_CPU_LIMIT_MILLIS = 2500
 # The operator renders no ephemeral-storage request on the proxy, so the API server sets it
 # to the limit: footprint.yaml's 8Gi request is that defaulting, and it follows an override
 # of the limit alone.
 _PROXY_EPHEMERAL_LIMIT_BYTES = 8 * 1024**3
 _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
+# The API kube-agents.gkeAutopilot reads: the resource the operator's isGKEAutopilot probes,
+# at any served version.
+_AUTOPILOT_API = "auto.gke.io/v1/AllowlistedWorkload"
+_AUTOPILOT_API_V1BETA1 = "auto.gke.io/v1beta1/AllowlistedWorkload"
+_AUTOPILOT_API_V2 = "auto.gke.io/v2/AllowlistedWorkload"
 
 # The agent-api-auth sidecar's defaults (agentAPIAuth* in platformagent_manifests.go);
 # it is one container of the agent pod, so these are already in agentPod.base and an
@@ -230,8 +233,8 @@ class PreflightDecisionTest(unittest.TestCase):
         finally:
             pathlib.Path(values_path).unlink(missing_ok=True)
 
-    def _requirements(self, sets: list[str] | None = None, values: dict | None = None) -> dict:
-        res = self._render({"probe": {"emitRequirements": True}, **(values or {})}, sets)
+    def _requirements(self, sets: list[str] | None = None, values: dict | None = None, extra_args: list[str] | None = None) -> dict:
+        res = self._render({"probe": {"emitRequirements": True}, **(values or {})}, sets, extra_args)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
         for doc in yaml.safe_load_all(res.stdout):
             if doc and doc.get("metadata", {}).get("name") == "probe-requirements":
@@ -313,12 +316,12 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_credential_proxy_request_and_cpu_overrides_are_each_counted(self) -> None:
         base = self._requirements()
         raised = self._requirements([
-            f"{_PROXY_VALUE}.requests.memory={_PROXY_MEMORY_LIMIT_BYTES}",
+            f"{_PROXY_VALUE}.requests.memory={_PROXY_OVERRIDE_MEMORY_REQUEST_BYTES}",
             f"{_PROXY_VALUE}.limits.cpu={_PROXY_OVERRIDE_CPU_LIMIT_MILLIS}m",
         ])
         self.assertEqual(
             raised["requestsMemory"] - base["requestsMemory"],
-            _PROXY_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_REQUEST_BYTES,
+            _PROXY_OVERRIDE_MEMORY_REQUEST_BYTES - _PROXY_MEMORY_REQUEST_BYTES,
         )
         self.assertEqual(
             raised["limitsCpu"] - base["limitsCpu"],
@@ -327,6 +330,46 @@ class PreflightDecisionTest(unittest.TestCase):
         # A request the override does not name keeps the footprint's, not the new limit.
         self.assertEqual(raised["requestsCpu"], base["requestsCpu"])
         self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
+
+    def test_a_credential_proxy_limit_alone_below_the_default_request_lowers_it(self) -> None:
+        # The operator lowers a cpu or memory request the override does not set to a
+        # limit set below it (resolveCredentialProxyResources); the preflight counts that.
+        base = self._requirements()
+        for sets, key, delta in (
+            ([f"{_PROXY_VALUE}.limits.cpu=200m"], "requestsCpu", 200 - 500),
+            ([f"{_PROXY_VALUE}.limits.memory=768Mi"], "requestsMemory", (768 - 1024) * 1024**2),
+            ([f"{_PROXY_VALUE}.limits.cpu=4"], "requestsCpu", 0),
+        ):
+            with self.subTest(sets=sets):
+                self.assertEqual(self._requirements(sets)[key] - base[key], delta)
+
+    def test_credential_proxy_on_autopilot_counts_the_autopilot_requests(self) -> None:
+        # On Autopilot the operator requests 2 CPU and 2Gi (credentialProxyAutopilot*), and a
+        # CPU request the override does not set stays at one CPU per GiB of memory or under.
+        autopilot = ["--api-versions", _AUTOPILOT_API]
+        base = self._requirements()
+        on = self._requirements(extra_args=autopilot)
+        self.assertEqual(on["requestsCpu"] - base["requestsCpu"], 2000 - 500)
+        self.assertEqual(on["requestsMemory"] - base["requestsMemory"], (2048 - 1024) * 1024**2)
+        self.assertEqual(on["limitsCpu"], base["limitsCpu"])
+        lowered = self._requirements([f"{_PROXY_VALUE}.limits.memory=1536Mi"], extra_args=autopilot)
+        self.assertEqual(lowered["requestsMemory"] - base["requestsMemory"], (1536 - 1024) * 1024**2)
+        self.assertEqual(lowered["requestsCpu"] - base["requestsCpu"], 1500 - 500)
+        # Standard does not hold the CPU request to the band.
+        small = self._requirements([f"{_PROXY_VALUE}.requests.memory=256Mi"])
+        self.assertEqual(small["requestsCpu"], base["requestsCpu"])
+        small_on = self._requirements([f"{_PROXY_VALUE}.requests.memory=256Mi"], extra_args=autopilot)
+        self.assertEqual(small_on["requestsCpu"] - base["requestsCpu"], 250 - 500)
+        # A cluster serving the resource at v1beta1 only is Autopilot to the operator too.
+        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V1BETA1]), on)
+        self.assertEqual(self._requirements(extra_args=["--api-versions", _AUTOPILOT_API_V2]), on)
+        # Another resource in the group is not Autopilot: Standard serves auto.gke.io too.
+        self.assertEqual(self._requirements(extra_args=["--api-versions", "auto.gke.io/v1/WorkloadAllowlist"]), base)
+        # Just under 2Gi rounds the CPU request down to the 250m step, as the operator does.
+        under = self._requirements([f"{_PROXY_VALUE}.limits.memory=2147483647"], extra_args=autopilot)
+        self.assertEqual(under["requestsCpu"] - base["requestsCpu"], 1750 - 500)
+        at_floor = self._requirements([f"{_PROXY_VALUE}.limits.memory=672Mi"], extra_args=autopilot)
+        self.assertEqual(at_floor["requestsCpu"] - base["requestsCpu"], 500 - 500)
 
     def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:
         # A values file's `cpu: 1.5` arrives as a YAML float, not the string `--set` gives.
@@ -703,6 +746,177 @@ class PreflightDecisionTest(unittest.TestCase):
             )
         finally:
             footprint_path.write_text(original_footprint)
+
+    def _next_mode_delta(self, agent_replicas: int = 1) -> dict:
+        """What footprint.yaml's nextMode adds, summed independently of the template."""
+        following = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]
+        bridge = following["agentPod"]["hermesBridge"]
+        workloads = [v for k, v in following.items() if k not in ("agentPod", "storage")]
+        self.assertTrue(workloads, "footprint.yaml has no nextMode workloads")
+        delta = {
+            "pods": sum(w["pods"] for w in workloads),
+            "persistentVolumeClaims": following["storage"]["persistentVolumeClaims"],
+            "requestsStorage": following["storage"]["storageBytesRequest"],
+        }
+        for out, key in (
+            ("requestsCpu", "cpuMillisRequest"), ("limitsCpu", "cpuMillisLimit"),
+            ("requestsMemory", "memoryBytesRequest"), ("limitsMemory", "memoryBytesLimit"),
+            ("requestsEphemeral", "ephemeralStorageBytesRequest"),
+            ("limitsEphemeral", "ephemeralStorageBytesLimit"),
+        ):
+            delta[out] = sum(w[key] for w in workloads) + bridge[key] * agent_replicas
+        return delta
+
+    def test_mode_next_adds_the_next_mode_footprint(self) -> None:
+        """A next-mode install runs the A2A stack beside the today-mode one (#3753)."""
+        base = self._requirements()
+        following = self._requirements(["platformAgent.mode=next"])
+        for key, value in self._next_mode_delta().items():
+            with self.subTest(key=key):
+                self.assertEqual(following[key] - base[key], value)
+        # Not a vacuous zero: the stack is several pods and a JetStream claim.
+        self.assertGreaterEqual(following["pods"] - base["pods"], 7)
+        # One JetStream claim per NATS server, three by default.
+        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 3)
+
+    def test_mode_today_counts_what_an_unset_mode_does(self) -> None:
+        self.assertEqual(self._requirements(["platformAgent.mode=today"]), self._requirements())
+
+    def test_mode_next_bridge_scales_with_the_agent_replicas(self) -> None:
+        """hermes-bridge is a container of the agent pod, so each agent replica carries one."""
+        replicas = 2
+        base = self._requirements([f"platformAgent.deployment.availability.replicas={replicas}"])
+        following = self._requirements(
+            ["platformAgent.mode=next", f"platformAgent.deployment.availability.replicas={replicas}"]
+        )
+        self.assertEqual(
+            following["requestsCpu"] - base["requestsCpu"],
+            self._next_mode_delta(agent_replicas=replicas)["requestsCpu"],
+        )
+
+    def test_a_quota_that_fits_today_refuses_a_next_mode_install(self) -> None:
+        pods = self._requirements()["pods"]
+        values = {"probe": {"quotas": [self._quota({"pods": str(pods)})]}}
+        self.assertEqual(self._render(values).returncode, 0)
+        res = self._render(values, ["platformAgent.mode=next"])
+        self.assertNotEqual(res.returncode, 0, "a next-mode render should have failed")
+        self.assertIn("pods", res.stderr)
+
+    def test_mode_next_surge_room_fits_a_callout_with_litellm_off(self) -> None:
+        """The callouts and verifiers roll surge-first, so the patch leaves room for one."""
+        following = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]
+        surging = [w for w in following.values() if isinstance(w, dict) and w.get("surges")]
+        self.assertGreaterEqual(len(surging), 2, "the callouts and verifiers should surge")
+        widest = max(w["cpuMillisRequest"] // w["pods"] for w in surging)
+        # LiteLLM and the operator also roll surge-first; shrink both below the widest.
+        quiet = ["litellm.enabled=false", "operator.resources.requests.cpu=10m"]
+        today = self._requirements(quiet)
+        self.assertLess(today["surgeRequestsCpu"], widest, "the test needs the chart's own surges out of the way")
+        req = self._requirements([*quiet, "platformAgent.mode=next"])
+        self.assertGreaterEqual(req["surgeRequestsCpu"], widest)
+
+    def _bridge_delta(self, extra_env: list[dict]) -> int:
+        """The next-mode CPU request with operator.extraEnv set, less the api-bridge one."""
+        base = self._requirements(["platformAgent.mode=next"])
+        req = self._requirements(
+            ["platformAgent.mode=next"], values={"operator": {"extraEnv": extra_env}}
+        )
+        return req["requestsCpu"] - base["requestsCpu"]
+
+    def test_mode_next_counts_an_overridden_bridge_at_least_at_the_agent_containers_size(self) -> None:
+        """The chart does not re-implement the operator's reader of A2A_BRIDGE_EXECUTOR and
+        A2A_BRIDGE_RESOURCES; with either set, in any form, the bridge is counted at no less
+        than the agent container's size, the operator's fallback under cli."""
+        bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]
+        cli = bridge["hermesBridgeCli"]["cpuMillisRequest"] - bridge["hermesBridge"]["cpuMillisRequest"]
+        self.assertGreater(cli, 0)
+        zero_cpu_limit = (
+            '{"requests": {"cpu": "100m", "memory": "256Mi"}, "limits": {"cpu": "0", "memory": "512Mi"}}'
+        )
+        for name, env in (
+            ("cli", [{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"}]),
+            ("api, set explicitly", [{"name": "A2A_BRIDGE_EXECUTOR", "value": "api"}]),
+            ("by valueFrom", [{"name": "A2A_BRIDGE_EXECUTOR",
+                               "valueFrom": {"configMapKeyRef": {"name": "x", "key": "executor"}}}]),
+            ("a smaller override beside cli", [{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"},
+                                               {"name": "A2A_BRIDGE_RESOURCES",
+                                                "value": '{"requests": {"cpu": "100m"}}'}]),
+            ("one the operator refuses (zero cpu limit) beside cli",
+             [{"name": "A2A_BRIDGE_EXECUTOR", "value": "cli"},
+              {"name": "A2A_BRIDGE_RESOURCES", "value": zero_cpu_limit}]),
+            ("not JSON", [{"name": "A2A_BRIDGE_RESOURCES", "value": "big"}]),
+            ("a quantity it cannot read", [{"name": "A2A_BRIDGE_RESOURCES",
+                                            "value": '{"limits": {"cpu": "1x"}}'}]),
+            ("a side that is not a map", [{"name": "A2A_BRIDGE_RESOURCES",
+                                           "value": '{"requests": "x", "limits": {"cpu": "1"}}'}]),
+        ):
+            with self.subTest(name):
+                self.assertEqual(self._bridge_delta(env), cli)
+
+    def test_mode_next_counts_a_larger_a2a_bridge_resources_as_written(self) -> None:
+        """A readable A2A_BRIDGE_RESOURCES above the agent container's size raises the count."""
+        bridge = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]
+        self.assertEqual(
+            self._bridge_delta(
+                [{"name": "A2A_BRIDGE_RESOURCES", "value": '{"requests": {"cpu": "3500m", "memory": "1Gi"}}'}]
+            ),
+            3500 - bridge["cpuMillisRequest"],
+        )
+        # A request left out is its limit, as the API server defaults it.
+        self.assertEqual(
+            self._bridge_delta([{"name": "A2A_BRIDGE_RESOURCES", "value": '{"limits": {"cpu": "4"}}'}]),
+            4000 - bridge["cpuMillisRequest"],
+        )
+        # Every spelling the Kubernetes quantity grammar admits raises it, not only the
+        # common suffixes: a JSON number (a float that prints with an exponent), a leading
+        # "+", an exponent and a Pi suffix, each above the agent container's 2Gi memory.
+        cli_mem = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridgeCli"][
+            "memoryBytesRequest"
+        ]
+        base = self._requirements(["platformAgent.mode=next"])
+        for written, want in (
+            ('{"requests": {"memory": 4294967296}}', 4294967296),
+            ('{"requests": {"memory": "+4Gi"}}', 4 * 1024**3),
+            ('{"requests": {"memory": "4e9"}}', 4 * 10**9),
+            ('{"requests": {"memory": "1Pi"}}', 1024**5),
+        ):
+            with self.subTest(written):
+                req = self._requirements(
+                    ["platformAgent.mode=next"],
+                    values={"operator": {"extraEnv": [{"name": "A2A_BRIDGE_RESOURCES", "value": written}]}},
+                )
+                self.assertGreater(want, cli_mem)
+                self.assertEqual(
+                    req["requestsMemory"] - base["requestsMemory"],
+                    want - yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["agentPod"]["hermesBridge"]["memoryBytesRequest"],
+                )
+
+    def test_an_operator_owned_quota_is_left_to_the_operator(self) -> None:
+        """The next-mode session quota a PlatformAgent owns is not a quota this check can fix:
+        the operator reapplies it, so a patch would be reverted; its size is maxSessions's
+        and the headroom's (#3848)."""
+        owned = self._quota({"pods": "2"})
+        owned["metadata"]["ownerReferences"] = [
+            {"apiVersion": "kubeagents.x-k8s.io/v1alpha1", "kind": "PlatformAgent", "name": "platformagent"}
+        ]
+        res = self._render({"probe": {"quotas": [owned]}}, ["platformAgent.mode=next"])
+        self.assertEqual(res.returncode, 0, f"an operator-owned quota should be skipped:\n{res.stderr}")
+        res = self._render({"probe": {"quotas": [self._quota({"pods": "2"})]}}, ["platformAgent.mode=next"])
+        self.assertNotEqual(res.returncode, 0, "the same quota, unowned, must still be checked")
+
+    def test_mode_next_without_a_next_mode_footprint_fails_loudly(self) -> None:
+        """A footprint without nextMode must not count the A2A stack as zero."""
+        footprint_path = self.chart / "files" / "footprint.yaml"
+        original = footprint_path.read_text()
+        data = yaml.safe_load(original)
+        del data["nextMode"]
+        try:
+            footprint_path.write_text(yaml.safe_dump(data))
+            res = self._render({"probe": {"emitRequirements": True}}, ["platformAgent.mode=next"])
+        finally:
+            footprint_path.write_text(original)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("no nextMode section", res.stderr)
 
     def test_a_scoped_quota_is_skipped(self) -> None:
         """A scoped quota covers a subset of pods this template cannot identify."""
@@ -1206,7 +1420,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.cpu quota must fail")
         self.assertIn("  - limits.cpu:", res.stderr)
-        self.assertIn('"limits.cpu":"10700m"', res.stderr)
+        self.assertIn('"limits.cpu":"13700m"', res.stderr)
 
     def test_limits_memory_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.memory must be refused and named in the patch."""
@@ -1215,7 +1429,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small limits.memory quota must fail")
         self.assertIn("  - limits.memory:", res.stderr)
-        self.assertIn('"limits.memory":"26496Mi"', res.stderr)
+        self.assertIn('"limits.memory":"27520Mi"', res.stderr)
 
     def test_limits_ephemeral_storage_shortfall_is_enforced(self) -> None:
         """A quota deficient in limits.ephemeral-storage must be refused and named in the patch."""
@@ -1236,8 +1450,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        # The release's 2506m plus one LiteLLM surge Pod's 100m.
-        self.assertIn('"cpu":"2606m"', res.stderr)
+        # The release's 2706m plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"2806m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -1246,7 +1460,7 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"10944Mi"', res.stderr)
+        self.assertIn('"memory":"11456Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
@@ -1301,6 +1515,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertIn("dashboard", op["agentPod"])
         self.assertIn("shellSandbox", op)
         self.assertIn("credentialProxy", op)
+        self.assertIn("kubeProxy", op)
         self.assertIn("storage", op)
 
         # Verify agent-api-auth CPU limit cut to 1 core is reflected in footprint
@@ -1308,16 +1523,19 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["base"]["cpuMillisLimit"], 4500)
         self.assertEqual(op["agentPod"]["dashboard"]["cpuMillisLimit"], 1000)
         self.assertEqual(op["shellSandbox"]["cpuMillisLimit"], 2000)
-        self.assertEqual(op["credentialProxy"]["cpuMillisLimit"], 1000)
+        self.assertEqual(op["credentialProxy"]["cpuMillisLimit"], 2000)
+        self.assertEqual(op["kubeProxy"]["cpuMillisLimit"], 2000)
 
-        # Total operator limits on default install: 4500 + 1000 + 2000 + 1000 = 8500m (8.5 CPU)
+        # Total operator limits on default install: 4500 + 1000 + 2000 + 2000 + 2000 = 11500m (11.5 CPU);
+        # the kube-proxy runs two replicas of 1000m each.
         total_op_cpu_limit = (
             op["agentPod"]["base"]["cpuMillisLimit"]
             + op["agentPod"]["dashboard"]["cpuMillisLimit"]
             + op["shellSandbox"]["cpuMillisLimit"]
             + op["credentialProxy"]["cpuMillisLimit"]
+            + op["kubeProxy"]["cpuMillisLimit"]
         )
-        self.assertEqual(total_op_cpu_limit, 8500)
+        self.assertEqual(total_op_cpu_limit, 11500)
 
         # Memory, in the same shape. A generator that stopped parsing memory would emit 0
         # here; `--check` alone would not catch that if the regenerated file were committed
@@ -1326,6 +1544,7 @@ class QuotaPreflightTest(unittest.TestCase):
         self.assertEqual(op["agentPod"]["dashboard"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["shellSandbox"]["memoryBytesLimit"], 2 * 1024**3)
         self.assertEqual(op["credentialProxy"]["memoryBytesLimit"], 2 * 1024**3)
+        self.assertEqual(op["kubeProxy"]["memoryBytesLimit"], 1024 * 1024**2)
 
         # Ephemeral storage is set on two of the four and deliberately 0 on the others;
         # asserting the zeroes is the point, since an unparsed value looks identical.
@@ -1609,7 +1828,7 @@ class DocumentedFootprintTest(unittest.TestCase):
 
         # Check limits table row.
         m_limits = re.search(
-            r"plus\s+~?([\d\.]+)\s+CPU and ~([\d\.]+)\s+GiB in limits\.",
+            r"plus\s+~?([\d\.]+)\s+CPU and ~([\d\.]+)\s+GiB in limits\b",
             page,
         )
         self.assertIsNotNone(
@@ -1622,6 +1841,34 @@ class DocumentedFootprintTest(unittest.TestCase):
         self.assertEqual(
             float(m_limits.group(2)),
             math.floor((required["limitsMemory"] / gib) * 10 + 0.5) / 10,
+        )
+
+        # The same row's next-mode limits, from a render with platformAgent.mode=next.
+        res_next = subprocess.run(
+            [_HELM, "template", "test-release", str(chart), "-f", values_path]
+            + _REQUIRED_HARNESS
+            + ["--set", "platformAgent.mode=next"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res_next.returncode, 0, f"render failed:\n{res_next.stderr}")
+        required_next = None
+        for doc in yaml.safe_load_all(res_next.stdout):
+            if doc and doc.get("metadata", {}).get("name") == "probe-requirements":
+                required_next = json.loads(doc["data"]["requirements"])
+        self.assertIsNotNone(required_next, "probe ConfigMap not found in the next render")
+        m_next = re.search(
+            r"GiB in limits \(~([\d\.]+)\s+CPU and ~([\d\.]+)\s+GiB under `spec\.mode: next`\)",
+            page,
+        )
+        self.assertIsNotNone(m_next, "next-mode limits not found on prerequisites page")
+        self.assertEqual(
+            float(m_next.group(1)),
+            math.floor((required_next["limitsCpu"] / 1000) * 10 + 0.5) / 10,
+        )
+        self.assertEqual(
+            float(m_next.group(2)),
+            math.floor((required_next["limitsMemory"] / gib) * 10 + 0.5) / 10,
         )
 
     def _extract_match(
@@ -1664,56 +1911,33 @@ class DocumentedFootprintTest(unittest.TestCase):
             r'workerMemoryLimit\s*=\s*"([^"]+)"', spawn_src, "workerMemoryLimit"
         )
 
+        # Every A2A figure comes from footprint.yaml's nextMode, which make chart-check
+        # keeps equal to the next-mode operator golden (#1632): the page cannot drift from
+        # what the preflight counts. Only the session pods and the operator's own quota are
+        # outside the footprint, and they are read from source below.
+        following = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]
+
+        def per_pod(key: str) -> tuple[str, str, int]:
+            entry = following[key]
+            pods = entry["pods"]
+            cpu = entry["cpuMillisRequest"] // pods
+            mem = entry["memoryBytesRequest"] // pods
+            cpu_str = str(cpu // 1000) if cpu % 1000 == 0 else f"{cpu}m"
+            mem_str = f"{mem // 1024**3}Gi" if mem % 1024**3 == 0 else f"{mem // 1024**2}Mi"
+            return cpu_str, mem_str, pods
+
+        nats_cpu, nats_mem, nats_replicas = per_pod("a2aNats")
+        callout_cpu, callout_mem, callout_replicas = per_pod("a2aCallout")
+        verifier_cpu, verifier_mem, verifier_replicas = per_pod("a2aVerifier")
+        gateway_cpu, gateway_mem, gateway_replicas = per_pod("a2aGateway")
+        console_cpu, console_mem, console_replicas = per_pod("a2aConsole")
+        provision_cpu, provision_mem, _ = per_pod("a2aProvision")
+        bridge = following["agentPod"]["hermesBridge"]
+        bridge_cpu = f"{bridge['cpuMillisRequest']}m"
+        bridge_mem = f"{bridge['memoryBytesRequest'] // 1024**2}Mi"
+        jetstream_gib = (following["storage"]["storageBytesRequest"] // nats_replicas) // 1024**3
+
         manifests_src = _A2A_MANIFESTS.read_text()
-        nats_cpu = self._extract_match(
-            r'a2aNATSCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSCPURequest"
-        )
-        nats_mem = self._extract_match(
-            r'a2aNATSMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aNATSMemoryRequest"
-        )
-        # The bus's default server count (spec.harness.tuning.busReplicas
-        # unset), which the StatefulSet renders through a2aNATSReplicas.
-        nats_replicas = int(
-            self._extract_match(
-                r'DefaultBusReplicas\s*=\s*(\d+)',
-                _COMMON_TYPES.read_text(),
-                "DefaultBusReplicas",
-            )
-        )
-        gateway_cpu = self._extract_match(
-            r'a2aGatewayCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aGatewayCPURequest"
-        )
-        gateway_mem = self._extract_match(
-            r'a2aGatewayMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aGatewayMemoryRequest"
-        )
-        gateway_replicas = int(
-            self._extract_match(
-                r'buildA2AGatewayDeployment.*?Replicas:\s*ptr\.To\(int32\((\d+)\)\)',
-                manifests_src,
-                "gateway replicas",
-                flags=re.DOTALL,
-            )
-        )
-        verifier_cpu = self._extract_match(
-            r'a2aVerifierCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aVerifierCPURequest"
-        )
-        verifier_mem = self._extract_match(
-            r'a2aVerifierMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aVerifierMemoryRequest"
-        )
-        provision_cpu = self._extract_match(
-            r'a2aProvisionCPURequest\s*=\s*"([^"]+)"', manifests_src, "a2aProvisionCPURequest"
-        )
-        provision_mem = self._extract_match(
-            r'a2aProvisionMemoryRequest\s*=\s*"([^"]+)"', manifests_src, "a2aProvisionMemoryRequest"
-        )
-        jetstream_gib = int(
-            self._extract_match(
-                r'a2aNATSDataClaim.*?resource\.MustParse\("(\d+)Gi"\)',
-                manifests_src,
-                "JetStream PVC storage request",
-                flags=re.DOTALL,
-            )
-        )
         max_sessions = int(
             self._extract_match(
                 r'defaultA2AMaxSessions\s*=\s*(\d+)',
@@ -1725,57 +1949,6 @@ class DocumentedFootprintTest(unittest.TestCase):
             self._extract_match(
                 r'a2aQuotaHeadroom\s*=\s*(\d+)', manifests_src, "a2aQuotaHeadroom"
             )
-        )
-
-        console_src = _A2A_CONSOLE.read_text()
-        console_replicas = int(
-            self._extract_match(
-                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', console_src, "console replicas"
-            )
-        )
-        console_cpu = self._extract_match(
-            r'a2aConsoleCPURequest\s*=\s*"([^"]+)"', console_src, "a2aConsoleCPURequest"
-        )
-        console_mem = self._extract_match(
-            r'a2aConsoleMemoryRequest\s*=\s*"([^"]+)"', console_src, "a2aConsoleMemoryRequest"
-        )
-
-        callout_src = _A2A_CALLOUT.read_text()
-        callout_replicas = int(
-            self._extract_match(
-                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', callout_src, "callout replicas"
-            )
-        )
-        callout_cpu = self._extract_match(
-            r'Requests:\s*corev1\.ResourceList\{[^}]*ResourceCPU:\s*resource\.MustParse\("([^"]+)"\)',
-            callout_src,
-            "callout CPU request",
-            flags=re.DOTALL,
-        )
-        callout_mem = self._extract_match(
-            r'Requests:\s*corev1\.ResourceList\{[^}]*ResourceMemory:\s*resource\.MustParse\("([^"]+)"\)',
-            callout_src,
-            "callout memory request",
-            flags=re.DOTALL,
-        )
-
-        verifier_src = _A2A_VERIFIER.read_text()
-        verifier_replicas = int(
-            self._extract_match(
-                r'Replicas:\s*ptr\.To\(int32\((\d+)\)\)', verifier_src, "verifier replicas"
-            )
-        )
-
-        bridge_src = _A2A_BRIDGE.read_text()
-        bridge_cpu = self._extract_match(
-            r'corev1\.ResourceCPU:\s*resource\.MustParse\("([^"]+)"\)',
-            bridge_src,
-            "bridge CPU request",
-        )
-        bridge_mem = self._extract_match(
-            r'corev1\.ResourceMemory:\s*resource\.MustParse\("([^"]+)"\)',
-            bridge_src,
-            "bridge memory request",
         )
 
         page = " ".join(self._PREREQUISITES.read_text().split())
@@ -1830,7 +2003,8 @@ class DocumentedFootprintTest(unittest.TestCase):
             page,
         )
         self.assertIn(
-            f"one-time {provision_cpu} CPU / {provision_mem} memory provisioning Job",
+            f"{provision_cpu} CPU / {provision_mem} memory provisioning Job, run at install,"
+            " again whenever its spec changes, and about daily",
             page,
         )
 

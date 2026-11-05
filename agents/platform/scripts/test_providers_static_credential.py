@@ -18,6 +18,7 @@ from pathlib import Path
 
 import git_credential_token_file
 import providers
+from providers import credentials
 from providers.credentials import StaticFileCredential
 from workspace_paths import WorkspaceError
 
@@ -210,3 +211,23 @@ class HelperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_the_bearer_username_answers_only_a_git_that_offers_authtype(self):
+        # Bitbucket Data Center refuses an HTTP access token as a Basic
+        # password; git 2.46 and later take it as a bearer from a helper that
+        # answers `authtype` (seen live on ka-bb-pr2). An older git, which
+        # does not offer the capability, gets nothing rather than a password.
+        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+            handle.write("BBDC-token\n")
+        self.addCleanup(os.unlink, handle.name)
+
+        def ask(request):
+            return subprocess.run(
+                [HELPER, handle.name, git_credential_token_file.BEARER_USERNAME, "get"],
+                input=request, capture_output=True, text=True, timeout=30,
+            ).stdout
+
+        offered = ask("capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=x\n\n")
+        self.assertEqual("capability[]=authtype\nauthtype=Bearer\ncredential=BBDC-token\n", offered)
+        self.assertEqual("", ask("protocol=https\nhost=x\n\n"))
+        self.assertEqual(credentials.BEARER_GIT_USERNAME, git_credential_token_file.BEARER_USERNAME)

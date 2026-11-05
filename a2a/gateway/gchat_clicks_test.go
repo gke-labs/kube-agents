@@ -110,8 +110,8 @@ func TestGchatClickIsATurnOnce(t *testing.T) {
 	if reason != "" {
 		t.Fatalf("click dropped: %s", reason)
 	}
-	// The bot's top-level DM post is not a thread reply, so the click
-	// lands in the DM's one conversation, as a typed reply there would.
+	// The click binds to the remembered question's conversation, the DM's
+	// thread-less key the card was posted under, not to the event's surface.
 	// The click's id is the message and the event time, so two clicks on
 	// one message are two ids in the ingress log.
 	if msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != "dm" || msg.AuthorID != "sender@example.com" ||
@@ -283,6 +283,49 @@ func TestGchatPostNotifyMessageLaysOut(t *testing.T) {
 	}
 }
 
+// A home post edited through the notify route is patched in place, and the
+// question it settles is closed; the one it carries stays bound to no
+// conversation, as the post's was.
+func TestGchatEditNotifyMessagePatchesAHomePost(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/S1/messages/M1", "thread": map[string]any{"name": "spaces/S1/threads/M1"}}
+	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/S1/messages/M1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	ask := OutMessage{Text: "which?", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster?", Choices: []chatmsg.Choice{{Text: "prod"}, {Text: "dev"}}}}
+	if _, _, err := a.PostNotifyMessage("spaces/S1", "", ask); err != nil {
+		t.Fatal(err)
+	}
+	reask := OutMessage{Text: "which, again?", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster, again?", Choices: []chatmsg.Choice{{Text: "prod"}}}}
+	if err := a.EditNotifyMessage("spaces/S1", "spaces/S1/threads/M1", "spaces/S1/messages/M1", reask); err != nil {
+		t.Fatal(err)
+	}
+	call := f.call(1)
+	if call.method != "patch" || call.arguments["name"] != "spaces/S1/messages/M1" {
+		t.Fatalf("edit = %+v, want a patch of the post", call)
+	}
+	if body := call.arguments["body"].(map[string]any); body["text"] != "*Which cluster, again?*" || len(body["accessoryWidgets"].([]any)) != 1 {
+		t.Errorf("patched body = %v", body)
+	}
+	a.mu.Lock()
+	q, open := a.uxLocked().questions["spaces/S1/messages/M1"]
+	a.mu.Unlock()
+	if !open || q.conversation != "" {
+		t.Fatalf("question = %+v, %v; want it open and bound to no conversation", q, open)
+	}
+	if err := a.EditNotifyMessage("spaces/S1", "spaces/S1/threads/M1", "spaces/S1/messages/M1", OutMessage{Text: "settled: prod"}); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	_, open = a.uxLocked().questions["spaces/S1/messages/M1"]
+	a.mu.Unlock()
+	if open {
+		t.Error("a settled home question is still open")
+	}
+	if err := a.EditNotifyMessage("not-a-space", "", "spaces/S1/messages/M1", reask); err == nil {
+		t.Error("a non-space must error")
+	}
+}
+
 // A click the gateway drops changes nothing: no rewrite, and the question
 // stays open for the next click. A click on a question posted before a
 // restart is still a turn, and its rewrite reads the message the event
@@ -363,9 +406,9 @@ func TestGchatTypedReplyAnswersAndEditsClose(t *testing.T) {
 		t.Errorf("a click after a typed answer: %q", reason)
 	}
 
-	// Asked again on the side thread: a click's event names the top-level
-	// DM (the bot's message is no thread reply to Chat), but the question
-	// binds its click to the conversation it was posted in.
+	// Asked again in the DM thread: a click's event surface names the
+	// message's thread, and the click binds to the conversation the
+	// remembered question was posted in.
 	if err := a.EditMessage(side, "spaces/_c2fixtureAA/messages/BOT1.BOT1", OutMessage{Text: "fallback", Chat: question}); err != nil {
 		t.Fatal(err)
 	}
@@ -621,5 +664,130 @@ func TestGchatSettlingAnUnrememberedQuestionForgetsItsPendingClick(t *testing.T)
 	a.mu.Unlock()
 	if pending != 0 || waiting {
 		t.Errorf("pending = %d, waiting = %v after the settle; want the click forgotten", pending, waiting)
+	}
+}
+
+// A click in a DM binds to the remembered question's conversation, else to
+// its card's thread. A home card's question is remembered under no
+// conversation, so its click binds to the card's thread before and after a
+// restart. The home mark stays on a home card's buttons, because cards
+// already posted carry it.
+func TestGchatClickOnAHomeCardInADMBindsToItsThread(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1", "thread": map[string]any{"name": "spaces/_c2fixtureAA/threads/BOT1"}}
+	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	ask := OutMessage{Text: "which?", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster?", Choices: []chatmsg.Choice{{Text: "Look at the first one", Reply: "Look at the first one: prod-eu"}}}}
+	if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", ask); err != nil {
+		t.Fatal(err)
+	}
+	ev := gchatClickEvent(t)
+	if ev.Message.ThreadReply {
+		t.Fatal("the fixture click is on a thread head; it must carry no threadReply")
+	}
+	msg, reason := a.classifyClick(ev)
+	if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA/threads/BOT1" {
+		t.Fatalf("click = %+v (%q); want it bound to the card's thread", msg, reason)
+	}
+	// The home card's buttons say so, and a conversation's do not.
+	params := func(call relayCall) []any {
+		widgets := call.arguments["body"].(map[string]any)["accessoryWidgets"].([]any)
+		buttons := widgets[0].(map[string]any)["buttonList"].(map[string]any)["buttons"].([]any)
+		return buttons[0].(map[string]any)["onClick"].(map[string]any)["action"].(map[string]any)["parameters"].([]any)
+	}
+	if ps := params(f.call(0)); len(ps) != 3 || ps[2].(map[string]any)["key"] != gchatChatParamHome {
+		t.Fatalf("home button parameters = %v; want the home mark", ps)
+	}
+	if _, err := a.PostMessage("gchat:dm/spaces/_c2fixtureAA", ask); err != nil {
+		t.Fatal(err)
+	}
+	if ps := params(f.call(1)); len(ps) != 2 {
+		t.Fatalf("conversation button parameters = %v; want no home mark", ps)
+	}
+	// After a restart the adapter remembers nothing; the click binds to the
+	// card's thread, with the mark or without it.
+	restarted := newTestGchatAdapterWithRelay(t, f)
+	later := gchatClickEvent(t)
+	later.click.Parameters[gchatChatParamHome] = gchatChatParamHomeValue
+	msg, reason = restarted.classifyClick(later)
+	if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA/threads/BOT1" {
+		t.Fatalf("click after a restart = %+v (%q); want it bound to the card's thread", msg, reason)
+	}
+	unmarked := gchatClickEvent(t)
+	if msg, reason := newTestGchatAdapterWithRelay(t, f).classifyClick(unmarked); reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA/threads/BOT1" {
+		t.Fatalf("an unmarked click after a restart = %+v (%q); want the card's thread", msg, reason)
+	}
+	// Edited into the head by its key, the question stays bound to no
+	// conversation.
+	if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "spaces/_c2fixtureAA/threads/BOT1", "spaces/_c2fixtureAA/messages/BOT1.BOT1", ask); err != nil {
+		t.Fatal(err)
+	}
+	a.mu.Lock()
+	q := a.uxLocked().questions["spaces/_c2fixtureAA/messages/BOT1.BOT1"]
+	a.mu.Unlock()
+	if q.conversation != "" {
+		t.Errorf("question after the edit = %+v", q)
+	}
+}
+
+// Where the adapter clears a DM's thread (an unthreaded space, or a click
+// event with no thread name), a home card's click binds the shared space
+// conversation, as a typed message there does.
+func TestGchatClickOnAHomeCardInAnUnthreadedDMBindsTheSpace(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/BOT1.BOT1", "thread": map[string]any{"name": "spaces/_c2fixtureAA/threads/BOT1"}}
+	ask := OutMessage{Text: "which?", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster?", Choices: []chatmsg.Choice{{Text: "Look at the first one", Reply: "Look at the first one: prod-eu"}}}}
+	unthreaded := gchatClickEvent(t)
+	unthreaded.Space.SpaceThreadingState = gchatThreadingUnthreaded
+	threadless := gchatClickEvent(t)
+	threadless.Message.Thread.Name = ""
+	// One adapter per click: a second click on the same question is held as
+	// already waiting.
+	for name, ev := range map[string]*gchatEvent{"unthreaded space": unthreaded, "no thread name": threadless} {
+		a := newTestGchatAdapterWithRelay(t, f)
+		if _, _, err := a.PostNotifyMessage("spaces/_c2fixtureAA", "", ask); err != nil {
+			t.Fatal(err)
+		}
+		msg, reason := a.classifyClick(ev)
+		if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != sessionKindDM {
+			t.Errorf("%s: click = %+v (%q); want it bound to the shared space", name, msg, reason)
+		}
+	}
+}
+
+// A re-ask whose patch fails with the message left as it was (a rate limit)
+// keeps the answer the message still shows; one whose layout Chat refuses
+// forgets it, since the notifier's text edit follows.
+func TestGchatReAskKeepsTheAnswerUnlessTheLayoutIsRefused(t *testing.T) {
+	f := newFakeChatRelay(t)
+	a := newTestGchatAdapterWithRelay(t, f)
+	const name = "spaces/S1/messages/M9"
+	mark := func() {
+		a.mu.Lock()
+		ux := a.uxLocked()
+		ux.answered[name] = true
+		ux.lines[name] = "✓ Test Sender: prod"
+		a.mu.Unlock()
+	}
+	answered := func() (bool, string) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return a.uxLocked().answered[name], a.uxLocked().lines[name]
+	}
+	reask := OutMessage{Text: "again?", Chat: &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which, again?", Choices: []chatmsg.Choice{{Text: "prod"}}}}
+	mark()
+	f.responses["spaces.messages/patch"] = fakeChatAPIError{status: 429, reason: "RESOURCE_EXHAUSTED"}
+	if err := a.EditNotifyMessage("spaces/S1", "spaces/S1/threads/M9", name, reask); err == nil || errors.Is(err, ErrLayoutRefused) {
+		t.Fatalf("a rate-limited patch = %v; want a plain error", err)
+	}
+	if ok, line := answered(); !ok || line == "" {
+		t.Fatalf("after a rate-limited re-ask answered=%v line=%q; want the answer kept", ok, line)
+	}
+	f.responses["spaces.messages/patch"] = fakeChatAPIError{status: 400, reason: "INVALID_ARGUMENT"}
+	if err := a.EditNotifyMessage("spaces/S1", "spaces/S1/threads/M9", name, reask); !errors.Is(err, ErrLayoutRefused) {
+		t.Fatalf("a 400 = %v; want ErrLayoutRefused", err)
+	}
+	if ok, line := answered(); ok || line != "" {
+		t.Fatalf("after a refused re-ask answered=%v line=%q; want the answer forgotten", ok, line)
 	}
 }

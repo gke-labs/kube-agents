@@ -1078,7 +1078,7 @@ func TestGitIntegrationAdmission(t *testing.T) {
 			// check has to hold too: a CR applied before the enum narrowed, or one
 			// reaching the webhook by another path, must not reconcile.
 			name: "a provider with no registered rules",
-			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "bb", Provider: "bitbucket"}}},
+			spec: agentv1alpha1.IntegrationSpec{Forges: []agentv1alpha1.ForgeSpec{{Name: "gg", Provider: "gogs"}}},
 			path: "spec.integration.forges[0].provider",
 		},
 		{

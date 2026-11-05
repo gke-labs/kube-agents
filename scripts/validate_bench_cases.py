@@ -320,6 +320,14 @@ FIXTURE_NOT_READY = {
     "terraform-new-cluster-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
     ),
+    # Needs a cluster that runs Config Connector in the audited fleet of a
+    # pool project; no pool project runs it (provisioning-kcc-cluster-without-
+    # crds-stops relies on that). bench/tf/prebuilt/kcc-stalled-declaration
+    # plants the stalled object on such a cluster and removes it.
+    "fleet-audit-manifest-fix-names-stalled-config-connector": (
+        "#4218: needs a cluster that runs Config Connector in the pool fleet, for the "
+        "stalled ContainerNodePool the stack plants; no pool project runs Config Connector"
+    ),
     "fanout-bound-ten-cards": (
         "#3560: needs an eval install with more than ten clusters in scope, so a "
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
@@ -413,6 +421,12 @@ FIXTURE_NOT_READY = {
         "project's GitOps repository; the dev project carries it, the pool does "
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
+    ),
+    "inspect-repository-unmanaged-and-context-read": (
+        "#4243: needs kubernetes-sigs/kind at v0.24.0 registered in each pool "
+        "install's context_repos, as the case's header gives; no pool install "
+        "registers it, so the context check fails with the repository absent, "
+        "which is broken rather than red"
     ),
     "gce-startup-script-failure": (
         "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
@@ -1326,6 +1340,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             f"'tool_calls_optional:' {spec['tool_calls_optional']!r} is not a YAML "
             "boolean; write a bare true or false. bench-gate refuses a quoted "
             "value at spec-load time, after the lease"
+        )
+    if "writes_alone" in spec and not isinstance(spec["writes_alone"], bool):
+        problems.append(
+            f"'writes_alone:' {spec['writes_alone']!r} is not a YAML boolean; write a "
+            "bare true or false. The lane reads only a bare true, so a quoted value "
+            "would leave the case in the shared first phase"
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster

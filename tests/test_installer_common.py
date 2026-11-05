@@ -17,7 +17,12 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
+from tests.testing.common import (
+    NOTES_PROBE_TEMPLATE,
+    chart_with_notes_probe,
+    create_minimal_tools_bin,
+    get_isolated_test_env,
+)
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
@@ -3028,6 +3033,28 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("enable_github_minter = true", dest.read_text())
 
+    def test_minter_deferred_names_the_restore_for_scheduled_versions(self):
+        # A key whose versions a destroy scheduled: the generator still defers,
+        # but names the restore instead of asking for the PEM again.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            env = {
+                "API_SERVER_KEY": "k",
+                "GITOPS_ORG": "org",
+                "GITOPS_REPO": "repo",
+                "GITHUB_APP_ID": "42",
+            }
+            proc = self._run(
+                'print_info() { echo "INFO: $*"; }; print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"', env=env, kms_versions="",
+                gcloud_extra_cases="  *\"state=DESTROY_SCHEDULED\"*) printf '2'; exit 0 ;;\n",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("enable_github_minter = false", dest.read_text())
+            out = proc.stdout + proc.stderr
+            self.assertIn("Its versions are scheduled for destruction", out)
+            self.assertNotIn("Provide the PEM via --github-pem-path", out)
+
     def test_tfvars_recovery_refuses_a_foreign_kube_context(self):
         # A stale context pointing at some other install must not donate that
         # environment's credentials: recovery skips, and the generator fails
@@ -3092,6 +3119,83 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn("enable_pubsub_platform       = true", content)
             self.assertIn("enable_stockout_investigator = true", content)
+
+    def test_tfvars_generation_includes_helm_upgrade_install(self):
+        """HELM_UPGRADE_INSTALL reaches the composition's helm_upgrade_install.
+
+        Off unless install.env (or the environment) says otherwise, because
+        upgrade_install also adopts a release this install's state does not
+        own (#4108). The key has no flag and no interview question, so the
+        generator's own fallback is the only default it has.
+        """
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"',
+                env={"API_SERVER_KEY": "k"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("helm_upgrade_install = false\n", dest.read_text())
+
+            for spelling in ("true", "True", "yes", "1"):
+                with self.subTest(spelling=spelling):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"',
+                        env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": spelling},
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("helm_upgrade_install = true\n", dest.read_text())
+
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"',
+                env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("helm_upgrade_install = false\n", dest.read_text())
+
+    def test_tfvars_refuse_a_helm_upgrade_install_spelling_that_is_neither_true_nor_false(self):
+        # Read as off, a typo leaves upgrade_install off on the environment it
+        # was set to rescue, and the apply fails as before naming nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for value in ("ture", "enabled", "t", " "):
+                with self.subTest(value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", "HELM_UPGRADE_INSTALL": value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"HELM_UPGRADE_INSTALL='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn("is neither true nor false", proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a misspelt switch")
+
+    def test_helm_upgrade_install_reaches_the_kube_agents_release(self):
+        """The tfvars key is inert unless main.tf hands it to the release."""
+        composition = _REPO_ROOT / "terraform" / "examples" / "full-install"
+        main_tf = (composition / "main.tf").read_text()
+        release = main_tf.split('resource "helm_release" "kube_agents" {', 1)[1]
+        release = release.split("\n}\n", 1)[0]
+        self.assertIsNotNone(
+            re.search(r"(?m)^  upgrade_install\s*=\s*var\.helm_upgrade_install\s*$", release),
+            "helm_release.kube_agents does not set upgrade_install = var.helm_upgrade_install",
+        )
+        # With upgrade_install on and version unset, the provider's plan reads the
+        # installed release's version from the cluster: a from-nothing install
+        # cannot plan, and a chart version change fails the apply (#4108).
+        self.assertIsNotNone(
+            re.search(
+                r'(?m)^  version\s*=\s*yamldecode\(file\("\$\{path\.module\}/\.\./\.\./\.\./charts/kube-agents/Chart\.yaml"\)\)\.version\s*$',
+                release,
+            ),
+            "helm_release.kube_agents does not pin version to the chart's Chart.yaml version",
+        )
+        variables_tf = (composition / "variables.tf").read_text()
+        block = variables_tf.split('variable "helm_upgrade_install" {', 1)[1].split("\n}\n", 1)[0]
+        self.assertIsNotNone(
+            re.search(r"(?m)^\s*default\s*=\s*false\s*$", block),
+            "helm_upgrade_install must default to false",
+        )
 
     def test_tfvars_carries_namespace_identity_and_cmek_names(self):
         # Every one of these used to be a fixed name the generator never wrote,
@@ -5932,6 +6036,445 @@ class SlackHomeChannelPolicyTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("SLACK_HOME_CHANNEL_POLICY is 'sometimes'", proc.stdout + proc.stderr)
         self.assertIsNone(content, "the file must be left untouched")
+
+# ── print_footprint_summary: the step 11 footprint and modeled-cost block ───
+
+_FOOTPRINT_TFVARS = """# generated
+platform_agent_storage_size = "200Gi"
+enable_github_minter = true
+hermes_dashboard_enabled = false
+web_console_enabled      = true   # trailing comment
+memory_provider          = "kube_agents_memory"
+platform_agent_mode = "next"
+cluster_mode = "autopilot"
+namespace    = "agents-ns"
+"""
+_MAIN_TF = _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
+
+# The `--set` each tfvars key becomes, as terraform/examples/full-install/main.tf
+# maps them onto the chart.
+_FOOTPRINT_EXPECTED_SETS = [
+    "--set platformAgent.storage.size=200Gi",
+    "--set platformAgent.harness.memory.provider=kube_agents_memory",
+    "--set platformAgent.harness.hermes.dashboardEnabled=false",
+    "--set webConsole.enabled=true",
+    "--set githubMinter.enabled=true",
+    "--set platformAgent.mode=next",
+]
+
+# The chart keys kube-agents.quotaRequirements (and the summary's own mode read) take
+# their figures from and the composition can set from a tfvar: a `var.` the composition
+# puts under one of these, or under a `resources` subtree of a summed workload, has to
+# be a line in FOOTPRINT_TFVARS_VALUE_MAP, or the installer's figure drifts from the
+# notes' while every test stays green.
+_FOOTPRINT_READ_KEYS = {
+    "operator.enabled", "operator.replicaCount",
+    "litellm.enabled", "litellm.replicaCount",
+    "hindsight.enabled", "hindsight.postgresql.storage",
+    "githubMinter.enabled", "githubMinter.replicaCount",
+    "webConsole.enabled",
+    "platformAgent.enabled", "platformAgent.mode", "platformAgent.cleanupHook.enabled",
+    "platformAgent.storage.size",
+    "platformAgent.harness.memory.provider",
+    "platformAgent.harness.hermes.dashboardEnabled",
+    "platformAgent.deployment.availability.replicas",
+}
+_FOOTPRINT_READ_SUBTREES = (
+    "operator.resources", "litellm.resources", "githubMinter.resources", "webConsole.resources",
+    "hindsight.api.resources", "hindsight.postgresql.resources",
+    "platformAgent.deployment.credentialProxy.resources",
+    "platformAgent.deployment.kubeProxy.resources",
+    "platformAgent.deployment.agentAPIAuth.resources",
+    "platformAgent.harness.experimental.shellSandbox.resources",
+)
+_HCL_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
+_HCL_TOKEN = re.compile(
+    r'"[^"\\]*(?:\\.[^"\\]*)*"|#[^\n]*|\b(' + _HCL_IDENT + r')\s*=(?![=>])'
+    r"|\bmerge\(|\bvar\.(" + _HCL_IDENT + r")"
+    r"|\b((?:local|module|data|each)\." + _HCL_IDENT + r"(?:\." + _HCL_IDENT + r")*)|[{}()\[\]]"
+)
+# A `{` that opens a `for` comprehension is an expression, not an object literal.
+_HCL_FOR_AHEAD = re.compile(r"\s*for\b")
+# A `${` that is not the `$${` escape: the string is a template, not a literal.
+_HCL_INTERPOLATION = re.compile(r"(?<!\$)\$\{")
+
+
+def _hcl_chart_vars(src, pos=0):
+    """Every (chart key, reference) pair the HCL object opening at src[pos] assigns.
+
+    The reference is the bare tfvar name for `var.x`; for anything else the walker cannot
+    follow to a tfvar it is the text itself, so a caller can tell the two apart with
+    `_HCL_IDENT`: a `local.x`, `module.x.y`, `data.x.y` or `each.x` chain, or a string
+    carrying an interpolation (`"${var.x}"`, `"${local.p}-suffix"`; the `$${` escape is a
+    literal). The map test fails on one under a footprint key rather than resolving it,
+    because a local or a template can be anything.
+
+    Walks the object with a stack of enclosing keys: `key = {` and `key = merge(` push the
+    key, `(`, `[` and a `{ for` comprehension push an anonymous frame, and a reference
+    anywhere in the right-hand side of `leaf =` records the path: right after the `=`, or
+    inside anonymous frames under it (`leaf = try(var.x, false)`, `leaf = [for r in var.x : ...]`,
+    `leaf = { for k in var.x : k => ... }`), never past a named one.
+    A closer ends the leaves inside and at the frame it closes, and the next `key =` at a
+    depth ends the leaf there, so a `var.x` that follows a block (the condition in
+    `}, var.x ? {} : {`) has no leaf and is skipped: it decides whether a block renders,
+    and the block's own assignments record what it sets.
+    """
+    stack, closers, pairs, leaf_at = [], [], set(), {}
+    while True:
+        m = _HCL_TOKEN.search(src, pos)
+        assert m is not None, "unterminated values block"
+        tok, pos = m.group(0), m.end()
+        if tok.startswith("#") or (tok.startswith('"') and not _HCL_INTERPOLATION.search(tok)):
+            continue
+        depth = len(stack)
+        if m.group(1):
+            leaf_at[depth] = m.group(1)
+            continue
+        if tok in ("merge(", "{", "(", "["):
+            named = tok == "merge(" or (tok == "{" and not _HCL_FOR_AHEAD.match(src, pos))
+            stack.append(leaf_at.get(depth) if named else None)
+            closers.append("}" if tok == "{" else ")" if tok.endswith("(") else "]")
+            continue
+        if tok in "})]":
+            closers.pop()
+            stack.pop()
+            if not closers:
+                return pairs
+            leaf_at = {d: k for d, k in leaf_at.items() if d < len(stack)}
+            continue
+        ref = m.group(2) or m.group(3) or tok
+        while depth not in leaf_at and depth > 0 and stack[depth - 1] is None:
+            depth -= 1
+        if depth in leaf_at:
+            pairs.add((".".join([*(k for k in stack[:depth] if k), leaf_at[depth]]), ref))
+
+
+def _composition_chart_vars():
+    """Every (chart key, tfvar) the kube_agents helm_release's first values document assigns."""
+    src = _MAIN_TF.read_text()
+    release = src.index('resource "helm_release" "kube_agents"')
+    return _hcl_chart_vars(src, src.index("values = [yamlencode(", release) + len("values = [yamlencode("))
+
+
+def _footprint_value_map():
+    """FOOTPRINT_TFVARS_VALUE_MAP as installer_common.sh declares it: {tfvar: chart key}."""
+    text = _INSTALLER_COMMON.read_text()
+    match = re.search(r'readonly FOOTPRINT_TFVARS_VALUE_MAP="([^"]*)"', text)
+    assert match, "FOOTPRINT_TFVARS_VALUE_MAP not declared"
+    return dict(line.split("=", 1) for line in match.group(1).splitlines() if line)
+
+# A helm that answers `template` with the probe ConfigMap's shape, the arguments it
+# was given as the summary's one line, so the test reads the --set mapping and the
+# block-scalar extraction off the helper's stdout.
+_ECHO_HELM = (
+    "#!/usr/bin/env bash\n"
+    "printf 'apiVersion: v1\\nkind: ConfigMap\\nmetadata:\\n  name: footprint-summary\\n'\n"
+    "printf 'data:\\n  summary: |\\n    args: %s\\n    second line\\n' \"$*\"\n"
+)
+
+_FOOTPRINT_LABEL = "(modeled from us-central1 list prices, excluding LLM tokens)"
+# The resource kube-agents.gkeAutopilot probes; the installer tells its render the cluster
+# serves it unless the tfvars say standard, and the notes' parity render here does the same.
+_AUTOPILOT_API = "auto.gke.io/v1/AllowlistedWorkload"
+_NOTES_SETS = [
+    "--set", "platformAgent.harness.clusterName=ci-cluster",
+    "--set", "platformAgent.harness.location=us-central1",
+    "--set", "platformAgent.harness.projectId=ci-project",
+    "--set", "platformAgent.storage.size=200Gi",
+    "--set", "platformAgent.harness.memory.provider=kube_agents_memory",
+    "--set", "platformAgent.harness.hermes.dashboardEnabled=false",
+    "--set", "githubMinter.enabled=true",
+    "--set", "githubMinter.org=foo",
+    "--set", "githubMinter.repo=bar",
+    "--set", "platformAgent.integration.github.gitRepo=foo/bar",
+    "--set", "platformAgent.integration.github.org=foo",
+    "--set", "webConsole.enabled=true",
+    "--set", "platformAgent.mode=next",
+]
+
+
+class CompositionChartVarsWalkerTest(unittest.TestCase):
+    """The HCL walker the map-completeness test rests on, over the shapes main.tf uses."""
+
+    def test_a_var_inside_a_function_or_a_for_expression_is_credited_to_its_leaf(self):
+        src = """{
+          a = try(var.x, false)
+          b = coalesce(var.y, "50Gi")
+          c = [for r in var.z.rules : { for k, v in r : k => v if v != null }]
+          d = [{ e = local.n }, var.w]
+          e = { for k in var.v : k => k }
+          f = {
+            for k, v in var.u : k => v
+          }
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src),
+            {("a", "x"), ("b", "y"), ("c", "z"), ("d", "w"), ("e", "local.n"), ("e", "v"), ("f", "u")},
+        )
+
+    def test_a_local_a_module_output_or_a_template_string_is_recorded_as_itself(self):
+        # The shapes the walker cannot follow to a tfvar: recorded verbatim, so the map
+        # test fails on one under a footprint key instead of staying green.
+        src = """{
+          a = local.n
+          b = { size = "${var.x}" }
+          c = "${local.p}-suffix"
+          d = module.m.out
+          e = "$${literal}"
+          f = each.value.g
+          g = var.y
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src),
+            {
+                ("a", "local.n"), ("b.size", '"${var.x}"'), ("c", '"${local.p}-suffix"'),
+                ("d", "module.m.out"), ("f", "each.value.g"), ("g", "y"),
+            },
+        )
+        self.assertEqual([ref for _, ref in _hcl_chart_vars(src) if re.fullmatch(_HCL_IDENT, ref)], ["y"])
+
+    def test_a_var_in_a_condition_after_a_block_is_not_credited_to_the_previous_leaf(self):
+        # main.tf's shape: a leaf set from a local, then a merge() argument gated on a var.
+        src = """{
+          root = merge({
+            integration = local.integration
+          }, var.size == local.default_size ? {} : {
+            storage = { size = var.size }
+          }, var.mode == "today" ? {} : {
+            mode = var.mode
+          })
+        }"""
+        self.assertEqual(
+            _hcl_chart_vars(src),
+            {("root.integration", "local.integration"), ("root.storage.size", "size"), ("root.mode", "mode")},
+        )
+
+    def test_nested_blocks_and_bare_vars_record_the_full_path(self):
+        src = """{
+          a = {
+            b = { c = var.x }
+            d = var.y ? { e = 1 } : {}
+            f = local.g
+          }
+          h = var.z
+        }"""
+        self.assertEqual(_hcl_chart_vars(src), {("a.b.c", "x"), ("a.d", "y"), ("a.f", "local.g"), ("h", "z")})
+
+
+class FootprintSummaryTest(unittest.TestCase):
+    def _run(self, script, helm_script=None, tfvars=_FOOTPRINT_TFVARS, without_helm=False):
+        """Source installer_common.sh and run `script` with a tfvars file at $TFVARS.
+
+        `helm_script` puts a stub helm first on PATH; `without_helm` runs on a PATH
+        of the essential tools only, where no helm exists. Otherwise the real helm
+        answers.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tfvars_path = pathlib.Path(tmp) / "terraform.tfvars"
+            tfvars_path.write_text(tfvars)
+            if without_helm:
+                bin_dir = create_minimal_tools_bin(tmp)
+                env = get_isolated_test_env(overrides={"TFVARS": str(tfvars_path)})
+                env["PATH"] = str(bin_dir)
+            else:
+                bin_dir = pathlib.Path(tmp) / "bin"
+                bin_dir.mkdir()
+                if helm_script:
+                    helm = bin_dir / "helm"
+                    helm.write_text(helm_script)
+                    helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
+                env = get_isolated_test_env(overrides={"TFVARS": str(tfvars_path)}, bin_dir=str(bin_dir))
+            body = (
+                f'set -u\n{_PRINT_STUBS}\nprint_warning() {{ echo "WARN: $*"; }}\n'
+                f'print_info() {{ echo "INFO: $*"; }}\nsource "{_INSTALLER_COMMON}"\n{script}'
+            )
+            return subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT))
+
+    def test_tfvars_scalar_reads_the_generator_shapes(self):
+        proc = self._run(
+            'for k in platform_agent_storage_size enable_github_minter hermes_dashboard_enabled '
+            'web_console_enabled memory_provider absent_key; do '
+            'printf "%s=[%s]\\n" "$k" "$(tfvars_scalar "$TFVARS" "$k")"; done'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("platform_agent_storage_size=[200Gi]", proc.stdout)
+        self.assertIn("enable_github_minter=[true]", proc.stdout)
+        self.assertIn("hermes_dashboard_enabled=[false]", proc.stdout)
+        self.assertIn("web_console_enabled=[true]", proc.stdout)
+        self.assertIn("memory_provider=[kube_agents_memory]", proc.stdout)
+        self.assertIn("absent_key=[]", proc.stdout)
+
+    def test_render_passes_each_tfvars_setting_under_its_chart_key(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        args_line = next((line for line in proc.stdout.splitlines() if line.startswith("args: ")), None)
+        self.assertIsNotNone(args_line, proc.stdout)
+        self.assertTrue(args_line.startswith("args: template footprint-summary "), args_line)
+        for item in _FOOTPRINT_EXPECTED_SETS:
+            self.assertIn(item, args_line)
+        # The tfvars say autopilot: the render is told the cluster serves the resource the
+        # chart probes, so the credential proxy is counted at its Autopilot requests.
+        self.assertIn(f"--api-versions {_AUTOPILOT_API}", args_line)
+        # The block scalar's indent is stripped and nothing but its lines come out.
+        self.assertIn("\nsecond line\n", proc.stdout)
+        self.assertNotIn("kind: ConfigMap", proc.stdout)
+
+    def test_render_passes_nothing_for_a_key_the_tfvars_lacks(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            helm_script=_ECHO_HELM,
+            tfvars='platform_agent_storage_size = "80Gi"\n',
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("--set platformAgent.storage.size=80Gi", proc.stdout)
+        for item in _FOOTPRINT_EXPECTED_SETS[1:]:
+            self.assertNotIn(item.split("=")[0], proc.stdout)
+
+    def test_the_map_carries_every_footprint_key_the_composition_sets_from_a_tfvar(self):
+        # Checked against main.tf, the mapping's owner, rather than against a copy of
+        # the map: a composition variable that reaches a key the summary reads and is
+        # not forwarded makes the installer's figure differ from the notes'.
+        pairs = _composition_chart_vars()
+        self.assertGreater(len(pairs), 20, pairs)
+        value_map = _footprint_value_map()
+        footprint_pairs = {
+            (key, ref) for key, ref in pairs
+            if key in _FOOTPRINT_READ_KEYS or key.startswith(tuple(f"{s}." for s in _FOOTPRINT_READ_SUBTREES))
+        }
+        self.assertTrue(footprint_pairs)
+        # A footprint key set from a local, a module output or a template string is one
+        # the walker cannot follow to a tfvar; it fails here rather than passing unseen.
+        unfollowed = sorted((key, ref) for key, ref in footprint_pairs if not re.fullmatch(_HCL_IDENT, ref))
+        self.assertFalse(
+            unfollowed,
+            f"main.tf sets footprint keys from something this test cannot follow to a tfvar: {unfollowed}. "
+            "Set them from var.<name> and carry the pair in FOOTPRINT_TFVARS_VALUE_MAP, or the installer's "
+            "figure drifts from the notes'.",
+        )
+        for key, var in sorted(footprint_pairs):
+            self.assertEqual(value_map.get(var), key, f"main.tf sets {key} from var.{var}; FOOTPRINT_TFVARS_VALUE_MAP must carry {var}={key}")
+        for var, key in value_map.items():
+            self.assertIn((key, var), pairs, f"the map forwards {var} to {key}, which main.tf does not set from var.{var}")
+
+    def test_a_standard_cluster_is_told_the_rates_price_pods_not_nodes(self):
+        standard = _FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"')
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM, tfvars=standard)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("This is a GKE Standard cluster", proc.stdout)
+        # The install creates a gVisor pool only when asked; the sentence claims no pool.
+        self.assertNotIn("gVisor", proc.stdout)
+        # And its render is not told the cluster is Autopilot.
+        self.assertNotIn("--api-versions", proc.stdout)
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
+        self.assertNotIn("GKE Standard cluster", proc.stdout)
+        self.assertIn(f"--api-versions {_AUTOPILOT_API}", proc.stdout)
+
+    def test_extra_helm_values_are_named_as_outside_the_figure(self):
+        script = f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"'
+        caveat = "Chart values set through the composition's extra_helm_values are not in this figure"
+        proc = self._run(script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
+        proc = self._run("export TF_VAR_extra_helm_values='{litellm={replicaCount=4}}'\n" + script, helm_script=_ECHO_HELM)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn(caveat, proc.stdout)
+        # The apply goes through Terraform, which shows no notes: the hint names the
+        # command that prints them, for the namespace the tfvars carry.
+        self.assertIn("'helm get notes kube-agents -n agents-ns' prints it", proc.stdout)
+        self.assertNotIn("install notes", proc.stdout)
+        # Every variables file Terraform auto-loads beside the generated terraform.tfvars.
+        for name in ("extra.auto.tfvars", "extra.auto.tfvars.json", "terraform.tfvars.json"):
+            proc = self._run(f'touch "$(dirname "$TFVARS")/{name}"\n' + script, helm_script=_ECHO_HELM)
+            self.assertIn(caveat, proc.stdout, name)
+        proc = self._run('touch "$(dirname "$TFVARS")/notes.json"\n' + script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
+        # Terraform's extra command-line arguments: a -var-file from anywhere on disk in
+        # any of the three, or the variable itself; -auto-approve alone, the route
+        # lifecycle.sh reads, carries no values and prints no caveat.
+        for name in ("TF_CLI_ARGS", "TF_CLI_ARGS_plan", "TF_CLI_ARGS_apply"):
+            proc = self._run(f'export {name}="-var-file=$HOME/kube-agents.tfvars"\n' + script, helm_script=_ECHO_HELM)
+            self.assertIn(caveat, proc.stdout, name)
+        proc = self._run("export TF_CLI_ARGS_apply=\"-input=false -var 'extra_helm_values={litellm={replicaCount=4}}'\"\n" + script, helm_script=_ECHO_HELM)
+        self.assertIn(caveat, proc.stdout)
+        proc = self._run('export TF_CLI_ARGS_apply="-var=extra_helm_values={}"\n' + script, helm_script=_ECHO_HELM)
+        self.assertIn(caveat, proc.stdout)
+        proc = self._run('export TF_CLI_ARGS_apply="-auto-approve -input=false"\n' + script, helm_script=_ECHO_HELM)
+        self.assertNotIn(caveat, proc.stdout)
+
+    def test_render_fails_naming_the_cause_when_helm_refuses(self):
+        proc = self._run(
+            f'render_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            helm_script="#!/usr/bin/env bash\necho 'Error: values don'\"'\"'t meet the specifications' >&2\nexit 1\n",
+        )
+        self.assertIn("rc=1", proc.stdout)
+        self.assertIn("values don't meet the specifications", proc.stderr)
+        self.assertNotIn("Release footprint", proc.stdout)
+
+    def test_print_warns_and_goes_on_without_helm(self):
+        proc = self._run(
+            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"', without_helm=True
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("WARN: Could not render the release footprint summary: helm is not on PATH", proc.stdout)
+        self.assertNotIn("Release footprint", proc.stdout)
+        # The fallback is the one command that shows the notes after a Terraform apply,
+        # not the notes the apply never prints nor a dry run the operator cannot value.
+        self.assertIn("'helm get notes kube-agents -n agents-ns' prints them", proc.stdout)
+        self.assertNotIn("install notes", proc.stdout)
+        self.assertNotIn("helm install", proc.stdout)
+        # Without a namespace in the tfvars the hint carries the placeholder.
+        proc = self._run(
+            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            tfvars=_FOOTPRINT_TFVARS.replace('namespace    = "agents-ns"\n', ""), without_helm=True,
+        )
+        self.assertIn("'helm get notes kube-agents -n <namespace>' prints them", proc.stdout)
+
+    def test_print_warns_and_goes_on_when_the_chart_is_not_in_the_checkout(self):
+        proc = self._run('print_footprint_summary /nonexistent "$TFVARS"; echo "rc=$?"', helm_script=_ECHO_HELM)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("WARN: Could not render the release footprint summary: the chart at /nonexistent/", proc.stdout)
+
+    @unittest.skipIf(shutil.which("helm") is None, "helm is required to render the chart")
+    def test_real_render_prints_the_notes_block_for_the_tfvars(self):
+        proc = self._run(f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"')
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
+        self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
+        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console,
+        # and, since the tfvars say next, the NATS bus's three 40Gi JetStream claims (one per server) and the
+        # next-mode pods the preflight now sums: the settings the tfvars carry reached
+        # the render.
+        self.assertIn("Persistent storage:  530 GiB over 8 claims", proc.stdout)
+        self.assertIn("Pods:                24", proc.stdout)
+        # The tfvars say autopilot, so the credential proxy is counted at the operator's
+        # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
+        # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
+        self.assertIn("CPU requests:        5.800 cores", proc.stdout)
+        self.assertIn("Memory requests:     13.28 GiB", proc.stdout)
+        standard = self._run(
+            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+            tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+        )
+        self.assertIn("rc=0", standard.stdout, standard.stderr)
+        self.assertIn("CPU requests:        4.300 cores", standard.stdout)
+        self.assertIn("Memory requests:     12.28 GiB", standard.stdout)
+        # The tfvars say next, so the installer prints the caveat the notes print.
+        self.assertIn("Not counted: the session pods", proc.stdout)
+        # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one
+        # wording. NOTES.txt is captured through a ConfigMap, as the chart tests do.
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = chart_with_notes_probe(_REPO_ROOT / "charts" / "kube-agents", pathlib.Path(tmp) / "kube-agents")
+            rendered = subprocess.run(
+                ["helm", "template", "test-release", str(chart), "--show-only",
+                 NOTES_PROBE_TEMPLATE, "--api-versions", _AUTOPILOT_API, *_NOTES_SETS],
+                capture_output=True, text=True, check=True,
+            )
+            notes_text = json.loads(rendered.stdout.split("notes: ", 1)[1].strip())
+        summary_lines = [line[6:] for line in proc.stdout.splitlines() if line.startswith("      ")]
+        self.assertTrue(summary_lines, proc.stdout)
+        self.assertIn("\n".join(summary_lines), notes_text)
+
 
 if __name__ == "__main__":
     unittest.main()

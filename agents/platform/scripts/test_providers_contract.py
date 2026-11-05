@@ -130,6 +130,11 @@ REVIEW_STATES = frozenset({"approved", "changes_requested", "commented", "dismis
 # What every recording of `proposal-list-by-author` and `proposal-tally` says
 # the forge counted, and who closed the proposal in `proposal-closer`.
 RECORDED_TOTAL = 8
+# Forges whose listing gives no count of the query, so `total` is None.
+FORGES_WITHOUT_A_COUNT = frozenset({"bitbucket-datacenter"})
+# Forges whose author filter cannot find the install's account, so the forge
+# reads the repository's proposals and keeps the author's itself.
+FORGES_THAT_FILTER_THE_AUTHOR_HERE = frozenset({"bitbucket-datacenter"})
 RECORDED_TALLY = {"open": 2, "merged": 5, "closed": 1}
 RECORDED_CLOSER = {"actor": "example-maintainer", "bot": False}
 # The address the broker stamps the install's proxied commits with. No forge
@@ -152,6 +157,23 @@ PROSELESS_WRITES = frozenset({"proposal-close", "issue-close"})
 
 
 TESTDATA = Path(__file__).resolve().parent / "testdata" / "providers"
+
+# How the fixtures' repository, `acme/infra`, appears in a forge's API path.
+REPOSITORY_IN_PATH = ("acme/infra", "acme%2Finfra", "acme/repos/infra")
+
+
+def strings_in(value: Any) -> list[str]:
+    """Every string in a request body, at any depth.
+
+    A forge's API may nest the text a caller wrote -- Bitbucket Cloud takes a
+    comment as `{"content": {"raw": ...}}` -- and it is still in the body, not
+    in the path or the query.
+    """
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in strings_in(item)]
+    if isinstance(value, list):
+        return [text for item in value for text in strings_in(item)]
+    return [str(value)]
 
 
 def fixtures_dir(forge_class: type) -> Path:
@@ -493,9 +515,10 @@ class ContractTest(unittest.TestCase):
                         self.assertFalse(path.startswith("/"))
                         # The repository, in the form the forge's API keys
                         # it by: GitLab's takes the whole path as one
-                        # URL-encoded segment.
+                        # URL-encoded segment, and Bitbucket Data Center's
+                        # puts `repos` between the project and the slug.
                         self.assertTrue(
-                            "acme/infra" in path or "acme%2Finfra" in path,
+                            any(spelling in path for spelling in REPOSITORY_IN_PATH),
                             f"{path} does not name the repository",
                         )
                         self.assertIsInstance(params, (dict, type(None)))
@@ -546,13 +569,13 @@ class ContractTest(unittest.TestCase):
                         carrying = [
                             c
                             for c in writes
-                            if text and text in [str(v) for v in (c[3] or {}).values()]
+                            if text and text in strings_in(c[3] or {})
                         ]
                         method, path, params, body, _raw = (carrying or writes)[0]
                         self.assertIn(method, {"POST", "PATCH", "PUT"})
                         self.assertIsInstance(body, dict)
                         if text:
-                            self.assertIn(text, [str(value) for value in body.values()])
+                            self.assertIn(text, strings_in(body))
                             self.assertNotIn(text, path)
                             self.assertNotIn(
                                 text, [str(value) for value in (params or {}).values()]
@@ -625,7 +648,11 @@ class ContractTest(unittest.TestCase):
                 self.assertEqual(set(answer), {"proposals", "count", "truncated", "total"})
                 self.assertEqual(answer["count"], len(answer["proposals"]))
                 self.assertIsInstance(answer["truncated"], bool)
-                self.assertEqual(RECORDED_TOTAL, answer["total"])
+                if name in FORGES_WITHOUT_A_COUNT:
+                    # The forge pages by position and counts no query.
+                    self.assertIsNone(answer["total"])
+                else:
+                    self.assertEqual(RECORDED_TOTAL, answer["total"])
                 self.assertTrue(answer["proposals"])
                 for item in answer["proposals"]:
                     self.assertEqual(set(item), AUTHORED_SHAPE)
@@ -635,10 +662,14 @@ class ContractTest(unittest.TestCase):
                 # Each recording holds one proposal in each state, so a forge
                 # that told merged from closed wrongly fails here.
                 self.assertEqual(PROPOSAL_STATES, {item["state"] for item in answer["proposals"]})
-                # Filtered at the forge, on the author the payload names.
+                # Filtered at the forge, on the author the payload names; a
+                # forge whose filter cannot find the author filters its one
+                # read itself.
                 self.assertEqual(1, len(api.calls))
                 method, _path, params, _body, _raw = api.calls[0]
                 self.assertEqual("GET", method)
+                if name in FORGES_THAT_FILTER_THE_AUTHOR_HERE:
+                    continue
                 wanted = {str(fixture["payload"]["author"]), str(fixture["payload"].get("authorId"))}
                 self.assertTrue(
                     any(token in str(value) for value in params.values() for token in wanted),
@@ -951,9 +982,14 @@ class ContractTest(unittest.TestCase):
                     # property is about the forges that give one.
                     continue
                 url = forge.capabilities(repo)["fileUrl"]
-                self.assertTrue(url.startswith(f"https://{forge.hosts[0]}/acme/infra/"))
+                self.assertTrue(url.startswith(f"https://{forge.hosts[0]}/"), url)
+                # The repository's own page: its path names the repository,
+                # however the forge lays the page out around it.
+                self.assertTrue(
+                    any(f"/{spelling}/" in url for spelling in REPOSITORY_IN_PATH), url
+                )
                 self.assertIn("{ref}", url)
-                self.assertTrue(url.endswith("{path}"))
+                self.assertIn("{path}", url)
                 self.assertNotIn("@", url)
 
     def test_a_github_file_url_is_exactly_the_blob_page(self):
