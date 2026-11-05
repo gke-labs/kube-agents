@@ -307,7 +307,7 @@ def recall_decisions(query: str, max_results: int = 4) -> List[str]:
         if not text:
             continue
         is_okf = (
-            rec_id.startswith(("DEC-", "LES-"))
+            rec_id.startswith(("DEC-", "LES-", "ADR-", "RFC-"))
             or doc_id.startswith("okf:")
             or rec_id in records_by_id
         )

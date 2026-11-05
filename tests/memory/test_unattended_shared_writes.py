@@ -281,6 +281,66 @@ class TestUnattendedSharedWrites(unittest.TestCase):
             self.assertEqual(r.get("result"), "Stored in shared memory.", r)
             self.assertEqual(retained["items"][0]["tags"], [SHARED_TAG], retained)
 
+    def test_handoff_checkpoint_stores_under_checkpoint_strategy_without_gitops_pr(self):
+        """Iteration-budget handoff checkpoints store directly in Hindsight under
+        CHECKPOINT_STRATEGY with `kind:handoff` and do not open a GitOps PR.
+        """
+        from unittest.mock import patch
+        from kube_agents_memory import client as kam_client
+        from kube_agents_memory.config_schema import CHECKPOINT_STRATEGY
+
+        p, retained = provider(unattended=True)
+        p._session_id = "sess-42"
+        with patch.dict(
+            os.environ,
+            {
+                "NATS_URL": "nats://localhost:4222",
+                "DECISION_MEMORY_GITOPS_PRS": "true",
+            },
+        ), patch.object(kam_client, "emit_shared_decision") as emit_mock:
+            r = json.loads(
+                p.handle_tool_call(
+                    "memory_retain",
+                    {
+                        "content": "Verified: checkout OOM is not caused by HPA. Remaining: inspect Redis pool.",
+                        "kind": "handoff",
+                    },
+                )
+            )
+            emit_mock.assert_not_called()
+            self.assertEqual(r.get("kind"), "handoff", r)
+            self.assertEqual(retained["items"][0]["strategy"], CHECKPOINT_STRATEGY, retained)
+            self.assertIn("kind:handoff", retained["items"][0]["tags"], retained)
+            self.assertIn("session:sess-42", retained["items"][0]["tags"], retained)
+
+    def test_recall_since_hours_filters_older_timestamps(self):
+        """Shift-handover recall with `since_hours` filters out memories older than the lookback window."""
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+        from kube_agents_memory import client as kam_client
+
+        p, _ = provider(unattended=True)
+        now = datetime.now(timezone.utc)
+        recent_ts = (now - timedelta(hours=2)).isoformat()
+        stale_ts = (now - timedelta(hours=36)).isoformat()
+        fake_results = [
+            SimpleNamespace(text="Recent checkout handoff note", occurred_start=recent_ts),
+            SimpleNamespace(text="Old staging alert from two days ago", occurred_start=stale_ts),
+        ]
+        with patch.object(kam_client, "recall", return_value=fake_results), \
+             patch.object(kam_client, "recall_decisions", return_value=[]):
+            r = json.loads(
+                p.handle_tool_call(
+                    "memory_recall",
+                    {"query": "shift handover", "scope": "shared", "since_hours": 12},
+                )
+            )
+            self.assertEqual(r["status"], "found", r)
+            self.assertEqual(r["matches"], 1, r)
+            self.assertEqual(r["searched"].get("since_hours"), 12, r)
+            self.assertIn("Recent checkout handoff note", r["result"], r)
+            self.assertNotIn("Old staging alert", r["result"], r)
+
 
 if __name__ == "__main__":
     unittest.main()

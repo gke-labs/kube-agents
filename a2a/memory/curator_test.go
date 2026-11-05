@@ -606,3 +606,54 @@ spec:
 		t.Fatalf("expected Reviewer Modification Before Merge section in body, got:\n%s", foundMod.Body)
 	}
 }
+
+func TestExternalDocRecordsAndRepoBoundary(t *testing.T) {
+	repoDir := t.TempDir()
+	adrDir := filepath.Join(repoDir, "docs", "adr")
+	if err := os.MkdirAll(adrDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	adrText := "# ADR 12: Regional PostgreSQL Failover\n\n## Decision\nAlways keep a warm standby replica in a secondary zone.\n"
+	if err := os.WriteFile(filepath.Join(adrDir, "0012-regional-postgres-failover.md"), []byte(adrText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recs, err := LoadExternalDocRecords(repoDir)
+	if err != nil {
+		t.Fatalf("LoadExternalDocRecords: %v", err)
+	}
+	if len(recs) != 1 || recs[0].Meta.ID != "ADR-0012" {
+		t.Fatalf("expected ADR-0012, got %+v", recs)
+	}
+	if !strings.Contains(recs[0].Meta.Title, "Regional PostgreSQL Failover") {
+		t.Fatalf("unexpected ADR title: %q", recs[0].Meta.Title)
+	}
+
+	kDir := filepath.Join(repoDir, "knowledge")
+	if err := os.MkdirAll(kDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sob := "---\nrepo: acme/infra\nmanaged_namespaces:\n  - checkout\n  - payments\nunmanaged_namespaces:\n  - legacy-billing\nenforce_namespace_boundary: true\n---\n\n# State of Being\n"
+	if err := os.WriteFile(filepath.Join(kDir, "STATE_OF_BEING.md"), []byte(sob), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	boundary := LoadRepoBoundary(repoDir)
+	if !boundary.EnforceNamespaceBoundary || len(boundary.ManagedNamespaces) != 2 {
+		t.Fatalf("unexpected boundary: %+v", boundary)
+	}
+
+	badYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: billing-worker\n  namespace: legacy-billing\n"
+	okYAML := "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout-api\n  namespace: checkout\n"
+	repBlock := CheckChangedFilesWithBoundary(nil, map[string]*string{
+		"apps/legacy-billing/deployment.yaml": &badYAML,
+	}, boundary)
+	if repBlock.Verdict != "block" || len(repBlock.Findings) != 1 || repBlock.Findings[0].ID != RepoBoundaryID {
+		t.Fatalf("expected REPO-BOUNDARY block finding, got %+v", repBlock)
+	}
+
+	repOK := CheckChangedFilesWithBoundary(nil, map[string]*string{
+		"apps/checkout/deployment.yaml": &okYAML,
+	}, boundary)
+	if repOK.Verdict != "ok" || len(repOK.Findings) != 0 {
+		t.Fatalf("expected ok verdict for managed namespace, got %+v", repOK)
+	}
+}

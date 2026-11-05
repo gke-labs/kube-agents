@@ -1243,6 +1243,9 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 
 	c.mu.Lock()
 	records, _ := LoadRecords(c.cfg.RepoDir)
+	if extRecords, err := LoadExternalDocRecords(c.cfg.RepoDir); err == nil && len(extRecords) > 0 {
+		records = append(records, extRecords...)
+	}
 	repoID := c.cfg.RepoID
 	c.mu.Unlock()
 

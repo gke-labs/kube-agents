@@ -54,12 +54,14 @@ import yaml
 DEFAULT_BANK_ID = "kube-agents-decisions"
 SHARED_TAG = "scope:shared"
 RECORD_DIRS = ("knowledge/decisions", "knowledge/lessons")
+EXTERNAL_DOC_DIRS = ("docs/adr", "docs/adrs", "docs/rfcs", "adr", "rfcs")
 RECORD_TYPES = ("decision", "lesson")
 STATUSES = ("proposed", "active", "rejected", "superseded", "retired")
 SEVERITIES = ("block", "warn", "info")
 VALID_OPS = ("==", "!=", ">=", ">", "<=", "<", "absent", "present", "regex")
 RECORD_STRATEGY = "record"
 DOC_PREFIX = "okf:"
+REPO_BOUNDARY_ID = "REPO-BOUNDARY"
 DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
 DEFAULT_PAGE_SIZE = 100
 DEFAULT_RECALL_MAX_TOKENS = 2048
@@ -248,13 +250,158 @@ def load_records(repo: Path) -> List[Record]:
         if not base.is_dir():
             continue
         for p in sorted(base.glob("*.md")):
-            if p.name.lower() in ("index.md", "readme.md"):
+            if p.name.lower() in ("index.md", "readme.md", "template.md"):
                 continue
             rel = str(p.relative_to(repo))
             try:
                 out.append(parse_record(p.read_text(), rel))
             except (ValueError, yaml.YAMLError) as exc:
                 out.append(Record(path=rel, meta={"_parse_error": str(exc)}, body=""))
+    return out
+
+
+_EXTERNAL_ID_RE = re.compile(r"\b(DEC-\d{4}-\d{3,}|LES-\d{4}-\d{3,}|ADR-\d{1,5}|RFC-\d{1,5})\b", re.I)
+_LEADING_NUM_RE = re.compile(r"^0*(\d{1,5})(?:[-_.\s]+(.*))?$")
+
+
+def parse_external_doc_record(text: str, rel_path: str) -> Record:
+    """Parse a Markdown ADR or RFC (with or without strict OKF frontmatter) into a Record."""
+    meta: Dict[str, Any] = {}
+    body = text
+    m = FRONTMATTER.match(text)
+    if m:
+        try:
+            loaded = yaml.safe_load(m.group(1))
+            if isinstance(loaded, dict):
+                meta = dict(loaded)
+                body = m.group(2)
+        except yaml.YAMLError:
+            pass
+
+    stem = Path(rel_path).stem
+    lower_rel = rel_path.lower()
+    is_rfc = "rfc" in lower_rel
+    prefix = "RFC" if is_rfc else "ADR"
+
+    rec_id = str(meta.get("id") or "").strip()
+    if not rec_id:
+        m_id = _EXTERNAL_ID_RE.search(stem) or _EXTERNAL_ID_RE.search(body[:400])
+        if m_id:
+            rec_id = m_id.group(1).upper()
+        else:
+            m_num = _LEADING_NUM_RE.match(stem)
+            if m_num:
+                rec_id = f"{prefix}-{int(m_num.group(1)):04d}"
+            else:
+                clean_slug = re.sub(r"[^A-Za-z0-9]+", "-", stem).strip("-").upper()[:32] or "DOC"
+                rec_id = f"{prefix}-{clean_slug}"
+
+    title = str(meta.get("title") or "").strip()
+    if not title:
+        for line in body.splitlines():
+            s = line.strip()
+            if s.startswith("#"):
+                title = s.lstrip("#").strip()
+                break
+    if not title:
+        title = stem.replace("-", " ").replace("_", " ").strip() or rec_id
+
+    raw_status = str(meta.get("status") or "active").strip().lower()
+    status_map = {
+        "accepted": "active",
+        "approved": "active",
+        "active": "active",
+        "proposed": "proposed",
+        "draft": "proposed",
+        "rejected": "rejected",
+        "deprecated": "superseded",
+        "superseded": "superseded",
+        "retired": "retired",
+        "obsolete": "retired",
+    }
+    status = status_map.get(raw_status, "active")
+    rtype = str(meta.get("type") or "decision").strip().lower()
+    if rtype not in RECORD_TYPES:
+        rtype = "decision"
+    scope = meta.get("scope") if isinstance(meta.get("scope"), dict) else {"paths": ["**"]}
+    if not any(scope.get(k) for k in ("paths", "resources", "checks")):
+        scope = dict(scope)
+        scope["paths"] = ["**"]
+
+    norm_meta = dict(meta)
+    norm_meta.update({
+        "type": rtype,
+        "id": rec_id,
+        "title": title,
+        "status": status,
+        "scope": scope,
+        "_external_doc": True,
+    })
+    return Record(path=rel_path, meta=norm_meta, body=body)
+
+
+def _configured_extra_repos(primary_repo: Path, extra_repos: Optional[Iterable[str]] = None) -> List[Path]:
+    """Return additional local repository checkouts from --extra-repo or REPOSITORIES_JSON."""
+    candidates: List[Path] = []
+    seen = {primary_repo.resolve()}
+    raw_list: List[str] = list(extra_repos or [])
+    env_repos = os.environ.get("DECISION_MEMORY_EXTRA_REPOS", "").strip()
+    if env_repos:
+        raw_list.extend(p.strip() for p in env_repos.split(",") if p.strip())
+    repos_json = os.environ.get("REPOSITORIES_JSON", "").strip()
+    if repos_json:
+        try:
+            entries = json.loads(repos_json)
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        for key in ("path", "local_path", "checkout_path", "url", "repo"):
+                            val = str(entry.get(key) or "").strip()
+                            if val:
+                                raw_list.append(val)
+                                break
+                    elif isinstance(entry, str) and entry.strip():
+                        raw_list.append(entry.strip())
+        except Exception:
+            pass
+    for spec in raw_list:
+        resolved = _resolve_repo_dir(spec)
+        if resolved.is_dir():
+            rpath = resolved.resolve()
+            if rpath not in seen:
+                seen.add(rpath)
+                candidates.append(resolved)
+    return candidates
+
+
+def load_external_doc_records(repo: Path, extra_repos: Optional[Iterable[str]] = None) -> List[Record]:
+    """Load Markdown ADRs and RFCs from docs/adr, docs/rfcs, etc. across repo and extra_repos."""
+    out: List[Record] = []
+    seen_ids = {r.id for r in load_records(repo) if r.id}
+    repos_to_scan = [repo] + _configured_extra_repos(repo, extra_repos)
+    for idx, rdir in enumerate(repos_to_scan):
+        prefix = "" if idx == 0 else f"{rdir.name}:"
+        if idx > 0:
+            for r in load_records(rdir):
+                if not validate_record(r) and r.id not in seen_ids:
+                    seen_ids.add(r.id)
+                    out.append(Record(path=f"{prefix}{r.path}", meta=r.meta, body=r.body))
+        for d in EXTERNAL_DOC_DIRS:
+            base = rdir / d
+            if not base.is_dir():
+                continue
+            for p in sorted(base.rglob("*.md")):
+                if p.name.lower() in ("index.md", "readme.md", "template.md", "0000-template.md"):
+                    continue
+                rel = f"{prefix}{p.relative_to(rdir).as_posix()}"
+                try:
+                    rec = parse_external_doc_record(p.read_text(), rel)
+                except OSError:
+                    continue
+                if rec.id in seen_ids:
+                    continue
+                seen_ids.add(rec.id)
+                out.append(rec)
     return out
 
 
@@ -390,6 +537,175 @@ def _resources_in(content: str) -> List[str]:
     return out
 
 
+_CLUSTER_SCOPED_KINDS = frozenset({
+    "Namespace",
+    "ClusterRole",
+    "ClusterRoleBinding",
+    "CustomResourceDefinition",
+    "Node",
+    "PersistentVolume",
+    "StorageClass",
+    "IngressClass",
+    "PriorityClass",
+    "RuntimeClass",
+    "MutatingWebhookConfiguration",
+    "ValidatingWebhookConfiguration",
+})
+
+
+def _manifest_namespaces_in(content: str, rel_path: str = "") -> List[str]:
+    """Extract target namespaces declared in a Kubernetes YAML manifest."""
+    namespaces: List[str] = []
+    try:
+        for d in yaml.safe_load_all(content):
+            if not isinstance(d, dict):
+                continue
+            kind = str(d.get("kind") or "").strip()
+            md = d.get("metadata") if isinstance(d.get("metadata"), dict) else {}
+            if not kind or not md:
+                continue
+            if kind == "Namespace":
+                name = str(md.get("name") or "").strip()
+                if name:
+                    namespaces.append(name)
+                continue
+            if kind in ("Application", "ApplicationSet"):
+                dest = (d.get("spec") or {}).get("destination") or {}
+                if isinstance(dest, dict) and dest.get("namespace"):
+                    namespaces.append(str(dest["namespace"]).strip())
+                continue
+            if kind in ("Kustomization", "HelmRelease"):
+                target_ns = (d.get("spec") or {}).get("targetNamespace")
+                if target_ns:
+                    namespaces.append(str(target_ns).strip())
+                continue
+            if kind in _CLUSTER_SCOPED_KINDS:
+                continue
+            ns = str(md.get("namespace") or "").strip()
+            if ns:
+                namespaces.append(ns)
+    except yaml.YAMLError:
+        pass
+    if not namespaces and rel_path:
+        parts = Path(rel_path).parts
+        for idx, p in enumerate(parts[:-1]):
+            if p in ("namespaces", "apps", "tenants") and idx + 1 < len(parts) - 1:
+                cand = parts[idx + 1]
+                if cand and not cand.startswith("."):
+                    namespaces.append(cand)
+                    break
+    return sorted({n for n in namespaces if n and "{{" not in n and "$" not in n})
+
+
+def _discover_managed_namespaces(repo: Path) -> List[str]:
+    """Discover the repository's managed Kubernetes namespaces from GitOps manifests."""
+    discovered = set()
+    for rel in _list_repo_files(repo):
+        if rel.startswith("knowledge/") or not (rel.endswith(".yaml") or rel.endswith(".yml")):
+            continue
+        fp = repo / rel
+        if not fp.is_file():
+            continue
+        try:
+            content = fp.read_text()
+        except OSError:
+            continue
+        for ns in _manifest_namespaces_in(content, rel):
+            discovered.add(ns)
+    return sorted(discovered)
+
+
+def _load_repo_boundary(repo: Path) -> Dict[str, Any]:
+    """Load repository ownership boundary metadata from knowledge/STATE_OF_BEING.md frontmatter."""
+    sob = repo / "knowledge/STATE_OF_BEING.md"
+    if not sob.is_file():
+        return {}
+    try:
+        text = sob.read_text()
+    except OSError:
+        return {}
+    m = FRONTMATTER.match(text)
+    if not m:
+        return {}
+    try:
+        meta = yaml.safe_load(m.group(1))
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(meta, dict):
+        return {}
+    managed = [str(x).strip() for x in (meta.get("managed_namespaces") or []) if str(x).strip()]
+    unmanaged = [str(x).strip() for x in (meta.get("unmanaged_namespaces") or []) if str(x).strip()]
+    enforce = bool(meta.get("enforce_namespace_boundary", False))
+    return {
+        "managed_namespaces": managed,
+        "unmanaged_namespaces": unmanaged,
+        "enforce_namespace_boundary": enforce,
+    }
+
+
+def _evaluate_repo_boundary(
+    changed: Dict[str, Optional[str]],
+    boundary: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Check whether modified manifests target namespaces outside the repository's ownership boundary."""
+    if not boundary:
+        return None
+    managed = set(boundary.get("managed_namespaces") or [])
+    unmanaged = set(boundary.get("unmanaged_namespaces") or [])
+    enforce = bool(boundary.get("enforce_namespace_boundary", False))
+    if not unmanaged and not (enforce and managed):
+        return None
+
+    violating_files: List[str] = []
+    guard_results: List[Dict[str, Any]] = []
+    for fpath, content in sorted(changed.items()):
+        if content is None or fpath.startswith("knowledge/"):
+            continue
+        if not (fpath.endswith(".yaml") or fpath.endswith(".yml")):
+            continue
+        for ns in _manifest_namespaces_in(content, fpath):
+            is_unmanaged = (ns in unmanaged) or (enforce and bool(managed) and ns not in managed)
+            if is_unmanaged:
+                if fpath not in violating_files:
+                    violating_files.append(fpath)
+                guard_results.append({
+                    "file": fpath,
+                    "actual": f"namespace={ns}",
+                    "ok": False,
+                })
+    if not guard_results:
+        return None
+    managed_str = ", ".join(sorted(managed)) if managed else "(none)"
+    rule_msg = (
+        f"Do not create or modify manifests for out-of-scope tenant namespaces in this repository "
+        f"(managed namespaces: {managed_str})."
+    )
+    return {
+        "id": REPO_BOUNDARY_ID,
+        "type": "decision",
+        "status": "active",
+        "title": "Repository namespace ownership boundary (STATE_OF_BEING.md)",
+        "path": "knowledge/STATE_OF_BEING.md",
+        "guard": {"rule": rule_msg, "severity": "block"},
+        "pull_request": None,
+        "breaking_pr": None,
+        "incident": None,
+        "rejected_proposals": None,
+        "supersedes": None,
+        "superseded_by": None,
+        "body": (
+            "This GitOps repository manages only its declared namespaces (`managed_namespaces` in "
+            "`knowledge/STATE_OF_BEING.md`). Workloads in unmanaged or external tenant namespaces are "
+            "owned by separate repositories and must not be added here."
+        ),
+        "verdict": "violates",
+        "severity": "block",
+        "files": violating_files,
+        "guard_results": guard_results,
+        "superseded_records": [],
+    }
+
+
 def _is_fleet_wide_clusters(clusters: List[str]) -> bool:
     return not clusters or clusters == ["*"]
 
@@ -424,13 +740,20 @@ def _select_precedence_winners(records: List[Record], target_files: Iterable[str
     return [r for r in records if r.id not in suppressed_ids]
 
 
-def match_change(records: Iterable[Record], changed: Dict[str, Optional[str]]) -> List[Dict[str, Any]]:
+def match_change(
+    records: Iterable[Record],
+    changed: Dict[str, Optional[str]],
+    boundary: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """changed: {path: new content, or None if deleted}. Returns findings."""
     rec_list = [r for r in records if not r.meta.get("_parse_error")]
     by_id = {r.id: r for r in rec_list}
     active_candidates = [r for r in rec_list if r.status in ("active", "proposed")]
     effective_records = _select_precedence_winners(active_candidates, changed.keys())
     findings = []
+    boundary_finding = _evaluate_repo_boundary(changed, boundary)
+    if boundary_finding:
+        findings.append(boundary_finding)
     new_resources = {p: _resources_in(c) for p, c in changed.items() if c}
     for rec in effective_records:
         s = rec.scope
@@ -891,7 +1214,9 @@ def cmd_index(a) -> Dict[str, Any]:
     repo_id = a.repo_id or repo_identity(repo)
     hs = Hindsight(a.hindsight_url, a.bank)
     hs.ensure_bank()
+    extra_repos = getattr(a, "extra_repo", None) or []
     records = [r for r in load_records(repo) if not validate_record(r)]
+    records.extend(load_external_doc_records(repo, extra_repos))
     wanted = {r.document_id(repo_id): r for r in records}
     existing = {d["id"]: d for d in hs.documents() if str(d.get("id", "")).startswith(f"{DOC_PREFIX}{repo_id}:")}
     upserted, unchanged, deleted = [], [], []
@@ -938,8 +1263,9 @@ def _load_changed(a, repo: Path) -> Dict[str, Optional[str]]:
 def cmd_check(a) -> Dict[str, Any]:
     repo = _resolve_repo_dir(a.knowledge_repo or a.repo)
     records = [r for r in load_records(repo) if not validate_record(r)]
+    boundary = _load_repo_boundary(repo)
     changed = _load_changed(a, _resolve_repo_dir(a.repo))
-    findings = match_change(records, changed)
+    findings = match_change(records, changed, boundary=boundary)
     semantic: List[Dict[str, Any]] = []
     if a.hindsight_url and a.semantic:
         query = a.semantic if isinstance(a.semantic, str) and a.semantic != "auto" else \
@@ -2199,16 +2525,48 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
         triage_counts["routine"] += 1
 
     # Write STATE_OF_BEING.md
+    managed_namespaces = _discover_managed_namespaces(repo)
+    unmanaged_namespaces = [
+        str(x).strip()
+        for x in (getattr(a, "unmanaged_namespaces", None) or [])
+        if str(x).strip()
+    ]
+    enforce_boundary = bool(getattr(a, "enforce_namespace_boundary", False) or unmanaged_namespaces)
     if a.write:
         records = load_records(repo)
+        sob_meta: Dict[str, Any] = {
+            "repo": gh_repo,
+            "managed_namespaces": managed_namespaces,
+        }
+        if unmanaged_namespaces:
+            sob_meta["unmanaged_namespaces"] = unmanaged_namespaces
+        if enforce_boundary:
+            sob_meta["enforce_namespace_boundary"] = True
         sob_lines = [
             f"# State of Being — `{gh_repo}`",
             "",
             "Generated by the Decision Memory First-Two-Hours Bootstrap Harvester.",
             "",
-            "## Active Decisions and Lessons",
+            "## Managed Namespaces & Repository Ownership",
             "",
         ]
+        if managed_namespaces:
+            sob_lines.append(
+                "Managed namespaces discovered from manifests and GitOps targets: "
+                + ", ".join(f"`{ns}`" for ns in managed_namespaces)
+            )
+        else:
+            sob_lines.append("No explicit namespace manifests discovered in this repository.")
+        if unmanaged_namespaces:
+            sob_lines.append(
+                "Out-of-scope / unmanaged namespaces: "
+                + ", ".join(f"`{ns}`" for ns in unmanaged_namespaces)
+            )
+        sob_lines.extend([
+            "",
+            "## Active Decisions and Lessons",
+            "",
+        ])
         for r in records:
             if r.status == "active":
                 sob_lines.append(
@@ -2224,19 +2582,20 @@ def cmd_bootstrap(a) -> Dict[str, Any]:
                 )
         sob_path = repo / "knowledge/STATE_OF_BEING.md"
         sob_path.parent.mkdir(parents=True, exist_ok=True)
-        sob_path.write_text("\n".join(sob_lines) + "\n")
+        sob_path.write_text(render_record(sob_meta, "\n".join(sob_lines)))
         written.append("knowledge/STATE_OF_BEING.md")
 
     idx_res = None
     if a.hindsight_url and a.write:
         ns = argparse.Namespace(repo=str(repo), repo_id=gh_repo, hindsight_url=a.hindsight_url,
-                                bank=a.bank, force=True)
+                                bank=a.bank, force=True, extra_repo=getattr(a, "extra_repo", None) or [])
         idx_res = cmd_index(ns)
 
     return {
         "github_repo": gh_repo,
         "prs_scanned": len(prs),
         "issues_scanned": len(issues),
+        "managed_namespaces": managed_namespaces,
         "triage": triage_counts,
         "llm_synthesized": llm_synthesized_count,
         "written": written,
@@ -2258,6 +2617,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub.add_parser("validate")
     p = sub.add_parser("index")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--extra-repo", action="append", default=[],
+                   help="Additional read-only repository path to ingest ADRs, RFCs, or knowledge/ from")
     p = sub.add_parser("check")
     p.add_argument("--base")
     p.add_argument("--head", default="HEAD")
@@ -2290,6 +2651,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--since", default="2y", help="history window to harvest (for example, 2y or 180d)")
     p.add_argument("--budget-minutes", type=int, default=120, help="wall-clock budget in minutes for bootstrap")
     p.add_argument("--write", action="store_true", help="write harvested records into knowledge/")
+    p.add_argument("--unmanaged-namespaces", nargs="*", default=[],
+                   help="explicit out-of-scope tenant namespaces to block in STATE_OF_BEING.md")
+    p.add_argument("--enforce-namespace-boundary", action="store_true",
+                   help="enforce that manifests only target discovered managed_namespaces")
+    p.add_argument("--extra-repo", action="append", default=[],
+                   help="Additional read-only repository path to ingest ADRs or RFCs from")
     p.add_argument("--llm-url", default=None, help="OpenAI-compatible LLM base URL for OKF synthesis")
     p.add_argument("--llm-model", default=None, help="Model name for OKF synthesis")
     p.add_argument("--no-llm", action="store_true", help="Disable LLM synthesis")

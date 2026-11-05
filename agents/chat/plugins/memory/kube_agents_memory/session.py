@@ -28,6 +28,7 @@ stock Hindsight provider is in `client.py`; anything the model reads is in
 """
 
 from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
 import json
@@ -44,6 +45,7 @@ from tools.registry import tool_error
 
 from . import client
 from .config_schema import (
+    CHECKPOINT_STRATEGY,
     PERSONAL_STRATEGY,
     PROVIDER_NAME,
     SCOPES,
@@ -71,6 +73,49 @@ MAX_PARENT_SESSION_HOPS = 256
 SQLITE_TIMEOUT_SECONDS = 2.0
 COMPRESSION_END_REASON = "compression"
 INTERACTIVE_PLATFORMS = frozenset({"google_chat", "slack", "discord", "telegram"})
+_RE_ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?)\b")
+
+
+def _parse_item_timestamp(item: Any) -> Optional[datetime]:
+    """Extract a UTC timestamp from a Hindsight recall result object, dict, or text."""
+    candidates: List[Any] = []
+    for attr in ("occurred_start", "mentioned_at", "created_at", "timestamp", "date"):
+        if isinstance(item, dict) and attr in item:
+            candidates.append(item.get(attr))
+        elif hasattr(item, attr):
+            candidates.append(getattr(item, attr))
+    text = item.get("text") if isinstance(item, dict) else getattr(item, "text", "")
+    if text:
+        m = _RE_ISO_DATE.search(str(text))
+        if m:
+            candidates.append(m.group(1))
+    for raw in candidates:
+        if not raw:
+            continue
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        s = str(raw).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _filter_results_since_hours(results: List[Any], since_hours: Optional[int]) -> List[Any]:
+    """Filter recall results to items within ``since_hours`` when timestamps are present."""
+    if not since_hours or since_hours <= 0:
+        return results
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=int(since_hours))
+    filtered: List[Any] = []
+    for r in results:
+        ts = _parse_item_timestamp(r)
+        if ts is None or ts >= cutoff:
+            filtered.append(r)
+    return filtered
 
 
 def _resolve_a2a_session_id(session_id: str, kwargs: Dict[str, Any]) -> str:
@@ -410,21 +455,45 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             return [self._user_tag]
         return [self._user_tag, SHARED_TAG] if self._user_tag else [SHARED_TAG]
 
+    def retain_handoff_checkpoint(self, content: str, context: str = "") -> str:
+        """Store an iteration-budget investigation handoff checkpoint in shared Hindsight memory."""
+        if self._hindsight is None:
+            return tool_error("Memory is unavailable.")
+        if self._read_only:
+            return tool_error("Memory is read-only for this agent.", status="read_only")
+        return self._retain(
+            {"content": content, "context": context or "iteration-budget handoff", "kind": "handoff"},
+            "shared",
+        )
+
     def _retain(self, args: Dict[str, Any], scope: str) -> str:
         content = str(args.get("content") or "").strip()
         if not content:
             return tool_error("Missing required parameter: content")
-        tags = self._tags_for(scope)
+        kind = str(args.get("kind") or "fact").strip().lower()
+        if kind not in ("fact", "handoff"):
+            return tool_error(f"Invalid kind {kind!r} for memory_retain. Use 'fact' or 'handoff'.")
+        if kind == "handoff":
+            scope = "shared"
+            tags = [SHARED_TAG, "kind:handoff"]
+            if self._session_id:
+                tags.append(f"session:{self._session_id}")
+            strategy = CHECKPOINT_STRATEGY
+            obs_scopes = [[SHARED_TAG]]
+        else:
+            tags = self._tags_for(scope)
+            strategy = SHARED_STRATEGY if scope == "shared" else PERSONAL_STRATEGY
+            obs_scopes = [tags]
         item: Dict[str, Any] = {
             "content": content,
             "tags": tags,
-            "observation_scopes": [tags],
-            "strategy": SHARED_STRATEGY if scope == "shared" else PERSONAL_STRATEGY,
+            "observation_scopes": obs_scopes,
+            "strategy": strategy,
         }
         context = str(args.get("context") or "").strip()
         if context:
             item["context"] = context
-        if scope == "shared":
+        if scope == "shared" and kind != "handoff":
             decision = client.emit_shared_decision(content, context)
             if decision and decision.get("record_id"):
                 rec_id = decision["record_id"]
@@ -446,6 +515,12 @@ class KubeAgentsMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("%s: retain failed (scope=%s): %s", PROVIDER_NAME, scope, e)
             return tool_error(f"Failed to store the memory: {e}")
+        if kind == "handoff":
+            return json.dumps({
+                "result": "Stored investigation handoff checkpoint in shared memory.",
+                "kind": "handoff",
+                "scope": "shared",
+            })
         return json.dumps({"result": f"Stored in {scope} memory."})
 
     def _read(self, tool_name: str, args: Dict[str, Any], scope: str) -> str:
@@ -454,10 +529,27 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             return tool_error("Missing required parameter: query")
         tags = self._tags_for(scope)
         if tool_name == "memory_recall":
-            return self._recall(query, scope, tags)
+            raw_since = args.get("since_hours")
+            since_hours: Optional[int] = None
+            if raw_since is not None and str(raw_since).strip() != "":
+                try:
+                    since_hours = int(raw_since)
+                except (TypeError, ValueError):
+                    return tool_error(f"Invalid since_hours {raw_since!r} for memory_recall.")
+                if since_hours <= 0:
+                    return tool_error("since_hours must be a positive integer.")
+            return self._recall(query, scope, tags, since_hours=since_hours)
         return self._reflect(query, scope, tags)
 
-    def _searched(self, tool_name: str, query: str, scope: str, tags: List[str]) -> Dict[str, Any]:
+    def _searched(
+        self,
+        tool_name: str,
+        query: str,
+        scope: str,
+        tags: List[str],
+        *,
+        since_hours: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """Describe the search that was run, whatever its outcome.
 
         Returned alongside every read so that "nothing came back" is a statement
@@ -474,10 +566,19 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             types = getattr(self._hindsight, "_recall_types", None)
             if types:
                 envelope["layer"] = list(types)
+            if since_hours is not None:
+                envelope["since_hours"] = since_hours
         return envelope
 
-    def _recall(self, query: str, scope: str, tags: List[str]) -> str:
-        searched = self._searched("memory_recall", query, scope, tags)
+    def _recall(
+        self,
+        query: str,
+        scope: str,
+        tags: List[str],
+        *,
+        since_hours: Optional[int] = None,
+    ) -> str:
+        searched = self._searched("memory_recall", query, scope, tags, since_hours=since_hours)
         try:
             results = list(client.recall(self._hindsight, query, tags))
         except Exception as e:
@@ -491,6 +592,7 @@ class KubeAgentsMemoryProvider(MemoryProvider):
             for entry in client.recall_decisions(query):
                 if not any(entry in (getattr(r, "text", "") or "") for r in results):
                     results.append(SimpleNamespace(text=entry))
+        results = _filter_results_since_hours(results, since_hours)
         if not results:
             return json.dumps(
                 {"status": "no_match", "searched": searched, "matches": 0,

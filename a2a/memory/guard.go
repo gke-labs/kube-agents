@@ -51,6 +51,176 @@ type CheckReport struct {
 	Markdown string         `json:"markdown"`
 }
 
+// RepoBoundaryID is the synthetic finding ID emitted when a change touches an out-of-scope namespace.
+const RepoBoundaryID = "REPO-BOUNDARY"
+
+// RepoBoundary describes namespace ownership boundaries parsed from knowledge/STATE_OF_BEING.md.
+type RepoBoundary struct {
+	ManagedNamespaces        []string `json:"managed_namespaces,omitempty"`
+	UnmanagedNamespaces      []string `json:"unmanaged_namespaces,omitempty"`
+	EnforceNamespaceBoundary bool     `json:"enforce_namespace_boundary,omitempty"`
+}
+
+// LoadRepoBoundary parses knowledge/STATE_OF_BEING.md frontmatter for namespace ownership boundaries.
+func LoadRepoBoundary(repoDir string) RepoBoundary {
+	var out RepoBoundary
+	sobPath := filepath.Join(repoDir, "knowledge", "STATE_OF_BEING.md")
+	raw, err := os.ReadFile(sobPath)
+	if err != nil {
+		return out
+	}
+	text := string(raw)
+	if !strings.HasPrefix(text, "---\n") {
+		return out
+	}
+	idx := strings.Index(text[4:], "\n---\n")
+	if idx < 0 {
+		return out
+	}
+	var fm map[string]any
+	if err := yamlv3.Unmarshal([]byte(text[4:4+idx]), &fm); err != nil || fm == nil {
+		return out
+	}
+	if ml, ok := fm["managed_namespaces"].([]any); ok {
+		for _, v := range ml {
+			if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
+				out.ManagedNamespaces = append(out.ManagedNamespaces, s)
+			}
+		}
+	}
+	if ul, ok := fm["unmanaged_namespaces"].([]any); ok {
+		for _, v := range ul {
+			if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
+				out.UnmanagedNamespaces = append(out.UnmanagedNamespaces, s)
+			}
+		}
+	}
+	if enf, ok := fm["enforce_namespace_boundary"].(bool); ok {
+		out.EnforceNamespaceBoundary = enf
+	}
+	return out
+}
+
+// ManifestNamespacesIn extracts target Kubernetes namespaces from a YAML manifest or path convention.
+func ManifestNamespacesIn(content, relPath string) []string {
+	seen := map[string]bool{}
+	docs, err := parseMultiYAMLDocs(content)
+	if err == nil {
+		for _, d := range docs {
+			kind, _ := d["kind"].(string)
+			md, _ := d["metadata"].(map[string]any)
+			spec, _ := d["spec"].(map[string]any)
+			if kind == "Namespace" && md != nil {
+				if n, ok := md["name"].(string); ok && strings.TrimSpace(n) != "" {
+					seen[strings.TrimSpace(n)] = true
+				}
+			} else if md != nil {
+				if n, ok := md["namespace"].(string); ok && strings.TrimSpace(n) != "" {
+					seen[strings.TrimSpace(n)] = true
+				}
+			}
+			if kind == "Application" && spec != nil {
+				if dest, ok := spec["destination"].(map[string]any); ok {
+					if n, ok := dest["namespace"].(string); ok && strings.TrimSpace(n) != "" {
+						seen[strings.TrimSpace(n)] = true
+					}
+				}
+			} else if (kind == "Kustomization" || kind == "HelmRelease") && spec != nil {
+				if n, ok := spec["targetNamespace"].(string); ok && strings.TrimSpace(n) != "" {
+					seen[strings.TrimSpace(n)] = true
+				}
+			}
+		}
+	}
+	parts := strings.Split(filepath.ToSlash(relPath), "/")
+	for i := 0; i+1 < len(parts); i++ {
+		if (parts[i] == "namespaces" || parts[i] == "apps") && parts[i+1] != "" && !strings.HasSuffix(parts[i+1], ".yaml") && !strings.HasSuffix(parts[i+1], ".yml") {
+			seen[parts[i+1]] = true
+		}
+	}
+	var out []string
+	for ns := range seen {
+		out = append(out, ns)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func evaluateRepoBoundaryFinding(changed map[string]*string, boundary RepoBoundary) *CheckFinding {
+	managed := map[string]bool{}
+	for _, n := range boundary.ManagedNamespaces {
+		managed[n] = true
+	}
+	unmanaged := map[string]bool{}
+	for _, n := range boundary.UnmanagedNamespaces {
+		unmanaged[n] = true
+	}
+	if len(unmanaged) == 0 && (!boundary.EnforceNamespaceBoundary || len(managed) == 0) {
+		return nil
+	}
+	var results []GuardResult
+	hitSet := map[string]bool{}
+	keys := make([]string, 0, len(changed))
+	for k := range changed {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, p := range keys {
+		content := changed[p]
+		if content == nil || (!strings.HasSuffix(p, ".yaml") && !strings.HasSuffix(p, ".yml")) {
+			continue
+		}
+		for _, ns := range ManifestNamespacesIn(*content, p) {
+			if unmanaged[ns] || (boundary.EnforceNamespaceBoundary && len(managed) > 0 && !managed[ns]) {
+				hitSet[p] = true
+				results = append(results, GuardResult{File: p, Actual: ns, OK: false})
+			}
+		}
+	}
+	if len(results) == 0 {
+		return nil
+	}
+	var files []string
+	for f := range hitSet {
+		files = append(files, f)
+	}
+	sort.Strings(files)
+	var allowedList []string
+	for n := range managed {
+		allowedList = append(allowedList, n)
+	}
+	sort.Strings(allowedList)
+	allowedText := strings.Join(allowedList, ", ")
+	if allowedText == "" {
+		allowedText = "(none)"
+	}
+	var blockedList []string
+	for n := range unmanaged {
+		blockedList = append(blockedList, n)
+	}
+	sort.Strings(blockedList)
+	rule := fmt.Sprintf("Modified manifest targets a namespace outside this repository's ownership boundary (managed_namespaces: %s)", allowedText)
+	if len(blockedList) > 0 {
+		rule += fmt.Sprintf("; unmanaged_namespaces: %s", strings.Join(blockedList, ", "))
+	}
+	return &CheckFinding{
+		ID:       RepoBoundaryID,
+		Type:     RecordTypeDecision,
+		Status:   StatusActive,
+		Title:    "Repository namespace ownership boundary",
+		Path:     "knowledge/STATE_OF_BEING.md",
+		Verdict:  "violates",
+		Severity: "block",
+		Files:    files,
+		Guard: &RecordGuard{
+			Severity: "block",
+			Rule:     rule,
+		},
+		GuardResults: results,
+		Body:         "## Decision\nChanges in this repository must only target namespaces owned by this repository as declared in `knowledge/STATE_OF_BEING.md`.",
+	}
+}
+
 // RecurrenceCandidate describes >= 2 cluster lessons that share a check or guarded YAML path.
 type RecurrenceCandidate struct {
 	Key       string   `json:"key"`
@@ -474,6 +644,12 @@ func selectPrecedenceWinners(records []Record, targetFiles []string) []Record {
 // Active records with failing block guards produce verdict="block" (exit code 2);
 // proposed records produce advisory warnings ("warn") until approved.
 func CheckChangedFiles(records []Record, changed map[string]*string) CheckReport {
+	return CheckChangedFilesWithBoundary(records, changed, RepoBoundary{})
+}
+
+// CheckChangedFilesWithBoundary matches modified or deleted files against active/proposed records
+// and enforces any repository namespace boundary defined in knowledge/STATE_OF_BEING.md.
+func CheckChangedFilesWithBoundary(records []Record, changed map[string]*string, boundary RepoBoundary) CheckReport {
 	var candidates []Record
 	for _, r := range records {
 		if r.Meta.Status == StatusActive || r.Meta.Status == StatusProposed {
@@ -502,6 +678,9 @@ func CheckChangedFiles(records []Record, changed map[string]*string) CheckReport
 	}
 
 	var findings []CheckFinding
+	if bf := evaluateRepoBoundaryFinding(changed, boundary); bf != nil {
+		findings = append(findings, *bf)
+	}
 	for _, rec := range effective {
 		hitSet := map[string]bool{}
 		for _, p := range changedPaths {

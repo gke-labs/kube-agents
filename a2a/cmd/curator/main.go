@@ -450,7 +450,8 @@ func runCheck(args []string) error {
 			changed[filepath.ToSlash(rel)] = nil
 		}
 	}
-	report := memory.CheckChangedFiles(records, changed)
+	boundary := memory.LoadRepoBoundary(kDir)
+	report := memory.CheckChangedFilesWithBoundary(records, changed, boundary)
 	if *markdownOnly {
 		fmt.Println(report.Markdown)
 	} else {
@@ -495,6 +496,14 @@ func runIndex(args []string) error {
 			return err
 		}
 		upserted = append(upserted, r.Meta.ID)
+	}
+	if extRecords, err := memory.LoadExternalDocRecords(*repoDir); err == nil {
+		for _, r := range extRecords {
+			if err := hs.RetainRecord(ctx, *repoID, r); err != nil {
+				return err
+			}
+			upserted = append(upserted, r.Meta.ID)
+		}
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")

@@ -78,8 +78,8 @@ python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo 
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> check --base origin/main --semantic --markdown
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> from-outcome outcome.json
 python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> dream
-python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> bootstrap --since 2y --write
-python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> index
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> bootstrap --since 2y --write [--enforce-namespace-boundary] [--unmanaged-namespaces ns1,ns2]
+python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> index [--extra-repo <read-only-adr-clone>]
 ```
 
 Pass `--hindsight-url` (or set `HINDSIGHT_API_URL`) to query the `kube-agents-decisions` Hindsight bank.

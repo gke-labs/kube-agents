@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -263,8 +264,11 @@ type MemoryQueryResponse struct {
 }
 
 var (
-	reRecordID   = regexp.MustCompile(`^(DEC|LES)-\d{4}-\d{3,}$`)
-	reSlugNonAln = regexp.MustCompile(`[^a-z0-9]+`)
+	reRecordID      = regexp.MustCompile(`^(DEC|LES)-\d{4}-\d{3,}$`)
+	reExternalDocID = regexp.MustCompile(`(?i)\b(DEC-\d{4}-\d{3,}|LES-\d{4}-\d{3,}|ADR-\d{1,5}|RFC-\d{1,5})\b`)
+	reLeadingNum    = regexp.MustCompile(`^0*(\d{1,5})(?:[-_.\s]+(.*))?$`)
+	reSlugNonAln    = regexp.MustCompile(`[^a-z0-9]+`)
+	externalDocDirs = []string{"docs/adr", "docs/adrs", "docs/rfcs", "adr", "rfcs"}
 )
 
 // Slug formats a title into a URL-safe filename suffix (up to 60 characters).
@@ -530,6 +534,227 @@ func LoadRecords(repoDir string) ([]Record, error) {
 				continue
 			}
 			out = append(out, rec)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Meta.ID < out[j].Meta.ID })
+	return out, nil
+}
+
+// ParseExternalDocRecord normalizes a Markdown ADR, RFC, or partial OKF document into a Record.
+func ParseExternalDocRecord(text, relPath string) Record {
+	if rec, err := ParseRecord(text, relPath); err == nil && len(ValidateRecord(rec)) == 0 {
+		return rec
+	}
+	var fm map[string]any
+	body := strings.TrimSpace(text)
+	if strings.HasPrefix(text, "---\n") {
+		if idx := strings.Index(text[4:], "\n---\n"); idx >= 0 {
+			rawFM := text[4 : 4+idx]
+			body = strings.TrimSpace(text[4+idx+5:])
+			_ = yaml.Unmarshal([]byte(rawFM), &fm)
+		}
+	}
+	stem := strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
+	prefix := "ADR"
+	if strings.Contains(strings.ToLower(relPath), "rfc") {
+		prefix = "RFC"
+	}
+	recID := ""
+	if fm != nil {
+		if idStr, ok := fm["id"].(string); ok {
+			recID = strings.TrimSpace(idStr)
+		}
+	}
+	if recID == "" {
+		if m := reExternalDocID.FindStringSubmatch(stem); len(m) > 1 {
+			recID = strings.ToUpper(m[1])
+		} else if nm := reLeadingNum.FindStringSubmatch(stem); len(nm) > 1 {
+			if n, err := strconv.Atoi(nm[1]); err == nil {
+				recID = fmt.Sprintf("%s-%04d", prefix, n)
+			}
+		}
+	}
+	if recID == "" {
+		sum := sha256.Sum256([]byte(relPath))
+		recID = fmt.Sprintf("%s-%s", prefix, strings.ToUpper(hex.EncodeToString(sum[:])[:6]))
+	}
+
+	title := ""
+	if fm != nil {
+		if tStr, ok := fm["title"].(string); ok {
+			title = strings.TrimSpace(tStr)
+		}
+	}
+	if title == "" {
+		for _, line := range strings.Split(body, "\n") {
+			s := strings.TrimSpace(line)
+			if strings.HasPrefix(s, "# ") {
+				title = strings.TrimSpace(strings.TrimPrefix(s, "# "))
+				break
+			}
+		}
+	}
+	if title == "" {
+		title = strings.ReplaceAll(strings.ReplaceAll(stem, "-", " "), "_", " ")
+	}
+
+	status := StatusActive
+	if fm != nil {
+		if stStr, ok := fm["status"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(stStr)) {
+			case "proposed", "draft":
+				status = StatusProposed
+			case "superseded", "deprecated", "obsolete":
+				status = StatusSuperseded
+			}
+		}
+	}
+	clusters := []string{"*"}
+	paths := []string{"**"}
+	var resources []string
+	if fm != nil {
+		if sc, ok := fm["scope"].(map[string]any); ok {
+			if cl, ok := sc["clusters"].([]any); ok && len(cl) > 0 {
+				clusters = nil
+				for _, v := range cl {
+					clusters = append(clusters, fmt.Sprint(v))
+				}
+			}
+			if pl, ok := sc["paths"].([]any); ok && len(pl) > 0 {
+				paths = nil
+				for _, v := range pl {
+					paths = append(paths, fmt.Sprint(v))
+				}
+			}
+			if rl, ok := sc["resources"].([]any); ok && len(rl) > 0 {
+				for _, v := range rl {
+					resources = append(resources, fmt.Sprint(v))
+				}
+			}
+		}
+	}
+	created := time.Now().UTC().Format("2006-01-02")
+	if fm != nil {
+		if cStr, ok := fm["created"].(string); ok && strings.TrimSpace(cStr) != "" {
+			created = strings.TrimSpace(cStr)
+		} else if dStr, ok := fm["date"].(string); ok && strings.TrimSpace(dStr) != "" {
+			created = strings.TrimSpace(dStr)
+		}
+	}
+	return Record{
+		Meta: RecordMeta{
+			ID:     recID,
+			Type:   RecordTypeDecision,
+			Status: status,
+			Title:  title,
+			Date:   created,
+			Scope: RecordScope{
+				Clusters:  clusters,
+				Paths:     paths,
+				Resources: resources,
+			},
+		},
+		Body: body,
+		Path: filepath.ToSlash(relPath),
+	}
+}
+
+func configuredExtraRepos(primaryRepo string, extraRepos []string) []string {
+	var candidates []string
+	candidates = append(candidates, extraRepos...)
+	if envExtra := strings.TrimSpace(os.Getenv("DECISION_MEMORY_EXTRA_REPOS")); envExtra != "" {
+		for _, item := range strings.Split(envExtra, ",") {
+			if s := strings.TrimSpace(item); s != "" {
+				candidates = append(candidates, s)
+			}
+		}
+	}
+	if rawJSON := strings.TrimSpace(os.Getenv("REPOSITORIES_JSON")); rawJSON != "" {
+		var parsed []any
+		if err := json.Unmarshal([]byte(rawJSON), &parsed); err == nil {
+			for _, item := range parsed {
+				switch v := item.(type) {
+				case string:
+					if strings.TrimSpace(v) != "" {
+						candidates = append(candidates, strings.TrimSpace(v))
+					}
+				case map[string]any:
+					for _, k := range []string{"local_path", "worktree", "path"} {
+						if p, ok := v[k].(string); ok && strings.TrimSpace(p) != "" {
+							candidates = append(candidates, strings.TrimSpace(p))
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+	primaryAbs, _ := filepath.Abs(primaryRepo)
+	seen := map[string]bool{primaryAbs: true}
+	var out []string
+	for _, c := range candidates {
+		abs, err := filepath.Abs(c)
+		if err != nil || seen[abs] {
+			continue
+		}
+		if st, err := os.Stat(abs); err == nil && st.IsDir() {
+			seen[abs] = true
+			out = append(out, abs)
+		}
+	}
+	return out
+}
+
+// LoadExternalDocRecords scans ADR and RFC directories in repoDir and any configured extra repos.
+func LoadExternalDocRecords(repoDir string, extraRepos ...string) ([]Record, error) {
+	roots := []struct {
+		dir    string
+		prefix string
+	}{{dir: repoDir, prefix: ""}}
+	for _, extra := range configuredExtraRepos(repoDir, extraRepos) {
+		roots = append(roots, struct {
+			dir    string
+			prefix string
+		}{dir: extra, prefix: filepath.Base(extra)})
+	}
+	seenIDs := map[string]bool{}
+	if existing, err := LoadRecords(repoDir); err == nil {
+		for _, r := range existing {
+			seenIDs[r.Meta.ID] = true
+		}
+	}
+	var out []Record
+	for _, root := range roots {
+		for _, sub := range externalDocDirs {
+			dir := filepath.Join(root.dir, filepath.FromSlash(sub))
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				continue
+			}
+			for _, e := range entries {
+				if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+					continue
+				}
+				lower := strings.ToLower(e.Name())
+				if lower == "index.md" || lower == "readme.md" || lower == "template.md" || strings.HasPrefix(lower, "0000-") {
+					continue
+				}
+				full := filepath.Join(dir, e.Name())
+				raw, err := os.ReadFile(full)
+				if err != nil {
+					continue
+				}
+				rel := filepath.ToSlash(filepath.Join(sub, e.Name()))
+				if root.prefix != "" {
+					rel = filepath.ToSlash(filepath.Join(root.prefix, rel))
+				}
+				rec := ParseExternalDocRecord(string(raw), rel)
+				if seenIDs[rec.Meta.ID] {
+					continue
+				}
+				seenIDs[rec.Meta.ID] = true
+				out = append(out, rec)
+			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Meta.ID < out[j].Meta.ID })
