@@ -310,14 +310,20 @@ class SettleTest(unittest.TestCase):
         self.assertIn("rollout status statefulset/platform-agent-shell", self.rollouts)
         self.assertIn("env HERMES_HOME=/opt/data python3 /opt/data/scripts/cluster_agent_reconcile.py", reconciles)
 
+    # The settle's deadline is bash's SECONDS, which ticks on whole wall-clock
+    # seconds, so a budget of N leaves between N-1 and N seconds. The two short
+    # budgets below are 2, not 1: one tick inside the stubbed kubectl calls before
+    # the rollout wait still leaves a second, where 1 left none and the settle
+    # failed with "no time left" instead of the message asserted on.
     def test_a_file_that_never_matches_fails_without_a_reconcile(self):
-        result, reconciles = self.settle([], "0", seconds=1)
+        result, reconciles = self.settle([], "0", seconds=2)
         self.assertIn("rc=1", result.stdout)
         self.assertIn("still reads []", result.stderr)
         self.assertEqual(reconciles, "")
 
     def test_reconcile_retries_stop_at_the_settle_bound(self):
-        result, reconciles = self.settle([SEEDED_B], "3 3 3", seconds=1, failure_pause=2)
+        # The reconcile's pause is the whole budget, so the bound is crossed after one attempt.
+        result, reconciles = self.settle([SEEDED_B], "3 3 3", seconds=2, failure_pause=2)
         self.assertIn("rc=1", result.stdout)
         self.assertIn("settle bound", result.stderr)
         self.assertEqual(len(reconciles.splitlines()), 1)
