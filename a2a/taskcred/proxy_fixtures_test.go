@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -88,6 +89,9 @@ type proxyFixtureClaims struct {
 	PodUID  string  `json:"pod_uid"`
 	Expires int64   `json:"exp"`
 	Target  *Target `json:"target"`
+	// Permits is what the verifier must read out of the permits claim: absent
+	// (null in the file) for a credential that carries none.
+	Permits []Permit `json:"permits"`
 }
 
 // fixtureKey is a task-signing key from a fixed 32-byte seed.
@@ -160,6 +164,22 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(proxyFixture{Name: "the second of two trusted keys (rotation)", Token: sign(base), Now: fixtureNow, GoOK: true, ProxyOK: true,
 		Trusted: []string{otherPub, pub}, Claims: wantClaims})
 	add(proxyFixture{Name: "expired inside the skew", Token: sign(base), Now: exp + 29, GoOK: true, ProxyOK: true, Claims: wantClaims})
+	permitted := `"cluster":"cluster-a"}`
+	withPermit := `"cluster":"cluster-a"},"permits":["vcs:proposal-create"]`
+	permitClaims := *wantClaims
+	permitClaims.Permits = []Permit{PermitVCSProposalCreate}
+	add(proxyFixture{Name: "a permit", Token: edited(permitted, withPermit), Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: &permitClaims})
+	mintedWithPermit, err := Mint(kp, Claims{
+		Task: "task-1", Profile: "auditor", Tier: "read", Pod: "auditor-read-x7k2p",
+		PodUID: "0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0", Audience: AudienceCredentialProxy,
+		Expires: mintNow.Add(10 * time.Minute), Target: &fixtureTarget, Permits: []Permit{PermitVCSProposalCreate},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mintedPermitClaims := mintedClaims
+	mintedPermitClaims.Permits = []Permit{PermitVCSProposalCreate}
+	add(proxyFixture{Name: "minted by taskcred.Mint with a permit", Token: mintedWithPermit, Now: mintNow.Unix(), GoOK: true, ProxyOK: true, Claims: &mintedPermitClaims})
 	add(proxyFixture{Name: "a lowercase typ (jwt/v2 upper-cases it)", Token: signWithHeader(t, kp, `{"typ":"jwt","alg":"ed25519-nkey"}`, base),
 		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: wantClaims})
 
@@ -200,6 +220,22 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(refused("an unknown nats claim", edited(`"tier":"read"`, `"tier":"read","grants":"a2a.>"`)))
 	add(refused("an unknown target claim", edited(`"cluster":"cluster-a"`, `"cluster":"cluster-a","server":"https://x"`)))
 	add(refused("a NaN", edited(`"version":2`, `"version":NaN`)))
+
+	// Permits: a closed set of strings, in a non-empty list, on this
+	// audience alone.
+	add(refused("an unknown permit", edited(permitted, `"cluster":"cluster-a"},"permits":["vcs:proposal-merge"]`)))
+	add(refused("a known permit beside an unknown one", edited(permitted, `"cluster":"cluster-a"},"permits":["vcs:proposal-create","vcs:branch-delete"]`)))
+	add(refused("a case variant of the permit", edited(permitted, `"cluster":"cluster-a"},"permits":["VCS:proposal-create"]`)))
+	add(refused("the permit twice", edited(permitted, `"cluster":"cluster-a"},"permits":["vcs:proposal-create","vcs:proposal-create"]`)))
+	add(refused("permits on the nats audience", edited(`"aud":"credential-proxy"`, `"aud":"nats"`, permitted, withPermit)))
+	add(refused("permits as a bare string", edited(permitted, `"cluster":"cluster-a"},"permits":"vcs:proposal-create"`)))
+	add(refused("a number in permits", edited(permitted, `"cluster":"cluster-a"},"permits":[1]`)))
+	add(refused("an object in permits", edited(permitted, `"cluster":"cluster-a"},"permits":[{"name":"vcs:proposal-create"}]`)))
+	add(refused("permits as an object", edited(permitted, `"cluster":"cluster-a"},"permits":{"vcs:proposal-create":true}`)))
+	add(refused("an empty permits list", edited(permitted, `"cluster":"cluster-a"},"permits":[]`)))
+	add(refused("a null permits", edited(permitted, `"cluster":"cluster-a"},"permits":null`)))
+	add(refused("a duplicate permits key", edited(permitted, `"cluster":"cluster-a"},"permits":["x"],"permits":["vcs:proposal-create"]`)))
+	add(refused("a case-variant Permits", edited(permitted, `"cluster":"cluster-a"},"Permits":["vcs:proposal-create"]`)))
 
 	// Types.
 	add(refused("version 1", edited(`"version":2`, `"version":1`)))
@@ -312,7 +348,8 @@ func TestCredentialProxyFixtures(t *testing.T) {
 		if err == nil && c.Claims != nil {
 			w := c.Claims
 			if got.Task != w.Task || got.Profile != w.Profile || got.Tier != w.Tier || got.Pod != w.Pod ||
-				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires || got.Target == nil || *got.Target != *w.Target {
+				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires || got.Target == nil || *got.Target != *w.Target ||
+				!slices.Equal(got.Permits, w.Permits) {
 				t.Errorf("%s: claims = %+v (target %+v), fixture says %+v", c.Name, got, got.Target, w)
 			}
 		}

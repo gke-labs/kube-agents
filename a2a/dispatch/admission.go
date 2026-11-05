@@ -10,6 +10,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 // Verifier is the one verifier call the dispatcher makes: may the grant at
@@ -42,6 +43,17 @@ var errStopping = errors.New("dispatcher stopping")
 // about again, until a verdict or its queue timeout ends it.
 var ErrVerifierUnreachable = errors.New("the verifier could not be reached")
 
+// admitted is what an admitted submission's credentials are minted from:
+// the cluster the verifier permitted the task on (nil when the task names
+// none and was checked against the namespace), the target a task credential
+// for the credential proxy confines it to (#3889); and whether the
+// submission asked for a change (lib.TaskParameters.ChangeRequested), which
+// puts the vcs:proposal-create permit on that credential (#3993).
+type admitted struct {
+	cluster         *taskcred.Target
+	changeRequested bool
+}
+
 // refusal is an admission verdict against a submission.
 type refusal struct {
 	reason string
@@ -49,86 +61,104 @@ type refusal struct {
 }
 
 // admit runs the admission checks in order, cheapest first: the tier, the
-// queue age, the parameters, then the verifier. A nil refusal admits; an
-// error is no verdict (errStopping, or a verifier that could not be reached,
+// queue age, the parameters, then the verifier. A nil refusal admits, and
+// then adm is what the task's credentials are minted from. An error is no
+// verdict (errStopping, or a verifier that could not be reached,
 // ErrVerifierUnreachable), and the submission is not refused for it. The
 // verifier's permit is reused for verifiedFor across the same submission's
 // retries over a cap, so a queue waiting on a cap doesn't call the verifier
 // once per retry delay, but only while the retry asks for the same ref and
 // target the permit was given for; the cheap checks run every time.
-func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (*refusal, error) {
+func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.DispatchConfig, prof lib.DispatchProfile, hk holdKey, now time.Time) (adm admitted, _ *refusal, _ error) {
 	env := del.Envelope()
 	tier := hk.tier
 	if !allowsTier(prof, tier) {
-		return &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
+		return admitted{}, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
 	}
 	if rec := del.Received(); !rec.IsZero() {
 		if age, limit := now.Sub(rec), queueTimeout(prof); age > limit {
-			return &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
+			return admitted{}, &refusal{ReasonQueueTimeout, fmt.Sprintf("queued %s, over the profile's %s", age.Round(time.Second), limit)}, nil
 		}
 	}
-	target, bad := taskTarget(env, prof, snap.Namespace)
+	target, cluster, changeRequested, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {
-		return &refusal{ReasonParametersInvalid, bad}, nil
+		return admitted{}, &refusal{ReasonParametersInvalid, bad}, nil
 	}
 	ref, present, err := capability.RefFromAuthority(env.Authority)
 	switch {
 	case err != nil:
-		return &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, "the authority block is not well-formed"}, nil
 	case !present:
-		return &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, "the submission carries no capability"}, nil
 	case d.verifier == nil:
-		return &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, "no verifier is configured"}, nil
 	}
 	// The permit is for what the verifier was asked: this ref, this target.
 	// The stream keeps one submission per subject and a newer one replaces
-	// it, so a retry can carry another capability or another target under
+	// it, so a retry can carry another capability or another cluster under
 	// the same key: that is a cache miss, checked afresh, never the old
 	// permit stretched over an unchecked target.
-	asked := permit{ref: ref, target: target}
+	asked := permit{ref: ref, target: target, cluster: cluster}
 	d.mu.Lock()
 	p, cached := d.verified[hk]
 	d.mu.Unlock()
-	if cached && now.Sub(p.at) <= verifiedFor && p.ref == asked.ref && p.target == asked.target {
-		return nil, nil
+	// Read from this delivery every time, never cached with the permit: it
+	// is not the verifier's to answer, and a retry's newer submission says
+	// whether a change is asked for now.
+	adm = admitted{cluster: cluster, changeRequested: changeRequested}
+	if cached && now.Sub(p.at) <= verifiedFor && p.covers(asked) {
+		return adm, nil, nil
 	}
 	if err := d.verifier.CheckProfileRun(ctx, ref, prof.Name, capability.Tier(tier), target); err != nil {
 		if ctx.Err() != nil {
-			return nil, errStopping
+			return admitted{}, nil, errStopping
 		}
 		if errors.Is(err, ErrVerifierUnreachable) {
-			return nil, err
+			return admitted{}, nil, err
 		}
-		return &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
+		return admitted{}, &refusal{ReasonVerifierRefused, capability.Reason(err)}, nil
 	}
 	asked.at = now
 	d.mu.Lock()
 	d.verified[hk] = asked
 	d.mu.Unlock()
-	return nil, nil
+	return adm, nil, nil
 }
 
 // permit is a verifier permit admission reuses: when it was given, and the
-// capability ref and target it was given for.
+// ref, target and cluster it was given for.
 type permit struct {
-	at     time.Time
-	ref    capability.Ref
-	target capability.Scope
+	at      time.Time
+	ref     capability.Ref
+	target  capability.Scope
+	cluster *taskcred.Target
+}
+
+// covers says p was given for exactly what q asks: the same ref, the same
+// verifier target and the same cluster fields.
+func (p permit) covers(q permit) bool {
+	if p.ref != q.ref || p.target != q.target || (p.cluster == nil) != (q.cluster == nil) {
+		return false
+	}
+	return p.cluster == nil || *p.cluster == *q.cluster
 }
 
 // taskTarget reads the submission's task parameters, checks them against
 // the profile's declared ones, and builds the verifier's target: the cluster
-// path when the task names a cluster, the install's namespace otherwise. A
-// non-empty bad is the parameters-invalid detail.
-func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (target capability.Scope, bad string) {
+// path when the task names a cluster, the install's namespace otherwise.
+// cluster is the same cluster as fields, nil for a namespace target, and
+// changeRequested is the submission's ChangeRequested. A non-empty bad is the
+// parameters-invalid detail.
+func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (target capability.Scope, cluster *taskcred.Target, changeRequested bool, bad string) {
 	var msg lib.Message
 	if err := json.Unmarshal(env.Payload, &msg); err != nil {
-		return "", "the submission's message does not parse"
+		return "", nil, false, "the submission's message does not parse"
 	}
 	tp, _, err := lib.TaskParametersOf(msg.Parts)
 	if err != nil {
-		return "", err.Error()
+		return "", nil, false, err.Error()
 	}
+	changeRequested = tp.ChangeRequested
 	params := tp.Parameters
 	var missing []string
 	for _, p := range prof.Parameters {
@@ -137,18 +167,19 @@ func taskTarget(env *lib.Envelope, prof lib.DispatchProfile, namespace string) (
 		}
 	}
 	if len(missing) > 0 {
-		return "", "missing required parameters: " + strings.Join(missing, ", ")
+		return "", nil, false, "missing required parameters: " + strings.Join(missing, ", ")
 	}
 	project, hasProject := params[paramProject]
 	location, hasLocation := params[paramLocation]
-	cluster, hasCluster := params[paramCluster]
+	clusterName, hasCluster := params[paramCluster]
 	switch {
 	case hasProject && hasLocation && hasCluster:
-		return capability.Scope(fmt.Sprintf(clusterTargetForm, project, location, cluster)), ""
+		return capability.Scope(fmt.Sprintf(clusterTargetForm, project, location, clusterName)),
+			&taskcred.Target{Project: project, Location: location, Cluster: clusterName}, changeRequested, ""
 	case hasProject || hasLocation || hasCluster:
-		return "", "a cluster target needs all of project, location and cluster"
+		return "", nil, false, "a cluster target needs all of project, location and cluster"
 	case namespace == "":
-		return "", "the task names no cluster and the dispatcher has no namespace to scope it to"
+		return "", nil, false, "the task names no cluster and the dispatcher has no namespace to scope it to"
 	}
-	return capability.Scope(namespaceTarget + namespace), ""
+	return capability.Scope(namespaceTarget + namespace), nil, changeRequested, ""
 }

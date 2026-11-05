@@ -103,6 +103,41 @@ func TestADispatchMessageIsCheckedBothWays(t *testing.T) {
 	}
 }
 
+// The task credentials (#3889) ride on a confirm only: a confirm carrying
+// them survives the wire, and an offer or an abandon carrying either is
+// refused.
+func TestTaskCredentialsRideOnAConfirmOnly(t *testing.T) {
+	confirm := DispatchMessage{Type: DispatchConfirm, TaskID: "t1", TaskCredential: "nats-token", ProxyToken: "proxy-token"}
+	raw, err := json.Marshal(confirm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"taskCredential":"nats-token"`) || !strings.Contains(string(raw), `"proxyToken":"proxy-token"`) {
+		t.Errorf("the confirm's wire form %s does not name the fields taskCredential and proxyToken", raw)
+	}
+	var back DispatchMessage
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	if err := back.Validate(); err != nil || back.TaskCredential != "nats-token" || back.ProxyToken != "proxy-token" {
+		t.Errorf("a confirm with credentials: Validate = %v, back %+v", err, back)
+	}
+	if bare, _ := json.Marshal(DispatchMessage{Type: DispatchConfirm, TaskID: "t1"}); strings.Contains(string(bare), "taskCredential") || strings.Contains(string(bare), "proxyToken") {
+		t.Errorf("a confirm without credentials carries the fields: %s", bare)
+	}
+	abandon := DispatchMessage{Type: DispatchAbandon, TaskID: "t1", Reason: "stopped"}
+	for name, m := range map[string]DispatchMessage{
+		"offer with a task credential":   func() DispatchMessage { m := validOffer(); m.TaskCredential = "x"; return m }(),
+		"offer with a proxy token":       func() DispatchMessage { m := validOffer(); m.ProxyToken = "x"; return m }(),
+		"abandon with a task credential": func() DispatchMessage { m := abandon; m.TaskCredential = "x"; return m }(),
+		"abandon with a proxy token":     func() DispatchMessage { m := abandon; m.ProxyToken = "x"; return m }(),
+	} {
+		if err := m.Validate(); err == nil || !strings.Contains(err.Error(), "confirm only") {
+			t.Errorf("%s: Validate = %v, want it refused", name, err)
+		}
+	}
+}
+
 // A decline says why; an accept and a renewal need only the task.
 func TestAnAcceptAndARenewalAreChecked(t *testing.T) {
 	if err := (DispatchAccept{TaskID: "t1", Accepted: true}).Validate(); err != nil {

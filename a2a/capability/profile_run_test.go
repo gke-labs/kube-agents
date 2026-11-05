@@ -141,8 +141,8 @@ func TestProfileFieldsOnAnotherVerbAreRefused(t *testing.T) {
 	root := s.write(t, rootKey(t, gwTask), profileGrant(TierRead, "tse"))
 	nc := serveVerifier(t, s)
 	for _, req := range []Request{
-		{Ref: root, Verb: VerbTaskExecute, Resource: targetInScope, Profile: "tse"},
-		{Ref: root, Verb: VerbTaskExecute, Resource: targetInScope, Tier: TierRead},
+		{Ref: root, Verb: VerbTaskExecute, Resource: targetInScope, Profile: "tse", RequestID: testRequestID(t)},
+		{Ref: root, Verb: VerbTaskExecute, Resource: targetInScope, Tier: TierRead, RequestID: testRequestID(t)},
 	} {
 		body, err := json.Marshal(req)
 		if err != nil {

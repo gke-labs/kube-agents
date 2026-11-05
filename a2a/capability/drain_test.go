@@ -109,7 +109,7 @@ func TestAnInFlightRequestIsAnsweredAcrossADrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subject: %v", err)
 	}
-	body, err := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C"})
+	body, err := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C", RequestID: testRequestID(t)})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -181,7 +181,7 @@ func TestACancelledHandlerContextRefusesWhatItShouldHaveAnswered(t *testing.T) {
 	gate := &gateStore{inner: inner, entered: make(chan struct{}, 1), release: released}
 
 	svc := &Service{Resolver: &Resolver{Store: gate}}
-	body, err := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C"})
+	body, err := json.Marshal(Request{Ref: hop, Verb: VerbTaskExecute, Resource: "project/P/cluster/C", RequestID: testRequestID(t)})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}

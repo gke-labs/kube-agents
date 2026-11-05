@@ -344,6 +344,26 @@ leave open:
   nobody can read counts as a running one: its task is treated as started, and the sweep
   waits as long from the record's last write. Answers a pod
   sends for tasks it doesn't hold are held to a small budget per pod.
+- **Task credentials.** With a task-signing key (a cluster seed, read from the file
+  `A2A_TASK_SIGNING_SEED_FILE` names), the confirm carries two credentials the dispatcher
+  mints for the confirmed pod once the lease record is written (contract addendum 8, #3889).
+  `taskCredential` (audience `nats`) is the password of the worker's task connection.
+  `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
+  admission, and a task that names no cluster gets none. When the submission's
+  `taskParameters.changeRequested` is true, the `proxyToken` also carries
+  `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
+  broker (#3993); otherwise it carries no `permits` key at all, never an empty list, so its
+  claims are those of a token minted before the claim existed. The `taskCredential` never
+  carries one, and the callout refuses one that does. Both name the task, its profile and
+  tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
+  offer's deadline plus the callout's 30s clock skew, and never later than
+  `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
+  never carries either, and renewals mint nothing. A pod with no UID in the pool isn't
+  offered the task. A pod whose UID changed by the confirm isn't confirmed, and the task
+  fails `lease-expired`. With the variable unset, confirms carry neither, workers keep their
+  pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
+  or holds another key type stops the dispatcher at startup. The dispatcher logs a
+  credential's `jti`, never the token.
 - **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
   the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
   `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
