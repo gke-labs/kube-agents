@@ -41,7 +41,15 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/periodics
 # The bucket these jobs log to, not the Prow archive: they run under their
 # own identities, which cannot write gs://kube-agents-prow.
 LOGS_ROOT = "gs://kube-agents-periodic-logs/logs"
-JOB_HISTORY_ROOT = "https://oss.gprow.dev/job-history/gs/kube-agents-periodic-logs/logs"
+# Where the eval lanes that share the nightlies' decoration log: the
+# certification slice job writes there, beside the nightlies, not to the
+# periodic-logs bucket the other watched jobs use.
+EVAL_NIGHTLY_LOGS_ROOT = collect.NIGHTLY_LOGS_ROOT
+# Deck's job-history page for a logs root: the gs:// prefix becomes a path
+# under this host, so a job logged in another bucket links to its own page.
+JOB_HISTORY_HOST = "https://oss.gprow.dev/job-history/gs/"
+GS_SCHEME = "gs://"
+JOB_HISTORY_ROOT = f"{JOB_HISTORY_HOST}{LOGS_ROOT[len(GS_SCHEME):]}"
 POINTER = "latest-build.txt"
 FINISHED = "finished.json"
 ARTIFACTS_DIR = "artifacts"
@@ -208,6 +216,11 @@ REPORT_KEY_ALLOWLIST_UNUSED = "allowlist_unused"
 # The Prow job names (oss-test-infra, kube-agents-periodics.yaml and
 # kube-agents-postsubmits.yaml); a rename there is a rename here.
 RECONCILE_DAILY_JOB = "ci-kube-agents-fleet-reconcile-daily"
+# The certification lane's first slice (oss-test-infra: kube-agents-periodics.yaml).
+CERTIFICATION_SLICE_JOB = "ci-kube-agents-certification-1"
+# A week between runs, plus a day: a Saturday run that never started (no
+# cron fire, no lease) reads STALE on the Sunday, one tick after the slot.
+CERTIFICATION_STALE_AFTER = timedelta(days=8)
 RECONCILE_POSTSUBMIT_JOB = "post-kube-agents-fleet-reconcile"
 # A watched job whose failed build is retired by another job's later pass:
 # the postsubmit has no window, and the daily that followed it did its work.
@@ -310,6 +323,9 @@ class Periodic:
     # Reports the job writes beside `artifact`, read into the reading when
     # present and absent otherwise; their lines ride in the note's detail.
     extra_artifacts: tuple = ()
+    # The bucket prefix the job's builds are read from; a job decorated like
+    # the nightlies logs beside them (EVAL_NIGHTLY_LOGS_ROOT).
+    logs_root: str = LOGS_ROOT
 
 
 SWEEP_DOES = "closes the pull requests the agent opened during eval runs in the pool projects' `kube-agents-evals[-<n>]-infra` repos"
@@ -342,14 +358,26 @@ WATCHED = (
         "runs on every merge to main that changes the stack under bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
     ),
+    # The certification lane's first slice: weekly and on Rerun, graded on
+    # main, recorded for the certified-capabilities page from its logs
+    # bucket and nowhere else, so a failed build (a forbidden write, an
+    # unrun check, a deploy refusal) reaches a person only through this note.
+    Periodic(
+        CERTIFICATION_SLICE_JOB, "certification lane (slice 1)", CERTIFICATION_STALE_AFTER, None,
+        "Certification lane", "the certification suite's weekly run is not recording", "the certification suite's weekly run is recording again",
+        "runs weekly on Saturday 14:00 UTC and on Rerun, grading part 1 of hack/eval/certification-cases.txt at three repetitions on a leased pool project",
+        "the certified-capabilities page's suite tests stop accruing runs, and a forbidden write or an unrun check on the lane is a failed build nobody reads.",
+        f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#59-the-certification-lane",
+        logs_root=EVAL_NIGHTLY_LOGS_ROOT,
+    ),
 )
 WATCHED_BY_JOB = {p.job: p for p in WATCHED}
 # The reconcile jobs, for the digest's run line; the words name the trigger.
 RECONCILE_RUN_WORDS = {RECONCILE_DAILY_JOB: "daily run", RECONCILE_POSTSUBMIT_JOB: "postsubmit run"}
 
 
-def history_url(job: str) -> str:
-    return f"{JOB_HISTORY_ROOT}/{job}"
+def history_url(job: str, logs_root: str = LOGS_ROOT) -> str:
+    return f"{JOB_HISTORY_HOST}{logs_root[len(GS_SCHEME):]}/{job}"
 
 
 def iso(value: datetime | None) -> str | None:
@@ -376,10 +404,10 @@ class Unreadable(Exception):
     on this job rather than walking back to an older build and reporting it."""
 
 
-def _finished(job: str, build: str, runner) -> dict | None:
+def _finished(job: str, build: str, runner, logs_root: str = LOGS_ROOT) -> dict | None:
     """The build's finished.json, None when it has none (still running or
     aborted); Unreadable when the read itself failed."""
-    out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{job}/{build}/{FINISHED}"], runner=runner)
+    out, err = collect._gcloud_storage_call(["cat", f"{logs_root}/{job}/{build}/{FINISHED}"], runner=runner)
     if out is None:
         if _not_found(err):
             return None
@@ -437,7 +465,7 @@ def _entrypoint_message(line: str) -> str:
     return str(doc.get(ENTRYPOINT_KEY_MESSAGE) or line) if isinstance(doc, dict) else line
 
 
-def _failed_build_cause(job: str, build: str, runner, has_report: bool) -> dict:
+def _failed_build_cause(job: str, build: str, runner, has_report: bool, logs_root: str = LOGS_ROOT) -> dict:
     """The node a failed build's pod ran on and a Warning pod event
     (podinfo.json), and the line of its log that says how it died (a ranged
     read of the tail: the last error-shaped line, or the last line of all when
@@ -445,7 +473,7 @@ def _failed_build_cause(job: str, build: str, runner, has_report: bool) -> dict:
     than only that it did. Best-effort: an absent or unreadable object leaves
     its keys out."""
     cause: dict = {}
-    out = _cause_read(f"{LOGS_ROOT}/{job}/{build}/{PODINFO}", runner)
+    out = _cause_read(f"{logs_root}/{job}/{build}/{PODINFO}", runner)
     if out is not None:
         try:
             podinfo = json.loads(out)
@@ -465,7 +493,7 @@ def _failed_build_cause(job: str, build: str, runner, has_report: bool) -> dict:
             ]
             if warnings:
                 cause[KEY_LAST_EVENT] = warnings[-1]
-    out = _cause_read(f"{LOGS_ROOT}/{job}/{build}/{BUILD_LOG}", runner, ranged=True)
+    out = _cause_read(f"{logs_root}/{job}/{build}/{BUILD_LOG}", runner, ranged=True)
     if out is not None:
         lines = [" ".join(line.split()) for line in CONTROL_CHARS_RE.sub("", out).splitlines() if line.strip()]
         own = [line for line in lines if not line.startswith(ENTRYPOINT_LINE_PREFIX) and ERROR_LINE_RE.search(line)]
@@ -477,8 +505,8 @@ def _failed_build_cause(job: str, build: str, runner, has_report: bool) -> dict:
     return cause
 
 
-def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
-    out, err = collect._gcloud_storage_call(["ls", f"{LOGS_ROOT}/{job}/"], runner=runner)
+def _earlier_builds(job: str, newest: str, runner, log=print, logs_root: str = LOGS_ROOT) -> list[str]:
+    out, err = collect._gcloud_storage_call(["ls", f"{logs_root}/{job}/"], runner=runner)
     if out is None:
         log(f"{WARNING_PREFIX}could not list {job}'s builds behind a running {newest}: {err.strip()}", file=sys.stderr)
         return []
@@ -491,12 +519,12 @@ def _earlier_builds(job: str, newest: str, runner, log=print) -> list[str]:
     return [name for _, name in sorted(ids, reverse=True)[:FALLBACK_BUILDS]]
 
 
-def _candidates(job: str, newest: str, runner, log=print):
+def _candidates(job: str, newest: str, runner, log=print, logs_root: str = LOGS_ROOT):
     """The newest build, then -- only if it is needed -- the finished builds
     before it: the listing is one call over a prefix that only grows, and the
     newest build has finished most of the time."""
     yield newest
-    yield from _earlier_builds(job, newest, runner, log)
+    yield from _earlier_builds(job, newest, runner, log, logs_root)
 
 
 def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | None:
@@ -505,7 +533,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     None is also what a pointer that cannot be read for a reason other than
     NotFound returns, after a warning: the bot has gone blind on this job, and
     an absent reading holds any open note rather than ending it."""
-    out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{POINTER}"], runner=runner)
+    out, err = collect._gcloud_storage_call(["cat", f"{periodic.logs_root}/{periodic.job}/{POINTER}"], runner=runner)
     if out is None:
         if not _not_found(err):
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s build pointer: {err.strip()}", file=sys.stderr)
@@ -517,9 +545,9 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
     if not newest.isdecimal():
         log(f"{WARNING_PREFIX}{periodic.job}'s build pointer is not a build id: {newest!r}", file=sys.stderr)
         return None
-    for build in _candidates(periodic.job, newest, runner, log):
+    for build in _candidates(periodic.job, newest, runner, log, periodic.logs_root):
         try:
-            finished = _finished(periodic.job, build, runner)
+            finished = _finished(periodic.job, build, runner, periodic.logs_root)
         except Unreadable as exc:
             log(f"{WARNING_PREFIX}could not read {periodic.job}'s {exc}", file=sys.stderr)
             return None
@@ -548,7 +576,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # than never. Any other failure is unreadable and the tick is blind
             # on this job, as for finished.json: a note is posted once, and one
             # written without its projects would stay so.
-            out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
+            out, err = collect._gcloud_storage_call(["cat", f"{periodic.logs_root}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{periodic.artifact}"], runner=runner)
             if out is not None:
                 try:
                     loaded = json.loads(out)
@@ -571,7 +599,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
             # not an object is said in its own lines; a read that fails for
             # another reason follows the main report's rule above: a failed
             # build's note is posted once, so it goes out whole or not yet.
-            out, err = collect._gcloud_storage_call(["cat", f"{LOGS_ROOT}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
+            out, err = collect._gcloud_storage_call(["cat", f"{periodic.logs_root}/{periodic.job}/{build}/{ARTIFACTS_DIR}/{name}"], runner=runner)
             if out is not None:
                 try:
                     loaded = json.loads(out)
@@ -585,7 +613,7 @@ def read_job(periodic: Periodic, runner=subprocess.run, log=print) -> dict | Non
         if extras:
             reading[KEY_EXTRA_ARTIFACTS] = extras
         if not reading[KEY_PASSED]:
-            reading.update(_failed_build_cause(periodic.job, build, runner, has_report=reading[KEY_ARTIFACT] is not None))
+            reading.update(_failed_build_cause(periodic.job, build, runner, has_report=reading[KEY_ARTIFACT] is not None, logs_root=periodic.logs_root))
         return reading
     return None
 
@@ -997,7 +1025,7 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             # thresholded job leads with the projects that keep failing.
             KEY_DETAIL: token_lines if verdict == VERDICT_TOKEN else ((_thresholded_detail(periodic, persistent, artifact, extras) if periodic.run_alert_after > FIRST_FAILURE else detail_lines(periodic, artifact, extras)) if verdict == VERDICT_FAILED else []),
             KEY_SUMMARY: f"the run passed; {len(token_lines)} token(s) to rotate" if verdict == VERDICT_TOKEN else (run_summary(periodic, artifact, bool(reading.get(KEY_PASSED)), extras) if verdict == VERDICT_FAILED else None),
-            KEY_HISTORY_URL: history_url(periodic.job),
+            KEY_HISTORY_URL: history_url(periodic.job, periodic.logs_root),
             KEY_PLACE: periodic.place,
             # A TOKEN note is about the credential, not the sweep: its words say so.
             KEY_ABSENCE: TOKEN_ABSENCE if verdict == VERDICT_TOKEN else periodic.absence,

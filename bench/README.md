@@ -169,7 +169,7 @@ Thresholds are named environment variables, all with the documented default: `EV
 The certification suite is the set of cases behind the certified-capabilities page. It has its
 own lane and nothing else: `hack/eval/certification-cases.txt` is its roster, `EVAL_TIER=certification` in
 `hack/ci-eval-pr.sh` runs that file alone (one `# part N` section of it under
-`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, rerun from Deck and never on a cron),
+`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
 and no pull request and no nightly runs a case named there. A certification case is an ordinary
 case under `bench/tasks/<id>/` whose `task.yaml` carries `suite: certification`;
 `scripts/validate_bench_cases.py` refuses a rostered case without the line and a case with the line

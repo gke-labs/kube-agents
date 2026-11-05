@@ -1431,7 +1431,7 @@ projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
-failure for the reconciles), and the poster treats a told job as recovered only
+failure for the reconciles and for the certification slice), and the poster treats a told job as recovered only
 on a build that passed (`periodics_runs`), not on a sub-threshold failure, and
 a told `TOKEN` note only on a passed build whose `tokens_current` is true. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
