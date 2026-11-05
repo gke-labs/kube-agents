@@ -216,8 +216,9 @@ spec:
     namespaceSelector:
       matchLabels:
         app.kubernetes.io/component: profiles
+        app.kubernetes.io/part-of: kube-agents
   paramRef:
-    # No namespace: the Job's own. Only PodTemplates the operator rendered, by its labels.
+    # No namespace: the Job's own. Only the DispatchJobTemplates the operator rendered, by its labels.
     selector:
       matchLabels:
         app.kubernetes.io/managed-by: platformagent-controller

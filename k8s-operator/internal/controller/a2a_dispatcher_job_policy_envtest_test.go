@@ -73,13 +73,16 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 	// Labelled as the chart labels it: the binding selects profile
 	// namespaces by it.
 	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: pns,
-		Labels: map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent}}})
+		Labels: map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent, labelPartOf: partOfKubeAgents}}})
 	// The dispatcher's Jobs Role and binding, as the operator renders them.
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRole(agent))
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRoleBinding(agent))
 	dispatcher := impersonatedClient(t, cfg, agent.Namespace, a2aDispatcherName(agent))
 
 	tse := buildProfileJobTemplate(agent, ptr.To(unattendedProfile(agent, "tse")), false)
+	// A PodTemplate already under a param's name: the operator's dry run
+	// generates its name, so it doesn't collide.
+	mustCreate(ctx, t, admin, &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + "tse", Namespace: pns}, Template: *tse.DeepCopy()})
 
 	// Before any operator param: DispatchJobTemplates without its labels, one
 	// posing as the index and listing tse's account, one as tse's template.
@@ -373,6 +376,14 @@ func TestTheDispatcherJobPolicyHoldsJobsToTheRenderedTemplate(t *testing.T) {
 		t.Errorf("a Job outside the profile namespace was refused: %v", err)
 	}
 
+	// Not selected: a namespace carrying only the component label, not
+	// kube-agents' own: someone else's "profiles" namespace.
+	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "someone-elses-profiles",
+		Labels: map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent}}})
+	if err := admin.Create(ctx, dispatcherJob("theirs", tse, func(j *batchv1.Job) { j.Namespace = "someone-elses-profiles" })); err != nil {
+		t.Errorf("a Job in another product's \"profiles\" namespace was refused: %v", err)
+	}
+
 	// Not selected: the same out-of-shape Job from a requester that is not
 	// a dispatcher.
 	tmpl := tse.DeepCopy()
@@ -499,7 +510,7 @@ func TestTheDispatcherJobPolicyFailsClosedOnAFreshInstall(t *testing.T) {
 	pns := profileNamespaceName(agent)
 	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: agent.Namespace}})
 	mustCreate(ctx, t, admin, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: pns,
-		Labels: map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent}}})
+		Labels: map[string]string{profileNamespaceComponentLabel: profileNamespaceComponent, labelPartOf: partOfKubeAgents}}})
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRole(agent))
 	mustCreate(ctx, t, admin, buildA2ADispatcherJobsRoleBinding(agent))
 	dispatcher := impersonatedClient(t, cfg, agent.Namespace, a2aDispatcherName(agent))

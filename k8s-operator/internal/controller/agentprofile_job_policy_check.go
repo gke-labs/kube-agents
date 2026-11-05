@@ -80,9 +80,10 @@ func (r *PlatformAgentReconciler) dispatcherJobPolicyInPlace(ctx context.Context
 		return false, "its binding does not select params by label with no params denied", nil
 	case ref.Selector.MatchLabels[labelManagedBy] != fieldOwner || ref.Selector.MatchLabels[dispatchJobTemplateLabel] != "true" ||
 		len(ref.Selector.MatchExpressions) != 0:
-		return false, "its binding's params are not the operator's labelled PodTemplates alone", nil
+		return false, "its binding's params are not the operator's labelled DispatchJobTemplates alone", nil
 	case bs.MatchResources == nil || bs.MatchResources.NamespaceSelector == nil ||
-		bs.MatchResources.NamespaceSelector.MatchLabels[profileNamespaceComponentLabel] != profileNamespaceComponent:
+		bs.MatchResources.NamespaceSelector.MatchLabels[profileNamespaceComponentLabel] != profileNamespaceComponent ||
+		bs.MatchResources.NamespaceSelector.MatchLabels[labelPartOf] != partOfKubeAgents:
 		return false, "its binding is not scoped to profile namespaces", nil
 	}
 	return true, "", nil

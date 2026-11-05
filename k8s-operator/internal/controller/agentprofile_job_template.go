@@ -202,11 +202,20 @@ func settleForPlatformMutation(spec *corev1.PodSpec, p *agentv1alpha1.AgentProfi
 		}
 	}
 	profile := p.Spec.Resources
+	// The pod's ephemeral-storage ceiling is its containers' limits, and its
+	// disk-backed emptyDirs count against it: the worker's share covers
+	// their size limits, on top of the default for its own writes.
+	ephemeral := jobDefaultResources[corev1.ResourceEphemeralStorage].DeepCopy()
+	for _, v := range spec.Volumes {
+		if v.EmptyDir != nil && v.EmptyDir.Medium != corev1.StorageMediumMemory && v.EmptyDir.SizeLimit != nil {
+			ephemeral.Add(*v.EmptyDir.SizeLimit)
+		}
+	}
 	for i := range spec.Containers {
 		var requests, limits corev1.ResourceList
 		if i == 0 { // the worker
-			requests = corev1.ResourceList{corev1.ResourceCPU: profile.Requests.CPU, corev1.ResourceMemory: profile.Requests.Memory}
-			limits = corev1.ResourceList{corev1.ResourceCPU: profile.Limits.CPU, corev1.ResourceMemory: profile.Limits.Memory}
+			requests = corev1.ResourceList{corev1.ResourceCPU: profile.Requests.CPU, corev1.ResourceMemory: profile.Requests.Memory, corev1.ResourceEphemeralStorage: ephemeral}
+			limits = corev1.ResourceList{corev1.ResourceCPU: profile.Limits.CPU, corev1.ResourceMemory: profile.Limits.Memory, corev1.ResourceEphemeralStorage: ephemeral}
 		}
 		settle(&spec.Containers[i], requests, limits)
 	}
@@ -355,7 +364,9 @@ func dispatchJobParamTemplate(param *agentv1alpha1.DispatchJobTemplate) (corev1.
 // it follows the API server's defaults across upgrades. The operator's only
 // podtemplate verb is create, for this.
 func (r *PlatformAgentReconciler) defaultedJobTemplate(ctx context.Context, ns, profile string, tmpl *corev1.PodTemplateSpec) (*corev1.PodTemplateSpec, error) {
-	dry := &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + profile, Namespace: ns}, Template: *tmpl.DeepCopy()}
+	// A generated name: nothing is stored, and no PodTemplate of a fixed
+	// name, the operator's or anyone's, can make the create collide.
+	dry := &corev1.PodTemplate{ObjectMeta: metav1.ObjectMeta{GenerateName: dispatchJobTemplatePrefix + profile + "-", Namespace: ns}, Template: *tmpl.DeepCopy()}
 	if err := r.Create(ctx, dry, client.DryRunAll); err != nil {
 		return nil, fmt.Errorf("default the Job template of profile %s (a dry-run PodTemplate): %w", profile, err)
 	}
@@ -495,16 +506,11 @@ func (r *PlatformAgentReconciler) applyDispatchJobParam(ctx context.Context, age
 	return nil
 }
 
-// deleteDispatcherJobResources removes what Job mode put in the profile
-// namespace, each only if it carries this agent's labels, read uncached. The
-// Jobs Role and binding go first: once the dispatcher can't create a Job, the
-// order of the rest can't open the policy (a template left without its index
-// admits any account no template runs as). Then the dispatcher's Jobs (no
-// dispatcher holds their leases once it is gone; propagated, so their pods go
-// too), then the templates, and the index last.
-func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	ns := profileNamespaceName(agent)
-	key := types.NamespacedName{Namespace: ns, Name: a2aDispatcherJobsRoleName(agent)}
+// revokeDispatcherJobsRole deletes the dispatcher's Jobs RoleBinding and
+// Role in the profile namespace, if they carry this agent's labels, so it
+// can create no more Jobs; its running Jobs, and the policy's params, stay.
+func (r *PlatformAgentReconciler) revokeDispatcherJobsRole(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherJobsRoleName(agent)}
 	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
 		if err := r.a2aReader().Get(ctx, key, obj); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -518,6 +524,21 @@ func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Conte
 		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
 			return fmt.Errorf("deleting the dispatcher's Jobs %T: %w", obj, err)
 		}
+	}
+	return nil
+}
+
+// deleteDispatcherJobResources removes what Job mode put in the profile
+// namespace, each only if it carries this agent's labels, read uncached. The
+// Jobs Role and binding go first: once the dispatcher can't create a Job, the
+// order of the rest can't open the policy (a template left without its index
+// admits any account no template runs as). Then the dispatcher's Jobs (no
+// dispatcher holds their leases once it is gone; propagated, so their pods go
+// too), then the templates, and the index last.
+func (r *PlatformAgentReconciler) deleteDispatcherJobResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	ns := profileNamespaceName(agent)
+	if err := r.revokeDispatcherJobsRole(ctx, agent); err != nil {
+		return err
 	}
 	// One by one: the operator holds delete on Jobs, not deletecollection.
 	// Only those with this agent's labels (dispatchJobLabels, which the

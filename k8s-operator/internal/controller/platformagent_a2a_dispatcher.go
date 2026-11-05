@@ -576,28 +576,54 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// dispatch config and into the admission policy's params, so the two
 	// never differ.
 	jobTemplates := dispatchJobTemplates(agent, profiles, r.imageVolumeSupported(agent))
+	// Wanted: the chart's signal, and the policy in the cluster as
+	// rendered. A read that answers neither way changes nothing.
+	jobMode := dispatcherJobPolicyRendered()
+	if jobMode {
+		ok, why, err := r.dispatcherJobPolicyInPlace(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("check the dispatcher Job admission policy: %w", err)
+		}
+		if !ok {
+			jobMode = false
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
+				"A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), so unattended profile tasks run on the worker pool", why))
+		}
+	}
+	// Wanted, the params and the Jobs Role come before the dispatch config
+	// that names the templates, so the config never says Job mode while the
+	// dispatcher can't run one. Any failure, or a profile namespace not
+	// ready (the binding selects profile namespaces by the label it may
+	// lack), revokes the Jobs Role alone and leaves the templates out, so
+	// unattended tasks take the pool; Jobs already running stay. Not
+	// wanted (a deliberate gate-off) tears Job mode down below.
+	var jobErr error
+	switch {
+	case !jobMode:
+		jobTemplates = nil
+	case !profileNamespaceReady:
+		jobTemplates = nil
+		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
+	default:
+		if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
+			jobTemplates = nil
+			jobErr = errors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+			break
+		}
+		for _, obj := range []client.Object{buildA2ADispatcherJobsRole(agent), buildA2ADispatcherJobsRoleBinding(agent)} {
+			if err := r.applyManaged(ctx, agent, obj); err != nil {
+				jobTemplates = nil
+				jobErr = errors.Join(fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err), r.revokeDispatcherJobsRole(ctx, agent))
+				break
+			}
+		}
+	}
 	for i := range profiles {
 		if jobTemplates[profiles[i].Name] == nil {
 			continue
 		}
 		if problem := autopilotRatioProblem(&profiles[i]); problem != "" {
 			r.recordEvent(agent, corev1.EventTypeWarning, reasonProfileJobResources, "AgentProfile "+profiles[i].Name+": "+problem)
-		}
-	}
-	// Signalled, the policy must also be in the cluster as rendered before
-	// the dispatcher gets Job mode: no templates and no Jobs Role otherwise.
-	jobMode := dispatcherJobPolicyRendered()
-	if jobMode {
-		ok, why, err := r.dispatcherJobPolicyInPlace(ctx)
-		if err != nil {
-			// Neither in place nor gone: change nothing until a read
-			// answers.
-			return nil, fmt.Errorf("check the dispatcher Job admission policy: %w", err)
-		}
-		if !ok {
-			jobMode, jobTemplates = false, nil
-			r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
-				"A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), so unattended profile tasks run on the worker pool", why))
 		}
 	}
 	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, jobTemplates)
@@ -642,31 +668,18 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 		}
 	}
 	if !profileNamespaceReady {
-		// The admission policy's binding selects profile namespaces by the
-		// label whose absence makes this one not ready, so Job mode can't
-		// stand here: revoke what an earlier pass rendered.
-		return r.deleteDispatcherJobResources(ctx, agent), nil
+		return jobErr, nil
 	}
 	for _, obj := range []client.Object{buildA2ADispatcherPodsRole(agent), buildA2ADispatcherPodsRoleBinding(agent)} {
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
-	// Job mode, only where the chart rendered its admission policy:
-	// elsewhere, what an earlier pass rendered goes. The policy's params
-	// before the Role that lets the dispatcher create Jobs against them.
+	// Not wanted: what an earlier pass rendered goes.
 	if !jobMode {
 		return r.deleteDispatcherJobResources(ctx, agent), nil
 	}
-	if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
-		return err, nil
-	}
-	for _, obj := range []client.Object{buildA2ADispatcherJobsRole(agent), buildA2ADispatcherJobsRoleBinding(agent)} {
-		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err), nil
-		}
-	}
-	return nil, nil
+	return jobErr, nil
 }
 
 // removeA2ADispatcher deletes what reconcileA2ADispatcher rendered: the

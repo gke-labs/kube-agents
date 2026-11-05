@@ -291,8 +291,12 @@ func (b *bus) noRedelivery(profile, tier string) {
 		b.t.Fatal(err)
 	}
 	time.Sleep(time.Second) // a give-back's redelivery comes RetryDelay later
-	if info, err := cons.Info(b.ctx); err != nil || info.Delivered.Consumer != 1 {
-		b.t.Errorf("delivered %d times (%v): a stopped task is ended where it is found, not put back in the queue", info.Delivered.Consumer, err)
+	info, err := cons.Info(b.ctx)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	if info.Delivered.Consumer != 1 {
+		b.t.Errorf("delivered %d times: a stopped task is ended where it is found, not put back in the queue", info.Delivered.Consumer)
 	}
 }
 
@@ -419,5 +423,37 @@ func TestAStopHeardDuringAdmissionIsNotLost(t *testing.T) {
 	}
 	if w.offerCount() != 0 || w.startedCount() != 0 {
 		t.Errorf("a task stopped during admission was offered %d times, started %d", w.offerCount(), w.startedCount())
+	}
+}
+
+// The stop subscriptions are made afresh every stopResubscribe, so one the
+// bus refused for want of a grant (which still succeeds client-side) starts
+// working once the grant is there; within the period they're kept.
+func TestStopSubscriptionsAreMadeAfreshPeriodically(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 1, 0, "read")
+	d, _ := b.runDispatcher(testConfig(), oneProfile("tse", 1, "tse-0"), &fakeVerifier{})
+	waitFor(t, 5*time.Second, "the stop subscription", func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.stopSubs["tse"] != nil
+	})
+	d.mu.Lock()
+	first := d.stopSubs["tse"]
+	d.mu.Unlock()
+	d.syncStops()
+	d.mu.Lock()
+	kept := d.stopSubs["tse"] == first
+	d.stopSubsAt = d.now().Add(-stopResubscribe - time.Second)
+	d.mu.Unlock()
+	if !kept {
+		t.Error("a stop subscription was remade within the period")
+	}
+	d.syncStops()
+	d.mu.Lock()
+	remade := d.stopSubs["tse"] != nil && d.stopSubs["tse"] != first
+	d.mu.Unlock()
+	if !remade {
+		t.Error("the stop subscription wasn't made afresh after the period")
 	}
 }

@@ -22,6 +22,10 @@ const (
 	// (lib.DispatchStopStream) keeps the record longer; this covers a
 	// stream not yet provisioned.
 	stoppedMemory = 24 * time.Hour
+	// stopResubscribe is how often syncStops makes the stop subscriptions
+	// afresh, so one the bus refused for want of a grant starts working
+	// once the grant is there.
+	stopResubscribe = 5 * time.Minute
 	// stopCheckTimeout bounds one direct read of the stop stream.
 	stopCheckTimeout = 2 * time.Second
 	// directGetPrefix is JetStream's direct get by subject: the last message
@@ -56,9 +60,11 @@ func stopFor(profile, subject string, data []byte) (string, bool) {
 
 // syncStops keeps one live subscription to each configured profile's stop
 // subject, a2a.stop.<profile>.*, and drops those of profiles gone from the
-// config. Its grant is per profile, so a profile added later is subscribed
-// once the connection has its grant (a regrant reconnects); until then the
-// subscribe fails and is retried on the next refresh.
+// config. A subscribe the bus refuses for want of the grant still succeeds
+// client-side (the refusal is an asynchronous permissions error, and
+// nats.go keeps the subscription), so every stopResubscribe the
+// subscriptions are made afresh: one made before its grant existed starts
+// working within that period of the grant arriving.
 func (d *Dispatcher) syncStops() {
 	want := map[string]bool{}
 	for _, p := range d.src.Config().Profiles {
@@ -66,6 +72,13 @@ func (d *Dispatcher) syncStops() {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if now := d.now(); now.Sub(d.stopSubsAt) >= stopResubscribe {
+		for profile, sub := range d.stopSubs {
+			sub.Stop()
+			delete(d.stopSubs, profile)
+		}
+		d.stopSubsAt = now
+	}
 	for profile, sub := range d.stopSubs {
 		if !want[profile] {
 			sub.Stop()

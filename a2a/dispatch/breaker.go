@@ -94,7 +94,7 @@ func (b *breakers) finished(profile, tier string) {
 	delete(b.m, ptKey{profile, tier})
 }
 
-// open lists the (profile, tier) pairs refusing submissions at now, as
+// open lists the (profile, tier) pairs holding submissions back at now, as
 // "profile/tier", for health.
 func (b *breakers) open(now time.Time) []string {
 	if b == nil {

@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
@@ -25,6 +26,8 @@ type fakeJobs struct {
 	pod string
 	// launchErr, if set, is what Launch returns.
 	launchErr error
+	// podErr, if set, is what Pod returns.
+	podErr error
 }
 
 func newFakeJobs(readyAfter time.Duration) *fakeJobs {
@@ -47,6 +50,9 @@ func (f *fakeJobs) Launch(_ context.Context, _, _, taskID string) error {
 func (f *fakeJobs) Pod(_ context.Context, _, _, taskID string) (string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.podErr != nil {
+		return "", false, f.podErr
+	}
 	if f.failed[taskID] {
 		return "", true, nil
 	}
@@ -215,6 +221,15 @@ func TestAProfileWithoutAJobTemplateUsesThePool(t *testing.T) {
 	if jobs.launchCount() != 0 {
 		t.Errorf("%d Jobs launched for a profile with no Job template", jobs.launchCount())
 	}
+	// A pool task has no Job to delete: deleting one anyway is a refused
+	// call on an install without the Jobs Role.
+	time.Sleep(300 * time.Millisecond)
+	jobs.mu.Lock()
+	deletes := len(jobs.deletes)
+	jobs.mu.Unlock()
+	if deletes != 0 {
+		t.Errorf("%d Job deletes for a task run on the pool", deletes)
+	}
 }
 
 // runDispatcherWith is runDispatcher with Jobs.
@@ -341,5 +356,37 @@ func TestAJobRefusedByThePolicyIsReported(t *testing.T) {
 	}
 	if h := d.Health(); h.JobAdmission != "" {
 		t.Errorf("Health still reports %q after a Job was admitted", h.JobAdmission)
+	}
+}
+
+// A Job that can't be read through its start limit (the API erroring, not
+// the Job seen failing) is no worker's fault: the task stays queued, its Job
+// isn't deleted, the breaker doesn't count it, and it shows as waiting.
+func TestAnUnreadableJobAtItsStartLimitKeepsTheTaskQueued(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	b.ensure("inv", 1, 0, "unattended")
+	jobs := newFakeJobs(0)
+	jobs.podErr = errors.New("the API server timed out")
+	d, _ := b.runDispatcherWith(testConfig(), unattendedInstall(1, func(c *lib.DispatchConfig) {
+		c.JobStartSeconds, c.BreakerThreshold = 1, 1
+	}), &fakeVerifier{}, jobs)
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 15*time.Second, "a second pass", func() bool { return jobs.launchCount() >= 2 })
+	if ts := b.terminalsOf("task-1"); len(ts) != 0 {
+		t.Errorf("terminals %+v for a task whose Job couldn't be read", ts)
+	}
+	if jobs.deleted("task-1") {
+		t.Error("the Job was deleted though it was never seen failing")
+	}
+	h := d.Health()
+	if len(h.OpenBreakers) != 0 {
+		t.Errorf("open breakers %v over an unreadable Job", h.OpenBreakers)
+	}
+	waiting := 0
+	for _, n := range h.Waiting {
+		waiting += n
+	}
+	if waiting == 0 {
+		t.Errorf("Health.Waiting %v: the task stays queued, so it shows as waiting", h.Waiting)
 	}
 }

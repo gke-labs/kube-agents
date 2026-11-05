@@ -100,6 +100,9 @@ type holdKey struct{ profile, tier, kind, taskID string }
 type holding struct {
 	profile, tier, kind, taskID string
 	unattended                  bool
+	// onJob is a task run on a Job of its own (job.go), whose Job endJob
+	// deletes; a pool task has none.
+	onJob bool
 	// lease and renew are what the task was offered (or, re-adopted, what
 	// its record shows): a config change never moves them.
 	lease, renew time.Duration
@@ -216,7 +219,9 @@ type Dispatcher struct {
 	// stopSubs is the live subscription to each profile's stop subject, and
 	// stopped the stops heard live, by profile/task (stop.go).
 	stopSubs map[string]lib.Subscription
-	stopped  map[string]time.Time
+	// stopSubsAt is when they were last made afresh (syncStops).
+	stopSubsAt time.Time
+	stopped    map[string]time.Time
 	// stopStreamErr is why the last read of the stop stream failed ("" once
 	// one succeeds), and stopReadRetry when to read it again (stop.go).
 	stopStreamErr string
@@ -671,6 +676,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the pool takes the task.
 	if h.unattended && d.jobs != nil && len(prof.JobTemplate) > 0 {
+		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
 		if ended {
@@ -695,6 +701,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	if err != nil || key == "" {
 		d.release(h, false)
 		if err != nil {
+			d.noteWaiting(hk, del.Received(), waitHandOffFailed)
 			log.Warn("hand-off failed; the submission stays queued", "err", err)
 		} else {
 			d.noteWaiting(hk, del.Received(), ReasonNoWorker)
@@ -1086,7 +1093,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier),
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier), onJob: d.cfg.unattended(hk.tier) && d.jobs != nil && len(prof.JobTemplate) > 0,
 		lease: lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()

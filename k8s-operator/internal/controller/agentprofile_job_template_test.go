@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -182,7 +183,7 @@ func TestNoDispatcherRoleCanWriteThePolicysParams(t *testing.T) {
 	}
 	for _, role := range roles.Items {
 		for _, rule := range role.Rules {
-			if slices.Contains(rule.Resources, "podtemplates") || slices.Contains(rule.Resources, "*") {
+			if slices.Contains(rule.Resources, "podtemplates") || slices.Contains(rule.Resources, "dispatchjobtemplates") || slices.Contains(rule.Resources, "*") {
 				t.Errorf("Role %s/%s grants %v on %v", role.Namespace, role.Name, rule.Verbs, rule.Resources)
 			}
 		}
@@ -442,6 +443,10 @@ func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
 			p.Spec.FailurePolicy = ptr.To(admissionregistrationv1.Ignore)
 			return true, true
 		},
+		"not scoped to kube-agents' namespaces": func(_ *admissionregistrationv1.ValidatingAdmissionPolicy, b *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
+			delete(b.Spec.MatchResources.NamespaceSelector.MatchLabels, labelPartOf)
+			return true, true
+		},
 		"params of a built-in kind": func(p *admissionregistrationv1.ValidatingAdmissionPolicy, _ *admissionregistrationv1.ValidatingAdmissionPolicyBinding) (bool, bool) {
 			p.Spec.ParamKind = &admissionregistrationv1.ParamKind{APIVersion: "v1", Kind: "PodTemplate"}
 			return true, true
@@ -555,6 +560,17 @@ func TestTheJobTemplateSettlesWhatAutopilotFillsIn(t *testing.T) {
 	}
 	if n != 1 || len(tmpl.Spec.Tolerations) != 1 {
 		t.Errorf("tolerations %+v, want the architecture's alone, once", tmpl.Spec.Tolerations)
+	}
+	// The worker's ephemeral-storage covers the pod's disk-backed emptyDirs
+	// (they count against the pod's ceiling), plus its own writes.
+	need := jobDefaultResources[corev1.ResourceEphemeralStorage].DeepCopy()
+	for _, v := range tmpl.Spec.Volumes {
+		if v.EmptyDir != nil && v.EmptyDir.Medium != corev1.StorageMediumMemory && v.EmptyDir.SizeLimit != nil {
+			need.Add(*v.EmptyDir.SizeLimit)
+		}
+	}
+	if got := tmpl.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage]; got.Cmp(need) < 0 {
+		t.Errorf("the worker's ephemeral-storage limit %s is under its emptyDirs plus its own writes, %s", got.String(), need.String())
 	}
 	// An init container a builder leaves bare (the stub's declare theirs) is
 	// settled too, from the defaults.
@@ -704,12 +720,68 @@ func TestANotReadyProfileNamespaceRevokesJobMode(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}); err != nil {
 		t.Fatalf("precondition: no Jobs RoleBinding: %v", err)
 	}
+	running := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "dispatch-running", Namespace: pns, Labels: dispatchJobLabels(agent)}}
+	if err := c.Create(ctx, running); err != nil {
+		t.Fatal(err)
+	}
 	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, false); err != nil || profileErr != nil {
 		t.Fatalf("not ready: %v / %v", err, profileErr)
+	}
+	// Revoked, not torn down: a not-ready namespace may be a transient
+	// failure reading it, and the unattended tasks running there stay.
+	if err := c.Get(ctx, client.ObjectKeyFromObject(running), &batchv1.Job{}); err != nil {
+		t.Errorf("a running dispatcher Job went with the namespace's readiness: %v", err)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "tse"}, &agentv1alpha1.DispatchJobTemplate{}); err != nil {
+		t.Errorf("the param went with the namespace's readiness: %v", err)
 	}
 	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
 		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, obj); !apierrors.IsNotFound(err) {
 			t.Errorf("the Jobs %T outlived the profile namespace's readiness: %v", obj, err)
 		}
+	}
+}
+
+// A params pass that fails (here a foreign index under the index's name,
+// after a good pass) revokes the dispatcher's Jobs Role and renders the
+// dispatch config without Job templates, so the dispatcher takes the pool
+// for unattended tasks instead of queueing them to a Job it can't create.
+func TestAFailedParamsPassRevokesJobModeAndKeepsThePool(t *testing.T) {
+	agent := a2aTestAgent()
+	r, c := jobTemplateTestReconciler(t, agent)
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	pns := profileNamespaceName(agent)
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("render: %v / %v", err, profileErr)
+	}
+	var index agentv1alpha1.DispatchJobTemplate
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Delete(ctx, &index); err != nil {
+		t.Fatal(err)
+	}
+	foreign := &agentv1alpha1.DispatchJobTemplate{ObjectMeta: metav1.ObjectMeta{Name: dispatchJobIndexName, Namespace: pns, Labels: map[string]string{"x": "y"}}}
+	if err := c.Create(ctx, foreign); err != nil {
+		t.Fatal(err)
+	}
+	profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refused errForeignDispatchJobParam
+	if !errors.As(profileErr, &refused) {
+		t.Errorf("profileErr = %v, want the foreign-param refusal", profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}); !apierrors.IsNotFound(err) {
+		t.Errorf("the Jobs RoleBinding outlived a failed params pass: %v", err)
+	}
+	var cm corev1.ConfigMap
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplate"`) {
+		t.Error("the dispatch config still names a Job template after a failed params pass")
 	}
 }

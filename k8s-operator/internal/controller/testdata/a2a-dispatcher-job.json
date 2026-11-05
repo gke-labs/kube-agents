@@ -153,12 +153,12 @@
             "resources": {
               "limits": {
                 "cpu": "1",
-                "ephemeral-storage": "1Gi",
+                "ephemeral-storage": "3584Mi",
                 "memory": "2Gi"
               },
               "requests": {
                 "cpu": "250m",
-                "ephemeral-storage": "1Gi",
+                "ephemeral-storage": "3584Mi",
                 "memory": "512Mi"
               }
             },

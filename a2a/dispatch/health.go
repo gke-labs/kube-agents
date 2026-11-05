@@ -41,7 +41,7 @@ type Health struct {
 	// were dropped over a pod's budget, since start.
 	DroppedAnswers int64
 	// OpenBreakers are the (profile, tier) pairs, as profile/tier, whose
-	// breaker is refusing new submissions (breaker.go).
+	// breaker is holding new submissions queued (breaker.go).
 	OpenBreakers []string
 	// StopStream is why the dispatcher can't read the stop stream, or ""
 	// (stop.go): while it is set, a stop counts only if heard live.
@@ -68,12 +68,13 @@ func (d *Dispatcher) noteWaiting(hk holdKey, queued time.Time, why string) {
 
 // offeringWaiting is a reserved submission's waiting entry as its offer
 // round starts. Waiting over a cap ends there: the slot is taken. Waiting
-// for a worker doesn't: until a pod accepts, the submission still waits for
-// one, and the health line keeps saying so through the round.
+// for a worker doesn't, nor waiting on a hand-off that keeps failing: until a
+// pod accepts, the submission still waits, and the health line keeps saying
+// so through the round.
 func (d *Dispatcher) offeringWaiting(hk holdKey) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if w, ok := d.waiting[hk]; ok && w.why != ReasonNoWorker {
+	if w, ok := d.waiting[hk]; ok && w.why != ReasonNoWorker && w.why != waitHandOffFailed {
 		delete(d.waiting, hk)
 	}
 }

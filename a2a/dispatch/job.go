@@ -86,6 +86,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 		}
 		return lib.LeaseRecord{}, "", false, errStopped
 	}
+	var pollErr error
 	for {
 		d.mu.Lock()
 		stopped := h.stopRequested
@@ -94,6 +95,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 			return stoppedJob()
 		}
 		p, failed, err := d.jobs.Pod(ctx, h.profile, h.tier, h.taskID)
+		pollErr = err
 		switch {
 		case err != nil:
 			log.Warn("look for the task's Job pod", "err", err)
@@ -106,6 +108,12 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 			break
 		}
 		if !d.now().Before(until) {
+			if pollErr != nil {
+				// The Job couldn't be read, not seen failing: no worker's
+				// fault, so no breaker count. The submission stays queued,
+				// and the next pass finds the Job again by its task.
+				return lib.LeaseRecord{}, "", false, fmt.Errorf("the task's Job could not be read at its start limit: %w", pollErr)
+			}
 			return noWorker(fmt.Sprintf("the task's Job had no ready worker within %s", limit))
 		}
 		if !sleepCtx(ctx, jobPoll) {
@@ -140,7 +148,7 @@ func (d *Dispatcher) runJob(ctx context.Context, log *slog.Logger, del lib.Deliv
 // dispatcher is stopping; only the first ends the Job, since a restarted
 // dispatcher re-adopts a live task and needs its Job.
 func (d *Dispatcher) endJob(ctx context.Context, log *slog.Logger, h *holding) {
-	if !h.unattended || d.jobs == nil || ctx.Err() != nil {
+	if !h.onJob || d.jobs == nil || ctx.Err() != nil {
 		return
 	}
 	if err := d.jobs.Delete(ctx, h.profile, h.tier, h.taskID); err != nil {

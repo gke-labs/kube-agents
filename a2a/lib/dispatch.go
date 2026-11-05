@@ -331,7 +331,7 @@ type DispatchConfig struct {
 	BreakerThreshold       int `json:"breakerThreshold,omitempty"`
 	BreakerCooldownSeconds int `json:"breakerCooldownSeconds,omitempty"`
 	// JobStartSeconds is how long an unattended task's Job may take to have
-	// a Ready worker pod before the task is rejected no-worker. 0 takes the
+	// a Ready worker pod before the task fails no-worker. 0 takes the
 	// dispatcher's default (300).
 	JobStartSeconds int `json:"jobStartSeconds,omitempty"`
 	// StopGraceSeconds is how long a running task's executor has to stop on
