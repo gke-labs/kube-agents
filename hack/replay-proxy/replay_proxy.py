@@ -16,6 +16,11 @@ client, the proxy:
 - scrubs the request text and keeps it under the store directory
   (request_store.py), or keeps nothing if the scrubbers cannot load.
 
+With `REPLAY_LOG_DIR` set, every line also goes to closed segment files there
+(spool.py), which is what a CI job copies out while it runs; with
+`REPLAY_DATA_MAX_BYTES` set, the store and those files stop growing at that
+size.
+
 All of that runs on one background thread fed by a bounded queue
 (ANALYSIS_QUEUE_SIZE); the handler only enqueues, and drops the analysis (an
 `analysis_dropped` line) rather than wait when the queue is full. Memory is
@@ -45,6 +50,7 @@ import diagnosis
 import normalizer
 import request_store
 import schema as F
+import spool
 
 COMPLETIONS_PATH = "/v1/chat/completions"
 HEALTH_PATH = "/replay/healthz"
@@ -84,6 +90,15 @@ DEFAULT_STORE_DIR = "/data/shadow"
 DEFAULT_REDACTOR_PATH = "/app/scrubbers/redactor.py"
 DEFAULT_TRANSCRIPT_RULES_PATH = "/app/scrubbers/worker_transcript.py"
 UNSET = ""
+# A segment is closed after this long open, so a collector copying closed
+# segments is never more than this far behind the proxy.
+DEFAULT_LOG_SEGMENT_SECONDS = 60.0
+# 0: no budget.
+DEFAULT_DATA_MAX_BYTES = 0
+# How often the budget re-measures the data volume, and how often the open
+# segment is checked for its age.
+DATA_BUDGET_INTERVAL_SECONDS = 30.0
+SEGMENT_ROLL_CHECK_SECONDS = 1.0
 
 # Request headers not forwarded: hop-by-hop ones, and Accept-Encoding so the
 # upstream answers uncompressed and the usage block can be read.
@@ -141,6 +156,12 @@ class Config:
     job_project: str = UNSET
     job_build: str = UNSET
     job_pr: str = UNSET
+    # Where each line is also written, in closed segments (spool.py); unset
+    # writes stdout only.
+    log_dir: str = UNSET
+    log_segment_seconds: float = DEFAULT_LOG_SEGMENT_SECONDS
+    # The most the store and the segments may hold together; 0 is no limit.
+    data_max_bytes: int = DEFAULT_DATA_MAX_BYTES
 
     @classmethod
     def from_env(cls, env: Dict[str, str]) -> "Config":
@@ -158,6 +179,9 @@ class Config:
             job_project=env.get("REPLAY_JOB_PROJECT", UNSET),
             job_build=env.get("REPLAY_JOB_BUILD", UNSET),
             job_pr=env.get("REPLAY_JOB_PR", UNSET),
+            log_dir=env.get("REPLAY_LOG_DIR", UNSET),
+            log_segment_seconds=float(env.get("REPLAY_LOG_SEGMENT_SECONDS", DEFAULT_LOG_SEGMENT_SECONDS)),
+            data_max_bytes=int(env.get("REPLAY_DATA_MAX_BYTES", DEFAULT_DATA_MAX_BYTES)),
         )
 
 
@@ -173,6 +197,8 @@ class Metrics:
         "store_skipped": "replay_shadow_requests_store_skipped_total",
         "prompt_tokens": "replay_shadow_prompt_tokens_total",
         "analysis_dropped": "replay_shadow_analysis_dropped_total",
+        "log_file_errors": "replay_shadow_log_file_errors_total",
+        "log_file_dropped": "replay_shadow_log_file_dropped_total",
     }
 
     def __init__(self, scrubbers_loaded: bool):
@@ -399,8 +425,27 @@ class ShadowProxy:
         self.config = config
         self.key_context = normalizer.KeyContext(config.litellm_config_checksum, config.litellm_image)
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
-        self.store = request_store.RequestStore(config.store_dir, self.scrubber)
+        self.budget: Optional[spool.DataBudget] = None
+        if config.data_max_bytes > 0:
+            self.budget = spool.DataBudget(
+                [config.store_dir, config.log_dir], config.data_max_bytes, DATA_BUDGET_INTERVAL_SECONDS
+            )
+        self.store = request_store.RequestStore(config.store_dir, self.scrubber, self.budget)
         self.metrics = Metrics(self.scrubber.available)
+        self.segments: Optional[spool.SegmentLog] = None
+        self.segments_error: Optional[str] = None
+        if config.log_dir:
+            try:
+                self.segments = spool.SegmentLog(
+                    config.log_dir, spool.segment_prefix(), config.log_segment_seconds, self.budget
+                )
+            except OSError as exc:  # stdout still carries every line
+                self.segments_error = type(exc).__name__
+        self._stopping = threading.Event()
+        self._roller: Optional[threading.Thread] = None
+        if self.segments is not None:
+            self._roller = threading.Thread(target=self._roll, name="replay-shadow-segments", daemon=True)
+            self._roller.start()
         self.diagnosis = diagnosis.DiagnosisHasher()
         self.out = out if out is not None else sys.stdout
         self._log_lock = threading.Lock()
@@ -422,9 +467,26 @@ class ShadowProxy:
         self._queue.join()
 
     def close(self) -> None:
-        """Log what is queued, then stop the worker."""
+        """Log what is queued, stop the worker, and close the open segment."""
         self._queue.put(_STOP)
         self._worker.join()
+        self._stopping.set()
+        if self._roller is not None:
+            self._roller.join()
+        if self.segments is not None:
+            try:
+                self.segments.close()
+            except OSError:
+                self.metrics.add("log_file_errors")
+        if self.budget is not None:
+            self.budget.close()
+
+    def _roll(self) -> None:
+        while not self._stopping.wait(SEGMENT_ROLL_CHECK_SECONDS):
+            try:
+                self.segments.roll_if_due()  # type: ignore[union-attr]
+            except OSError:
+                self.metrics.add("log_file_errors")
 
     def _work(self) -> None:
         while True:
@@ -452,6 +514,14 @@ class ShadowProxy:
         with self._log_lock:
             self.out.write(line + "\n")
             self.out.flush()
+            if self.segments is not None:
+                # The segment is a copy for the collector; failing to write it
+                # never costs the stdout line or the worker.
+                try:
+                    if not self.segments.write(line):
+                        self.metrics.add("log_file_dropped")
+                except OSError:
+                    self.metrics.add("log_file_errors")
 
     def job(self) -> Dict[str, str]:
         return {
@@ -471,6 +541,10 @@ class ShadowProxy:
             F.LITELLM_IMAGE: self.config.litellm_image,
             F.SCRUBBERS_LOADED: self.scrubber.available,
             F.SCRUBBERS_ERROR: self.scrubber.error,
+            F.LOG_FILE: self.segments is not None,
+            F.LOG_FILE_ERROR: self.segments_error,
+            F.LOG_SEGMENTS_RECOVERED: self.segments.recovered if self.segments is not None else 0,
+            F.DATA_MAX_BYTES: self.config.data_max_bytes,
         }
 
     def analyze(

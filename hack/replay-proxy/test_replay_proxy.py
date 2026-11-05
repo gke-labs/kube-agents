@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -178,6 +179,9 @@ class ProxyTestCase(unittest.TestCase):
     redactor_path = REDACTOR
     upstream_timeout = replay_proxy.DEFAULT_UPSTREAM_TIMEOUT_SECONDS
     store_is_file = False
+    # Set to a subdirectory name to write segment files there (REPLAY_LOG_DIR).
+    log_subdir = None
+    data_max_bytes = replay_proxy.DEFAULT_DATA_MAX_BYTES
 
     def setUp(self):
         FakeLiteLLM.calls = []
@@ -195,12 +199,14 @@ class ProxyTestCase(unittest.TestCase):
             with open(self.store, "w"):
                 pass
         self.out = io.StringIO()
+        self.log_dir = os.path.join(temp, self.log_subdir) if self.log_subdir else replay_proxy.UNSET
         config = replay_proxy.Config(
             listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
             store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
             upstream_timeout_seconds=self.upstream_timeout,
             litellm_config_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
             job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
+            log_dir=self.log_dir, data_max_bytes=self.data_max_bytes,
         )
         self.server = replay_proxy.make_server(config, host="127.0.0.1", out=self.out)
         self.proxy = self.server.proxy
@@ -524,6 +530,76 @@ class StoreWriteFailureTest(ProxyTestCase):
         self.assertTrue(line["store_skipped"].startswith("write_failed"), line["store_skipped"])
         self.assertTrue(line["fingerprint"])
         self.assertTrue(line["message_hashes"])
+
+
+class SegmentLogTest(ProxyTestCase):
+    log_subdir = "logs"
+
+    def segment_lines(self):
+        out = []
+        for name in sorted(os.listdir(self.log_dir)):
+            with open(os.path.join(self.log_dir, name), encoding="utf-8") as handle:
+                out += [json.loads(l) for l in handle if l.strip()]
+        return out
+
+    def test_every_stdout_line_is_also_in_the_segments(self):
+        self.proxy.log(self.proxy.startup_line())
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.lines(2)
+        self.proxy.drain()
+        stdout = [json.loads(l) for l in self.out.getvalue().splitlines() if l]
+        self.assertEqual(self.segment_lines(), stdout)
+        self.assertTrue(stdout[0]["log_file"])
+        self.assertIsNone(stdout[0]["log_file_error"])
+        self.assertEqual(stdout[0]["log_segments_recovered"], 0)
+
+    def test_close_leaves_only_closed_segments(self):
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.lines(1)
+        self.proxy.close()
+        names = os.listdir(self.log_dir)
+        self.assertTrue(names)
+        self.assertTrue(all(n.endswith(".jsonl") for n in names), names)
+
+
+class SegmentLogUnavailableTest(ProxyTestCase):
+    # A directory cannot be made under a file.
+    log_subdir = "a-file/logs"
+
+    def setUp(self):
+        temp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp, ignore_errors=True)
+        with open(os.path.join(temp, "a-file"), "w"):
+            pass
+        with unittest.mock.patch.object(tempfile, "mkdtemp", return_value=temp):
+            super().setUp()
+
+    def test_stdout_carries_on_and_the_start_line_says_why(self):
+        start = json.loads(json.dumps(self.proxy.startup_line()))
+        self.assertFalse(start["log_file"])
+        self.assertTrue(start["log_file_error"])
+        status, _, _ = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertEqual(status, 200)
+        self.assertTrue(self.lines(1)[0]["fingerprint"])
+
+
+class DataBudgetSpentTest(ProxyTestCase):
+    log_subdir = "logs"
+    data_max_bytes = 1
+
+    def test_store_and_segments_stop_and_stdout_keeps_every_line(self):
+        self.assertEqual(self.proxy.startup_line()["data_max_bytes"], 1)
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.request("POST", "/v1/chat/completions", chat("t_22222222", stream=False))
+        first, second = self.lines(2)[:2]
+        # The volume was empty, so the first request is stored; that spends
+        # the budget, and from then on nothing more is written to the volume.
+        self.assertTrue(first["stored"])
+        self.assertFalse(second["stored"])
+        self.assertEqual(second["store_skipped"], "budget_spent")
+        self.proxy.drain()
+        self.assertEqual(os.listdir(self.log_dir), [])
+        self.assertIn("replay_shadow_log_file_dropped_total 2", self.proxy.metrics.render())
 
 
 class DiagnosisHashTest(ProxyTestCase):

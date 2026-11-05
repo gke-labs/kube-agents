@@ -53,6 +53,13 @@ ERROR_ANALYSIS_DROPPED = "analysis_dropped"
 # Fields of the start line.
 SCRUBBERS_LOADED = "scrubbers_loaded"
 SCRUBBERS_ERROR = "scrubbers_error"
+# Whether lines also go to segment files (REPLAY_LOG_DIR), why not when that
+# was asked for and failed, how many segments a previous run left open and
+# this one closed, and the data budget in bytes (0: none).
+LOG_FILE = "log_file"
+LOG_FILE_ERROR = "log_file_error"
+LOG_SEGMENTS_RECOVERED = "log_segments_recovered"
+DATA_MAX_BYTES = "data_max_bytes"
 
 # Fields of `job`.
 JOB_KIND = "kind"
