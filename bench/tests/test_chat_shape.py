@@ -111,6 +111,8 @@ def test_a_plain_verdict_line_followed_by_a_section_label_opens_on_it():
         ('"Got it." Two pods are OOMKilled.', 2),
         ("I\u2019ll look into this. Two pods are OOMKilled.", 4),
         ("Let\u2019s see. Two pods are OOMKilled.", 2),
+        ("\u2018Got it.\u2019 Two pods are OOMKilled.", 2),
+        ("Sure (checking now). Two pods are OOMKilled.", 3),
     ],
 )
 def test_a_lead_in_before_the_answer_is_counted(reply: str, before: int):
@@ -196,6 +198,20 @@ def test_an_apology_quoted_in_an_artifact_is_not_the_replys():
     shape = chat_shape.measure(final)
     assert shape[chat_shape.APOLOGY] is False
     assert shape[chat_shape.BOT_MESSAGES] == 2
+
+
+def test_a_card_that_paused_on_a_question_is_answered_by_the_question():
+    final = "\n\n".join([ACK, "Question from delegated task t_1:\nWhich option should I take?"])
+    assert chat_shape.answer_text(final) == "Which option should I take?"
+    shape = chat_shape.measure(final)
+    assert shape[chat_shape.OPENS_ON_VERDICT] is True
+    assert shape[chat_shape.ANSWER_WORDS] == 5
+    assert shape[chat_shape.BOT_MESSAGES] == 2
+
+
+def test_an_artifact_alone_leaves_the_reply_as_the_answer():
+    final = "\n\n".join(["**Two pods are OOMKilled.**", "Artifact report.md produced by delegated task t_1:\n# Report"])
+    assert chat_shape.answer_text(final) == "**Two pods are OOMKilled.**"
 
 
 def test_a_reply_with_no_ack_counts_only_its_sections():

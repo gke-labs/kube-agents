@@ -20,7 +20,8 @@ back preambles and walls of text shows up as a trend rather than in one case's
 judged score. Reported, never scored: nothing here reaches a verdict.
 
 The answer is the last card result delivered into the thread when the ask was
-delegated, and the whole reply otherwise. The checks are structural on
+delegated (the last question, when a card paused to ask one instead), and the
+whole reply otherwise. The checks are structural on
 purpose: an opening line that is a heading, ends on a colon, or starts with
 one of a short list of lead-in phrases, and an apology word anywhere outside
 quoted code. A sentence that merely sounds hedged is the judge's to notice.
@@ -51,6 +52,7 @@ _DELIVERED_HEADER = re.compile(
     re.MULTILINE,
 )
 _RESULT_HEADER_PREFIX = "Result of delegated task "
+_QUESTION_HEADER_PREFIX = "Question from delegated task "
 _ARTIFACT_HEADER_PREFIX = "Artifact "
 _ATX_HEADING = re.compile(r"^ {0,3}#{1,6}(?:\s|$)")
 # Markup and symbols ahead of a line's first word: emphasis, a quote mark, a
@@ -68,9 +70,10 @@ _APOLOGY = re.compile(r"\b(?:sorry|apologi[sz]e[sd]?|apologies)\b", re.IGNORECAS
 # The typographic apostrophe a model writes as often as the ASCII one; folded
 # before the lead-in match, as verifiers.py's _MARKDOWN_NOISE folds it.
 _CURLY_APOSTROPHE = "\u2019"
-# The end of the first sentence on a line: a stop, any emphasis or quote
-# closing over it ("**Sure!**"), and the whitespace after.
-_FIRST_SENTENCE = re.compile(r"^(.+?[.!?:])[*_\"'\u201d)]*(?:\s+|$)")
+# The end of the first sentence on a line: a stop, any markup closing over it
+# ("**Sure!**", a quote, a bracket), and the whitespace after. Any non-word
+# run, the same tolerance _LEADING_MARKUP gives the sentence's other end.
+_FIRST_SENTENCE = re.compile(r"^(.+?[.!?:])[^\w\s]*(?:\s+|$)")
 _WORD = re.compile(r"\S+")
 _FENCE = re.compile(r"```.*?```", re.DOTALL)
 # Inline code: a quoted log line or HTTP body, not the agent's own words.
@@ -91,10 +94,12 @@ def _sections(final_message: str) -> tuple[str, list[tuple[str, str]]]:
 
 
 def answer_text(final_message: str) -> str:
-    """The answer in ``final_message``: its last delivered card result, or all of it."""
+    """The answer in ``final_message``: its last delivered card result, else the
+    last question a paused card asked, else the reply ahead of any section."""
     opening, sections = _sections(final_message)
     results = [body for header, body in sections if header.startswith(_RESULT_HEADER_PREFIX)]
-    return (results[-1] if results else final_message).strip()
+    questions = [body for header, body in sections if header.startswith(_QUESTION_HEADER_PREFIX)]
+    return (results or questions or [opening])[-1].strip()
 
 
 def _posted(final_message: str) -> list[str]:
