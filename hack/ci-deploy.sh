@@ -904,18 +904,22 @@ export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
 # Under gemini it is the leased project's own key, and an unreadable or empty
 # secret stops the deploy here, before any Helm call: no fallback to the job
 # env's key, whose shared quota is what the per-project key replaces. Under any
-# other provider it is GEMINI_API_KEY unchanged. The key is never echoed;
-# $(...) drops the trailing newline a stored value may carry.
+# other provider it is GEMINI_API_KEY unchanged. The key is never echoed. A
+# whitespace-only value counts as empty, and the surrounding whitespace of a
+# stored value (a trailing newline, a CRLF's \r) is dropped.
 resolve_agent_gemini_api_key() {
   if [ "${MODEL_PROVIDER}" != "gemini" ]; then
     AGENT_GEMINI_API_KEY="${GEMINI_API_KEY}"
     return 0
   fi
   local key=""
-  if ! key="$(gcloud secrets versions access latest --secret="${EVAL_AGENT_GEMINI_KEY_SECRET}" --project="${PROJECT_ID}")" || [ -z "${key}" ]; then
+  if ! key="$(gcloud secrets versions access latest --secret="${EVAL_AGENT_GEMINI_KEY_SECRET}" --project="${PROJECT_ID}")" || [[ -z "${key//[[:space:]]/}" ]]; then
     echo "FATAL: MODEL_PROVIDER=gemini but Secret Manager ${PROJECT_ID}/${EVAL_AGENT_GEMINI_KEY_SECRET} cannot be read as this runner or is empty. Run scripts/provision_ci_pool_gemini_key.sh ${PROJECT_ID} to mint the project's key and grant the runner access." >&2
     exit 1
   fi
+  # A real key holds no whitespace: drop what surrounds it, a CRLF's \r included.
+  key="${key#"${key%%[![:space:]]*}"}"
+  key="${key%"${key##*[![:space:]]}"}"
   AGENT_GEMINI_API_KEY="${key}"
 }
 # --- agent key: end

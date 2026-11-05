@@ -127,6 +127,21 @@ class CiDeployGeminiKeyTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertNotIn("RESOLVED=", proc.stdout)
         self.assertIn(_REPAIR_SCRIPT, proc.stderr)
+        self.assertIn(_PROJECT, proc.stderr)
+        self.assertIn(_SECRET, proc.stderr)
+
+    def test_gemini_with_a_whitespace_only_secret_fails(self) -> None:
+        proc = self._run("gemini", stdout="  \n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("RESOLVED=", proc.stdout)
+        self.assertIn(_REPAIR_SCRIPT, proc.stderr)
+        self.assertIn(_PROJECT, proc.stderr)
+        self.assertIn(_SECRET, proc.stderr)
+
+    def test_gemini_strips_a_crlf_line_ending_from_the_key(self) -> None:
+        proc = self._run("gemini", stdout="k9\r\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RESOLVED=[k9]", proc.stdout)
 
     def test_the_rationale_comment_names_the_nightlies_as_the_gemini_path(self) -> None:
         head = self.text[: self.text.index('export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"')]
