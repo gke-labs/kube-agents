@@ -893,7 +893,7 @@ class AssessTest(unittest.TestCase):
         # No reading keeps everything.
         self.assertEqual(periodics.streaks({}, three)[SWEEP.job], three[SWEEP.job])
 
-    def test_two_failed_sweep_checks_are_not_news_and_three_in_a_row_are(self):
+    def test_a_single_failed_sweep_check_is_not_news_and_two_in_a_row_are(self):
         def reading(build, passed, outcomes):
             return {"job": SWEEP.job, "build": build, "finished_at": NOW.isoformat(timespec="seconds"), "passed": passed, "result": "SUCCESS" if passed else "FAILURE",
                     "artifact": {"projects": len(outcomes), "closed": 0, "failed": sum(1 for o in outcomes.values() if "error" in o), "left_for_next_run": 0, "outcomes": outcomes}}
@@ -901,23 +901,16 @@ class AssessTest(unittest.TestCase):
         readings = {SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}
         streaks = periodics.streaks(readings, None)
         self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {}, "one flap is not news")
-        # Nor is a second: on 2026-11-03 the sweep failed two reads ten
-        # minutes apart and passed the next one, four times in a morning.
-        readings = {SWEEP.job: reading("2", False, {"kube-agents-evals-3": fail})}
-        streaks = periodics.streaks(readings, streaks)
-        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {}, "two failed reads are not news either")
-        passed = {SWEEP.job: reading("2b", True, {})}
-        self.assertEqual(periodics.assess(passed, NOW, None, streaks=periodics.streaks(passed, streaks)), {}, "and a pass after them ends it unsaid")
-        # The third consecutive failed check is; a project that failed in all three leads the detail with its count.
-        readings = {SWEEP.job: reading("3", False, {"kube-agents-evals-3": fail, "kube-agents-evals-4": fail})}
+        # The second consecutive failed check is; a project that failed in both leads the detail with its count.
+        readings = {SWEEP.job: reading("2", False, {"kube-agents-evals-3": fail, "kube-agents-evals-4": fail})}
         streaks = periodics.streaks(readings, streaks)
         note = periodics.assess(readings, NOW, None, streaks=streaks)[SWEEP.job]
         self.assertEqual(note["detail"], [
-            "kube-agents-evals-3: failed in 3 consecutive checks (HTTP 401 Unauthorized: owner mismatch request by x, currently owned by )",
+            "kube-agents-evals-3: failed in 2 consecutive checks (HTTP 401 Unauthorized: owner mismatch request by x, currently owned by )",
             "kube-agents-evals-4: HTTP 401 Unauthorized: owner mismatch request by x, currently owned by ",
         ])
         # A project with an old count that this build did not reach is not named as persisting.
-        readings = {SWEEP.job: reading("3b", False, {"kube-agents-evals-4": fail})}
+        readings = {SWEEP.job: reading("3", False, {"kube-agents-evals-4": fail})}
         streaks = periodics.streaks(readings, streaks)
         self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks)[SWEEP.job]["detail"][0], "kube-agents-evals-4: failed in 2 consecutive checks (HTTP 401 Unauthorized: owner mismatch request by x, currently owned by )")
         # The cap bounds the merged list, and the run's own lines follow it.

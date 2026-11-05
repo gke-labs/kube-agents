@@ -381,8 +381,10 @@ class Shapes(RunHarness):
             " The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).\n"
             f"{URL}#since=2026-09-03T18:30:00Z&view=gate",
         )
+        # The wave's end is posted: its message said to retest once workers
+        # are finishing again, and this is the only word that they are.
         self.tick(health(), T0.replace(hour=15, minute=30))
-        self.assertEqual(len(self.opener.texts), 1, "a DEGRADED episode ends without a post")
+        self.assertEqual(self.opener.texts[1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 21h (workers were not finishing).")
 
     def test_the_digest_carries_the_ceiling_count_on_a_day_that_had_one(self):
         doc = health()
@@ -409,16 +411,21 @@ class Shapes(RunHarness):
         rc, err = self.tick(health(), T0.replace(hour=15, minute=30))
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.opener.texts), 1)
-        self.assertIn("recovery from DEGRADED recorded, not posted", err)
+        self.assertIn("recovery from storm recorded, not posted", err)
         self.assertIn("posted nothing", err)
         self.assertEqual(self.recorded()["state"], "GREEN")
         self.tick(storm(since="2026-09-04T16:00:00+00:00"), T0.replace(hour=16))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🟡", "🟡"])
 
-    def test_an_outage_that_eases_to_degraded_ends_without_a_post(self):
-        # The DEGRADED change already replaced the outage's "don't retest"
-        # with its own retest time; only a recovery straight from OUTAGE is
-        # posted (test_recovery).
+    def test_the_end_of_setup_deaths_is_recorded_not_posted(self):
+        self.tick(deaths(), T0)
+        self.tick(health(), T0.replace(hour=15, minute=30))
+        self.assertEqual(len(self.opener.texts), 1, "its message said to retest now")
+        self.assertEqual(self.recorded()["state"], "GREEN")
+
+    def test_an_outage_that_eases_to_a_storm_ends_without_a_post(self):
+        # The storm's change already replaced the outage's "don't retest"
+        # with its own retest time.
         self.tick(outage(cases=["a-probe"], since="2026-09-04T09:00:00+00:00", prs=(1, 2, 3)), T0)
         self.tick(storm(since="2026-09-04T13:00:00+00:00"), T0.replace(hour=13, minute=30))
         self.tick(health(), T0.replace(hour=15, minute=30))
@@ -1714,11 +1721,11 @@ class LostPods(RunHarness):
         self.tick(health(), T0.replace(hour=18), environ=self.environ())
         self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1200/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1200")])
 
-    def test_the_end_of_a_lost_pods_episode_closes_the_issue_without_a_post(self):
+    def test_the_recovery_names_the_lost_nodes_and_the_issue(self):
         self.tick(lost_pods(), T0.replace(day=11, hour=14, minute=30), environ=self.environ())
         self.tick(health(), T0.replace(day=11, hour=16), environ=self.environ())
-        self.assertEqual(len(self.opener.texts), 1, "lost pods is DEGRADED: its end is not posted")
         # `since` is the first loss, 14:05:52Z; the recovery tick is 16:00Z.
+        self.assertEqual(self.opener.texts[1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 1h 54m (the build cluster lost nodes, #1300).")
         self.assertEqual(self.gh.calls[-2][2], {"body": "Healthy again after 1h 54m; closing (filed by the bot; reopen if the cause is still live)."})
         self.assertEqual(self.gh.writes()[-1], ("PATCH", "repos/gke-labs/kube-agents/issues/1300"))
         self.assertIsNone(self.recorded()["issue"])
@@ -2003,13 +2010,13 @@ class FixtureDrift(RunHarness):
         self.assertEqual(gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1290/labels")], "labelled, nothing filed")
         self.assertEqual(self.recorded()["issue"]["condition"], "fixture_drift")
 
-    def test_the_end_of_a_drift_comments_and_closes_without_a_post(self):
+    def test_the_recovery_says_the_fixtures_had_drifted_and_comments(self):
         self.tick(fixture_drift(), T14, environ=self.environ())
         later = T14 + timedelta(hours=2)
         green = health("GREEN")
         green["fixture_state"] = fixture_block()
         self.tick(green, later, environ=self.environ())
-        self.assertEqual(len(self.opener.texts), 1, "fixture drift is DEGRADED: its end is not posted")
+        self.assertEqual(self.opener.texts[-1].splitlines()[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (seeded fixtures had drifted, #1300).")
         self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
         self.assertIsNone(self.recorded()["issue"])
 
@@ -2740,12 +2747,12 @@ class PoolDrift(RunHarness):
             [f"🧭 *Pool projects:* 1 of 30 checked pool projects drifted at 9:00 AM ET ({FINDING});{post_health.POOL_DIGEST_REDS_RUNS}"],
         )
 
-    def test_the_end_of_a_pool_drift_comments_and_closes_without_a_post(self):
+    def test_the_recovery_says_the_pool_had_drifted_and_comments(self):
         self.tick(pool_drift(), T14, environ=self.environ())
         green = health("GREEN")
         green["pool_state"] = pool_block()
         self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
-        self.assertEqual(len(self.opener.texts), 1, "pool drift is DEGRADED: its end is not posted")
+        self.assertEqual(self.opener.texts[-1].splitlines()[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (pool projects had drifted, #1300).")
         self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
 
     def test_the_digest_carries_one_line_on_the_latest_scan(self):
@@ -3201,7 +3208,8 @@ class IssueLifecycle(RunHarness):
         rc, err = self.tick(green, T14 + timedelta(hours=2), environ=self.environ())
         self.assertIn("tracking issue: #1300 is closed; dropped", err)
         self.assertEqual([path for _, path in self.gh.writes() if "/1300" in path], [])
-        self.assertFalse(self.opener.texts[-1].startswith("🟢"), "a DEGRADED episode ends without a post")
+        self.assertTrue(self.opener.texts[-1].startswith("🟢"))
+        self.assertNotIn("#1300", self.opener.texts[-1])
 
     def test_a_dry_run_prints_the_close(self):
         self.tick(self.drifting(), T14, environ=self.environ())

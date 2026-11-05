@@ -274,6 +274,9 @@ class Shapes(Harness):
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> 🟡 **Gate degraded** since Tue 9:00 AM ET. quota storm 9:15 AM–10:25 AM ET hit 3 PRs."), box)
         self.assertIn("Your 1 failure is exactly that one, so this red is not your code.", box)
+        # The storm's end is not posted, so the box points at its own retest time.
+        self.assertIn("Run `/retest` when the #kube-agents-ci-health message for it says to.", box)
+        self.assertNotIn("healthy again", box)
         self.assertIn("| 0 / 3 reps (1 infra) |", self.gh.bodies()[0])
 
     def test_a_run_that_records_where_it_lives_links_the_console_browser(self):

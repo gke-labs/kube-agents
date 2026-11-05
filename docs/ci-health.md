@@ -20,8 +20,8 @@ In the same way, a `rep N timing:` line under each grading line carries the
 repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
-Chat — only when the state changes (the end of a DEGRADED episode is
-recorded, not posted: [Hysteresis](#hysteresis)), plus one digest a day at
+Chat — only when the state changes (the end of a storm or of setup deaths
+is recorded, not posted: [Hysteresis](#hysteresis)), plus one digest a day at
 11 AM Toronto time, which also carries the slow-gate and close-to-the-deadline
 notes ([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
@@ -216,7 +216,7 @@ what keeps the replay fixtures cut before the field valid. A run without the
 recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
-announces the end of an OUTAGE ([Hysteresis](#hysteresis)); the daily digest carries the last 24 hours' runs, greens,
+announces it, which a storm or setup deaths do not get ([Hysteresis](#hysteresis)); the daily digest carries the last 24 hours' runs, greens,
 PR-caused reds (by rule 4's test, below, less its storm silence: a two-hour
 storm cannot blank a 24-hour count) and infra reds (setup deaths, lost
 pods and deadline kills that graded nothing are folded into the infra count),
@@ -274,13 +274,15 @@ advice says a retest is reasonable, and nothing is posted. The adjudicator's
 only state between ticks is the previous `health.json`; the poster keeps what
 it last told the space in `health-state.json` beside it.
 
-The return to GREEN is posted only after an OUTAGE, whose recovery is the
-"retest now" after its "don't retest". After a DEGRADED episode, including an
-OUTAGE that eased to DEGRADED before it cleared, the poster records the
-recovery without posting it: every yellow message already said when to retest.
-It still comments on and closes the episode's tracking issues
-([The tracking issue](#the-tracking-issue)), and the next DEGRADED change is
-posted as a new episode.
+The return to GREEN is posted unless the episode last read a quota storm or
+setup deaths, whose message already said when to retest (a clock time, or
+now). For those, including an OUTAGE that eased into one before it cleared,
+the poster records the recovery without posting it, still comments on and
+closes the episode's tracking issues ([The tracking issue](#the-tracking-issue)),
+and posts the next DEGRADED change as a new episode. The other DEGRADED
+conditions say to retest once something happens (new jobs progressing, workers
+finishing, the reconcile or the repair), and the recovery is the space's word
+that it has; an OUTAGE's recovery is the "retest now" after its "don't retest".
 
 Inside an OUTAGE the message is repeated when a new case joins the set, at most
 every 2 hours. A case dropping off is not news until the state changes. A
@@ -357,8 +359,9 @@ line for as long as it lasts:
 ⏱ Close to the deadline since 12:00 PM ET: slowest run 327 min, 33 min of headroom.
 ```
 
-A run killed at the deadline counts here too; the message for kills is the
-`deadline_kill` OUTAGE. Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
+A run killed at the deadline counts here too: one or two kills below the
+`deadline_kill` OUTAGE's threshold show only in this digest line, and the
+OUTAGE is the message for a wave of them. Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
 floored at 0 (or overrun minutes past the timeout).
 
 The timeout itself lives in `GoogleCloudPlatform/oss-test-infra` (`timeout: 360m`
@@ -529,15 +532,11 @@ episode, and cleared by the first passed build whose report was read and
 names none.
 
 Like the pool note it rides beside the state and never becomes one. A job whose
-latest finished build failed is a `FAILED` note, once it is news. This tick
-reads the sweep's latest finished build every fifteen minutes and counts each
-build it reads once; the sweep's builds land faster than that (ten minutes
-apart in the history of 2026-11-03), so some go unread. That morning the sweep
-failed two reads in a row and passed the next one four times, each a message
-and its recovery 15 minutes apart. The sweep's note therefore waits until
-three consecutive reads have failed, about half an hour of failing. The
-reconciles run once a day or on a merge, where a second failure would hold the
-message a day: their first failed build is the news. Any project's failure fails a
+latest finished build failed is a `FAILED` note, once it is news: the sweep runs
+hourly and this tick reads its latest finished build every fifteen minutes, so
+every build is read and counted once, and one failed build followed by a clean
+one is a flap. The sweep's note waits until two consecutive checks have failed;
+the reconciles' first failed build is the news. Any project's failure fails a
 sweep run, so a per-project threshold could never fire before the run's; the
 per-project counts name, in the message, the projects that failed in this check
 and the ones before it.
