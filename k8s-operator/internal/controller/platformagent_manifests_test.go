@@ -6180,6 +6180,34 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 	}
 }
 
+// The chart's platformAgent.deployment.eventWatcher renders the watcher's tuning
+// settings as WATCHER_* entries in spec.deployment.env, and
+// deploy/shared/start-services.sh reads them in this container. So each entry,
+// a valueFrom entry included, has to arrive here once and unchanged: a reserved
+// name or a prefix filter would make every chart setting do nothing.
+func TestDeploymentEnvReachesTheEventWatcherSettings(t *testing.T) {
+	fromConfigMap := &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "watcher"}, Key: "span",
+	}}
+	custom := []corev1.EnvVar{
+		{Name: "WATCHER_SETTLE", Value: "3m"},
+		{Name: "WATCHER_BACKOFF_MIN_COUNT", Value: "4"},
+		{Name: "WATCHER_FAILEDSCHEDULING_MIN_SPAN", ValueFrom: fromConfigMap},
+	}
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: custom}
+
+	got := map[string][]corev1.EnvVar{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		got[e.Name] = append(got[e.Name], e)
+	}
+	for _, want := range custom {
+		if entries := got[want.Name]; len(entries) != 1 || !reflect.DeepEqual(entries[0], want) {
+			t.Errorf("agent-api-auth env %s = %+v, want exactly %+v", want.Name, entries, want)
+		}
+	}
+}
+
 // agentWithDriftDetector builds a PlatformAgent whose harness names the drift
 // detector. The harness triple is filled in, because the detector's own gate
 // requires it and a fixture without it would make every "enabled" case look

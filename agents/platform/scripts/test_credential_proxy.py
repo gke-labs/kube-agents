@@ -3056,6 +3056,70 @@ class ResourcePressureRouteTest(unittest.TestCase):
         self.assertEqual(1, len(listing.endpoints_asked))
 
 
+class ExecRouteTruncationReplyTest(unittest.TestCase):
+    """A cut reply says how much it kept and what the cap was, beside `truncated`."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
+        )
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def kubectl_that(self, body):
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir(exist_ok=True)
+        stub = stub_dir / "kubectl"
+        stub.write_text(f"#!/bin/bash\n{body}\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+
+    def post(self, argv):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}/v1/exec",
+            data=json.dumps({"requestId": "req-1", "argv": argv}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            return response.status, json.loads(response.read())
+
+    def test_a_cut_reply_carries_the_kept_count_and_the_cap(self):
+        self.kubectl_that("head -c 100000 /dev/zero | tr '\\0' a")
+        status, body = self.post(["kubectl", "get", "pods"])
+        self.assertEqual(200, status)
+        self.assertEqual((0, True, True), (body["exitCode"], body["truncated"], body["stdoutTruncated"]))
+        self.assertEqual((4096, 4096), (body["bytesWritten"], body["limit"]))
+        self.assertEqual(4096, len(body["stdout"]))
+
+    def test_a_cut_on_stderr_alone_says_the_payload_is_whole(self):
+        self.kubectl_that("printf ok; head -c 100000 /dev/zero | tr '\\0' e >&2")
+        status, body = self.post(["kubectl", "get", "pods"])
+        self.assertEqual(200, status)
+        self.assertEqual((True, False), (body["truncated"], body["stdoutTruncated"]))
+        self.assertEqual(("ok", 2), (body["stdout"], body["bytesWritten"]))
+
+    def test_a_whole_reply_carries_its_size_and_the_cap_too(self):
+        # Always present, so a caller reads the same two keys on every reply
+        # and sizes its next page from them without a cut first.
+        self.kubectl_that("echo pods")
+        status, body = self.post(["kubectl", "get", "pods"])
+        self.assertEqual(200, status)
+        self.assertEqual((0, False, False), (body["exitCode"], body["truncated"], body["stdoutTruncated"]))
+        self.assertEqual((len("pods\n"), 4096), (body["bytesWritten"], body["limit"]))
+
+
 class ExecRouteCapacityTest(unittest.TestCase):
     """The concurrency cap and the caller watch as the agent meets them: over /v1/exec."""
 
@@ -3961,6 +4025,7 @@ class SessionRoleExecutableTest(unittest.TestCase):
 
     def test_the_table_of_kubectl_flags(self):
         S = credential_proxy.CALLER_ROLE_SESSION
+        P = credential_proxy.CALLER_ROLE_PROFILE
         for role, argv, want in (
             # The file routes the fence exists to close, in every spelling
             # pflag accepts: separate value, attached, `=`, and clustered
@@ -3988,7 +4053,25 @@ class SessionRoleExecutableTest(unittest.TestCase):
             (S, ["kubectl", "logs", "pod/x", "-f"], "-f"),
             (S, ["kubectl", "logs", "pod/x", "--follow"], "--follow"),
             # Unknown or unlisted flags are refused rather than guessed at.
-            (S, ["kubectl", "get", "pods", "--raw", "/api"], "--raw"),
+            (S, ["kubectl", "get", "pods", "--subresource", "status"], "--subresource"),
+            # A paged collection read passes the table; command_policy's
+            # `kubernetes.raw-path` rule judges the path.
+            (S, ["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None),
+            (S, ["kubectl", "get", "--raw=/apis/apps/v1/deployments?limit=500&continue=t"], None),
+            (P, ["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None),
+            # The rule's exact endpoints (`/metrics`) are the shell role's:
+            # refused for both narrowed roles, in each spelling and
+            # percent-encoded, through the policy's own decoder.
+            (S, ["kubectl", "get", "--raw", "/metrics"], "--raw"),
+            (S, ["kubectl", "get", "--raw=/metrics"], "--raw"),
+            (S, ["kubectl", "get", "--raw", "/%6detrics"], "--raw"),
+            (S, ["kubectl", "get", "--raw=/%6Detrics"], "--raw"),
+            (S, ["kubectl", "get", "--raw", "/metrics?watch=true"], "--raw"),
+            (P, ["kubectl", "get", "--raw", "/metrics"], "--raw"),
+            (P, ["kubectl", "get", "--raw=/metrics"], "--raw"),
+            (P, ["kubectl", "get", "--raw", "/%6detrics"], "--raw"),
+            (P, ["kubectl", "get", "--raw=/%6Detrics"], "--raw"),
+            (credential_proxy.CALLER_ROLE_SHELL, ["kubectl", "get", "--raw", "/metrics"], None),
             (S, ["kubectl", "get", "pods", "-v=9"], "-v"),
             (S, ["kubectl", "get", "pods", "--server=https://x"], "--server"),
             # The inspection surface passes, in the spellings a model emits.
@@ -4058,6 +4141,19 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
         status, body = self.post_as("", {"argv": ["kubectl", "get", "-f", "x.yaml"]})
         self.assertEqual(200, status, body)
+
+    def test_a_metrics_read_from_a_session_is_refused_as_a_flag_before_the_policy(self):
+        # The raw-path rule admits /metrics for every caller; the walker keeps
+        # it from the session, plain or percent-encoded, under the flag rule.
+        for path in ("/metrics", "/%6detrics"):
+            with self.subTest(path=path), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(
+                    credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "--raw", path]}
+                )
+                self.assertEqual(403, status)
+                self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+                self.assertEqual(credential_proxy.RULE_CALLER_KUBECTL_FLAG, body["rule"])
+                self.assertIn("--raw", body["message"])
 
 
 class GetCredentialsFlagsBetweenWordsTest(unittest.TestCase):
@@ -5192,6 +5288,25 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(result.truncated)
         self.assertEqual(4096, len(result.stdout))
         self.assertEqual("a" * 4096, result.stdout)
+        # The counts the reply carries beside `truncated`: what was kept, and
+        # the cap it was held to.
+        self.assertEqual((4096, 4096), (result.stdout_bytes, result.output_limit))
+
+    def test_a_cut_re_decode_reports_the_bytes_the_text_holds(self):
+        # Bytes that are not UTF-8 decode to a wider text, which `_bounded_text`
+        # cuts again; the count is of the text the caller receives, not of the
+        # bytes captured, so it never exceeds the cap.
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=4096),
+            body="head -c 100000 /dev/zero | tr '\\0' '\\377'",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.truncated)
+        self.assertLessEqual(result.stdout_bytes, 4096)
+        self.assertEqual(len(result.stdout.encode("utf-8")), result.stdout_bytes)
+        self.assertEqual(4096, result.output_limit)
 
     def test_each_stream_is_capped_on_its_own(self):
         executor = self.fake_kubectl(
@@ -5217,6 +5332,7 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertFalse(result.truncated)
         self.assertEqual(200000, len(result.stdout))
         self.assertEqual("err", result.stderr)
+        self.assertEqual((200000, 1 << 20), (result.stdout_bytes, result.output_limit))
 
     def test_output_that_is_not_utf8_is_bounded_once_decoded(self):
         # Every byte that is not UTF-8 decodes to a three-byte replacement
@@ -5868,6 +5984,82 @@ class CommandExecutorTest(unittest.TestCase):
             {"slot_cap": 8, "budget_admits": None, "admitted": 8, "interactive_cap": 7, "session_cap": 2},
             self._admission_report(executor),
         )
+
+    def _report_with_replicas_file(self, content, executor=None):
+        """The admission report with the replicas file at a temporary path
+        holding ``content``; None writes no file."""
+        executor = executor or self.executor()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        path = os.path.join(directory, "replicas")
+        if content is not None:
+            Path(path).write_text(content, encoding="utf-8")
+        with mock.patch.dict(os.environ, {credential_proxy.EXEC_REPLICAS_FILE_ENV: path}):
+            return self._admission_report(executor)
+
+    def test_a_replica_count_adds_the_tiers_totals(self):
+        self.assertEqual(
+            {
+                "slot_cap": 8, "budget_admits": None, "admitted": 8, "interactive_cap": 7, "session_cap": 2,
+                "replicas": 2, "tier_admitted": 16, "tier_interactive_cap": 14,
+            },
+            self._report_with_replicas_file(" 2\n"),
+        )
+
+    def test_the_tiers_totals_are_the_admitted_count_below_the_slot_cap(self):
+        mib = credential_proxy.MEBIBYTE
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO"):
+            executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
+        # The 1Gi budget admits 4 of the 8 slots, so each total is the admitted count's, not the slot cap's.
+        self.assertEqual(
+            {
+                "slot_cap": 8, "budget_admits": 4, "admitted": 4, "interactive_cap": 3, "session_cap": 2,
+                "replicas": 2, "tier_admitted": 8, "tier_interactive_cap": 6,
+            },
+            self._report_with_replicas_file("2", executor),
+        )
+
+    def test_a_replica_count_above_the_crs_bound_is_held_to_it(self):
+        report = self._report_with_replicas_file("40")
+        self.assertEqual(credential_proxy.EXEC_REPLICAS_MAX, report["replicas"])
+        self.assertEqual(8 * credential_proxy.EXEC_REPLICAS_MAX, report["tier_admitted"])
+        self.assertEqual(7 * credential_proxy.EXEC_REPLICAS_MAX, report["tier_interactive_cap"])
+
+    def test_no_usable_replica_count_adds_no_tier_keys(self):
+        per_replica = {"slot_cap": 8, "budget_admits": None, "admitted": 8, "interactive_cap": 7, "session_cap": 2}
+        executor = self.executor()
+        for name, content in {
+            "missing": None, "empty": "", "blank": " \n", "text": "abc", "zero": "0", "negative": "-1",
+            "a sign": "+2", "an underscore": "1_0", "a fraction": "2.5",
+        }.items():
+            with self.subTest(case=name), self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+                self.assertEqual(per_replica, self._report_with_replicas_file(content, executor))
+
+    def test_an_unreadable_replicas_file_adds_no_tier_keys(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        not_utf8 = os.path.join(directory, "not-utf8")
+        Path(not_utf8).write_bytes(b"\xff2")
+        executor = self.executor()
+        for name, path in {"a directory": directory, "not UTF-8": not_utf8}.items():
+            with self.subTest(case=name), mock.patch.dict(os.environ, {credential_proxy.EXEC_REPLICAS_FILE_ENV: path}), \
+                    self.assertNoLogs(credential_proxy.LOGGER, level="INFO"):
+                self.assertNotIn("replicas", self._admission_report(executor))
+
+    def test_the_replicas_file_is_the_default_path_unless_the_variable_names_another(self):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        default, named = os.path.join(directory, "default"), os.path.join(directory, "named")
+        Path(default).write_text("2", encoding="utf-8")
+        Path(named).write_text("3", encoding="utf-8")
+        executor = self.executor()
+        environ = {k: v for k, v in os.environ.items() if k != credential_proxy.EXEC_REPLICAS_FILE_ENV}
+        with mock.patch.object(credential_proxy, "EXEC_REPLICAS_FILE", default):
+            with mock.patch.dict(os.environ, environ, clear=True):
+                self.assertEqual(2, self._admission_report(executor)["replicas"])
+            with mock.patch.dict(os.environ, {credential_proxy.EXEC_REPLICAS_FILE_ENV: named}):
+                self.assertEqual(3, self._admission_report(executor)["replicas"])
+        self.assertEqual("/etc/credential-proxy-exec-tier/replicas", credential_proxy_client.EXEC_REPLICAS_FILE)
 
     def test_a_missing_limit_is_logged_once_at_startup(self):
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
@@ -12015,7 +12207,7 @@ class VcsRouteTest(unittest.TestCase):
         unclassified = routes - vcs_broker.WRITE_VERBS
         self.assertEqual(
             {"capabilities", "clone", "snapshot", "identity", "proposal-list", "proposal-view",
-             "proposal-commits", "issue-list", "issue-view", "branch-view"},
+             "proposal-commits", "proposal-claim", "issue-list", "issue-view", "branch-view"},
             unclassified,
             "a new verb must be classified as a read or a write",
         )
@@ -14005,12 +14197,14 @@ class PrincipalPodTest(unittest.TestCase):
         self.assertEqual(principal.pod, "agent-a2a-session-abc12")
         self.assertEqual(self.CALLER, principal.describe())
         record = credential_proxy._tool_audit(
-            credential_proxy.AUDIT_STATUS_STARTED, "req-1", principal.describe(), "kubectl", "get", pod=principal.pod
+            credential_proxy.AUDIT_STATUS_STARTED, "req-1", principal.describe(), "kubectl", "get", pod=principal.pod,
+            broker_tier="stateful", klass="interactive",
         )
         self.assertEqual(record["pod"], "agent-a2a-session-abc12")
         self.assertEqual(record["principal"], self.CALLER)
         bare = credential_proxy._tool_audit(
-            credential_proxy.AUDIT_STATUS_STARTED, "req-2", self.CALLER, "kubectl", "get", pod=""
+            credential_proxy.AUDIT_STATUS_STARTED, "req-2", self.CALLER, "kubectl", "get", pod="",
+            broker_tier="stateful", klass="interactive",
         )
         self.assertNotIn("pod", bare)
 
@@ -15018,7 +15212,14 @@ class MCPVcsVerbGateTest(unittest.TestCase):
             for verb in sorted(vcs_broker.VCS_VERBS):
                 with self.subTest(role=role, verb=verb):
                     self.assertTrue(credential_proxy.vcs_verb_permitted(role, verb))
-                    handler = self._handler(verb, role)
+                    body = None
+                    tokens = credential_proxy.ClaimTokens()
+                    if verb == credential_proxy.PROPOSAL_CLAIM_VERB:
+                        # A claim reaches its route only with a token a create minted.
+                        url = "https://github.com/acme/infra/pull/7"
+                        body = {"url": url, "claim": tokens.mint(url, self.PAYLOAD["repository"], 7)}
+                    handler = self._handler(verb, role, body)
+                    handler.claim_tokens = tokens
                     route = mock.Mock(return_value={})
                     with mock.patch.object(
                         credential_proxy.vcs_broker, "route_table", return_value={verb: route}
@@ -15026,6 +15227,206 @@ class MCPVcsVerbGateTest(unittest.TestCase):
                         handler._handle_vcs_post()
                     self.assertEqual(HTTPStatus.OK, handler.replies[0][0], handler.replies)
                     route.assert_called_once()
+
+
+class ProposalClaimRouteTest(unittest.TestCase):
+    """`proposal-create` mints a one-time claim token; `proposal-claim` burns it."""
+
+    REPOSITORY = "https://github.com/acme/infra"
+    URL = "https://github.com/acme/infra/pull/7"
+    TOKEN_SHAPE = re.compile(r"^[0-9a-f]{64}$")
+
+    def setUp(self):
+        self.clock = [1000.0]
+        self.tokens = credential_proxy.ClaimTokens(clock=lambda: self.clock[0])
+        self.metrics = credential_proxy.ProxyMetrics()
+        self.claimed = []
+        self.refuse = False
+        self.create_fails = False
+        self.nameless = False
+
+    def _create(self, payload):
+        if self.create_fails:
+            raise providers.WorkspaceError("the forge refused the proposal", status=422, code="FORGE_REFUSED")
+        return {
+            "proposal": {"number": 7, "url": self.URL, "title": "Bump replicas", "state": "open"},
+            "forge": "github",
+            "repo": "acme/infra",
+        }
+
+    def _claim(self, payload):
+        self.claimed.append(dict(payload))
+        if self.nameless:
+            raise providers.IdentityUnknown("bitbucket")
+        if self.refuse:
+            raise providers.WorkspaceError(
+                "the forge does not say this install just opened it", status=409, code="CLAIM_NOT_CONFIRMED"
+            )
+        return {"url": payload["url"], "number": payload["number"], "title": "Bump replicas"}
+
+    def _post(self, verb, body, role=credential_proxy.CALLER_ROLE_SHELL, managed=True):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/vcs/" + verb
+        handler.principal = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:agent", uid="u", groups=(), role=role
+        )
+        handler.metrics = self.metrics
+        handler.claim_tokens = self.tokens
+        handler.max_request_bytes = 1 << 20
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        encoded = json.dumps(body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.vcs = mock.Mock()
+        forge = mock.Mock()
+        forge.name = "github"
+        handler.vcs.registry.resolve.return_value = (forge, "acme/infra")
+        routes = {"proposal-create": self._create, "proposal-claim": self._claim}
+        with mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value=routes), \
+                mock.patch.object(credential_proxy, "repository_is_managed", return_value=managed):
+            handler._handle_vcs_post()
+        self.assertEqual(1, len(replies), replies)
+        return replies[0]
+
+    def _created_token(self):
+        status, answer = self._post(
+            "proposal-create",
+            {"repository": self.REPOSITORY, "source": "fix/a", "target": "main", "title": "t"},
+        )
+        self.assertEqual(HTTPStatus.OK, status, answer)
+        return answer[credential_proxy.CLAIM_TOKEN_FIELD]
+
+    def test_proposal_create_answers_with_a_claim_token(self):
+        first = self._created_token()
+        second = self._created_token()
+        self.assertEqual("claim", credential_proxy.CLAIM_TOKEN_FIELD)
+        self.assertRegex(first, self.TOKEN_SHAPE)
+        # One token per answer, never the same one twice.
+        self.assertNotEqual(first, second)
+        # Counted under the verb like any other, and no label carries the token.
+        self.assertEqual(
+            {("proposal-create", credential_proxy.TOOL_STATUS_SUCCESS, "github"): 2}, self.metrics._vcs
+        )
+        for key in self.metrics._vcs:
+            self.assertNotIn(first, key)
+            self.assertNotIn(second, key)
+
+    def test_a_claim_is_accepted_once(self):
+        token = self._created_token()
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.OK, status, answer)
+        self.assertEqual({"url": self.URL, "number": 7, "title": "Bump replicas"}, answer)
+        # The broker checks the url it kept with the token, on the repository
+        # the create resolved, never a repository the claim names.
+        self.assertEqual(
+            [{"repository": self.REPOSITORY, "url": self.URL, "number": 7}], self.claimed
+        )
+        self.assertIn(
+            ("proposal-claim", credential_proxy.TOOL_STATUS_SUCCESS, "github"), self.metrics._vcs
+        )
+        for key in self.metrics._vcs:
+            self.assertNotIn(token, key)
+
+    def test_a_second_claim_is_404(self):
+        token = self._created_token()
+        self.assertEqual(HTTPStatus.OK, self._post("proposal-claim", {"url": self.URL, "claim": token})[0])
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("CLAIM_UNKNOWN", answer["code"])
+        self.assertNotIn(token, json.dumps(answer))
+        self.assertEqual(1, len(self.claimed))
+        # An unknown token, and one presented for another url, are the same 404;
+        # the second burns the token too.
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": "0" * 64})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        other = self._created_token()
+        status, _ = self._post("proposal-claim", {"url": self.URL + "0", "claim": other})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": other})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual(1, len(self.claimed))
+
+    def test_a_claim_after_the_window_is_404(self):
+        token = self._created_token()
+        self.clock[0] += credential_proxy.CLAIM_TOKEN_TTL_SECONDS
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("CLAIM_UNKNOWN", answer["code"])
+        self.assertEqual([], self.claimed)
+        self.assertEqual(900, credential_proxy.CLAIM_TOKEN_TTL_SECONDS)
+
+    def test_an_expired_claim_is_pruned_on_the_next_mint(self):
+        # A token nobody claims leaves only by the prune, not by a burn.
+        self._created_token()
+        self.assertEqual(1, len(self.tokens))
+        self.clock[0] += credential_proxy.CLAIM_TOKEN_TTL_SECONDS
+        self._created_token()
+        self.assertEqual(1, len(self.tokens))
+
+    def test_a_claim_on_a_repository_no_longer_managed_is_403_and_burned(self):
+        token = self._created_token()
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token}, managed=False)
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", answer["code"])
+        self.assertEqual([], self.claimed)
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual([], self.claimed)
+
+    def test_a_failed_proposal_create_mints_no_claim(self):
+        self.create_fails = True
+        status, answer = self._post(
+            "proposal-create",
+            {"repository": self.REPOSITORY, "source": "fix/a", "target": "main", "title": "t"},
+        )
+        self.assertEqual(422, status)
+        self.assertNotIn(credential_proxy.CLAIM_TOKEN_FIELD, answer)
+        self.assertEqual(0, len(self.tokens))
+
+    def test_a_claim_whose_forge_check_fails_is_409_and_burned(self):
+        token = self._created_token()
+        self.refuse = True
+        with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+            credential_proxy.LOGGER.debug("marker")
+            status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.CONFLICT, status)
+        self.assertEqual("CLAIM_NOT_CONFIRMED", answer["code"])
+        self.assertFalse(any(token in line for line in logs.output), logs.output)
+        self.refuse = False
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual(1, len(self.claimed))
+
+    def test_a_claim_on_a_forge_that_cannot_name_its_account_answers_its_own_code(self):
+        token = self._created_token()
+        self.nameless = True
+        status, answer = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("FORGE_IDENTITY_UNKNOWN", answer["code"])
+        self.assertIn("Configure the forge's identity", answer["error"])
+        self.assertIn(
+            ("proposal-claim", credential_proxy.TOOL_STATUS_ERROR, "github"), self.metrics._vcs
+        )
+        # Burned before the check, as every claim is.
+        self.nameless = False
+        status, _ = self._post("proposal-claim", {"url": self.URL, "claim": token})
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual(1, len(self.claimed))
+
+    def test_the_mcp_role_cannot_claim(self):
+        token = self._created_token()
+        status, answer = self._post(
+            "proposal-claim", {"url": self.URL, "claim": token}, role=credential_proxy.CALLER_ROLE_MCP
+        )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("CALLER_VERB_FORBIDDEN", answer["code"])
+        self.assertFalse(credential_proxy.vcs_verb_permitted(credential_proxy.CALLER_ROLE_MCP, "proposal-claim"))
+        self.assertTrue(credential_proxy.vcs_verb_permitted(credential_proxy.CALLER_ROLE_SHELL, "proposal-claim"))
+        # Refused before the token is looked at: the shell can still claim it.
+        self.assertEqual([], self.claimed)
+        self.assertEqual(HTTPStatus.OK, self._post("proposal-claim", {"url": self.URL, "claim": token})[0])
 
 
 class RoleVcsVerbsTableTest(unittest.TestCase):
@@ -15395,6 +15796,32 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
             report,
         )
         self.assertEqual([], self.executor.executed, "the admission report must run nothing")
+
+    def test_a_new_replica_count_changes_the_next_admission_report_without_a_restart(self):
+        """A scale change rewrites the ConfigMap and does not restart the pod,
+        so the running server reads the file again on each request."""
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory)
+        path = Path(directory) / "replicas"
+
+        def report():
+            request = urllib.request.Request(
+                self.endpoint + credential_proxy.ADMISSION_PATH,
+                headers={"Authorization": "Bearer good-token"},
+                method="GET",
+            )
+            with urllib.request.urlopen(request) as response:
+                return json.loads(response.read())
+
+        def tier(answer):
+            return answer["replicas"], answer["tier_admitted"], answer["tier_interactive_cap"]
+
+        with mock.patch.dict(os.environ, {credential_proxy.EXEC_REPLICAS_FILE_ENV: str(path)}):
+            self.assertNotIn("replicas", report())
+            path.write_text("2", encoding="utf-8")
+            self.assertEqual((2, 16, 14), tier(report()))
+            path.write_text("3", encoding="utf-8")
+            self.assertEqual((3, 24, 21), tier(report()))
 
     def test_an_unauthenticated_get_on_the_admission_report_is_401(self):
         request = urllib.request.Request(self.endpoint + credential_proxy.ADMISSION_PATH, method="GET")
@@ -18231,6 +18658,17 @@ class FeedbackRouteTest(_ExecRouteServer):
         self.assertEqual((status, body["status"]), (400, "BLOCKED"))
         self.assertFalse(any(token in line for line in logs.output), "the token reached the log")
         self.assertTrue(any("feedback submit" in line for line in logs.output))
+
+    def test_the_audit_record_names_the_tier_and_the_interactive_class(self):
+        with self.assertLogs("credential-proxy", level="INFO") as logs:
+            self.post_as(credential_proxy.CALLER_ROLE_SHELL, {**self.GOOD_PAYLOAD, "user_confirmed": False})
+        audits = [record.audit for record in logs.records if hasattr(record, "audit")]
+        self.assertTrue(audits)
+        for audit in audits:
+            self.assertEqual(
+                (audit["event_type"], audit["broker_tier"], audit["class"]),
+                ("tool_execution_audit", "stateful", "interactive"),
+            )
 
     def test_a_refusal_reason_is_redacted_before_it_is_logged(self):
         token = "ghp_" + "b" * 36

@@ -888,7 +888,17 @@ Consequences:
   deploys it); the rest is drained and dropped, so what a command prints past
   the cap costs the broker nothing. The same bound applies to the decoded
   text's UTF-8 size, so output that is not UTF-8, whose every byte becomes a
-  three-byte replacement character, cannot cost more than text does. At most
+  three-byte replacement character, cannot cost more than text does. The reply
+  says when it was cut: `truncated` is true when either stream was cut,
+  `stdoutTruncated` when the cut fell on stdout, `bytesWritten` is the stdout
+  the caller receives in UTF-8 bytes, and `limit` is the cap (all four are
+  present on every completed reply). When stdout was cut the shim exits
+  `EXIT_OUTPUT_TRUNCATED` (74, `EX_IOERR`) whatever the command exited, and
+  prints the counts after its `credential proxy output truncated` stderr
+  marker, so a cut `-o json` dump reads as a failure to the model's own
+  `kubectl` and to a script alike, never as an exit 0 with a partial payload; a
+  cut on stderr alone keeps the command's exit code, and the marker says stdout
+  is complete. At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
   flight at once (8; the operator sets it, as it sets the output cap, and
   reserves the name). A slot is held from admission until the response is on

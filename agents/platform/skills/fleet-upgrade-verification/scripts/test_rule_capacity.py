@@ -19,9 +19,23 @@ import fleet_upgrade_report as report  # noqa: E402
 import readiness_rules as shared  # noqa: E402
 from fleet_upgrade_report import parse_version  # noqa: E402
 from readiness_rules import capacity  # noqa: E402
-from test_fleet_upgrade_report import FakeReadinessCommands  # noqa: E402
+from test_fleet_upgrade_report import FakeReadinessCommands, paged_dump_adapter  # noqa: E402
 from test_fleet_upgrade_report import cluster as report_cluster  # noqa: E402
 from test_readiness_rules import CURRENT, LAGGING, TARGET, cluster, deployment_pod, node, pod, read  # noqa: E402
+
+# FakeReadinessCommands answers the one-shot `kubectl get <kinds> -A -o json`; the report
+# pages through `kubectl get --raw`, and the adapter joins the two for this module's own
+# runs of `report.main` (`test_fleet_upgrade_report.paged_dump_adapter` says why each
+# module starts its own).
+_PAGED_DUMP = paged_dump_adapter()
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 TARGET_TEXT = "1.35.1-gke.1000"
 # The report tests' fleet runs below TARGET_TEXT: the location's server config lists the target

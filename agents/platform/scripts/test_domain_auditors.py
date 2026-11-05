@@ -1497,6 +1497,19 @@ class TestAuditStorage(unittest.TestCase):
         self.assertNotEqual(t_code, 0)
         self.assertIn("credential proxy output truncated", t_data["error"])
 
+        # The shim now exits 74 on a cut reply, with the counts after the
+        # marker; the read fails closed the same way, and the error still
+        # names the cut rather than a bare exit code.
+        cut_proc = mock.Mock(
+            returncode=74,
+            stdout="PODS\nprod\tweb-0\tPending\tpvc-a\n",
+            stderr="credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)",
+        )
+        with mock.patch.object(audit_storage.subprocess, "run", return_value=cut_proc):
+            c_code, c_data = self._real_run_kubectl_pods({})
+        self.assertEqual(c_code, 74)
+        self.assertIn("credential proxy output truncated", c_data["error"])
+
         warn_proc = mock.Mock(
             returncode=0,
             stdout="PODS\nprod\tweb-0\tPending\tpvc-a\n",

@@ -85,6 +85,11 @@ Environment:
         ``28099``). The remote side is always the Service's 8099.
     AGENT_INJECT_URL: A gateway base URL to use instead of spawning a
         port-forward.
+    AGENT_GATEWAY_LEASE: The gateway's Lease (default
+        ``<AGENT_SERVICE_NAME>-a2a-gateway``). When it names a holder, the
+        tunnel forwards to that pod rather than the Service, and finds the
+        holder again on every respawn, so a standby's 503 is retried against
+        the replica serving the door.
     AGENT_INJECT_TOKEN: The door's bearer token, required. The operator
         renders it into the ``<agent>-a2a-inject`` Secret under its eval
         flag, and this is read the way the presubmit reads the agent's own
@@ -270,6 +275,15 @@ _MAX_CARD_MESSAGE_LOG_CHARS = 200
 # forwarding cannot be mistaken for this tunnel.
 _INJECT_SERVICE_SUFFIX = "-a2a-inject"
 _INJECT_REMOTE_PORT = 8099
+# The A2A gateway's Lease, whose holder is the one replica serving the doors
+# once the gateway runs more than one (docs/designs/gateway-replicas.md). The
+# tunnel forwards to that pod, read again on every respawn; a standby answers
+# 503 and a respawn finds the new holder. With no Lease, or none readable,
+# the install runs one unelected gateway and the door's Service reaches it.
+_GATEWAY_LEASE_SUFFIX = "-a2a-gateway"
+_LEASE_READ_TIMEOUT = 15
+# How much of a failed kubectl read's stderr the warning quotes.
+_KUBECTL_STDERR_LOG_CHARS = 300
 _INJECT_DEFAULT_LOCAL_PORT = 28099
 # The Secret the operator renders the door's bearer token into, named in the
 # message a run without the token fails with. Suffix and key, so the message
@@ -455,8 +469,23 @@ _MAX_ARTIFACTS = 8
 # than hold the run open.
 _EXEC_TIMEOUT = 60.0
 
-_PF_LOCK = threading.Lock()  # guards the three registries below
+# The agent pod's clock at the run's start, the purge's floor for the run's own
+# cards (:func:`_pod_clock`). ``sh`` and ``date``, two process spawns, not
+# python3: that takes about 30 s to start in the sandboxed container. Shorter than
+# ``_EXEC_TIMEOUT`` because the run waits on it before the agent is invoked.
+_POD_CLOCK_SCRIPT = "date +%s"
+_POD_CLOCK_TIMEOUT_SECONDS = 15.0
+# How long the purge's shell fallback (clearing the run's files when the script
+# never sorted them) may take. Short: it is ``rm`` alone, and on a pod the
+# purge could not reach at all it would otherwise cost a second full timeout.
+_FALLBACK_CLEAR_TIMEOUT_SECONDS = 15.0
+
+_PF_LOCK = threading.Lock()  # guards the registries below
 _PF_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+# The kubectl target (``svc/<name>``, ``pod/<name>``) each owned forward was
+# spawned for, so a caller can tell a live tunnel aimed elsewhere from one
+# aimed where it wants.
+_PF_TARGETS: dict[int, str] = {}
 _PF_PORT_LOCKS: dict[int, threading.Lock] = {}
 _PF_LOG_DIR: Path | None = None
 # True while _PF_LOG_DIR is this process's own temp directory, and therefore
@@ -543,6 +572,7 @@ def _cleanup_port_forwards() -> None:
     """Terminate every port-forward this process spawned."""
     global _PF_LOG_DIR
     with _PF_LOCK:
+        _PF_TARGETS.clear()
         while _PF_PROCESSES:
             port, proc = _PF_PROCESSES.popitem()
             if proc.poll() is None:
@@ -563,8 +593,10 @@ def _kubectl_target(service: str | None = None) -> list[str]:
     passes the gateway's inject Service, which lives in the same namespace and
     the same context.
     """
+    target = service or os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
     cmd = [
-        f"svc/{service or os.environ.get('AGENT_SERVICE_NAME', 'platform-agent')}",
+        # A resolved target (``pod/<name>``, ``svc/<name>``) is used as given.
+        target if "/" in target else f"svc/{target}",
         "-n",
         os.environ.get("AGENT_NAMESPACE", "kubeagents-system"),
     ]
@@ -572,6 +604,87 @@ def _kubectl_target(service: str | None = None) -> list[str]:
     if context:
         cmd.extend(["--context", context])
     return cmd
+
+
+def _kubectl_read(args: list[str], what: str, *, missing_ok: bool = False) -> str | None:
+    """Run a read-only ``kubectl`` in the agent's namespace and context and
+    return its stdout, or ``None`` when it fails.
+
+    A failure is logged with kubectl's stderr: a forbidden Lease read, say,
+    shows up in the run rather than silently forwarding the Service. A
+    ``NotFound`` is expected when ``missing_ok`` (no Lease on an unelected
+    install) and logged only at debug.
+    """
+    cmd = ["kubectl", *args, "-n", os.environ.get("AGENT_NAMESPACE", _DEFAULT_AGENT_NAMESPACE)]
+    context = os.environ.get("AGENT_CLUSTER_CONTEXT")
+    if context:
+        cmd.extend(["--context", context])
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=_LEASE_READ_TIMEOUT, check=False
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.warning("reading %s failed: %s", what, exc)
+        return None
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()[:_KUBECTL_STDERR_LOG_CHARS]
+        if missing_ok and "NotFound" in stderr:
+            _log.debug("%s not found", what)
+        else:
+            _log.warning("reading %s failed (kubectl exited %d): %s", what, proc.returncode, stderr)
+        return None
+    return proc.stdout
+
+
+def _gateway_door_target(agent_service: str, service: str) -> str:
+    """The port-forward target for a gateway door: the Lease holder's pod, or
+    the door's Service when no Lease names one.
+
+    ``AGENT_GATEWAY_LEASE`` overrides the Lease's name (default
+    ``<AGENT_SERVICE_NAME>-a2a-gateway``). Best effort: a Lease that is
+    missing, unreadable or held by nobody leaves the Service, which is what
+    every install that renders no Lease serves the door through.
+
+    The holder is taken only if it is one of the pods the door's Service
+    selects. The tunnel carries the door's bearer token, and a Lease's
+    holder is just a string anyone who can write the Lease sets: a holder
+    outside the gateway's own pods would otherwise be handed the token. The
+    Service's own endpoints are the same pods, so the Lease narrows the
+    choice among them and never adds a target the Service wouldn't reach.
+    """
+    fallback = f"svc/{service}"
+    lease = os.environ.get("AGENT_GATEWAY_LEASE") or agent_service + _GATEWAY_LEASE_SUFFIX
+    out = _kubectl_read(
+        ["get", "lease", lease, "-o", "jsonpath={.spec.holderIdentity}"],
+        f"lease {lease}",
+        missing_ok=True,
+    )
+    holder = (out or "").strip()
+    if not holder:
+        return fallback
+    raw = _kubectl_read(["get", "svc", service, "-o", "jsonpath={.spec.selector}"], f"service {service}'s selector")
+    try:
+        selector = json.loads(raw) if raw else {}
+    except ValueError:
+        selector = {}
+    if not isinstance(selector, dict) or not selector:
+        _log.warning("service %s has no readable selector; forwarding to it rather than the lease holder %s", service, holder)
+        return fallback
+    label_selector = ",".join(f"{k}={v}" for k, v in sorted(selector.items()))
+    names = _kubectl_read(
+        ["get", "pods", "-l", label_selector, "-o", "jsonpath={.items[*].metadata.name}"],
+        f"the pods service {service} selects",
+    )
+    if holder not in (names or "").split():
+        _log.warning(
+            "lease %s names %s, which is not a pod service %s selects; forwarding to the service",
+            lease,
+            holder,
+            service,
+        )
+        return fallback
+    _log.info("gateway lease %s is held by %s; forwarding to that pod", lease, holder)
+    return f"pod/{holder}"
 
 
 def _port_forward_command(
@@ -646,6 +759,27 @@ def _agent_shell(script: str, timeout: float) -> str:
     return proc.stdout
 
 
+def _pod_clock() -> int | None:
+    """The agent pod's clock in epoch seconds, or ``None`` when it could not be read.
+
+    Read before the agent is invoked and passed to the stall archive and every
+    purge as their floor: a top-level card whose ``tasks.created_at`` is earlier
+    was not filed by this run, whatever its ``kanban_create`` result said
+    (:data:`_PURGE_ROWS_SCRIPT`, :func:`_archive_stalled_cards`).
+    The pod's clock, not the runner's, because hermes stamps ``created_at``
+    from it.
+    """
+    out = _agent_shell(_POD_CLOCK_SCRIPT, _POD_CLOCK_TIMEOUT_SECONDS).strip()
+    if out.isascii() and out.isdigit():
+        return int(out)
+    _log.warning(
+        "could not read the agent pod's clock (%s); the stall archive and the purge will take "
+        "every card the front door's kanban_create returned as the run's own",
+        out[:_LOG_EXCERPT_CHARS] or "no output",
+    )
+    return None
+
+
 def _ensure_port_forward(
     local_port: int, *, service: str | None = None, remote_port: int = SERVICE_API_PORT
 ) -> None:
@@ -666,6 +800,7 @@ def _ensure_port_forward(
 
         with _PF_LOCK:
             stale = _PF_PROCESSES.pop(local_port, None)
+            _PF_TARGETS.pop(local_port, None)
         if stale is not None:
             _stop_process(stale)
 
@@ -686,6 +821,7 @@ def _ensure_port_forward(
             raise RuntimeError(f"failed to spawn kubectl port-forward: {exc}") from exc
         with _PF_LOCK:
             _PF_PROCESSES[local_port] = proc
+            _PF_TARGETS[local_port] = cmd[2]
 
         try:
             deadline = time.monotonic() + 15
@@ -706,8 +842,16 @@ def _ensure_port_forward(
         except BaseException:
             with _PF_LOCK:
                 _PF_PROCESSES.pop(local_port, None)
+                _PF_TARGETS.pop(local_port, None)
             _stop_process(proc)
             raise
+
+
+def _owned_forward_target(local_port: int) -> str | None:
+    """The target this process's live forward on ``local_port`` was spawned
+    for, or ``None`` when it owns none there."""
+    with _PF_LOCK:
+        return _PF_TARGETS.get(local_port) if local_port in _PF_PROCESSES else None
 
 
 def _reset_port_forward(
@@ -731,6 +875,7 @@ def _reset_port_forward(
     with _port_establishment_lock(local_port):
         with _PF_LOCK:
             proc = _PF_PROCESSES.pop(local_port, None)
+            _PF_TARGETS.pop(local_port, None)
         if proc is None:
             _log.info("no port-forward owned on port %d; nothing to tear down", local_port)
         else:
@@ -1236,6 +1381,25 @@ _MAX_ARCHIVED_DESCENDANTS = 32
 
 _CARD_ID = re.compile(r"t_[0-9a-f]+")
 
+# Prints each given card whose ``tasks.created_at`` is earlier than the floor,
+# then :data:`_CREATED_BEFORE_DONE_MARKER`; read-only. The stall archive asks it before it archives, so
+# a card the front door's create handed back that predates the run keeps its
+# worker, as the purge keeps its rows (:data:`_PURGE_ROWS_SCRIPT`).
+_CREATED_BEFORE_SCRIPT = r"""
+import sqlite3, sys
+ROOT, FLOOR, BUSY, DONE = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+try:
+    kb = sqlite3.connect("file:%s/kanban.db?mode=ro" % ROOT, uri=True, timeout=BUSY)
+    for tid in sys.argv[5:]:
+        r = kb.execute("SELECT created_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+        if r is not None and r[0] is not None and int(r[0]) < FLOOR:
+            print(tid)
+    print(DONE)
+except sqlite3.Error as exc:
+    print("unread: %s" % exc)
+"""
+_CREATED_BEFORE_DONE_MARKER = "listed"
+
 
 def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
     """The unsettled cards the stalled cards' workers fanned out, recursively."""
@@ -1264,8 +1428,34 @@ def _stalled_descendants(stalled: Sequence[str], timeout: float) -> list[str]:
     return ids
 
 
-def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
+def _created_before(ids: Sequence[str], floor: int, timeout: float) -> set[str] | None:
+    """Which of ``ids`` were created before ``floor``; ``None`` when the board could not be read."""
+    args = " ".join(
+        _shell_quote(a)
+        for a in [
+            worker_trajectory.DATA_ROOT, str(floor), str(_PURGE_BUSY_TIMEOUT_SECONDS),
+            _CREATED_BEFORE_DONE_MARKER, *ids,
+        ]
+    )
+    out = _agent_shell(
+        f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
+        f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
+        f'"$PY" -c {_shell_quote(_CREATED_BEFORE_SCRIPT)} {args}',
+        timeout,
+    )
+    lines = [line.strip() for line in out.splitlines()]
+    if _CREATED_BEFORE_DONE_MARKER not in lines:
+        return None
+    return {line for line in lines if line in ids}
+
+
+def _archive_stalled_cards(stalled: Sequence[str], timeout: float, floor: int | None = None) -> None:
     """Archive the cards that ran to the ceiling, and the cards they fanned out.
+
+    With ``floor`` (the run's :func:`_pod_clock`), a stalled card created
+    before it is left running, and so is its fan-out: the front door's create
+    handed it back by its key, so it is not the run's. When the board cannot be
+    read to tell, every stalled card is archived, as without a floor.
 
     The unit has given up on them: its record is written and their files are
     about to be deleted. Left alone, a worker that still heartbeats keeps its
@@ -1284,6 +1474,19 @@ def _archive_stalled_cards(stalled: Sequence[str], timeout: float) -> None:
     its worker may still hold a slot, and the run log should not say
     otherwise.
     """
+    # A card created before the run's floor is not the run's (the front door's
+    # create handed it back by its key): its worker is someone else's to stop.
+    if floor is not None and stalled:
+        older = _created_before(stalled, floor, timeout)
+        if older is None:
+            _log.warning(
+                "could not read when stalled cards %s were created; archiving them all", ", ".join(stalled)
+            )
+        elif older:
+            _log.warning(
+                "not archiving stalled cards %s: created before this run started", ", ".join(sorted(older))
+            )
+            stalled = [t for t in stalled if t not in older]
     # The stalled cards first, so their workers can't file another child while
     # the rest is listed. Then the descendants, listed again until a pass finds
     # nothing new: a listed child's worker is alive until its own archive.
@@ -1339,13 +1542,25 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 # transaction: the dispatcher's claim is a write too, so a card cannot start
 # running between its status read and its delete.
 #
-# The run's own cards come first and are taken as given. A fan-out card after
-# them is taken only when its ``created`` event names a card already taken as
-# its ``creator_task_id``: hermes writes that event only for a create that
-# made the card, so a card a worker's ``kanban_create`` handed back by its
-# ``idempotency_key`` (which ``kanban_worker_children`` attributes when it is
-# under a minute old) is printed ``foreign <id>`` and left alone, files
-# included. A taken card is kept, printed ``kept <id>``, files included, while
+# The run's own cards come first and are taken as given, unless the harness
+# passed the run's start floor (the pod's clock before the agent was invoked,
+# :func:`_pod_clock`) and the card's ``tasks.created_at`` is earlier: a
+# front-door ``kanban_create`` whose ``idempotency_key`` matches a live card
+# returns that card in a result that looks like a create (#4591). Such a card
+# is printed ``foreign <id>`` and left alone, files included. The other own
+# cards' files go before the board step, so they still go when it fails; with
+# a floor but no board read to check it against, every root's files go too: a
+# stranger's card losing its files is rarer, and cheaper, than the run's own
+# report outliving it. Once the roots are sorted it leaves the ``SORTED``
+# marker until it exits: the harness clears every root's files from the shell
+# only when the script printed nothing and no marker is there, so a script cut
+# off mid-board-step does not cost a pre-run card its files after all.
+# A fan-out card after them is taken only when its ``created`` event names a
+# card already taken as its ``creator_task_id``: hermes writes that event only
+# for a create that made the card, so a card a worker's ``kanban_create``
+# handed back by its ``idempotency_key`` (which ``kanban_worker_children``
+# attributes when it is under a minute old) is printed ``foreign <id>`` and
+# left alone, files included. A taken card is kept, printed ``kept <id>``, files included, while
 # it or the card that filed it runs (a worker would write to, or read, a
 # deleted row) and while a fan-out card of its creator
 # or of its own can still run (``LIVE``) and is not a ``task_links`` follow-up:
@@ -1360,13 +1575,48 @@ def _archive_card(tid: str, kind: str, timeout: float) -> None:
 _PURGE_ROWS_SCRIPT = r"""
 import json, os, shutil, sqlite3, sys
 ROOT, BUSY = sys.argv[1], float(sys.argv[2])
-KEPT, FOREIGN, DONE, ATTACHMENTS, LOGS = sys.argv[3:8]
-rest = [a for a in sys.argv[9:] if a]
-roots, fanned = rest[:int(sys.argv[8])], rest[int(sys.argv[8]):]
+KEPT, FOREIGN, DONE, ATTACHMENTS, LOGS, SORTED = sys.argv[3:9]
+FLOOR = int(sys.argv[9]) if sys.argv[9] else None
+rest = [a for a in sys.argv[11:] if a]
+roots, fanned = rest[:int(sys.argv[10])], rest[int(sys.argv[10]):]
 BY_TASK = ("task_comments", "task_events", "task_runs", "task_attachments", "kanban_notify_subs")
 LIVE = ("todo", "scheduled", "ready", "running")
+def unlink(tid):
+    shutil.rmtree(os.path.join(ATTACHMENTS, tid), ignore_errors=True)
+    try:
+        os.remove(os.path.join(LOGS, tid + ".log"))
+    except OSError:
+        pass
+def mark_sorted(on):
+    try:
+        if on:
+            open(SORTED, "w").close()
+        else:
+            os.remove(SORTED)
+    except OSError:
+        pass
+kb, older, failed = None, set(), None
 try:
     kb = sqlite3.connect("%s/kanban.db" % ROOT, timeout=BUSY, isolation_level=None)
+    if FLOOR is not None:
+        for tid in roots:
+            r = kb.execute("SELECT created_at FROM tasks WHERE id = ?", (tid,)).fetchone()
+            if r is not None and r[0] is not None and int(r[0]) < FLOOR:
+                older.add(tid)
+except sqlite3.Error as exc:
+    failed = exc
+for tid in roots:
+    if tid in older:
+        print("%s %s" % (FOREIGN, tid))
+    else:
+        unlink(tid)
+mark_sorted(True)
+if failed is not None:
+    mark_sorted(False)
+    print("rows kept: %s" % failed)
+    sys.exit(0)
+roots = [t for t in roots if t not in older]
+try:
     kb.execute("BEGIN IMMEDIATE")
     tables = {r[0] for r in kb.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     children = "kanban_worker_children" in tables
@@ -1419,14 +1669,11 @@ try:
         kb.execute("DELETE FROM tasks WHERE id = ?", (tid,))
     kb.execute("COMMIT")
     for tid in gone:
-        shutil.rmtree(os.path.join(ATTACHMENTS, tid), ignore_errors=True)
-        try:
-            os.remove(os.path.join(LOGS, tid + ".log"))
-        except OSError:
-            pass
+        unlink(tid)
     print(DONE)
 except sqlite3.Error as exc:
     print("rows kept: %s" % exc)
+mark_sorted(False)
 """
 # How long the purge waits on hermes' write lock, as the capture's read does
 # (``worker_trajectory`` ``SQLITE_BUSY_TIMEOUT``).
@@ -1436,9 +1683,18 @@ _PURGE_BUSY_TIMEOUT_SECONDS = 10
 _PURGE_KEPT_MARKER = "kept"
 _PURGE_FOREIGN_MARKER = "foreign"
 _PURGE_DONE_MARKER = "purged"
+# The file the purge script leaves in the logs directory while it has sorted
+# the roots and not yet exited. Named for this process as well as the run's
+# first card: each repetition is its own process, so a concurrent repetition
+# handed the same card cannot remove this run's marker, and a marker a failed
+# fallback left behind cannot satisfy a later run's check.
+_PURGE_SORTED_PREFIX = ".purge-sorted-"
+_PURGE_SORTED_TOKEN = uuid.uuid4().hex
 
 
-def _purge_argv(task_ids: list[str], fanned_out: Sequence[str] = ()) -> list[str]:
+def _purge_argv(
+    task_ids: list[str], fanned_out: Sequence[str] = (), floor: int | None = None
+) -> list[str]:
     """:data:`_PURGE_ROWS_SCRIPT`'s arguments, in the order it reads them."""
     return [
         worker_trajectory.DATA_ROOT,
@@ -1448,21 +1704,34 @@ def _purge_argv(task_ids: list[str], fanned_out: Sequence[str] = ()) -> list[str
         _PURGE_DONE_MARKER,
         _ATTACHMENTS_DIR,
         _LOGS_DIR,
+        _purge_sorted_marker(task_ids),
+        "" if floor is None else str(floor),
         str(len(task_ids)),
         *task_ids,
         *fanned_out,
     ]
 
 
-def _purge_card_state(task_ids: list[str], timeout: float, fanned_out: Sequence[str] = ()) -> None:
+def _purge_sorted_marker(task_ids: list[str]) -> str:
+    """The purge script's sorted marker for this run (:data:`_PURGE_SORTED_PREFIX`)."""
+    return f"{_LOGS_DIR}/{_PURGE_SORTED_PREFIX}{_PURGE_SORTED_TOKEN}-{task_ids[0]}" if task_ids else ""
+
+
+def _purge_card_state(
+    task_ids: list[str], timeout: float, fanned_out: Sequence[str] = (), floor: int | None = None
+) -> None:
     """Delete the attachments, worker log and board rows of every card this run filed.
 
     The agent pod outlives the run, so without this each finished task leaves
     its report and its worker transcript on disk for the next run to find --
     which is how a repeat of a task reads back the previous attempt's answer
     instead of doing the work. Scoped to cards this run filed: ``task_ids`` are
-    the harness's own, and a card in ``fanned_out`` (in walk order, creators
-    first) goes only when hermes recorded one of them as its creator.
+    the harness's own, unless one was created before ``floor`` (the pod's
+    clock at the run's start, :func:`_pod_clock`; ``None`` takes them all), and
+    a card in ``fanned_out`` (in walk order, creators first) goes only when
+    hermes recorded one of them as its creator. With a floor but no board to
+    check it against, or a script that never sorted the roots, every root's
+    files go: the run's own report must not outlive it.
 
     The board rows go too (:data:`_PURGE_ROWS_SCRIPT`): every card view ends
     with a "Recent work by @<assignee>" digest of that profile's last completed
@@ -1473,17 +1742,30 @@ def _purge_card_state(task_ids: list[str], timeout: float, fanned_out: Sequence[
     fanned_out = [t for t in fanned_out if t not in task_ids]
     if not task_ids:
         return
-    listing = " ".join(_shell_quote(t) for t in task_ids)
-    args = " ".join(_shell_quote(a) for a in _purge_argv(task_ids, fanned_out))
-    script = (
-        f"for t in {listing}; do "
+    args = " ".join(_shell_quote(a) for a in _purge_argv(task_ids, fanned_out, floor))
+    # With no floor every root is the run's own, so its files go from the shell
+    # first and still go when python cannot start; with one, the script decides,
+    # and the shell clears them afterwards only if the script never ran.
+    clear_roots = (
+        f"for t in {' '.join(_shell_quote(t) for t in task_ids)}; do "
         f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
         "done; "
-        f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
+    )
+    script = (
+        ("" if floor is not None else clear_roots)
+        + f"PY={_shell_quote(worker_trajectory.HERMES_PYTHON)}; "
         f'[ -x "$PY" ] || PY={_shell_quote(worker_trajectory.FALLBACK_PYTHON)}; '
         f'"$PY" -c {_shell_quote(_PURGE_ROWS_SCRIPT)} {args}'
     )
     out = _agent_shell(script, timeout)
+    if floor is not None and not out.strip():
+        # No output: no python, or the exec failed or timed out. The marker says
+        # whether the script got as far as sorting the roots; without it the
+        # run's own reports must not outlive it.
+        marker = _shell_quote(_purge_sorted_marker(task_ids))
+        _agent_shell(
+            f"if [ -e {marker} ]; then rm -f {marker}; else {clear_roots}fi", _FALLBACK_CLEAR_TIMEOUT_SECONDS
+        )
     lines = out.splitlines()
 
     def marked(marker: str) -> list[str]:
@@ -1495,10 +1777,20 @@ def _purge_card_state(task_ids: list[str], timeout: float, fanned_out: Sequence[
             "aside), and stay on the board; the next run's role-history digest can show their "
             "summaries", ", ".join(kept),
         )
-    if foreign := marked(_PURGE_FOREIGN_MARKER):
+    foreign = marked(_PURGE_FOREIGN_MARKER)
+    if older := [t for t in foreign if t in task_ids]:
+        # Someone else's card, or an earlier repetition's leftover that the
+        # front door's create handed back by its key: nothing purges it now.
+        _log.warning(
+            "left cards %s on the board: the front door's kanban_create returned them, but they were "
+            "created before this run started; if one is an earlier run's, its summary can reach the "
+            "next run's role-history digest", ", ".join(older),
+        )
+    if adopted := [t for t in foreign if t not in task_ids]:
         _log.info(
-            "left cards %s on the board: attributed to the run's workers, but not created by them",
-            ", ".join(foreign),
+            "left cards %s on the board: not created by the run's own cards (a fan-out of a card "
+            "that predates the run, or a card a worker's create handed back by its key)",
+            ", ".join(adopted),
         )
     if _PURGE_DONE_MARKER not in lines:
         _log.warning(
@@ -2057,6 +2349,10 @@ class KubeAgentsHarness(AgentHarness):
     net covers anything unexpected.
     """
 
+    # The purge's floor (:func:`_pod_clock`), set by :meth:`run`; ``None`` for
+    # a run that could not read it, or an ``_execute`` called without ``run``.
+    _pod_floor: int | None = None
+
     def run(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
         """Run the agent, then stash the transcript for the text/trace verifiers.
 
@@ -2081,6 +2377,9 @@ class KubeAgentsHarness(AgentHarness):
         # that reuses a cluster name reuses the run branch, and the previous
         # run's merged PR is still listed against it.
         self._run_started_at = started_at
+        # Before the agent is invoked, so every card this run files is stamped
+        # at or after it.
+        self._pod_floor = _pod_clock()
         result = super().run(prompt, workspace_path)
         transcript.set(
             result.output,
@@ -2644,11 +2943,23 @@ class KubeAgentsHarness(AgentHarness):
         # retries.
         own_tunnel = not base_url
 
+        # The last target the tunnel was aimed at, for the messages below.
+        tunnel_target = [f"svc/{service}"]
+
         def _tunnel(reset: bool) -> None:
             if not own_tunnel:
                 return
+            # Resolved on every spawn: after a 503 from a standby or a tunnel
+            # dropped with its pod, the lease names where the door is now.
+            tunnel_target[0] = _gateway_door_target(agent_service, service)
+            # A tunnel this process already owns on the port (from an earlier
+            # exchange) may still go where the lease pointed then; a port that
+            # is open says nothing about where, so it is replaced.
+            owned = _owned_forward_target(local_port)
+            if owned is not None and owned != tunnel_target[0]:
+                reset = True
             forward = _reset_port_forward if reset else _ensure_port_forward
-            forward(local_port, service=service, remote_port=_INJECT_REMOTE_PORT)
+            forward(local_port, service=tunnel_target[0], remote_port=_INJECT_REMOTE_PORT)
 
         # Same establishment retry as the api path's, for the same reason: a
         # tunnel that cannot come up is the run class, not an answer.
@@ -2660,15 +2971,15 @@ class KubeAgentsHarness(AgentHarness):
             except RuntimeError as exc:
                 transport_failures += 1
                 _log.warning(
-                    "inject: port-forward to svc/%s failed to establish (%d/%d): %s",
-                    service,
+                    "inject: port-forward to %s failed to establish (%d/%d): %s",
+                    tunnel_target[0],
                     transport_failures,
                     _MAX_TRANSPORT_FAILURES,
                     exc,
                 )
                 if transport_failures >= _MAX_TRANSPORT_FAILURES:
                     return _infra_failure(
-                        f"the inject tunnel to svc/{service} failed to establish "
+                        f"the inject tunnel to {tunnel_target[0]} failed to establish "
                         f"{transport_failures} times running; last failure: {exc}"
                     )
         if not base_url:
@@ -3345,10 +3656,10 @@ class KubeAgentsHarness(AgentHarness):
         # but an earlier one did is archived too: nothing says it ended.
         still = [t for t in known if statuses.get(t) not in _TERMINAL_STATUSES]
         if still:
-            _archive_stalled_cards(still, _EXEC_TIMEOUT)
+            _archive_stalled_cards(still, _EXEC_TIMEOUT, floor=self._pod_floor)
         # As every other path that learns card ids ends: the pod outlives the
         # run, and a worker log left on it is there for the next run to find.
-        _purge_card_state(known, _EXEC_TIMEOUT)
+        _purge_card_state(known, _EXEC_TIMEOUT, floor=self._pod_floor)
 
         if unreachable is not None:
             # The door, not the agent: infrastructure, never graded.
@@ -3507,7 +3818,9 @@ class KubeAgentsHarness(AgentHarness):
         capped = False
 
         def _exhausted(still: list[str]) -> _DelegationTransportExhausted:
-            _purge_card_state(awaited or (read.card_ids if read is not None else []), _EXEC_TIMEOUT)
+            _purge_card_state(
+                awaited or (read.card_ids if read is not None else []), _EXEC_TIMEOUT, floor=self._pod_floor
+            )
             return _DelegationTransportExhausted(
                 f"the kanban board could not be read {_MAX_TRANSPORT_FAILURES} times running; "
                 "still waiting on: " + (", ".join(still) or "nothing (reading results)")
@@ -3610,6 +3923,7 @@ class KubeAgentsHarness(AgentHarness):
             observed,
             awaited,
             stalled=outstanding if timed_out else [],
+            floor=self._pod_floor,
         )
         if not shown and len(result.trajectory) > before:
             withheld = result.trajectory[before:]
@@ -3697,7 +4011,7 @@ class KubeAgentsHarness(AgentHarness):
         # results. Kept beside the graded trajectory rather than in it.
         observed: list[dict[str, Any]] = list(result.trajectory)
         if not outstanding:
-            self._settle(result, observed, awaited)
+            self._settle(result, observed, awaited, floor=self._pod_floor)
             return ""
 
         deadline = time.monotonic() + delegation_timeout
@@ -3773,7 +4087,7 @@ class KubeAgentsHarness(AgentHarness):
                 status_turn, turn_session = turn(poll, min(timeout, remaining))
             except _TransportError as exc:
                 if exc.failure_reason in _INFRA_FAILURE_REASONS and opening_turn:
-                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    _purge_card_state(awaited, _EXEC_TIMEOUT, floor=self._pod_floor)
                     raise _DelegationTransportExhausted(
                         f"status turn hit infrastructure failure ({exc.failure_reason}): {exc}"
                     ) from exc
@@ -3817,7 +4131,7 @@ class KubeAgentsHarness(AgentHarness):
                     # settled into a record that is about to be replaced, but
                     # a rerun must not find this attempt's leavings), then the
                     # run becomes infrastructure, mirroring the opening turn.
-                    _purge_card_state(awaited, _EXEC_TIMEOUT)
+                    _purge_card_state(awaited, _EXEC_TIMEOUT, floor=self._pod_floor)
                     raise _DelegationTransportExhausted(
                         f"status turns failed in transport {transport_failures} times "
                         "running; still waiting on: " + ", ".join(outstanding) + "; "
@@ -3933,6 +4247,7 @@ class KubeAgentsHarness(AgentHarness):
             awaited,
             stalled=outstanding if timed_out else [],
             board_messages=board_messages,
+            floor=self._pod_floor,
         )
         return session_id
 
@@ -3944,6 +4259,7 @@ class KubeAgentsHarness(AgentHarness):
         *,
         stalled: Sequence[str] = (),
         board_messages: Sequence[str] = (),
+        floor: int | None = None,
     ) -> None:
         """Collect everything the delegated cards produced, then clear them out.
 
@@ -3955,7 +4271,9 @@ class KubeAgentsHarness(AgentHarness):
         along with the cards their workers fanned out.
         Keyword-only with a default
         so a caller that has no stalled cards, in-tree or in a sibling branch,
-        need not name it.
+        need not name it. ``floor`` is the run's :attr:`_pod_floor`, passed to
+        the stall archive and the purge: an awaited card created before it is
+        neither archived nor deleted.
 
         The workers' own tool calls join the trajectory here, after the front
         agent's, each tagged with the profile that made them (see
@@ -3980,7 +4298,7 @@ class KubeAgentsHarness(AgentHarness):
         logs = _worker_logs(awaited, _EXEC_TIMEOUT)
         result.metadata["worker_commands"] = _worker_commands(logs)
         _dump_worker_logs(logs, stalled)
-        _archive_stalled_cards(stalled, _EXEC_TIMEOUT)
+        _archive_stalled_cards(stalled, _EXEC_TIMEOUT, floor=floor)
         captured = worker_trajectory.capture(_agent_shell, awaited, _EXEC_TIMEOUT)
         if captured is None:
             result.metadata["worker_trajectory"] = None
@@ -4095,7 +4413,7 @@ class KubeAgentsHarness(AgentHarness):
 
         # The cards the workers fanned out too: a Cluster Agent profile
         # outlives the run, and its digest would carry their summaries forward.
-        _purge_card_state(awaited, _EXEC_TIMEOUT, _fanned_out_closure(awaited, captured))
+        _purge_card_state(awaited, _EXEC_TIMEOUT, _fanned_out_closure(awaited, captured), floor)
 
         if infra_reason and trajectory_clean and logs_clean and not agent_acted:
             _mark_result_infra_failure(

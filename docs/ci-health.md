@@ -21,8 +21,10 @@ repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages s
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
-plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
+which also carries the slow-gate and close-to-the-deadline notes
+([below](#a-slow-gate)), plus one line, once per episode, when a
+close-to-the-deadline note's window holds a run killed at the deadline
+([below](#close-to-the-deadline)), plus one when runs start waiting to be scheduled or
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
@@ -90,10 +92,20 @@ scan](#the-pool-state-scan)); the tick reads them for the `fixture_drift` and
 `workflow_dispatch` of the same workflow is the on-demand refresh button
 (its `fixture_state_scan` input also runs both scans).
 
+The smoke lanes log to `gs://kube-agents-evals-presubmit-logs`, a bucket kube-agents owns, not
+the Prow cluster's default: Deck's service account has no read on it, so the Prow run page shows
+no files to anyone (this Prow has no login, and the lanes grade a public repository with a
+model in the loop). The collector reads it with its own identity, and each lane's old
+archive alongside until that leaves the window; the pool-pressure check and step 0's verdict reuse
+read the new bucket only, so a green from before the move is not reused and the pool gauge's window
+fills over its first week. A run in that bucket records where it lives (`runs[].gcs_base`), and
+the dashboard's and the health bot's build links open that directory in the Cloud Console for a
+project reader; a run in the old bucket keeps its Prow link, which still renders it.
+
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
-digest, and the bare `index.html#view=agent` for the slow-gate and pool notes,
+digest, and the bare `index.html#view=agent` for the pool notes,
 which report no incident and so have no window to scope a link to. The two
 that say the pool check itself is not reporting — `wait unknown` and `pool
 check stopped` — link to the periodic's job history instead, the one place
@@ -287,20 +299,21 @@ clock of the last 5 full runs — a concluded run of at least one case fewer tha
 finished in the last 6 hours — is at least 1.2× the median of the trailing 7
 days' full runs (at least 20 of them), and stays set until that median is back
 under 1.1×. Wall clock is a run's finish minus its start, the digest's
-measure. The poster sends one line the first tick the note appears:
+measure. The note is not a break and /retest does not help, so the poster
+sends no message of its own for it; the digest carries one line while it
+lasts:
 
 ```text
-🐢 Smoke gate: slow — the last 5 full runs took 152–213 min (median 183)
+🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183)
 against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty
-records. Not a break, and /retest won't make yours faster.
+records.
 ```
 
-and not again until the note has cleared and come back. The digest repeats
-the line while it lasts, the Brief's healthy headline carries the same
-sentence, and the state, the advice and the gate comment do not move. The
+The Brief's healthy headline carries the same sentence, and the state, the
+advice and the gate comment do not move. The
 note reads finished runs, so it trails the slowdown by about one run's
 length: on 2026-09-14 the pod count rose from 11:30 AM ET and the note
-would have gone out at 2:00 PM ET. The ages of the running pods would show
+would have appeared at 2:00 PM ET. The ages of the running pods would show
 it sooner and are not read: the adjudicate step runs as the dashboard
 publisher, which holds nothing on the Prow build cluster, and the tick
 carries no `kubectl`. The rule the issue proposed — three consecutive full
@@ -330,20 +343,23 @@ recorded (`run.deadline_kill and run.full`); a kill finished at or before the
 current GREEN episode began does not count. If the window has no qualifying runs
 (such as over a quiet weekend), the note holds its previous value across ticks.
 
-The poster sends one line when the note appears:
-
-```text
-⏱ *Smoke gate: close to the deadline* — slowest run 327 min in the last 24h, 33 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.
-```
-
-and repeats it in the daily digest for as long as it lasts:
+The daily digest carries one line for as long as it lasts:
 
 ```text
 ⏱ Close to the deadline since 12:00 PM ET: slowest run 327 min, 33 min of headroom.
 ```
 
-When qualifying runs in the window include a deadline kill, the alert omits the
-"Not a break" assurance since a run was killed without an evaluation verdict.
+Without a kill in the window it has no message of its own, like the slow note.
+A run killed at the deadline counts here too, and it reached no verdict, so the
+first tick a note's window holds one, the poster sends one line, and not again
+until the note has cleared and come back:
+
+```text
+⏱ *Smoke gate: close to the deadline* — slowest run 365 min in the last 24h, 5 min past the 360-minute Prow timeout. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.
+```
+
+That covers kills below the `deadline_kill` OUTAGE's threshold (3 kills on 2
+pull requests within 2 hours); the OUTAGE is the message for a wave of them.
 Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
 floored at 0 (or overrun minutes past the timeout).
 
@@ -607,7 +623,8 @@ a not-evaluated run, a lost pod and a deadline kill.
   counts;
 - a table of the failed cases — result as `passed / total reps`, and how many
   other pull requests the case is failing on right now;
-- the check's reason for a case that looks like the pull request's;
+- no grading text: the check's reason and the agent's words stay on the
+  dashboard's run page, behind the link, since the pull request is public;
 - how many cases passed, the run's wall clock and pool project, and links: the
   build log, `run.html#build=<build id>` on the dashboard, and the incident
   brief when there is an incident.
@@ -682,8 +699,8 @@ Ran 128 min before the node went away · build log
 
 While `health.json`'s condition is `lost_pods` the box adds "part of a
 build-cluster event: N runs on M PRs" (below the 8-run event bar, "one of N
-runs on M PRs that lost their build node") and the incident brief link. Prow's
-build-log page shows the pod's events. Setup deaths and conflicted merges stay
+runs on M PRs that lost their build node") and the incident brief link. The
+build's `podinfo.json` in its bucket shows the pod's events. Setup deaths and conflicted merges stay
 silent; the build log says which it was.
 
 The third is a run Prow killed at the job deadline with no verdict (#1894),
@@ -1581,7 +1598,8 @@ section](#the-nightly-section)).
 The release-stage notifier (`.github/workflows/release-stage-broken-notify.yml`,
 `scripts/release/notify_release_stage_broken.py`) posts to the same space with
 the same app identity and variables when it opens or closes a
-`ci:release-stage-broken` issue for a failed run of a release pipeline
+`ci:release-stage-broken` issue for a failed run of a release pipeline, or
+opens or closes a `ci:release-stalled` issue for a stalled release chain
 ([`scripts/release/README.md`](../scripts/release/README.md), "Pipeline Cadence &
 Execution Flow", the "When a stage fails" bullet). The workflow mints the app
 token and reads no webhook URL. `CI_HEALTH_MUTE=true` silences it too, and its

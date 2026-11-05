@@ -130,6 +130,19 @@ MCP_SERVERS: tuple[McpServer, ...] = (
 
 _SERVERS_BY_NAME = {server.name: server for server in MCP_SERVERS}
 
+# What a profile worker (the broker's `profile` role, #3658) may reach on the
+# relay: the Developer Knowledge server's two document reads, and nothing else.
+# `gke` stays out because the relay has no per-task target check: a tool call
+# names its project and cluster in its arguments, so a task confined to one
+# cluster could read any other through it. Its kubectl and gcloud already reach
+# its target through /v1/exec. `answer_query` stays out because every agent of
+# an install shares its small daily quota. Widened only by pull request.
+PROFILE_SERVER_TOOLS: dict[str, frozenset[str]] = {
+    "developer_knowledge": frozenset({"get_documents", "search_documents"}),
+}
+RULE_PROFILE_SERVER = "gcp.mcp.profile-server"
+RULE_PROFILE_TOOL = "gcp.mcp.profile-tool"
+
 
 def _validate_servers(servers: tuple[McpServer, ...]) -> None:
     """Refuse a table that cannot enforce what it appears to say. Raises at import."""
@@ -257,6 +270,38 @@ def evaluate(server_name: str, message: dict[str, Any] | None) -> Decision:
     return Decision(allowed=True, rule_id=method, message="")
 
 
+def evaluate_for_profile(server_name: str, message: dict[str, Any] | None) -> Decision:
+    """`evaluate`, narrowed to PROFILE_SERVER_TOOLS for a profile worker.
+
+    The table's own answer first, so every refusal `evaluate` gives a profile
+    worker reads the same as anyone's. Then a server outside the profile set
+    answers ``gcp.mcp.profile-server``, and a ``tools/call`` outside its tools
+    answers ``gcp.mcp.profile-tool``. Never raises.
+    """
+    decision = evaluate(server_name, message)
+    if not decision.allowed:
+        return decision
+    tools = PROFILE_SERVER_TOOLS.get(server_name)
+    if tools is None:
+        return Decision(
+            allowed=False,
+            rule_id=RULE_PROFILE_SERVER,
+            message=(
+                f"Profile workers may not use the {server_name} MCP server. Use kubectl "
+                f"or gcloud, which the credential proxy holds to the task's target."
+            ),
+        )
+    if decision.rule_id == METHOD_TOOLS_CALL:
+        name = message["params"]["name"]  # evaluate() admitted a string name
+        if name not in tools:
+            return Decision(
+                allowed=False,
+                rule_id=RULE_PROFILE_TOOL,
+                message=f"Profile workers may use only {', '.join(sorted(tools))} on the {server_name} MCP server.",
+            )
+    return decision
+
+
 def refusal(message: dict[str, Any] | None, decision: Decision) -> dict[str, Any] | None:
     """The JSON-RPC reply that carries a refusal to the model, or None.
 
@@ -301,7 +346,7 @@ def _blocked_text(decision: Decision) -> str:
     return f"SECURITY_POLICY_BLOCKED: {decision.message}\npolicy rule: {decision.rule_id}"
 
 
-def filter_tools_list(server_name: str, body: bytes) -> bytes | None:
+def filter_tools_list(server_name: str, body: bytes, allowed: frozenset[str] | None = None) -> bytes | None:
     """The upstream `tools/list` reply with every tool outside the table removed.
 
     Returns the re-serialised reply, or None when the body is not a JSON-RPC
@@ -310,11 +355,13 @@ def filter_tools_list(server_name: str, body: bytes) -> bytes | None:
     tools to filter and comes back unchanged. A `nextCursor` is dropped: a later
     page would be fetched with a `tools/list` that this filters too, but no
     server in the table pages, and dropping it keeps that an assumption that
-    fails closed.
+    fails closed. `allowed`, when given, narrows the table's set further (a
+    profile worker's, PROFILE_SERVER_TOOLS).
     """
     entry = server(server_name)
     if entry is None:
         return None
+    tools = entry.tools if allowed is None else entry.tools & allowed
     try:
         reply = json.loads(body.decode("utf-8"), object_pairs_hook=_refuse_duplicate_keys)
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -331,7 +378,7 @@ def filter_tools_list(server_name: str, body: bytes) -> bytes | None:
         for tool in result["tools"]
         if isinstance(tool, dict)
         and isinstance(tool.get("name"), str)
-        and tool["name"] in entry.tools
+        and tool["name"] in tools
     ]
     result.pop("nextCursor", None)
     return json.dumps(reply, separators=(",", ":")).encode("utf-8")
