@@ -199,6 +199,20 @@ OPENING_PULL_REQUEST = re.compile(
 _edited: OrderedDict[tuple[str, str], None] = OrderedDict()
 
 
+def _chat_ux_platforms() -> tuple:
+    """The platforms whose alerts the triage edits (kanban_notifier.CHAT_UX_PLATFORMS): Slack,
+    and Google Chat under ``spec.mode: next``, where the edit is a chat message the gateway
+    lays out. Slack alone on an image without the notifier module."""
+    try:
+        try:
+            from gateway import kanban_notifier
+        except ImportError:  # Unit tests import the patch modules flat.
+            import kanban_notifier
+        return tuple(kanban_notifier.CHAT_UX_PLATFORMS)
+    except Exception:  # noqa: BLE001 - never fail a delivery on presentation
+        return (SLACK,)
+
+
 def enabled() -> bool:
     """Whether ``KAGE_SLACK_UX`` is on and the presenter is importable."""
     return _presenter is not None and _presenter.enabled()
@@ -426,12 +440,12 @@ def _db_path() -> str:
 
 
 def _alert_metas(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[dict]:
-    """The routing metadata of every event alert on Slack posted as ``thread_id`` in ``chat_id``."""
+    """The routing metadata of every event alert posted as ``thread_id`` in ``chat_id`` on a platform the triage edits."""
     return [meta for _session, meta in _alert_rows(conn, chat_id, thread_id)]
 
 
 def _alert_rows(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[tuple[str, dict]]:
-    """``(event session id, routing metadata)`` of every event alert on Slack posted as ``thread_id`` in ``chat_id``."""
+    """``(event session id, routing metadata)`` of every event alert posted as ``thread_id`` in ``chat_id`` on a platform the triage edits (Slack, or Google Chat under ``spec.mode: next``)."""
     # The LIKE on metadata narrows the scan; the JSON check below decides.
     rows = conn.execute(
         "SELECT session_id, metadata FROM session_metadata WHERE session_id LIKE ? AND metadata LIKE '%' || ? || '%'",
@@ -445,7 +459,7 @@ def _alert_rows(conn: sqlite3.Connection, chat_id: str, thread_id: str) -> list[
             continue
         if (
             isinstance(meta, dict)
-            and str(meta.get("platform") or "").lower() == SLACK
+            and str(meta.get("platform") or "").lower() in _chat_ux_platforms()
             and str(meta.get("thread_id") or "") == thread_id
             and str(meta.get("chat_id") or "") == chat_id
         ):
@@ -589,13 +603,20 @@ class _ChatAlertEditor:
 def adapter_for(adapter: Any, platform: str, event: Any, task: Any, sub: Any) -> Any:
     """``adapter``, or one whose ``send`` edits the alert this report answers.
 
-    The editor is returned only with the flag on, on Slack, for a ``completed``
+    The editor is returned only with the flag on, on Slack or on Google Chat through
+    the chat.notify stand-in (``spec.mode: next``), for a ``completed``
     event whose result is an actionable report with at least one option,
     bound for the thread of an event alert that has no stored report yet.
     Everything else, including any error deciding, gets ``adapter`` itself.
     """
     try:
-        if not enabled() or str(platform or "").lower() != SLACK:
+        name = str(platform or "").lower()
+        if not enabled() or name not in _chat_ux_platforms():
+            return adapter
+        if name != SLACK and not callable(getattr(adapter, "send_chat", None)):
+            # Google Chat edits the alert only through the chat.notify stand-in
+            # (spec.mode: next), where the gateway lays the triage out; under
+            # today Hermes's own adapter takes text and has no Slack client.
             return adapter
         if getattr(event, "kind", None) != COMPLETED or not isinstance(sub, dict):
             return adapter

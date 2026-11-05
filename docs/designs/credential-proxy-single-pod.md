@@ -64,7 +64,13 @@ What one pod costs is a gap on every eviction, drain and rollout, and the gap is
 than removed. On SIGTERM the broker refuses new Chat event pulls, keeps the settle routes open for a few
 seconds so the gateway's acks for pulls already answered land, hands any receipt still unsettled
 back to Pub/Sub, and exits; without that the message waits out its 60 s ack deadline on the
-replacement. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
+replacement. The standalone broker also drains: it keeps the health probe, the event pulls, the
+settle routes and the Chat reply routes open for the whole drain, answers every other new request `503` with the `draining`
+bound, stops taking Slack events, and gives the requests in flight up to 30 s to finish.
+It then ends the commands still running, which answer exit 143 with a line that says why, waits a
+few seconds for those answers, and stops. Its pod's `terminationGracePeriodSeconds` of 45 s holds
+the drain and the entrypoint's stop of Envoy after it. The drain is bounded because `Recreate`
+leaves no other broker serving while it runs. The operator writes a `maxUnavailable: 1` budget with `unhealthyPodEvictionPolicy:
 AlwaysAllow`, which on one replica refuses no eviction and holds no drain; a budget that would
 protect the pod is the one the obtainability audit reports as blocking. While the pod is away the
 `PlatformAgent` reads `Provisioning` and, when its pod scan names no other fault, the `Ready` message
@@ -95,7 +101,7 @@ fleet sweeps and was OOM-killed. Since then:
 
 - The child memory budget stops the OOM. On Standard the default limit is 2Gi: the budget
   admits nine requests, and the slot cap holds it to eight. On Autopilot without bursting the limit
-  is clamped to the 1Gi request, and the budget admits four.
+  is clamped to the 2Gi Autopilot request, so the budget admits the same nine there.
 - The Controller Stall Watch reuses kubeconfigs across ticks, which removed about 290
   `get-credentials` calls per tick; each cluster's credentials are now fetched about once a day.
 - The reconciler's and the stall watch's listing pools are four wide, sized to the four requests

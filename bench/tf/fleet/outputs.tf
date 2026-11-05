@@ -28,7 +28,7 @@ output "fleet_reader_service_account" {
 }
 
 output "lagging_version" {
-  description = "The version seeded-b is pinned to this cycle: the newest patch REGULAR offers one minor behind its default, or the hold when seeded-b runs a patch REGULAR does not carry (seeded_b_pin.py)."
+  description = "The version seeded-b is pinned to this cycle: on a create the newest patch REGULAR offers one minor behind its default, afterwards the running version inside that minor, or the step below it (seeded_b_pin.py)."
   value       = local.lagging_version
 }
 

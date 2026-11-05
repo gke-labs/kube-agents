@@ -63,6 +63,17 @@ const (
 	// 'PING'" — which names nothing about authorization at all. See handle.
 	authDecisionBudget = 1500 * time.Millisecond
 
+	// calloutWorkers is how many authorization requests one replica decides
+	// at once. nats.go dispatches one subscription's callbacks from one
+	// goroutine, so without this a replica answered strictly one at a time
+	// and a fleet reconnecting together queued past the server's first-ping
+	// timer (#4332: twelve workers per replica were enough). Sixteen keeps
+	// a replica's TokenReviews inside the client's own rate limit (see
+	// cmd/authcallout) with the API server's latency as the only other
+	// bound; the queue behind the slots is still bounded by
+	// authDecisionBudget, measured from receipt.
+	calloutWorkers = 16
+
 	// taskCredentialSkew is the clock skew a task credential's expiry and
 	// issue time are allowed against this callout's clock: the dispatcher
 	// that signed it runs on another node.
@@ -234,6 +245,8 @@ type Service struct {
 	reserved        map[string]reservedKind
 	now             func() time.Time
 	log             *slog.Logger
+	// slots bounds the decisions in flight at once; see calloutWorkers.
+	slots chan struct{}
 }
 
 // NewService builds the callout.
@@ -290,6 +303,7 @@ func NewService(store *Store, validator *TokenValidator, cfg Config, log *slog.L
 		reserved:  reserved,
 		now:       cfg.Now,
 		log:       log,
+		slots:     make(chan struct{}, calloutWorkers),
 	}
 	if svc.grantTTL <= 0 {
 		svc.grantTTL = defaultGrantTTL
@@ -349,10 +363,27 @@ func (s *Service) Subscribe(nc *nats.Conn) (*nats.Subscription, error) {
 
 func (s *Service) handle(m *nats.Msg) {
 	// The server's own first-ping timer, not authorization.timeout, is what
-	// actually bounds everything below. See authDecisionBudget.
+	// actually bounds everything below. See authDecisionBudget. The budget
+	// starts here, on receipt, so time spent waiting for a slot counts
+	// against it: a request that waited past the point the client has
+	// already given up is not worth a TokenReview.
 	ctx, cancel := context.WithTimeout(context.Background(), authDecisionBudget)
-	defer cancel()
 
+	// nats.go delivers this subscription's messages from one goroutine, so
+	// the callback itself does nothing slow: it hands the request on and
+	// returns, which is what lets calloutWorkers requests proceed at once.
+	// One goroutine per request, each alive for at most the budget, so a
+	// burst holds at most its own arrival count of them.
+	go func() {
+		defer cancel()
+		s.decide(ctx, m)
+	}()
+}
+
+// decide takes a worker slot and answers one request. Decoding comes before
+// the slot: it is cheap, and a refusal needs the decoded user nkey to be
+// addressed to anything.
+func (s *Service) decide(ctx context.Context, m *nats.Msg) {
 	req, serverXKey, err := s.decode(m)
 	if err != nil {
 		// Nothing to answer to: without a decoded request there is no user
@@ -364,6 +395,27 @@ func (s *Service) handle(m *nats.Msg) {
 
 	resp := jwt.NewAuthorizationResponseClaims(req.UserNkey)
 	resp.Audience = req.Server.ID
+
+	select {
+	case s.slots <- struct{}{}:
+		defer func() { <-s.slots }()
+	case <-ctx.Done():
+		// Refused rather than decided late: by now the client has failed
+		// on the server's timer, and a TokenReview for it would only hold
+		// a slot the next request needs. No holder keeps a slot past its
+		// own budget (authorize returns at ctx's deadline), so a waiter
+		// normally sees a slot free inside its window and this is the
+		// floor: the budget and a slot coming ready together, or a slow
+		// path between. The floor still has to answer, or the client
+		// hangs to the server's timer.
+		s.log.Warn("refusing a connection",
+			"reason", "the decision budget lapsed before a worker was free",
+			"host", req.ClientInformation.Host,
+			"map_version", s.store.Version())
+		resp.Error = "authorization timed out"
+		s.respond(m, resp, serverXKey)
+		return
+	}
 
 	d, err := s.authorize(ctx, req)
 	if err != nil {
@@ -388,11 +440,17 @@ func (s *Service) handle(m *nats.Msg) {
 				"user", d.user,
 				"account", d.account,
 				"task", d.task,
+				"review", d.review,
 				"host", req.ClientInformation.Host,
 				"map_version", s.store.Version())
 		}
 	}
+	s.respond(m, resp, serverXKey)
+}
 
+// respond signs the response and sends it, sealed to the server's curve key
+// when the request arrived encrypted.
+func (s *Service) respond(m *nats.Msg, resp *jwt.AuthorizationResponseClaims, serverXKey string) {
 	out, err := resp.Encode(s.issuer)
 	if err != nil {
 		s.log.Error("could not encode the authorization response", "error", err)
@@ -451,6 +509,10 @@ type decision struct {
 	// mint): the task credential's expiry there, or the entry's NotAfter.
 	task     string
 	notAfter time.Time
+
+	// review says whether the token was reviewed by the API server on this
+	// connection or remembered from a recent one (see TokenValidator).
+	review reviewSource
 }
 
 // authorize resolves the presented token to a mapped identity.
@@ -496,7 +558,11 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 		return decision{}, fmt.Errorf("no token presented")
 	}
 
-	att, err := s.validator.Validate(ctx, token)
+	// A review this request's budget cuts short goes on without it, bounded
+	// by a budget of its own (see TokenValidator): the slot is given back
+	// here, the answer is remembered when it arrives, and the client's
+	// reconnect is served from memory rather than queued for a second one.
+	att, review, err := s.validator.validate(ctx, token)
 	if err != nil {
 		return decision{}, fmt.Errorf("token rejected: %w", err)
 	}
@@ -616,7 +682,7 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			att.ServiceAccount, len(grants.Publish), len(grants.Subscribe))
 	}
 
-	return decision{account: id.Account, perms: permissionsFor(grants), user: user, task: task, notAfter: notAfter}, nil
+	return decision{account: id.Account, perms: permissionsFor(grants), user: user, task: task, notAfter: notAfter, review: review}, nil
 }
 
 // verifyTaskCredential checks a task credential against the connection that

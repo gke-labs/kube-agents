@@ -26,6 +26,16 @@ _FOOTER = (
     "clusters are running, how many, or what versions is live state and goes to "
     "a specialist."
 )
+# Appended only when the block counts a group of agents instead of naming them
+# (agent_roster.SUMMARY_HINT is in the text), so it never points at a lookup
+# the block did not call for.
+_SUMMARY_FOOTER = (
+    "Where the block above counts agents rather than naming them, a named "
+    "cluster's `assignee` comes from `list_agents` with `filter` set to that "
+    "cluster's name: route to the agent it returns; when it says the roster "
+    "could not be fully read, call it again; route to `platform` only when it "
+    "says no agent matches. Fleet inventory still goes to `platform`."
+)
 # Appended only when the host cluster identity is present, so it never points
 # at a section that was not rendered (agent_roster.read_host_identity).
 _HOST_FOOTER = (
@@ -38,8 +48,9 @@ _HOST_FOOTER = (
 
 # Cached across turns in one process, keyed by (path, st_mtime_ns) so an in-place
 # script update on the shared volume is picked up automatically while normal turns
-# pay only a stat() call. The roster it produces is always re-read every turn —
-# a cluster agent created a moment ago has to show up on the next message, which
+# pay only a stat() call. The roster it produces is cached by the module itself
+# on the profiles directory's mtime (agent_roster.render), never on time — a
+# cluster agent created a moment ago has to show up on the next message, which
 # is the whole reason the front door was calling the tool in the first place.
 _roster_module: Optional[ModuleType] = None
 _roster_module_source: Optional[Tuple[Path, int]] = None
@@ -127,6 +138,11 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     if empty and roster.startswith(empty):
         return {"context": f"\n\n{_HEADER}\n{roster}\n"}
     footer = f"{_FOOTER} {_HOST_FOOTER}" if has_host else _FOOTER
+    # getattr again: a module without the constant (an older script on the
+    # volume) renders no counted block, so there is nothing to point at.
+    hint = getattr(module, "SUMMARY_HINT", None)
+    if hint and hint in roster:
+        footer = f"{footer} {_SUMMARY_FOOTER}"
     return {"context": f"\n\n{_HEADER}\n{roster}\n\n{footer}\n"}
 
 

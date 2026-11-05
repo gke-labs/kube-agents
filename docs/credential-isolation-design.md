@@ -118,8 +118,10 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 `FEEDBACK_PROMPT_*` switch and delay, the four findings pacing limits
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
 `FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
-window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, and the `KAGE_SLACK_UX` flag —
-but only as literal values; all `valueFrom` sources are rejected. One name goes to the shell Pod
+window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
+cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
+roster count, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
@@ -205,9 +207,9 @@ PlatformAgent gateway Pod
 credential-proxy Pod
 
   envoy-credential-proxy
-    Envoy listener
-              |
-              | private Unix socket
+    Envoy listener :8765        Envoy health listener :8768 (readinessProbe)
+              |                             |
+              | private Unix socket         | same socket, /healthz only
               v
     credential runtime
     real CLIs, Slack/Chat clients, Minty client
@@ -247,6 +249,26 @@ which one presented the token — the audience and the route table it feeds do �
 allowlist itself keeps other workloads out rather than telling those callers apart. The token
 crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
+
+Envoy opens a second listener, on port 8768 (`credentialProxyHealthPort` in the operator,
+the container port `cred-health`), where the broker Pod's `readinessProbe` reads `/healthz`.
+The credentialed listener sends every path through the `credential_runtime` cluster, and
+every open cluster watch holds one of that cluster's connections, so a probe through it is
+refused with the watches' 503 once the fleet reaches the cluster's connection ceiling, and
+three refusals remove the Pod from the Service. That ceiling is declared rather than
+inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
+requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
+backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
+refuses first. The health listener routes `/healthz` alone to a `credential_health` cluster
+on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
+no watch can mark the Pod unready; any other path on it is a 404. The Service and the
+NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
+`start-services.sh` rebinds both listeners off loopback together, to the address the operator
+passes (`0.0.0.0`, so the Pod IP answers), and refuses to start Envoy if a render leaves one
+behind. There is no `livenessProbe`: the start script
+supervises both processes and restarts the runtime in place, and a probe-driven restart
+would drop every open watch and the broker's workspace state. Envoy's admin interface stays
+on its Unix socket, where nothing on the Pod network reaches it.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
 8643 and forwards to the agent on loopback using a non-secret sentinel. It is a
@@ -366,7 +388,10 @@ including:
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` (8 by default), and within that only as many
   as fit the child memory budget it derives from its container's memory limit (four at
   the operator's defaults); a request waits up to 60 seconds for admission and is then
-  refused with `503 CREDENTIAL_PROXY_BUSY`.
+  refused with `503 CREDENTIAL_PROXY_BUSY`. At the broker's hard resource watermark (live
+  cgroup memory, or a scratch volume near the sizeLimit it is evicted on) a background
+  caller is refused at once with `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE` and a
+  `Retry-After`; the session role keeps one slot up to a higher ceiling.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -681,8 +706,8 @@ The cap counts a list the runtime keeps in memory, so a worker that dies without
 closing its workspace would otherwise hold a slot until the pod restarts. Two
 things bound that. A workspace no verb has named for
 `CREDENTIAL_PROXY_WORKSPACE_IDLE_SECONDS` (30 minutes by default) is reclaimed by
-the next `open`, and every tree a previous process left under the root is removed
-when the runtime starts. A refusal at the cap logs each holder's handle prefix,
+the next `open` or by the broker's resource watermark relief step (below), and every
+tree a previous process left under the root is removed when the runtime starts. A refusal at the cap logs each holder's handle prefix,
 repository, caller label (the card or session id the client sends), age and idle
 time, so a full store is diagnosable from the runtime's log.
 
@@ -863,7 +888,17 @@ Consequences:
   deploys it); the rest is drained and dropped, so what a command prints past
   the cap costs the broker nothing. The same bound applies to the decoded
   text's UTF-8 size, so output that is not UTF-8, whose every byte becomes a
-  three-byte replacement character, cannot cost more than text does. At most
+  three-byte replacement character, cannot cost more than text does. The reply
+  says when it was cut: `truncated` is true when either stream was cut,
+  `stdoutTruncated` when the cut fell on stdout, `bytesWritten` is the stdout
+  the caller receives in UTF-8 bytes, and `limit` is the cap (all four are
+  present on every completed reply). When stdout was cut the shim exits
+  `EXIT_OUTPUT_TRUNCATED` (74, `EX_IOERR`) whatever the command exited, and
+  prints the counts after its `credential proxy output truncated` stderr
+  marker, so a cut `-o json` dump reads as a failure to the model's own
+  `kubectl` and to a script alike, never as an exit 0 with a partial payload; a
+  cut on stderr alone keeps the command's exit code, and the marker says stdout
+  is complete. At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
   flight at once (8; the operator sets it, as it sets the output cap, and
   reserves the name). A slot is held from admission until the response is on
@@ -888,9 +923,9 @@ Consequences:
   startup WARNING naming the limit read and that floor: GKE Autopilot without bursting
   sets limits equal to requests, so the proxy's limit there is its memory request, and a
   budget that serialised every command would cost more than the out-of-memory exposure
-  it prevents. The operator declares that request at 1Gi, above the floor, so that the
-  budget engages there too, admitting four; the floor remains for a CR override that
-  sets a smaller request.
+  it prevents. The operator declares that request at 2Gi on Autopilot (1Gi on Standard),
+  above the floor, so that the budget engages there too, admitting nine, held to eight by
+  the slot cap; the floor remains for a CR override that sets a smaller request.
   The exec and vcs routes hold a slot and a reservation; the vcs route reads its
   body, which may carry a bundle of tens of MiB, only once admitted, while the
   exec route's body (at most 1 MiB) is read before.
@@ -902,11 +937,49 @@ Consequences:
   `503 CREDENTIAL_PROXY_BUSY`, naming the slot cap
   (`the credential proxy is at its limit of 8 concurrent commands …`) or the budget
   (`the credential proxy is at its child memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests) …`),
+  the background share (`the credential proxy keeps … of its … admissions for interactive work …`)
+  or the interactive cap (`the credential proxy keeps one of its … admissions for background work …`),
   whichever held it, or, when the request itself fits and only requests ahead of it that
   are waiting for the budget kept it queued, the queue
   (`the credential proxy's admission queue is held by requests waiting for its child memory budget (…) …`).
-  The queue is in arrival order, except that a forge refresh that fits the budget passes
-  requests the slot cap alone holds, since it takes no slot.
+  The queue is in arrival order inside each admission class, with interactive requests ahead
+  of queued background ones (`designs/credential-broker-exec-tier.md` §4.2), except that a
+  forge refresh that fits the budget passes requests only a slot cap holds (the full slot cap,
+  or their own class's full cap), since it takes
+  no slot.
+  Beside the static budget sits the resource watermark gate, which reads what the container
+  holds now: the working set (`memory.current` less `memory.stat`'s `inactive_file`, the
+  kubelet's eviction signal) against `memory.max` on every admission, and the state and
+  `/tmp` emptyDirs against the caps the operator passes
+  (`CREDENTIAL_PROXY_STATE_LIMIT_BYTES`, `CREDENTIAL_PROXY_TMP_LIMIT_BYTES`: each volume's
+  sizeLimit, or, when an override puts the container's ephemeral-storage limit under the
+  two sizeLimits together, shares of that limit in the sizeLimits' proportion, summing to
+  it, since the kubelet sums the volumes into that one limit; a volume with no cap is off,
+  since statvfs on an emptyDir reads the node, not the cap) on the memory sampler's 30 s
+  tick. From the soft watermark
+  (`CREDENTIAL_PROXY_MEM_SOFT_PCT` 75, `CREDENTIAL_PROXY_DISK_SOFT_PCT` 70) admitted commands
+  run one at a time and the first tick reclaims idle content workspaces and orphaned vcs
+  scratch, collects and trims the allocator. From the hard watermark
+  (`CREDENTIAL_PROXY_MEM_HARD_PCT` 85, `CREDENTIAL_PROXY_DISK_HARD_PCT` 80) a background
+  caller is answered at once, before it queues, with
+  `429 CREDENTIAL_PROXY_RESOURCE_PRESSURE`, `Retry-After: N` (5 to 30, drawn at random) and
+  the same envelope plus `retry_after`, with `retry in N s` in the text the shim prints; one
+  slot stays open to the session role, which is the one interactive class, up to a ceiling
+  of 92% memory or 90% disk, past which it is refused too. A level is left only once the
+  readings clear three points under the watermark it was entered at, so a reading that
+  hovers at a watermark is one episode: one transition line, one relief. A workspace write
+  refused this way has its body drained before the 429, as a vcs verb's refusal does, so a
+  commit still sending its files reads the refusal rather than a reset. Under the clamp that reserve is a
+  slot in the executor as well, one above the background commands running (those admitted
+  before the clamp arrived keep their slots) and bounded by the configured cap alone, not by
+  the interactive class cap of `designs/credential-broker-exec-tier.md` §4.2, which the
+  shell's sweep can hold when the clamp arrives: a session's command runs beside them, and
+  passes background requests the clamp holds. The class is the authenticated role, never a header. The gate covers
+  `/v1/exec`, `/v1/vcs/*` and the feedback route; a `/v1/k8s` list without `watch=true`
+  and the content workspace's `open`, `commit` and `push` take the hard check alone, and a
+  watch and the workspace reads pass. A missing or `max` `memory.max` turns the
+  memory half off. The refusal counts under `bound="pressure"`, and
+  `kubeagents_credential_proxy_resource_watermark_ratio` carries each resource's fill.
   A long-running command holds its slot and reservation for as long as it runs,
   and a caller that stops reading its response is given up on after 60 seconds
   so that it cannot keep them.
@@ -916,8 +989,8 @@ Consequences:
   applies at the deadline. On the exec, vcs and forge refresh routes, a caller
   that disconnects while queued for admission (a slot, the child memory budget,
   or both) is dropped without anything being started; a vcs verb's own git commands, once started, run to completion
-  unwatched. Admission goes in arrival order, so the caller refused after the wait
-  is the one that waited longest. Disconnecting means the peer closed for good
+  unwatched. Admission goes in arrival order inside each class, so the caller refused
+  after the wait is the one of its class that waited longest. Disconnecting means the peer closed for good
   (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
   half is still answered, and a broker spoken to over TCP, where a closed peer
   and a half-closed one look alike, runs its commands unwatched.
@@ -1008,7 +1081,8 @@ file and never a `.git` it can write into.
 - Every container the operator builds — the credential-cleanup init container,
   the agent, the dashboard, `agent-api-auth`, the log shipper — has a read-only
   root filesystem;
-  writable state uses bounded `emptyDir` volumes. The sandbox and dashboard
+  writable state uses bounded `emptyDir` volumes, bar the log shipper's cursor
+  directory on the `system-metadata` claim, described below. The sandbox and dashboard
   share a 2Gi `/tmp` scratch volume: the entrypoint runs several hermes
   invocations with `HOME=/tmp` before the agent starts, and those two
   containers already share the data PVC, so the shared volume is not a new
@@ -1016,8 +1090,8 @@ file and never a `.git` it can write into.
   container's own writable layer, discarded whenever that container restarted.
   An `emptyDir` is scoped to the Pod, so its contents now survive a container
   crash or restart and are visible to both containers' next boot. The log
-  shipper gets no `/tmp`: it buffers in memory
-  and keeps its tail database on its own volume. Containers supplied through
+  shipper gets no `/tmp`: it buffers in memory, and its one writable path is
+  the directory below. Containers supplied through
   `spec.deployment.sidecars`/`initContainers` are appended to the Pod
   substantially as written; the webhook does not require a read-only root of
   them, so a CR can still add a writable container to this Pod. "As written"
@@ -1028,6 +1102,22 @@ file and never a `.git` it can write into.
   that discards a CR value, `POD_NAMESPACE` as a default a CR value beats.
   Neither edit touches the container's filesystem posture, which is what this
   bullet is about.
+- The log shipper's tail cursors, the two SQLite files that record how far it
+  has read each log, live in a per-agent directory on the namespace's
+  `system-metadata` claim, mounted into the shipper alone at a `subPath` of its
+  own. A cursor on an `emptyDir` died with the Pod, and every replacement
+  shipped each file again from its first line. The agent's data claim was not
+  used for it because the agent and the dashboard mount that claim at its root,
+  and a cursor file rewritten into something SQLite cannot open stops the
+  shipper at every start; the `system-metadata` claim is reached by those two
+  containers only through `subPath: session`, so no container the operator
+  renders for model-authored code can write the cursors. Of the rendered
+  containers the shipper is the only one with a mount under `fluent-bit-state/`;
+  a CR's `spec.deployment.extraVolumeMounts` can still name the claim without a
+  `subPath`, and the operator does not refuse it. The databases use the rollback
+  journal rather than WAL: the claim is the gofer-backed mount under a runtime
+  class, where WAL-mode SQLite corrupts, and a corrupt cursor on a claim
+  outlives the Pod.
 - A policy ConfigMap hash is placed on the Pod template to trigger rollout when
   command policy changes.
 - The operator reports Ready only when every workload it renders is ready, with

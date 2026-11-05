@@ -704,7 +704,7 @@ func TestTheProvisionJobWaitsForTheBusToRollOut(t *testing.T) {
 		Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	reportCalloutStatus(t, ctx, cl, agent, 2, 2, 2)
@@ -719,7 +719,7 @@ func TestTheProvisionJobWaitsForTheBusToRollOut(t *testing.T) {
 	if err := cl.Status().Update(ctx, sts); err != nil {
 		t.Fatal(err)
 	}
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -738,7 +738,7 @@ func TestTheProvisionJobWaitsForTheBusToRollOut(t *testing.T) {
 	if err := cl.Status().Update(ctx, sts); err != nil {
 		t.Fatal(err)
 	}
-	if state, err = r.reconcileA2A(ctx, agent); err != nil {
+	if state, err = r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if !state.jobHeld {
@@ -747,7 +747,7 @@ func TestTheProvisionJobWaitsForTheBusToRollOut(t *testing.T) {
 
 	// Rolled out: created.
 	reportBusRolledOut(t, ctx, cl, agent)
-	if state, err = r.reconcileA2A(ctx, agent); err != nil {
+	if state, err = r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if state.jobHeld {
@@ -787,7 +787,7 @@ func TestASingleServerBusHasNoRoutesServiceOrBudget(t *testing.T) {
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
 	ctx := context.Background()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	routes := client.ObjectKey{Name: a2aNATSRoutesName(agent), Namespace: agent.Namespace}
@@ -801,7 +801,7 @@ func TestASingleServerBusHasNoRoutesServiceOrBudget(t *testing.T) {
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationShrinking),
 		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if a2aNATSReplicas(agent) != 1 {
@@ -863,7 +863,16 @@ func TestAMigrationProvisionsTheBusAgain(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	// The callout's current ReplicaSet, which the fake's absent Deployment
+	// controller would have made: without one the bus holds each config
+	// change of the migration until it can tell the callout has rolled
+	// (a2aBusWaitsForCallout).
+	callout := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aCalloutName(agent)}, callout); err != nil {
+		t.Fatal(err)
+	}
+	calloutReplicaSet(t, ctx, cl, callout, "current", "1")
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	completeTheProvisionJob(t, ctx, cl, agent)
@@ -878,7 +887,7 @@ func TestAMigrationProvisionsTheBusAgain(t *testing.T) {
 		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(servers)}}
 		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "1-1", Phase: string(phase),
 			Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
-		state, err := r.reconcileA2A(ctx, agent)
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -887,7 +896,7 @@ func TestAMigrationProvisionsTheBusAgain(t *testing.T) {
 		}
 		reportBusRolledOut(t, ctx, cl, agent)
 		agent.Status.BusMigration.Phase = string(busMigrationDone)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -931,7 +940,7 @@ func TestASingleServerBusSkipsAForeignBudgetUnderItsName(t *testing.T) {
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
-	if _, err := r.reconcileA2A(context.Background(), agent); err != nil {
+	if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("a foreign budget under the bus's name failed the pass: %v", err)
 	}
 	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(foreign), &policyv1.PodDisruptionBudget{}); err != nil {
@@ -994,7 +1003,7 @@ func TestAMigrationsCountChangeDropsBusProvisioned(t *testing.T) {
 		t.Fatal("precondition: BusProvisioned not set")
 	}
 	// The same shape: the record stands.
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if !busProvisioned(agent) {
@@ -1003,14 +1012,14 @@ func TestAMigrationsCountChangeDropsBusProvisioned(t *testing.T) {
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationPinning),
 		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if !busProvisioned(agent) {
 		t.Fatal("BusProvisioned dropped while the pin ran at three servers")
 	}
 	agent.Status.BusMigration.Phase = string(busMigrationShrinking)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if busProvisioned(agent) {
@@ -1227,7 +1236,9 @@ func TestAFailedCountChangingPassStillDropsBusProvisionedOnTheRetry(t *testing.T
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-				if _, isDep := obj.(*appsv1.Deployment); failCallout && isDep && obj.GetName() == a2aCalloutName(agent) {
+				// The bus's client Service, applied right after the
+				// StatefulSet (the callout reconciles before it).
+				if _, isSvc := obj.(*corev1.Service); failCallout && isSvc && obj.GetName() == a2aNATSName(agent) {
 					return fmt.Errorf("injected: the apply after the bus StatefulSet fails")
 				}
 				return base.Patch(ctx, c, obj, patch, opts...)
@@ -1236,8 +1247,16 @@ func TestAFailedCountChangingPassStillDropsBusProvisionedOnTheRetry(t *testing.T
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
+	// The callout's current ReplicaSet, which the fake's absent Deployment
+	// controller would have made: without one the bus holds a config change
+	// until it can tell the callout has rolled (a2aBusWaitsForCallout).
+	callout := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aCalloutName(agent)}, callout); err != nil {
+		t.Fatal(err)
+	}
+	calloutReplicaSet(t, ctx, cl, callout, "current", "1")
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if agent.Status.BusReplicas != 3 || !busProvisioned(agent) {
@@ -1250,7 +1269,7 @@ func TestAFailedCountChangingPassStillDropsBusProvisionedOnTheRetry(t *testing.T
 	// The count-changing pass, on a copy: it fails, so none of its
 	// in-memory status reaches the CR the retry reads.
 	failCallout = true
-	if _, err := r.reconcileA2A(ctx, agent.DeepCopy()); err == nil {
+	if _, err := r.reconcileA2A(ctx, agent.DeepCopy(), homeChannelRecord{}); err == nil {
 		t.Fatal("precondition: the injected failure did not fail the count-changing pass")
 	}
 	failCallout = false
@@ -1259,7 +1278,7 @@ func TestAFailedCountChangingPassStillDropsBusProvisionedOnTheRetry(t *testing.T
 		t.Fatalf("precondition: the failed pass did not land the StatefulSet at 1 (err=%v replicas=%v)", err, sts.Spec.Replicas)
 	}
 
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if busProvisioned(agent) {
@@ -1388,7 +1407,9 @@ func TestAFieldChangeRendersNothingTowardTheNewCountBeforeTheMigrationDoes(t *te
 		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
 			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
 			WithInterceptorFuncs(interceptor.Funcs{Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
-				if _, isDep := obj.(*appsv1.Deployment); failCallout && isDep && obj.GetName() == a2aCalloutName(agent) {
+				// The bus's client Service, applied right after the
+				// StatefulSet (the callout reconciles before it).
+				if _, isSvc := obj.(*corev1.Service); failCallout && isSvc && obj.GetName() == a2aNATSName(agent) {
 					return fmt.Errorf("injected: the apply after the bus StatefulSet fails")
 				}
 				return base.Patch(ctx, c, obj, patch, opts...)
@@ -1397,7 +1418,7 @@ func TestAFieldChangeRendersNothingTowardTheNewCountBeforeTheMigrationDoes(t *te
 		ctx := context.Background()
 		theCalloutIsServing(t, ctx, cl, r, agent)
 		setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		replicas := func() int32 {
@@ -1413,14 +1434,14 @@ func TestAFieldChangeRendersNothingTowardTheNewCountBeforeTheMigrationDoes(t *te
 		}
 		agent.Spec.Harness.Tuning.BusReplicas = ptr.To(to)
 		failCallout = true
-		if _, err := r.reconcileA2A(ctx, agent.DeepCopy()); err == nil {
+		if _, err := r.reconcileA2A(ctx, agent.DeepCopy(), homeChannelRecord{}); err == nil {
 			t.Fatal("precondition: the injected failure did not fail the pass")
 		}
 		if got := replicas(); got != from {
 			t.Errorf("%d to %d, failed pass: the StatefulSet went to %d", from, to, got)
 		}
 		failCallout = false
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		if got := replicas(); got != from || agent.Status.BusReplicas != from {

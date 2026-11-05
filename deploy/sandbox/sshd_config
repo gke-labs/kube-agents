@@ -73,6 +73,25 @@ AcceptEnv LANG LC_*
 ClientAliveInterval 60
 ClientAliveCountMax 5
 
+# Channels per connection. Every ssh the agent pod spawns multiplexes over one
+# ControlMaster connection per user@host:port (deploy/docker/patches/
+# apply_ssh_shared_master.py), so every concurrent command the gateway, the
+# worker and every delegated card run against this sandbox is a session on the
+# same connection. OpenSSH's default MaxSessions is 10: the eleventh concurrent
+# command is refused by the master and the client exits 255 with nothing on
+# stderr, which is what a fan-out sweep over a large fleet hit. 128 covers a
+# sweep's worth of cards each holding a command open; the memory the shell
+# container is given (spec.harness.experimental.shellSandbox.resources) is the
+# counterpart, since each session is a shell and whatever it runs.
+#
+# MaxStartups bounds connections still in authentication rather than sessions,
+# so it does not gate the multiplexed commands; it is raised from 10:30:100 for
+# the moment several agent processes open a master at once after a sandbox
+# restart, when every one of them is unauthenticated together. Random early
+# drop starts at 64 pending, reaches certainty at 256.
+MaxSessions 128
+MaxStartups 64:30:256
+
 # The session environment: PATH, plus whatever the entrypoint was able to
 # forward from the pod. It has to come through sshd rather than /etc/profile.d
 # because a non-login session reads no profile, and `ssh sandbox kubectl get

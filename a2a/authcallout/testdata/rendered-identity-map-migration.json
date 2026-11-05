@@ -1,10 +1,12 @@
 {
-  "version": "23c57ca61fb30be8",
+  "version": "2baa102ae5371269",
+  "shard": 0,
+  "shards": 1,
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-bus-stream-3-1",
       "user": "migrate-stream-3-1",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "$JS.API.STREAM.INFO.TASKS",
@@ -31,6 +33,9 @@
           "$JS.API.STREAM.INFO.KV_feedback",
           "$JS.API.STREAM.SNAPSHOT.KV_feedback",
           "$JS.SNAPSHOT.ACK.KV_feedback.>",
+          "$JS.API.STREAM.INFO.KV_people",
+          "$JS.API.STREAM.SNAPSHOT.KV_people",
+          "$JS.SNAPSHOT.ACK.KV_people.>",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.SNAPSHOT.KV_PROFILE_LEASES",
           "$JS.SNAPSHOT.ACK.KV_PROFILE_LEASES.>",
@@ -47,7 +52,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-bus-frozen-3-1",
       "user": "migrate-frozen-3-1",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "_INBOX.migrate-frozen-3-1.>"

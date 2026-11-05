@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,11 +46,59 @@ import (
 // It holds no secret. Under the callout a principal's credential is a token the
 // cluster mints, so the map carries only ServiceAccount names and subject
 // lists, and the passwords that remain live where they always did.
+//
+// It is sharded. One ConfigMap holds at most a2aAuthMapShardByteBudget of map,
+// and the identities are cut into as many numbered objects as that takes,
+// <agent>-a2a-authmap-0 through -<n-1>; a map that fits is one shard, shard 0
+// of 1. Every shard carries the version of the WHOLE map and its own
+// shard/shards stamps, in the document and as annotations, and the callout
+// serves nothing new until it holds every shard of one version with agreeing
+// stamps. The ConfigMap API refuses an object past 1 MiB, and the unsharded
+// map crossed it near 640 bound AgentProfiles; from there no profile could
+// be onboarded, and no identity could change.
 
 const (
 	// a2aAuthMapKey is the ConfigMap key holding the rendered map. The
 	// callout reads this key by name.
 	a2aAuthMapKey = "identities.json"
+
+	// a2aAuthMapShardByteBudget is the most rendered map one shard's data
+	// carries, as the indented JSON the ConfigMap holds. Three quarters of
+	// the API server's 1 MiB ConfigMap limit, which bounds the object's
+	// data as a whole: the quarter left is for the metadata, the
+	// managedFields the apply writes, and the JSON envelope around the
+	// identities, none of which this budget counts. At about half a
+	// kilobyte per profile entry a shard holds some 1,500 of them.
+	a2aAuthMapShardByteBudget = 768 * 1024
+
+	// a2aAuthMapShardEnvelopeBytes is the allowance the partition keeps for
+	// the bytes of a shard document that are not identities: the braces,
+	// the version, the two stamps and the key names. Measured under 100
+	// bytes; rounded up so a stamp growing a digit changes nothing.
+	a2aAuthMapShardEnvelopeBytes = 256
+
+	// a2aAuthMapIndent is the indentation step of the rendered document.
+	// Indented on purpose: this object is read by people during an incident
+	// at least as often as by the callout, and "which grants does the bus
+	// think this workload has" should be answerable with kubectl get -o
+	// yaml rather than by piping through a formatter. The partition
+	// measures each identity at the depth it is rendered at,
+	// a2aAuthMapIdentityDepth steps in (inside the document, inside the
+	// identities array), so the budget it keeps is the budget on the file.
+	a2aAuthMapIndent        = "  "
+	a2aAuthMapIdentityDepth = 2
+
+	// a2aAuthMapShardAnnotation and a2aAuthMapShardsAnnotation carry the
+	// shard's index and the shard count on the object, as the document
+	// carries them inside, so `kubectl get cm` answers "is this set
+	// complete" without parsing the payload.
+	a2aAuthMapShardAnnotation  = "kubeagents.x-k8s.io/a2a-authmap-shard"
+	a2aAuthMapShardsAnnotation = "kubeagents.x-k8s.io/a2a-authmap-shards"
+
+	// a2aAuthMapComponent is the a2aLabels component every identity-map
+	// object carries, shard or legacy, which is how the prune and the
+	// teardown find them whatever their names (deleteA2AAuthMapObjects).
+	a2aAuthMapComponent = "authmap"
 
 	// a2aAuthMapVersionLength is how much of the content digest becomes the
 	// version. Sixteen hex characters matches the config hash the NATS
@@ -77,9 +126,28 @@ const (
 	a2aServiceAccountFields = 4
 )
 
-// a2aAuthMapName is the ConfigMap holding the identity map.
+// a2aAuthMapName is the stem every shard's name is built from. The callout
+// receives it as A2A_AUTHMAP_NAME and appends the index itself, so the two
+// sides spell the shard names from one string. It is also the name of the
+// single, unsharded object releases before sharding rendered, which the
+// reconcile deletes (pruneA2AAuthMapShards) and nothing watches any more.
 func a2aAuthMapName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-authmap"
+}
+
+// a2aAuthMapShardName is the ConfigMap holding shard i of the identity map.
+func a2aAuthMapShardName(agent *agentv1alpha1.PlatformAgent, i int) string {
+	return a2aAuthMapName(agent) + "-" + strconv.Itoa(i)
+}
+
+// a2aAuthMapShardNames is every shard's name, in index order: what the
+// callout Role's resourceNames lists and what the callout watches.
+func a2aAuthMapShardNames(agent *agentv1alpha1.PlatformAgent, shards int) []string {
+	names := make([]string, 0, shards)
+	for i := 0; i < shards; i++ {
+		names = append(names, a2aAuthMapShardName(agent, i))
+	}
+	return names
 }
 
 // The wire shape of the map. This mirrors the types in the a2a module's
@@ -133,7 +201,20 @@ type a2aAuthMapTopics struct {
 }
 
 type a2aAuthMapDocument struct {
-	Version    string               `json:"version"`
+	// Version names the content of the whole map, not of this shard: every
+	// shard of one render carries the same one, and the callout serves a
+	// set only when they agree.
+	Version string `json:"version"`
+
+	// Shard and Shards are the stamps: this document's index and the count
+	// it is one of. The callout is told the count (A2A_AUTHMAP_SHARDS) and
+	// watches each name, and refuses a document whose stamps disagree with
+	// what it was told or with the name it arrived under. Plain ints
+	// rather than omitted at zero, so shard 0 of 1 carries the keys too
+	// and the schema is one shape (a2aIdentityMapSchema, schema 5).
+	Shard  int `json:"shard"`
+	Shards int `json:"shards"`
+
 	Identities []a2aAuthMapIdentity `json:"identities"`
 }
 
@@ -218,43 +299,110 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 	}
 	sum := sha256.Sum256(body)
 
+	// The whole map in one document: shard 0 of 1 until
+	// shardA2AAuthMap cuts it.
 	return a2aAuthMapDocument{
 		Version:    hex.EncodeToString(sum[:])[:a2aAuthMapVersionLength],
+		Shard:      0,
+		Shards:     1,
 		Identities: identities,
 	}, nil
 }
 
-// buildA2AAuthMapConfigMap renders the map into the object the callout watches,
-// and returns the version it rendered.
-func buildA2AAuthMapConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) (*corev1.ConfigMap, string, error) {
+// shardA2AAuthMap cuts the whole map into the documents the ConfigMaps carry:
+// identities in render order, each shard filled to a2aAuthMapShardByteBudget
+// and no further, every shard stamped with its index and the count and
+// carrying the whole map's version. Always at least one shard, and an identity
+// larger than the budget on its own is still rendered, alone in its shard,
+// rather than dropped: the budget keeps a shard under the API server's limit,
+// and the limit is what refuses an object that cannot be kept under it.
+//
+// Greedy and in order, so the same identities always cut the same way and an
+// unchanged map never moves an entry between shards.
+func shardA2AAuthMap(doc a2aAuthMapDocument) ([]a2aAuthMapDocument, error) {
+	prefix := strings.Repeat(a2aAuthMapIndent, a2aAuthMapIdentityDepth)
+	// The bytes one identity adds to a shard's body: its indented encoding
+	// at the depth it is rendered, the indent before its first line, and
+	// the separator after it.
+	entryBytes := func(id a2aAuthMapIdentity) (int, error) {
+		body, err := encodeA2AJSONPrefixed(id, prefix, a2aAuthMapIndent)
+		if err != nil {
+			return 0, err
+		}
+		return len(prefix) + len(body) + len(",\n"), nil
+	}
+
+	var cuts [][]a2aAuthMapIdentity
+	var current []a2aAuthMapIdentity
+	used := a2aAuthMapShardEnvelopeBytes
+	for _, id := range doc.Identities {
+		size, err := entryBytes(id)
+		if err != nil {
+			return nil, fmt.Errorf("measuring identity %q for the shard budget: %w", id.User, err)
+		}
+		if len(current) > 0 && used+size > a2aAuthMapShardByteBudget {
+			cuts = append(cuts, current)
+			current = nil
+			used = a2aAuthMapShardEnvelopeBytes
+		}
+		current = append(current, id)
+		used += size
+	}
+	cuts = append(cuts, current)
+
+	shards := make([]a2aAuthMapDocument, 0, len(cuts))
+	for i, ids := range cuts {
+		if ids == nil {
+			ids = make([]a2aAuthMapIdentity, 0)
+		}
+		shards = append(shards, a2aAuthMapDocument{
+			Version:    doc.Version,
+			Shard:      i,
+			Shards:     len(cuts),
+			Identities: ids,
+		})
+	}
+	return shards, nil
+}
+
+// buildA2AAuthMapConfigMaps renders the map into the shards the callout
+// watches, in index order, and returns the version it rendered.
+func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) ([]*corev1.ConfigMap, string, error) {
 	doc, err := renderA2AAuthMap(agent, profiles)
 	if err != nil {
 		return nil, "", err
 	}
-	// Indented on purpose: this object is read by people during an incident
-	// at least as often as by the callout, and "which grants does the bus
-	// think this workload has" should be answerable with kubectl get -o
-	// yaml rather than by piping through a formatter.
-	body, err := encodeA2AJSON(doc, "  ")
+	shards, err := shardA2AAuthMap(doc)
 	if err != nil {
-		return nil, "", fmt.Errorf("rendering the identity map: %w", err)
+		return nil, "", fmt.Errorf("sharding the identity map: %w", err)
 	}
 
-	return &corev1.ConfigMap{
-		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      a2aAuthMapName(agent),
-			Namespace: agent.Namespace,
-			Labels:    a2aLabels(agent, "authmap"),
-			Annotations: map[string]string{
-				// The version on the object as well as inside it, so an
-				// operator can compare what was rendered against what
-				// the callout reports without parsing the payload.
-				a2aAuthMapVersionAnnotation: doc.Version,
+	cms := make([]*corev1.ConfigMap, 0, len(shards))
+	for _, shard := range shards {
+		body, err := encodeA2AJSON(shard, a2aAuthMapIndent)
+		if err != nil {
+			return nil, "", fmt.Errorf("rendering identity map shard %d: %w", shard.Shard, err)
+		}
+		cms = append(cms, &corev1.ConfigMap{
+			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      a2aAuthMapShardName(agent, shard.Shard),
+				Namespace: agent.Namespace,
+				Labels:    a2aLabels(agent, a2aAuthMapComponent),
+				Annotations: map[string]string{
+					// The version and the stamps on the object as well as
+					// inside it, so an operator can compare what was
+					// rendered against what the callout reports without
+					// parsing the payload.
+					a2aAuthMapVersionAnnotation: shard.Version,
+					a2aAuthMapShardAnnotation:   strconv.Itoa(shard.Shard),
+					a2aAuthMapShardsAnnotation:  strconv.Itoa(shard.Shards),
+				},
 			},
-		},
-		Data: map[string]string{a2aAuthMapKey: string(body) + "\n"},
-	}, doc.Version, nil
+			Data: map[string]string{a2aAuthMapKey: string(body) + "\n"},
+		})
+	}
+	return cms, doc.Version, nil
 }
 
 // encodeA2AJSON marshals with HTML escaping off and no trailing newline.
@@ -267,11 +415,18 @@ func buildA2AAuthMapConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []age
 // digest, or the version would depend on an encoder setting rather than on the
 // grants.
 func encodeA2AJSON(v any, indent string) ([]byte, error) {
+	return encodeA2AJSONPrefixed(v, "", indent)
+}
+
+// encodeA2AJSONPrefixed is encodeA2AJSON with every line after the first
+// prefixed, which is how an element inside an indented array is laid out; the
+// shard partition measures identities with it.
+func encodeA2AJSONPrefixed(v any, prefix, indent string) ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	if indent != "" {
-		enc.SetIndent("", indent)
+	if indent != "" || prefix != "" {
+		enc.SetIndent(prefix, indent)
 	}
 	if err := enc.Encode(v); err != nil {
 		return nil, err
@@ -306,8 +461,8 @@ func encodeA2AJSON(v any, indent string) ([]byte, error) {
 //     in this system to read from the outside, because the connection behaves
 //     normally in every other respect.
 //   - The account becomes the audience of the user JWT the callout signs, so
-//     it decides which account a connection lands in. Only APP is mintable;
-//     SYS above all is not.
+//     it decides which account a connection lands in. Only APP and TRUSTED
+//     are mintable, a narrowed entry only into APP; SYS above all is not.
 //   - Duplicate ServiceAccounts make the grant set a function of map order,
 //     and duplicate users re-create the shared-credential problem and collide
 //     on each other's inbox prefix.
@@ -330,8 +485,11 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		if !isDNS1123LabelToken(id.User) {
 			return fmt.Errorf("identity %d: user %q must be a single lowercase DNS-1123 label, because it becomes the _INBOX.<user>.> prefix", i, id.User)
 		}
-		if id.Account != a2aAccountApp {
-			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (only %q is mintable)", i, id.User, id.Account, a2aAccountApp)
+		if id.Account != a2aAccountApp && id.Account != a2aAccountControl {
+			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (allowed: [%s %s])", i, id.User, id.Account, a2aAccountControl, a2aAccountApp)
+		}
+		if id.Narrowing != "" && id.Account != a2aAccountApp {
+			return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountApp, id.Account)
 		}
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 		if id.NotAfter != nil && id.Narrowing != "" {

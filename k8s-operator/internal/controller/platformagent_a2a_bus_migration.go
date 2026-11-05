@@ -666,8 +666,10 @@ func busMigrationIdentities(agent *agentv1alpha1.PlatformAgent) []a2aIdentity {
 		}
 	}
 	return []a2aIdentity{{
-		user:           user,
-		account:        a2aAccountApp,
+		user: user,
+		// The account the streams live in: a migration identity anywhere
+		// else would reach none of them.
+		account:        a2aAccountControl,
 		comment:        "the bus migration's " + step + " identity for run " + run.RunID + "; present only while its work runs",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, step, run.RunID)),
@@ -1026,6 +1028,7 @@ func a2aStreamPolicies(replicas int) []busmigrate.StreamPolicy {
 		kv("session-state", 268435456, 0),
 		kv("cap", 268435456, 0),
 		kv("feedback", 67108864, 30*day),
+		kv("people", 33554432, 30*day),
 		kv("PROFILE_LEASES", 67108864, 0),
 		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1),
 	}
@@ -1223,7 +1226,7 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 // busMigrationFreezeActive reports the one to three leg's write freeze in
 // force: from Freezing until Releasing begins. While it is, the identity map
 // holds only busMigrationFrozenIdentities, and, once the callout serves that
-// map (FreezeConfirmed), the bus renders without its APP account's static
+// map (FreezeConfirmed), the bus renders without its application accounts' static
 // users.
 func busMigrationFreezeActive(agent *agentv1alpha1.PlatformAgent) bool {
 	run := agent.Status.BusMigration
@@ -1257,7 +1260,7 @@ func busMigrationSentinel(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1
 	user := busMigrationPrincipal(busMigrationSentinelIdentity, run.RunID)
 	return a2aIdentity{
 		user:           user,
-		account:        a2aAccountApp,
+		account:        a2aAccountControl,
 		comment:        "the bus migration's freeze sentinel for run " + run.RunID + "; keeps the frozen map non-empty, bound to a ServiceAccount nothing creates",
 		auth:           a2aAuthCallout,
 		serviceAccount: a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, busMigrationSentinelIdentity, run.RunID)),
@@ -1362,7 +1365,7 @@ func podReady(pod *corev1.Pod) bool {
 
 // busMigrationFreezeConfigured reports the bus rendered for the freeze:
 // the freeze is in force and the callout confirmed serving its map. Only
-// then does nats.conf drop the APP account's static users, and the bus's
+// then does nats.conf drop the application accounts' static users (every static user outside SYS), and the bus's
 // pod template carry the run's ID, so the restart into the freeze begins
 // after every replica refuses everyone but the migration.
 func busMigrationFreezeConfigured(agent *agentv1alpha1.PlatformAgent) bool {

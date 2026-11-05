@@ -33,7 +33,7 @@ type renderedRole struct {
 // a new builder cannot quietly escape the sweeps below.
 func everyRenderedRole(agent *agentv1alpha1.PlatformAgent) []renderedRole {
 	return []renderedRole{
-		{"buildA2ACalloutRole", buildA2ACalloutRole(agent).Rules},
+		{"buildA2ACalloutRole", buildA2ACalloutRole(agent, 1).Rules},
 		{"buildA2AGatewayRole", buildA2AGatewayRole(agent).Rules},
 		{"buildA2ADispatcherConfigRole", buildA2ADispatcherConfigRole(agent).Rules},
 		{"buildA2ADispatcherPodsRole", buildA2ADispatcherPodsRole(agent).Rules},
@@ -41,6 +41,7 @@ func everyRenderedRole(agent *agentv1alpha1.PlatformAgent) []renderedRole {
 		{"buildMinimalPlatformRole", buildMinimalPlatformRole(agent).Rules},
 		{"buildPlatformLocalRole", buildPlatformLocalRole(agent).Rules},
 		{"buildPlatformLeaderRole", buildPlatformLeaderRole(agent).Rules},
+		{"buildScopePublisherRole", buildScopePublisherRole(agent).Rules},
 	}
 }
 

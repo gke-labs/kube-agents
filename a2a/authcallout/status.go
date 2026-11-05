@@ -52,11 +52,21 @@ type Status struct {
 	// answer it.
 	Users []string `json:"users"`
 
-	// LastError is why the most recent update was refused, if it was. A
-	// callout serving version N with a LastError set is one whose newer
-	// render did not land, which is the state that would otherwise look
-	// identical to nothing having been rendered.
+	// LastError is the refusals that stand: per refused shard, why its
+	// latest document was not taken, then why the complete set was not
+	// assembled; empty once each has been superseded. A callout serving
+	// version N with a LastError set is one whose newer render did not
+	// land, which is the state that would otherwise look identical to
+	// nothing having been rendered.
 	LastError string `json:"lastError,omitempty"`
+
+	// Shards is how many ConfigMaps this callout was told the map is cut
+	// into and watches; Pending says why the shards it holds are not yet
+	// a map it can serve (one not arrived, or two versions among them),
+	// empty once they are. A callout serving version N with Pending set is
+	// mid-way through a re-render, or stuck in one.
+	Shards  int    `json:"shards"`
+	Pending string `json:"pending,omitempty"`
 }
 
 // StatusOf snapshots the store.
@@ -66,6 +76,8 @@ func StatusOf(s *Store) Status {
 		Serving:   s.Ready(),
 		LastError: s.LastError(),
 		Users:     []string{},
+		Shards:    s.Shards(),
+		Pending:   s.Pending(),
 	}
 	if m := s.Current(); m != nil {
 		st.Users = m.Users()
@@ -116,8 +128,11 @@ func StatusHandlerExpecting(s *Store, busAttached func() bool, expectVersion str
 		}
 		if !s.Ready() {
 			w.WriteHeader(http.StatusServiceUnavailable)
-			if e := s.LastError(); e != "" {
-				_, _ = w.Write([]byte("no identity map: " + e + "\n"))
+			// With the reason: a refused render, or the shard whose watch
+			// delivered nothing yet, is what `kubectl describe pod` has to
+			// show on a probe failure.
+			if why := s.Unserved(); why != "" {
+				_, _ = w.Write([]byte("no identity map; " + why + "\n"))
 				return
 			}
 			_, _ = w.Write([]byte("no identity map\n"))

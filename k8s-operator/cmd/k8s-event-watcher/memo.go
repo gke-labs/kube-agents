@@ -19,8 +19,11 @@ import "time"
 // boundedEntries is the per-UID map the watcher's memos share: a value and
 // the time it is dated, expiring after ttl and capped at max entries with
 // expired entries evicted before the oldest. pullClassMemo dates an entry by
-// arrival and scaleUpMemo by the event's own timestamp; what "latest" means
-// and what supersedes what stays with each memo. Not safe for concurrent use:
+// arrival, scaleUpMemo by the event's own timestamp and the filter's
+// FailedScheduling log memo (fsLogged) by the watcher's clock at the line;
+// that last one holds itself under the cap and only sweeps (see expire), so
+// the eviction below never reaches it. What "latest" means and what
+// supersedes what stays with each memo. Not safe for concurrent use:
 // each memo holds its own lock around these calls.
 type boundedEntries[V any] struct {
 	entries map[string]memoEntry[V]
@@ -74,15 +77,28 @@ func (b *boundedEntries[V]) evictIfFull(now time.Time) {
 	if len(b.entries) < b.max {
 		return
 	}
+	b.expire(now)
+	if len(b.entries) < b.max {
+		return
+	}
+	delete(b.entries, b.evictee())
+}
+
+// expire drops every entry that has aged past ttl as of now: the first step
+// of evictIfFull, on its own for a memo that never evicts a live entry and
+// sweeps on a clock of its own instead (the filter's FailedScheduling log
+// memo). One pass over the map.
+func (b *boundedEntries[V]) expire(now time.Time) {
 	for uid, e := range b.entries {
 		if now.Sub(e.at) > b.ttl {
 			delete(b.entries, uid)
 		}
 	}
-	if len(b.entries) < b.max {
-		return
-	}
-	delete(b.entries, b.evictee())
+}
+
+// full reports whether the memo holds max entries.
+func (b *boundedEntries[V]) full() bool {
+	return len(b.entries) >= b.max
 }
 
 // evictee picks the live entry a full map gives up: the oldest in the map

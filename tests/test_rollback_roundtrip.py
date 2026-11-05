@@ -89,6 +89,30 @@ _FAST_ENV = {
     "ROLLBACK_BUS_TASK_TIMEOUT": "10",
 }
 
+# The signal case sends SIGTERM only while the script is blocked in a poll
+# sleep. bash 5.2 runs a pending trap at the start of the next command, unless
+# a `$(...)` expansion comes first: xparse_dolparen() sets the parser's eof
+# token to `)` and calls parse_command(), whose first act is
+# run_pending_traps(), so the trap string is parsed where only a `)` may end
+# the input and dies with "trap: line 2: unexpected EOF while looking for
+# matching `)'", exit status 2, before on_signal runs. With POLL_SECONDS at 0
+# the script expands one every few milliseconds. A signal that lands while
+# the script's foreground child is `sleep` stays pending until that sleep
+# ends, and the loop's next command is a clean checkpoint.
+_SIGNAL_POLL_SECONDS = "3"
+_SIGNAL_WAIT_SECONDS = 60
+_SIGNAL_CHECK_INTERVAL_SECONDS = 0.05
+_PGREP_CHILDREN = ["pgrep", "-P"]
+_PS_COMMAND_NAMES = ["ps", "-o", "comm=", "-p"]
+
+
+def child_commands(pid: int) -> list[str]:
+    """The command name of each direct child of pid; a child that exits between the two reads is dropped."""
+    children = subprocess.run([*_PGREP_CHILDREN, str(pid)], capture_output=True, text=True, check=False).stdout.split()
+    if not children:
+        return []
+    return subprocess.run([*_PS_COMMAND_NAMES, ",".join(children)], capture_output=True, text=True, check=False).stdout.split()
+
 # Every assertion a passing run prints, in order, for a CR that declares the
 # bridge sidecar by hand (the case the unset and restore exist for; the
 # operator's rendered bridge needs neither, test_no_sidecars_... below).
@@ -352,6 +376,8 @@ FAKE_KUBECTL = textwrap.dedent(
             return obj["spec"].get("mode", "")
         if path == "{.metadata.generation}":
             return str(obj["metadata"]["generation"])
+        if path == "{.spec.holderIdentity}":
+            return obj["spec"].get("holderIdentity", "")
         if path == "{.spec.volumes[*].persistentVolumeClaim.claimName}":
             return " ".join(v["persistentVolumeClaim"]["claimName"] for v in obj["spec"]["volumes"])
         sys.exit("fake kubectl: unsupported jsonpath " + path)
@@ -440,6 +466,22 @@ FAKE_KUBECTL = textwrap.dedent(
             if kind == "platformagent":
                 obj = s["cr"]
                 out = json.dumps(obj) if fmt == "json" else jsonpath(obj, fmt[len("jsonpath="):])
+            elif kind == "pods" and "-l" in rest and s["scenario"].get("pods_forbidden"):
+                sys.stderr.write('Error from server (Forbidden): pods is forbidden\n'); rc = 1
+            elif kind == "pods" and "-l" in rest:
+                # The pods a label selector picks, by name: the selector's
+                # pairs must all be on the pod.
+                want = dict(pair.split("=", 1) for pair in rest[rest.index("-l") + 1].split(","))
+                out = "".join("pod/%s\n" % p["name"] for p in s["scenario"].get("labelled_pods", [])
+                              if all(p["labels"].get(k) == v for k, v in want.items()))
+            elif kind == "lease" and s["scenario"].get("lease_forbidden"):
+                sys.stderr.write('Error from server (Forbidden): leases.coordination.k8s.io "%s" is forbidden\n' % name); rc = 1
+            elif kind == "svc" and fmt.startswith("go-template="):
+                obj = s["objects"].get("svc/%s" % name)
+                if obj is None:
+                    sys.stderr.write('Error from server (NotFound): services "%s" not found\n' % name); rc = 1
+                else:
+                    out = "".join("%s=%s," % kv for kv in sorted(obj["spec"]["selector"].items()))
             elif kind == "pods":
                 out = json.dumps({"items": s["pods"]})
                 late_unschedulable(s)
@@ -1033,6 +1075,75 @@ class PortForwardTest(RoundTripTest):
         time.sleep(0.5)
         self.assertEqual([pid for pid in pids if alive(pid)], [])
 
+    def test_the_inject_tunnel_goes_to_the_gateway_lease_holder(self) -> None:
+        # Behind an elected gateway only the Lease holder serves the door (a
+        # standby answers 503), so the bus task's tunnel targets its pod; the
+        # agent's own tunnel stays on its Service. With no Lease, as on the
+        # healthy state the other tests run, it's the door's Service.
+        gateway_pods = [{"name": "platform-agent-a2a-gateway-7d9f-abcde", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods)
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "platform-agent-a2a-gateway-7d9f-abcde"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("pod/platform-agent-a2a-gateway-7d9f-abcde"), 2, targets)
+        self.assertEqual(targets.count("svc/platform-agent"), 1, targets)
+
+        result, after, _ = self.run_sim(healthy_next_state(), **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+
+    def test_a_forbidden_lease_read_is_said_and_falls_back_to_the_service(self) -> None:
+        # A missing Lease is the quiet case; a read that fails otherwise is
+        # said, since the Service it falls back to can land on the standby.
+        result, after, _ = self.run_sim(healthy_next_state(lease_forbidden=True), **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("reading lease platform-agent-a2a-gateway failed", result.stderr)
+        self.assertIn("Forbidden", result.stderr)
+
+        result, _, _ = self.run_sim(healthy_next_state(), **self.tunnel_env())
+        self.assertNotIn("reading lease", result.stderr)
+
+    def test_a_failed_pod_list_is_said_and_not_blamed_on_the_holder(self) -> None:
+        gateway_pods = [{"name": "platform-agent-a2a-gateway-7d9f-abcde", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods, pods_forbidden=True)
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "platform-agent-a2a-gateway-7d9f-abcde"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env(), ROLLBACK_POLL_SECONDS="0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("listing the pods svc/platform-agent-a2a-inject selects failed", result.stderr)
+        self.assertNotIn("which is not a pod", result.stderr)
+
+    def test_a_holder_that_is_not_a_pod_name_is_not_trusted(self) -> None:
+        gateway_pods = [{"name": "gw-a", "labels": {"app": "platform-agent-a2a-gateway"}}]
+        state = healthy_next_state(labelled_pods=gateway_pods)
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "gw-a\nanything"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("isn't a pod name", result.stderr)
+
+    def test_a_lease_holder_outside_the_inject_service_is_not_trusted(self) -> None:
+        # The tunnel carries the door's token: a Lease naming a pod the inject
+        # Service doesn't select (written by something else) is ignored.
+        state = healthy_next_state(labelled_pods=[{"name": "some-other-pod", "labels": {"app": "something-else"}}])
+        state["objects"]["lease/platform-agent-a2a-gateway"] = {"spec": {"holderIdentity": "some-other-pod"}}
+        state["objects"]["svc/platform-agent-a2a-inject"] = {"spec": {"selector": {"app": "platform-agent-a2a-gateway"}}}
+        result, after, _ = self.run_sim(state, **self.tunnel_env())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        targets = [call[call.index("port-forward") + 1] for call in after["calls"] if "port-forward" in call]
+        self.assertNotIn("pod/some-other-pod", targets)
+        self.assertEqual(targets.count("svc/platform-agent-a2a-inject"), 2, targets)
+        self.assertIn("not a pod svc/platform-agent-a2a-inject selects", result.stderr)
+
     def test_a_dead_first_tunnel_is_replaced_by_a_fresh_one(self) -> None:
         # The first port-forward (the pre bus task's) accepts and drops every
         # connection. The script's retry has to be a new tunnel on the same
@@ -1306,14 +1417,36 @@ class FailureTest(RoundTripTest):
         sim = Sim(healthy_next_state(never_ready_on="today"))
         self.addCleanup(sim.close)
         proc = subprocess.Popen(
-            ["bash", str(_SCRIPT), _NS, _CR], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=sim.env(ROLLBACK_READY_TIMEOUT="600")
+            ["bash", str(_SCRIPT), _NS, _CR],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=sim.env(ROLLBACK_READY_TIMEOUT="600", ROLLBACK_POLL_SECONDS=_SIGNAL_POLL_SECONDS),
         )
-        deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and not any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"]):
-            time.sleep(0.2)
-        time.sleep(1)
+        # Past the flip to today and inside a poll sleep (_SIGNAL_POLL_SECONDS
+        # above): leg1.mode-today's rollout wait, which sleeps until the fake's
+        # reconcile lands, is the first one. The signal goes the moment the
+        # sleep is seen, not an interval later.
+        deadline = time.monotonic() + _SIGNAL_WAIT_SECONDS
+        flipped = sleeping = False
+        while time.monotonic() < deadline and proc.poll() is None:
+            flipped = flipped or any(p.get("spec", {}).get("mode") == "today" for p in sim.state()["patches"])
+            sleeping = flipped and child_commands(proc.pid) == ["sleep"]
+            if sleeping:
+                break
+            time.sleep(_SIGNAL_CHECK_INTERVAL_SECONDS)
+        if proc.poll() is not None:
+            out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
+            self.fail(f"the script exited with status {proc.returncode} before the signal:\n{out}{err}")
+        if not sleeping:
+            # The script is still running somewhere this test did not expect:
+            # reap it and carry its transcript, so the failure says what it was doing.
+            proc.kill()
+            out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
+            what = "reach a poll sleep after the flip" if flipped else "flip to today"
+            self.fail(f"the script did not {what} within {_SIGNAL_WAIT_SECONDS}s:\n{out}{err}")
         proc.send_signal(signal.SIGTERM)
-        out, err = proc.communicate(timeout=60)
+        out, err = proc.communicate(timeout=_SIGNAL_WAIT_SECONDS)
         self.assertEqual(proc.returncode, 1, out + err)
         self.assertIn("FAIL leg1.interrupted:", out, err)
         self.assertEqual(out.strip().splitlines()[-1], "ROLLBACK ROUND TRIP FAILED at leg1.interrupted", out + err)
@@ -1671,9 +1804,9 @@ class CiEvalWiringTest(unittest.TestCase):
                 self.assertEqual(list(artifacts.iterdir()), [])
 
     def test_skipped_on_a_pull_requests_run(self) -> None:
-        # The merge-blocking presubmit grades next, and a Tide batch runs it
-        # too; neither reads a report-only round trip, and the today lane
-        # proves the path on main.
+        # The merge-blocking presubmit grades next, and Tide ran it in batches
+        # too; neither reads a report-only round trip, and the today presubmit
+        # proves the path on pull requests that touch it, or on demand.
         for job_type in ("presubmit", "batch"):
             with self.subTest(job_type=job_type):
                 result, artifacts = self.run_wiring(mode_next="1", job_type=job_type)

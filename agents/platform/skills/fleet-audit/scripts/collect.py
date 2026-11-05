@@ -74,7 +74,6 @@ import ipaddress
 import json
 import math
 import os
-import posixpath
 import re
 import shlex
 import stat
@@ -100,7 +99,6 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
     :REVISION_DIGEST_CHARS
 ]
 
-SCRATCH_DIR = os.environ.get("FLEET_AUDIT_SCRATCH_DIR") or "/opt/data/scratch"
 KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconfigs"
 # The shared kubeconfig directory is this uid's and closed to every other
 # uid: 0755, so only its owner (and root, which no mode binds) creates
@@ -159,13 +157,16 @@ DEFAULT_TIMEOUT_S = 60
 # resolved in collect_fleet. Every check is a kubectl or gcloud the credential
 # broker runs, and the broker admits its slot cap or what its child memory
 # budget fits at the container's effective limit, whichever is smaller: 8 at
-# the operator's default 2Gi limit, 4 on GKE Autopilot without bursting, where
-# the limit is the 1Gi request. A wider pool only queues the rest at the broker,
+# the operator's default 2Gi limit, and on GKE Autopilot without bursting, where
+# the limit is the 2Gi default request; fewer where an override sets a smaller
+# memory request. A wider pool only queues the rest at the broker,
 # where a check still waiting at its 60 s admission bound is refused busy, or
 # hits DEFAULT_TIMEOUT_S here first and reads its cluster as unreachable. So the
-# width is read from the broker (GET /v1/exec/admission), less two slots of
-# headroom for chat when it admits six or more, and at most today's four below
-# that; four when the broker can't say. The procedural collectors beside this
+# width is read from the broker (GET /v1/exec/admission): its interactive cap
+# (admitted - 1) less the session cap's headroom for chat, never below four,
+# from six admitted up (the headroom is whole from seven), and at most four or the
+# interactive cap below that; four when the broker can't say
+# (broker_admission.width_for). The procedural collectors beside this
 # file resolve the same width. stall_watch.py's and cluster_agent_reconcile.py's
 # background listing pools stay at four: they share the broker with kanban
 # workers, and their own comments say why.
@@ -250,6 +251,14 @@ for _shared_dir in _platform_script_dirs():
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
 import broker_admission  # noqa: E402
+# The Config Connector read that the collectors share: this file's `gcp` read
+# gives the compliance stream's entries their `kcc_unready` keys through it.
+# It sits beside this file, which a caller can load by path with this
+# directory not on `sys.path` (a test of another skill does), so the
+# directory is added first.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parent))
+import kcc_health  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -310,10 +319,10 @@ GIT_DIR_NAME = ".git"
 
 # In content mode `audit_report.py start` makes no clone: `--workspace` is an
 # empty scratch directory and the repository lives in the credential broker.
-# `broker_mirror` copies the repository's YAML out of the broker into a private
-# directory so the three indexes below read the same tree a clone would give
-# them. The lease marker above the workspace names the repository; the broker
-# endpoint is the one every other content-mode call uses.
+# `broker_mirror` copies one revision of the repository out of the broker's
+# `snapshot` into a private directory, so the three indexes below read the same
+# tree a clone would give them. The lease marker above the workspace names the
+# repository; the broker endpoint is the one every other content-mode call uses.
 CREDENTIAL_PROXY_URL_ENV = "CREDENTIAL_PROXY_URL"
 # How a leased workspace directory names its repository: `owner__name`.
 REPO_DIR_SEPARATOR = "__"
@@ -321,28 +330,35 @@ REPO_DIR_SEPARATOR = "__"
 # repository: distinct from None, which means "not content mode, walk it".
 UNRESOLVED_REPO = ""
 MIRROR_DIR_PREFIX = "collect-gitops-mirror-"
+# The snapshot goes into this subdirectory of the private directory, because it
+# stages its files beside the directory it is given: there, the staging is
+# removed with the rest.
+MIRROR_TREE_NAME = "tree"
 # The only names the indexes open. `KUSTOMIZATION_FILE_NAMES` adds the one
 # extension-less spelling Kustomize also accepts.
 MIRROR_SUFFIXES = (".yaml", ".yml")
-# Under the broker's per-request ceilings (256 paths, 8 MiB), the same numbers
-# `api_deprecation_scan.py` and `inspect_repository.py` batch with.
-MIRROR_BATCH_PATHS = 100
-MIRROR_BATCH_BYTES = 6 << 20
-# Bounds on one repository, so a repository nobody sized cannot fill the
-# sandbox's disk. Hitting either abandons the mirror rather than indexing part
-# of the tree: a capped listing cannot say which regions it missed, and
+# Bounds on one repository. MIRROR_MAX_BYTES caps the unpacked snapshot, so a
+# repository nobody sized cannot fill the sandbox's disk; MIRROR_MAX_FILES caps
+# the YAML files the indexes read, counted once the tree is on disk. Hitting
+# either abandons the mirror rather than indexing part of the tree:
 # `broker_mirror` says why a partial region is worse than none.
 MIRROR_MAX_FILES = 5000
 MIRROR_MAX_BYTES = 64 << 20
-# `Workspace.read_many`'s "ask again for the rest" reason.
-BROKER_SKIP_REQUEST_BUDGET = "requestBudget"
-# The skips that are final for one file: the broker will never send it, but
-# the rest of the tree is whole. A clone's walk reads both, so each withholds
-# the region of the mirror the file could have declared into (`broker_mirror`).
-BROKER_SKIP_TOO_LARGE = "tooLarge"
-BROKER_SKIP_SYMLINK = "symlink"
-BROKER_WITHHOLDING_SKIPS = frozenset({BROKER_SKIP_TOO_LARGE, BROKER_SKIP_SYMLINK})
-# Left in a mirror a file that could hold a release was withheld from.
+# The codes a snapshot is refused with for its size, and the broker's knob for
+# each, named in the WARNING so whoever reads it knows which limit to raise.
+# SNAPSHOT_TOO_LARGE is also the client's answer to a tree over MIRROR_MAX_BYTES.
+BROKER_MAX_SNAPSHOT_BYTES_ENV = "CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
+BROKER_MAX_CLONE_BYTES_ENV = "CREDENTIAL_PROXY_MAX_CLONE_BYTES"
+SNAPSHOT_TOO_LARGE_CODE = "SNAPSHOT_TOO_LARGE"
+CLONE_TOO_LARGE_CODE = "CLONE_TOO_LARGE"
+# How the snapshot names a directory laid out as a bare repository, which it
+# leaves out whole with every file in it. Copied from
+# `vcs_client.BARE_LAYOUT_SKIPPED`, which this module imports only on the
+# content-mode path.
+BARE_LAYOUT_SKIPPED_PREFIX = "a directory laid out as a bare repository"
+# The reason recorded for a file link whose target the mirror dropped.
+DANGLING_LINK_REASON = "a link to a file the mirror dropped"
+# Left in a mirror an entry that could hold a release was left out of.
 # `release_declarations` reads Argo CD Applications from anywhere in the tree,
 # for any destination, so such a file can hide a release for every cluster;
 # the marker makes that index, and `namespace_directories` which leans on it,
@@ -350,7 +366,7 @@ BROKER_WITHHOLDING_SKIPS = frozenset({BROKER_SKIP_TOO_LARGE, BROKER_SKIP_SYMLINK
 # no repository can carry one into a clone and switch the indexes off there;
 # not YAML, and the indexes skip `.git/`, so none opens it.
 MIRROR_RELEASES_WITHHELD_MARKER = ".git/collect-releases-withheld"
-# Beside it: the clusters whose `clusters/<name>/` tree a withheld file took out
+# Beside it: the clusters whose `clusters/<name>/` tree a left-out entry took out
 # of the mirror, one per line. `namespace_directories` answers nothing for
 # them, because the sibling arm that would have won there reads that tree.
 MIRROR_CLUSTERS_WITHHELD_MARKER = ".git/collect-clusters-withheld"
@@ -427,63 +443,6 @@ RENDERER_KUSTOMIZE = "kustomize"
 # build` still accepts, and a repo that uses one is exactly as unresolvable
 # without this as one that uses the first.
 KUSTOMIZATION_FILE_NAMES = ("kustomization.yaml", "kustomization.yml", "Kustomization")
-# What `release_declarations` reads, as a `git grep -E` expression the broker
-# runs over one withheld file: a `tooLarge` file that names none of these
-# cannot hide a release, so it costs only its cluster's tree. A release is a
-# document's own `kind`, so a block-style one sits at column 0, and a CRD
-# bundle's `spec.names.kind: Application` (Argo CD's `install.yaml`, Flux's
-# `gotk-components.yaml`) is indented and does not match. A column-0 `kind`
-# whose value this cannot read on its line (a tag, an anchor, an alias, a
-# block scalar, a comment, the next line), a `? kind` key, and a JSON
-# `"kind":` that ends its line, match whatever the value. Flow and JSON forms
-# with the value on the line can put `kind` anywhere, so they match there.
-# It over-charges a flow or JSON CRD `names:` block (`{kind: Application, …}`)
-# it cannot tell from a flow release. It misses an indented release document
-# beside a column-0 one (a file with no column-0 `kind` at all is caught by
-# COLUMN_ZERO_KIND_PATTERN), and rarer still: a flow `kind` with a tag or
-# anchor, a merge key, an escaped scalar, and line breaks git does not split
-# on (a bare CR, NEL, U+2028). A file the broker sent is parsed instead.
-# Written for both ERE and Python's `re` (with `re.MULTILINE`): no POSIX
-# classes, a literal tab.
-RELEASE_KIND_ALTERNATION = "(" + "|".join(
-    [ARGOCD_APPLICATION_KIND, FLUX_HELM_RELEASE_KIND, FLUX_HELM_REPOSITORY_KIND, ARGOCD_APPPROJECT_KIND]
-) + ")"
-_OPTIONAL_QUOTE = "['\"]?"
-_LINE_START = "^(\ufeff)?"
-_KIND_KEY = _OPTIONAL_QUOTE + "kind" + _OPTIONAL_QUOTE
-_KIND_VALUE = _KIND_KEY + "[ \t]*:[ \t]*" + _OPTIONAL_QUOTE + RELEASE_KIND_ALTERNATION + "([^A-Za-z0-9]|$)"
-# Nothing on the line but a CRLF line's CR, which the broker will not take
-# in a pattern; excluding what starts a value keeps out `kind: {` and the
-# `"kind": {` of every JSON schema.
-_LINE_END = "[^{A-Za-z0-9\"'[]?$"
-_KIND_VALUE_ELSEWHERE = _KIND_KEY + "[ \t]*:[ \t]*([!&*|>#]|" + _LINE_END + ")"
-RELEASE_DECLARING_PATTERN = "|".join(
-    [
-        _LINE_START + _KIND_VALUE,
-        _LINE_START + _KIND_VALUE_ELSEWHERE,
-        _LINE_START + "\\?[ \t]*" + _KIND_KEY + "([^A-Za-z0-9]|$)",
-        "[{,][ \t]*" + _KIND_VALUE,
-        '"kind"[ \t]*:[ \t]*("' + RELEASE_KIND_ALTERNATION + '"|' + _LINE_END + ")",
-        ARGOCD_CLUSTER_SECRET_LABEL.replace(".", r"\."),
-    ]
-)
-# A column-0 `kind` key of any value. A CRD bundle has one on every document
-# (`kind: CustomResourceDefinition`), so a withheld file with none at all is
-# not that case: written indented or as JSON, it counts as declaring. A file
-# git treats as binary (a `binary` or `-diff` attribute) answers "no match"
-# to `git grep -I` too, so a search that never read the file lands here.
-COLUMN_ZERO_KIND_PATTERN = _LINE_START + _KIND_KEY + "[ \t]*:"
-# How many directory links `_application_source_paths` follows in a chain:
-# Linux's own limit before ELOOP.
-LINK_FOLLOW_LIMIT = 40
-# What `release_declarations` reads, as a document's own `kind`; a Secret
-# counts only with the cluster-registration label.
-RELEASE_KINDS = frozenset(
-    {ARGOCD_APPLICATION_KIND, FLUX_HELM_RELEASE_KIND, FLUX_HELM_REPOSITORY_KIND, ARGOCD_APPPROJECT_KIND}
-)
-# The broker's per-file limit, named in the WARNING for a `tooLarge` file so
-# whoever reads it knows which knob returns the file to the mirror.
-BROKER_MAX_FILE_BYTES_ENV = "CREDENTIAL_PROXY_WORKSPACE_MAX_FILE_BYTES"
 # Spelled the same way `audit_report.KCC_API_GROUP_SUFFIX` spells it, and
 # copied rather than imported for the reason `SYSTEM_NAMESPACES` is below.
 KCC_API_GROUP_SUFFIX = "cnrm.cloud.google.com"
@@ -579,6 +538,8 @@ Run = collector_run.Run
 TIMEOUT_RC = collector_run.TIMEOUT_RC
 Discovery = collector_run.Discovery
 default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
 
 
 RunFn = Callable[..., Run]
@@ -620,6 +581,9 @@ def not_running_entry(c: dict, project: str) -> dict:
         "autopilot": bool((c.get("autopilot") or {}).get("enabled")),
         "outcome": OUTCOME_UNREACHABLE,
         "error": f"cluster status is {c.get('status') or 'unknown'}, which is neither RUNNING nor RECONCILING; no check was evaluated against it",
+        # GKE's status, so `finish` does not count this cluster as one that
+        # may run Config Connector (`audit_report.kcc_health`).
+        kcc_health.CLUSTER_STATUS_FIELD: c.get("status") or "",
     }
 
 
@@ -1014,11 +978,13 @@ def run_and_gate(
     A `kubectl get <kinds> ... -o json` list response gates on `.items`
     being a list; a `gcloud ... --format=json(...)` object response has no
     such envelope, so it gates on parsing as an object at all. Both share
-    the same failure mode this function exists to catch: exit 0 with
-    truncated or empty output, which the credential proxy's output cap makes
-    a real possibility, not a theoretical one. That cap is 8 MiB per stream
+    the same failure mode this function exists to catch: truncated or empty
+    output, which the credential proxy's output cap makes a real possibility,
+    not a theoretical one (the shim now exits 74 on a cut reply; an older one
+    exited 0, and the gate holds either way). That cap is 8 MiB per stream
     as the operator deploys it, 4 MiB if `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES`
-    is unset; either way a 16-cluster `-A -o json` dump can reach it.
+    is unset; the multi-kind dumps that reached it are paged now
+    (`paged_and_gate`), and the one-shot reads left here are small.
     """
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     result = run(argv, env=env, timeout=timeout)
@@ -1035,6 +1001,17 @@ def run_and_gate(
     return parsed, result
 
 
+def paged_and_gate(kinds: str, kubeconfig: Path, *, run: RunFn = default_run, timeout: int = DEFAULT_TIMEOUT_S) -> tuple[dict | None, Run]:
+    """`run_and_gate` for a multi-kind dump: the kinds (a kubectl kind list,
+    `"deploy,sts,ds,cronjob,pod"`) read one at a time in pages through
+    `collector_run.paged_dump`, so a cluster of a few hundred nodes no longer
+    meets the credential proxy's output cap in one reply. The gate is the
+    same one: `None` on any page that failed, was cut, or is not a list, never
+    a shorter list from the pages that answered."""
+    env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
+    return paged_dump(kinds.split(","), run=run, env=env, timeout=timeout)
+
+
 class GateFailure(Exception):
     """Raised by a stream's context builder when a required collection
     command fails its gate. `collect_cluster` turns this into
@@ -1046,29 +1023,18 @@ class GateFailure(Exception):
 
 def dump_state(
     kubeconfig: Path, cluster: str, *, project: str = "", location: str = "", run: RunFn = default_run
-) -> tuple[Path, Run, bool]:
-    """`obtainability-audit`'s one dump, behind `run_and_gate`. Kept as its
-    own function (rather than inlined into its context builder) because its
-    fixed dump-to-a-named-file shape predates the multi-collection builder
-    contract and nothing else needs a file on disk — every check reads the
-    parsed dict `run_and_gate` already returns.
-
-    Keyed the way `kubeconfig_path` is, on the whole `(project, cluster,
-    location)` triple. The design's thread-safety rule is that a worker writes
-    only to paths keyed by its own cluster, and it named this file as the
-    example of a name no two threads can collide on — but a cluster name is
-    unique within a project, not across the fleet, and this collector runs
-    several projects at once. Two clusters called `prod` in two projects wrote
-    the same path, and the loser re-read the winner's dump: not a truncated
-    file or a crash, but one cluster's workloads published under the other's
-    name, with a manifest recording a clean rc=0 read.
+) -> tuple[dict | None, Run, bool]:
+    """`obtainability-audit`'s dump, behind the paged gate: `DUMP_COMMAND_KINDS`
+    read one kind at a time (`paged_and_gate`), returned parsed. It used to be
+    written to a `wra_state_<project>_<cluster>_<location>.json` scratch file
+    and read straight back; nothing read the file after that, and a dump that
+    exists only as the parsed dict costs no disk and leaves nothing behind.
+    `cluster`, `project` and `location` are kept for the callers that name
+    the read by them.
     """
-    dump_path = Path(SCRATCH_DIR) / f"wra_state_{project}_{cluster}_{location}.json"
-    parsed, result = run_and_gate(["kubectl", "get", DUMP_COMMAND_KINDS, "-A", "-o", "json"], kubeconfig, run=run)
-    if parsed is not None:
-        dump_path.parent.mkdir(parents=True, exist_ok=True)
-        dump_path.write_text(result.stdout, encoding="utf-8")
-    return dump_path, result, parsed is not None
+    del cluster, project, location
+    parsed, result = paged_and_gate(DUMP_COMMAND_KINDS, kubeconfig, run=run)
+    return parsed, result, parsed is not None
 
 
 def output_digest(text: str) -> str:
@@ -4373,6 +4339,13 @@ COMPLIANCE_WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob"
 # either exists or does not.
 _SCALABLE_WORKLOAD_KINDS = ("Deployment", "StatefulSet")
 COMPLIANCE_DUMP_KINDS = "deploy,sts,ds,cronjob,pod"
+# The other built-in kinds compliance-audit reads, each list one paged read per
+# kind (`paged_and_gate`); the two single kinds are spelled the same way so
+# every read takes the same path.
+RBAC_DUMP_KINDS = "clusterroles,roles,clusterrolebindings,rolebindings"
+NETPOL_DUMP_KINDS = "netpol,ns"
+SERVICE_DUMP_KINDS = "svc"
+SERVICEACCOUNT_DUMP_KINDS = "sa"
 _SYSTEM_SA_NAMESPACE_RE_PARTS = (
     "kube-system", "gmp-system", "cnrm-system", "configconnector-operator-system", "krmapihosting-system",
 )
@@ -6989,13 +6962,12 @@ def check_lb_world_open(context: dict) -> list[dict]:
 
 
 def _kcc_ready_condition(item: dict) -> dict | None:
-    """The `Ready` condition off a Config Connector object, if it has one."""
-    status = item.get("status")
-    conditions = status.get("conditions") if isinstance(status, dict) else None
-    for condition in conditions or []:
-        if isinstance(condition, dict) and condition.get("type") == KCC_READY_CONDITION:
-            return condition
-    return None
+    """The `Ready` condition off a Config Connector object, if it has one.
+
+    `kcc_health.ready_condition`, so this check and the `kcc_unready` keys on
+    the manifest read one condition the same way.
+    """
+    return kcc_health.ready_condition(item)
 
 
 def check_kcc_object_wedged(context: dict) -> list[dict]:
@@ -7006,9 +6978,10 @@ def check_kcc_object_wedged(context: dict) -> list[dict]:
     has stopped applying is invisible to every other check in this skill --
     while being the one condition that makes every `manifest` remediation the
     skill produces a no-op. `audit_report.disclose_stalled_kcc_remediations`
-    covers the half where some finding's fix edits the stalled object's file.
-    This covers the rest, which is most of it: nothing in the ledger has to
-    point at an object for it to be wedged.
+    covers the half where some finding's fix edits the stalled object's file,
+    from the `kcc_unready` keys this read also gives the manifest entry
+    (`kcc_health`). This covers the rest, which is most of it: nothing in the
+    ledger has to point at an object for it to be wedged.
 
     Twice in two days on this fleet, and neither showed up anywhere a person
     was looking. On 2026-09-05 a `PubSubTopic` failed on a missing
@@ -7047,8 +7020,12 @@ def check_kcc_object_wedged(context: dict) -> list[dict]:
         ready = _kcc_ready_condition(item)
         # No condition yet means KCC has not reached the object, which is the
         # normal state for seconds after an apply and is not evidence of
-        # anything. Only an explicit `False` is -- the same bar
-        # `audit_report.kcc_resource_health` sets, for the same reason.
+        # anything. Only an explicit `False` is. This check flags every
+        # `Ready=False`, the transient reasons `Updating` and `Deleting`
+        # included, and its finding does not call them transient;
+        # `kcc_health.unready_objects` leaves those two out of `kcc_unready`,
+        # because the manifest note says that Config Connector is not applying
+        # the object.
         if ready is None or str(ready.get("status")) != "False":
             continue
         meta = item.get("metadata") or {}
@@ -7962,14 +7939,13 @@ def _record(argv_str: str, result: Run) -> dict:
 
 
 def _collect_obtainability(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec, ...], *, run: RunFn) -> CollectedContext:
-    dump_path, dump_run, gate_ok = dump_state(
+    dump, dump_run, gate_ok = dump_state(
         kubeconfig, cluster["name"], project=cluster["project"], location=cluster["location"], run=run
     )
     if not gate_ok:
         raise GateFailure(f"dump gate failed (rc={dump_run.rc}): {dump_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
-    dump = json.loads(dump_path.read_text(encoding="utf-8"))
     workloads = normalize_workloads(dump)
-    record = _record(f"KUBECONFIG={kubeconfig} kubectl get {DUMP_COMMAND_KINDS} -A -o json", dump_run)
+    record = _record(paged_command_text(DUMP_COMMAND_KINDS.split(","), kubeconfig=kubeconfig), dump_run)
 
     context = build_context(dump, workloads)
     commands = {spec.slug: record for spec in checks}
@@ -8087,10 +8063,14 @@ _COMPLIANCE_CHECK_SOURCES: dict[str, tuple[str, ...]] = {
     "lb-world-open": ("services",),
 }
 
-# `kubectl get gcp` is the category Config Connector registers across every CRD
-# it installs, so one read returns every object it owns -- rather than the
-# ~200 `kubectl get <kind>` calls that enumerating the CRDs would cost.
+# The category Config Connector registers across every CRD it installs.
+# `kcc_health.read_objects` finds the kinds in it through discovery and then
+# lists each kind in parallel, because `kubectl get gcp -A` lists the ~230 kinds one after
+# another, too slowly through the credential proxy.
 KCC_CATEGORY = "gcp"
+# The command `kcc-object-wedged` records as its evidence: one read a person
+# can run that returns the objects the collector's parallel read returned.
+KCC_REPRODUCER_ARGV = ("kubectl", "get", KCC_CATEGORY, "-A", "-o", "json")
 
 DEFAULT_SERVICE_ACCOUNT = "default"
 
@@ -8103,8 +8083,11 @@ AUTOPILOT_ALLOWLIST_KINDS = (
     "allowlistedv2workloads.auto.gke.io",
 )
 
-# The one read in this file that does not fit `DEFAULT_TIMEOUT_S`, because a
-# category read is not one list call. `kubectl` expands `gcp` to every CRD
+# The one read in this file that does not fit `DEFAULT_TIMEOUT_S`, because the
+# Config Connector read is not one list call: it is now the time limit of the
+# whole `kcc_health.read_objects` read (discovery and one list per kind, in
+# parallel), not of one `kubectl` process. The history below is of the
+# category read it replaced. `kubectl` expands `gcp` to every CRD
 # carrying the category -- 221 of them on this fleet's hub -- and issues a list
 # against each, so the cost scales with how much of Config Connector is
 # installed rather than with how many objects exist. Measured from the agent
@@ -8235,12 +8218,19 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     def gated(argv: list[str]) -> tuple[dict | list | None, Run]:
         return run_and_gate(argv, kubeconfig, run=run)
 
+    def paged(kinds: str) -> tuple[dict | None, Run]:
+        return paged_and_gate(kinds, kubeconfig, run=run)
+
+    def paged_text(kinds: str) -> str:
+        return paged_command_text(kinds.split(","), kubeconfig=kubeconfig)
+
     # Every collection below is gate-checked independently, and a gate
     # failure raises immediately — this stream fails the whole cluster
     # closed on any missing input, the same as a single-dump stream, per
-    # `GateFailure`'s own docstring.
-    workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = gated(workload_argv)
+    # `GateFailure`'s own docstring. The built-in kinds are read in pages,
+    # one kind at a time; the CRD and category reads further down keep their
+    # one-shot shape, since an absent CRD is their ordinary answer.
+    parsed, result = paged(COMPLIANCE_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["workloads"] = normalize_compliance_workloads(parsed)
@@ -8275,42 +8265,39 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
         for i in parsed.get("items", []) or []
         if i.get("kind") == "Pod"
     ]
-    workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
+    workload_record = _record(paged_text(COMPLIANCE_DUMP_KINDS), result)
     for spec in checks:
         if spec.slug not in _COMPLIANCE_CHECK_SOURCES:
             commands[spec.slug] = workload_record
 
-    rbac_argv = ["kubectl", "get", "clusterroles,roles,clusterrolebindings,rolebindings", "-A", "-o", "json"]
-    parsed, result = gated(rbac_argv)
+    parsed, result = paged(RBAC_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"RBAC dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     items = parsed.get("items", [])
     context["roles"] = [i for i in items if i.get("kind") in ("ClusterRole", "Role")]
     context["clusterrolebindings"] = [i for i in items if i.get("kind") == "ClusterRoleBinding"]
     context["rolebindings"] = [i for i in items if i.get("kind") == "RoleBinding"]
-    record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(rbac_argv)}", result)
+    record = _record(paged_text(RBAC_DUMP_KINDS), result)
     for slug in ("cluster-admin-binding", "wildcard-rbac", "anonymous-rbac-binding"):
         commands[slug] = record
 
-    netpol_argv = ["kubectl", "get", "netpol,ns", "-A", "-o", "json"]
-    parsed, result = gated(netpol_argv)
+    parsed, result = paged(NETPOL_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"NetworkPolicy/Namespace dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     items = parsed.get("items", [])
     context["networkpolicies"] = [i for i in items if i.get("kind") == "NetworkPolicy"]
     context["namespaces"] = [i for i in items if i.get("kind") == "Namespace"]
-    commands["netpol-missing"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(netpol_argv)}", result)
+    commands["netpol-missing"] = _record(paged_text(NETPOL_DUMP_KINDS), result)
 
     # Gated like the reads above rather than treated as optional: every cluster
     # has a Services API, so a failure here is a broken read and not an absent
     # feature, and `check_lb_world_open` reading an empty list would report a
     # cluster clean on a collection it never saw.
-    service_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
-    parsed, result = gated(service_argv)
+    parsed, result = paged(SERVICE_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"Service dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["services"] = parsed.get("items", []) or []
-    commands["lb-world-open"] = _record(f"KUBECONFIG={kubeconfig} {shlex.join(service_argv)}", result)
+    commands["lb-world-open"] = _record(paged_text(SERVICE_DUMP_KINDS), result)
 
     # A deliberate exception to "every read above raises": Dataplane V2's
     # `ClusterNetworkPolicy` CRD (§2.6's Do-NOT-flag case, `kubectl get ccnp
@@ -8343,62 +8330,64 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # the absence of a CRD they are not supposed to have. Absence is reported
     # as an inapplicable check rather than as a clean one -- a cluster with no
     # Config Connector has not cleared anything.
-    kcc_argv = ["kubectl", "get", KCC_CATEGORY, "-A", "-o", "json"]
-    kcc_parsed, kcc_result = run_and_gate(kcc_argv, kubeconfig, run=run, timeout=KCC_READ_TIMEOUT_S)
-    context["kcc_objects"] = (kcc_parsed or {}).get("items") or []
-    # `run_and_gate` returns `None` for four different things, and only one of
-    # them means "no Config Connector here". Collapsing them would publish
-    # "Config Connector is not installed on this cluster" as the audit's own
-    # claim about a cluster where the read timed out or came back truncated --
-    # a statement the collector cannot support, on the strength of a read that
-    # failed. Each gets the reason that is true of it.
+    # `kcc_health.read_objects`, the one Config Connector read the collectors
+    # share: discovery (`kubectl api-resources`, no RBAC needed) finds the
+    # Config Connector kinds, then each kind is listed in pages, in parallel,
+    # with no more than `kcc_health.proxy_slots()` (the broker's sweep width)
+    # in flight in the process. `kubectl get gcp -A` does the same requests one
+    # after another, and through the credential proxy they took longer than
+    # `KCC_READ_TIMEOUT_S` on the hub. The whole read still ends inside that
+    # time.
+    kcc_started = time.monotonic()
+    kcc_read = kcc_health.read_objects(kubeconfig, run=run, deadline=kcc_started + KCC_READ_TIMEOUT_S)
+    context["kcc_objects"] = list(kcc_read.items)
+    # The same read, as the manifest entry's `kcc_unready` or `kcc_unread`
+    # key, so `finish` can say when a fix edits a declaration Config Connector
+    # does not apply. No second read.
+    context["kcc_health"] = kcc_health.read_fields(kcc_read)
+    # An object with no project annotation takes its namespace's; the
+    # namespaces are already in the context from the NetworkPolicy read.
+    kcc_health.fill_namespace_projects(context["kcc_health"].get(kcc_health.UNREADY_FIELD) or [], context.get("namespaces") or [])
+    # Each outcome of the read gets the reason that is true of it. Only "no
+    # Config Connector kind served here" means the check does not apply; a timeout, a
+    # refused list or an unreadable answer is a read that did not happen, and
+    # the cluster most likely to produce one is the hub the check exists for.
     kcc_reason = ""
-    if kcc_parsed is not None and not context["kcc_objects"]:
+    if kcc_read.status == kcc_health.READ_LISTED and not context["kcc_objects"]:
         kcc_reason = (
-            f"Config Connector is installed on this cluster -- `kubectl get "
-            f"{KCC_CATEGORY} -A` was served -- but it declares no GCP "
-            "resources, so there is nothing whose reconciliation could stall."
+            f"Config Connector is installed on this cluster -- its {kcc_read.kinds} kind(s) "
+            "were listed -- but it declares no GCP resources, so there is nothing whose "
+            "reconciliation could stall."
         )
-    elif kcc_result.rc == TIMEOUT_RC:
-        # Split out ahead of the `rc != 0` arm below, which is only entitled to
-        # read an exit code as the API server's answer when the API server is
-        # the one that produced it. A timeout is this collector giving up, and
-        # the cluster it is most likely to give up on is the one where the read
-        # has the most work to do -- which is the cluster that runs Config
-        # Connector, the exact opposite of what the arm below would have said.
+    elif kcc_read.status == kcc_health.READ_TIMED_OUT:
         kcc_reason = (
-            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` did not finish "
-            f"within {KCC_READ_TIMEOUT_S}s and was killed, so whether Config "
+            f"Undetermined: the Config Connector read did not finish within "
+            f"{KCC_READ_TIMEOUT_S}s ({kcc_read.detail}), so whether Config "
             "Connector is installed here -- and whether anything it owns is "
             "stalled -- was not established. This check cleared nothing on "
             "this cluster."
         )
-    elif kcc_result.rc != 0 and RESOURCE_TYPE_ABSENT_MARKER in kcc_result.stderr:
+    elif kcc_read.status == kcc_health.READ_ABSENT:
         kcc_reason = (
-            f"Config Connector is not installed on this cluster: `kubectl get "
-            f"{KCC_CATEGORY} -A` answered that the server does not serve the "
-            "category. Nothing here declares a GCP resource. This fleet runs "
-            "one Config Connector, on the hub cluster."
+            "Config Connector is not installed on this cluster: its API "
+            "discovery serves no Config Connector kind in the "
+            f"`{KCC_CATEGORY}` category. Nothing here declares a GCP resource. "
+            "This fleet runs one Config Connector, on the hub cluster."
         )
-    elif kcc_result.rc != 0:
-        # Any other failure -- Forbidden, one CRD in the category refusing to
-        # list, an API server error -- is a read that failed, and the cluster
-        # most likely to produce one is the hub the check exists for.
-        stderr = kcc_result.stderr.strip()[:ERROR_EXCERPT_CHARS] or "no stderr"
+    elif kcc_read.status == kcc_health.READ_FAILED:
         kcc_reason = (
-            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` exited "
-            f"{kcc_result.rc} without saying the category is unserved "
-            f"({stderr}), so whether Config Connector is installed here -- and "
-            "whether anything it owns is stalled -- was not established. This "
-            "check cleared nothing on this cluster."
+            f"Undetermined: the Config Connector read failed ({kcc_read.detail}), "
+            "so whether Config Connector is installed here -- and whether "
+            "anything it owns is stalled -- was not established. This check "
+            "cleared nothing on this cluster."
         )
-    elif kcc_parsed is None:
+    elif kcc_read.status == kcc_health.READ_UNREADABLE:
         kcc_reason = (
-            f"Undetermined: `kubectl get {KCC_CATEGORY} -A` exited 0 but "
-            "returned output this collector could not read as a list of "
-            "objects, so whether Config Connector is installed here -- and "
-            "whether anything it owns is stalled -- was not established. This "
-            "check cleared nothing on this cluster."
+            f"Undetermined: the Config Connector read returned output this "
+            f"collector could not read as a list of objects ({kcc_read.detail}), "
+            "so whether Config Connector is installed here -- and whether "
+            "anything it owns is stalled -- was not established. This check "
+            "cleared nothing on this cluster."
         )
     if kcc_reason.startswith(UNDETERMINED_PREFIX):
         # Not `not_applicable`: that list leaves the coverage denominator, so
@@ -8408,9 +8397,16 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     elif kcc_reason:
         context.setdefault("not_applicable", {})["kcc-object-wedged"] = kcc_reason
     else:
-        commands["kcc-object-wedged"] = _record(
-            f"KUBECONFIG={kubeconfig} {shlex.join(kcc_argv)}", kcc_result
-        )
+        # The record is the finding's `evidence.command`, so it is a command a
+        # reader can run: the category read, which returns the same objects,
+        # though slowly on a hub (the SOP's §2.12 says so). The collector made
+        # the read in parallel steps (`kcc_health.read_objects`), so no single
+        # command produced its output, and the record carries no output digest.
+        commands["kcc-object-wedged"] = {
+            "command": f"KUBECONFIG={kubeconfig} {shlex.join(KCC_REPRODUCER_ARGV)}",
+            "rc": 0,
+            "duration_s": round(time.monotonic() - kcc_started, 2),
+        }
 
     # Config Sync's sync objects, for §2.17. Ungated like the `gcp` read above
     # and for the same reason: most clusters do not run Config Sync, and an
@@ -8436,12 +8432,11 @@ def _collect_compliance(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpec
     # workload names, and a read narrowed to `default` left it nothing to find
     # -- every named account read as absent, so the check returned no hits on
     # any cluster while its command recorded a clean run.
-    sa_argv = ["kubectl", "get", "sa", "-A", "-o", "json"]
-    parsed, result = gated(sa_argv)
+    parsed, result = paged(SERVICEACCOUNT_DUMP_KINDS)
     if parsed is None:
         raise GateFailure(f"ServiceAccount dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     context["serviceaccounts"] = parsed.get("items", [])
-    sa_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(sa_argv)}", result)
+    sa_record = _record(paged_text(SERVICEACCOUNT_DUMP_KINDS), result)
     commands["default-sa-automount"] = sa_record
     commands["unbound-sa-automount"] = sa_record
 
@@ -8537,18 +8532,16 @@ def _collect_ai_security(cluster: dict, kubeconfig: Path, checks: tuple[CheckSpe
     `inference-endpoint-public` alone. Either failing fails the whole
     cluster closed, the same trade-off compliance-audit's several
     independent reads accept."""
-    workload_argv = ["kubectl", "get", COMPLIANCE_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = run_and_gate(workload_argv, kubeconfig, run=run)
+    parsed, result = paged_and_gate(COMPLIANCE_DUMP_KINDS, kubeconfig, run=run)
     if parsed is None:
         raise GateFailure(f"workload dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
     ai_workloads = normalize_ai_workloads(parsed)
-    workload_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(workload_argv)}", result)
+    workload_record = _record(paged_command_text(COMPLIANCE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), result)
 
-    svc_argv = ["kubectl", "get", "svc", "-A", "-o", "json"]
-    svc_parsed, svc_result = run_and_gate(svc_argv, kubeconfig, run=run)
+    svc_parsed, svc_result = paged_and_gate(SERVICE_DUMP_KINDS, kubeconfig, run=run)
     if svc_parsed is None:
         raise GateFailure(f"service dump gate failed (rc={svc_result.rc}): {svc_result.stderr.strip()[:ERROR_EXCERPT_CHARS]}")
-    svc_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(svc_argv)}", svc_result)
+    svc_record = _record(paged_command_text(SERVICE_DUMP_KINDS.split(","), kubeconfig=kubeconfig), svc_result)
 
     context = {"ai_workloads": ai_workloads, "services": svc_parsed.get("items", [])}
     commands = {
@@ -9594,6 +9587,9 @@ def collect_cluster(
     }
     if checks_not_applicable:
         result["checks_not_applicable"] = checks_not_applicable
+    # Only the compliance context builder reads `gcp`, so only its entries
+    # carry these keys.
+    result.update(collected.context.get("kcc_health") or {})
     if unevaluated:
         result["checks_unevaluated"] = [
             {"check": slug, "reason": reason} for slug, reason in sorted(unevaluated.items())
@@ -9856,82 +9852,6 @@ def _mirrored(path: str) -> bool:
     return name.endswith(MIRROR_SUFFIXES) or name in KUSTOMIZATION_FILE_NAMES
 
 
-def _safe_relative(path: str) -> Path | None:
-    """`path` as a relative path inside the mirror, or None if it is not one.
-
-    The broker's names are repository-relative already; this is the check that
-    a name it should never send -- absolute, climbing out, or inside `.git` --
-    is dropped rather than written outside the mirror.
-    """
-    relative = Path(path)
-    if (
-        not path
-        or relative.is_absolute()
-        or ".." in relative.parts
-        or GIT_DIR_NAME in relative.parts
-    ):
-        return None
-    return relative
-
-
-def _mirror_directory_link(dest: Path, path: str, target: str) -> Path | None:
-    """Recreate the repository's directory link `path` -> `target` in `dest`.
-
-    Neither a clone's walk nor the mirror's enters a directory link, but the
-    Kustomize overlay check resolves an Application's path through one, so the
-    mirror holds the same link the clone does. None, and no link, for a target
-    that is absolute or climbs out of the repository, and for a path that runs
-    through another link -- the broker's walk never lists one, and creating
-    its parent there would follow that link. `_links_inside` checks where the
-    links resolve once all of them exist, since a later one can redirect an
-    earlier one.
-    """
-    relative = _safe_relative(path)
-    if relative is None or not target or PurePosixPath(target).is_absolute():
-        return None
-    landing = posixpath.normpath(posixpath.join(relative.parent.as_posix(), target))
-    if landing == ".." or landing.startswith("../"):
-        return None
-    if any((dest / parent).is_symlink() for parent in relative.parents):
-        return None
-    link = dest / relative
-    try:
-        link.parent.mkdir(parents=True, exist_ok=True)
-        link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        return None
-    return link
-
-
-def _links_inside(dest: Path, links: dict[str, Path]) -> dict[str, str]:
-    """Remove each link in `links` that resolves outside `dest` or into `.git`.
-
-    Repeated until none is removed, because removing one changes where a link
-    through it resolves. Answers each removed path with its target, and
-    drops it from `links`. A loop is left in place: it resolves nowhere, in a clone too.
-    """
-    root = dest.resolve()
-    removed: dict[str, str] = {}
-    changed = True
-    while changed:
-        changed = False
-        for path, link in list(links.items()):
-            try:
-                resolved = link.resolve()
-            except (OSError, RuntimeError):  # a loop, which older Pythons raise as RuntimeError
-                continue
-            if root in (resolved, *resolved.parents) and (root / GIT_DIR_NAME) not in (
-                resolved,
-                *resolved.parents,
-            ):
-                continue
-            removed[path] = os.readlink(link)
-            link.unlink()
-            del links[path]
-            changed = True
-    return removed
-
-
 def _cluster_tree(path: str) -> str | None:
     """The cluster whose `clusters/<name>/` tree holds `path`, or None.
 
@@ -9942,151 +9862,8 @@ def _cluster_tree(path: str) -> str | None:
     return None
 
 
-def _may_declare_release(workspace, path: str) -> bool:
-    """Whether withheld `path` could hold something the release index reads.
-
-    The broker searches a file it will not send, so a vendored CRD bundle over
-    its size limit need not cost every cluster its `release_declaration`. A
-    withheld Kustomization file still counts, since which Applications name
-    its directory is not looked up for a file the broker would not send, and a
-    search that fails or answers in a shape this does not know could not rule
-    the file out, so each of those still counts as declaring.
-    """
-    if Path(path).name in KUSTOMIZATION_FILE_NAMES:
-        return True
-    try:
-        found = workspace.grep(RELEASE_DECLARING_PATTERN, prefix=path, regex=True)
-    except Exception:  # noqa: BLE001 -- an unanswered search keeps the marker
-        return True
-    if not isinstance(found, dict):
-        return True
-    try:
-        if int(found.get("total", 1)) > 0:
-            return True
-        # A file with no column-0 `kind` could hold an indented release the
-        # search above cannot see, or was never read at all.
-        probe = workspace.grep(COLUMN_ZERO_KIND_PATTERN, prefix=path, regex=True)
-        return not isinstance(probe, dict) or int(probe.get("total", 0)) == 0
-    except Exception:  # noqa: BLE001 -- an unanswered search keeps the marker
-        return True
-
-
-def _application_source_paths(
-    files: dict[str, bytes], directory_links: list[dict]
-) -> set[str] | None:
-    """Every directory an Argo CD Application's source names, through links.
-
-    `_argocd_kustomize_source` resolves an Application's `path` by finding a
-    Kustomization file there on disk, so a Kustomization nothing names is read
-    by nothing. None when the Applications cannot all be read (no PyYAML, a
-    file that names one and does not parse): then any Kustomization counts.
-    """
-    try:
-        import yaml  # noqa: PLC0415 -- optional; absence counts every Kustomization
-    except ImportError:
-        return None
-    named: set[str] = set()
-    for content in files.values():
-        # A backslash may escape the kind (`"\u0041pplication"`), so only a
-        # file with neither is passed over unparsed.
-        if ARGOCD_APPLICATION_KIND.encode() not in content and b"\\" not in content:
-            continue
-        try:
-            docs = list(yaml.safe_load_all(content.decode("utf-8", errors="replace")))
-        except Exception:  # noqa: BLE001 -- an Application this cannot read could name anything
-            return None
-        for doc in docs:
-            if not isinstance(doc, dict) or doc.get("kind") != ARGOCD_APPLICATION_KIND:
-                continue
-            spec = doc.get("spec") if isinstance(doc.get("spec"), dict) else {}
-            sources = [spec.get("source"), *(spec.get("sources") if isinstance(spec.get("sources"), list) else [])]
-            for source in sources:
-                # Coerced as `_argocd_kustomize_source` coerces it: `path: 2024`
-                # names a directory too.
-                path = str(source.get("path") or "").strip() if isinstance(source, dict) else ""
-                if path:
-                    named.add(posixpath.normpath(path))
-    links = [
-        (str(link.get("path") or ""), str(link.get("target") or ""))
-        for link in directory_links
-        if isinstance(link, dict) and link.get("target")
-    ]
-    # A path through a directory link names the link's target too. Each pass
-    # follows one more link from the paths the last pass reached; a chain
-    # longer than the kernel would follow (a link into itself grows forever)
-    # cannot be settled, so it counts every Kustomization.
-    frontier = set(named)
-    for _ in range(LINK_FOLLOW_LIMIT):
-        reached = set()
-        for path in frontier:
-            for link, target in links:
-                if path == link or path.startswith(link + "/"):
-                    rest = path[len(link) + 1 :]
-                    reached.add(posixpath.normpath(posixpath.join(posixpath.dirname(link), target, rest)))
-        frontier = reached - named
-        if not frontier:
-            return named
-        named |= frontier
-    return None
-
-
-def _sent_file_declares_release(path: str, content: bytes, rendered: set[str] | None = None) -> bool:
-    """`_may_declare_release` for a file the broker did send.
-
-    A withheld file under `clusters/<c>/` drops that whole tree from the mirror,
-    and the dropped files the broker sent may hold an Application for another
-    cluster, an AppProject, or a Kustomization an Application renders: one in a
-    directory `rendered` (`_application_source_paths`) names, or any when that
-    is None. Its bytes are here, so it is read the way `release_declarations`
-    reads it; the search stands in only where PyYAML is absent or the file
-    does not parse."""
-    if Path(path).name in KUSTOMIZATION_FILE_NAMES and (
-        rendered is None or posixpath.dirname(path) in rendered
-    ):
-        return True
-    try:
-        import yaml  # noqa: PLC0415 -- optional; absence falls back to the search
-
-        docs = list(yaml.safe_load_all(content.decode("utf-8", errors="replace")))
-    except Exception:  # noqa: BLE001 -- unparseable or no PyYAML: search instead
-        return re.search(RELEASE_DECLARING_PATTERN.encode(), content, re.MULTILINE) is not None
-    for doc in docs:
-        # A `kind` that is not a string names no release, and `str` of an
-        # aliased tree of lists would expand it.
-        kind = doc.get("kind") if isinstance(doc, dict) else None
-        if not isinstance(kind, str):
-            continue
-        meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
-        labels = meta.get("labels") if isinstance(meta.get("labels"), dict) else {}
-        if kind in RELEASE_KINDS or (
-            kind == "Secret" and labels.get(ARGOCD_CLUSTER_SECRET_LABEL) == ARGOCD_CLUSTER_SECRET_VALUE
-        ):
-            return True
-    return False
-
-
-def _batches(
-    wanted: list[tuple[str, int]], max_paths: int = MIRROR_BATCH_PATHS
-) -> list[list[str]]:
-    """Split `(path, size)` pairs under both per-request batch limits."""
-    batches: list[list[str]] = []
-    current: list[str] = []
-    current_bytes = 0
-    for path, size in wanted:
-        if current and (
-            len(current) >= max_paths or current_bytes + size > MIRROR_BATCH_BYTES
-        ):
-            batches.append(current)
-            current, current_bytes = [], 0
-        current.append(path)
-        current_bytes += size
-    if current:
-        batches.append(current)
-    return batches
-
-
-def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None) -> bool:
-    """Copy `repo`'s YAML out of the credential broker into `dest`.
+def broker_mirror(repo: str, dest: Path, snapshot: Callable | None = None) -> bool:
+    """Copy one revision of `repo` out of the credential broker into `dest`.
 
     Content mode's counterpart of the clone `workload_declarations`,
     `release_declarations` and `namespace_directories` walk. Without it, a
@@ -10095,219 +9872,119 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
     its own search and a fix the collector could have placed becomes
     `kind: manual`.
 
-    `dest` is a private temporary directory, never the remediation workspace:
-    `finish` publishes every file in that, and a mirrored manifest written there
-    would be proposed as a fix.
+    `dest` is absent or empty, and is a private temporary directory, never the
+    remediation workspace: `finish` publishes every file in that, and a
+    mirrored manifest written there would be proposed as a fix.
 
-    Every region it indexes is whole. A region missing files would index an
-    object declared twice as declared once, and `declaration_for` would then
+    The broker's `snapshot` sends every file of the revision, with the links
+    that stay inside the tree, so the indexes read the mirror as they read a
+    clone. Every region they index is whole. A region missing files would index
+    an object declared twice as declared once, and `declaration_for` would then
     name one of the two files instead of refusing -- a wrong path, which is
-    worse than the absent one the SOPs already handle. So a capped listing,
-    an unknown skip, any broker failure, or a failed write returns False, the
-    caller does not index `dest`, and the run proceeds as it did before this
-    existed.
+    worse than the absent one the SOPs already handle. So a refused snapshot (a
+    tree over the broker's ceiling, a name it will not write), more YAML than
+    MIRROR_MAX_FILES, or a failed write returns False, the caller does not
+    index `dest`, and the run proceeds as it did before this existed.
 
-    One file the broker will never send -- over its per-file limit
-    (`tooLarge`), or a symlink, which `read` refuses and `list` names apart
-    from its entries -- withholds only what it could have declared into. A
-    file under `clusters/<c>/` drops that cluster's whole tree from the
-    mirror, because `workload_declarations` keys by that path. Any withheld
-    file that could hold a release, wherever it sits, leaves
-    MIRROR_RELEASES_WITHHELD_MARKER, because an Argo CD Application can live
-    anywhere and target any cluster: no candidate then carries
-    `release_declaration` or `namespace_directory`. A symlink and a
-    Kustomization file always could; a `tooLarge` file could unless the
-    broker's search reads it, finds none of the kinds the release index reads,
-    and finds a column-0 `kind` (`_may_declare_release`), and the rest of its
-    cluster's tree (a Kustomization only where an Application names its
-    directory, `_application_source_paths`), which
-    goes with it, holds none either. The other clusters keep their `declaration`, and
-    each withheld file is logged with what it cost.
-
-    A link to a directory, which `list` names with its target, is recreated
-    in the mirror (`_mirror_directory_link`); one whose target the mirror
-    cannot hold leaves the marker instead.
+    The snapshot leaves out a link it will not follow (out of the tree,
+    through another link, into `.git`) and a directory laid out as a bare
+    repository, and names each under `skipped`. A YAML-named link, a bare
+    layout, and a YAML-named file link that the drop below leaves with no
+    target could each have held a declaration: under `clusters/<c>/` it drops
+    that cluster's YAML from the mirror, because `workload_declarations` keys
+    by that path. Any entry left out could have held a release, since the
+    snapshot does not say whether a link was to a file or to a directory an
+    Application names: it leaves MIRROR_RELEASES_WITHHELD_MARKER, because an
+    Argo CD Application can live anywhere and target any cluster, and then no
+    candidate carries `release_declaration` or `namespace_directory`. A link
+    that already had no target in the repository costs nothing: a clone reads
+    it the same way. A dropped tree keeps its directory links, which no walk
+    enters. The other clusters keep their `declaration`, and each entry is
+    logged with what it cost.
     """
-    if open_workspace is None:
-        client = _import_platform_script("credential_proxy_client")
+    if snapshot is None:
+        client = _import_platform_script("vcs_client")
         if client is None:
             log(f"WARNING: no broker client to read {repo} with; no candidate will carry a declaration")
             return False
-        open_workspace = client.Workspace.open
-    endpoint = os.environ.get(CREDENTIAL_PROXY_URL_ENV, "").strip()
-    if not endpoint:
+        snapshot = client.snapshot
+    if not os.environ.get(CREDENTIAL_PROXY_URL_ENV, "").strip():
         log(f"WARNING: {CREDENTIAL_PROXY_URL_ENV} is unset, so {repo} cannot be read; no candidate will carry a declaration")
         return False
-    files: dict[str, bytes] = {}
-    withheld: dict[str, str] = {}
-    directory_links: list[dict] = []
-    total_bytes = 0
     try:
-        with open_workspace(endpoint, repo, depth=1) as workspace:
-            wanted: list[tuple[str, int]] = []
-            cursor: str | None = None
-            # A truncated page is as long as the broker lets one request be,
-            # and that limit is configurable below MIRROR_BATCH_PATHS; a read
-            # over it fails whole.
-            max_paths = MIRROR_BATCH_PATHS
-            while True:
-                listing = workspace.list(after=cursor)
-                if listing.truncated and listing:
-                    max_paths = min(max_paths, len(listing))
-                withheld.update(
-                    (str(link), BROKER_SKIP_SYMLINK)
-                    for link in getattr(listing, "symlinks", ())
-                    if _mirrored(str(link))
-                )
-                for link in getattr(listing, "symlinked_directories", ()):
-                    path = str(link.get("path") or "") if isinstance(link, dict) else ""
-                    if _safe_relative(path) is None:
-                        log(
-                            f"WARNING: the broker listed the directory link {link!r} in {repo}, "
-                            "which is not a path inside the repository; no candidate will carry a declaration"
-                        )
-                        return False
-                    directory_links.append(link)
-                if len(directory_links) > MIRROR_MAX_FILES:
-                    log(
-                        f"WARNING: {repo} holds more directory links than the collector mirrors "
-                        f"({MIRROR_MAX_FILES}); no candidate will carry a declaration"
-                    )
-                    return False
-                for entry in listing:
-                    path = str(entry.get("path") or "")
-                    if not _mirrored(path):
-                        continue
-                    if _safe_relative(path) is None:
-                        log(
-                            f"WARNING: the broker listed {path!r} in {repo}, which is not a path "
-                            "inside the repository; no candidate will carry a declaration"
-                        )
-                        return False
-                    size = int(entry.get("size", 0) or 0)
-                    total_bytes += size
-                    wanted.append((path, size))
-                    if len(wanted) > MIRROR_MAX_FILES or total_bytes > MIRROR_MAX_BYTES:
-                        log(
-                            f"WARNING: {repo} holds more YAML than the collector mirrors "
-                            f"({MIRROR_MAX_FILES} files, {MIRROR_MAX_BYTES} bytes); "
-                            "no candidate will carry a declaration"
-                        )
-                        return False
-                if not listing or not listing.truncated:
-                    break
-                cursor = str(listing[-1].get("path") or "")
-            for batch in _batches(wanted, max_paths):
-                pending = batch
-                # `requestBudget` means ask again for the rest; stop when a
-                # round returns nothing, so a broker that never relents cannot
-                # spin this.
-                while pending:
-                    got, skipped = workspace.read_many(pending)
-                    files.update(got)
-                    for entry in skipped:
-                        if entry.get("reason") in BROKER_WITHHOLDING_SKIPS:
-                            withheld[str(entry.get("path") or "")] = str(entry.get("reason"))
-                    retry = [e for e in skipped if e.get("reason") == BROKER_SKIP_REQUEST_BUDGET]
-                    refused = [
-                        e
-                        for e in skipped
-                        if e.get("reason") not in BROKER_WITHHOLDING_SKIPS
-                        and e.get("reason") != BROKER_SKIP_REQUEST_BUDGET
-                    ]
-                    if retry and not got and not refused:
-                        # A file larger than one request's budget stalls every
-                        # round that starts with it; a single `read` has only
-                        # the per-file limit, so ask for it alone.
-                        stalled = str(retry[0].get("path") or "")
-                        try:
-                            files[stalled] = workspace.read(stalled)
-                        except Exception as exc:  # noqa: BLE001 -- reported below with its cause
-                            refused = [{"path": stalled, "reason": f"{BROKER_SKIP_REQUEST_BUDGET}, then {exc}"}]
-                        else:
-                            retry = retry[1:]
-                    if refused:
-                        first = refused[0]
-                        log(
-                            f"WARNING: the broker did not send {first.get('path')} from {repo} "
-                            f"({first.get('reason')}); no candidate will carry a declaration"
-                        )
-                        return False
-                    pending = [str(e.get("path") or "") for e in retry]
-            # A symlink's blob is its target's name, so the broker cannot
-            # search what it points at; only a `tooLarge` file is ruled out.
-            releasing = {
-                path
-                for path, reason in withheld.items()
-                if reason != BROKER_SKIP_TOO_LARGE or _may_declare_release(workspace, path)
-            }
+        answer = snapshot(repo, into=dest, max_bytes=MIRROR_MAX_BYTES)
     except Exception as exc:  # noqa: BLE001 -- the annotation is optional; the run is not
-        log(f"WARNING: could not read {repo} through the broker ({exc}); no candidate will carry a declaration")
+        code = getattr(exc, "code", None)
+        knob = ""
+        if code == SNAPSHOT_TOO_LARGE_CODE:
+            knob = f"; the size limits are the broker's {BROKER_MAX_SNAPSHOT_BYTES_ENV} and this collector's MIRROR_MAX_BYTES ({MIRROR_MAX_BYTES} bytes)"
+        elif code == CLONE_TOO_LARGE_CODE:
+            knob = f"; raise {BROKER_MAX_CLONE_BYTES_ENV} on the broker to mirror it"
+        log(f"WARNING: could not read {repo} through the broker ({exc}){knob}; no candidate will carry a declaration")
         return False
-    # Listed names were checked above; this catches a name `read_many`
-    # returned that the listing did not, before anything is written.
-    unsafe = sorted(path for path in files if _safe_relative(path) is None)
-    if unsafe:
-        log(f"WARNING: the broker sent {unsafe[0]!r} from {repo}; no candidate will carry a declaration")
-        return False
-    clusters = {_cluster_tree(path) for path in withheld} - {None}
-    # A cluster's tree goes with the file withheld from it, so whatever release
-    # the rest of that tree held is lost too, and the file is charged for it.
-    releasing_trees: set[str | None] = set()
-    rendered = _application_source_paths(files, directory_links) if clusters else set()
-    for path, content in files.items():
-        tree = _cluster_tree(path)
-        # Parsed, so a tree already charged is not read again.
-        if (
-            tree in clusters
-            and tree not in releasing_trees
-            and _sent_file_declares_release(path, content, rendered)
-        ):
-            releasing_trees.add(tree)
-    releasing |= {path for path in withheld if _cluster_tree(path) in releasing_trees}
-    for path, reason in sorted(withheld.items()):
-        region = _cluster_tree(path)
-        costs = []
-        if region:
-            # Its tree goes, so its `namespace_directory` too, unless every
-            # cluster's already does.
-            also = "" if path in releasing else " or namespace_directory"
-            costs.append(f"no candidate on cluster {region} will carry a declaration{also}")
-        if path in releasing:
-            costs.append("no candidate will carry a release_declaration or namespace_directory")
-        knob = f"; raise {BROKER_MAX_FILE_BYTES_ENV} on the broker to mirror it" if reason == BROKER_SKIP_TOO_LARGE else ""
-        log(
-            f"WARNING: the broker will not send {path} from {repo} ({reason}); "
-            + (", and ".join(costs) or "it declares nothing the indexes read")
-            + knob
-        )
-    files = {path: content for path, content in files.items() if _cluster_tree(path) not in clusters}
+    left_out = {
+        str(entry.get("path") or ""): str(entry.get("reason") or "")
+        for entry in answer.get("skipped") or []
+        if isinstance(entry, dict)
+    }
+    withheld = {
+        path for path, reason in left_out.items() if _mirrored(path) or reason.startswith(BARE_LAYOUT_SKIPPED_PREFIX)
+    }
+    releasing = set(left_out)
+    # A path one level past the entry, so a skipped directory at
+    # `clusters/<name>` names its cluster as a file under it would.
+    clusters = {_cluster_tree(f"{path}/-") for path in withheld} - {None}
+    mirrored = 0
     try:
-        for path, content in files.items():
-            target = dest / Path(path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content)
-        links: dict[str, Path] = {}
-        unheld: dict[str, str] = {}
-        for link in directory_links:
-            # A link in a dropped tree stays: an Application elsewhere may
-            # name a path through it, and no walk enters it.
-            path, target = str(link["path"]), str(link.get("target") or "")
-            made = _mirror_directory_link(dest, path, target) if path not in links else None
-            if made is None:
-                unheld[path] = target
-            else:
-                links[path] = made
-        unheld.update(_links_inside(dest, links))
-        for path, target in sorted(unheld.items()):
-            # The overlay check resolves a path through the link in a clone,
-            # and here it would find nothing.
-            releasing.add(path)
-            named = repr(target) if target else "an absolute target, or none"
-            log(
-                f"WARNING: the directory link {path} in {repo} names {named}, which "
-                "the mirror cannot hold; no candidate will carry a release_declaration or namespace_directory"
-            )
+        # Links the repository itself leaves with no target, which a clone
+        # reads the same way; only the ones the drop below breaks are charged.
+        # A link into an entry the snapshot left out has a target in a clone,
+        # so it is not one of these, and the loop charges it.
+        broken = set()
+        root = dest.resolve()
+        for directory, _subdirs, names in os.walk(dest):
+            for name in names:
+                path = Path(directory, name)
+                if not (_mirrored(name) and path.is_symlink() and not path.exists()):
+                    continue
+                try:
+                    target = path.resolve().relative_to(root).as_posix()
+                except ValueError:
+                    target = None
+                if target is not None and any(
+                    target == entry or target.startswith(entry + "/") for entry in left_out if entry
+                ):
+                    continue
+                broken.add(path.relative_to(dest).as_posix())
+        # Repeated, because dropping a tree can leave a file link elsewhere
+        # with no target, and that link's own region is then partial too. A
+        # directory link is in `subdirs` and is not entered; a file link is in
+        # `names` and goes with its tree like any file.
+        while True:
+            yaml = [
+                Path(directory, name)
+                for directory, _subdirs, names in os.walk(dest)
+                for name in names
+                if _mirrored(name)
+            ]
+            for path in yaml:
+                if _cluster_tree(path.relative_to(dest).as_posix()) in clusters:
+                    path.unlink()
+            dangling = {
+                path.relative_to(dest).as_posix()
+                for path in yaml
+                if path.is_symlink() and not path.exists()
+            } - withheld - broken
+            left_out.update((path, DANGLING_LINK_REASON) for path in dangling)
+            withheld |= dangling
+            releasing |= dangling
+            added = {_cluster_tree(path) for path in dangling} - {None} - clusters
+            if not added:
+                break
+            clusters |= added
+        mirrored = sum(
+            1 for directory, _subdirs, names in os.walk(dest) for name in names if _mirrored(name) and Path(directory, name).is_file()
+        )
         if releasing:
             (dest / MIRROR_RELEASES_WITHHELD_MARKER).parent.mkdir(parents=True, exist_ok=True)
             (dest / MIRROR_RELEASES_WITHHELD_MARKER).touch()
@@ -10318,9 +9995,25 @@ def broker_mirror(repo: str, dest: Path, open_workspace: Callable | None = None)
             )
     except OSError as exc:
         # `dest` now holds part of the tree; False tells the caller not to index it.
-        log(f"WARNING: could not write {repo}'s mirror ({exc}); no candidate will carry a declaration")
+        log(f"WARNING: could not prepare {repo}'s mirror ({exc}); no candidate will carry a declaration")
         return False
-    log(f"mirrored {len(files)} YAML file(s) of {repo} from the broker")
+    if mirrored > MIRROR_MAX_FILES:
+        log(
+            f"WARNING: {repo} holds more YAML than the collector mirrors ({MIRROR_MAX_FILES} files); "
+            "no candidate will carry a declaration"
+        )
+        return False
+    for path in sorted(releasing):
+        region = _cluster_tree(f"{path}/-") if path in withheld else None
+        costs = [f"no candidate on cluster {region} will carry a declaration"] if region else []
+        costs.append("no candidate will carry a release_declaration or namespace_directory")
+        what = (
+            f"{path} in {repo} links to a file the mirror dropped"
+            if left_out[path] == DANGLING_LINK_REASON
+            else f"the broker left {path} out of {repo}'s snapshot ({left_out[path]})"
+        )
+        log(f"WARNING: {what}; " + ", and ".join(costs))
+    log(f"mirrored {mirrored} YAML file(s) of {repo} at {answer.get('revision')} from the broker")
     return True
 
 
@@ -10329,8 +10022,8 @@ def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
     """The directory the declaration indexes walk for `--workspace`.
 
     A clone, or a directory no lease holds, as it is. A content-mode scratch
-    workspace stands in for a repository the broker holds, so that
-    repository's YAML is mirrored into a private directory for the duration,
+    workspace stands in for a repository the broker holds, so one revision of
+    that repository is mirrored into a private directory for the duration,
     and None -- nothing indexed -- when the mirror fails: the scratch
     workspace itself is never walked, because after an `audit_report.py
     fetch` it holds an arbitrary part of the tree, and `broker_mirror` says
@@ -10357,7 +10050,8 @@ def indexed_workspace(workspace: Path | None) -> Iterator[Path | None]:
         yield None
         return
     with holder as mirror:
-        yield Path(mirror) if broker_mirror(repo, Path(mirror)) else None
+        tree = Path(mirror) / MIRROR_TREE_NAME
+        yield tree if broker_mirror(repo, tree) else None
 
 
 # The suffix of the temporary file `--out` writes beside its target before the

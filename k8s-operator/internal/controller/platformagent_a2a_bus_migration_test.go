@@ -615,7 +615,7 @@ func TestAMigrationHoldsTheProvisionJob(t *testing.T) {
 	if err := cl.Status().Update(ctx, sts); err != nil {
 		t.Fatal(err)
 	}
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -982,10 +982,7 @@ func TestRenderedBusMigrationFixture(t *testing.T) {
 	agent := authMapTestAgent()
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationSnapshot),
 		Deadline: metav1.NewTime(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))}
-	cm, _, err := buildA2AAuthMapConfigMap(agent, nil)
-	if err != nil {
-		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
-	}
+	cm, _ := singleA2AAuthMapShard(t, agent, nil)
 	rendered := cm.Data[a2aAuthMapKey]
 	var doc a2aAuthMapDocument
 	if err := json.Unmarshal([]byte(rendered), &doc); err != nil {
@@ -1006,18 +1003,12 @@ func TestRenderedBusMigrationFixture(t *testing.T) {
 	// The same run in Restoring: the same identity, with the restore's
 	// grants instead of the snapshot's.
 	agent.Status.BusMigration.Phase = string(busMigrationRestoring)
-	cm, _, err = buildA2AAuthMapConfigMap(agent, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cm, _ = singleA2AAuthMapShard(t, agent, nil)
 	checkFixture(t, busMigrationRestoreMapFixturePath, cm.Data[a2aAuthMapKey])
 
 	// And in Clearing: INFO and DELETE only.
 	agent.Status.BusMigration.Phase = string(busMigrationClearing)
-	cm, _, err = buildA2AAuthMapConfigMap(agent, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	cm, _ = singleA2AAuthMapShard(t, agent, nil)
 	checkFixture(t, busMigrationClearMapFixturePath, cm.Data[a2aAuthMapKey])
 }
 
@@ -1539,7 +1530,7 @@ func TestTheRunSecretIsReadUncached(t *testing.T) {
 func TestNoRenderedPrincipalCanMakeOrBorrowAMigrationIdentity(t *testing.T) {
 	agent := a2aTestAgent()
 	roles := map[string][]rbacv1.PolicyRule{
-		"buildA2ACalloutRole":                  buildA2ACalloutRole(agent).Rules,
+		"buildA2ACalloutRole":                  buildA2ACalloutRole(agent, 1).Rules,
 		"buildA2ADispatcherConfigRole":         buildA2ADispatcherConfigRole(agent).Rules,
 		"buildA2ADispatcherPodsRole":           buildA2ADispatcherPodsRole(agent).Rules,
 		"buildA2AGatewayRole":                  buildA2AGatewayRole(agent).Rules,
@@ -1547,6 +1538,7 @@ func TestNoRenderedPrincipalCanMakeOrBorrowAMigrationIdentity(t *testing.T) {
 		"buildMinimalPlatformRole":             buildMinimalPlatformRole(agent).Rules,
 		"buildPlatformLocalRole":               buildPlatformLocalRole(agent).Rules,
 		"buildPlatformLeaderRole":              buildPlatformLeaderRole(agent).Rules,
+		"buildScopePublisherRole":              buildScopePublisherRole(agent).Rules,
 	}
 	if got := buildersReturning(t, map[string]bool{"Role": true, "ClusterRole": true}); len(got) != len(roles) {
 		var names []string
@@ -1682,7 +1674,7 @@ func TestTheFreezeRenders(t *testing.T) {
 			Deadline: metav1.NewTime(time.Now().Add(time.Hour)), FreezeConfirmed: tc.confirmed}
 		name := fmt.Sprintf("%s confirmed=%v", tc.phase, tc.confirmed)
 
-		dep := buildA2ACalloutDeployment(a, "pub")
+		dep := buildA2ACalloutDeployment(a, "pub", 1)
 		var env string
 		for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
 			if e.Name == a2aCalloutExpectMapVersionEnv {
@@ -1704,15 +1696,28 @@ func TestTheFreezeRenders(t *testing.T) {
 		}
 		for _, id := range staticIdentities(a) {
 			present := strings.Contains(conf, "user: "+id.user+"\n")
-			if id.account == a2aAccountApp && present {
-				t.Errorf("%s: APP user %s is still in nats.conf", name, id.user)
+			if id.account != a2aAccountSys && present {
+				t.Errorf("%s: %s user %s is still in nats.conf", name, id.account, id.user)
 			}
-			if id.account != a2aAccountApp && !present {
+			if id.account == a2aAccountSys && !present {
 				t.Errorf("%s: %s user %s is gone from nats.conf", name, id.account, id.user)
 			}
 		}
 		if !strings.Contains(conf, "user: "+a2aCalloutConfUser+"\n") {
 			t.Errorf("%s: the callout's own user is gone", name)
+		}
+		// By name, whichever account each is in after the split: the
+		// callout's own user (its AUTH account, outside the static list)
+		// and SYS's stay; every application user goes.
+		for _, user := range []string{a2aCalloutConfUser, "sys"} {
+			if !strings.Contains(conf, "user: "+user+"\n") {
+				t.Errorf("%s: %s is gone from the frozen nats.conf", name, user)
+			}
+		}
+		for _, user := range []string{"gateway", "seed", "web", "bridge", "console", "console-mcp"} {
+			if strings.Contains(conf, "user: "+user+"\n") {
+				t.Errorf("%s: %s is still in the frozen nats.conf", name, user)
+			}
 		}
 		if !strings.Contains(conf, "auth_users: [ "+a2aCalloutConfUser+a2aAuthUsersSeparator+"sys ]") {
 			t.Errorf("%s: auth_users is not the callout's and SYS's:\n%s", name, conf)

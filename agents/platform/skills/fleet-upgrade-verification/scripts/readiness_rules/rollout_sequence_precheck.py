@@ -166,10 +166,11 @@ def list_sequences(run_cmd, host: str, timeout=None) -> tuple[list | None, str |
     if run_cmd is None:
         return None, NO_RUNNER_ERROR
     rc, stdout, stderr = run_cmd(cmd, timeout) if timeout else run_cmd(cmd)
-    if rc != 0:
-        return None, READ_FAILED_ERROR.format(command=command, rc=rc, stderr=one_line(stderr, STDERR_EXCERPT_CHARS) or NO_STDERR)
+    # The marker before the exit code: the shim exits 74 on a cut reply.
     if PROXY_TRUNCATION_MARKER in str(stderr or ""):
         return None, OUTPUT_CUT_ERROR.format(command=command)
+    if rc != 0:
+        return None, READ_FAILED_ERROR.format(command=command, rc=rc, stderr=one_line(stderr, STDERR_EXCERPT_CHARS) or NO_STDERR)
     if not str(stdout or "").strip():
         return [], None
     try:
