@@ -2700,19 +2700,19 @@ type AgentUsageStatus struct {
 	// kubeagents_chat_feedback_negative_total; Google Chat delivers no
 	// reaction events. On a next-mode install the A2A gateway's
 	// kubeagents_a2a_gateway_answer_feedback_total under rating down joins
-	// it: each Bad answer tap a verified sender made on one of its answers,
-	// a repeated or changed rating counted again. Read every five minutes
-	// and kept monotonic the same way as ToolExecutionsTotal. Does not move
+	// it: one count each time a verified sender's rating of one of its
+	// answers becomes Bad answer, so a repeated tap adds nothing. Read every
+	// five minutes and kept monotonic the same way as ToolExecutionsTotal.
+	// Does not move
 	// LastActiveTime: the message the person rated already did.
 	// +optional
 	NegativeFeedbackTotal int64 `json:"negativeFeedbackTotal,omitempty"`
-	// PositiveFeedbackTotal is the cumulative count of Good answer taps a
-	// verified sender made on one of the A2A gateway's answers:
+	// PositiveFeedbackTotal is the cumulative count of times a verified
+	// sender's rating of one of the A2A gateway's answers became Good answer,
+	// so a repeated tap adds nothing:
 	// kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
-	// over its other labels, a repeated or changed rating counted again;
-	// read every five minutes and kept monotonic the same way as
-	// ToolExecutionsTotal. Next
-	// mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
+	// over its other labels; read every five minutes and kept monotonic the
+	// same way as ToolExecutionsTotal. Next mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
 	// install this stays at 0. Does not move LastActiveTime: the message the
 	// person rated already did.
 	// +optional
