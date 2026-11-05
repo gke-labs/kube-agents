@@ -1552,7 +1552,11 @@ func firstPositiveInt(vals ...int) int {
 // alias; an alias with no usable slug falls back to its parent's slug, then
 // to a short form of its handle.
 func deriveSessionMemberName(alias, parentSlug, handle string) string {
-	if slug := sanitizeAliasSlug(alias); slug != "" && slug != "default" {
+	rawAlias := strings.TrimSpace(alias)
+	if strings.HasPrefix(strings.ToLower(rawAlias), "session-") {
+		rawAlias = rawAlias[len("session-"):]
+	}
+	if slug := sanitizeAliasSlug(rawAlias); slug != "" && slug != "default" {
 		if strings.HasPrefix(slug, "session-") || strings.HasPrefix(slug, "s-") {
 			return sanitizeMemberName(slug)
 		}

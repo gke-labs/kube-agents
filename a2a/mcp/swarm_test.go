@@ -1304,3 +1304,14 @@ func TestBuildSwarmStateInputRequiredMemberShowsQuestion(t *testing.T) {
 		t.Errorf("workstream note = %q, want the question", note)
 	}
 }
+
+func TestDeriveSessionMemberNamePreservesSessionPrefixedSlug(t *testing.T) {
+	got := deriveSessionMemberName("session-fleet-explorer-session", "", "tok-fleet")
+	want := "session-fleet-explorer-session"
+	if got != want {
+		t.Errorf("deriveSessionMemberName(%q) = %q, want %q", "session-fleet-explorer-session", got, want)
+	}
+	if unprefixed := deriveSessionMemberName("fleet-explorer-session", "", "tok-fleet"); unprefixed != want {
+		t.Errorf("deriveSessionMemberName(%q) = %q, want %q", "fleet-explorer-session", unprefixed, want)
+	}
+}

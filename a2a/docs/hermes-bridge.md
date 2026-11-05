@@ -800,11 +800,11 @@ the finalize lock, ahead of the result and the terminal, so the trace is complet
 nothing of it follows the final event. What of the input is published depends on the executor:
 
 - **Under `cli` (shape mode):** `input` is capped at 2 KiB (`activityInputCap`) and published as its **shape**: its
-structure with every string value replaced by `<string, N chars>` and every key that is not
-shaped like a schema key (a letter or `_` first, then letters, digits, `_`, `-`, at most 48, and not token-like: no credential prefix, no long digit, hex or single-case run, few changes of character class) by
-`<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
-wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
-name, a wrapper's nested names). No string value rides the `cli` trace under any key, and no tool results are included.
+  structure with every string value replaced by `<string, N chars>` and every key that is not
+  shaped like a schema key (a letter or `_` first, then letters, digits, `_`, `-`, at most 48, and not token-like: no credential prefix, no long digit, hex or single-case run, few changes of character class) by
+  `<key n, N chars>`, numbers, booleans and the redaction markers kept, and one exception, the nested tool names of hermes's `tool_call`
+  wrapper (`calls[].name` at the wrapper's own level), which is all the graders read (a tool's
+  name, a wrapper's nested names). No string value rides the `cli` trace under any key, and no tool results are included.
 - **Under `api` (scrubbed detail mode):** `input` is capped at 4 KiB (`detailedInputCap`), string values are scrubbed for inline credential tokens, `Bearer`/`Basic` headers, URL userinfo, and `key=value` secrets (`scrubInlineSecrets`) and capped at 512 bytes (`detailedStringCap`), and non-schema or token-shaped keys are replaced by `<key n, N chars>` with their values shaped. Each `api` activity entry also carries a human-readable `title`, `sessionId`, `worker` (`platform` for the coordinator session, `card:<id> (<title>)` or `card:<id>` for a session mapped to a Kanban card, or `worker:<session-prefix>` otherwise), `cardId` when associated with a card, and a one-line scrubbed `resultPreview` (or `errorMessage` on failure) capped at 320 bytes (`entryPreviewCap`).
 
 In both modes, values under keys with `token`, `secret`, `password`,
@@ -837,10 +837,10 @@ The turn's steps go on a `steps` artifact as `kube-agents.step/v1` records
 ([`a2a/lib/stepmsg`](../lib/stepmsg/stepmsg.go)):
 
 - **Under `cli`:** a `plan` step is made from the trace itself (`activity_steps.go`): each
-`pre_tool_call` opens or extends one, titled with the call's tool name and carrying its call id, the
-same id its activity entry carries, so a renderer places each entry under its step.
-Consecutive calls of one tool within one model request share a step; a call of another tool, the
-next model request, or the task's finalize closes it and publishes it. `post_api_request` marks where one request ends and the next begins and emits the `synthesis` step (`Writing the answer`) when a request stops after work.
+  `pre_tool_call` opens or extends one, titled with the call's tool name and carrying its call id, the
+  same id its activity entry carries, so a renderer places each entry under its step.
+  Consecutive calls of one tool within one model request share a step; a call of another tool, the
+  next model request, or the task's finalize closes it and publishes it. `post_api_request` marks where one request ends and the next begins and emits the `synthesis` step (`Writing the answer`) when a request stops after work.
 - **Under `api`:** `post_api_request` (`activity_thinking.go`) builds descriptive `plan` steps from the planned tool calls (`expandPlannedToolCall` / `describePlannedTool`, grouping batch `kanban_create` calls into `Dispatching N specialist tasks on the Kanban board.`), attaches scrubbed single-line reasoning to the step's `thought` field (capped at 1,200 runes / 4,000 bytes, validated under `stepmsg.MaxThoughtBytes` = 4,096 bytes), publishes scrubbed multi-line reasoning to the `thinking` artifact, and emits a `synthesis` step (`Synthesizing findings into final response.` when planned titles or reasoning were seen, else `Writing the answer`) when the model stops after prior work. When `BRIDGE_WAIT_KANBAN_IN_TURN` is enabled (default `true`, active on non-Slack/GChat routes such as the console and MCP doors), a turn that files Kanban cards holds the task open after the coordinator turn and polls SQLite `kanban.db` (`resolveKanbanDBPath()` / `querySessionKanbanCards`, `kanban.go`). As cards run and settle, it maps worker sessions (`SyncKanbanCard`, `/kanban/workspaces/<cardId>`) so worker tool calls and reasoning are attributed to `@card:<id> (<title>)`, publishes `subtask` steps (`stepmsg.KindSubtask`, titled `Specialist check completed: <shortTitle>.`) and `progress` updates, and when multiple cards settle runs a synthesis turn (`Idempotency-Key: <taskId>/synth-<turn>`, step `Synthesizing findings across N specialist card(s).`) to fold the card reports into the final `result` artifact. If a console session's card settles after its turn has already ended, `watchOutOfTurnKanbanCards` publishes a synthetic task (`task-card-<sanitized-id>`) with `submitted`, the `steps` subtask record (`parentTaskId` naming the originating task), the scrubbed `result` artifact, and the terminal status.
 
 A step the record refuses to encode is skipped, with one log line per task. One task publishes at most
