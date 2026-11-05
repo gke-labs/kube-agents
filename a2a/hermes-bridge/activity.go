@@ -728,6 +728,7 @@ func (a *activityState) observe(d hookDelivery) (ActivityEntry, bool, []stepmsg.
 		}
 		if status == ActivityStatusError {
 			e.ErrorType = capRunes(activityErrorType(d), activityWordCap)
+			e.ErrorMessage = debugErrorText(d)
 		}
 		a.enrichPostToolCallLocked(d, openEntry, openRaw, status, &e)
 		return e, true, steps
@@ -826,6 +827,37 @@ func (a *activityState) truncationMarker() (ActivityEntry, bool) {
 
 func (a *activityState) signalStop() {
 	a.stopOnce.Do(func() { close(a.stop) })
+}
+
+// debugErrorTextEnv turns on a failed call's error text in its activity
+// entry, for debugging. Off by default: error text is free text a tool wrote,
+// which can carry a value the tool was handed, and the entries go to TASKS.
+// It is the bridge container's own variable, set by hand while debugging;
+// the operator renders it nowhere and no CR field reaches it, so it is never
+// on in a customer's install by configuration.
+const debugErrorTextEnv = "BRIDGE_DEBUG_ERROR_TEXT"
+
+// debugErrorTextCap bounds the debug error text: its first line, scrubbed.
+const debugErrorTextCap = 320
+
+// debugErrorText is a failed call's error text for its activity entry: ""
+// unless BRIDGE_DEBUG_ERROR_TEXT is true, else the first line of hermes's
+// error_message (or of the result, when hermes gave none), run through
+// scrubInlineSecrets and capped.
+func debugErrorText(d hookDelivery) string {
+	if on, _ := strconv.ParseBool(os.Getenv(debugErrorTextEnv)); !on {
+		return ""
+	}
+	text := d.Extra.ErrorMessage
+	if text == "" {
+		var s string
+		if json.Unmarshal(d.Extra.Result, &s) == nil {
+			text = s
+		} else {
+			text = string(d.Extra.Result)
+		}
+	}
+	return oneLinePreview(scrubInlineSecrets(text), debugErrorTextCap)
 }
 
 // activityErrorType is hermes's own verdict for a failed call: its status

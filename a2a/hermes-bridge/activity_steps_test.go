@@ -696,6 +696,53 @@ func TestAPI_EntriesCarryShapesAndNoResultErrorOrReasoningText(t *testing.T) {
 	}
 }
 
+// With BRIDGE_DEBUG_ERROR_TEXT on (a maintainer's debugging switch, off by
+// default), a failed call's entry carries the first line of its error text,
+// scrubbed and capped; hermes's error_message first, else the result. A
+// successful call carries none either way.
+func TestAPI_DebugErrorTextCarriesTheScrubbedFirstLine(t *testing.T) {
+	t.Setenv(debugErrorTextEnv, "true")
+	a := newActivityState(false)
+	a.sessionID = "a2a-debug-test"
+	call := func(id, status, errMsg, result string) ActivityEntry {
+		t.Helper()
+		pre := hookDelivery{Event: hookPreToolCall, SessionID: "a2a-debug-test", DeliveryID: "pre-" + id, ToolName: "terminal",
+			ToolInput: json.RawMessage(`{"command":"psql -h db.internal"}`)}
+		pre.Extra.ToolCallID = id
+		a.observe(pre)
+		post := hookDelivery{Event: hookPostToolCall, SessionID: "a2a-debug-test", DeliveryID: "post-" + id, ToolName: "terminal",
+			ToolInput: json.RawMessage(`{"command":"psql -h db.internal"}`)}
+		post.Extra.ToolCallID = id
+		post.Extra.Status = status
+		post.Extra.ErrorMessage = errMsg
+		post.Extra.Result = json.RawMessage(result)
+		e, ok, _ := a.observe(post)
+		if !ok {
+			t.Fatalf("%s: no entry", id)
+		}
+		return e
+	}
+	e := call("c1", "error", "psql: FATAL connection refused token=tok_in_error_text\nsecond line", `null`)
+	if !strings.HasPrefix(e.ErrorMessage, "psql: FATAL connection refused") {
+		t.Errorf("error text = %q, want the first line of error_message", e.ErrorMessage)
+	}
+	for _, leaked := range []string{"tok_in_error_text", "second line"} {
+		if strings.Contains(e.ErrorMessage, leaked) {
+			t.Errorf("error text %q carries %q", e.ErrorMessage, leaked)
+		}
+	}
+	if e = call("c2", "error", "", `"exit status 2: no such host\nmore"`); e.ErrorMessage != "exit status 2: no such host" {
+		t.Errorf("error text from the result = %q, want its first line", e.ErrorMessage)
+	}
+	if e = call("c3", hookStatusOK, "", `"all good"`); e.ErrorMessage != "" {
+		t.Errorf("a successful call carried error text %q", e.ErrorMessage)
+	}
+	t.Setenv(debugErrorTextEnv, "false")
+	if e = call("c4", "error", "psql: FATAL", `null`); e.ErrorMessage != "" {
+		t.Errorf("error text %q with the switch off", e.ErrorMessage)
+	}
+}
+
 func TestStep_BeginTurnResetsCardsFiledAndKeepsTheSynthesisRule(t *testing.T) {
 	a := newActivityState(false)
 	a.sessionID = "a2a-coord"
