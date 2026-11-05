@@ -117,8 +117,8 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # Every tracked shell script through shellcheck. The `validate` job in
 # .github/workflows/validate.yml runs this target on every pull request with
 # the shellcheck release it pins there, so a warning in a tracked script fails
-# the merge; run it with that release locally, since the apt package is older
-# and reports a different set. No `-s`: each shebang decides the dialect, so
+# the merge; run it with that release locally, since a different release
+# reports a different set. No `-s`: each shebang decides the dialect, so
 # deploy/shared/docker-entrypoint.sh (`#!/bin/sh`) is checked as POSIX sh.
 # SC1090 joins SC1091 in the exclude list because scripts/installer/common.sh
 # sources a runtime path that `-x` cannot follow; every other finding is fixed
