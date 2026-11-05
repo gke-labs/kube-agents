@@ -47,13 +47,14 @@ below say where violations hide; the paragraph is the test.
   flag a progress line that survives the answer.
 - **No plumbing in user text**: Flag task ids, card ids, session keys, file paths, tool names,
   JSON, CLI flags, exit codes and roster ids used as names. Allow a cluster, a workload, a linked
-  pull request, and a specialist's name where `SOUL.md` asks for attribution.
+  pull request, a specialist's name where `SOUL.md` asks for attribution, and a board read's short
+  task id.
 - **Choices are buttons**: Flag a choice offered without buttons, a button that does not send its
   answer, "reply X", "type X" or "say X" in a message body; flag more than 5 buttons in one row.
   Allow the text fallback listing the options.
-- **A failure is one plain line**: Flag an apology, a second explanation, a failure that does not
-  say what would work instead, a retry or re-route offered as text rather than a button, or a retry
-  promise; for each promise, find the code that retries and flag it when none runs on that path.
+- **A failure is one plain line**: Flag an apology, a failure that does not lead with one plain
+  line, a gateway notice longer than that line, a failure that does not say what would work instead,
+  a retry or re-route offered as text rather than a button, or a retry promise; for each promise, find the code that retries and flag it when none runs on that path.
 - **Speak up only when it matters**: Flag a new message of its own that is not the
   acknowledgement, a pull request opened, a question only the user can answer, a failure, or done.
 - **A destructive action needs the asker's confirm**: Flag a destructive action reachable without
