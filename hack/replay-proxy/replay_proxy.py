@@ -43,6 +43,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
@@ -69,6 +70,9 @@ MAX_OBSERVED_BYTES = 8 * 1024 * 1024
 MAX_TOOL_CALLS = 256
 # Requests waiting for the background analysis; past this, analysis is dropped.
 ANALYSIS_QUEUE_SIZE = 1024
+# Slot answers whose (context, answer) the replay lookup keeps, so a turn
+# normalizes only its new answer's prefix.
+VARIANT_MEMO_CAPACITY = 100_000
 # A rough prompt-token estimate for a line whose response carried no usage.
 BYTES_PER_TOKEN = 4
 DEFAULT_BIND_HOST = "0.0.0.0"
@@ -501,6 +505,10 @@ class ShadowProxy:
         self.store = request_store.RequestStore(config.store_dir, self.scrubber)
         self.metrics = Metrics(self.scrubber.available)
         self.diagnosis = diagnosis.DiagnosisHasher()
+        # (context, answer) of each slot answers_recorded has checked, by the
+        # digests of its raw prefix and answer; oldest dropped past the capacity.
+        self._variants: "OrderedDict[str, Tuple[str, str]]" = OrderedDict()
+        self._variant_lock = threading.Lock()
         self.out = out if out is not None else sys.stdout
         self._log_lock = threading.Lock()
         self._queue: "queue.Queue[Any]" = queue.Queue(maxsize=ANALYSIS_QUEUE_SIZE)
@@ -526,7 +534,7 @@ class ShadowProxy:
         messages = messages if isinstance(messages, list) else []
         # Noted now, not by the background analysis, so a later request's
         # slots can normalize this one's messages as of when they arrived.
-        first_seen = self.diagnosis.first_seen_times(messages, received)
+        digests, first_seen = self.diagnosis.first_seen_with_digests(messages, received)
         normalized, fingerprint = keyed or self.keyed(body, received)
         via = F.VIA_EXACT
         entry = self.cache.load(fingerprint)
@@ -538,7 +546,7 @@ class ShadowProxy:
             if recorded is None:
                 return None, None
             fingerprint, via, entry = recorded, F.VIA_ANSWER_SLOTS, self.cache.load(recorded)
-            if not self.answers_recorded(body, messages, first_seen, received):
+            if entry is not None and not self.answers_recorded(body, messages, digests, first_seen, received):
                 return None, refusal(via, F.GUARD_ANSWER_NOT_RECORDED)
         if entry is None or not isinstance(entry.get(replay_cache.ENTRY_ANSWER), dict):
             return None, refusal(via, F.GUARD_UNREADABLE_ENTRY)
@@ -555,23 +563,36 @@ class ShadowProxy:
         return (answer, entry, fingerprint, via), None
 
     def answers_recorded(
-        self, body: Dict[str, Any], messages: List[Any], first_seen: List[float], received: float,
+        self, body: Dict[str, Any], messages: List[Any], digests: List[str], first_seen: List[float], received: float,
     ) -> bool:
         """Whether each assistant message is an answer a recording stored for the request it replied to.
 
         Each is checked against that request: the messages before it, with the
         settings, normalized on their own as of when the last of them arrived,
-        as record mode normalized the request when it noted the answer.
+        as record mode normalized the request when it noted the answer. That
+        pair depends only on the raw prefix and the answer (and, in this
+        process, on when the prefix arrived), so it is kept by their digests:
+        each turn normalizes only its new answer's prefix, not every earlier one.
         """
+        settings = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
+        chain = normalizer.stable_hash(settings)
         for index, message in enumerate(messages):
-            if not (isinstance(message, dict) and message.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE):
-                continue
-            asked = dict(body)
-            asked[request_store.MESSAGES_KEY] = messages[:index]
-            now = first_seen[index - 1] if index else received
-            context, answer = normalizer.answer_variant(normalizer.normalize_request(asked, now), message, self.key_context)
-            if not self.cache.has_variant(context, answer):
-                return False
+            if isinstance(message, dict) and message.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE:
+                memo_key = normalizer.stable_hash([chain, digests[index]])
+                with self._variant_lock:
+                    variant = self._variants.get(memo_key)
+                if variant is None:
+                    asked = dict(body)
+                    asked[request_store.MESSAGES_KEY] = messages[:index]
+                    now = first_seen[index - 1] if index else received
+                    variant = normalizer.answer_variant(normalizer.normalize_request(asked, now), message, self.key_context)
+                    with self._variant_lock:
+                        self._variants[memo_key] = variant
+                        while len(self._variants) > VARIANT_MEMO_CAPACITY:
+                            self._variants.popitem(last=False)
+                if not self.cache.has_variant(*variant):
+                    return False
+            chain = normalizer.stable_hash([chain, digests[index]])
         return True
 
     def submit(

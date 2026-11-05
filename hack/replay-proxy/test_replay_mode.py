@@ -169,6 +169,28 @@ class SlotPointerTest(SlotCacheCase):
         self.assertEqual((hit[0]["content"], hit[3]), ("done", "answer_slots"))
 
 
+class SlotCheckCostTest(SlotCacheCase):
+    """Each turn's recorded-answer check normalizes only its new answer's prefix."""
+
+    def test_a_second_turn_does_not_renormalize_earlier_prefixes(self):
+        turn = [{"role": "user", "content": "work kanban task t_bbbbbbbb"}]
+        for said, shown in (("Looking.", "card open"), ("Commenting.", "comment added")):
+            asked = {"model": "m", "messages": list(turn)}
+            self.recorded(asked, {"role": "assistant", "content": said})
+            turn += [{"role": "assistant", "content": said}, {"role": "user", "content": shown}]
+        replay = self.proxy()
+        calls = []
+        original = normalizer.normalize_request
+        normalizer.normalize_request = lambda *args: calls.append(args) or original(*args)
+        self.addCleanup(setattr, normalizer, "normalize_request", original)
+        for length, expected in ((3, 1), (5, 1)):
+            calls.clear()
+            body = {"model": "m", "messages": turn[:length]}
+            digests, seen = replay.diagnosis.first_seen_with_digests(body["messages"], time.time())
+            self.assertTrue(replay.answers_recorded(body, body["messages"], digests, seen, time.time()))
+            self.assertEqual(len(calls), expected, f"{length} messages")
+
+
 class UnreadableEntryTest(SlotCacheCase):
     """A key that points at a missing or broken saved answer is a refused miss, never a served one."""
 
@@ -188,6 +210,16 @@ class UnreadableEntryTest(SlotCacheCase):
         for path in Path(self.cache_dir, replay_cache.ANSWERS_DIR).iterdir():
             path.unlink()
         self.assertEqual(self.proxy().lookup(self.BODY, time.time()),
+                         (None, {"via": "answer_slots", "guard": "unreadable_entry"}))
+
+    def test_a_slot_whose_entry_is_gone_is_refused_before_checking_its_answers(self):
+        # Checking the answers is the costly step; a dangling slot skips it.
+        self.recorded(self.BODY, {"role": "assistant", "content": "done"})  # its answers never recorded
+        for path in Path(self.cache_dir, replay_cache.ANSWERS_DIR).iterdir():
+            path.unlink()
+        replay = self.proxy()
+        replay.answers_recorded = lambda *args: self.fail("checked a slot whose entry is gone")
+        self.assertEqual(replay.lookup(self.BODY, time.time()),
                          (None, {"via": "answer_slots", "guard": "unreadable_entry"}))
 
 

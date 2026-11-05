@@ -51,7 +51,9 @@ class DiagnosisHasher:
         self._lock = threading.Lock()
 
     def _first_seen(self, raw: str, now: float) -> float:
-        key = _digest(raw)
+        return self._first_seen_digest(_digest(raw), now)
+
+    def _first_seen_digest(self, key: str, now: float) -> float:
         with self._lock:
             seen = self.first_seen.get(key)
             if seen is None:
@@ -62,7 +64,12 @@ class DiagnosisHasher:
 
     def first_seen_times(self, messages: List[Any], now: float) -> List[float]:
         """When this proxy first saw each message, noting `now` for the ones it has not seen."""
-        return [self._first_seen(json.dumps(m, sort_keys=True, ensure_ascii=False), now) for m in messages]
+        return self.first_seen_with_digests(messages, now)[1]
+
+    def first_seen_with_digests(self, messages: List[Any], now: float) -> Tuple[List[str], List[float]]:
+        """Each message's digest, and when this proxy first saw it (noting `now` for a new one)."""
+        digests = [_digest(json.dumps(m, sort_keys=True, ensure_ascii=False)) for m in messages]
+        return digests, [self._first_seen_digest(d, now) for d in digests]
 
     def settings_hash(self, body: Dict[str, Any], context: Dict[str, str], now: float) -> str:
         """The request's settings alone, normalized without any message's context."""
