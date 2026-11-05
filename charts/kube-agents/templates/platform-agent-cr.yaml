@@ -537,11 +537,29 @@ spec:
       {{- end }}
     {{- end }}
     {{- end }}
+    {{- /*
+      The exec tier's replica count, forwarded as
+      spec.deployment.credentialProxy.exec.replicas when above 0. Written only
+      then, for the reason the resources block is: 0 is the operator's default,
+      and an empty block on every CR is noise a reader takes for a setting.
+    */}}
+    {{- $execReplicas := dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int }}
     {{- if $proxyQuantities }}
     {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.credentialProxy.resources" "path" (list "deployment" "credentialProxy") "field" "resources") }}
+    {{- end }}
+    {{- if gt $execReplicas 0 }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.credentialProxy.exec.replicas" "path" (list "deployment" "credentialProxy") "field" "exec") }}
+    {{- end }}
+    {{- if or $proxyQuantities (gt $execReplicas 0) }}
     credentialProxy:
+      {{- if $proxyQuantities }}
       resources:
         {{- include "kube-agents.resourcesOverrideBlock" $proxyQuantities | nindent 8 }}
+      {{- end }}
+      {{- if gt $execReplicas 0 }}
+      exec:
+        replicas: {{ $execReplicas }}
+      {{- end }}
     {{- end }}
     {{- /*
       The agent-api-auth sidecar's requests and limits, forwarded to the CR as
