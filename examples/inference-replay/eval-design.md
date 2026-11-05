@@ -133,9 +133,10 @@ The rules that keep this safe:
   request's own day instead ("today", "yesterday", "days ago", ...), counted in the time zone
   written after it, so a nightly recorded on Wednesday still matches a presubmit on Thursday. A
   date-only `2026-11-05` and an `ls -l` date with a year are counted the same way. An answer that
-  names the date, with or without the year or by its weekday (a `memory/2026-11-04.md` note,
-  "findings for November 04"), isn't saved, since replayed the next day it would carry the wrong
-  date; in the dev-install trials that was 1 of 153 saved answers. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
+  names one of these dates isn't saved, since replayed the next day it would carry the wrong date.
+  The answer is read for dates in any common shape (`memory/2026-11-04.md`, `20261104`,
+  `11/04/2026`, "4 November", "nov-04"), and today's date also counts without the year or by its
+  weekday ("findings for November 04"). In the dev-install trials that was 1 of 153 saved answers. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
   `timestamp`); any other 10-digit number, like `memory: 1717986918`, isn't read as a time. IP
   addresses stay as they are whenever the request mentions a network range (like `10.0.0.0/16`),
   because then which range an IP falls in can matter.

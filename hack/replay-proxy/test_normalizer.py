@@ -205,12 +205,29 @@ class LongDateTest(unittest.TestCase):
         for answer in ('{"path": "memory/2026-11-04.md"}', "## Findings for November 04, 2026",
                        "as of November 4, 2026", "started Wednesday, November 04, 2026",
                        "notes_2026-11-04.md", "2026-11-04_standup.md", "plan_2026-11-04",
-                       "## Findings for November 04", "updated Nov 4", "today is Wednesday"):
+                       "## Findings for November 04", "updated Nov 4", "today is Wednesday",
+                       # Spellings no list of strings caught: any date shape counts.
+                       "report_20261104.md", "backup-20261104.tar", "notes-nov-04.md", "nov04", "11/04/2026",
+                       "11-04-2026", "04.11.2026", "2026/11/04", "november 4", "wednesday", "Nov. 4",
+                       "4 November 2026", "November 4th", "the 4th of Nov"):
             self.assertTrue(mapping.answer_repeats_date(answer), answer)
             self.assertFalse(mapping.answer_repeats_bare_number(answer), "a date is not a number: " + answer)
-        for answer in ("memory/2026-11-05.md", "November 14, 2026", "build 20261104", "2026-11-04T10:00:00Z",
-                       "Nov 40", "Wednesdays"):
+        for answer in ("memory/2026-11-05.md", "November 14, 2026", "2026-11-04T10:00:00Z",
+                       "Nov 40", "Wednesdays", "renew before November 04, 2027", "11/05/2026", "v2026.11"):
             self.assertFalse(mapping.answer_repeats_date(answer), answer)
+
+    def test_a_tool_output_date_counts_only_as_itself(self):
+        # An old file in `ls -la` must not make "every Monday" unsaveable for
+        # the rest of the conversation: only the request's own day counts
+        # without a year or by weekday.
+        body = {"messages": [
+            {"role": "system", "content": self.PROMPT.format("Wednesday, November 04, 2026")},
+            {"role": "tool", "content": "-rw-r--r-- 1 root root 1234 Nov  3  2025 passwd\nDate:   2026-10-15"}]}
+        mapping = normalizer.normalize_request(body, self.at(2026, 11, 4)).mapping
+        for answer in ("runs every Monday", "the Thursday run", "due November 3", "Oct 15"):
+            self.assertFalse(mapping.answer_repeats_date(answer), answer)
+        for answer in ("passwd changed 2025-11-03", "commit from 2026-10-15", "November 3, 2025"):
+            self.assertTrue(mapping.answer_repeats_date(answer), answer)
 
     def test_hermes_zone_names_before_the_offset(self):
         now = calendar.timegm(datetime(2026, 11, 5, 3, 0).timetuple())
@@ -229,13 +246,22 @@ class LongDateTest(unittest.TestCase):
         self.assertEqual(self.norm_at("notAfter 2026-11-05", self.at(2026, 11, 5, 0)), "notAfter ⟦TIME_today⟧")
         self.assertEqual(self.norm_at("-rw-r--r-- 1 root root 12 Nov  3  2026 a", self.at(2026, 11, 5)),
                          "-rw-r--r-- 1 root root 12 ⟦TIME_past_days⟧ a")
+        # The day itself: hours ago by the hour buckets, today by days.
+        self.assertEqual(self.norm_at("-rw-r--r-- 1 root root 12 Nov  5  2026 a", self.at(2026, 11, 5)),
+                         "-rw-r--r-- 1 root root 12 ⟦TIME_today⟧ a")
 
     def test_a_date_with_a_time_of_day_is_left_alone(self):
         now = self.at(2026, 11, 5)
         for text in ("November 05, 2026 at 10:42:01", "Thursday, November 05, 2026 10:42 AM",
                      "November 05, 2026, 9:30 PM", "November 05, 2026 - 10:42", "November 05, 2026 at 10 PM",
                      "November 05, 2026 (10:42)", "November 05, 2026 10h42", "10:42 on November 05, 2026",
-                     "10pm, November 05, 2026"):
+                     "10pm, November 05, 2026",
+                     # A word between the date and the time.
+                     "November 05, 2026 (Thursday) 10:42", "November 05, 2026 at around 10:42",
+                     "November 05, 2026 at approximately 3 PM", "10:42 UTC on November 05, 2026",
+                     "November 05, 2026 UTC 10:42",
+                     # A date-only ISO value with a time beside it that the ISO rule doesn't join.
+                     "2026-11-05 at 10:42", "2026-11-05, 10:42:00"):
             self.assertEqual(self.norm_at(text, now), text)
         # Hermes's zone suffix is not a time of day.
         self.assertEqual(self.norm_at("November 05, 2026 (UTC, UTC+00:00)", now), "⟦TIME_today⟧ (UTC, UTC+00:00)")

@@ -159,23 +159,38 @@ LONG_DATE_RE = re.compile(
     r"(?=\s*\((?:[\w/+-]+,\s*)*UTC([+-])(\d{2}):(\d{2})\))?"
 )
 DATE_TODAY = "today"
-LONG_DATE_FORMAT = "%B %d, %Y"
-# A date an answer repeats counts unless a letter or digit touches it, so
-# `notes_2026-11-04.md` counts and `20261104` does not.
-DATE_BEFORE = r"(?<![A-Za-z0-9])"
-DATE_AFTER = r"(?![A-Za-z0-9])"
-SHORT_DATE_FORMAT = "%b %d"
-MONTH_DAY_FORMAT = "%B %d"
-WEEKDAY_FORMAT = "%A"
-# A time of day next to a spelled-out date (`10:42`, `10:42:01`, `10 PM`,
-# `10pm`, `10h42`): then the date is left alone, since day counting would
-# drop what the time says. Looked for just after and just before the date;
-# Hermes's zone suffix starts with letters (`(UTC, UTC+00:00)`), so its offset
-# is never read as a time.
-TIME_OF_DAY = r"\d{1,2}(?::\d{2}(?::\d{2})?|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)"
-TIME_AFTER_DATE_RE = re.compile(r"[^\w\n]{0,4}(?:at\s+)?" + TIME_OF_DAY)
-TIME_BEFORE_DATE_RE = re.compile(TIME_OF_DAY + r"\s*(?:on\s+|,\s*)?$")
-TIME_NEAR_DATE_CHARS = 20
+# A time of day near a date (`10:42`, `10:42:01`, `10 PM`, `10pm`, `10h42`),
+# anywhere within TIME_NEAR_DATE_CHARS on either side: then the date is left
+# alone, since day counting would drop what the time says. Digits right after
+# `+` or `-` are a zone offset (Hermes's `UTC+00:00`), not a time of day.
+TIME_OF_DAY_RE = re.compile(r"(?<![\w:+-])\d{1,2}(?::\d{2}(?::\d{2})?|\s?[AaPp]\.?[Mm]\b|h\d{2}\b)")
+TIME_NEAR_DATE_CHARS = 30
+# The shapes an answer may name a date in, read case-insensitively and
+# compared as dates (Mapping.answer_repeats_date), so a new spelling is a new
+# shape here, not a missed string. A letter or digit touching a shape stops
+# it, so `notes_2026-11-04.md` is read and `2026-11-04T10:00:00Z` (a
+# timestamp, with its time) is not.
+SHORT_MONTHS = tuple(m[:3] for m in LONG_MONTHS)
+SEPT_SPELLING = "sept"
+ANSWER_MONTH = r"(" + "|".join(sorted(LONG_MONTHS + SHORT_MONTHS + (SEPT_SPELLING,), key=len, reverse=True)) + r")"
+ANSWER_BOUND_BEFORE = r"(?<![A-Za-z0-9])"
+ANSWER_BOUND_AFTER = r"(?![A-Za-z0-9])"
+ANSWER_GAP = r"[\s._-]*"
+ANSWER_ORDINAL = r"(?:st|nd|rd|th)?"
+ANSWER_YEAR = r"(?:,?" + ANSWER_GAP + r"(\d{4}))?"
+# 2026-11-04, 2026/11/04, 2026.11.04, 2026_11_04, 20261104.
+ANSWER_ISO_RE = re.compile(ANSWER_BOUND_BEFORE + r"(\d{4})([-/._]?)(\d{2})\2(\d{2})" + ANSWER_BOUND_AFTER)
+# 11/04/2026, 11-04-2026, 04.11.2026: read both ways round.
+ANSWER_NUMERIC_RE = re.compile(ANSWER_BOUND_BEFORE + r"(\d{1,2})([/.-])(\d{1,2})\2(\d{4})" + ANSWER_BOUND_AFTER)
+# November 4, Nov. 04 2026, nov-04, November 4th.
+ANSWER_MONTH_FIRST_RE = re.compile(
+    ANSWER_BOUND_BEFORE + ANSWER_MONTH + r"\.?" + ANSWER_GAP + r"(\d{1,2})" + ANSWER_ORDINAL + ANSWER_YEAR
+    + ANSWER_BOUND_AFTER, re.I)
+# 4 November 2026, 4th of Nov.
+ANSWER_DAY_FIRST_RE = re.compile(
+    ANSWER_BOUND_BEFORE + r"(\d{1,2})" + ANSWER_ORDINAL + ANSWER_GAP + r"(?:of\s+)?" + ANSWER_MONTH + r"\.?"
+    + ANSWER_YEAR + ANSWER_BOUND_AFTER, re.I)
+ANSWER_WEEKDAY_RE = re.compile(ANSWER_BOUND_BEFORE + r"(" + "|".join(LONG_DAYS) + r")" + ANSWER_BOUND_AFTER, re.I)
 # Fewer whole days from the request's day than this is "day" (one day either way).
 DAYS_IN_DAY_BUCKET = 2
 # Whole days from the request's day -> bucket: under each limit, with the
@@ -280,6 +295,32 @@ def time_bucket(when: float, now: float) -> str:
     return f"{OPEN}{TIME_CLASS}_{name}{CLOSE}"
 
 
+def time_near(text: str, start: int, end: int) -> bool:
+    """Whether a time of day sits within TIME_NEAR_DATE_CHARS before `start` or after `end`."""
+    before = text[max(0, start - TIME_NEAR_DATE_CHARS):start]
+    after = text[end:end + TIME_NEAR_DATE_CHARS]
+    return bool(TIME_OF_DAY_RE.search(before) or TIME_OF_DAY_RE.search(after))
+
+
+def answer_dates(text: str) -> List[Tuple[Optional[int], int, int]]:
+    """Every (year or None, month, day) an answer names in one of the ANSWER_* shapes."""
+    found: List[Tuple[Optional[int], int, int]] = []
+    for m in ANSWER_ISO_RE.finditer(text):
+        found.append((int(m.group(1)), int(m.group(3)), int(m.group(4))))
+    for m in ANSWER_NUMERIC_RE.finditer(text):
+        first, second, year = int(m.group(1)), int(m.group(3)), int(m.group(4))
+        found += [(year, first, second), (year, second, first)]
+    for m in ANSWER_MONTH_FIRST_RE.finditer(text):
+        found.append((int(m.group(3)) if m.group(3) else None, month_number(m.group(1)), int(m.group(2))))
+    for m in ANSWER_DAY_FIRST_RE.finditer(text):
+        found.append((int(m.group(3)) if m.group(3) else None, month_number(m.group(2)), int(m.group(1))))
+    return found
+
+
+def month_number(name: str) -> int:
+    return [m.lower() for m in SHORT_MONTHS].index(name[:3].lower()) + 1
+
+
 def day_bucket(days: int) -> str:
     """The placeholder for a date with no time of day: how many calendar days from the request's, and which way."""
     if days == 0:
@@ -300,19 +341,17 @@ class Mapping:
     # (keyed numbers) and epoch timestamps, which become an unnumbered
     # how-far-from-now time token.
     bare_numbers: set = field(default_factory=set)
-    # Dates swapped for a day-count token, in the forms an answer would write
-    # them: the token can't be put back either, so an answer naming one is not
-    # saved (it would carry the recording's day into a replay on another day).
+    # Dates swapped for a day-count token. The token can't be put back, so an
+    # answer naming one is not saved: replayed on another day it would carry
+    # the recording's. `today_dates` are the ones on the request's own day,
+    # which an answer may also name without the year or by weekday.
     dates: set = field(default_factory=set)
+    today_dates: set = field(default_factory=set)
 
-    def add_date(self, when: "date", raw: str) -> None:
-        month = LONG_MONTHS[when.month - 1]
-        self.dates.update({
-            raw, when.isoformat(), when.strftime(LONG_DATE_FORMAT), f"{month} {when.day}, {when.year}",
-            # Without the year, and the weekday: "findings for November 04".
-            when.strftime(MONTH_DAY_FORMAT), f"{month} {when.day}", when.strftime(SHORT_DATE_FORMAT),
-            f"{MONTHS[when.month - 1]} {when.day}", when.strftime(WEEKDAY_FORMAT),
-        })
+    def add_date(self, when: "date", today: bool) -> None:
+        self.dates.add(when)
+        if today:
+            self.today_dates.add(when)
 
     def placeholder(self, cls: str, value: str) -> str:
         key = (cls if cls in (OPAQUE_CLASS, NUMBER_CLASS) else "") + MAPPING_KEY_SEPARATOR + value
@@ -346,8 +385,26 @@ class Mapping:
         return text
 
     def answer_repeats_date(self, text: str) -> bool:
-        """Whether an answer names a date the request's key counts by days, which cannot be put back."""
-        return any(re.search(DATE_BEFORE + re.escape(value) + DATE_AFTER, text) for value in self.dates)
+        """Whether an answer names a date the request's key counts by days, which cannot be put back.
+
+        A date with a year must be one the request held; one without a year,
+        or a weekday, must be the request's own day's.
+        """
+        if not self.dates:
+            return False
+        month_days = {(d.month, d.day) for d in self.today_dates}
+        weekdays = {LONG_DAYS[d.weekday()].lower() for d in self.today_dates}
+        for year, month, day in answer_dates(text):
+            if year is None:
+                if (month, day) in month_days:
+                    return True
+                continue
+            try:
+                if date(year, month, day) in self.dates:
+                    return True
+            except ValueError:
+                continue
+        return any(m.group(1).lower() in weekdays for m in ANSWER_WEEKDAY_RE.finditer(text))
 
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""
@@ -501,9 +558,7 @@ class Normalizer:
 
     def long_date(self, m: "re.Match[str]") -> str:
         month, day, year, sign, hours, minutes = m.groups()
-        after = m.string[m.end():m.end() + TIME_NEAR_DATE_CHARS]
-        before = m.string[max(0, m.start() - TIME_NEAR_DATE_CHARS):m.start()]
-        if TIME_AFTER_DATE_RE.match(after) or TIME_BEFORE_DATE_RE.search(before):
+        if time_near(m.string, m.start(), m.end()):
             return m.group(0)
         try:
             when = datetime(int(year), LONG_MONTHS.index(month) + 1, int(day)).date()
@@ -512,12 +567,13 @@ class Normalizer:
         offset = 0
         if sign:
             offset = (-1 if sign == ZONE_NEGATIVE else 1) * (int(hours) * SECONDS_PER_HOUR + int(minutes) * SECONDS_PER_MINUTE)
-        return self.date_token(when, m.group(0), offset)
+        return self.date_token(when, offset)
 
-    def date_token(self, when: "date", raw: str, offset: int = 0) -> str:
+    def date_token(self, when: "date", offset: int = 0) -> str:
         """A date with no time of day: days from the request's day (at `offset` from UTC), noted as unrestorable."""
-        self.mapping.add_date(when, raw)
-        return day_bucket((when - datetime.fromtimestamp(self.now + offset, timezone.utc).date()).days)
+        days = (when - datetime.fromtimestamp(self.now + offset, timezone.utc).date()).days
+        self.mapping.add_date(when, today=days == 0)
+        return day_bucket(days)
 
     def iso(self, m: "re.Match[str]") -> str:
         year, month, day, hour, minute, second, zone = m.groups()
@@ -526,7 +582,9 @@ class Normalizer:
         except ValueError:
             return m.group(0)
         if hour is None:
-            return self.date_token(when.date(), m.group(0))
+            if time_near(m.string, m.start(), m.end()):
+                return m.group(0)
+            return self.date_token(when.date())
         offset = 0
         if zone and zone != UTC_ZONE:
             sign = -1 if zone[0] == ZONE_NEGATIVE else 1
@@ -557,7 +615,7 @@ class Normalizer:
         now_year = datetime.fromtimestamp(self.now, timezone.utc).year
         try:
             if year:
-                return self.date_token(datetime(int(year), MONTHS.index(month) + 1, int(day)).date(), m.group(0))
+                return self.date_token(datetime(int(year), MONTHS.index(month) + 1, int(day)).date())
             else:
                 when = calendar.timegm(
                     datetime(now_year, MONTHS.index(month) + 1, int(day), int(hour), int(minute)).timetuple()
