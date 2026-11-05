@@ -225,6 +225,11 @@ func runNotify(args []string) error {
 		return fmt.Errorf("notify: unreadable answer: %w", err)
 	}
 	fmt.Println(string(msg.Data))
+	if answer.Error != "" && answer.MessageID == "" && answer.Retry {
+		// Nothing was posted and the same request may land later: the same
+		// exit as no route, which a sender waits out.
+		return fmt.Errorf("notify: the gateway posted nothing, for now: %s: %w", answer.Error, errNotifyRouteUnavailable)
+	}
 	if answer.Error != "" && answer.MessageID == "" {
 		return fmt.Errorf("notify: the gateway posted nothing: %s", answer.Error)
 	}

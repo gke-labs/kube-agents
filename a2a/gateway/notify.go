@@ -51,9 +51,14 @@ const (
 	// grace period.
 	notifyStopGrace = 20 * time.Second
 	// notifyStoppingRefusal is the answer to a request the gateway will not
-	// post because it is stopping. A refusal (exit 1 at the CLI), never
-	// silence: silence reads as "may have posted" and is not retried.
+	// post because it is stopping. A refusal marked Retry (route-unavailable,
+	// exit 4 at the CLI, which a sender waits out), never silence: silence
+	// reads as "may have posted" and is not retried.
 	notifyStoppingRefusal = "the gateway is stopping; not posted"
+	// notifyRecordUnreadable answers a conversation request whose session
+	// record couldn't be read in time. Transient, like the stopping refusal,
+	// and says nothing about whether the conversation exists.
+	notifyRecordUnreadable = "the conversation's record couldn't be read in time; not posted"
 	// notifyEmptyText answers an empty request: nothing to post.
 	notifyEmptyText = "text is empty"
 	// The backoff between attempts to bind the route when the first fails
@@ -492,7 +497,7 @@ func (n *Notifier) handle(m *nats.Msg) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.stopping {
-		answer(n.refuse(notifyStoppingRefusal))
+		answer(n.refuseRetry(notifyStoppingRefusal))
 		return
 	}
 	job := notifyJob{req: req, answer: answer, home: home}
@@ -510,7 +515,7 @@ func (n *Notifier) work() {
 	defer close(n.done)
 	for job := range n.jobs {
 		if n.isStopping() {
-			n.reply(job, n.refuse(notifyStoppingRefusal))
+			n.reply(job, n.refuseRetry(notifyStoppingRefusal))
 			continue
 		}
 		n.post(job)
@@ -523,7 +528,7 @@ func (n *Notifier) drainRefusing() {
 	for {
 		select {
 		case job := <-n.jobs:
-			n.reply(job, n.refuse(notifyStoppingRefusal))
+			n.reply(job, n.refuseRetry(notifyStoppingRefusal))
 		default:
 			return
 		}
@@ -678,7 +683,7 @@ func (n *Notifier) post(job notifyJob) {
 		have, err := n.conv.ConversationContext(ctx, job.req.Conversation)
 		if err != nil {
 			n.log.Warn("notify: session record unreadable", "conversation", job.req.Conversation, "err", err)
-			n.reply(job, n.refuse(notifyConversationRefused))
+			n.reply(job, n.refuseRetry(notifyRecordUnreadable))
 			return
 		}
 		if have == "" || have != job.req.ContextID {
@@ -687,7 +692,7 @@ func (n *Notifier) post(job notifyJob) {
 			return
 		}
 		if n.isStopping() {
-			n.reply(job, n.refuse(notifyStoppingRefusal))
+			n.reply(job, n.refuseRetry(notifyStoppingRefusal))
 			return
 		}
 	}
@@ -1332,6 +1337,14 @@ func (n *Notifier) homePostHint(err error) string {
 func (n *Notifier) refuse(reason string) lib.NotifyReply {
 	n.log.Warn("notify refused", "reason", reason)
 	return lib.NotifyReply{Error: reason}
+}
+
+// refuseRetry is a refusal the sender should wait out rather than count
+// against the destination (lib.NotifyReply.Retry).
+func (n *Notifier) refuseRetry(reason string) lib.NotifyReply {
+	r := n.refuse(reason)
+	r.Retry = true
+	return r
 }
 
 // gatewayConversations is the gateway's NotifyConversations: session records

@@ -656,7 +656,7 @@ func TestNotifyRefusesAConversationItCannotMatch(t *testing.T) {
 		{"no session record", &fakeConversations{contexts: map[string]string{}},
 			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyConversationRefused},
 		{"an unreadable record", &fakeConversations{err: errors.New("kv down")},
-			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyConversationRefused},
+			lib.NotifyRequest{Conversation: testConversation, ContextID: testContext}, notifyRecordUnreadable},
 		{"another backend's conversation", &fakeConversations{contexts: map[string]string{"slack:C1/1.2": testContext}},
 			lib.NotifyRequest{Conversation: "slack:C1/1.2", ContextID: testContext}, "not on this route's backend"},
 		{"no context id", &fakeConversations{contexts: map[string]string{testConversation: ""}},
@@ -680,6 +680,27 @@ func TestNotifyRefusesAConversationItCannotMatch(t *testing.T) {
 	n := newTestNotifier(t, &fakeNotifyPoster{})
 	if got := serveJSON(t, n, lib.NotifyRequest{Text: "x", Conversation: testConversation, ContextID: testContext}); got.Error != notifyNoConversations {
 		t.Fatalf("reply = %+v, want the not-armed refusal from a notifier without conversations", got)
+	}
+}
+
+// A record that can't be read, or a stopping gateway, is a refusal the
+// sender waits out (Retry), and says nothing about the conversation; no
+// record or the wrong context is the one refusal, and not a retry.
+func TestATransientRefusalAsksTheSenderToWait(t *testing.T) {
+	n := newTestNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(&fakeConversations{err: errors.New("kv down")})
+	got := serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: testConversation, ContextID: testContext})
+	if !got.Retry || got.Error != notifyRecordUnreadable {
+		t.Fatalf("unreadable record: reply = %+v, want a retry", got)
+	}
+	n = newTestNotifier(t, &fakeNotifyPoster{})
+	n.SetConversations(&fakeConversations{contexts: map[string]string{}})
+	got = serveJSON(t, n, lib.NotifyRequest{Text: "report", Conversation: testConversation, ContextID: testContext})
+	if got.Retry || got.Error != notifyConversationRefused {
+		t.Fatalf("no record: reply = %+v, want the one refusal and no retry", got)
+	}
+	if r := n.refuseRetry(notifyStoppingRefusal); !r.Retry {
+		t.Fatal("the stopping refusal isn't a retry")
 	}
 }
 
