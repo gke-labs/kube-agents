@@ -220,3 +220,43 @@ func TestReadinessNamesABusOutage(t *testing.T) {
 		t.Fatalf("Readiness with the bus down = %v %q, want the bus named", ready, why)
 	}
 }
+
+// TestATermStartWaitsForTheSessionStateBucket: an elected gateway that wins
+// the lease before the provision Job has created session-state waits for
+// the bucket, reporting the wait through Readiness, rather than ending the
+// term before it starts.
+func TestATermStartWaitsForTheSessionStateBucket(t *testing.T) {
+	r := startRig(t)
+	ctx := context.Background()
+	js := r.bus.JetStream()
+	if err := js.DeleteKeyValue(ctx, lib.SessionStateBucket); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		term uint64
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		term, err := r.g.BeginTerm(ctx)
+		done <- result{term, err}
+	}()
+	waitFor(t, "the term wait in Readiness", func() bool {
+		_, why := r.g.Readiness()
+		return strings.Contains(why, "waiting for bucket "+lib.SessionStateBucket)
+	})
+	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || got.term != 1 {
+			t.Fatalf("BeginTerm = %d, %v, want term 1", got.term, got.err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("BeginTerm didn't return once the bucket existed")
+	}
+	if _, why := r.g.Readiness(); strings.Contains(why, "waiting for bucket") {
+		t.Fatalf("Readiness still names the term wait: %q", why)
+	}
+}

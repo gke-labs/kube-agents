@@ -82,6 +82,15 @@ const (
 	retireRefusalStillOn    = "⚠️ could not close the previous task on the bus; the session route is still on and its pod still there — try `/session off` again in a moment"
 )
 
+// A term start waits for the session-state bucket rather than failing: on a
+// fresh install the provision Job creates it, and can trail the gateway's
+// start. termWaitRetry spaces the attempts, and termWaitLogEvery the log
+// lines while the wait lasts.
+const (
+	termWaitRetry    = 2 * time.Second
+	termWaitLogEvery = 30 * time.Second
+)
+
 // noticeBusUnreachable says a task's publish failed: on its rolling line, or
 // posted when the backend keeps none (StatusShower).
 const noticeBusUnreachable = "❌ could not reach the bus; try again"
@@ -332,6 +341,9 @@ type Gateway struct {
 	// rather than the stream's.
 	relayBound    atomic.Bool
 	relayHeldBack atomic.Bool
+	// termWaiting is set while BeginTerm waits for the session-state bucket,
+	// which the provision Job creates, so Readiness names that wait.
+	termWaiting atomic.Bool
 }
 
 // Options are the injectable pieces; tests provide fakes.
@@ -629,6 +641,9 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // listener answers ReadyzPath from it. It latches: once bound it stays ready,
 // and a later loss of TASKS is the rebuild path's to recover, as before.
 func (g *Gateway) Readiness() (bool, string) {
+	if g.termWaiting.Load() {
+		return false, fmt.Sprintf("waiting for bucket %s: the gateway's term can't start until the provision Job creates it", lib.SessionStateBucket)
+	}
 	if g.relayBound.Load() {
 		return true, "ready"
 	}
@@ -802,8 +817,35 @@ func (g *Gateway) bindRelay(ctx context.Context) (lib.Subscription, error) {
 // BeginTerm starts a new gateway term on the registry every write goes
 // through (Registry.BeginTerm). The election calls it on acquiring the
 // lease, before Run.
+//
+// A missing session-state bucket, or a bus that is down, is waited out
+// rather than returned: returning ends the term before it starts, and the
+// restarted pod meets the same wait. Readiness names it meanwhile.
 func (g *Gateway) BeginTerm(ctx context.Context) (uint64, error) {
-	return g.reg.BeginTerm(ctx)
+	defer g.termWaiting.Store(false)
+	var loggedAt time.Time
+	for {
+		term, err := g.reg.BeginTerm(ctx)
+		if err == nil || !g.termCanWait(err) {
+			return term, err
+		}
+		g.termWaiting.Store(true)
+		if time.Since(loggedAt) >= termWaitLogEvery {
+			g.log.Warn("gateway term: waiting for the session-state bucket", "bucket", lib.SessionStateBucket, "err", err)
+			loggedAt = time.Now()
+		}
+		select {
+		case <-ctx.Done():
+			return 0, err
+		case <-time.After(termWaitRetry):
+		}
+	}
+}
+
+// termCanWait reports whether a term start's error is one that clears on its
+// own: the bucket not created yet, or the bus unreachable.
+func (g *Gateway) termCanWait(err error) bool {
+	return errors.Is(err, jetstream.ErrBucketNotFound) || (g.client != nil && !g.client.Connected())
 }
 
 // OnFenced sets what runs when a registry write is refused because a newer
