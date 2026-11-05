@@ -336,13 +336,15 @@ func buildDispatchJobIndex(agent *agentv1alpha1.PlatformAgent, templates map[str
 
 // buildDispatchJobIndexFor is the index listing accounts.
 func buildDispatchJobIndexFor(agent *agentv1alpha1.PlatformAgent, accounts []string) *agentv1alpha1.DispatchJobTemplate {
-	accounts = slices.Clone(accounts)
+	// Never nil: an index with no accounts is sent as an empty list, not as
+	// an empty spec (see DispatchJobTemplateSpec.ServiceAccounts).
+	accounts = append([]string{}, accounts...)
 	sort.Strings(accounts)
 	accounts = slices.Compact(accounts)
 	return &agentv1alpha1.DispatchJobTemplate{
 		TypeMeta:   metav1.TypeMeta{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "DispatchJobTemplate"},
 		ObjectMeta: metav1.ObjectMeta{Name: dispatchJobIndexName, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent)},
-		Spec:       agentv1alpha1.DispatchJobTemplateSpec{ServiceAccounts: accounts},
+		Spec:       agentv1alpha1.DispatchJobTemplateSpec{ServiceAccounts: &accounts},
 	}
 }
 

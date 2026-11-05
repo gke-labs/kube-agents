@@ -69,6 +69,45 @@ func TestTheIndexIsSentWithoutATemplate(t *testing.T) {
 	if _, ok := obj.Spec["serviceAccounts"]; !ok {
 		t.Errorf("the index is sent without its serviceAccounts: %s", raw)
 	}
+	// With no accounts it still sends a list: an empty spec, applied over
+	// an index that had accounts, is pruned to null and refused (also found
+	// live).
+	raw, err = json.Marshal(buildDispatchJobIndexFor(a2aTestAgent(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj.Spec = nil
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(obj.Spec["serviceAccounts"]); got != "[]" {
+		t.Errorf("an index with no accounts is sent with serviceAccounts %q; want []", got)
+	}
+	// A template param sends no serviceAccounts key: a null is refused as
+	// not an array (found live too).
+	param, err := buildDispatchJobTemplate(a2aTestAgent(), "tse", &corev1.PodTemplateSpec{Spec: corev1.PodSpec{ServiceAccountName: "agentprofile-tse-unattended"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err = json.Marshal(param)
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj.Spec = nil
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if sa, ok := obj.Spec["serviceAccounts"]; ok {
+		t.Errorf("a template param is sent with serviceAccounts %s; want no key", sa)
+	}
+}
+
+// indexAccounts is an index param's accounts, nil-safe.
+func indexAccounts(p *agentv1alpha1.DispatchJobTemplate) []string {
+	if p.Spec.ServiceAccounts == nil {
+		return nil
+	}
+	return *p.Spec.ServiceAccounts
 }
 
 // One rendering reaches both readers: the template in the dispatch config
@@ -133,7 +172,7 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
 		t.Fatalf("the policy's index: %v", err)
 	}
-	if got, want := strings.Join(index.Spec.ServiceAccounts, ","), inConfig.Spec.ServiceAccountName; got != want || want == "" {
+	if got, want := strings.Join(indexAccounts(&index), ","), inConfig.Spec.ServiceAccountName; got != want || want == "" {
 		t.Errorf("the index lists %q, want the template's account %q", got, want)
 	}
 	for _, pt := range []*agentv1alpha1.DispatchJobTemplate{&param, &index} {
@@ -156,7 +195,7 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
 		t.Fatal(err)
 	}
-	if got := index.Spec.ServiceAccounts; len(got) != 0 {
+	if got := indexAccounts(&index); len(got) != 0 {
 		t.Errorf("the index still lists %q", got)
 	}
 }
@@ -336,7 +375,7 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 			}
 		}
 		{
-			for _, sa := range index.Spec.ServiceAccounts {
+			for _, sa := range indexAccounts(&index) {
 				if !running[sa] {
 					t.Errorf("after %s %T %s: the index lists %s, which no template runs as, so a Job as %s is held to nothing", op, obj, obj.GetName(), sa, sa)
 				}
@@ -384,7 +423,7 @@ func TestTheJobPolicyHoldsAfterEveryOperatorWrite(t *testing.T) {
 		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobIndexName}, &index); err != nil {
 			t.Fatalf("%s: the index: %v", step, err)
 		}
-		if got := strings.Join(index.Spec.ServiceAccounts, ","); got != strings.Join(want, ",") {
+		if got := strings.Join(indexAccounts(&index), ","); got != strings.Join(want, ",") {
 			t.Errorf("%s: the index lists %q, want %q", step, got, strings.Join(want, ","))
 		}
 	}

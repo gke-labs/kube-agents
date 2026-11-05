@@ -38,9 +38,13 @@ type DispatchJobTemplateSpec struct {
 	Template *runtime.RawExtension `json:"template,omitempty"`
 
 	// ServiceAccounts, on the index only, are the accounts the templates run
-	// as: a dispatcher Job must run as one of them.
+	// as: a dispatcher Job must run as one of them. A pointer: the index
+	// always sends the list, empty when there are no accounts, since
+	// server-side apply prunes a spec left with no fields to null, which the
+	// schema refuses; a template param leaves it nil, so it isn't sent (a
+	// null would be refused as not an array).
 	// +optional
-	ServiceAccounts []string `json:"serviceAccounts,omitempty"`
+	ServiceAccounts *[]string `json:"serviceAccounts,omitempty"`
 }
 
 // +kubebuilder:object:root=true

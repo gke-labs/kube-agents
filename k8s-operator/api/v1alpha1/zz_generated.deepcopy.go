@@ -925,8 +925,12 @@ func (in *DispatchJobTemplateSpec) DeepCopyInto(out *DispatchJobTemplateSpec) {
 	}
 	if in.ServiceAccounts != nil {
 		in, out := &in.ServiceAccounts, &out.ServiceAccounts
-		*out = make([]string, len(*in))
-		copy(*out, *in)
+		*out = new([]string)
+		if **in != nil {
+			in, out := *in, *out
+			*out = make([]string, len(*in))
+			copy(*out, *in)
+		}
 	}
 }
 
