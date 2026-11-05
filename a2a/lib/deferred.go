@@ -27,9 +27,11 @@ import (
 // returns. Until then the lib renews the delivery with in-progress acks paced
 // from the durable's AckWait. Stop gives every unsettled delivery back at
 // once, so another subscriber on the durable gets it without waiting out
-// AckWait. A redelivery is expected (after a stop, or a holder that died) and
-// is the caller's to recognise: the envelopeId dedup doesn't apply, and
-// Sequence is what to recognise it by.
+// AckWait; the deliveries come back in stream order only to a subscriber
+// already bound when the give-back falls due (see giveBack). A redelivery is
+// expected (after a stop, or a holder that died) and is the caller's to
+// recognise: the envelopeId dedup doesn't apply, and Sequence is what to
+// recognise it by.
 
 // deferredDrainTimeout bounds how long a stop waits for the consume context to
 // drain. A connection already gone never closes it; the unsettled deliveries
@@ -136,10 +138,20 @@ func (d *deferredState) giveBack() {
 		pending = append(pending, dd)
 	}
 	d.mu.Unlock()
-	// In stream order, so the next subscriber gets them back in the order
-	// they first came. A run of immediate naks comes back in no order the
-	// server promises (newest first, measured on 2.15), but a delayed one is
-	// redelivered when its delay ends, so the delays set the order.
+	// In stream order. The give-back falls due when the delays end and the
+	// server queues the deliveries for redelivery; a subscriber already bound
+	// to the durable then (its pull request waiting on the server) gets them
+	// back in the order they first came. A run of immediate naks comes back
+	// in no order the server promises (newest first, measured on 2.15), but a
+	// delayed one is redelivered when its delay ends, so the delays set the
+	// order. The order holds no further than that. With no subscriber bound
+	// when the give-back falls due, the server (2.15) takes the oldest
+	// delivery for the pull request this subscriber left waiting, finds
+	// nobody listening on it, and puts the delivery back at the end of its
+	// redelivery queue, so a subscriber that binds later gets it last. And
+	// only the deliveries given back here are ordered: a message the server
+	// hadn't sent this subscriber yet can reach a bound subscriber ahead of
+	// them, as new.
 	sort.Slice(pending, func(i, j int) bool { return pending[i].seq < pending[j].seq })
 	for i, dd := range pending {
 		_ = dd.Nak(time.Duration(i+1) * giveBackSpacing)

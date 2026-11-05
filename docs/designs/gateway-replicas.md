@@ -77,8 +77,12 @@ leader hold its relay too.
 
 - **Graceful (a rollout, a drain).** The active replica stops as above and releases the lease.
   The standby, which has been retrying the lease every `retryPeriod` (2s, jittered to between 2 and
-  4.4s by client-go), acquires it and starts. Events the old replica gave back are redelivered at
-  once, in order. The gap is the standby's next retry plus its start-up (Slack's `auth.test` and
+  4.4s by client-go), acquires it and starts. Events the old replica gave back are redelivered as
+  soon as the standby's relay binds, without waiting out AckWait, but not always in order: the
+  give-back keeps stream order only for a relay already bound when it falls due, milliseconds
+  after the stop, and with none bound the bus can move the oldest event behind the rest. The relay
+  sorts each batch by stream sequence, which restores the order only among events that land in
+  one batch. The gap is the standby's next retry plus its start-up (Slack's `auth.test` and
   socket, Discord's identify, the relay's bind): a few seconds.
 - **Crash.** The lease expires (`leaseDuration`, 20s) and the standby takes it. The dead replica's
   held relay events come back only when the relay durable's AckWait (30s) runs out, and a newer
