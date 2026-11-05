@@ -105,7 +105,11 @@
           { "text": "Roll back" }
         ]
       },
-      "findings": ["choice-raw-command", "choice-raw-command", "choice-raw-command"]
+      "findings": [
+        "choice-raw-command",
+        "choice-raw-command",
+        "choice-raw-command"
+      ]
     },
     {
       "name": "every-headline-rule-at-once",
