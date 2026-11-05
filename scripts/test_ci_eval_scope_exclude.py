@@ -266,8 +266,11 @@ class SettleTest(unittest.TestCase):
         rendered = {"present": True, "exclude": {"projects": [], "clusters": file_clusters}}
         # A tick landing between the deadline's computation and the stub's first
         # read, the gap a spin from the stub's own baseline would mistake for a
-        # phase it still has to wait out.
-        gap_tick = 'local tick=$SECONDS; while [ "$SECONDS" -eq "$tick" ]; do sleep 0.01; done' if tick_before_first_call else ""
+        # phase it still has to wait out. Measured from the deadline's second,
+        # not from the stub's clock: a tick the clock took on its own in that
+        # gap already is the tick, and a spin from the stub's clock would wait
+        # out a second one, the very flaw the case guards against.
+        gap_tick = 'while [ "$SECONDS" -le "$((deadline - EVAL_SCOPE_SETTLE_SECONDS))" ]; do sleep 0.01; done' if tick_before_first_call else ""
         stub = textwrap.dedent(
             f"""\
             echo {reconcile_rcs} > rcs
