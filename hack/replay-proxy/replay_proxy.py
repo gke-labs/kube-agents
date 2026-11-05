@@ -13,8 +13,9 @@ client, the proxy:
 - normalizes the request and computes its fingerprint (normalizer.py);
 - writes one JSON line to stdout: the fingerprint, per-message hashes, token
   usage, model latency, a hash of the answer and LiteLLM's fallback headers.
-  Nothing in the line is request text, but its hashes can be guessed
-  against, so the log is private, like the stored text;
+  A shadow or record line holds no request text; a replay miss line adds
+  short scrubbed snippets of the message where it differed. Its hashes can be
+  guessed against too, so the log is private, like the stored text;
 - adds `diag_message_hashes` and `diag_settings_hash` (diagnosis.py), used
   only to find the closest earlier request for a miss;
 - scrubs the request text and keeps it under the store directory
