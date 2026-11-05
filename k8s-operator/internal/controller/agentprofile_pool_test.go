@@ -536,3 +536,47 @@ func TestTheWorkerFitsAutopilotUpToTheToolLimit(t *testing.T) {
 		t.Errorf("with %d tools the worker requests %s of ephemeral storage, past Autopilot's 10Gi per pod", profileWorkerAutopilotToolLimit, req.String())
 	}
 }
+
+// Past the tool limit with image volumes off, the pool isn't applied, the
+// reconcile reports the profile as a profile-namespace error, and the other
+// profiles' pools still go out. With image volumes on, the same profile gets
+// its pool.
+func TestAProfilePastTheToolLimitGetsNoPoolWithoutImageVolumes(t *testing.T) {
+	withDispatcher(t)
+	agent := a2aTestAgent()
+	pns := profileNamespaceName(agent)
+	big := testAgentProfile(agent.Namespace, "big", func(p *agentv1alpha1.AgentProfile) {
+		for i := 0; i <= profileWorkerAutopilotToolLimit; i++ {
+			p.Spec.Tools = append(p.Spec.Tools, agentv1alpha1.AgentProfileTool{Name: fmt.Sprintf("tool%d", i), Image: fmt.Sprintf("registry.example/tool%d:1", i)})
+		}
+	})
+	small := testAgentProfile(agent.Namespace, "small")
+	r, c := poolTestReconciler(t, agent)
+	ctx := context.Background()
+	pool := func(name string) error {
+		return c.Get(ctx, types.NamespacedName{Namespace: pns, Name: profilePoolName(name, "read")}, &appsv1.Deployment{})
+	}
+
+	agent.Annotations = map[string]string{"kubeagents.x-k8s.io/enable-image-volumes": "false"}
+	profileErr, err := r.reconcileA2ADispatcher(ctx, agent, []agentv1alpha1.AgentProfile{big, small}, true)
+	if err != nil || profileErr == nil {
+		t.Fatalf("a profile past the tool limit should surface as a profile-namespace error: %v / %v", err, profileErr)
+	}
+	if want := fmt.Sprintf("AgentProfile big has %d tools", profileWorkerAutopilotToolLimit+1); !strings.Contains(profileErr.Error(), want) {
+		t.Errorf("the error %q doesn't name the profile and its tools (%q)", profileErr, want)
+	}
+	if err := pool("big"); !apierrors.IsNotFound(err) {
+		t.Errorf("a profile past the tool limit got a pool without image volumes: %v", err)
+	}
+	if err := pool("small"); err != nil {
+		t.Errorf("a profile past the tool limit held up another profile's pool: %v", err)
+	}
+
+	agent.Annotations["kubeagents.x-k8s.io/enable-image-volumes"] = "true"
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, []agentv1alpha1.AgentProfile{big, small}, true); err != nil || profileErr != nil {
+		t.Fatalf("with image volumes: %v / %v", err, profileErr)
+	}
+	if err := pool("big"); err != nil {
+		t.Errorf("with image volumes the profile got no pool: %v", err)
+	}
+}

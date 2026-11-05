@@ -47,8 +47,8 @@ const (
 	// /healthz, pod-local.
 	profileWorkerStatusPort = 8080
 
-	profileWorkerScratchVolume    = "scratch"
-	profileWorkerScratchPath      = "/scratch"
+	profileWorkerScratchVolume = "scratch"
+	profileWorkerScratchPath   = "/scratch"
 	// 2Gi: the session worker, the same image and harness, left its 1Gi
 	// scratch at 4 KiB over a week of dev-lane sessions (a2a/gateway/
 	// spawn.go), and the image has no git to clone with. Twice that floor
@@ -358,26 +358,36 @@ func buildProfileCABundle(agent *agentv1alpha1.PlatformAgent, data map[string]st
 func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution) error {
 	imageVolumes := r.imageVolumeSupported(agent)
 	var pools []*appsv1.Deployment
+	var errs []error
+	want := map[string]bool{}
 	for i := range profiles {
 		res := resolved[profiles[i].Name]
 		if res.refused != nil {
 			continue
 		}
 		for _, id := range res.identities {
-			if interactiveTier(id.tier) {
-				pools = append(pools, buildProfilePool(agent, &profiles[i], id.tier, id.serviceAccount, imageVolumes))
+			if !interactiveTier(id.tier) {
+				continue
 			}
+			pool := buildProfilePool(agent, &profiles[i], id.tier, id.serviceAccount, imageVolumes)
+			want[pool.Name] = true
+			// Past the tool limit with image volumes off, the worker's
+			// ephemeral request passes Autopilot's 10Gi and its pods would
+			// never schedule. The pool isn't applied, and the error names the
+			// profile, like a pool the API server refuses (which stays
+			// wanted too, so an earlier pool isn't swept).
+			if n := len(profiles[i].Spec.Tools); !imageVolumes && n > profileWorkerAutopilotToolLimit {
+				errs = append(errs, fmt.Errorf("the warm pool %s: AgentProfile %s has %d tools; without image volumes a worker fits Autopilot's 10Gi of ephemeral storage with at most %d",
+					pool.Name, profiles[i].Name, n, profileWorkerAutopilotToolLimit))
+				continue
+			}
+			pools = append(pools, pool)
 		}
 	}
-	if len(pools) == 0 {
+	if len(want) == 0 {
 		// Nothing left to mount the bundle copy either.
 		return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
 	}
-	want := map[string]bool{}
-	for _, pool := range pools {
-		want[pool.Name] = true
-	}
-	var errs []error
 	// The CA bundle the pools mount, copied before the pools that need it.
 	// A copy that fails skips the pool applies (they would mount nothing)
 	// but not the sweep, which needs nothing from it.
