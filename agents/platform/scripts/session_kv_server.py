@@ -168,7 +168,7 @@ CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
 # DATA_VOLUME_REARM_PERCENT it says that too, and the warning is re-armed. The
 # operator reports the same reading on the CR as the DataVolumeNearlyFull
 # condition; this is the half a chat user sees.
-DATA_VOLUME_PATH = os.getenv("PLATFORM_AGENT_HOME", "/opt/data")
+DATA_VOLUME_PATH = os.getenv("PLATFORM_AGENT_HOME") or "/opt/data"
 DATA_VOLUME_CHECK_INTERVAL_SECONDS = 300
 DATA_VOLUME_REARM_PERCENT = 85
 DATA_VOLUME_CLEARED = "The agent's data volume is back to {percent}% full ({used:.1f} of {total:.1f} GiB)."

@@ -12612,6 +12612,23 @@ class TestDataVolumeWarning(unittest.TestCase):
         self.post.assert_not_called()
         self.assertFalse(session_kv_server._data_volume_warned())
 
+    def test_an_empty_agent_home_measures_the_default_volume(self):
+        # As the entrypoint and gitops_workspace read it: an empty value is
+        # unset, and the working directory is not the data volume.
+        import subprocess
+
+        env = dict(os.environ, PLATFORM_AGENT_HOME="")
+        result = subprocess.run(
+            [sys.executable, "-c", "import session_kv_server as s; print(s.DATA_VOLUME_PATH)"],
+            cwd=Path(session_kv_server.__file__).resolve().parent,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "/opt/data")
+
     def test_reads_a_real_filesystem(self):
         patch.stopall()
         usage = session_kv_server.kanban_board_health.data_volume_usage(Path(tempfile.gettempdir()))
