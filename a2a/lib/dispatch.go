@@ -19,8 +19,9 @@ import (
 // dispatcher, the bucket's only writer, persists it under a key that starts
 // with that (profile, tier, pod). Workers hold no grant on the bucket at all:
 // a KV bucket allows rollup headers, so a put grant on any key would let a
-// worker purge every lease in it. After a restart the dispatcher lists a
-// (profile, tier)'s keys to rebuild which workers are busy.
+// worker purge every lease in it. Before each hand-off the dispatcher reads
+// a (profile, tier)'s records to know which workers are busy, held here or
+// not (a restart's redeliveries come up to an AckWait later).
 
 // ProfileLeaseBucket is the KV bucket the leases live in.
 const ProfileLeaseBucket = "PROFILE_LEASES"
@@ -36,6 +37,13 @@ const ProfileSubmitRetention = 72 * time.Hour
 // writes for a submission it refused at admission, which no pod ever held.
 // It is not a DNS label, so it can't be a pod's name.
 const ProfileLeaseRefusedPod = "_refused"
+
+// DispatcherSession is the `from.session` of the terminals the profile
+// dispatcher writes on a profile task's `…supervisor` subject (a refusal at
+// admission, a lease or deadline failure). A consumer that names its
+// supervisor (AgreementPolicy.Supervisor) lists it in OtherSupervisors to
+// read them.
+const DispatcherSession = "dispatcher"
 
 // DispatchSubject is where the dispatcher hands a task to one worker pod of
 // a (profile, tier) pool.
@@ -351,7 +359,7 @@ type DispatchProfile struct {
 	Durables []DispatchDurable `json:"durables"`
 }
 
-// DispatchDurable names one shared durable on TASKS.
+// DispatchDurable names one shared durable on ProfileSubmitStream.
 type DispatchDurable struct {
 	Tier string `json:"tier"`
 	Kind string `json:"kind"`

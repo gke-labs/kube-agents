@@ -25,9 +25,9 @@ const (
 
 const (
 	// terminalEnvelopePrefix makes the dispatcher's terminal for a task one
-	// envelope id, so a terminal re-published after a redelivery (the first
-	// was published but the ack never landed) is dropped by the stream's
-	// duplicate window rather than stored twice.
+	// envelope id (terminalEnvelopeID), so a terminal re-published after a
+	// redelivery (the first was published but the ack never landed) is
+	// dropped by the stream's duplicate window rather than stored twice.
 	terminalEnvelopePrefix = "env-dispatch-terminal-"
 	// noticeRole is the A2A role of the terminal's message.
 	noticeRole = "agent"
@@ -50,13 +50,23 @@ func noticeText(reason, detail string) string {
 	return noticeReasonPrefix + reason + noticeDetailSeparator + detail
 }
 
+// terminalEnvelopeID is the one envelope id of a task's dispatcher terminal.
+// The TASKS stream's duplicate window is keyed on it alone, whatever the
+// subject, and a task id is unique only within its (profile, tier, kind)
+// durable, so it carries all four: a second profile's terminal for the same
+// task id is its own message, not a duplicate of the first's. The parts are
+// subject tokens, so none holds a dot and the dotted id is unambiguous.
+func terminalEnvelopeID(hk holdKey) string {
+	return terminalEnvelopePrefix + hk.profile + "." + hk.tier + "." + hk.kind + "." + hk.taskID
+}
+
 // publishTerminal is the dispatcher's one write to a task: a final status
 // update on its `.supervisor` subject (lib.TaskSupervisorSubject, contract
 // addendum 6), `rejected` for a submission refused at admission (nothing
 // ran) or `failed` once a worker had it. `.supervisor`, not `.events`, so
 // `.events` stays the executor's alone and replay can tell the two apart.
 // Every terminal the dispatcher writes goes through here.
-func (d *Dispatcher) publishTerminal(ctx context.Context, profile string, sub *lib.Envelope, state lib.TaskState, reason, detail string) error {
+func (d *Dispatcher) publishTerminal(ctx context.Context, hk holdKey, sub *lib.Envelope, state lib.TaskState, reason, detail string) error {
 	payload, err := json.Marshal(lib.StatusUpdate{
 		TaskID:    sub.TaskID,
 		ContextID: sub.ContextID,
@@ -72,9 +82,9 @@ func (d *Dispatcher) publishTerminal(ctx context.Context, profile string, sub *l
 	}
 	env, err := lib.NewStatusUpdateEnvelope(lib.Party{Session: selfSession, AgentType: selfAgentType},
 		sub.TaskID, sub.ContextID, sub.CorrelationID, payload,
-		lib.WithEnvelopeID(terminalEnvelopePrefix+sub.TaskID))
+		lib.WithEnvelopeID(terminalEnvelopeID(hk)))
 	if err != nil {
 		return fmt.Errorf("build the %s terminal: %w", reason, err)
 	}
-	return d.bus.Publish(ctx, lib.TaskSupervisorSubject(profile, sub.TaskID), env)
+	return d.bus.Publish(ctx, lib.TaskSupervisorSubject(hk.profile, sub.TaskID), env)
 }

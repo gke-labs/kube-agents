@@ -76,7 +76,15 @@ readonly KUBECONFIG_READ_RC_NO_PARSER=12
 # a margin lets a queued call wait its turn, and past it the broker has
 # answered or refused, so waiting longer only delays the JSON. Each call gets
 # the smaller of that cap and what the budget has left, and a call that hits
-# its cap says which bound it ran into.
+# its cap says which bound it ran into. The shim retries a refusal on its own
+# (credential_proxy_client.py), keeping a retry's admission wait, but not the
+# command's run after it, inside a deadline the caller may shorten through
+# SHIM_RETRY_DEADLINE_ENV. The cap has room for one admission wait and one
+# run: a retry admitted late and then run would carry past it, where
+# `timeout` kills the shim with the broker's reason unread and this script's
+# text stands in for it. So `capped` tells the shim the cap less the margin
+# and the run bound, 60 s, under which no retry fits, and the shim gives up
+# at the first refusal, held or immediate, with that refusal's text.
 #
 # An instruction that passes the tool a larger `timeout` can raise the budget
 # to match through CLUSTER_PREFLIGHT_BUDGET_SECONDS (today no instruction does,
@@ -94,6 +102,10 @@ readonly BROKER_ADMISSION_WAIT_SECONDS=60
 readonly BROKER_KUBECTL_RUN_SECONDS=60
 readonly CAP_MARGIN_SECONDS=5
 readonly KUBECTL_CAP_SECONDS=$((BROKER_ADMISSION_WAIT_SECONDS + BROKER_KUBECTL_RUN_SECONDS + CAP_MARGIN_SECONDS))
+# The shim's variable for the deadline its retries keep to, in seconds from
+# its first send (credential_proxy_client.RETRY_DEADLINE_ENV; test_cluster_preflight.py
+# holds the two equal).
+readonly SHIM_RETRY_DEADLINE_ENV=CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS
 # The smallest cap a call gets once the budget is spent: one second, because
 # `timeout 0` runs the command uncapped. What `timeout` exits with when it fires.
 readonly KUBECTL_CAP_FLOOR_SECONDS=1
@@ -104,10 +116,12 @@ readonly RC_TIMED_OUT=124
 readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|connection refused|network is unreachable|TLS handshake timeout|dial tcp'
 # ...except the shim's own messages, which are the shim or the broker and not
 # the cluster (matched on the shim's prefixes, since the cap text above
-# mentions "the credential proxy's admission wait" and is a real timeout), and
-# anything the API server answered, which "Error from server" fronts: a
-# degraded etcd's "request timed out" was reached, and the list cannot help.
-readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy( token)? unavailable|credential proxy error|credential proxy:|Error from server'
+# mentions "the credential proxy's admission wait" and is a real timeout; only
+# its terminal lines, since a "credential proxy busy ... retrying" line is
+# followed by the admitted attempt's own stderr), and anything the API server
+# answered, which "Error from server" fronts: a degraded etcd's "request timed
+# out" was reached, and the list cannot help.
+readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy( token)? unavailable|credential proxy error|credential proxy:|credential proxy throttled|Error from server'
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
 readonly RC_COMMAND_NOT_EXECUTABLE=126
@@ -202,8 +216,14 @@ call_cap() {
     [ "$cap" -lt "$KUBECTL_CAP_FLOOR_SECONDS" ] && cap="$KUBECTL_CAP_FLOOR_SECONDS"
     printf '%s' "$cap"
 }
+# The deadline the shim is told under a cap: the cap less the margin and the
+# command's run bound, which the shim's rule does not reserve, so a retry it
+# admitted late would still run out before `timeout` fires; never negative.
+# Under the per-call cap that is 60 s, which no retry fits.
+readonly SHIM_DEADLINE_RESERVE_SECONDS=$((CAP_MARGIN_SECONDS + BROKER_KUBECTL_RUN_SECONDS))
+shim_deadline() { printf '%s' "$(( $1 > SHIM_DEADLINE_RESERVE_SECONDS ? $1 - SHIM_DEADLINE_RESERVE_SECONDS : 0 ))"; }
 if command -v timeout >/dev/null 2>&1; then
-    capped() { timeout "$1" "${@:2}"; }
+    capped() { env "$SHIM_RETRY_DEADLINE_ENV=$(shim_deadline "$1")" timeout "$1" "${@:2}"; }
 else
     capped() { "${@:2}"; }
 fi

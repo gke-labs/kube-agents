@@ -1,0 +1,37 @@
+# Whole-cluster kubectl reads under agents/ that were there when
+# scripts/check_cluster_reads.py arrived, pinned at the count each file had
+# that day. One entry per line: `<path> <rule> <count> <reason>`, the path
+# relative to the repository root, the rule as the check reports it
+# (`multi-kind-dump`, `unpaged-list` or `unresolved-kinds`), the count above
+# zero, the reason the rest of the line.
+#
+# The list only shrinks. The check fails when a file has more findings than
+# its entry (a rise), when it has fewer (lower the count, or remove the entry
+# once the file is clean), when an entry names a file the check does not
+# scan, repeats a file and rule, names another rule, or is not an entry. A
+# file with no entry is held at zero, so a new whole-cluster read anywhere is
+# a failure, never a new line here.
+#
+# Every read below is one the pagination conversion of the collectors and
+# the SOPs replaces with a paged or per-kind read; an entry leaves this file
+# when its read is converted. `python3 scripts/check_cluster_reads.py --counts`
+# prints the first three fields for the tree as it stands.
+
+agents/platform/governance/ai_security_audit_sop.md multi-kind-dump 2 the AI-workload audit's per-cluster dump of Deployments, StatefulSets, DaemonSets, CronJobs and Pods, and the same dump as the checks_run example's command
+agents/platform/governance/ai_security_audit_sop.md unpaged-list 1 the AI-workload audit's per-cluster Service read
+agents/platform/governance/cluster_inventory_audit_sop.md unpaged-list 1 names the Deployment dump as a read the collector must not skip over; the step runs through collect.py's shared dump
+agents/platform/governance/compliance_audit_sop.md unpaged-list 3 the compliance audit's Config Connector and Config Sync (RootSync, RepoSync) reads per cluster, CRDs outside the paged collections
+agents/platform/governance/fleet_wide_cost_analysis_sop.md multi-kind-dump 2 the cost SOP's fifteen-kind dump per cluster and the Deployment-and-StatefulSet read the age check joins against
+agents/platform/governance/fleet_wide_cost_analysis_sop.md unpaged-list 7 the Pod, PVC and Job reads the cost SOP's checks join against the dump
+agents/platform/governance/obtainability_audit_sop.md multi-kind-dump 1 the obtainability audit's thirteen-kind dump per cluster
+agents/platform/governance/obtainability_audit_sop.md unpaged-list 1 the obtainability audit's ComputeClass read
+agents/platform/governance/stockout_prevention_sop.md multi-kind-dump 2 the stockout SOP's dump of ComputeClasses, workloads and StorageClasses, and the ComputeClass check's own read
+agents/platform/governance/stockout_prevention_sop.md unpaged-list 1 the ComputeClass read the checks_run example shows as its command
+agents/platform/scripts/audit_certificates.py unpaged-list 3 the certificate collector lists Certificates, Issuers and ManagedCertificates one kind per call; its helper appends -o json
+agents/platform/scripts/audit_networking.py unpaged-list 6 the networking collector lists Services, Ingresses, Gateways, HTTPRoutes, BackendConfigs and HealthCheckPolicies one kind per call; its helper appends -o json
+agents/platform/scripts/audit_storage.py unpaged-list 1 the storage collector's PVC list; its helper appends -o json
+agents/platform/skills/capacity-obtainability/SKILL.md unpaged-list 1 the skill's raw read of the metrics API's node list, one entry per node
+agents/platform/skills/fleet-audit/scripts/collect.py unpaged-list 5 the fleet-audit collector's single-kind ComputeClass, ccnp and Config Connector reads, and the Config Sync loop's RootSync and RepoSync reads, CRDs outside the paged collections
+agents/platform/skills/fleet-audit/scripts/fleet_stockout.py unpaged-list 1 the stockout collector's one-shot ComputeClass read, the one kind of its former five-kind dump the paged dump does not cover (a CRD outside the paged collections)
+agents/platform/skills/gitops-helm-chart/SKILL.md unpaged-list 4 the GitOps controller discovery reads (Argo CD Applications, Flux Kustomizations, Config Sync RootSyncs and RepoSyncs) the skill tells the model to run
+agents/platform/skills/submit-suggestion/SKILL.md unpaged-list 4 the same GitOps controller discovery reads, run against the target cluster's kubeconfig

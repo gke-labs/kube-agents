@@ -29,6 +29,8 @@ CONVERSATION = "issue"
 DIFF_NOTE = "review_comment"
 #: The kinds an award emoji can be left on: every note.
 ACKNOWLEDGEABLE = frozenset({CONVERSATION, DIFF_NOTE})
+#: The neutral review state an approval becomes: GitLab has no other kind.
+APPROVED = "approved"
 
 #: How GitLab names the bot user behind a project or group access token.
 #: `bot` is on the user object only on some endpoints, so the name is the
@@ -189,14 +191,58 @@ def is_system_note(node: dict[str, Any]) -> bool:
 
 
 def commit(node: dict[str, Any]) -> dict[str, Any]:
-    """One commit. The committer date, for the reason GitHub's translation gives."""
+    """One commit. The committer date, for the reason GitHub's translation gives.
+
+    GitLab links a commit to no account here: it answers a git name and an
+    email, so `author` is the name, `email` is the only thing that says the
+    commit is the install's own, and `bot` is always False.
+    """
     return {
         "sha": node.get("id") or "",
         "author": node.get("author_name") or "",
+        "email": node.get("author_email") or "",
+        "bot": False,
         "committed": node.get("committed_date") or "",
         "message": node.get("message") or "",
         "url": node.get("web_url") or "",
     }
+
+
+def authored(node: dict[str, Any]) -> dict[str, Any]:
+    """A merge request as one of an author's proposals."""
+    item = proposal(node)
+    return {
+        "number": item["number"],
+        "state": item["state"],
+        "author": item["author"],
+        "authorBot": is_automation(node.get("author")),
+        "created": item["created"],
+        "updated": item["updated"],
+        "closed": item["closed"],
+    }
+
+
+def approval(entry: dict[str, Any]) -> dict[str, Any]:
+    """One `approved_by` entry of a merge request's approvals, as a review.
+
+    GitLab's approvals carry no body and no review of their own, so each is an
+    `approved` review keyed by the approver's user id. It gives no time an
+    approval was made, so `created` is "".
+    """
+    user = entry.get("user") or {}
+    return {
+        "id": user.get("id"),
+        "state": APPROVED,
+        "author": actor(user),
+        "bot": is_automation(user),
+        "created": "",
+    }
+
+
+def closer(node: dict[str, Any]) -> dict[str, Any]:
+    """Who a merge request names as `closed_by`; "" for none, as on a merge."""
+    who = node.get("closed_by")
+    return {"actor": actor(who), "bot": is_automation(who)}
 
 
 def label(node: dict[str, Any]) -> dict[str, Any]:

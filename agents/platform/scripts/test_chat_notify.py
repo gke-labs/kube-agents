@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -16,6 +17,83 @@ import chat_notify  # noqa: E402
 import chat_platforms  # noqa: E402
 
 ROUTED = {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
+
+
+class HomeFileTest(unittest.TestCase):
+    """The home channel the operator projects into the pod as a file.
+
+    A learned channel is never rendered into the pod env; ``routed_platform``
+    and ``home_file_value`` take it from the file after a non-empty env, and
+    read it on every call because the kubelet refreshes it in place.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {
+            chat_notify.NOTIFY_PLATFORM_ENV: "",
+            chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        directory = mock.patch.object(chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_projected_channel_routes_slack_and_names_the_home(self):
+        self._write("C0FILE\n")
+        self.assertEqual(chat_notify.home_file_value(), "C0FILE")
+        self.assertEqual(chat_notify.routed_platform(), "slack")
+        self.assertTrue(chat_notify.routes("slack"))
+
+    def test_a_non_empty_env_wins_over_the_file(self):
+        self._write("C0FILE\n")
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
+            self.assertEqual(chat_notify.routed_platform(), "google_chat")
+
+    def test_an_empty_or_absent_file_routes_nothing(self):
+        # The directory is mounted and empty: the Optional volume before the
+        # operator writes the ConfigMap. Mounted, no home.
+        self.assertEqual(chat_notify.home_file(), ("", True))
+        self.assertEqual(chat_notify.home_file_value(), "")
+        self._write("")
+        self.assertEqual(chat_notify.home_file(), ("", True))
+        self.assertEqual(chat_notify.routed_platform(), "")
+        self._write("")
+        self.assertEqual(chat_notify.routed_platform(), "")
+        self._write("   \n")
+        self.assertEqual(chat_notify.home_file_value(), "")
+
+    def test_the_file_routes_only_the_platform_the_gateway_holds(self):
+        self._write("C0FILE\n")
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
+            self.assertEqual(chat_notify.routed_platform(), "")
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
+            self.assertEqual(chat_notify.routed_platform(), "")
+
+    def test_the_file_is_read_on_every_call(self):
+        self._write("C0ONE\n")
+        self.assertEqual(chat_notify.home_file_value(), "C0ONE")
+        self._write("C0TWO\n")
+        self.assertEqual(chat_notify.home_file_value(), "C0TWO")
+        os.unlink(os.path.join(self.dir, chat_notify.HOME_FILE_KEY))
+        self.assertEqual(chat_notify.home_file_value(), "")
+
+    def test_a_file_that_is_not_text_reads_as_nothing(self):
+        with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "wb") as handle:
+            handle.write(b"\xff\xfe\x00C0")
+        self.assertEqual(chat_notify.home_file(), ("", True))
+        self.assertEqual(chat_notify.routed_platform(), "")
+
+    def test_a_missing_directory_reads_as_nothing(self):
+        with mock.patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
+            self.assertEqual(chat_notify.home_file(), ("", False))
+            self.assertEqual(chat_notify.home_file_value(), "")
+            self.assertEqual(chat_notify.routed_platform(), "")
 
 
 class CommandTest(unittest.TestCase):
@@ -346,7 +424,7 @@ class SlackRouteTest(unittest.TestCase):
     CHAT = {"schema": "kube-agents.chat/v1", "headline": "Security audit: 2 critical findings",
             "choices": [{"text": "Look at the first one", "primary": True}]}
 
-    def _gateway_post(self, returncode, stdout, thread=""):
+    def _gateway_post(self, returncode, stdout, thread="", platform="slack"):
         seen = {}
 
         def run(argv, **_kwargs):
@@ -357,8 +435,15 @@ class SlackRouteTest(unittest.TestCase):
             return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr="refused")
 
         with mock.patch.object(self.skv.subprocess, "run", side_effect=run):
-            post = self.skv._post_audit_chat_via_gateway("platform", "fleet-audit", self.CHAT, "3 findings", thread, 30)
+            post = self.skv._post_audit_chat_via_gateway(platform, "platform", "fleet-audit", self.CHAT, "3 findings", thread, 30)
         return post, seen
+
+    def test_the_audit_card_goes_to_the_gateway_for_google_chat_too(self):
+        # Under next the gateway lays the card out on Google Chat as on Slack; the thread
+        # it lands in is read back from the Chat message name.
+        post, seen = self._gateway_post(0, json.dumps({"message_id": "spaces/H/messages/M.M"}), platform="google_chat")
+        self.assertEqual(seen["argv"][:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertEqual(post, self.skv.AuditPost("spaces/H/threads/M"))
 
     def test_the_gateway_card_keeps_its_buttons(self):
         # The gateway draws a chat message's choices itself, so nothing is stripped.
@@ -398,9 +483,9 @@ class SlackRouteTest(unittest.TestCase):
                 mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue") as blocks, \
                 mock.patch.object(self.skv.slack_audit_report, "chat_from_issue", return_value=(self.CHAT, "t")), \
                 mock.patch.object(self.skv, "_post_audit_chat_via_gateway", return_value=self.skv.AuditPost("9.9")) as via:
-            post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "", "", float("inf"))
+            post = self.skv._post_audit_blocks("slack", "platform", "fleet-audit", headline, "m", "", "", float("inf"))
         self.assertEqual(post, self.skv.AuditPost("9.9"))
-        self.assertEqual(via.call_args.args[2:4], (self.CHAT, "t"))
+        self.assertEqual(via.call_args.args[3:5], (self.CHAT, "t"))
         blocks.assert_not_called()
 
     def test_the_audit_report_keeps_block_kit_when_slack_is_not_routed(self):
@@ -410,7 +495,7 @@ class SlackRouteTest(unittest.TestCase):
                 mock.patch.object(self.skv.slack_audit_report, "chat_from_issue") as chat, \
                 mock.patch.object(self.skv.slack_audit_report, "blocks_from_issue", return_value=([{"type": "divider"}], "t")), \
                 mock.patch.object(self.skv.slack_blocks_post, "post", return_value="4.4") as post_blocks:
-            post = self.skv._post_audit_blocks("platform", "fleet-audit", headline, "m", "C1", "", float("inf"))
+            post = self.skv._post_audit_blocks("slack", "platform", "fleet-audit", headline, "m", "C1", "", float("inf"))
         self.assertEqual(post, self.skv.AuditPost("4.4"))
         self.assertEqual(post_blocks.call_args.args[:3], ("C1", "t", [{"type": "divider"}]))
         chat.assert_not_called()

@@ -493,7 +493,7 @@ tool-call trace and the turn's model requests, structure only
 **An envelope's publisher is the principal implied by the subject it arrived on** - the
 stored subject, on replay - and that implication is decision-grade exactly where two
 conditions hold. No signed claim, no signing key on the hot path, no key registry at
-replay: every check is a field-to-token comparison, plus the one supervisor name a
+replay: every check is a field-to-token comparison, plus the supervisor names a
 consumer is configured with. The alternatives this beat - a signed claim per envelope,
 a server-stamped header, a key registry consulted at replay - were taken through
 successive hostile review rounds before it was ratified; this section is the contract, and the
@@ -515,7 +515,7 @@ source, and replay skips and counts it.
 | Subject class                        | Admissible kinds                   | `taskId` | Writer the subject implies, and the check                                                                                                                                                                                                                                                        |
 | ------------------------------------ | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `…events`                            | `status-update`, `artifact-update` | = token  | The addressee: `from.session` for a chat session, `from.profile` for a profile-addressed executor; at least one MUST equal the addressee token. Advisory as shipped; hard only once an operator sets `A2A_STRICT_EVENTS_WRITER=true`.                                                            |
-| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it; one that does not checks the negative form, `from` is not the addressee.                                              |
+| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it (the gateway's names the dispatcher too); one that does not checks the negative form, `from` is not the addressee.     |
 | `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee. `to` is conventionally present here and checked when it is, but is not required; see the note below.                                                                               |
 | `…submit` (10/22)                    | `message`                          | = token  | The submitter, the gateway. A consumer that names it (`Submitter`, as a dispatcher does) checks `from.session` against it; one that names none uses the negative form, `from` is not the profile (neither `from.session` nor `from.profile`). `to`, where present, MUST equal the profile token. |
 | `a2a.agents.{profile}`               | `agent-card`, `agent-closed`       | absent   | The profile's owner; `from.profile` MUST equal the subject token (the profile binding, mandated 9/9 before any card publisher exists). A card MUST NOT be refused for lacking a `taskId`.                                                                                                        |
@@ -595,15 +595,15 @@ artifact names).
 
 ### Where one may appear
 
-| Carrier                                                | Renders as                                       | Its text fallback                                    |
-| ------------------------------------------------------ | ------------------------------------------------ | ---------------------------------------------------- |
-| `result` artifact, on the chunk with `lastChunk: true` | the answer                                       | the artifact's text as folded per A2A chunking rules |
-| `turn` artifact, on the chunk with `lastChunk: true`   | a finished turn's answer, posted as it completes | the artifact's text as folded per A2A chunking rules |
-| `progress` artifact                                    | the task's one live message, edited in place     | the TextPart in the same part list                   |
-| `notice` artifact                                      | one message of its own, posted once              | the TextPart in the same part list                   |
-| the message of an `input-required` `status-update`     | the question                                     | the TextPart in the same message                     |
-| the message of a terminal `status-update`              | nothing; only its `mark` is read                 | none (the one carrier without a fallback)            |
-| a conversation chat.notify request (Card work, below)  | a card's post, or an edit of one by `update` key | the request's `text`                                 |
+| Carrier                                                                     | Renders as                                       | Its text fallback                                    |
+| --------------------------------------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------- |
+| `result` artifact, on the chunk with `lastChunk: true`                      | the answer                                       | the artifact's text as folded per A2A chunking rules |
+| `turn` artifact, on the chunk with `lastChunk: true`                        | a finished turn's answer, posted as it completes | the artifact's text as folded per A2A chunking rules |
+| `progress` artifact                                                         | the task's one live message, edited in place     | the TextPart in the same part list                   |
+| `notice` artifact                                                           | one message of its own, posted once              | the TextPart in the same part list                   |
+| the message of an `input-required` `status-update`                          | the question                                     | the TextPart in the same message                     |
+| the message of a terminal `status-update`                                   | nothing; only its `mark` is read                 | none (the one carrier without a fallback)            |
+| a chat.notify request to a conversation or a home thread (Card work, below) | a card's post, or an edit of one by `update` key | the request's `text`                                 |
 
 At most one chat message per artifact chunk or status message. `plan` is read only in
 `progress` and on a conversation chat.notify (Card work, below). In `progress` the chat message is the whole current state, not a delta, so a
@@ -793,15 +793,16 @@ carry the same chat message:
   fallback. Every rule in this section applies to it, as on the bus. (On Slack it takes
   the place of the request's raw `blocks` for a conversation post. A home-channel request
   may carry one too: the cron relay's fleet-audit card or the first inventory's, laid out
-  the same way, with its `update` and `mark` not read.)
+  the same way, its `update` key kept per home thread as below and its `mark` not read.)
 - **`update`** is a key the sender picks (eg `plan`, or a card's question). The first
   request with a key posts a message. A later request with the same key edits that
   message in place instead of posting a new one, which is how a plan stays one message
   per thread and an answered question settles where it was asked. An `update` key edits
-  only a message the gateway itself posted for that same conversation and key. A key it
-  has no message for (another conversation's, one evicted, or one lost to a restart)
-  posts a new message and edits nothing. A conversation holds at most 16 live keys, and
-  the least recently used is evicted first, so a chatty card can't grow gateway state without bound.
+  only a message the gateway itself posted for that same conversation, or home-channel
+  thread, and key. A key it has no message for (another conversation's or thread's, one
+  evicted, or one lost to a restart) posts a new message and edits nothing. A conversation
+  or home thread holds at most 16 live keys, and the least recently used is evicted first,
+  so a chatty card can't grow gateway state without bound.
 - **`mark`** on a conversation notify marks the message of the chain the card belongs to,
   and counts as that chain's newest writer once every task in it has ended. A notify names
   no task, so its `update` key names the chain: the first notify with a key and a `mark`
@@ -847,8 +848,9 @@ id takes one too), so no plan takes another's key and edits its message, which t
 still holds: not one its first card reopens after the plan lapsed, and not one opened after
 a restart. The shared cases spell only the stem (`plan`, `question-<card>`); their runner
 matches a key that adds a `-` suffix to it. The alert is a
-home-channel post and its triage a reply in its thread, so the edit asks the gateway to
-keep `update` keys for a home-channel thread as it does for a conversation. The plan
+home-channel post and its triage a reply in its thread, and the gateway keeps `update` keys
+per home-channel thread as it does per conversation, so the triage's keyed post edits the alert
+(spec-chatops-gateway.md, "Proactive posts: the chat.notify route"). The plan
 carries the `mark` when it changes: `ask` while a card runs, `ask` with `settle: blocked`
 while one waits on the user, and `settle: done` or `failed` once all have settled. A
 completed card's report, or a hard-wall block's reason, whose settle finished the ask's plan goes
@@ -858,8 +860,7 @@ post the gateway draws rating controls on, under the ask the plan's key is bound
 nothing, so a fan-out flags its creator's completion alone. The notifier has not seen the ask, so the bridge records its kind on the conversation route
 (`PUT /v1/sessions/{id}/route`, `ask`) for the notifier to read back. Not yet ported: a
 typed answer read back onto the question it answers, which needs the backend's own
-history. Until the gateway reads `chat` and `update` (`lib.NotifyRequest` says where it
-stands), it posts each notify's text, a later `update` of the same key included.
+history.
 
 **Stopping the cards (gke-labs#3263).** A `stop` cancels the conversation's task, and by
 then that task has usually ended. The cards it filed are what still runs, and no carrier
@@ -937,7 +938,7 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
 - **Size.** The part counts against the envelope's max message size like any other. A
   carrier too large with it is published without it: the text is the deliverable.
 - **A backend that can't hold it.** The caps fit Slack. A valid chat message may still be
-  more than another backend takes (a Google Chat card message is capped at 32,000 bytes,
+  more than another backend takes (a Google Chat message is capped at 32,000 bytes,
   a Discord embed at 6,000 characters). A renderer whose backend can't hold a valid chat
   message posts the fallback, logged and counted, as for an invalid one, and never clips
   it or sends a card the API will refuse. The same goes for a post the backend's API

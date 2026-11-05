@@ -227,10 +227,7 @@ func TestRenderedDispatcherFixtures(t *testing.T) {
 	tse := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
 	})
-	cm, _, err := buildA2AAuthMapConfigMap(agent, []agentv1alpha1.AgentProfile{tse})
-	if err != nil {
-		t.Fatalf("buildA2AAuthMapConfigMap: %v", err)
-	}
+	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{tse})
 	checkFixture(t, dispatcherMapFixturePath, cm.Data[a2aAuthMapKey])
 	cfgMap, err := buildA2ADispatchConfigMap(agent, []agentv1alpha1.AgentProfile{tse})
 	if err != nil {
@@ -431,7 +428,7 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 		}
 	}
 	env := map[string]string{}
-	for _, e := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers[0].Env {
+	for _, e := range buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers[0].Env {
 		env[e.Name] = e.Value
 	}
 	if env["A2A_TASK_CREDENTIAL_MAX_LIFETIME"] != "6h0m0s" {
@@ -442,7 +439,7 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 	lowered.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{Profiles: &agentv1alpha1.ProfileTuning{MaxTaskDeadlineSeconds: ptr.To(900)}}}
 	cfg, _ = desiredDispatchConfig(lowered, []agentv1alpha1.AgentProfile{short})
 	env = map[string]string{}
-	for _, e := range buildA2ACalloutDeployment(lowered, "").Spec.Template.Spec.Containers[0].Env {
+	for _, e := range buildA2ACalloutDeployment(lowered, "", 1).Spec.Template.Spec.Containers[0].Env {
 		env[e.Name] = e.Value
 	}
 	lifetime, err := time.ParseDuration(env["A2A_TASK_CREDENTIAL_MAX_LIFETIME"])
@@ -501,5 +498,50 @@ func TestDefaultOffRendersNoDispatcherAndNoGrantsForIt(t *testing.T) {
 	h.reconcile(agent.Namespace, "tse")
 	if len(h.dir.durables) != 0 {
 		t.Errorf("durables synced with the dispatcher off: %+v", h.dir.durables)
+	}
+}
+
+// Deleting the PlatformAgent removes the dispatcher's pod-read Role and
+// binding in the profile namespace, which nothing owns: left behind, a later
+// ServiceAccount of the dispatcher's name would inherit pod read there. A
+// pair under that name without this agent's labels is someone else's, and
+// stays.
+func TestHandleDeletionRemovesTheDispatchersPodReadRBAC(t *testing.T) {
+	for _, own := range []bool{true, false} {
+		scheme := setupScheme()
+		agent := a2aTestAgent()
+		agent.Finalizers = []string{platformAgentFinalizer}
+		now := metav1.Now()
+		agent.DeletionTimestamp = &now
+		role, binding := buildA2ADispatcherPodsRole(agent), buildA2ADispatcherPodsRoleBinding(agent)
+		if own {
+			withCommonLabels(role, agent)
+			withCommonLabels(binding, agent)
+		} else {
+			role.Labels = map[string]string{labelInstance: "foreign-agent"}
+			binding.Labels = map[string]string{labelInstance: "foreign-agent"}
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).
+			WithObjects(agent.DeepCopy(), role, binding).
+			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		ctx := context.Background()
+		current := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, current); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.handleDeletion(ctx, current); err != nil {
+			t.Fatalf("handleDeletion (own=%v): %v", own, err)
+		}
+		key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherName(agent)}
+		for _, obj := range []client.Object{&rbacv1.Role{}, &rbacv1.RoleBinding{}} {
+			err := cl.Get(ctx, key, obj)
+			switch {
+			case own && !apierrors.IsNotFound(err):
+				t.Errorf("this agent's dispatcher pod-read %T survived deletion: %v", obj, err)
+			case !own && err != nil:
+				t.Errorf("a foreign %T under the dispatcher's name was deleted: %v", obj, err)
+			}
+		}
 	}
 }

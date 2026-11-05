@@ -137,7 +137,26 @@ class KubectlConfinementTest(unittest.TestCase):
                 self.redirect_refused(["kubectl", "get", "pods", flag], flag.split("=")[0])
 
     def test_an_unlisted_flag_is_refused(self):
-        self.refused(["kubectl", "get", "pods", "--raw", "/api"])
+        self.refused(["kubectl", "get", "pods", "--subresource", "status"])
+
+    def test_a_raw_collection_read_passes_the_flag_table(self):
+        # The value is command_policy's to judge (`kubernetes.raw-path`); the
+        # flag table admits the flag so a profile task can page a large kind.
+        confine(["kubectl", "get", "--raw", "/api/v1/pods?limit=500"], None, TARGET)
+
+    def test_a_raw_endpoint_read_is_refused_in_every_spelling(self):
+        # The rule's exact endpoints (`/metrics`) are the shell role's. The
+        # confinement decodes the path as the rule does, so an encoded
+        # spelling is the same path, and the query does not hide it.
+        for argv in (
+            ["kubectl", "get", "--raw", "/metrics"],
+            ["kubectl", "get", "--raw=/metrics"],
+            ["kubectl", "get", "--raw", "/%6detrics"],
+            ["kubectl", "get", "--raw=/%6Detrics"],
+            ["kubectl", "get", "--raw", "/metrics?watch=true"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn("/metrics", self.refused(argv))
 
     def test_a_flag_after_double_dash_is_the_remote_commands(self):
         # After `--` the words are the command kubectl exec runs in the pod.
@@ -834,7 +853,7 @@ class ProfileRouteTest(unittest.TestCase):
         shell = credential_proxy.Principal(workload="system:serviceaccount:ns:shell", role=credential_proxy.CALLER_ROLE_SHELL)
         CredentialProxyHandler.authenticator = _StubAuthenticator(shell)
         self.set_gate(trusted=[DOC["untrusted"]])
-        status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+        status, body = self.post({"argv": ["gcloud", "container", "clusters", "list"]})
         self.assertEqual(200, status, body)
         (_, kwargs), = self.executor.calls
         self.assertIsNone(kwargs["kubeconfig_context"])
@@ -1334,20 +1353,23 @@ class ConfinedExecutionTest(unittest.TestCase):
 class ProfileSlotShareTest(unittest.TestCase):
     """Profile work holds a bounded share of the pool, and the shell keeps a slot."""
 
-    def test_the_share_is_named_defaulted_and_clamped_below_the_pool(self):
+    def test_the_share_is_named_defaulted_and_clamped_to_the_background_cap(self):
         with mock.patch.dict(os.environ, {credential_proxy.ENV_PROFILE_SLOTS: ""}):
-            self.assertEqual(4, credential_proxy.profile_slot_limit_from_env(8, 2))
-        for raw, pool, session, want, warns in (
-            ("3", 8, 2, 3, False),
-            ("10", 8, 2, 5, True),  # clamped: 8 - 2 - 1, so the shell keeps a slot
-            ("x", 8, 2, 4, True),
-            ("0", 8, 2, 4, True),
-            ("4", 3, 2, 1, True),  # a pool too small to share still serves one
+            self.assertEqual(4, credential_proxy.profile_slot_limit_from_env(6))
+            # The default clamped on a small pod is expected, so it is quiet.
+            with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+                self.assertEqual(2, credential_proxy.profile_slot_limit_from_env(2))
+        for raw, background_cap, want, warns in (
+            ("3", 6, 3, False),
+            ("10", 6, 6, True),  # P = min(P, B): the interactive reserve stays free
+            ("x", 6, 4, True),
+            ("0", 6, 4, True),
+            ("4", 2, 2, True),  # a budget-bound pod (admitted 4, B 2)
         ):
-            with self.subTest(raw=raw, pool=pool):
+            with self.subTest(raw=raw, background_cap=background_cap):
                 with mock.patch.dict(os.environ, {credential_proxy.ENV_PROFILE_SLOTS: raw}):
                     with self.assertLogs(credential_proxy.LOGGER, level="WARNING") if warns else contextlib.nullcontext():
-                        self.assertEqual(want, credential_proxy.profile_slot_limit_from_env(pool, session))
+                        self.assertEqual(want, credential_proxy.profile_slot_limit_from_env(background_cap))
 
     def test_a_profile_past_its_share_is_busy_and_the_shell_is_not(self):
         slots = credential_proxy.SessionSlots(
@@ -1368,10 +1390,15 @@ class ProfileSlotShareTest(unittest.TestCase):
 
 
 class ProfileRouteTableTest(unittest.TestCase):
-    def test_the_profile_role_reaches_the_exec_and_vcs_routes_alone(self):
+    def test_the_profile_role_reaches_exec_mcp_and_vcs_alone(self):
+        # The MCP relay narrows a profile caller to PROFILE_SERVER_TOOLS inside
+        # its handler (#3658), and the version-control routes to the reads and
+        # the permit-gated writes (#3993); every other route stays closed to
+        # the role.
+        reached = {"/v1/exec", credential_proxy.mcp_policy.MCP_RELAY_PREFIX, "/v1/vcs/"}
         for prefix, roles in credential_proxy.ROUTE_ROLES:
             with self.subTest(prefix=prefix):
-                self.assertEqual(prefix in ("/v1/exec", "/v1/vcs/"), credential_proxy.CALLER_ROLE_PROFILE in roles)
+                self.assertEqual(prefix in reached, credential_proxy.CALLER_ROLE_PROFILE in roles)
 
     def test_the_broker_and_the_verifier_name_one_permit(self):
         self.assertEqual(task_credential.PERMIT_VCS_PROPOSAL_CREATE, credential_proxy.VCS_PROPOSAL_CREATE_PERMIT)

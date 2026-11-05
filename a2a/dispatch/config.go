@@ -83,7 +83,7 @@ const (
 	DefaultUnattendedTier = "unattended"
 	// selfSession and selfAgentType are the `from` of the terminals the
 	// dispatcher writes.
-	selfSession   = "dispatcher"
+	selfSession   = lib.DispatcherSession
 	selfAgentType = "a2a-dispatcher"
 )
 

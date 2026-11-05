@@ -463,6 +463,31 @@ class RuntimeTest(unittest.TestCase):
         self.deliver(refused)
         self.assertEqual([e[0] for e in refused.log], ["send_chat", "send"])
 
+    def test_under_next_a_google_chat_alert_is_edited_too(self):
+        # The gateway lays the triage out on Google Chat under next, so the alert in a
+        # Chat space is edited by its key as a Slack one is; Hermes's own Chat adapter
+        # (today, no send_chat) is left alone.
+        class StandIn(_Adapter):
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                self.log.append(("send_chat", chat_id, content, chat, update))
+                return SimpleNamespace(success=True, error=None)
+
+        space, thread = "spaces/H", "spaces/H/threads/T"
+        self.route("k8s-evt-0000abcd", "google_chat", space, thread)
+        adapter = StandIn()
+        wrapped = runtime.adapter_for(adapter, "google_chat", SimpleNamespace(kind="completed"), SimpleNamespace(result=REPORT),
+                                      {"chat_id": space, "thread_id": thread})
+        self.assertIsNot(wrapped, adapter)
+        res = asyncio.run(wrapped.send(space, "the report", metadata={"thread_id": thread}))
+        self.assertTrue(res.success)
+        (kind, chat_id, _text, chat, update), = adapter.log
+        self.assertEqual((kind, chat_id, update), ("send_chat", space, "alert-k8s-evt-0000abcd"))
+        self.assertEqual(chat["headline"], runtime.parse_triage(REPORT)["headline"])
+        runtime._edited.clear()
+        plain = _Adapter()
+        self.assertIs(runtime.adapter_for(plain, "google_chat", SimpleNamespace(kind="completed"), SimpleNamespace(result=REPORT),
+                                          {"chat_id": space, "thread_id": thread}), plain)
+
     def test_an_alert_is_edited_once_even_when_no_row_is_stored(self):
         adapter = _Adapter()
         self.deliver(adapter)

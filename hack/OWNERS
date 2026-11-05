@@ -13,8 +13,12 @@
 # whether it runs: ci-env.sh and fleet-kubeconfigs.sh, which it sources;
 # ci-deploy.sh, whose functions it evals; ci-revalidate.sh, whose exit 0
 # reuses an earlier verdict in place of a run; and fleet-fixture-state.py,
-# whose report excuses a case as infrastructure. (scripts/installer/OWNERS
-# covers gke_dns_endpoint.sh, which ci-env.sh sources.) Everything else under
+# whose report excuses a case as infrastructure. replay-proxy/ joins them
+# because its normalizer decides which requests match a recorded answer, so
+# whoever changes it controls what replay serves (eval-design.md in
+# examples/inference-replay/, "The proxy can't come from the pull request").
+# (scripts/installer/OWNERS covers gke_dns_endpoint.sh, which ci-env.sh
+# sources.) Everything else under
 # hack/ -- hack/eval/nightly-cases.txt, the subprocess helpers that reset the
 # environment or mint tokens -- matches no filter and falls through to the
 # root OWNERS, so a new case lands in the nightly with the normal approvers
@@ -30,6 +34,9 @@ filters:
     approvers:
     - eval-crew
   '^fleet-fixture-state\.py$':
+    approvers:
+    - eval-crew
+  '^replay-proxy/':
     approvers:
     - eval-crew
 options:

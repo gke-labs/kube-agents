@@ -361,8 +361,10 @@ What the operator renders per profile, as built (amended 10/6):
   shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
   ask the metadata server for the broker's Workload Identity token). The broker gives them a
   role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
-  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist, and the
-  version-control routes under the permit rule below.
+  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist; with a
+  task credential, the MCP relay for Developer Knowledge's two document reads alone
+  (`mcp_policy.PROFILE_SERVER_TOOLS`); and the version-control routes under the permit rule
+  below.
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
@@ -441,9 +443,9 @@ What the operator renders per profile, as built (amended 10/6):
     `--name=value` token, then positionals), and its executor reads the parse for the
     kubeconfig, isolation and `get-credentials`, never parsing the argv again. The shim honours no
     `KUBECONFIG` or `CLOUDSDK_*` override for a task, and says so. Profile calls hold at most
-    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the pool
-    less the session share and one (never below one), so the platform agent's shell keeps a
-    slot given a pool larger than the session share plus one.
+    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the
+    background share: profile work is background, which holds at most the admitted count less two,
+    so on a pod that admits three or more, interactive work keeps two admissions ([`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §4.2).
   - Nothing may change what a later bare command targets. `gcloud config set`, `unset` and
     `configurations`, and every `kubectl config` write (`use-context`, `set-context`,
     `set-cluster`, `set-credentials` and the rest) are refused with or without a credential.

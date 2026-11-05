@@ -9,7 +9,9 @@ import datetime as dt
 import io
 import json
 import subprocess
+import re
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import feedback_summary as fs
@@ -37,15 +39,23 @@ CR = {
     },
     "status": {
         "conditions": [{"type": "Ready", "status": "True"}],
+        "inference": {"provider": "vertex_ai", "model": "claude-opus-5"},
         "usage": {
             "clustersRegistered": 3,
             "clustersMonitored": 2,
             "chatMessagesInboundTotal": 41,
             "sessionsTotal": 7,
+            "chatSessionsTotal": 4,
             "toolExecutionsTotal": 19127,
             "eventsIngestedTotal": 10,
             "remediationsProposedTotal": 4,
             "remediationsMergedTotal": 1,
+            "proposalsAuthored": 6,
+            "remediationsOpen": 2,
+            "remediationsClosedUnmergedTotal": 3,
+            "proposalHumanTouches": 5,
+            "peopleSeen7d": 3,
+            "peopleSeen30d": 11,
             "lastActiveTime": "2026-10-20T17:34:06Z",
             "activeInterfaces": ["googlechat"],
         },
@@ -57,6 +67,13 @@ LITELLM_CONFIG_YAML = """model_list:
     litellm_params:
       model: vertex_ai/claude-opus-5
       vertex_project: acme-platform-prod
+"""
+
+#: A gateway config that disagrees with the fixture's status.inference.
+OTHER_LITELLM_CONFIG_YAML = """model_list:
+  - model_name: model-default
+    litellm_params:
+      model: openai/gpt-4o
 """
 
 SERVER_VERSION = {"serverVersion": {"gitVersion": "v1.33.4-gke.1234000"}}
@@ -134,7 +151,15 @@ class RenderTest(unittest.TestCase):
         self.assertIn("kubernetes: v1.33.4-gke.1234000", text)
         self.assertIn("installed: 19 days", text)
         self.assertIn("toolExecutionsTotal: 19127", text)
-        self.assertIn("sessionsTotal: 7", text)
+        self.assertIn("  sessionsTotal: 7\n  chatSessionsTotal: 4\n", text)
+        self.assertIn("  remediationsMergedTotal: 1 (as the forge reports)\n", text)
+        self.assertIn("  proposalsAuthored: 6 (as the forge reports)\n", text)
+        self.assertIn("  remediationsOpen: 2 (as the forge reports)\n", text)
+        self.assertIn("  remediationsClosedUnmergedTotal: 3 (as the forge reports)\n", text)
+        self.assertIn("  proposalHumanTouches: 5 (as the forge reports)\n", text)
+        self.assertIn("  peopleSeen7d: 3 (as the gateway reports)\n", text)
+        self.assertIn("  peopleSeen30d: 11 (as the gateway reports)\n", text)
+        self.assertIn("  remediationsProposedTotal: 4\n", text)
         self.assertIn("Rating:", text)
         self.assertIn("What worked well:", text)
         self.assertIn("What failed or was slow:", text)
@@ -206,8 +231,10 @@ class RenderTest(unittest.TestCase):
         self.assertIn("latency p50 2.3s / p95 17.5s", text)
 
     def test_missing_sources_degrade_to_unavailable_lines(self):
+        cr = json.loads(json.dumps(CR))
+        del cr["status"]["inference"]
         snapshot = full_snapshot(
-            tasks=None, litellm_metrics=None, litellm_config=None, server_version=None,
+            cr=cr, tasks=None, litellm_metrics=None, litellm_config=None, server_version=None,
             sources={"session-kv": False, "litellm-metrics": False},
         )
         text = fs.render(snapshot)
@@ -217,6 +244,31 @@ class RenderTest(unittest.TestCase):
         self.assertIn("kubernetes: unavailable", text)
         self.assertLessEqual(len(text.splitlines()), fs.SUMMARY_MAX_LINES)
 
+    def test_the_model_line_reads_status_inference_first(self):
+        text = fs.render(full_snapshot(litellm_config=OTHER_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  model: vertex_ai/claude-opus-5\n", text)
+        self.assertNotIn("gpt-4o", text)
+
+    def test_an_empty_inference_key_prints_unavailable_without_a_fallback(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["inference"] = {}
+        text = fs.render(full_snapshot(cr=cr, litellm_config=OTHER_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  model: unavailable\n", text)
+        self.assertNotIn("gpt-4o", text)
+        cr["status"]["inference"] = {"provider": "vertex_ai"}
+        self.assertIn("\n  model: unavailable\n", fs.render(full_snapshot(cr=cr)))
+
+    def test_an_absent_inference_key_falls_back_to_the_gateway_config(self):
+        cr = json.loads(json.dumps(CR))
+        del cr["status"]["inference"]
+        text = fs.render(full_snapshot(cr=cr, litellm_config=OTHER_LITELLM_CONFIG_YAML))
+        self.assertIn("\n  model: openai/gpt-4o\n", text)
+
+    def test_the_environment_lines_print_in_the_shared_key_order(self):
+        text = fs.render(full_snapshot())
+        keys = [line.split(":", 1)[0].strip() for line in text.split("environment:\n", 1)[1].split("\nusage:", 1)[0].splitlines()]
+        self.assertEqual(keys, list(fs.ENVIRONMENT_KEYS))
+
     def test_an_empty_usage_block_prints_zeroes_not_blanks(self):
         cr = json.loads(json.dumps(CR))
         cr["status"] = {}
@@ -224,6 +276,20 @@ class RenderTest(unittest.TestCase):
         self.assertIn("toolExecutionsTotal: 0", text)
         self.assertIn("lastActive: never", text)
         self.assertIn("ready: unknown", text)
+
+    def test_readings_print_no_reading_when_absent_and_counters_print_zero(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["usage"] = {"remediationsOpen": 0, "peopleSeen7d": 0}
+        text = fs.render(full_snapshot(cr=cr))
+        for reading in ("remediationsMergedTotal", "proposalsAuthored", "remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched"):
+            self.assertIn(f"  {reading}: no reading (as the forge reports)\n", text)
+        self.assertIn("  remediationsOpen: 0 (as the forge reports)\n", text)
+        self.assertIn("  peopleSeen7d: 0 (as the gateway reports)\n", text)
+        self.assertIn("  peopleSeen30d: no reading (as the gateway reports)\n", text)
+        for counter in ("clustersRegistered", "toolExecutionsTotal", "remediationsProposedTotal"):
+            self.assertIn(f"  {counter}: 0\n", text)
+        self.assertNotIn("remediationsAppliedTotal", fs.USAGE_COUNTERS)
+        self.assertEqual(fs.audit(text, full_snapshot(cr=cr).identifiers), [])
 
     def test_next_mode_and_interfaces_are_printed_as_enums(self):
         cr = json.loads(json.dumps(CR))
@@ -264,8 +330,84 @@ class ParsingTest(unittest.TestCase):
         self.assertEqual(model, "vertex_ai/987")
         self.assertNotIn("acme-prod-123", model)
         self.assertNotIn("us-central1", model)
-        self.assertEqual(fs.model_from_litellm_config("model: openrouter/anthropic/claude-sonnet-4\n"), "openrouter/claude-sonnet-4")
+        self.assertEqual(fs.model_from_litellm_config("model: openrouter/anthropic/claude-sonnet-4\n"), "openrouter/anthropic/claude-sonnet-4")
+        self.assertEqual(fs.model_from_litellm_config("model: hosted_vllm/meta-llama/Llama-3.1-8B-Instruct\n"), "hosted_vllm/meta-llama/Llama-3.1-8B-Instruct")
         self.assertEqual(fs.model_from_litellm_config("model: vertex_ai/claude-opus-5\n"), "vertex_ai/claude-opus-5")
+
+    def test_a_bedrock_arn_keeps_its_resource_id_only(self):
+        for model, want in (
+            ("bedrock/arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-5", "bedrock/us.anthropic.claude-opus-5"),
+            ("bedrock/converse/arn:aws:bedrock:us-east-1:123456789012:inference-profile/abc", "bedrock/abc"),
+            ("bedrock/invoke/arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/xyz", "bedrock/xyz"),
+            ("bedrock/arn:aws:bedrock:us-east-1:123456789012:provisioned-model:pm1", "bedrock/pm1"),
+        ):
+            got = fs.model_from_litellm_config(f"model: {model}\n")
+            self.assertEqual(got, want, model)
+            self.assertNotIn("123456789012", got)
+            self.assertNotIn("us-east-1", got)
+
+    def test_a_truncated_resource_reference_is_malformed(self):
+        for model in (
+            "vertex_ai/projects/acme-prod",
+            "vertex_ai/projects/acme/locations/us-central1",
+            "vertex_ai/projects/acme/regions/us-central1/endpoints/987",
+            "bedrock/arn:aws:bedrock:us-east-1:123456789012",
+            "bedrock/arn:aws:bedrock:us-east-1:123456789012:",
+        ):
+            self.assertIsNone(fs.split_model(model), model)
+        self.assertEqual(fs.split_model("vertex_ai/projects/acme-prod-123/locations/us-central1/endpoints/987"), "vertex_ai/987")
+        self.assertEqual(fs.split_model("bedrock/arn:aws:bedrock:us-east-1:123456789012:provisioned-model:abc"), "bedrock/abc")
+        self.assertEqual(fs.split_model("bedrock/converse/arn:aws:bedrock:us-east-1:123456789012:inference-profile/p1"), "bedrock/p1")
+
+    def test_the_model_default_entry_answers_over_an_earlier_entry(self):
+        config = (
+            "model_list:\n"
+            "  - model_name: fast\n    litellm_params:\n      model: openai/gpt-4o-mini\n"
+            "  - model_name: \"model-default\"\n    litellm_params:\n      api_base: http://x\n      model: 'anthropic/claude-opus-5'\n"
+        )
+        self.assertEqual(fs.model_from_litellm_config(config), "anthropic/claude-opus-5")
+
+    def test_a_crlf_config_reads_its_model_default_entry(self):
+        config = (
+            "model_list:\r\n"
+            "  - model_name: fast\r\n    litellm_params:\r\n      model: openai/gpt-4o-mini\r\n"
+            "  - model_name: model-default\r\n    litellm_params:\r\n      model: vertex_ai/gemini-4-argon\r\n"
+        )
+        self.assertEqual(fs.model_from_litellm_config(config), "vertex_ai/gemini-4-argon")
+        malformed = config.replace("vertex_ai/gemini-4-argon", "gpt-4o")
+        self.assertIsNone(fs.model_from_litellm_config(malformed))
+
+    def test_a_malformed_model_default_entry_is_a_negative_with_no_fallback(self):
+        for model in ("gpt-4o", "gemini/", "/claude", '""', "projects/acme/locations/x/endpoints/9",
+                      "arn:aws:bedrock:us-east-1:1:x/y", "vertex_ai/projects/acme/locations/x/endpoints/"):
+            config = (
+                "model_list:\n"
+                "  - model_name: fast\n    litellm_params:\n      model: openai/gpt-4o-mini\n"
+                f"  - model_name: model-default\n    litellm_params:\n      model: {model}\n"
+                "  - model_name: later\n    litellm_params:\n      model: openai/gpt-4o\n"
+            )
+            self.assertIsNone(fs.model_from_litellm_config(config), model)
+        empty = "model_list:\n  - model_name: model-default\n    litellm_params:\n      model:\n  - model_name: b\n    litellm_params:\n      model: openai/gpt-4o\n"
+        self.assertIsNone(fs.model_from_litellm_config(empty))
+
+    def test_whitespace_in_a_provider_or_name_is_malformed(self):
+        for model in ("gemini/flash\nx", "gemini/gemini 3", "gem ini/flash", "gemini/flash\u00a0x"):
+            self.assertIsNone(fs.split_model(model), repr(model))
+        self.assertEqual(fs.split_model("gemini/flash"), "gemini/flash")
+
+    def test_without_a_model_default_entry_the_first_qualified_model_answers(self):
+        config = (
+            "model_list:\n"
+            "  - model_name: bare\n    litellm_params:\n      model: gpt-4o\n"
+            "  - model_name: fast\n    litellm_params:\n      model: openai/gpt-4o-mini\n"
+        )
+        self.assertEqual(fs.model_from_litellm_config(config), "openai/gpt-4o-mini")
+
+    def test_model_from_status_distinguishes_present_empty_and_absent(self):
+        self.assertEqual(fs.model_from_status({"inference": {"provider": "gemini", "model": "gemini-3-pro"}}), "gemini/gemini-3-pro")
+        self.assertEqual(fs.model_from_status({"inference": {}}), fs.UNAVAILABLE)
+        self.assertEqual(fs.model_from_status({"inference": None}), fs.UNAVAILABLE)
+        self.assertIsNone(fs.model_from_status({}))
 
     def test_a_label_value_holding_a_brace_keeps_its_sample(self):
         samples = fs.parse_prometheus('litellm_input_tokens_metric_total{model="a}b",team="x\\"y"} 5\nlitellm_input_tokens_metric_total{model="c"} 2\n')
@@ -347,6 +489,19 @@ class CollectTest(unittest.TestCase):
                 fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW))
         self.assertIn("platformagent", str(ctx.exception))
 
+    def test_the_configmap_is_listed_only_when_the_status_has_no_inference_key(self):
+        """The ConfigMap is the fallback for an older operator or CRD; with the key
+        present the namespace listing would be fetched and discarded."""
+        with_key = json.loads(json.dumps(CR))
+        with_key.setdefault("status", {})["inference"] = {"provider": "vertex_ai", "model": "claude-opus-5"}
+        without_key = json.loads(json.dumps(CR))
+        without_key.get("status", {}).pop("inference", None)
+        for cr, expected_calls in ((with_key, 0), (without_key, 1)):
+            run, _ = self.fake_run({"get platformagent": json.dumps(cr)})
+            with mock.patch.object(fs.subprocess, "run", run), mock.patch.object(fs, "_litellm_config", return_value=None) as listing:
+                fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW))
+            self.assertEqual(listing.call_count, expected_calls, cr.get("status", {}).keys())
+
     def test_optional_sources_failing_leave_unavailable_lines(self):
         run, _ = self.fake_run({
             "get platformagent": json.dumps(CR),
@@ -400,8 +555,11 @@ class CollectTest(unittest.TestCase):
         self.assertIn("tasks (14 days): unavailable", fs.render(snapshot))
 
     def test_a_stale_hashed_config_map_loses_to_the_mounted_one(self):
+        # The ConfigMap is read only for a status with no ``inference`` key.
+        legacy_cr = json.loads(json.dumps(CR))
+        legacy_cr.get("status", {}).pop("inference", None)
         run, _ = self.fake_run({
-            "get platformagent": json.dumps(CR),
+            "get platformagent": json.dumps(legacy_cr),
             "get configmap": json.dumps({"items": [
                 {"metadata": {"name": "litellm-config-a1b2stale", "creationTimestamp": "2026-10-11T00:00:00Z"}, "data": {"config.yaml": "model: vertex_ai/old-model\n"}},
                 {"metadata": {"name": "litellm-config-k4b9ht22c7", "creationTimestamp": "2026-10-10T00:00:00Z"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},
@@ -412,7 +570,7 @@ class CollectTest(unittest.TestCase):
             snapshot = fs.collect(fs.Options(namespace=NAMESPACE, name="platform-agent", now=NOW, in_pod=False))
         self.assertEqual(fs.model_from_litellm_config(snapshot.litellm_config), "vertex_ai/claude-opus-5")
         run, _ = self.fake_run({
-            "get platformagent": json.dumps(CR),
+            "get platformagent": json.dumps(legacy_cr),
             "get configmap": json.dumps({"items": [
                 {"metadata": {"name": "litellm-config-a1b2stale", "creationTimestamp": "2026-10-01T00:00:00Z"}, "data": {"config.yaml": "model: vertex_ai/old-model\n"}},
                 {"metadata": {"name": "litellm-config-k4b9ht22c7", "creationTimestamp": "2026-10-10T00:00:00Z"}, "data": {"config.yaml": LITELLM_CONFIG_YAML}},
@@ -453,6 +611,59 @@ class MainTest(unittest.TestCase):
             code = fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err)
         self.assertEqual(code, fs.EXIT_LEAK)
         self.assertIn("refused", err.getvalue())
+
+    def test_a_model_segment_equal_to_the_cluster_name_is_not_refused(self):
+        cr = json.loads(json.dumps(CR))
+        cr["status"]["inference"] = {"provider": "hosted_vllm", "model": f"{CLUSTER}/llama-8b"}
+        snapshot = full_snapshot(cr=cr)
+        text = fs.render(snapshot)
+        self.assertIn(f"\n  model: hosted_vllm/{CLUSTER}/llama-8b\n", text)
+        self.assertEqual(fs.audit(text, snapshot.identifiers), [CLUSTER])
+        self.assertEqual(fs.audit(fs._without_model_line(text), snapshot.identifiers), [])
+        out = io.StringIO()
+        with mock.patch.object(fs, "collect", return_value=snapshot):
+            self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=out, stderr=io.StringIO()), fs.EXIT_OK)
+        self.assertIn(f"hosted_vllm/{CLUSTER}/llama-8b", out.getvalue())
+
+    def test_the_audit_skips_the_model_line_and_nothing_else(self):
+        text = f"```\n  mode: today\n  model: x/{CLUSTER}\n  kubernetes: {CLUSTER}\n```"
+        stripped = fs._without_model_line(text)
+        self.assertNotIn("model:", stripped)
+        self.assertIn(f"  kubernetes: {CLUSTER}", stripped)
+        self.assertEqual(len(stripped.splitlines()), len(text.splitlines()) - 1)
+        snapshot = full_snapshot()
+        err = io.StringIO()
+        with mock.patch.object(fs, "collect", return_value=snapshot), mock.patch.object(fs, "render", return_value=text):
+            self.assertEqual(fs.main(["--namespace", NAMESPACE], stdout=io.StringIO(), stderr=err), fs.EXIT_LEAK)
+
+
+
+class GatewayCopyTest(unittest.TestCase):
+    """The gateway's Go copy of the field lists is this script's, verbatim."""
+
+    GO_FILE = Path(__file__).resolve().parents[3] / "a2a" / "gateway" / "feedback_summary.go"
+
+    def _go_strings(self, var: str) -> list[str]:
+        source = self.GO_FILE.read_text()
+        start = source.index(f"var {var} = ")
+        body = source[start : source.index("}", start)]
+        return re.findall(r'"([A-Za-z0-9]+)"', body)
+
+    def test_the_gateway_prints_the_same_counters_and_readings(self):
+        self.assertEqual(list(fs.USAGE_COUNTERS), self._go_strings("usageSummaryCounters"))
+        self.assertEqual(sorted(fs.USAGE_READINGS), sorted(self._go_strings("usageSummaryReadings")))
+
+    def test_the_gateway_prints_the_same_environment_lines(self):
+        self.assertEqual(list(fs.ENVIRONMENT_KEYS), self._go_strings("usageSummaryEnvironmentKeys"))
+
+    def test_the_gateway_names_the_same_source_for_each_reading(self):
+        source = self.GO_FILE.read_text()
+        start = source.index("var usageSummaryReadings = ")
+        body = source[start : source.index("}", start)]
+        go_gateway = sorted(re.findall(r'"([A-Za-z0-9]+)":\s*usageGatewayReadingSuffix', body))
+        py_gateway = sorted(k for k, v in fs.USAGE_READINGS.items() if v == fs.USAGE_GATEWAY_READING_SUFFIX)
+        self.assertEqual(py_gateway, ["peopleSeen30d", "peopleSeen7d"])
+        self.assertEqual(go_gateway, py_gateway)
 
 
 if __name__ == "__main__":

@@ -47,8 +47,10 @@ jobs:
       cancel-in-progress: false
     # A GKE cluster destroy is slower than its create — node pools drain before
     # the control plane goes, and lifecycle.sh clears the PlatformAgent
-    # finalizers first. Well below the deploy job's budget, which is sized to
-    # provision_environment.sh's stockout retry; one destroy needs no retry.
+    # finalizers first. On a candidate whose teardown_common.sh carries the
+    # retry, a failed destroy runs once more after a minute's wait; two
+    # destroys of about ten minutes each (eleven measured for a success, four
+    # for a failure) and the wait fit.
     timeout-minutes: 45
     permissions:
       contents: read

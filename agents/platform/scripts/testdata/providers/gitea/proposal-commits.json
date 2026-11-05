@@ -12,8 +12,8 @@
         "commit": {
           "url": "https://gitea.example.test/api/v1/repos/acme/infra/git/commits/e1c50cb5a53b3b91235cdb8aa3331aa202011f6b",
           "author": {
-            "name": "ka",
-            "email": "ka@example.test",
+            "name": "platform-agent",
+            "email": "platform-agent@kube-agents.invalid",
             "date": "2026-10-04T10:20:39-04:00"
           },
           "committer": {

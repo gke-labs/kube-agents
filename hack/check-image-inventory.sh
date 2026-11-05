@@ -143,6 +143,8 @@ check_base_image() {
 
 check_base_image envoy deploy/docker/Dockerfile ENVOY_IMAGE ENVOY_VERSION
 check_base_image golang deploy/docker/Dockerfile GOLANG_IMAGE GOLANG_VERSION
+check_base_image golang deploy/kube-proxy/Dockerfile GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static deploy/kube-proxy/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
@@ -177,6 +179,9 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 # deployed by hand or by an eval lane, never by an install.
 check_base_image golang hack/ghes-proxy/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static hack/ghes-proxy/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
+# The shadow-mode replay proxy, an eval fixture (hack/replay-proxy/README.md):
+# built by hand or by an eval lane, never by an install.
+check_base_image python hack/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 
 # The agent plugin images pin their base with a literal `FROM repo:tag@digest`
 # rather than an ARG pair, so the ARG check above never reaches them. This
@@ -189,7 +194,8 @@ check_base_image distroless-static hack/ghes-proxy/Dockerfile DISTROLESS_IMAGE D
 # the FROM reference normalised and compared to the inventory. Anything else
 # -- an indented or lowercase keyword, an empty reference, a flag, a tab, a
 # CR, a stage name, a continuation, a second stage, a RUN, a heredoc, another
-# COPY destination --
+# COPY destination than the call names (the fourth argument, `/` by default;
+# a persona image's is `/files/`) --
 # fails closed with the expected lines and the lines found, printed through
 # `cat -vet` so an invisible byte shows. One rule runs before the strip: a
 # comment line holding `=` anywhere in the leading run of comments is refused
@@ -202,7 +208,7 @@ check_base_image distroless-static hack/ghes-proxy/Dockerfile DISTROLESS_IMAGE D
 # comment with `=` in it belongs below the first instruction, where it is a
 # comment to Docker and to this fence alike.
 check_literal_from() {
-  local name=$1 dockerfile=$2 src=$3
+  local name=$1 dockerfile=$2 src=$3 dest=${4:-/}
   local want body other first second ref got
   fenced_plugin_dockerfiles="${fenced_plugin_dockerfiles:-}$dockerfile"$'\n'
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
@@ -217,9 +223,9 @@ check_literal_from() {
   ref="${first#FROM }"
   got="$(normalise "$ref")"
   if [ "$(printf '%s\n' "$body" | wc -l | tr -d ' ')" != 2 ] || [ "$ref" = "$first" ] || [ -z "$got" ] ||
-    [ "$ref" != "${ref%% *}" ] || [ "$second" != "COPY $src /" ] ||
+    [ "$ref" != "${ref%% *}" ] || [ "$second" != "COPY $src $dest" ] ||
     printf '%s\n' "$body" | LC_ALL=C grep -q '[^[:print:]]'; then
-    fail "$dockerfile: after comment and blank lines, a plugin Dockerfile must be exactly two lines, 'FROM <ref>' (one space, nothing after the reference) and 'COPY $src /', the shape docker build and the crane reader in agentplugins/lib/plugin_image.sh read alike; found: $(printf '%s\n' "$body" | LC_ALL=C cat -vet | tr '\n' ' ')"
+    fail "$dockerfile: after comment and blank lines, a plugin or persona Dockerfile must be exactly two lines, 'FROM <ref>' (one space, nothing after the reference) and 'COPY $src $dest', the shape docker build and the crane reader in agentplugins/lib/plugin_image.sh read alike; found: $(printf '%s\n' "$body" | LC_ALL=C cat -vet | tr '\n' ' ')"
     return
   fi
   [ "$got" = "$want" ] ||
@@ -228,19 +234,25 @@ check_literal_from() {
 
 check_literal_from busybox agentplugins/pubsub-platform/Dockerfile files/platforms/pubsub/
 check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile files/
+# A persona image has the same two-line shape, with the persona directory as
+# its build context and the payload under /files, where profilepod mounts it.
+check_literal_from busybox a2a/Dockerfile.persona-cluster . /files/
 
-# The two calls above name their files, so a third plugin copied from the pair
-# (agentplugins/README.md, "Adding a plugin") would carry a pin nothing
-# compares to the inventory while this check stayed green. Every Dockerfile
-# under PLUGIN_DIR must have been through check_literal_from, which records
+# The calls above name their files, so a third plugin copied from the pair
+# (agentplugins/README.md, "Adding a plugin"), or a second persona image copied
+# from a2a/Dockerfile.persona-cluster, would carry a pin nothing compares to
+# the inventory while this check stayed green. Every Dockerfile under
+# PLUGIN_DIR, and every a2a/Dockerfile.persona-*, must have been through
+# check_literal_from, which records
 # each file it is given before judging it, so a file that failed the fence is
 # reported once, as drift or shape, not again here.
 check_plugin_dockerfiles_are_fenced() {
   local dockerfile
-  for dockerfile in "$PLUGIN_DIR"/*/Dockerfile; do
+  for dockerfile in "$PLUGIN_DIR"/*/Dockerfile a2a/Dockerfile.persona-*; do
     [ -e "$dockerfile" ] || continue
+    case $dockerfile in *.dockerignore) continue ;; esac
     grep -qxF "$dockerfile" <<<"${fenced_plugin_dockerfiles:-}" ||
-      fail "$dockerfile has no check_literal_from call in hack/check-image-inventory.sh, so its FROM pin is not held in step with $INVENTORY. Add one beside the existing calls, naming the inventory entry and the COPY source (agentplugins/README.md, \"Adding a plugin\")."
+      fail "$dockerfile has no check_literal_from call in hack/check-image-inventory.sh, so its FROM pin is not held in step with $INVENTORY. Add one beside the existing calls, naming the inventory entry and the COPY source (agentplugins/README.md, \"Adding a plugin\"), and for a persona image the COPY destination too."
   done
 }
 check_plugin_dockerfiles_are_fenced
@@ -292,6 +304,7 @@ check_go_directive() {
 }
 
 check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
+check_go_directive deploy/kube-proxy/Dockerfile GOLANG_VERSION k8s-api-proxy/go.mod
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
@@ -390,6 +403,7 @@ check_compiled_image_name a2a-verifier k8s-operator/internal/controller/platform
 check_compiled_image_name a2a-dispatcher k8s-operator/internal/controller/platformagent_a2a_dispatcher.go a2aDispatcherImageName
 check_compiled_image_name a2a-console k8s-operator/internal/controller/platformagent_a2a_console.go a2aConsoleImageName
 check_compiled_image_name hermes-bridge k8s-operator/internal/controller/platformagent_a2a_bridge.go a2aBridgeImageName
+check_compiled_image_name kube-proxy k8s-operator/internal/controller/kube_proxy_manifests.go kubeProxyRepositoryName
 check_compiled_repository a2a-worker a2a/gateway/config.go defaultWorkerRepository
 
 # ---------------------------------------------------------------------------
@@ -624,6 +638,9 @@ check_mirror_names "$LABEL_MIRRORED" "$mirrored_images"
 
 check_toggle githubMinter "${MINTER_VALUES[@]}"
 check_toggle webConsole --set webConsole.enabled=true
+# The cluster agent's AgentProfile (#3658) adds its persona image; its
+# harness, a2a-worker, is already in the default render.
+check_toggle profiles.cluster --set profiles.cluster.enabled=true
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by

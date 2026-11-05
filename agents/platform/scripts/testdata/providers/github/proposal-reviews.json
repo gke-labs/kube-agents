@@ -1,0 +1,79 @@
+{
+  "payload": {
+    "number": 4321,
+    "limit": 30
+  },
+  "responses": [
+    [
+      {
+        "id": 88812300,
+        "user": {
+          "login": "example-maintainer",
+          "id": 4401,
+          "type": "User"
+        },
+        "body": "",
+        "state": "APPROVED",
+        "submitted_at": "2026-08-30T10:05:00Z",
+        "commit_id": "8f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9",
+        "author_association": "MEMBER",
+        "html_url": "https://github.com/acme/infra/pull/4321#pullrequestreview-88812300"
+      },
+      {
+        "id": 88812301,
+        "user": {
+          "login": "example-reviewer",
+          "id": 88121,
+          "type": "User"
+        },
+        "body": "One inline note, otherwise fine.",
+        "state": "COMMENTED",
+        "submitted_at": "2026-08-30T10:16:00Z",
+        "commit_id": "8f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9",
+        "author_association": "MEMBER",
+        "html_url": "https://github.com/acme/infra/pull/4321#pullrequestreview-88812301"
+      },
+      {
+        "id": 88812302,
+        "user": {
+          "login": "example-reviewer",
+          "id": 88121,
+          "type": "User"
+        },
+        "body": "The floor needs a PDB too.",
+        "state": "CHANGES_REQUESTED",
+        "submitted_at": "2026-08-30T10:20:00Z",
+        "commit_id": "8f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9",
+        "author_association": "MEMBER",
+        "html_url": "https://github.com/acme/infra/pull/4321#pullrequestreview-88812302"
+      },
+      {
+        "id": 88812303,
+        "user": {
+          "login": "policy-checker[bot]",
+          "id": 9902,
+          "type": "Bot"
+        },
+        "body": "",
+        "state": "DISMISSED",
+        "submitted_at": "2026-08-30T10:30:00Z",
+        "commit_id": "8f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9",
+        "author_association": "NONE",
+        "html_url": "https://github.com/acme/infra/pull/4321#pullrequestreview-88812303"
+      },
+      {
+        "id": 88812304,
+        "user": {
+          "login": "example-reviewer",
+          "id": 88121,
+          "type": "User"
+        },
+        "body": "",
+        "state": "PENDING",
+        "commit_id": "8f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9",
+        "author_association": "MEMBER",
+        "html_url": "https://github.com/acme/infra/pull/4321#pullrequestreview-88812304"
+      }
+    ]
+  ]
+}

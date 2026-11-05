@@ -320,6 +320,14 @@ FIXTURE_NOT_READY = {
     "terraform-new-cluster-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
     ),
+    # Needs a cluster that runs Config Connector in the audited fleet of a
+    # pool project; no pool project runs it (provisioning-kcc-cluster-without-
+    # crds-stops relies on that). bench/tf/prebuilt/kcc-stalled-declaration
+    # plants the stalled object on such a cluster and removes it.
+    "fleet-audit-manifest-fix-names-stalled-config-connector": (
+        "#4218: needs a cluster that runs Config Connector in the pool fleet, for the "
+        "stalled ContainerNodePool the stack plants; no pool project runs Config Connector"
+    ),
     "fanout-bound-ten-cards": (
         "#3560: needs an eval install with more than ten clusters in scope, so a "
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
@@ -414,6 +422,12 @@ FIXTURE_NOT_READY = {
         "not, so the case fails with the branch absent, which is broken rather "
         "than red"
     ),
+    "inspect-repository-unmanaged-and-context-read": (
+        "#4243: needs kubernetes-sigs/kind at v0.24.0 registered in each pool "
+        "install's context_repos, as the case's header gives; no pool install "
+        "registers it, so the context check fails with the repository absent, "
+        "which is broken rather than red"
+    ),
     "gce-startup-script-failure": (
         "#2483: needs bench/tf/fleet's startup_fail VM applied to every pool project "
         "(fleet re-apply); no pool project runs a VM whose startup script fails"
@@ -504,15 +518,15 @@ KNOWN_JUDGE_ONLY: dict[str, str] = {}
 # the run did.
 #
 # devops-bench's registry is authoritative and rejects an unknown type at
-# spec-load time; this table is the pre-cluster copy. The first three come
-# from the pinned devops-bench SHA in bench/pyproject.toml, the last three
-# from bench/kube_agents_bench/verifiers.py -- a test re-derives those from
-# the entry-point group so a new local verifier fails here rather than
-# drifting silently.
+# spec-load time; this table is the pre-cluster copy. The upstream entries
+# come from the pinned devops-bench SHA in bench/pyproject.toml, the local
+# ones from the `devops_bench.verifiers` entry-point group in the same file
+# -- a test re-derives the local ones from that group so a new local
+# verifier fails here rather than drifting silently.
 #
-# For the first three the named field is also required by the verifier's own
+# For the upstream entries the named field is also required by the verifier's own
 # pydantic model, so this rule only moves the rejection earlier -- from after a
-# cluster lease to now. The rule earns its keep on the last three, where the
+# cluster lease to now. The rule earns its keep on the local ones, where the
 # field is optional and an empty or blank-stringed list is the shape that
 # actually ships: a check that reads as an assertion and can only pass.
 CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
@@ -544,6 +558,11 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
         "any_of_phrases",
         "every_finding_named",
     ),
+    # No field: the verifier's own model refuses a spec that binds nothing
+    # (`state: closed` or `min_comments` >= 1 is required), and
+    # bench/tests/test_lane.py parses every shipped case through devops-bench
+    # on every pull request, so an unbound spec never reaches a lease.
+    "forge_issue_state": (),
     # No field: a bold one-sentence lead, no heading and the length caps are
     # the assertion, and every field narrows it.
     "answer_first": (),
@@ -1321,6 +1340,12 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             f"'tool_calls_optional:' {spec['tool_calls_optional']!r} is not a YAML "
             "boolean; write a bare true or false. bench-gate refuses a quoted "
             "value at spec-load time, after the lease"
+        )
+    if "writes_alone" in spec and not isinstance(spec["writes_alone"], bool):
+        problems.append(
+            f"'writes_alone:' {spec['writes_alone']!r} is not a YAML boolean; write a "
+            "bare true or false. The lane reads only a bare true, so a quoted value "
+            "would leave the case in the shared first phase"
         )
 
     # Fixture roles. Cases address the seeded fleet by role, never by cluster

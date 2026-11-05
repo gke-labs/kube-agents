@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,6 +22,11 @@ import (
 	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/dispatch"
@@ -89,14 +97,15 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 	current.Store(dial())
 	v := busVerifier{conn: current.Load}
 
-	// Nobody answers: a refusal, within the caller's ctx.
+	// Nobody answers: no verdict, so the dispatcher holds the submission
+	// rather than rejecting it. It ends within the caller's ctx.
 	nctx, ncancel := context.WithTimeout(ctx, 2*time.Second)
 	err = v.CheckProfileRun(nctx, ref, "tse", "read", "namespace/ka")
 	ncancel()
-	var r *capability.Refusal
-	if !errors.As(err, &r) {
-		t.Fatalf("with no verifier, got %v, want a refusal", err)
+	if !errors.Is(err, dispatch.ErrVerifierUnreachable) {
+		t.Fatalf("with no verifier, got %v, want ErrVerifierUnreachable", err)
 	}
+	var r *capability.Refusal
 
 	verifier := dial()
 	var asked atomic.Pointer[capability.Request]
@@ -108,7 +117,7 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 		var req capability.Request
 		_ = json.Unmarshal(m.Data, &req)
 		asked.Store(&req)
-		resp := capability.Response{Allowed: req.Ref.Key == "cap-ok"}
+		resp := capability.Response{Allowed: req.Ref.Key == "cap-ok", RequestID: req.RequestID}
 		if !resp.Allowed {
 			resp.Reason = "not this one"
 		}
@@ -131,12 +140,12 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 		t.Errorf("the verifier was asked %+v, want profile.run for tse at read on namespace/ka", req)
 	}
 	err = v.CheckProfileRun(ctx, capability.Ref{Key: "cap-bad", Revision: 1}, "tse", "read", "namespace/ka")
-	if !errors.As(err, &r) || capability.Reason(err) != "not this one" {
+	if !errors.As(err, &r) || capability.Reason(err) != "not this one" || errors.Is(err, dispatch.ErrVerifierUnreachable) {
 		t.Errorf("refused ref: got %v, want the verifier's refusal", err)
 	}
 	current.Store(nil)
-	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); !errors.As(err, &r) {
-		t.Errorf("with no connection, got %v, want a refusal", err)
+	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); !errors.Is(err, dispatch.ErrVerifierUnreachable) {
+		t.Errorf("with no connection, got %v, want ErrVerifierUnreachable", err)
 	}
 }
 
@@ -234,13 +243,37 @@ func TestTheFirstBusConnectIsRetried(t *testing.T) {
 	if err != nil || got != 7 || calls != 3 {
 		t.Fatalf("got %d, %v after %d calls; want 7 after 3", got, err, calls)
 	}
-	calls = 0
-	_, err = connectWithRetry(context.Background(), log, time.Millisecond, func(context.Context) (int, error) {
-		calls++
-		return 0, nats.ErrAuthorization
-	})
-	if err == nil || calls != 1 {
-		t.Fatalf("a refused credential: %v after %d calls; want an error after 1", err, calls)
+	// An authorization violation is retried: the bus gives the same text
+	// for a bad token as for an auth callout that is down or not yet
+	// subscribed, and the callout's outage passes.
+	for _, refusal := range []error{nats.ErrAuthorization, errors.New("nats connect: nats: Authorization Violation")} {
+		calls = 0
+		got, err = connectWithRetry(context.Background(), log, time.Millisecond, func(context.Context) (int, error) {
+			calls++
+			if calls < 3 {
+				return 0, refusal
+			}
+			return 7, nil
+		})
+		if err != nil || got != 7 || calls != 3 {
+			t.Fatalf("%v: got %d, %v after %d calls; want 7 after 3", refusal, got, err, calls)
+		}
+	}
+	// An untrusted certificate is not: no retry fixes it.
+	for _, untrusted := range []error{x509.UnknownAuthorityError{}, x509.HostnameError{Host: "nats"}, &tls.CertificateVerificationError{Err: errors.New("bad")}} {
+		calls = 0
+		ctx, cancel := context.WithCancel(context.Background())
+		_, err = connectWithRetry(ctx, log, time.Millisecond, func(context.Context) (int, error) {
+			calls++
+			if calls == 3 {
+				cancel() // retried: stop it rather than loop forever
+			}
+			return 0, fmt.Errorf("nats connect: %w", untrusted)
+		})
+		cancel()
+		if err == nil || calls != 1 {
+			t.Fatalf("an untrusted certificate (%T): %v after %d calls; want an error after 1", untrusted, err, calls)
+		}
 	}
 }
 
@@ -343,5 +376,92 @@ func TestABadSeedFileStopsTheDispatcherAtStartup(t *testing.T) {
 		if code := run(env(e)); code != 2 {
 			t.Errorf("%s: run exited %d, want 2 (refused at startup)", name, code)
 		}
+	}
+}
+
+// signalWriter collects a log and closes seen the first time it holds want.
+type signalWriter struct {
+	mu   sync.Mutex
+	buf  strings.Builder
+	want string
+	seen chan struct{}
+	once sync.Once
+}
+
+func (w *signalWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf.Write(p)
+	if strings.Contains(w.buf.String(), w.want) {
+		w.once.Do(func() { close(w.seen) })
+	}
+	return len(p), nil
+}
+
+// A SIGTERM while the process still waits for its first config, or for its
+// first bus connect, is a stop like one while dispatching: serve returns nil
+// (run logs "stopped" at Info and exits 0), not context.Canceled.
+func TestAStopBeforeDispatchingIsACleanStop(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	const ns, name = "kube-agents", "agent-a2a-dispatch"
+	// Nothing listens on port 1: every connect fails and is retried.
+	s := settings{natsURL: "nats://127.0.0.1:1", namespace: ns, configMap: name}
+	cfg := lib.DispatchConfig{Version: "test", Namespace: ns, ProfileNamespace: "kube-agents-profiles", Ceiling: 6,
+		InteractiveReserve: 2, ChildReserve: 2, LeaseSeconds: 3, RenewSeconds: 1, RestartGraceSeconds: 2, AcceptTimeoutSeconds: 1,
+		Profiles: []lib.DispatchProfile{{Name: "tse", Tiers: []string{"read"}, Concurrency: 1, QueueTimeoutSeconds: 60, ActiveDeadlineSeconds: 60,
+			Durables: []lib.DispatchDurable{
+				{Tier: "read", Kind: lib.SubmitKindTop, Name: lib.ProfileDurableName("tse", "read", lib.SubmitKindTop)},
+				{Tier: "read", Kind: lib.SubmitKindChild, Name: lib.ProfileDurableName("tse", "read", lib.SubmitKindChild)}}}}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name}, Data: map[string]string{lib.DispatchConfigKey: string(raw)}}
+	for _, tc := range []struct {
+		name string
+		kube *fake.Clientset
+		// stopAt is the log line that says serve is in the wait the stop
+		// lands in; the config wait logs nothing.
+		stopAt string
+	}{
+		{"during the config wait", fake.NewSimpleClientset(), ""},
+		{"during the first connect", fake.NewSimpleClientset(cm), "the bus is not reachable yet"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &signalWriter{want: tc.stopAt, seen: make(chan struct{})}
+			log := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- serve(ctx, log, s, tc.kube) }()
+			if tc.stopAt == "" {
+				time.Sleep(300 * time.Millisecond)
+			} else {
+				select {
+				case <-w.seen:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("serve never reached the connect retry; log:\n%s", w.buf.String())
+				}
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("serve returned %v on a stop, want nil (a clean stop)", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("serve did not return after the stop")
+			}
+		})
+	}
+	// A moved profile namespace cancels the same context, and is still the
+	// error that restarts the process.
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(errProfileNamespaceMoved)
+	if err := stopped(ctx, fmt.Errorf("bus connect: %w", ctx.Err())); !errors.Is(err, errProfileNamespaceMoved) {
+		t.Errorf("a moved namespace during the connect: %v, want errProfileNamespaceMoved", err)
 	}
 }

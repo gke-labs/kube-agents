@@ -8,13 +8,10 @@
 > `providers/github/` and `providers/gitlab/` behind it; the `version-control` skill drives those verbs from a
 > sandbox that holds a credential-free git; and the consumers reach the forge
 > through those verbs rather than by naming GitHub. The sandbox carries no `gh`
-> and no credential shim named `git`. One thing is deliberately left behind and
-> is not a scheduling slip: `inspect_repository.py` stays on the broker's
-> content-workspace route rather than moving to the verbs, because it reads
-> repositories this install does not manage and does it with a shallow clone —
-> neither of which `clone` offers, the second on purpose
-> ([The seam](#3-the-seam)). The `snapshot` verb now offers both; the move is
-> not made yet. The CRD declares forges and repositories in `spec.integration.forges`
+> and no credential shim named `git`. `inspect_repository.py` reads repositories
+> this install does not manage, and context repositories, through the `snapshot`
+> verb: one revision with no history, which `clone` does not offer, on purpose
+> ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
 > and `spec.integration.repositories`; each provider states its own hosts, grammar and credential.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
@@ -132,12 +129,11 @@ The coupling runs through five layers, each with a different owner and a differe
    `forge.py`; three shelled `gh` directly — `resolver.py`, `submit_suggestion.py` and
    `audit_report.py`, two behind a private runner of their own and one inline. A seventh,
    `inspect_repository.py`, reaches a repository rather than an API, and does it through the
-   broker's content-workspace route, which clones on the credential side and honours `--depth`.
+   `snapshot` verb, which clones one revision on the credential side and sends its tree.
    (`github_token_refresh.py` and
    `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
-   layer 3.) All six go through the verbs, and `forge.py` with them — it holds typed values and
-   three policy rules and no forge implementation. `inspect_repository.py` does not move: see the
-   status banner.
+   layer 3.) All seven go through the verbs, and `forge.py` with them — it holds typed values and
+   three policy rules and no forge implementation.
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
    across Python and Go, one regex expressing it copy-pasted into six modules. The widest assumption
    and the one least visible from any single file. Each language now runs its assertions through
@@ -950,7 +946,7 @@ thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
 The rows down to `issue-create` except `snapshot`, and the two branch rows, are the version-control skill's;
-`snapshot` is served to library callers (`vcs_client.snapshot`). The rest are the union of
+`snapshot` is served to library callers (`vcs_client.snapshot`), which `inspect-repository` is. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
@@ -2108,19 +2104,19 @@ ways this design did not anticipate. It is also two products, Bitbucket Cloud
 and Bitbucket Data Center, with two APIs ([8. Bitbucket](#8-bitbucket)). The
 table is about both:
 
-| Bitbucket is different in                                                        | Absorbed by                                                                                                                                                     | Shared file changed      |
-| -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| `workspace/repo` slugs and a UUID form (Cloud); `KEY/repo` and `~user/repo` (DC) | `parse`, `clone_url` in its own package                                                                                                                         | none                     |
-| pull requests, not MRs; comments are on an `/comments` sub-resource              | `translate.py` in its own package                                                                                                                               | none                     |
-| access tokens and API tokens, all static, all sent as `Authorization: Bearer`    | `StaticFileCredential` with the username `x-token-auth`, as it is                                                                                               | none                     |
-| no issue tracker at all                                                          | `verbs` omitting the six issue verbs, `ForgeUnsupported` for free; the ledgers that need issues read the omission — **[below](#not-every-provider-is-a-forge)** | the consumers            |
-| no labels on a pull request                                                      | the `labels` capability, refused by name in the broker; callers use a branch prefix and a body marker                                                           | `base.py`, the consumers |
-| no current-user route for some tokens                                            | `Forge.whoami` and `identity_required`                                                                                                                          | `base.py`, the broker    |
-| `values` pagination with an opaque `next` link (Cloud), or `start`/`limit` (DC)  | its own translation of listings                                                                                                                                 | none                     |
-| 401 from git over HTTPS on a hidden repository, where the REST API answers 404   | `error_overrides`, and clone text that says "or the token cannot see it"                                                                                        | none                     |
-| the `/scm/` clone path, a context path and a port (DC)                           | the root path on port 443 only; the other forms refused with a reason                                                                                           | none                     |
+| Bitbucket is different in                                                       | Absorbed by                                                                                                                                                     | Shared file changed       |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| `workspace/repo` (Cloud); `KEY/repo` (DC); `~user/repo` refused by name         | `parse`, `clone_url` in its own package                                                                                                                         | none                      |
+| pull requests, not MRs; comments are on an `/comments` sub-resource             | `translate.py` in its own package                                                                                                                               | none                      |
+| access tokens and API tokens, all static, all sent as `Authorization: Bearer`   | `StaticFileCredential`; git gets the username `x-token-auth` on Cloud, and the token as a bearer on Data Center                                                 | the token-file git helper |
+| no issue tracker at all                                                         | `verbs` omitting the six issue verbs, `ForgeUnsupported` for free; the ledgers that need issues read the omission — **[below](#not-every-provider-is-a-forge)** | the consumers             |
+| no labels on a pull request                                                     | the `labels` capability, refused by name in the broker; callers use a branch prefix and a body marker                                                           | `base.py`, the consumers  |
+| no current-user route for some tokens                                           | `Forge.whoami` and `identity_required`                                                                                                                          | `base.py`, the broker     |
+| `values` pagination with an opaque `next` link (Cloud), or `start`/`limit` (DC) | its own translation of listings                                                                                                                                 | none                      |
+| 401 from git over HTTPS on a hidden repository, where the REST API answers 404  | `error_overrides`, and clone text that says "or the token cannot see it"                                                                                        | none                      |
+| the `/scm/` clone path, a context path and a port (DC)                          | the root path on port 443 only; the other forms refused with a reason                                                                                           | none                      |
 
-The table has three rows that change shared code, and each is at an edge, not in
+The table has four rows that change shared code, and each is at an edge, not in
 the middle. Every API difference lands in the forge's own directory. What does
 not land there is what the callers assumed about every forge: that it has
 issues, that it has labels, and that its token can name its own account. Each
@@ -2899,9 +2895,12 @@ self-managed GitLab does, and it can name a CA bundle for that host.
 ### The Bitbucket credential
 
 Every recommended token is a static string. The broker sends it as
-`Authorization: Bearer <token>` to the REST API, and git sends it with the
-username `x-token-auth`. `StaticFileCredential` takes all of them as it is, so
-Bitbucket adds no credential strategy and no refresh step.
+`Authorization: Bearer <token>` to the REST API. On Cloud, git sends it with the
+username `x-token-auth`. Data Center refuses an HTTP access token as a Basic
+password with any shared username, so git sends it as a bearer too: the
+token-file helper answers with `authtype=Bearer`, which git 2.46 and later
+support. `StaticFileCredential` takes all of them, so Bitbucket adds no
+credential strategy and no refresh step.
 
 | Product | Token                                                    | Use it when                                                               |
 | ------- | -------------------------------------------------------- | ------------------------------------------------------------------------- |
@@ -3067,11 +3066,21 @@ that account:
   account's `uuid`, because a Cloud `nickname` is not unique.
 - A Cloud workspace, project or repository access token has no account
   permission, so `/2.0/user` is expected to refuse it.
-- DC has no current-user resource for a token, and a project or repository
-  token is not a user. The login is a user `slug`.
+- DC has no current-user resource in its REST API. A project or repository
+  token acts as a service user, `access-token-user/<project>/<token>`. The login
+  is the user `name`, which every authenticated answer names, URL-encoded, in
+  its `X-AUSERNAME` header. The instance's `whoami` servlet
+  (`/plugins/servlet/applinks/whoami`, outside the REST API) answers a personal
+  token's user, but answers a project token with nothing. The participant
+  filter of the pull-request list finds no proposal of a token user, so the
+  readings filter the author in the broker.
 
 So the forge names the login (`Forge.whoami`, in [The protocol](#the-protocol)):
-from an identity configured on its forge entry, or from a lookup of its own.
+from the `identity` field of its forge entry, or from a lookup of its own. The
+field is for the two Bitbucket providers only; GitHub, GitLab and Gitea refuse it,
+because their API names the account. The configured value answers first, with
+no call. On Cloud it is the account `uuid`, which the package writes with its
+braces, as Bitbucket writes every author, and any other value is refused.
 Both packages declare `identity_required`. An unknown login is then
 `FORGE_IDENTITY_UNKNOWN`, and the ownership checks refuse. They never fall back
 to "do not compare". Which source each token uses is the one a recorded
@@ -3107,8 +3116,11 @@ A DC host is supported at its root path on port 443. A context path
 them. The broker's loader takes no port, and it builds the API root from the
 host alone, so a context path needs a new field on the forge entry. A repository is named `KEY/repo`. A full DC URL
 (`https://host/scm/KEY/repo.git` or `https://host/projects/KEY/repos/repo`)
-has more path segments than a repository, so the package reads it or refuses it
-with a reason. A draft proposal needs DC 8.18 or later.
+has more path segments than a repository. The broker's package reads both forms
+as `KEY/repo`, because git reports the clone URL as the remote. A declared
+repository on the CR is refused in that form, with the form to write, so that
+the state ConfigMap holds one spelling. The broker refuses a personal repository
+(`~user/repo`) by name, and the operator refuses `~user` as a project key. A draft proposal needs DC 8.18 or later.
 
 ### Installing with Bitbucket
 
@@ -3472,7 +3484,8 @@ forge. On an install with none it is read from github.com with no credential,
 because github.com is not in that install's host table and a URL cannot name
 it, unless the install's own forge lists the name as managed or context; then
 it is read there, as `clone` reads it. The MCP role cannot call `snapshot`. The verb is reachable to the `shell` role;
-`capabilities` does not list it (`LIBRARY_VERBS`), because no `vcs.py` command runs it, and no skill calls it yet.
+`capabilities` does not list it (`LIBRARY_VERBS`), because no `vcs.py` command runs it.
+The `inspect-repository` skill's `clone` and `fleet-upgrade-verification`'s `api_deprecation_scan.py` read through it.
 
 **Registered context repositories** are the one unmanaged read the install does
 grant a credential for. A repository under `context_repos` is read for declared intent and

@@ -1329,6 +1329,25 @@ class ContentWorkspaceStore:
             self._workspaces.pop(workspace.handle, None)
             _remove_tree(workspace.tree.parent)
 
+    def reclaim_idle(self) -> int:
+        """Drop the workspaces idle past the limit now, for a caller outside
+        any verb: the broker's resource watermark gate, when the container is
+        short of memory or scratch disk. The same rule `open` applies before
+        counting, run without waiting for the next `open`. Returns how many
+        were dropped. Never waits for the lock: a verb holds it across a clone
+        or a push for minutes, and a relief step that queued behind one would
+        hold the gate's tick for as long; it answers 0 and the next tick asks
+        again.
+        """
+        if not self._lock.acquire(blocking=False):
+            return 0
+        try:
+            before = len(self._workspaces)
+            self._reclaim_idle()
+            return before - len(self._workspaces)
+        finally:
+            self._lock.release()
+
     # -- reads -----------------------------------------------------------
 
     def read(self, handle: str, path: str) -> bytes:

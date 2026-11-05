@@ -211,9 +211,10 @@ func writeNonClusterProfile(t *testing.T, base, profile string) {
 	}
 }
 
-// clusterprofiles.Discoverer owns the scan itself and is tested there; these
-// cover what discoverClusterProfiles adds on top of it — a Kubernetes client
-// per cluster, and a skipped profile becoming a log line and a metric.
+// clusterprofiles.DiscoverAndBuild owns the scan, the skip policy and the skip
+// log lines, and is tested there; these cover what discoverClusterProfiles adds
+// on top of it — a Kubernetes client per cluster, and a skipped profile
+// becoming a metric.
 
 func TestDiscoverClusterProfiles_BuildsAClientPerCluster(t *testing.T) {
 	stubGKE(t)
@@ -437,6 +438,11 @@ func TestBuildWatchSet_ProfileDuplicateIsDroppedAndItsIdentityKept(t *testing.T)
 	// cluster the watcher knows most about reading as Standard.
 	if !mgmt[0].Autopilot {
 		t.Error("the absorbed profile's Autopilot bit did not reach the direct entry")
+	}
+	// So does the profile's name: the rescan's duplicate report names it as
+	// the owner of the host's identity, and a copy of it as the duplicate.
+	if mgmt[0].Source != "cluster-projA-mgmt-us-central1" {
+		t.Errorf("direct entry's Source = %q, want the absorbed profile cluster-projA-mgmt-us-central1", mgmt[0].Source)
 	}
 	// Absorbing one profile must not disturb the others.
 	if clusters[0].Name != "prod" || clusters[0].Profile != "cluster-projA-prod-us-central1" {

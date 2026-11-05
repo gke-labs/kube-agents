@@ -10,10 +10,14 @@ import (
 	"github.com/nats-io/nkeys"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	clientfeatures "k8s.io/client-go/features"
 	clientfeaturestesting "k8s.io/client-go/features/testing"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -78,6 +82,45 @@ func noWatchList(t *testing.T) {
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
 }
 
+// honorFieldSelectors makes the fake clientset's ConfigMap list and watch
+// apply a request's field selector, as the API server does; the fake
+// tracker ignores it, so without this a watch narrowed by name and one that
+// isn't look the same.
+func honorFieldSelectors(client *fake.Clientset) {
+	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
+	matches := func(sel fields.Selector, obj runtime.Object) bool {
+		cm, ok := obj.(*corev1.ConfigMap)
+		return ok && (sel == nil || sel.Matches(fields.Set{"metadata.name": cm.Name, "metadata.namespace": cm.Namespace}))
+	}
+	client.PrependReactor("list", "configmaps", func(a k8stesting.Action) (bool, runtime.Object, error) {
+		la := a.(k8stesting.ListActionImpl)
+		obj, err := client.Tracker().List(la.GetResource(), gvk, la.GetNamespace(), la.ListOptions)
+		if err != nil {
+			return true, nil, err
+		}
+		list := obj.(*corev1.ConfigMapList)
+		kept := list.Items[:0]
+		for i := range list.Items {
+			if matches(la.GetListRestrictions().Fields, &list.Items[i]) {
+				kept = append(kept, list.Items[i])
+			}
+		}
+		list.Items = kept
+		return true, list, nil
+	})
+	client.PrependWatchReactor("configmaps", func(a k8stesting.Action) (bool, watch.Interface, error) {
+		wa := a.(k8stesting.WatchActionImpl)
+		w, err := client.Tracker().Watch(wa.GetResource(), wa.GetNamespace(), wa.ListOptions)
+		if err != nil {
+			return true, nil, err
+		}
+		sel := wa.GetWatchRestrictions().Fields
+		return true, watch.Filter(w, func(e watch.Event) (watch.Event, bool) {
+			return e, e.Type == watch.Error || matches(sel, e.Object)
+		}), nil
+	})
+}
+
 // The binary's source: the one ConfigMap, watched through the API, so a
 // change lands without a restart.
 func TestConfigStoreWatchesTheConfigMap(t *testing.T) {
@@ -87,9 +130,14 @@ func TestConfigStoreWatchesTheConfigMap(t *testing.T) {
 	cfg.Version = "v1"
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
 		Data: map[string]string{lib.DispatchConfigKey: string(rawConfig(t, cfg))}}
+	// The decoy is a valid config under the same key in the same namespace,
+	// so only the watch's narrowing keeps it out: Validate would take it.
+	decoy := cfg
+	decoy.Version = "intruder"
 	other := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "something-else"},
-		Data: map[string]string{lib.DispatchConfigKey: `{"version":"intruder"}`}}
+		Data: map[string]string{lib.DispatchConfigKey: string(rawConfig(t, decoy))}}
 	client := fake.NewSimpleClientset(cm, other)
+	honorFieldSelectors(client)
 	s := NewConfigStore(quietLog())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -97,8 +145,19 @@ func TestConfigStoreWatchesTheConfigMap(t *testing.T) {
 	if err := s.WaitForConfig(ctx, 5*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(200 * time.Millisecond) // the rest of the list, were it delivered
 	if s.Config().Version != "v1" {
-		t.Fatalf("serving %q", s.Config().Version)
+		t.Fatalf("serving %q, want v1: the watch let another ConfigMap in", s.Config().Version)
+	}
+	// Nor does a change to the decoy reach the store through the watch.
+	decoy.Version = "intruder-2"
+	other.Data[lib.DispatchConfigKey] = string(rawConfig(t, decoy))
+	if _, err := client.CoreV1().ConfigMaps(ns).Update(ctx, other, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if s.Config().Version != "v1" {
+		t.Fatalf("serving %q after the decoy changed, want v1", s.Config().Version)
 	}
 	cfg.Version, cfg.Ceiling = "v2", 9
 	cm.Data[lib.DispatchConfigKey] = string(rawConfig(t, cfg))

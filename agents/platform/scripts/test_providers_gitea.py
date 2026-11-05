@@ -41,9 +41,11 @@ class Api:
     def __init__(self, *responses):
         self.responses = list(responses)
         self.calls = []
+        self.with_headers = []
 
-    def __call__(self, method, path, *, params=None, body=None, raw=None):
+    def __call__(self, method, path, *, params=None, body=None, raw=None, with_headers=False):
         self.calls.append((method, path, params or {}, body, raw))
+        self.with_headers.append(with_headers)
         answer = self.responses.pop(0)
         if isinstance(answer, WorkspaceError):
             raise answer
@@ -347,6 +349,56 @@ class ProposalTest(unittest.TestCase):
         page4 = forge().proposal_commits(Api(*batches), "acme/infra", {"number": 1, "limit": 100, "page": 4})
         self.assertEqual([], page4["commits"])
         self.assertFalse(page4["truncated"])
+
+    def test_list_by_author_reads_the_total_header(self):
+        api = Api(([pr(4, state="closed", merged=True)], {"x-total-count": "41"}))
+        answer = forge().proposal_list_by_author(
+            api, "acme/infra", {"author": "kube-agents", "authorId": 7, "page": 2, "limit": 1}
+        )
+        self.assertEqual([True], api.with_headers)
+        self.assertEqual(41, answer["total"])
+        self.assertEqual(["merged"], [p["state"] for p in answer["proposals"]])
+        self.assertTrue(answer["truncated"])
+        self.assertEqual("repos/acme/infra/pulls", api.calls[0][1])
+        self.assertEqual({"state": "all", "poster": 7, "sort": "recentupdate", "limit": 1, "page": 2}, api.calls[0][2])
+        # A page the server clamped short is still a page when the total says so.
+        clamped = forge().proposal_list_by_author(
+            Api(([pr(1)], {"x-total-count": "3"})), "acme/infra", {"author": "kube-agents", "authorId": 7, "limit": 2}
+        )
+        self.assertTrue(clamped["truncated"])
+        # A server that clamps a page to 50 pages by 50 too: page 2 of 120 has
+        # read 100, not 150, so it is not the last page.
+        second = forge().proposal_list_by_author(
+            Api(([pr(n) for n in range(51, 101)], {"x-total-count": "120"})),
+            "acme/infra",
+            {"author": "kube-agents", "authorId": 7, "limit": 100, "page": 2},
+        )
+        self.assertTrue(second["truncated"])
+        last = forge().proposal_list_by_author(
+            Api(([], {"x-total-count": "120"})),
+            "acme/infra",
+            {"author": "kube-agents", "authorId": 7, "limit": 100, "page": 4},
+        )
+        self.assertFalse(last["truncated"])
+        missing = forge().proposal_list_by_author(
+            Api(([], {})), "acme/infra", {"author": "kube-agents", "authorId": 7}
+        )
+        self.assertIsNone(missing["total"])
+        self.assertFalse(missing["truncated"])
+
+    def test_list_by_author_needs_the_author_id(self):
+        for author_id in (None, "7", 0, True):
+            with self.subTest(author_id=author_id):
+                api = Api()
+                with self.assertRaises(WorkspaceError):
+                    forge().proposal_list_by_author(
+                        api, "acme/infra", {"author": "kube-agents", "authorId": author_id}
+                    )
+                self.assertEqual([], api.calls)
+
+    def test_a_proposal_never_closed_has_no_closer(self):
+        answer = forge().proposal_closer(Api([], []), "acme/infra", {"number": 2})
+        self.assertEqual({"actor": "", "bot": False}, answer)
 
 
 class IssueAndLabelTest(unittest.TestCase):

@@ -77,7 +77,9 @@ const (
 // connection, and the dispatcher replaces its connection when its grants
 // change (lib.Client.Reconnect), so one is built per check: it is only the
 // connection and a subject, and the check's reply subscription ends with
-// the check. Any error, an unreachable verifier included, is a refusal.
+// the check. A verifier nobody answers (or no connection at all) is
+// dispatch.ErrVerifierUnreachable, which holds the submission; any other
+// error is a refusal.
 type busVerifier struct {
 	conn func() *nats.Conn
 	log  *slog.Logger
@@ -86,14 +88,18 @@ type busVerifier struct {
 func (v busVerifier) CheckProfileRun(ctx context.Context, ref capability.Ref, profile string, tier capability.Tier, target capability.Scope) error {
 	nc := v.conn()
 	if nc == nil {
-		return &capability.Refusal{Rule: "the dispatcher is not connected to the bus"}
+		return fmt.Errorf("%w: the dispatcher is not connected to the bus", dispatch.ErrVerifierUnreachable)
 	}
 	c, err := capability.NewClient(nc, natsUser)
 	if err != nil {
 		return err
 	}
 	c.Log = v.log
-	return c.CheckProfileRun(ctx, ref, profile, tier, target)
+	err = c.CheckProfileRun(ctx, ref, profile, tier, target)
+	if capability.IsUnreachable(err) {
+		return fmt.Errorf("%w: %w", dispatch.ErrVerifierUnreachable, err)
+	}
+	return err
 }
 
 // errProfileNamespaceMoved ends the process when the config's profile
@@ -218,7 +224,7 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	}()
 	go func() { _ = store.WatchConfigMap(ctx, kube, s.namespace, s.configMap, lib.DispatchConfigKey) }()
 	if err := store.WaitForConfig(ctx, configWait); err != nil {
-		return err
+		return stopped(ctx, err)
 	}
 	profileNS := store.Config().ProfileNamespace
 	pool := dispatch.NewPodPool(ctx, kube, profileNS, log)
@@ -231,7 +237,7 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 			lib.WithNATSOptions(append(s.auth, nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))...))
 	})
 	if err != nil {
-		return fmt.Errorf("bus connect: %w", err)
+		return stopped(ctx, fmt.Errorf("bus connect: %w", err))
 	}
 	defer client.Close()
 	pr.setBus(func() bool { return client.Conn().IsConnected() })
@@ -244,6 +250,21 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	pr.setDispatcher(d.Ready)
 	log.Info("dispatching", "configmap", s.configMap, "profileNamespace", profileNS)
 	if err := d.Run(ctx); err != nil {
+		return err
+	}
+	if cause := context.Cause(ctx); errors.Is(cause, errProfileNamespaceMoved) {
+		return cause
+	}
+	return nil
+}
+
+// stopped is err from a wait before dispatching starts (the config, the
+// first connect), or nil if the wait ended on a stop: a SIGTERM there ends
+// the process as cleanly as one while dispatching, where Run returns nil. A
+// moved profile namespace cancels the same context and stays the error it
+// is.
+func stopped(ctx context.Context, err error) error {
+	if !errors.Is(err, context.Canceled) {
 		return err
 	}
 	if cause := context.Cause(ctx); errors.Is(cause, errProfileNamespaceMoved) {
@@ -364,8 +385,8 @@ const (
 )
 
 // connectWithRetry calls dial until it succeeds, the bus refuses the
-// credential or certificate (connectRefused, which no retry fixes), or ctx is
-// done, logging each failure with the wait before the next attempt.
+// certificate (connectRefused, which no retry fixes), or ctx is done,
+// logging each failure with the wait before the next attempt.
 func connectWithRetry[C any](ctx context.Context, log *slog.Logger, backoff time.Duration, dial func(context.Context) (C, error)) (C, error) {
 	for {
 		c, err := dial(ctx)
@@ -374,9 +395,13 @@ func connectWithRetry[C any](ctx context.Context, log *slog.Logger, backoff time
 		}
 		if connectRefused(err) {
 			var zero C
-			return zero, fmt.Errorf("the bus refused the connection (check the dispatcher's bus token and the bus CA): %w", err)
+			return zero, fmt.Errorf("the bus refused the connection (check the bus CA): %w", err)
 		}
-		log.Warn("the bus is not reachable yet; retrying", "in", backoff, "err", err)
+		msg := "the bus is not reachable yet; retrying"
+		if authorizationViolation(err) {
+			msg = "the bus refused the connection: a bad bus token, or the auth callout not answering yet; retrying"
+		}
+		log.Warn(msg, "in", backoff, "err", err)
 		select {
 		case <-ctx.Done():
 			var zero C
@@ -387,13 +412,20 @@ func connectWithRetry[C any](ctx context.Context, log *slog.Logger, backoff time
 	}
 }
 
-// connectRefused reports a connect failure no retry fixes: a refused
-// credential or an untrusted certificate.
+// connectRefused reports a connect failure no retry fixes: an untrusted
+// certificate. An authorization violation is not one: the bus gives the
+// same text for a refused token as for an auth callout that is down, not
+// yet subscribed, or still filling its identity map, and those pass.
 func connectRefused(err error) bool {
 	var unknownCA x509.UnknownAuthorityError
 	var wrongName x509.HostnameError
 	var unverified *tls.CertificateVerificationError
+	return errors.As(err, &unknownCA) || errors.As(err, &wrongName) || errors.As(err, &unverified)
+}
+
+// authorizationViolation reports the bus's refusal at connect, whatever its
+// cause.
+func authorizationViolation(err error) bool {
 	return errors.Is(err, nats.ErrAuthorization) ||
-		strings.Contains(strings.ToLower(err.Error()), "authorization violation") ||
-		errors.As(err, &unknownCA) || errors.As(err, &wrongName) || errors.As(err, &unverified)
+		strings.Contains(strings.ToLower(err.Error()), "authorization violation")
 }

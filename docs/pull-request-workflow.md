@@ -129,6 +129,16 @@ place, and the comment above the target says why. In a mirrored `gke-*` skill, m
 place and record it as a patch with `make skills-refresh SKILL=<skill>`, or `make skills-check`
 fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 
+**Agent blueprints.** If you add a `kubectl get` to a `.py`, `.sh` or `.md` under `agents/`, run
+`make cluster-reads-check`. It fails a read of several kinds, or of one kind in one page, across
+every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply
+at its output cap on a large cluster. Read one kind per call, project the fields with
+`-o jsonpath=` or `custom-columns=`, or read per namespace; the reads already in the tree are pinned
+with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks. A Markdown span that
+quotes the shape only to warn against it carries `<!-- cluster-reads-check: warning -->` on its
+line, and the check skips the spans on that line. CI runs the same check through
+`scripts/test_check_cluster_reads.py`.
+
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
 ```bash
@@ -162,7 +172,14 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+`docker-build.yml` also retries whole steps: the buildx setup and each image build that fetches
+from the network run once more, after a pause, when the first attempt fails. The in-image gate
+check runs once, because its failure is a test verdict. A new `docker/setup-buildx-action` or
+`docker/build-push-action` step there takes the same id, pause and retry steps, or joins
+`_EXEMPT_STEPS` with a reason. `python3 -m unittest tests.test_docker_build_retry` checks the
+shape.
+
+`tests/test_third_party_download_retry.py` gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
 the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
 nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
@@ -172,7 +189,10 @@ clone that pip does not retry, and `tests/test_bench_deps_install_retry.py` runs
 stub pip. The artifact download in `python-tests.yml`'s join gets a second attempt a minute after a
 failed first one, because the action's own retries ran out twice with every shard uploaded;
 `test_the_join_downloads_the_shards_coverage_twice` in `scripts/test_integration_contracts.py` holds
-that shape.
+that shape. Every workflow that restores an Actions cache caps `@actions/cache`'s wait on one
+segment at a minute (`SEGMENT_DOWNLOAD_TIMEOUT_MINS`), so a restore the service refuses under the
+account's egress limit falls through to a cold install instead of holding the step for ten;
+`.agents/rules/github_actions.md` has the rule and `tests/test_cache_segment_timeout.py` holds it.
 
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
@@ -707,8 +727,6 @@ statuses on the head when an input changes — a push, a label, a new smoke stat
 green, so a gate missing from the head has not passed yet. Its `merge_group` jobs decide the same
 two again on the queue commit, and the enqueue sweep re-posts the head statuses of approved pull
 requests on its schedule. `scripts/merge_gate.py` is the reference for what each one reads.
-[`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) still re-pins a green's
-`BaseSHA:` suffix to the new head of `main`, which only Tide read.
 
 A push starts a fresh smoke run.
 [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0, makes some runs cheap: before
@@ -787,8 +805,10 @@ a required check blocks on it the same way) for any owner, member or collaborato
 at the start of a later line; the Actions re-run, like `/request-review`, reads the start of the
 comment only, so a `/retest` under a line of explanation re-runs the Prow jobs alone. It re-runs
 only the pull request's own runs: a head commit that is also a commit on `main` or a release line
-carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded or one cancelled while still queued is
-not re-run: neither blocks anything. GitHub's own re-run button needs Write access, which most
+carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded is not re-run, except
+under a check name the base branch requires: GitHub still counts that red run and keeps the pull request out
+of the queue, so it is re-run once no run of its workflow on the pull request is still going, one run per workflow per `/retest`. A run cancelled while still queued made no check run and is never
+re-run. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot

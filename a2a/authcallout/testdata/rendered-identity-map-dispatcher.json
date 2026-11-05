@@ -1,10 +1,12 @@
 {
-  "version": "b410f03c5a5cf23f",
+  "version": "0c098a8e6d0a8365",
+  "shard": 0,
+  "shards": 1,
   "identities": [
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
       "user": "provision",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.topics.agent.platform.upgrade-readiness",
@@ -22,6 +24,7 @@
           "$JS.API.STREAM.CREATE.KV_session-state",
           "$JS.API.STREAM.CREATE.KV_cap",
           "$JS.API.STREAM.CREATE.KV_feedback",
+          "$JS.API.STREAM.CREATE.KV_people",
           "$JS.API.STREAM.CREATE.KV_PROFILE_LEASES",
           "$JS.API.STREAM.CREATE.PROFILE_SUBMITS",
           "$JS.API.STREAM.INFO.TASKS",
@@ -32,6 +35,7 @@
           "$JS.API.STREAM.INFO.KV_session-state",
           "$JS.API.STREAM.INFO.KV_cap",
           "$JS.API.STREAM.INFO.KV_feedback",
+          "$JS.API.STREAM.INFO.KV_people",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
           "_INBOX.provision.>"
@@ -81,7 +85,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-verifier",
       "user": "verifier",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.cap.reply.>",
@@ -99,7 +103,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-operator:kubeagents-controller-manager",
       "user": "operator",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "a2a.agents.*",
@@ -128,7 +132,7 @@
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-dispatcher",
       "user": "dispatcher",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": [
           "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-tse-read-top",

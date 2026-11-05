@@ -2,9 +2,12 @@
 """Collect eval smoke-test runs from Prow build logs into data.json.
 
 The presubmit (hack/ci-eval-pr.sh, run by pull-kube-agents-smoke-test) prints
-one `Task <name> Result:` line per bench case and a final verdict line, and
-Prow archives the whole thing as build-log.txt next to started.json and
-finished.json under gs://kube-agents-prow. Nothing structured survives the
+a final verdict line into the job log, which Prow archives as build-log.txt
+next to started.json and finished.json under the lanes' log bucket,
+gs://kube-agents-evals-presubmit-logs (runs from before the move sit in
+gs://kube-agents-prow), and writes one `Task <name> Result:` block per bench
+case to artifacts/eval-grading.log beside it (builds from before the artifact
+existed carry the blocks in the log itself). Nothing structured survives the
 run, so this collector re-derives structure from those lines and writes the
 data.json the dashboard renders.
 
@@ -219,8 +222,8 @@ SCHEMA_VERSION = 1
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
 # pointer object to follow. The bucket is the nightly's own, not the
-# cluster default gs://kube-agents-prow the presubmit and the RC lane log
-# to: the nightly runs as an identity that cannot write that one (night one
+# cluster default gs://kube-agents-prow the RC lane logs to (the presubmit
+# has its own as well): the nightly runs as an identity that cannot write that one (night one
 # died in initupload on a 403), so its job overrides the bucket and
 # github-actions@kube-agents-prow reads it as objectViewer. Only the bucket
 # differs; Prow's path strategy still puts a periodic under logs/<job>/.
@@ -332,6 +335,18 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # the health adjudicator needs to tell a lost pod from a clone failure.
 PODINFO_FILE = "podinfo.json"
 BUILD_LOG_FILE = "build-log.txt"
+# The grading detail hack/ci-eval-pr.sh keeps out of the job log
+# (EVAL_GRADING_LOG there): the `Task <name> Result:` blocks with their
+# `rep N:` lines, and `bench-gate suite`'s table with its pass-rate line.
+# Read for every build and parsed ahead of build-log.txt, whose final verdict
+# line closes the grading; a build from before the file existed parses as it
+# always did.
+EVAL_GRADING_FILE = "artifacts/eval-grading.log"
+# Buckets Deck has no read on, so Spyglass shows nothing for a build there:
+# a run read from one records its directory (runs[].gcs_base) and the pages
+# and the health bot link the Cloud Console instead. A run in any other
+# bucket keeps the Spyglass link, which still renders it.
+PRIVATE_LOG_BUCKETS = frozenset({"kube-agents-evals-presubmit-logs"})
 # The suite's own verdict, written by `bench-gate suite --json-out` into
 # the job's artifacts and uploaded by Prow beside the log (module
 # docstring). Read only for a build whose final line carries the marker
@@ -662,6 +677,28 @@ def _attach_tokens(task: dict, n: int, fields: str) -> None:
             return
 
 
+def read_retrying(read, name: str) -> str | None:
+    """One file, read up to LOG_READ_ATTEMPTS times. A recorded build is
+    never re-read, so a transient miss on a file that carries its tasks
+    would otherwise record the build with none for good."""
+    text = None
+    for _attempt in range(LOG_READ_ATTEMPTS):
+        text = read(name)
+        if text is not None:
+            break
+    return text
+
+
+def with_grading(grading_text: str | None, log_text: str | None) -> str:
+    """The grading artifact's lines ahead of the build log's, as one text.
+
+    The blocks come first, where they sat when the log carried them, so the
+    log's final verdict line still closes the grading, and its banners still
+    end any block a truncated artifact left open.
+    """
+    return (grading_text or "") + "\n" + (log_text or "")
+
+
 def parse_build_log(text: str) -> dict:
     """Extract the eval facts from one build-log.txt, best effort.
 
@@ -952,12 +989,8 @@ def build_run(
         except ValueError:
             started = {}
 
-    log_text = None
-    for _attempt in range(LOG_READ_ATTEMPTS):
-        log_text = read(BUILD_LOG_FILE)
-        if log_text is not None:
-            break
-    parsed = parse_build_log(log_text or "")
+    log_text = read_retrying(read, BUILD_LOG_FILE)
+    parsed = parse_build_log(with_grading(read_retrying(read, EVAL_GRADING_FILE), log_text))
     result = finished.get("result")
 
     # The suite's own verdict (module docstring): one read of the artifact,
@@ -1168,7 +1201,7 @@ def build_release(build_id: str, read) -> dict | None:
     run = build_run(build_id, read)
     if run is None:
         return None
-    banner = parse_rc_banner(read("build-log.txt") or "")
+    banner = parse_rc_banner(with_grading(read_retrying(read, EVAL_GRADING_FILE), read(BUILD_LOG_FILE)))
     return {
         "build_id": run["build_id"],
         "rc_tag": banner["rc_tag"],
@@ -1547,22 +1580,38 @@ def _build_dirs(listing: str) -> list[tuple[str, str]]:
 def _gcs_reader(base: str, gcloud: str):
     """A build_run/build_release reader over one GCS build directory.
 
-    Caches per file: build_run asks for finished.json, started.json and
-    build-log.txt (plus podinfo.json and clone-records.json for a build that
-    ended with no tasks), and build_release re-asks for the log. A failed read is not cached, so
-    build_run's retry of the log is a real second attempt.
+    Caches per file: build_run asks for finished.json, started.json,
+    artifacts/eval-grading.log and build-log.txt (plus podinfo.json and
+    clone-records.json for a build that ended with no tasks), and
+    build_release re-asks for the log and the grading file. A failed read is
+    not cached, so build_run's retries are real second attempts; an absent
+    object is, so a file a build never wrote costs one call.
     """
-    cache: dict[str, str] = {}
+    cache: dict[str, str | None] = {}
 
     def reader(name: str) -> str | None:
         if name not in cache:
-            text = _gcloud_storage(["cat", base + name], gcloud)
+            text, stderr = _gcloud_storage_call(["cat", base + name], gcloud)
             if text is None:
+                # A definitive absence (the object is not there) is cached as
+                # None, so a retry costs no second process; any other failure
+                # is not cached and the retry is a real attempt.
+                if _NO_OBJECTS.search(stderr or ""):
+                    cache[name] = None
                 return None
             cache[name] = text
         return cache[name]
 
     return reader
+
+
+def records_location(base: str) -> bool:
+    """Whether a run read from `base` carries `gcs_base`: only for a bucket
+    Deck cannot read (PRIVATE_LOG_BUCKETS); elsewhere Spyglass still renders
+    the build and the pages keep that link."""
+    if not isinstance(base, str) or not base.startswith(GS_SCHEME):
+        return False
+    return base[len(GS_SCHEME):].split("/", 1)[0] in PRIVATE_LOG_BUCKETS
 
 
 def spyglass_url(base: str) -> str | None:
@@ -1612,6 +1661,10 @@ def _read_build(
         return build_id, None, _UNFINISHED
     if periodic:
         run["log_url"] = spyglass_url(base)
+    # Where the run was read from, when that is a bucket Deck cannot read, so
+    # its links follow it (SCHEMA.md, runs[].gcs_base).
+    if records_location(base):
+        run["gcs_base"] = base
     return build_id, run, _RECORDED
 
 
@@ -1742,6 +1795,7 @@ def runs_from_index(
     unfinished: set[str] | None = None,
     tier: str = tiers.TIER_PRESUBMIT,
     unlisted_is_note: bool = False,
+    empty_is_note: bool = False,
 ) -> list[dict]:
     """Discover builds through Prow's per-job directory index, then read them.
 
@@ -1750,12 +1804,13 @@ def runs_from_index(
     per-build reads as the glob path. A failed listing is a warning and an
     empty result -- the refresh workflow greps for that warning and refuses
     to publish, so a stall never republishes old runs as fresh -- unless
-    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows.
+    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows,
+    or `empty_is_note` and it matched no objects.
     """
     prefix = index_prefix.rstrip("/") + "/"
     listing, stderr = _gcloud_storage_call(["ls", prefix], gcloud)
     if listing is None:
-        if _unlisted_is_note(unlisted_is_note, after_build, stderr):
+        if _unlisted_is_note(unlisted_is_note, after_build, stderr) or (empty_is_note and _NO_OBJECTS.search(stderr or "")):
             print(f"note: directory index {prefix} did not list (no builds yet, or moved); nothing from it this scan", file=sys.stderr)
         else:
             print(f"warning: gcloud storage ls failed for {prefix}; nothing new this scan", file=sys.stderr)
@@ -1790,6 +1845,7 @@ def runs_from_gcs(
     unfinished: set[str] | None = None,
     tier: str = tiers.TIER_PRESUBMIT,
     unlisted_is_note: bool = False,
+    empty_is_note: bool = False,
 ) -> list[dict]:
     """Discover builds by listing the build-directory glob(s), then read them.
 
@@ -1797,13 +1853,14 @@ def runs_from_gcs(
     ~1700 builds, so this is the cold-sweep path; an incremental scan goes
     through runs_from_index. A glob that does not list is the `warning:
     gcloud storage ls ... failed` line the refresh workflow refuses on, unless
-    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows.
+    `unlisted_is_note` and the listing is the kind _unlisted_is_note allows,
+    or `empty_is_note` and it matched no objects.
     """
     runs = []
     for glob in pr_globs:
         listing, stderr = _gcloud_storage_call(["ls", glob], gcloud)
         if listing is None:
-            if _unlisted_is_note(unlisted_is_note, after_build, stderr):
+            if _unlisted_is_note(unlisted_is_note, after_build, stderr) or (empty_is_note and _NO_OBJECTS.search(stderr or "")):
                 print(f"note: glob {glob} did not list (no builds yet, or unreadable); nothing from it this scan", file=sys.stderr)
             else:
                 print(f"warning: gcloud storage ls failed for {glob}; skipping", file=sys.stderr)
@@ -2308,6 +2365,11 @@ def collect(
     # The presubmit's retries are its own pending builds; a GitLab or nightly
     # one is retried by its source, which knows where it lives.
     presubmit_retry = frozenset(b for b in retry if b not in gitlab_pending and b not in nightly_pending)
+    # An index that matched no objects is a note here: the lanes moved
+    # buckets, so the new index holds nothing until their first run lands and
+    # the old one may be purged later. Any other failure keeps the warning the
+    # refresh workflow refuses to publish on (`empty_is_note`, not the lane
+    # rule `unlisted_is_note`, which on a cold sweep would note every failure).
     for prefix in indexes:
         fresh.extend(
             runs_from_index(
@@ -2317,8 +2379,11 @@ def collect(
                 since_cutoff=since_cutoff,
                 retry_builds=presubmit_retry,
                 unfinished=unfinished,
+                empty_is_note=True,
             )
         )
+    # The cold sweep (no watermark) lists the globs; a glob that matched no
+    # objects is the same note as the index above, for the same reason.
     if glob_only:
         fresh.extend(
             runs_from_gcs(
@@ -2328,6 +2393,7 @@ def collect(
                 since_cutoff=since_cutoff,
                 retry_builds=presubmit_retry,
                 unfinished=unfinished,
+                empty_is_note=True,
             )
         )
     # The GitLab lane: pull-request builds of its own job, read through the
@@ -2541,7 +2607,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         metavar="GS_GLOB",
-        help="gs:// glob of Prow build dirs, e.g. gs://kube-agents-prow/"
+        help="gs:// glob of Prow build dirs, e.g. gs://kube-agents-evals-presubmit-logs/"
         "pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*"
         " (repeatable). Discovers builds only for a cold sweep (no watermark"
         " from --merge-with); with a watermark, --index-prefix is listed"
@@ -2553,7 +2619,7 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         metavar="GS_GLOB",
         help="gs:// glob of the GitLab lane's Prow build dirs, e.g."
-        " gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/"
+        " gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/"
         "pull-kube-agents-smoke-test-gitlab/* (repeatable). Read through"
         " the job's own directory index, whole on a cold sweep and above its"
         " own watermark after; its runs carry tier=gitlab and count in no"

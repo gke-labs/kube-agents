@@ -41,6 +41,10 @@ const (
 	// settleRetry paces retries of a terminal publish or an ack that
 	// failed: the task's outcome is decided, only its delivery is owed.
 	settleRetry = 500 * time.Millisecond
+	// ackConfirmWindow bounds the retries of an ack the server hasn't
+	// confirmed; past it the tombstone already written answers the
+	// redelivery.
+	ackConfirmWindow = time.Minute
 	// shutdownWait bounds Run's wait for handlers to return on shutdown.
 	shutdownWait = 10 * time.Second
 	// The abandon reasons.
@@ -71,11 +75,19 @@ const (
 	// verifier a call per retry delay, short enough that a revoked grant
 	// stops admitting soon.
 	verifiedFor = time.Minute
+	// reportAfterStop is how long a refusal already recorded keeps trying
+	// to publish its terminal after the dispatcher starts stopping (inside
+	// shutdownWait).
+	reportAfterStop = 5 * time.Second
 	// tombstoneMargin is how long past the submit stream's retention a
 	// tombstone is kept: a replay can come no later than the retention, and
 	// the margin covers a clock or a stream's age check running late.
 	tombstoneMargin = time.Hour
 )
+
+// errWatchEnded is a lease-bucket watch that closed before its initial
+// values were all read.
+var errWatchEnded = errors.New("the lease watch ended before its initial values")
 
 // The kinds a profile's submissions come in; one durable per tier each.
 var submitKinds = []string{lib.SubmitKindTop, lib.SubmitKindChild}
@@ -168,7 +180,7 @@ type Dispatcher struct {
 	started   time.Time
 	active    map[holdKey]*holding
 	offers    map[offerKey]chan lib.DispatchAccept
-	waiting   map[string]waiting
+	waiting   map[holdKey]waiting
 	lastAdmit map[string]time.Time
 	// released is the lease keys of tasks whose final renewal came while no
 	// hold here had them, by when: settled, not failed, when the
@@ -243,7 +255,7 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 		mint: mint, taskKeys: taskKeys, taskMaxLifetime: maxLifetime,
 		active:     map[holdKey]*holding{},
 		offers:     map[offerKey]chan lib.DispatchAccept{},
-		waiting:    map[string]waiting{},
+		waiting:    map[holdKey]waiting{},
 		lastAdmit:  map[string]time.Time{},
 		released:   map[string]time.Time{},
 		verified:   map[holdKey]permit{},
@@ -415,7 +427,8 @@ func (d *Dispatcher) syncBindings(ctx context.Context) {
 
 // regrant reconnects so the bus connection carries grants for the durables
 // and profiles the config added, then binds the durables. A bind still refused (the callout's
-// watch lagging the config) gets another reconnect, with backoff, up to
+// watch lagging the config; not a missing durable or one whose stored config
+// the held bind refuses) gets another reconnect, with backoff, up to
 // RegrantAttempts; then it is logged as an error and left for the next
 // refresh. Held work is untouched throughout (lib.Client.Reconnect).
 func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durables map[string]lib.DispatchDurable, added, addedProfiles []string) {
@@ -448,9 +461,11 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 			err := d.bindNow(ctx, want[name], durables[name])
 			switch {
 			case err == nil:
-			case errors.Is(err, jetstream.ErrConsumerNotFound):
+			case errors.Is(err, jetstream.ErrConsumerNotFound), errors.Is(err, lib.ErrHeldBindRefused):
 				// The bus answered, so the grant is there: the durable
-				// just isn't yet, and the bind retries pick it up.
+				// just isn't yet, or its stored config is refused (the
+				// server's record, which no reconnect changes). The bind
+				// retries pick it up, with backoff, as bind's would.
 				d.noteBindFailure(name, err)
 			default:
 				refused = append(refused, name)
@@ -605,12 +620,19 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 
 	now := d.now()
 	adm, ref, err := d.admit(ctx, del, snap, prof, hk, now)
+	if errors.Is(err, ErrVerifierUnreachable) {
+		// No verdict: the submission stays queued and is asked about
+		// again, until a verdict or its queue timeout ends it.
+		log.Warn("the verifier could not be reached; the submission stays queued", "err", err)
+		_ = del.Nak(d.cfg.RetryDelay)
+		return
+	}
 	if err != nil {
 		return // stopping: the lib gives the delivery back
 	}
 	if ref != nil {
 		log.Info("submission refused at admission", "reason", ref.reason, "detail", ref.detail)
-		d.clearWaiting(taskID)
+		d.clearWaiting(hk)
 		d.reject(ctx, log, del, hk, ref)
 		return
 	}
@@ -623,21 +645,24 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 				return
 			}
 		}
-		d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), why)
+		d.noteWaiting(hk, del.Received(), why)
 		log.Debug("over a cap; the submission stays queued", "cap", why)
 		_ = del.Nak(d.cfg.RetryDelay)
 		return
 	}
-	d.clearWaiting(taskID)
+	d.offeringWaiting(hk)
 	h.cluster, h.changeRequested = adm.cluster, adm.changeRequested
 
 	rec, key, err = d.handOff(ctx, log, del, snap, prof, h)
+	if err == nil && key != "" {
+		d.clearWaiting(hk)
+	}
 	if err != nil || key == "" {
 		d.release(h, false)
 		if err != nil {
 			log.Warn("hand-off failed; the submission stays queued", "err", err)
 		} else {
-			d.noteWaiting(taskID, lib.ProfileDurableName(profile, tier, kind), del.Received(), ReasonNoWorker)
+			d.noteWaiting(hk, del.Received(), ReasonNoWorker)
 			log.Info("no worker took the task; the submission stays queued")
 		}
 		if ctx.Err() == nil {
@@ -680,27 +705,38 @@ func (d *Dispatcher) followHolder(ctx context.Context, log *slog.Logger, del lib
 	_ = del.Nak(d.cfg.RetryDelay)
 }
 
-// reject publishes a refusal's terminal, writes the task's tombstone (under
-// ProfileLeaseRefusedPod: no pod ever held it) and terminates the
-// submission, so it is never redelivered, nor run or refused again if a
-// re-created durable replays it (a grant given since would otherwise run a
-// task once refused). A terminal or tombstone that can't be written leaves
-// the delivery to come back and be refused again (the terminal's envelope id
-// is fixed, so a repeat is a duplicate the stream drops).
+// reject writes a refusal's tombstone (under ProfileLeaseRefusedPod: no pod
+// ever held it), then publishes its terminal and terminates the submission,
+// so it is never redelivered, nor run or refused again if a re-created
+// durable replays it (a grant given since would otherwise run a task once
+// refused). The tombstone comes first: a refusal reported but not recorded
+// could run after all, on the next instance's fresh admission, once its
+// cause cleared. A tombstone that can't be written leaves the delivery to
+// come back and be decided afresh, with nothing reported. Once it is
+// written the refusal stands, so its terminal is owed even to a stop, for up
+// to reportAfterStop; one still unpublished then (or lost to a crash) stays
+// unpublished, since the redelivery finds the tombstone and is acked as a
+// replay. A repeat terminal is a duplicate the stream drops (its envelope id
+// is fixed).
 func (d *Dispatcher) reject(ctx context.Context, log *slog.Logger, del lib.Delivery, hk holdKey, ref *refusal) {
+	key := lib.ProfileLeaseKey(hk.profile, hk.tier, lib.ProfileLeaseRefusedPod, hk.taskID)
+	if !d.entomb(ctx, log, key, lib.LeaseRecord{TaskID: hk.taskID, Pod: lib.ProfileLeaseRefusedPod, Kind: hk.kind}) {
+		return
+	}
+	pctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	// A stop leaves the terminal reportAfterStop more to land.
+	defer context.AfterFunc(ctx, func() { time.AfterFunc(reportAfterStop, cancel) })()
 	for {
-		err := d.publishTerminal(ctx, hk.profile, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
+		err := d.publishTerminal(pctx, hk, del.Envelope(), lib.StateRejected, ref.reason, ref.detail)
 		if err == nil {
 			break
 		}
 		log.Warn("publish the rejection terminal; retrying", "err", err)
-		if !sleepCtx(ctx, settleRetry) {
+		if !sleepCtx(pctx, settleRetry) {
+			log.Error("a recorded refusal's terminal was not published before the stop", "err", err)
 			return
 		}
-	}
-	key := lib.ProfileLeaseKey(hk.profile, hk.tier, lib.ProfileLeaseRefusedPod, hk.taskID)
-	if !d.entomb(ctx, log, key, lib.LeaseRecord{TaskID: hk.taskID, Pod: lib.ProfileLeaseRefusedPod, Kind: hk.kind}) {
-		return
 	}
 	for del.Term() != nil {
 		if !sleepCtx(ctx, settleRetry) {
@@ -1054,10 +1090,15 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	}
 	if rec.Deadline.IsZero() {
 		// A record that doesn't say (unreadable, or not this dispatcher's
-		// shape): the profile's current limit from the confirm.
+		// shape): the profile's current limit from the confirm, or from now
+		// when the record names no time at all, or the first tick would fail
+		// a live task before the restart grace could protect it.
 		started := rec.ConfirmedAt
 		if started.IsZero() {
 			started = rec.RenewedAt
+		}
+		if started.IsZero() {
+			started = d.now()
 		}
 		rec.Deadline = started.Add(seconds(prof.ActiveDeadlineSeconds))
 	}
@@ -1144,7 +1185,7 @@ func deadlineLimit(rec lib.LeaseRecord) time.Duration {
 // to the next instance, whose record says started, and is failed there.
 func (d *Dispatcher) fail(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord, reason, detail string) {
 	for {
-		err := d.publishTerminal(ctx, h.profile, del.Envelope(), lib.StateFailed, reason, detail)
+		err := d.publishTerminal(ctx, h.key(), del.Envelope(), lib.StateFailed, reason, detail)
 		if err == nil {
 			break
 		}
@@ -1158,22 +1199,24 @@ func (d *Dispatcher) fail(ctx context.Context, log *slog.Logger, del lib.Deliver
 
 // settle ends a task whose outcome is decided (its final renewal came, or
 // its failure terminal is written): it turns the lease record into a
-// tombstone, acks the submission and waits for the server to confirm the
-// ack, then frees the slot. The tombstone comes first, so the submission is
+// tombstone, frees the slot, then acks the submission and waits for the
+// server to confirm the ack. The tombstone comes first, so the submission is
 // never without a record: one that comes back before the ack lands (a lost
-// ack, a crash) or long after (a durable re-created with DeliverAll replays
-// the stream's retention) finds the tombstone and is acked as a replay,
-// never offered again or failed a second time. A fire-and-forget ack can be
-// lost, so the ack is confirmed. The sweep deletes the tombstone once no
-// replay can come.
+// ack, a crash, a durable the operator deleted with the task still held) or
+// long after (a durable re-created with DeliverAll replays the stream's
+// retention) finds the tombstone and is acked as a replay, never offered
+// again or failed a second time. So the slot is freed once the tombstone is
+// written, whether or not the ack ever lands. A fire-and-forget ack can be
+// lost, so the ack is confirmed, for up to ackConfirmWindow. The sweep
+// deletes the tombstone once no replay can come.
 func (d *Dispatcher) settle(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord) {
 	if !d.entomb(ctx, log, key, rec) {
 		return
 	}
-	if !d.ackSyncRetry(ctx, del) {
-		return
-	}
 	d.release(h, true)
+	if !d.ackSyncRetry(ctx, del) && ctx.Err() == nil {
+		log.Warn("the settled submission's ack was not confirmed; its tombstone answers a redelivery", "key", key)
+	}
 }
 
 // entomb writes rec under key as a tombstone, finished now, until the write
@@ -1200,10 +1243,13 @@ func (d *Dispatcher) entomb(ctx context.Context, log *slog.Logger, key string, r
 	}
 }
 
-// ackSyncRetry acks del until the server confirms it. A repeat ack of a
-// message already acked is confirmed too, so a retry after a lost reply
-// ends.
+// ackSyncRetry acks del until the server confirms it, for up to
+// ackConfirmWindow (a durable deleted under a held delivery never answers).
+// A repeat ack of a message already acked is confirmed too, so a retry after
+// a lost reply ends.
 func (d *Dispatcher) ackSyncRetry(ctx context.Context, del lib.Delivery) bool {
+	ctx, cancel := context.WithTimeout(ctx, ackConfirmWindow)
+	defer cancel()
 	for {
 		actx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 		err := del.AckSync(actx)
@@ -1344,21 +1390,7 @@ func (d *Dispatcher) onRenewal(msg *nats.Msg) {
 	elsewhere := h == nil && d.heldAnywhereLocked(profile, tier, r.TaskID)
 	d.mu.Unlock()
 	if h != nil {
-		rn := renewal{pod: pod, final: r.Final}
-		select {
-		case h.renewals <- rn:
-		default:
-			// A full buffer drops a plain renewal (the next one renews);
-			// a final one must land, by one goroutine per hold at most.
-			if rn.final && h.finalQueued.CompareAndSwap(false, true) {
-				go func() {
-					select {
-					case h.renewals <- rn:
-					case <-h.done:
-					}
-				}()
-			}
-		}
+		deliverRenewal(h, renewal{pod: pod, final: r.Final})
 		return
 	}
 	allowed, logIt := d.allowUnknown(profile, tier, pod)
@@ -1400,16 +1432,36 @@ func (d *Dispatcher) onRenewal(msg *nats.Msg) {
 			d.mu.Unlock()
 			<-d.orphanSem
 		}()
-		d.renewOrphan(key, r, logIt)
+		d.renewOrphan(profile, tier, pod, key, r, logIt)
 	}()
+}
+
+// deliverRenewal hands a renewal to its hold. A full buffer drops a plain
+// renewal (the next one renews); a final one must land, by one goroutine per
+// hold at most.
+func deliverRenewal(h *holding, rn renewal) {
+	select {
+	case h.renewals <- rn:
+	default:
+		if rn.final && h.finalQueued.CompareAndSwap(false, true) {
+			go func() {
+				select {
+				case h.renewals <- rn:
+				case <-h.done:
+				}
+			}()
+		}
+	}
 }
 
 // renewOrphan handles a renewal for a task not held here: refreshed (by
 // compare-and-set, so a record deleted meanwhile stays deleted) when the
 // bucket holds it under this pod's key, ignored otherwise. A final one is
 // remembered, so the task is settled, not failed, when its submission comes
-// back. A tombstone is never renewed: its task is over.
-func (d *Dispatcher) renewOrphan(key string, r lib.LeaseRenewal, logIt bool) {
+// back, unless a hold took the task during the lookup (adopt registers it
+// and reads released under one lock): then the final is that hold's. A
+// tombstone is never renewed: its task is over.
+func (d *Dispatcher) renewOrphan(profile, tier, pod, key string, r lib.LeaseRenewal, logIt bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), kvOpTimeout)
 	defer cancel()
 	kv, err := d.bus.KV(ctx, lib.ProfileLeaseBucket)
@@ -1437,8 +1489,14 @@ func (d *Dispatcher) renewOrphan(key string, r lib.LeaseRenewal, logIt bool) {
 	}
 	if r.Final {
 		d.mu.Lock()
-		d.released[key] = d.now()
+		h := d.heldOnLocked(profile, tier, pod, r.TaskID)
+		if h == nil {
+			d.released[key] = d.now()
+		}
 		d.mu.Unlock()
+		if h != nil {
+			deliverRenewal(h, renewal{pod: pod, final: true})
+		}
 		return
 	}
 	if err := recErr; err != nil {
@@ -1506,7 +1564,8 @@ func (d *Dispatcher) prune() {
 //   - a running lease expired for longer than SweepAfter, held by no hold
 //     here, in a (profile, tier) whose durables are all bound (so a
 //     submission still on the stream would have come back and been
-//     re-adopted long since).
+//     re-adopted long since). An unreadable record counts as running and
+//     waits SweepAfter from its own write.
 func (d *Dispatcher) sweep(ctx context.Context) {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
@@ -1558,7 +1617,14 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 			d.log.Info("swept a tombstone past the submit stream's retention", "key", k, "finishedAt", rec.FinishedAt)
 			continue
 		}
-		if !bound || (readable && !rec.Expired(now, d.cfg.SweepAfter)) {
+		if !bound {
+			continue
+		}
+		// An unreadable record still says its task started (findLease), so
+		// it gets the same wait, counted from the entry's own write: no
+		// renewal can rewrite it, so that is its last sign of life.
+		if readable && !rec.Expired(now, d.cfg.SweepAfter) ||
+			!readable && now.Sub(entry.Created()) <= d.cfg.SweepAfter {
 			continue
 		}
 		if err := kv.Delete(kctx, k, jetstream.LastRevision(entry.Revision())); err != nil {
@@ -1687,7 +1753,10 @@ func (d *Dispatcher) findLease(ctx context.Context, profile, tier, taskID string
 // tier): one not expired, given grace. A record past that is no worker's
 // current task (its worker died, or it is garbage the sweep has yet to
 // remove), so it doesn't keep its pod from new work; nor does a tombstone,
-// which Expired always reports expired.
+// which Expired always reports expired. Every hand-off asks, and the bucket
+// keeps every finished task's tombstone for the submit stream's retention,
+// so the records are read in one pass (a watch's initial values), never one
+// round trip each.
 func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace time.Duration) (map[string]bool, error) {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
@@ -1695,30 +1764,32 @@ func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace
 	if err != nil {
 		return nil, err
 	}
-	lister, err := kv.ListKeysFiltered(kctx, lib.ProfileLeaseKeyFilter(profile, tier, "*"))
+	w, err := kv.WatchFiltered(kctx, []string{lib.ProfileLeaseKeyFilter(profile, tier, "*")}, jetstream.IgnoreDeletes())
 	if err != nil {
 		return nil, err
 	}
-	var keys []string
-	for k := range lister.Keys() {
-		keys = append(keys, k)
-	}
-	if kctx.Err() != nil {
-		return nil, kctx.Err()
-	}
+	defer func() { _ = w.Stop() }()
 	now := d.now()
 	pods := map[string]bool{}
-	for _, k := range keys {
-		pod := keyPod(k)
+	for {
+		var entry jetstream.KeyValueEntry
+		var open bool
+		select {
+		case entry, open = <-w.Updates():
+		case <-kctx.Done():
+			return nil, kctx.Err()
+		}
+		if !open {
+			// The watch ended before its initial values did.
+			return nil, errors.Join(errWatchEnded, kctx.Err())
+		}
+		if entry == nil {
+			// The initial values are all in.
+			return pods, nil
+		}
+		pod := keyPod(entry.Key())
 		if pod == "" || pods[pod] {
 			continue
-		}
-		entry, err := kv.Get(kctx, k)
-		if errors.Is(err, jetstream.ErrKeyNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, err
 		}
 		var rec lib.LeaseRecord
 		if err := json.Unmarshal(entry.Value(), &rec); err == nil && rec.Expired(now, grace) {
@@ -1726,7 +1797,6 @@ func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace
 		}
 		pods[pod] = true
 	}
-	return pods, nil
 }
 
 func (d *Dispatcher) putLease(ctx context.Context, key string, rec lib.LeaseRecord) error {

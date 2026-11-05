@@ -571,11 +571,15 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
         self.assertGreaterEqual(checked, 5, "the scan matched fewer remote servers than ship")
 
     def test_B1_only_the_gateway_reaches_the_mcp_relay(self) -> None:
-        """The relay is the gateway's: the sandbox and session pods get no new read path."""
+        """The relay is the gateway's: the sandbox and session pods get no new read path.
+
+        Profile workers are the one other role, narrowed in the handler to the
+        servers whose tools name no cluster (A3, PROFILE_SERVER_TOOLS, #3658).
+        """
         prefix = h.mcp_policy.MCP_RELAY_PREFIX
         self.assertEqual(
             h.credential_proxy.required_roles(prefix + "gke"),
-            (h.credential_proxy.CALLER_ROLE_CHAT,),
+            (h.credential_proxy.CALLER_ROLE_CHAT, h.credential_proxy.CALLER_ROLE_PROFILE),
         )
 
     def test_B1_the_operator_points_the_relay_url_at_the_brokers_mcp_route(self) -> None:
@@ -711,9 +715,9 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         auto-merge, which with a merge queue on `main` means "enqueue once the
         required checks pass". That is assent by policy: it fires only on
         `lgtm` and `approved` with no `do-not-merge` label, the predicate Tide
-        merges on today, and Prow sets those two labels only for accounts the
-        `OWNERS` files name. No model verdict is an input. The call runs on a
-        GitHub App token, not on a `pull-requests: write` grant: the holder
+        merged on before the merge queue, and Prow sets those two labels only
+        for accounts the `OWNERS` files name. No model verdict is an input.
+        The call runs on a GitHub App token, not on a `pull-requests: write` grant: the holder
         list above shows `auto-enqueue.yml` only for its left-out comment, and
         the App-token test below pins who mints one. The next test pins the predicate; any other script under
         `scripts/` making one of these calls is a red.
@@ -750,7 +754,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
 
         Auto-merge goes on only for a pull request that is not a draft, carries
         both `lgtm` and `approved`, and carries none of the `do-not-merge`
-        labels Tide's query excludes. Every other combination must leave it
+        labels Tide's query excluded. Every other combination must leave it
         off. That holds on each removal path too: never removed, removed with
         the one retry after a `failed_checks` removal due, and removed with it
         spent, which stays out.

@@ -100,6 +100,17 @@ chat_platforms.CONFIG_PATH = "/nonexistent/kube-agents-test/profile.yaml"
 BLANK_CHAT_ENV = {
     var: "" for signals in chat_platforms._ENV_SIGNALS.values() for var in signals
 } | {chat_notify.NOTIFY_PLATFORM_ENV: "", chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}
+# The projected home-channel file is absent on a test runner; say so rather
+# than rely on it.
+_HOME_DIR_PATCH = patch.object(chat_notify, "HOME_FILE_DIR", "/nonexistent/kube-agents-chat-home")
+
+
+def setUpModule():
+    _HOME_DIR_PATCH.start()
+
+
+def tearDownModule():
+    _HOME_DIR_PATCH.stop()
 
 from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification, report_to_chat, _sanitize_log_text, _sanitize_audit_value, _strip_audit_log_noise
 
@@ -788,6 +799,31 @@ class TestSendNotification(unittest.TestCase):
             ["hermes", "send", "--to", "slack:C12345", "alert"],
             capture_output=True, text=True, check=True, env={}, timeout=None, stdin=subprocess.DEVNULL
         )
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {
+        **BLANK_CHAT_ENV,
+        'SLACK_BOT_TOKEN': 'xoxb-dummy',
+        'A2A_NOTIFY_CONVERSATIONS': 'slack',
+    })
+    def test_send_notification_slack_learned_home_targets_the_bare_platform(self, mock_run, mock_env):
+        # A learned home channel is projected into a file, never into env: the
+        # target is the bare platform (the gateway posts into its home) and the
+        # gateway path carries no channel.
+        mock_env.return_value = {}
+        mock_response = MagicMock()
+        mock_response.stdout = '{"ok": true}'
+        mock_run.return_value = mock_response
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, 'slack_home'), 'w', encoding='utf-8') as handle:
+                handle.write('C0FILE\n')
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory):
+                result = send_notification("alert", session_id="")
+        self.assertIn("SUCCESS: Notification posted to slack", result)
+        argv = mock_run.call_args[0][0]
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "slack"])
+        self.assertNotIn("C0FILE", " ".join(argv))
 
     @patch('platform_mcp_server._run_env')
     @patch('platform_mcp_server.subprocess.run')

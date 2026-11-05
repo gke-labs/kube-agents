@@ -69,7 +69,7 @@ JOB_NAME = "pull-kube-agents-smoke-test"
 # way to enumerate builds: a recursive listing of pr-logs/pull/ takes seven
 # minutes and a wildcard over the per-build subdirectories takes two, against
 # under ten seconds to copy every object in here.
-GCS_BUCKET = "kube-agents-prow"
+GCS_BUCKET = "kube-agents-evals-presubmit-logs"
 GCS_BUILD_INDEX = f"gs://{GCS_BUCKET}/pr-logs/directory/{JOB_NAME}"
 BUILD_INDEX_SUFFIX = ".txt"
 # The index files, and only them. `latest-build.txt` sits under the same prefix
