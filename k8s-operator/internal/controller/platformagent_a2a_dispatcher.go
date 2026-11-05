@@ -137,7 +137,7 @@ func a2aDispatcherPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]str
 //   - stop records (contract addendum 9), per profile it dispatches for:
 //     subscribe on a2a.stop.<profile>.*, and a direct get of the same
 //     subjects on DISPATCH_STOPS to catch up after a restart. The gateway is
-//     their only writer.
+//     their only writer, once #4127 grants it.
 //
 // No subscribe on a2a.tasks.> or a2a.submit.>: it reads submissions only
 // through its durables, and never a task's .in or .events.
@@ -220,8 +220,9 @@ func a2aTaskSigningSeedVolumeSource(agent *agentv1alpha1.PlatformAgent) corev1.V
 }
 
 // a2aTaskCredentialMaxLifetimeEnv is the one lifetime ceiling the minter and
-// both verifiers read: the dispatcher mints no credential past it, and the
-// callout and the broker refuse one that is. Rendered from one resolver for
+// both verifiers read: the callout and the broker refuse a credential past
+// it, and the dispatcher mints none past it once its minting (#4346) reads
+// it. Rendered from one resolver for
 // all three, because a dispatcher minting longer than a verifier allows has
 // every credential refused, which fails every profile task.
 func a2aTaskCredentialMaxLifetimeEnv(agent *agentv1alpha1.PlatformAgent) corev1.EnvVar {
@@ -243,6 +244,17 @@ func buildA2ADispatcherServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev
 // two at once would each hold their own share of every durable's in-flight
 // count and enforce the ceiling against half the picture. The gap Recreate
 // leaves is what restartGraceSeconds covers.
+// a2aTaskSigningKeyHashAnnotation carries a2aTaskSigningKeyHash on the
+// dispatcher's pod template.
+const a2aTaskSigningKeyHashAnnotation = "kubeagents.x-k8s.io/task-signing-key-hash"
+
+// a2aTaskSigningKeyHash is a short digest of the task-signing key's public
+// half: it changes exactly when the key does, and names nothing secret.
+func a2aTaskSigningKeyHash(public string) string {
+	sum := sha256.Sum256([]byte(public))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
 func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aDispatcherName(agent)
 	selector := a2aDispatcherPodSelector(agent)
@@ -633,9 +645,15 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// The task-signing key before the Deployment that mounts its seed: the
 	// pod can't start on a Secret that isn't there. #4130 made the key; this
 	// only ensures it exists.
-	if _, err := r.ensureA2ATaskSigningKeySecret(ctx, agent); err != nil {
+	signingKey, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
+	if err != nil {
 		return nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
 	}
+	dispatcher := buildA2ADispatcherDeployment(agent)
+	// The seed is a file mount, so a repaired key wouldn't reach a running
+	// dispatcher. A hash of its public half on the pod template rolls the
+	// dispatcher when the key changes, as the callout rolls on its env.
+	dispatcher.Spec.Template.Annotations = map[string]string{a2aTaskSigningKeyHashAnnotation: a2aTaskSigningKeyHash(signingKey.Public)}
 	// The identity before the Deployment that mounts a token for it, and the
 	// config and its Role before the pod that watches them.
 	owned := []client.Object{
@@ -643,7 +661,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 		cm,
 		buildA2ADispatcherConfigRole(agent),
 		buildA2ADispatcherConfigRoleBinding(agent),
-		buildA2ADispatcherDeployment(agent),
+		dispatcher,
 	}
 	for _, obj := range owned {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {

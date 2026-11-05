@@ -133,7 +133,8 @@ const (
 	// a2aDispatchStopStream holds the gateway's stop records, one per task
 	// on a2aDispatchStopPrefix<profile>.<task> (lib.DispatchStopStream and
 	// lib.DispatchStopSubject; contract addendum 9). The gateway is its only
-	// writer and the dispatcher its only reader.
+	// writer, once its grant lands with #4127 (until then nothing writes it),
+	// and the dispatcher its only reader.
 	a2aDispatchStopStream = "DISPATCH_STOPS"
 	a2aDispatchStopPrefix = "a2a.stop."
 
@@ -3344,8 +3345,10 @@ $NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SU
 # DISPATCH_STOPS: the gateway's stop records for AgentProfile tasks, one per
 # task (a2a.stop.<profile>.<task>), read by the dispatcher by subject (contract
 # addendum 9). It is outside a2a.dispatch. on purpose: the dispatcher publishes
-# there, and a stop must have one writer, the gateway. A record outlives any
-# task (24h against the 6h deadline cap), and nothing makes a consumer here.
+# there, and a stop must have one writer, the gateway (granted with #4127). A
+# record outlives any task (24h against the 6h deadline cap). Nothing makes a
+# consumer here; --max-consumers=1 is the tightest cap JetStream has, since 0
+# means unlimited.
 $NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream add DISPATCH_STOPS --allow-direct \
   --subjects='a2a.stop.>' --storage=file --retention=limits \
   --max-age=24h --max-bytes=67108864 --discard=old --replicas=1 \

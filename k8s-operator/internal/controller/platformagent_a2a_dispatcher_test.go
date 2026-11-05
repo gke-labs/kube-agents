@@ -611,3 +611,77 @@ func TestTheDispatchConfigsRetentionIsTheSubmitStreamsMaxAge(t *testing.T) {
 		t.Errorf("the dispatch config's submitRetentionSeconds = %d, the stream's max age %dh", cfg.SubmitRetentionSeconds, hours)
 	}
 }
+
+// DISPATCH_STOPS is provisioned exactly as the contract has it: the stop
+// subjects, a day's retention (longer than any task), one record per task,
+// 64MiB, direct get, and at most one consumer, the tightest cap JetStream
+// has.
+func TestTheStopStreamIsProvisionedToItsContract(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+	m := regexp.MustCompile(`stream add DISPATCH_STOPS((?:[^\n]*\\\n)*[^\n]*)`).FindStringSubmatch(script)
+	if m == nil {
+		t.Fatal("the provision script doesn't add DISPATCH_STOPS")
+	}
+	for _, flag := range []string{"--allow-direct", "--subjects='a2a.stop.>'", "--max-age=24h", "--max-bytes=67108864", "--max-msgs-per-subject=1", "--max-consumers=1", "--storage=file", "--discard=old", "--replicas=1"} {
+		if !strings.Contains(m[1], flag) {
+			t.Errorf("DISPATCH_STOPS is added without %s: %s", flag, m[0])
+		}
+	}
+}
+
+// A CR's spec.deployment.env can't hand a broker-side container a seed file
+// of its choosing: A2A_TASK_SIGNING_SEED_FILE is reserved.
+func TestTheSeedFileEnvIsReserved(t *testing.T) {
+	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{
+		{Name: a2aTaskSigningSeedFileEnvVar, Value: "/tmp/theirs"},
+		{Name: "HARMLESS_PLUGIN_SETTING", Value: "kept"},
+	})
+	if _, count := envValueCount(merged, a2aTaskSigningSeedFileEnvVar); count != 0 {
+		t.Errorf("%s survived the merge from spec.deployment.env", a2aTaskSigningSeedFileEnvVar)
+	}
+	if value, count := envValueCount(merged, "HARMLESS_PLUGIN_SETTING"); count != 1 || value != "kept" {
+		t.Error("the merge dropped an unrelated variable; the reserved list is too wide")
+	}
+}
+
+// A repaired task-signing key rolls the dispatcher: the seed is a file mount,
+// so only a pod-template change gets the new one to a running dispatcher.
+func TestARepairedSigningKeyRollsTheDispatcher(t *testing.T) {
+	withDispatcher(t)
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, chartProfileNamespace(agent)).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	hash := func() string {
+		t.Helper()
+		dep := &appsv1.Deployment{}
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatcherName(agent)}, dep); err != nil {
+			t.Fatalf("get the dispatcher: %v", err)
+		}
+		return dep.Spec.Template.Annotations[a2aTaskSigningKeyHashAnnotation]
+	}
+	if _, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	before := hash()
+	if before == "" {
+		t.Fatal("the dispatcher's pod template carries no signing-key hash")
+	}
+	// Damage the seed; the next pass repairs the key in place.
+	sec := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aTaskSigningKeyName(agent)}, sec); err != nil {
+		t.Fatal(err)
+	}
+	sec.Data["task-signing-seed"] = []byte("not a seed")
+	if err := cl.Update(ctx, sec); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	if after := hash(); after == before {
+		t.Errorf("the signing key was repaired and the dispatcher's pod template didn't change (%s)", after)
+	}
+}
