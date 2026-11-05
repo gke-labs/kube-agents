@@ -526,7 +526,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	// taskCtx stays cancelable through the body read: the server can send
 	// its headers before the body, and a cancel or shutdown in between must
 	// still end the request.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, apiResponseCap+1))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, int64(b.responseCap)+1))
 	// The turn's wall time: from the connection the server answered on to
 	// the end of the body, before any lock below adds to it, and without
 	// the refused dials sendAPI retried first.
@@ -562,13 +562,13 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 			reason, resp.StatusCode, sessionID, turnNote(turn), tail(string(raw), apiBodyTailBytes)), nil)
 		return "", false
 	}
-	if len(raw) > apiResponseCap {
+	if len(raw) > b.responseCap {
 		// Refused, never truncated: a cut answer would fail to parse and
 		// read as a protocol fault, and a shortened one is worse than a
 		// loud failure.
 		b.finalize(run, lib.StateFailed, fmt.Sprintf("reason: hermes-api-oversize - HTTP %d; session: %s%s; "+
 			"the response body is over the %d-byte limit (apiResponseCap in api.go); the answer was refused rather than truncated",
-			resp.StatusCode, sessionID, turnNote(turn), apiResponseCap), nil)
+			resp.StatusCode, sessionID, turnNote(turn), b.responseCap), nil)
 		return "", false
 	}
 	var out apiChatResponse

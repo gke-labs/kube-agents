@@ -904,6 +904,19 @@ class BrowserTest(unittest.TestCase):
         out = render_to(pathlib.Path(self.tmp.name) / sub, self.data, health=health)
         return dom_text(out / "index.html")
 
+    def test_a_lane_run_that_records_where_it_lives_links_the_console_browser(self):
+        """gcs_base (the lanes' own bucket, which Deck cannot read) turns the
+        row's build link into the Console's bucket browser; a night's
+        log_url still wins, and a record without either keeps Spyglass."""
+        data = copy.deepcopy(self.data)
+        base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600/"
+        lane_run = dict(data["runs"][0], build_id="2097282860221206600", tier="gitlab", job="pull-kube-agents-smoke-test-gitlab", pr=2475, result="FAILURE", eval_verdict="RED", gcs_base=base)
+        data["runs"].append(lane_run)
+        out = render_to(pathlib.Path(self.tmp.name) / "gitlab-moved", data, health=health_doc())
+        page = dom_text(out / "index.html")
+        self.assertIn('href="https://console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/2475/pull-kube-agents-smoke-test-gitlab/2097282860221206600"', page)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/2475/", page)
+
     def test_the_gitlab_lane_has_its_own_section_outside_the_gates_numbers(self):
         """A tier-gitlab run is listed under "GitLab lane" with its own
         Spyglass link and never among the gate's runs; without one the
@@ -1226,11 +1239,9 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Smoke gate is healthy", app)
         sentence = "Runs are slow since Tue 8:00 AM ET: the last 5 full runs took a median of 183 min against a 7-day typical of 151. Nothing is broken; /retest won't make yours faster."
         self.assertIn(sentence, app)
-        # The 🐢 message's own link lands on this headline, not on a
-        # synthetic past incident: a `since` at the note's GREEN start would.
-        fragment = "#" + render.post_health.render_slow(health_doc("GREEN", slow=note)).rsplit("#", 1)[1]
-        self.assertEqual(fragment, "#view=agent")
-        linked = dom_text(out / "index.html", fragment=fragment)
+        # The bare agent view lands on this headline, not on a synthetic past
+        # incident: a `since` at the note's GREEN start would.
+        linked = dom_text(out / "index.html", fragment="#view=agent")
         self.assertIn("Smoke gate is healthy", linked)
         self.assertIn(sentence, linked)
         self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")
@@ -1519,6 +1530,21 @@ class BrowserTest(unittest.TestCase):
         hand_written = urllib.parse.urlencode({"cases": ",".join(sixty[:51]), "since": OUTAGE_SINCE})
         self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=hand_written))
         self.assertIn("50 gate cases fail", dom_text(out / "index.html", fragment=f"#{hand_written}"))
+
+    def test_a_run_that_records_where_it_lives_links_its_build_and_transcripts_there(self):
+        """The run page's build link opens the Console's bucket browser and a
+        transcript link the object itself, for a run with gcs_base; the
+        Spyglass link under the old bucket is gone from that page."""
+        data = copy.deepcopy(self.data)
+        base = "gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528/"
+        moved = [r for r in data["runs"] if r["build_id"] == "2097282860221206528"]
+        self.assertEqual(len(moved), 1)
+        moved[0]["gcs_base"] = base
+        out = render_to(pathlib.Path(self.tmp.name) / "moved", data, health=health_doc())
+        app = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("console.cloud.google.com/storage/browser/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
+        self.assertIn("storage.cloud.google.com/kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528/artifacts/eval_cluster-agent-crashloop-debug_rep1.log", app)
+        self.assertNotIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
 
     def test_pr_view_outage_run(self):
         app = dom_text(self.run_page, query="build=2097282860221206528")

@@ -959,6 +959,10 @@ INJECT_LANE_REQUESTING = [
     # the change as a pull request; its objective's pull_request_opened leaf
     # allows one.
     "scale-request-proposes-pr",
+    # stop-on-permission-refusal: refused or declined the kubectl scale the
+    # user asked for, it may propose the change as a pull request (#4224);
+    # its objective's pull_request_opened leaf allows one.
+    "stop-on-permission-refusal",
     "vcs-review-feedback-read-back",
     # Also listed in `requesting:`, for the pull request it opens and closes
     # beside the one its check grades.

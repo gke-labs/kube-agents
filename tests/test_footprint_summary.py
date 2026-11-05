@@ -155,14 +155,14 @@ class FootprintSummaryTest(unittest.TestCase):
         self._assert_summary_matches(notes, req)
         # The stock install's figures, the ones the prerequisites page quotes, in the
         # words the notes use, so a wording change is a deliberate one here too.
-        self.assertIn("CPU requests:        2.606 cores", notes)
-        self.assertIn("Memory requests:     8.94 GiB", notes)
+        self.assertIn("CPU requests:        2.706 cores", notes)
+        self.assertIn("Memory requests:     9.19 GiB", notes)
         self.assertIn("Persistent storage:  102 GiB over 4 claims", notes)
         self.assertIn("$0.0445/vCPU-hour", notes)
         self.assertIn("$0.0049225/GiB-hour", notes)
         self.assertIn("$0.10/GiB-month", notes)
         self.assertIn("$73.00/month GKE cluster fee", notes)
-        self.assertNotIn("Not counted: the spec.mode next workloads", notes)
+        self.assertNotIn("Not counted", notes)
         # The disk is the balanced class on the footprint line and on the cost line alike.
         self.assertIn("balanced persistent disk", notes)
         self.assertNotIn("SSD", notes)
@@ -187,11 +187,18 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn(_expected_lines(default_req)["total"], default_notes)
 
     def test_next_mode_names_what_the_summary_leaves_out(self) -> None:
-        notes, _ = self._render(["platformAgent.mode=next"])
-        self.assertIn("Not counted: the spec.mode next workloads", notes)
-        self.assertIn("40 GiB JetStream claim", notes)
-        today, _ = self._render(["platformAgent.mode=today"])
-        self.assertNotIn("Not counted", today)
+        notes, req = self._render(["platformAgent.mode=next"])
+        self._assert_summary_matches(notes, req)
+        # The preflight sums the next-mode workloads (footprint.yaml's nextMode), so
+        # the figures carry them, the NATS bus's JetStream claim included, and only
+        # the session pods are left out.
+        self.assertIn("Not counted: the session pods", notes)
+        self.assertIn("40 GiB JetStream claim among them, are in the figures above", notes)
+        today_notes, today = self._render(["platformAgent.mode=today"])
+        self.assertNotIn("Not counted", today_notes)
+        self.assertEqual(req["persistentVolumeClaims"], today["persistentVolumeClaims"] + 1)
+        self.assertEqual(req["requestsStorage"], today["requestsStorage"] + 40 * _GIB)
+        self.assertGreater(req["pods"], today["pods"])
 
     def test_summary_follows_the_quota_preflight_switch(self) -> None:
         # The summary shares the preflight's arithmetic, and the preflight's refusals name

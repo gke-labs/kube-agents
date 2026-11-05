@@ -11,6 +11,16 @@ Both channels terminate at the **Planning Agent** — the `default` Hermes profi
 
 The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
+On a large fleet the roster counts the Cluster Agents by project and location instead of naming each, and the Planning Agent looks a named cluster's agent up with `list_agents` before it files the card. The switch is the number of Cluster Agents, above `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`, 20 unless set. A fleet of four Cluster Agents never reaches it. Set the variable in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages; a value that is not a whole number keeps the default, and changing it rolls the agent pod.
+
+```yaml
+platformAgent:
+  deployment:
+    env:
+      - name: KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD
+        value: "100"
+```
+
 Under `spec.mode: next`, Google Chat terminates at the A2A gateway instead: the same Chat app, topic and subscription, pulled through the credential broker by the gateway rather than by the Planning Agent, with the same `allowedUsers` list deciding who is answered. The Planning Agent's Google Chat platform is off on such an install, so proactive alerts and scheduled reports reach the [home channel](#home-channel) through the gateway instead. The gateway posts them there as new threads or as replies in those threads. A reply a person types in one of those threads starts a new conversation rather than continuing the investigation that raised the alert.
 
 The reports of the cards a triage files reach the alert's thread the same way, and so do the answers of the cards the agent files for a question you asked it in chat. They post in the thread or DM you asked in, whether or not a home channel is configured (a home channel that is set but is not a space name turns this off too). Either way there are two differences from the Planning Agent's own delivery. A card's progress is one plan message the gateway edits in place with `KAGE_SLACK_UX` on, and a message per note with it off. A file the card produced is not attached. The design of record is [`docs/designs/spec-chatops-gateway.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/spec-chatops-gateway.md).
@@ -444,15 +454,16 @@ On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/s
 `/feedback summary` is the one `/feedback <text>` the gateway answers itself. It posts one fenced block, short enough to read in full before pasting it into an email or a chat message, with no model in the loop. The block holds:
 
 - the image tag, the mode, the Kubernetes version, and the install's age and readiness;
+- the model as `provider/name` from the resource's `status.inference` (`unavailable` while the operator has not written it);
 - the `status.usage` counters;
 - a roll-up of the chat turns the gateway's own records still hold (ended, cancelled, active);
 - a short feedback template.
 
 The line is labelled `chat turns`, not `tasks`, because the script's `tasks` line counts kanban cards and the two pastes from one install would otherwise disagree under one label. The roll-up's window is fourteen days, or the install's session TTL when that is shorter, since the gateway deletes a conversation's records once it has been idle that long. The gateway's records hold a turn's start, a cancel and whether it is the conversation's running turn, not its outcome: a turn that ended any other way counts as ended, where the script's block tells done from failed.
 
-It names no cluster, project, namespace, task or person. The gateway refuses to post a block in which the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings) appears, and says so instead. The block's own words, such as a bucket or interface name, are not refused.
+It names no cluster, project, namespace, task or person. The gateway audits the block outside its `model:` line, which carries only the provider and model name from the status. It refuses to post a block whose audited lines contain the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings), and says so instead. The block's own words, such as a bucket or interface name, are not refused.
 
-The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the model, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
+The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
 
 ### The Slack Home tab
 
@@ -709,7 +720,7 @@ The job fires every minute (`* * * * *`, see [Autonomous watchdogs](/kube-agents
 
 ## When no chat platform is enabled
 
-Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. On a `spec.mode: next` install the A2A gateway still runs, on its console door alone, so the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console)'s chat pane reaches the Planning Agent with nothing to turn on: `kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080`, then `http://localhost:8080`. The [web console](/kube-agents/deploy/web-console/) is a browser alternative in either mode, turned on with `install.sh --enable-web-console`; its channels also show event triage and scheduled checks. The Hermes CLI above is another way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
+Both channels are opt-in and default to disabled, so an install that enabled neither has no chat to talk to. Under `spec.mode: next` it also carries the [`NoChatPlatform`](/kube-agents/operator/platformagent-crd/#status) condition, which says where its findings go. On a `spec.mode: next` install the A2A gateway still runs, on its console door alone, so the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console)'s chat pane reaches the Planning Agent with nothing to turn on: `kubectl -n kubeagents-system port-forward svc/platform-agent-a2a-console 8080:8080`, then `http://localhost:8080`. The [web console](/kube-agents/deploy/web-console/) is a browser alternative in either mode, turned on with `install.sh --enable-web-console`; its channels also show event triage and scheduled checks. The Hermes CLI above is another way in, and the installer prints these two commands when you choose "None" at its chat prompt and again when it finishes:
 
 ```bash
 gcloud container clusters get-credentials <cluster> --location <region> --project <project> --dns-endpoint
@@ -722,7 +733,9 @@ This reaches the Platform Agent directly, bypassing the front door: a request ty
 
 The [admin console](/kube-agents/reference/admin-console/), started from a repository checkout on your own machine, is one more. Its Chat page reaches the Planning Agent through the front door, so a request typed there is planned and delegated the way a chat message would be. [User interfaces](/kube-agents/reference/user-interfaces/) compares the browser pages.
 
-Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither arrives anywhere. And the onboarding delivery stage waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume. Read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
+Two things a chat-less install does not exercise. Scheduled reports and alert-driven triage are delivered only to enabled chat platforms — the delivery resolver enumerates Google Chat and Slack and nothing else — so neither reaches a person as it happens. The audit reports stay in the report store on the data volume, the triage shows on the board, and other scheduled reports are not kept.
+
+The onboarding delivery stage waits for a human to connect over chat before it posts the first-run inventory report, so that report stays at `/opt/data/INVENTORY.md` on the shell sandbox pod's volume. Read it with `kubectl exec -n kubeagents-system platform-agent-shell-0 -c shell -- cat /opt/data/INVENTORY.md` rather than waiting for it.
 
 ## Where to go next
 

@@ -37,6 +37,7 @@ import json
 import logging
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
 from collections.abc import Generator, Sequence
@@ -1292,6 +1293,15 @@ def test_an_own_tunnel_forwards_the_inject_service_and_respawns_it_on_a_drop(
 
     monkeypatch.setattr(harness, "_ensure_port_forward", _ensure)
     monkeypatch.setattr(harness, "_reset_port_forward", _reset)
+    # No Lease on this install: the door's Service, as every unelected
+    # gateway serves it.
+    asked: list[tuple[str, str]] = []
+
+    def _no_lease(agent_service: str, service: str) -> str:
+        asked.append((agent_service, service))
+        return f"svc/{service}"
+
+    monkeypatch.setattr(harness, "_gateway_door_target", _no_lease)
     stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
     stub_gateway.poll_status = 503
     stub_gateway.poll_failures = 1
@@ -1300,13 +1310,213 @@ def test_an_own_tunnel_forwards_the_inject_service_and_respawns_it_on_a_drop(
 
     result = KubeAgentsHarness().run("take your time")
 
-    door = (local_port, "platform-agent-a2a-inject", harness._INJECT_REMOTE_PORT)
+    door = (local_port, "svc/platform-agent-a2a-inject", harness._INJECT_REMOTE_PORT)
     assert established == [door]
     assert respawned == [door]
+    assert asked == [("platform-agent", "platform-agent-a2a-inject")] * 2
     assert stub_gateway.failed_polls == 1
     assert len(stub_gateway.submissions) == 1
     assert result.output == "partial findings"
     assert not infra(result)
+
+
+def test_a_respawn_after_a_standbys_503_forwards_to_the_new_holder(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behind an elected gateway the tunnel goes to the Lease holder's pod,
+    and the holder is read again on each respawn: a 503 from a standby (the
+    lease moved, or the first read was stale) is retried against the replica
+    that holds it now, not the same pod or the Service."""
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    local_port = stub_gateway.server_address[1]
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(local_port))
+    targets: list[str | None] = []
+
+    def _forward(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        targets.append(service)
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _forward)
+    monkeypatch.setattr(harness, "_reset_port_forward", _forward)
+    holders = iter(["pod/platform-agent-a2a-gateway-a", "pod/platform-agent-a2a-gateway-b"])
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: next(holders))
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.poll_status = 503
+    stub_gateway.poll_failures = 1
+    stub_gateway.poll_fail_after_seconds = 0.5
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert targets == ["pod/platform-agent-a2a-gateway-a", "pod/platform-agent-a2a-gateway-b"]
+    assert result.output == "partial findings"
+    assert not infra(result)
+
+
+@pytest.mark.parametrize(
+    ("owned", "want_reset"),
+    [
+        # An earlier exchange's tunnel still goes to the old holder, now a
+        # standby: replaced on this exchange's first spawn.
+        ("pod/platform-agent-a2a-gateway-a", True),
+        # Already where the lease points: kept.
+        ("pod/platform-agent-a2a-gateway-b", False),
+        # No tunnel of this process's own on the port: established as usual.
+        (None, False),
+    ],
+)
+def test_a_first_spawn_replaces_an_owned_tunnel_aimed_at_an_old_holder(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, owned: str | None, want_reset: bool
+) -> None:
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    local_port = stub_gateway.server_address[1]
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(local_port))
+    calls: list[tuple[str, str | None]] = []
+
+    def _ensure(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        calls.append(("ensure", service))
+
+    def _reset(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        calls.append(("reset", service))
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _ensure)
+    monkeypatch.setattr(harness, "_reset_port_forward", _reset)
+    monkeypatch.setattr(harness, "_owned_forward_target", lambda port: owned)
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: "pod/platform-agent-a2a-gateway-b")
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    result = KubeAgentsHarness().run("hello")
+
+    assert calls[0] == ("reset" if want_reset else "ensure", "pod/platform-agent-a2a-gateway-b")
+    assert not infra(result)
+
+
+def test_the_owned_target_is_what_this_process_spawned() -> None:
+    port = 41234
+    with harness._PF_LOCK:
+        harness._PF_TARGETS[port] = "pod/x"
+    try:
+        # A target with no live process of ours: not owned.
+        assert harness._owned_forward_target(port) is None
+        with harness._PF_LOCK:
+            harness._PF_PROCESSES[port] = object()  # type: ignore[assignment]
+        assert harness._owned_forward_target(port) == "pod/x"
+    finally:
+        with harness._PF_LOCK:
+            harness._PF_TARGETS.pop(port, None)
+            harness._PF_PROCESSES.pop(port, None)
+
+
+class _KubectlReads:
+    """A stand-in for ``subprocess.run`` answering the three reads the door
+    target takes: the Lease's holder, the door Service's selector, and the
+    pods it selects."""
+
+    def __init__(
+        self,
+        holder: str = "platform-agent-a2a-gateway-7d9f-abcde",
+        lease_rc: int = 0,
+        lease_stderr: str = "",
+        raises: BaseException | None = None,
+        selector: str = '{"app.kubernetes.io/component":"a2a-gateway","app.kubernetes.io/instance":"platform-agent"}',
+        pods: str = "platform-agent-a2a-gateway-7d9f-abcde platform-agent-a2a-gateway-7d9f-fghij",
+    ) -> None:
+        self.holder, self.lease_rc, self.lease_stderr, self.raises = holder, lease_rc, lease_stderr, raises
+        self.selector, self.pods = selector, pods
+        self.commands: list[list[str]] = []
+
+    def __call__(self, cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        self.commands.append(cmd)
+        if self.raises is not None:
+            raise self.raises
+        if cmd[1:3] == ["get", "lease"]:
+            return subprocess.CompletedProcess(cmd, self.lease_rc, stdout=self.holder if self.lease_rc == 0 else "", stderr=self.lease_stderr)
+        if cmd[1:3] == ["get", "svc"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.selector, stderr="")
+        if cmd[1:3] == ["get", "pods"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.pods, stderr="")
+        raise AssertionError(f"unexpected kubectl {cmd}")
+
+
+_SERVICE = "platform-agent-a2a-inject"
+_HOLDER_POD = "pod/platform-agent-a2a-gateway-7d9f-abcde"
+
+
+@pytest.mark.parametrize(
+    ("reads", "want"),
+    [
+        (_KubectlReads(), _HOLDER_POD),
+        # Released, or between leaders: nobody to point at.
+        (_KubectlReads(holder=""), f"svc/{_SERVICE}"),
+        # No Lease: an unelected gateway, every install before the operator renders one.
+        (_KubectlReads(lease_rc=1, lease_stderr='Error from server (NotFound): leases.coordination.k8s.io "x" not found'), f"svc/{_SERVICE}"),
+        (_KubectlReads(raises=OSError("kubectl not found")), f"svc/{_SERVICE}"),
+        (_KubectlReads(raises=subprocess.TimeoutExpired(["kubectl"], 15)), f"svc/{_SERVICE}"),
+        # The tunnel carries the door's token: a holder that isn't one of the
+        # gateway's own pods (a Lease written by something else) is not
+        # trusted with it.
+        (_KubectlReads(holder="some-other-pod"), f"svc/{_SERVICE}"),
+        (_KubectlReads(selector=""), f"svc/{_SERVICE}"),
+        (_KubectlReads(selector="not json"), f"svc/{_SERVICE}"),
+        (_KubectlReads(pods=""), f"svc/{_SERVICE}"),
+    ],
+)
+def test_the_door_target_is_a_gateway_pod_holding_the_lease_or_the_service(
+    monkeypatch: pytest.MonkeyPatch, reads: _KubectlReads, want: str
+) -> None:
+    monkeypatch.delenv("AGENT_GATEWAY_LEASE", raising=False)
+    monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
+    monkeypatch.setenv("AGENT_CLUSTER_CONTEXT", "ctx-1")
+    monkeypatch.setattr(harness.subprocess, "run", reads)
+
+    assert harness._gateway_door_target("platform-agent", _SERVICE) == want
+    assert reads.commands[0] == [
+        "kubectl",
+        "get",
+        "lease",
+        "platform-agent-a2a-gateway",
+        "-o",
+        "jsonpath={.spec.holderIdentity}",
+        "-n",
+        "kubeagents-system",
+        "--context",
+        "ctx-1",
+    ]
+    if want == _HOLDER_POD:
+        # The holder is checked against the pods the door's own Service selects.
+        assert reads.commands[2][1:5] == [
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/component=a2a-gateway,app.kubernetes.io/instance=platform-agent",
+        ]
+
+
+def test_a_lease_read_that_fails_for_another_reason_is_said(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A forbidden read falls back to the Service like a missing Lease, but
+    says so: at two replicas the Service can land on the standby every time."""
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        _KubectlReads(lease_rc=1, lease_stderr='Error from server (Forbidden): leases.coordination.k8s.io "x" is forbidden'),
+    )
+    with caplog.at_level(logging.WARNING, logger=harness._log.name):
+        assert harness._gateway_door_target("platform-agent", _SERVICE) == f"svc/{_SERVICE}"
+    assert "Forbidden" in caplog.text
+
+
+def test_a_resolved_target_is_forwarded_as_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pod target from the lease reaches kubectl unchanged, not as a
+    Service named ``svc/pod/...``."""
+    monkeypatch.delenv("AGENT_CLUSTER_CONTEXT", raising=False)
+    monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
+    cmd = harness._port_forward_command(28099, "pod/platform-agent-a2a-gateway-7d9f-abcde", harness._INJECT_REMOTE_PORT)
+    assert cmd[2:4] == ["pod/platform-agent-a2a-gateway-7d9f-abcde", "28099:8099"]
 
 
 def test_a_status_outside_the_retry_set_is_not_retried(stub_gateway: _StubGatewayServer) -> None:
@@ -3150,6 +3360,62 @@ def test_a_board_that_stops_answering_is_infrastructure(
 
     assert infra(result)
     assert "the kanban board could not be read 3 times running" in result.errors[0]
+
+
+def test_an_inject_lane_settle_floors_its_purge(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The settle the presubmit's inject lane takes carries the run-start floor (#4591)."""
+    floor = 1_700_000_000
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    real = local_shell(tmp_path, monkeypatch)
+    purges: list[str] = []
+
+    def clocked(script: str, timeout: float) -> str:
+        if script == harness._POD_CLOCK_SCRIPT:
+            return f"{floor}\n"
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            purges.append(script)
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    (purge,) = purges
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([CARD_A], floor=floor)))
+
+
+def test_a_board_that_stops_answering_floors_its_purge(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The purge on the way out of an exhausted board wait carries the run-start floor (#4591)."""
+    floor = 1_700_000_000
+    build_session_store(tmp_path, created=[CARD_A])
+    real = local_shell(tmp_path, monkeypatch)
+    calls: list[str] = []
+    purges: list[str] = []
+
+    def flaky(script: str, timeout: float) -> str:
+        if script == harness._POD_CLOCK_SCRIPT:
+            return f"{floor}\n"
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            purges.append(script)
+        if board.SESSION_CARDS_PRESENT in script:
+            calls.append(script)
+            if len(calls) > 1:
+                return "error: unable to upgrade connection"
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", flaky)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert "the kanban board could not be read 3 times running" in result.errors[0]
+    (purge,) = purges
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([CARD_A], floor=floor)))
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,7 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "persona-cluster",
     "a2a-authcallout",
     "a2a-verifier",
+    "a2a-dispatcher",
     "a2a-console",
     "hermes-bridge",
     "web-console",

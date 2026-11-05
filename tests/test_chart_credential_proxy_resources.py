@@ -61,7 +61,7 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
 
     def test_values_yaml_carries_an_empty_default(self):
         values = yaml.safe_load(_VALUES.read_text())
-        self.assertEqual(values["platformAgent"]["deployment"]["credentialProxy"], {"resources": {}})
+        self.assertEqual(values["platformAgent"]["deployment"]["credentialProxy"], {"resources": {}, "exec": {"replicas": 0}})
 
     def test_credential_proxy_is_closed_and_resources_is_an_open_object(self):
         node = _schema_node(("platformAgent", "deployment", "credentialProxy"))
@@ -69,8 +69,15 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
         self.assertEqual(node["properties"]["resources"], {"type": "object"})
 
 
-@unittest.skipUnless(_HELM, "helm is not installed")
-class CredentialProxyResourcesRenderTest(unittest.TestCase):
+    def test_exec_replicas_is_a_bounded_integer_in_a_closed_block(self):
+        node = _schema_node(("platformAgent", "deployment", "credentialProxy", "exec"))
+        self.assertIs(node["additionalProperties"], False)
+        self.assertEqual(node["properties"]["replicas"], {"type": "integer", "minimum": 0, "maximum": 32})
+
+
+class _RenderCR:
+    """The CR template rendered with helm, shared by the render tests below."""
+
     def _render_cr(self, sets=(), expect_failure=False, values=None):
         args = [_HELM, "template", "r", str(_CHART), "-s", _CR_TEMPLATE, *_REQUIRED]
         for item in sets:
@@ -87,6 +94,35 @@ class CredentialProxyResourcesRenderTest(unittest.TestCase):
         self.assertEqual(len(docs), 1, res.stdout)
         return docs[0]
 
+
+@unittest.skipUnless(_HELM, "helm is not installed")
+class CredentialProxyExecReplicasRenderTest(_RenderCR, unittest.TestCase):
+    """spec.deployment.credentialProxy.exec.replicas is written only above 0."""
+
+    _EXEC = "platformAgent.deployment.credentialProxy.exec.replicas"
+
+    def test_zero_writes_no_block(self):
+        cr = self._render_cr([f"{self._EXEC}=0"])
+        self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
+
+    def test_a_positive_count_is_forwarded(self):
+        cr = self._render_cr([f"{self._EXEC}=2"])
+        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"], {"exec": {"replicas": 2}})
+
+    def test_a_count_beside_a_resources_override_writes_both(self):
+        cr = self._render_cr([f"{self._EXEC}=3", f"{_VALUE_PATH}.limits.memory=3Gi"])
+        self.assertEqual(cr["spec"]["deployment"]["credentialProxy"],
+                         {"resources": {"limits": {"memory": "3Gi"}}, "exec": {"replicas": 3}})
+
+    def test_the_schema_refuses_a_count_out_of_range(self):
+        for value in ("33", "-1"):
+            res = self._render_cr([f"{self._EXEC}={value}"], expect_failure=True)
+            self.assertNotEqual(res.returncode, 0, value)
+            self.assertIn("exec/replicas", res.stderr, value)
+
+
+@unittest.skipUnless(_HELM, "helm is not installed")
+class CredentialProxyResourcesRenderTest(_RenderCR, unittest.TestCase):
     def test_default_render_writes_no_credential_proxy_block(self):
         cr = self._render_cr()
         self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
@@ -395,9 +431,12 @@ class CrdGuardTest(unittest.TestCase):
 
     def setUp(self):
         template = (_CHART / _CR_TEMPLATE).read_text()
-        call = re.search(r"\{\{- if \$proxyQuantities \}\}\n\s*(\{\{- include \"kube-agents.crdFieldGuard\" \(dict [^\n]*\) \}\})\n\s*credentialProxy:\n", template)
+        call = re.search(r"\{\{- if \$proxyQuantities \}\}\n\s*(\{\{- include \"kube-agents.crdFieldGuard\" \(dict [^\n]*\) \}\})\n", template)
         self.assertIsNotNone(call, "the credentialProxy block does not call the CRD guard on a set override")
         self.call = call.group(1)
+        exec_call = re.search(r"\{\{- if gt \$execReplicas 0 \}\}\n\s*(\{\{- include \"kube-agents.crdFieldGuard\" \(dict [^\n]*\) \}\})\n", template)
+        self.assertIsNotNone(exec_call, "the credentialProxy block does not call the CRD guard on an exec count")
+        self.exec_call = exec_call.group(1)
         helpers = (_CHART / "templates" / "_helpers.tpl").read_text()
         body = re.search(r'\{\{- define "kube-agents.crdFieldGuard" -\}\}\n(.*?)\n\{\{- end \}\}', helpers, re.DOTALL)
         self.assertIsNotNone(body, "kube-agents.crdFieldGuard is missing from _helpers.tpl")
@@ -406,6 +445,10 @@ class CrdGuardTest(unittest.TestCase):
     def test_a_set_override_names_the_value_and_the_field(self):
         self.assertIn('"value" "platformAgent.deployment.credentialProxy.resources"', self.call)
         self.assertIn('"path" (list "deployment" "credentialProxy") "field" "resources"', self.call)
+
+    def test_an_exec_count_names_the_value_and_the_field(self):
+        self.assertIn('"value" "platformAgent.deployment.credentialProxy.exec.replicas"', self.exec_call)
+        self.assertIn('"path" (list "deployment" "credentialProxy") "field" "exec"', self.exec_call)
 
     def test_the_guard_looks_up_the_installed_crd(self):
         self.assertIn(self._LOOKUP, self.guard)

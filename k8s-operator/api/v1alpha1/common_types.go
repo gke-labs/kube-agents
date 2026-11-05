@@ -1289,6 +1289,26 @@ type CredentialProxySpec struct {
 	// declared limits stand.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Exec configures the exec tier: stateless broker replicas beside the
+	// stateful broker that answer /v1/exec and /v1/gcp/ only.
+	// +optional
+	Exec *CredentialProxyExecSpec `json:"exec,omitempty"`
+}
+
+// CredentialProxyExecSpec sizes the credential broker's exec tier.
+type CredentialProxyExecSpec struct {
+	// Replicas is the number of exec-tier pods. Unset or 0 renders no exec
+	// tier. Each replica requests and is limited to 2 CPU and 2Gi of memory,
+	// with no override. A change between two positive values rewrites the
+	// count the pods read and does not restart them. The operator does not
+	// derive the count from the fleet size. Above 0 the agent's name must be
+	// at most 36 characters, so the tier's objects fit a 63-character name;
+	// a longer one is refused, the tier is not rendered, and Degraded says so.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=32
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 // AgentAPIAuthSpec configures the agent-api-auth sidecar in the gateway pod.
@@ -1303,6 +1323,13 @@ type AgentAPIAuthSpec struct {
 	// reads the memory limit through the Downward API and sets its Go soft
 	// memory limit to half of it, so raising the memory limit is the knob for an
 	// install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+	// The startup peak depends on the control plane: with the WatchList
+	// feature gate (on at 1.32 and from 1.34) the reflector holds a cluster's
+	// whole initial stream until its bookmark, so up to four of the largest
+	// backlogs (the initial-list concurrency) are resident at once; without
+	// the gate the watcher reads the backlog in pages of 500 Events and holds
+	// one page per cluster. Steady state scales with the number of watched
+	// clusters and their open incidents.
 	// Only cpu, memory and ephemeral-storage are accepted, the quantities the
 	// container declares. The operator refuses a request above its limit, a
 	// negative quantity, a zero limit, an unrepresentable byte or CPU count and
@@ -2323,6 +2350,24 @@ type TelemetryStatus struct {
 	OTLPEndpointSource string `json:"otlpEndpointSource,omitempty"`
 }
 
+// InferenceStatus reports the Platform Agent's default model as the install's LiteLLM
+// config states it.
+//
+// A resource reference, a Vertex AI endpoint path or a Bedrock ARN, keeps its resource id
+// only, so a project id, a region or an account id never appears here. Both fields are
+// absent when the config states no default model.
+type InferenceStatus struct {
+	// Provider is the LiteLLM provider slug, the text before the first "/" of the
+	// default model (gemini, vertex_ai, anthropic, openai, hosted_vllm).
+	// +optional
+	Provider string `json:"provider,omitempty"`
+
+	// Model is the model name after the provider, as typed, or the resource id alone
+	// for a resource reference.
+	// +optional
+	Model string `json:"model,omitempty"`
+}
+
 // NetworkPolicyStatus reports the network wiring the operator resolved, and its source —
 // the same diagnostic split as TelemetryStatus: the value alone cannot say whether a DNS
 // IP was discovered or pinned.
@@ -2435,6 +2480,13 @@ type AgentStatus struct {
 	// aggregate counters of what it has done.
 	// +optional
 	Usage AgentUsageStatus `json:"usage,omitempty"`
+
+	// Inference reports the Platform Agent's default model, as the install's LiteLLM
+	// config states it. The key is absent until the operator reads the config; an
+	// empty object means the config states no default model; a read that fails keeps
+	// what is there; the key is absent while the served CRD predates it.
+	// +optional
+	Inference *InferenceStatus `json:"inference,omitempty"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static
@@ -2450,9 +2502,10 @@ type AgentStatus struct {
 // plugin's and, on a next install, the A2A gateway's metrics
 // listeners, and the six proposal readings (RemediationsMergedTotal,
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
-// ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, all
-// of which it reads every five minutes on the leader; the agent's own
-// ServiceAccount holds no write verb on this status.
+// ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, and
+// the two people readings (PeopleSeen7d and PeopleSeen30d) from the A2A
+// gateway's, all of which it reads every five minutes on the leader; the
+// agent's own ServiceAccount holds no write verb on this status.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
 	// triage sessions the event watcher opened for events the daemon
@@ -2689,6 +2742,26 @@ type AgentUsageStatus struct {
 	// RemediationsClosedUnmergedTotal. Does not move LastActiveTime.
 	// +optional
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
+
+	// PeopleSeen7d is the A2A gateway's count now of the distinct people who
+	// wrote on the chat platform it serves within the last 7 days:
+	// kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
+	// across gateway pods. A reading, not an accumulation: it falls as a
+	// person's last message ages out of the window. A 0 is a reading. Absent
+	// until the first reading, after two polls in a row without one, while a
+	// chat platform the install enables is served through Hermes (Google Chat
+	// or Slack on their legacy consumers, or Teams), and while the served CRD
+	// predates the field. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	PeopleSeen7d *int64 `json:"peopleSeen7d,omitempty"`
+
+	// PeopleSeen30d is PeopleSeen7d over 30 days:
+	// kubeagents_a2a_gateway_people_seen under window 30d, the largest reading
+	// across gateway pods. A 0 is a reading. Absent on the same terms as
+	// PeopleSeen7d. Moves neither LastActiveTime nor LastHumanActiveTime.
+	// +optional
+	PeopleSeen30d *int64 `json:"peopleSeen30d,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher has
 	// built a client for: the management cluster and the Cluster Agent

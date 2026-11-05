@@ -4,6 +4,7 @@
 import errno
 import io
 import json
+from pathlib import Path
 import os
 import sys
 import tempfile
@@ -24,9 +25,10 @@ import patch_readiness as pr  # noqa: E402
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 # The sweep width is read from the credential broker (broker_admission); with its
-# URL unset that read makes no request and the width is the fallback, four, so
+# URLs unset that read makes no request and the width is the fallback, four, so
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
@@ -1403,6 +1405,16 @@ class CollectFleetTest(unittest.TestCase):
 
         return run
 
+    def test_a_collected_entry_keeps_the_cluster_status_for_the_config_connector_read(self):
+        """`_status` is removed before the manifest prints; the Config
+        Connector read still needs the status to skip a cluster that is not
+        running."""
+        run = self.discovering(clusters={"base": run_of(0, json.dumps([cluster(name="base-c", status="RECONCILING")]))})
+        manifest = pr.collect_fleet(run=run, now=NOW, max_workers=1)
+        [entry] = [e for e in manifest["clusters"] if e["outcome"] == "collected"]
+        self.assertEqual(entry[pr.kcc_health.CLUSTER_STATUS_FIELD], "RECONCILING")
+        self.assertNotIn("_status", entry)
+
     def test_a_project_with_the_api_disabled_reads_as_empty(self):
         """A project whose Kubernetes Engine API is off cannot hold a cluster;
         treating its failed listing as a lost project makes every non-GKE
@@ -1469,6 +1481,78 @@ class CollectFleetTest(unittest.TestCase):
         self.assertIn("no auditable cluster (1 out of scope)", manifest["error"])
         self.assertNotIn("held none", manifest["error"])
         self.assertIn("out-of-scope", {c["outcome"] for c in manifest["clusters"]})
+
+    def test_main_prints_the_sweep_when_the_time_budget_is_spent(self):
+        """The Config Connector reads stop at the collector's time budget, and
+        the manifest of the sweep prints with `kcc_unread` on each entry."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        out = io.StringIO()
+        with mock.patch.object(pr, "collect_fleet", return_value=manifest), mock.patch.object(pr.kcc_health, "RUN_DEADLINE_S", 0):
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                pr.main(["--config-connector"])
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("time budget", entry["kcc_unread"])
+
+    def test_main_reads_no_config_connector_without_the_flag(self):
+        """The chat route runs this collector without `--config-connector`:
+        only `finish` uses the read, so nothing reads it there."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+        out = io.StringIO()
+        with mock.patch.object(pr, "collect_fleet", return_value=manifest), mock.patch.object(pr.kcc_health, "annotate_manifest") as annotate:
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                pr.main([])
+        annotate.assert_not_called()
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertNotIn("kcc_unread", entry)
+        self.assertNotIn("kcc_unready", entry)
+
+    def test_main_reads_config_connector_while_an_audit_run_is_in_flight(self):
+        """The live run never passed `--config-connector`. The read must not
+        depend on the model copying the flag: while `start`'s in-flight note
+        of this stream is there, `main` reads without it, and the manifest
+        says why (`config_connector_read`)."""
+        import contextlib as _contextlib  # noqa: PLC0415
+        import io as _io  # noqa: PLC0415
+        import tempfile as _tempfile  # noqa: PLC0415
+        from unittest import mock as _mock  # noqa: PLC0415
+
+        def run(argv, scratch, note):
+            manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1",
+                                       "outcome": "collected", "candidates": []}]}
+            if note:
+                Path(scratch, f"inflight_{pr.AUDIT_ID}.json").write_text("{}", encoding="utf-8")
+            out = _io.StringIO()
+            with _mock.patch.dict(os.environ, {"FLEET_AUDIT_SCRATCH_DIR": scratch}), _mock.patch.object(
+                pr, "collect_fleet", return_value=manifest
+            ), _mock.patch.object(pr.kcc_health, "annotate_manifest") as annotate:
+                with _contextlib.redirect_stdout(out), _contextlib.redirect_stderr(_io.StringIO()):
+                    pr.main(argv)
+            return annotate.called, json.loads(out.getvalue())["config_connector_read"]
+
+        for argv, note, expected in (([], True, (True, "in-flight")), ([], False, (False, False)),
+                                     (["--config-connector"], False, (True, "flag"))):
+            with self.subTest(argv=argv, note=note), _tempfile.TemporaryDirectory() as scratch:
+                self.assertEqual(run(argv, scratch, note), expected)
+
+    def test_main_adds_the_config_connector_read_before_it_prints(self):
+        """A patch fix can edit a `ContainerCluster` or `ContainerNodePool`
+        declaration, so `main` puts `kcc_health`'s keys on the manifest."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        def annotate(found, *, mapper, deadline, **kwargs):
+            self.assertGreater(deadline, 0)
+            # Only the kinds this stream's findings can own: from the agent, all
+            # ~230 kinds do not fit the time budget.
+            self.assertEqual(kwargs["kinds"], pr.kcc_health.CONTAINER_KINDS)
+            found["clusters"][0]["kcc_unread"] = "".join(mapper(lambda entry: entry["name"], found["clusters"]))
+
+        out = io.StringIO()
+        with mock.patch.object(pr, "collect_fleet", return_value=manifest), mock.patch.object(pr.kcc_health, "annotate_manifest", side_effect=annotate):
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                pr.main(["--config-connector"])
+        self.assertEqual(json.loads(out.getvalue())["clusters"][0]["kcc_unread"], "acme/us-central1/hub")
 
     def test_main_exits_non_zero_on_a_manifest_error_and_still_prints_it(self):
         run = self.discovering(base="", listing=(1, ""))
