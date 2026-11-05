@@ -4438,6 +4438,19 @@ def test_finding_scope_grades_the_nearest_finding_of_the_check(token, github):
     assert "Deployment/" in res.reason
 
 
+def test_finding_scope_takes_no_object_from_a_heading_not_followed_by_a_where_line(token, github):
+    """The renderer writes the Where: line first under every heading; a
+    heading followed by anything else has no object and binds nothing."""
+    _stash_report()
+    findings = (
+        "#### no-memory-limit on something <!-- finding:no-memory-limit.seeded-a.seeded-workloads.x -->\n\n"
+        "- **Impact:** `Deployment/memory-unbounded-worker` — `Deployment/memory-unbounded-worker`\n\n"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "fail", res.reason
+
+
 def test_finding_scope_reads_the_object_alone_not_its_cluster_or_namespace(token, github):
     """The cluster and namespace sit on the Where: line too, but a phrase for
     them binds nothing: a case names the object alone."""
