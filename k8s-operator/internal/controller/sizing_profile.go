@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -134,14 +135,14 @@ const (
 	shellSandboxContainerName = "shell"
 )
 
-// sizingLandedRequests and sizingLandedLimits are the resource names the
-// landed check (sizedContainerCarries) compares on a sized container's
+// sizingSettledRequests and sizingSettledLimits are the resource names the
+// settled check (sizedContainerCarries) compares on a sized container's
 // template: the figures the tier rows move. The proxy's ephemeral-storage is
 // a limit alone, so it is read on that side only; an ephemeral-storage
 // request is what GKE Autopilot adds to a template and no row sets.
 var (
-	sizingLandedRequests = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory}
-	sizingLandedLimits   = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
+	sizingSettledRequests = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory}
+	sizingSettledLimits   = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
 )
 
 // sizingShortfall is one ResourceQuota dimension without room for a step up:
@@ -559,58 +560,71 @@ func sizingQuotaBindsThePods(quota *corev1.ResourceQuota, classes []string) bool
 	return true
 }
 
-// sizedWorkloadSelectors are the pod selectors of the three sized workloads,
-// the labels their pods carry.
-func sizedWorkloadSelectors(agent *agentv1alpha1.PlatformAgent) []map[string]string {
-	return []map[string]string{
-		credentialProxySelector(agent),
-		{"app": agent.Name + gatewayWorkloadNameSuffix},
-		shellSandboxSelector(agent),
-	}
-}
-
-// sizedPodPriorityClasses is the set of spec.priorityClassName values the
-// live pods of the three sized workloads carry, "" for a pod with none,
-// sorted; empty when no pod is found. Pods are not a cached kind here
+// namespacePodPriorityClasses is the set of spec.priorityClassName values the
+// live pods in the agent's namespace carry, "" for a pod with none, sorted;
+// nil when the namespace has no pod. The pods read are the ones this operator
+// created (commonLabels), admitted the way the three sized pods are; with
+// none of those yet, any pod in the namespace, since a globalDefault
+// PriorityClass is filled in on every pod created without one; with no pod
+// at all there is nothing to read, and the caller takes a PriorityClass
+// requirement as selecting the pods. Pods are not a cached kind here
 // (manager_cache.go), so the lists go through the API reader, as the
 // ResourceQuota list does, and only when a quota has a PriorityClass scope.
-func (r *PlatformAgentReconciler) sizedPodPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
-	var classes []string
-	for _, selector := range sizedWorkloadSelectors(agent) {
+func (r *PlatformAgentReconciler) namespacePodPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
+	for _, opts := range [][]client.ListOption{
+		{client.InNamespace(agent.Namespace), client.MatchingLabels(commonLabels(agent))},
+		{client.InNamespace(agent.Namespace)},
+	} {
 		pods := &corev1.PodList{}
-		if err := r.a2aReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
-			return nil, fmt.Errorf("listing the sized pods for the quota scopes: %w", err)
+		if err := r.a2aReader().List(ctx, pods, opts...); err != nil {
+			return nil, fmt.Errorf("listing the namespace's pods for the quota scopes: %w", err)
 		}
+		if len(pods.Items) == 0 {
+			continue
+		}
+		var classes []string
 		for _, pod := range pods.Items {
 			if !slices.Contains(classes, pod.Spec.PriorityClassName) {
 				classes = append(classes, pod.Spec.PriorityClassName)
 			}
 		}
+		slices.Sort(classes)
+		return classes, nil
 	}
-	slices.Sort(classes)
-	return classes, nil
+	return nil, nil
 }
 
-// sizingWorkloadRolledOut reports whether a workload's controller has created
-// every replica of the template the workload now carries: its status is for
-// the current generation and its updated replicas reach the spec's. That is
-// the point at which quota admission has charged the new pods, which is what
-// the step-up check waits for; readiness is not part of it, and the old pods
-// still draining only add to the used total.
-func sizingWorkloadRolledOut(generation, observedGeneration int64, desired *int32, updated int32) bool {
-	return observedGeneration >= generation && updated >= ptr.Deref(desired, 1)
+// sizingDeploymentSettled and sizingStatefulSetSettled report whether one
+// sized workload has settled at rendered: its roll is complete by the two-term
+// test the status writers use (deploymentRollIncomplete, its StatefulSet
+// twin), every replica the spec asks for is available (ready, for a
+// StatefulSet), and the template carries rendered's figures for the sized
+// container (sizedContainerCarries). The available term is what reads the
+// proxy's Recreate window, where the old pod is gone and the new one not yet
+// created: the generation is observed, no replica is old, and none is there.
+func sizingDeploymentSettled(dep *appsv1.Deployment, container string, rendered corev1.ResourceRequirements) bool {
+	return !bool(deploymentRollIncomplete(dep)) &&
+		dep.Status.AvailableReplicas >= ptr.Deref(dep.Spec.Replicas, 1) &&
+		sizedContainerCarries(dep.Spec.Template, container, rendered)
+}
+
+func sizingStatefulSetSettled(sts *appsv1.StatefulSet, container string, rendered corev1.ResourceRequirements) bool {
+	return !bool(statefulSetRollIncomplete(sts)) &&
+		sts.Status.ReadyReplicas >= ptr.Deref(sts.Spec.Replicas, 1) &&
+		sizedContainerCarries(sts.Spec.Template, container, rendered)
 }
 
 // sizedContainerCarries reports whether the container named name in a pod
 // template (its containers or, for the native sidecar, its init containers)
-// carries at least rendered's figures on the names sizingLandedRequests and
-// sizingLandedLimits list, or is not in the template at all, in which case
+// carries at least rendered's figures on the names sizingSettledRequests and
+// sizingSettledLimits list, or is not in the template at all, in which case
 // nothing of it is charged. At least rather than equal, because GKE
 // Autopilot's admission rewrites a workload's template (an ephemeral-storage
-// request added, a request raised to a minimum) and only ever upward. A
-// template rendered at a lower tier falls short on a figure the step raises;
-// one whose override has since been lowered reads as landed with the quota
-// charged more than the step assumes, the safe side.
+// request added, a request raised to a minimum) and only ever upward, so an
+// equal test would never settle there. A template rendered at a lower tier
+// falls short on a figure the step raises; one whose override has since been
+// lowered reads as settled with the quota charged more than the step assumes,
+// the safe side.
 func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendered corev1.ResourceRequirements) bool {
 	var found *corev1.Container
 	for _, list := range [][]corev1.Container{template.Spec.Containers, template.Spec.InitContainers} {
@@ -636,39 +650,45 @@ func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendere
 		}
 		return true
 	}
-	return carries(found.Resources.Requests, rendered.Requests, sizingLandedRequests) &&
-		carries(found.Resources.Limits, rendered.Limits, sizingLandedLimits)
+	return carries(found.Resources.Requests, rendered.Requests, sizingSettledRequests) &&
+		carries(found.Resources.Limits, rendered.Limits, sizingSettledLimits)
 }
 
-// sizingTierLanded reports whether the three sized workloads carry tier's
-// render and their controllers have created every replica of it, so that
-// every ResourceQuota's used total includes the pods the tier runs. The
-// step-up check measures each candidate step from the running tier against
-// those totals, and the latch runs ahead of the pods: resolveSizingTier
-// writes status.effectiveSizingTier before the workloads are re-rendered,
-// the write re-enqueues the CR at once, and the proxy's Recreate rollout
-// admits its new pod only after the old one has gone. A pass in that window
-// that measured the next step from the latch would count the admitted step
-// as already charged and could promote past the quota; it measures nothing
-// until the pods have landed instead. The reads are cache hits (both kinds
-// are Owns()'d), and a workload that cannot be read, or is not there yet,
-// has not landed.
-func (r *PlatformAgentReconciler) sizingTierLanded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) bool {
+// sizingTierSettled reports whether the three sized workloads have settled at
+// tier: each carries tier's render, its roll is complete and every replica is
+// available, so that every ResourceQuota's used total includes the pods the
+// tier runs and nothing older. The step-up check measures each candidate step
+// from the running tier against those totals, and the latch runs ahead of the
+// pods: resolveSizingTier writes status.effectiveSizingTier before the
+// workloads are re-rendered, the write re-enqueues the CR at once, and the
+// proxy's Recreate rollout admits its new pod only after the old one has
+// gone. A pass in that window that measured the next step from the latch
+// would count the admitted step as already charged and could promote past
+// the quota; it measures nothing until the pods have settled instead, and the
+// workloads' status updates re-enqueue the CR when they have. The reads are
+// cache hits (both kinds are Owns()'d). A workload that cannot be read has
+// not settled; one that is not there yet has nothing charged, which at small
+// is the tier settled (the first pass of a fresh install, before the steps
+// after this one create the workloads) and above small is a latch the
+// workloads have not caught up with (a pass that failed between the status
+// write and the renders, or a controller restarted between them).
+func (r *PlatformAgentReconciler) sizingTierSettled(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) bool {
 	autopilot := r.clusterAutopilot()
+	absent := func(err error) bool { return apierrors.IsNotFound(err) && tier == sizingTierSmall }
 	proxy := &appsv1.Deployment{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, proxy); err != nil {
-		return false
-	}
-	if !sizingWorkloadRolledOut(proxy.Generation, proxy.Status.ObservedGeneration, proxy.Spec.Replicas, proxy.Status.UpdatedReplicas) ||
-		!sizedContainerCarries(proxy.Spec.Template, credentialProxyContainerName, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier)) {
+		if !absent(err) {
+			return false
+		}
+	} else if !sizingDeploymentSettled(proxy, credentialProxyContainerName, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier)) {
 		return false
 	}
 	shell := &appsv1.StatefulSet{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: shellSandboxName(agent)}, shell); err != nil {
-		return false
-	}
-	if !sizingWorkloadRolledOut(shell.Generation, shell.Status.ObservedGeneration, shell.Spec.Replicas, shell.Status.UpdatedReplicas) ||
-		!sizedContainerCarries(shell.Spec.Template, shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, tier)) {
+		if !absent(err) {
+			return false
+		}
+	} else if !sizingStatefulSetSettled(shell, shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, tier)) {
 		return false
 	}
 	gatewayKey := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}
@@ -676,53 +696,60 @@ func (r *PlatformAgentReconciler) sizingTierLanded(ctx context.Context, agent *a
 	if useStatefulSet(agent) {
 		gateway := &appsv1.StatefulSet{}
 		if err := r.Get(ctx, gatewayKey, gateway); err != nil {
-			return false
+			return absent(err)
 		}
-		return sizingWorkloadRolledOut(gateway.Generation, gateway.Status.ObservedGeneration, gateway.Spec.Replicas, gateway.Status.UpdatedReplicas) &&
-			sizedContainerCarries(gateway.Spec.Template, agentAPIAuthContainerName, sidecar)
+		return sizingStatefulSetSettled(gateway, agentAPIAuthContainerName, sidecar)
 	}
 	gateway := &appsv1.Deployment{}
 	if err := r.Get(ctx, gatewayKey, gateway); err != nil {
-		return false
+		return absent(err)
 	}
-	return sizingWorkloadRolledOut(gateway.Generation, gateway.Status.ObservedGeneration, gateway.Spec.Replicas, gateway.Status.UpdatedReplicas) &&
-		sizedContainerCarries(gateway.Spec.Template, agentAPIAuthContainerName, sidecar)
+	return sizingDeploymentSettled(gateway, agentAPIAuthContainerName, sidecar)
 }
 
-// sizingQuotaShortfall is nil when every ResourceQuota in the agent's
-// namespace that counts the sized pods has room for the step from tier from
-// to tier to, or the first quota and dimension that is short, quotas in name
-// order and dimensions in sizingQuotaDimensions order so the condition
-// message is stable across passes. The hard figure is the spec's, the used
-// figure the quota controller's last accounting (zero on a quota it has not
-// accounted yet, which admission then settles). A quota whose scopes cannot
-// select the three pods (sizingQuotaBindsThePods) is not read: admission
-// would never evaluate them against it, so it can neither refuse the step nor
-// be raised to admit it. ResourceQuota is not a watched kind, so the list
-// goes through the API reader, as the A2A session quota's reads do.
-func (r *PlatformAgentReconciler) sizingQuotaShortfall(ctx context.Context, agent *agentv1alpha1.PlatformAgent, from, to sizingTier) (*sizingShortfall, error) {
+// sizingQuotas lists the ResourceQuotas in the agent's namespace in name
+// order, so the condition message is stable across passes. ResourceQuota is
+// not a watched kind, so the list goes through the API reader, as the A2A
+// session quota's reads do.
+func (r *PlatformAgentReconciler) sizingQuotas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]corev1.ResourceQuota, error) {
 	quotas := &corev1.ResourceQuotaList{}
 	if err := r.a2aReader().List(ctx, quotas, client.InNamespace(agent.Namespace)); err != nil {
-		return nil, fmt.Errorf("listing ResourceQuotas for the sizing step to %s: %w", to, err)
+		return nil, fmt.Errorf("listing ResourceQuotas for the sizing step: %w", err)
 	}
-	if len(quotas.Items) == 0 {
-		return nil, nil
-	}
-	step := sizingStepBetween(agent, r.clusterAutopilot(), from, to)
 	slices.SortFunc(quotas.Items, func(a, b corev1.ResourceQuota) int { return strings.Compare(a.Name, b.Name) })
-	// The live pods' priority classes, read once, and only when a quota's
-	// scope asks for them.
-	var classes []string
-	classesRead := false
-	for _, quota := range quotas.Items {
-		if !classesRead && sizingQuotaScopesPriorityClass(&quota) {
-			var err error
-			if classes, err = r.sizedPodPriorityClasses(ctx, agent); err != nil {
-				return nil, err
-			}
-			classesRead = true
+	return quotas.Items, nil
+}
+
+// sizingQuotaPriorityClasses is namespacePodPriorityClasses when a quota in
+// quotas has a PriorityClass scope, the one scope whose answer needs the live
+// pods read, and nil without a list otherwise.
+func (r *PlatformAgentReconciler) sizingQuotaPriorityClasses(ctx context.Context, agent *agentv1alpha1.PlatformAgent, quotas []corev1.ResourceQuota) ([]string, error) {
+	for i := range quotas {
+		if sizingQuotaScopesPriorityClass(&quotas[i]) {
+			return r.namespacePodPriorityClasses(ctx, agent)
 		}
-		if !sizingQuotaBindsThePods(&quota, classes) {
+	}
+	return nil, nil
+}
+
+// sizingQuotaShortfall is nil when every quota in quotas (the namespace's
+// ResourceQuotas, in name order) that counts the sized pods has room for the
+// step from tier from to tier to, or the first quota and dimension that is
+// short, dimensions in sizingQuotaDimensions order so the condition message
+// is stable across passes. The hard figure is the spec's, the used figure the
+// quota controller's last accounting (zero on a quota it has not accounted
+// yet, which admission then settles). A quota whose scopes cannot select the
+// three pods (sizingQuotaBindsThePods, a PriorityClass scope read against
+// classes) is not read: admission would never evaluate them against it, so
+// it can neither refuse the step nor be raised to admit it.
+func sizingQuotaShortfall(agent *agentv1alpha1.PlatformAgent, autopilot bool, quotas []corev1.ResourceQuota, classes []string, from, to sizingTier) *sizingShortfall {
+	if len(quotas) == 0 {
+		return nil
+	}
+	step := sizingStepBetween(agent, autopilot, from, to)
+	for i := range quotas {
+		quota := &quotas[i]
+		if !sizingQuotaBindsThePods(quota, classes) {
 			continue
 		}
 		for _, dim := range sizingQuotaDimensions {
@@ -743,11 +770,11 @@ func (r *PlatformAgentReconciler) sizingQuotaShortfall(ctx context.Context, agen
 				free.Sub(used)
 			}
 			if free.Cmp(need) < 0 {
-				return &sizingShortfall{quota: quota.Name, key: dim.key, free: free, need: need}, nil
+				return &sizingShortfall{quota: quota.Name, key: dim.key, free: free, need: need}
 			}
 		}
 	}
-	return nil, nil
+	return nil
 }
 
 // sizingCappedConditionCurrent reports whether the SizingCappedByQuota
@@ -799,10 +826,11 @@ func sizingCappedConditionMessage(agent *agentv1alpha1.PlatformAgent) string {
 // the highest tier, at or under what the cluster count earns, whose step from
 // the running tier every ResourceQuota that counts the pods has room for; a
 // quota short on every step keeps the running tier, and any refused step sets
-// the condition. A step is measured only once the running tier's pods have
-// landed (sizingTierLanded), since the used totals it is measured against do
-// not charge a step whose pods admission has not yet created; until then the
-// latch and the condition stay where they are. A count that falls leaves the latch where it is and clears the
+// the condition. With a quota in the namespace, a step is measured only once
+// the running tier's workloads have settled (sizingTierSettled), since the
+// used totals it is measured against do not charge a step whose pods
+// admission has not yet created; until then the latch and the condition stay
+// where they are, with no write and no event. A count that falls leaves the latch where it is and clears the
 // condition, since it no longer earns the step; a pass with no reading (the
 // gauges absent before the first poll, or cleared after two polls that read
 // no gateway) leaves the latch and the condition both where they are, so a
@@ -828,37 +856,47 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 		tier = latched
 		if observed, ok := observedClusterCount(agent); ok {
 			count = observed
-			if earned := sizingTierForClusterCount(count); earned > tier && !r.sizingTierLanded(ctx, agent, tier) {
-				// The running tier's pods have not all been admitted yet (the
-				// pass after a promotion, while the proxy recreates), so the
-				// quotas' used totals do not yet charge the step just taken
-				// and a step measured from the latch would count it as free.
-				// Nothing is measured: the cap stands as written, and the
-				// workloads' status updates re-enqueue the CR when the pods
-				// have landed.
-				capped = sizingCappedConditionMessage(agent)
-			} else if earned > tier {
-				// The earned tier first, then each tier between it and the
-				// running one, every step measured from the running tier
-				// against the same used totals: the highest step the quotas
-				// admit is taken, so a count that earns fleet with room for
-				// medium alone reaches medium rather than waiting at small
-				// for the whole fleet step. The cap reports the lowest step
-				// refused, the one raising the quota by the least relieves.
-				running := tier
-				for candidate := earned; candidate > running; candidate-- {
-					shortfall, err := r.sizingQuotaShortfall(ctx, agent, running, candidate)
+			if earned := sizingTierForClusterCount(count); earned > tier {
+				quotas, err := r.sizingQuotas(ctx, agent)
+				if err != nil {
+					return err
+				}
+				if len(quotas) > 0 && !r.sizingTierSettled(ctx, agent, tier) {
+					// The running tier's pods have not all been admitted yet
+					// (the pass after a promotion, while the proxy recreates),
+					// so the quotas' used totals do not yet charge the step
+					// just taken and a step measured from the latch would
+					// count it as free. Nothing is measured: the cap stands
+					// as written, and the workloads' status updates
+					// re-enqueue the CR when the pods have settled. With no
+					// quota there is nothing to measure against, and the
+					// earned tier is taken as before.
+					capped = sizingCappedConditionMessage(agent)
+				} else {
+					classes, err := r.sizingQuotaPriorityClasses(ctx, agent, quotas)
 					if err != nil {
 						return err
 					}
-					if shortfall == nil {
-						tier = candidate
-						break
+					// The earned tier first, then each tier between it and
+					// the running one, every step measured from the running
+					// tier against the same used totals: the highest step the
+					// quotas admit is taken, so a count that earns fleet with
+					// room for medium alone reaches medium rather than
+					// waiting at small for the whole fleet step. The cap
+					// reports the lowest step refused, the one raising the
+					// quota by the least relieves.
+					running := tier
+					for candidate := earned; candidate > running; candidate-- {
+						shortfall := sizingQuotaShortfall(agent, r.clusterAutopilot(), quotas, classes, running, candidate)
+						if shortfall == nil {
+							tier = candidate
+							break
+						}
+						short = shortfall
 					}
-					short = shortfall
-				}
-				if short != nil {
-					capped = fmt.Sprintf(sizingCappedByQuotaMessageFormat, earned, short.quota, short.key, tier, tier)
+					if short != nil {
+						capped = fmt.Sprintf(sizingCappedByQuotaMessageFormat, earned, short.quota, short.key, tier, tier)
+					}
 				}
 			}
 		} else if eventWatcherEnabled(agent) {
