@@ -129,7 +129,7 @@ func loadAlertExclude(raw string, m *metrics) []alertExcludeRule {
 // String is the rule as the startup log names it: each part it sets, and in
 // a cluster each key it sets, with the values quoted. A key it leaves unset
 // is not printed, so it reads apart from a key set to a literal "*", which
-// matches only "*".
+// is compared as the literal "*", not as a wildcard.
 func (r alertExcludeRule) String() string {
 	var parts []string
 	if r.Cluster != nil {

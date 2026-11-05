@@ -143,13 +143,13 @@ type metrics struct {
 	fleetControllers     prometheus.Gauge
 	fleetPods            prometheus.Gauge
 	fleetMaxClusterPods  prometheus.Gauge
+	fleetShapeClusters   *prometheus.GaugeVec
 	// alertExcludeRules is the number of alert-exclude rules in force, and
 	// alertExcludeRefused is 1 when --alert-exclude was refused and the
 	// watcher runs with none, which an alert can read where the ALERT log
 	// line cannot be. loadAlertExclude sets both once, at start.
 	alertExcludeRules   prometheus.Gauge
 	alertExcludeRefused prometheus.Gauge
-	fleetShapeClusters  *prometheus.GaugeVec
 }
 
 // newMetrics instantiates and registers all watcher metrics using a custom registry.
