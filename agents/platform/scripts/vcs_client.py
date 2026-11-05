@@ -390,8 +390,7 @@ def local_git(cwd: Path, *args: str, check: bool = True, text: bool = True) -> s
     repository supplied. A bundle carries objects and refs and no config, so the
     only config this copy has is the one git just wrote — which means a
     `.gitattributes` naming `filter.foo.clean` finds no `foo` defined and is
-    inert, the same reasoning `content_workspace` makes about the broker's
-    trees. `core.hooksPath` is pointed at an empty directory rather than left to
+    inert. `core.hooksPath` is pointed at an empty directory rather than left to
     default, because a hook is the one thing that would not need a config entry
     to have been supplied. `safe.bareRepository=explicit` stops git from
     opening a directory of files laid out as a bare repository, and so from

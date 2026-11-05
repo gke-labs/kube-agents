@@ -237,10 +237,9 @@ class MintedWriteCredential:
     (`GIT_CONFIG_VALUE_n`), never in argv, a file, a CLI's store or the
     sandbox.
 
-    `stored_token` is set for the content workspace's reason: no ambient
-    helper stands behind this token, so a managed clone presents it on its own
-    fetch and push, and the workspace asks again before each presentation
-    whether the repository still earns it.
+    `stored_token` is set because no ambient helper stands behind this token:
+    a managed clone presents it on its own fetch and push, and the broker asks
+    again before each presentation whether the repository still earns it.
 
     A refused mint (`PermissionError`) propagates: the repository is not one
     the install manages. Any other failure is raised as
@@ -360,10 +359,9 @@ def is_token(token: str) -> bool:
 class StaticFileCredential:
     """A long-lived token an administrator put in a Secret, read from its file.
 
-    `stored_token` marks it for the content workspace: nothing ambient stands
-    behind a stored token, so a clone that holds one presents it on its own
-    push, and asks again before every presentation whether the repository
-    still earns it.
+    `stored_token` marks it: nothing ambient stands behind a stored token, so
+    a clone that holds one presents it on its own push, and asks again before
+    every presentation whether the repository still earns it.
 
     Nothing to acquire and nothing to refresh, so `ensure` does nothing -- the
     strategy says the token does not need it rather than implementing a step

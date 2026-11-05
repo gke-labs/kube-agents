@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for the workspace protocol's path validator.
+"""Tests for the repository path validator.
 
-The validator was reachable from tests only through
-`content_workspace.repo_relative`, and `content_workspace` is the one module
-the sandbox image does not carry -- so the end that turns a name into a write
-was covered by exercising the end that does not. These import
-`workspace_paths` on its own, the way `audit_report` does.
+These import `workspace_paths` on its own, the way `audit_report` does, so
+the end that turns a name into a write is covered directly.
 
 Names travel both ways through this validator, which is the property most of
 these are about: `list` answers with names read out of a repository nobody
@@ -117,12 +114,9 @@ class StandaloneRulesTest(unittest.TestCase):
                 self.assertEqual(path, workspace_paths.validate_path(path))
 
     def test_the_dotgit_rule_is_public_because_another_module_calls_it(self):
-        """`content_workspace` filters its own tree walk with this.
-
-        It reached in for a private name to do it, which is the two
-        implementations the module header argues against, one import short of
-        being two functions.
-        """
+        """Public, so a caller that filters a tree walk imports the one rule
+        rather than copying it, which is the two implementations the module
+        header argues against."""
         self.assertTrue(workspace_paths.looks_like_dotgit(".GIT"))
         self.assertFalse(workspace_paths.looks_like_dotgit("gitops"))
 

@@ -287,8 +287,8 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 	if value, found := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_WORKSPACE_ROOT"); found {
 		t.Errorf("the broker has no shared workspace, so naming one points it at a path that is not there: %q", value)
 	}
-	if value, _ := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_CONTENT_WORKSPACE"); value != "1" {
-		t.Errorf("with no shared filesystem, content has to move over the workspace API; got %q", value)
+	if value, found := brokerEnvValue(broker.Env, "CREDENTIAL_PROXY_CONTENT_WORKSPACE"); found {
+		t.Errorf("the content workspace is retired, so the broker carries no switch for it: %q", value)
 	}
 }
 

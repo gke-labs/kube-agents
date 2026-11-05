@@ -95,8 +95,7 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 #: The key in a forge's credentials Secret that holds its read-only token.
 FORGE_READ_TOKEN_KEY = "read-token"
 
-# The same shape of ceiling `content_workspace` applies, for the same reason:
-# the broker's scratch volume is an emptyDir sized for manifests, and a
+# A ceiling on one clone: the broker's scratch volume is an emptyDir sized for manifests, and a
 # repository that does not fit should say so rather than fill the disk out from
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB

@@ -33,7 +33,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -740,31 +739,11 @@ class ConsumerLinksTest(unittest.TestCase):
         self.assertEqual([{"provider": "github", "repository": f"https://{HOST}/acme/infra"}], seen)
 
 
-class ContentWorkspaceTest(unittest.TestCase):
-    def test_a_bare_name_is_placed_on_the_install_github_host(self):
-        from content_workspace import ContentWorkspaceStore
-
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        (root / "agent").mkdir()
-        store = ContentWorkspaceStore(root / "trees", root / "agent", lambda *a, **k: None, github_host=lambda: HOST)
-        self.assertEqual((f"{HOST}/acme/infra", f"https://{HOST}/acme/infra.git"), store._where("acme/infra"))
-        dotcom = ContentWorkspaceStore(root / "trees2", root / "agent", lambda *a, **k: None)
-        self.assertEqual(("acme/infra", "https://github.com/acme/infra.git"), dotcom._where("acme/infra"))
-
-    def test_the_broker_locates_an_enterprise_repository_with_its_host(self):
+class ProviderForgeTest(unittest.TestCase):
+    def test_the_broker_finds_the_enterprise_forge_by_its_provider(self):
         registry = providers.Registry({"forges": [{"provider": "github", "host": HOST}]})
         with mock.patch.object(credential_proxy, "forge_registry", return_value=registry):
-            self.assertEqual((f"{HOST}/acme/infra", f"https://{HOST}/acme/infra.git"),
-                             credential_proxy._workspace_locate(f"{HOST}/acme/infra"))
-            self.assertEqual(HOST, credential_proxy._workspace_github_host())
             self.assertIs(registry.forges[0], credential_proxy._provider_forge("github"))
-        dotcom = providers.Registry({"forges": [{"provider": "github", "host": "github.com"}]})
-        with mock.patch.object(credential_proxy, "forge_registry", return_value=dotcom):
-            self.assertEqual(("acme/infra", "https://github.com/acme/infra.git"),
-                             credential_proxy._workspace_locate("github.com/acme/infra"))
-            self.assertEqual("github.com", credential_proxy._workspace_github_host())
 
 
 WRITE_TOKEN = "mock-write-token-0002"
@@ -890,82 +869,6 @@ class VcsBrokerGitTest(_EnterpriseGitCase):
         self.assertEqual({"acme/infra"}, set(minted))
         tip = _git(self.origins[f"https://{HOST}/acme/infra.git"], "rev-parse", "refs/heads/fix/replicas").stdout
         self.assertTrue(tip.strip())
-
-
-class ContentWorkspaceGitTest(_EnterpriseGitCase):
-    """`build_workspace_store` opens a managed and a context repository with the right token."""
-
-    def setUp(self):
-        super().setUp()
-        executor = credential_proxy.CommandExecutor(
-            timeout_seconds=5, max_output_bytes=1 << 16, state_dir=str(self.dir / "state"), scoped_pool=None
-        )
-        self.helper_runs: list[list[str]] = []
-
-        def run_helper(provider, helper, arguments, action, log_success=False):
-            self.helper_runs.append(arguments)
-            if arguments[0] == credential_proxy.FORGE_READ_ONLY_FLAG:
-                stdout = READ_TOKEN
-            else:
-                stdout = json.dumps({"token": WRITE_TOKEN, "repositories": ["acme/infra"]})
-            return credential_proxy.ExecutionResult(exit_code=0, stdout=stdout, stderr="", duration_ms=1,
-                                                    truncated=False, timed_out=False)
-
-        def workspace_git(argv, cwd, config=()):
-            done = self.run_git(argv, cwd, config)
-            return credential_proxy.ExecutionResult(exit_code=done.returncode, stdout=done.stdout,
-                                                    stderr=done.stderr, duration_ms=1, truncated=False,
-                                                    timed_out=False)
-
-        helper = self.dir / "github_token_refresh.py"
-        helper.write_text("")
-        for patcher in (
-            mock.patch.object(credential_proxy, "managed_repositories",
-                              return_value=frozenset({f"github:{HOST}/acme/infra"})),
-            mock.patch.object(credential_proxy, "context_repositories",
-                              return_value=frozenset({f"github:{HOST}/acme/docs"})),
-            mock.patch.object(credential_proxy.CommandExecutor, "_forge_helper", return_value=helper),
-            mock.patch.object(credential_proxy.CommandExecutor, "_run_forge_helper", side_effect=run_helper),
-        ):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        self.store = credential_proxy.build_workspace_store(types.SimpleNamespace(
-            content_workspace_root=self.dir / "trees",
-            workspace_dir=self.dir / "agent",
-            execute_workspace_git=workspace_git,
-            mint_read_credential=executor.mint_read_credential,
-            mint_write_credential=executor.mint_write_credential,
-            drop_write_credential=executor.drop_write_credential,
-            tls_refusal=executor.tls_refusal,
-        ))
-        (self.dir / "agent").mkdir()
-
-    def test_a_managed_repository_opens_and_pushes_on_the_write_token(self):
-        from content_workspace import Change, repo_relative
-
-        workspace = self.store.open("acme/infra")
-        self.assertEqual(f"{HOST}/acme/infra", workspace.repo)
-        self.store.commit(workspace.handle, "platform-agent/change", "feat: a change",
-                          [Change(repo_relative("notes.md"), b"hello\n")])
-        credential_proxy.require_managed_workspace(self.store, workspace.handle)
-        self.store.push(workspace.handle, "platform-agent/change")
-        remote = self.remote_calls()
-        self.assertIn("clone", [sub for sub, _ in remote])
-        self.assertIn("push", [sub for sub, _ in remote])
-        for sub, config in remote:
-            with self.subTest(subcommand=sub):
-                self.assertEqual(_basic(WRITE_TOKEN), config.get(EXTRAHEADER))
-        # The mint was asked about the forge's path, never the store's host-qualified name.
-        self.assertTrue(self.helper_runs)
-        for arguments in self.helper_runs:
-            self.assertEqual("acme/infra", arguments[-1])
-
-    def test_a_context_repository_opens_on_a_read_token_and_never_the_write_one(self):
-        workspace = self.store.open(f"{HOST}/acme/docs")
-        self.assertEqual(f"{HOST}/acme/docs", workspace.repo)
-        [(sub, config)] = [c for c in self.remote_calls() if c[0] == "clone"]
-        self.assertEqual(_basic(READ_TOKEN), config.get(EXTRAHEADER))
-        self.assertEqual([[credential_proxy.FORGE_READ_ONLY_FLAG, "acme/docs"]], self.helper_runs)
 
 
 BOT = "kube-agents[bot]"
