@@ -39,7 +39,7 @@ Under `spec.mode: next` the operator also renders the A2A stack ([Architecture â
 - **`<name>-a2a-console`**: the console server, which hands the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page the shared `console` bus password and proxies its websocket. Reachable only through `kubectl port-forward`.
 - **`<name>-a2a-provision-<hash>`**: the Job that provisions the streams, once per change.
 - **Session pods** (`<profile>-<animal>-<hex>`): one per `/session` conversation, all on one session ServiceAccount distinct from the gateway's, fenced by an egress NetworkPolicy and a ResourceQuota. They read a cluster only under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, through the broker, as the next paragraph says. [Security and IAM](/kube-agents/reference/security-and-iam/#each-a2a-session-pod-is-its-own-bus-identity) covers their bus identity.
-- **`<name>-a2a-mcp`**, opt-in: the [MCP server](/kube-agents/reference/a2a-mcp/), holding the `console` password and its own bearer token.
+- **`<name>-a2a-mcp`**, opt-in: the [MCP server](/kube-agents/reference/a2a-mcp/), holding its own `console-mcp` bus password and its own bearer token.
 
 Under `today` none of them is rendered, and the gateway Pod has no `hermes-bridge` container. Switching back removes them and keeps the bus volume and its credentials Secret ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
 
