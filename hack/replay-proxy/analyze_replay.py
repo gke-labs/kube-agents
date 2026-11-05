@@ -15,7 +15,10 @@ Reported:
   and every request after it in its conversation), by the role of the first
   differing message and by the miss signature the proxy logged;
 - with `--verdicts`, whether each conversation's run verdict matched the
-  verdict of the run that recorded its first served answer.
+  verdict of the run that recorded its first served answer;
+- lost requests: replay lines whose analysis was dropped or failed, so they
+  carry no hashes and join no conversation. They are counted, served or not;
+  a conversation that lost a request not served may show its first miss late.
 
 Usage: python3 analyze_replay.py LOG [LOG ...] [--verdicts VERDICTS.json] [--top N] [--json]
 VERDICTS.json maps a build ID to "pass" or "fail".
@@ -54,6 +57,8 @@ class Line:
     miss: Dict[str, Any]
     served_from_build: Optional[str]
     served_via: str
+    # A line whose analysis was dropped or failed: no fingerprint, no hashes.
+    lost: bool = False
 
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
@@ -74,6 +79,7 @@ class Line:
             chain=chain,
             miss=entry.get(F.MISS) or {},
             served_from_build=str(served_from.get(F.JOB_BUILD)) if served_from.get(F.JOB_BUILD) else None,
+            lost=not entry.get(F.FINGERPRINT),
         )
 
 
@@ -106,8 +112,9 @@ def load(paths: Iterable[str]) -> List[Line]:
                     entry = json.loads(raw)
                 except ValueError:
                     continue
+                # Lost lines too: they carry `mode` and `served`, and are counted apart.
                 if (isinstance(entry, dict) and entry.get(F.EVENT) == F.REQUEST_EVENT
-                        and entry.get(F.MODE) == F.MODE_REPLAY and entry.get(F.FINGERPRINT)):
+                        and entry.get(F.MODE) == F.MODE_REPLAY):
                     lines.append(Line.from_entry(entry))
     lines.sort(key=lambda line: line.ts)
     return lines
@@ -129,6 +136,8 @@ def conversations(lines: List[Line]) -> List[Conversation]:
     ended: Dict[Tuple[Tuple[str, str, str], str], Conversation] = {}
     tips: Dict[int, Tuple[Tuple[str, str, str], str]] = {}
     for line in lines:
+        if line.lost:
+            continue
         found = None
         for prefix in reversed(line.chain[:-1]):
             key = (line.scope, prefix)
@@ -171,6 +180,8 @@ def verdict_join(convs: List[Conversation], verdicts: Dict[str, str]) -> Dict[st
 
 
 def summarize(lines: List[Line], verdicts: Optional[Dict[str, str]] = None, top: int = DEFAULT_TOP) -> Dict[str, Any]:
+    lost_lines = [line for line in lines if line.lost]
+    lines = [line for line in lines if not line.lost]
     convs = conversations(lines)
     total = sum(line.prompt_tokens for line in lines)
     served = sum(line.prompt_tokens for line in lines if line.served)
@@ -203,6 +214,9 @@ def summarize(lines: List[Line], verdicts: Optional[Dict[str, str]] = None, top:
     report: Dict[str, Any] = {
         "requests": len(lines),
         "conversations": len(convs),
+        "lost_requests": len(lost_lines),
+        "lost_requests_served": sum(1 for line in lost_lines if line.served),
+        "lost_requests_not_served": sum(1 for line in lost_lines if not line.served),
         "prompt_tokens": total,
         "served_token_percent": percent(served, total),
         "served_via_answer_slots_token_percent": percent(via_slots, total),
@@ -225,6 +239,8 @@ def render(report: Dict[str, Any]) -> str:
         f"served: {report['served_token_percent']}% of prompt tokens"
         f" ({report['served_before_first_miss_token_percent']}% before each conversation's first miss;"
         f" {report['served_via_answer_slots_token_percent']}% through answer slots)",
+        f"lost requests (analysis dropped or failed; in no conversation): {report['lost_requests']}"
+        f" ({report['lost_requests_served']} served, {report['lost_requests_not_served']} not served)",
         f"first-miss tokens lost by role: {report['first_miss_tokens_lost_by_role']}",
         "first-miss signatures (tokens lost, role, signature):",
     ]

@@ -118,6 +118,19 @@ class SummaryTest(unittest.TestCase):
         self.assertEqual(report["served_token_percent"], 50.0)
         self.assertEqual(report["served_before_first_miss_token_percent"], 0.0)
 
+    def test_lost_lines_are_counted(self):
+        lost = [
+            {"event": "replay_shadow_request", "mode": "replay", "ts": 1.5, "job": {"build": "b1"}, "status": 200,
+             "error": "analysis_dropped", "served": False},
+            {"event": "replay_shadow_request", "mode": "replay", "ts": 1.6, "job": {"build": "b1"}, "status": 200,
+             "error": "RuntimeError", "served": True, "served_from": {"build": "rec-1"}},
+            {"event": "replay_shadow_request", "mode": "shadow", "ts": 1.7, "error": "RuntimeError", "served": False},
+        ]
+        report = analyze_replay.summarize(analyze_replay.load([write(entries() + lost)]))
+        self.assertEqual((report["lost_requests"], report["lost_requests_served"], report["lost_requests_not_served"]),
+                         (2, 1, 1))
+        self.assertEqual((report["requests"], report["conversations"], report["prompt_tokens"]), (6, 3, 1000))
+
     def test_served_through_answer_slots_is_reported_apart(self):
         lines = [line("x1", 1, ["m1"], True, tokens=300), line("x2", 2, ["m1", "m2"], True, tokens=100)]
         lines[0]["served_via"], lines[1]["served_via"] = "exact", "answer_slots"
