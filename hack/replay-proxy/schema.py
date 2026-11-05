@@ -71,6 +71,9 @@ UNSTORABLE_NO_MODEL_GROUP = "no_model_group_header"
 UNSTORABLE_OTHER_MODEL_GROUP = "answered_by_other_model_group"
 UNSTORABLE_FALLBACK = "fallback_attempted"
 UNSTORABLE_REPEATS_NUMBER = "repeats_swapped_number"
+# The answer repeats an age the key swapped (`--since 5m` after `AGE 5m`),
+# which is never put back: this run's age would change what it does.
+UNSTORABLE_REPEATS_AGE = "repeats_swapped_age"
 # Normalized, the answer still names an identifier or IP the request bound, so
 # it would be served with the recording's value.
 UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"

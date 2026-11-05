@@ -630,11 +630,21 @@ class AnswerMappingTest(unittest.TestCase):
     def test_restore_puts_this_requests_values_back(self):
         mapping = normalizer.normalize_request(request("task t_11111111 pod web-7d4b9c8f6d-x2k9p age: 5m"), NOW).mapping
         self.assertEqual(mapping.to_value["⟦TASK_1⟧"], "t_11111111")
-        restored, missing = mapping.restore("kanban_show(⟦TASK_1⟧) on web-⟦POD_1⟧, ⟦AGEm_1⟧ old")
-        self.assertEqual(restored, "kanban_show(t_11111111) on web-7d4b9c8f6d-x2k9p, 5m old")
+        restored, missing = mapping.restore("kanban_show(⟦TASK_1⟧) on web-⟦POD_1⟧")
+        self.assertEqual(restored, "kanban_show(t_11111111) on web-7d4b9c8f6d-x2k9p")
         self.assertEqual(missing, [])
+        # An age is never put back: this run's would be another reading of the clock.
+        _, missing = mapping.restore("⟦AGEm_1⟧ old")
+        self.assertEqual(missing, ["⟦AGEm_1⟧"])
         _, missing = mapping.restore("and ⟦TASK_2⟧")
         self.assertEqual(missing, ["⟦TASK_2⟧"])
+
+    def test_an_age_is_never_swapped_into_an_answer_and_repeating_one_counts(self):
+        mapping = normalizer.normalize_request(request("pod web-7d4b9c8f6d-x2k9p AGE: 5m"), NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("kubectl logs --since 5m"), "kubectl logs --since 5m")
+        self.assertTrue(mapping.answer_repeats_age("kubectl logs --since 5m"))
+        for answer in ("cpu 25m", "requests 5mi", "x5m"):
+            self.assertFalse(mapping.answer_repeats_age(answer), answer)
 
     def test_repeated_number_uses_token_boundaries(self):
         mapping = normalizer.normalize_request(request("resourceVersion: 4821"), NOW).mapping

@@ -465,6 +465,10 @@ class Mapping:
     today_dates: set = field(default_factory=set)
     # Each bucketed timestamp's text outside assistant messages, in order (TIME_LITERAL_CLASS).
     time_occurrences: List[str] = field(default_factory=list)
+    # Ages swapped (`5m`, `3 hours`): never put back in an answer. An age is a
+    # reading of the clock, and a served `--since 5m` must not become this
+    # run's `--since 3m`; an answer repeating one is not saved instead.
+    ages: set = field(default_factory=set)
 
     def add_date(self, when: "date", today: bool) -> None:
         self.dates.add(when)
@@ -472,20 +476,24 @@ class Mapping:
             self.today_dates.add(when)
 
     def placeholder(self, cls: str, value: str) -> str:
-        key = (cls if cls in UNSWAPPABLE_CLASSES else "") + MAPPING_KEY_SEPARATOR + value
+        age = cls.startswith(AGE_CLASS)
+        key = (cls if cls in UNSWAPPABLE_CLASSES or age else "") + MAPPING_KEY_SEPARATOR + value
         if key not in self.to_placeholder:
             number = self.counts.get(cls, 0) + 1
             self.counts[cls] = number
             token = f"{OPEN}{cls}_{number}{CLOSE}"
             self.to_placeholder[key] = token
-            self.to_value[token] = value
+            if not age:
+                self.to_value[token] = value
         if cls == NUMBER_CLASS:
             self.bare_numbers.add(value)
+        if age:
+            self.ages.add(value)
         return self.to_placeholder[key]
 
     def copy(self) -> "Mapping":
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
-                       set(self.dates), set(self.today_dates), list(self.time_occurrences))
+                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages))
 
     def swappable_values(self) -> Dict[str, str]:
         """Values an answer may be rewritten with: not opaque, not bare numbers."""
@@ -629,6 +637,10 @@ class Mapping:
             except ValueError:
                 continue
         return any(m.group(1).lower() in weekdays for m in ANSWER_WEEKDAY_RE.finditer(text))
+
+    def answer_repeats_age(self, text: str) -> bool:
+        """Whether an answer repeats, as a whole token, an age the request's key swapped."""
+        return any(re.search(TOKEN_BEFORE + re.escape(value) + TOKEN_AFTER, text) for value in self.ages)
 
     def answer_repeats_bare_number(self, text: str) -> bool:
         """Whether an answer repeats a swapped value that cannot be restored."""

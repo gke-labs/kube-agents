@@ -421,6 +421,8 @@ def unstorable_reasons(
     texts = [str(view["content"] or "")] + [str(c["arguments"] or "") for c in view["tool_calls"]]
     if any(mapping.answer_repeats_bare_number(t) for t in texts):
         reasons.append(F.UNSTORABLE_REPEATS_NUMBER)
+    if any(mapping.answer_repeats_age(t) for t in texts):
+        reasons.append(F.UNSTORABLE_REPEATS_AGE)
     if stored is None:
         stored = replay_cache.stored_answer(message, mapping)
     normalized = replay_cache.answer_texts(stored)
