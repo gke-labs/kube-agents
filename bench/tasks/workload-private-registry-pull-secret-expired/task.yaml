@@ -31,29 +31,25 @@ infrastructure:
 validated: false
 
 verification_spec:
-  # Body scope, on the Where: line the ledger writes under every finding: the
-  # finding ids are clipped at 100 characters and lose this workload's name
-  # for every slug, so an id check could never pass once the gap is fixed.
-  - name: ledger-tracks-target-resource
+  # One finding must carry both the check and the planted workload: a body
+  # phrase alone matches every finding on the workload, a slug among the ids
+  # alone matches the check on any workload, and the id's object segment is
+  # clipped per host, so neither scope can bind the pair. The three checks
+  # are the names the case accepts for the defect.
+  - name: ledger-files-the-dead-pull-path-on-the-planted-workload
     role: objective
     mode: assert
     check:
       type: ledger_issue_contains
       audit: compliance-audit
-      required_phrases: ["Deployment/private-image-worker"]
-  - name: ledger-uses-expected-check-slug
-    role: objective
-    mode: assert
-    check:
-      type: ledger_issue_contains
-      audit: compliance-audit
-      scope: finding_ids
-      any_of_phrases:
+      scope: finding
+      finding_check:
         [
           "registry-auth-iam-missing",
           "private-registry-pull-secret",
           "image-pull-auth-expired",
         ]
+      required_phrases: ["Deployment/private-image-worker"]
   # The write a remediation would make is the pull path: swapping or dropping
   # the dead pull secret, or repointing the image. The planted values must
   # still be there after the run; the Secret itself is never read. The
