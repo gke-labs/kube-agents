@@ -692,6 +692,20 @@ def answer_slots(normalized: NormalizedRequest, context: KeyContext) -> Tuple[st
     return current, slots
 
 
+def answer_in_context(body: Dict[str, Any], answer: Dict[str, Any], now: float) -> str:
+    """The identity `answer` has as the next assistant message of `body`'s conversation.
+
+    The answer is normalized after the request's messages, with their mapping,
+    as it will be when a later request's history holds it, so record mode can
+    note it under the context answer_slots gives that later request's slot.
+    """
+    messages = body.get(MESSAGES_FIELD)
+    history = list(messages) if isinstance(messages, list) else []
+    extended = dict(body)
+    extended[MESSAGES_FIELD] = history + [dict(answer, role=ASSISTANT_ROLE)]
+    return answer_identity(normalize_request(extended, now).messages[-1])
+
+
 def placeholders_outside_answers(normalized: NormalizedRequest) -> Set[str]:
     """The placeholders the request's non-assistant messages hold.
 

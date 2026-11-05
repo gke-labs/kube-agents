@@ -203,6 +203,19 @@ class AnswerSlotTest(unittest.TestCase):
         self.assertNotEqual(slots[0][1], normalizer.answer_slots(
             self.acted("kanban_show", {}, "Looking.", "call_1"), self.CONTEXT)[1][0][1], "the words name the answer")
 
+    def test_an_answer_noted_at_record_time_is_the_one_a_later_slot_holds(self):
+        asked = {"model": "m", "messages": [{"role": "user", "content": "work kanban task t_aaaaaaaa"}]}
+        # As the proxy assembled it from the stream, and as the client sends it back.
+        streamed = {"role": "assistant", "content": "", "tool_calls": [{"index": 0, "id": "call_1__thought__QUJD",
+                    "type": "function", "function": {"name": "kubectl", "arguments": '{"pod": "web-7d4b9c8f6d-x2k9p"}'}}]}
+        returned = {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1__thought__QUJD",
+                    "type": "function", "function": {"name": "kubectl", "arguments": '{"pod": "web-7d4b9c8f6d-x2k9p"}'}}]}
+        later = dict(asked, messages=asked["messages"] + [returned, {"role": "tool", "tool_call_id": "call_1__thought__QUJD",
+                                                                     "content": "ok"}])
+        context, _ = normalizer.answer_slots(normalizer.normalize_request(asked, NOW), self.CONTEXT)
+        _, slots = normalizer.answer_slots(normalizer.normalize_request(later, NOW), self.CONTEXT)
+        self.assertEqual(slots, [(context, normalizer.answer_in_context(asked, streamed, NOW))])
+
     def test_placeholders_outside_answers(self):
         n = self.convo("I'll look at web-7d4b9c8f6d-x2k9p", "ticket for web-5f6c7d8b9c-m8n7q")
         self.assertEqual(normalizer.placeholders_outside_answers(n), {"⟦TASK_1⟧", "⟦POD_2⟧"})

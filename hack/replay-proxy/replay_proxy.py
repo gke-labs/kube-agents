@@ -583,17 +583,20 @@ class ShadowProxy:
             return None
 
     def record(
-        self, entry: Dict[str, Any], upstream: Dict[str, Any], normalized: normalizer.NormalizedRequest,
-        raw_messages: List[Any], diag_walked: List[Any], received: float,
+        self, body: Dict[str, Any], entry: Dict[str, Any], upstream: Dict[str, Any],
+        normalized: normalizer.NormalizedRequest, raw_messages: List[Any], diag_walked: List[Any], received: float,
     ) -> bool:
         """Record mode: save a storable answer under its fingerprint; True when this call saved it."""
-        mapping = normalized.mapping
-        slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
-        # Every answer in the history is one the model gave to what preceded it.
-        for context, answer_hash in slots:
-            self.cache.add_variant(context, answer_hash)
         if entry[F.UNSTORABLE]:
             return False
+        mapping = normalized.mapping
+        slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
+        # The model's own answer to this context, noted as one a later request's
+        # slot may hold. Only answers this proxy recorded count: never a client's
+        # assistant message, a fallback's answer or any other unstorable one. Each
+        # recording notes its own, so two that answered differently both count,
+        # even where the first write of the saved answer won.
+        self.cache.add_variant(slot_key, normalizer.answer_in_context(body, upstream["message"], received))
         if slots:
             self.cache.save_slot(slot_key, entry[F.FINGERPRINT])
         saved = self.cache.save(entry[F.FINGERPRINT], {
@@ -746,7 +749,7 @@ class ShadowProxy:
         entry[F.DIAG_MESSAGE_HASHES] = diag_hashes
         entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
         if self.config.mode == F.MODE_RECORD:
-            entry[F.RECORDED] = self.record(entry, upstream, normalized, raw_messages, diag_walked, received)
+            entry[F.RECORDED] = self.record(body, entry, upstream, normalized, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked)
         entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)

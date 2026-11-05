@@ -465,8 +465,9 @@ So the proxy also files each saved answer under a second key, where the words of
 earlier answers are left blank. Their tool calls, by name and arguments, stay in the key. A request
 that misses on the exact key can still be served from the second one, but only if:
 
-- every earlier answer in it is one the model really gave to that same point in a recording, never
-  a made-up one;
+- every earlier answer in it is one the model really gave to that same point in a recording, and
+  that the proxy itself recorded and could have stored: never one the client wrote into the history,
+  and never an answer from a fallback;
 - the agent did the same things: every tool call matches by name and arguments. A different action
   that happened to get the same output (`{"ok": true}` from completing a card rather than commenting
   on it) is still a miss, and so is the same tool with different arguments, even a harmless one such
