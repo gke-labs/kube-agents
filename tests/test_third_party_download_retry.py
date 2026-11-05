@@ -12,7 +12,10 @@ nothing about the fix is either -- dropping `--retry` from a curl line, or the
 minute, by which time the connection to this change is lost. The `go install`
 of the tools themselves is the same kind of fetch and failed the same way once
 (#3029): `GoInstallRetryTest` runs that macro against a stub `go`, and
-`NatsCliInstallRetryTest` runs a2a-test.yml's nats CLI step the same way.
+`NatsCliInstallRetryTest` runs a2a-test.yml's nats CLI step the same way. So
+did the module fetch inside the injector seam's `go test` (#4800):
+`OperatorModuleDownloadRetryTest` runs python-tests.yml's download steps the
+same way.
 
 So the loop is *run*, not read: `RetryLoopBehaviourTest` points the recipe at a
 stub `setup-envtest` and counts invocations, which is what catches a backoff
@@ -183,8 +186,9 @@ ENVTEST_VERSION_VAR = "ENVTEST_K8S_VERSION"
 ENVTEST_VERSION_DECLARATION = re.compile(r"^%s \?= (.+)$" % ENVTEST_VERSION_VAR, re.MULTILINE)
 
 #: The two retry tunables as k8s-operator/Makefile declares them. The nats CLI
-#: step in a2a-test.yml copies their values, so the test that runs that step
-#: reads the schedule from here rather than from a second copy of its own.
+#: step in a2a-test.yml and the module download steps in python-tests.yml copy
+#: their values, so the tests that run those steps read the schedule from here
+#: rather than from a second copy of their own.
 RETRY_ATTEMPTS_VAR = "ENVTEST_DOWNLOAD_ATTEMPTS"
 RETRY_DELAY_VAR = "ENVTEST_RETRY_DELAY_SECONDS"
 RETRY_TUNABLE_DECLARATION = r"^%s \?= (\d+)$"
@@ -243,6 +247,41 @@ NATS_CLI_WORKFLOW = "a2a-test.yml"
 #: asked for and returns at once, so the backoff is observed, not waited for.
 SLEEP_STUB = """#!/bin/sh
 echo "$1" >> "%s"
+"""
+
+#: The workflow whose jobs run the injector seam's `go test` inside the Python
+#: sweep, and the step in which each of them downloads the operator module's
+#: dependencies first, found by name.
+MODULE_DOWNLOAD_WORKFLOW = "python-tests.yml"
+MODULE_DOWNLOAD_STEP = "Download the operator module's dependencies"
+
+#: The action whose step marks a job that needs the download: without Go the
+#: seam test skips, and with it the test fetches whatever modules are missing.
+SETUP_GO_ACTION = "actions/setup-go@"
+
+#: The commands that run the sweep: the shard jobs' and the agent-image job's.
+SWEEP_COMMANDS = (("make", "coverage"), ("make", "test-python"))
+
+#: The jobs known to run the sweep with Go set up. A floor rather than the
+#: list: the walk finds jobs by their setup-go step, and these must be among
+#: them, so a walk that finds nothing cannot pass.
+MODULE_DOWNLOAD_JOBS = ("test-shard", "test-agent-python")
+
+#: Stands in for the Go toolchain under the download step. `go mod download`
+#: appends a line to a calls file and fails until that file holds more lines
+#: than the failure count the test asked for. Any other command fails, so a
+#: step that stops running `go mod download` cannot pass.
+GO_MOD_DOWNLOAD_STUB = """#!/bin/sh
+if [ "$1" = mod ] && [ "$2" = download ]; then
+  echo call >> "%(calls)s"
+  if [ "$(wc -l < "%(calls)s")" -le %(failures)d ]; then
+    echo "go: k8s.io/apimachinery@v0.37.1: read: connection reset by peer" >&2
+    exit 1
+  fi
+  exit 0
+fi
+echo "unexpected: go $*" >&2
+exit 2
 """
 
 
@@ -1214,6 +1253,94 @@ class NatsCliInstallRetryTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self._calls(), 3)
         self.assertEqual(self._delays(), [delay, delay * 2])
+
+
+class OperatorModuleDownloadRetryTest(unittest.TestCase):
+    """python-tests.yml downloads the operator module's dependencies first, retried (#4800).
+
+    The injector seam's `go test` fetched the watcher package's modules from
+    the module proxy inside the test, and one failed fetch failed it with
+    nothing but "[setup failed]" on stdout. Every job that sets Go up now
+    downloads the operator module's dependencies first, in a step of its own,
+    on the Makefile's retry schedule. A job without the step, or a step without
+    its loop, fails no build and reports green until the next bad minute, so
+    the step is found in every such job and each copy's loop is run the way
+    NatsCliInstallRetryTest runs the nats CLI step.
+    """
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp(prefix="module-download-retry-")).resolve()
+        self.calls = self.tmp / "calls"
+        self.sleeps = self.tmp / "sleeps"
+        self.toolchain = self.tmp / "toolchain"
+        self.toolchain.mkdir()
+        jobs = _load_workflow(MODULE_DOWNLOAD_WORKFLOW)["jobs"]
+        self.go_jobs = {
+            name: job.get("steps", [])
+            for name, job in jobs.items()
+            if any(str(step.get("uses", "")).startswith(SETUP_GO_ACTION) for step in job.get("steps", []))
+        }
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _download_step(self, steps):
+        found = [step for step in steps if step.get("name") == MODULE_DOWNLOAD_STEP]
+        self.assertEqual(len(found), 1, "the job should have exactly one %r step" % MODULE_DOWNLOAD_STEP)
+        return found[0]
+
+    def _run(self, step, failures):
+        self.calls.write_text("")
+        self.sleeps.write_text("")
+        _executable(self.toolchain / "go", GO_MOD_DOWNLOAD_STUB % {"calls": self.calls, "failures": failures})
+        _executable(self.toolchain / "sleep", SLEEP_STUB % self.sleeps)
+        script = self.tmp / "step.sh"
+        script.write_text(step["run"])
+        env = dict(os.environ, PATH="%s%s%s" % (self.toolchain, os.pathsep, os.environ["PATH"]))
+        return subprocess.run(["bash", "-e", str(script)], capture_output=True, text=True, env=env, timeout=MAKE_TIMEOUT_SECONDS)
+
+    def _calls(self):
+        return len(self.calls.read_text().splitlines())
+
+    def _delays(self):
+        return [int(line) for line in self.sleeps.read_text().split()]
+
+    def test_every_job_that_sets_go_up_downloads_in_the_operator_module_before_its_sweep(self):
+        missing = sorted(set(MODULE_DOWNLOAD_JOBS) - set(self.go_jobs))
+        self.assertEqual(missing, [], "jobs that run the sweep no longer set Go up: %s" % ", ".join(missing))
+        for name, steps in self.go_jobs.items():
+            with self.subTest(job=name):
+                download = steps.index(self._download_step(steps))
+                setup_go = [i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith(SETUP_GO_ACTION)]
+                sweep = [i for i, step in enumerate(steps) if tuple(str(step.get("run", "")).split()[:2]) in SWEEP_COMMANDS]
+                self.assertEqual(len(sweep), 1, "the job should run the sweep in exactly one step")
+                self.assertLess(max(setup_go), download, "the download runs before Go is set up")
+                self.assertLess(download, sweep[0], "the download runs after the sweep whose seam test needs it")
+                self.assertEqual(
+                    steps[download].get("working-directory"),
+                    OPERATOR_DIR.relative_to(REPO_ROOT).as_posix(),
+                    "the download runs outside the operator module the seam test builds in",
+                )
+
+    def test_a_failing_download_stops_at_the_makefile_ceiling_with_its_doubling_delay(self):
+        attempts, delay = _declared_retry_schedule()
+        for name, steps in self.go_jobs.items():
+            with self.subTest(job=name):
+                result = self._run(self._download_step(steps), NEVER_SUCCEEDS)
+                self.assertNotEqual(result.returncode, 0, "exhausting the attempts must fail the step")
+                self.assertEqual(self._calls(), attempts, result.stdout + result.stderr)
+                self.assertEqual(self._delays(), [delay * 2**i for i in range(attempts - 1)], "the step's delays should follow the Makefile's")
+                self.assertIn("::error::", result.stdout)
+
+    def test_it_stops_at_the_first_success_with_a_warning_per_retry(self):
+        _, delay = _declared_retry_schedule()
+        for name, steps in self.go_jobs.items():
+            with self.subTest(job=name):
+                result = self._run(self._download_step(steps), 2)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self._calls(), 3, "it should stop at the first success")
+                self.assertEqual(self._delays(), [delay, delay * 2])
+                self.assertEqual(result.stdout.count("::warning::"), 2, "each retry should leave a warning, the record of a rescued attempt")
 
 
 if __name__ == "__main__":
