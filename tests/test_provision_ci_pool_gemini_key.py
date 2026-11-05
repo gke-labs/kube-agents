@@ -10,6 +10,7 @@ assertions are against the script that ships.
 import json
 import os
 import pathlib
+import re
 import stat
 import subprocess
 import tempfile
@@ -19,6 +20,11 @@ from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO_ROOT / "scripts" / "provision_ci_pool_gemini_key.sh"
+_PROVISION_SCRIPT = _REPO_ROOT / "scripts" / "provision_ci_pool_project.sh"
+_KEY_SCRIPT_CALL = '"${SCRIPT_DIR}/provision_ci_pool_gemini_key.sh" "${PROJECT_ID}"'
+# A command line that runs Terraform or OpenTofu: either binary, or lifecycle.sh,
+# which drives terraform. Comments and the Step 0 toolchain loop do not match.
+_IAC_INVOCATION = re.compile(r"^\s*(tofu|terraform|\./lifecycle\.sh)\s")
 
 # Literals on purpose: the script defines the same values, and a test that
 # read them back from it would assert nothing.
@@ -251,6 +257,17 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
         self.assertEqual(64, proc.returncode)
         self.assertIn("usage:", proc.stderr.lower())
         self.assertEqual([], calls)
+
+    def test_the_provisioning_script_calls_the_key_script_once_with_the_project(self):
+        lines = _PROVISION_SCRIPT.read_text().splitlines()
+        calls = [i for i, line in enumerate(lines) if _KEY_SCRIPT_CALL in line]
+        self.assertEqual(1, len(calls), calls)
+
+        enable = next(i for i, line in enumerate(lines) if line.strip().startswith("gcloud services enable"))
+        enable_end = next(i for i in range(enable, len(lines)) if not lines[i].rstrip().endswith("\\"))
+        first_iac = next(i for i, line in enumerate(lines) if _IAC_INVOCATION.match(line))
+        self.assertLess(enable_end, calls[0])
+        self.assertLess(calls[0], first_iac, lines[first_iac])
 
 
 if __name__ == "__main__":
