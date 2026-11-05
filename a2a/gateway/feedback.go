@@ -82,9 +82,9 @@ const (
 
 // feedbackRetryInterval is how often the gateway looks again for a feedback
 // bucket it did not find at start: on an upgrade the provision Job that
-// creates it can finish after the new gateway starts. A variable so a test
-// can run the retries in milliseconds.
-var feedbackRetryInterval = time.Minute
+// creates it can finish after the new gateway starts. Each Gateway carries
+// its own copy (feedbackRetry), which a test shortens on its own gateway.
+const feedbackRetryInterval = time.Minute
 
 var (
 	// errFeedbackUnverified is a rating from a sender the gateway would not
@@ -217,14 +217,14 @@ func (g *Gateway) startFeedback(ctx context.Context) bool {
 	return g.tryFeedback(ctx, false)
 }
 
-// retryFeedback tries again every feedbackRetryInterval until feedback is on,
+// retryFeedback tries again every g.feedbackRetry until feedback is on,
 // ctx ends or feedbackRetries tries have failed. Run starts it once the relay
 // has bound rather than before: the provision Job creates the bucket with
 // TASKS, and a relay that waited for TASKS longer than the retries last would
 // otherwise come up with feedback given up on for good.
 func (g *Gateway) retryFeedback(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(feedbackRetryInterval)
+		ticker := time.NewTicker(g.feedbackRetry)
 		defer ticker.Stop()
 		for range feedbackRetries {
 			select {

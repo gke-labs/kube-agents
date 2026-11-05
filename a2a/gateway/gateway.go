@@ -141,8 +141,9 @@ const (
 // authority: what makes a supervisor terminal the supervisor's is the subject
 // it is published on (`…supervisor`, which only the gateway's grant reaches),
 // and from is checked for agreement with that subject by every consumer -
-// a terminal on `…supervisor` whose from is not this party is a protocol
-// error, and so is one on an executor's `…events` wearing it. That is how
+// a terminal on `…supervisor` whose from is not this party (or the profile
+// dispatcher, SupervisorAgreement) is a protocol error, and so is one on an
+// executor's `…events` wearing it. That is how
 // replay distinguishes "the worker said failed" from "the supervisor declared
 // it dead" without trusting a field the publisher writes.
 var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
@@ -151,7 +152,10 @@ var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 // gateway's own consumers, and the one main hands the bus client so that
 // tasks/get replay and the relay agree about who the supervisor is. The
 // gateway is the supervisor for every session it spawned, so the
-// `…supervisor` writer check is exact rather than the negative form.
+// `…supervisor` writer check is exact rather than the negative form. The
+// profile dispatcher is named beside it: it writes the terminal of a profile
+// task it refuses or fails on that task's `…supervisor`, a subject its grant
+// reaches only for the profiles it dispatches.
 //
 // The strict flag is config, not code, on purpose. The `…events` writer-class
 // check ships advisory because for one TASKS retention window after an
@@ -163,6 +167,7 @@ var gatewayParty = lib.Party{Session: "gateway", AgentType: "a2a-gateway"}
 func SupervisorAgreement(cfg *Config) lib.AgreementPolicy {
 	return lib.AgreementPolicy{
 		Supervisor:         gatewayParty.Session,
+		OtherSupervisors:   []string{lib.DispatcherSession},
 		StrictEventsWriter: cfg != nil && cfg.StrictEventsWriter,
 	}
 }
@@ -198,7 +203,13 @@ type Gateway struct {
 	// and peoplePurgeList lists the bucket's keys for one attempt
 	// (listPeopleKeys); tests replace both.
 	peoplePurgeRetry time.Duration
-	peoplePurgeList  func(ctx context.Context, kv jetstream.KeyValue) ([]string, error)
+	// feedbackRetry and peopleRetry space the looks for a feedback or people
+	// bucket not found at start (retryFeedback, retryPeople):
+	// feedbackRetryInterval and peopleRetryInterval, per gateway so a test
+	// can shorten them on its own.
+	feedbackRetry   time.Duration
+	peopleRetry     time.Duration
+	peoplePurgeList func(ctx context.Context, kv jetstream.KeyValue) ([]string, error)
 	// consoleResults holds a console chain end's deliverable from
 	// observeTaskDelivered to the observeTaskTerminal that follows it
 	// (consoleFrame).
@@ -403,8 +414,9 @@ func New(o Options) (*Gateway, error) {
 	// its whole identity join. On Slack the map is an optional override (the
 	// allowlist admits, and an unmapped sender is attributed by member id),
 	// so an empty one is noted, not warned. The console does not use one
-	// either: its grant is the mechanism, since only the console credential
-	// may publish on the console subject. And a gateway whose only ingress
+	// either: its grant is the mechanism, since only the console's
+	// credentials (console and console-mcp, the MCP server's) may publish on
+	// the console subject. And a gateway whose only ingress
 	// is the side door uses the door's map below instead of this one.
 	// Naming the backend matters, because the other ingresses beside it
 	// keep working.
@@ -521,6 +533,8 @@ func New(o Options) (*Gateway, error) {
 		ps:               ps,
 		peopleKeyer:      peopleKeys,
 		peoplePurgeRetry: peopleRetryInterval,
+		feedbackRetry:    feedbackRetryInterval,
+		peopleRetry:      peopleRetryInterval,
 		peoplePurgeList:  listPeopleKeys,
 		log:              log,
 		runCtx:           context.Background(),

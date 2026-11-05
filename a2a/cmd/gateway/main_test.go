@@ -734,3 +734,45 @@ func TestTheChatNotifyRouteArmsWithConversations(t *testing.T) {
 		})
 	}
 }
+
+// TestALeaderCanBindTheDoorTheStandbyAnsweredOn: the standby answers on the
+// doors' addresses until its replica leads, and the doors bind those same
+// addresses inside lead, so the wrapper closes the standby first. Without
+// it every elected leader's doors would fail to listen and the replica
+// would crash-loop.
+func TestALeaderCanBindTheDoorTheStandbyAnsweredOn(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	cfg := &gateway.Config{InjectListen: addr, InjectToken: "t"}
+	standby, err := gateway.StartStandbyDoors(standbyListens(cfg), "kubeagents-system", &gateway.LeaseView{}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer standby.Stop()
+	lead := leadAfterStandby(standby, func(context.Context, gateway.RunOptions) error {
+		door, err := net.Listen("tcp", addr)
+		if err != nil {
+			return err
+		}
+		return door.Close()
+	})
+	if err := lead(context.Background(), gateway.RunOptions{}); err != nil {
+		t.Fatalf("the door couldn't bind where the standby answered: %v", err)
+	}
+}
+
+// TestTheStandbyAnswersOnEveryArmedDoor: the inject door and the A2A door,
+// whichever are armed, and nothing when neither is.
+func TestTheStandbyAnswersOnEveryArmedDoor(t *testing.T) {
+	if got := standbyListens(&gateway.Config{}); len(got) != 0 {
+		t.Fatalf("no doors armed, standby listens %v", got)
+	}
+	got := standbyListens(&gateway.Config{InjectListen: "127.0.0.1:8099", InjectToken: "t", A2ADoorListen: "127.0.0.1:8100", A2ADoorToken: "u"})
+	if strings.Join(got, ",") != "127.0.0.1:8099,127.0.0.1:8100" {
+		t.Fatalf("standby listens %v", got)
+	}
+}

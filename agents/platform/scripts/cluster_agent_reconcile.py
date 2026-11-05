@@ -64,6 +64,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
 
+import credential_proxy_client
 import sandbox_exec
 import chat_notify
 from chat_platforms import enabled_chat_platforms
@@ -72,6 +73,7 @@ from cluster_agent_profile import (
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
     create_profile,
     delete_profile,
+    delete_profiles,
     profile_name,
     kubeconfig_landed,
     list_profiles,
@@ -154,7 +156,8 @@ ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
 # The two fields the resolver reads, projected so a container of thousands of clusters
 # stays far below the credential proxy's output cap; full-fidelity JSON is ~1 KB a row.
 ASSET_SEARCH_FORMAT = "json(name,location)"
-# The credential proxy's stderr note when it cut a stream at its output cap.
+# The credential proxy's stderr note when it cut a stream at its output cap; the
+# shim exits 74 with it, so the note is read before the exit code.
 _PROXY_TRUNCATED_MARKER = "truncated"
 # Regional clusters render as .../locations/<L>/clusters/<C>, zonal ones as
 # .../zones/<Z>/clusters/<C>; a parser written to one shape drops the other (design §4).
@@ -190,6 +193,25 @@ _api_disabled_this_run: set[str] = set()
 # still waiting at its 60s admission bound is refused busy and reads unlisted for the tick.
 LIST_WORKERS = 4
 LIST_TIMEOUT_SECONDS = 120
+# The broker bounds one gcloud it runs at 300 s (its `--timeout-seconds` default), so the cap
+# above holds one admission wait and part of one run. The shim retries a refusal on its own
+# (credential_proxy_client, keeping a retry's admission wait, not its run, inside a deadline the
+# caller may shorten), and under this cap a retry would carry past it, where TimeoutExpired
+# stands in for the broker's reason. `_run` and scope_publisher's `broker_run` tell the shim the
+# cap less the run bound, under which no retry fits, so a refused lookup logs the refusal's text
+# at once, as cluster_preflight.sh's calls do.
+BROKER_GCLOUD_RUN_SECONDS = 300
+SHIM_RETRY_DEADLINE_SECONDS = max(0, LIST_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
+# The same rule for the two short gcloud hops below the lookups: the describe behind
+# `_cluster_exists` (DESCRIBE_TIMEOUT_SECONDS, or the prune budget left) and the gcloud config
+# fallback in `_project_source`. Neither cap holds a held refusal's 60 s admission wait, but the
+# broker's resource watermark gate refuses at once with a 5 to 30 s Retry-After, and the shim's
+# 170 s default admits three or four such waits, so without the deadline a 30 s cap fires inside
+# the chain on a high draw and TimeoutExpired stands in for the gate's reason. The describe
+# derives the deadline from the cap it is given, so a budget past the run bound would still
+# admit what fits.
+PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
+PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS = max(0, PROJECT_LOOKUP_TIMEOUT_SECONDS - BROKER_GCLOUD_RUN_SECONDS)
 # 12s per listing at four wide: the per-listing share the 150s budget gave at eight.
 LIST_BUDGET_SECONDS = 300
 LIST_GRACE_SECONDS = 5
@@ -305,8 +327,14 @@ def _run_env() -> dict[str, str]:
 
 
 def _run(argv: list[str], *, check: bool, timeout: float):
-    """One scope lookup's gcloud, through COMMAND_RUNNER when one is set, else `sandbox_exec.run`."""
-    return (COMMAND_RUNNER or sandbox_exec.run)(argv, check=check, timeout=timeout)
+    """One scope lookup's gcloud, through COMMAND_RUNNER when one is set, else `sandbox_exec.run`
+    with the shim told its retry deadline (a COMMAND_RUNNER sets that in its own environment)."""
+    if COMMAND_RUNNER is not None:
+        return COMMAND_RUNNER(argv, check=check, timeout=timeout)
+    return sandbox_exec.run(
+        argv, check=check, timeout=timeout,
+        remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(SHIM_RETRY_DEADLINE_SECONDS)},
+    )
 
 
 def _project_source() -> tuple[str | None, bool]:
@@ -352,7 +380,10 @@ def _project_source() -> tuple[str | None, bool]:
     if p:
         return p, True
     try:
-        r = sandbox_exec.run(["gcloud", "config", "get-value", "project"], timeout=30)
+        r = sandbox_exec.run(
+            ["gcloud", "config", "get-value", "project"], timeout=PROJECT_LOOKUP_TIMEOUT_SECONDS,
+            remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS)},
+        )
         return r.stdout.strip() or None, False
     except Exception:  # noqa: BLE001
         return None, False
@@ -918,6 +949,12 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
         if not isinstance(assets, list):
             raise ValueError("asset search did not return a list")
     except subprocess.CalledProcessError as e:
+        if _PROXY_TRUNCATED_MARKER in (e.stderr or ""):
+            # The shim's exit 74 on a cut reply: the cap, not a failed call.
+            log(f"resolving {container} errored ({OUTCOME_UNREACHABLE}; its previous members are carried "
+                f"forward): the credential proxy cut the search output at its cap; the container "
+                f"holds more clusters than one search can return through it")
+            return None, OUTCOME_UNREACHABLE
         outcome = _classify_list_failure(e.stderr or "")
         log(f"resolving {container} through Cloud Asset Inventory failed ({outcome}; its previous "
             f"members are carried forward, no CREATE under them): {(e.stderr or '').strip()}")
@@ -1534,9 +1571,10 @@ def _previous_management(previous: dict | None) -> str | None:
 def remaining_profiles(project: str, identities: dict, pruned: list[str]) -> int:
     """Profiles of a project still on the volume after this run's deletes.
 
-    A pruned name still counts while its home is on disk: `delete_profile` swallows
-    its own errors, and a project whose delete failed must stay `retiring` so the
-    next run tries again instead of reading the survivor as never in scope.
+    A pruned name still counts while its home is on disk: `delete_profiles` swallows
+    its own errors and skips a name whose lock is held, and a project whose delete
+    failed or was skipped must stay `retiring` so the next run tries again instead
+    of reading the survivor as never in scope.
     """
     pruned_set = set(pruned)
     return sum(
@@ -1589,7 +1627,13 @@ def _cluster_exists(project: str, cluster: str, location: str, timeout: float = 
         f"--location={location}", f"--project={project}", "--format=json(status, id)",
     ]
     try:
-        sandbox_exec.run(cmd, check=True, timeout=timeout)
+        # The shim is told the cap less the broker's gcloud run bound (the constants comment at
+        # SHIM_RETRY_DEADLINE_SECONDS), under which no retry fits, so a refusal, held or the
+        # watermark gate's, is logged below with the broker's reason rather than as a timeout.
+        sandbox_exec.run(
+            cmd, check=True, timeout=timeout,
+            remote_env={credential_proxy_client.RETRY_DEADLINE_ENV: str(max(0, timeout - BROKER_GCLOUD_RUN_SECONDS))},
+        )
         return True
     except subprocess.CalledProcessError as e:
         stderr = e.stderr or ""
@@ -1632,10 +1676,11 @@ def _exclusive_run():
     apart. Overlapping runs would call `create_profile` and `delete_profile` against
     the same profile home: interleaved read-modify-writes of `config.yaml` and
     `.env`, or an rmtree under a scaffold in progress. The lock lives here rather
-    than in either caller because it has to cover both. create_profile and
-    delete_profile also hold a per-profile lock of their own, which is what keeps a
+    than in either caller because it has to cover both. create_profile and the
+    deletes also hold a per-profile lock of their own, which is what keeps a
     `create` run outside the reconcile (by hand in the agent pod, or bench seeding)
-    apart from this run's PRUNE of the same name (#4389).
+    apart from this run's PRUNE of the same name (#4389). PRUNE's batch
+    (delete_profiles) takes those locks without blocking and skips a held one (#4574).
     """
     path = _hermes_home() / RECONCILE_LOCK
     try:
@@ -2153,6 +2198,9 @@ def reconcile(dry_run: bool = False) -> dict:
             consequence="inconclusive; the profile is kept",
         ))
     described.update({name: (True, "") for name in listed_alive})
+    # Pruned names, deleted together once the loop has judged every profile: their
+    # sandbox homes go in one mirror call rather than one each (#4574).
+    prune_queue: list[str] = []
     for name in profiles:
         identity = identities[name]
         if identity is None:
@@ -2179,7 +2227,7 @@ def reconcile(dry_run: bool = False) -> dict:
                 log(f"{name}: {identity['cluster']} is in {why} — WOULD prune (dry-run).")
             else:
                 log(f"{name}: {identity['cluster']} is in {why} — pruning.")
-                delete_profile(name)
+                prune_queue.append(name)
             report["pruned"].append(name)
             continue
 
@@ -2192,7 +2240,7 @@ def reconcile(dry_run: bool = False) -> dict:
                     log(f"{name}: project {project} left the scope — WOULD prune (dry-run).")
                 else:
                     log(f"{name}: project {project} left the scope — pruning.")
-                    delete_profile(name)
+                    prune_queue.append(name)
                 report["pruned"].append(name)
                 continue
             if management_changed and management_listed and project == previous_management:
@@ -2255,8 +2303,17 @@ def reconcile(dry_run: bool = False) -> dict:
         else:
             log(f"{name}: cluster {identity['cluster']} ({identity['project']}/{identity['location']}) "
                 f"is gone — pruning.")
-            delete_profile(name)
+            prune_queue.append(name)
         report["pruned"].append(name)
+
+    # Before anything below reads which homes are left. A name the batch skipped
+    # (its lock held) or could not delete stays in "pruned"; remaining_profiles
+    # counts it while its home is on disk, so its project stays retiring.
+    if prune_queue:
+        outcomes = delete_profiles(prune_queue)
+        undone = {name: outcome for name, outcome in outcomes.items() if outcome != "deleted"}
+        log(f"pruned {len(prune_queue) - len(undone)} of {len(prune_queue)} profile(s) here and in the sandbox"
+            + (f"; not fully: {', '.join(f'{n} ({o})' for n, o in sorted(undone.items()))}" if undone else ""))
 
     # A project absent from the resolved set whose only profiles were unreadable this run
     # was judged by nothing above; it is judged here by attribution, the same way a

@@ -783,8 +783,10 @@ than every case running at the time; a write no repetition names fails none, and
 leftovers listing still names it. The script also runs the cases that request a pull request
 (the same leaf count as the allowance), the stopped asks and the cases that declare
 `writes_alone: true` in a second phase, after every first-phase unit has
-finished (a case that declares `scope_exclude:` runs after them, in a phase of its own), one unit at a time, each after a settle as long as the check's clock-skew tolerance, so no window
-reaches back into the unit before. The lane marks those cases' windows `exclusive_window`, and a
+finished, one unit at a time. Before each of those units the script archives every kanban card
+still live that was filed since the fan-out began, then settles as long as the check's clock-skew
+tolerance, so no window reaches back into the unit before. A case that declares `scope_exclude:`
+runs after them, in a phase of its own. The lane marks those cases' windows `exclusive_window`, and a
 write in one is charged whether the repetition names it or not, since nothing else was writing;
 each is allowed the pull requests its own reply names. A pull request that was only
 commented on, labelled or closed in the window is not a write: an `updated_at` moved without a

@@ -470,6 +470,44 @@ func TestARunningTurnReturnsItsTaskForTaskControl(t *testing.T) {
 	}
 }
 
+// The profile dispatcher writes the terminal of a profile task it fails or
+// refuses on the task's supervisor subject, under its own session. The task
+// read folds it as final, as the gateway's fold does; anyone else's terminal
+// there is still dropped.
+func TestADispatcherTerminalFoldsAsFinal(t *testing.T) {
+	url, js := testBus(t)
+	b := dial(t, url)
+	const profile, taskID = "tse", "task-d"
+	publishSubmission(t, js, profile, taskID, "console:x", "q", "")
+	publishRun(t, js, profile, taskID, "", false)
+	terminal := func(from lib.Party) {
+		p := mustJSON(t, lib.StatusUpdate{TaskID: taskID, ContextID: "ctx-" + taskID,
+			Status: lib.TaskStatus{State: lib.StateFailed}, Final: true})
+		env, err := lib.NewStatusUpdateEnvelope(from, taskID, "ctx-"+taskID, "corr-"+taskID, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pub(t, js, lib.TaskSupervisorSubject(profile, taskID), env)
+	}
+	ref := TaskRef{Addressee: profile, TaskID: taskID}
+	terminal(lib.Party{Session: otherSession, AgentType: "a2a-dispatcher"})
+	task, err := b.ReadTask(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != lib.StateWorking || task.Final {
+		t.Fatalf("a terminal from %q was folded: state %s, final %v", otherSession, task.State, task.Final)
+	}
+	terminal(lib.Party{Session: lib.DispatcherSession, AgentType: "a2a-dispatcher"})
+	task, err = b.WaitForTask(context.Background(), ref, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != lib.StateFailed || !task.Final {
+		t.Errorf("the dispatcher's terminal was not folded: state %s, final %v", task.State, task.Final)
+	}
+}
+
 // Another principal publishing under its own addressee with the same task id
 // does not reach the fold: the read is pinned to the task's addressee. And a
 // bare id submitted to two addressees is refused rather than guessed.

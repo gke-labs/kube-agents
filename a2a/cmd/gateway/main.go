@@ -282,9 +282,40 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("gateway election", "err", err)
 		return err
 	}
+	// While it stands by, the replica answers on its doors' addresses with
+	// the holder and the port-forward that reaches it; leading, it closes
+	// them first so the doors can bind.
+	election.View = &gateway.LeaseView{}
+	standby, err := gateway.StartStandbyDoors(standbyListens(cfg), cfg.Namespace, election.View, log)
+	if err != nil {
+		log.Error("standby doors", "err", err)
+		return err
+	}
+	defer standby.Stop()
 	return serve(ctx, cfg, gw.Metrics(), gw.Readiness, log, func(ctx context.Context) error {
-		return election.Run(ctx, gw, lead)
+		return election.Run(ctx, gw, leadAfterStandby(standby, lead))
 	})
+}
+
+// leadAfterStandby is lead with the standby's doors closed first, so the
+// doors can bind the addresses the standby answered on.
+func leadAfterStandby(standby *gateway.StandbyDoors, lead func(context.Context, gateway.RunOptions) error) func(context.Context, gateway.RunOptions) error {
+	return func(ctx context.Context, opts gateway.RunOptions) error {
+		standby.Stop()
+		return lead(ctx, opts)
+	}
+}
+
+// standbyListens is the armed doors' addresses, which a standby answers on.
+func standbyListens(cfg *gateway.Config) []string {
+	var listens []string
+	if cfg.InjectArmed() {
+		listens = append(listens, cfg.InjectListen)
+	}
+	if cfg.A2ADoorArmed() {
+		listens = append(listens, cfg.A2ADoorListen)
+	}
+	return listens
 }
 
 // gatewayElection is the campaign for the gateway's Lease, through the pod's

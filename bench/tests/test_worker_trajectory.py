@@ -1229,7 +1229,7 @@ def test_settle_appends_worker_calls_after_the_routers_and_before_the_purge(
     ]
     assert {e["agent"] for e in result.trajectory[1:]} == {"platform", "cluster-abc"}
     assert result.metadata["worker_trajectory"]["calls"] == 3
-    assert "rm -rf" in scripts[-1]
+    assert harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in scripts[-1]
     assert worker_trajectory.CAPTURE_PRESENT in scripts[-2]
 
 

@@ -26,7 +26,21 @@ import upgrade_readiness as readiness  # noqa: E402
 import upgrade_shape_tables as tables  # noqa: E402
 from readiness_rules import audit_log, changed_defaults, client_addon_skew, deprecated_api_callers, removed_api_callers  # noqa: E402
 from test_audit_log import AT, ENDPOINT_CONTROLLER, FAIL, STALE_KUBECTL, TUNER, WRITER, FakeRunner, context_with, full_page, sample_context, sample_entries, split_sample  # noqa: E402
-from test_fleet_upgrade_report import FakeReadinessCommands, cluster, k8s_pdb, k8s_workload  # noqa: E402
+from test_fleet_upgrade_report import FakeReadinessCommands, cluster, k8s_pdb, k8s_workload, paged_dump_adapter  # noqa: E402
+
+# FakeReadinessCommands answers the one-shot `kubectl get <kinds> -A -o json`; the report
+# pages through `kubectl get --raw`, and the adapter joins the two for this module's own
+# runs of `report.main` (`test_fleet_upgrade_report.paged_dump_adapter` says why each
+# module starts its own).
+_PAGED_DUMP = paged_dump_adapter()
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 GATEWAY_OPERATOR = "system:serviceaccount:mesh:gateway-operator"
 TARGET_1_35 = (1, 35, 1, 1000)

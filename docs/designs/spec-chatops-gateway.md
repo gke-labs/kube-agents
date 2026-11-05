@@ -1287,7 +1287,9 @@ that treated the three alike is what this value exists to stop.
    reaching a listener it would otherwise only need a token to use.
 4. **Its Service is a ClusterIP.** Not a NodePort, not a LoadBalancer, and it routes nothing:
    it exists so that `kubectl port-forward svc/<cr>-a2a-inject` resolves to the pod and the
-   port.
+   port. Under the gateway's election only the Lease holder serves the door, and a standby
+   answers 503 naming the holder, so clients forward to `pod/<holder>` instead
+   (`hack/gateway-port-forward.sh`, [`gateway-replicas.md`](gateway-replicas.md)).
 5. **While it is armed, a NetworkPolicy fences the gateway pod against every pod on the cluster
    network**: two ingress rules, which admit the managed-Prometheus collector's namespace and the
    operator's pods to the metrics-only port and nothing to the door (see "Metrics" below). The gateway's own fence, which renders on every next gateway whether or not a door is armed, admits the same, so this copy is the door's record of the intent rather than the pod's only fence. It is a second control over the edge the bind already

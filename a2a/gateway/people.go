@@ -42,8 +42,9 @@ const peopleKeyHexLen = 32
 // bucket it did not find at start, and peopleRetries how many times, as for
 // the feedback bucket (feedbackRetryInterval, feedbackRetries). The off
 // switch's purge (purgePeople) retries a failed attempt on the same schedule.
-// A variable so a test can run the retries in milliseconds.
-var peopleRetryInterval = time.Minute
+// Each Gateway carries its own copy (peopleRetry), which a test shortens on
+// its own gateway.
+const peopleRetryInterval = time.Minute
 
 const (
 	peopleRetries = 30
@@ -154,14 +155,14 @@ func (g *Gateway) startPeople(ctx context.Context) bool {
 	return g.tryPeople(ctx, false)
 }
 
-// retryPeople tries again every peopleRetryInterval until the count is on,
+// retryPeople tries again every g.peopleRetry until the count is on,
 // ctx ends or peopleRetries tries have failed. Run starts it once the relay
 // has bound rather than before: the provision Job creates the bucket with
 // TASKS, and a relay that waited for TASKS longer than the retries last
 // would otherwise come up with the count given up on for good.
 func (g *Gateway) retryPeople(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(peopleRetryInterval)
+		ticker := time.NewTicker(g.peopleRetry)
 		defer ticker.Stop()
 		for range peopleRetries {
 			select {

@@ -127,14 +127,12 @@ func TestTheRelayWaitsForItsStream(t *testing.T) {
 // still look for the bucket once the relay binds, not have given up while it
 // waited.
 func TestFeedbackRetriesStartOnceTheRelayBinds(t *testing.T) {
-	old := feedbackRetryInterval
-	feedbackRetryInterval = 10 * time.Millisecond // 30 retries: 300ms
-	t.Cleanup(func() { feedbackRetryInterval = old })
 	g, url, ctx := newUnprovisionedGateway(t)
-	go func() { _ = g.Run(ctx) }()
+	g.feedbackRetry = 10 * time.Millisecond // 30 retries: 300ms
+	runGateway(t, ctx, g.Run)
 
 	// Longer than every retry put together, with no TASKS.
-	time.Sleep(time.Duration(feedbackRetries+20) * feedbackRetryInterval)
+	time.Sleep(time.Duration(feedbackRetries+20) * g.feedbackRetry)
 	provision(t, url)
 	waitFor(t, "the relay to bind", func() bool { ready, _ := g.Readiness(); return ready })
 	if g.feedback.Load() != nil {
@@ -147,13 +145,11 @@ func TestFeedbackRetriesStartOnceTheRelayBinds(t *testing.T) {
 // The people bucket comes from the same provision Job as TASKS, so its
 // retries start once the relay binds too, as feedback's do.
 func TestPeopleRetriesStartOnceTheRelayBinds(t *testing.T) {
-	old := peopleRetryInterval
-	peopleRetryInterval = 10 * time.Millisecond // 30 retries: 300ms
-	t.Cleanup(func() { peopleRetryInterval = old })
 	g, url, ctx := newUnprovisionedGateway(t)
-	go func() { _ = g.Run(ctx) }()
+	g.peopleRetry = 10 * time.Millisecond // 30 retries: 300ms
+	runGateway(t, ctx, g.Run)
 
-	time.Sleep(time.Duration(peopleRetries+20) * peopleRetryInterval)
+	time.Sleep(time.Duration(peopleRetries+20) * g.peopleRetry)
 	provision(t, url)
 	waitFor(t, "the relay to bind", func() bool { ready, _ := g.Readiness(); return ready })
 	if g.people.Load() != nil {
@@ -168,11 +164,22 @@ func TestPeopleRetriesStartOnceTheRelayBinds(t *testing.T) {
 func TestReadinessNamesAHeldBackBind(t *testing.T) {
 	g, url, ctx := newUnprovisionedGateway(t)
 	provision(t, url)
-	go func() { _ = g.RunWith(ctx, RunOptions{RelayBindDelay: 2 * time.Second}) }()
+	runGateway(t, ctx, func(ctx context.Context) error { return g.RunWith(ctx, RunOptions{RelayBindDelay: 2 * time.Second}) })
 	waitFor(t, "the bind to be held back", func() bool { return g.relayHeldBack.Load() })
 	ready, reason := g.Readiness()
 	if ready || !strings.Contains(reason, "held back after a crash start") || strings.Contains(reason, "waiting for stream") {
 		t.Fatalf("Readiness while held back = %v %q", ready, reason)
 	}
 	waitFor(t, "the held-back bind to land", func() bool { r, _ := g.Readiness(); return r })
+}
+
+// runGateway runs g until the test ends, then stops it and waits for Run to
+// return before the cleanups registered earlier (a restored retry interval,
+// say) run, so nothing the run started reads them concurrently.
+func runGateway(t *testing.T, ctx context.Context, run func(context.Context) error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(ctx)
+	ran := make(chan struct{})
+	go func() { defer close(ran); _ = run(ctx) }()
+	t.Cleanup(func() { cancel(); <-ran })
 }

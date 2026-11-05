@@ -449,6 +449,24 @@ def _stash_submitted_result(connect, task_id: str, text: str) -> None:
             pass
 
 
+def _append(text: str, lines: str) -> str:
+    """``text`` with ``lines`` added after its body and above a trailing ``[next: ...]`` line.
+
+    ``kanban_verified_claims.append_section`` keeps the answer's declared next
+    step on the last line, where Slack reads it; the ledger line goes through it
+    so an audit answer that ends on a step line keeps its button. Without that
+    module (a test tree that lacks it) the lines go on the end as before.
+    """
+    try:
+        from tools import kanban_verified_claims as gate
+    except ImportError:
+        try:
+            import kanban_verified_claims as gate
+        except ImportError:
+            return text + lines
+    return gate.append_section(text, lines.strip("\n"))
+
+
 def require_audit_ledger(task_id, connect, result, state_db=None):
     """The completion gate. Returns ``(error, result_to_store)``.
 
@@ -479,7 +497,8 @@ def require_audit_ledger(task_id, connect, result, state_db=None):
         return None, result
     text = "" if result is None else str(result)
     missing = [url for url in run["urls"] if url not in text]
-    text += "".join(LEDGER_LINE.format(url=url) for url in missing)
+    if missing:
+        text = _append(text, "".join(LEDGER_LINE.format(url=url) for url in missing))
     audit = run["open_audit"]
     if audit is not None and run["hidden"]:
         logger.warning(

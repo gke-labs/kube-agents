@@ -2195,7 +2195,9 @@ func TestHostClusterContextNameAgreesOnKindAndGKE(t *testing.T) {
 	if sandboxEnv["KUBE_CONTEXT_NAME"] != inClusterContextName {
 		t.Errorf("shell sandbox KUBE_CONTEXT_NAME on kind = %q, want %q", sandboxEnv["KUBE_CONTEXT_NAME"], inClusterContextName)
 	}
-	if kpEnv["KUBE_PROXY_DEFAULT_CLUSTER"] != inClusterContextName {
-		t.Errorf("kube-proxy KUBE_PROXY_DEFAULT_CLUSTER on kind = %q, want %q", kpEnv["KUBE_PROXY_DEFAULT_CLUSTER"], inClusterContextName)
+	// The kube-proxy has no default cluster to name (#4739): a request with no
+	// /clusters/<context> prefix is refused, so the env is gone on every harness.
+	if v, ok := kpEnv["KUBE_PROXY_DEFAULT_CLUSTER"]; ok {
+		t.Errorf("kube-proxy still renders KUBE_PROXY_DEFAULT_CLUSTER=%q; it routes nothing now", v)
 	}
 }
