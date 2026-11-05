@@ -42,8 +42,8 @@ Store the bot credentials in the PlatformAgent credentials secret:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: platform-agent-credentials
-  namespace: kube-agents-system
+  name: platform-agent-secrets
+  namespace: kubeagents-system
 type: Opaque
 stringData:
   TEAMS_APP_ID: "00000000-0000-0000-0000-000000000000"
@@ -61,7 +61,7 @@ The tenant lock-down is not read from this Secret. Set it with `tenantId` in Ste
 ```yaml
 platformAgent:
   credentials:
-    secretName: platform-agent-credentials
+    secretName: platform-agent-secrets
   integration:
     teams:
       enabled: true
@@ -80,18 +80,18 @@ apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: PlatformAgent
 metadata:
   name: platform-agent
-  namespace: kube-agents-system
+  namespace: kubeagents-system
 spec:
   credentialsSecretRef:
-    name: platform-agent-credentials
+    name: platform-agent-secrets
   integration:
     teams:
       enabled: true
       appIdSecretRef:
-        name: platform-agent-credentials
+        name: platform-agent-secrets
         key: TEAMS_APP_ID
       appPasswordSecretRef:
-        name: platform-agent-credentials
+        name: platform-agent-secrets
         key: TEAMS_APP_PASSWORD
       tenantId: "11111111-1111-1111-1111-111111111111"
       allowedUsers:
