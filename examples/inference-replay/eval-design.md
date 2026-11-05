@@ -230,7 +230,13 @@ inject door, as the presubmit runs). Four cases were recorded once, the way the 
 then each was replayed three times. "Reused" is the share of prompt tokens served from saved
 answers instead of the model.
 
-| Case (share reused)                          | First trial | After the answer-variant fix |
+Between the two trials we fixed one cause of misses. The model sometimes answers the same request
+in two different ways that do the same thing, such as looking up its own kanban card with no
+arguments one time and with its card's id the next. The cache had saved only one of the two, so a
+replay that got the other answer missed from then on. The fix lets replay accept either answer, as
+long as a recording really gave it ("Different words for the same answer" has the rules).
+
+| Case (share reused)                          | First trial | Second trial, after that fix |
 | -------------------------------------------- | ----------- | ---------------------------- |
 | `chat-routing-own-cluster-namespaces`        | 88%         | 85%                          |
 | `obtainability-design-quota-vs-capacity`     | 32–45%      | 31%                          |
