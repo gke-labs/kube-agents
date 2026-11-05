@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -756,5 +758,295 @@ func TestPersonaRenderWarningsAreLogged(t *testing.T) {
 	logPersonaWarnings(log, nil)
 	if buf.Len() != 0 {
 		t.Errorf("logged %q with no persona", buf.String())
+	}
+}
+
+// Two tasks on one warm worker share its consumer names while confirms carry
+// no task credential (the stem is the pod's), and the second task's
+// consumers start fresh: an input left on the first task after it ended
+// never reaches the second. Until per-task credentials, this is the
+// isolation between tasks on a warm pod.
+func TestTheSecondTaskOnAWarmWorkerSeesNothingOfTheFirst(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"pw-two"}'
+read first || exit 1
+all="$first"
+while read -t 2 line; do all="$all $line"; done
+saw=$(printf '%s' "$all" | grep -oE 'ALPHAWORD|BETAWORD|STALEWORD' | tr '\n' ' ')
+printf '{"type":"result","subtype":"success","result":"saw: %s"}\n' "$saw"
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startProfileWorker(t, ctx, profileWorkerConfig(t, url, harness), false)
+	c := testClient(t, url)
+
+	origins := map[string]*lib.Envelope{}
+	run := func(task, text string) *lib.Task {
+		t.Helper()
+		origins[task] = profileSubmission(t, task, text, nil)
+		d.offer(task, origins[task], 5)
+		if a := d.nextAccept(5 * time.Second); a.TaskID != task || !a.Accepted {
+			t.Fatalf("offer of %s = %+v, want an accept", task, a)
+		}
+		d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+		waitState(t, c, pwProfile, task, lib.StateCompleted)
+		drainLeases(d, task, time.Second)
+		return foldTask(t, c, pwProfile, task)
+	}
+
+	first := run("task-first", "ALPHAWORD")
+	if got := artifactText(first, lib.ArtifactResult); !strings.Contains(got, "ALPHAWORD") {
+		t.Fatalf("the first task's result %q doesn't carry its own prompt", got)
+	}
+	// An input on the first task after it ended: undelivered, and on a
+	// consumer name the second task reuses.
+	stalePayload, err := json.Marshal(lib.Message{
+		Role: "user", Parts: []lib.Part{{Kind: "text", Text: "STALEWORD"}},
+		MessageID: "msg-stale-1", TaskID: "task-first", ContextID: origins["task-first"].ContextID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := lib.NewFollowUpEnvelope(origins["task-first"], gatewayParty, stalePayload, lib.WithTo(lib.Party{Session: pwProfile}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pubCancel()
+	if err := c.Publish(pubCtx, lib.TaskInSubject(pwProfile, "task-first"), stale); err != nil {
+		t.Fatalf("publish the stale input: %v", err)
+	}
+
+	second := run("task-second", "BETAWORD")
+	got := artifactText(second, lib.ArtifactResult)
+	if !strings.Contains(got, "BETAWORD") {
+		t.Errorf("the second task's result %q doesn't carry its own prompt", got)
+	}
+	if strings.Contains(got, "STALEWORD") || strings.Contains(got, "ALPHAWORD") {
+		t.Errorf("the second task saw the first task's input: %q", got)
+	}
+}
+
+// After an abandon, the next task on the pod starts whatever the abandoned
+// task left of its consumers: it gets its own input, under the same names,
+// even with a consumer of the old task still standing under one of them.
+func TestATaskAfterAnAbandonStartsCleanly(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"pw-after-abandon"}'
+read first || exit 1
+case "$first" in
+  *HANGWORD*) sleep 30 ;;
+esac
+saw=$(printf '%s' "$first" | grep -oE 'HANGWORD|NEXTWORD' | tr '\n' ' ')
+printf '{"type":"result","subtype":"success","result":"saw: %s"}\n' "$saw"
+`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startProfileWorker(t, ctx, profileWorkerConfig(t, url, harness), false)
+	c := testClient(t, url)
+
+	d.offer("task-hang", profileSubmission(t, "task-hang", "HANGWORD", nil), 5)
+	d.nextAccept(5 * time.Second)
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-hang"})
+	waitState(t, c, pwProfile, "task-hang", lib.StateWorking)
+	d.send(lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: "task-hang", Reason: "stop - test"})
+	drainLeases(d, "task-hang", 2*time.Second)
+
+	// A consumer the abandoned task left under the pod's names, as a crash
+	// or a failed delete would: on the hung task's subject, from its start.
+	// Its start sequence can't be changed by an update, so a worker that
+	// reused the name instead of replacing it couldn't open its input.
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsCtx, jsCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer jsCancel()
+	if _, err := js.CreateOrUpdateConsumer(jsCtx, lib.TasksStream, jetstream.ConsumerConfig{
+		Name: lib.SessionConsumerName(pwPod, lib.SessionConsumerIn), FilterSubject: lib.TaskInSubject(pwProfile, "task-hang"),
+		DeliverPolicy: jetstream.DeliverByStartSequencePolicy, OptStartSeq: 1,
+		AckPolicy: jetstream.AckNonePolicy, MemoryStorage: true, Replicas: 1,
+	}); err != nil {
+		t.Fatalf("leave a consumer behind: %v", err)
+	}
+
+	d.offer("task-next", profileSubmission(t, "task-next", "NEXTWORD", nil), 5)
+	if a := d.nextAccept(5 * time.Second); a.TaskID != "task-next" || !a.Accepted {
+		t.Fatalf("an offer after the abandon = %+v, want an accept", a)
+	}
+	d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: "task-next"})
+	waitState(t, c, pwProfile, "task-next", lib.StateCompleted)
+	if got := artifactText(foldTask(t, c, pwProfile, "task-next"), lib.ArtifactResult); !strings.Contains(got, "NEXTWORD") {
+		t.Errorf("the task after the abandon answered %q", got)
+	}
+}
+
+// An abandon that's already waiting when the task starts ends it before it
+// is marked working: nothing of the task goes out after the dispatcher's
+// terminal. Run at the adapter, so the abandon is in place before setup
+// rather than racing it.
+func TestAnAbandonDuringSetupPublishesNothing(t *testing.T) {
+	url := startServer(t)
+	harness := stub(t, `
+read first || exit 1
+echo '{"type":"result","subtype":"success","result":"should never run"}'
+`)
+	cfg := profileWorkerConfig(t, url, harness)
+	const task = "task-abandon-setup"
+	origin := profileSubmission(t, task, "never started", nil)
+	cfg.TaskID = task
+	b, closeBus, err := dialBus(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBus()
+	abandon := make(chan string, 1)
+	abandon <- "stop - test"
+	a := newTaskAdapter(cfg, b)
+	a.dispatched = true
+	a.abandon = abandon
+
+	out := a.execute(context.Background(), origin, 0, turnPlan{})
+	if !out.res.Abandoned {
+		t.Errorf("execute = %+v, err %v; want abandoned", out.res, out.err)
+	}
+	for _, e := range replayEvents(t, url, pwProfile, task) {
+		if e.Kind == lib.KindStatusUpdate {
+			var u lib.StatusUpdate
+			if json.Unmarshal(e.Payload, &u) == nil && (u.Status.State == lib.StateWorking || u.Final) {
+				t.Errorf("published %s (final=%v) for a task abandoned before it started", u.Status.State, u.Final)
+			}
+		}
+	}
+}
+
+// An abandon the worker has received and a SIGTERM right behind it: however
+// the worker's selects order them, the task gets no terminal and no final
+// renewal. The stub's child holds stdout past the kill, so the harness is
+// still draining when the SIGTERM lands. (An abandon still on the wire when
+// the SIGTERM lands can't be seen by any worker; the dispatcher's terminal is
+// then the first, and a fold drops the eviction's.)
+func TestAnAbandonBesideASigtermPublishesNoTerminal(t *testing.T) {
+	for i := 0; i < 3; i++ {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			url := startServer(t)
+			d := newFakeDispatcher(t, url)
+			harness := stub(t, `
+echo '{"type":"system","subtype":"init","session_id":"pw-both"}'
+read first || exit 1
+perl -e 'setpgrp(0,0); sleep 4' &
+sleep 30
+`)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := startProfileWorker(t, ctx, profileWorkerConfig(t, url, harness), false)
+			task := fmt.Sprintf("task-both-%d", i)
+			d.offer(task, profileSubmission(t, task, "long job", nil), 5)
+			d.nextAccept(5 * time.Second)
+			d.send(lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: task})
+			waitState(t, testClient(t, url), pwProfile, task, lib.StateWorking)
+			// The abandon, then the SIGTERM as soon as it has arrived.
+			d.send(lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: task, Reason: "stop - test"})
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Fatal("the worker did not stop")
+			}
+			if _, final := drainLeases(d, task, time.Second); final {
+				t.Error("a final renewal for an abandoned task")
+			}
+			if got := foldTask(t, testClient(t, url), pwProfile, task); got.Final {
+				t.Errorf("the worker published a terminal (%s) for an abandoned task", got.State)
+			}
+		})
+	}
+}
+
+// A task that ended with an error got no terminal (the publish of working,
+// or of the terminal itself, failed), so it gets no final renewal either:
+// the lease settles it.
+func TestNoFinalRenewalWithoutATerminal(t *testing.T) {
+	url := startServer(t)
+	d := newFakeDispatcher(t, url)
+	cfg := profileWorkerConfig(t, url, nil)
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	b, closeBus, err := dialBus(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeBus()
+	w := &profileWorker{cfg: cfg, pw: ProfileWorkerConfig{Tier: pwTier}, b: b}
+	const task = "task-no-terminal"
+	stop := func() {}
+	renewDone := make(chan struct{})
+	close(renewDone)
+	h := &held{offer: lib.DispatchMessage{TaskID: task}, stopRenew: stop, renewDone: renewDone}
+
+	w.finish(h, turnOutcome{res: Result{State: lib.StateFailed}, err: errors.New("publish working: connection closed")})
+	if _, final := drainLeases(d, task, time.Second); final {
+		t.Error("a final renewal for a task whose terminal didn't go out")
+	}
+	// And one that did end cleanly still gets it, so the check above isn't
+	// passing on a worker that never sends one.
+	w.finish(h, turnOutcome{res: Result{State: lib.StateCompleted}})
+	if _, final := drainLeases(d, task, 2*time.Second); !final {
+		t.Error("no final renewal for a task whose terminal went out")
+	}
+}
+
+// finalize is the one door every terminal goes through, so it's where an
+// abandon is honoured last: with one waiting, it publishes nothing and says
+// so.
+func TestFinalizeWritesNoTerminalForAnAbandonedTask(t *testing.T) {
+	abandon := make(chan string, 1)
+	abandon <- "stop - test"
+	a := &adapter{abandon: abandon}
+	// No execution is wired: a finalize that tried to publish would panic.
+	if err := a.finalize(lib.StateFailed, "reason: worker-evicted", ""); !errors.Is(err, errAbandoned) {
+		t.Errorf("finalize of an abandoned task = %v, want errAbandoned", err)
+	}
+	if !a.abandoned() || a.abandonReason != "stop - test" {
+		t.Errorf("the abandon wasn't kept: seen=%v reason=%q", a.abandonSeen, a.abandonReason)
+	}
+}
+
+// On a SIGTERM, the worker passes the held task an abandon that's already
+// queued beside it, and only that task's: the loop's select may have taken
+// the SIGTERM first.
+func TestAQueuedAbandonReachesTheTaskOnEviction(t *testing.T) {
+	w := &profileWorker{msgs: make(chan *nats.Msg, 4)}
+	cur := &held{offer: lib.DispatchMessage{TaskID: "task-held"}, abandon: make(chan string, 1)}
+	for _, m := range []lib.DispatchMessage{
+		{Type: lib.DispatchAbandon, TaskID: "task-other", Reason: "not this one"},
+		{Type: lib.DispatchConfirm, TaskID: "task-held"},
+		{Type: lib.DispatchAbandon, TaskID: "task-held", Reason: "stop - test"},
+	} {
+		data, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.msgs <- &nats.Msg{Data: data}
+	}
+	w.forwardPendingAbandon(cur)
+	select {
+	case got := <-cur.abandon:
+		if got != "stop - test" {
+			t.Errorf("the held task got the abandon %q", got)
+		}
+	default:
+		t.Error("the queued abandon didn't reach the held task")
 	}
 }

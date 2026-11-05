@@ -298,8 +298,13 @@ func (w *profileWorker) loop(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			if cur != nil && cur.running {
-				// execute sees the same ctx and publishes worker-evicted;
-				// wait for it so the final renewal still goes out.
+				// An abandon for this task that's already here goes to it
+				// first: the dispatcher writes that terminal, and the
+				// eviction mustn't write another.
+				w.forwardPendingAbandon(cur)
+				// execute sees the same ctx and publishes worker-evicted
+				// (or, abandoned, nothing); wait for it so the final
+				// renewal still goes out when it's owed.
 				out := <-taskDone
 				w.finish(cur, out)
 			}
@@ -388,6 +393,27 @@ func (w *profileWorker) loop(ctx context.Context) error {
 					return nil
 				}
 			}
+		}
+	}
+}
+
+// forwardPendingAbandon passes the held task an abandon that's already in
+// the worker's queue, without waiting for more. The loop's select can take a
+// SIGTERM before a message that arrived beside it.
+func (w *profileWorker) forwardPendingAbandon(cur *held) {
+	for {
+		select {
+		case msg := <-w.msgs:
+			var m lib.DispatchMessage
+			if json.Unmarshal(msg.Data, &m) != nil || m.Type != lib.DispatchAbandon || m.TaskID != cur.offer.TaskID {
+				continue
+			}
+			select {
+			case cur.abandon <- m.Reason:
+			default:
+			}
+		default:
+			return
 		}
 	}
 }
@@ -550,7 +576,10 @@ func (w *profileWorker) finish(h *held, out turnOutcome) {
 	if out.err != nil {
 		w.cfg.Logger.Warn("the task ended with an error", "task", h.offer.TaskID, "err", out.err)
 	}
-	if out.res.State == "" || out.res.Abandoned {
+	// An error means no terminal went out (the publish of working or of
+	// the terminal itself failed), so there's nothing for a final renewal
+	// to vouch for: the lease settles it, as for an abandon.
+	if out.res.State == "" || out.res.Abandoned || out.err != nil {
 		return
 	}
 	// Renewals stop before the final one, so Final is the last word.
