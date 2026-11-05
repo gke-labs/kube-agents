@@ -43,6 +43,7 @@ const (
 	noticeProfilePinnedOther  = "%s works only on cluster %s, not %s"
 	noticeProfileNoTarget     = "%s needs a target cluster (project, location and cluster)"
 	noticeProfileTakesNone    = "%s doesn't take a target cluster"
+	noticeProfileTier         = "%s doesn't run at tier %s"
 	noticeProfileAmbiguous    = "more than one agent profile is pinned to cluster %s"
 	noticeProfileNoGeneric    = "no agent profile serves cluster %s"
 	noticeTargetExcluded      = "cluster %s is excluded from this install's scope"
@@ -323,7 +324,11 @@ type scopeDeclaration struct {
 	Projects      []string `json:"projects"`
 	Folders       []string `json:"folders"`
 	Organizations []string `json:"organizations"`
-	Exclude       struct {
+	// SharedVpcHosts and MetricsScopes are selectors whose member projects
+	// the reconcile resolves, like folders and organizations.
+	SharedVpcHosts []string `json:"sharedVpcHosts"`
+	MetricsScopes  []string `json:"metricsScopes"`
+	Exclude        struct {
 		Projects []string `json:"projects"`
 		Clusters []struct {
 			ProjectID   string `json:"projectId"`
@@ -389,7 +394,7 @@ func checkTargetScope(decl *scopeDeclaration, management string, t clusterTarget
 	if slices.Contains(decl.Projects, t.Project) {
 		return nil
 	}
-	if len(decl.Folders) > 0 || len(decl.Organizations) > 0 {
+	if len(decl.Folders) > 0 || len(decl.Organizations) > 0 || len(decl.SharedVpcHosts) > 0 || len(decl.MetricsScopes) > 0 {
 		return refused(noticeTargetUnconfirmed, t)
 	}
 	return refused(noticeTargetOutOfScope, t)
@@ -514,6 +519,13 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 	if err != nil {
 		return nil, err
 	}
+	// The dispatcher has a durable only for each tier the profile allows
+	// (its card's tiers), so a submission at another tier would sit with
+	// nothing to consume it until the never-started heal. A card with no
+	// tiers is from an operator that predates them, and isn't checked.
+	if card, ok := g.profiles.lookup(profile); ok && len(card.Tiers) > 0 && !slices.Contains(card.Tiers, string(tier)) {
+		return nil, refused(noticeProfileTier, profile, tier)
+	}
 	route := &profileRoute{Profile: profile, Tier: tier, Kind: kind, Params: maps.Clone(params),
 		Scope: capability.NamespaceScope(g.cfg.Namespace)}
 	if target == nil {
@@ -544,6 +556,15 @@ func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, ch
 	parent, ok := rec.TaskRefFor(child.ParentTaskID)
 	if !ok || parent.Tier == "" {
 		return false
+	}
+	if parent.Canceled || parent.TerminalObserved {
+		// A stop cancelled the parent with its child, or the parent has
+		// ended: nothing reads its .in, and restoring it would hand the
+		// conversation a task the user already saw end, or steer the next
+		// message into one they stopped. Handled, so no session is woken.
+		g.log.Info("child result not delivered: the parent is cancelled or has ended",
+			"child", child.ID, "parent", parent.ID, "canceled", parent.Canceled, "ended", parent.TerminalObserved)
+		return true
 	}
 	text := reason
 	if state == lib.StateCompleted {

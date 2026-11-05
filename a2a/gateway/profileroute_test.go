@@ -516,3 +516,94 @@ func TestDirectoryFeed_AReReadForgetsAProfileWhoseTombstoneWasMissed(t *testing.
 		}
 	}
 }
+
+// TestANeverStartedProfileTaskGetsItsStopRecord: the heal releases a profile
+// task with no first event inside the grace, and writes its stop record, so
+// a dispatcher still holding the submission queued drops it rather than run
+// it later into a conversation that has moved on.
+func TestANeverStartedProfileTaskGetsItsStopRecord(t *testing.T) {
+	r := startProfileRig(t)
+	conv := "discord:9/9"
+	rec := &SessionRecord{
+		Key: conv, ContextID: "ctx-queued", Kind: "dm", LastActivity: time.Now().UTC(), Addressee: "chat",
+		ActiveTask: &ActiveTask{TaskID: "task-queued", CorrelationID: "corr-queued", Ask: "look at prod",
+			SubmittedAt: time.Now().Add(-(defaultFirstEventGrace + time.Minute))},
+		Tasks: []TaskRef{{ID: "task-queued", Addressee: "chat", Tier: "read", CorrelationID: "corr-queued"}},
+	}
+	if err := r.g.reg.Put(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-9", Text: "how is the fleet?"}
+	waitFor(t, "the never-started notice", postedContaining(r, "has produced nothing on its event stream"))
+	waitFor(t, "the stop record", func() bool {
+		stop, ok := dispatchStopFor(t, r.url, "chat", "task-queued")
+		return ok && stop.TaskID == "task-queued"
+	})
+}
+
+// TestACancelByIDOfAReleasedProfileTaskWritesItsStopRecord: the cancel goes
+// on .in, which the dispatcher doesn't read, so a task it still holds
+// queued is dropped only by the record.
+func TestACancelByIDOfAReleasedProfileTaskWritesItsStopRecord(t *testing.T) {
+	r := startProfileRig(t)
+	rec := &SessionRecord{Key: "discord:10/10", ContextID: "ctx-released",
+		Tasks: []TaskRef{{ID: "task-released", Addressee: "prod-east", Tier: "read", CorrelationID: "corr-released"}}}
+	r.g.cancelNamedTask(context.Background(), rec, "task-released", Authority{Requester: AuthorityRequester{Principal: "test:bnaylor", Backend: "discord"}})
+	waitFor(t, "the stop record", func() bool {
+		stop, ok := dispatchStopFor(t, r.url, "prod-east", "task-released")
+		return ok && stop.TaskID == "task-released"
+	})
+}
+
+// TestARefusedDelegationLeavesAProfileTasksResultAlone: a session turn's
+// completed after a refused delegation is only its hand-off line; a profile
+// task keeps running after a refusal, and its completed is its own result.
+func TestARefusedDelegationLeavesAProfileTasksResultAlone(t *testing.T) {
+	rec := &SessionRecord{Tasks: []TaskRef{
+		{ID: "task-session", DelegationEnd: "delegation-refused"},
+		{ID: "task-profile", Tier: "read", DelegationEnd: "delegation-refused"},
+	}}
+	if state, _, handOff := rec.handOffEnd("task-session", lib.StateCompleted); !handOff || state != lib.StateFailed {
+		t.Fatalf("session turn: %s, %v; want the hand-off rewritten to failed", state, handOff)
+	}
+	if state, _, handOff := rec.handOffEnd("task-profile", lib.StateCompleted); handOff || state != lib.StateCompleted {
+		t.Fatalf("profile task: %s, %v; want its completed to stand", state, handOff)
+	}
+}
+
+// TestAChildResultIsNotDeliveredToACancelledOrEndedParent: after a stop the
+// parent is cancelled, and a child's end arriving later must neither post to
+// the parent's .in nor restore it as the conversation's task.
+func TestAChildResultIsNotDeliveredToACancelledOrEndedParent(t *testing.T) {
+	r := startProfileRig(t)
+	for _, parent := range []TaskRef{
+		{ID: "task-parent-c", Addressee: "chat", Tier: "read", CorrelationID: "corr-c", Canceled: true},
+		{ID: "task-parent-e", Addressee: "chat", Tier: "read", CorrelationID: "corr-e", TerminalObserved: true},
+	} {
+		child := TaskRef{ID: parent.ID + "-child", Addressee: "prod-east", Tier: "read", ParentTaskID: parent.ID, Role: taskRoleChild}
+		rec := &SessionRecord{Key: "discord:11/" + parent.ID, ContextID: "ctx-" + parent.ID, Tasks: []TaskRef{parent, child}}
+		if !r.g.deliverChildResult(context.Background(), rec, child, lib.StateCanceled, "", "canceled") {
+			t.Fatalf("%s: not reported handled, so a session would be woken", parent.ID)
+		}
+		if rec.ActiveTask != nil {
+			t.Fatalf("%s: restored as the conversation's task: %+v", parent.ID, rec.ActiveTask)
+		}
+		if envs := streamEnvelopes(t, r.url, lib.TaskInSubject("chat", parent.ID)); len(envs) != 0 {
+			t.Fatalf("%s: %d message(s) on the parent's .in", parent.ID, len(envs))
+		}
+	}
+}
+
+// TestAProfileThatDoesntRunAtTheTierIsRefusedUpFront: the dispatcher has a
+// durable only for each tier the profile allows, so a submission at another
+// would sit unconsumed until the heal; the gateway refuses it first.
+func TestAProfileThatDoesntRunAtTheTierIsRefusedUpFront(t *testing.T) {
+	r := startProfileRig(t)
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Tiers: []string{"unattended"}})
+	conv := "discord:12/12"
+	r.adapter.inbox <- profileTurn(conv, "chat", nil)
+	waitFor(t, "the refusal", postedContaining(r, "chat doesn't run at tier read"))
+	if envs := streamEnvelopes(t, r.url, "a2a.submit.chat.>"); len(envs) != 0 {
+		t.Fatalf("%d submission(s) for a tier the profile doesn't allow", len(envs))
+	}
+}

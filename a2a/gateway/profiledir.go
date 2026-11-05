@@ -122,13 +122,15 @@ func (g *Gateway) readDirectory(ctx context.Context, f *directoryFeed) error {
 	if err != nil {
 		return err
 	}
+	// A read speaks for every profile the live feed hasn't since it began;
+	// one the read no longer finds is gone (its tombstone was missed). It
+	// begins before the subject list is taken, so a new profile's first card
+	// that the feed applies after the list was computed keeps its claim.
+	f.beginRead()
 	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(agentsWildcard))
 	if err != nil {
 		return err
 	}
-	// A read speaks for every profile the live feed hasn't since it began;
-	// one the read no longer finds is gone (its tombstone was missed).
-	f.beginRead()
 	n := 0
 	seen := map[string]bool{}
 	for subject := range info.State.Subjects {

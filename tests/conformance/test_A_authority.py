@@ -1277,13 +1277,28 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         )
         self.assertEqual(["gateway"], writers)
         derivation = self._session_publish_derivation()
-        for spelling in ("TaskSubmitSubject", ".submit"):
+        for spelling in self.SUBMIT_SPELLINGS:
             self.assertNotIn(
                 spelling,
                 derivation,
                 "the callout derives an executor a publish grant on a profile's submit "
                 "subject; a worker that can write there can start tasks of its own",
             )
+        dispatcher = self._dispatcher_identity()
+        for spelling in self.SUBMIT_SPELLINGS:
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a grant on a profile's submit subject")
+
+    # The ways the tree spells each subject: the library helpers, their
+    # prefix constants and the literal. An executor's or the dispatcher's
+    # grant written through any of them is a second writer.
+    SUBMIT_SPELLINGS = ("TaskSubmitSubject", "SubmitSubjectPrefix", ".submit", "a2a.submit")
+    STOP_SPELLINGS = ("DispatchStopSubject", "DispatchStopPrefix", "a2a.stop")
+
+    @staticmethod
+    def _dispatcher_identity() -> str:
+        """`dispatcherIdentity`'s body: the dispatcher authenticates through
+        the callout, so no served config carries its grants."""
+        return h.go_function_body(h.text("a2a_dispatcher"), "dispatcherIdentity")
 
     STOP_PROBE = "a2a.stop.cluster.task-0001"
 
@@ -1302,12 +1317,17 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
             if any(self._subject_matches(g, self.STOP_PROBE) for g in grants)
         )
         self.assertEqual(["gateway"], writers)
-        self.assertNotIn(
-            "a2a.stop",
-            self._session_publish_derivation(),
-            "the callout derives an executor a publish grant on a stop record; "
-            "a worker that can write there can stop other requesters' tasks",
-        )
+        derivation = self._session_publish_derivation()
+        for spelling in self.STOP_SPELLINGS:
+            self.assertNotIn(
+                spelling,
+                derivation,
+                "the callout derives an executor a publish grant on a stop record; "
+                "a worker that can write there can stop other requesters' tasks",
+            )
+        dispatcher = self._dispatcher_identity()
+        for spelling in self.STOP_SPELLINGS:
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a grant on the stop record")
 
     CONSOLE_CONFIRM_PROBE = "chat.console.tab-1.confirm"
     CONSOLE_IN_PROBE = "chat.console.tab-1.in"

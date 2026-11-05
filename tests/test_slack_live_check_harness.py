@@ -1372,13 +1372,22 @@ class UnitTest(unittest.TestCase):
         rendered = set()
         for fmt in formats:
             self.assertTrue(harness.NOT_STARTED_PATTERN.match(fmt), fmt)
-            literal = re.escape(fmt).replace("%d", "%s").replace("%s", ".+")
             if fmt.endswith(": "):
-                # A bare prefix constant: the gateway appends the reason.
-                literal += ".+"
+                # A bare prefix constant renders nothing by itself (the
+                # gateway appends a notice, pinned below), and as a pattern
+                # it would match every rendering here.
+                continue
+            literal = re.escape(fmt).replace("%d", "%s").replace("%s", ".+")
             matching = [n for n in NOT_STARTED_NOTICES if re.fullmatch(literal, n, re.DOTALL)]
             self.assertTrue(matching, f"no test rendering of {fmt!r}")
             rendered.update(matching)
+        # The profile route's notices are posted under that prefix: each
+        # rendering here is the prefix plus a notice the source spells out.
+        prefix = 'noticeTurnNotStarted       = "⚠️ not started: "'
+        self.assertIn(prefix, sources["profiles.go"])
+        profile_notice = "a task is still running here; stop it or wait for it before asking an agent profile"
+        self.assertIn(f'noticeProfileWhileRunning = "{profile_notice}"', sources["profiles.go"])
+        rendered.add("⚠️ not started: " + profile_notice)
         self.assertEqual(rendered, set(NOT_STARTED_NOTICES))
         # The session cap's count phrase, both forms.
         self.assertIn('workers := fmt.Sprintf("%d session workers are", live)', sources["spawn.go"])

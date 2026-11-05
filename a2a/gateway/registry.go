@@ -425,9 +425,12 @@ type TaskRef struct {
 // that minted a child ends quietly as the chain's parent (observedAs).
 // relayTerminal, the heal and the read route all decide through it, after
 // settleHandOff has written what the stream shows.
+//
+// Not for a task submitted to an AgentProfile (Tier set): a refused
+// delegation doesn't end it, and its `completed` is a real result of its own.
 func (rec *SessionRecord) handOffEnd(taskID string, state lib.TaskState) (lib.TaskState, string, bool) {
 	ref, ok := rec.TaskRefFor(taskID)
-	if !ok || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
+	if !ok || ref.Tier != "" || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
 		return state, "", false
 	}
 	return lib.StateFailed, ref.DelegationEnd, true

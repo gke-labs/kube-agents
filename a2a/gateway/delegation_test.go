@@ -1669,7 +1669,7 @@ func TestAnOffListSteerIntoTheChildIsRefusedAndNotSent(t *testing.T) {
 				waitFor(t, "the ack", postedContaining(r, ackSteerQueued))
 				return
 			}
-			waitFor(t, "the notice", postedContaining(r, noticeDelegationNotAllowed))
+			waitFor(t, "the notice", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)))
 			waitFor(t, "the audit line", loggedContaining(r, "steer refused", "rule="+ruleDelegationChildSteer, child.TaskID))
 			if n := childSteers(t, r, child); n != 0 {
 				t.Fatalf("a refused steer reached the child: %d", n)
@@ -1905,8 +1905,8 @@ func TestAnEarlierAuthorInTheIncarnationRefusesTheDelegation(t *testing.T) {
 	waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationSessionAuthor,
 		"sessionBackend=discord", "sessionAuthor="+off.Subject))
 	completeTask(t, exec, "delegated to platform")
-	waitFor(t, "notice", postedContaining(r, noticeDelegationNotAllowed))
-	if i, j := postIndex(r, "delegated to platform"), postIndex(r, noticeDelegationNotAllowed); i < 0 || j < i {
+	waitFor(t, "notice", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)))
+	if i, j := postIndex(r, "delegated to platform"), postIndex(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)); i < 0 || j < i {
 		t.Fatalf("posts %v: want the answer, then the notice", r.adapter.postTexts())
 	}
 	if n := platformSubmissions(t, r); n != 0 {
@@ -2141,7 +2141,7 @@ func TestTheDoorWithNoListMayNotDelegate(t *testing.T) {
 			}
 			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+tc.rule, "backend="+a2aBackend))
 			completeTask(t, exec, "delegated to platform")
-			waitFor(t, "the target-only notice", postedContaining(r, noticeDelegationNotAllowed))
+			waitFor(t, "the target-only notice", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)))
 			if n := platformSubmissions(t, r); n != 0 {
 				t.Fatalf("a door turn with no list minted %d children", n)
 			}
@@ -2181,7 +2181,7 @@ func TestADoorAuthorWithNoListRefusesAChatTurnsDelegation(t *testing.T) {
 			}
 			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+ruleDelegationDoorUnlisted, tc.field))
 			completeTask(t, exec, "delegated to platform")
-			waitFor(t, "the target-only notice", postedContaining(r, noticeDelegationNotAllowed))
+			waitFor(t, "the target-only notice", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, targetPlatform)))
 			if n := platformSubmissions(t, r); n != 0 {
 				t.Fatalf("minted past a door author with no list: %d", n)
 			}
