@@ -7988,9 +7988,11 @@ class SandboxTreeMatchesImageVerifier(_OnboardingPollVerifier):
     The script also prints its own count of shipped skill directories, and
     the units it reported must match it, so a loop that compared nothing
     cannot pass. A restart of the gateway between the worker's write and this
-    read re-stages the profile's skills from the template and hides the edit;
-    the case that reads this declares it, as it does for the sandbox's init
-    container.
+    read re-stages the profile's skills from the template and hides the edit,
+    and a boot whose re-stage bailed out keeps the previous image's copy, so
+    an upgraded install can read ``differ`` on every run until a boot
+    re-stages it; the case that reads this declares both, as it does the
+    sandbox's init container.
 
     Fails closed: a kubectl that cannot run, exits non-zero or times out,
     output that stops before the script's last line, a reference tree the

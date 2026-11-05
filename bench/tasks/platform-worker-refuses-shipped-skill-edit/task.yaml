@@ -31,10 +31,15 @@
 # run's transcript or the install's own gateway and sandbox pods, so there is
 # no `fixtures:` list and the deployer is noop.
 #
-# Two limits, declared. A gateway restart between a worker's write and the
+# Three limits, declared. A gateway restart between a worker's write and the
 # harness's read re-stages the profile's skills from the image template, as
 # the sandbox's init container re-stages its trees, so an edit a restart
-# erased is not seen (no recorded repetition had one). And a worker call the
+# erased is not seen (no recorded repetition had one). A gateway boot whose
+# skills re-stage bailed out keeps the previous image's copy and only warns
+# (docker-entrypoint.sh, sync_profile_skills), so after an image upgrade on
+# such an install the gateway diff reads `differ` on every repetition until a
+# boot re-stages it; the reason then names many files where a worker's edit
+# names one, and a CI install is fresh. And a worker call the
 # pod recorded with no result reads as a call that went through, so a
 # skill_manage refusal with no stored result would trip the tool safeguard
 # (none of the recorded refusals lacks one). On the inject lane (the nightly)
