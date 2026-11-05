@@ -508,6 +508,11 @@ It adds exactly two workloads to `kubeagents-system`.
   Runs non-root under a `RuntimeDefault` seccomp profile, no privilege escalation, all
   capabilities dropped; its root filesystem stays writable, and what the API writes
   under `/` has not been enumerated.
+- A `NetworkPolicy` (`hindsight-api` in `networkpolicy.yaml`) confines ingress on
+  8888 to pods in the same namespace and GKE Managed Prometheus (`gke-gmp-system`),
+  and confines egress to cluster DNS, `hindsight-postgresql` on 5432, and the
+  in-cluster inference gateway (`app: litellm` and `app: standalone-replay` on 80,
+  4000, and 8080).
 
 **2. `hindsight-postgresql` — a `StatefulSet`, one replica** (`postgresql.yaml`).
 
@@ -579,9 +584,9 @@ It adds exactly two workloads to `kubeagents-system`.
   password would have to be generated, agreed between two keys and rotated by
   someone. Note this is read by `initdb` once and written into `pg_hba.conf`;
   flipping it on an existing volume does nothing.
-- A `NetworkPolicy` (`networkpolicy.yaml`) permits ingress on 5432 **only** from
-  pods labelled as the API component. Ingress only — Postgres makes no outbound
-  calls.
+- A `NetworkPolicy` (`hindsight-postgresql` in `networkpolicy.yaml`) permits ingress
+  on 5432 **only** from pods labelled as the API component. Ingress only — Postgres
+  makes no outbound calls.
 
 Deleting the Postgres PVC is a complete, safe reset of memory — see
 [Bank provisioning is lazy](#bank-provisioning-is-lazy).
