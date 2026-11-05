@@ -1292,9 +1292,12 @@ the adjudicator can ask "drifted last scan too?" from one file.
 **The identity and the one grant.** Every read runs as that project's
 read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
-impersonate it for the cluster listing, the credentials and the control-plane
-describes, and `FLEET_READONLY_SA` makes the runner rewrite each kubeconfig so
-`kubectl`'s token is minted as it too. The bot,
+impersonate it for the cluster listing, the credentials, the control-plane
+describes and the `gcloud compute instances list` and `gcloud compute
+firewall-rules list` reads of the project-scoped roles (`startup-fail-vm` and
+`world-open-ingress`, which have no cluster slot; the account holds
+`roles/compute.viewer` for them), and `FLEET_READONLY_SA` makes the runner
+rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
 grant #1238 gave the presubmit's identity — and, for this scan, nothing on the project itself.
@@ -1416,7 +1419,7 @@ The verifier is the one implementation; the scan runs it and reads its report.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
 Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
-(`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
+(`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout), the Gemini Developer API key (`gemini_api_key`; lease-silent, and kept out until the registered projects carry the key, because until then it reports drift on every one).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
 `checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,
