@@ -956,6 +956,45 @@ class TestTheRulesReject(unittest.TestCase):
         )
         self.assertIn("'fixture_roles:' names 'orphan-disks'", problem)
 
+    def test_a_project_scoped_role_is_rejected_in_fixture_role(self):
+        # startup-fail-vm has cluster_slot null: the runner writes no
+        # kubeconfig for it, so a check cannot read its objects.
+        problem = self._only(
+            "a project-scoped role",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={
+                "type": "fleet_resource_property", "fixture_role": "startup-fail-vm", "kind": "deployment",
+                "resource_name": "x", "path": "spec.replicas", "op": "eq", "value": 1,
+            }),
+        )
+        self.assertIn("'fixture_role:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_rejected_in_fixture_roles(self):
+        problem = self._only(
+            "has no cluster slot in the fleet catalogue",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["startup-fail-vm"]}),
+        )
+        self.assertIn("'fixture_roles:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_accepted_in_fixtures(self):
+        self.assertEqual(self._validate(fixtures=["startup-fail-vm"]), [])
+
+    def test_a_project_scoped_catalogue_role_the_overlay_omits_is_a_disagreement(self):
+        roles = {**validator._catalog_roles(), "made-up-vm": {"cluster_slot": None, "probes": ["instance/made-up-*"]}}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-vm' is project-scoped", problems[0])
+
+    def test_a_catalogue_role_that_is_not_a_mapping_is_rejected_not_project_scoped(self):
+        roles = {**validator._catalog_roles(), "made-up-broken": "cluster_slot: a"}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            self.assertNotIn("made-up-broken", validator._catalog_project_roles())
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-broken' is not a mapping", problems[0])
+
     def test_a_scalar_fixture_roles_is_rejected_as_a_shape_not_as_letters(self):
         problem = self._only(
             "'fixture_roles:' must be a list of role slugs",

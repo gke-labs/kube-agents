@@ -33,6 +33,7 @@ import (
 
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -70,6 +71,9 @@ import (
 const PlatformAgentControllerName = fieldOwner
 
 const (
+	// a2aPendingRequeue is how soon a pass comes back while the A2A stack is
+	// still coming up or its gateway is held or waking.
+	a2aPendingRequeue      = 30 * time.Second
 	platformAgentFinalizer = "kubeagents.x-k8s.io/finalizer"
 	// usageStatusReprobeInterval is how long a CR stays marked as served by a
 	// CRD without status.usage before the Ready writer probes again (see
@@ -515,6 +519,15 @@ type PlatformAgentReconciler struct {
 	// with no entry was not read by this process yet, and the status writers
 	// then leave the condition as it stands. Cleared when the CR is deleted.
 	dataVolumeExpansion sync.Map
+
+	// gatewayLeaseSeen records each A2A gateway Lease this process has seen
+	// exist, and gatewayLeaseGoneAt when it first saw a seen one missing:
+	// a deletion's recreate is held back from then (ensureA2AGatewayLease).
+	// Keyed by the Lease's ObjectKey; cleared when the CR is deleted.
+	gatewayLeaseSeen   sync.Map
+	gatewayLeaseGoneAt sync.Map
+	// gatewayLeaseHold overrides a2aGatewayLeaseRecreateHold; tests only.
+	gatewayLeaseHold time.Duration
 
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
@@ -1223,15 +1236,27 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that darkened its gateway, the A2AGateway condition is kept until the
 	// scaled-up replica is ready, and the pass that clears it should not
 	// depend on the Deployment's status event alone.
-	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking) {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	// busHeld shares it for the gateway's reason: the bus waits on the
+	// callout's rollout, and the pass that sees it finish has to happen.
+	if a2aNext && (!a2aState.done || a2aState.gatewayHeld || a2aState.gatewayWaking || a2aState.busHeld) {
+		requeue := a2aPendingRequeue
+		// A held-back Lease recreate can be due sooner (ensureA2AGatewayLease).
+		if a2aState.leaseRequeue > 0 {
+			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
 	// which triggers no reconcile of its own, so poll while the condition
 	// stands rather than leave it until an unrelated event (rbac_selfcheck.go).
 	if rbacDegraded {
-		return ctrl.Result{RequeueAfter: rbacReprobeInterval}, nil
+		requeue := rbacReprobeInterval
+		// A held-back Lease recreate is due sooner (ensureA2AGatewayLease).
+		if a2aState.leaseRequeue > 0 {
+			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
 	// Secret material reaches the gateway as environment, and a container's
@@ -1267,6 +1292,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// that turns ScopeResolved False have to be asked for.
 	if a2aNext && a2aState.scopeRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.scopeRequeue)
+	}
+	// A deleted gateway Lease whose recreate is being held back: nothing
+	// else wakes the pass that creates it.
+	if a2aNext && a2aState.leaseRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.leaseRequeue)
 	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
 }
@@ -1401,6 +1431,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
+		r.forgetA2AGatewayLease(agent)
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -4253,6 +4284,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		noChatPlatformConditionCurrent(agent, noChatMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
+		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) {
 		return nil
 	}
@@ -4262,6 +4294,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
 			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
+			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition)
 	}) {
 		return nil
@@ -4273,6 +4306,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setNoChatPlatformCondition(agent, noChatMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
+	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	return r.Status().Update(ctx, agent)
 }
@@ -4616,6 +4650,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	verifierNotReady, verifierKnown := r.a2aVerifierNotReady(ctx, agent)
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
+	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
 
 	// A data claim its StorageClass cannot expand, from what growDataClaim
@@ -4680,7 +4715,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged && scopeResolvedUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && scopeResolvedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
@@ -4761,6 +4796,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setBusProvisionedCondition(agent, busProvisionedWanted, a2a.jobName, now)
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
+	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
@@ -5832,7 +5868,11 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Service{}).
 		Owns(&networkingv1.NetworkPolicy{}).
-		Owns(&policyv1.PodDisruptionBudget{})
+		Owns(&policyv1.PodDisruptionBudget{}).
+		// The A2A gateway's Lease, so a deletion is seen and the Lease
+		// recreated (ensureA2AGatewayLease). The cache holds only Leases
+		// carrying a2aGatewayLeaseLabel (ManagerCacheOptions).
+		Owns(&coordinationv1.Lease{}, builder.WithPredicates(a2aGatewayLeaseEvents))
 
 	enqueueAgentsInNamespace := func(ctx context.Context, namespace string) []reconcile.Request {
 		var list agentv1alpha1.PlatformAgentList

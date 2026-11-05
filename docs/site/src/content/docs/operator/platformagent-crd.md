@@ -46,7 +46,7 @@ Under `next` the operator additionally renders the A2A stack:
 | Component                                  | What is rendered                                                                                                                                                                                                                                                                                                                                                                                 | Notes                                                                                                                                                                                                                                                                                                                          |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Bus                                        | the NATS/JetStream component and its provisioning Job, an ingress NetworkPolicy fencing the bus, an egress NetworkPolicy fencing the session pods, and a session-pod ResourceQuota                                                                                                                                                                                                               |                                                                                                                                                                                                                                                                                                                                |
-| A2A gateway                                | its Deployment, with session-pod spawning armed and the console door always on (`A2A_CONSOLE_DOOR=true`)                                                                                                                                                                                                                                                                                         | runs on the console alone when no chat backend is configured                                                                                                                                                                                                                                                                   |
+| A2A gateway                                | its Deployment, with session-pod spawning armed and the console door always on (`A2A_CONSOLE_DOOR=true`); with the operator's `A2A_GATEWAY_ELECTION=true`, its election Lease `<agent>-a2a-gateway`, which the gateway may only read and renew                                                                                                                                                   | runs on the console alone when no chat backend is configured                                                                                                                                                                                                                                                                   |
 | Capability verifier                        | a Deployment of two replicas, with its own ServiceAccount, a NetworkPolicy fencing it to DNS and the bus, a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread                                                                                                                                                                                            | the only bus principal permitted to read the `cap` KV bucket, and it needs nothing else; a submission arriving while no verifier is ready is refused terminally, so a node drain must not take both replicas at once                                                                                                           |
 | Auth callout                               | the Deployment that authenticates bus clients, its Service, ServiceAccount, Role and RoleBinding, a cluster-scoped ClusterRoleBinding to `system:auth-delegator`, the identity-map ConfigMaps `<agent>-a2a-authmap-<n>`, and the keys Secret `<agent>-a2a-callout-keys`; its two replicas also carry a PodDisruptionBudget of `maxUnavailable: 1` and a `kubernetes.io/hostname` topology spread | while no callout is ready the bus refuses every new connection, so a node drain evicts one callout at a time and waits for its replacement to be ready before taking the other                                                                                                                                                 |
 | Console server                             | the Deployment and Service `<agent>-a2a-console`, which serve the A2A console page and proxy its websocket to the bus, and a deny-all ingress NetworkPolicy, `<agent>-a2a-console-netpol`                                                                                                                                                                                                        | reachable only through `kubectl port-forward`, and that port-forward is also what hands out the console credential                                                                                                                                                                                                             |
@@ -161,9 +161,8 @@ CRD unchanged. `make install` in `k8s-operator/` applies them the same way.
 **This is an emergency stop, not a tuning knob.** It exists for the case where events arrive faster
 than the agent can triage them — a fleet-wide rollout gone wrong, a node pool flapping — and the
 cheapest way to get the agent back is to cut the inflow rather than chase the cards it has already
-been handed. It is all-or-nothing across every watched cluster: the watcher's reason and namespace
-filters live in the sidecar's entrypoint and are not exposed on the CRD, so there is no way to
-silence one noisy namespace through this field.
+been handed. It is all-or-nothing across every watched cluster. To silence one noisy namespace,
+cluster, reason or workload while the rest still alerts, use `alertExclude` below.
 
 If the board is merely busy rather than swamped, [`tuning.maxInProgress`](#specharnesstuning) is the
 knob for that — it throttles how many cards run at once without losing the events.
@@ -186,6 +185,39 @@ Three consequences before you press it:
 Unset means enabled. The watcher is how a fleet notices its own incidents, so an install that never
 mentions the field — which is every install today — keeps watching, and only an explicit `false`
 turns it off.
+
+`alertExclude` is the narrow tool: a list of rules for events that open no incident — no alert, no
+triage card, no share of the daily alert ceiling. Their clusters stay in scope, so the agent still
+reads them when asked; [`spec.scope.exclude`](#specscope) is what hides a cluster. Each rule sets one
+or more of `cluster`, `namespace`, `reason`, `kind` and `name`, and matches an event when every part
+it sets matches. `reason` and `kind` are matched without regard to case, and `reason` also matches
+the family the watcher groups a reason in, so
+`CrashLoopBackOff` covers kubelet's `BackOff` events for a restarting container. `name` takes a
+trailing `*` as a prefix, since pod names carry generated suffixes.
+
+```yaml
+spec:
+  harness:
+    eventWatcher:
+      alertExclude:
+        - namespace: payments # every alert from this namespace, on every cluster
+        - cluster: { clusterName: staging-a } # every alert from this cluster
+        - reason: FailedScheduling
+          cluster:
+            projectId: my-project
+            location: us-central1
+            clusterName: batch
+        - namespace: shop
+          kind: Pod
+          name: inventory-api-*
+```
+
+A change rolls the pod, as `enabled` does. What the rules hold back is counted in the watcher's
+`k8s_event_watcher_events_filtered_total{gate="alert_excluded"}`, not in the end-of-day report. While
+the list is set, it replaces a `WATCHER_ALERT_EXCLUDE` entry in `spec.deployment.env`. The chart
+renders the list from `platformAgent.harness.eventWatcher.alertExclude`; a `helm upgrade` that
+removes the last rule removes the whole `eventWatcher` block from the CR, `enabled: false` with it,
+so set the emergency stop again after one.
 
 ### `spec.harness.driftDetector`
 
@@ -1174,7 +1206,7 @@ Whichever backend is armed, under `mode: next` the operator renders an empty Con
 
 The operator projects the admitted channel (`homeChannel` when set, else the record) into the `<agent>-chat-home` ConfigMap, one key `slack_home`. It mounts that ConfigMap as a read-only directory in the agent pod and the gateway pod. Both read the file where it is mounted, within about a minute of a change, and no pod restarts for a learn. An agent image older than the operator reads env only and never sees a learned channel: keep the agent image at the operator's release.
 
-It admits a recorded channel under policy `auto` when the value is a channel id and no refusal is recorded beside it, and clears `HomeChannelUnset` then. Otherwise the condition says why: the policy is `manual`, the recorded value is not a channel id, or the gateway refused the channel (archived, shared through Slack Connect, the app not a member). A hand edit of the record carries the same trust as the field, and the gateway checks the channel before each post: one Slack refuses is recorded as refused, the condition names it, and the next mention replaces it.
+It admits a recorded channel under policy `auto` when the value is a channel id and no refusal is recorded beside it, and clears `HomeChannelUnset` then. Otherwise the condition says why: the policy is `manual`, the recorded value is not a channel id, or the gateway refused the channel (archived, shared through Slack Connect, the app not a member, a direct or group direct message). A hand edit of the record carries the same trust as the field, and the gateway checks the channel before each post: one Slack refuses is recorded as refused, the condition names it, and the next mention replaces it.
 
 `manual` turns the learn off. A set `homeChannel` wins; the learned channel stays in the record, so clearing the field returns to it. An allowed member moves the learned channel from the app's Home tab; the record keeps who moved it and when, and picking the previous channel there moves it back. To forget it, delete the ConfigMap: the operator re-creates it empty and the next mention learns again.
 

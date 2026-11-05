@@ -37,7 +37,9 @@ SIZED_METRICS = (hl.MEMORY_PEAK, hl.CPU_PEAK)
 EVIDENCE_METRICS_SHOWN = 12
 PROFILE_CAPTION = (
     "{projects:,} projects, {autopilot:.0%} of clusters on Autopilot, {workloads:,} workloads a day "
-    "(each counted as one Pod created). Nodes and objects per cluster keep the measured clusters' shape."
+    "(each counted as one Pod created). Nodes and objects per cluster keep the measured clusters' shape. "
+    "The fleet sizes count small clusters like the measured ones; a fleet of larger clusters reaches these "
+    "limits at fewer clusters."
 )
 STORY = (
     "Pick a fleet size and the container size you have in mind. The forecast says whether one "
@@ -45,11 +47,17 @@ STORY = (
     "cannot hold it, how many installs it needs and what each one needs. Part 2 shows the "
     "measurements behind every number."
 )
+NO_AXIS_WARNING = (
+    "These records measured one fleet point and vary no input, so the forecast below has nothing to "
+    "grow from. Choose a commit with factor runs under *Measurement data*; Part 2 shows these records "
+    "as evidence."
+)
 SPLIT_NONE = "One install holds all {clusters:,.0f} clusters."
 SPLIT_NEEDED = (
-    "One install holds about {held:.0f} clusters (measured), so {clusters:,.0f} clusters need "
+    "One install holds about {held:.0f} clusters ({source}), so {clusters:,.0f} clusters need "
     "**{installs:,} installs of about {per_install:.0f} clusters**, or {stall_installs:,} for Stall Watch "
-    "to read every cluster each half hour."
+    "to read every cluster each half hour. Both counts come from small test clusters; a fleet of larger "
+    "clusters needs more installs."
 )
 VERDICT_OK = "**Yes.** {split} The {size} container size is enough for each install."
 VERDICT_SHORT = (
@@ -66,6 +74,14 @@ SHELL_FIXED_LINE = (
     "starts there, so the command path carries about 1.5 commands per second. At {held:.0f} clusters "
     "the shell peaked at {shell:.0%} of it."
 )
+# Without a measured fleet that held there is no run at the capacity to read the shell's peak from.
+SHELL_FIXED_MODEL_LINE = (
+    "- **Sandbox shell: 2 CPU, fixed by the kube-agents operator, not by GKE.** Every brokered command "
+    "starts there, so the command path carries about 1.5 commands per second. No measured fleet held, "
+    "so the {held:.0f} clusters here are the model's line, not a measurement."
+)
+HELD_MEASURED = "measured"
+HELD_MODELLED = "the model's line"
 SHELL_SETTABLE_LINE = (
     "- **Sandbox shell: sized like the other containers here,** which assumes an operator change. "
     "Past {held:.0f} clusters nothing is measured, so the next limit there is unknown."
@@ -180,9 +196,11 @@ if not dataset.records:
 
 with st.expander("Measurement data"):
     commit_column, mode_column = st.columns(SELECTOR_WIDTHS)
+    available_commits = hl.commits(dataset.records)
     commit = commit_column.selectbox(
         "Commit",
-        hl.commits(dataset.records),
+        available_commits,
+        index=hl.default_commit_index(dataset.records, available_commits),
         format_func=lambda item: hl.commit_label(dataset.records, item),
         key=f"{KEY_PREFIX}:commit",
     )
@@ -195,6 +213,8 @@ with st.expander("Measurement data"):
         key=f"{KEY_PREFIX}:mode:{commit}",
     )
 records = hl.select(dataset.records, commit, mode)
+if not hl.factors(records):
+    st.warning(NO_AXIS_WARNING)
 scope = f"{commit}:{mode}"
 containers = hl.containers(records)
 colors = hl.container_colors(containers, PALETTE.series_colors, PALETTE.neutral)
@@ -238,7 +258,8 @@ with st.expander("Change the fleet size"):
         )
 plan = hl.install_plan(records, containers, fleet)
 # What one install holds: the largest measured fleet that held, or the model's line without one.
-held = hl.measured_install_capacity(records) or plan.capacity
+measured_held = hl.measured_install_capacity(records)
+held = measured_held or plan.capacity
 stall_seconds = hl.stall_watch_seconds_per_cluster(records)
 stall_clusters = hl.STALL_WATCH_BUDGET_SECONDS / stall_seconds if stall_seconds else None
 per_install_clusters = min(fleet[hl.CLUSTERS], held) if held else plan.fleet[hl.CLUSTERS]
@@ -276,6 +297,7 @@ if installs == 1:
 else:
     split_text = SPLIT_NEEDED.format(
         clusters=fleet[hl.CLUSTERS], held=held or 0.0, installs=installs,
+        source=HELD_MEASURED if measured_held else HELD_MODELLED,
         per_install=install_fleet[hl.CLUSTERS], stall_installs=stall_installs,
     )
 # The same sizes the list below gives: a settable container is short where its need passes its size.
@@ -302,7 +324,11 @@ shell_limit = defaults.get(hl.SHELL_CONTAINER, {}).get(hl.LIMIT_CPU) or 1.0
 with st.expander("Why these limits cannot be raised"):
     st.markdown(
         FIXED_WHY.format(
-            shell_line=(SHELL_SETTABLE_LINE if shell_settable else SHELL_FIXED_LINE).format(
+            shell_line=(
+                SHELL_SETTABLE_LINE if shell_settable
+                else SHELL_FIXED_LINE if measured_held
+                else SHELL_FIXED_MODEL_LINE
+            ).format(
                 held=held or 0.0, shell=shell_peak / shell_limit
             ),
             held=held or 0.0,

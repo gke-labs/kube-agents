@@ -872,12 +872,12 @@ names a repository, does one thing, and keeps nothing. There is no session, no
 handle, and no state on the broker that a later call depends on — a caller that
 crashes between two verbs leaves nothing behind to reconcile, and two agents
 calling the same verb on the same repository do not have to be ordered against
-each other. `clone` and `snapshot` are the only routes that hand back something
+each other. `proposal-claim` is the one exception, stated below the next paragraph. `clone` and `snapshot` are the only routes that hand back something
 durable: a bundle and a tar, never a tree the broker keeps.
 
 That is a constraint on what the verbs may be, not just a description of them.
 It is why `publish` carries `baseRevision` instead of remembering what `clone`
-served, and why nothing in the table takes an identifier the broker minted. It
+served, and why no verb in the table but `proposal-claim` takes an identifier the broker minted. It
 is also why the routes take no lock at all. Each request gets a fresh directory
 under the broker's own scratch volume, named from a counter rather than from
 anything the caller sent, and deletes it on the way out; two requests share
@@ -886,13 +886,37 @@ class. There is no shared tree here to serialise access to, and serialising
 whole requests anyway would make a clone of one repository wait on a publish of
 another for no property gained.
 
+`proposal-claim` is the one exception. `proposal-create` mints a one-time claim
+token with each answer that names its proposal, and the broker keeps it, with
+the proposal's url, number and repository, in an in-memory store under its own
+lock. The first `proposal-claim` that presents the token burns it, whatever the
+forge check then answers. A token lives 15 minutes, the window the forge check
+holds the proposal's creation time to. The store is per process, so a broker
+restart drops every unclaimed token, and a claim after it answers 404. The
+state is that small on purpose: the claim proves that this install opened the
+proposal, which no caller-supplied field can prove.
+
+The broker checks what the create kept with the token, never a repository or
+number the caller sends. The claim answers 200 with `{url, number, title}` when
+the forge confirms the proposal: open, at that url, authored by this
+credential, and created inside the window. It answers 404 `CLAIM_UNKNOWN` for a
+token that is unknown, already burned or expired, or whose `url` does not
+match. It answers 409 `CLAIM_NOT_CONFIRMED` when the forge check fails, 502
+`FORGE_IDENTITY_UNKNOWN` when the forge cannot name the credential's account and
+no `identity` is configured, and 403 when the repository is no longer on the
+managed list. A forge failure that
+persists after the one retry answers the forge's own code, and the token is
+spent either way. The `shell` role can call
+it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
+
 | Verb                                 | Request                                                              | Response                                                                                 |
 | ------------------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, labels, missing, baseBranch, fileUrl?}` |
 | `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                        |
 | `snapshot`                           | `{repository, ref?, paths?}`                                         | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
-| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                                             |
+| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
+| `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
 | `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                             |
 | `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}`                 |
@@ -934,8 +958,11 @@ labels serves `label-ensure`, and a forge without them does not: the two say one
 thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
-The rows down to `issue-create` except `snapshot`, and the two branch rows, are the version-control skill's;
-`snapshot` is served to library callers (`vcs_client.snapshot`), which `inspect-repository` is. The rest are the union of
+The rows down to `issue-create` except `snapshot` and `proposal-claim`, and the two branch rows, are the
+version-control skill's. `snapshot` and `proposal-claim` are the library verbs (`LIBRARY_VERBS` in
+`providers/base.py`), which `capabilities` leaves out of `verbs`. `snapshot` is served to library callers
+(`vcs_client.snapshot`), which `inspect-repository` is. `proposal-claim` is served to the `pr_opened` plugin,
+which presents the token from a proposal record line. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
