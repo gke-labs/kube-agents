@@ -593,8 +593,8 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// Wanted, the params and the Jobs Role come before the dispatch config
 	// that names the templates, so the config never says Job mode while the
 	// dispatcher can't run one. Any failure, or a profile namespace not
-	// ready (the binding selects profile namespaces by the label it may
-	// lack), revokes the Jobs Role alone and leaves the templates out, so
+	// ready or not selected by the policy's binding (the binding selects
+	// profile namespaces by labels it may lack), revokes the Jobs Role alone and leaves the templates out, so
 	// unattended tasks take the pool; Jobs already running stay. Not
 	// wanted (a deliberate gate-off) tears Job mode down below.
 	var jobErr error
@@ -605,6 +605,17 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 		jobTemplates = nil
 		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
 	default:
+		selected, err := r.profileNamespaceSelectedByJobPolicy(ctx, agent)
+		if err != nil || !selected {
+			if err == nil {
+				r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
+					"the profile namespace %s lacks the %s=%s label the dispatcher Job admission policy selects it by, so unattended profile tasks run on the worker pool",
+					profileNamespaceName(agent), labelPartOf, partOfKubeAgents))
+			}
+			jobTemplates = nil
+			jobErr = errors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+			break
+		}
 		if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
 			jobTemplates = nil
 			jobErr = errors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))

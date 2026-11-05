@@ -1242,17 +1242,24 @@ func (d *Dispatcher) fail(ctx context.Context, log *slog.Logger, del lib.Deliver
 // failAs ends a held task with a terminal in state (failed, or canceled for
 // a stop), then settles it: tombstoned, acked, released.
 func (d *Dispatcher) failAs(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord, state lib.TaskState, reason, detail string) {
+	if d.publishTerminalRetry(ctx, log, del, h, state, reason, detail) {
+		d.settle(ctx, log, del, h, key, rec)
+	}
+}
+
+// publishTerminalRetry publishes a held task's terminal until it lands or
+// ctx ends, and says whether it landed.
+func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, state lib.TaskState, reason, detail string) bool {
 	for {
 		err := d.publishTerminal(ctx, h.key(), del.Envelope(), state, reason, detail)
 		if err == nil {
-			break
+			return true
 		}
 		log.Warn("publish the failure terminal; retrying", "err", err)
 		if !sleepCtx(ctx, settleRetry) {
-			return
+			return false
 		}
 	}
-	d.settle(ctx, log, del, h, key, rec)
 }
 
 // settle ends a task whose outcome is decided (its final renewal came, or

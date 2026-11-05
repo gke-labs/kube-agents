@@ -742,6 +742,47 @@ func TestANotReadyProfileNamespaceRevokesJobMode(t *testing.T) {
 	}
 }
 
+// A profile namespace the policy's binding doesn't select (here without
+// part-of: kube-agents) is not held to the policy, so the dispatcher gets
+// no Jobs Role there and the config no templates, though the namespace is
+// otherwise ready.
+func TestAProfileNamespaceThePolicyDoesNotSelectGetsNoJobMode(t *testing.T) {
+	agent := a2aTestAgent()
+	r, c := jobTemplateTestReconciler(t, agent)
+	ctx := context.Background()
+	profiles := []agentv1alpha1.AgentProfile{unattendedProfile(agent, "tse")}
+	pns := profileNamespaceName(agent)
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("render: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}); err != nil {
+		t.Fatalf("precondition: no Jobs RoleBinding: %v", err)
+	}
+	var ns corev1.Namespace
+	if err := c.Get(ctx, types.NamespacedName{Name: pns}, &ns); err != nil {
+		t.Fatal(err)
+	}
+	delete(ns.Labels, labelPartOf)
+	if err := c.Update(ctx, &ns); err != nil {
+		t.Fatal(err)
+	}
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("unselected: %v / %v", err, profileErr)
+	}
+	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
+		if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, obj); !apierrors.IsNotFound(err) {
+			t.Errorf("the Jobs %T stayed in a namespace the policy doesn't select: %v", obj, err)
+		}
+	}
+	var cm corev1.ConfigMap
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplate"`) {
+		t.Error("the dispatch config names a Job template in a namespace the policy doesn't select")
+	}
+}
+
 // A params pass that fails (here a foreign index under the index's name,
 // after a good pass) revokes the dispatcher's Jobs Role and renders the
 // dispatch config without Job templates, so the dispatcher takes the pool

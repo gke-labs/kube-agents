@@ -161,6 +161,32 @@ func TestARunningTaskThatDoesNotStopIsAbandoned(t *testing.T) {
 	})
 }
 
+// A worker that answers the stop's abandon with its own failed terminal (an
+// eviction) can't make the stopped task end failed: the canceled terminal
+// is written before the abandon is sent.
+func TestAStopEndsCanceledWhenTheWorkerEvictsOnTheAbandon(t *testing.T) {
+	b := newBus(t, "tse-0")
+	withStopStream(t, b)
+	b.ensure("tse", 1, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	w.evictOnAbandon = true
+	ti := oneProfile("tse", 1, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.StopGraceSeconds = 1 })
+	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 running", func() bool { return w.startedTask("task-1") })
+	b.stop("tse", "task-1")
+	waitFor(t, 10*time.Second, "both terminals", func() bool { return len(b.terminalsOf("task-1")) >= 2 })
+	ts := b.terminalsOf("task-1")
+	if ts[0].state != lib.StateCanceled || ts[0].class != lib.TaskClassSupervisor {
+		t.Errorf("terminals %+v, want the dispatcher's canceled first, before the worker's eviction", ts)
+	}
+	if ts[1].state != lib.StateFailed {
+		t.Errorf("second terminal %+v, want the worker's eviction (the test's own premise)", ts[1])
+	}
+}
+
 // A stopped unattended task's Job is deleted once the task is canceled.
 func TestAStoppedJobIsDeleted(t *testing.T) {
 	b := newBus(t, "job-task-1")

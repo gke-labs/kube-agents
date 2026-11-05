@@ -226,14 +226,20 @@ func (d *Dispatcher) stopQueued(ctx context.Context, log *slog.Logger, del lib.D
 func stopDeadline(cfg lib.DispatchConfig, now time.Time) time.Time { return now.Add(stopGrace(cfg)) }
 
 // stopHeld ends a running task whose executor didn't stop within the grace:
-// the worker is told to abandon it (a warm one resets), and the task ends
-// canceled, tombstoned and acked; its Job, if it has one, goes after hold.
+// the task ends canceled, the worker is told to abandon it (a warm one
+// resets), and it is tombstoned and acked; its Job, if it has one, goes
+// after hold. The canceled terminal is written before the abandon: the
+// worker's own terminal for an abandoned task says failed, and whichever
+// lands first is the task's end.
 func (d *Dispatcher) stopHeld(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord) {
 	log.Info("the task didn't stop within the grace; abandoning it", "pod", rec.Pod)
 	// Ended by its requester, not lost by its worker: a half-open breaker
 	// closes as on a finish.
 	d.breakers.finished(h.profile, h.tier)
+	if !d.publishTerminalRetry(ctx, log, del, h, lib.StateCanceled, ReasonStopped,
+		fmt.Sprintf("stopped by the conversation; the worker %s didn't stop within %s", rec.Pod, stopGrace(d.src.Config()))) {
+		return
+	}
 	_ = d.send(lib.DispatchSubject(h.profile, h.tier, rec.Pod), lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonStopped})
-	d.failAs(ctx, log, del, h, key, rec, lib.StateCanceled, ReasonStopped,
-		fmt.Sprintf("stopped by the conversation; the worker %s didn't stop within %s", rec.Pod, stopGrace(d.src.Config())))
+	d.settle(ctx, log, del, h, key, rec)
 }

@@ -22,6 +22,7 @@ import (
 	"slices"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -97,4 +98,15 @@ func policyReadFailure(kind string, err error) (bool, string, error) {
 		return false, fmt.Sprintf("the operator can't read the %s %s (its role lacks the get grant): %v", kind, dispatcherJobPolicyName, err), nil
 	}
 	return false, "", fmt.Errorf("read the %s %s: %w", kind, dispatcherJobPolicyName, err)
+}
+
+// profileNamespaceSelectedByJobPolicy reports whether the profile namespace
+// carries every label the policy's binding selects it by: one that lacks one
+// is not held to the policy, so the dispatcher must not create Jobs there.
+func (r *PlatformAgentReconciler) profileNamespaceSelectedByJobPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	var ns corev1.Namespace
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: profileNamespaceName(agent)}, &ns); err != nil {
+		return false, fmt.Errorf("read the profile namespace %s: %w", profileNamespaceName(agent), err)
+	}
+	return ns.Labels[profileNamespaceComponentLabel] == profileNamespaceComponent && ns.Labels[labelPartOf] == partOfKubeAgents, nil
 }
