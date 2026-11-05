@@ -74,6 +74,14 @@ STORE_BLOBS_DIR = "store/blobs"
 # What a pod's data volume may hold that is ours to copy, by directory, and the
 # suffix a complete file there has.
 SOURCES = ((LOGS_DIR, SEGMENT_SUFFIX), (STORE_REQUESTS_DIR, JSON_SUFFIX), (STORE_BLOBS_DIR, JSON_SUFFIX))
+# Every name the pod may hand back, by the same rule. The listing and the tar
+# stream come from the proxy's container, whose image is built from the commit
+# under test, so a name is checked here before it becomes a path on this
+# machine or an object name: one directory from SOURCES, one plain file name.
+SAFE_NAME = re.compile(
+    r"^(?:logs/[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl(?:\.open)?"
+    r"|store/(?:requests|blobs)/[A-Za-z0-9][A-Za-z0-9._-]*\.json)$"
+)
 
 # The chart closes a segment 30 s after its first line
 # (REPLAY_LOG_SEGMENT_SECONDS), so at this interval a line is in the bucket
@@ -381,11 +389,14 @@ class Collector:
         if proc is None:
             return []
         try:
-            raw = json.loads(proc.stdout)
-            return sorted((str(rel), int(size)) for rel, size in raw)
+            listed = [(str(rel), int(size)) for rel, size in json.loads(proc.stdout)]
         except (ValueError, TypeError):
             self.fail("list_files_parse")
             return []
+        safe = [(rel, size) for rel, size in listed if SAFE_NAME.match(rel) and size > 0]
+        if len(safe) != len(listed):
+            self.fail("list_files_unsafe_name")
+        return sorted(safe)
 
     def fetch(self, pod: str, batch: Sequence[Tuple[str, int]], root: str) -> Dict[str, int]:
         """Copy `batch` out of the pod into `root`; returns {object name: bytes written}.
@@ -401,7 +412,7 @@ class Collector:
         try:
             with tarfile.open(fileobj=io.BytesIO(proc.stdout), mode="r|") as tar:
                 for member in tar:
-                    if member.name not in wanted or not member.isfile():
+                    if member.name not in wanted or not member.isfile() or not SAFE_NAME.match(member.name):
                         continue
                     handle = tar.extractfile(member)
                     data = handle.read() if handle is not None else b""

@@ -274,6 +274,43 @@ class TruncateOnlyAfterUploadTest(CollectorTestCase):
         self.assertEqual(os.path.getsize(outside), 1)
 
 
+class UnsafeNamesTest(CollectorTestCase):
+    """The pod's listing and tar stream choose no path on this machine."""
+
+    def test_names_outside_the_layout_are_dropped_and_counted(self):
+        self.put("store/requests/ok.json", b"{}")
+        real = self.cluster.kubectl
+        forged = [["../../escape.json", 2], ["logs/../../x.jsonl", 2], ["store/other/y.json", 2],
+                  ["store/requests/ok.json", 2], ["logs/.hidden.jsonl", 2]]
+
+        def forge(cmd, input):
+            if C.LIST_SCRIPT in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps(forged).encode(), b"")
+            return real(cmd, input)
+
+        self.cluster.kubectl = forge
+        self.collector.collect_pass()
+        self.assertEqual(self.cluster.objects(), {self.key("store/requests/ok.json"): b"{}"})
+        self.assertEqual(self.collector.totals.errors.get("list_files_unsafe_name"), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "escape.json")))
+
+    def test_a_tar_member_with_an_unsafe_name_is_not_written(self):
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for name in ("../evil.json", "store/requests/ok.json"):
+                info = tarfile.TarInfo(name)
+                info.size = 2
+                tar.addfile(info, io.BytesIO(b"{}"))
+        root = os.path.join(self.staging, "batch")
+        os.makedirs(root)
+        self.collector.runner = lambda cmd, input=None, remaining=None, env=None: subprocess.CompletedProcess(
+            cmd, 0, buf.getvalue(), b"")
+        written = self.collector.fetch("proxy-a", [("../evil.json", 2), ("store/requests/ok.json", 2)], root)
+        self.assertEqual(written, {"store/requests/ok.json": 2})
+        self.assertFalse(os.path.exists(os.path.join(self.staging, "evil.json")))
+
+
 class FinalPassTest(CollectorTestCase):
     def test_final_pass_takes_open_segments_cut_to_whole_lines_and_never_empties_them(self):
         rel = "logs/p-1-000002.jsonl.open"
