@@ -71,8 +71,16 @@ if head == ["services", "api-keys", "list"]:
         refused.write_text(str(count + 1))
         fail("ERROR: (gcloud.services.api-keys.list) PERMISSION_DENIED: API Keys API has not been used in "
              "project 123 before or it is disabled.\n  reason: SERVICE_DISABLED")
+    keys = json.loads(os.environ.get("FAKE_OTHER_KEYS", "[]"))
     if os.environ.get("FAKE_KEY_EXISTS") == "1" or key_created.exists():
-        out(os.environ["FAKE_KEY_NAME"] + "\n")
+        restrictions = {"apiTargets": [{"service": "generativelanguage.googleapis.com"}]}
+        if os.environ.get("FAKE_KEY_EXISTS") == "1" and "FAKE_KEY_RESTRICTIONS" in os.environ:
+            restrictions = json.loads(os.environ["FAKE_KEY_RESTRICTIONS"])
+        keys.append({"name": os.environ["FAKE_KEY_NAME"], "displayName": "kube-agents-eval-gemini",
+                     "restrictions": restrictions})
+    out(json.dumps(keys))
+    log(); sys.exit(0)
+if head == ["services", "api-keys", "update"]:
     log(); sys.exit(0)
 if head == ["services", "api-keys", "create"]:
     # Real gcloud prints the operation result, key string included, on create.
@@ -127,7 +135,7 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
         sleep.chmod(sleep.stat().st_mode | stat.S_IEXEC)
 
     def _run(self, *args, key_exists=False, secret_exists=False, key_string="k1", current_value=None,
-             create_fails=False, bash_flags=(), list_disabled_times=0):
+             create_fails=False, bash_flags=(), list_disabled_times=0, restrictions=None, other_keys=None):
         overrides = {
             "PATH": f"{self.bindir}{os.pathsep}{os.environ.get('PATH', '')}",
             "FAKE_GCLOUD_LOG": str(self.log),
@@ -138,10 +146,14 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
             "FAKE_KEY_STRING": key_string,
             "FAKE_CREATE_FAILS": "1" if create_fails else "0",
             "FAKE_LIST_DISABLED_TIMES": str(list_disabled_times),
+            "FAKE_OTHER_KEYS": json.dumps(other_keys or []),
         }
-        absent = ()
+        absent = ("FAKE_KEY_RESTRICTIONS",)
+        if restrictions is not None:
+            overrides["FAKE_KEY_RESTRICTIONS"] = json.dumps(restrictions)
+            absent = ()
         if current_value is None:
-            absent = ("FAKE_CURRENT_VALUE",)
+            absent += ("FAKE_CURRENT_VALUE",)
         else:
             overrides["FAKE_CURRENT_VALUE"] = current_value
         env = get_isolated_test_env(overrides=overrides, absent=absent)
@@ -261,6 +273,61 @@ class ProvisionGeminiKeyTest(unittest.TestCase):
         self.assertNotIn(key, proc.stdout)
         argvs = [c["argv"] for c in calls]
         self.assertFalse([a for a in argvs if a[:2] == ["secrets", "create"]], argvs)
+
+    def _updates(self, calls):
+        updates = [c["argv"] for c in calls if c["argv"][:3] == ["services", "api-keys", "update"]]
+        for argv in updates:
+            self.assertEqual(_KEY_NAME, argv[3])
+            self.assertIn(f"--project={_PROJECT}", argv)
+        return [[a for a in argv[4:] if not a.startswith("--project=")] for argv in updates]
+
+    def test_the_listing_is_unfiltered_and_matches_the_display_name_exactly(self):
+        probe = {"name": "projects/123/locations/global/keys/probe-1", "displayName": "kube-agents-eval-gemini-probe",
+                 "restrictions": {}}
+        proc, calls = self._run(_PROJECT, key_exists=True, secret_exists=True, current_value="k1", other_keys=[probe])
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        argvs = [c["argv"] for c in calls]
+        for argv in argvs:
+            if argv[:3] == ["services", "api-keys", "list"]:
+                self.assertFalse([a for a in argv if a.startswith("--filter")], argv)
+        self.assertIn(f"Using API key {_KEY_NAME}", proc.stdout)
+        self.assertFalse([a for a in argvs if a[:3] == ["services", "api-keys", "create"]], argvs)
+        self.assertEqual([], self._updates(calls))
+        # The probe key alone is not the key: the script creates one.
+        proc, calls = self._run(_PROJECT, other_keys=[probe])
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual(1, len([c for c in calls if c["argv"][:3] == ["services", "api-keys", "create"]]))
+        self.assertNotIn("probe-1", proc.stdout)
+
+    def test_an_existing_key_with_the_right_restriction_is_not_updated(self):
+        proc, calls = self._run(_PROJECT, key_exists=True, secret_exists=True, current_value="k1",
+                                restrictions={"apiTargets": [{"service": _API_TARGET}]})
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual([], self._updates(calls))
+
+    def test_an_existing_unrestricted_key_is_restricted_to_the_api_target(self):
+        for restrictions in ({}, {"apiTargets": [{"service": _API_TARGET}, {"service": "aiplatform.googleapis.com"}]}):
+            with self.subTest(restrictions=restrictions):
+                self.log.unlink(missing_ok=True)
+                proc, calls = self._run(_PROJECT, key_exists=True, secret_exists=True, key_string="AIzaFAKE-upd",
+                                        current_value="k1", restrictions=restrictions)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                self.assertEqual([[f"--api-target=service={_API_TARGET}"]], self._updates(calls))
+                for call in calls:
+                    self.assertNotIn("AIzaFAKE-upd", " ".join(call["argv"]))
+                get = self._index(calls, ["services", "api-keys", "get-key-string"])
+                update = self._index(calls, ["services", "api-keys", "update"])
+                self.assertLess(update, get)
+
+    def test_an_existing_key_with_a_client_restriction_is_cleared_then_restricted(self):
+        for field in ("browserKeyRestrictions", "serverKeyRestrictions", "androidKeyRestrictions", "iosKeyRestrictions"):
+            with self.subTest(field=field):
+                self.log.unlink(missing_ok=True)
+                restrictions = {"apiTargets": [{"service": _API_TARGET}], field: {"allowedIps": ["10.0.0.1"]}}
+                proc, calls = self._run(_PROJECT, key_exists=True, secret_exists=True, current_value="k1",
+                                        restrictions=restrictions)
+                self.assertEqual(0, proc.returncode, proc.stderr)
+                self.assertEqual([["--clear-restrictions"], [f"--api-target=service={_API_TARGET}"]], self._updates(calls))
 
     def _sleeps(self):
         return self.sleeps.read_text().split() if self.sleeps.exists() else []

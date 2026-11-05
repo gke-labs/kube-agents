@@ -152,14 +152,6 @@ class CiDeployGeminiKeyTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RESOLVED=[k9]", proc.stdout)
 
-    def test_the_rationale_comment_names_the_nightlies_as_the_gemini_path(self) -> None:
-        head = self.text[: self.text.index('export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"')]
-        comment = head[head.rindex("\n\n") :]
-        self.assertIn("nightlies", comment)
-        self.assertIn("presubmit", comment)
-        self.assertIn("429", comment)
-        self.assertIn("own key", comment)
-
 
 if __name__ == "__main__":
     unittest.main()

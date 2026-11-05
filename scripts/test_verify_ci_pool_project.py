@@ -5951,7 +5951,8 @@ class GeminiApiKeyCheckTest(unittest.TestCase):
         restrictions = {"apiTargets": [{"service": t} for t in targets]}
         restrictions.update(clients or {})
         key = {"name": self.KEY_NAME, "displayName": "kube-agents-eval-gemini", "restrictions": restrictions}
-        out = [keys_answer or _ok(json.dumps([key] * keys))]
+        probe = {"name": "projects/123/locations/global/keys/probe", "displayName": "kube-agents-eval-gemini-probe", "restrictions": {}}
+        out = [keys_answer or _ok(json.dumps([key] * keys + [probe]))]
         out.append(api_answer or self.API_ENABLED)
         out.append(_ok(json.dumps([{"name": "projects/123/secrets/kube-agents-eval-gemini-api-key/versions/1", "state": version}] if version else [])))
         policy = {"bindings": [{"role": "roles/secretmanager.secretAccessor", "members": list(accessors)}]} if accessors else {}
@@ -5971,7 +5972,7 @@ class GeminiApiKeyCheckTest(unittest.TestCase):
         self.assertTrue(result.read)
         self.assertEqual(result.warnings, [])
         self.assertIn("gcloud services api-keys list", argv[0])
-        self.assertIn("--filter=displayName=kube-agents-eval-gemini", argv[0])
+        self.assertNotIn("--filter", argv[0])
         self.assertIn("gcloud services list --enabled", argv[1])
         self.assertIn("--filter=config.name=generativelanguage.googleapis.com", argv[1])
         self.assertIn("gcloud secrets versions list kube-agents-eval-gemini-api-key", argv[2])
@@ -5982,6 +5983,14 @@ class GeminiApiKeyCheckTest(unittest.TestCase):
             self.assertNotIn("get-key-string", line)
             self.assertNotIn("versions access", line)
             self.assertIn(f"--project={self.PROJECT}", line)
+
+    def test_a_key_whose_display_name_only_starts_with_the_name_is_ignored(self):
+        # _answers lists kube-agents-eval-gemini-probe, unrestricted, beside the key.
+        result, _ = self._check(self._answers())
+        self.assertTrue(result.passed, result.details)
+        self.assertFalse(any("probe" in d for d in result.details), result.details)
+        result, _ = self._check(self._answers(keys=0))
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_MISSING])
 
     def test_a_missing_key_is_the_missing_finding_with_the_script_as_repair(self):
         result, _ = self._check(self._answers(keys=0))
@@ -6113,6 +6122,7 @@ class GeminiApiKeyCheckTest(unittest.TestCase):
             [f"serviceAccount:{email}" for email in value("GEMINI_KEY_SECRET_ACCESSORS").split()],
         )
         self.assertEqual(checker.GEMINI_KEY_SECRET_ACCESSORS, (checker.PROW_RUNNER_MEMBER, checker.NIGHTLY_RUNNER_MEMBER))
+        self.assertEqual(list(checker.GEMINI_KEY_CLIENT_RESTRICTIONS), value("GEMINI_KEY_CLIENT_RESTRICTIONS").split())
         self.assertEqual(checker.GEMINI_KEY_SCRIPT, "scripts/provision_ci_pool_gemini_key.sh")
         self.assertTrue((checker._ROOT / checker.GEMINI_KEY_SCRIPT).is_file())
 

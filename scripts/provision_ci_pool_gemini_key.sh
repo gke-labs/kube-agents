@@ -4,8 +4,9 @@
 # ==============================================================================
 # Mints the eval nightlies' Gemini Developer API key in a pool project and keeps
 # the key string as the current version of a Secret Manager secret in the same
-# project. Re-runs converge: an existing key is reused, and a secret version is
-# added only when the stored value differs from the key string.
+# project. Re-runs converge: an existing key is reused and restricted to the
+# one API target, and a secret version is added only when the stored value
+# differs from the key string.
 #
 # The key string never reaches stdout, stderr, a command line or an xtrace: it
 # moves from gcloud to Secret Manager through a variable and stdin, and the
@@ -26,6 +27,9 @@ set -euo pipefail
 readonly GEMINI_KEY_DISPLAY_NAME="kube-agents-eval-gemini"
 readonly GEMINI_KEY_SECRET_NAME="kube-agents-eval-gemini-api-key"
 readonly GEMINI_KEY_API_TARGET="generativelanguage.googleapis.com"
+# Client restrictions on an API key: a key with any of them accepts calls only
+# from that browser, server address or app, so the agent pod's calls fail.
+readonly GEMINI_KEY_CLIENT_RESTRICTIONS="browserKeyRestrictions serverKeyRestrictions androidKeyRestrictions iosKeyRestrictions"
 readonly GEMINI_KEY_APIS="apikeys.googleapis.com secretmanager.googleapis.com generativelanguage.googleapis.com"
 # The two runners: prowjob-default-sa runs the presubmits, eval-baseline-recorder
 # runs the nightlies.
@@ -49,6 +53,8 @@ readonly EX_USAGE=64
 # Appended inside a command substitution so trailing newlines in the stored
 # value survive the comparison.
 readonly CAPTURE_SENTINEL="x"
+# Separates the fields of one key row: name, API targets, client restrictions.
+readonly KEY_ROW_SEPARATOR="|"
 
 usage() {
   echo "usage: $0 <PROJECT_ID>" >&2
@@ -78,9 +84,25 @@ gcloud services enable ${GEMINI_KEY_APIS} --project="${PROJECT_ID}" ||
   die "could not enable ${GEMINI_KEY_APIS}"
 
 # ─── API key ───────────────────────────────────────────────────────────────────
+# One row per API key whose display name is exactly GEMINI_KEY_DISPLAY_NAME:
+# its name, its API targets (sorted, comma-separated) and the client
+# restriction fields it carries. gcloud's --filter is not an exact match, so
+# the listing is unfiltered and the comparison is here. The listing holds no
+# key string.
 find_key() {
-  gcloud services api-keys list --project="${PROJECT_ID}" \
-    --filter="displayName=${GEMINI_KEY_DISPLAY_NAME}" --format='value(name)'
+  local listing
+  listing="$(gcloud services api-keys list --project="${PROJECT_ID}" --format=json)" || return 1
+  printf '%s' "${listing}" | python3 -c '
+import json, sys
+want, clients, sep = sys.argv[1], sys.argv[2].split(), sys.argv[3]
+for key in json.load(sys.stdin) or []:
+    if key.get("displayName") != want:
+        continue
+    restrictions = key.get("restrictions") or {}
+    targets = sorted(t.get("service", "") for t in restrictions.get("apiTargets") or [])
+    present = [field for field in clients if field in restrictions]
+    print(sep.join([key.get("name", ""), ",".join(targets), ",".join(present)]))
+' "${GEMINI_KEY_DISPLAY_NAME}" "${GEMINI_KEY_CLIENT_RESTRICTIONS}" "${KEY_ROW_SEPARATOR}"
 }
 
 # The first listing follows the enable above, so it retries while the API
@@ -88,7 +110,7 @@ find_key() {
 list_keys_after_enable() {
   local attempt
   for ((attempt = 1; ; attempt++)); do
-    if KEY_NAMES="$(find_key 2>"${ERR_FILE}")"; then
+    if KEY_ROWS="$(find_key 2>"${ERR_FILE}")"; then
       return 0
     fi
     if ((attempt >= GEMINI_KEY_LIST_ATTEMPTS)) || ! grep -qE "${GCLOUD_SERVICE_DISABLED}" "${ERR_FILE}"; then
@@ -101,7 +123,7 @@ list_keys_after_enable() {
 }
 
 list_keys_after_enable || die "could not list API keys"
-if [[ -z "${KEY_NAMES}" ]]; then
+if [[ -z "${KEY_ROWS}" ]]; then
   echo "[${PROJECT_ID}] Creating API key ${GEMINI_KEY_DISPLAY_NAME} for ${GEMINI_KEY_API_TARGET}"
   if ! gcloud services api-keys create --project="${PROJECT_ID}" \
     --display-name="${GEMINI_KEY_DISPLAY_NAME}" \
@@ -109,13 +131,33 @@ if [[ -z "${KEY_NAMES}" ]]; then
     show_err
     die "could not create API key ${GEMINI_KEY_DISPLAY_NAME}"
   fi
-  KEY_NAMES="$(find_key)" || die "could not list API keys"
-  [[ -n "${KEY_NAMES}" ]] || die "API key ${GEMINI_KEY_DISPLAY_NAME} is absent after create"
+  KEY_ROWS="$(find_key)" || die "could not list API keys"
+  [[ -n "${KEY_ROWS}" ]] || die "API key ${GEMINI_KEY_DISPLAY_NAME} is absent after create"
 fi
-[[ "${KEY_NAMES}" != *$'\n'* ]] ||
-  die "more than one API key named ${GEMINI_KEY_DISPLAY_NAME}: $(echo "${KEY_NAMES}" | tr '\n' ' ')"
-readonly KEY_NAME="${KEY_NAMES}"
+[[ "${KEY_ROWS}" != *$'\n'* ]] ||
+  die "more than one API key named ${GEMINI_KEY_DISPLAY_NAME}: $(cut -d"${KEY_ROW_SEPARATOR}" -f1 <<<"${KEY_ROWS}" | tr '\n' ' ')"
+IFS="${KEY_ROW_SEPARATOR}" read -r KEY_NAME KEY_TARGETS KEY_CLIENTS <<<"${KEY_ROWS}"
+readonly KEY_NAME KEY_TARGETS KEY_CLIENTS
 echo "[${PROJECT_ID}] Using API key ${KEY_NAME}"
+
+# Converge the restriction of a key that already existed. gcloud refuses
+# --clear-restrictions beside --api-target, so a client restriction takes two
+# calls: clear, then set the API target. The calls name the key, not its string.
+update_key() {
+  if ! gcloud services api-keys update "${KEY_NAME}" --project="${PROJECT_ID}" "$@" \
+    >/dev/null 2>"${ERR_FILE}"; then
+    show_err
+    die "could not update the restriction of API key ${KEY_NAME}"
+  fi
+}
+if [[ -n "${KEY_CLIENTS}" ]]; then
+  echo "[${PROJECT_ID}] Clearing the client restrictions (${KEY_CLIENTS}) of API key ${KEY_NAME}"
+  update_key --clear-restrictions
+fi
+if [[ -n "${KEY_CLIENTS}" || "${KEY_TARGETS}" != "${GEMINI_KEY_API_TARGET}" ]]; then
+  echo "[${PROJECT_ID}] Restricting API key ${KEY_NAME} to ${GEMINI_KEY_API_TARGET}"
+  update_key --api-target="service=${GEMINI_KEY_API_TARGET}"
+fi
 
 KEY_STRING="$(gcloud services api-keys get-key-string "${KEY_NAME}" \
   --project="${PROJECT_ID}" --format='value(keyString)')" ||

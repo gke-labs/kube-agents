@@ -4270,13 +4270,15 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
         passed = False
         _drift(details, findings, finding_id, observed, fix)
 
+    # Unfiltered: gcloud's --filter is not an exact match, so the display name
+    # is compared here and a key such as kube-agents-eval-gemini-probe is not taken.
     keys, keys_checked = read(
-        ["gcloud", "services", "api-keys", "list", f"--project={project_id}", f"--filter=displayName={GEMINI_KEY_DISPLAY_NAME}", "--format=json"],
+        ["gcloud", "services", "api-keys", "list", f"--project={project_id}", "--format=json"],
         f"the API key {GEMINI_KEY_DISPLAY_NAME}",
     )
     missing: List[str] = []
     if keys_checked:
-        keys = keys or []
+        keys = [key for key in (keys or []) if key.get("displayName") == GEMINI_KEY_DISPLAY_NAME]
         if not keys:
             missing.append(f"No API key named {GEMINI_KEY_DISPLAY_NAME} in {project_id}; the eval nightly has no Gemini Developer API key here")
         if len(keys) > 1:

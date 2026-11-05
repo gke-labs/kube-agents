@@ -891,8 +891,8 @@ fi
 # shared quota, with no fixed per-minute wall, and authenticates the LiteLLM pod
 # through Workload Identity (the kubeagents-litellm KSA annotation below)
 # instead of an API key.
-# The eval nightlies export MODEL_PROVIDER=gemini, and the agent then reads the
-# leased project's own key from that project's Secret Manager
+# When a job exports MODEL_PROVIDER=gemini, the agent reads the leased
+# project's own key from that project's Secret Manager
 # (resolve_agent_gemini_api_key below). Each project's key has its own quota,
 # so the shared-minute 429 storm cannot recur there. The job env's
 # GEMINI_API_KEY stays the judge's key.
