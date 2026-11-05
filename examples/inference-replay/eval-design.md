@@ -164,7 +164,7 @@ The rules that keep this safe:
 - **Where a warning line lands doesn't change the key.** The shell tool mixes a command's errors
   and its normal output in whatever order they arrive. So the same `gcloud` command, with the same
   output, put its `WARNING:` line before the JSON in one run and after it in the next, and that one
-  difference cost the obtainability case the rest of its conversation in the replay lane. The key treats any line starting `WARNING: ` as if it were at the end of its text. The text the agent sees isn't touched.
+  difference cost the obtainability case the rest of its conversation in the replay lane. When a text is one JSON document with `WARNING: ` lines before or after it (each with any indented lines that continue it), the key puts the warnings after the JSON. Any other text keeps its order, because there the order can mean something: `WARNING: disk pressure` then `Pod evicted` is not the same story told backwards. The text the agent sees isn't touched.
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/

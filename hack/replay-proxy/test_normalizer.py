@@ -157,6 +157,21 @@ class StderrOrderTest(unittest.TestCase):
         before = json.dumps({"exit_code": 0, "output": warning + "\n" + body + "\n"})
         self.assertEqual(norm(after), norm(before))
 
+    def test_a_wrapped_warning_moves_with_its_continuation_lines(self):
+        warning = "WARNING: Accessing a Kubernetes Engine cluster requires the kubernetes commandline\n    tool [kubectl]."
+        body = '[{"name": "alpha", "status": "RUNNING"}]'
+        self.assertEqual(norm(warning + "\n" + body + "\n"), norm(body + "\n" + warning))
+        self.assertEqual(norm(warning + "\n" + body), body + "\n" + warning)
+
+    def test_the_order_of_a_warning_and_plain_output_still_counts(self):
+        # In either direction: only a JSON document between warnings is reordered.
+        self.assertNotEqual(norm("WARNING: disk pressure\nPod evicted"), norm("Pod evicted\nWARNING: disk pressure"))
+        self.assertNotEqual(norm("Pod evicted\nWARNING: disk pressure"), norm("WARNING: disk pressure\nPod evicted"))
+        self.assertEqual(norm("WARNING: disk pressure\nPod evicted"), "WARNING: disk pressure\nPod evicted")
+        body = '{"ok": true}'
+        self.assertNotEqual(norm("WARNING: a\nnote\n" + body), norm(body + "\nWARNING: a\nnote"),
+                            "an unindented line is output, not a warning's continuation")
+
     def test_the_rest_of_the_output_still_counts(self):
         warning = "WARNING: something"
         self.assertNotEqual(norm(warning + "\nlimit: 16"), norm(warning + "\nlimit: 64"))

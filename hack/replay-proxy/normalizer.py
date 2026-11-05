@@ -79,10 +79,14 @@ EVENT_KIND_KEY = "kind"
 HEARTBEAT_KIND = "heartbeat"
 # gcloud writes warnings to stderr, and the shell tool merges stderr into the
 # output in whatever order the two streams arrive: the same command's warning
-# came before its JSON in one run and after it in the next. Warning lines are
-# moved to the end of a multi-line output.
+# came before its JSON in one run and after it in the next. Only that shape is
+# rewritten (warnings_last): one JSON document, with blocks of warnings before
+# or after it, each a `WARNING: ` line and the indented lines that continue it.
 STDERR_WARNING_PREFIX = "WARNING: "
 LINE_BREAK = "\n"
+# A line that opens a JSON document, and an indented line continuing a warning.
+JSON_LINE_RE = re.compile(r"^[{\[]", re.M)
+CONTINUATION_PREFIXES = (" ", "\t")
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -243,18 +247,41 @@ def stable_hash(value: Any) -> str:
     return hashlib.sha256(data.encode(TEXT_ENCODING, ENCODING_ERRORS)).hexdigest()
 
 
+def warning_block(lines: List[str]) -> bool:
+    """Whether `lines` are warnings only: each a `WARNING: ` line or an indented line continuing one."""
+    started = False
+    for line in lines:
+        if line.startswith(STDERR_WARNING_PREFIX):
+            started = True
+        elif not (started and line.startswith(CONTINUATION_PREFIXES)):
+            return False
+    return started
+
+
 def warnings_last(text: str) -> str:
-    """`text` with its stderr warning lines moved to the end, in their order."""
+    """A JSON output with stderr warnings around it, as the JSON and then the warnings, in their order.
+
+    Narrow on purpose: anything but one JSON document between blocks of
+    warnings keeps its order, because there the order of a warning and the
+    line beside it can mean something (`WARNING: disk pressure` then `Pod
+    evicted`). Blank lines at the ends of either side do not count.
+    """
     if STDERR_WARNING_PREFIX not in text:
         return text
-    lines = text.split(LINE_BREAK)
-    warnings = [line for line in lines if line.startswith(STDERR_WARNING_PREFIX)]
-    rest = [line for line in lines if not line.startswith(STDERR_WARNING_PREFIX)]
-    if not warnings or not any(rest):
+    decoder = json.JSONDecoder()
+    for opener in JSON_LINE_RE.finditer(text):
+        before = [line for line in text[: opener.start()].split(LINE_BREAK) if line.strip()]
+        if before and not warning_block(before):
+            return text
+        try:
+            _, end = decoder.raw_decode(text, opener.start())
+        except ValueError:
+            continue
+        after = [line for line in text[end:].split(LINE_BREAK) if line.strip()]
+        if (before or after) and (not after or warning_block(after)):
+            return LINE_BREAK.join([text[opener.start(): end]] + before + after)
         return text
-    while rest and not rest[-1]:
-        rest.pop()
-    return LINE_BREAK.join(rest + warnings)
+    return text
 
 
 def time_bucket(when: float, now: float) -> str:
