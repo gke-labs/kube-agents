@@ -259,9 +259,10 @@ func TestAHalfOpenProbesChildRunsAndAStrangersChildWaits(t *testing.T) {
 	}
 }
 
-// A stopped task is neutral to the breaker however it ends: the executor
-// ending it within the grace (a final renewal) doesn't close a half-open
-// breaker, and its worker dying after the stop doesn't count as an expiry.
+// A stopped task never closes the breaker: the executor ending it within
+// the grace (a final renewal) leaves a half-open breaker as it was. Its
+// worker dying after the stop still counts as an expiry and re-opens it, so
+// stopping each poisoned task can't hide the workers it kills.
 func TestAStoppedTaskEndingOnItsOwnLeavesTheBreakerAsItWas(t *testing.T) {
 	for name, end := range map[string]func(w *fakeWorker){
 		"ends itself": func(w *fakeWorker) { w.finish("task-probe", lib.StateCanceled) },
@@ -304,8 +305,16 @@ func TestAStoppedTaskEndingOnItsOwnLeavesTheBreakerAsItWas(t *testing.T) {
 				_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", "tse-1", "task-probe")]
 				return ok
 			})
-			if got := d.breakers.epoch("tse", "read"); got != epoch {
-				t.Errorf("breaker epoch %d after the stopped probe ended, want %d (neither closed nor re-opened)", got, epoch)
+			got := d.breakers.epoch("tse", "read")
+			switch name {
+			case "ends itself":
+				if got != epoch {
+					t.Errorf("breaker epoch %d after the stopped probe ended itself, want %d (not closed)", got, epoch)
+				}
+			case "worker dies":
+				if got == epoch || got == 0 {
+					t.Errorf("breaker epoch %d after the stopped probe's worker died, want a new opening past %d", got, epoch)
+				}
 			}
 		})
 	}

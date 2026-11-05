@@ -1197,9 +1197,11 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// A worker that is alive but unheard must not go on with a
 				// task that has failed.
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonLeaseExpired})
-				if !d.stopRequestedOn(h) {
-					d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
-				}
+				// Counted even for a stopped task: a worker lost is a worker
+				// lost, and a stop must not hide one (stopping each poisoned
+				// task would keep the breaker shut). Only closing is denied
+				// a stopped task.
+				d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
 				d.fail(ctx, log, del, h, key, rec, ReasonLeaseExpired,
 					fmt.Sprintf("worker %s stopped renewing at %s", rec.Pod, rec.RenewedAt.UTC().Format(time.RFC3339)))
 				return

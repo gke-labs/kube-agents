@@ -175,9 +175,10 @@ func (d *Dispatcher) pruneStoppedLocked(now time.Time) {
 	}
 }
 
-// stopRequestedOn reports whether h has a stop. A stopped task is neutral
-// to the breaker however it ends: its own end, its worker's loss, or the
-// grace running out.
+// stopRequestedOn reports whether h has a stop. A stopped task never closes
+// the breaker, however it ends (its own end, its deadline, the grace running
+// out); its worker's loss still counts as an expiry, so a stop can't hide
+// the workers a poisoned input kills.
 func (d *Dispatcher) stopRequestedOn(h *holding) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -290,9 +291,8 @@ func stopDeadline(cfg lib.DispatchConfig, now time.Time) time.Time { return now.
 // failed, and whichever lands first is the task's end.
 func (d *Dispatcher) stopHeld(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord) {
 	log.Info("the task didn't stop within the grace; abandoning it", "pod", rec.Pod)
-	// Ended by its requester, not by its worker either way: the breaker
-	// neither counts it nor closes on it, so stopping one's own task can't
-	// reset a breaker one's other tasks opened.
+	// Ended by its requester: the breaker doesn't close on it, so stopping
+	// one's own task can't reset a breaker one's other tasks opened.
 	if !d.publishTerminalRetry(ctx, log, del, h, lib.StateCanceled, ReasonStopped,
 		fmt.Sprintf("stopped by the conversation; the worker %s didn't stop within %s", rec.Pod, stopGrace(d.src.Config()))) {
 		return
