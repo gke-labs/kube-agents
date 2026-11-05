@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
+import sys
+import subprocess
 import threading
 import time
 import types
@@ -669,7 +673,7 @@ def test_cluster_creation_runs_at_most_the_bound_at_once(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: [])
     monkeypatch.setattr(run, "_create_cluster", create)
-    monkeypatch.setattr(runner.kube, "has_context", lambda *a: True)
+    monkeypatch.setattr(runner.kube, "get_credentials", lambda *a: None)
     monkeypatch.setattr(run, "wait_registered", lambda count: None)
     run.ensure_clusters(5)
     assert peak[0] == 2
@@ -715,6 +719,23 @@ def test_a_stored_combined_run_of_another_point_is_pending(monkeypatch, tmp_path
     monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a, **k: None)
     specs = [s for s in plan.matrix() if s.factor == "combined" and s.operation.name == "fan_out"]
     assert [s.run for s in run.pending(specs)] == [2, 3]
+
+
+def test_a_combined_point_that_would_replace_another_plan_s_record_is_refused(monkeypatch, tmp_path):
+    plan = load_plan(PHASE2, environ=ENV)
+    path = tmp_path / "data.json"
+    commit = "eeb8a95ceb0a9efd66434161f87820b35b65360c"
+    records.merge(path, [records.Record(
+        commit=commit, mode="next", phase="phase4", factor="combined", level=1, operation="fan_out", run=1,
+        started="2026-10-27T00:00:00Z", ended="2026-10-27T00:10:00Z",
+        values={**plan.base, "clusters": 40.0, "objects": 100.0})])
+    run = runner.Runner(plan, path)
+    run.install = type("Install", (), {"image": lambda self: f"x:{commit}", "mode": lambda self: "next",
+                                       "context": "ctx", "namespace": "ns"})()
+    monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a, **k: None)
+    specs = [s for s in plan.matrix() if s.factor == "combined" and s.operation.name == "fan_out"]
+    with pytest.raises(SystemExit, match="holds phase4's record of another point"):
+        run.pending(specs)
 
 
 def test_a_proxy_load_needs_a_list_command(tmp_path):
@@ -1017,6 +1038,15 @@ def test_a_pod_unread_at_the_start_adds_no_growth():
     assert collect._growth(collect.Snapshot(), after, "proxy", "kubeagents_tool_execution_duration_seconds_count") == 500.0
 
 
+def test_job_seconds_are_read_for_completed_runs_only(monkeypatch):
+    out = ("compliance-audit completed 2026-10-28T20:30:32.450605+00:00 2026-10-28T20:10:28.731243+00:00\n"
+           "stall-watch running None 2026-10-28T20:30:28.731243+00:00\n"
+           "obtainability-audit unclaimed None None\n")
+    monkeypatch.setattr(operations, "_gateway_pod", lambda *a: "pod")
+    monkeypatch.setattr(operations.kube, "kubectl", lambda *a, **k: out)
+    durations = operations.job_seconds("ctx", "ns", "/home", ("compliance-audit", "stall-watch"), "2026-10-28T20:00:00Z")
+    assert durations == {"compliance-audit": pytest.approx(1203.72, abs=0.01)}
+
 
 def test_a_cluster_delete_writes_no_shared_kubeconfig(monkeypatch):
     seen = {}
@@ -1029,3 +1059,199 @@ def test_a_cluster_delete_writes_no_shared_kubeconfig(monkeypatch):
     monkeypatch.setenv("KUBECONFIG", "/shared/kubeconfig")
     kube.delete_cluster("p", "z", "scale-01")
     assert seen["kubeconfig"] and seen["kubeconfig"] != "/shared/kubeconfig"
+
+
+PHASE4 = REPO_BENCH / "scale" / "phase4.yaml"
+
+
+def test_a_triggered_window_writes_its_job_metrics_at_once(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    spec = next(s for s in plan.matrix() if s.factor == "clusters" and s.operation.kind == "trigger_soak")
+    stamped = records.Record(commit="e" * 40, mode="next", phase="phase4", factor=spec.factor, level=spec.level,
+                             operation=spec.operation.name, run=1, started="2026-10-29T00:00:00Z",
+                             ended="2026-10-29T00:10:00Z")
+    monkeypatch.setattr(run, "apply_level", lambda factor, level: {"clusters": spec.level})
+    monkeypatch.setattr(run, "backfill_peaks", lambda *a, **k: None)
+    monkeypatch.setattr(run, "pending", lambda specs: specs)
+    monkeypatch.setattr(run, "preflight", lambda: None)
+    monkeypatch.setattr(run, "wait_registered", lambda count: None)
+    monkeypatch.setattr(run, "execute", lambda s, values: stamped)
+    monkeypatch.setattr(run, "drain_jobs", lambda op, since: None)
+    monkeypatch.setattr(run, "flush_peaks", lambda awaiting, wait: [])
+    monkeypatch.setattr(runner.operations, "job_seconds", lambda *a: {"stall-watch": 418.5})
+    monkeypatch.setattr(runner.operations.Relay, "start", lambda self: None)
+    monkeypatch.setattr(runner.operations.Relay, "stop", lambda self: None)
+    assert run.run([spec], force=False) is True
+    [stored] = records.load(tmp_path / "data.json")["records"]
+    assert {m["name"]: m["value"] for m in stored["metrics"]} == {"jobs_completed": 1.0, "job_seconds": 418.5}
+
+
+@pytest.mark.parametrize("error", [kube.CommandError("exec failed"), ValueError("bad timestamp"), TypeError("None")])
+def test_a_job_log_that_cannot_be_read_costs_only_the_job_metrics(monkeypatch, tmp_path, error):
+    run = runner.Runner(load_plan(PHASE4, environ=ENV), tmp_path / "data.json")
+    run.install = type("Install", (), {"context": "ctx", "namespace": "ns"})()
+    op = next(o for o in run.plan.operations if o.kind == "trigger_soak")
+
+    def fail(*args):
+        raise error
+    monkeypatch.setattr(runner.operations, "job_seconds", fail)
+    assert run.job_metrics(op, "2026-10-29T00:00:00Z") == []
+
+
+def test_the_dry_run_lists_each_level_s_cluster_changes_and_runs(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    lines = run.dry_run([s for s in plan.matrix() if s.factor == "clusters" and s.level in (40, 32)], force=True)
+    assert lines[0] == "8 runs to do (of 8); test clusters now: 2"
+    assert any(line.startswith("  create 38 clusters:") for line in lines)
+    assert any(line.startswith("  delete 8 clusters: scale-33") for line in lines)
+    assert sum("(prompt, model calls)" in line for line in lines) == 4
+
+
+def test_a_lease_held_elsewhere_refuses_the_run(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        return subprocess.CompletedProcess(args, 1, stdout="held by someone@host", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with pytest.raises(SystemExit, match="could not take the install.s live-test lease"):
+        with runner.hold_lease(plan, "test"):
+            pytest.fail("the block ran without the lease")
+    assert calls == ["acquire"]
+
+
+def test_a_held_lease_is_released_when_the_block_ends(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        assert kwargs["env"]["KUBE_AGENTS_LIVE_TEST_ENVS"]
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        assert calls == ["acquire"]
+    assert calls == ["acquire", "release"]
+
+
+def test_the_dry_run_stops_where_limit_stops_the_run(monkeypatch, tmp_path):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    specs = [s for s in plan.matrix() if s.factor == "clusters" and s.level in (40, 32)]
+    lines = run.dry_run(specs, force=True, limit=2)
+    assert lines[0] == "2 runs to do (of 8); test clusters now: 2"
+    assert sum(line.startswith("level ") for line in lines) == 1
+    assert sum(line.startswith("  run ") for line in lines) == 2
+
+
+@pytest.mark.parametrize("command", ["apply", "teardown"])
+def test_dry_run_is_refused_where_it_is_not_implemented(command, capsys):
+    with pytest.raises(SystemExit):
+        runner.main([command, str(PHASE4), "--dry-run", "--delete-fleet"])
+    assert "--dry-run applies to run only" in capsys.readouterr().err
+
+
+def test_the_lease_script_runs_where_no_install_env_can_be_found(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setenv("CLAUDE_CWD", "/some/checkout")
+    seen = []
+
+    def lease(args, **kwargs):
+        seen.append((kwargs["env"].get("CLAUDE_CWD"), kwargs["cwd"]))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        pass
+    assert all(cwd_var is None and cwd and "harness-scale-lease-" in cwd for cwd_var, cwd in seen)
+
+
+def test_the_lease_is_renewed_while_the_block_runs(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setitem(plan.settings, "lease_ttl_minutes", 1)
+    monkeypatch.setattr(runner, "SECONDS_PER_MINUTE", 0.03)
+    calls = []
+
+    def lease(args, **kwargs):
+        calls.append(args[2])
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with runner.hold_lease(plan, "test"):
+        time.sleep(0.1)
+    assert calls[0] == "acquire" and calls[-1] == "release"
+    assert "renew" in calls
+
+
+def test_a_lease_that_cannot_be_renewed_stops_the_run(monkeypatch):
+    plan = load_plan(PHASE4, environ=ENV)
+    monkeypatch.setitem(plan.settings, "lease_ttl_minutes", 1)
+    monkeypatch.setattr(runner, "SECONDS_PER_MINUTE", 0.03)
+
+    def lease(args, **kwargs):
+        code = 1 if args[2] == "renew" else 0
+        return subprocess.CompletedProcess(args, code, stdout="not the holder", stderr="")
+    monkeypatch.setattr(runner.subprocess, "run", lease)
+    with pytest.raises(KeyboardInterrupt):
+        with runner.hold_lease(plan, "test"):
+            time.sleep(1)
+            pytest.fail("the run went on without its lease")
+
+
+def test_a_triggered_run_is_read_past_the_skip_row_a_later_tick_writes(tmp_path):
+    (tmp_path / "cron").mkdir()
+    db = sqlite3.connect(tmp_path / "cron" / "executions.db")
+    db.execute("create table executions(job_id, status, claimed_at, started_at, finished_at)")
+    db.execute("insert into executions values('stall-watch', 'completed', '2026-01-01T00:05', '2026-01-01T00:05', "
+               "'2026-01-01T00:30')")
+    db.execute("insert into executions values('stall-watch', 'skipped', '2026-01-01T00:10', NULL, '2026-01-01T00:10')")
+    db.commit()
+    out = subprocess.run([sys.executable, "-c", runner.operations.JOB_RUNS_SCRIPT, "2026-01-01T00:00", "stall-watch"],
+                         env={**os.environ, "HERMES_HOME": str(tmp_path)}, capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["stall-watch", "completed", "2026-01-01T00:30", "2026-01-01T00:05"]
+
+
+def test_a_run_inside_a_measured_stall_watch_pass_is_marked_as_sharing_the_broker():
+    # Phase 4's 32-cluster fan-out started 1,301 s after the 02:00 tick, inside a pass at the measured
+    # rate of about 50 s per cluster; at 8 clusters the pass is over by 520 s.
+    assert runner._overlaps_stall_watch("2026-10-29T02:21:41Z", "2026-10-29T02:28:00Z", 32)
+    assert not runner._overlaps_stall_watch("2026-10-29T02:10:00Z", "2026-10-29T02:15:00Z", 8)
+
+
+def test_a_run_another_phase_recorded_is_skipped_with_a_warning(monkeypatch, tmp_path, caplog):
+    plan = load_plan(PHASE4, environ=ENV)
+    run = runner.Runner(plan, tmp_path / "data.json")
+    spec = next(s for s in plan.matrix() if s.operation.kind == "prompt" and s.factor == "clusters")
+    records.merge(tmp_path / "data.json", [records.Record(
+        commit="e" * 40, mode="next", phase="phase3", factor=spec.factor, level=spec.level,
+        operation=spec.operation.name, run=spec.run, started="2026-10-27T00:00:00Z", ended="2026-10-27T00:05:00Z")])
+    monkeypatch.setattr(runner.operations, "wait_gateway_ready", lambda *a: None)
+    run.install = type("Install", (), {"context": "ctx", "namespace": "ns", "image": lambda self: "img:" + "e" * 40,
+                                       "mode": lambda self: "next"})()
+    with caplog.at_level("WARNING"):
+        assert spec not in run.pending([spec])
+    assert "already recorded by phase3" in caplog.text
+
+
+def test_every_test_cluster_s_credentials_are_refreshed(monkeypatch, tmp_path):
+    run = runner.Runner(load_plan(PHASE4, environ=ENV), tmp_path / "data.json")
+    fetched = []
+    monkeypatch.setattr(runner.kube, "clusters_with_prefix", lambda *a: ["scale-01", "scale-02"])
+    monkeypatch.setattr(runner.kube, "has_context", lambda name: True)
+    monkeypatch.setattr(runner.kube, "get_credentials", lambda project, zone, name: fetched.append(name))
+    monkeypatch.setattr(run, "wait_registered", lambda count: None)
+    run.ensure_clusters(2)
+    # A cluster created again under an old name keeps no stale endpoint.
+    assert fetched == ["scale-01", "scale-02"]
+
+
+def test_kubectl_requests_time_out_except_streaming_ones(monkeypatch):
+    calls = []
+    monkeypatch.setattr(kube, "run", lambda args, **kwargs: calls.append(args) or "")
+    kube.kubectl("ctx", "get", "nodes", timeout=60)
+    kube.kubectl("ctx", "exec", "pod", "--", "true", timeout=60)
+    assert "--request-timeout=60s" in calls[0]
+    assert not any(arg.startswith("--request-timeout") for arg in calls[1])

@@ -87,13 +87,13 @@ func TestHandlerAuditEvents(t *testing.T) {
 				Resource: "pods", Namespace: "kube-system", Outcome: OutcomeForwarded, StatusCode: http.StatusOK},
 		},
 		{
-			name: "dry-run write", method: http.MethodPost, target: "/apis/apps/v1/namespaces/default/deployments?dryRun=All",
+			name: "dry-run write", method: http.MethodPost, target: "/clusters/in-cluster/apis/apps/v1/namespaces/default/deployments?dryRun=All",
 			want: AuditEvent{ClusterID: InClusterID, Path: "/apis/apps/v1/namespaces/default/deployments", Verb: "create",
 				APIGroup: "apps", APIVersion: "v1", Resource: "deployments", Namespace: "default", DryRun: true,
 				Outcome: OutcomeForwarded, StatusCode: http.StatusOK},
 		},
 		{
-			name: "upstream 5xx", method: http.MethodGet, target: "/api/v1/nodes/n1",
+			name: "upstream 5xx", method: http.MethodGet, target: "/clusters/in-cluster/api/v1/nodes/n1",
 			cfg: Config{Upstream: respondWith(http.StatusServiceUnavailable, strings.NewReader("{}"))},
 			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/nodes/n1", Verb: "get", APIVersion: "v1", Resource: "nodes",
 				Name: "n1", Outcome: OutcomeForwarded, StatusCode: http.StatusServiceUnavailable},
@@ -106,9 +106,9 @@ func TestHandlerAuditEvents(t *testing.T) {
 			wantErr: "token expired", noCaller: true,
 		},
 		{
-			name: "authentication unavailable", method: http.MethodGet, target: "/api/v1/pods",
+			name: "authentication unavailable", method: http.MethodGet, target: "/clusters/in-cluster/api/v1/pods",
 			cfg:     Config{Authenticator: staticAuthenticator{err: fmt.Errorf("%w: %w", errAuthenticationUnavailable, errors.New("connection refused"))}},
-			want:    AuditEvent{Path: "/api/v1/pods", Outcome: OutcomeAuthUnavailable, StatusCode: http.StatusServiceUnavailable},
+			want:    AuditEvent{Path: "/clusters/in-cluster/api/v1/pods", Outcome: OutcomeAuthUnavailable, StatusCode: http.StatusServiceUnavailable},
 			wantErr: "caller authentication is unavailable: connection refused", noCaller: true,
 		},
 		{
@@ -117,24 +117,24 @@ func TestHandlerAuditEvents(t *testing.T) {
 				StatusCode: http.StatusBadRequest},
 		},
 		{
-			name: "unclassifiable", method: http.MethodGet, target: "/api/v1/watch",
+			name: "unclassifiable", method: http.MethodGet, target: "/clusters/in-cluster/api/v1/watch",
 			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/watch", Outcome: OutcomeRefused, Reason: ReasonInvalidRoute,
 				StatusCode: http.StatusBadRequest},
 		},
 		{
-			name: "policy refusal", method: http.MethodPost, target: "/api/v1/namespaces/default/pods/p/exec?command=sh",
+			name: "policy refusal", method: http.MethodPost, target: "/clusters/in-cluster/api/v1/namespaces/default/pods/p/exec?command=sh",
 			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/namespaces/default/pods/p/exec", Verb: "create",
 				APIVersion: "v1", Resource: "pods", Subresource: "exec", Namespace: "default", Name: "p",
 				Outcome: OutcomeRefused, Reason: ReasonSubresourceBlocked, StatusCode: http.StatusForbidden},
 		},
 		{
-			name: "secret refusal", method: http.MethodPatch, target: "/api/v1/namespaces/default/secrets/s?dryRun=All",
+			name: "secret refusal", method: http.MethodPatch, target: "/clusters/in-cluster/api/v1/namespaces/default/secrets/s?dryRun=All",
 			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/namespaces/default/secrets/s", Verb: "patch",
 				APIVersion: "v1", Resource: "secrets", Namespace: "default", Name: "s", DryRun: true,
 				Outcome: OutcomeRefused, Reason: ReasonSecretWriteBlocked, StatusCode: http.StatusForbidden},
 		},
 		{
-			name: "secret read", method: http.MethodGet, target: "/api/v1/namespaces/default/secrets/db",
+			name: "secret read", method: http.MethodGet, target: "/clusters/in-cluster/api/v1/namespaces/default/secrets/db",
 			cfg: Config{Upstream: &recordingTransport{response: func(*http.Request) *http.Response {
 				return jsonResponse([]byte(secretJSON), nil)
 			}}},
@@ -144,14 +144,14 @@ func TestHandlerAuditEvents(t *testing.T) {
 		},
 		{
 			// The default test upstream answers with a PodList, which the redactor refuses.
-			name: "unredactable secret", method: http.MethodGet, target: "/api/v1/namespaces/default/secrets/db",
+			name: "unredactable secret", method: http.MethodGet, target: "/clusters/in-cluster/api/v1/namespaces/default/secrets/db",
 			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/namespaces/default/secrets/db", Verb: "get",
 				APIVersion: "v1", Resource: "secrets", Namespace: "default", Name: "db",
 				Outcome: OutcomeForwarded, StatusCode: http.StatusBadGateway},
 			wantErr: `unexpected kind "PodList" in "v1"`,
 		},
 		{
-			name: "unredactable secret watch", method: http.MethodGet, target: "/api/v1/namespaces/default/secrets?watch=true",
+			name: "unredactable secret watch", method: http.MethodGet, target: "/clusters/in-cluster/api/v1/namespaces/default/secrets?watch=true",
 			cfg: Config{Upstream: respondWith(http.StatusOK, strings.NewReader("c2VjcmV0\n"))},
 			want: AuditEvent{ClusterID: InClusterID, Path: "/api/v1/namespaces/default/secrets", Verb: "watch",
 				APIVersion: "v1", Resource: "secrets", Namespace: "default",
@@ -159,8 +159,8 @@ func TestHandlerAuditEvents(t *testing.T) {
 			wantErr: "a watch event is not one JSON object",
 		},
 		{
-			name: "upstream error", method: http.MethodGet, target: "/api/v1/pods",
-			cfg: Config{Upstream: &recordingTransport{err: errors.New(transportErr)}, DefaultClusterID: gkeHost},
+			name: "upstream error", method: http.MethodGet, target: "/clusters/" + gkeHost + "/api/v1/pods",
+			cfg: Config{Upstream: &recordingTransport{err: errors.New(transportErr)}},
 			want: AuditEvent{ClusterID: gkeHost, Path: "/api/v1/pods", Verb: "list", APIVersion: "v1", Resource: "pods",
 				Outcome: OutcomeUpstreamError, StatusCode: http.StatusBadGateway},
 			wantErr: transportErr,
@@ -207,7 +207,7 @@ func TestHandlerAuditsAbortedResponse(t *testing.T) {
 		Upstream: respondWith(http.StatusOK, failingBody{content: strings.NewReader(`{"kind":"PodList"`), err: errors.New(readErr)}),
 	})
 	// Under an HTTP server the reverse proxy aborts a response that fails mid-copy.
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil)
+	req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/pods", nil)
 	req = req.WithContext(context.WithValue(req.Context(), http.ServerContextKey, &http.Server{}))
 
 	func() {
@@ -231,7 +231,7 @@ func TestHandlerDefaultAuditSink(t *testing.T) {
 	const token = "sandbox-token"
 	var logs bytes.Buffer
 	h, _ := newTestHandler(t, Config{Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods?labelSelector=app", nil)
+	req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/pods?labelSelector=app", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
 	if rec := serve(h, req); rec.Code != http.StatusOK {
 		t.Fatalf("code = %d: %s", rec.Code, rec.Body.String())
@@ -377,7 +377,7 @@ func TestHandlerAuditsUpgrade(t *testing.T) {
 		b, _ := io.ReadAll(callerSide)
 		received <- string(b)
 	}()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/pods/p/exec?command=sh", nil)
+	req := httptest.NewRequest(http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/pods/p/exec?command=sh", nil)
 	req.Header.Set("Upgrade", "SPDY/3.1")
 	req.Header.Set("Connection", "Upgrade")
 	h.ServeHTTP(&hijackableRecorder{ResponseRecorder: httptest.NewRecorder(), conn: proxySide}, req)
@@ -409,7 +409,7 @@ func TestHandlerAuditsFailedUpgradeWrite(t *testing.T) {
 	// The caller's side is gone, so writing the 101 onto the hijacked connection fails.
 	proxySide, callerSide := net.Pipe()
 	_ = callerSide.Close()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/pods/p/exec?command=sh", nil)
+	req := httptest.NewRequest(http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/pods/p/exec?command=sh", nil)
 	req.Header.Set("Upgrade", "SPDY/3.1")
 	req.Header.Set("Connection", "Upgrade")
 	h.ServeHTTP(&hijackableRecorder{ResponseRecorder: httptest.NewRecorder(), conn: proxySide}, req)
@@ -432,7 +432,7 @@ func TestHandlerAuditsCancelAndPanic(t *testing.T) {
 		if serverCtx {
 			ctx = context.WithValue(ctx, http.ServerContextKey, &http.Server{})
 		}
-		return httptest.NewRequest(http.MethodGet, "/api/v1/pods?watch=1", nil).WithContext(ctx)
+		return httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/pods?watch=1", nil).WithContext(ctx)
 	}
 	tests := []struct {
 		name        string
@@ -458,7 +458,7 @@ func TestHandlerAuditsCancelAndPanic(t *testing.T) {
 		{
 			name:      "panic",
 			cfg:       Config{Authenticator: panicAuthenticator{}},
-			req:       httptest.NewRequest(http.MethodGet, "/api/v1/pods", nil),
+			req:       httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/pods", nil),
 			wantPanic: "authenticator bug", wantErr: "panic: authenticator bug",
 		},
 	}

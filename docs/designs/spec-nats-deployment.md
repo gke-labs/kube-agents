@@ -355,6 +355,14 @@ Layout:
   radius container. Stage 1 exercises exactly one; the multi-scope split (and any
   cross-account exports) is designed but deliberately unexercised until a second scope
   exists.
+  Amended 11/3: within a scope, the application side is three accounts, joined only by
+  explicit exports and imports, so control-plane writers are isolated from worker
+  credentials. `TRUSTED` holds the control-plane services (the gateway, provision, the
+  verifier, the operator, seed and the dispatcher) and the JetStream store. `CONSOLE` holds
+  the web console and its MCP server (`console-mcp`). `APP` holds agent and session workers
+  and the read-only principals. The static user blocks are rendered per account, still from
+  `platformagent_a2a_identities.go`, so where this document says the config's APP and `$SYS`
+  static user blocks, read the `TRUSTED`, `CONSOLE`, `APP` and `$SYS` blocks.
 - **One user per agent identity** inside the account. Permissions are exact subject lists,
   deny by default: publish only to the subjects its role emits on, subscribe only to its own
   addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the shared topics it
@@ -647,6 +655,10 @@ Layout:
   and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the
   access gate is the Secret's RBAC plus `pods/portforward`. That is a gate the console does
   not have: its pod hands the password to whoever forwards to it.
+  **Amended 11/3:** the MCP server no longer shares `console`. It holds its own principal,
+  `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
+  the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
+  console's read surface and `chat.console.*.in`, without the console's confirmation subject.
 
 - **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
   kanban card's report back to the gateway conversation it was filed in
@@ -903,6 +915,24 @@ becomes a per-replica version check, which is exactly what the status endpoint a
 exposes. Rolling the callout pods on every map change would close the gap and was
 rejected: the callout is on the connection path, so a rolling restart is a window in
 which new connections fail, which is the thing the informer exists to avoid.
+
+**Amended 11/3:** the bus has an ordering of its own with the callout. When the bus restarts
+on a new config, every client reconnects, and whichever callout replica answers a reconnect
+places it by the map that replica holds. A connection placed by the previous map stays in
+that map's account until it next reconnects. So a running bus moves to a new config only
+once the callout's current spec is observed and no pod of an older ReplicaSet can still answer
+(`a2aBusWaitsForCallout`). Readiness does not hold it: a current replica that is not ready places
+nobody, and a callout cannot be ready while the bus it connects to is down. The config Secret waits with the StatefulSet, and the callout is
+reconciled ahead of both. A fresh install is not held, since there is no running bus. The
+wait is bounded. A rollout the Deployment controller has given up on (its progress deadline,
+600s by default) does not hold the bus, because the config can carry a credential repair or a
+key change. The release records a Warning event, and the `A2ACalloutRolloutStalled` condition
+stays on the PlatformAgent while the rollout is past its deadline. A stall counts only once the
+Deployment controller has observed the current spec. Only pods an older ReplicaSet of the callout controls are counted, and a
+terminating one only until its deletion deadline.
+While the bus waits, a reconnect is placed by the current map, which can name an account the
+running config does not have yet. That connection is refused until the bus moves, which
+fails closed.
 
 Three numbers in the render are load-bearing and none of them is a preference.
 

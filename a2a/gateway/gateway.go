@@ -402,8 +402,9 @@ func New(o Options) (*Gateway, error) {
 	// its whole identity join. On Slack the map is an optional override (the
 	// allowlist admits, and an unmapped sender is attributed by member id),
 	// so an empty one is noted, not warned. The console does not use one
-	// either: its grant is the mechanism, since only the console credential
-	// may publish on the console subject. And a gateway whose only ingress
+	// either: its grant is the mechanism, since only the console's
+	// credentials (console and console-mcp, the MCP server's) may publish on
+	// the console subject. And a gateway whose only ingress
 	// is the side door uses the door's map below instead of this one.
 	// Naming the backend matters, because the other ingresses beside it
 	// keep working.
