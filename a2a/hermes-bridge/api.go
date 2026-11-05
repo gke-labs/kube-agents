@@ -39,11 +39,13 @@ import (
 // The subprocess executor stays as a fallback (Config.Executor); what this
 // one does not do, by design of the stopgap it is: steer a running turn (a
 // follow-up waits for the turn to end and runs as the next turn in the same
-// session; bridge.go, queueSteer). A kanban card's completion never reaches
-// the A2A task (the API server has no push channel); it goes back to the
-// conversation through the gateway's chat.notify route instead, on the route
-// this executor records before a task's first turn (route.go). Both are
-// named in a2a/docs/hermes-bridge.md.
+// session; bridge.go, queueSteer). On routed chat turns (Slack and Google
+// Chat), a kanban card's completion goes back to the conversation
+// asynchronously through the gateway's chat.notify route, using the route
+// this executor records before a task's first turn (route.go). On console
+// and unrouted A2A/MCP turns, runTaskAPI waits in-turn for the session's
+// kanban cards to settle and synthesizes their findings into the task's
+// answer (kanban.go). Both are named in a2a/docs/hermes-bridge.md.
 const (
 	// ExecutorAPI runs a task as a turn in the conversation's Hermes session
 	// through the pod's API server. The daemon's default.
@@ -340,11 +342,6 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		return
 	}
 	sessionID := apiSessionID(run.origin.ContextID)
-	defer func() {
-		if run.canceled.Load() {
-			b.markSessionCanceled(sessionID)
-		}
-	}()
 	// The task's own context: the deadline bounds every turn together;
 	// cancel and shutdown end whichever request is in flight. Not the
 	// consumer's context, which a shutdown cancels before shutdownTasks can
@@ -415,6 +412,7 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	// payload carries, signed with the pod's shared secret, and only while
 	// this task holds the session's turn - every turn of it.
 	act := newSessionActivityState(sessionID, b.apiTraced())
+	act.waitInTurn.Store(waitKanbanInTurn)
 	act.inTurn.Store(true)
 	defer act.inTurn.Store(false)
 	run.mu.Lock()
@@ -428,7 +426,12 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 
 	if waitKanbanInTurn {
 		b.beginKanbanWait(sessionID)
-		defer b.endKanbanWait(sessionID)
+		defer func() {
+			if run.canceled.Load() && act.cardsFiled.Load() {
+				b.markSessionCanceled(sessionID)
+			}
+			b.endKanbanWait(sessionID)
+		}()
 	}
 	taskStartUnix := time.Now().Unix() - kanbanStartGraceSeconds
 	var steer *lib.Envelope // the follow-up this turn runs; nil on turn 1

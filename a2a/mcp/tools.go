@@ -36,6 +36,9 @@ const (
 
 	// maxPollSeconds bounds poll_events' wait for a new frame.
 	maxPollSeconds = 60
+
+	metaConversationIDKey    = "conversation_id"
+	metaConversationIDSuffix = "/conversation_id"
 )
 
 // MaxTurnWait is the longest a turn tool holds a request: the wait for the
@@ -70,7 +73,7 @@ func shouldStreamSteps(ctx context.Context, explicit *bool) bool {
 	}
 	meta := CallMetaFromContext(ctx)
 	for k, v := range meta {
-		if k == "conversation_id" || strings.HasSuffix(k, "/conversation_id") {
+		if k == metaConversationIDKey || strings.HasSuffix(k, metaConversationIDSuffix) {
 			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
 				return true
 			}

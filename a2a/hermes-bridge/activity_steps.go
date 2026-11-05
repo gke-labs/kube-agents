@@ -160,6 +160,7 @@ func (a *activityState) beginTurn() {
 	defer a.mu.Unlock()
 	a.turnCalls = 0
 	a.trace.apiCalls = 0
+	a.trace.turnCardsFiled = false
 	a.trace.prevBatchKey = ""
 }
 

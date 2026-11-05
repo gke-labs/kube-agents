@@ -423,3 +423,287 @@ func TestAPI_AFollowUpThatAnswersOutrightIsNoSynthesis(t *testing.T) {
 		t.Fatalf("steps = %+v, want %+v: turn 2 did no work", steps, want)
 	}
 }
+
+func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
+	cases := []struct {
+		name      string
+		in        string
+		forbidden []string
+		wantSub   []string
+	}{
+		{
+			name:      "json quoted secret keys",
+			in:        `{"password": "super-secret-value", "client_secret": "top-secret-client"}`,
+			forbidden: []string{"super-secret-value", "top-secret-client"},
+			wantSub:   []string{`"password": "[redacted]"`, `"client_secret": "[redacted]"`},
+		},
+		{
+			name:      "quoted multi-word secret values",
+			in:        `password="my secret phrase" and api_key='two words' and secret=unquotedSecret123`,
+			forbidden: []string{"my secret phrase", "two words", "unquotedSecret123"},
+			wantSub:   []string{`password="[redacted]"`, `api_key='[redacted]'`, `secret=[redacted]`},
+		},
+		{
+			name:      "non-http URL credentials",
+			in:        `psql postgresql://admin:my-db-pass@db.internal:5432/prod && redis-cli -u redis://default:redispass@10.0.0.1:6379 && nats pub -s nats://user:natspass@nats:4222 && mysql://root:mysqlpass@db/app`,
+			forbidden: []string{"my-db-pass", "redispass", "natspass", "mysqlpass"},
+			wantSub:   []string{"postgresql://admin:[redacted]@db.internal:5432/prod", "redis://default:[redacted]@10.0.0.1:6379", "nats://user:[redacted]@nats:4222", "mysql://root:[redacted]@db/app"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scrubInlineSecrets(tc.in)
+			for _, f := range tc.forbidden {
+				if strings.Contains(got, f) {
+					t.Fatalf("scrubInlineSecrets(%q) leaked %q in %q", tc.in, f, got)
+				}
+			}
+			for _, w := range tc.wantSub {
+				if !strings.Contains(got, w) {
+					t.Fatalf("scrubInlineSecrets(%q) = %q, missing %q", tc.in, got, w)
+				}
+			}
+		})
+	}
+
+	// Verify through API-mode activity and thinking observation as well.
+	a := newActivityState(false)
+	a.sessionID = "a2a-scrub-test"
+	var apiDel hookDelivery
+	apiBody, _ := json.Marshal(map[string]any{
+		"hook_event_name": hookPostAPIRequest,
+		"session_id":      "a2a-scrub-test",
+		"delivery_id":     "api-1",
+		"extra": map[string]any{
+			"api_call_count": 1,
+			"finish_reason":  "tool_calls",
+			"response": map[string]any{
+				"finish_reason": "tool_calls",
+				"assistant_message": map[string]any{
+					"reasoning_content": ` Connecting with {"password": "super-secret-value"} and password="my secret phrase" to postgresql://admin:my-db-pass@db.internal:5432/prod.`,
+					"tool_calls": []map[string]any{
+						{"id": "c1", "function": map[string]any{"name": "terminal", "arguments": json.RawMessage(`{"command":"psql postgresql://admin:my-db-pass@db.internal:5432/prod"}`)}},
+					},
+				},
+			},
+		},
+	})
+	if err := json.Unmarshal(apiBody, &apiDel); err != nil {
+		t.Fatal(err)
+	}
+	_, _, _, reasoning := a.observeWithThinking(apiDel)
+	for _, leaked := range []string{"super-secret-value", "my secret phrase", "my-db-pass"} {
+		if strings.Contains(reasoning, leaked) {
+			t.Fatalf("API reasoning leaked %q: %q", leaked, reasoning)
+		}
+	}
+
+	var postDel hookDelivery
+	postBody, _ := json.Marshal(map[string]any{
+		"hook_event_name": hookPostToolCall,
+		"session_id":      "a2a-scrub-test",
+		"delivery_id":     "post-1",
+		"tool_name":       "terminal",
+		"tool_input":      map[string]any{"command": `psql postgresql://admin:my-db-pass@db.internal:5432/prod -c "SET password='two words'"`},
+		"extra": map[string]any{
+			"tool_call_id": "c1",
+			"status":       "ok",
+			"result":       `{"output": "{\"password\": \"super-secret-value\", \"redis\": \"redis://default:redispass@10.0.0.1:6379\"}"}`,
+		},
+	})
+	if err := json.Unmarshal(postBody, &postDel); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok, _, _ := a.observeWithThinking(postDel)
+	if !ok {
+		t.Fatal("expected post_tool_call entry")
+	}
+	rawEntry, _ := json.Marshal(entry)
+	for _, leaked := range []string{"my-db-pass", "two words", "super-secret-value", "redispass"} {
+		if strings.Contains(string(rawEntry), leaked) {
+			t.Fatalf("API ActivityEntry leaked %q: %s", leaked, rawEntry)
+		}
+	}
+}
+
+func TestStep_BeginTurnResetsCardsFiledAndPreservesCoordinatorReasoning(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord"
+
+	// Turn 1: coordinator calls kanban_create, then finishes turn 1 with reasoning.
+	var createPost hookDelivery
+	_ = json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","session_id":"a2a-coord","delivery_id":"d1","tool_name":"kanban_create","tool_input":{"title":"Check cluster-a"},"extra":{"tool_call_id":"c1","status":"ok","result":{"id":"t_card1"}}}`), &createPost)
+	a.observeWithThinking(createPost)
+	if !a.cardsFiled.Load() {
+		t.Fatal("expected cardsFiled to be true after kanban_create")
+	}
+
+	var turn1Stop hookDelivery
+	_ = json.Unmarshal([]byte(`{"hook_event_name":"post_api_request","session_id":"a2a-coord","delivery_id":"d2","extra":{"api_call_count":2,"finish_reason":"stop","response":{"finish_reason":"stop","assistant_message":{"reasoning_content":"Dispatched card to worker; waiting for results.","content":"Card filed."}}}}`), &turn1Stop)
+	_, _, steps1, reasoning1 := a.observeWithThinking(turn1Stop)
+	if len(steps1) != 0 {
+		t.Fatalf("turn 1 synthesis step should be suppressed when cardsFiled is true, got %+v", steps1)
+	}
+	if !strings.Contains(reasoning1, "Dispatched card to worker") {
+		t.Fatalf("coordinator reasoning was discarded when cardsFiled was true: got %q", reasoning1)
+	}
+
+	// Turn 2: beginTurn resets turnCardsFiled while keeping task-wide cardsFiled intact for handoff,
+	// so a subsequent turn's synthesis step is emitted.
+	a.beginTurn()
+	if !a.cardsFiled.Load() {
+		t.Fatal("expected beginTurn to keep task-wide cardsFiled true for handoff")
+	}
+	if a.trace.turnCardsFiled {
+		t.Fatal("expected beginTurn to reset turnCardsFiled to false")
+	}
+
+	var turn2Tool hookDelivery
+	_ = json.Unmarshal([]byte(`{"hook_event_name":"post_tool_call","session_id":"a2a-coord","delivery_id":"d3","tool_name":"kubectl","tool_input":{"cmd":"get nodes"},"extra":{"tool_call_id":"c2","status":"ok"}}`), &turn2Tool)
+	a.observeWithThinking(turn2Tool)
+
+	var turn2Stop hookDelivery
+	_ = json.Unmarshal([]byte(`{"hook_event_name":"post_api_request","session_id":"a2a-coord","delivery_id":"d4","extra":{"api_call_count":2,"finish_reason":"stop","response":{"finish_reason":"stop","assistant_message":{"reasoning_content":"All nodes are Ready.","content":"Final report."}}}}`), &turn2Stop)
+	_, _, steps2, reasoning2 := a.observeWithThinking(turn2Stop)
+	if len(steps2) != 1 || !steps2[0].IsSynthesis() {
+		t.Fatalf("turn 2 synthesis step not emitted after beginTurn: %+v", steps2)
+	}
+	if !strings.Contains(reasoning2, "All nodes are Ready") {
+		t.Fatalf("turn 2 reasoning = %q", reasoning2)
+	}
+}
+
+func TestStep_ConsecutiveToolCallsWithSameTitleAndDifferentCallIDsEmitBothSteps(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-batch-key"
+
+	mkReq := func(delID, callID string, count int) hookDelivery {
+		var d hookDelivery
+		body, _ := json.Marshal(map[string]any{
+			"hook_event_name": hookPostAPIRequest,
+			"session_id":      "a2a-batch-key",
+			"delivery_id":     delID,
+			"extra": map[string]any{
+				"api_call_count": count,
+				"finish_reason":  "tool_calls",
+				"response": map[string]any{
+					"finish_reason": "tool_calls",
+					"assistant_message": map[string]any{
+						"tool_calls": []map[string]any{
+							{"id": callID, "function": map[string]any{"name": "execute_code", "arguments": json.RawMessage(`{"code":"print(1)"}`)}},
+						},
+					},
+				},
+			},
+		})
+		if err := json.Unmarshal(body, &d); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+
+	_, _, steps1, _ := a.observeWithThinking(mkReq("api-1", "call_1", 1))
+	if len(steps1) != 1 || len(steps1[0].CallIDs) != 1 || steps1[0].CallIDs[0] != "call_1" {
+		t.Fatalf("first post_api_request steps = %+v, want call_1", steps1)
+	}
+
+	_, _, steps2, _ := a.observeWithThinking(mkReq("api-2", "call_2", 2))
+	if len(steps2) != 1 || len(steps2[0].CallIDs) != 1 || steps2[0].CallIDs[0] != "call_2" {
+		t.Fatalf("second post_api_request with distinct CallID was dropped: %+v", steps2)
+	}
+
+	// A true duplicate delivery with the exact same CallID is still deduped.
+	_, _, stepsDup, _ := a.observeWithThinking(mkReq("api-2-dup", "call_2", 2))
+	if len(stepsDup) != 0 {
+		t.Fatalf("duplicate post_api_request with identical CallID was not deduped: %+v", stepsDup)
+	}
+}
+
+func TestMatchWorkerDeliveryRun_IgnoresUnrelatedBackgroundSession(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-waiting-task"
+	a.waitingCard.Store(true)
+	a.SyncKanbanCard("t_card42", "Upgrade gke-prod", "")
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-waiting"}}
+	run.act.Store(a)
+	runs := []*taskRun{run}
+
+	// An unrelated background session with no matching Cwd, card ID, or claimed session ID is not attributed.
+	unrelated := hookDelivery{
+		Event:     hookPreToolCall,
+		SessionID: "20990101_120000_bgcron",
+		Cwd:       "/home/hermes",
+		ToolName:  "terminal",
+		ToolInput: json.RawMessage(`{"command":"ls"}`),
+	}
+	if got := matchWorkerDeliveryRun(runs, unrelated); got != nil {
+		t.Fatalf("unrelated background session matched waiting run: %+v", got)
+	}
+
+	// A delivery carrying the card's workspace in Cwd matches and claims the worker session.
+	matchingCwd := hookDelivery{
+		Event:     hookPreToolCall,
+		SessionID: "20990101_120001_worker",
+		Cwd:       "/var/lib/hermes/kanban/workspaces/t_card42/repo",
+		ToolName:  "terminal",
+		ToolInput: json.RawMessage(`{"command":"kubectl get nodes"}`),
+	}
+	if got := matchWorkerDeliveryRun(runs, matchingCwd); got != run {
+		t.Fatalf("worker delivery with matching card Cwd did not match waiting run: %+v", got)
+	}
+}
+
+func TestExtractLeadingCommand_SkipsFlagArgumentsAndEnvFlags(t *testing.T) {
+	cases := []struct {
+		cmd       string
+		wantBin   string
+		wantSub   string
+		wantTitle string
+	}{
+		{
+			cmd:       "kubectl -n kube-system get pods",
+			wantBin:   "kubectl",
+			wantSub:   "get",
+			wantTitle: "Running kubectl get.",
+		},
+		{
+			cmd:       "kubectl --context prod-1 get nodes",
+			wantBin:   "kubectl",
+			wantSub:   "get",
+			wantTitle: "Running kubectl get (prod-1).",
+		},
+		{
+			cmd:       "git -C /workspace status",
+			wantBin:   "git",
+			wantSub:   "status",
+			wantTitle: "Running git status.",
+		},
+		{
+			cmd:       "helm -n monitoring list",
+			wantBin:   "helm",
+			wantSub:   "list",
+			wantTitle: "Running helm list.",
+		},
+		{
+			cmd:       "env -i kubectl get pods",
+			wantBin:   "kubectl",
+			wantSub:   "get",
+			wantTitle: "Running kubectl get.",
+		},
+		{
+			cmd:       "env -u KUBECONFIG FOO=bar kubectl -o wide apply -f manifest.yaml",
+			wantBin:   "kubectl",
+			wantSub:   "apply",
+			wantTitle: "Running kubectl apply.",
+		},
+	}
+	for _, tc := range cases {
+		bin, sub := extractLeadingCommand(tc.cmd)
+		if bin != tc.wantBin || sub != tc.wantSub {
+			t.Fatalf("extractLeadingCommand(%q) = (%q, %q), want (%q, %q)", tc.cmd, bin, sub, tc.wantBin, tc.wantSub)
+		}
+		if gotTitle := describeShellTool("terminal", map[string]any{"command": tc.cmd}); gotTitle != tc.wantTitle {
+			t.Fatalf("describeShellTool(%q) = %q, want %q", tc.cmd, gotTitle, tc.wantTitle)
+		}
+	}
+}

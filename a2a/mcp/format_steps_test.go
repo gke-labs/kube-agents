@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
@@ -290,5 +291,155 @@ func TestHandleJSONRPC_ToolsCallMetaEnablesStepStreaming(t *testing.T) {
 	}
 	if !strings.Contains(env2.Result, "Cluster is healthy.") {
 		t.Errorf("env2.Result missing final answer:\n%s", env2.Result)
+	}
+}
+
+func TestHumanizeStepTitleSubtaskStatuses(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  string
+		verdict string
+		want    string
+	}{
+		{
+			name:   "failed without verdict",
+			status: "failed",
+			want:   "Kanban Card #7 Failed: Inspect ingress controller",
+		},
+		{
+			name:    "failed with distinct verdict",
+			status:  "error",
+			verdict: "TIMEOUT",
+			want:    "Kanban Card #7 Failed (TIMEOUT): Inspect ingress controller",
+		},
+		{
+			name:   "blocked",
+			status: "blocked",
+			want:   "Kanban Card #7 Blocked: Inspect ingress controller",
+		},
+		{
+			name:   "gave_up",
+			status: "gave_up",
+			want:   "Kanban Card #7 Gave up: Inspect ingress controller",
+		},
+		{
+			name:   "canceled",
+			status: "canceled",
+			want:   "Kanban Card #7 Canceled: Inspect ingress controller",
+		},
+		{
+			name:   "cancelled",
+			status: "cancelled",
+			want:   "Kanban Card #7 Canceled: Inspect ingress controller",
+		},
+		{
+			name:   "archived",
+			status: "archived",
+			want:   "Kanban Card #7 Archived: Inspect ingress controller",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := humanizeStepTitle(StepDetail{
+				Step: stepmsg.Step{
+					Kind: stepmsg.KindSubtask,
+					Subtask: &stepmsg.Subtask{
+						ID:      "7",
+						Title:   "Inspect ingress controller",
+						Status:  tc.status,
+						Verdict: tc.verdict,
+					},
+				},
+			})
+			if got != tc.want {
+				t.Errorf("humanizeStepTitle() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTruncateInlineTextPreservesValidUTF8(t *testing.T) {
+	inputs := []string{
+		"abc—defghij",  // '—' is 3 bytes at index 3..5
+		"abcd🚀efghijk", // '🚀' is 4 bytes at index 4..7
+		"• bullet—item🚀end",
+	}
+	for _, s := range inputs {
+		for maxLen := 1; maxLen <= len(s)+2; maxLen++ {
+			got := truncateInlineText(s, maxLen)
+			if !utf8.ValidString(got) {
+				t.Errorf("truncateInlineText(%q, %d) produced invalid UTF-8: %q", s, maxLen, got)
+			}
+			if len(got) > maxLen {
+				t.Errorf("len(truncateInlineText(%q, %d)) = %d > %d (%q)", s, maxLen, len(got), maxLen, got)
+			}
+		}
+	}
+}
+
+func TestFormatTurnCustomToolEnvelopeTerminalStates(t *testing.T) {
+	ref := TaskRef{Addressee: "platform", TaskID: "t-term"}
+	details := []StepDetail{
+		{
+			Step: stepmsg.Step{
+				Schema: stepmsg.Schema,
+				Kind:   stepmsg.KindPlan,
+				Title:  "Checking control plane pods",
+			},
+			Agent: "platform",
+		},
+		{
+			Step: stepmsg.Step{
+				Schema: stepmsg.Schema,
+				Kind:   stepmsg.KindPlan,
+				Title:  "Inspecting kube-apiserver logs",
+			},
+			Agent: "platform",
+		},
+	}
+
+	cases := []struct {
+		state     lib.TaskState
+		wantTitle string
+	}{
+		{
+			state:     lib.StateFailed,
+			wantTitle: "Failed (2 steps): Inspecting kube-apiserver logs",
+		},
+		{
+			state:     lib.StateCanceled,
+			wantTitle: "Canceled (2 steps): Inspecting kube-apiserver logs",
+		},
+		{
+			state:     lib.StateRejected,
+			wantTitle: "Rejected (2 steps): Inspecting kube-apiserver logs",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(string(tc.state), func(t *testing.T) {
+			task := &lib.Task{
+				ID:    ref.TaskID,
+				State: tc.state,
+				Final: true,
+			}
+			title, _, _ := FormatTurnCustomToolEnvelope(TurnStepOutcome{
+				Outcome:           TurnOutcome{Root: ref, Task: task},
+				Token:             "mcp0123456789abcdef01234567",
+				Alias:             "default",
+				StepDetails:       details,
+				PrevReportedSteps: 2,
+				LastReportedSteps: 2,
+				Elapsed:           3 * time.Second,
+				StillRunning:      false,
+			})
+			if title != tc.wantTitle {
+				t.Errorf("title for %s = %q, want %q", tc.state, title, tc.wantTitle)
+			}
+			if strings.HasPrefix(title, "Completed") {
+				t.Errorf("title for %s should not start with Completed: %q", tc.state, title)
+			}
+		})
 	}
 }

@@ -80,6 +80,17 @@ const (
 
 	// DefaultConversation is the alias a call without one uses.
 	DefaultConversation = "default"
+
+	firstStepWaitWindow   = 6 * time.Second
+	nextStepWaitWindow    = 5 * time.Second
+	minStepBatchWait      = 600 * time.Millisecond
+	stepDebounceWait      = 350 * time.Millisecond
+	stepActivityWaitMax   = 1100 * time.Millisecond
+	stepPollWait          = 200 * time.Millisecond
+	stepPollIdleSleep     = 50 * time.Millisecond
+	delegationSettleGrace = 400 * time.Millisecond
+	delegationFollowGrace = 2 * time.Second
+	reportGatherBudget    = 5 * time.Second
 )
 
 // ConsoleInFrame is what the console door reads (gateway.ConsoleInFrame).
@@ -598,7 +609,12 @@ type taskStepState struct {
 	watchTimer        *time.Timer
 	taskWatches       map[TaskRef]*taskWatch
 	finalTasks        map[TaskRef]*lib.Task
+	failedTasks       map[TaskRef]error
 	idleTimer         *time.Timer
+}
+
+func (s *taskStepState) isUnsubmittedRootLocked(ref TaskRef) bool {
+	return ref == s.ref && s.watch == nil && s.lastReportedSteps == 0 && s.lastReportedActs == 0 && s.finalTasks[ref] == nil && s.failedTasks[ref] == nil
 }
 
 func (s *taskStepState) closeTaskWatchesLocked() {
@@ -667,6 +683,7 @@ func (c *Conversations) initTaskStepState(ref TaskRef, token, alias string, byTo
 		watch:       w,
 		taskWatches: map[TaskRef]*taskWatch{},
 		finalTasks:  map[TaskRef]*lib.Task{},
+		failedTasks: map[TaskRef]error{},
 	}
 	if w != nil {
 		st.watchTimer = time.AfterFunc(MaxTurnWait, st.closeAll)
@@ -704,6 +721,7 @@ func (c *Conversations) getOrCreateTaskStepState(ref TaskRef, w *turnWatch) *tas
 		watch:       w,
 		taskWatches: map[TaskRef]*taskWatch{},
 		finalTasks:  map[TaskRef]*lib.Task{},
+		failedTasks: map[TaskRef]error{},
 	}
 	if w != nil {
 		st.watchTimer = time.AfterFunc(MaxTurnWait, st.closeAll)
@@ -750,14 +768,14 @@ func (c *Conversations) knownTaskRef(taskID string) (TaskRef, bool) {
 	return TaskRef{}, false
 }
 
-func (c *Conversations) stopTaskStepState(token string) {
+func (c *Conversations) stopTaskStepState(token string, refs ...TaskRef) {
 	if c == nil || token == "" {
 		return
 	}
 	c.mu.Lock()
 	var toClose []*taskStepState
 	for k, st := range c.steps {
-		if st != nil && st.token == token {
+		if st != nil && st.token == token && (len(refs) == 0 || slices.Contains(refs, st.ref)) {
 			toClose = append(toClose, st)
 			delete(c.steps, k)
 		}
@@ -766,6 +784,41 @@ func (c *Conversations) stopTaskStepState(token string) {
 	for _, st := range toClose {
 		st.closeAll()
 	}
+}
+
+func (c *Conversations) deleteTaskStepState(ref TaskRef, st *taskStepState) {
+	if c == nil || ref.TaskID == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.steps[ref.TaskID] == st {
+		delete(c.steps, ref.TaskID)
+	}
+	c.mu.Unlock()
+}
+
+func (c *Conversations) activeStepFollowedTasks(token string, ref TaskRef) []TaskRef {
+	if c == nil || token == "" {
+		return nil
+	}
+	c.mu.Lock()
+	var candidates []*taskStepState
+	for _, st := range c.steps {
+		if st != nil && st.token == token && st.ref == ref {
+			candidates = append(candidates, st)
+		}
+	}
+	c.mu.Unlock()
+	var out []TaskRef
+	for _, st := range candidates {
+		st.mu.Lock()
+		w := st.watch
+		st.mu.Unlock()
+		if w != nil {
+			out = append(out, w.followedTasks()...)
+		}
+	}
+	return out
 }
 
 func (c *Conversations) closeTaskStepState(ref TaskRef) {
@@ -1147,17 +1200,17 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 		t, err := b.waitForSubmittedTask(ctx, ref, time.Until(deadlineOf(ctx)))
 		switch {
 		case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final:
+			if t != nil && delegated(t) {
+				for _, fRef := range convs.activeStepFollowedTasks(token, ref) {
+					if err := b.awaitSingleTask(ctx, convs, token, fRef); err != nil {
+						return err
+					}
+				}
+			}
 			convs.clearRunning(token, ref)
-			if stepRef, active := convs.hasActiveStepState(token); active {
-				if stepRef != ref {
-					continue
-				}
-				select {
-				case <-time.After(stepPollIdleSleep):
-					continue
-				case <-ctx.Done():
-					return convs.busy(token, ctx.Err())
-				}
+			convs.stopTaskStepState(token, ref)
+			if _, active := convs.hasActiveStepState(token); active {
+				continue
 			}
 			return nil
 		case tooLargeToRead(err):
@@ -1165,6 +1218,7 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 			// on either. Holding the conversation for it would refuse every
 			// later message, so let this one go.
 			convs.clearRunning(token, ref)
+			convs.stopTaskStepState(token, ref)
 			return nil
 		case ctx.Err() != nil:
 			return convs.busy(token, ctx.Err())
@@ -1174,6 +1228,22 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 		case err != nil:
 			return fmt.Errorf("reading the conversation's running task %s: %w", ref, err)
 		}
+		return convs.busy(token, context.DeadlineExceeded)
+	}
+}
+
+func (b *NATSBus) awaitSingleTask(ctx context.Context, convs *Conversations, token string, ref TaskRef) error {
+	t, err := b.waitForSubmittedTask(ctx, ref, time.Until(deadlineOf(ctx)))
+	switch {
+	case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final, tooLargeToRead(err):
+		return nil
+	case ctx.Err() != nil:
+		return convs.busy(token, ctx.Err())
+	case errors.Is(err, context.DeadlineExceeded):
+		return convs.busy(token, err)
+	case err != nil:
+		return fmt.Errorf("reading the conversation's running task %s: %w", ref, err)
+	default:
 		return convs.busy(token, context.DeadlineExceeded)
 	}
 }
@@ -1454,19 +1524,6 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 	return out, nil
 }
 
-const (
-	firstStepWaitWindow   = 6 * time.Second
-	nextStepWaitWindow    = 5 * time.Second
-	minStepBatchWait      = 600 * time.Millisecond
-	stepDebounceWait      = 350 * time.Millisecond
-	stepActivityWaitMax   = 1100 * time.Millisecond
-	stepPollWait          = 200 * time.Millisecond
-	stepPollIdleSleep     = 50 * time.Millisecond
-	delegationSettleGrace = 400 * time.Millisecond
-	delegationFollowGrace = 2 * time.Second
-	reportGatherBudget    = 5 * time.Second
-)
-
 // WaitForTurnStep advances a streaming turn by one or more live steps (or waits
 // up to a short step window for the next step or task completion) and returns a
 // TurnStepOutcome suitable for FormatTurnCustomToolEnvelope.
@@ -1514,9 +1571,13 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 			waitedOnBus bool
 			err         error
 		)
+		unsubmittedRoot := st.isUnsubmittedRootLocked(root)
 		out, chainSettled, waitedOnBus, err = b.pollTurnStepSnapshotLocked(stepCtx, convs, st, &settledDelegationsAt)
-		if err != nil && !errors.Is(err, ErrTaskNotFound) && stepCtx.Err() == nil {
+		if err != nil && (unsubmittedRoot || (!errors.Is(err, ErrTaskNotFound) && stepCtx.Err() == nil)) {
 			st.closeAllLocked()
+			if unsubmittedRoot {
+				convs.deleteTaskStepState(root, st)
+			}
 			return TurnStepOutcome{}, err
 		}
 		details, totalActs = CollectTurnStepDetails(out)
@@ -1639,9 +1700,10 @@ func stepReadyForDisplay(d StepDetail) bool {
 func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Conversations, st *taskStepState, settledAt *time.Time) (TurnOutcome, bool, bool, error) {
 	root := st.ref
 	out := TurnOutcome{Root: root}
+	unsubmittedRoot := st.isUnsubmittedRootLocked(root)
 
 	t, waitedRoot, err := b.pollSingleTaskLocked(ctx, st, root)
-	if err != nil && !errors.Is(err, ErrTaskNotFound) {
+	if err != nil && (!errors.Is(err, ErrTaskNotFound) || unsubmittedRoot) {
 		return out, false, waitedRoot, err
 	}
 	out.Task = t
@@ -1674,7 +1736,11 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 			waitedAny = true
 		}
 		out.Followed = append(out.Followed, FollowedTask{Ref: fRef, Task: ft, Err: ferr})
-		if ferr != nil && !errors.Is(ferr, ErrTaskNotFound) && !tooLargeToRead(ferr) {
+		if tooLargeToRead(ferr) {
+			st.failedTasks[fRef] = ferr
+			continue
+		}
+		if ferr != nil {
 			allFollowedFinal = false
 			continue
 		}
@@ -1705,6 +1771,10 @@ func (b *NATSBus) pollSingleTaskLocked(ctx context.Context, st *taskStepState, r
 	if ft, ok := st.finalTasks[ref]; ok && ft != nil {
 		return ft, false, nil
 	}
+	if fErr, ok := st.failedTasks[ref]; ok && fErr != nil {
+		return nil, false, fErr
+	}
+	unsubmittedRoot := st.isUnsubmittedRootLocked(ref)
 	tw, ok := st.taskWatches[ref]
 	if !ok || tw == nil {
 		var err error
@@ -1713,6 +1783,11 @@ func (b *NATSBus) pollSingleTaskLocked(ctx context.Context, st *taskStepState, r
 			return nil, false, err
 		}
 		st.taskWatches[ref] = tw
+	}
+	if tw.pending == 0 && len(tw.events) == 0 && unsubmittedRoot {
+		tw.close()
+		delete(st.taskWatches, ref)
+		return nil, false, ErrTaskNotFound
 	}
 
 	waited := false
@@ -1724,8 +1799,16 @@ func (b *NATSBus) pollSingleTaskLocked(ctx context.Context, st *taskStepState, r
 			}
 			tw.close()
 			delete(st.taskWatches, ref)
+			if tooLargeToRead(err) {
+				st.failedTasks[ref] = err
+			}
 			return nil, waited, err
 		}
+	}
+	if unsubmittedRoot && len(tw.events) == 0 {
+		tw.close()
+		delete(st.taskWatches, ref)
+		return nil, waited, ErrTaskNotFound
 	}
 
 	var t *lib.Task
@@ -1744,9 +1827,8 @@ func (b *NATSBus) pollSingleTaskLocked(ctx context.Context, st *taskStepState, r
 		if err := tw.nextWait(ctx, stepPollWait); err != nil && ctx.Err() == nil {
 			tw.close()
 			delete(st.taskWatches, ref)
-			if len(tw.events) > 0 {
-				folded, foldErr := tw.fold()
-				return folded, waited, foldErr
+			if tooLargeToRead(err) {
+				st.failedTasks[ref] = err
 			}
 			return nil, waited, err
 		}
@@ -1808,7 +1890,7 @@ func synthesizeWaitStepTitle(out TurnOutcome, details []StepDetail, elapsed time
 	}
 	if activeTask != nil {
 		if p := artifactText(activeTask, lib.ArtifactProgress); p != "" {
-			line := truncateInlineText(collapseInlineWhitespace(lastLine(p)), 84)
+			line := truncateInlineText(collapseInlineWhitespace(lastLine(p)), maxWaitProgressLen)
 			if line != "" && line != lastTitle {
 				return line
 			}
@@ -1824,7 +1906,7 @@ func synthesizeWaitStepTitle(out TurnOutcome, details []StepDetail, elapsed time
 	}
 	agent := strings.TrimSpace(activeRef.Addressee)
 	if agent == "" {
-		agent = "platform"
+		agent = defaultStepAgent
 	}
 	return fmt.Sprintf("Waiting for @%s response (elapsed %s)", agent, elapsed.Round(time.Second))
 }

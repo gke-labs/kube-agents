@@ -2,13 +2,21 @@ package hermesbridge
 
 import (
 	"context"
-	"os"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	lib "github.com/gke-labs/kube-agents/a2a/lib"
 )
 
 // kanbanFixtureDB builds a Hermes-shaped kanban.db (tasks, task_runs, task_events) with
@@ -119,56 +127,373 @@ func TestKanbanDBScript_PollReadsCardsRunsAndEvents(t *testing.T) {
 	}
 }
 
-func TestKanbanDBScript_CancelSettlesOpenCardsAndSignalsWorkspaces(t *testing.T) {
-	since := time.Now().Unix() - 3600
+func TestCancelSessionCards_CallsSessionKVCardStopEndpoint(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		gotPath  string
+		gotAuth  string
+		gotReq   cardStopRequest
+		calledCh = make(chan struct{}, 1)
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		mu.Unlock()
+		select {
+		case calledCh <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"session_id":"a2a-ctx-1","stopped":[{"id":"t_running","title":"Check","prior_status":"running"}]}`))
+	}))
+	defer srv.Close()
+
+	b := &Bridge{
+		cfg: Config{
+			RouteURL:        srv.URL,
+			RouteKey:        "session-kv-token",
+			CardStopTimeout: 5 * time.Second,
+		},
+		routeClient: srv.Client(),
+	}
+	b.rememberRoute("a2a-ctx-1", conversationRoute{
+		Platform:     lib.NotifyPlatformConsole,
+		Conversation: "console:conv-1",
+		ContextID:    "ctx-1",
+	})
+
+	b.markSessionCanceled("a2a-ctx-1")
+	if !b.isSessionCanceled("a2a-ctx-1") {
+		t.Fatal("isSessionCanceled(a2a-ctx-1) = false, want true")
+	}
+
+	select {
+	case <-calledCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for session-kv /cards/stop call")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotPath != "/v1/sessions/a2a-ctx-1/cards/stop" {
+		t.Errorf("card stop path = %q, want /v1/sessions/a2a-ctx-1/cards/stop", gotPath)
+	}
+	if gotAuth != "Bearer session-kv-token" {
+		t.Errorf("Authorization = %q, want Bearer session-kv-token", gotAuth)
+	}
+	if gotReq.ContextID != "ctx-1" || gotReq.Conversation != "console:conv-1" {
+		t.Errorf("cardStopRequest = %+v, want ContextID=ctx-1 Conversation=console:conv-1", gotReq)
+	}
+}
+
+func TestCancelQueuedTask_DoesNotCancelActiveSessionOrStopCards(t *testing.T) {
+	_, url := startServer(t)
+	var stopCalls atomic.Int32
+	routeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/cards/stop") {
+			stopCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer routeSrv.Close()
+
+	stub := newAPIStub(t, nil)
+	b := startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.RouteURL = routeSrv.URL
+		cfg.RouteKey = "route-key"
+	})
+
+	sessionID := "a2a-ctx-cwait-cards"
+	release := b.turns.acquire(context.Background(), sessionID)
+	if release == nil {
+		t.Fatal("could not acquire session turn")
+	}
+	t.Cleanup(release)
+	b.beginKanbanWait(sessionID)
+	defer b.endKanbanWait(sessionID)
+
+	c := gatewayClient(t, url)
+	origin := submitIn(t, c, "task-queued-cancel", "ctx-cwait-cards", "second")
+	waitFor(t, 10*time.Second, "the second task queued on the session turn", func() bool {
+		b.turns.mu.Lock()
+		defer b.turns.mu.Unlock()
+		slot, ok := b.turns.slots[sessionID]
+		return ok && slot.refs == 2
+	})
+
+	publishCancel(t, c, origin)
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCanceled {
+		t.Fatalf("queued task state = %s, want canceled", task.State)
+	}
+	if b.isSessionCanceled(sessionID) {
+		t.Fatal("canceling a queued task waiting for the session turn must not mark the active session canceled")
+	}
+	if !b.hasActiveKanbanWait(sessionID) {
+		t.Fatal("active task's kanban wait should still be active")
+	}
+	if got := stopCalls.Load(); got != 0 {
+		t.Fatalf("session-kv /cards/stop calls = %d, want 0", got)
+	}
+}
+
+func TestCancelActiveKanbanWait_MarksSessionCanceledBeforeWaitEnds(t *testing.T) {
+	since := time.Now().Unix() - 60
 	db := kanbanFixtureDB(t, since)
-	ctx := context.Background()
+	t.Setenv(hermesKanbanDBEnv, db)
 
-	// A recording stand-in for pkill, so the test asserts which workspaces the cancel signals
-	// without signaling anything on this machine.
-	binDir := t.TempDir()
-	log := filepath.Join(binDir, "pkill.log")
-	stub := "#!/bin/sh\necho \"$@\" >> " + log + "\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(binDir, "pkill"), []byte(stub), 0o755); err != nil {
-		t.Fatal(err)
+	_, url := startServer(t)
+	stub := newAPIStub(t, nil)
+	b := startAPIBridge(t, url, stub, nil)
+
+	sessionID := "a2a-ctx-1"
+	taskCtx, cancelTask := context.WithCancel(context.Background())
+	run := &taskRun{
+		origin: &lib.Envelope{TaskID: "task-active-cancel", ContextID: "ctx-1", CorrelationID: "corr-active-cancel"},
+		state:  stateRunning,
 	}
-	cmd := exec.CommandContext(ctx, "python3", "-c", kanbanDBPyScript, "cancel", db, "a2a-ctx-1")
-	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("cancel script: %v\n%s", err, out)
+	act := newSessionActivityState(sessionID, false)
+
+	waitDone := make(chan struct{})
+	go func() {
+		defer close(waitDone)
+		b.waitForKanbanCards(run, taskCtx, act, sessionID, since, 1, "working")
+	}()
+
+	waitFor(t, 5*time.Second, "waitForKanbanCards to enter active wait", func() bool {
+		return b.hasActiveKanbanWait(sessionID)
+	})
+
+	var sawUncanceledAfterWaitEnded atomic.Bool
+	observerStop := make(chan struct{})
+	observerDone := make(chan struct{})
+	go func() {
+		defer close(observerDone)
+		for {
+			select {
+			case <-observerStop:
+				return
+			default:
+				if !b.hasActiveKanbanWait(sessionID) && !b.isSessionCanceled(sessionID) {
+					sawUncanceledAfterWaitEnded.Store(true)
+					return
+				}
+			}
+		}
+	}()
+
+	run.canceled.Store(true)
+	cancelTask()
+
+	select {
+	case <-waitDone:
+	case <-time.After(5 * time.Second):
+		close(observerStop)
+		t.Fatal("waitForKanbanCards did not exit after cancel")
+	}
+	close(observerStop)
+	<-observerDone
+
+	if sawUncanceledAfterWaitEnded.Load() {
+		t.Fatal("observed a window where hasActiveKanbanWait was false before isSessionCanceled became true")
 	}
 
-	rows, err := querySessionKanbanCards(ctx, "python3", db, "a2a-ctx-1", since-1000, []string{"t_child"})
-	if err != nil {
-		t.Fatal(err)
+	if b.hasActiveKanbanWait(sessionID) {
+		t.Fatal("hasActiveKanbanWait(a2a-ctx-1) = true after waitForKanbanCards returned, want false")
 	}
-	got := kanbanRowsByID(rows)
-	for _, id := range []string{"t_running", "t_blocked"} {
-		if got[id].Status != "canceled" || got[id].Err != "Canceled by user (A2A task stopped)" {
-			t.Errorf("%s after cancel = status %q err %q; want canceled with the user-facing reason", id, got[id].Status, got[id].Err)
+	if !b.isSessionCanceled(sessionID) {
+		t.Fatal("isSessionCanceled(a2a-ctx-1) = false when active wait ended, want true")
+	}
+	if _, ok := b.shouldDeliverOutOfTurnKanbanCard("t_done", sessionID); ok {
+		t.Fatal("shouldDeliverOutOfTurnKanbanCard returned true for a canceled session")
+	}
+}
+
+func TestOutOfTurnWatcher_LazyDBCreationAndSlidingWindow(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	prevInterval := outOfTurnPollInterval
+	outOfTurnPollInterval = 25 * time.Millisecond
+	t.Cleanup(func() { outOfTurnPollInterval = prevInterval })
+
+	lazyDir := t.TempDir()
+	lazyDB := filepath.Join(lazyDir, "kanban.db")
+	t.Setenv(hermesKanbanDBEnv, lazyDB)
+
+	b := &Bridge{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go b.watchOutOfTurnKanbanCards(ctx)
+
+	// Give the watcher a couple ticks while kanban.db does not exist yet.
+	time.Sleep(70 * time.Millisecond)
+
+	// Now create kanban.db lazily with a settled card in the active window.
+	now := time.Now().Unix()
+	srcDB := kanbanFixtureDB(t, now-10)
+	if out, err := exec.Command("cp", srcDB, lazyDB).CombinedOutput(); err != nil {
+		t.Fatalf("copying fixture db to lazy path: %v\n%s", err, out)
+	}
+
+	waitFor(t, 5*time.Second, "watcher to pick up lazily created kanban.db and deliver t_done", func() bool {
+		return b.isKanbanCardDelivered("t_done")
+	})
+}
+
+func TestOutOfTurnWatcher_DeliveredIDsBoundedEvictionDoesNotReplayRecentCards(t *testing.T) {
+	b := &Bridge{}
+	baseNow := time.Now()
+	prevNow := kanbanNow
+	var offsetSecs atomic.Int64
+	kanbanNow = func() time.Time {
+		return baseNow.Add(time.Duration(offsetSecs.Load()) * time.Second)
+	}
+	t.Cleanup(func() { kanbanNow = prevNow })
+
+	// Record an expired card (older than 2*kanbanOutOfTurnWindowSecs) and a set of recent cards.
+	offsetSecs.Store(-int64(kanbanTrackedRetentionSecs + 100))
+	b.markKanbanCardDelivered("t_expired")
+
+	offsetSecs.Store(0)
+	for i := 0; i < maxTrackedKanbanEntries+100; i++ {
+		offsetSecs.Add(1)
+		b.markKanbanCardDelivered(fmt.Sprintf("t_card_%04d", i))
+	}
+
+	if b.isKanbanCardDelivered("t_expired") {
+		t.Errorf("t_expired should have been evicted past retention window")
+	}
+	// The oldest cards beyond maxTrackedKanbanEntries were evicted one-by-one,
+	// while the most recent maxTrackedKanbanEntries cards remain delivered.
+	if b.isKanbanCardDelivered("t_card_0000") {
+		t.Errorf("oldest card t_card_0000 should have been evicted when exceeding maxTrackedKanbanEntries")
+	}
+	for i := 100; i < maxTrackedKanbanEntries+100; i++ {
+		id := fmt.Sprintf("t_card_%04d", i)
+		if !b.isKanbanCardDelivered(id) {
+			t.Fatalf("recent card %s was forgotten after exceeding maxTrackedKanbanEntries", id)
+		}
+		if _, ok := b.shouldDeliverOutOfTurnKanbanCard(id, "a2a-ctx-1"); ok {
+			t.Fatalf("recent card %s was re-delivered after exceeding maxTrackedKanbanEntries", id)
 		}
 	}
-	for _, id := range []string{"t_done", "t_failed", "t_old"} {
-		if got[id].Status == "canceled" {
-			t.Errorf("%s was already settled and must not be re-marked canceled", id)
+}
+
+func TestSynthesizeCardAnswer_CapsPromptOnUTF8Boundary(t *testing.T) {
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
+		writeCompletion(w, c.sessionID, "synthesized fleet summary")
+	})
+	b := &Bridge{
+		cfg: Config{
+			APIURL:   stub.srv.URL + "/v1/chat/completions",
+			APIKey:   testAPIKey,
+			APIModel: DefaultAPIModel,
+		},
+		apiClient: stub.srv.Client(),
+	}
+	run := &taskRun{
+		origin: &lib.Envelope{TaskID: "task-synth-cap", ContextID: "ctx-synth"},
+		state:  stateRunning,
+	}
+
+	// Build multi-byte UTF-8 card outputs ("🔥" is 4 bytes) exceeding cardSynthesisInputCap.
+	hugeChunk := strings.Repeat("集群状态正常🔥", (cardSynthesisInputCap/10)+500)
+	cards := []kanbanCardRow{
+		{ID: "t_1", Title: "Cluster 1", Status: "done", Result: hugeChunk},
+		{ID: "t_2", Title: "Cluster 2", Status: "done", Result: hugeChunk},
+	}
+	parts := []string{hugeChunk, hugeChunk}
+
+	got := b.synthesizeCardAnswer(run, context.Background(), "a2a-ctx-synth", 1, "ack", cards, parts)
+	if got != "synthesized fleet summary" {
+		t.Fatalf("synthesizeCardAnswer = %q, want synthesized fleet summary", got)
+	}
+	calls := stub.seen()
+	if len(calls) != 1 {
+		t.Fatalf("apiSynthesisTurn calls = %d, want 1", len(calls))
+	}
+	prompt := calls[0].prompt
+	if len(prompt) > cardSynthesisInputCap {
+		t.Errorf("synthesis prompt length = %d, want <= %d (cardSynthesisInputCap)", len(prompt), cardSynthesisInputCap)
+	}
+	if !utf8.ValidString(prompt) {
+		t.Errorf("synthesis prompt is not valid UTF-8 after truncation")
+	}
+	if !strings.HasSuffix(prompt, cardSynthesisTruncationNote) {
+		t.Errorf("synthesis prompt missing truncation note suffix")
+	}
+}
+
+func TestSynthesizeCardAnswer_CancelStopsHermesTurn(t *testing.T) {
+	reqArrived := make(chan struct{})
+	stopCalled := make(chan string, 1)
+	stub := newAPIStub(t, func(w http.ResponseWriter, r *http.Request, c apiCall) {
+		close(reqArrived)
+		<-r.Context().Done()
+	})
+	stub.stop = func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case stopCalled <- r.URL.Path:
+		default:
 		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"turns":1,"interrupted":1,"ended":true}`))
 	}
-	// The child card of a canceled card is canceled too, even though a worker session owns it.
-	wild, err := querySessionKanbanCards(ctx, "python3", db, "*", since-1000, nil)
-	if err != nil {
-		t.Fatal(err)
+
+	b := &Bridge{
+		cfg: Config{
+			APIURL:   stub.srv.URL + "/v1/chat/completions",
+			APIKey:   testAPIKey,
+			APIModel: DefaultAPIModel,
+		},
+		apiClient: stub.srv.Client(),
 	}
-	all := kanbanRowsByID(wild)
-	if other := all["t_other"]; other.Status != "done" {
-		t.Errorf("another session's card was touched by the cancel: %+v", other)
+	run := &taskRun{
+		origin: &lib.Envelope{TaskID: "task-synth-cancel", ContextID: "ctx-synth-cancel"},
+		state:  stateRunning,
 	}
-	signaled, _ := os.ReadFile(log)
-	for _, id := range []string{"t_running", "t_blocked", "t_child"} {
-		if !strings.Contains(string(signaled), "/kanban/workspaces/"+id) {
-			t.Errorf("cancel did not signal the workspace of %s; pkill calls:\n%s", id, signaled)
+	taskCtx, cancelTask := context.WithCancel(context.Background())
+
+	cards := []kanbanCardRow{
+		{ID: "t_1", Title: "Cluster 1", Status: "done", Result: "Nodes Ready"},
+		{ID: "t_2", Title: "Cluster 2", Status: "done", Result: "Pods Healthy"},
+	}
+	parts := []string{"Nodes Ready", "Pods Healthy"}
+
+	done := make(chan string, 1)
+	go func() {
+		done <- b.synthesizeCardAnswer(run, taskCtx, "a2a-ctx-synth-cancel", 1, "ack", cards, parts)
+	}()
+
+	select {
+	case <-reqArrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for synthesis request to reach API server")
+	}
+
+	run.canceled.Store(true)
+	cancelTask()
+
+	select {
+	case stopPath := <-stopCalled:
+		wantPath := "/v1/kube-agents/sessions/a2a-ctx-synth-cancel/stop"
+		if stopPath != wantPath {
+			t.Errorf("turn stop path = %q, want %q", stopPath, wantPath)
 		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for turn-stop endpoint to be called after synthesis cancel")
 	}
-	if strings.Contains(string(signaled), "/kanban/workspaces/t_done") {
-		t.Errorf("cancel signaled a settled card's workspace; pkill calls:\n%s", signaled)
+
+	select {
+	case fallback := <-done:
+		if !utf8.ValidString(fallback) {
+			t.Errorf("fallback answer is not valid UTF-8")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("synthesizeCardAnswer did not return after cancel")
 	}
 }

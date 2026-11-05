@@ -1053,3 +1053,132 @@ func TestAnUnreadRootIsUnfinished(t *testing.T) {
 		t.Errorf("Unfinished() = %v, want the root", got)
 	}
 }
+
+// Streaming task_control get on an unknown <addressee>/<task-id> fails
+// immediately with ErrTaskNotFound rather than spinning for 6s and returning
+// STREAMING_STEP_CONTINUE, and leaves no taskStepState in convs.steps.
+func TestWaitingOnAnUnknownTaskWithStreamStepsEndsAtOnce(t *testing.T) {
+	url, _ := testBus(t)
+	b := dial(t, url)
+	convs := NewConversations()
+	s := mustServer(t, TaskControlTool(b, convs))
+
+	start := time.Now()
+	res := callTool(t, s, ToolTaskControl, map[string]any{
+		"action":       "get",
+		"task_id":      "platform/task-does-not-exist",
+		"stream_steps": true,
+	})
+	elapsed := time.Since(start)
+	if !res.IsError {
+		t.Fatalf("expected error on unknown task, got: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, ErrTaskNotFound.Error())
+	mustNotContain(t, res.Content[0].Text, StreamingStepContinuePrefix)
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("streaming task_control get on unknown task took %s, want < 500ms", elapsed)
+	}
+	convs.mu.Lock()
+	stepsCount := len(convs.steps)
+	convs.mu.Unlock()
+	if stepsCount != 0 {
+		t.Errorf("len(convs.steps) = %d, want 0", stepsCount)
+	}
+}
+
+// When a streamed turn finishes on the bus before the caller polls its
+// terminal step with task_control get, the next send_message on the same
+// conversation clears the active step state cleanly without busy-polling or
+// exhausting maxTaskReaders.
+func TestAwaitRunningTurnClearsFinishedStreamedTurn(t *testing.T) {
+	url, js := testBus(t)
+	runFakeGateway(t, url, js, gatewayScenario{
+		root: func(turn int32) (string, bool) {
+			return fmt.Sprintf("task-root%d", turn), turn > 1
+		},
+	})
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	s := mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs))
+
+	res1 := callTool(t, s, ToolSendMessage, map[string]any{
+		"text":         "first streamed turn",
+		"wait_seconds": 1,
+		"stream_steps": true,
+	})
+	if res1.IsError {
+		t.Fatalf("first send_message failed: %s", res1.Content[0].Text)
+	}
+	mustContain(t, res1.Content[0].Text, StreamingStepContinuePrefix)
+
+	// Finish the first task on the bus without calling task_control get.
+	publishResult(t, js, fakeAddressee, "task-root1", answerText)
+	publishStatus(t, js, fakeAddressee, "task-root1", lib.StateCompleted, true)
+
+	// Immediately send a second message on the same conversation.
+	res2 := callTool(t, s, ToolSendMessage, map[string]any{
+		"text":         "second turn after finish",
+		"wait_seconds": 5,
+	})
+	if res2.IsError {
+		t.Fatalf("second send_message failed: %s", res2.Content[0].Text)
+	}
+	mustContain(t, res2.Content[0].Text, fakeAddressee+"/task-root2", answerText)
+}
+
+// During step streaming, a followed child task that exceeds readMaxBytes
+// caches its tooLargeToRead error without re-opening consumers on subsequent
+// polls and settles the chain cleanly.
+func TestStreamingStepsFollowedTaskTooLargeToReadIsReadOnceAndSettles(t *testing.T) {
+	url, js := bigBus(t)
+	runFakeGateway(t, url, js, gatewayScenario{delegate: true, bigChild: true})
+	var reads atomic.Int32
+	sub, err := js.Conn().Subscribe("$JS.API.CONSUMER.CREATE.>", func(m *nats.Msg) {
+		if strings.Contains(string(m.Data), "task-deleg1") {
+			reads.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	s := mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs))
+
+	res := callTool(t, s, ToolSendMessage, map[string]any{
+		"text":         "delegate check the rollout",
+		"wait_seconds": 10,
+		"stream_steps": true,
+	})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	var env CustomToolResultEnvelope
+	if err := json.Unmarshal([]byte(res.Content[0].Text), &env); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if strings.HasPrefix(env.Result, StreamingStepContinuePrefix) {
+		// If the first step returned before the child settled, one follow-up poll settles it.
+		res2 := callTool(t, s, ToolTaskControl, map[string]any{
+			"action":       "get",
+			"task_id":      "platform/task-root1",
+			"wait_seconds": 10,
+			"stream_steps": true,
+		})
+		if res2.IsError {
+			t.Fatalf("task_control get failed: %s", res2.Content[0].Text)
+		}
+		if err := json.Unmarshal([]byte(res2.Content[0].Text), &env); err != nil {
+			t.Fatalf("unmarshal envelope 2: %v", err)
+		}
+	}
+	if strings.HasPrefix(env.Result, StreamingStepContinuePrefix) {
+		t.Fatalf("expected chain to settle, got still-running result:\n%s", env.Result)
+	}
+	mustContain(t, env.Result, "cluster-a/task-deleg1", "not read")
+	if n := reads.Load(); n != 1 {
+		t.Errorf("read the over-budget child task %d times during step streaming; want once", n)
+	}
+}

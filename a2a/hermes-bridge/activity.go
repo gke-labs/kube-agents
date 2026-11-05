@@ -224,6 +224,7 @@ const (
 //     patterns (scrubInlineSecrets) and non-schema/token-shaped keys
 //     (scrubValueDetailed) so interactive console clients can render step
 //     cards without exposing tokens, headers, or URL credentials.
+//
 // activityEntryBudget bounds the parts one task publishes on its trace and
 // its heartbeat together. Both ride the task's own events subject, which
 // the TASKS stream caps at 4096 messages per subject with discard-old, so a
@@ -499,6 +500,7 @@ type activityState struct {
 	// marked (cardsMark in bridge.go).
 	cardsFiled  atomic.Bool
 	waitingCard atomic.Bool
+	waitInTurn  atomic.Bool
 
 	// traced says a delivery can reach this task at all: the door is open
 	// and the task has a key, or, on the API executor, the shared secret
@@ -553,6 +555,7 @@ func newActivityState(withKey bool) *activityState {
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+	a.waitInTurn.Store(true)
 	if withKey {
 		raw := make([]byte, activityKeyBytes)
 		// crypto/rand.Read does not fail (it crashes the program if the
@@ -684,9 +687,13 @@ func (a *activityState) observeWithThinking(d hookDelivery) (ActivityEntry, bool
 		if _, seen := a.open[id]; !seen {
 			a.openOrder = append(a.openOrder, id)
 		}
+		var input json.RawMessage
+		if a.sessionID == "" {
+			input = redactInput(d.ToolName, d.ToolInput)
+		}
 		entry := ActivityEntry{
 			Tool:   capRunes(d.ToolName, activityToolNameCap),
-			Input:  redactInput(d.ToolName, d.ToolInput),
+			Input:  input,
 			CallID: capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			At:     capRunes(d.Timestamp, activityWordCap),
 		}
@@ -702,9 +709,13 @@ func (a *activityState) observeWithThinking(d hookDelivery) (ActivityEntry, bool
 		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
 			a.cardsFiled.Store(true)
 		}
+		var input json.RawMessage
+		if a.sessionID == "" {
+			input = redactInput(d.ToolName, d.ToolInput)
+		}
 		e := ActivityEntry{
 			Tool:       capRunes(d.ToolName, activityToolNameCap),
-			Input:      redactInput(d.ToolName, d.ToolInput),
+			Input:      input,
 			CallID:     capRunes(d.Extra.ToolCallID, activityCallIDCap),
 			Status:     status,
 			DurationMs: durationMillis(d.Extra.DurationMs),
@@ -885,7 +896,7 @@ func redactInput(tool string, raw json.RawMessage) json.RawMessage {
 		return out
 	}
 	if tool == hermesToolCallWrapper {
-		if capped, ok := capWrapperCalls(red); ok {
+		if capped, ok := capWrapperCalls(red, activityInputCap); ok {
 			return capped
 		}
 	}
@@ -909,7 +920,7 @@ func truncatedStandIn(out []byte, headLen int) map[string]any {
 // small calls still keeps its names. False when the wrapper still does not
 // fit, or when the input is not the wrapper's shape, and the caller falls
 // back to the whole stand-in.
-func capWrapperCalls(red any) (json.RawMessage, bool) {
+func capWrapperCalls(red any, maxBytes int) (json.RawMessage, bool) {
 	m, ok := red.(map[string]any)
 	if !ok {
 		return nil, false
@@ -948,7 +959,7 @@ func capWrapperCalls(red any) (json.RawMessage, bool) {
 		if err != nil {
 			return nil, false
 		}
-		if len(out) <= activityInputCap {
+		if len(out) <= maxBytes {
 			return out, true
 		}
 	}

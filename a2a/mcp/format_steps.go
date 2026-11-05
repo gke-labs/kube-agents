@@ -6,14 +6,38 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
-// StreamingStepContinuePrefix is the prefix placed at the start of a tool result
-// when a task is still running and more steps remain to be streamed.
-const StreamingStepContinuePrefix = "STREAMING_STEP_CONTINUE: "
+const (
+	// StreamingStepContinuePrefix is the prefix placed at the start of a tool result
+	// when a task is still running and more steps remain to be streamed.
+	StreamingStepContinuePrefix = "STREAMING_STEP_CONTINUE: "
+
+	defaultStepAgent    = "platform"
+	defaultThoughtTitle = "Thinking"
+	defaultStepTitle    = "Working on cluster task"
+	silentTurnMarker    = "[SILENT]"
+	emptyVerdictCell    = "—"
+	ellipsisText        = "..."
+	ellipsisLen         = len(ellipsisText)
+	chatAgentPrefix     = "chat-"
+	sessionAgentPrefix  = "s-"
+
+	maxThoughtSentenceLen = 90
+	maxThoughtTitleLen    = 80
+	maxCardTitleLen       = 72
+	maxStepTitleLen       = 96
+	maxActivityCmdLen     = 180
+	maxActivityDetailLen  = 200
+	maxActivityErrLen     = 140
+	maxAnswerPreviewLen   = 400
+	maxWaitProgressLen    = 88
+	maxTableCardTitleLen  = 60
+)
 
 var (
 	inlineWhitespaceRe = regexp.MustCompile(`\s+`)
@@ -80,12 +104,6 @@ type TurnStepOutcome struct {
 	Elapsed           time.Duration
 	StillRunning      bool
 	WaitStepTitle     string
-}
-
-type delegateRecord struct {
-	Target string
-	TaskID string
-	Prompt string
 }
 
 // CustomToolResultEnvelope is the JSON payload returned to MCP hosts that
@@ -166,37 +184,6 @@ func taskThinkingFromTask(t *lib.Task) []string {
 	return out
 }
 
-func taskDelegatesFromTask(t *lib.Task) []delegateRecord {
-	if t == nil {
-		return nil
-	}
-	art := t.Artifact(lib.ArtifactDelegate)
-	if art == nil {
-		return nil
-	}
-	var out []delegateRecord
-	for _, p := range art.Parts {
-		if len(p.Data) == 0 {
-			continue
-		}
-		var m map[string]any
-		if json.Unmarshal(p.Data, &m) != nil {
-			continue
-		}
-		target, _ := m["target"].(string)
-		taskID, _ := m["taskId"].(string)
-		prompt, _ := m["prompt"].(string)
-		if target != "" || taskID != "" {
-			out = append(out, delegateRecord{
-				Target: target,
-				TaskID: taskID,
-				Prompt: prompt,
-			})
-		}
-	}
-	return out
-}
-
 func taskResultText(t *lib.Task) string {
 	if t == nil {
 		return ""
@@ -209,8 +196,8 @@ func taskResultText(t *lib.Task) string {
 			return msg
 		}
 	}
-	if turn := artifactText(t, lib.ArtifactTurn); turn == "[SILENT]" {
-		return "[SILENT]"
+	if turn := artifactText(t, lib.ArtifactTurn); turn == silentTurnMarker {
+		return silentTurnMarker
 	}
 	return ""
 }
@@ -226,7 +213,7 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 	thinking := taskThinkingFromTask(t)
 	agentDefault := strings.TrimSpace(ref.Addressee)
 	if agentDefault == "" {
-		agentDefault = "platform"
+		agentDefault = defaultStepAgent
 	}
 
 	details := make([]StepDetail, len(steps))
@@ -428,23 +415,10 @@ func extractKanbanCards(details []StepDetail) []KanbanCardSummary {
 	return cards
 }
 
-const (
-	maxThoughtSentenceLen = 90
-	maxThoughtTitleLen    = 80
-	maxCardTitleLen       = 72
-	maxStepTitleLen       = 96
-	maxActivityCmdLen     = 180
-	maxActivityDetailLen  = 200
-	maxActivityErrLen     = 140
-	maxAnswerPreviewLen   = 400
-	maxWaitProgressLen    = 88
-	maxTableCardTitleLen  = 60
-)
-
 func summarizeThoughtTitle(thought string) string {
 	clean := collapseInlineWhitespace(thought)
 	if clean == "" {
-		return "Thinking"
+		return defaultThoughtTitle
 	}
 	if idx := strings.IndexAny(clean, ".!?"); idx > 0 && idx < maxThoughtSentenceLen {
 		return clean[:idx+1]
@@ -505,20 +479,28 @@ func truncateInlineText(s string, maxLen int) string {
 	if maxLen <= 0 || len(s) <= maxLen {
 		return s
 	}
-	if maxLen <= 3 {
-		return s[:maxLen]
+	if maxLen <= ellipsisLen {
+		cut := maxLen
+		for cut > 0 && !utf8.RuneStart(s[cut]) {
+			cut--
+		}
+		return s[:cut]
 	}
-	return strings.TrimSpace(s[:maxLen-3]) + "..."
+	cut := maxLen - ellipsisLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(s[:cut]) + ellipsisText
 }
 
 func canonicalStepAgent(agent, convAlias string) string {
 	a := strings.TrimSpace(strings.TrimPrefix(agent, "@"))
 	alias := strings.TrimSpace(strings.TrimPrefix(convAlias, "@"))
-	if alias != "" && alias != DefaultConversation && (a == "" || strings.HasPrefix(a, "chat-") || strings.HasPrefix(a, "s-")) {
+	if alias != "" && alias != DefaultConversation && (a == "" || strings.HasPrefix(a, chatAgentPrefix) || strings.HasPrefix(a, sessionAgentPrefix)) {
 		return alias
 	}
 	if a == "" {
-		return "platform"
+		return defaultStepAgent
 	}
 	return a
 }
@@ -526,9 +508,16 @@ func canonicalStepAgent(agent, convAlias string) string {
 func formatAgentBadge(agent string) string {
 	a := strings.TrimSpace(strings.TrimPrefix(agent, "@"))
 	if a == "" {
-		a = "platform"
+		a = defaultStepAgent
 	}
 	return "`@" + sanitizeInlineBackticks(a) + "`"
+}
+
+func formatSubtaskStatusTitle(prefix, label, status, verdict, shortTitle string) string {
+	if verdict != "" && !strings.EqualFold(verdict, status) && !strings.EqualFold(verdict, label) {
+		return fmt.Sprintf("%s %s (%s): %s", prefix, label, verdict, shortTitle)
+	}
+	return fmt.Sprintf("%s %s: %s", prefix, label, shortTitle)
 }
 
 func humanizeStepTitle(d StepDetail) string {
@@ -546,16 +535,27 @@ func humanizeStepTitle(d StepDetail) string {
 		if cardID != "" {
 			prefix = fmt.Sprintf("Kanban Card #%s", cardID)
 		}
+		shortTitle := truncateInlineText(cardTitle, maxCardTitleLen)
 		switch status {
 		case "done", "completed":
 			if verdict != "" {
-				return fmt.Sprintf("%s (%s): %s", prefix, verdict, truncateInlineText(cardTitle, maxCardTitleLen))
+				return fmt.Sprintf("%s (%s): %s", prefix, verdict, shortTitle)
 			}
-			return fmt.Sprintf("%s Completed: %s", prefix, truncateInlineText(cardTitle, maxCardTitleLen))
+			return fmt.Sprintf("%s Completed: %s", prefix, shortTitle)
 		case "in_progress", "running", "claimed":
-			return fmt.Sprintf("%s In Progress: %s", prefix, truncateInlineText(cardTitle, maxCardTitleLen))
+			return fmt.Sprintf("%s In Progress: %s", prefix, shortTitle)
+		case "failed", "error":
+			return formatSubtaskStatusTitle(prefix, "Failed", status, verdict, shortTitle)
+		case "blocked":
+			return formatSubtaskStatusTitle(prefix, "Blocked", status, verdict, shortTitle)
+		case "gave_up":
+			return formatSubtaskStatusTitle(prefix, "Gave up", status, verdict, shortTitle)
+		case "canceled", "cancelled":
+			return formatSubtaskStatusTitle(prefix, "Canceled", status, verdict, shortTitle)
+		case "archived":
+			return formatSubtaskStatusTitle(prefix, "Archived", status, verdict, shortTitle)
 		default:
-			return fmt.Sprintf("%s Queued: %s", prefix, truncateInlineText(cardTitle, maxCardTitleLen))
+			return fmt.Sprintf("%s Queued: %s", prefix, shortTitle)
 		}
 	}
 	if title != "" && !isBareToolName(title) {
@@ -580,7 +580,7 @@ func humanizeStepTitle(d StepDetail) string {
 	if title != "" {
 		return fmt.Sprintf("Running %s", title)
 	}
-	return "Working on cluster task"
+	return defaultStepTitle
 }
 
 func isBareToolName(s string) bool {
@@ -788,9 +788,12 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 		if totalSteps > 0 {
 			lastD := details[totalSteps-1]
 			title = humanizeStepTitle(lastD)
+			if activeTask != nil && activeTask.State != "" && activeTask.State != lib.StateCompleted {
+				title = fmt.Sprintf("%s (%d steps): %s", terminalStateTitlePrefix(activeTask.State), totalSteps, title)
+			}
 			markdown = FormatStepDetailMarkdownWithOptions(lastD, false)
 		} else {
-			state := "completed"
+			state := string(lib.StateCompleted)
 			if activeTask != nil && activeTask.State != "" {
 				state = string(activeTask.State)
 			}
@@ -831,7 +834,7 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 		for _, c := range cards {
 			verdict := c.Verdict
 			if verdict == "" {
-				verdict = "—"
+				verdict = emptyVerdictCell
 			}
 			fmt.Fprintf(&kb, "| `#%s` | %s | `%s` | %s |\n",
 				sanitizeTableCell(c.ID),
@@ -875,4 +878,17 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 	writeOutcome(&res, out)
 	writeReports(&res, out, stepOut.Token)
 	return title, markdown, res.String()
+}
+
+func terminalStateTitlePrefix(state lib.TaskState) string {
+	switch state {
+	case lib.StateFailed:
+		return "Failed"
+	case lib.StateCanceled:
+		return "Canceled"
+	case lib.StateRejected:
+		return "Rejected"
+	default:
+		return fmt.Sprintf("Task %s", state)
+	}
 }

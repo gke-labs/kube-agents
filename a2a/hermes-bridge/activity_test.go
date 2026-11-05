@@ -669,6 +669,9 @@ func TestActivity_NoArgumentTextReachesTheBus(t *testing.T) {
 	_, url := startServer(t)
 	startBridgeCfg(t, url, hermesStub(t, `
 call("kubectl", {"cmd": "get pods", "token": "hunter2", "nested": {"api_key": "k", "keep": 1}, "project": "p"}, "call_1")
+call("read_file", {"path": "/etc/secret-path.yaml"}, "call_2")
+call("mcp__gke__list_clusters", {"cluster": "secret-cluster-name"}, "call_3")
+call("terminal", {"command": "kubectl get pods --cluster secret-cluster"}, "call_4")
 print("the answer")
 `), nil)
 	c := gatewayClient(t, url)
@@ -678,8 +681,13 @@ print("the answer")
 		t.Fatalf("state = %s, want completed", task.State)
 	}
 	entries := activityEntries(t, task)
-	if len(entries) != 1 {
-		t.Fatalf("activity entries = %d, want 1: %+v", len(entries), entries)
+	if len(entries) != 4 {
+		t.Fatalf("activity entries = %d, want 4: %+v", len(entries), entries)
+	}
+	for i, e := range entries {
+		if e.Title != "" {
+			t.Fatalf("entry %d in cli mode populated Title = %q, want empty", i, e.Title)
+		}
 	}
 	var input map[string]any
 	if err := json.Unmarshal(entries[0].Input, &input); err != nil {
@@ -693,8 +701,10 @@ print("the answer")
 	}
 	for _, art := range task.Artifacts {
 		for _, p := range art.Parts {
-			if strings.Contains(string(p.Data), "get pods") || strings.Contains(string(p.Data), "hunter2") || strings.Contains(p.Text, "hunter2") {
-				t.Fatalf("raw argument text on the bus under %s: %s %s", art.Name, p.Data, p.Text)
+			for _, secret := range []string{"get pods", "hunter2", "/etc/secret-path.yaml", "secret-path.yaml", "secret-cluster-name", "secret-cluster"} {
+				if strings.Contains(string(p.Data), secret) || strings.Contains(p.Text, secret) {
+					t.Fatalf("raw argument text %q on the bus under %s: %s %s", secret, art.Name, p.Data, p.Text)
+				}
 			}
 		}
 	}
@@ -1336,5 +1346,38 @@ func TestServeActivity_CloseIsNotAStoppedDoor(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if strings.Contains(logs.String(), "activity door stopped") {
 		t.Fatalf("close logged a stopped door: %s", logs.String())
+	}
+}
+
+// redactInputDetailed caps hermes_tool_call_wrapper at detailedInputCap
+// (4096 bytes) rather than activityInputCap (2048 bytes), so a wrapper whose
+// pass-1 redacted JSON lands between 2049 and 4096 bytes retains its calls
+// array with non-empty head previews.
+func TestRedactInputDetailed_WrapperRespectsDetailedCap(t *testing.T) {
+	big := `[` + strings.Repeat("1,", activityInputCap) + `1]`
+	var calls []string
+	for i := 0; i < 9; i++ {
+		calls = append(calls, fmt.Sprintf(`{"name":"kanban_comment_%d","arguments":{"body":%s}}`, i, big))
+	}
+	in := json.RawMessage(`{"calls":[` + strings.Join(calls, ",") + `]}`)
+	out := redactInputDetailed(hermesToolCallWrapper, in)
+	if len(out) <= activityInputCap || len(out) > detailedInputCap {
+		t.Fatalf("redactInputDetailed wrapper len = %d, want in (%d, %d]", len(out), activityInputCap, detailedInputCap)
+	}
+	var parsed struct {
+		Truncated *bool `json:"truncated"`
+		Calls     []struct {
+			Name string         `json:"name"`
+			Args map[string]any `json:"arguments"`
+		} `json:"calls"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil || parsed.Truncated != nil || len(parsed.Calls) != 9 {
+		t.Fatalf("wrapper collapsed or malformed: %s (%v)", out, err)
+	}
+	for i, c := range parsed.Calls {
+		head, _ := c.Args["head"].(string)
+		if head == "" {
+			t.Fatalf("call %d head was wiped to empty despite fitting under detailedInputCap: %s", i, out)
+		}
 	}
 }

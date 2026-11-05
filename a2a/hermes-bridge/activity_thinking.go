@@ -22,8 +22,31 @@ var (
 
 	inlineTokenValuePattern = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
 	inlineAuthHeaderPattern = regexp.MustCompile(`(?i)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
-	inlineURLCredPattern    = regexp.MustCompile(`(https?://[^/\s:@]+:)[^@\s/]+(@)`)
-	inlineKVSecretPattern   = regexp.MustCompile(`(?i)\b(token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|access[_-]?token|client[_-]?secret|pgpassword|dbpassword)\s*([=:])\s*(['"]?)[^\s'"]+(['"]?)`)
+	inlineURLCredPattern    = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:)[^@\s/]+(@)`)
+	inlineKVSecretPattern   = regexp.MustCompile(`(?i)\b(token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|access[_-]?token|client[_-]?secret|pgpassword|dbpassword)(['"]?\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|['"]?[^\s"',;})\]>]+['"]?)`)
+
+	// envFlagsWithValue are flags to `env` that consume the following
+	// argument before the command name.
+	envFlagsWithValue = map[string]bool{
+		"-u": true, "--unset": true,
+		"-C": true, "--chdir": true,
+		"-S": true, "--split-string": true,
+	}
+	// shellFlagsWithValue are CLI flags that take a separate value argument
+	// before the subcommand token (e.g. `kubectl -n kube-system get pods`).
+	shellFlagsWithValue = map[string]bool{
+		"-n": true, "--namespace": true,
+		"-c": true, "--context": true,
+		"--cluster": true, "--kubeconfig": true,
+		"--server": true, "-s": true,
+		"--user": true, "--token": true,
+		"-C": true,
+		"-f": true, "--filename": true,
+		"-k": true, "--kustomize": true,
+		"-l": true, "--selector": true, "--field-selector": true,
+		"-o": true, "--output": true, "--template": true,
+		"-v": true, "--v": true,
+	}
 )
 
 const (
@@ -67,6 +90,7 @@ const (
 type sessionTrace struct {
 	apiCalls             int
 	partsPublished       int
+	turnCardsFiled       bool
 	prevBatchKey         string
 	plannedTitles        map[string]string // tool call id -> the step title it was planned under
 	sessionCards         map[string]string // worker sessionID -> cardID
@@ -236,9 +260,18 @@ func (a *activityState) observePostAPIRequestLocked(d hookDelivery) ([]stepmsg.S
 		a.observeWorkerContextLocked(d, nil, "")
 	}
 	steps, reasoning := buildAPIRequestSteps(d, a.trace.apiCalls, a.turnCalls, a.sessionID != "", len(a.trace.plannedTitles) > 0)
-	if (isWorker || a.cardsFiled.Load()) && len(steps) == 1 && steps[0].IsSynthesis() {
-		steps, reasoning = nil, ""
+	if len(steps) == 1 && steps[0].IsSynthesis() {
+		if isWorker {
+			steps, reasoning = nil, ""
+		} else if a.trace.turnCardsFiled && a.waitInTurn.Load() {
+			steps = nil
+		}
 	}
+	key := stepBatchKey(steps, reasoning)
+	if key == "" || key == a.trace.prevBatchKey {
+		return nil, ""
+	}
+	a.trace.prevBatchKey = key
 	for _, st := range steps {
 		for _, id := range st.CallIDs {
 			if len(a.trace.plannedTitles) >= maxPlannedTitles {
@@ -247,11 +280,6 @@ func (a *activityState) observePostAPIRequestLocked(d hookDelivery) ([]stepmsg.S
 			a.trace.plannedTitles[id] = st.Title
 		}
 	}
-	key := stepBatchKey(steps, reasoning)
-	if key == "" || key == a.trace.prevBatchKey {
-		return nil, ""
-	}
-	a.trace.prevBatchKey = key
 	return steps, reasoning
 }
 
@@ -266,6 +294,8 @@ func stepBatchKey(steps []stepmsg.Step, reasoning string) string {
 		sb.WriteString(string(st.Kind))
 		sb.WriteByte(':')
 		sb.WriteString(st.Title)
+		sb.WriteByte(':')
+		sb.WriteString(strings.Join(st.CallIDs, ","))
 		sb.WriteByte('\n')
 	}
 	sb.WriteString(reasoning)
@@ -273,11 +303,11 @@ func stepBatchKey(steps []stepmsg.Step, reasoning string) string {
 }
 
 func (a *activityState) enrichPreToolCallLocked(d hookDelivery, entry *ActivityEntry) {
-	a.initSessionTraceLocked()
-	entry.Title = a.entryTitleLocked(d.Extra.ToolCallID, d.ToolName, d.ToolInput)
 	if a.sessionID == "" {
 		return
 	}
+	a.initSessionTraceLocked()
+	entry.Title = a.entryTitleLocked(d.Extra.ToolCallID, d.ToolName, d.ToolInput)
 	entry.Input = redactInputDetailed(d.ToolName, d.ToolInput)
 	a.observeWorkerContextLocked(d, d.ToolInput, "")
 	entry.SessionID = capRunes(d.SessionID, activityCallIDCap)
@@ -320,6 +350,9 @@ func (a *activityState) popOpenCallLocked(id string, d hookDelivery) ActivityEnt
 }
 
 func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry ActivityEntry, status string, e *ActivityEntry) {
+	if a.sessionID == "" {
+		return
+	}
 	rawToolInput := d.ToolInput
 	if len(rawToolInput) == 0 && len(openEntry.Input) > 0 {
 		rawToolInput = openEntry.Input
@@ -327,14 +360,12 @@ func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry Activ
 	effectiveTool, _ := unwrapHermesToolCall(d.ToolName, rawToolInput)
 	if status != ActivityStatusError && (effectiveTool == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(rawToolInput), kanbanCreateTool))) {
 		a.cardsFiled.Store(true)
+		a.trace.turnCardsFiled = true
 	}
 	a.initSessionTraceLocked()
 	e.Title = openEntry.Title
 	if e.Title == "" {
 		e.Title = a.entryTitleLocked(d.Extra.ToolCallID, d.ToolName, rawToolInput)
-	}
-	if a.sessionID == "" {
-		return
 	}
 	e.Input = redactInputDetailed(d.ToolName, d.ToolInput)
 	if len(e.Input) == 0 && len(openEntry.Input) > 0 {
@@ -848,8 +879,24 @@ func describeShellTool(toolName string, parsedArgs map[string]any) string {
 func extractLeadingCommand(cmd string) (bin, sub string) {
 	for _, seg := range strings.FieldsFunc(cmd, func(r rune) bool { return r == '\n' || r == ';' || r == '&' || r == '|' }) {
 		fields := strings.Fields(strings.TrimSpace(seg))
-		for len(fields) > 0 && (strings.Contains(fields[0], "=") || fields[0] == "env" || fields[0] == "sudo" || fields[0] == "timeout") {
-			fields = fields[1:]
+		for len(fields) > 0 {
+			f := fields[0]
+			if strings.Contains(f, "=") || f == "sudo" || f == "timeout" {
+				fields = fields[1:]
+				continue
+			}
+			if f == "env" {
+				fields = fields[1:]
+				for len(fields) > 0 && strings.HasPrefix(fields[0], "-") {
+					flag := fields[0]
+					fields = fields[1:]
+					if !strings.Contains(flag, "=") && envFlagsWithValue[flag] && len(fields) > 0 {
+						fields = fields[1:]
+					}
+				}
+				continue
+			}
+			break
 		}
 		if len(fields) == 0 {
 			continue
@@ -861,8 +908,12 @@ func extractLeadingCommand(cmd string) (bin, sub string) {
 		if b == "cd" || b == "export" || b == "set" || b == "echo" || b == "true" {
 			continue
 		}
-		for _, arg := range fields[1:] {
+		for i := 1; i < len(fields); i++ {
+			arg := fields[i]
 			if strings.HasPrefix(arg, "-") {
+				if !strings.Contains(arg, "=") && shellFlagsWithValue[arg] {
+					i++
+				}
 				continue
 			}
 			if s := strings.ToLower(strings.Trim(arg, "'\"")); len(s) <= leadingSubcommandCap {
@@ -882,7 +933,25 @@ func scrubInlineSecrets(s string) string {
 	s = inlineTokenValuePattern.ReplaceAllString(s, redactedValue)
 	s = inlineAuthHeaderPattern.ReplaceAllString(s, "$1 "+redactedValue)
 	s = inlineURLCredPattern.ReplaceAllString(s, "${1}"+redactedValue+"${2}")
-	s = inlineKVSecretPattern.ReplaceAllString(s, "${1}${2}${3}"+redactedValue+"${4}")
+	s = inlineKVSecretPattern.ReplaceAllStringFunc(s, func(m string) string {
+		sepIdx := strings.IndexAny(m, "=:")
+		if sepIdx < 0 {
+			return m
+		}
+		valStart := sepIdx + 1
+		for valStart < len(m) && (m[valStart] == ' ' || m[valStart] == '\t') {
+			valStart++
+		}
+		prefix := m[:valStart]
+		val := m[valStart:]
+		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
+			return prefix + string(val[0]) + redactedValue + string(val[len(val)-1])
+		}
+		if len(val) >= 1 && (val[0] == '"' || val[0] == '\'') {
+			return prefix + string(val[0]) + redactedValue
+		}
+		return prefix + redactedValue
+	})
 	return s
 }
 
@@ -906,7 +975,7 @@ func redactInputDetailed(tool string, raw json.RawMessage) json.RawMessage {
 		return out
 	}
 	if tool == hermesToolCallWrapper {
-		if capped, ok := capWrapperCalls(red); ok {
+		if capped, ok := capWrapperCalls(red, detailedInputCap); ok {
 			return capped
 		}
 	}
@@ -1033,14 +1102,9 @@ func matchWorkerDeliveryRun(runs []*taskRun, d hookDelivery) *taskRun {
 		return nil
 	}
 	var waiting []*taskRun
-	hasCLIRun := false
 	for _, r := range runs {
 		a := r.act.Load()
-		if a == nil {
-			continue
-		}
-		if a.sessionID == "" {
-			hasCLIRun = true
+		if a == nil || a.sessionID == "" {
 			continue
 		}
 		if a.waitingCard.Load() {
@@ -1082,9 +1146,6 @@ func matchWorkerDeliveryRun(runs []*taskRun, d hookDelivery) *taskRun {
 				return r
 			}
 		}
-	}
-	if len(waiting) == 1 && !hasCLIRun {
-		return waiting[0]
 	}
 	return nil
 }
