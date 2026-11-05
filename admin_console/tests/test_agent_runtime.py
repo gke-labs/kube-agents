@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -31,6 +32,10 @@ from admin_console.agent_runtime import (
 from admin_console.kanban_view import display_status
 from admin_console.kube_access import GKEKubeAccess, KubeCommandResult, KubeFailure
 from admin_console.project_config import DeploymentTarget
+
+# The broker's provider list, so the console's pull-request scan is held to
+# every forge the broker serves.
+PROVIDERS_DIR = Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts"
 
 # A result that cites a status page and a log path. It does not link a PR.
 CITED_RESULT = (
@@ -325,6 +330,35 @@ class NonCanonicalAgentRunner:
                 ),
             )
         return KubeCommandResult(1, stderr="unexpected command")
+
+
+class PullRequestUrlPatternTest(unittest.TestCase):
+    def test_the_scan_knows_a_pull_request_url_on_every_forge_the_broker_serves(self):
+        sys.path.insert(0, str(PROVIDERS_DIR))
+        self.addCleanup(sys.path.remove, str(PROVIDERS_DIR))
+        import providers
+
+        # The scan runs inside the pod as part of _READ_SCRIPT, so its pattern is
+        # read out of that script's text.
+        literal = re.search(r'^PR_URL_PATTERN = re\.compile\(r"(.+)"\)$', agent_runtime._READ_SCRIPT, re.MULTILINE)
+        self.assertIsNotNone(literal, "the read script no longer declares PR_URL_PATTERN on one line")
+        pattern = re.compile(literal.group(1))
+        # One proposal url per forge in providers.AVAILABLE, as its translate.py
+        # emits it. A forge that joins the broker without a row here fails this.
+        shapes = {
+            "github": "https://github.com/acme/infra/pull/12",
+            "gitlab": "https://gitlab.example.com/group/sub/infra/-/merge_requests/12",
+            "gitea": "http://gitea-http.gitea.svc.cluster.local:3000/demo/infra/pulls/12",
+            "bitbucket": "https://bitbucket.org/acme/infra/pull-requests/12/_/diff#comment-42",
+            "bitbucket-datacenter": "https://bitbucket.example.com/projects/ACME/repos/infra/pull-requests/12/overview",
+        }
+        self.assertEqual(set(shapes), {cls.name for cls in providers.AVAILABLE}, "a forge the broker serves has no url shape here")
+        for provider, url in shapes.items():
+            with self.subTest(provider=provider):
+                self.assertTrue(pattern.search(f"Opened {url} for review."))
+        for issue in ("https://gitea.example.com/acme/infra/issues/12", "https://bitbucket.org/acme/infra/issues/12"):
+            with self.subTest(url=issue):
+                self.assertFalse(pattern.search(f"Filed {issue}."))
 
 
 class EmbeddedReadScriptTest(unittest.TestCase):
