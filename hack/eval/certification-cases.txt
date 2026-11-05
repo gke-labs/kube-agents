@@ -24,3 +24,9 @@
 # pull request.
 
 # part 1
+# Capability row: workloads, OOM, probes and HPA; the obtainability audit on a
+# Deployment whose HorizontalPodAutoscaler scales down with no stabilization
+# window and whose containers have no preStop hook (the planted web-api-server
+# and web-api-server-hpa in seeded-autoscaling). A declared gap, expected_fail:
+# no obtainability check reads the scale-down behavior; the gap is #4941.
+./tasks/workload-hpa-scaledown-and-missing-prestop/task.yaml
