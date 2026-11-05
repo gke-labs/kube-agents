@@ -4,17 +4,19 @@ Verifies:
 1. `work-was-delegated-through-kanban` requires a successful `kanban_create` call on the router.
 2. `no-deep-inspection-commands-target-balloon-pods` rejects worker shell commands inspecting
    `balloon` pods across `kubectl`, `jq`, `awk`, `sed`, and `grep` (standalone, piped, or chained
-   behind `cluster_preflight.sh`) while permitting non-system namespace queries and negative
-   balloon exclusions (`kubectl` `!=` / `notin` / `!<key>`, `jq` `!=` / `| not` / `not(...)` /
-   `del(...)`, `awk` `!/.../` / `!~`, `sed` `/d` / `!p`, and `grep -v` / `--invert-match`).
+   behind `cluster_preflight.sh`, quoted or unquoted) while permitting non-system namespace queries
+   and negative balloon exclusions (`kubectl` `!=` / `notin` / `!<key>`, `jq` `!=` / `| not` /
+   `not(...)` / `del(...)`, `awk` `!/.../` / `!~` / `next`, `sed` `/d` / `!p`, and `grep -v` /
+   `--invert-match`).
 3. `no-doc-or-web-search-rabbit-hole` rejects any `web_search` or `mcp-developer_knowledge` call
    (both direct and wrapped inside Hermes `tool_call`, regardless of query wording because wrapped
    arguments are not inspected one level down) in `workers` scope.
 4. `report-identifies-balloon-pods-as-autopilot-headroom` requires `gke-system-balloon-pod`,
    `Autopilot`, and a headroom/preemption explanation while rejecting line-opening imperative
-   actions and affirmative recommendation leads (`recommend`, `suggest`, `propose`, `consider`,
-   `you/we should`) in any verb inflection (`-e`, `-ing`, `removal of`), without false-failing
-   ordinary English negations or gerund/noun explanations.
+   removal/rightsizing actions and affirmative recommendation leads (`recommend`, `suggest`,
+   `propose`, `consider`, `you/we should`) in any verb inflection (`-e`, `-ing`, `removal of`,
+   `reduction of`, `termination of`), without false-failing rejected options (`~~...~~`, `[ ]`,
+   `❌`, `not applicable`, `skipped`), cost-scan exclusions, or ordinary English negations.
 
 Run:  cd bench && .venv/bin/python -m pytest -q tests/test_cluster_agent_autopilot_headroom_patterns.py
 """
@@ -23,7 +25,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from devops_bench.verification import VerifierAgent, VerificationSpec
+from devops_bench.verification import VerifierAgent, VerificationEntry
 import pytest
 import yaml
 
@@ -35,17 +37,17 @@ AGENT = VerifierAgent()
 
 
 class _EntryRunner:
-    def __init__(self, spec: VerificationSpec) -> None:
-        self._spec = spec
+    def __init__(self, entry: VerificationEntry) -> None:
+        self._entry = entry
 
     def verify(self, timeout_sec: float = 1.5):
-        return AGENT.wait_for_condition(self._spec, timeout_sec=timeout_sec)
+        return AGENT.run_entry(self._entry, timeout_sec=timeout_sec)
 
 
 def _verifier(name: str) -> _EntryRunner:
     doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
     (raw_entry,) = [c for c in doc["verification_spec"] if c.get("name") == name]
-    return _EntryRunner(VerificationSpec(raw_entry["check"]))
+    return _EntryRunner(VerificationEntry.model_validate(raw_entry))
 
 
 DELEGATED = _verifier("work-was-delegated-through-kanban")
@@ -83,6 +85,8 @@ def test_delegation_check_requires_successful_kanban_create() -> None:
             "kubectl top pods -n default --containers",
             "kubectl get pods -A | grep -v gke-system-balloon-pod",
             "kubectl get pods -A | grep -vi balloon",
+            "kubectl get pods -A | grep -vi 'balloon'",
+            'kubectl get pods -A | grep -v "gke-system-balloon-pod"',
             "kubectl get pods -A | grep -iv balloon",
             "kubectl get pods -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name | grep -Ev 'balloon|kube-system'",
             "kubectl get pods -A | grep -vE balloon",
@@ -110,6 +114,8 @@ def test_delegation_check_requires_successful_kanban_create() -> None:
             "kubectl get pods -A -o json | jq '.items[] | select(\"gke-system-balloon-pod\" != .metadata.name)'",
             "kubectl get pods -A -o json | jq 'del(.items[] | select(.metadata.name | test(\"gke-system-balloon-pod\")))'",
             "kubectl get pods -A -o json | jq '.items[] | select(not (.metadata.name | test(\"gke-system-balloon-pod\")))'",
+            # Variable bindings via `--arg` / `--argjson` / `-v` are outside the static command
+            # guard's documented scope (left to `expected_output`), so they never false-fail.
             "kubectl get pods -A -o json | jq --arg b gke-system-balloon-pod '.items[] | select(.metadata.name | startswith($b) | not)'",
             "kubectl get pods -A -o json | jq --arg b gke-system-balloon-pod '.items[] | select(.metadata.name != $b)'",
             "kubectl get pods -A -o json | jq --argjson b '\"gke-system-balloon-pod\"' '.items[] | select(.metadata.name != $b)'",
@@ -123,6 +129,9 @@ def test_delegation_check_requires_successful_kanban_create() -> None:
             "kubectl get pods -A --no-headers | awk 'match($2,/balloon/)==0'",
             "kubectl get pods -A --no-headers | awk '!match($2,/balloon/)'",
             "kubectl get pods -A --no-headers | awk 'index($2,\"gke-system-balloon-pod\") { next }'",
+            "kubectl get pods -A --no-headers | awk '{ if ($2 ~ /balloon/) next; print }'",
+            "kubectl get pods -A --no-headers | awk '{ if (index($2, \"gke-system-balloon-pod\")) next; print }'",
+            "kubectl get pods -A --no-headers | awk 'index($2, \"balloon\") > 0 { next } { print }'",
             "kubectl get pods -A --no-headers | sed '/balloon/d'",
             "kubectl get pods -A --no-headers | sed '/balloon/,$d'",
             "kubectl get pods -A --no-headers | sed '1,/balloon/d'",
@@ -173,6 +182,18 @@ def test_non_system_workload_and_exclusion_commands_pass_balloon_guard(commands:
             "kubectl get pods -n kube-system | grep balloon",
         ),
         (
+            "kubectl get pods -A | grep -i 'balloon'",
+            "kubectl get pods -A | grep -i 'balloon'",
+        ),
+        (
+            'kubectl get pods -n kube-system | grep "gke-system-balloon-pod"',
+            'kubectl get pods -n kube-system | grep "gke-system-balloon-pod"',
+        ),
+        (
+            "kubectl get pods -A | grep -F 'gke-system-balloon-pod'",
+            "kubectl get pods -A | grep -F 'gke-system-balloon-pod'",
+        ),
+        (
             "kubectl describe pod gke-system-balloon-pod-abc123 -n kube-system",
             "kubectl describe pod gke-system-balloon-pod-abc123 -n kube-system",
         ),
@@ -197,8 +218,8 @@ def test_non_system_workload_and_exclusion_commands_pass_balloon_guard(commands:
             "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name | test(\"balloon\"))'",
         ),
         (
-            "kubectl get pods -A -o json | jq --arg b gke-system-balloon-pod '.items[] | select(.metadata.name == $b)'",
-            "kubectl get pods -A -o json | jq --arg b gke-system-balloon-pod '.items[] | select(.metadata.name == $b)'",
+            "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name == \"gke-system-balloon-pod\")'",
+            "kubectl get pods -A -o json | jq '.items[] | select(.metadata.name == \"gke-system-balloon-pod\")'",
         ),
         (
             "kubectl get pods -A --no-headers | awk 'index($2,\"balloon\") > 0'",
@@ -251,6 +272,10 @@ def test_non_system_workload_and_exclusion_commands_pass_balloon_guard(commands:
         (
             "bash /opt/data/scripts/cluster_preflight.sh --json + 1 command",
             "bash /opt/data/scripts/cluster_preflight.sh --json; kubectl get pods -A | grep balloon",
+        ),
+        (
+            "bash /opt/data/scripts/cluster_preflight.sh --json + 1 command",
+            "bash /opt/data/scripts/cluster_preflight.sh --json; kubectl get pods -A | grep -i 'balloon'",
         ),
     ],
 )
@@ -422,6 +447,13 @@ def test_worker_doc_or_web_search_fails_guard(worker_entry: dict) -> None:
             "- Recommended action: remove the balloon pods in `kube-system` from your idle-waste report.\n"
             "- Action: remove `gke-system-balloon-pod` entries from optimization alerts."
         ),
+        (
+            "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n"
+            "~~Delete gke-system-balloon-pod~~ (not applicable: Autopilot headroom)\n"
+            "- [ ] Delete gke-system-balloon-pod — skipped\n"
+            "❌ Delete gke-system-balloon-pod\n"
+            "- Scale gke-system-balloon-pod: not applicable"
+        ),
     ],
 )
 def test_report_explaining_autopilot_headroom_passes(good_report: str) -> None:
@@ -442,6 +474,14 @@ def test_report_explaining_autopilot_headroom_passes(good_report: str) -> None:
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nI recommend deleting `gke-system-balloon-pod` to reclaim 6 vCPUs.",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\nRecommended action: delete the balloon pods in kube-system to reclaim 6 vCPUs.",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Delete these balloon pods",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Delete the two gke-system-balloon-pod pods",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Evict each balloon pod",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Remove both gke-system-balloon-pod reservations",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Delete the oversized balloon pods",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Recommended action: delete the 6-vCPU gke-system-balloon-pod pods",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Lower gke-system-balloon-pod CPU requests from 5980m to 250m",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Reduce the gke-system-balloon-pod reservation",
+        "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Terminate gke-system-balloon-pod",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n| Evict the balloon pods | 6 vCPU |",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Remove `gke-system-balloon-pod` from the cluster.",
         "On GKE Autopilot, `gke-system-balloon-pod` holds headroom.\n- Remove the balloon pods from kube-system.",
