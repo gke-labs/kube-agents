@@ -73,6 +73,8 @@ type ProfileWorkerConfig struct {
 	// the worker never guesses, so it can't empty a directory it wasn't
 	// given.
 	ResetPaths []string
+	// resetTimeout replaces resetTimeout in tests.
+	resetTimeout time.Duration
 	// readyListener, when set, is a listener already bound to ReadyAddr,
 	// which serveReadiness uses instead of binding one. Tests set it, so no
 	// other process can take the port between choosing it and listening.
@@ -89,9 +91,9 @@ type ProfileWorkerConfig struct {
 // and final renewal sent before the dispatcher's own deadline.
 const defaultDeadlineMargin = 5 * time.Second
 
-// declineUnreset is the reason a worker gives for every offer once a reset
-// between tasks has failed: what the last task left may still be there.
-const declineUnreset = "unreset: a reset between tasks failed, so this pod takes no more tasks"
+// resetTimeout bounds one reset of the workspace, so a huge leftover tree
+// fails the worker (and restarts it) rather than hanging it past its probes.
+const resetTimeout = 30 * time.Second
 
 // declineBusy is the reason a worker gives for an offer while it holds a
 // task. The dispatcher tracks busy pods itself, so this is the race where
@@ -125,6 +127,11 @@ func RunProfileWorker(ctx context.Context, cfg Config, pw ProfileWorkerConfig) e
 	defer closeBus()
 
 	w := &profileWorker{cfg: cfg, pw: pw, b: b, msgs: make(chan *nats.Msg, 16)}
+	// Before anything can be offered: whatever a previous process in this
+	// container left (it died mid-task, or its reset failed) goes first.
+	if err := w.resetWorkspace("startup", ""); err != nil {
+		return err
+	}
 	if pw.PersonaDir != "" {
 		if w.persona, err = renderPersona(pw); err != nil {
 			return err
@@ -161,9 +168,6 @@ type profileWorker struct {
 	b     *busConns
 	msgs  chan *nats.Msg
 	ready atomic.Bool
-	// unreset is set for good when a reset between tasks fails: the pod
-	// stops being Ready and declines every offer after.
-	unreset atomic.Bool
 	// persona is the persona as rendered for the harness, or nil.
 	persona *persona.Output
 }
@@ -336,7 +340,17 @@ func (w *profileWorker) loop(ctx context.Context) error {
 
 		case out := <-taskDone:
 			w.finish(cur, out)
-			if release() {
+			oneShot := release()
+			// A pod that can't run a harness, or whose workspace couldn't be
+			// emptied, ends rather than taking another task: the kubelet
+			// restarts it (and the startup reset runs again).
+			if out.resetErr != nil {
+				return out.resetErr
+			}
+			if out.podBroken {
+				return fmt.Errorf("this pod can't run a harness (%v); ending so it restarts", out.err)
+			}
+			if oneShot {
 				return nil
 			}
 
@@ -356,10 +370,7 @@ func (w *profileWorker) loop(ctx context.Context) error {
 					w.answer(m.TaskID, false, declineBusy)
 					continue
 				}
-				if w.unreset.Load() {
-					w.answer(m.TaskID, false, declineUnreset)
-					continue
-				}
+
 				origin, why := w.admitOffer(m)
 				if why != "" {
 					log.Warn("declining an offer", "task", m.TaskID, "reason", why)
@@ -563,39 +574,59 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		removeConfig()
 		removeToken()
 		closeTaskBus()
-		w.resetWorkspace(h.offer.TaskID)
+		out.resetErr = w.resetWorkspace("after-task", h.offer.TaskID)
 		h.done <- out
 	}()
 	return h.done
 }
 
-// resetWorkspace empties each of the reset paths after a task: everything
-// inside goes, the directory itself stays (it's a mount). A path that can't
-// be emptied marks the worker unreset, which fails closed: not Ready, and
-// every later offer declined.
-func (w *profileWorker) resetWorkspace(task string) {
+// resetWorkspace empties each of the reset paths: everything inside goes,
+// the directory itself stays (it's a mount). It runs before the worker first
+// goes Ready, so a restarted container never takes a task over what the last
+// process left, and after every task. It's bounded by resetTimeout. A reset
+// that fails or runs over is returned, and the worker ends on it: the kubelet
+// restarts the container, whose startup reset tries again, and a reset that
+// keeps failing shows as a restart loop, never as a pod taking tasks.
+func (w *profileWorker) resetWorkspace(phase, task string) error {
 	if len(w.pw.ResetPaths) == 0 {
-		return
+		return nil
 	}
-	var errs []error
-	for _, dir := range w.pw.ResetPaths {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		for _, e := range entries {
-			if err := removeAllWritable(filepath.Join(dir, e.Name())); err != nil {
+	done := make(chan error, 1)
+	go func() {
+		var errs []error
+		for _, dir := range w.pw.ResetPaths {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
 				errs = append(errs, err)
+				continue
+			}
+			for _, e := range entries {
+				if err := removeAllWritable(filepath.Join(dir, e.Name())); err != nil {
+					errs = append(errs, err)
+				}
 			}
 		}
+		done <- errors.Join(errs...)
+	}()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(w.resetTimeout()):
+		err = fmt.Errorf("the reset took longer than %s", w.resetTimeout())
 	}
-	if err := errors.Join(errs...); err != nil {
-		w.unreset.Store(true)
-		w.cfg.Logger.Error("workspace reset failed; this pod takes no more tasks", "task", task, "paths", len(w.pw.ResetPaths), "err", err)
-		return
+	if err != nil {
+		w.cfg.Logger.Error("workspace reset failed; the worker ends", "phase", phase, "task", task, "paths", len(w.pw.ResetPaths), "err", err)
+		return fmt.Errorf("workspace reset (%s): %w", phase, err)
 	}
-	w.cfg.Logger.Info("workspace reset", "task", task, "paths", len(w.pw.ResetPaths), "ok", true)
+	w.cfg.Logger.Info("workspace reset", "phase", phase, "task", task, "paths", len(w.pw.ResetPaths), "ok", true)
+	return nil
+}
+
+func (w *profileWorker) resetTimeout() time.Duration {
+	if w.pw.resetTimeout > 0 {
+		return w.pw.resetTimeout
+	}
+	return resetTimeout
 }
 
 // removeAllWritable removes path and everything under it, first making
@@ -691,13 +722,22 @@ func (w *profileWorker) serveReadiness(addr string, ln net.Listener) (func(), er
 	mux.HandleFunc("/readyz", func(rw http.ResponseWriter, _ *http.Request) {
 		// Listening, and still connected: a pod that lost the bus can't
 		// hear an offer, so it stops being Ready until it reconnects.
-		if !w.ready.Load() || w.unreset.Load() || !w.b.nc.IsConnected() {
+		if !w.ready.Load() || !w.b.nc.IsConnected() {
 			http.Error(rw, "not listening", http.StatusServiceUnavailable)
 			return
 		}
 		_, _ = rw.Write([]byte("ok"))
 	})
-	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) { _, _ = rw.Write([]byte("ok")) })
+	// Alive while its bus connection is: one that has closed for good (it
+	// reconnects forever, so only a fatal error closes it) can't take a task
+	// again, so liveness fails and the kubelet restarts the worker.
+	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, _ *http.Request) {
+		if w.b.nc.IsClosed() {
+			http.Error(rw, "the bus connection is closed", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = rw.Write([]byte("ok"))
+	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
