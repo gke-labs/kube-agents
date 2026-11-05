@@ -272,6 +272,15 @@ class SchemaTest(unittest.TestCase):
         self.assertNotEqual(res.returncode, 0)
         self.assertIn("/litellm/replayShadow/job/kind", res.stderr)
 
+    def test_every_kind_the_ci_files_under_renders_and_is_stamped(self):
+        # hack/ci-env.sh's REPLAY_SHADOW_KIND_* values; collect_shadow.py's JOB_KINDS.
+        for kind in ("nightly", "nightly-untrusted", "presubmit"):
+            with self.subTest(kind=kind):
+                res = _render([*_ON, f"litellm.replayShadow.job.kind={kind}"], show_only="templates/litellm.yaml")
+                self.assertEqual(res.returncode, 0, res.stderr)
+                container = _find(_docs(res.stdout), "Deployment", _PROXY)["spec"]["template"]["spec"]["containers"][0]
+                self.assertEqual({e["name"]: e.get("value") for e in container["env"]}["REPLAY_JOB_KIND"], kind)
+
     def test_on_with_an_unknown_job_kind_is_refused(self):
         res = _render([*_ON, "litellm.replayShadow.job.kind=weekly"])
         self.assertNotEqual(res.returncode, 0)

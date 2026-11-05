@@ -17,6 +17,10 @@ answer" and Rollout step 1):
   under replay those answers would have been the recorded ones. It assumes the
   recorded answer's tool calls would have returned the results this run saw.
 
+A `nightly-untrusted` line (a scheduled run that uploaded as an account
+presubmits can also run as, hack/ci-env.sh) is counted and never a source:
+pull-request code could have written it.
+
 A sighting is available from when its answer finished (`ts + latency_ms`),
 and counts only when replay would have saved it (the line's `unstorable` list
 is empty, so a cut-short upstream answer never counts); `--ignore-storable`
@@ -56,8 +60,9 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 import schema as F
 
 NIGHTLY = "nightly"
+NIGHTLY_UNTRUSTED = "nightly-untrusted"
 PRESUBMIT = "presubmit"
-JOB_KINDS = (NIGHTLY, PRESUBMIT)
+JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT)
 ASSISTANT_ROLE = "assistant"
 # Stands in for an assistant message's content in the simulated key: its place
 # in the conversation counts, its words do not.
@@ -240,6 +245,8 @@ class Sources:
             if best is None or record.available_at < best.available_at:
                 self.nightly[key] = record
             return
+        if record.kind != PRESUBMIT:
+            return
         merged_at = self.merged.get(record.pr)
         if merged_at is not None and self.merge_build.get(record.pr) == record.build_key:
             best_copy = self.merge_copy.get(key)
@@ -412,7 +419,8 @@ def summarize(
     report: Dict[str, Any] = {
         "requests": len(records),
         "presubmit_requests": len(presubmit),
-        "nightly_requests": len(records) - len(presubmit),
+        "nightly_requests": sum(1 for r in records if r.kind == NIGHTLY),
+        "nightly_untrusted_requests": sum(1 for r in records if r.kind == NIGHTLY_UNTRUSTED),
         "presubmit_prompt_tokens": total_tokens,
         "merge_times_given": len(merged or {}),
         "health": health(records, skipped),
@@ -455,7 +463,8 @@ def summarize(
 
 def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
     lines = [
-        f"requests: {report['requests']} ({report['presubmit_requests']} presubmit, {report['nightly_requests']} nightly);"
+        f"requests: {report['requests']} ({report['presubmit_requests']} presubmit, {report['nightly_requests']} nightly,"
+        f" {report['nightly_untrusted_requests']} nightly-untrusted, never a source);"
         f" presubmit prompt tokens: {report['presubmit_prompt_tokens']}",
         f"skipped lines: {skipped}; merge times given: {report['merge_times_given']}",
         "",

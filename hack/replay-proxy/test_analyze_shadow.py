@@ -163,6 +163,20 @@ class EstimateTest(unittest.TestCase):
         self.assertEqual(rep["presubmit_prompt_tokens"], 0)
         self.assertEqual(rep["estimates"]["high"]["token_weighted_hit_percent"], 0.0)
 
+    def test_a_nightly_untrusted_line_is_never_a_source(self):
+        # Written by an account presubmits also run as, so pull-request code could have forged it.
+        for pr in ("", "10"):
+            with self.subTest(pr=pr):
+                lines = [line("u1", 1, "nightly-untrusted", "u", "A", ["a", "b"], pr=pr),
+                         presubmit("p1", 2, "10", "b1", "A", ["a", "b"])]
+                rep, skipped = report(lines, merged={"10": 1.5})
+                for estimate in analyze_shadow.ESTIMATES:
+                    self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+                self.assertIsNone(rep["top_misses"][0]["closest_request_id"])
+                self.assertEqual((rep["nightly_requests"], rep["nightly_untrusted_requests"]), (0, 1))
+                self.assertEqual(rep["health"]["lines_by_kind"]["nightly-untrusted"], 1)
+                self.assertEqual(skipped["untagged"], 0)
+
     def test_cross_project_share(self):
         rep, _ = report([
             line("n1", 1, "nightly", "n", "A", ["a"], project="p9"),
@@ -314,7 +328,7 @@ class HealthTest(unittest.TestCase):
         ])])
         rep = analyze_shadow.summarize(records, skipped=skipped)
         h = rep["health"]
-        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "presubmit": 4})
+        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "nightly-untrusted": 0, "presubmit": 4})
         self.assertEqual(h["observe_too_large"], 1)
         self.assertEqual(h["error_lines"], 1)
         self.assertEqual(h["analysis_dropped"], 1)

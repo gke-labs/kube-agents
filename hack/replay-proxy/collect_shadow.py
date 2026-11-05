@@ -62,7 +62,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 BUCKET_ROOT = "replay-shadow"
-JOB_KINDS = ("nightly", "presubmit")
+# One folder each, so an IAM condition on the object name can confine each
+# runner to its own: nightly/ is written by the nightly runner alone, and a
+# scheduled run as any other account is nightly-untrusted (hack/ci-env.sh,
+# resolve_replay_shadow).
+JOB_KINDS = ("nightly", "nightly-untrusted", "presubmit")
 DATE_FORMAT = "%Y-%m-%d"
 JOB_MANIFEST_PREFIX = "job-"
 JSON_SUFFIX = ".json"

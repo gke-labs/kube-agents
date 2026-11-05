@@ -551,6 +551,22 @@ class ProcessTest(unittest.TestCase):
         self.assertEqual(events[0], "start")
         self.assertEqual(events[-1], "stop")
 
+    def test_a_nightly_untrusted_run_uploads_under_its_own_folder(self):
+        with open(os.path.join(self.pod, "logs", "p-1-000001.jsonl"), "wb") as handle:
+            handle.write(b"line\n")
+        proc = self.start("--kind", "nightly-untrusted", "--final-deadline", "20")
+        self.wait_for(lambda: any(f.endswith(".jsonl") for f in self.bucket_files()))
+        proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=PROCESS_WAIT_SECONDS)
+        self.assertEqual(proc.returncode, 0, err)
+        files = self.bucket_files()
+        self.assertTrue(files)
+        for name in files:
+            self.assertTrue(name.startswith(f"{BUCKET}/replay-shadow/nightly-untrusted/"), name)
+        [manifest] = [f for f in files if "/job-" in f]
+        with open(os.path.join(self.bucket, manifest)) as handle:
+            self.assertEqual(json.load(handle)["kind"], "nightly-untrusted")
+
     def test_sigterm_cuts_a_hung_upload_at_the_final_deadline_and_exits_0(self):
         with open(os.path.join(self.pod, "logs", "p-1-000001.jsonl"), "wb") as handle:
             handle.write(b"line\n")

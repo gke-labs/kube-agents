@@ -431,7 +431,7 @@
               "properties": {
                 "kind": {
                   "type": "string",
-                  "enum": ["", "nightly", "presubmit"]
+                  "enum": ["", "nightly", "nightly-untrusted", "presubmit"]
                 },
                 "project": {
                   "type": "string"
@@ -474,7 +474,7 @@
                 "required": ["kind"],
                 "properties": {
                   "kind": {
-                    "enum": ["nightly", "presubmit"]
+                    "enum": ["nightly", "nightly-untrusted", "presubmit"]
                   }
                 }
               }

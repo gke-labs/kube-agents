@@ -677,7 +677,8 @@ litellm:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-    # Stamped on every log line (REPLAY_JOB_*). kind is nightly or presubmit,
+    # Stamped on every log line (REPLAY_JOB_*). kind is nightly,
+    # nightly-untrusted or presubmit (hack/ci-env.sh, resolve_replay_shadow),
     # and is required when the proxy is on: an untagged line counts in no
     # estimate.
     job:
