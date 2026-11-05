@@ -121,8 +121,8 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 	if env[a2aNATSCAFileEnv] != a2aNATSCAFile() {
 		t.Errorf("%s = %q, want %q", a2aNATSCAFileEnv, env[a2aNATSCAFileEnv], a2aNATSCAFile())
 	}
-	if env[a2aMCPEnvBusUser] != a2aConsoleConfUser {
-		t.Errorf("bus user = %q, want the console principal", env[a2aMCPEnvBusUser])
+	if env[a2aMCPEnvBusUser] != a2aConsoleMCPUser {
+		t.Errorf("bus user = %q, want the console-mcp principal", env[a2aMCPEnvBusUser])
 	}
 
 	// Every file the server reads sits in a mount of this pod.
@@ -151,12 +151,13 @@ func TestBuildA2AMCPDeployment(t *testing.T) {
 	}
 }
 
-// The creds Secret holds every static user's password. The MCP pod gets the
-// console's and nothing else, and its only other Secret is its own token.
+// The creds Secret holds every static user's password. The MCP pod gets its
+// own, console-mcp's, and nothing else, and its only other Secret is its own
+// token.
 // With broker access on (A2A_MCP_DOOR=true on a next install) it also holds
 // exactly one projected token, for the broker's mcp audience and nothing else;
 // with it off, none.
-func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
+func TestTheMCPPodHoldsItsBusPasswordAndItsOwnTokenOnly(t *testing.T) {
 	for _, brokerOn := range []bool{false, true} {
 		t.Run(map[bool]string{false: "broker access off", true: "broker access on"}[brokerOn], func(t *testing.T) {
 			t.Setenv(a2aMCPDoorEnvVar, map[bool]string{false: "", true: "true"}[brokerOn])
@@ -175,7 +176,7 @@ func TestTheMCPPodHoldsTheConsolePasswordAndItsOwnTokenOnly(t *testing.T) {
 			if len(secrets) != 2 {
 				t.Fatalf("secret volumes = %v, want the creds Secret and the token Secret", secrets)
 			}
-			for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsolePasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
+			for name, key := range map[string]string{a2aCredsSecretName(agent): a2aConsoleMCPPasswordKey, a2aMCPAccessName(agent): a2aMCPAccessKey} {
 				src := secrets[name]
 				if src == nil {
 					t.Errorf("no volume from Secret %s", name)
@@ -362,7 +363,7 @@ func TestTheMCPTokenIsMintedOnceAndNeverAdopted(t *testing.T) {
 		squatter := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace},
 			Data: map[string][]byte{a2aMCPAccessKey: []byte("chosen-by-someone-else")}}
 		r, cl := mcpTestReconciler(t, squatter)
-		if _, err := r.reconcileA2AMCP(ctx, agent); err != nil {
+		if _, err := r.reconcileA2AMCP(ctx, agent, false); err != nil {
 			t.Fatalf("an unowned Secret under the reserved name stopped the reconcile: %v", err)
 		}
 		if got, err := readMCPToken(t, cl); err != nil || string(got.Data[a2aMCPAccessKey]) != "chosen-by-someone-else" {
@@ -405,7 +406,7 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if _, err := r.reconcileA2AMCP(ctx, agent); err != nil {
+	if _, err := r.reconcileA2AMCP(ctx, agent, false); err != nil {
 		t.Fatal(err)
 	}
 	// The fence is reconcileA2ANetworkFences's; applied here as that pass
@@ -426,7 +427,7 @@ func TestTheMCPServerComesAndGoesWithItsFlag(t *testing.T) {
 	}
 
 	t.Setenv(a2aMCPDoorEnvVar, "")
-	if _, err := r.reconcileA2AMCP(ctx, agent); err != nil {
+	if _, err := r.reconcileA2AMCP(ctx, agent, false); err != nil {
 		t.Fatal(err)
 	}
 	for name, obj := range map[string]client.Object{
@@ -495,7 +496,7 @@ func TestTheFlagOffMCPRemovalSkipsAnUnownedFence(t *testing.T) {
 	agent := a2aTestAgent()
 	squatter := buildA2AMCPNetworkPolicy(agent)
 	r, cl := mcpTestReconciler(t, squatter)
-	if _, err := r.reconcileA2AMCP(ctx, agent); err != nil {
+	if _, err := r.reconcileA2AMCP(ctx, agent, false); err != nil {
 		t.Fatalf("an unowned NetworkPolicy under the fence's name stopped the reconcile: %v", err)
 	}
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(squatter), &networkingv1.NetworkPolicy{}); err != nil {

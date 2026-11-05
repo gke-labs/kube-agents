@@ -1401,8 +1401,19 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
         covered = set(_WATCHER_DURATION_KNOBS) | set(_WATCHER_COUNT_KNOBS)
         self.assertEqual(
             set(),
-            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD"},
+            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD", "WATCHER_ALERT_EXCLUDE"},
             "a WATCHER_* value reaches the watcher without a normaliser",
+        )
+
+    def test_the_alert_exclude_list_reaches_the_watcher_as_it_is(self) -> None:
+        """A JSON list, so the watcher parses it, and fails open on a bad one.
+
+        Quoted whole: the list carries spaces and double quotes.
+        """
+        self.assertIn('WATCHER_ALERT_EXCLUDE="${WATCHER_ALERT_EXCLUDE:-}"', self.text)
+        self.assertIn(
+            '--alert-exclude="${WATCHER_ALERT_EXCLUDE}"',
+            self.lift("start_event_watcher"),
         )
 
 

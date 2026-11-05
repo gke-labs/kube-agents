@@ -7,10 +7,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	natsserver "github.com/nats-io/nats-server/v2/server"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -58,20 +61,50 @@ func TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed(t *testing.T) {
 	}
 }
 
-// atCapTerminalWait is the at-cap test's own terminal budget. An answer of
-// apiResponseCap bytes takes about 10 s to
-// its terminal under the race detector on an idle machine (0.6 s to read and
-// parse, 6.4 s in the chat fold scanning one 8 MiB line, 3 s publishing the
-// result chunks; 1.3 s without -race), so the shared terminalWait is crossed
-// on a busy CI runner at a two-fold slowdown, and 58 s to 132 s was
-// measured with the module's packages sharing four starved cores, a
-// thirteen-fold slowdown at worst; the budget is eighteen-fold on the idle
-// figure. The task deadline bounds only the HTTP turn, and the fold runs
-// before finalizeResult opens its publish window, so this budget is the one
-// that decides while the chunks publish inside finalizePublishTimeout; a run
-// that ends failed with bus-publish-failed instead crossed that window, and
-// this budget is not the one to raise.
-const atCapTerminalWait = 180 * time.Second
+// atCapAnswerBytes is the cap the at-cap test runs the bridge at, two result
+// chunks. The boundary is the same comparison at any cap, and the chat fold
+// and the result publish scale with the answer: at apiResponseCap's 8 MiB the
+// answer took about 10 s to its terminal under the race detector on an idle
+// machine, and on a loaded runner it outran finalizePublishTimeout, so the
+// task ended with no terminal at all. TestAPI_OversizeAnswerIsRefusedWithTheLimitNamed
+// keeps the default cap, which reads and refuses but never folds or
+// publishes.
+const atCapAnswerBytes = 512 << 10
+
+// fullCapEnv opts in to TestAPI_AnswerAtTheProductionCapReachesATerminal,
+// and fullCapTerminalWait is its terminal budget. An answer of apiResponseCap
+// bytes reached its terminal in about 10 s under the race detector on an idle
+// machine, and in 58 s to 132 s with the module's packages sharing four
+// starved cores; the budget is over twice the slowest.
+const (
+	fullCapEnv          = "HERMES_BRIDGE_TEST_FULL_CAP"
+	fullCapTerminalWait = 300 * time.Second
+)
+
+// An answer of exactly apiResponseCap bytes, folded and published, reaches a
+// terminal. finalizeResult publishes the result chunks and the terminal inside
+// one finalizePublishTimeout window, so on a host slow enough that the chunks
+// use the window, the terminal publish fails too and no terminal arrives
+// until the sweep. This test observes that defect; the at-cap boundary itself
+// is TestAPI_AnswerAtTheCapCompletes, at atCapAnswerBytes.
+//
+// It runs only with fullCapEnv set. On a loaded host the window, not the
+// wait, decides: with twenty-four busy loops on eight cores (load average 57
+// to 72), 8 of 8 runs had no terminal at fullCapTerminalWait. Set it on an
+// idle host, or to watch the defect.
+func TestAPI_AnswerAtTheProductionCapReachesATerminal(t *testing.T) {
+	if os.Getenv(fullCapEnv) == "" {
+		t.Skipf("set %s to run an answer of apiResponseCap bytes to its terminal", fullCapEnv)
+	}
+	_, url := startServer(t)
+	startAPIBridge(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil)
+	c := gatewayClient(t, url)
+	submitIn(t, c, "task-fullcap", "ctx-fullcap", "write something enormous")
+	task := waitTerminalFor(t, c, "task-fullcap", fullCapTerminalWait)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("state = %s (%v), want completed", task.State, task.FinalMessage)
+	}
+}
 
 // resultPublishCall is what the at-cap test's hooks record: when the
 // bridge's chat fold returned, and the deadline of the context resultPublish
@@ -82,13 +115,13 @@ type resultPublishCall struct {
 	hasDeadline bool
 }
 
-// The boundary's other side: an answer of exactly apiResponseCap bytes is
-// read whole and completes, so the one-byte look-ahead refuses nothing the
-// cap admits.
+// The boundary's other side: an answer of exactly the cap is read whole and
+// completes, so the one-byte look-ahead refuses nothing the cap admits. The
+// bridge runs at atCapAnswerBytes here, not apiResponseCap.
 //
-// The same answer is the one whose chat fold costs enough to matter, so the
-// test also checks where finalizeResult runs it: before the publish window
-// opens, not inside it. The chatPart hook records when the fold returned,
+// At the production cap the chat fold costs enough to matter, so the test
+// also checks where finalizeResult runs it: before the publish window opens,
+// not inside it. The chatPart hook records when the fold returned,
 // the resultPublish hook the deadline of the context it was entered with,
 // and the window opened finalizePublishTimeout before that deadline. Both
 // run on the finalizer's goroutine, in that order, so the fold's time rides
@@ -98,7 +131,8 @@ type resultPublishCall struct {
 func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	_, url := startServer(t)
 	published := make(chan resultPublishCall, 1)
-	startAPIBridgeHooked(t, url, newAPIStub(t, completionOfSize(t, apiResponseCap)), nil, func(b *Bridge) {
+	startAPIBridgeHooked(t, url, newAPIStub(t, completionOfSize(t, atCapAnswerBytes)), nil, func(b *Bridge) {
+		b.responseCap = atCapAnswerBytes
 		var foldedAt time.Time
 		fold := b.chatPart
 		b.chatPart = func(answer string) (lib.Part, bool) {
@@ -118,7 +152,7 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 	}, func(net.Addr) bool { return true })
 	c := gatewayClient(t, url)
 	submitIn(t, c, "task-atcap", "ctx-atcap", "write something large")
-	task := waitTerminalFor(t, c, "task-atcap", atCapTerminalWait)
+	task := waitTerminalFor(t, c, "task-atcap", 3*terminalWait)
 	if task.State != lib.StateCompleted {
 		reason := ""
 		if task.FinalMessage != nil && len(task.FinalMessage.Parts) > 0 {
@@ -148,22 +182,25 @@ func TestAPI_AnswerAtTheCapCompletes(t *testing.T) {
 }
 
 // A result artifact the bus refuses carries the refusal into the terminal.
-// The chunk size here is past the bus's 1 MiB default max payload, so the
-// first chunk's envelope is over it, the case lib's publish gate names. The
-// terminal used to read the bare `bus-publish-failed at result`, with the
-// cause only in the bridge log.
+// The test server's max payload is pubFailMaxPayload and the chunk size twice
+// that, so the first chunk's envelope is over it, the case lib's publish gate
+// names. The terminal used to read the bare `bus-publish-failed at result`,
+// with the cause only in the bridge log.
+//
+// The limit is the server's, not the bus default of 1 MiB: an answer past
+// 1 MiB spent 40 s in the chat fold before its first publish on a loaded
+// runner, and the refusal is the same comparison at any limit.
 func TestResultPublishFailureCarriesTheCause(t *testing.T) {
-	const chunk = 2 << 20
-	_, url := startServer(t)
+	const pubFailMaxPayload = 64 << 10
+	const chunk = 2 * pubFailMaxPayload
+	_, url := startServerOpt(t, true, func(o *natsserver.Options) { o.MaxPayload = pubFailMaxPayload })
 	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, c apiCall) {
 		writeCompletion(w, c.sessionID, strings.Repeat("y", chunk-1))
 	})
 	startAPIBridge(t, url, stub, func(cfg *Config) { cfg.ResultChunkSize = chunk })
 	c := gatewayClient(t, url)
 	submitIn(t, c, "task-pubfail", "ctx-pubfail", "answer at length")
-	// A quarter of the at-cap answer: 22 s measured under the load that
-	// took the at-cap test past 100 s, against terminalWait's 20 s.
-	task := waitTerminalFor(t, c, "task-pubfail", 3*terminalWait)
+	task := waitTerminal(t, c, "task-pubfail")
 	if task.State != lib.StateFailed {
 		t.Fatalf("state = %s, want failed", task.State)
 	}
@@ -172,7 +209,7 @@ func TestResultPublishFailureCarriesTheCause(t *testing.T) {
 	if !strings.HasPrefix(reason, want) {
 		t.Fatalf("reason = %q, want prefix %q", reason, want)
 	}
-	if !strings.Contains(reason, "bus max message size is") {
+	if !strings.Contains(reason, fmt.Sprintf("bus max message size is %d", pubFailMaxPayload)) {
 		t.Errorf("reason does not carry the bus's refusal: %q", reason)
 	}
 }

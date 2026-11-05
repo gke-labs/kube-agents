@@ -271,6 +271,17 @@ class ForgeScriptTest(unittest.TestCase):
             "host=ghes.eval.internal", "enterprise-version=3.17.0", "block-project-ssh-keys=TRUE", "startup-script=", "tls-crt=", "tls-key=", "ca-crt=",
         ):
             self.assertIn(flag, create)
+        # The registry helper writes its config to /var before the pull: Container-Optimized OS mounts /root
+        # read-only, and without the config docker pulls the proxy image unauthenticated and is refused.
+        startup = (self.gstate / "startup-script").read_text()
+        self.assertIn("export DOCKER_CONFIG=/var/", startup)
+        self.assertLess(startup.index("export DOCKER_CONFIG="), startup.index("docker-credential-gcr configure-docker"))
+        self.assertLess(startup.index("docker-credential-gcr configure-docker"), startup.index('docker pull "$IMAGE"'))
+        # Both steps print their cause on failure, before the `FORGE failed` line `up` stops reading at;
+        # the login's line is not itself a `FORGE failed`, so `up` waits for the pull's.
+        login = next(line for line in startup.splitlines() if "FORGE registry-login" in line)
+        self.assertNotIn("FORGE failed", login)
+        self.assertLess(startup.index("FORGE pull: "), startup.index("FORGE failed pull"))
         # Readiness from the serial console, the key out of metadata, then one curl from a pod in the host cluster, with the CA.
         self.assertTrue(self.calls_of("get-serial-port-output forge-ghes"))
         self.assertTrue(self.calls_of("compute instances remove-metadata forge-ghes --zone=us-central1-a"))
@@ -392,10 +403,18 @@ class ForgeScriptTest(unittest.TestCase):
         self.assertFalse(self.state_dir.exists())
 
     def test_up_takes_the_vm_down_when_the_serial_console_reports_a_failure(self):
-        self.provision(serial="startup-script: FORGE script-start t=1s\nstartup-script: FORGE failed pull us-central1-docker.pkg.dev/x\n")
+        self.provision(serial=(
+            "startup-script: FORGE script-start t=1s\n"
+            "startup-script: FORGE registry-login rc=1: ERROR: Unable to save docker config\n"
+            "startup-script: FORGE pull: denied: Unauthenticated request\n"
+            "startup-script: FORGE failed pull us-central1-docker.pkg.dev/x\n"
+        ))
         proc = self.run_forge("up")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("startup failed: FORGE failed pull", proc.stderr)
+        # The cause the VM printed before the failed line reaches the job's log.
+        self.assertIn("FORGE registry-login rc=1: ERROR: Unable to save docker config", proc.stderr)
+        self.assertIn("FORGE pull: denied: Unauthenticated request", proc.stderr)
         self.assertTrue(self.calls_of("compute instances delete forge-ghes --zone=us-central1-a"))
         self.assertFalse(self.state_dir.exists())
         self.assertFalse(self.calls_of("kubectl run"), "no in-cluster check on a forge that never came up")

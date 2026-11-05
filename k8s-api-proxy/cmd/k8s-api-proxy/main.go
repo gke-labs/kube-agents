@@ -124,15 +124,12 @@ func parseAllowedCallers(raw string) ([]string, error) {
 }
 
 func main() {
-	defaultCluster := envOrDefault("KUBE_PROXY_DEFAULT_CLUSTER", envOrDefault("KUBE_CONTEXT_NAME", k8sapiproxy.InClusterID))
-
 	var (
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
 		metricsPort              = flag.Int("metrics-port", envIntOrDefault("KUBE_PROXY_METRICS_PORT", 0), "TCP port for the Prometheus /metrics listener (0 disables the listener)")
 		tlsCertFile              = flag.String("tls-cert-file", envOrDefault("KUBE_PROXY_TLS_CERT_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.crt"), "TLS server certificate PEM file (empty for plain HTTP)")
 		tlsKeyFile               = flag.String("tls-key-file", envOrDefault("KUBE_PROXY_TLS_KEY_FILE", "/var/run/secrets/kubeagents/kube-proxy-tls/tls.key"), "TLS server private key PEM file")
 		modeRaw                  = flag.String("mode", envOrDefault("KUBE_PROXY_MODE", string(k8sapiproxy.ModeReadOnlyWithDryRun)), "Proxy policy mode: read-only, read-only-dry-run, or read-write")
-		defaultClusterF          = flag.String("default-cluster", defaultCluster, "Default cluster ID when /clusters/{id} prefix is omitted")
 		hostClusterIDF           = flag.String("host-cluster-id", envOrDefault("KUBE_PROXY_HOST_CLUSTER_ID", ""), "Optional gke_ cluster ID to route through the in-cluster ServiceAccount instead of Google credentials")
 		redactSecrets            = flag.Bool("redact-secrets", envBoolOrDefault("KUBE_PROXY_REDACT_SECRETS", true), "Redact core/v1 Secret payloads and rewrite Accept headers to PartialObjectMetadata")
 		allowUpgradeSubresources = flag.Bool("allow-upgrade-subresources", envBoolOrDefault("KUBE_PROXY_ALLOW_UPGRADE_SUBRESOURCES", false), "Allow exec, attach, portforward, and proxy subresources when mode is read-write")
@@ -226,9 +223,8 @@ func main() {
 	}
 
 	handler, err := k8sapiproxy.NewHandler(k8sapiproxy.Config{
-		Authenticator:    authn,
-		Upstream:         upstreamTransport,
-		DefaultClusterID: *defaultClusterF,
+		Authenticator: authn,
+		Upstream:      upstreamTransport,
 		Policy: k8sapiproxy.Policy{
 			Mode:                     mode,
 			RedactSecrets:            *redactSecrets,
@@ -260,10 +256,10 @@ func main() {
 	}()
 
 	if *tlsCertFile != "" && *tlsKeyFile != "" {
-		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, defaultCluster=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *defaultClusterF, *redactSecrets, *metricsPort, *cacheMaxBytes)
+		log.Printf("starting k8s-api-proxy (TLS) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 		err = srv.ListenAndServeTLS(*tlsCertFile, *tlsKeyFile)
 	} else {
-		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, defaultCluster=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *defaultClusterF, *redactSecrets, *metricsPort, *cacheMaxBytes)
+		log.Printf("starting k8s-api-proxy (plain HTTP) on %s (mode=%s, redactSecrets=%v, metricsPort=%d, cacheMaxBytes=%d)", *listenAddr, mode, *redactSecrets, *metricsPort, *cacheMaxBytes)
 		err = srv.ListenAndServe()
 	}
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {

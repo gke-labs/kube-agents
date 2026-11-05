@@ -47,7 +47,9 @@ func startServerNoVerifier(t *testing.T) (*natsserver.Server, string) {
 	return startServerOpt(t, false)
 }
 
-func startServerOpt(t *testing.T, withVerifier bool) (*natsserver.Server, string) {
+// startServerOpt starts the test server; each mutate sees its options
+// before it starts.
+func startServerOpt(t *testing.T, withVerifier bool, mutate ...func(*natsserver.Options)) (*natsserver.Server, string) {
 	t.Helper()
 	opts := &natsserver.Options{
 		Host:      "127.0.0.1",
@@ -56,6 +58,9 @@ func startServerOpt(t *testing.T, withVerifier bool) (*natsserver.Server, string
 		StoreDir:  t.TempDir(),
 		NoLog:     true,
 		NoSigs:    true,
+	}
+	for _, m := range mutate {
+		m(opts)
 	}
 	s, err := natsserver.NewServer(opts)
 	if err != nil {

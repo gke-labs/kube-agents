@@ -1239,11 +1239,9 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Smoke gate is healthy", app)
         sentence = "Runs are slow since Tue 8:00 AM ET: the last 5 full runs took a median of 183 min against a 7-day typical of 151. Nothing is broken; /retest won't make yours faster."
         self.assertIn(sentence, app)
-        # The 🐢 message's own link lands on this headline, not on a
-        # synthetic past incident: a `since` at the note's GREEN start would.
-        fragment = "#" + render.post_health.render_slow(health_doc("GREEN", slow=note)).rsplit("#", 1)[1]
-        self.assertEqual(fragment, "#view=agent")
-        linked = dom_text(out / "index.html", fragment=fragment)
+        # The bare agent view lands on this headline, not on a synthetic past
+        # incident: a `since` at the note's GREEN start would.
+        linked = dom_text(out / "index.html", fragment="#view=agent")
         self.assertIn("Smoke gate is healthy", linked)
         self.assertIn(sentence, linked)
         self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")

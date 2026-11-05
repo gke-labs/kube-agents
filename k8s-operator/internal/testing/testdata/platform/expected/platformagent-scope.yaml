@@ -780,8 +780,6 @@ spec:
               value: read-only-dry-run
             - name: KUBE_PROXY_REDACT_SECRETS
               value: "true"
-            - name: KUBE_PROXY_DEFAULT_CLUSTER
-              value: gke_example-project_us-central1-a_cluster-a
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
