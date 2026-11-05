@@ -13,6 +13,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import contextvars
+import importlib.util
+import os
+import sys
 import json
 import sqlite3
 import tempfile
@@ -34,6 +38,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 SESSION_KV_SERVER = REPO / "agents" / "platform" / "scripts" / "session_kv_server.py"
 DOCKERFILE = HERE.parent / "Dockerfile"
+TURN_CONTEXT = REPO / "agents" / "chat" / "defaults" / "plugins" / "session_store" / "turn_context.py"
 
 QUEUED_LINE = "⏳ Queued: the system is busy. Your request will start when a worker frees up."
 
@@ -122,6 +127,104 @@ class StampTest(unittest.TestCase):
     def test_the_runtime_origin_fails_toward_no_session(self):
         # No tools.async_delegation on the host: the read must not raise.
         self.assertEqual(kp.trusted_origin_session(), "")
+
+    def test_trusted_origin_session_falls_back_to_the_gateway_binding(self):
+        # A gateway platform turn: no api_server id, so the Hermes session id
+        # the session_store plugin bound at dispatch is the origin session.
+        spec = importlib.util.spec_from_file_location("turn_context_under_test", TURN_CONTEXT)
+        turn_context = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(turn_context)
+
+        def gateway_turn():
+            turn_context.bind_session(GATEWAY_SESSION)
+            return kp.trusted_origin_session()
+
+        self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(gateway_turn))
+
+        # An api_server turn's own id wins over any binding.
+        api = SimpleNamespace(_current_origin_session_id=lambda: EVENT_SESSION)
+        with mock.patch.dict(sys.modules, {"tools": SimpleNamespace(async_delegation=api), "tools.async_delegation": api}):
+            self.assertEqual(EVENT_SESSION, contextvars.copy_context().run(gateway_turn))
+
+        # No plugin loaded and no session context bound: no session, whatever
+        # the process env holds.
+        with mock.patch.dict(sys.modules), mock.patch.dict(os.environ, {"HERMES_SESSION_ID": GATEWAY_SESSION}):
+            sys.modules.pop(turn_context.TURN_CONTEXT_MODULE, None)
+            self.assertEqual("", kp.trusted_origin_session())
+
+    def _session_context(self, bound=None):
+        """A stand-in for Hermes' ``gateway.session_context``: its ContextVar and sentinel.
+
+        ``get_session_env`` answers the stale process env, as Hermes' does when the
+        ContextVar is unset, so a reader that calls it fails these tests.
+        """
+        unset = object()
+        var = contextvars.ContextVar("HERMES_SESSION_ID", default=unset)
+        if bound is not None:
+            var.set(bound)
+        session_context = SimpleNamespace(
+            _SESSION_ID=var,
+            _UNSET=unset,
+            get_session_env=lambda name, default="": os.environ.get(name, default),
+        )
+        gateway = SimpleNamespace(session_context=session_context)
+        return mock.patch.dict(sys.modules, {"gateway": gateway, "gateway.session_context": session_context})
+
+    def _turn_context(self):
+        spec = importlib.util.spec_from_file_location("turn_context_under_test", TURN_CONTEXT)
+        turn_context = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(turn_context)
+        return turn_context
+
+    def test_an_empty_binding_falls_to_the_turns_session_context(self):
+        turn_context = self._turn_context()
+
+        def turn():
+            turn_context.bind_session("")
+            return kp.trusted_origin_session()
+
+        with self._session_context(bound=GATEWAY_SESSION), \
+                mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "process-wide-stale"}):
+            self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(turn))
+
+    def test_a_fresh_session_context_wins_over_a_stale_binding(self):
+        # An internal event skips pre_gateway_dispatch, so it inherits the
+        # previous turn's binding; its own session context names the right id.
+        turn_context = self._turn_context()
+
+        def internal_turn():
+            turn_context.bind_session("20261008_090000_stale000")
+            return kp.trusted_origin_session()
+
+        with self._session_context(bound=GATEWAY_SESSION):
+            self.assertEqual(GATEWAY_SESSION, contextvars.copy_context().run(internal_turn))
+
+    def test_no_binding_and_no_session_context_is_no_session(self):
+        turn_context = self._turn_context()
+
+        def turn():
+            turn_context.bind_session("")
+            return kp.trusted_origin_session()
+
+        env = {k: v for k, v in os.environ.items() if k != "HERMES_SESSION_ID"}
+        with mock.patch.dict(os.environ, env, clear=True), self._session_context():
+            self.assertEqual("", contextvars.copy_context().run(turn))
+
+    def test_a_stale_process_env_session_id_is_ignored(self):
+        # Hermes writes os.environ["HERMES_SESSION_ID"] for every root agent in
+        # the gateway, so outside a bound turn it names the last turn's session.
+        turn_context = self._turn_context()
+
+        def unbound():
+            turn_context.bind_session("")
+            return kp.trusted_origin_session()
+
+        with mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "20261103_090000_lastturn"}):
+            with self._session_context():
+                self.assertEqual("", contextvars.copy_context().run(unbound), "unset ContextVar")
+            with self._session_context(bound=""):
+                self.assertEqual("", contextvars.copy_context().run(unbound), "cleared ContextVar")
+            self.assertEqual("", contextvars.copy_context().run(unbound), "no Hermes session context")
 
     def test_the_class_boundary_is_the_floor(self):
         self.assertTrue(kp.is_user_priority(kp.USER_PRIORITY))
@@ -223,6 +326,17 @@ class SessionPrefixPinTest(unittest.TestCase):
 
     def _minted_prefixes(self):
         tree = ast.parse(SESSION_KV_SERVER.read_text())
+        # Module-level string constants, so a mint site that builds the id from
+        # one (`f"{WATCHER_SESSION_PREFIX}..."`) is read as its literal.
+        constants = {
+            t.id: stmt.value.value
+            for stmt in tree.body
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+            for t in stmt.targets
+            if isinstance(t, ast.Name)
+        }
         found = {}
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -241,6 +355,14 @@ class SessionPrefixPinTest(unittest.TestCase):
                     head = value.values[0]
                     if isinstance(head, ast.Constant) and isinstance(head.value, str):
                         found.setdefault(node.name, set()).add(head.value)
+                    elif (
+                        isinstance(head, ast.FormattedValue)
+                        and head.conversion == -1
+                        and head.format_spec is None
+                        and isinstance(head.value, ast.Name)
+                        and head.value.id in constants
+                    ):
+                        found.setdefault(node.name, set()).add(constants[head.value.id])
         return found
 
     def test_each_background_prefix_is_minted_by_session_kv_server(self):
