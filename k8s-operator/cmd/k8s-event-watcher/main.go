@@ -673,6 +673,10 @@ type dispatcher struct {
 	// noFollowupLogged keeps the "daemon serves no follow-ups" line to one
 	// per change of answer.
 	noFollowupLogged atomic.Bool
+
+	// excluded sends the events alert-exclude rules hold back to the daemon,
+	// for the daily recap's count; nil in a dry run.
+	excluded *excludedRecorder
 }
 
 func (d *dispatcher) clock() time.Time {
@@ -692,7 +696,12 @@ func (d *dispatcher) clock() time.Time {
 // filter's config rather than the flag so the default applies when the flag
 // was left at zero.
 func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
+	var excluded *excludedRecorder
+	if inj != nil && !f.dryRun {
+		excluded = newExcludedRecorder((&excludedPoster{inj: inj}).Post)
+	}
 	return &dispatcher{
+		excluded:    excluded,
 		filter:      filter,
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
@@ -917,6 +926,9 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			log.Printf("ignored %s pod=%s/%s reported by %q, not %s; no verdict recorded, not forwarded",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Reporter, scaleUpReporter)
 		}
+		if gate == gateAlertExcluded && d.excluded != nil {
+			d.excluded.Note(ev)
+		}
 		// A sighting a gate stopped is still a sighting: an alerted object
 		// the scale-up hold keeps from Observe is not quiet.
 		d.dedup.Sighted(ev.Key, ev.Message, ev.LastSeen)
@@ -1095,6 +1107,9 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
+	if d.excluded != nil {
+		d.excluded.Sweep(ctx)
+	}
 	now := d.clock()
 	quiet := d.filter.cfg.settle + settleQuietSlack
 	for _, h := range d.settles.Expire(now, quiet) {

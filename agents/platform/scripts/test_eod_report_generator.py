@@ -1951,3 +1951,149 @@ class TestTheNamespaceFilterReadsItsValue(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAlertExcludedEventsAreCountedApart(unittest.TestCase):
+    """Rows an alert-exclude rule held back in the watcher (`excluded = 1`).
+
+    Told as one count, like the withheld alerts, and kept out of every other
+    figure: the rules silenced them on purpose, so they are not forwarded
+    events, not withheld alerts, and no reason to withhold the all-clear.
+    """
+
+    def _excluded(self, **overrides):
+        row = dict(notified=False, severity="Warning", reason="BackOff", alert_excluded=True)
+        row.update(overrides)
+        return event(**row)
+
+    def test_they_get_their_own_line_and_no_other_figure(self):
+        events = [
+            event(workload="api", reason="OOMKilled", notified=True),
+            self._excluded(workload="payments-api", object_uid="u1", occurrences=4),
+            self._excluded(workload="payments-api", object_uid="u2", occurrences=2),
+            self._excluded(workload="inventory", object_uid="u3", occurrences=1),
+        ]
+        summary, report = recap(events)
+
+        self.assertEqual(summary["alert_excluded_events"], 7)
+        self.assertEqual(summary["alert_excluded_workloads"], 2)
+        self.assertIn("🔇 7 events from 2 workloads were silenced by alert-exclude rules:", report)
+        self.assertIn("    • `prod-api/payments-api` (6 events)", report)
+        self.assertIn("    • `prod-api/inventory` (1 event)", report)
+        self.assertEqual(summary["total_occurrences"], 1)
+        self.assertEqual(summary["alerts_posted"], 1)
+        self.assertEqual(summary["cap_dropped"], 0)
+        self.assertEqual(listed_labels(report), [])
+        self.assertEqual(report.count("payments-api"), 1, "named once, on the alert-exclude line only")
+
+    def test_a_day_with_only_excluded_events_is_still_all_clear(self):
+        summary, report = recap([self._excluded(object_uid="u1", occurrences=3)])
+
+        self.assertTrue(report.startswith("🟢"), report.splitlines()[0])
+        self.assertIn("🔇 3 events from 1 workload were silenced by alert-exclude rules:", report)
+
+    def test_one_event_reads_in_the_singular(self):
+        _, report = recap([self._excluded(object_uid="u1")])
+
+        self.assertIn("🔇 1 event from 1 workload was silenced by alert-exclude rules:", report)
+
+    def test_the_noisiest_workloads_are_named_and_the_rest_counted(self):
+        events = [
+            self._excluded(namespace="ns", workload=f"w{i}", object_uid=f"u{i}", occurrences=i)
+            for i in range(1, 8)
+        ]
+        summary, report = recap(events)
+        lines = report.splitlines()
+        start = lines.index("🔇 28 events from 7 workloads were silenced by alert-exclude rules:")
+        listed = lines[start + 1:start + 7]
+
+        self.assertEqual(listed, [
+            "    • `ns/w7` (7 events)",
+            "    • `ns/w6` (6 events)",
+            "    • `ns/w5` (5 events)",
+            "    • `ns/w4` (4 events)",
+            "    • `ns/w3` (3 events)",
+            "    • and 2 more workloads",
+        ])
+        self.assertNotIn("ns/w2", report)
+
+    def test_a_workload_on_another_cluster_is_named_with_its_cluster(self):
+        _, report = recap([self._excluded(cluster="seeded-a", namespace="ns", workload="api", object_uid="u1")],
+                          cluster_name="host")
+
+        self.assertIn("    • `seeded-a:ns/api` (1 event)", report)
+
+    def test_an_excluded_namespace_is_out_of_the_line(self):
+        with exclude("kube-system"):
+            _, report = recap([self._excluded(namespace="kube-system", workload="kube-dns", object_uid="u1")])
+
+        self.assertNotIn(eod_report_generator.ALERT_EXCLUDED_EMOJI, report)
+        self.assertNotIn("kube-dns", report)
+
+    def test_a_row_with_no_name_is_listed_by_its_uid_or_as_unknown(self):
+        _, report = recap([
+            self._excluded(namespace="ns", workload="", object_uid="uid-9", occurrences=2),
+            self._excluded(namespace="ns", workload="", object_uid="", occurrences=1),
+        ])
+
+        self.assertIn("    • `ns/uid-9` (2 events)", report)
+        self.assertIn(f"    • `ns/{eod_report_generator.UNKNOWN_WORKLOAD}` (1 event)", report)
+
+    def test_a_cluster_with_only_excluded_rows_is_named_in_the_scope(self):
+        summary, _ = recap([event(cluster="host"), self._excluded(cluster="seeded-a", object_uid="u1")])
+
+        self.assertIn("seeded-a", summary["clusters"])
+
+    def test_no_excluded_rows_print_no_line(self):
+        _, report = recap([event()])
+
+        self.assertNotIn(eod_report_generator.ALERT_EXCLUDED_EMOJI, report)
+
+
+class TestTheLoaderReadsTheExcludedMarker(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _db(self, with_column):
+        path = os.path.join(self.tmp.name, "session_kv.db")
+        conn = sqlite3.connect(path)
+        with conn:
+            conn.execute(
+                "CREATE TABLE intercepted_events (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "cluster TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL DEFAULT '', "
+                "workload TEXT NOT NULL DEFAULT '', object_uid TEXT NOT NULL DEFAULT '', "
+                "object_kind TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', "
+                "message TEXT NOT NULL DEFAULT '', severity TEXT NOT NULL DEFAULT '', "
+                "occurrences INTEGER NOT NULL DEFAULT 1, notified INTEGER NOT NULL DEFAULT 0, "
+                "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                + (", excluded INTEGER NOT NULL DEFAULT 0" if with_column else "")
+                + ")"
+            )
+            conn.execute(
+                "INSERT INTO intercepted_events (namespace, workload, object_uid, reason, severity, notified) "
+                "VALUES ('prod', 'api', 'u1', 'OOMKilled', 'Critical', 1)"
+            )
+            if with_column:
+                conn.execute(
+                    "INSERT INTO intercepted_events "
+                    "(namespace, workload, object_uid, reason, severity, occurrences, notified, excluded) "
+                    "VALUES ('payments', 'payments-api', 'u2', 'BackOff', 'Warning', 5, 0, 1)"
+                )
+        conn.close()
+        return path
+
+    def test_the_marker_is_read(self):
+        rows = load_intercepted_events(self._db(with_column=True), window_hours=24)
+
+        self.assertEqual(sorted((r["workload"], r["alert_excluded"]) for r in rows),
+                         [("api", False), ("payments-api", True)])
+
+    def test_a_ledger_without_the_column_reads_no_row_as_excluded(self):
+        rows = load_intercepted_events(self._db(with_column=False), window_hours=24)
+
+        self.assertEqual([r["alert_excluded"] for r in rows], [False])
+
+    def test_the_column_name_matches_the_writer(self):
+        source = (Path(__file__).resolve().parent / "session_kv_server.py").read_text()
+        self.assertIn('("excluded", "excluded INTEGER NOT NULL DEFAULT 0")', source)

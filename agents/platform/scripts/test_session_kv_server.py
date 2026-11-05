@@ -1317,6 +1317,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         # A kind the route refuses after the key check, so the authorised half
         # of the test writes no backlog row and starts no digest worker.
         ("POST", "/v1/drift-backlog", {"kind": "not-drift"}),
+        ("POST", "/v1/excluded-events", {"kind": "not-an-event"}),
         ("GET", "/v1/sessions", None),
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
@@ -11393,6 +11394,125 @@ class TestBoardAction(unittest.TestCase):
         self.board.unlink()
         results = self.act("retry", ["t_a"]).json()["results"]
         self.assertEqual(results, [{"id": "t_a", "outcome": "gone"}])
+class TestExcludedEvents(unittest.TestCase):
+    """`POST /v1/excluded-events`: the events alert-exclude rules held back."""
+
+    PAYLOAD = {
+        "kind": "k8s-event",
+        "reason": "BackOff",
+        "namespace": "payments",
+        "kind_of_object": "Pod",
+        "name": "payments-api-7d9f-abcde",
+        "uid": "uid-excluded-1",
+        "message": "Back-off restarting failed container app",
+        "cluster": "seeded-a",
+        "type": "Warning",
+        "occurrences": 3,
+    }
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
+        self.trigger = trigger.start()
+        self.addCleanup(trigger.stop)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+                conn.execute("DELETE FROM intercepted_events WHERE excluded != 0")
+
+    def tearDown(self):
+        import sqlite3
+
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM intercepted_events WHERE excluded != 0")
+
+    def _post(self, **overrides):
+        return self.client.post("/v1/excluded-events", json=dict(self.PAYLOAD, **overrides))
+
+    def _rows(self):
+        import sqlite3
+        from contextlib import closing
+
+        with closing(sqlite3.connect(temp_db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM intercepted_events WHERE excluded != 0 ORDER BY id")]
+
+    def test_the_daemon_advertises_the_route(self):
+        health = self.client.get("/healthz").json()
+        self.assertIn(session_kv_server.ALERT_EXCLUDED_FEATURE, health["features"])
+
+    def test_a_record_writes_an_excluded_row_with_no_session_alert_or_quota(self):
+        resp = self._post()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"status": "excluded"})
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["cluster"], row["namespace"], row["object_uid"], row["reason"]),
+                         ("seeded-a", "payments", "uid-excluded-1", "BackOff"))
+        self.assertEqual(row["occurrences"], 3)
+        self.assertEqual((row["notified"], row["session_id"], row["fold_key"], row["excluded"]), (0, "", "", 1))
+        self.trigger.assert_not_called()
+        quota = self.client.get("/v1/alert-quota").json()
+        self.assertFalse(any(bucket.get("used") for bucket in quota.values() if isinstance(bucket, dict)),
+                         f"an excluded event spent quota: {quota}")
+
+    def test_later_records_add_to_the_same_row(self):
+        self._post(occurrences=2)
+        self._post(occurrences=5)
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["occurrences"], 7)
+
+    def test_another_reason_or_object_gets_its_own_row(self):
+        self._post()
+        self._post(reason="Failed")
+        self._post(uid="uid-excluded-2")
+        self._post(cluster="seeded-b")
+        self.assertEqual(len(self._rows()), 4)
+
+    def test_records_without_a_uid_fold_only_within_their_workload(self):
+        self._post(uid="", name="api-1")
+        self._post(uid="", name="api-1")
+        self._post(uid="", name="billing")
+        rows = self._rows()
+        self.assertEqual(sorted((r["workload"], r["occurrences"]) for r in rows), [("api-1", 6), ("billing", 3)])
+
+    def test_a_row_older_than_the_fold_window_is_not_added_to(self):
+        import sqlite3
+
+        self._post()
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE excluded = 1",
+                    (f"-{session_kv_server.EXCLUDED_ROW_FOLD_SECONDS + 60} seconds",),
+                )
+        self._post()
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_the_feed_reads_the_row_as_excluded(self):
+        self._post()
+        feed = self.client.get("/v1/intercepted-events").json()
+        statuses = [e["status"] for e in feed["events"] if e["cluster"] == "seeded-a" and e["namespace"] == "payments"]
+        self.assertIn(session_kv_server.FEED_STATUS_EXCLUDED, statuses)
+
+    def test_refused_records(self):
+        too_many = session_kv_server.EXCLUDED_OCCURRENCES_MAX + 1
+        for overrides in ({"kind": "gitops-drift"}, {"occurrences": 0}, {"occurrences": "3"}, {"occurrences": True},
+                          {"occurrences": too_many}, {"occurrences": 2 ** 70}):
+            with self.subTest(overrides=overrides):
+                self.assertEqual(self._post(**overrides).status_code, 400)
+        self.assertEqual(self._rows(), [])
+
+
 class TestDriftBacklog(unittest.TestCase):
     """`POST /v1/drift-backlog` and the digest that follows it."""
 
