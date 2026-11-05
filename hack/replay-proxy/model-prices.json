@@ -1,9 +1,10 @@
 {
-  "as_of": "2026-11-04",
+  "as_of": "2026-10-20",
+  "confirmed": false,
   "currency": "USD",
   "unit": "per 1M tokens",
-  "source": "Vertex AI list prices for Gemini 3.1 Pro preview at the <=200k and >200k prompt tiers, as used for the 2026-10-20 eval token measurement; not re-checked against the price page on as_of",
-  "note": "A model missing here is reported as unpriced, never as zero: add it with its list price and move as_of when you do. completion tokens are billed at the output price, thinking tokens included.",
+  "source": "Vertex AI list prices for Gemini 3.1 Pro preview at the <=200k and >200k prompt tiers, as taken for the 2026-10-20 eval token measurement; not re-checked against the price page",
+  "note": "A model missing here is reported as unpriced, never as zero: add it with its list price and move as_of when you do. Set confirmed to true only after checking every price against the provider's price page on as_of. completion tokens are billed at the output price, thinking tokens included.",
   "models": {
     "gemini-3.1-pro-preview": {
       "input": 2.0,

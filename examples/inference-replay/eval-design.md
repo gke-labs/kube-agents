@@ -2,8 +2,8 @@
 
 > **STATUS — proposal; measured; part of shadow mode built, not deployed.** A prototype proxy was
 > run against a dev install on 2026-10-31 to 2026-11-02. [`hack/replay-proxy/`](../../hack/replay-proxy/README.md)
-> has the shadow-mode proxy, its fingerprint log, the scrubbed request store and the hit-rate
-> script; the join with run verdicts and the collision report (Rollout step 1) are not built yet.
+> has the shadow-mode proxy, its fingerprint log, the scrubbed request store, the hit-rate
+> script and the baseline report; the join with run verdicts and the collision report (Rollout step 1) are not built yet.
 > Nothing here is wired into `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or the chart. Shadow mode
 > changes no verdict.
 

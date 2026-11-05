@@ -493,6 +493,58 @@ class LiteLLMAccounting(unittest.TestCase):
         self.assertAlmostEqual(total["cost_usd"], 1.0)
 
 
+class ReviewFixes(unittest.TestCase):
+    def test_estimated_tokens_are_never_priced_but_a_litellm_cost_still_counts(self):
+        r = report([
+            line("a", 1, group="m2", prompt=1_000_000, completion=0),
+            line("b", 2, group="m2", prompt=1_000_000, cached=None, completion=None, estimated=True),
+            line("c", 3, group="m2", prompt=1_000_000, cached=None, completion=None, estimated=True,
+                 litellm_cost_usd=0.5),
+        ])
+        total = r["scopes"]["total"]
+        self.assertAlmostEqual(total["cost_usd"], 1.0 + 0.5)
+        self.assertAlmostEqual(total["table_cost_usd"], 1.0)
+        self.assertEqual(total["table_priced_requests"], 1)
+        self.assertEqual((total["estimated_token_requests"], total["estimated_unpriced_requests"]), (2, 1))
+        self.assertEqual(total["unpriced_requests"], 0)
+        self.assertIsNone(total["table_to_litellm_cost_ratio"])
+
+    def test_compare_notes_estimated_lines_on_either_side(self):
+        clean = report([line("a", 1, group="m2")])
+        estimated = report([line("a", 1, group="m2"), line("b", 2, group="m2", estimated=True, cached=None)])
+        self.assertEqual(br.compare(clean, clean)["notes"], [])
+        notes = " | ".join(br.compare(clean, estimated)["notes"])
+        self.assertIn("current total: 1 requests have estimated tokens (1 of them left out of cost_usd)", notes)
+        notes = " | ".join(br.compare(estimated, clean)["notes"])
+        self.assertIn("baseline total: 1 requests have estimated tokens", notes)
+
+    def test_the_prices_say_whether_they_were_confirmed_and_where_from(self):
+        r = report([line("a", 1)])
+        self.assertEqual((r["prices"]["confirmed"], r["prices"]["source"], r["prices"]["as_of"]),
+                         (False, "test", "2026-11-04"))
+        self.assertIn("prices: as of 2026-11-04 (not confirmed; source: test)", br.render(r))
+        confirmed = br.Prices(dict(TABLE, confirmed=True), "d", {})
+        self.assertTrue(confirmed.describe()["confirmed"])
+        result = br.compare(r, r)
+        self.assertEqual(result["baseline_prices"], {"as_of": "2026-11-04", "confirmed": False, "source": "test"})
+        self.assertIn("prices as of 2026-11-04 (not confirmed; source: test)", br.render_compare(result))
+        with self.assertRaises(ValueError):
+            br.Prices(dict(TABLE, confirmed="yes"), "d", {})
+
+    def test_the_checked_in_table_states_its_confirmation(self):
+        loaded = br.Prices.load(br.DEFAULT_PRICES_PATH, {})
+        self.assertIsInstance(loaded.confirmed, bool)
+        self.assertTrue(loaded.source)
+
+    def test_partial_harness_tokens_are_left_out_and_counted(self):
+        runs = [eval_run("b1", [task("c", {"result": "pass", "tokens": {"total": 100, "partial": False}},
+                                     {"result": "pass", "tokens": {"total": 900, "partial": True}},
+                                     {"result": "pass", "tokens": {"total": 50}})])]
+        total = report([line("a", 1, build="b1")], runs=runs)["scopes"]["total"]
+        self.assertEqual((total["harness_tokens_total"], total["harness_partial_reps"]), (150, 1))
+        self.assertIsNone(report([line("a", 1)])["scopes"]["total"]["harness_partial_reps"])
+
+
 class MalformedInput(unittest.TestCase):
     def test_skips_and_bad_values_are_counted_not_fatal(self):
         r = report([

@@ -41,16 +41,17 @@ The image is built from the repository root (`docker build -f hack/replay-proxy/
 
 `baseline_report.py` reports what eval inference costs today, from the same lines: requests, prompt tokens split cached and uncached, completion tokens, the token-weighted cache hit rate, estimated cost, model time, non-200 statuses (429s above all), LiteLLM fallbacks, and, given the eval dashboard's `data.json`, model time against agent time, pass rates and flaky cases. It reports totals, each job kind, each build and, from the eval data, each case. The baseline is the report over the shadow data from before replay is switched on; every later report comes from the same script, so `--compare` measures the change the same way.
 
-It takes JSONL files or directories, searched for `*.jsonl` and `*.jsonl.open` segments and `job-<ms>.json` manifests, so a bucket prefix downloaded as it is works. A build named in a manifest with no lines is listed under data quality. Tokens and cost count the lines answered with 200, because a refused request bills nothing; model time counts every line with a latency. A line whose analysis failed or was dropped still counts as a request and by status.
+It takes JSONL files or directories: a file named on the command line is read whatever its suffix, and a directory is searched for `*.jsonl` and `*.jsonl.open` log segments and `job-<ms>.json` run manifests, so a directory of collected proxy output can be passed as it is. A build named in a manifest with no lines is listed under data quality. Tokens and cost count the lines answered with 200, because a refused request bills nothing; model time counts every line with a latency. A line whose analysis failed or was dropped still counts as a request and by status.
 
-`cost_usd` takes LiteLLM's own cost for a line (`litellm_cost_usd`) when it has one, and otherwise an estimate from `model-prices.json`: a dated table of list prices per 1M tokens (input, cached input, output, and a long-context tier above a prompt size). The report gives both totals and how many lines each covered (`litellm_cost_usd`, `table_cost_usd`, `cost_from_table_requests`), and `table_to_litellm_cost_ratio` compares them over the lines that have both, which checks the table. The table is looked up by the deployment's model (`litellm_model_name`, with and then without its provider prefix such as `vertex_ai/`), then by the model group and the request's model; `--price-as <group>=<model>` is only the fallback, for lines written before the model name was logged (the group on an eval install is the `model-default` alias). A line with neither a LiteLLM cost nor a price is reported as unpriced with its count and left out, never counted as zero; the report prints the table's `as_of` date and hash. The table does not price cache writes.
+`cost_usd` takes LiteLLM's own cost for a line (`litellm_cost_usd`) when it has one, and otherwise an estimate from `model-prices.json`: a dated table of list prices per 1M tokens (input, cached input, output, and a long-context tier above a prompt size). The report gives both totals and how many lines each covered (`litellm_cost_usd`, `table_cost_usd`, `cost_from_table_requests`), and `table_to_litellm_cost_ratio` compares them over the lines that have both, which checks the table. The table is looked up by the deployment's model (`litellm_model_name`, with and then without its provider prefix such as `vertex_ai/`), then by the model group and the request's model; `--price-as <group>=<model>` is only the fallback, for lines written before the model name was logged (the group on an eval install is the `model-default` alias). A line with neither a LiteLLM cost nor a price is reported as unpriced with its count and left out, never counted as zero. A line whose tokens were estimated (the response carried no usage, so `prompt_tokens` is the request's size and there is no completion count) is never priced from the table: it counts only through a LiteLLM cost, and otherwise goes to `estimated_unpriced_requests` and out of `cost_usd`. Such lines are a minority, and a streamed answer that carries its usage carries LiteLLM's cost too, but `--compare` notes them on either side. The report prints the table's `as_of` date, whether its prices were `confirmed` against the provider's price page on that date, its `source` and its hash; the checked-in table is not confirmed. The table does not price cache writes.
 
 The eval join matches a line's `job.build` to a dashboard run's `build_id`. Lines carry no case, so tokens, cost and model time stop at the build; the case table comes from the eval data's repetitions. Model time includes every agent on the install and every request a repetition never waited on, so its ratio to agent time can pass 100%.
 
 To freeze a baseline, download the window and keep the report and its inputs together:
 
 ```bash
-gcloud storage cp -r "gs://<bucket>/replay-shadow" shadow/
+# The proxy's log segments and run manifests; the scrubbed request text is not needed.
+gcloud storage cp -r "gs://<bucket>/<prefix>/**/logs/*" "gs://<bucket>/<prefix>/**/job-*.json" shadow/
 gcloud storage cp gs://kube-agents-dashboards/evals/data.json data.json
 python3 baseline_report.py shadow/ --eval-data data.json --price-as model-default=<model> \
   --since 2026-11-05 --until 2026-11-18 --json > baseline.json
@@ -80,15 +81,17 @@ The metrics, as `baseline_report.py` defines them:
 | `prompt_tokens_per_build` | tokens | yes | prompt_tokens / builds. |
 | `cache_hit_rate` | fraction | yes | cached / prompt tokens, token-weighted, over status-200 lines whose usage was reported (not estimated): an estimated line has no cached count and would read as a miss. |
 | `estimated_prompt_token_share` | fraction |  | Prompt tokens on status-200 lines with tokens_estimated, over prompt_tokens. |
-| `cost_usd` | usd | yes | Sum over status-200 lines of LiteLLM's own cost (litellm_cost_usd) where the line has it, else the price-table estimate (see table_cost_usd); cost_from_table_requests says how many lines took the table. Lines with neither are left out: a partial figure when unpriced_requests &gt; 0. |
+| `cost_usd` | usd | yes | Sum over status-200 lines of LiteLLM's own cost (litellm_cost_usd) where the line has it, else the price-table estimate (see table_cost_usd); cost_from_table_requests says how many lines took the table. Lines with neither are left out, and so are lines with estimated tokens and no LiteLLM cost: a partial figure when unpriced_requests or estimated_unpriced_requests &gt; 0. |
 | `cost_per_build_usd` | usd | yes | cost_usd / builds. |
 | `litellm_cost_usd` | usd |  | Sum of litellm_cost_usd over the status-200 lines that carry it. |
 | `litellm_costed_requests` | count |  | Status-200 lines that carry litellm_cost_usd. |
-| `table_cost_usd` | usd |  | Sum over status-200 lines the price table prices (with or without a LiteLLM cost) of (uncached x input + cached x cached_input + completion x output) per 1M tokens, at the long-context price when the line's prompt_tokens exceed the table's above_prompt_tokens. Cache writes are not priced. |
-| `table_priced_requests` | count |  | Status-200 lines the price table prices. |
+| `table_cost_usd` | usd |  | Sum over status-200 lines with reported (not estimated) tokens that the price table prices (with or without a LiteLLM cost) of (uncached x input + cached x cached_input + completion x output) per 1M tokens, at the long-context price when the line's prompt_tokens exceed the table's above_prompt_tokens. Cache writes are not priced. |
+| `table_priced_requests` | count |  | Status-200 lines with reported tokens that the price table prices. |
 | `cost_from_table_requests` | count |  | Status-200 lines whose cost_usd came from the price table (no LiteLLM cost). |
 | `table_to_litellm_cost_ratio` | fraction |  | The table estimate over LiteLLM's cost, both over the status-200 lines that have both: the cross-check of the price table (1.0 is agreement). |
-| `unpriced_requests` | count |  | Status-200 lines with neither a LiteLLM cost nor a price-table price. |
+| `unpriced_requests` | count |  | Status-200 lines with reported tokens but neither a LiteLLM cost nor a price-table price. |
+| `estimated_token_requests` | count |  | Status-200 lines with tokens_estimated. |
+| `estimated_unpriced_requests` | count |  | Status-200 lines with tokens_estimated and no LiteLLM cost: an estimate of the prompt size and no completion count cannot be priced, so they are left out of cost_usd and table_cost_usd. |
 | `model_time_s` | seconds | yes | Sum of latency_ms over lines that carry one, any status, in seconds. Concurrent requests add up, so this can exceed wall clock. |
 | `model_time_per_build_s` | seconds | yes | model_time_s / builds. |
 | `latency_p50_ms` | ms | yes | Median latency_ms (nearest rank) over lines that carry one. |
@@ -103,7 +106,8 @@ The metrics, as `baseline_report.py` defines them:
 | `eval_builds_joined` | count |  | Builds in scope whose build id is a run in the eval data. |
 | `agent_time_s` | seconds |  | Sum of agent_s over the repetitions of joined builds that carry it. |
 | `model_time_share_of_agent_time` | fraction | yes | model_time_s over agent_time_s, both over the joined builds that have repetitions with agent_s. Model time outside a repetition (background agents, retries the harness never sees) counts too, so it is a ratio, not a share bounded by 1. |
-| `harness_tokens_total` | tokens |  | Sum of tokens.total over the repetitions of joined builds that carry it (the harness's own count; a cross-check on prompt_tokens + completion_tokens). |
+| `harness_tokens_total` | tokens |  | Sum of tokens.total over the repetitions of joined builds that carry it (the harness's own count; a cross-check on prompt_tokens + completion_tokens), leaving out repetitions whose tokens.partial is true. |
+| `harness_partial_reps` | count |  | Repetitions of joined builds left out of harness_tokens_total because their tokens.partial is true. |
 | `graded_reps` | count |  | Repetitions of joined builds graded pass or fail. |
 | `passed_reps` | count |  | Repetitions graded pass. |
 | `infra_reps` | count |  | Repetitions lost to infrastructure (infra), outside pass_rate. |

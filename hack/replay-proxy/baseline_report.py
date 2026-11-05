@@ -10,9 +10,9 @@ the same way (examples/inference-replay/eval-design.md, Rollout).
 
 Inputs:
 
-- LOG paths: JSONL files, or directories searched for `*.jsonl` and
-  `*.jsonl.open` segments and `job-<ms>.json` manifests (the bucket layout
-  `<kind>/<day>/<build>/logs/*.jsonl`, downloaded as it is);
+- LOG paths: JSONL files (read whatever their suffix), or directories
+  searched for `*.jsonl` and `*.jsonl.open` log segments and
+  `job-<ms>.json` run manifests;
 - `--eval-data data.json` (repeatable): the dashboard's runs, joined to the
   lines on the Prow build id (`job.build` == `runs[].build_id`);
 - `--prices`: the dated price table (default: model-prices.json beside this
@@ -66,6 +66,11 @@ PRICE_FIELDS = ("input", "cached_input", "output")
 PRICES_AS_OF = "as_of"
 PRICES_SOURCE = "source"
 PRICES_MODELS = "models"
+# False (or absent) until someone has checked the prices against the
+# provider's price page on as_of.
+PRICES_CONFIRMED = "confirmed"
+PRICES_SHA256 = "sha256"
+PRICES_PRICE_AS = "price_as"
 LONG_CONTEXT = "long_context"
 LONG_CONTEXT_THRESHOLD = "above_prompt_tokens"
 UNPRICED_NO_MODEL = "(no model)"
@@ -104,6 +109,8 @@ EVAL_RESULT = "result"
 EVAL_AGENT_S = "agent_s"
 EVAL_TOKENS = "tokens"
 EVAL_TOKENS_TOTAL = "total"
+# True when the harness's counts are short (a chain link or a worker unread).
+EVAL_TOKENS_PARTIAL = "partial"
 EVAL_PASS, EVAL_FAIL, EVAL_INFRA = "pass", "fail", "infra"
 EVAL_RESULTS = (EVAL_PASS, EVAL_FAIL, EVAL_INFRA)
 EVAL_TIER_DEFAULT = PRESUBMIT
@@ -116,6 +123,38 @@ SKIP_UNTAGGED = analyze_shadow.SKIP_UNTAGGED
 SKIP_BAD_TS = "bad_ts"
 SKIP_DUPLICATE = "duplicate_request_id"
 SKIP_OUTSIDE_WINDOW = "outside_window"
+
+# Report keys read back by render() and compare().
+REPORT_SCHEMA = "report_schema"
+REPORT_WINDOW = "window"
+REPORT_PRICES = "prices"
+REPORT_SCOPES = "scopes"
+REPORT_BUILDS = "builds"
+REPORT_CASES = "cases"
+REPORT_DATA_QUALITY = "data_quality"
+BUILD_METRICS = "metrics"
+COMPARE_BASELINE_PRICES = "baseline_prices"
+COMPARE_CURRENT_PRICES = "current_prices"
+COMPARE_NOTES = "notes"
+COMPARE_BASELINE_WINDOW = "baseline_window"
+COMPARE_CURRENT_WINDOW = "current_window"
+WINDOW_SINCE = "since"
+WINDOW_UNTIL = "until"
+WINDOW_FIRST_TS = "first_request_ts"
+WINDOW_LAST_TS = "last_request_ts"
+# A scope's breakdowns beside its metrics.
+STATUS_COUNTS = "status_counts"
+UNPRICED_BY_MODEL = "unpriced"
+
+# Text layout: column widths and how much of the price table's hash to show.
+METRIC_COLUMN_WIDTH = 32
+SCOPE_COLUMN_WIDTH = 18
+COMPARE_COLUMN_WIDTH = 16
+PERCENT_COLUMN_WIDTH = 10
+KIND_COLUMN_WIDTH = 9
+HASH_DISPLAY_CHARS = 12
+PRICES_CONFIRMED_LABEL = "confirmed"
+PRICES_UNCONFIRMED_LABEL = "not confirmed"
 
 # Metric units.
 COUNT, TOKENS, FRACTION, USD, SECONDS, MS = "count", "tokens", "fraction", "usd", "seconds", "ms"
@@ -166,21 +205,28 @@ METRICS: Tuple[Metric, ...] = (
     Metric("cost_usd", USD,
            "Sum over status-200 lines of LiteLLM's own cost (litellm_cost_usd) where the line has it, else the "
            "price-table estimate (see table_cost_usd); cost_from_table_requests says how many lines took the "
-           "table. Lines with neither are left out: a partial figure when unpriced_requests > 0.", True),
+           "table. Lines with neither are left out, and so are lines with estimated tokens and no LiteLLM cost: "
+           "a partial figure when unpriced_requests or estimated_unpriced_requests > 0.", True),
     Metric("cost_per_build_usd", USD, "cost_usd / builds.", True),
     Metric("litellm_cost_usd", USD, "Sum of litellm_cost_usd over the status-200 lines that carry it."),
     Metric("litellm_costed_requests", COUNT, "Status-200 lines that carry litellm_cost_usd."),
     Metric("table_cost_usd", USD,
-           "Sum over status-200 lines the price table prices (with or without a LiteLLM cost) of (uncached x "
+           "Sum over status-200 lines with reported (not estimated) tokens that the price table prices (with or "
+           "without a LiteLLM cost) of (uncached x "
            "input + cached x cached_input + completion x output) per 1M tokens, at the long-context price when "
            "the line's prompt_tokens exceed the table's above_prompt_tokens. Cache writes are not priced."),
-    Metric("table_priced_requests", COUNT, "Status-200 lines the price table prices."),
+    Metric("table_priced_requests", COUNT, "Status-200 lines with reported tokens that the price table prices."),
     Metric("cost_from_table_requests", COUNT,
            "Status-200 lines whose cost_usd came from the price table (no LiteLLM cost)."),
     Metric("table_to_litellm_cost_ratio", FRACTION,
            "The table estimate over LiteLLM's cost, both over the status-200 lines that have both: the cross-check "
            "of the price table (1.0 is agreement)."),
-    Metric("unpriced_requests", COUNT, "Status-200 lines with neither a LiteLLM cost nor a price-table price."),
+    Metric("unpriced_requests", COUNT,
+           "Status-200 lines with reported tokens but neither a LiteLLM cost nor a price-table price."),
+    Metric("estimated_token_requests", COUNT, "Status-200 lines with tokens_estimated."),
+    Metric("estimated_unpriced_requests", COUNT,
+           "Status-200 lines with tokens_estimated and no LiteLLM cost: an estimate of the prompt size and no "
+           "completion count cannot be priced, so they are left out of cost_usd and table_cost_usd."),
     Metric("model_time_s", SECONDS,
            "Sum of latency_ms over lines that carry one, any status, in seconds. Concurrent requests add up, so "
            "this can exceed wall clock.", True),
@@ -206,7 +252,10 @@ METRICS: Tuple[Metric, ...] = (
            "ratio, not a share bounded by 1.", True),
     Metric("harness_tokens_total", TOKENS,
            "Sum of tokens.total over the repetitions of joined builds that carry it (the harness's own count; "
-           "a cross-check on prompt_tokens + completion_tokens)."),
+           "a cross-check on prompt_tokens + completion_tokens), leaving out repetitions whose tokens.partial is "
+           "true."),
+    Metric("harness_partial_reps", COUNT,
+           "Repetitions of joined builds left out of harness_tokens_total because their tokens.partial is true."),
     Metric("graded_reps", COUNT, "Repetitions of joined builds graded pass or fail."),
     Metric("passed_reps", COUNT, "Repetitions graded pass."),
     Metric("infra_reps", COUNT, "Repetitions lost to infrastructure (infra), outside pass_rate."),
@@ -274,6 +323,7 @@ class Rep:
     result: str
     agent_s: Optional[float]
     tokens_total: Optional[int]
+    tokens_partial: bool = False
 
 
 @dataclass
@@ -326,6 +376,10 @@ class Prices:
             raise ValueError(f"--price-as names models the price table does not have: {', '.join(unknown)}")
         self.as_of: str = table[PRICES_AS_OF]
         self.source: str = str(table.get(PRICES_SOURCE, ""))
+        confirmed = table.get(PRICES_CONFIRMED, False)
+        if not isinstance(confirmed, bool):
+            raise ValueError(f"the price table's `{PRICES_CONFIRMED}` must be true or false")
+        self.confirmed: bool = confirmed
         self.models: Dict[str, Dict[str, Any]] = models
         self.digest = digest
         self.price_as = dict(price_as)
@@ -366,8 +420,9 @@ class Prices:
         ) / TOKENS_PER_PRICE_UNIT
 
     def describe(self) -> Dict[str, Any]:
-        return {"as_of": self.as_of, "source": self.source, "sha256": self.digest,
-                "models": sorted(self.models), "price_as": dict(sorted(self.price_as.items()))}
+        return {PRICES_AS_OF: self.as_of, PRICES_CONFIRMED: self.confirmed, PRICES_SOURCE: self.source,
+                PRICES_SHA256: self.digest, PRICES_MODELS: sorted(self.models),
+                PRICES_PRICE_AS: dict(sorted(self.price_as.items()))}
 
 
 def strip_provider(model_name: Optional[str]) -> Optional[str]:
@@ -484,7 +539,10 @@ def load_lines(paths: Iterable[str], quality: Quality) -> Tuple[List[Line], List
     for entry in analyze_shadow.iter_request_lines(logs, quality.skipped):
         request_id = entry.get(F.REQUEST_ID)
         if isinstance(request_id, str) and request_id:
-            # A segment uploaded open and again closed carries its lines twice.
+            # The bucket holds each segment once (the collector uploads an open
+            # segment under its closed name, without overwriting), but local
+            # copies can overlap. Error and dropped lines carry no request_id
+            # and are never deduplicated.
             if request_id in seen:
                 quality.skip(SKIP_DUPLICATE)
                 continue
@@ -576,7 +634,8 @@ def load_eval(paths: Iterable[str], quality: Quality) -> Dict[str, EvalRun]:
                     tokens = rep.get(EVAL_TOKENS) if isinstance(rep.get(EVAL_TOKENS), dict) else {}
                     agent_s = _as_seconds(rep.get(EVAL_AGENT_S)) if has_reps else None
                     run.reps.append(Rep(str(task[EVAL_TASK_NAME]), result, agent_s,
-                                        _as_count(tokens.get(EVAL_TOKENS_TOTAL))))
+                                        _as_count(tokens.get(EVAL_TOKENS_TOTAL)),
+                                        tokens.get(EVAL_TOKENS_PARTIAL) is True))
             runs[build_id] = run
     return runs
 
@@ -603,11 +662,12 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
     measured_prompt = sum(line.prompt_tokens or 0 for line in measured)
     measured_cached = sum(min(line.cached_tokens or 0, line.prompt_tokens or 0) for line in measured)
     cost = litellm_cost = table_cost = both_litellm = both_table = 0.0
-    litellm_costed = table_priced = from_table = 0
+    litellm_costed = table_priced = from_table = estimated_unpriced = 0
     unpriced: Dict[str, int] = {}
     for line in ok:
         model, label = prices.model_for(line)
-        estimate = prices.cost(model, line) if model is not None else None
+        # Estimated tokens are the request's size and no completion count: never priced.
+        estimate = prices.cost(model, line) if model is not None and not line.tokens_estimated else None
         if estimate is not None:
             table_cost += estimate
             table_priced += 1
@@ -621,6 +681,8 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
         elif estimate is not None:
             cost += estimate
             from_table += 1
+        elif line.tokens_estimated:
+            estimated_unpriced += 1
         else:
             unpriced[label] = unpriced.get(label, 0) + 1
     with_reasoning = [line for line in ok if line.reasoning_tokens is not None]
@@ -649,7 +711,7 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
                 by_case.setdefault(rep.case, set()).add(rep.result)
         flaky.update(case for case, results in by_case.items() if len(results) > 1)
     has_eval = bool(joined)
-    harness_tokens = [rep.tokens_total for rep in reps if rep.tokens_total is not None]
+    harness_tokens = [rep.tokens_total for rep in reps if rep.tokens_total is not None and not rep.tokens_partial]
 
     values: Dict[str, Any] = {
         "builds": len(builds),
@@ -677,6 +739,8 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
         "cost_from_table_requests": from_table,
         "table_to_litellm_cost_ratio": ratio(both_table, both_litellm),
         "unpriced_requests": sum(unpriced.values()),
+        "estimated_token_requests": sum(1 for line in ok if line.tokens_estimated),
+        "estimated_unpriced_requests": estimated_unpriced,
         "model_time_s": round(model_s, SECONDS_DECIMALS),
         "model_time_per_build_s": ratio(model_s, len(builds), PER_BUILD_DECIMALS),
         "latency_p50_ms": percentile(latencies, P50),
@@ -692,17 +756,18 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
         "agent_time_s": round(agent_s, SECONDS_DECIMALS) if timed_builds else None,
         "model_time_share_of_agent_time": ratio(timed_model_s, agent_s) if timed_builds else None,
         "harness_tokens_total": sum(harness_tokens) if harness_tokens else None,
+        "harness_partial_reps": sum(1 for rep in reps if rep.tokens_partial) if has_eval else None,
         "graded_reps": len(graded) if has_eval else None,
         "passed_reps": passed if has_eval else None,
         "infra_reps": sum(1 for rep in reps if rep.result == EVAL_INFRA) if has_eval else None,
         "pass_rate": ratio(passed, len(graded)) if has_eval else None,
-        "cases": len({rep.case for rep in reps}) if has_eval else None,
+        REPORT_CASES: len({rep.case for rep in reps}) if has_eval else None,
         "flaky_cases": len(flaky) if has_eval else None,
     }
     values["rate_limited_rate"] = ratio(values["rate_limited_requests"], len(lines))
     assert tuple(values) == METRIC_NAMES, "aggregate() and METRICS disagree"
-    values["status_counts"] = dict(sorted(statuses.items()))
-    values["unpriced"] = dict(sorted(unpriced.items()))
+    values[STATUS_COUNTS] = dict(sorted(statuses.items()))
+    values[UNPRICED_BY_MODEL] = dict(sorted(unpriced.items()))
     return values
 
 
@@ -753,8 +818,8 @@ def build_report(
         first = build_lines[0]
         builds_out.append({
             "kind": kind, "build": build or NO_BUILD, "project": first.project, "pr": first.pr,
-            "first_request_ts": first.ts, "last_request_ts": build_lines[-1].ts,
-            "metrics": aggregate(build_lines, runs, prices),
+            WINDOW_FIRST_TS: first.ts, WINDOW_LAST_TS: build_lines[-1].ts,
+            BUILD_METRICS: aggregate(build_lines, runs, prices),
         })
     scopes = {TOTAL_SCOPE: aggregate(lines, runs, prices)}
     cases: Dict[str, Dict[str, Any]] = {}
@@ -766,18 +831,18 @@ def build_report(
     ok_lines = [line for line in lines if line.ok]
     estimated = [line for line in ok_lines if line.tokens_estimated]
     return {
-        "report_schema": REPORT_SCHEMA_VERSION,
+        REPORT_SCHEMA: REPORT_SCHEMA_VERSION,
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec=ISO_TIMESPEC),
-        "window": {
-            "since": since, "until": until,
-            "first_request_ts": lines[0].ts if lines else None,
-            "last_request_ts": lines[-1].ts if lines else None,
+        REPORT_WINDOW: {
+            WINDOW_SINCE: since, WINDOW_UNTIL: until,
+            WINDOW_FIRST_TS: lines[0].ts if lines else None,
+            WINDOW_LAST_TS: lines[-1].ts if lines else None,
         },
-        "prices": prices.describe(),
-        "scopes": scopes,
-        "builds": builds_out,
-        "cases": cases,
-        "data_quality": {
+        REPORT_PRICES: prices.describe(),
+        REPORT_SCOPES: scopes,
+        REPORT_BUILDS: builds_out,
+        REPORT_CASES: cases,
+        REPORT_DATA_QUALITY: {
             "log_files": quality.files,
             "manifests": quality.manifests,
             "bad_manifests": quality.bad_manifests,
@@ -821,44 +886,55 @@ def _iso(ts: Optional[float]) -> str:
     return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat(timespec=ISO_TIMESPEC)
 
 
+def _prices_label(prices: Dict[str, Any]) -> str:
+    """as_of, whether the prices were confirmed on it, and their source (absent in older reports)."""
+    confirmed = PRICES_CONFIRMED_LABEL if prices.get(PRICES_CONFIRMED) else PRICES_UNCONFIRMED_LABEL
+    return f"as of {prices.get(PRICES_AS_OF)} ({confirmed}; source: {prices.get(PRICES_SOURCE) or '-'})"
+
+
+def _prices_summary(prices: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: prices.get(key) for key in (PRICES_AS_OF, PRICES_CONFIRMED, PRICES_SOURCE)}
+
+
 def render(report: Dict[str, Any]) -> str:
-    window = report["window"]
-    prices = report["prices"]
+    window = report[REPORT_WINDOW]
+    prices = report[REPORT_PRICES]
     lines = [
-        f"window: {_iso(window['first_request_ts'])} to {_iso(window['last_request_ts'])}"
-        f" (filter since {_iso(window['since'])}, until {_iso(window['until'])})",
-        f"prices: as of {prices['as_of']}, sha256 {prices['sha256'][:12]}, models {', '.join(prices['models'])};"
-        f" price-as {prices['price_as'] or 'none'}",
+        f"window: {_iso(window[WINDOW_FIRST_TS])} to {_iso(window[WINDOW_LAST_TS])}"
+        f" (filter since {_iso(window[WINDOW_SINCE])}, until {_iso(window[WINDOW_UNTIL])})",
+        f"prices: {_prices_label(prices)}, sha256 {prices[PRICES_SHA256][:HASH_DISPLAY_CHARS]}, models {', '.join(prices['models'])};"
+        f" price-as {prices[PRICES_PRICE_AS] or 'none'}",
         "",
-        f"{'metric':<32}" + "".join(f"{scope:>18}" for scope in SCOPES),
+        f"{'metric':<{METRIC_COLUMN_WIDTH}}" + "".join(f"{scope:>{SCOPE_COLUMN_WIDTH}}" for scope in SCOPES),
     ]
     for name in METRIC_NAMES:
-        lines.append(f"{name:<32}" + "".join(f"{_fmt(name, report['scopes'][s][name]):>18}" for s in SCOPES))
+        lines.append(f"{name:<{METRIC_COLUMN_WIDTH}}" + "".join(f"{_fmt(name, report[REPORT_SCOPES][s][name]):>{SCOPE_COLUMN_WIDTH}}" for s in SCOPES))
     for scope in SCOPES:
-        values = report["scopes"][scope]
-        if values["status_counts"] or values["unpriced"]:
-            lines.append(f"{scope}: non-200 statuses {values['status_counts']}; unpriced by model {values['unpriced']}")
+        values = report[REPORT_SCOPES][scope]
+        if values[STATUS_COUNTS] or values[UNPRICED_BY_MODEL]:
+            lines.append(f"{scope}: non-200 statuses {values[STATUS_COUNTS]};"
+                         f" unpriced by model {values[UNPRICED_BY_MODEL]}")
     lines += ["", "builds (kind build project pr: requests, prompt tokens, cache hit, cost, model time, 429s, pass rate):"]
-    for build in report["builds"]:
-        m = build["metrics"]
+    for build in report[REPORT_BUILDS]:
+        m = build[BUILD_METRICS]
         lines.append(
-            f"  {build['kind']:<9} {build['build']} {build['project'] or '-'} {build['pr'] or '-'}:"
+            f"  {build['kind']:<{KIND_COLUMN_WIDTH}} {build['build']} {build['project'] or '-'} {build['pr'] or '-'}:"
             f" {m['requests']}, {_fmt('prompt_tokens', m['prompt_tokens'])},"
             f" {_fmt('cache_hit_rate', m['cache_hit_rate'])}, {_fmt('cost_usd', m['cost_usd'])},"
             f" {_fmt('model_time_s', m['model_time_s'])} s, {m['rate_limited_requests']},"
             f" {_fmt('pass_rate', m['pass_rate'])}"
         )
     for kind in JOB_KINDS:
-        if report["cases"].get(kind):
+        if report[REPORT_CASES].get(kind):
             lines += ["", f"{kind} cases (builds, graded reps, pass rate, flaky builds, infra reps, agent_s p50):"]
-            for case, c in report["cases"][kind].items():
+            for case, c in report[REPORT_CASES][kind].items():
                 lines.append(
                     f"  {case}: {c['case_builds']}, {c['case_graded_reps']},"
                     f" {_fmt('pass_rate', c['case_pass_rate'])}, {c['case_flaky_builds']}, {c['case_infra_reps']},"
                     f" {_fmt('agent_time_s', c['case_agent_s_p50'])}"
                 )
     lines += ["", "data quality:"]
-    lines += [f"  {name}: {value}" for name, value in report["data_quality"].items()]
+    lines += [f"  {name}: {value}" for name, value in report[REPORT_DATA_QUALITY].items()]
     return "\n".join(lines)
 
 
@@ -876,51 +952,55 @@ def cost_source(values: Dict[str, Any]) -> Optional[str]:
 def compare(baseline: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
     """Headline deltas per scope: current - baseline, and that as a percent of the baseline."""
     notes = []
-    if baseline.get("report_schema") != current.get("report_schema"):
-        notes.append(f"report schemas differ ({baseline.get('report_schema')} vs {current.get('report_schema')}):"
+    if baseline.get(REPORT_SCHEMA) != current.get(REPORT_SCHEMA):
+        notes.append(f"report schemas differ ({baseline.get(REPORT_SCHEMA)} vs {current.get(REPORT_SCHEMA)}):"
                      " metric definitions may have changed")
-    if baseline["prices"]["sha256"] != current["prices"]["sha256"] or \
-            baseline["prices"]["price_as"] != current["prices"]["price_as"]:
+    if baseline[REPORT_PRICES][PRICES_SHA256] != current[REPORT_PRICES][PRICES_SHA256] or \
+            baseline[REPORT_PRICES][PRICES_PRICE_AS] != current[REPORT_PRICES][PRICES_PRICE_AS]:
         notes.append("price tables or --price-as differ: cost deltas mix price changes with usage changes")
     for side, report in (("baseline", baseline), ("current", current)):
         for scope in SCOPES:
-            values = report["scopes"][scope]
+            values = report[REPORT_SCOPES][scope]
             if values.get("unpriced_requests"):
                 notes.append(f"{side} {scope}: cost is partial ({values['unpriced_requests']} unpriced requests)")
+            if values.get("estimated_token_requests"):
+                notes.append(f"{side} {scope}: {values['estimated_token_requests']} requests have estimated tokens"
+                             f" ({values.get('estimated_unpriced_requests') or 0} of them left out of cost_usd)")
             if cost_source(values) == COST_SOURCE_MIXED:
                 notes.append(f"{side} {scope}: cost_usd takes LiteLLM's cost for {values['litellm_costed_requests']}"
                              f" requests and the price table for {values['cost_from_table_requests']}")
     for scope in SCOPES:
-        sources = (cost_source(baseline["scopes"][scope]), cost_source(current["scopes"][scope]))
+        sources = (cost_source(baseline[REPORT_SCOPES][scope]), cost_source(current[REPORT_SCOPES][scope]))
         if None not in sources and sources[0] != sources[1]:
             notes.append(f"{scope}: cost_usd comes from {sources[0]} in the baseline and {sources[1]} now")
     scopes: Dict[str, Dict[str, Any]] = {}
     for scope in SCOPES:
         rows = {}
         for name in HEADLINE_METRICS:
-            base = baseline["scopes"][scope].get(name)
-            new = current["scopes"][scope].get(name)
+            base = baseline[REPORT_SCOPES][scope].get(name)
+            new = current[REPORT_SCOPES][scope].get(name)
             delta = round(new - base, RATE_DECIMALS) if base is not None and new is not None else None
             pct = round(PERCENT * delta / base, DELTA_DECIMALS) if delta is not None and base else None
             rows[name] = {"baseline": base, "current": new, "delta": delta, "delta_percent": pct}
         scopes[scope] = rows
     return {
-        "baseline_window": baseline["window"], "current_window": current["window"],
-        "baseline_prices_as_of": baseline["prices"]["as_of"], "current_prices_as_of": current["prices"]["as_of"],
-        "notes": notes, "scopes": scopes,
+        COMPARE_BASELINE_WINDOW: baseline[REPORT_WINDOW], COMPARE_CURRENT_WINDOW: current[REPORT_WINDOW],
+        COMPARE_BASELINE_PRICES: _prices_summary(baseline[REPORT_PRICES]),
+        COMPARE_CURRENT_PRICES: _prices_summary(current[REPORT_PRICES]),
+        COMPARE_NOTES: notes, REPORT_SCOPES: scopes,
     }
 
 
 def render_compare(result: Dict[str, Any]) -> str:
     lines = [
-        f"baseline: {_iso(result['baseline_window']['first_request_ts'])} to"
-        f" {_iso(result['baseline_window']['last_request_ts'])}, prices as of {result['baseline_prices_as_of']}",
-        f"current:  {_iso(result['current_window']['first_request_ts'])} to"
-        f" {_iso(result['current_window']['last_request_ts'])}, prices as of {result['current_prices_as_of']}",
+        f"baseline: {_iso(result[COMPARE_BASELINE_WINDOW][WINDOW_FIRST_TS])} to"
+        f" {_iso(result[COMPARE_BASELINE_WINDOW][WINDOW_LAST_TS])}, prices {_prices_label(result[COMPARE_BASELINE_PRICES])}",
+        f"current:  {_iso(result[COMPARE_CURRENT_WINDOW][WINDOW_FIRST_TS])} to"
+        f" {_iso(result[COMPARE_CURRENT_WINDOW][WINDOW_LAST_TS])}, prices {_prices_label(result[COMPARE_CURRENT_PRICES])}",
     ]
-    lines += [f"note: {note}" for note in result["notes"]]
-    for scope, rows in result["scopes"].items():
-        lines += ["", f"{scope}:", f"  {'metric':<32}{'baseline':>16}{'current':>16}{'delta':>16}{'delta %':>10}"]
+    lines += [f"note: {note}" for note in result[COMPARE_NOTES]]
+    for scope, rows in result[REPORT_SCOPES].items():
+        lines += ["", f"{scope}:", f"  {'metric':<{METRIC_COLUMN_WIDTH}}{'baseline':>{COMPARE_COLUMN_WIDTH}}{'current':>{COMPARE_COLUMN_WIDTH}}{'delta':>{COMPARE_COLUMN_WIDTH}}{'delta %':>{PERCENT_COLUMN_WIDTH}}"]
         for name, row in rows.items():
             delta = row["delta"]
             if delta is not None and METRIC_UNITS[name] == FRACTION:
@@ -932,8 +1012,8 @@ def render_compare(result: Dict[str, Any]) -> str:
             else:
                 shown = "-"
             pct = f"{row['delta_percent']:+.{DELTA_DECIMALS}f}%" if row["delta_percent"] is not None else "-"
-            lines.append(f"  {name:<32}{_fmt(name, row['baseline']):>16}{_fmt(name, row['current']):>16}"
-                         f"{shown:>16}{pct:>10}")
+            lines.append(f"  {name:<{METRIC_COLUMN_WIDTH}}{_fmt(name, row['baseline']):>{COMPARE_COLUMN_WIDTH}}{_fmt(name, row['current']):>{COMPARE_COLUMN_WIDTH}}"
+                         f"{shown:>{COMPARE_COLUMN_WIDTH}}{pct:>{PERCENT_COLUMN_WIDTH}}")
     return "\n".join(lines)
 
 
