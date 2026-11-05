@@ -392,7 +392,7 @@ Helm install, set the block in your values file.
 
 Execution limits per agent persona, where `<persona>` is one of `default` (the Planning Agent front
 door), `platform` (the Platform Agent), or `cluster` (**every** Cluster Agent), plus the board-wide
-`maxInProgress`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
+`maxInProgress` and the dispatcher's memory `admission`, the mode-next session-pod cap `maxSessions`, and the AgentProfile knobs under
 `profiles` (the ceiling and its child reserve, `warmReplicas`, and the dispatcher's intervals; see [AgentProfile](./agentprofile-crd.md)). Unset,
 `maxSessions` renders `10`, `profiles.ceiling` follows `maxInProgress` (`6` unless set) and `profiles.warmReplicas` `1`; all three are
 inert under `mode: today`.
@@ -422,11 +422,28 @@ below. Set it on the CR to raise or lower that. Either way the value is pinned i
 at `/etc/hermes`, so it applies over whatever the agent's own `config.yaml` says, and removing the
 field puts the default back.
 
+**`admission` is pinned the same way.** On every tick the dispatcher reads `kanban.admission` from
+the managed scope and counts the container's working set, its cgroup memory usage less the inactive
+file cache, against a budget. Past it the dispatcher refuses a card rather than spawn a worker: the
+card is blocked with kind `capacity` and a reason that names the figures, so the thread that filed
+it is told it is throttled. The budget is the request, not the limit, because the kubelet evicts the
+pod under node pressure once its working set passes the request. Under GKE Sandbox the limit the container can read is the sandbox's, not the
+cgroup's, so Hermes' own `/proc/meminfo` guard never fires there.
+
+Unset, `memoryBudgetMiB` is the agent container's memory request in MiB (`spec.deployment.resources`,
+`4096` at the default `4Gi`), so raising the request raises the budget. `workerRssCapMiB` (`1536`)
+stops a running worker whose process tree passes it and blocks its card the same way.
+`queueBoundSeconds` (`600`) refuses a ready card that memory pressure or a full board has held for
+that long. `failClosed` (`true`) makes a tick that cannot read the memory counters spawn nothing.
+[PlatformAgent fields](/kube-agents/operator/platformagent-fields/) lists the bounds.
+
 ```yaml
 spec:
   harness:
     tuning:
       maxInProgress: 8 # board-wide; raises the operator's default of 6
+      admission:
+        memoryBudgetMiB: 3072 # the dispatcher's budget; defaults to the container's memory request
       platform:
         apiMaxRetries: 8
         maxTurns: 200
@@ -515,6 +532,18 @@ should set `maxInProgress` to fit: about 430 MiB per worker over the 1.8 GiB the
 a 4Gi limit fits about five. Raise it once you know your worker footprint and your model quota —
 that quota is the other shared resource, and for most deployments it binds before memory does.
 
+At the operator's defaults the budget and this cap are close. The budget is the container's memory
+request, 4Gi unless `spec.deployment.resources` changes it, and it counts the agent container alone.
+A tick admits one new worker per 512 MiB of headroom under the budget: from an idle set of about
+800 MiB that is six, from the 1.5 GiB a `spec.mode: next` gateway idles at, five. Six workers at
+430 MiB add about 2.6 GiB, inside the request from the smaller idle set and one worker short from
+the larger. To admit more, raise the request, not the limit: under node pressure the kubelet evicts
+the pod once its working set passes the request ([`admission`](#specharnesstuning)).
+
+[`docs/designs/safe-throttling.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/safe-throttling.md)
+is the design for admission by memory beside this count: a pressure guard on the container's own
+memory counters, a resident cap per worker, and a `capacity` refusal that names the alternatives.
+
 The cap comes from the operator, not from the image or the agent's own `config.yaml`. The operator
 pins `kanban.max_in_progress` in the managed scope at `/etc/hermes`: the CR's value, or `6` when it
 says nothing. Hermes applies that file over the agent's config on every load, so a value an existing
@@ -551,6 +580,11 @@ waits, because every slot is busy or the only free one is triage's, gets one lin
 part of a request already running (a worker's child, or a card with a parent link) waits without
 one.
 
+The wait is bounded. A card that memory pressure or a full board has held past
+`tuning.admission.queueBoundSeconds` (600 s by default) is blocked with kind `capacity`. The queued
+line settles as stopped, and the Planning Agent answers the thread with the reason and the
+alternatives ([`admission`](#specharnesstuning)).
+
 A full board is logged as what it is. When every slot is busy for six ticks in a row the gateway
 logs, at most every five minutes:
 
@@ -575,7 +609,9 @@ The arithmetic behind `6`:
   two Node MCP proxies about 100 MiB each, a supervisor and an ssh. Six of them are about 2.6 GiB
   over the gateway's 1.8 GiB idle set, about 4.4 GiB under the container's 8Gi limit. A coordinator
   waiting on its own children gives its slot back but stays resident, so the process count can sit
-  above six; the 8Gi limit leaves room for about fourteen workers at that size.
+  above six; the 8Gi limit leaves room for about fourteen workers at that size. That is the limit's
+  room; the room a default install uses is the request's, because the admission budget follows the
+  request (above).
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
   request only when its children fit the proxy's memory limit: 176 MiB per request after 320 MiB of
   fixed reserves. At its default 2Gi limit that is 9 at once
@@ -603,7 +639,7 @@ The cap counts running cards, not resident processes, and one case makes those d
 waiting on work it fanned out is discounted, or it would hold the slot its own children need
 ([`kanban_scheduling.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_scheduling.py)).
 Peak memory is therefore the cap plus however many coordinators are waiting, held down by the
-dispatcher's memory-pressure guard rather than by this number.
+dispatcher's memory admission ([`tuning.admission`](#specharnesstuning)) rather than by this number.
 
 ### `spec.harness.experimental`
 
@@ -629,8 +665,9 @@ Three things change while it is on:
 - `profile-platform.overlay.yaml` gains the three profile-shaped things only the `default` profile
   carried before: the toolsets each chat platform key resolves, the ingress plugins, and the
   `kanban` block. The adapters themselves are not copied — the managed scope at `/etc/hermes` is
-  machine-global, so `platforms.*`, `display.platforms` and the board's worker cap
-  ([`tuning.maxInProgress`](#specharnesstuning)) already land on this profile. The rest of `kanban`
+  machine-global, so `platforms.*`, `display.platforms`, the board's worker cap
+  ([`tuning.maxInProgress`](#specharnesstuning)) and the dispatcher's memory admission
+  ([`tuning.admission`](#specharnesstuning)) already land on this profile. The rest of `kanban`
   does have to follow the gateway, because the dispatcher and the notifier run in the gateway
   process and read their settings from its own home. The board itself does not move — Hermes
   anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
@@ -778,7 +815,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
 
 - `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`. When set, the managed config also carries `database.journal_mode: delete`, and the entrypoint converts Hermes' existing databases out of WAL once at start-up — `state.db`, `kanban.db` and the cron, project, evidence, response, memory and Discord stores Hermes opens through the same journal-mode helper. A sandboxed runtime serves the data volume over a gofer mount that accepts SQLite's WAL mode and then corrupts it. The Session KV store (`session_kv.db` on the `system-metadata` volume) sets WAL itself and is not covered by either. Clearing the field drops the pin, and the databases return to WAL on their next open.
 - `env` — additional container environment variables.
-- `resources` — requests and limits for the agent container, replacing the operator's defaults as a block.
+- `resources` — requests and limits for the agent container, replacing the operator's defaults as a block. The memory request is also the dispatcher's default admission budget ([`tuning.admission`](#specharnesstuning)), so raising it admits more workers at once.
 - `credentialProxy.resources` — requests and limits for the credential-proxy container, the broker that runs every credentialed command in a pod of its own. Merged over the operator's defaults per key, unlike `resources`; [`spec.deployment.credentialProxy.resources`](#specdeploymentcredentialproxyresources) has the defaults it keeps, what the operator refuses, and what admission warns about.
 - `credentialProxy.exec.replicas` — the number of exec-tier broker pods, 0 to 32: stateless replicas beside the broker pod that answer `/v1/exec` and `/v1/gcp/` only. Unset or 0 renders none. A positive count renders the `<name>-credential-proxy-exec-tier` Deployment and Service, a ConfigMap with the count, a NetworkPolicy, and a PodDisruptionBudget from two replicas. Each replica requests and is limited to 2 CPU and 2Gi. A change between two positive counts does not restart the pods. Above 0 the agent's name must be at most 36 characters; a longer one is refused, the tier is not rendered, and `Degraded` reports `InvalidCredentialProxyExec`. The operator does not size the tier from the fleet, and the CR status reports no readiness for it.
 - `agentAPIAuth.resources` — requests and limits for the `agent-api-auth` sidecar in the gateway pod, the native container that authenticates the agent's API-server calls and also runs the event watcher and the drift detector. Merged over the operator's defaults per key, like `credentialProxy.resources`: a CR that sets only `limits.memory` keeps the default 150m CPU request, 384Mi memory request, 1 CPU limit and 2Gi ephemeral-storage limit.
@@ -1658,6 +1695,9 @@ _and_ beyond the agent's own repair:
 - `model.*`, `platforms.*`, `approvals.cron_mode` and `display.platforms`;
 - `kanban.max_in_progress`: the board is shared by every profile, and a burst of workers past it is
   lost to the OOM killer without a restart or an event;
+- `kanban.admission`: the dispatcher's memory budget, worker cap, queue bound and fail-closed
+  switch, from `spec.harness.tuning.admission`; the board is shared and an eviction is pod-wide, so
+  no profile may admit past the pod's request;
 - `terminal.*`: where the shell runs, one sandbox per Pod, reached the same way by every profile;
 - `database.journal_mode`, when the agent Pod has a runtime class: one data volume per Pod, and a
   corrupted database is found only after the sessions in it are unreadable;
