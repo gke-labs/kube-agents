@@ -8572,6 +8572,19 @@ func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 			if got := warnings(rec); got != 1 {
 				t.Fatalf("%d %s events after a new bad value at the same generation, want 1", got, a2aChartPodsDiscardedReason)
 			}
+			// A usable value in between re-arms it: the same bad value again
+			// warns once more.
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "5"}
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "99"}
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := warnings(rec); got != 1 {
+				t.Fatalf("%d %s events for a bad value back after a usable one, want 1", got, a2aChartPodsDiscardedReason)
+			}
 		})
 	}
 }

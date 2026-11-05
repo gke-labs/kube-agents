@@ -5839,6 +5839,10 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			r.recordEvent(agent, corev1.EventTypeWarning, a2aChartPodsDiscardedReason, why)
 			r.a2aChartPodsWarned.Store(key, seen)
 		}
+	} else {
+		// A usable count re-arms the Warning, so a bad value that returns
+		// after it warns again.
+		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
 	}
 	if err := ctrl.SetControllerReference(agent, quota, r.Scheme); err != nil {
 		return state, err

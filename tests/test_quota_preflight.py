@@ -957,6 +957,10 @@ class PreflightDecisionTest(unittest.TestCase):
         refused = self._render({"probe": {}}, ["platformAgent.mode=next", f"operator.replicaCount={cap - 3}"])
         self.assertNotEqual(refused.returncode, 0, "a chart count past the cap rendered")
         self.assertIn("past the operator's cap of 64", refused.stderr)
+        # The quota renders only in next mode, so a today-mode render at the same size
+        # stamps its figure and passes.
+        today = self._render({"probe": {}}, [f"operator.replicaCount={cap - 3}"])
+        self.assertEqual(today.returncode, 0, today.stderr)
 
     def test_the_operators_fallback_is_the_charts_default(self) -> None:
         """An install without the chart gets a2aDefaultChartPods, which must be what a
