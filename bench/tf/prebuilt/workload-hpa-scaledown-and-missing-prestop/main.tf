@@ -52,7 +52,6 @@ resource "null_resource" "scenario" {
     host_cluster  = var.host_cluster_name
     host_location = var.host_cluster_location
     host_project  = var.project_id
-    manifest      = sha256(join("|", [local.ns, local.target, local.hpa, var.host_cluster_name]))
   }
 
   provisioner "local-exec" {
@@ -106,8 +105,8 @@ resource "null_resource" "scenario" {
         name: ${local.ns}
         labels:
           managed-by: ${local.ci_labels["managed-by"]}
-          build-id: ${local.ci_labels["build-id"]}
-          pull-number: ${local.ci_labels["pull-number"]}
+          build-id: "${local.ci_labels["build-id"]}"
+          pull-number: "${local.ci_labels["pull-number"]}"
           created-by-stack: workload-hpa-scaledown-and-missing-prestop
       NAMESPACE
       kubectl apply -f - <<'MANIFEST'
@@ -192,10 +191,21 @@ resource "null_resource" "scenario" {
       fi
       gcloud container clusters get-credentials "${self.triggers.host_cluster}" \
         --location "${self.triggers.host_location}" --project "$project" --quiet
-      kubectl -n "${self.triggers.namespace}" delete hpa "${self.triggers.hpa}" --ignore-not-found
-      kubectl -n "${self.triggers.namespace}" delete deployment "${self.triggers.target}" --ignore-not-found --wait=false
-      if [ "$(kubectl get namespace "${self.triggers.namespace}" -o jsonpath='{.metadata.labels.created-by-stack}' 2>/dev/null)" = "workload-hpa-scaledown-and-missing-prestop" ]; then
-        kubectl delete namespace "${self.triggers.namespace}" --ignore-not-found --wait=false
+      # One delete: the namespace cascades to the Deployment and the autoscaler,
+      # so no earlier object delete can abort the script before it. The label is
+      # read once, with a read error told apart from "not this stack's", so a
+      # namespace this stack owns is never skipped in silence.
+      ns_owner="$(kubectl get namespace "${self.triggers.namespace}" \
+        -o jsonpath='{.metadata.labels.created-by-stack}' 2>"$kubeconfig_dir/ns-read.err")" && ns_present=1 || ns_present=0
+      if [ "$ns_present" = 1 ]; then
+        if [ "$ns_owner" = "workload-hpa-scaledown-and-missing-prestop" ]; then
+          kubectl delete namespace "${self.triggers.namespace}" --ignore-not-found --wait=false
+        else
+          echo "WARNING: ${self.triggers.namespace} on ${self.triggers.host_cluster} was not created by this stack (created-by-stack='$ns_owner'); left in place." >&2
+        fi
+      elif ! grep -qi "not found" "$kubeconfig_dir/ns-read.err"; then
+        echo "ERROR: could not read namespace ${self.triggers.namespace} on ${self.triggers.host_cluster}; it may still hold the planted workload: $(cat "$kubeconfig_dir/ns-read.err")" >&2
+        exit 1
       fi
     EOT
   }
