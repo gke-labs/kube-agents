@@ -14,18 +14,10 @@ nothing.
 
 # Scope
 
-The diff touches chat output when a non-test file it changes matches one of these:
-
-- `agents/*/SOUL.md`, `agents/chat/defaults/**`
-- `agents/platform/scripts/slack_*.py`, `agents/platform/scripts/chat_*.py`,
-  `agents/platform/scripts/*_presenter.py`
-- `a2a/gateway/slack_*.go`, `a2a/gateway/gchat*.go`, `a2a/gateway/*chat*.go`, `a2a/gateway/relay*.go`,
-  `a2a/hermes-bridge/chat*.go`, `a2a/lib/chatmsg/**`
-- `deploy/docker/patches/kanban_notifier.py`, `deploy/docker/patches/kanban_progress_lines.py`,
-  `deploy/docker/patches/kanban_chat_notify.py`, `deploy/docker/patches/slack_*.py`
-
-Outside this list, still review a hunk that adds or rewords a string a user reads in chat. Inside
-it, skip hunks that change no user-visible string, layout or posting decision.
+The `paths:` frontmatter of `chat_ux.md` is the list of chat output files. The diff touches chat
+output when it changes a non-test file matching one of those globs, adds or rewords a string a user
+reads in chat anywhere else, or changes who may confirm, stop or press a button. Inside scope, skip
+hunks that change no user-visible string, layout, posting decision or click gate.
 
 # Workflow
 
@@ -41,27 +33,36 @@ it, skip hunks that change no user-visible string, layout or posting decision.
 
 ## 2. Check each rule
 
-Read `chat_ux.md` first, then test every surface item against every rule:
+Test every surface item against each rule's paragraph in `chat_ux.md`, by its heading. The cues
+below say where violations hide; the paragraph is the test.
 
-- **Answer first**: Flag an answer whose first line is context, a heading or a restatement; flag a
-  change that moves the verdict below the fold or drops the headline's bold.
-- **Ack names its target**: Flag an ack that is generic (`on it`, `working on it`), capitalised,
-  multi-sentence, or carries a task id, attribution or plan.
-- **One live line**: Flag a new `post` or `chat.postMessage` for a progress step where an edit of the
-  existing message would do; flag a progress line that survives the answer.
-- **No plumbing**: Flag task ids, card ids, session keys, file paths, tool names, JSON, CLI flags,
-  exit codes and internal agent names in user text. Do not flag a cluster, workload or linked pull
-  request.
-- **Buttons**: Flag "reply X", "type X" or "say X" in a message body; flag more than 5 buttons in one
-  row. Do not flag the text fallback listing the options.
-- **One-line failure**: Flag an apology, a second explanation, or a retry promise. For each retry
-  promise, find the code that retries; flag it when none exists or it does not run on that path.
-- **Speak up only when it matters**: Flag a new message of its own that is not a pull request
-  opened, a question only the user can answer, or done.
-- **Destructive confirm**: Flag a destructive action reachable without the asker's explicit
-  confirm, or a confirm or control another participant can satisfy.
+- **The answer comes first, as one bold line**: Flag an answer whose first line is context, a
+  heading or a restatement; flag a change that moves the verdict below the fold or drops the
+  headline's bold; flag reasoning, a table or long detail above the fold.
+- **The acknowledgement names its target**: Flag an ack that is generic (`on it`), capitalised,
+  multi-sentence, not ended by a period, a restatement, named by the change instead of what is
+  checked, or carrying a task id, attribution or plan.
+- **One live status line, updated in place**: Flag a new post (Slack
+  `chat.postMessage`, Google Chat `messages.create`) for a progress step where an edit would do;
+  flag a progress line that survives the answer.
+- **No plumbing in user text**: Flag task ids, card ids, session keys, file paths, tool names,
+  JSON, CLI flags, exit codes and roster ids used as names. Allow a cluster, a workload, a linked
+  pull request, and a specialist's name where `SOUL.md` asks for attribution.
+- **Choices are buttons**: Flag a choice offered without buttons, a button that does not send its
+  answer, "reply X", "type X" or "say X" in a message body; flag more than 5 buttons in one row.
+  Allow the text fallback listing the options.
+- **A failure is one plain line**: Flag an apology, a second explanation, a failure that does not
+  say what would work instead, a retry or re-route offered as text rather than a button, or a retry
+  promise; for each promise, find the code that retries and flag it when none runs on that path.
+- **Speak up only when it matters**: Flag a new message of its own that is not the
+  acknowledgement, a pull request opened, a question only the user can answer, a failure, or done.
+- **A destructive action needs the asker's confirm**: Flag a destructive action reachable without
+  stating the resolved target back and the asker's explicit confirm, or a confirm another
+  participant can satisfy.
 - **Renderers never compose**: Flag a renderer that writes words of its own, reads text to fill a
-  field, rewords, clips or repairs a message. Allow what the rule file lists as the backend's own.
+  field or rewords; flag an invalid message rendered clipped or repaired instead of posting its
+  text fallback whole. Allow what the rule's paragraph and the spec it
+  names list as the backend's own.
 
 ## 3. Verify every candidate
 
