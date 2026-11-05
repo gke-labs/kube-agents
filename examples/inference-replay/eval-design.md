@@ -159,6 +159,11 @@ The rules that keep this safe:
   card read differs between otherwise identical runs. The same block leaks earlier repetitions'
   answers into later ones, live or replayed (#1730). Stripping it is a stopgap; fixing #1730 removes
   the need.
+- **Where a gcloud warning lands doesn't change the key.** The shell tool mixes a command's errors
+  and its normal output in whatever order they arrive. So the same `gcloud` command, with the same
+  output, put its `WARNING:` line before the JSON in one run and after it in the next, and that one
+  difference cost the obtainability case the rest of its conversation in the replay lane. The key
+  treats warning lines as if they were at the end. The text the agent sees isn't touched.
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
@@ -215,6 +220,48 @@ pressure.
 An earlier offline estimate from nightly trajectories (56–70% if prompts are unchanged) compared
 kanban results on status fields only, which hid the recent-work digest; the live numbers above
 replace it.
+
+### Replay lane trials
+
+The table above replays a recording minutes later. To test what the replay lane would do, we ran
+the lane's record and replay modes on the same dev install (2026-11-04 and 05, `gemini-4-argon`, the
+inject door, as the presubmit runs). Four cases were recorded once, the way the nightly would, and
+then each was replayed three times. "Reused" is the share of prompt tokens served from saved
+answers instead of the model.
+
+| Case                                         | First trial | After the answer-variant fix |
+| -------------------------------------------- | ----------- | ---------------------------- |
+| `chat-routing-own-cluster-namespaces`        | 88%         | 85%                          |
+| `obtainability-design-quota-vs-capacity`     | 32–45%      | 31%                          |
+| `provisioning-cluster-request-never-creates` | 12–19%      | 66%                          |
+| A health check fanned out to every cluster   | 10–12%      | 80%                          |
+| **All four together**                        | **23%**     | **63%**                      |
+
+The second column is the first replay pass of the second trial. Its other two passes reused
+nothing, for the midnight reason below.
+
+Every run passed, recordings and replays, and every replayed conversation got the same pass or fail
+as the run it reused answers from: 33 of 33 in the first trial and 11 of 11 in the second. Replay
+runs also finished faster, about 24 minutes for a pass of the four cases against 42 for recording.
+
+What the trials taught us:
+
+- **A miss spreads between agents.** When one agent's request misses, the model writes fresh text,
+  and every agent that reads it (a Cluster Agent reading the card the platform agent wrote) misses
+  from its first step. Most of the first trial's loss was this.
+- **The model answers the same request in different words.** Every worker's opening request is the
+  same once IDs are swapped ("work kanban task ⟦TASK⟧"), and the model sometimes looked its card up
+  with no arguments and sometimes with the task id. The cache kept the first answer and served it to
+  every worker, so a case recorded after the other answer never matched again. Treating recorded
+  answers to the same request as interchangeable ("What goes into the cache key") took the fleet
+  case from 10% to 80%.
+- **The day changes the key.** Every system prompt says which day the conversation started. The
+  second trial's last two passes ran after midnight UTC and reused nothing, because every request
+  now said Thursday where the recording said Wednesday. In CI the nightly records one day and
+  presubmits run the next, so this would have stopped almost every hit. The date now becomes how
+  many days it is from the request's own day.
+- **Small output differences matter.** A `gcloud` warning that landed before the JSON in one run and
+  after it in the next ended a conversation (fixed in "Normalization").
 
 ## Design for CI
 
@@ -400,6 +447,26 @@ it fell back (see [the gateway page](../../docs/site/src/content/docs/concepts/i
 The proxy only saves an answer when it came from the main setup with no fallback. Our prototype
 didn't check these headers, so this part hasn't been tested yet.
 
+**Different words for the same answer.** The model doesn't always answer the same request the same
+way. A worker opening its card might call `kanban_show()` in one run and `kanban_show(task_id=…)` in
+the next. Both fetch the same card. The cache keeps one answer per request, so if a case was
+recorded after the other answer, the next request (which includes that answer) never matches its
+recording, and the agents after it miss too.
+
+So the proxy also files each saved answer under a second key, where the model's own earlier
+answers are left as blanks. A request that misses on the exact key can still be served from the
+second one, but only if:
+
+- every earlier answer in it is one the model really gave to that same point in a recording, never
+  a made-up one;
+- everything the tools returned still matches exactly, since tool results stay in the key. If the
+  two answers led to different tool output, it's still a miss;
+- every value the saved answer names (a pod, a card) also appears outside the model's own earlier
+  answers. Otherwise that value's placeholder could point at something else in this run.
+
+Each served line says which key it matched, so the lane reports how much of the reuse came from
+this.
+
 ### How a pull request run finds an answer
 
 For every model request, a pull request run (including a `/retest` or a new push) does this:
@@ -475,10 +542,43 @@ already run the affected cases on the new prompt, so its answers go into the cac
 merges, and the pull requests after it get hits. The nightly fills in cases no recent pull request
 ran.
 
-### The nightly stays live
+### How we keep testing the model's randomness
 
-The nightly never replays. It's what measures each case's real pass rate, which the dashboard and
-the blocking roster rely on, and replay would make those numbers look better than they are.
+The same case doesn't always do the same thing: the model can pick a different tool, word its
+answer differently, or take another path. That randomness is part of what our evals test. A case
+that passes 2 out of 3 times on `main` is telling us something real. Replay hides it, because a
+replayed run repeats what the recording did.
+
+**Our plan: the nightly always runs live, and presubmits replay.** The nightly never replays. It
+measures each case's real pass rate every night, which the dashboard and the blocking roster rely
+on. Replay would make those numbers look better than they are. Presubmits replay what they can,
+because what a presubmit asks is narrower: did this pull request break something? A case the pull
+request touches (its prompt, its skill, its code path) misses the cache and runs live anyway. A
+case it doesn't touch replays, and that's the point: its flakiness isn't this pull request's
+fault, and today it's what makes unrelated pull requests go red.
+
+The alternatives we looked at:
+
+- **Presubmits replay, plus a new live eval at merge time.** Every merged change would get a live
+  run of the cases, in the merge queue or right after merge.
+  - Pros: a change that makes a case flaky is caught on that change, not up to a day later in the
+    nightly; and the blame is clear.
+  - Cons: a second full eval for every merge, which is about what replay saves. In the merge queue
+    it adds 1.5 to 3.5 hours to every merge; after merge it only finds problems once they're on
+    `main`, which is what the nightly already does. It also takes more eval projects from the pool,
+    which is already the bottleneck.
+- **Keep one of the three presubmit runs live.** Each case would run once live and twice from
+  replay.
+  - Pros: every pull request still samples the real model, so a pull request that changes how the
+    model behaves on a case it didn't touch still has a chance to show it.
+  - Cons: it saves only about two thirds of what full replay saves, and the live run brings back
+    the flake reds replay is meant to remove. The gate's "all three runs failed" rule would mean
+    something different for that run.
+
+We chose the nightly because it's already there, it costs nothing extra, and it already answers
+"how random is this case on `main`?". The price is that a change which makes the model's behaviour
+flakier on cases it didn't touch shows up the next morning instead of on the pull request. If
+shadow mode or the lane shows that happens often, keeping one run live is the cheapest fix.
 
 ## What changes for the gate
 
@@ -574,6 +674,30 @@ before stage 3 of the rollout (turning replay on):
 4. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
    polling loop, fix the polling rather than the cache.
 
+### Why a staged rollout and not an A/B test
+
+Another way to roll out would be an A/B test: turn replay on for, say, 30% of presubmits, leave the
+rest live, and compare the two groups.
+
+- Pros: it measures real pull request traffic, not a test job; both groups run at the same time,
+  against the same model and the same flaky cases, so the comparison is fair; and only 30% of pull
+  requests carry the risk.
+- Cons:
+  - Whether a pull request replays would be a coin flip, so the same change could pass in one group
+    and fail in the other. Authors would see the gate behave differently for no reason they can see.
+  - Different pull requests change different things, so the two groups never run the same work.
+    Evals are noisy and slow, so telling a real difference from noise would take weeks.
+  - It doesn't save any work: before even 30% of presubmits can replay, we need everything stage 3
+    needs (the shared cache, who can write to it, and the gate rules).
+
+Our staged plan answers the same questions without touching anyone's pull request until we know:
+shadow mode measures how often pull requests could hit, at no risk; the replay lane runs the same
+cases with and without replay on the same code, which is the like-for-like comparison an A/B test
+can't give; and only then do presubmits turn on. Its weakness is that the lane isn't real pull
+request traffic, and stage 3 turns replay on for everyone at once. If we want a ramp at stage 3, we
+would turn replay on case by case rather than by coin flip: the same cases replay for every pull
+request, so the gate stays fair, and we add cases as each one's lane results hold up.
+
 ## Open questions
 
 - **Following runs live, for one recording per run.** Working out which run an answer came from
@@ -584,6 +708,13 @@ before stage 3 of the rollout (turning replay on):
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We
   need to check the two options and pick one before stage 3.
+- **Answers that quote a full timestamp.** About 1 in 8 saved answers in the replay lane trials
+  quote a timestamp from a tool's output ("As of 2026-11-04T23:37:32Z"). The key treats timestamps
+  as "how long ago", so a replayed answer keeps the recording's time. None of the trials' verdicts
+  changed, but it puts a stale "as of" in reports. Refusing to save those answers would throw away
+  about 1 in 8 saved answers; the better fix is to make timestamps restorable, so a served answer gets this run's time.
+- **Why does the obtainability case reuse so little?** It stayed at 31–45% in both trials while the
+  others improved. There is likely another fork or normalizer gap like the ones above.
 - **How big does the cache get, and when do entries expire?** Answers recorded for an old version of
   a prompt can never be hit again, so entries should expire by age. Expiry also limits one thing the
   key can't see: a model update on the provider's side (Vertex) doesn't change our requests or our
