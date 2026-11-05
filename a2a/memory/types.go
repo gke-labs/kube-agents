@@ -76,12 +76,18 @@ const (
 	OutcomeRefused          OutcomeKind = "refused"
 )
 
-// RecordType classifies an OKF record ("decision" or "lesson").
+// RecordType classifies an OKF record ("decision", "lesson", "runbook", "cluster-blueprint", "tenancy-model", "metric-definition", "escalation", or "observation").
 type RecordType string
 
 const (
-	RecordTypeDecision RecordType = "decision"
-	RecordTypeLesson   RecordType = "lesson"
+	RecordTypeDecision         RecordType = "decision"
+	RecordTypeLesson           RecordType = "lesson"
+	RecordTypeRunbook          RecordType = "runbook"
+	RecordTypeClusterBlueprint RecordType = "cluster-blueprint"
+	RecordTypeTenancyModel     RecordType = "tenancy-model"
+	RecordTypeMetricDefinition RecordType = "metric-definition"
+	RecordTypeEscalation       RecordType = "escalation"
+	RecordTypeObservation      RecordType = "observation"
 )
 
 // RecordStatus tracks the lifecycle of an OKF record.
@@ -265,10 +271,29 @@ type MemoryQueryResponse struct {
 
 var (
 	reRecordID      = regexp.MustCompile(`^(DEC|LES)-\d{4}-\d{3,}$`)
-	reExternalDocID = regexp.MustCompile(`(?i)\b(DEC-\d{4}-\d{3,}|LES-\d{4}-\d{3,}|ADR-\d{1,5}|RFC-\d{1,5})\b`)
+	reExternalDocID = regexp.MustCompile(`(?i)\b(DEC-\d{4}-\d{3,}|LES-\d{4}-\d{3,}|ADR-\d{1,5}|RFC-\d{1,5}|RUN-\d{1,5}|BP-\d{1,5}|TEN-\d{1,5}|MET-\d{1,5}|ESC-\d{1,5}|OBS-\d{1,5})\b`)
 	reLeadingNum    = regexp.MustCompile(`^0*(\d{1,5})(?:[-_.\s]+(.*))?$`)
 	reSlugNonAln    = regexp.MustCompile(`[^a-z0-9]+`)
-	externalDocDirs = []string{"docs/adr", "docs/adrs", "docs/rfcs", "adr", "rfcs"}
+	externalDocDirs = []string{
+		"knowledge/runbooks",
+		"knowledge/cluster-blueprints",
+		"knowledge/blueprints",
+		"knowledge/tenancy-models",
+		"knowledge/tenancy",
+		"knowledge/metric-definitions",
+		"knowledge/metrics",
+		"knowledge/escalations",
+		"knowledge/observations",
+		"docs/adr",
+		"docs/adrs",
+		"docs/rfcs",
+		"docs/runbooks",
+		"docs/playbooks",
+		"adr",
+		"rfcs",
+		"runbooks",
+		"playbooks",
+	}
 )
 
 // Slug formats a title into a URL-safe filename suffix (up to 60 characters).
@@ -540,7 +565,56 @@ func LoadRecords(repoDir string) ([]Record, error) {
 	return out, nil
 }
 
-// ParseExternalDocRecord normalizes a Markdown ADR, RFC, or partial OKF document into a Record.
+func inferExternalDocTypeAndPrefix(fm map[string]any, relPath string) (RecordType, string) {
+	if fm != nil {
+		if tStr, ok := fm["type"].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(tStr)) {
+			case "decision", "adr", "rfc":
+				if strings.Contains(strings.ToLower(relPath), "rfc") || strings.EqualFold(strings.TrimSpace(tStr), "rfc") {
+					return RecordTypeDecision, "RFC"
+				}
+				return RecordTypeDecision, "ADR"
+			case "lesson":
+				return RecordTypeLesson, "LES"
+			case "runbook", "playbook":
+				return RecordTypeRunbook, "RUN"
+			case "cluster-blueprint", "blueprint":
+				return RecordTypeClusterBlueprint, "BP"
+			case "tenancy-model", "tenancy":
+				return RecordTypeTenancyModel, "TEN"
+			case "metric-definition", "metric":
+				return RecordTypeMetricDefinition, "MET"
+			case "escalation":
+				return RecordTypeEscalation, "ESC"
+			case "observation":
+				return RecordTypeObservation, "OBS"
+			}
+		}
+	}
+	lower := strings.ToLower(filepath.ToSlash(relPath))
+	switch {
+	case strings.Contains(lower, "runbook") || strings.Contains(lower, "playbook"):
+		return RecordTypeRunbook, "RUN"
+	case strings.Contains(lower, "blueprint"):
+		return RecordTypeClusterBlueprint, "BP"
+	case strings.Contains(lower, "tenancy"):
+		return RecordTypeTenancyModel, "TEN"
+	case strings.Contains(lower, "metric"):
+		return RecordTypeMetricDefinition, "MET"
+	case strings.Contains(lower, "escalation"):
+		return RecordTypeEscalation, "ESC"
+	case strings.Contains(lower, "observation"):
+		return RecordTypeObservation, "OBS"
+	case strings.Contains(lower, "lesson"):
+		return RecordTypeLesson, "LES"
+	case strings.Contains(lower, "rfc"):
+		return RecordTypeDecision, "RFC"
+	default:
+		return RecordTypeDecision, "ADR"
+	}
+}
+
+// ParseExternalDocRecord normalizes a Markdown ADR, RFC, runbook, or OKF knowledge document into a Record.
 func ParseExternalDocRecord(text, relPath string) Record {
 	if rec, err := ParseRecord(text, relPath); err == nil && len(ValidateRecord(rec)) == 0 {
 		return rec
@@ -555,10 +629,7 @@ func ParseExternalDocRecord(text, relPath string) Record {
 		}
 	}
 	stem := strings.TrimSuffix(filepath.Base(relPath), filepath.Ext(relPath))
-	prefix := "ADR"
-	if strings.Contains(strings.ToLower(relPath), "rfc") {
-		prefix = "RFC"
-	}
+	rtype, prefix := inferExternalDocTypeAndPrefix(fm, relPath)
 	recID := ""
 	if fm != nil {
 		if idStr, ok := fm["id"].(string); ok {
@@ -604,8 +675,12 @@ func ParseExternalDocRecord(text, relPath string) Record {
 			switch strings.ToLower(strings.TrimSpace(stStr)) {
 			case "proposed", "draft":
 				status = StatusProposed
+			case "rejected":
+				status = StatusRejected
 			case "superseded", "deprecated", "obsolete":
 				status = StatusSuperseded
+			case "retired":
+				status = StatusRetired
 			}
 		}
 	}
@@ -644,7 +719,7 @@ func ParseExternalDocRecord(text, relPath string) Record {
 	return Record{
 		Meta: RecordMeta{
 			ID:     recID,
-			Type:   RecordTypeDecision,
+			Type:   rtype,
 			Status: status,
 			Title:  title,
 			Date:   created,
@@ -725,6 +800,18 @@ func LoadExternalDocRecords(repoDir string, extraRepos ...string) ([]Record, err
 	}
 	var out []Record
 	for _, root := range roots {
+		if root.prefix != "" {
+			if extraRecs, err := LoadRecords(root.dir); err == nil {
+				for _, r := range extraRecs {
+					if seenIDs[r.Meta.ID] {
+						continue
+					}
+					seenIDs[r.Meta.ID] = true
+					r.Path = filepath.ToSlash(filepath.Join(root.prefix, r.Path))
+					out = append(out, r)
+				}
+			}
+		}
 		for _, sub := range externalDocDirs {
 			dir := filepath.Join(root.dir, filepath.FromSlash(sub))
 			entries, err := os.ReadDir(dir)

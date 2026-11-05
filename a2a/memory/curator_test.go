@@ -617,15 +617,41 @@ func TestExternalDocRecordsAndRepoBoundary(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(adrDir, "0012-regional-postgres-failover.md"), []byte(adrText), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	runbookDir := filepath.Join(repoDir, "knowledge", "runbooks")
+	if err := os.MkdirAll(runbookDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runbookText := "---\ntype: runbook\ntitle: CoreDNS High Latency Triage\nstatus: active\n---\n\nCheck upstream DNS forwarder saturation and conntrack table usage.\n"
+	if err := os.WriteFile(filepath.Join(runbookDir, "0003-coredns-latency.md"), []byte(runbookText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bpDir := filepath.Join(repoDir, "knowledge", "cluster-blueprints")
+	if err := os.MkdirAll(bpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bpText := "# Regional GKE Production Blueprint\n\nUse regional control planes across 3 zones with Workload Identity enabled.\n"
+	if err := os.WriteFile(filepath.Join(bpDir, "0001-regional-gke.md"), []byte(bpText), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	recs, err := LoadExternalDocRecords(repoDir)
 	if err != nil {
 		t.Fatalf("LoadExternalDocRecords: %v", err)
 	}
-	if len(recs) != 1 || recs[0].Meta.ID != "ADR-0012" {
-		t.Fatalf("expected ADR-0012, got %+v", recs)
+	if len(recs) != 3 {
+		t.Fatalf("expected 3 external/OKF records (ADR-0012, BP-0001, RUN-0003), got %+v", recs)
 	}
-	if !strings.Contains(recs[0].Meta.Title, "Regional PostgreSQL Failover") {
-		t.Fatalf("unexpected ADR title: %q", recs[0].Meta.Title)
+	byID := map[string]Record{}
+	for _, r := range recs {
+		byID[r.Meta.ID] = r
+	}
+	if r, ok := byID["ADR-0012"]; !ok || r.Meta.Type != RecordTypeDecision || !strings.Contains(r.Meta.Title, "Regional PostgreSQL Failover") {
+		t.Fatalf("unexpected ADR-0012 record: %+v", byID["ADR-0012"])
+	}
+	if r, ok := byID["RUN-0003"]; !ok || r.Meta.Type != RecordTypeRunbook || r.Meta.Title != "CoreDNS High Latency Triage" {
+		t.Fatalf("unexpected RUN-0003 record: %+v", byID["RUN-0003"])
+	}
+	if r, ok := byID["BP-0001"]; !ok || r.Meta.Type != RecordTypeClusterBlueprint || r.Meta.Title != "Regional GKE Production Blueprint" {
+		t.Fatalf("unexpected BP-0001 record: %+v", byID["BP-0001"])
 	}
 
 	kDir := filepath.Join(repoDir, "knowledge")

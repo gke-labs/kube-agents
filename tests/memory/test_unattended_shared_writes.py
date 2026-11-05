@@ -341,6 +341,48 @@ class TestUnattendedSharedWrites(unittest.TestCase):
             self.assertIn("Recent checkout handoff note", r["result"], r)
             self.assertNotIn("Old staging alert", r["result"], r)
 
+    def test_external_doc_loader_ingests_okf_runbooks_and_blueprints(self):
+        """load_external_doc_records ingests all OKF record types (runbook, cluster-blueprint,
+        tenancy-model, metric-definition) as well as ADRs and RFCs.
+        """
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+
+        script_path = (
+            Path(__file__).resolve().parents[2]
+            / "agents/platform/skills/decision-memory/scripts/decision_memory.py"
+        )
+        spec = importlib.util.spec_from_file_location("decision_memory_mod", script_path)
+        dm = importlib.util.module_from_spec(spec)
+        sys.modules["decision_memory_mod"] = dm
+        spec.loader.exec_module(dm)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "knowledge/runbooks").mkdir(parents=True)
+            (repo / "knowledge/cluster-blueprints").mkdir(parents=True)
+            (repo / "docs/adr").mkdir(parents=True)
+
+            (repo / "knowledge/runbooks/0003-coredns-latency.md").write_text(
+                "---\ntype: runbook\ntitle: CoreDNS High Latency Triage\nstatus: active\n---\n\nCheck upstream DNS.\n"
+            )
+            (repo / "knowledge/cluster-blueprints/0001-regional-gke.md").write_text(
+                "# Regional GKE Production Blueprint\n\nUse 3 zones.\n"
+            )
+            (repo / "docs/adr/0012-postgres-failover.md").write_text(
+                "# ADR 12: Regional Postgres Failover\n\nKeep standby replica.\n"
+            )
+
+            recs = dm.load_external_doc_records(repo)
+            by_id = {r.id: r for r in recs}
+            self.assertIn("RUN-0003", by_id)
+            self.assertEqual(by_id["RUN-0003"].type, "runbook")
+            self.assertIn("BP-0001", by_id)
+            self.assertEqual(by_id["BP-0001"].type, "cluster-blueprint")
+            self.assertIn("ADR-0012", by_id)
+            self.assertEqual(by_id["ADR-0012"].type, "decision")
+
 
 if __name__ == "__main__":
     unittest.main()

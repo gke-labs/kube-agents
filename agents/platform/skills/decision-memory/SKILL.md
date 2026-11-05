@@ -5,7 +5,7 @@ description: Check, recall, and explain infrastructure decisions and lessons in 
 
 # Task
 
-The GitOps repository stores infrastructure decisions and operational lessons as reviewed Operational Knowledge Format (OKF) records under `knowledge/decisions/` and `knowledge/lessons/`.
+The GitOps repository stores infrastructure decisions, operational lessons, and domain knowledge as reviewed Operational Knowledge Format (OKF) records under `knowledge/` (`decisions/`, `lessons/`, `runbooks/`, `cluster-blueprints/`, `tenancy-models/`, `metric-definitions/`, `escalations/`, `observations/`) alongside external ADRs (`docs/adr/`), RFCs (`docs/rfcs/`), and runbooks (`docs/runbooks/`).
 Use this skill to check those records before you modify a file or review a change.
 Every record update requires a pull request that a human merges.
 
@@ -35,8 +35,8 @@ Never claim that no decision exists.
 
 ```yaml
 ---
-type: lesson # decision | lesson
-id: LES-2026-001 # DEC-YYYY-NNN | LES-YYYY-NNN
+type: lesson # decision | lesson | runbook | cluster-blueprint | tenancy-model | metric-definition | escalation | observation
+id: LES-2026-001 # DEC-YYYY-NNN | LES-YYYY-NNN | ADR-NNNN | RFC-NNNN | RUN-NNNN | BP-NNNN | TEN-NNNN | MET-NNNN | ESC-NNNN | OBS-NNNN
 title: checkout OOM-kills below 256Mi
 status: active # proposed | active | superseded | retired
 date: 2026-09-10

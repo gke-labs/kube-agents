@@ -54,8 +54,36 @@ import yaml
 DEFAULT_BANK_ID = "kube-agents-decisions"
 SHARED_TAG = "scope:shared"
 RECORD_DIRS = ("knowledge/decisions", "knowledge/lessons")
-EXTERNAL_DOC_DIRS = ("docs/adr", "docs/adrs", "docs/rfcs", "adr", "rfcs")
-RECORD_TYPES = ("decision", "lesson")
+EXTERNAL_DOC_DIRS = (
+    "knowledge/runbooks",
+    "knowledge/cluster-blueprints",
+    "knowledge/blueprints",
+    "knowledge/tenancy-models",
+    "knowledge/tenancy",
+    "knowledge/metric-definitions",
+    "knowledge/metrics",
+    "knowledge/escalations",
+    "knowledge/observations",
+    "docs/adr",
+    "docs/adrs",
+    "docs/rfcs",
+    "docs/runbooks",
+    "docs/playbooks",
+    "adr",
+    "rfcs",
+    "runbooks",
+    "playbooks",
+)
+RECORD_TYPES = (
+    "decision",
+    "lesson",
+    "runbook",
+    "cluster-blueprint",
+    "tenancy-model",
+    "metric-definition",
+    "escalation",
+    "observation",
+)
 STATUSES = ("proposed", "active", "rejected", "superseded", "retired")
 SEVERITIES = ("block", "warn", "info")
 VALID_OPS = ("==", "!=", ">=", ">", "<=", "<", "absent", "present", "regex")
@@ -260,12 +288,55 @@ def load_records(repo: Path) -> List[Record]:
     return out
 
 
-_EXTERNAL_ID_RE = re.compile(r"\b(DEC-\d{4}-\d{3,}|LES-\d{4}-\d{3,}|ADR-\d{1,5}|RFC-\d{1,5})\b", re.I)
+_EXTERNAL_ID_RE = re.compile(
+    r"\b(DEC-\d{4}-\d{3,}|LES-\d{4}-\d{3,}|ADR-\d{1,5}|RFC-\d{1,5}|RUN-\d{1,5}|BP-\d{1,5}|TEN-\d{1,5}|MET-\d{1,5}|ESC-\d{1,5}|OBS-\d{1,5})\b",
+    re.I,
+)
 _LEADING_NUM_RE = re.compile(r"^0*(\d{1,5})(?:[-_.\s]+(.*))?$")
 
 
+def _infer_external_doc_type_and_prefix(meta: Dict[str, Any], rel_path: str) -> Tuple[str, str]:
+    raw_type = str(meta.get("type") or "").strip().lower()
+    lower_rel = rel_path.lower()
+    type_aliases = {
+        "decision": ("decision", "RFC" if "rfc" in lower_rel else "ADR"),
+        "adr": ("decision", "ADR"),
+        "rfc": ("decision", "RFC"),
+        "lesson": ("lesson", "LES"),
+        "runbook": ("runbook", "RUN"),
+        "playbook": ("runbook", "RUN"),
+        "cluster-blueprint": ("cluster-blueprint", "BP"),
+        "blueprint": ("cluster-blueprint", "BP"),
+        "tenancy-model": ("tenancy-model", "TEN"),
+        "tenancy": ("tenancy-model", "TEN"),
+        "metric-definition": ("metric-definition", "MET"),
+        "metric": ("metric-definition", "MET"),
+        "escalation": ("escalation", "ESC"),
+        "observation": ("observation", "OBS"),
+    }
+    if raw_type in type_aliases:
+        return type_aliases[raw_type]
+    if "runbook" in lower_rel or "playbook" in lower_rel:
+        return ("runbook", "RUN")
+    if "blueprint" in lower_rel:
+        return ("cluster-blueprint", "BP")
+    if "tenancy" in lower_rel:
+        return ("tenancy-model", "TEN")
+    if "metric" in lower_rel:
+        return ("metric-definition", "MET")
+    if "escalation" in lower_rel:
+        return ("escalation", "ESC")
+    if "observation" in lower_rel:
+        return ("observation", "OBS")
+    if "lesson" in lower_rel:
+        return ("lesson", "LES")
+    if "rfc" in lower_rel:
+        return ("decision", "RFC")
+    return ("decision", "ADR")
+
+
 def parse_external_doc_record(text: str, rel_path: str) -> Record:
-    """Parse a Markdown ADR or RFC (with or without strict OKF frontmatter) into a Record."""
+    """Parse a Markdown ADR, RFC, runbook, or OKF knowledge document into a Record."""
     meta: Dict[str, Any] = {}
     body = text
     m = FRONTMATTER.match(text)
@@ -279,9 +350,7 @@ def parse_external_doc_record(text: str, rel_path: str) -> Record:
             pass
 
     stem = Path(rel_path).stem
-    lower_rel = rel_path.lower()
-    is_rfc = "rfc" in lower_rel
-    prefix = "RFC" if is_rfc else "ADR"
+    rtype, prefix = _infer_external_doc_type_and_prefix(meta, rel_path)
 
     rec_id = str(meta.get("id") or "").strip()
     if not rec_id:
@@ -320,9 +389,6 @@ def parse_external_doc_record(text: str, rel_path: str) -> Record:
         "obsolete": "retired",
     }
     status = status_map.get(raw_status, "active")
-    rtype = str(meta.get("type") or "decision").strip().lower()
-    if rtype not in RECORD_TYPES:
-        rtype = "decision"
     scope = meta.get("scope") if isinstance(meta.get("scope"), dict) else {"paths": ["**"]}
     if not any(scope.get(k) for k in ("paths", "resources", "checks")):
         scope = dict(scope)
