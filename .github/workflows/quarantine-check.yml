@@ -14,6 +14,12 @@ on:
     - cron: "23 13 * * *"
   workflow_dispatch:
 
+# One run at a time: two overlapping runs would both read an issue's comments
+# before either posts, and both post the same notice.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 permissions: {}
 
 jobs:
@@ -23,6 +29,8 @@ jobs:
     # Hygiene): a fork inherits the schedule, and would comment on its own copies.
     if: github.repository == 'gke-labs/kube-agents'
     runs-on: ubuntu-latest
+    # A stalled API call would otherwise hold the job for GitHub's six hours.
+    timeout-minutes: 10
     permissions:
       contents: read # check out the tree to find the quarantines
       issues: write # read each cited issue, its comments and timeline; comment on one with a problem; create the label

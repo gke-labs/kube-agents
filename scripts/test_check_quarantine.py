@@ -2,6 +2,7 @@
 
 import sys
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -103,7 +104,13 @@ class ScanTest(unittest.TestCase):
         self.assertIn("KA_RUN_QUARANTINED", report.failures[0])
 
     def test_a_malformed_citation_fails(self):
-        for text in ('t.Skip("quarantined: #9")', 't.Skip("quarantined: kube-agents#9")'):
+        for text in (
+            't.Skip("quarantined: #9")',
+            't.Skip("quarantined: kube-agents#9")',
+            't.Skip("quarantined: https://github.com/gke-labs/kube-agents/issues/9")',
+            't.Skip("quarantined: see gke-labs/kube-agents#9")',
+            't.Skip("quarantined: 9")',
+        ):
             with self.subTest(text=text):
                 report = scanned(("a_test.go", f'if os.Getenv("KA_RUN_QUARANTINED") == "" {{ {text} }}'))
                 self.assertEqual([], report.quarantines)
@@ -160,6 +167,34 @@ class GitHubTest(unittest.TestCase):
         report = self.run_check(FakeAPI({4357: issue(4357, body=body)}))
         self.assertEqual(1, len(report.failures))
         self.assertIn("stays live", report.failures[0])
+
+    def test_a_blank_cause_does_not_borrow_the_next_line(self):
+        body = "Suspected cause:\nProduct race ruled out: yes, test-only fake.\n"
+        report = self.run_check(FakeAPI({4357: issue(4357, body=body)}))
+        self.assertEqual(1, len(report.failures))
+        self.assertIn("Suspected cause", report.failures[0])
+
+    def test_a_bare_yes_without_a_reason_fails(self):
+        for line in ("Product race ruled out: yes", "Product race ruled out: yes\nnext line"):
+            with self.subTest(line=line):
+                body = "Suspected cause: timing.\n" + line
+                report = self.run_check(FakeAPI({4357: issue(4357, body=body)}))
+                self.assertEqual(1, len(report.failures))
+                self.assertIn("Product race ruled out", report.failures[0])
+
+    def test_one_unreadable_issue_is_reported_and_the_rest_still_checked(self):
+        class Refusing(FakeAPI):
+            def get(self, path, tolerate=()):
+                if path.endswith("/1"):
+                    raise urllib.error.HTTPError(path, 403, "Forbidden", {}, None)
+                return super().get(path, tolerate)
+
+        go = 'if os.Getenv("KA_RUN_QUARANTINED") == "" {\n\tt.Skip("quarantined: gke-labs/kube-agents#1")\n}\n'
+        api = Refusing({4357: issue(4357, state="closed")})
+        report = self.run_check(api, files=(("a_test.go", go), ("test_b.py", PY_GATED)))
+        self.assertEqual(2, len(report.failures), report.failures)
+        self.assertIn("could not be read", report.failures[0])
+        self.assertIn("closed", report.failures[1])
 
     def test_cause_and_race_may_arrive_in_a_comment(self):
         api = FakeAPI({4357: issue(4357, body="bot-filed table")}, comments={4357: [{"body": GOOD_BODY}]})
@@ -227,6 +262,19 @@ class NotifyTest(unittest.TestCase):
         report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
         self.assertEqual(1, cq.notify(api, report))
         self.assertIn("@filer", api.posted[-1][1]["body"])
+
+    def test_a_refused_post_is_reported_and_the_rest_still_posted(self):
+        class RefusingPost(FakeAPI):
+            def post(self, path, payload=None, tolerate=()):
+                if path.endswith("/1/comments"):
+                    raise urllib.error.HTTPError(path, 403, "locked", {}, None)
+                super().post(path, payload, tolerate)
+
+        go = 'if os.Getenv("KA_RUN_QUARANTINED") == "" {\n\tt.Skip("quarantined: gke-labs/kube-agents#1")\n}\n'
+        api = RefusingPost({1: issue(1, state="closed"), 4357: issue(4357, state="closed")})
+        report = cq.check_github(api, scanned(("a_test.go", go), ("test_b.py", PY_GATED)), NOW)
+        self.assertEqual(1, cq.notify(api, report))
+        self.assertIn("could not be posted", report.failures[-1])
 
     def test_nothing_wrong_posts_nothing(self):
         api = FakeAPI({4357: issue(4357)})

@@ -46,6 +46,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.error
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,8 +61,9 @@ REPO = "gke-labs/kube-agents"
 REPO_ROOT = _HERE.parent
 #: The skip reason every quarantine carries, and the one thing this script greps for.
 MARKER_RE = re.compile(r"quarantined: gke-labs/kube-agents#(\d+)")
-#: Any `quarantined: ...#` string; one that MARKER_RE does not match is malformed.
-LOOSE_MARKER_RE = re.compile(r"quarantined:\s*\S*#")
+#: Any `quarantined:` at all; one that MARKER_RE does not match is malformed (a URL, a leading
+#: word, a bare number), and would otherwise skip a test with nothing tracking it.
+LOOSE_MARKER_RE = re.compile(r"quarantined:", re.IGNORECASE)
 #: The variable that runs quarantined tests anyway.
 RUN_ENV = "KA_RUN_QUARANTINED"
 #: The read of `RUN_ENV` that counts as a gate: Go `Getenv("...")`, Python `environ.get("...")` or
@@ -91,11 +93,19 @@ KIND_STALE = "stale"
 #: A quarantine older than this is flagged in the report.
 STALE_DAYS = 14
 #: Lines the tracking issue (body or a comment) must carry, matched at the start of a line.
-CAUSE_RE = re.compile(r"^\s*suspected cause:\s*\S", re.IGNORECASE | re.MULTILINE)
-RACE_RE = re.compile(r"^\s*product race ruled out:\s*yes\b", re.IGNORECASE | re.MULTILINE)
+#: `[^\S\n]` is whitespace short of a newline: the text has to be on the same line, so a blank
+#: `Suspected cause:` does not borrow the next line's.
+CAUSE_RE = re.compile(r"^[^\S\n]*suspected cause:[^\S\n]*\S", re.IGNORECASE | re.MULTILINE)
+#: `yes` and then a reason, on the same line.
+RACE_RE = re.compile(
+    r"^[^\S\n]*product race ruled out:[^\S\n]*yes\b[^\S\n]*[,:;.\u2014-]?[^\S\n]*\w", re.IGNORECASE | re.MULTILINE
+)
 USER_AGENT = "kube-agents-check-quarantine"
 TIMELINE_LABELED = "labeled"
 SECONDS_PER_DAY = 86400
+#: What a GitHub call raises once `GitHubAPI`'s retries are spent; one issue's failure is reported,
+#: and the rest are still checked and the report still written.
+API_ERRORS = (urllib.error.HTTPError, urllib.error.URLError)
 #: An issue number that was never filed, or was deleted.
 MISSING_STATUSES = (404, 410)
 
@@ -236,8 +246,16 @@ def check_github(api, report: Report, now: datetime) -> Report:
     for quarantine in report.quarantines:
         by_issue.setdefault(quarantine.issue, []).append(quarantine)
     for number in sorted(by_issue):
-        check_issue(api, number, by_issue[number], report, now)
-    for issue in api.get_all(f"/repos/{api.repo}/issues?state=open&labels={LABEL}"):
+        try:
+            check_issue(api, number, by_issue[number], report, now)
+        except API_ERRORS as error:
+            report.failures.append(f"#{number} could not be read ({error}); its quarantine went unchecked")
+    try:
+        labelled = api.get_all(f"/repos/{api.repo}/issues?state=open&labels={LABEL}")
+    except API_ERRORS as error:
+        report.failures.append(f"the open `{LABEL}` issues could not be listed ({error})")
+        labelled = []
+    for issue in labelled:
         if "pull_request" in issue:
             continue
         if issue["number"] not in by_issue:
@@ -274,7 +292,11 @@ def notify(api, report: Report) -> int:
             lines = [marker, owners or "Unassigned.", "", "The daily quarantine check found:", ""]
             lines += [f"- {item}" for item in items]
             lines += ["", "Policy: `docs/pull-request-workflow.md`, \"Quarantining a flaky test\"."]
-            api.post(f"/repos/{api.repo}/issues/{number}/comments", {"body": "\n".join(lines)})
+            try:
+                api.post(f"/repos/{api.repo}/issues/{number}/comments", {"body": "\n".join(lines)})
+            except API_ERRORS as error:
+                report.failures.append(f"#{number}: the {kind} notice could not be posted ({error})")
+                continue
             posted += 1
     return posted
 

@@ -844,9 +844,10 @@ the real fix. Quarantine is not triage: a flake can be a product race, and skipp
 the bug. Quarantine a test only when all of these hold:
 
 - No fix is already in review or in the merge queue. If one is, wait for it.
-- The tracking issue says, each at the start of a line in the body or a comment,
-  `Suspected cause: <one line>` and `Product race ruled out: yes, <why>`. Until a product race is
-  ruled out, the test stays live and the issue gets an owner instead.
+- The tracking issue says, each at the start of its own line,
+  `Suspected cause: <one line>` and `Product race ruled out: yes, <why>`. Put them in a comment: the
+  bot rebuilds a `ci:flaky` issue's body on every occurrence. Until a product race is ruled out, the
+  test stays live and the issue gets an owner instead.
 - The issue carries the `ci:quarantined` label and is assigned to the person who owns the fix: the
   area's primary owner in [`ownership.md`](ownership.md) when one is known. Reuse the `ci:flaky`
   issue when one exists.
