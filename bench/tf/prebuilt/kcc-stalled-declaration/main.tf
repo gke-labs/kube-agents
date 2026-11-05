@@ -45,8 +45,9 @@
 # TF_VAR_<name>: TF_VAR_project_id, TF_VAR_kcc_cluster_name,
 # TF_VAR_kcc_cluster_location, TF_VAR_gitops_repo (owner/name),
 # TF_VAR_bench_gitops_write_token_file and, in namespaced mode,
-# TF_VAR_kcc_google_service_account. The harness gives these to a stack only
-# when it declares bench_gitops_write_token_file (variables.tf); the task sets
+# TF_VAR_kcc_google_service_account. The harness will give these to a stack
+# only when it declares bench_gitops_write_token_file (variables.tf); that
+# depends on #4742, which is not merged. The task sets
 # kcc_namespace, seeded_slot and seeded_pool. This file gives them to
 # plant.py as KCC_EVAL_PROJECT, KCC_EVAL_CLUSTER, KCC_EVAL_LOCATION,
 # KCC_EVAL_NAMESPACE, KCC_EVAL_SLOT, KCC_EVAL_POOL, KCC_EVAL_GITOPS_REPO,
