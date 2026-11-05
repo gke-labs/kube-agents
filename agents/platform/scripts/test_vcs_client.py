@@ -883,6 +883,82 @@ class WorkingCopyTest(unittest.TestCase):
         self.assertIn("branch and target are both", str(caught.exception))
         self.assertEqual(self.published, [])
 
+    def test_publish_blocks_decision_memory_guard_and_appends_section_on_pass(self):
+        cloned = vcs_client.clone("acme/infra", key="fix/mem")
+        tree = Path(cloned["path"])
+        vcs_client.branch("acme/infra", "fix/mem", key="fix/mem")
+        (tree / "clusters" / "prod").mkdir(parents=True)
+        (tree / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n"
+        )
+        (tree / "knowledge" / "lessons").mkdir(parents=True)
+        (tree / "knowledge" / "lessons" / "LES-2026-001-checkout-memory.md").write_text(
+            "---\n"
+            "type: lesson\n"
+            "id: LES-2026-001\n"
+            "title: Keep checkout memory request >= 2Gi\n"
+            "status: active\n"
+            "date: 2026-03-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/checkout.yaml\n"
+            "guard:\n"
+            "  rule: Keep checkout memory request >= 2Gi.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/checkout.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: '>='\n"
+            "    value: 2Gi\n"
+            "evidence:\n"
+            "  pull_request: '#10'\n"
+            "---\n\n"
+            "## What happened\n\nOOMKilled below 2Gi.\n"
+        )
+        vcs_client.commit(
+            "lower memory to 512Mi",
+            [
+                "clusters/prod/checkout.yaml",
+                "knowledge/lessons/LES-2026-001-checkout-memory.md",
+            ],
+            spec="acme/infra",
+            key="fix/mem",
+        )
+        with self.assertRaises(vcs_client.VcsError) as caught:
+            vcs_client.publish("acme/infra", key="fix/mem")
+        self.assertEqual(caught.exception.code, vcs_client.DECISION_MEMORY_BLOCKED)
+        self.assertIsInstance(caught.exception, PermissionError)
+        self.assertIn("LES-2026-001", str(caught.exception))
+        self.assertEqual(self.published, [])
+
+        # Fix the manifest to satisfy the guard; publish succeeds and proposal-create gets the section.
+        (tree / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n"
+        )
+        vcs_client.commit("raise memory to 4Gi", spec="acme/infra", key="fix/mem")
+        vcs_client.publish("acme/infra", key="fix/mem")
+        self.assertEqual(len(self.published), 1)
+
+        seen_forge = []
+        with mock.patch.object(
+            vcs_client,
+            "call",
+            side_effect=lambda verb, payload: seen_forge.append((verb, payload))
+            or {"proposal": {"url": "https://forge.test/pr/1", "number": 1, "title": "t"}},
+        ):
+            vcs_client.forge(
+                "proposal-create",
+                {"title": "Raise memory", "body": "Summary.", "source": "fix/mem", "target": "main"},
+                repository="acme/infra",
+            )
+        self.assertEqual(len(seen_forge), 1)
+        self.assertIn("### Prior decisions and lessons", seen_forge[0][1]["body"])
+        self.assertIn("LES-2026-001", seen_forge[0][1]["body"])
+
 
 def build_tar(*members: tuple[tarfile.TarInfo, bytes | None]) -> bytes:
     """A tar holding `members`, each a header and, for a regular file, its bytes."""

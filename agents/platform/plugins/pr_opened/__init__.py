@@ -69,10 +69,14 @@ import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+MEMORY_RECORD_ID_RE = re.compile(r"\b((?:DEC|LES)-\d{4}-\d{3,})\b")
 
 #: ``vcs_client.PROPOSAL_OPENED_KEY`` / ``_EVENT`` / ``_FIELDS``, held here because a
 #: plugin is loaded by file path and the sandbox's client is not on its import
@@ -254,6 +258,37 @@ def record(task_id, proposal):
         kb._append_event(conn, task_id, PR_OPENED_KIND, proposal, run_id=kb._current_run_id(conn, task_id))
 
 
+def _notify_curator_pr_opened(confirmed):
+    """Best-effort: when a verified PR names an OKF record ID, attach its PR URL in Curator."""
+    if not os.environ.get("NATS_URL", "").strip():
+        return
+    title = str(confirmed.get("title") or "")
+    url = str(confirmed.get("url") or "")
+    match = MEMORY_RECORD_ID_RE.search(title) or MEMORY_RECORD_ID_RE.search(url)
+    if match is None:
+        return
+    rec_id = match.group(1)
+    curator_bin = os.environ.get("CURATOR_BIN", "").strip()
+    if not curator_bin:
+        if os.path.isfile("/usr/local/bin/curator") and os.access("/usr/local/bin/curator", os.X_OK):
+            curator_bin = "/usr/local/bin/curator"
+        else:
+            curator_bin = shutil.which("curator") or ""
+    if not curator_bin:
+        return
+    pr_ref = f"{url} (#{confirmed.get('number')})" if confirmed.get("number") else url
+    try:
+        subprocess.run(
+            [curator_bin, "emit", "--kind", "proposed", "--id", rec_id, "--pr", pr_ref],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("pr_opened: curator link for %s failed: %s", rec_id, exc)
+
+
 def _recorded(checker, task_id, proposal):
     """Check ``proposal`` with the forge and record the forge's answer on the card.
 
@@ -267,6 +302,7 @@ def _recorded(checker, task_id, proposal):
             logger.warning("pr_opened: %s is not a pull request this agent just opened; not recorded", proposal["url"])
             return False
         record(task_id, confirmed)
+        _notify_curator_pr_opened(confirmed)
         return True
     except Exception as exc:  # noqa: BLE001 — the PR is open; the thread falls back to the note
         logger.warning("pr_opened: recording %s on %s failed: %s", proposal.get("url"), task_id, exc)

@@ -63,6 +63,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -932,9 +933,518 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     return SweepResult(cards=cards, warnings=warnings)
 
 
+# --------------------------------------------------------------------------
+# Sweep: Decision Memory proposals (PR creation, merge, and rejection)
+# --------------------------------------------------------------------------
+
+_PR_NUM_RE = re.compile(r"(?:/pull/|/-/merge_requests/|#)(\d+)")
+
+
+def _resolve_curator_bin() -> str:
+    configured = os.environ.get("CURATOR_BIN", "").strip()
+    if configured:
+        return configured
+    if os.path.isfile("/usr/local/bin/curator") and os.access("/usr/local/bin/curator", os.X_OK):
+        return "/usr/local/bin/curator"
+    return shutil.which("curator") or ""
+
+
+def _parse_pr_number(pr_ref: str) -> int | None:
+    if not pr_ref:
+        return None
+    m = _PR_NUM_RE.search(str(pr_ref))
+    return int(m.group(1)) if m else None
+
+
+def _memory_pr_card(record: dict, repo: str) -> Card:
+    record_id = str(record.get("id") or "")
+    title = str(record.get("title") or f"Record {record_id}")
+    rel_path = str(record.get("path") or f"knowledge/decisions/{record_id}.md")
+    branch = str(record.get("branch") or f"platform-agent/memory/{record_id}")
+    pr_markdown = str(record.get("pr_markdown") or "").strip()
+    repo_flag = f" --repo {shlex.quote(repo)}" if repo else ""
+    body = (
+        f"Curator synthesized **{record_id}** (`{rel_path}`) with `status: active` "
+        "in its frontmatter for team review.\n\n"
+        "Open the pull request on the GitOps repository using the **submit-suggestion** "
+        "skill (`/v1/vcs/*` + local `git` in the sandbox):\n\n"
+        f"1. Run `python3 /opt/data/skills/submit-suggestion/scripts/submit_suggestion.py "
+        f"prepare{repo_flag} --branch {shlex.quote(branch)}` and read the `workspace` path.\n"
+        f"2. Write the exact Markdown below to `<workspace>/{rel_path}` (creating parent "
+        "directories if needed).\n"
+        f"3. Run `python3 /opt/data/skills/submit-suggestion/scripts/submit_suggestion.py "
+        f"submit{repo_flag} --branch {shlex.quote(branch)} "
+        f"--title {shlex.quote(f'docs(knowledge): record {record_id} ({title})')[:120]} "
+        f"--body {shlex.quote(f'Records {record_id} (`{rel_path}`) in Decision Memory with `status: active` upon merge.')}`.\n\n"
+        f"### `{rel_path}`\n\n"
+        f"```markdown\n{pr_markdown}\n```\n"
+    )
+    return Card(
+        title=f"Open Decision Memory PR for {record_id}: {title}"[:200],
+        body=body,
+        idempotency_key=f"memory-pr-{_slug(repo or 'default')}-{_key_part(record_id)}",
+    )
+
+
+def _extract_reviewer_reason(comments: list, viewer: str) -> str:
+    viewer_key = forge.normalise_login(viewer) if viewer else ""
+    for comment in reversed(comments or []):
+        if not isinstance(comment, dict):
+            continue
+        author = str(comment.get("author") or "")
+        if viewer_key and forge.normalise_login(author) == viewer_key:
+            continue
+        text = str(comment.get("body") or "").strip()
+        if text:
+            return text[:500]
+    return "Proposal closed unmerged by reviewer."
+
+
+SOAK_WINDOWS_SECONDS = {
+    "10m": 10 * 60,
+    "24h": 24 * 3600,
+    "7d": 7 * 24 * 3600,
+}
+SOAK_CHECKPOINTS_SECONDS = (10 * 60, 24 * 3600, 7 * 24 * 3600)
+INTERCEPTED_EVENTS_PATH: Path | str = ""
+
+
+def _parse_iso_timestamp(raw: str) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _extract_rule_from_markdown(md: str) -> str:
+    for line in str(md or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("rule:"):
+            return stripped.split("rule:", 1)[1].strip().strip("\"'")
+    return ""
+
+
+def _detect_human_modification(
+    rec: dict, prop: dict, view_ans: dict, viewer: str
+) -> dict | None:
+    """Detect whether a reviewer modified an agent PR before merging (`edit-before-merge`)."""
+    viewer_key = forge.normalise_login(viewer) if viewer else ""
+    initial_proposal = str(
+        rec.get("guard_rule")
+        or _extract_rule_from_markdown(str(rec.get("pr_markdown") or ""))
+        or rec.get("title")
+        or ""
+    ).strip()
+
+    edited_rule = str(prop.get("edited_guard_rule") or "").strip()
+    merged_md = str(prop.get("merged_markdown") or "").strip()
+    pr_md = str(rec.get("pr_markdown") or "").strip()
+    if not edited_rule and merged_md:
+        cand_rule = _extract_rule_from_markdown(merged_md)
+        if cand_rule and cand_rule != initial_proposal:
+            edited_rule = cand_rule
+
+    human_editor = ""
+    last_author = str(prop.get("last_commit_author") or "").strip()
+    if last_author and (not viewer_key or forge.normalise_login(last_author) != viewer_key):
+        if prop.get("initial_sha") and prop.get("head_sha") and prop.get("initial_sha") != prop.get("head_sha"):
+            human_editor = last_author
+
+    commits = view_ans.get("commits") or prop.get("commits") or []
+    if not human_editor and isinstance(commits, list):
+        for c in reversed(commits):
+            if not isinstance(c, dict):
+                continue
+            c_author = str(c.get("author") or "").strip()
+            if c_author and (not viewer_key or forge.normalise_login(c_author) != viewer_key):
+                human_editor = c_author
+                break
+
+    modified_flag = bool(
+        prop.get("modified_before_merge")
+        or edited_rule
+        or human_editor
+        or (merged_md and pr_md and merged_md != pr_md)
+    )
+    if not modified_flag:
+        return None
+
+    comments = view_ans.get("comments")
+    if not isinstance(comments, list):
+        comments = prop.get("comments") or []
+    reason = ""
+    if comments:
+        cand = _extract_reviewer_reason(comments, viewer)
+        if cand != "Proposal closed unmerged by reviewer.":
+            reason = cand
+    if not reason:
+        editor_label = f" by {human_editor}" if human_editor else ""
+        if edited_rule:
+            reason = f"Reviewer modified proposal before merging{editor_label}: {edited_rule}"
+        else:
+            reason = f"Reviewer modified proposal before merging{editor_label}."
+
+    return {
+        "initial_proposal": initial_proposal,
+        "rule": edited_rule,
+        "reason": reason[:500],
+    }
+
+
+def _evaluate_post_merge_soak(
+    rec: dict, prop: dict, view_ans: dict, *, now: datetime | None = None
+) -> tuple[str, str]:
+    """Evaluate post-merge soak checkpoints (`T+10m`, `T+24h`, `T+7d`) for a merged remediation PR.
+
+    Returns ``(state, reason)`` where ``state`` is one of:
+    - ``"soaking"``: merged recently; keep ``status:proposed`` until the soak window completes.
+    - ``"persists"``: failure recurred or GitOps sync degraded after merge (emit ``pr-merged-persists``).
+    - ``"resolved"``: soak window completed with healthy sync and zero recurrences (emit ``resolved-merged``).
+    """
+    post_status = str(
+        prop.get("post_merge_status") or rec.get("post_merge_status") or ""
+    ).strip().lower()
+    if post_status in ("persists", "pr-merged-persists", "failed"):
+        reason = str(
+            prop.get("persistence_reason")
+            or rec.get("reviewer_reason")
+            or "Finding recurred during post-merge soak verification."
+        ).strip()
+        return "persists", reason
+
+    sync_status = str(prop.get("sync_status") or "").strip().lower()
+    if sync_status in ("degraded", "outofsync", "unhealthy"):
+        return (
+            "persists",
+            f"GitOps sync reported {sync_status} during post-merge soak verification.",
+        )
+
+    finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
+    merged_at = _parse_iso_timestamp(
+        str(prop.get("merged_at") or rec.get("merged_at") or "")
+    )
+    events_path = str(INTERCEPTED_EVENTS_PATH or os.environ.get("INTERCEPTED_EVENTS_PATH", "")).strip()
+    if finding_id and events_path and Path(events_path).is_file():
+        try:
+            for line in Path(events_path).read_text().splitlines():
+                if not line.strip():
+                    continue
+                ev = json.loads(line)
+                if not isinstance(ev, dict):
+                    continue
+                if str(ev.get("finding_id") or "") != finding_id:
+                    continue
+                ev_ts = _parse_iso_timestamp(str(ev.get("timestamp") or ev.get("at") or ""))
+                if merged_at is None or (ev_ts is not None and ev_ts > merged_at):
+                    ev_reason = str(ev.get("reason") or "").strip()
+                    suffix = f": {ev_reason}" if ev_reason else "."
+                    return (
+                        "persists",
+                        f"Finding {finding_id} recurred in cluster events after PR merge{suffix}",
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
+    soak_key = str(rec.get("soak_window") or prop.get("soak_window") or "24h").strip().lower()
+    required_sec = SOAK_WINDOWS_SECONDS.get(soak_key, SOAK_WINDOWS_SECONDS["24h"])
+    if merged_at is not None:
+        cur_now = now or datetime.now(timezone.utc)
+        elapsed_sec = (cur_now - merged_at).total_seconds()
+        if elapsed_sec < required_sec:
+            next_cp = next(
+                (cp for cp in SOAK_CHECKPOINTS_SECONDS if cp > max(0.0, elapsed_sec)),
+                required_sec,
+            )
+            return (
+                "soaking",
+                f"Soaking post-merge ({int(max(0.0, elapsed_sec))}s / {required_sec}s; next checkpoint {next_cp}s).",
+            )
+
+    return (
+        "resolved",
+        f"Verified healthy across {soak_key} post-merge soak window.",
+    )
+
+
+def sweep_memory_proposals(
+    dry_run: bool = False, *, now: datetime | None = None
+) -> SweepResult:
+    """Reconcile ``status:proposed`` OKF records in Curator with GitOps PR states.
+
+    - If a proposed record has no PR open or closed on ``platform-agent/memory/<ID>``,
+      files an idempotent Kanban card for ``platform`` to open the PR via
+      ``submit-suggestion``.
+    - If a remediation lesson PR merged, verifies the post-merge soak checkpoints
+      (``T+10m``, ``T+24h``, ``T+7d``) before emitting ``resolved-merged`` (or
+      ``pr-merged-persists`` if the issue recurred).
+    - If a reviewer edited an agent PR before merging (``edit-before-merge``),
+      emits ``modified-merged`` with the human-corrected rule and superseded
+      initial proposal.
+    - If a decision PR merged unchanged, emits ``approved`` to Curator so
+      Hindsight updates ``okf:<repo>:<ID>`` in-place to ``status:active``.
+    - If the PR was closed unmerged (``state == "closed"``), emits ``refused``
+      with the reviewer's comment so Hindsight updates ``okf:<repo>:<ID>``
+      in-place to ``status:rejected``.
+    """
+    curator_bin = _resolve_curator_bin()
+    if not curator_bin or not os.environ.get("NATS_URL", "").strip():
+        return SweepResult()
+
+    try:
+        proc = subprocess.run(
+            [curator_bin, "pending"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return SweepResult()
+        payload = json.loads(proc.stdout)
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"github_scan_gate: curator pending failed: {exc}\n")
+        return SweepResult()
+
+    records = payload.get("records") or []
+    if not records:
+        return SweepResult()
+
+    managed = gitops_workspace.get_managed_repos()
+    repo = str(payload.get("repo") or "").strip()
+    if managed:
+        repo = gitops_workspace.qualify(repo, managed) if repo else managed[0]
+        if repo not in managed:
+            repo = managed[0]
+    if not repo:
+        return SweepResult()
+
+    provider = forge.BrokerProvider()
+    viewer = ""
+    try:
+        viewer = provider.viewer_login(repo)
+    except Exception:  # noqa: BLE001
+        pass
+
+    cards: list[Card] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        rec_id = str(rec.get("id") or "").strip()
+        if not rec_id:
+            continue
+        branch = str(rec.get("branch") or f"platform-agent/memory/{rec_id}").strip()
+        pr_ref = str(rec.get("pull_request") or "").strip()
+        pr_num = _parse_pr_number(pr_ref)
+
+        if pr_num is None:
+            try:
+                ans = forge.call(
+                    "proposal-list",
+                    {"source": branch, "state": "all", "limit": 5},
+                    repo,
+                    retry_transient=True,
+                )
+                proposals = ans.get("proposals") or []
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(f"github_scan_gate: proposal-list for {branch} failed: {exc}\n")
+                continue
+            if not proposals:
+                if rec.get("pr_markdown"):
+                    cards.append(_memory_pr_card(rec, repo))
+                continue
+            latest = proposals[0]
+            pr_num = int(latest.get("number") or 0) or None
+            pr_url = str(latest.get("url") or "").strip()
+            pr_ref = f"{pr_url} (#{pr_num})" if pr_url and pr_num else (pr_url or f"#{pr_num}")
+            if pr_num and not dry_run and latest.get("state") == "open":
+                subprocess.run(
+                    [curator_bin, "emit", "--kind", "proposed", "--id", rec_id, "--repo", repo, "--pr", pr_ref],
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+
+        if pr_num is None:
+            continue
+
+        try:
+            view_ans = forge.call(
+                "proposal-view",
+                {"number": pr_num, "comments": True},
+                repo,
+                retry_transient=True,
+            )
+            prop = view_ans.get("proposal") or {}
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(f"github_scan_gate: proposal-view #{pr_num} failed: {exc}\n")
+            continue
+
+        state = str(prop.get("state") or "").strip().lower()
+        pr_url = str(prop.get("url") or "").strip()
+        if pr_url:
+            pr_ref = f"{pr_url} (#{pr_num})"
+
+        if state == "merged":
+            is_lesson = (
+                str(rec.get("type") or "").strip().lower() == "lesson"
+                or rec_id.startswith("LES-")
+                or bool(rec.get("finding_id"))
+                or bool(rec.get("soak_window"))
+                or bool(prop.get("soak_window"))
+                or bool(prop.get("post_merge_status"))
+            )
+            if is_lesson:
+                soak_state, soak_reason = _evaluate_post_merge_soak(
+                    rec, prop, view_ans, now=now
+                )
+                if soak_state == "soaking":
+                    if dry_run:
+                        sys.stderr.write(
+                            f"github_scan_gate: {rec_id} soaking after merge of {pr_ref}: {soak_reason}\n"
+                        )
+                    continue
+                if soak_state == "persists":
+                    if dry_run:
+                        sys.stderr.write(
+                            f"github_scan_gate: would emit pr-merged-persists for {rec_id} from {pr_ref}: {soak_reason}\n"
+                        )
+                        continue
+                    persists_cmd = [
+                        curator_bin,
+                        "emit",
+                        "--kind",
+                        "pr-merged-persists",
+                        "--id",
+                        rec_id,
+                        "--repo",
+                        repo,
+                        "--pr",
+                        pr_ref,
+                        "--reason",
+                        soak_reason,
+                    ]
+                    finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
+                    if finding_id:
+                        persists_cmd.extend(["--finding-id", finding_id])
+                    subprocess.run(
+                        persists_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=8,
+                        check=False,
+                    )
+                    continue
+
+            mod = _detect_human_modification(rec, prop, view_ans, viewer)
+            if mod is not None:
+                if dry_run:
+                    sys.stderr.write(
+                        f"github_scan_gate: would emit modified-merged for {rec_id} from {pr_ref}\n"
+                    )
+                    continue
+                cmd = [
+                    curator_bin,
+                    "emit",
+                    "--kind",
+                    "modified-merged",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                    "--reason",
+                    mod["reason"],
+                ]
+                if mod.get("initial_proposal"):
+                    cmd.extend(["--initial-proposal", mod["initial_proposal"]])
+                if mod.get("rule"):
+                    cmd.extend(["--rule", mod["rule"]])
+                subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=8,
+                    check=False,
+                )
+                continue
+
+            emit_kind = "resolved-merged" if is_lesson else "approved"
+            if dry_run:
+                sys.stderr.write(
+                    f"github_scan_gate: would emit {emit_kind} for {rec_id} from merged {pr_ref}\n"
+                )
+                continue
+            emit_cmd = [
+                curator_bin,
+                "emit",
+                "--kind",
+                emit_kind,
+                "--id",
+                rec_id,
+                "--repo",
+                repo,
+                "--pr",
+                pr_ref,
+            ]
+            if is_lesson:
+                soak_key = str(rec.get("soak_window") or prop.get("soak_window") or "24h").strip()
+                emit_cmd.extend(["--soak-window", soak_key])
+                finding_id = str(rec.get("finding_id") or prop.get("finding_id") or "").strip()
+                if finding_id:
+                    emit_cmd.extend(["--finding-id", finding_id])
+            subprocess.run(
+                emit_cmd,
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        elif state == "closed":
+            comments = view_ans.get("comments")
+            if not isinstance(comments, list):
+                comments = prop.get("comments") or []
+            reason = _extract_reviewer_reason(comments, viewer)
+            if dry_run:
+                sys.stderr.write(f"github_scan_gate: would refuse {rec_id} from closed {pr_ref}: {reason}\n")
+                continue
+            subprocess.run(
+                [
+                    curator_bin,
+                    "emit",
+                    "--kind",
+                    "refused",
+                    "--id",
+                    rec_id,
+                    "--repo",
+                    repo,
+                    "--pr",
+                    pr_ref,
+                    "--reason",
+                    reason,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+
+    return SweepResult(cards=cards)
+
+
 SWEEPS = {
     "issues": sweep_issues,
     "pr_comments": sweep_pr_comments,
+    "memory_proposals": sweep_memory_proposals,
 }
 
 # Insertion order is run order, so this is the registry read one way rather

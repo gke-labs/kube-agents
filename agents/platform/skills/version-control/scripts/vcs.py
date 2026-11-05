@@ -82,7 +82,12 @@ def verb_commit(arguments) -> dict:
 
 
 def verb_publish(arguments) -> dict:
-    return client.publish(arguments.repo, arguments.target, advance=arguments.advance)
+    return client.publish(
+        arguments.repo,
+        arguments.target,
+        advance=arguments.advance,
+        override_decision=getattr(arguments, "override_decision", None),
+    )
 
 
 def verb_discard(arguments) -> dict:
@@ -478,6 +483,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--advance",
         action="store_true",
         help="this copy was cloned of a proposal branch to add to it; needs --target",
+    )
+    publish.add_argument(
+        "--override-decision",
+        default=None,
+        help="comma-separated DEC-*/LES-* IDs to override a blocking Decision Memory guard",
     )
     repo_option(publish).set_defaults(run=verb_publish)
 
