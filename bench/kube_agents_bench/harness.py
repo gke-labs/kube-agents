@@ -2117,7 +2117,7 @@ def _write_chat_shape(result: AgentResult) -> None:
     transport counts the posts it saw; the api transport leaves the count
     to the final message's delivered sections.
     """
-    posts = result.metadata.get("posts")
+    posts = result.metadata.get("window_posts")
     shape = chat_shape.measure(
         str(result.metadata.get("final_message") or ""),
         posts if isinstance(posts, int) and not isinstance(posts, bool) else None,
@@ -2344,6 +2344,9 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
             "reason_token": fold.reason_token or None,
             "executor_states": list(fold.executor_states),
             "posts": len(fold.posts),
+            # The messages this task posted (its window), which the reply
+            # shape counts.
+            "window_posts": len(fold.window_posts),
             "entries": len(fold.entries),
             "malformed_entries": fold.malformed,
             # The marker's arguments (calls written, calls dropped), or None

@@ -928,10 +928,15 @@ class Fold:
         """
         if self.stream_result:
             return self.stream_result
+        return "".join(post["text"] for post in self.window_posts if post["messageId"] not in self.edited)
+
+    @property
+    def window_posts(self) -> list[dict[str, Any]]:
+        """The messages this task posted: its window when its marker appeared,
+        every post otherwise. A post a later edit rewrote (the status
+        placeholder) is still a message the thread shows."""
         windowed = [post for post in self.posts if post["inWindow"]]
-        if not windowed:
-            windowed = self.posts
-        return "".join(post["text"] for post in windowed if post["messageId"] not in self.edited)
+        return windowed or self.posts
 
     @property
     def gateway_declared(self) -> bool:

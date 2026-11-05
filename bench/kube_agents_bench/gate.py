@@ -555,7 +555,7 @@ def _cmd_case(args: argparse.Namespace) -> int:
             partial = f" {REP_TOKENS_PARTIAL_FIELD}" if rep.tokens_partial else ""
             print(f"  rep {rep.index} tokens: {counts}{partial}")
         # The delivered reply's shape under chat_shape.KEYS, a flag as 1 or
-        # 0, for the dashboard's tone trend. Reported, never scored; no line
+        # 0, for the eval dashboard to collect. Reported, never scored; no line
         # for a run that delivered nothing.
         if rep.shape:
             shape = " ".join(

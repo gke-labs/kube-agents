@@ -172,7 +172,15 @@ def test_questions_and_artifacts_are_messages_but_not_the_answer():
         ]
     )
     assert chat_shape.answer_text(final) == PR_MOCK
-    assert chat_shape.measure(final)[chat_shape.BOT_MESSAGES] == 4
+    # The artifact is a file read back from the pod, not a post.
+    assert chat_shape.measure(final)[chat_shape.BOT_MESSAGES] == 3
+
+
+def test_an_apology_quoted_in_an_artifact_is_not_the_replys():
+    final = _delegated(PR_MOCK) + "\n\nArtifact report.md produced by delegated task t_1:\nsorry, connection refused"
+    shape = chat_shape.measure(final)
+    assert shape[chat_shape.APOLOGY] is False
+    assert shape[chat_shape.BOT_MESSAGES] == 2
 
 
 def test_a_reply_with_no_ack_counts_only_its_sections():

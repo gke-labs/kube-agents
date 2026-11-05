@@ -42,13 +42,16 @@ _FLAGS = (OPENS_ON_VERDICT, APOLOGY)
 
 # The headers harness.py opens each delivered card result, paused card's
 # question and artifact with in the final message (_RESULT_SECTION,
-# _QUESTION_SECTION, _append_artifacts). Each is a message the thread received.
+# _QUESTION_SECTION, _append_artifacts). A result or a question is a message
+# the thread received; an artifact is a file read back from the pod, which no
+# one was sent.
 _DELIVERED_HEADER = re.compile(
     r"^(?:Result of delegated task \S+|Question from delegated task \S+"
     r"|Artifact [^\n]* produced by delegated task \S+):\n",
     re.MULTILINE,
 )
 _RESULT_HEADER_PREFIX = "Result of delegated task "
+_ARTIFACT_HEADER_PREFIX = "Artifact "
 _ATX_HEADING = re.compile(r"^ {0,3}#{1,6}(?:\s|$)")
 # Markup and symbols ahead of a line's first word: emphasis, a quote mark, a
 # list bullet, an emoji. Stripped before the lead-in phrases are matched.
@@ -70,25 +73,34 @@ _FENCE = re.compile(r"```.*?```", re.DOTALL)
 _MAX_PREAMBLE_UNITS = 3
 
 
+def _sections(final_message: str) -> tuple[str, list[tuple[str, str]]]:
+    """The reply ahead of any delivered section, then each section's header and body."""
+    headers = list(_DELIVERED_HEADER.finditer(final_message))
+    opening = final_message[: headers[0].start()] if headers else final_message
+    sections = [
+        (h.group(0), final_message[h.end() : headers[i + 1].start() if i + 1 < len(headers) else len(final_message)])
+        for i, h in enumerate(headers)
+    ]
+    return opening, sections
+
+
 def answer_text(final_message: str) -> str:
     """The answer in ``final_message``: its last delivered card result, or all of it."""
-    headers = list(_DELIVERED_HEADER.finditer(final_message))
-    results = [
-        (h, headers[i + 1].start() if i + 1 < len(headers) else len(final_message))
-        for i, h in enumerate(headers)
-        if h.group(0).startswith(_RESULT_HEADER_PREFIX)
-    ]
-    if not results:
-        return final_message.strip()
-    header, end = results[-1]
-    return final_message[header.end() : end].strip()
+    opening, sections = _sections(final_message)
+    results = [body for header, body in sections if header.startswith(_RESULT_HEADER_PREFIX)]
+    return (results[-1] if results else final_message).strip()
+
+
+def _posted(final_message: str) -> list[str]:
+    """The text of each message the thread received: the reply, then each result and question."""
+    opening, sections = _sections(final_message)
+    posted = [body for header, body in sections if not header.startswith(_ARTIFACT_HEADER_PREFIX)]
+    return [text for text in [opening, *posted] if text.strip()]
 
 
 def bot_messages(final_message: str) -> int:
-    """How many messages the thread received: the reply itself, then one per delivered section."""
-    headers = list(_DELIVERED_HEADER.finditer(final_message))
-    opening = final_message[: headers[0].start()] if headers else final_message
-    return len(headers) + (1 if opening.strip() else 0)
+    """How many messages the thread received: the reply itself, then one per result or question."""
+    return len(_posted(final_message))
 
 
 def _words(text: str) -> int:
@@ -127,9 +139,9 @@ def _preamble_words(answer: str) -> tuple[bool, int]:
 def measure(final_message: str, posts: int | None = None) -> dict[str, Any] | None:
     """The shape of the reply in ``final_message``, or None when nothing was delivered.
 
-    ``posts`` is the number of messages the transport saw posted, when it
-    counts them (the inject transport does); without it the count is read
-    from the final message's delivered sections.
+    ``posts`` is the number of messages the transport saw posted for this
+    ask, when it counts them (the inject transport does); without it the
+    count is read from the final message's delivered sections.
     """
     answer = answer_text(final_message)
     if not answer:
@@ -137,7 +149,7 @@ def measure(final_message: str, posts: int | None = None) -> dict[str, Any] | No
     first_is_preamble, before = _preamble_words(answer)
     return {
         OPENS_ON_VERDICT: not first_is_preamble,
-        APOLOGY: bool(_APOLOGY.search(final_message)),
+        APOLOGY: any(_APOLOGY.search(text) for text in _posted(final_message)),
         BOT_MESSAGES: posts if posts is not None else bot_messages(final_message),
         WORDS_BEFORE_ANSWER: before,
         ANSWER_WORDS: _words(answer),
