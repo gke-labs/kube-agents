@@ -184,6 +184,40 @@ Which provider and model serve an install is `status.inference`, the default mod
 
 The agent's labels are `agent_namespace` and `agent`, not `namespace` and `name`: the collector owns `namespace` as a target label and would have renamed the agent's to `exported_namespace`. `time() - kubeagents_platformagent_usage_time_seconds{field="lastHumanActiveTime"}` is how long since a person last talked to an install, and `kubeagents_platformagent_usage{field="chatTurnsErroredTotal"}` over `{field="chatMessagesInboundTotal"}` is the share of turns that failed, with no PromQL over a status document.
 
+#### Answer feedback across installs
+
+Answer ratings leave an install only as counts, through a collector you run. Two series carry them, and neither carries a note, a question, an answer, a user or a cluster name:
+
+- `kubeagents_platformagent_usage{field="negativeFeedbackTotal"}`, the operator's gauge of each install's thumbs-downs, beside `{field="chatMessagesInboundTotal"}` for the messages they were out of. One scrape of the operator covers every install in its cluster.
+- `kubeagents_a2a_gateway_answer_feedback_total{platform, rating}`, each 👍 and 👎 on a `next` install's [answer feedback](/kube-agents/concepts/chatops/#answer-feedback) controls, straight from its A2A gateway. On a `next` install with Slack through the A2A gateway, `negativeFeedbackTotal` reads 0 and this series is the count.
+
+Managed Prometheus writes every cluster's samples to its project with `project_id`, `location` and `cluster` labels. A Cloud Monitoring [metrics scope](https://cloud.google.com/monitoring/settings) that monitors several projects lets one PromQL query read all of them. These queries give a fleet view:
+
+```promql
+# Thumbs-downs per install over the last day
+sum by (project_id, cluster, agent_namespace, agent) (
+  increase(kubeagents_platformagent_usage{field="negativeFeedbackTotal"}[1d]))
+
+# Thumbs-downs per 100 chat messages across the fleet, last 7 days
+100 * sum(increase(kubeagents_platformagent_usage{field="negativeFeedbackTotal"}[7d]))
+  / sum(increase(kubeagents_platformagent_usage{field="chatMessagesInboundTotal"}[7d]))
+
+# Share of next-mode ratings that were 👍, per cluster, last 7 days
+sum by (project_id, cluster) (increase(kubeagents_a2a_gateway_answer_feedback_total{rating="up"}[7d]))
+  / sum by (project_id, cluster) (increase(kubeagents_a2a_gateway_answer_feedback_total{rating=~"up|down"}[7d]))
+```
+
+An install whose metrics you cannot reach still has the counters in `status.usage`. This prints one line of counts per install across every context in your kubeconfig, with no names:
+
+```bash
+for ctx in $(kubectl config get-contexts -o name); do
+  kubectl --context "$ctx" get platformagents -A \
+    -o jsonpath='{range .items[*]}{.status.usage.negativeFeedbackTotal}{" "}{.status.usage.chatMessagesInboundTotal}{"\n"}{end}'
+done
+```
+
+The [summary block](#sharing-a-usage-and-feedback-summary) carries the same counters for an install that shares by pasting.
+
 ### Health cohorts and alerts
 
 The chart can turn those gauges into the health cohorts. `platformAgent.healthRules.enabled: true` renders one Managed Prometheus `Rules` object, `<name>-health-rules`, in the install's namespace. The managed rule-evaluator runs it against the namespace's metrics. It is off by default, because on means alerts fire.
