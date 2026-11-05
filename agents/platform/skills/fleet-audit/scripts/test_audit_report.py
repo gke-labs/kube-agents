@@ -23662,6 +23662,33 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(), self.root, declarations)
         self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
 
+    def test_the_workers_own_text_stays_before_the_paragraph(self):
+        """Live finding: two ledger rows showed only the paragraph as the
+        fix's text. The pass keeps the worker's own text, when there is any,
+        before the paragraph, for a manifest fix of the declaring file, a fix
+        of another file, a manual fix and a note long enough to be cut; with
+        no worker text, the paragraph is the whole note and nothing is made
+        up in its place."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        long_text = ("Append us-central1-b and us-central1-c to the pool's node locations. " * 40).strip()
+        for remediation, expected in (
+            ({"kind": "manifest", "path": self.PLANTED, "note": "Append zones."}, "Append zones."),
+            ({"kind": "manifest", "path": "clusters/fa2-seeded-a/other.yaml", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": long_text}, long_text[:200]),
+        ):
+            with self.subTest(kind=remediation["kind"], path=remediation.get("path")):
+                finding = self.pool_finding(dict(remediation))
+                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+                note = finding["remediation"]["note"]
+                self.assertTrue(note.startswith(expected), note[:200])
+                self.assertLess(note.index(expected), note.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        for remediation in ({"kind": "manifest", "path": self.PLANTED, "note": ""}, {"kind": "manifest", "path": self.PLANTED}):
+            finding = self.pool_finding(dict(remediation))
+            audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+            self.assertTrue(finding["remediation"]["note"].startswith(audit_report.KCC_STALLED_NOTE_MARK))
+
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, {})
