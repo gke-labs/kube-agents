@@ -48,6 +48,29 @@ func jobTemplateTestReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent,
 	return &PlatformAgentReconciler{Client: c, Scheme: scheme}, c
 }
 
+// The index carries no template, so it goes to the API server without a
+// template key at all: sent as null, the CRD's object schema refuses it, and
+// no profile gets Job mode (found live on GKE 1.35; envtest's 1.37 server
+// let the null through, so this checks the bytes sent).
+func TestTheIndexIsSentWithoutATemplate(t *testing.T) {
+	raw, err := json.Marshal(buildDispatchJobIndexFor(a2aTestAgent(), []string{"agentprofile-tse-unattended"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj struct {
+		Spec map[string]json.RawMessage `json:"spec"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if tmpl, ok := obj.Spec["template"]; ok {
+		t.Errorf("the index is sent with template %s; want no template key", tmpl)
+	}
+	if _, ok := obj.Spec["serviceAccounts"]; !ok {
+		t.Errorf("the index is sent without its serviceAccounts: %s", raw)
+	}
+}
+
 // One rendering reaches both readers: the template in the dispatch config
 // is the one in the admission policy's param, byte for byte, so the Jobs
 // the dispatcher stamps from the config are the ones the policy admits. The

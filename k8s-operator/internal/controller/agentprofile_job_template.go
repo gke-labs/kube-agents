@@ -320,7 +320,7 @@ func buildDispatchJobTemplate(agent *agentv1alpha1.PlatformAgent, profile string
 	return &agentv1alpha1.DispatchJobTemplate{
 		TypeMeta:   metav1.TypeMeta{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "DispatchJobTemplate"},
 		ObjectMeta: metav1.ObjectMeta{Name: dispatchJobTemplatePrefix + profile, Namespace: profileNamespaceName(agent), Labels: dispatchJobParamLabels(agent)},
-		Spec:       agentv1alpha1.DispatchJobTemplateSpec{Template: runtime.RawExtension{Raw: raw}},
+		Spec:       agentv1alpha1.DispatchJobTemplateSpec{Template: &runtime.RawExtension{Raw: raw}},
 	}, nil
 }
 
@@ -350,7 +350,7 @@ func buildDispatchJobIndexFor(agent *agentv1alpha1.PlatformAgent, accounts []str
 // index, or a template that won't decode).
 func dispatchJobParamTemplate(param *agentv1alpha1.DispatchJobTemplate) (corev1.PodTemplateSpec, bool) {
 	var tmpl corev1.PodTemplateSpec
-	if len(param.Spec.Template.Raw) == 0 || json.Unmarshal(param.Spec.Template.Raw, &tmpl) != nil {
+	if param.Spec.Template == nil || len(param.Spec.Template.Raw) == 0 || json.Unmarshal(param.Spec.Template.Raw, &tmpl) != nil {
 		return tmpl, false
 	}
 	return tmpl, true

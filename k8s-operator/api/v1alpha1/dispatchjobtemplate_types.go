@@ -29,12 +29,13 @@ type DispatchJobTemplateSpec struct {
 	// Template is the pod template an unattended profile's Jobs must equal
 	// exactly: the operator's rendering, as the API server defaults it (a
 	// server-side dry run of a PodTemplate), so it compares field for field
-	// with a Job's defaulted pod template. Absent on the index.
+	// with a Job's defaulted pod template. Absent on the index: a pointer, so
+	// it is omitted there rather than sent as null, which the schema refuses.
 	// +kubebuilder:pruning:PreserveUnknownFields
 	// +kubebuilder:validation:Schemaless
 	// +kubebuilder:validation:Type=object
 	// +optional
-	Template runtime.RawExtension `json:"template,omitempty"`
+	Template *runtime.RawExtension `json:"template,omitempty"`
 
 	// ServiceAccounts, on the index only, are the accounts the templates run
 	// as: a dispatcher Job must run as one of them.

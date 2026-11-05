@@ -60,7 +60,8 @@ spec:
                     Template is the pod template an unattended profile's Jobs must equal
                     exactly: the operator's rendering, as the API server defaults it (a
                     server-side dry run of a PodTemplate), so it compares field for field
-                    with a Job's defaulted pod template. Absent on the index.
+                    with a Job's defaulted pod template. Absent on the index: a pointer, so
+                    it is omitted there rather than sent as null, which the schema refuses.
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
               type: object
