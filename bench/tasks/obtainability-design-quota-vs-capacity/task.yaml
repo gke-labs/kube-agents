@@ -34,7 +34,7 @@ expected_output: >-
   requested family with fallback tiers behind it.
 infrastructure:
   deployer: noop
-validated: false
+validated: true
 
 # Slug per docs/designs/domains.yaml.
 domain: capacity
