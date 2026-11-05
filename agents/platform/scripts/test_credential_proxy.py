@@ -19492,6 +19492,22 @@ class TeamsRelayTest(unittest.TestCase):
                 with self.assertRaises(credential_proxy.TeamsUpstreamError, msg=raw):
                     relay._get_access_token()
 
+    def test_teams_relay_api_call_replaces_a_lone_surrogate_instead_of_raising(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        relay._token, relay._token_expires_at = "cached", 9999999999.0
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps({"id": "act-1"}).encode("utf-8")
+        resp.__enter__.return_value = resp
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", return_value=resp) as opened:
+            result = relay.api_call(
+                service_url="https://smba.trafficmanager.net/teams/",
+                path="v3/conversations/123/activities",
+                payload={"type": "message", "text": "ok \ud83d done"},
+            )
+        self.assertEqual(result, {"id": "act-1"})
+        posted = opened.call_args.args[0].data.decode("utf-8")
+        self.assertIn("ok ? done", posted)
+
     def test_teams_relay_api_call_refuses_http_redirects_over_real_socket(self):
         class RedirectingHandler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):

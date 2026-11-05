@@ -5757,7 +5757,13 @@ class TeamsRelay:
         url = f"{service_url.rstrip('/')}/{clean_path}"
         # UTF-8, not ``\uXXXX`` escapes: the adapter sizes the activity on the
         # same serialization, and Bot Framework counts the bytes it receives.
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        # A lone surrogate the gateway hop escaped is replaced rather than
+        # raised, so it cannot turn a post into a silent 400.
+        body = (
+            json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
+            if payload is not None
+            else None
+        )
         req = urllib.request.Request(
             url,
             data=body,
