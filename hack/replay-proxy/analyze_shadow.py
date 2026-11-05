@@ -301,10 +301,8 @@ class PrefixSources(Sources):
         return best, matched
 
 
-def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
-    """Read JSON lines from each path; returns the records in time order and skip counts."""
-    records: List[Record] = []
-    skipped = {reason: 0 for reason in SKIP_REASONS}
+def iter_request_lines(paths: Iterable[str], skipped: Dict[str, int]) -> Iterator[Dict[str, Any]]:
+    """Each request line in the files, parsed; counts the rest in `skipped` (not JSON, another event)."""
     for path in paths:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
@@ -314,24 +312,32 @@ def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
                 try:
                     entry = json.loads(line)
                 except ValueError:
-                    skipped[SKIP_NOT_JSON] += 1
+                    skipped[SKIP_NOT_JSON] = skipped.get(SKIP_NOT_JSON, 0) + 1
                     continue
                 if not isinstance(entry, dict) or entry.get(F.EVENT) != F.REQUEST_EVENT:
-                    skipped[SKIP_OTHER_EVENT] += 1
+                    skipped[SKIP_OTHER_EVENT] = skipped.get(SKIP_OTHER_EVENT, 0) + 1
                     continue
-                if entry.get(F.ERROR) == F.ERROR_ANALYSIS_DROPPED:
-                    skipped[SKIP_ANALYSIS_DROPPED] += 1
-                    continue
-                if entry.get(F.ERROR):
-                    skipped[SKIP_ERROR] += 1
-                    continue
-                if not entry.get(F.FINGERPRINT):
-                    skipped[SKIP_NO_FINGERPRINT] += 1
-                    continue
-                if (entry.get(F.JOB) or {}).get(F.JOB_KIND) not in JOB_KINDS:
-                    skipped[SKIP_UNTAGGED] += 1
-                    continue
-                records.append(Record.from_line(entry))
+                yield entry
+
+
+def load(paths: Iterable[str]) -> Tuple[List[Record], Dict[str, int]]:
+    """Read JSON lines from each path; returns the records in time order and skip counts."""
+    records: List[Record] = []
+    skipped = {reason: 0 for reason in SKIP_REASONS}
+    for entry in iter_request_lines(paths, skipped):
+        if entry.get(F.ERROR) == F.ERROR_ANALYSIS_DROPPED:
+            skipped[SKIP_ANALYSIS_DROPPED] += 1
+            continue
+        if entry.get(F.ERROR):
+            skipped[SKIP_ERROR] += 1
+            continue
+        if not entry.get(F.FINGERPRINT):
+            skipped[SKIP_NO_FINGERPRINT] += 1
+            continue
+        if (entry.get(F.JOB) or {}).get(F.JOB_KIND) not in JOB_KINDS:
+            skipped[SKIP_UNTAGGED] += 1
+            continue
+        records.append(Record.from_line(entry))
     records.sort(key=lambda r: r.ts)
     return records, skipped
 

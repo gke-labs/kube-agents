@@ -1,0 +1,891 @@
+"""Report eval inference cost, tokens, cache hits, model time, rate limits and reliability.
+
+Reads the shadow proxy's JSON lines (replay_proxy.py; field names in
+schema.py) and, optionally, the eval dashboard's data.json, and reports per job
+kind (nightly, presubmit), per build, per case where the eval data names one,
+and over the whole window. The same script produces the baseline frozen before
+replay is switched on and every report after it, and `--compare` prints the
+headline deltas between a saved report and a new one, so the two are measured
+the same way (examples/inference-replay/eval-design.md, Rollout).
+
+Inputs:
+
+- LOG paths: JSONL files, or directories searched for `*.jsonl` and
+  `*.jsonl.open` segments and `job-<ms>.json` manifests (the bucket layout
+  `<kind>/<day>/<build>/logs/*.jsonl`, downloaded as it is);
+- `--eval-data data.json` (repeatable): the dashboard's runs, joined to the
+  lines on the Prow build id (`job.build` == `runs[].build_id`);
+- `--prices`: the dated price table (default: model-prices.json beside this
+  script); `--price-as GROUP=MODEL` prices a logged model group (the LiteLLM
+  alias, `model-default` on an eval install) as a model in the table.
+
+Every metric is defined once, in METRICS and CASE_METRICS below; the README's
+table of them is generated from those (`make docs-generate`).
+
+Usage:
+  python3 baseline_report.py LOG [LOG ...] [--eval-data data.json] [--price-as model-default=MODEL]
+      [--since DATE] [--until DATE] [--json]
+  python3 baseline_report.py LOG [LOG ...] ... --compare BASELINE.json [--json]
+  python3 baseline_report.py --report CURRENT.json --compare BASELINE.json [--json]
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import analyze_shadow
+import replay_proxy
+import schema as F
+
+REPORT_SCHEMA_VERSION = 1
+NIGHTLY = analyze_shadow.NIGHTLY
+PRESUBMIT = analyze_shadow.PRESUBMIT
+JOB_KINDS = analyze_shadow.JOB_KINDS
+TOTAL_SCOPE = "total"
+SCOPES = (TOTAL_SCOPE,) + JOB_KINDS
+HTTP_OK = 200
+HTTP_TOO_MANY_REQUESTS = 429
+# The value of x-litellm-attempted-fallbacks when LiteLLM tried no fallback.
+NO_FALLBACKS = replay_proxy.NO_FALLBACKS
+
+DEFAULT_PRICES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model-prices.json")
+TOKENS_PER_PRICE_UNIT = 1_000_000
+PRICE_FIELDS = ("input", "cached_input", "output")
+# Price table keys.
+PRICES_AS_OF = "as_of"
+PRICES_SOURCE = "source"
+PRICES_MODELS = "models"
+LONG_CONTEXT = "long_context"
+LONG_CONTEXT_THRESHOLD = "above_prompt_tokens"
+UNPRICED_NO_MODEL = "(no model)"
+PRICE_AS_SEPARATOR = "="
+
+SEGMENT_SUFFIXES = (".jsonl", ".jsonl.open")
+MANIFEST_NAME = re.compile(r"^job-\d+\.json$")
+NO_BUILD = "(no build)"
+
+MS_PER_SECOND = 1000.0
+P50, P95 = 50, 95
+PERCENT = 100.0
+RATE_DECIMALS = 4
+USD_DECIMALS = 6
+USD_DISPLAY_DECIMALS = 2
+SECONDS_DECIMALS = 1
+PER_BUILD_DECIMALS = 1
+DELTA_DECIMALS = 1
+DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DATE_FORMAT = "%Y-%m-%d"
+ISO_TIMESPEC = "seconds"
+# The status_counts label of a line that carried no usable status.
+STATUS_NONE = "none"
+
+# Eval data (scripts/eval_dashboard/SCHEMA.md): its keys, and a repetition's results.
+EVAL_RUNS = "runs"
+EVAL_BUILD_ID = "build_id"
+EVAL_TIER = "tier"
+EVAL_TASKS = "tasks"
+EVAL_TASK_NAME = "name"
+EVAL_REPS = "reps"
+EVAL_RESULT = "result"
+EVAL_AGENT_S = "agent_s"
+EVAL_TOKENS = "tokens"
+EVAL_TOKENS_TOTAL = "total"
+EVAL_PASS, EVAL_FAIL, EVAL_INFRA = "pass", "fail", "infra"
+EVAL_RESULTS = (EVAL_PASS, EVAL_FAIL, EVAL_INFRA)
+EVAL_TIER_DEFAULT = PRESUBMIT
+# A dashboard tier that is a presubmit for the proxy's job kind.
+EVAL_TIERS_AS_PRESUBMIT = (PRESUBMIT, "gitlab")
+
+# Why a line or file was not counted, for the data-quality notes. not_json and
+# other_event come from analyze_shadow.iter_request_lines.
+SKIP_UNTAGGED = analyze_shadow.SKIP_UNTAGGED
+SKIP_BAD_TS = "bad_ts"
+SKIP_DUPLICATE = "duplicate_request_id"
+SKIP_OUTSIDE_WINDOW = "outside_window"
+
+# Metric units.
+COUNT, TOKENS, FRACTION, USD, SECONDS, MS = "count", "tokens", "fraction", "usd", "seconds", "ms"
+
+
+@dataclass(frozen=True)
+class Metric:
+    name: str
+    unit: str
+    definition: str
+    headline: bool = False
+
+
+# Every metric of a scope (the window, a job kind, or one build). Requests are
+# counted from every request line in scope; tokens and cost from the lines
+# LiteLLM answered with 200, since a refused request bills nothing; model time
+# from every line with a latency, since a 429 or a 500 still cost the agent
+# that wait. Eval metrics are null until a build in scope joins an eval run.
+METRICS: Tuple[Metric, ...] = (
+    Metric("builds", COUNT, "Distinct (job kind, build) pairs with at least one request line.", True),
+    Metric("requests", COUNT,
+           "Request lines, any status, including lines whose analysis failed or was dropped (each was a model "
+           "request).", True),
+    Metric("requests_per_build", COUNT, "requests / builds.", True),
+    Metric("ok_requests", COUNT, "Request lines with status 200."),
+    Metric("prompt_tokens", TOKENS,
+           "Sum of prompt_tokens over status-200 lines, estimated ones included (tokens_estimated: the response "
+           "carried no usage and the proxy estimated from the request size).", True),
+    Metric("cached_prompt_tokens", TOKENS, "Sum of cached_tokens over status-200 lines (missing counts as 0)."),
+    Metric("uncached_prompt_tokens", TOKENS,
+           "Sum over status-200 lines of max(prompt_tokens - cached_tokens, 0).", True),
+    Metric("completion_tokens", TOKENS,
+           "Sum of completion_tokens over status-200 lines. The proxy logs no separate reasoning count; on "
+           "OpenAI-shaped usage completion_tokens includes reasoning tokens.", True),
+    Metric("prompt_tokens_per_build", TOKENS, "prompt_tokens / builds.", True),
+    Metric("cache_hit_rate", FRACTION,
+           "cached / prompt tokens, token-weighted, over status-200 lines whose usage was reported (not "
+           "estimated): an estimated line has no cached count and would read as a miss.", True),
+    Metric("estimated_prompt_token_share", FRACTION,
+           "Prompt tokens on status-200 lines with tokens_estimated, over prompt_tokens."),
+    Metric("cost_usd", USD,
+           "Sum over priced status-200 lines of (uncached x input + cached x cached_input + completion x output) "
+           "price per 1M tokens, at the long-context price when the line's prompt_tokens exceed the table's "
+           "above_prompt_tokens. Excludes unpriced lines; a partial figure when unpriced_requests > 0.", True),
+    Metric("cost_per_build_usd", USD, "cost_usd / builds.", True),
+    Metric("unpriced_requests", COUNT, "Status-200 lines whose model has no entry in the price table."),
+    Metric("model_time_s", SECONDS,
+           "Sum of latency_ms over lines that carry one, any status, in seconds. Concurrent requests add up, so "
+           "this can exceed wall clock.", True),
+    Metric("model_time_per_build_s", SECONDS, "model_time_s / builds.", True),
+    Metric("latency_p50_ms", MS, "Median latency_ms (nearest rank) over lines that carry one.", True),
+    Metric("latency_p95_ms", MS, "95th percentile latency_ms (nearest rank) over lines that carry one.", True),
+    Metric("non_200_requests", COUNT, "Lines whose status is not 200 (status_counts breaks them down).", True),
+    Metric("rate_limited_requests", COUNT, "Lines with status 429.", True),
+    Metric("rate_limited_rate", FRACTION, "rate_limited_requests / requests.", True),
+    Metric("fallback_attempted_requests", COUNT,
+           "Lines whose x-litellm-attempted-fallbacks header was present and not 0.", True),
+    Metric("upstream_incomplete_requests", COUNT, "Lines with upstream_incomplete true (the answer broke off)."),
+    Metric("eval_builds_joined", COUNT, "Builds in scope whose build id is a run in the eval data."),
+    Metric("agent_time_s", SECONDS, "Sum of agent_s over the repetitions of joined builds that carry it."),
+    Metric("model_time_share_of_agent_time", FRACTION,
+           "model_time_s over agent_time_s, both over the joined builds that have repetitions with agent_s. Model "
+           "time outside a repetition (background agents, retries the harness never sees) counts too, so it is a "
+           "ratio, not a share bounded by 1.", True),
+    Metric("harness_tokens_total", TOKENS,
+           "Sum of tokens.total over the repetitions of joined builds that carry it (the harness's own count; "
+           "a cross-check on prompt_tokens + completion_tokens)."),
+    Metric("graded_reps", COUNT, "Repetitions of joined builds graded pass or fail."),
+    Metric("passed_reps", COUNT, "Repetitions graded pass."),
+    Metric("infra_reps", COUNT, "Repetitions lost to infrastructure (infra), outside pass_rate."),
+    Metric("pass_rate", FRACTION, "passed_reps / graded_reps.", True),
+    Metric("cases", COUNT, "Distinct case names among the joined builds' tasks."),
+    Metric("flaky_cases", COUNT,
+           "Cases with at least one joined build whose graded repetitions include both a pass and a fail.", True),
+)
+METRIC_NAMES = tuple(m.name for m in METRICS)
+METRIC_UNITS = {m.name: m.unit for m in METRICS}
+HEADLINE_METRICS = tuple(m.name for m in METRICS if m.headline)
+
+# Per case and job kind, over the joined builds.
+CASE_METRICS: Tuple[Metric, ...] = (
+    Metric("case_builds", COUNT, "Joined builds that ran the case."),
+    Metric("case_graded_reps", COUNT, "Its repetitions graded pass or fail."),
+    Metric("case_passed_reps", COUNT, "Its repetitions graded pass."),
+    Metric("case_infra_reps", COUNT, "Its repetitions lost to infrastructure."),
+    Metric("case_pass_rate", FRACTION, "case_passed_reps / case_graded_reps."),
+    Metric("case_flaky_builds", COUNT, "Builds whose graded repetitions of the case include a pass and a fail."),
+    Metric("case_agent_s_p50", SECONDS, "Median agent_s over its repetitions that carry it."),
+)
+CASE_METRIC_NAMES = tuple(m.name for m in CASE_METRICS)
+
+
+@dataclass
+class Line:
+    """One request line, reduced to what the report counts."""
+
+    kind: str
+    build: str
+    project: str
+    pr: str
+    ts: float
+    status: Optional[int]
+    latency_ms: Optional[int]
+    prompt_tokens: Optional[int]
+    cached_tokens: Optional[int]
+    completion_tokens: Optional[int]
+    tokens_estimated: bool
+    model_group: Optional[str]
+    model: Optional[str]
+    fallback_attempted: bool
+    upstream_incomplete: bool
+    error: Optional[str]
+
+    @property
+    def key(self) -> Tuple[str, str]:
+        return (self.kind, self.build)
+
+    @property
+    def ok(self) -> bool:
+        return self.status == HTTP_OK
+
+
+@dataclass
+class Rep:
+    case: str
+    result: str
+    agent_s: Optional[float]
+    tokens_total: Optional[int]
+
+
+@dataclass
+class EvalRun:
+    build_id: str
+    tier: str
+    reps: List[Rep] = field(default_factory=list)
+
+
+@dataclass
+class Quality:
+    """What the report could not count, and why."""
+
+    files: int = 0
+    manifests: int = 0
+    bad_manifests: int = 0
+    skipped: Dict[str, int] = field(default_factory=dict)
+    # A field present with a value of the wrong type or sign, by field name.
+    bad_values: Dict[str, int] = field(default_factory=dict)
+    analysis_errors: int = 0
+    analysis_dropped: int = 0
+    eval_runs_read: int = 0
+    eval_duplicate_runs: int = 0
+    eval_unknown_results: int = 0
+    eval_tier_mismatches: int = 0
+
+    def skip(self, reason: str) -> None:
+        self.skipped[reason] = self.skipped.get(reason, 0) + 1
+
+    def bad(self, name: str) -> None:
+        self.bad_values[name] = self.bad_values.get(name, 0) + 1
+
+
+class Prices:
+    """The dated price table: per model, USD per 1M input, cached input and output tokens."""
+
+    def __init__(self, table: Dict[str, Any], digest: str, price_as: Dict[str, str]):
+        models = table.get(PRICES_MODELS)
+        if not isinstance(table.get(PRICES_AS_OF), str) or not isinstance(models, dict):
+            raise ValueError("the price table needs an `as_of` date and a `models` object")
+        for name, entry in models.items():
+            tiers = [entry] + ([entry[LONG_CONTEXT]] if isinstance(entry, dict) and LONG_CONTEXT in entry else [])
+            for tier in tiers:
+                if not isinstance(tier, dict) or not all(_is_price(tier.get(p)) for p in PRICE_FIELDS):
+                    raise ValueError(f"price table entry {name!r} needs numeric {', '.join(PRICE_FIELDS)}")
+            if len(tiers) > 1 and _as_count(tiers[1].get(LONG_CONTEXT_THRESHOLD)) is None:
+                raise ValueError(f"price table entry {name!r}: {LONG_CONTEXT} needs {LONG_CONTEXT_THRESHOLD}")
+        unknown = sorted(target for target in price_as.values() if target not in models)
+        if unknown:
+            raise ValueError(f"--price-as names models the price table does not have: {', '.join(unknown)}")
+        self.as_of: str = table[PRICES_AS_OF]
+        self.source: str = str(table.get(PRICES_SOURCE, ""))
+        self.models: Dict[str, Dict[str, Any]] = models
+        self.digest = digest
+        self.price_as = dict(price_as)
+
+    @classmethod
+    def load(cls, path: str, price_as: Dict[str, str]) -> "Prices":
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        return cls(json.loads(raw), hashlib.sha256(raw).hexdigest(), price_as)
+
+    def model_for(self, line: Line) -> Tuple[Optional[str], str]:
+        """(the table's model, or None when unpriced; the label the line is reported under)."""
+        for name in (line.model_group, line.model):
+            if not name:
+                continue
+            if name in self.price_as:
+                return self.price_as[name], name
+            if name in self.models:
+                return name, name
+        return None, line.model_group or line.model or UNPRICED_NO_MODEL
+
+    def cost(self, model: str, line: Line) -> float:
+        entry = self.models[model]
+        prompt = line.prompt_tokens or 0
+        long_context = entry.get(LONG_CONTEXT)
+        if long_context and prompt > long_context[LONG_CONTEXT_THRESHOLD]:
+            entry = long_context
+        cached = min(line.cached_tokens or 0, prompt)
+        return (
+            (prompt - cached) * entry["input"] + cached * entry["cached_input"]
+            + (line.completion_tokens or 0) * entry["output"]
+        ) / TOKENS_PER_PRICE_UNIT
+
+    def describe(self) -> Dict[str, Any]:
+        return {"as_of": self.as_of, "source": self.source, "sha256": self.digest,
+                "models": sorted(self.models), "price_as": dict(sorted(self.price_as.items()))}
+
+
+def _is_price(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+
+
+def _as_count(value: Any) -> Optional[int]:
+    """A whole number at or above zero, else None (a bool is not a count)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _as_seconds(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
+
+
+def _field(entry: Dict[str, Any], name: str, quality: Quality) -> Optional[int]:
+    """A count field: None when absent or null, and counted as bad when present with another type."""
+    value = entry.get(name)
+    if value is None:
+        return None
+    count = _as_count(value)
+    if count is None:
+        quality.bad(name)
+    return count
+
+
+def expand_paths(paths: Iterable[str]) -> Tuple[List[str], List[str]]:
+    """(log files, job manifests). A directory is searched for segments and manifests; a file is a log
+    unless it is named like a manifest."""
+    logs: List[str] = []
+    manifests: List[str] = []
+    for path in paths:
+        if os.path.isdir(path):
+            for root, dirs, names in os.walk(path):
+                dirs.sort()
+                for name in sorted(names):
+                    full = os.path.join(root, name)
+                    if MANIFEST_NAME.match(name):
+                        manifests.append(full)
+                    elif name.endswith(SEGMENT_SUFFIXES):
+                        logs.append(full)
+        elif MANIFEST_NAME.match(os.path.basename(path)):
+            manifests.append(path)
+        else:
+            logs.append(path)
+    return logs, manifests
+
+
+def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
+    job = entry.get(F.JOB)
+    if not isinstance(job, dict) or job.get(F.JOB_KIND) not in JOB_KINDS:
+        quality.skip(SKIP_UNTAGGED)
+        return None
+    ts = _as_seconds(entry.get(F.TS))
+    if ts is None:
+        quality.skip(SKIP_BAD_TS)
+        return None
+    error = entry.get(F.ERROR)
+    if error == F.ERROR_ANALYSIS_DROPPED:
+        quality.analysis_dropped += 1
+    elif error:
+        quality.analysis_errors += 1
+    fallbacks = entry.get(F.LITELLM_ATTEMPTED_FALLBACKS)
+    group = entry.get(F.LITELLM_MODEL_GROUP)
+    model = entry.get(F.MODEL)
+    return Line(
+        kind=job[F.JOB_KIND],
+        build=str(job.get(F.JOB_BUILD) or ""),
+        project=str(job.get(F.JOB_PROJECT) or ""),
+        pr=str(job.get(F.JOB_PR) or ""),
+        ts=ts,
+        status=_field(entry, F.STATUS, quality),
+        latency_ms=_field(entry, F.LATENCY_MS, quality),
+        prompt_tokens=_field(entry, F.PROMPT_TOKENS, quality),
+        cached_tokens=_field(entry, F.CACHED_TOKENS, quality),
+        completion_tokens=_field(entry, F.COMPLETION_TOKENS, quality),
+        tokens_estimated=entry.get(F.TOKENS_ESTIMATED) is True,
+        model_group=group if isinstance(group, str) and group else None,
+        model=model if isinstance(model, str) and model else None,
+        fallback_attempted=fallbacks is not None and str(fallbacks) != NO_FALLBACKS,
+        upstream_incomplete=entry.get(F.UPSTREAM_INCOMPLETE) is True,
+        error=str(error) if error else None,
+    )
+
+
+def load_lines(paths: Iterable[str], quality: Quality) -> Tuple[List[Line], List[Tuple[str, str]]]:
+    """The request lines in time order, and the (kind, build) of each readable manifest."""
+    logs, manifest_paths = expand_paths(paths)
+    quality.files = len(logs)
+    quality.manifests = len(manifest_paths)
+    lines: List[Line] = []
+    seen: set = set()
+    for entry in analyze_shadow.iter_request_lines(logs, quality.skipped):
+        request_id = entry.get(F.REQUEST_ID)
+        if isinstance(request_id, str) and request_id:
+            # A segment uploaded open and again closed carries its lines twice.
+            if request_id in seen:
+                quality.skip(SKIP_DUPLICATE)
+                continue
+            seen.add(request_id)
+        line = parse_line(entry, quality)
+        if line is not None:
+            lines.append(line)
+    lines.sort(key=lambda l: l.ts)
+    manifests: List[Tuple[str, str]] = []
+    for path in manifest_paths:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                doc = json.load(handle)
+        except (OSError, ValueError):
+            quality.bad_manifests += 1
+            continue
+        if not isinstance(doc, dict) or doc.get(F.JOB_KIND) not in JOB_KINDS:
+            quality.bad_manifests += 1
+            continue
+        manifests.append((doc[F.JOB_KIND], str(doc.get(F.JOB_BUILD) or "")))
+    return lines, manifests
+
+
+def parse_time(value: str, end_of_day: bool = False) -> float:
+    """Epoch seconds from epoch seconds, an ISO date (UTC midnight; the next midnight with end_of_day)
+    or an ISO datetime (UTC unless it names an offset)."""
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    if DATE_ONLY.match(value):
+        day = datetime.datetime.strptime(value, DATE_FORMAT).replace(tzinfo=datetime.timezone.utc)
+        if end_of_day:
+            day += datetime.timedelta(days=1)
+        return day.timestamp()
+    moment = datetime.datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment.timestamp()
+
+
+def in_window(lines: List[Line], since: Optional[float], until: Optional[float], quality: Quality) -> List[Line]:
+    """Keep whole builds whose first request falls in [since, until), so no build is cut in two."""
+    first: Dict[Tuple[str, str], float] = {}
+    for line in lines:
+        first.setdefault(line.key, line.ts)
+    kept = []
+    for line in lines:
+        start = first[line.key]
+        if (since is not None and start < since) or (until is not None and start >= until):
+            quality.skip(SKIP_OUTSIDE_WINDOW)
+            continue
+        kept.append(line)
+    return kept
+
+
+def load_eval(paths: Iterable[str], quality: Quality) -> Dict[str, EvalRun]:
+    """The dashboard data.json runs by build id; the first file naming a build wins."""
+    runs: Dict[str, EvalRun] = {}
+    for path in paths:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+        raw_runs = doc.get(EVAL_RUNS) if isinstance(doc, dict) else None
+        if not isinstance(raw_runs, list):
+            raise ValueError(f"{path}: not a dashboard data.json (no `runs` list)")
+        for raw in raw_runs:
+            if not isinstance(raw, dict) or not raw.get(EVAL_BUILD_ID):
+                continue
+            build_id = str(raw[EVAL_BUILD_ID])
+            quality.eval_runs_read += 1
+            if build_id in runs:
+                quality.eval_duplicate_runs += 1
+                continue
+            run = EvalRun(build_id, str(raw.get(EVAL_TIER) or EVAL_TIER_DEFAULT))
+            for task in raw.get(EVAL_TASKS) or []:
+                if not isinstance(task, dict) or not task.get(EVAL_TASK_NAME):
+                    continue
+                reps = task.get(EVAL_REPS)
+                has_reps = isinstance(reps, list)
+                # A build graded before repetitions were logged counts its
+                # task verdict as one repetition, with no timing.
+                for rep in reps if has_reps else [task]:
+                    if not isinstance(rep, dict):
+                        continue
+                    result = rep.get(EVAL_RESULT)
+                    if result not in EVAL_RESULTS:
+                        quality.eval_unknown_results += 1
+                        continue
+                    tokens = rep.get(EVAL_TOKENS) if isinstance(rep.get(EVAL_TOKENS), dict) else {}
+                    agent_s = _as_seconds(rep.get(EVAL_AGENT_S)) if has_reps else None
+                    run.reps.append(Rep(str(task[EVAL_TASK_NAME]), result, agent_s,
+                                        _as_count(tokens.get(EVAL_TOKENS_TOTAL))))
+            runs[build_id] = run
+    return runs
+
+
+def percentile(values: Sequence[float], pct: int) -> Optional[float]:
+    """Nearest rank: the smallest value with at least pct% of values at or below it."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(math.ceil(pct / PERCENT * len(ordered)) - 1, 0)]
+
+
+def ratio(part: float, whole: float, decimals: int = RATE_DECIMALS) -> Optional[float]:
+    return round(part / whole, decimals) if whole else None
+
+
+def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Dict[str, Any]:
+    """Every metric in METRICS for one scope, plus status_counts and unpriced (by model label)."""
+    builds = {line.key for line in lines}
+    ok = [line for line in lines if line.ok]
+    prompt = sum(line.prompt_tokens or 0 for line in ok)
+    cached = sum(min(line.cached_tokens or 0, line.prompt_tokens or 0) for line in ok)
+    measured = [line for line in ok if not line.tokens_estimated and line.prompt_tokens is not None]
+    measured_prompt = sum(line.prompt_tokens or 0 for line in measured)
+    measured_cached = sum(min(line.cached_tokens or 0, line.prompt_tokens or 0) for line in measured)
+    cost = 0.0
+    unpriced: Dict[str, int] = {}
+    for line in ok:
+        model, label = prices.model_for(line)
+        if model is None:
+            unpriced[label] = unpriced.get(label, 0) + 1
+        else:
+            cost += prices.cost(model, line)
+    latencies = [line.latency_ms for line in lines if line.latency_ms is not None]
+    model_s = sum(latencies) / MS_PER_SECOND
+    statuses: Dict[str, int] = {}
+    for line in lines:
+        if not line.ok:
+            label = str(line.status) if line.status is not None else STATUS_NONE
+            statuses[label] = statuses.get(label, 0) + 1
+
+    joined = sorted({build for _, build in builds if build in runs})
+    reps = [rep for build in joined for rep in runs[build].reps]
+    timed_builds = {build for build in joined if any(rep.agent_s is not None for rep in runs[build].reps)}
+    agent_s = sum(rep.agent_s for rep in reps if rep.agent_s is not None)
+    timed_model_s = sum(
+        line.latency_ms for line in lines if line.build in timed_builds and line.latency_ms is not None
+    ) / MS_PER_SECOND
+    graded = [rep for rep in reps if rep.result in (EVAL_PASS, EVAL_FAIL)]
+    passed = sum(1 for rep in graded if rep.result == EVAL_PASS)
+    flaky = set()
+    for build in joined:
+        by_case: Dict[str, set] = {}
+        for rep in runs[build].reps:
+            if rep.result in (EVAL_PASS, EVAL_FAIL):
+                by_case.setdefault(rep.case, set()).add(rep.result)
+        flaky.update(case for case, results in by_case.items() if len(results) > 1)
+    has_eval = bool(joined)
+    harness_tokens = [rep.tokens_total for rep in reps if rep.tokens_total is not None]
+
+    values: Dict[str, Any] = {
+        "builds": len(builds),
+        "requests": len(lines),
+        "requests_per_build": ratio(len(lines), len(builds), PER_BUILD_DECIMALS),
+        "ok_requests": len(ok),
+        "prompt_tokens": prompt,
+        "cached_prompt_tokens": cached,
+        "uncached_prompt_tokens": prompt - cached,
+        "completion_tokens": sum(line.completion_tokens or 0 for line in ok),
+        "prompt_tokens_per_build": ratio(prompt, len(builds), PER_BUILD_DECIMALS),
+        "cache_hit_rate": ratio(measured_cached, measured_prompt),
+        "estimated_prompt_token_share": ratio(sum(line.prompt_tokens or 0 for line in ok if line.tokens_estimated),
+                                              prompt),
+        "cost_usd": round(cost, USD_DECIMALS),
+        "cost_per_build_usd": ratio(cost, len(builds), USD_DECIMALS),
+        "unpriced_requests": sum(unpriced.values()),
+        "model_time_s": round(model_s, SECONDS_DECIMALS),
+        "model_time_per_build_s": ratio(model_s, len(builds), PER_BUILD_DECIMALS),
+        "latency_p50_ms": percentile(latencies, P50),
+        "latency_p95_ms": percentile(latencies, P95),
+        "non_200_requests": sum(statuses.values()),
+        "rate_limited_requests": sum(1 for line in lines if line.status == HTTP_TOO_MANY_REQUESTS),
+        "rate_limited_rate": None,
+        "fallback_attempted_requests": sum(1 for line in lines if line.fallback_attempted),
+        "upstream_incomplete_requests": sum(1 for line in lines if line.upstream_incomplete),
+        "eval_builds_joined": len(joined),
+        "agent_time_s": round(agent_s, SECONDS_DECIMALS) if timed_builds else None,
+        "model_time_share_of_agent_time": ratio(timed_model_s, agent_s) if timed_builds else None,
+        "harness_tokens_total": sum(harness_tokens) if harness_tokens else None,
+        "graded_reps": len(graded) if has_eval else None,
+        "passed_reps": passed if has_eval else None,
+        "infra_reps": sum(1 for rep in reps if rep.result == EVAL_INFRA) if has_eval else None,
+        "pass_rate": ratio(passed, len(graded)) if has_eval else None,
+        "cases": len({rep.case for rep in reps}) if has_eval else None,
+        "flaky_cases": len(flaky) if has_eval else None,
+    }
+    values["rate_limited_rate"] = ratio(values["rate_limited_requests"], len(lines))
+    assert tuple(values) == METRIC_NAMES, "aggregate() and METRICS disagree"
+    values["status_counts"] = dict(sorted(statuses.items()))
+    values["unpriced"] = dict(sorted(unpriced.items()))
+    return values
+
+
+def case_table(builds: Iterable[str], runs: Dict[str, EvalRun]) -> Dict[str, Dict[str, Any]]:
+    """CASE_METRICS per case over the given joined builds."""
+    out: Dict[str, Dict[str, Any]] = {}
+    per_case: Dict[str, List[Tuple[str, Rep]]] = {}
+    for build in sorted(builds):
+        for rep in runs[build].reps:
+            per_case.setdefault(rep.case, []).append((build, rep))
+    for case, items in sorted(per_case.items()):
+        graded = [rep for _, rep in items if rep.result in (EVAL_PASS, EVAL_FAIL)]
+        passed = sum(1 for rep in graded if rep.result == EVAL_PASS)
+        results_by_build: Dict[str, set] = {}
+        for build, rep in items:
+            if rep.result in (EVAL_PASS, EVAL_FAIL):
+                results_by_build.setdefault(build, set()).add(rep.result)
+        values = {
+            "case_builds": len({build for build, _ in items}),
+            "case_graded_reps": len(graded),
+            "case_passed_reps": passed,
+            "case_infra_reps": sum(1 for _, rep in items if rep.result == EVAL_INFRA),
+            "case_pass_rate": ratio(passed, len(graded)),
+            "case_flaky_builds": sum(1 for results in results_by_build.values() if len(results) > 1),
+            "case_agent_s_p50": percentile([rep.agent_s for _, rep in items if rep.agent_s is not None], P50),
+        }
+        assert tuple(values) == CASE_METRIC_NAMES, "case_table() and CASE_METRICS disagree"
+        out[case] = values
+    return out
+
+
+def build_report(
+    lines: List[Line], manifests: List[Tuple[str, str]], runs: Dict[str, EvalRun], prices: Prices,
+    quality: Quality, since: Optional[float] = None, until: Optional[float] = None,
+) -> Dict[str, Any]:
+    by_build: Dict[Tuple[str, str], List[Line]] = {}
+    for line in lines:
+        by_build.setdefault(line.key, []).append(line)
+    for (kind, build), build_lines in by_build.items():
+        run = runs.get(build)
+        if run is None:
+            continue
+        tier_kind = PRESUBMIT if run.tier in EVAL_TIERS_AS_PRESUBMIT else run.tier
+        if tier_kind != kind:
+            quality.eval_tier_mismatches += 1
+    builds_out = []
+    for (kind, build), build_lines in sorted(by_build.items(), key=lambda kv: kv[1][0].ts):
+        first = build_lines[0]
+        builds_out.append({
+            "kind": kind, "build": build or NO_BUILD, "project": first.project, "pr": first.pr,
+            "first_request_ts": first.ts, "last_request_ts": build_lines[-1].ts,
+            "metrics": aggregate(build_lines, runs, prices),
+        })
+    scopes = {TOTAL_SCOPE: aggregate(lines, runs, prices)}
+    cases: Dict[str, Dict[str, Any]] = {}
+    for kind in JOB_KINDS:
+        kind_lines = [line for line in lines if line.kind == kind]
+        scopes[kind] = aggregate(kind_lines, runs, prices)
+        cases[kind] = case_table({line.build for line in kind_lines if line.build in runs}, runs)
+    logged = set(by_build)
+    ok_lines = [line for line in lines if line.ok]
+    estimated = [line for line in ok_lines if line.tokens_estimated]
+    return {
+        "report_schema": REPORT_SCHEMA_VERSION,
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec=ISO_TIMESPEC),
+        "window": {
+            "since": since, "until": until,
+            "first_request_ts": lines[0].ts if lines else None,
+            "last_request_ts": lines[-1].ts if lines else None,
+        },
+        "prices": prices.describe(),
+        "scopes": scopes,
+        "builds": builds_out,
+        "cases": cases,
+        "data_quality": {
+            "log_files": quality.files,
+            "manifests": quality.manifests,
+            "bad_manifests": quality.bad_manifests,
+            "manifest_builds_without_lines": sorted(
+                f"{kind}/{build}" for kind, build in set(manifests) - logged
+            ),
+            "skipped_lines": dict(sorted(quality.skipped.items())),
+            "bad_field_values": dict(sorted(quality.bad_values.items())),
+            "analysis_error_lines": quality.analysis_errors,
+            "analysis_dropped_lines": quality.analysis_dropped,
+            "lines_without_build": sum(1 for line in lines if not line.build),
+            "estimated_token_lines": len(estimated),
+            "lines_without_latency": sum(1 for line in lines if line.latency_ms is None),
+            "eval_runs_read": quality.eval_runs_read,
+            "eval_duplicate_runs": quality.eval_duplicate_runs,
+            "eval_unknown_results": quality.eval_unknown_results,
+            "eval_tier_mismatches": quality.eval_tier_mismatches,
+            "builds_without_eval_run": sum(1 for _, build in logged if build not in runs) if runs else None,
+        },
+    }
+
+
+def _fmt(name: str, value: Any) -> str:
+    if value is None:
+        return "-"
+    unit = METRIC_UNITS.get(name)
+    if unit == FRACTION:
+        return f"{value * PERCENT:.{DELTA_DECIMALS}f}%"
+    if unit == USD:
+        return f"${value:,.{USD_DISPLAY_DECIMALS}f}"
+    if isinstance(value, float):
+        return f"{value:,.1f}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return str(value)
+
+
+def _iso(ts: Optional[float]) -> str:
+    if ts is None:
+        return "-"
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).isoformat(timespec=ISO_TIMESPEC)
+
+
+def render(report: Dict[str, Any]) -> str:
+    window = report["window"]
+    prices = report["prices"]
+    lines = [
+        f"window: {_iso(window['first_request_ts'])} to {_iso(window['last_request_ts'])}"
+        f" (filter since {_iso(window['since'])}, until {_iso(window['until'])})",
+        f"prices: as of {prices['as_of']}, sha256 {prices['sha256'][:12]}, models {', '.join(prices['models'])};"
+        f" price-as {prices['price_as'] or 'none'}",
+        "",
+        f"{'metric':<32}" + "".join(f"{scope:>18}" for scope in SCOPES),
+    ]
+    for name in METRIC_NAMES:
+        lines.append(f"{name:<32}" + "".join(f"{_fmt(name, report['scopes'][s][name]):>18}" for s in SCOPES))
+    for scope in SCOPES:
+        values = report["scopes"][scope]
+        if values["status_counts"] or values["unpriced"]:
+            lines.append(f"{scope}: non-200 statuses {values['status_counts']}; unpriced by model {values['unpriced']}")
+    lines += ["", "builds (kind build project pr: requests, prompt tokens, cache hit, cost, model time, 429s, pass rate):"]
+    for build in report["builds"]:
+        m = build["metrics"]
+        lines.append(
+            f"  {build['kind']:<9} {build['build']} {build['project'] or '-'} {build['pr'] or '-'}:"
+            f" {m['requests']}, {_fmt('prompt_tokens', m['prompt_tokens'])},"
+            f" {_fmt('cache_hit_rate', m['cache_hit_rate'])}, {_fmt('cost_usd', m['cost_usd'])},"
+            f" {_fmt('model_time_s', m['model_time_s'])} s, {m['rate_limited_requests']},"
+            f" {_fmt('pass_rate', m['pass_rate'])}"
+        )
+    for kind in JOB_KINDS:
+        if report["cases"].get(kind):
+            lines += ["", f"{kind} cases (builds, graded reps, pass rate, flaky builds, infra reps, agent_s p50):"]
+            for case, c in report["cases"][kind].items():
+                lines.append(
+                    f"  {case}: {c['case_builds']}, {c['case_graded_reps']},"
+                    f" {_fmt('pass_rate', c['case_pass_rate'])}, {c['case_flaky_builds']}, {c['case_infra_reps']},"
+                    f" {_fmt('agent_time_s', c['case_agent_s_p50'])}"
+                )
+    lines += ["", "data quality:"]
+    lines += [f"  {name}: {value}" for name, value in report["data_quality"].items()]
+    return "\n".join(lines)
+
+
+def compare(baseline: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
+    """Headline deltas per scope: current - baseline, and that as a percent of the baseline."""
+    notes = []
+    if baseline.get("report_schema") != current.get("report_schema"):
+        notes.append(f"report schemas differ ({baseline.get('report_schema')} vs {current.get('report_schema')}):"
+                     " metric definitions may have changed")
+    if baseline["prices"]["sha256"] != current["prices"]["sha256"] or \
+            baseline["prices"]["price_as"] != current["prices"]["price_as"]:
+        notes.append("price tables or --price-as differ: cost deltas mix price changes with usage changes")
+    for side, report in (("baseline", baseline), ("current", current)):
+        for scope in SCOPES:
+            if report["scopes"][scope].get("unpriced_requests"):
+                notes.append(f"{side} {scope}: cost is partial ({report['scopes'][scope]['unpriced_requests']}"
+                             " unpriced requests)")
+    scopes: Dict[str, Dict[str, Any]] = {}
+    for scope in SCOPES:
+        rows = {}
+        for name in HEADLINE_METRICS:
+            base = baseline["scopes"][scope].get(name)
+            new = current["scopes"][scope].get(name)
+            delta = round(new - base, RATE_DECIMALS) if base is not None and new is not None else None
+            pct = round(PERCENT * delta / base, DELTA_DECIMALS) if delta is not None and base else None
+            rows[name] = {"baseline": base, "current": new, "delta": delta, "delta_percent": pct}
+        scopes[scope] = rows
+    return {
+        "baseline_window": baseline["window"], "current_window": current["window"],
+        "baseline_prices_as_of": baseline["prices"]["as_of"], "current_prices_as_of": current["prices"]["as_of"],
+        "notes": notes, "scopes": scopes,
+    }
+
+
+def render_compare(result: Dict[str, Any]) -> str:
+    lines = [
+        f"baseline: {_iso(result['baseline_window']['first_request_ts'])} to"
+        f" {_iso(result['baseline_window']['last_request_ts'])}, prices as of {result['baseline_prices_as_of']}",
+        f"current:  {_iso(result['current_window']['first_request_ts'])} to"
+        f" {_iso(result['current_window']['last_request_ts'])}, prices as of {result['current_prices_as_of']}",
+    ]
+    lines += [f"note: {note}" for note in result["notes"]]
+    for scope, rows in result["scopes"].items():
+        lines += ["", f"{scope}:", f"  {'metric':<32}{'baseline':>16}{'current':>16}{'delta':>16}{'delta %':>10}"]
+        for name, row in rows.items():
+            delta = row["delta"]
+            if delta is not None and METRIC_UNITS[name] == FRACTION:
+                shown = f"{delta * PERCENT:+.{DELTA_DECIMALS}f} pp"
+            elif delta is not None and METRIC_UNITS[name] == USD:
+                shown = f"{delta:+,.{USD_DISPLAY_DECIMALS}f}"
+            elif delta is not None:
+                shown = f"{delta:+,.{DELTA_DECIMALS}f}" if isinstance(delta, float) else f"{delta:+,}"
+            else:
+                shown = "-"
+            pct = f"{row['delta_percent']:+.{DELTA_DECIMALS}f}%" if row["delta_percent"] is not None else "-"
+            lines.append(f"  {name:<32}{_fmt(name, row['baseline']):>16}{_fmt(name, row['current']):>16}"
+                         f"{shown:>16}{pct:>10}")
+    return "\n".join(lines)
+
+
+def parse_price_as(values: Sequence[str]) -> Dict[str, str]:
+    out = {}
+    for value in values:
+        name, sep, model = value.partition(PRICE_AS_SEPARATOR)
+        if not sep or not name or not model:
+            raise ValueError(f"--price-as {value!r}: expected GROUP=MODEL")
+        out[name] = model
+    return out
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("logs", nargs="*", help="JSONL files or directories of them (and job-<ms>.json manifests)")
+    parser.add_argument("--eval-data", action="append", default=[], help="the eval dashboard's data.json")
+    parser.add_argument("--prices", default=DEFAULT_PRICES_PATH, help="the price table (JSON)")
+    parser.add_argument("--price-as", action="append", default=[], metavar="GROUP=MODEL",
+                        help="price a logged model group or model as a model in the price table")
+    parser.add_argument("--since", help="first build start to include: epoch seconds, YYYY-MM-DD or ISO datetime")
+    parser.add_argument("--until", help="builds starting at or after this are left out (a date means its end)")
+    parser.add_argument("--compare", metavar="BASELINE.json", help="print headline deltas against this report")
+    parser.add_argument("--report", metavar="CURRENT.json", help="with --compare: a saved report instead of logs")
+    parser.add_argument("--json", action="store_true", help="print JSON")
+    args = parser.parse_args(argv)
+    if args.report and (args.logs or not args.compare):
+        parser.error("--report takes no logs and needs --compare")
+    if not args.report and not args.logs:
+        parser.error("give log files or directories, or --report with --compare")
+    try:
+        if args.report:
+            with open(args.report, encoding="utf-8") as handle:
+                report = json.load(handle)
+        else:
+            prices = Prices.load(args.prices, parse_price_as(args.price_as))
+            quality = Quality()
+            since = parse_time(args.since) if args.since else None
+            until = parse_time(args.until, end_of_day=True) if args.until else None
+            lines, manifests = load_lines(args.logs, quality)
+            lines = in_window(lines, since, until, quality)
+            runs = load_eval(args.eval_data, quality)
+            report = build_report(lines, manifests, runs, prices, quality, since, until)
+        if args.compare:
+            with open(args.compare, encoding="utf-8") as handle:
+                result = compare(json.load(handle), report)
+            print(json.dumps(result, indent=2, sort_keys=True) if args.json else render_compare(result))
+        else:
+            print(json.dumps(report, indent=2, sort_keys=True) if args.json else render(report))
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"baseline_report: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -37,6 +37,82 @@ Check the report's health counts after the first day: lines by job kind; untagge
 
 The image is built from the repository root (`docker build -f hack/replay-proxy/Dockerfile .`), because it copies the scrubbers from `agents/`.
 
+## Baseline report
+
+`baseline_report.py` reports what eval inference costs today, from the same lines: requests, prompt tokens split cached and uncached, completion tokens, the token-weighted cache hit rate, estimated cost, model time, non-200 statuses (429s above all), LiteLLM fallbacks, and, given the eval dashboard's `data.json`, model time against agent time, pass rates and flaky cases. It reports totals, each job kind, each build and, from the eval data, each case. The baseline is the report over the shadow data from before replay is switched on; every later report comes from the same script, so `--compare` measures the change the same way.
+
+It takes JSONL files or directories, searched for `*.jsonl` and `*.jsonl.open` segments and `job-<ms>.json` manifests, so a bucket prefix downloaded as it is works. A build named in a manifest with no lines is listed under data quality. Tokens and cost count the lines answered with 200, because a refused request bills nothing; model time counts every line with a latency. A line whose analysis failed or was dropped still counts as a request and by status.
+
+Cost comes from `model-prices.json`: a dated table of list prices per 1M tokens (input, cached input, output, and a long-context tier above a prompt size). The lines name the LiteLLM model group, which on an eval install is the `model-default` alias, so name the model it routed to with `--price-as model-default=<model>`. A model with no price is reported as unpriced with its request count and its cost is left out, never counted as zero; the report prints the table's `as_of` date and hash. The proxy logs no reasoning token count (completion tokens include reasoning on OpenAI-shaped usage), no cache-write tokens, and no LiteLLM retry header, so none of those appear.
+
+The eval join matches a line's `job.build` to a dashboard run's `build_id`. Lines carry no case, so tokens, cost and model time stop at the build; the case table comes from the eval data's repetitions. Model time includes every agent on the install and every request a repetition never waited on, so its ratio to agent time can pass 100%.
+
+To freeze a baseline, download the window and keep the report and its inputs together:
+
+```bash
+gcloud storage cp -r "gs://<bucket>/replay-shadow" shadow/
+gcloud storage cp gs://kube-agents-dashboards/evals/data.json data.json
+python3 baseline_report.py shadow/ --eval-data data.json --price-as model-default=<model> \
+  --since 2026-11-05 --until 2026-11-18 --json > baseline.json
+```
+
+`--since` and `--until` take epoch seconds, a date (`--until` includes that day) or an ISO time, and keep whole builds by their first request. Read the data-quality block before freezing: skipped lines, bad field values, estimated token lines and unpriced requests each mean a number above is short. Later, run the same command over the new window with `--compare baseline.json` (add `--json` for the deltas as JSON), or compare two saved reports with `--report current.json --compare baseline.json`. The deltas are current minus baseline, absolutely (percentage points for rates) and as a percent of the baseline; a note says when the price tables, `--price-as` or the report schema differ, or when either side's cost is partial. Compare per-build metrics: two windows rarely hold the same number of builds.
+
+The metrics, as `baseline_report.py` defines them:
+
+<!-- BEGIN GENERATED: replay-baseline-metrics -->
+<!-- Regenerate with: make docs-generate -- do not edit by hand. -->
+<!-- prettier-ignore-start -->
+
+| Metric | Unit | Headline | Definition |
+| ------ | ---- | -------- | ---------- |
+| `builds` | count | yes | Distinct (job kind, build) pairs with at least one request line. |
+| `requests` | count | yes | Request lines, any status, including lines whose analysis failed or was dropped (each was a model request). |
+| `requests_per_build` | count | yes | requests / builds. |
+| `ok_requests` | count |  | Request lines with status 200. |
+| `prompt_tokens` | tokens | yes | Sum of prompt_tokens over status-200 lines, estimated ones included (tokens_estimated: the response carried no usage and the proxy estimated from the request size). |
+| `cached_prompt_tokens` | tokens |  | Sum of cached_tokens over status-200 lines (missing counts as 0). |
+| `uncached_prompt_tokens` | tokens | yes | Sum over status-200 lines of max(prompt_tokens - cached_tokens, 0). |
+| `completion_tokens` | tokens | yes | Sum of completion_tokens over status-200 lines. The proxy logs no separate reasoning count; on OpenAI-shaped usage completion_tokens includes reasoning tokens. |
+| `prompt_tokens_per_build` | tokens | yes | prompt_tokens / builds. |
+| `cache_hit_rate` | fraction | yes | cached / prompt tokens, token-weighted, over status-200 lines whose usage was reported (not estimated): an estimated line has no cached count and would read as a miss. |
+| `estimated_prompt_token_share` | fraction |  | Prompt tokens on status-200 lines with tokens_estimated, over prompt_tokens. |
+| `cost_usd` | usd | yes | Sum over priced status-200 lines of (uncached x input + cached x cached_input + completion x output) price per 1M tokens, at the long-context price when the line's prompt_tokens exceed the table's above_prompt_tokens. Excludes unpriced lines; a partial figure when unpriced_requests &gt; 0. |
+| `cost_per_build_usd` | usd | yes | cost_usd / builds. |
+| `unpriced_requests` | count |  | Status-200 lines whose model has no entry in the price table. |
+| `model_time_s` | seconds | yes | Sum of latency_ms over lines that carry one, any status, in seconds. Concurrent requests add up, so this can exceed wall clock. |
+| `model_time_per_build_s` | seconds | yes | model_time_s / builds. |
+| `latency_p50_ms` | ms | yes | Median latency_ms (nearest rank) over lines that carry one. |
+| `latency_p95_ms` | ms | yes | 95th percentile latency_ms (nearest rank) over lines that carry one. |
+| `non_200_requests` | count | yes | Lines whose status is not 200 (status_counts breaks them down). |
+| `rate_limited_requests` | count | yes | Lines with status 429. |
+| `rate_limited_rate` | fraction | yes | rate_limited_requests / requests. |
+| `fallback_attempted_requests` | count | yes | Lines whose x-litellm-attempted-fallbacks header was present and not 0. |
+| `upstream_incomplete_requests` | count |  | Lines with upstream_incomplete true (the answer broke off). |
+| `eval_builds_joined` | count |  | Builds in scope whose build id is a run in the eval data. |
+| `agent_time_s` | seconds |  | Sum of agent_s over the repetitions of joined builds that carry it. |
+| `model_time_share_of_agent_time` | fraction | yes | model_time_s over agent_time_s, both over the joined builds that have repetitions with agent_s. Model time outside a repetition (background agents, retries the harness never sees) counts too, so it is a ratio, not a share bounded by 1. |
+| `harness_tokens_total` | tokens |  | Sum of tokens.total over the repetitions of joined builds that carry it (the harness's own count; a cross-check on prompt_tokens + completion_tokens). |
+| `graded_reps` | count |  | Repetitions of joined builds graded pass or fail. |
+| `passed_reps` | count |  | Repetitions graded pass. |
+| `infra_reps` | count |  | Repetitions lost to infrastructure (infra), outside pass_rate. |
+| `pass_rate` | fraction | yes | passed_reps / graded_reps. |
+| `cases` | count |  | Distinct case names among the joined builds' tasks. |
+| `flaky_cases` | count | yes | Cases with at least one joined build whose graded repetitions include both a pass and a fail. |
+
+| Case metric | Unit | Definition |
+| ----------- | ---- | ---------- |
+| `case_builds` | count | Joined builds that ran the case. |
+| `case_graded_reps` | count | Its repetitions graded pass or fail. |
+| `case_passed_reps` | count | Its repetitions graded pass. |
+| `case_infra_reps` | count | Its repetitions lost to infrastructure. |
+| `case_pass_rate` | fraction | case_passed_reps / case_graded_reps. |
+| `case_flaky_builds` | count | Builds whose graded repetitions of the case include a pass and a fail. |
+| `case_agent_s_p50` | seconds | Median agent_s over its repetitions that carry it. |
+
+<!-- prettier-ignore-end -->
+<!-- END GENERATED: replay-baseline-metrics -->
+
 ## Tests
 
 The tests are standard-library `unittest` and need no cluster: `make test-python` runs them, or run them from this directory with `python3 -m unittest`. `test_replay_proxy.py` runs the proxy against a fake LiteLLM on localhost.

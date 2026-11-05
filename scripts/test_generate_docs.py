@@ -608,5 +608,24 @@ class CRDFieldBlocksTest(unittest.TestCase):
                 self.assertEqual(generate_docs.main(["--check", "example"], blocks), 0)
 
 
+class ReplayBaselineMetricsTest(unittest.TestCase):
+    """The replay proxy README's metric table is baseline_report.py's METRICS and CASE_METRICS."""
+
+    def test_the_block_is_registered_for_the_replay_proxy_readme(self):
+        self.assertEqual(
+            generate_docs.BLOCKS["replay-baseline-metrics"],
+            ((generate_docs.REPLAY_PROXY_README,), generate_docs.gen_replay_baseline_metrics),
+        )
+
+    def test_every_metric_is_a_row_with_its_unit_and_headline_mark(self):
+        module = generate_docs.load_replay_baseline_module()
+        body = generate_docs.gen_replay_baseline_metrics()
+        for metric in module.METRICS:
+            mark = "yes" if metric.headline else ""
+            self.assertIn(f"| `{metric.name}` | {metric.unit} | {mark} |", body)
+        for metric in module.CASE_METRICS:
+            self.assertIn(f"| `{metric.name}` | {metric.unit} |", body)
+
+
 if __name__ == "__main__":
     unittest.main()

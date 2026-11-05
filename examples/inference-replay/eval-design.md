@@ -548,6 +548,12 @@ before stage 3 of the rollout (turning replay on):
    collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
 
+   The first two weeks of shadow data also freeze the baseline that replay is measured against:
+   tokens, cache hits, estimated cost, model time, 429s and fallbacks, and pass rates, per job kind
+   and per build, from `hack/replay-proxy/baseline_report.py`. Replay is not switched on anywhere
+   until that report is saved, and every report after it comes from the same script with
+   `--compare`, so before and after are measured the same way.
+
 2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
    without changing their results, so it gets its own job: a periodic, non-blocking job that runs a
    set of cases on `main`'s code with replay on, served from the nightly's recordings. Its results
