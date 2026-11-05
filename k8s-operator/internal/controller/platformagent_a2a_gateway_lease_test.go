@@ -278,7 +278,7 @@ func TestAHeldBackRecreateRequeuesTheReconcile(t *testing.T) {
 	agent := a2aTestAgent()
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -297,8 +297,8 @@ func TestAHeldBackRecreateRequeuesTheReconcile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.RequeueAfter <= 0 || res.RequeueAfter > max(r.gatewayLeaseHold, a2aPendingRequeue) {
-		t.Fatalf("requeue after a deletion = %s, want within %s", res.RequeueAfter, max(r.gatewayLeaseHold, a2aPendingRequeue))
+	if res.RequeueAfter <= 0 || res.RequeueAfter > r.gatewayLeaseHold {
+		t.Fatalf("requeue after a deletion = %s, want within the %s hold", res.RequeueAfter, r.gatewayLeaseHold)
 	}
 }
 
