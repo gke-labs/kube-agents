@@ -541,8 +541,9 @@ reason and what would close it. An entry there is a debt with a name on it.
 ## Registration
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
-job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and only those.
-Cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
+job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
+`EVAL_TIER=certification`, the cases in `hack/eval/certification-cases.txt` alone. A case
+runs because one of those files names it; cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
@@ -567,6 +568,11 @@ seat, or because what they grade is not one of the core journeys the presubmit g
 for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A case the agent cannot pass
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
+
+The one exception is a case with `suite: certification` in its task file: it registers in
+`hack/eval/certification-cases.txt`, runs only under `EVAL_TIER=certification`, and never
+in the presubmit or nightly files
+([`bench/README.md`](../../bench/README.md#certification-suite)).
 
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was
