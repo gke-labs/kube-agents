@@ -200,5 +200,17 @@ class SubmitSuggestionHandsEditsToTheirAuthoringSkillTest(unittest.TestCase):
         self.assertIn("Never bundle unchosen options or optional hardening into the same pull request", flat)
         self.assertIn("never touch unrelated manifests or infrastructure definitions", flat)
 
+
+class KccCollectorSoulRoutingTest(unittest.TestCase):
+    def test_platform_soul_inline_exception_pins_per_target_kubeconfig(self):
+        platform_soul = (REPO_ROOT / "agents/platform/SOUL.md").read_text(encoding="utf-8")
+        self.assertIn(
+            'python3 /opt/data/scripts/kcc_fleet_audit.py --kubeconfig "$HERMES_HOME/.kubeconfigs/kubeconfig_${PROJECT}_${CLUSTER}_${LOCATION}.yaml"',
+            platform_soul,
+        )
+        cluster_soul = (REPO_ROOT / "agents/cluster/SOUL.md").read_text(encoding="utf-8")
+        self.assertIn("could not be read or is unserved/unestablished", cluster_soul)
+
+
 if __name__ == "__main__":
     unittest.main()
