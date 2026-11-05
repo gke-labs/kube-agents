@@ -578,8 +578,8 @@ The arithmetic behind `6`:
   waiting on its own children gives its slot back but stays resident, so the process count can sit
   above six; the 8Gi limit leaves room for about fourteen workers at that size.
 - **Credential proxy.** Every worker's `kubectl` and `gcloud` runs through the proxy, which admits a
-  request only when its children fit the proxy's memory limit: 176 MiB per request after 320 MiB of
-  fixed reserves. At its default 2Gi limit that is 9 at once
+  request only when its children fit the proxy's memory limit: 176 MiB per request after a 192 MiB
+  reserve for the broker and Envoy. At its default 2Gi limit that is 10 at once
   (`credentialProxyAdmittedRequests` in
   `k8s-operator/internal/controller/credential_proxy_manifests.go`), held to 8 by its slot cap. At
   the old 1Gi it was 4.
@@ -892,7 +892,7 @@ The default requests are 500m CPU and 1Gi of memory, and on GKE Autopilot 2 CPU 
 
 The broker sizes how many commands it admits at once from the memory limit, so that is the key to raise when the proxy is OOM-killed under a large fleet, or pick a [`sizingProfile`](#specdeployment) row that raises it. Only `cpu`, `memory` and `ephemeral-storage` are accepted, the quantities the container declares.
 
-**What the operator refuses.** A memory limit below 672Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the sizing profile's row (the operator's defaults under `small`) rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present.
+**What the operator refuses.** A memory limit below 544Mi (two commands at once), a request above its limit, a negative quantity, a zero limit and `claims`, which the proxy pod has no use for. A refused override, including an edit of one that was valid, renders the proxy Deployment at the sizing profile's row (the operator's defaults under `small`) rather than at the last accepted override until it is corrected, which restarts the proxy once (its Deployment is `Recreate`), and the agent stays Ready whether or not the webhook is on. The `Degraded` condition carries one reason, and reports `InvalidCredentialProxyResources` when no higher-ranked `Degraded` cause is present.
 
 **What admission adds.** Where the [validating webhook](/kube-agents/operator/#admission-webhooks) is enabled, admission refuses the same override at apply and the running proxy is untouched. Admission also warns, using the Autopilot default requests on every cluster type, when memory per CPU on the requests pair leaves the 1 to 6.5 GiB per vCPU band GKE Autopilot admits unchanged, because Autopilot then raises the smaller request and the chart's quota preflight is short by the difference; Autopilot applies the band to requests only.
 
