@@ -491,6 +491,13 @@ GEMINI_KEY_SECRET_ACCESSORS = (
 )
 # The state of a secret version the nightly's `versions access latest` reads.
 GEMINI_KEY_VERSION_ENABLED = "ENABLED"
+# The key script enables the API Keys and Secret Manager APIs, and nothing else
+# in the pool does, so on a project it never ran against both reads answer
+# PERMISSION_DENIED with reason SERVICE_DISABLED. The general classifier keeps
+# that a refusal; check_gemini_api_key alone reads it as the key absent.
+GEMINI_KEY_SERVICE_DISABLED = re.compile(
+    r"\bSERVICE_DISABLED\b|API has not been used in project \S+ before or it is disabled"
+)
 FINDING_GEMINI_KEY_MISSING = "apikeys/gemini/missing"
 FINDING_GEMINI_KEY_RESTRICTION = "apikeys/gemini/restriction"
 FINDING_GEMINI_KEY_SECRET_MISSING = "secrets/gemini-api-key/missing"
@@ -4224,11 +4231,15 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
     repair = f"{GEMINI_KEY_SCRIPT} {project_id}"
 
     def read(cmd: List[str], what: str) -> Tuple[Optional[object], bool]:
-        """(parsed JSON, read): None with read True when the resource is absent;
-        read False when the command could not tell."""
+        """(parsed JSON, read): None with read True when the resource is absent
+        (its API disabled included); read False when the command could not tell."""
         nonlocal read_any
         rc, out, err = run_cmd(cmd)
         if rc != 0:
+            if GEMINI_KEY_SERVICE_DISABLED.search(err or ""):
+                read_any = True
+                details.append(f"{what} absent: its API is disabled in {project_id}")
+                return None, True
             if _record_unreadable(err, f"{what} absent: {err.strip()[:200]}", f"Could not read {what} in {project_id}", details, warnings):
                 return None, False
             read_any = True
@@ -4297,6 +4308,11 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
             ["gcloud", "secrets", "get-iam-policy", secret, f"--project={project_id}", "--format=json"],
             f"the IAM policy of secret {secret}",
         )
+        if grants_checked and policy is None:
+            # A failure that was neither a refusal nor a transient: the
+            # policy was not read, so the accessors are not verified.
+            grants_checked = False
+            warnings.append(Unread(f"Could not read the IAM policy of secret {secret} in {project_id}, so its accessors are unverified"))
         if grants_checked and policy is not None:
             held = {
                 member

@@ -168,6 +168,45 @@ class DenialClassifierTest(unittest.TestCase):
         "ERROR: gcloud crashed (SSLError): [SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC] decryption failed",
         "ERROR: gcloud crashed (ReadTimeout): HTTPSConnectionPool(host='container.googleapis.com', port=443): Read timed out.",
     )
+    # A disabled API: gcloud's PERMISSION_DENIED with reason SERVICE_DISABLED.
+    # The general classifier keeps it a refusal; check_gemini_api_key alone
+    # reads it as absence (GEMINI_KEY_SERVICE_DISABLED), because the key
+    # script is what enables these two APIs.
+    SERVICE_DISABLED = (
+        "ERROR: (gcloud.services.api-keys.list) PERMISSION_DENIED: API Keys API has not been used in "
+        "project 123456789012 before or it is disabled. Enable it by visiting "
+        "https://console.developers.google.com/apis/api/apikeys.googleapis.com/overview?project=123456789012 "
+        "then retry. If you enabled this API recently, wait a few minutes for the action to propagate to "
+        "our systems and retry. This command is authenticated as x@y.iam.gserviceaccount.com using the "
+        "credentials in ..., specified by the [auth/credential_file_override] property.\n"
+        "- '@type': type.googleapis.com/google.rpc.ErrorInfo\n"
+        "  domain: googleapis.com\n"
+        "  metadata:\n"
+        "    consumer: projects/123456789012\n"
+        "    service: apikeys.googleapis.com\n"
+        "  reason: SERVICE_DISABLED",
+        "ERROR: (gcloud.secrets.versions.list) PERMISSION_DENIED: Secret Manager API has not been used in "
+        "project 123456789012 before or it is disabled. Enable it by visiting "
+        "https://console.developers.google.com/apis/api/secretmanager.googleapis.com/overview?project=123456789012 "
+        "then retry. If you enabled this API recently, wait a few minutes for the action to propagate to "
+        "our systems and retry.\n"
+        "- '@type': type.googleapis.com/google.rpc.ErrorInfo\n"
+        "  domain: googleapis.com\n"
+        "  metadata:\n"
+        "    consumer: projects/123456789012\n"
+        "    service: secretmanager.googleapis.com\n"
+        "  reason: SERVICE_DISABLED",
+    )
+
+    def test_a_disabled_api_is_a_refusal_and_only_the_gemini_check_reads_it_as_absence(self):
+        for err in self.SERVICE_DISABLED:
+            with self.subTest(err=err[:60]):
+                self.assertIsNotNone(checker._denial_reason(err), err)
+                self.assertTrue(checker.GEMINI_KEY_SERVICE_DISABLED.search(err), err)
+        for err in self.REFUSALS + self.ABSENCES + self.TRANSIENTS:
+            with self.subTest(err=err[:60]):
+                self.assertIsNone(checker.GEMINI_KEY_SERVICE_DISABLED.search(err), err)
+
     # A status code inside a resource name is not a status.
     NUMBERED_ABSENCES = (
         "ERROR: (gcloud.storage.buckets.describe) gs://kube-agents-evals-500-tf-state not found: 404.",
@@ -5990,6 +6029,37 @@ class GeminiApiKeyCheckTest(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertFalse(result.read)
         self.assertEqual(result.message, "Not checked")
+
+    def test_a_project_the_key_script_never_ran_on_is_the_missing_findings_not_unread(self):
+        # The key script enables both APIs, so an unrepaired project answers
+        # SERVICE_DISABLED to both reads; that is the drift this check reports.
+        keys_off, secrets_off = DenialClassifierTest.SERVICE_DISABLED
+        self.assertIn("(gcloud.services.api-keys.list)", keys_off)
+        self.assertIn("(gcloud.secrets.versions.list)", secrets_off)
+        result, argv = self._check([_fail(keys_off), _fail(secrets_off)])
+        self.assertFalse(result.passed)
+        self.assertTrue(result.read)
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_MISSING, checker.FINDING_GEMINI_KEY_SECRET_MISSING])
+        for finding in result.findings:
+            self.assertEqual(finding.repair, f"scripts/provision_ci_pool_gemini_key.sh {self.PROJECT}")
+        self.assertEqual(result.warnings, [])
+        # The secret is absent, so its policy is not read.
+        self.assertEqual(len(argv), 2)
+        # Each read alone: the other half still reads normally.
+        result, _ = self._check([_fail(keys_off)] + self._answers()[1:])
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_MISSING])
+        answers = self._answers()
+        result, _ = self._check([answers[0], _fail(secrets_off)])
+        self.assertEqual([f.id for f in result.findings], [checker.FINDING_GEMINI_KEY_SECRET_MISSING])
+
+    def test_a_failed_policy_read_leaves_the_accessors_unverified(self):
+        answers = self._answers()
+        answers[2] = _fail("boom")
+        result, _ = self._check(answers)
+        self.assertTrue(result.passed, result.details)
+        self.assertEqual(result.findings, [])
+        self.assertIn("the secret's accessors not checked", result.message)
+        self.assertTrue(any(isinstance(w, checker.Unread) and "accessors are unverified" in w for w in result.warnings), result.warnings)
 
     def test_the_check_is_in_the_default_set_and_not_in_the_pool_state_checks(self):
         self.assertEqual(checker.CHECK_GEMINI_KEY, "gemini_api_key")
