@@ -381,8 +381,6 @@ class Shapes(RunHarness):
             " The gateway log in a run's artifacts says whether the dispatcher stalled (#1879).\n"
             f"{URL}#since=2026-09-03T18:30:00Z&view=gate",
         )
-        # The wave's end is posted: its message said to retest once workers
-        # are finishing again, and this is the only word that they are.
         self.tick(health(), T0.replace(hour=15, minute=30))
         self.assertEqual(self.opener.texts[1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 21h (workers were not finishing).")
 
@@ -403,33 +401,10 @@ class Shapes(RunHarness):
             f"{URL}#since=2026-09-07T14:00:00Z&until=2026-09-08T01:00:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&view=gate",
         )
 
-    def test_the_end_of_a_storm_is_recorded_not_posted(self):
-        # Every yellow message carries its own retest time, so "healthy
-        # again" after one asks nothing of anyone. The state still moves:
-        # the next storm is a new episode and is posted.
+    def test_recovery_from_a_storm(self):
         self.tick(storm(since="2026-09-04T09:47:00+00:00"), T0)
-        rc, err = self.tick(health(), T0.replace(hour=15, minute=30))
-        self.assertEqual(rc, 0)
-        self.assertEqual(len(self.opener.texts), 1)
-        self.assertIn("recovery from storm recorded, not posted", err)
-        self.assertIn("posted nothing", err)
-        self.assertEqual(self.recorded()["state"], "GREEN")
-        self.tick(storm(since="2026-09-04T16:00:00+00:00"), T0.replace(hour=16))
-        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🟡", "🟡"])
-
-    def test_the_end_of_setup_deaths_is_recorded_not_posted(self):
-        self.tick(deaths(), T0)
         self.tick(health(), T0.replace(hour=15, minute=30))
-        self.assertEqual(len(self.opener.texts), 1, "its message said to retest now")
-        self.assertEqual(self.recorded()["state"], "GREEN")
-
-    def test_an_outage_that_eases_to_a_storm_ends_without_a_post(self):
-        # The storm's change already replaced the outage's "don't retest"
-        # with its own retest time.
-        self.tick(outage(cases=["a-probe"], since="2026-09-04T09:00:00+00:00", prs=(1, 2, 3)), T0)
-        self.tick(storm(since="2026-09-04T13:00:00+00:00"), T0.replace(hour=13, minute=30))
-        self.tick(health(), T0.replace(hour=15, minute=30))
-        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🔴", "🟡"])
+        self.assertEqual(self.opener.texts[1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 5h 43m (quota storm).")
 
     def test_digest(self):
         self.tick(health(), self.at(DIGEST_UTC, 5))
@@ -1714,7 +1689,7 @@ class LostPods(RunHarness):
         self.tick(health(), T0.replace(hour=15, minute=30), environ=self.environ())
         self.assertEqual(self.gh.writes()[-2:], [("POST", "repos/gke-labs/kube-agents/issues/1300/comments"), ("PATCH", "repos/gke-labs/kube-agents/issues/1300")])
         self.assertEqual(self.gh.calls[-2][2], {"body": "Healthy again after 2h 30m; closing (filed by the bot; reopen if the cause is still live)."})
-        self.assertFalse([text for text in self.opener.texts if text.startswith("🟢")], "the storm's end is recorded, not posted")
+        self.assertEqual(self.opener.texts[-1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (quota storm, #1300).")
         # A state file from before `issues` existed: its lone `issue` is
         # the episode's, and gets the comment too.
         self.state.write_text(json.dumps(dict(self.recorded(), state="DEGRADED", condition="storm", since="2026-09-04T13:00:00+00:00", issue={"number": 1200, "url": "x"}, issues=None)))
@@ -1869,7 +1844,7 @@ class Secrecy(RunHarness):
         failing = FakeOpener(statuses=[403])
         _, fail_err = self.tick(outage(), T0.replace(minute=15), opener=failing)
         environ = {post_health.WEBHOOK_ENV: WEBHOOK}
-        _, hook_err = self.tick(outage(), T0.replace(minute=30), environ=environ, opener=FakeOpener(statuses=[404]))
+        _, hook_err = self.tick(health(), T0.replace(minute=30), environ=environ, opener=FakeOpener(statuses=[404]))
         for text in (ok_err, fail_err, hook_err):
             self.assertNotIn(TOKEN, text)
             self.assertNotIn("SECRETKEY", text)

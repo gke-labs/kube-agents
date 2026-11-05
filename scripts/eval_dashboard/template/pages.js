@@ -1227,7 +1227,7 @@ function whatToDoHtml(run) {
   else if (run.verdict === "green") items.push("<li><b>Nothing.</b> This run is green.</li>");
   else if (run.verdict === "infra") {
     items.push("<li><b>Nothing right now.</b> Retesting before the gate is healthy will fail the same way.</li>");
-    items.push("<li>Run <code>/retest</code> once the brief says healthy again (the Chat space announces it, or for a quota storm names the time to retest).</li>");
+    items.push("<li>Run <code>/retest</code> once the brief says healthy again (the Chat space announces it).</li>");
     items.push('<li>If a case here were marked <span class="tag yours">only your PR</span>, the fix would be on you: the transcript usually names the problem.</li>');
   } else {
     const yours = (run.cases || []).filter((c) => c.cls === "only-this-pr").length;

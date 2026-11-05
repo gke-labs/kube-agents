@@ -20,10 +20,9 @@ In the same way, a `rep N timing:` line under each grading line carries the
 repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show
 ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
-Chat — only when the state changes (the end of a storm or of setup deaths
-is recorded, not posted: [Hysteresis](#hysteresis)), plus one digest a day at
-11 AM Toronto time, which also carries the slow-gate and close-to-the-deadline
-notes ([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
+Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
+which also carries the slow-gate and close-to-the-deadline notes
+([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
@@ -216,7 +215,7 @@ what keeps the replay fixtures cut before the field valid. A run without the
 recorded `null` is "no verdict".
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
-announces it, which a storm or setup deaths do not get ([Hysteresis](#hysteresis)); the daily digest carries the last 24 hours' runs, greens,
+announces it; the daily digest carries the last 24 hours' runs, greens,
 PR-caused reds (by rule 4's test, below, less its storm silence: a two-hour
 storm cannot blank a 24-hour count) and infra reds (setup deaths, lost
 pods and deadline kills that graded nothing are folded into the infra count),
@@ -273,16 +272,6 @@ the last kill. Until then `health.json` reports `recovering`, its
 advice says a retest is reasonable, and nothing is posted. The adjudicator's
 only state between ticks is the previous `health.json`; the poster keeps what
 it last told the space in `health-state.json` beside it.
-
-The return to GREEN is posted unless the episode last read a quota storm or
-setup deaths, whose message already said when to retest (a clock time, or
-now). For those, including an OUTAGE that eased into one before it cleared,
-the poster records the recovery without posting it, still comments on and
-closes the episode's tracking issues ([The tracking issue](#the-tracking-issue)),
-and posts the next DEGRADED change as a new episode. The other DEGRADED
-conditions say to retest once something happens (new jobs progressing, workers
-finishing, the reconcile or the repair), and the recovery is the space's word
-that it has; an OUTAGE's recovery is the "retest now" after its "don't retest".
 
 Inside an OUTAGE the message is repeated when a new case joins the set, at most
 every 2 hours. A case dropping off is not news until the state changes. A
@@ -756,8 +745,7 @@ on an adopted one. `issue` is the current condition's; every issue the
 incident filed or adopted rides in `health-state.json`'s `issues` list until
 the recovery or until the bot settles it below, so an outage that gives way
 to a storm or to lost pods before it clears still gets its recovery comment,
-and the recovery message, when one is posted ([Hysteresis](#hysteresis)),
-names the ones still carried. A recovery comment or
+and the recovery message names the ones still carried. A recovery comment or
 close that did not land, or an issue the bot could not read that tick, rides
 on past GREEN and is retried each tick until it does.
 

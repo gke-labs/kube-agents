@@ -8,8 +8,6 @@ sends a message only when:
 
     the state changed                       -> "CI health: DEGRADED (was GREEN)"
     the state returned to GREEN             -> the recovery, with how long it lasted
-                                               (after a storm or setup deaths:
-                                               recorded, not posted)
     an OUTAGE grew to name a new case       -> the same shape, rate-limited
     it is the digest hour and none went out -> the daily digest with the 24h numbers,
                                                plus a section on last night's
@@ -158,9 +156,6 @@ CONDITION_FIXTURE_DRIFT = "fixture_drift"
 CONDITION_POOL_DRIFT = "pool_drift"
 CONDITION_DELEGATION_CEILING = "delegation_ceiling"
 CONDITION_DEADLINE_KILL = "deadline_kill"
-# The DEGRADED conditions whose message gives its own retest time: their end
-# is recorded, not posted (run).
-QUIET_RECOVERY_CONDITIONS = ("storm", "setup_deaths")
 # The presubmit job's timeout in minutes, as health.py owns it.
 DEADLINE_MINUTES = int(PROW_JOB_TIMEOUT.total_seconds() // SECONDS_PER_MINUTE)
 # health.json's summary of the hourly seeded-fleet scan (health.py,
@@ -1873,18 +1868,7 @@ def run(
             carried.append(issue)
     section = nightly_section() if nightly_section is not None and data is not None and KIND_DIGEST in kinds else None
     coverage = coverage_lines() if coverage_lines is not None and KIND_DIGEST in kinds else []
-    # The end of a storm or of setup deaths is recorded, not posted: their
-    # message already said when to retest (a clock time, or now), so "healthy
-    # again" asks nothing of anyone. Every other recovery goes out: after an
-    # OUTAGE it is the "retest now" after a "don't retest", and the other
-    # DEGRADED conditions told people to retest once something happened,
-    # which the recovery is the space's only word of. The quiet one counts as
-    # sent below, so the state and the tracking issues' comments and closes
-    # move as if it had.
-    quiet = {KIND_RECOVERY} if KIND_RECOVERY in kinds and before.get("state") != OUTAGE and before.get("condition") in QUIET_RECOVERY_CONDITIONS else set()
-    if quiet:
-        log(f"recovery from {before.get('condition')} recorded, not posted")
-    messages = [(kind, render(kind, health, told, now, issue, data, section, coverage)) for kind in kinds if kind not in quiet]
+    messages = [(kind, render(kind, health, told, now, issue, data, section, coverage)) for kind in kinds]
     failed = []
     for kind, text in messages:
         if dry_run:

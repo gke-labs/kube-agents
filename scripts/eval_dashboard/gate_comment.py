@@ -153,9 +153,6 @@ ALL_THEIRS_RECOVERING = "**Your {n} {failures} {are} exactly {those}, so this re
 BOX_DEGRADED = "🟡 **Gate degraded** since {since}. {cause}"
 BOX_HEALTHY = "🟢 **Gate healthy.**"
 ALL_THEIRS = "**Your {n} {failures} {are} exactly {those}, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
-# A storm's or setup deaths' end is not posted (post_health.QUIET_RECOVERY_CONDITIONS):
-# their own message says when to retest.
-ALL_THEIRS_TIMED = "**Your {n} {failures} {are} exactly {those}, so this red is not your code.** Run `/retest` when the #kube-agents-ci-health message for it says to."
 SOME_THEIRS = "**{theirs} of your {n} failures {are_theirs} the gate's ({their_cases}); {yours_text}.** Fix {that}; don't retest for the rest until the gate is healthy."
 YOURS_ONLY = "{case} passed on the last {elsewhere} {runs} from other PRs and failed on your last {streak}."
 LOOKS_YOURS = "**This looks specific to your PR.**"
@@ -425,12 +422,7 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
         elif not other_outage:
             sentences.append(BOX_DEGRADED.format(since=post_health.clock(since, weekday=True), cause=post_health.cause_sentence(health_doc)))
         if not yours and not unclear:
-            if other_outage and recovering:
-                theirs_all = ALL_THEIRS_RECOVERING
-            elif state != health.OUTAGE and health_doc.get("condition") in post_health.QUIET_RECOVERY_CONDITIONS:
-                theirs_all = ALL_THEIRS_TIMED
-            else:
-                theirs_all = ALL_THEIRS
+            theirs_all = ALL_THEIRS_RECOVERING if other_outage and recovering else ALL_THEIRS
             sentences.append(theirs_all.format(n=n, failures=plural(n, "failure"), are=plural(n, "is", "are"), those=f"those {n}" if n > 1 else "that one"))
         else:
             yours_text = []
