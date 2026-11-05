@@ -171,7 +171,11 @@ nothing to do with the download. `tests/test_third_party_download_retry.py` fail
 request otherwise, and its `DOWNLOAD_SOURCES` is the hand-maintained list of files it walks — a new
 file that downloads something is not covered until it is added there. A download piped into a
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
-been fed the bytes of the failed one.
+been fed the bytes of the failed one. A GitHub release download in either Dockerfile must keep
+retrying for at least four minutes, which is `--retry 8`: GitHub's release-asset CDN can fail one
+runner for minutes while it serves others, and curl's doubling backoff waits 255 seconds over eight
+retries but 31 over five. The test reads that wait from the flags, where `--retry-max-time` can only
+shorten it, and runs the tirith download, a wget loop, against stubs.
 
 `docker-build.yml` also retries whole steps: the buildx setup and each image build that fetches
 from the network run once more, after a pause, when the first attempt fails. The in-image gate
