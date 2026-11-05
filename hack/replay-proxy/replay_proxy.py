@@ -392,9 +392,13 @@ def unstorable_reasons(
     body: Dict[str, Any], status: int, message: Dict[str, Any], headers: Dict[str, str],
     mapping: normalizer.Mapping, scrubber: request_store.Scrubber,
     upstream_incomplete: bool = False, client_disconnected: bool = False, observe_failed: bool = False,
-    observe_too_large: bool = False,
+    observe_too_large: bool = False, stored: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
-    """Why replay would not have saved this answer (eval-design.md); empty when it would."""
+    """Why replay would not have saved this answer (eval-design.md); empty when it would.
+
+    `stored` is the answer as it would be saved (replay_cache.stored_answer),
+    when the caller has it already.
+    """
     for flag, reason in (
         (upstream_incomplete, F.UNSTORABLE_UPSTREAM_INCOMPLETE),
         (client_disconnected, F.UNSTORABLE_CLIENT_DISCONNECTED),
@@ -417,7 +421,9 @@ def unstorable_reasons(
     texts = [str(view["content"] or "")] + [str(c["arguments"] or "") for c in view["tool_calls"]]
     if any(mapping.answer_repeats_bare_number(t) for t in texts):
         reasons.append(F.UNSTORABLE_REPEATS_NUMBER)
-    normalized = replay_cache.answer_texts(replay_cache.normalize_answer(message, mapping))
+    if stored is None:
+        stored = replay_cache.stored_answer(message, mapping)
+    normalized = replay_cache.answer_texts(stored)
     if any(mapping.identifier_left_literal(t) for t in normalized):
         reasons.append(F.UNSTORABLE_BOUND_VALUE_LEFT_LITERAL)
     if any(mapping.has_identifier(t) for t in normalized):
@@ -645,18 +651,17 @@ class ShadowProxy:
             return None
 
     def record(
-        self, body: Dict[str, Any], entry: Dict[str, Any], upstream: Dict[str, Any],
-        normalized: normalizer.NormalizedRequest, raw_messages: List[Any], diag_walked: List[Any], received: float,
+        self, entry: Dict[str, Any], upstream: Dict[str, Any], normalized: normalizer.NormalizedRequest,
+        stored: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any], received: float,
     ) -> bool:
         """Record mode: save a storable answer under its fingerprint; True when this call saved it."""
         if entry[F.UNSTORABLE]:
             return False
-        mapping = normalized.mapping
         # The entry first and the slot pointer last, so a failure in between
         # never leaves a pointer to an entry that was not written.
         saved = self.cache.save(entry[F.FINGERPRINT], {
             replay_cache.ENTRY_FINGERPRINT: entry[F.FINGERPRINT],
-            replay_cache.ENTRY_ANSWER: replay_cache.normalize_answer(upstream["message"], mapping),
+            replay_cache.ENTRY_ANSWER: stored,
             replay_cache.ENTRY_FINISH_REASON: upstream.get("finish_reason"),
             replay_cache.ENTRY_USAGE: upstream["usage"],
             replay_cache.ENTRY_MESSAGE_HASHES: entry[F.MESSAGE_HASHES],
@@ -805,12 +810,14 @@ class ShadowProxy:
         entry[F.FINGERPRINT] = fingerprint
         entry[F.SETTINGS_HASH] = normalizer.settings_hash(normalized, self.key_context)
         entry[F.ROLES] = normalized.roles()
+        stored = replay_cache.stored_answer(upstream["message"], normalized.mapping) if upstream["message"] else {}
         entry[F.UNSTORABLE] = unstorable_reasons(
             body, upstream["status"], upstream["message"], upstream["headers"], normalized.mapping, self.scrubber,
             upstream_incomplete=upstream["upstream_incomplete"],
             client_disconnected=upstream["client_disconnected"],
             observe_failed=upstream["observe_failed"],
             observe_too_large=upstream["observe_too_large"],
+            stored=stored,
         )
         # The per-message and answer hashes are of the normalized, unscrubbed
         # content, as the fingerprint is: the scrubber blanks the rest of a
@@ -825,7 +832,7 @@ class ShadowProxy:
         entry[F.DIAG_MESSAGE_HASHES] = diag_hashes
         entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
         if self.config.mode == F.MODE_RECORD:
-            entry[F.RECORDED] = self.record(body, entry, upstream, normalized, raw_messages, diag_walked, received)
+            entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked, upstream.get("refused"))
         entry[F.ANSWER_HASH] = answer_hash(upstream["message"], normalized.mapping)

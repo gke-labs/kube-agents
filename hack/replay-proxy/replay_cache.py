@@ -32,6 +32,8 @@ JSON_SUFFIX = ".json"
 TMP_SUFFIX = ".tmp"
 TEXT_ENCODING = "utf-8"
 TOOL_CALLS_KEY = "tool_calls"
+# The model's reasoning text in an answer, never stored (stored_answer).
+REASONING_KEY = "reasoning_content"
 # The parts of a message whose words a miss is ranked by.
 CONTENT_KEY = "content"
 TEXT_KEY = "text"
@@ -84,6 +86,18 @@ def _walk(value: Any, fn, key: Optional[str] = None, in_tool_call: bool = False)
 def normalize_answer(message: Dict[str, Any], mapping: normalizer.Mapping) -> Dict[str, Any]:
     """The answer with values the request bound swapped for placeholders, by whole token."""
     return _walk(message, mapping.apply_to_answer)
+
+
+def stored_answer(message: Dict[str, Any], mapping: normalizer.Mapping) -> Dict[str, Any]:
+    """The answer as record mode saves it: normalized, without its `reasoning_content`.
+
+    The client never sends reasoning back (the lane trials' requests hold none),
+    so dropping it changes no later key, and a served answer carries none of
+    the recording's reasoning. Thinking blocks stay: a client that sends them
+    back would key on them.
+    """
+    kept = {k: v for k, v in message.items() if k != REASONING_KEY}
+    return normalize_answer(kept, mapping)
 
 
 def answer_texts(message: Dict[str, Any]) -> List[str]:

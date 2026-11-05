@@ -370,6 +370,32 @@ class BoundValueTest(AnalyzeCase):
         self.assertEqual(line["unstorable"], [])
 
 
+class ReasoningTest(AnalyzeCase):
+    """An answer's reasoning is checked for credentials, and never stored."""
+
+    BODY = {"model": "m", "messages": [{"role": "user", "content": "check the registry login"}]}
+
+    def test_a_credential_only_in_the_reasoning_is_never_written(self):
+        for answer in (
+            {"role": "assistant", "content": "The login works.", "reasoning_content": f"the token is {TOKEN}"},
+            {"role": "assistant", "content": "The login works.",
+             "thinking_blocks": [{"type": "thinking", "thinking": f"the token is {TOKEN}", "signature": "c2ln"}]},
+        ):
+            with self.subTest(answer=list(answer)):
+                self.assertIn("scrub_masks_credential", self.recorded(self.BODY, answer)["unstorable"])
+        written = "".join(p.read_text() for p in Path(self.cache_dir).rglob("*.json"))
+        self.assertNotIn(TOKEN, written)
+
+    def test_reasoning_is_not_stored_and_thinking_blocks_are(self):
+        answer = {"role": "assistant", "content": "The login works.", "reasoning_content": "checked the secret's age",
+                  "thinking_blocks": [{"type": "thinking", "thinking": "checked it", "signature": "c2ln"}]}
+        line = self.recorded(self.BODY, answer)
+        self.assertTrue(line["recorded"])
+        saved = replay_cache.AnswerCache(self.cache_dir).load(line["fingerprint"])["answer"]
+        self.assertNotIn("reasoning_content", saved)
+        self.assertEqual(saved["thinking_blocks"][0]["signature"], "c2ln")
+
+
 class TimestampTest(AnalyzeCase):
     """A timestamp an answer copied from the request is restored to this run's; one the model made is never stored."""
 
@@ -520,6 +546,15 @@ class RecordTest(ProxyTestCase):
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=False))
         self.assertTrue(self.lines(1)[0]["recorded"])
         self.assertEqual(len(calls), 1, "the answer is noted from the analysis's normalization")
+
+    def test_a_recorded_answer_is_normalized_once(self):
+        calls = []
+        original = replay_cache.normalize_answer
+        replay_cache.normalize_answer = lambda *args: calls.append(args) or original(*args)
+        self.addCleanup(setattr, replay_cache, "normalize_answer", original)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False))
+        self.assertTrue(self.lines(1)[0]["recorded"])
+        self.assertEqual(len(calls), 1, "the stored form is checked and saved from one normalization")
 
     def test_unstorable_answer_is_not_saved(self):
         FakeLiteLLM.fallbacks = "1"
