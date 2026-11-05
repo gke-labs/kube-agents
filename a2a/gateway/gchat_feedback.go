@@ -168,7 +168,7 @@ func gchatWithRating(widgets []map[string]any, r gchatRating) []map[string]any {
 	if r.task == "" {
 		return widgets
 	}
-	out := make([]map[string]any, 0, len(widgets)+1)
+	out := make([]map[string]any, 0, len(widgets))
 	added := false
 	for _, w := range widgets {
 		list, ok := w[gchatButtonListKey].(map[string]any)
