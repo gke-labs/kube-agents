@@ -216,8 +216,6 @@ for ctx in $(kubectl config get-contexts -o name); do
 done
 ```
 
-The [summary block](#sharing-a-usage-and-feedback-summary) carries the same counters for an install that shares by pasting.
-
 ### Health cohorts and alerts
 
 The chart can turn those gauges into the health cohorts. `platformAgent.healthRules.enabled: true` renders one Managed Prometheus `Rules` object, `<name>-health-rules`, in the install's namespace. The managed rule-evaluator runs it against the namespace's metrics. It is off by default, because on means alerts fire.
