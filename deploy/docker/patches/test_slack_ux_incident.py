@@ -945,7 +945,7 @@ class RuntimeTest(unittest.TestCase):
 
     def mark_drift(self, session_id="k8s-evt-0000abcd"):
         meta = {"platform": "slack", "chat_id": CHANNEL, "thread_id": ALERT_TS,
-                "title": "checkout-gateway HPA drift · seeded-b", "alert_kind": "drift"}
+                "title": "checkout-gateway HPA drift in seeded-b", "alert_kind": "drift"}
         with closing(sqlite3.connect(self.db)) as conn:
             conn.execute("INSERT OR REPLACE INTO session_metadata VALUES (?, ?)", (session_id, json.dumps(meta)))
             conn.commit()
@@ -964,6 +964,25 @@ class RuntimeTest(unittest.TestCase):
             ("Put Git's version back", "apply Option A: Put Git's version back", True),
             ("Keep it · update Git", "apply Option B: Keep it · update Git", False),
         ])
+
+    def test_a_detail_stops_at_a_list_or_fence_under_the_sentence(self):
+        report = DRIFT.replace("under load.\n\n", "under load.\n- first bullet\n```\nraw\n```\n\n")
+        triage = runtime.drift_triage(runtime.parse_triage(report), report)
+        self.assertEqual(triage["detail"], DRIFT_DETAIL)
+
+    def test_a_long_recommended_title_keeps_the_room_its_suffix_had(self):
+        title = "Put Git's version back and roll the checkout gateway autoscaler to ten"
+        report = DRIFT.replace("Put Git's version back", title)
+        parsed = runtime.parse_triage(report)
+        self.assertTrue(parsed["choices"][0][0].endswith("…" + runtime.RECOMMENDED_SUFFIX))
+        self.assertEqual(runtime.drift_triage(parsed, report)["choices"][0][0], title)
+
+    def test_the_fallback_puts_the_detail_under_the_headline_unbolded(self):
+        text = runtime.fallback_text(runtime.drift_triage(runtime.parse_triage(DRIFT), DRIFT))
+        head, detail = text.split("\n")[:2]
+        self.assertEqual(head, "*checkout-gateway's autoscaler on seeded-b was changed outside Git.*")
+        self.assertIn("maxReplicas went from 10 to 3", detail)
+        self.assertFalse(detail.startswith("*"))
 
     def test_a_one_sentence_whats_wrong_gives_no_detail(self):
         report = REPORT.replace(" Nothing else changed.", "")

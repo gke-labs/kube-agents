@@ -1128,7 +1128,7 @@ ALERT_TITLE_CLUSTER = " in {cluster}"
 ALERT_TITLE_KEY = "title"
 # A drift alert's thread title, and the mark slack_ux_incident lays its triage out by.
 DRIFT_ALERT_TITLE = "{name} {kind} drift"
-DRIFT_ALERT_TITLE_CLUSTER = " · {cluster}"
+DRIFT_ALERT_TITLE_CLUSTER = " in {cluster}"
 ALERT_KIND_KEY = "alert_kind"
 ALERT_KIND_DRIFT = "drift"
 # The kind a drift title names, by the audit record's resource; any other resource is named as recorded.
@@ -2843,8 +2843,10 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
         logger.error(f"Failed to update session metadata with thread_id: {exc}")
 
 
-def _record_alert_title(session_id: str, title: str, kind: str = "") -> None:
+def _record_alert_title(session_id: str, title: Optional[str], kind: str = "") -> None:
     """Add the Slack session title, and any ``kind`` of alert, to the alert's routing row, for gateway/slack_ux_incident.py.
+
+    Either may be empty: a drift alert whose object has no name gets no title but keeps its kind.
 
     Cosmetic, so a failure is logged and the triage goes on without it.
     """
@@ -2857,7 +2859,8 @@ def _record_alert_title(session_id: str, title: str, kind: str = "") -> None:
                 ).fetchone()
                 if row:
                     meta = json.loads(row[0])
-                    meta[ALERT_TITLE_KEY] = title
+                    if title:
+                        meta[ALERT_TITLE_KEY] = title
                     if kind:
                         meta[ALERT_KIND_KEY] = kind
                     conn.execute(
@@ -4420,7 +4423,7 @@ def _trigger_agent_troubleshooter(
         if thread_id:
             _register_session_routing(session_id, active_platform, thread_id)
             notice = _TriageNotice(active_platform, thread_id, "")
-            if alert_title and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
+            if (alert_title or alert_kind) and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
                 # The title heads the plan the cards draw: on Slack, and on the
                 # platform the gateway lays the plan out for under spec.mode: next.
                 _record_alert_title(session_id, alert_title, alert_kind)
@@ -6116,7 +6119,7 @@ def _inject_drift(
 def _drift_session_title(payload: Dict[str, Any]) -> str | None:
     """The session title for a drift alert's thread with KAGE_SLACK_UX on, else None.
 
-    "checkout-gateway HPA drift · seeded-b": the object, its kind, and the cluster it changed on.
+    "checkout-gateway HPA drift in seeded-b": the object, its kind, and the cluster it changed on.
     """
     resource = _drift_resource(payload)
     name = _defang_drift_field(resource.get("name"))
