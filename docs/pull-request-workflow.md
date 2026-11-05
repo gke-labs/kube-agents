@@ -180,8 +180,9 @@ check runs once, because its failure is a test verdict. A new `docker/setup-buil
 shape.
 
 `tests/test_third_party_download_retry.py` gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
-the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
-nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+the `go install` retry behind setup-envtest, controller-gen and kustomize, `a2a-test.yml`'s
+nats CLI install step and `python-tests.yml`'s operator module download steps against stubs, and
+reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git
