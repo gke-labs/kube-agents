@@ -740,6 +740,20 @@ class LogLineTest(ProxyTestCase):
         plain = {"role": "assistant", "content": "notes written"}
         self.assertNotIn("repeats_swapped_date", replay_proxy.unstorable_reasons(body, 200, plain, headers, mapping, scrubber))
 
+    def test_an_identifier_holding_the_prompt_date_is_not_a_repeated_date(self):
+        # The date guard reads the answer after the swap: a session id is served
+        # with this run's value, so the date inside it doesn't repeat the day.
+        session = "20261104_002640_791a68"
+        body = {"model": "model-default", "messages": [
+            {"role": "system", "content": "Conversation started: Wednesday, November 04, 2026 (UTC, UTC+00:00)"},
+            {"role": "user", "content": f"resume ~/.hermes/sessions/{session}/"}]}
+        mapping = replay_proxy.normalizer.normalize_request(body, time.time()).mapping
+        scrubber = replay_proxy.request_store.Scrubber(REDACTOR, RULES)
+        headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
+        answer = {"role": "assistant", "content": f"Reading ~/.hermes/sessions/{session}/state.json"}
+        self.assertTrue(mapping.answer_repeats_date(answer["content"]), "the raw text does name the day")
+        self.assertEqual(replay_proxy.unstorable_reasons(body, 200, answer, headers, mapping, scrubber), [])
+
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
