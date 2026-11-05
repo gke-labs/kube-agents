@@ -1,8 +1,11 @@
 # The nightly evals' agent on the Gemini Developer API
 
-> **STATUS — design, not yet built.** Approved in conversation on 2026-11-04. Nothing in this
-> document is implemented; the plan that builds it follows from here. The one precondition that
-> could have made it moot was probed the same day (see "What the probe showed").
+> **STATUS — partly built; the move is tracked in #4850.** Approved in conversation on
+> 2026-11-04. The repository change ships the key script, the provisioning step, the verifier
+> check, the deploy's `gemini` path and the documentation. Three steps are pending: the
+> `oss-test-infra` change that exports `MODEL_PROVIDER=gemini` on the nightlies, the repair of the
+> registered projects, and the flip of the verifier findings to blocking. The one precondition that
+> could have made the design moot was probed on 2026-11-04 (see "What the probe showed").
 
 ## Intent
 
@@ -128,8 +131,9 @@ and the pool's other post-install prerequisites (the sweeper role, the minter gr
 seed files) are bash in the provisioning script for the same reason.
 
 The project needs three APIs it does not enable today: `apikeys.googleapis.com`,
-`secretmanager.googleapis.com` and `generativelanguage.googleapis.com`. They join section 1's
-list.
+`secretmanager.googleapis.com` and `generativelanguage.googleapis.com`. The key script enables
+them. They stay out of section 1's enable block and out of `REQUIRED_APIS` until the flip to
+blocking; until then the key check reports a project without them as missing the key.
 
 ### 2. Where the key lives
 
@@ -144,7 +148,8 @@ cross-project dependency to every lease and splits the repair across two project
 ### 3. One script does both the new project and the repair
 
 `scripts/provision_ci_pool_gemini_key.sh <project-id>`: idempotent; enables the three APIs,
-creates the key if none with the display name exists, reads its string, creates the secret if
+creates the key if none with the display name exists, restricts an existing key to the one API
+target, reads its string, creates the secret if
 absent, adds a version only when the current version's value differs, grants the two accessors.
 It prints nothing secret. `scripts/provision_ci_pool_project.sh` calls it for a new project; for
 the 40 registered projects the operator runs it once per project (a loop over the Boskos roster)
@@ -153,10 +158,12 @@ same script after deleting the key.
 
 ### 4. The verifier
 
-A new finding in `scripts/verify_ci_pool_project.py`: the key exists with exactly the one API
-target and nothing else, the secret exists with a current version, and both runner identities
-hold the accessor on it. It reads metadata and IAM only; it never reads the key string. Its resource types are mapped
-in `scripts/test_verify_ci_pool_project.py` as the other findings' are.
+A new check in `scripts/verify_ci_pool_project.py`: the key exists with exactly the one API
+target and no client restriction, `generativelanguage.googleapis.com` is enabled, the secret
+exists with a current version, and both runner identities hold the accessor on it. It reads
+metadata and IAM only; it never reads the key string. `scripts/test_verify_ci_pool_project.py`
+pins it with fake gcloud answers for each finding and for refused reads, and holds its names
+equal to the key script's constants.
 
 The verifier's classification is two-valued: a finding either passes leases (`LEASE_SILENT_FINDINGS`)
 or the health bot reads it as one that reds the run that leases the project. Between the
@@ -220,7 +227,7 @@ tracks the move, beside the last Vertex night's.
 
 ### 8. Documentation
 
-- `docs/ci-pool-projects.md`: section 1 gains the three APIs; section 3 gains the key as a
+- `docs/ci-pool-projects.md`: section 1 names the three APIs, outside its enable block; section 3 gains the key as a
   prerequisite beside the LiteLLM Vertex identity, with the repair; the sentence saying eval
   installs route model traffic through Vertex becomes "the presubmits route through Vertex; the
   nightlies through the Developer API with the project's own key, and why".
@@ -236,7 +243,9 @@ tracks the move, beside the last Vertex night's.
 - `tests/test_ci_deploy_litellm_vertex.py` keeps pinning the `vertex_ai` default; a sibling pins
   the `gemini` branch: the secret is read from the leased project, the job env's key is not used
   for the agent, and a missing secret fails before Helm.
-- `scripts/test_verify_ci_pool_project.py` maps the new finding's resource types.
+- `scripts/test_verify_ci_pool_project.py` drives the check with fake gcloud answers: each
+  finding, a disabled API read as absence, a refused read as not checked, and the names equal to
+  the key script's.
 - `make shellcheck` on the new script; a unit test over its idempotence shape if the repository's
   installer tests have a pattern for it (`tests/test_install_script.py` does).
 
@@ -249,7 +258,7 @@ tracks the move, beside the last Vertex night's.
 3. `oss-test-infra`: the five exports.
 4. Read the first night's three numbers; write them on the tracking issue.
 
-## Decisions made here, as my calls
+## Decisions made in this design
 
 - **Per-project Secret Manager over a central secrets project.** Self-contained projects, one
   repair per project, the verifier reads one project.
@@ -283,6 +292,3 @@ tracks the move, beside the last Vertex night's.
   read is fine; a reusable summariser is a follow-on).
 - Whether `generativelanguage.googleapis.com` must be enabled for the key to be created, or only
   for it to be used; enable it regardless.
-
-Implementation plan:
-[`docs/superpowers/plans/2026-11-04-eval-nightly-gemini-developer-api.md`](../superpowers/plans/2026-11-04-eval-nightly-gemini-developer-api.md).

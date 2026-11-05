@@ -897,13 +897,12 @@ lane keeps the sweep on, where a sweep's pull request names no repetition and la
 `platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
 `bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
-The serving path of the nightlies changed once. On the night the `oss-test-infra` change that
-exports `MODEL_PROVIDER=gemini` merges, the five nightlies (`ci-kube-agents-eval-nightly`,
-`-main-b`, `-writers`, `-gitlab` and `-gitlab-next`) moved the agent from Vertex AI to the Gemini
-Developer API, each with the leased pool project's own key
-([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3). The judge did not move. The
-version key does not carry the serving provider, so rung 6 compares nights on both sides of the
-switch at the same key. A step in cost or latency from that night has this cause.
+Once the `oss-test-infra` change that exports `MODEL_PROVIDER=gemini` on the five nightlies
+merges, they move the agent from Vertex AI to the Gemini Developer API, each with the leased pool
+project's own key ([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3); the judge does
+not move. The version key does not carry the serving provider, so rung 6 compares nights on both
+sides of the switch at the same key. Date that night here when it happens, because a step in cost
+or latency from that night has this cause.
 
 ## The GitLab lane
 
