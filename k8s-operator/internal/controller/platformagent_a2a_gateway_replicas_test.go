@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -234,5 +235,98 @@ func takeLease(t *testing.T, ctx context.Context, cl client.Client, agent *agent
 	lease.Spec.HolderIdentity = ptr.To(holder)
 	if err := cl.Update(ctx, lease); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestTheElectionReachesTheCRStatus: a full reconcile writes the
+// GatewayElected condition once a gateway pod on the rendered image holds
+// the Lease, and the next renders two replicas from it.
+func TestTheElectionReachesTheCRStatus(t *testing.T) {
+	const image = "example.com/a2a-gateway:elected"
+	t.Setenv(a2aGatewayImageEnvVar, image)
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	for i := 0; i < 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	holder := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-gateway-abc", Namespace: agent.Namespace,
+			Labels: map[string]string{"app": a2aGatewayName(agent)}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: a2aGatewayContainerName, Image: image}}},
+	}
+	if err := cl.Create(ctx, holder); err != nil {
+		t.Fatal(err)
+	}
+	takeLease(t, ctx, cl, agent, holder.Name)
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, live); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(live.Status.Conditions, gatewayElectedConditionType); c == nil || c.Message != image {
+		t.Fatalf("GatewayElected = %+v, want the holder's image", c)
+	}
+	// The holder's pod gone, the record carries the scale-out on.
+	if err := cl.Delete(ctx, holder); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, dep); err != nil {
+		t.Fatal(err)
+	}
+	if *dep.Spec.Replicas != 2 {
+		t.Fatalf("replicas after the record = %d, want 2", *dep.Spec.Replicas)
+	}
+}
+
+// TestTheElectionReachesTheCRStatusWhileParked: a pass parked on a Degraded
+// refusal after the render writes its conditions through
+// syncA2AConditions, which carries the election too.
+func TestTheElectionReachesTheCRStatusWhileParked(t *testing.T) {
+	const image = "example.com/a2a-gateway:elected"
+	t.Setenv(a2aGatewayImageEnvVar, image)
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	ctx := context.Background()
+	// A first pass brings every other condition current, so the second has
+	// only the election to write.
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{gatewayElected: ptr.To(image)}); err != nil {
+		t.Fatal(err)
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(live.Status.Conditions, gatewayElectedConditionType); c == nil || c.Message != image {
+		t.Fatalf("GatewayElected = %+v, want the holder's image", c)
 	}
 }
