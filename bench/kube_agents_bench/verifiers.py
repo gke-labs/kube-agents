@@ -4109,6 +4109,63 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
 _parse_github_time = github_writes.parse_github_time
 
 
+# Mirrors audit_report's `LISTED_LINE_RE`: a finding listed without detail is
+# one bullet, severity, title, location, then the object and the id in two
+# code spans: ``- **major** — <title> — `c` / `ns` — `Deployment/x` (`<id>`)``.
+_LISTED_FINDING_LINE_RE = re.compile(
+    r"^- \*\*[a-z]+\*\* — .* — `[^`\n]*`(?: / `[^`\n]*`| / _cluster-scoped_)"
+    r" — `[^`\n]*` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$"
+)
+# The renderer's location line under a finding's heading.
+_WHERE_LINE_PREFIX = "- **Where:**"
+# The separator between a finding's id and its object segments, as
+# ``audit_report.py`` composes the id: ``<check>.<cluster>.<namespace>.<object>``.
+_FINDING_ID_SEPARATOR = "."
+
+
+def _held_ids(body: str) -> set[str]:
+    """Ids the ledger carries without this run having filed them: the
+    collector-held ones and the previous findings the run did not re-check."""
+    return {
+        fid
+        for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
+        for match in pattern.findall(body)
+        for fid in _json_str_list(match)
+    }
+
+
+def _finding_lines(body: str) -> list[tuple[str, str]]:
+    """Each finding the ledger renders, as ``(id, text)``, the text being the
+    lines the renderer writes and the agent does not: the heading
+    (``#### <title> <!-- finding:<id> -->``) and the ``Where:`` line under it,
+    or, for a finding listed without detail, the one line that names it.
+
+    A finding runs to the next finding heading or listed row; nothing in
+    between (the impact, the evidence excerpt, the recommendation, a ``#``
+    comment or a ``---`` inside a fence, the next finding's anchor) is read,
+    so the text graded under ``scope: finding`` is never the agent's.
+    """
+    found: list[tuple[str, str]] = []
+    current: list[str] | None = None
+    for line in body.splitlines():
+        heading = _HEADING_ID_RE.match(line)
+        listed = _LISTED_FINDING_LINE_RE.match(line)
+        if heading or listed:
+            if current is not None:
+                found.append((current[0], "\n".join(current[1:])))
+                current = None
+            if heading:
+                current = [heading.group(1), line]
+            else:
+                found.append((listed.group(1), line))
+            continue
+        if current is not None and line.startswith(_WHERE_LINE_PREFIX):
+            current.append(line)
+    if current is not None:
+        found.append((current[0], "\n".join(current[1:])))
+    return found
+
+
 def _finding_ids(body: str) -> tuple[list[str], str] | None:
     """This run's finding ids and the block they came from, or None when the ledger carries no block.
 
@@ -4221,6 +4278,18 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     ledger that enumerated the fleet and found nothing. Against the ids it
     passes only when a finding was actually FILED against that cluster.
 
+    ``finding`` — one rendered finding at a time, those of the check (or
+    checks) ``finding_check`` names (the first segment of the id), the ids the
+    ledger only carries (collector-held, not re-checked) left out. The phrases
+    must all sit inside ONE such finding, on the lines the renderer writes:
+    its heading and its ``Where:`` line, or, for a finding listed without
+    detail, the one line that names it; never the impact, evidence or
+    recommendation text. Use it to bind a CHECK to an OBJECT: a ``body`` phrase for the
+    object matches every finding on that object, an id phrase for the check
+    matches that check on every object, and nothing in the pair requires one
+    finding to carry both. The id itself cannot carry the pair, since its
+    object segment is clipped per host.
+
     A FALSE CLEAN IS NAMED AS ONE. A clean run closes the ledger and only puts
     a banner above its body, keeping the footer, so a ledger the audit retired during this run still
     carries the previous run's stamp and would read, above, as "a previous
@@ -4258,7 +4327,12 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     required_phrases: list[str] = Field(default_factory=list)
     forbidden_phrases: list[str] = Field(default_factory=list)
     any_of_phrases: list[str] = Field(default_factory=list)
-    scope: Literal["body", "finding_ids"] = "body"
+    scope: Literal["body", "finding_ids", "finding"] = "body"
+    # The check whose findings ``scope: finding`` reads: the first segment of
+    # the finding id, ``no-memory-limit`` in
+    # ``no-memory-limit.<cluster>.<namespace>.<object>``. A list names the
+    # checks a case accepts for one defect (the SOP's slug and its synonyms).
+    finding_check: str | list[str] | None = None
     # Every id the ledger files must be readable in its body, outside the two
     # hidden id blocks: a finding cut for space and named only in
     # `audit-findings-all` is filed but invisible to the person reading it.
@@ -4271,6 +4345,20 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     # same stream -- the six audit scenarios use six DIFFERENT streams, so
     # even back-to-back tasks in one presubmit never share a ledger.
     max_clock_skew_sec: float = Field(default=120.0, ge=0)
+
+    def _finding_checks(self) -> list[str]:
+        raw = self.finding_check
+        names = [raw] if isinstance(raw, str) else list(raw or [])
+        return [n.strip() for n in names if n and n.strip()]
+
+    @model_validator(mode="after")
+    def _finding_scope_names_its_check(self) -> "LedgerIssueContainsVerifier":
+        checks = self._finding_checks()
+        if self.scope == "finding" and not checks:
+            raise ValueError("scope: finding needs finding_check, the check whose findings are read")
+        if self.scope != "finding" and self.finding_check is not None:
+            raise ValueError("finding_check is read only under scope: finding")
+        return self
 
     def _closed_by_the_reset(
         self,
@@ -4555,6 +4643,35 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             # the rendered subset, and the reason should say so rather than
             # read as a finding the agent never filed.
             surface = f"the {len(ids)} finding id(s) in {ledger['slug']}'s {source} block"
+        elif self.scope == "finding":
+            checks = self._finding_checks()
+            check = ", ".join(checks)
+            prefixes = tuple(f"{c}{_FINDING_ID_SEPARATOR}".lower() for c in checks)
+            held = _held_ids(ledger["body"])
+            candidates = [
+                lines.lower()
+                for fid, lines in _finding_lines(ledger["body"])
+                if fid.lower().startswith(prefixes) and fid not in held
+            ]
+
+            def _block_misses(block: str) -> int:
+                return (
+                    sum(1 for p in self.required_phrases if p.lower() not in block)
+                    + sum(1 for p in self.forbidden_phrases if p.lower() in block)
+                    + (1 if self.any_of_phrases and not any(p.lower() in block for p in self.any_of_phrases) else 0)
+                )
+
+            if candidates:
+                # The finding that comes closest is the one graded, so a fail
+                # names what the nearest finding of the check lacked.
+                text = min(candidates, key=_block_misses)
+                surface = (
+                    f"the {len(candidates)} finding(s) of check {check!r} in {ledger['slug']}, "
+                    "read one finding at a time"
+                )
+            else:
+                text = ""
+                surface = f"no finding of check {check!r} in {ledger['slug']}"
         else:
             text = ledger["body"].lower()
             surface = f"the body of {ledger['slug']}"
@@ -4580,12 +4697,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             # are previous findings this run did not check. Both are rendered
             # in what the findings leave; this check grades the findings the
             # run filed.
-            held = {
-                fid
-                for pattern in (_HELD_IDS_RE, _NOT_RECHECKED_IDS_RE)
-                for match in pattern.findall(body)
-                for fid in _json_str_list(match)
-            }
+            held = _held_ids(body)
             unnamed = [fid for fid in filed[0] if fid not in named and fid not in held]
             # Past its cap the complete-id block is left out and `filed` is the
             # delta block, which lacks the omitted ids; the renderer's omission
@@ -4602,6 +4714,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             "issue": ledger["slug"],
             "generated_at": generated_at.isoformat(),
             "scope": self.scope,
+            "finding_check": self.finding_check,
         }
         if missing or present or any_of_miss or unnamed or omitted_unlisted:
             parts = []

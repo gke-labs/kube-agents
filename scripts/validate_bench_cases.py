@@ -664,6 +664,12 @@ COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
 #: The property checks whose `value` the upstream verifier compares raw, so
 #: a quoted boolean never equals the API's boolean.
 RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
+# `ledger_issue_contains` under `scope: finding` reads the findings of the
+# check(s) `finding_check` names; the verifier's model refuses one without the
+# other, which in the lane is after the cluster lease.
+LEDGER_CHECK_TYPE = "ledger_issue_contains"
+LEDGER_FINDING_SCOPE = "finding"
+LEDGER_FINDING_CHECK_FIELD = "finding_check"
 EQUALITY_OPS = frozenset({"eq", "ne"})
 QUOTED_BOOLEANS = frozenset({"true", "false"})
 #: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
@@ -1105,6 +1111,20 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"
         )
+
+    if node_type == LEDGER_CHECK_TYPE:
+        scoped = node.get("scope") == LEDGER_FINDING_SCOPE
+        named = _populated(node.get(LEDGER_FINDING_CHECK_FIELD))
+        if scoped and not named:
+            problems.append(
+                f"{where}: check '{node_type}' under scope '{LEDGER_FINDING_SCOPE}' "
+                f"names no '{LEDGER_FINDING_CHECK_FIELD}', the check whose findings it reads"
+            )
+        elif named and not scoped:
+            problems.append(
+                f"{where}: check '{node_type}' sets '{LEDGER_FINDING_CHECK_FIELD}', "
+                f"which is read only under scope '{LEDGER_FINDING_SCOPE}'"
+            )
 
     # A quoted boolean against a boolean field never compares equal: the
     # verifier compares the value raw and the API holds a bool, so the check

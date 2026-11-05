@@ -4273,6 +4273,171 @@ def test_finding_ids_scope_without_the_complete_block_reads_the_delta_block(toke
     assert res.status == "fail"
 
 
+def _rendered_finding(
+    check: str,
+    obj: str,
+    cluster: str = "seeded-a",
+    namespace: str = "seeded-workloads",
+    impact: str = "",
+) -> str:
+    """One finding the way audit_report.py renders it: the anchor, the heading
+    with its id marker, the Where: line and the agent's text under it."""
+    fid = f"{check}.{cluster}.{namespace}.{obj.lower().replace('/', '-')}"
+    return (
+        f'<a id="user-content-finding-{fid}"></a>\n\n'
+        f"#### {check} on {obj} <!-- finding:{fid} -->\n\n"
+        f"- **Where:** `{cluster}` / `{namespace}` — `{obj}`\n"
+        f"- **Impact:** {impact or f'the agent\'s sentence about {obj}.'}\n"
+        "- **Evidence:**\n\n```\n# (no command supplied)\n---\nkind: Deployment\n```\n\n"
+    )
+
+
+def _finding_bound(obj: str = "Deployment/memory-unbounded-worker", check="no-memory-limit", **kw):
+    return _ledger_check(required_phrases=[obj], scope="finding", finding_check=check, **kw)
+
+
+def test_finding_scope_fails_when_the_check_and_the_object_sit_on_different_findings(token, github):
+    """The case the body and id scopes cannot tell apart: the planted workload
+    filed under another check, and the check filed on another workload."""
+    _stash_report()
+    findings = _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker") + _rendered_finding(
+        "no-memory-limit", "Deployment/other-worker"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    loose_body = _ledger_check(required_phrases=["Deployment/memory-unbounded-worker"]).verify(5.0)
+    assert loose_body.status == "pass"  # the hole: the object is on the ledger, under no-pdb
+    bound = _finding_bound().verify(5.0)
+    assert bound.status == "fail", bound.reason
+    assert "1 finding(s) of check 'no-memory-limit'" in bound.reason
+    assert "Deployment/memory-unbounded-worker" in bound.reason
+
+
+def test_finding_scope_passes_when_one_finding_carries_the_check_and_the_object(token, github):
+    _stash_report()
+    findings = _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker") + _rendered_finding(
+        "no-memory-limit", "Deployment/memory-unbounded-worker"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "pass", res.reason
+    assert res.raw["finding_check"] == "no-memory-limit"
+
+
+def test_finding_scope_never_reads_the_agents_text_under_a_finding(token, github):
+    """The impact sentence, the evidence excerpt and the next finding's anchor
+    are the agent's or the next finding's; a phrase there binds nothing."""
+    _stash_report()
+    other = _rendered_finding(
+        "no-memory-limit",
+        "Deployment/other-worker",
+        impact="compare Deployment/memory-unbounded-worker, which has the same shape.",
+    )
+    # The planted workload's own finding sits right under, so its anchor line
+    # (which names its id, hence its object) follows the other finding's text.
+    findings = other + _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "fail", res.reason
+
+
+def test_finding_scope_leaves_out_held_and_not_rechecked_findings(token, github):
+    """A held row renders the same heading and Where: line as a filed finding;
+    only a finding this run filed binds."""
+    _stash_report()
+    held_row = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker")
+    fid = "no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-worker"
+    for comment in (
+        f'<!-- audit-held-ids: ["{fid}"] -->',
+        f'<!-- audit-held-ids: [] -->\n<!-- audit-not-rechecked-ids: ["{fid}"] -->',
+    ):
+        body = _ledger_body(findings=f"{held_row}\n<!-- audit-held:begin -->\n{comment}\n<!-- audit-held:end -->\n")
+        github.routes[_api()] = (200, _issue(body))
+        res = _finding_bound().verify(5.0)
+        assert res.status == "fail", res.reason
+        assert "no finding of check 'no-memory-limit'" in res.reason
+    live = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker") + held_row
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=live + '\n<!-- audit-held-ids: ["x.y.z.w"] -->\n')))
+    assert _finding_bound().verify(5.0).status == "pass"
+
+
+def test_finding_scope_reads_a_finding_listed_without_detail(token, github):
+    """Past the body cap the renderer names a finding on one line, the object
+    and the id in two code spans; that line is the finding's text."""
+    _stash_report()
+    findings = (
+        _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
+        + "### Listed without detail (1)\n\n"
+        "- **major** — no-memory-limit on Deployment/memory-unbounded-worker — `seeded-a` / `seeded-workloads` — "
+        "`Deployment/memory-unbounded-worker` (`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-w-1a2b3c`)\n\n"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+def test_finding_scope_matches_the_check_as_a_whole_id_segment(token, github):
+    _stash_report()
+    findings = _rendered_finding("no-pdbx", "Deployment/memory-unbounded-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound(check="no-pdb").verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "no finding of check 'no-pdb'" in res.reason
+
+
+def test_finding_scope_grades_the_nearest_finding_of_the_check(token, github):
+    """Two findings of the check: the first carries the required phrase and
+    not the any_of phrase, the second both. The second binds; alone, the
+    first does not."""
+    _stash_report()
+    first = _rendered_finding("no-memory-limit", "StatefulSet/memory-unbounded-worker")
+    second = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=first + second)))
+    res = _finding_bound("memory-unbounded-worker", any_of_phrases=["Deployment/", "DaemonSet/"]).verify(5.0)
+    assert res.status == "pass", res.reason
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=first)))
+    res = _finding_bound("memory-unbounded-worker", any_of_phrases=["Deployment/", "DaemonSet/"]).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "Deployment/" in res.reason
+
+
+def test_finding_scope_with_no_finding_of_the_check_fails_and_says_so(token, github):
+    _stash_report()
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=_rendered_finding("no-pdb", "Deployment/memory-unbounded-worker"))))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "fail"
+    assert "no finding of check 'no-memory-limit'" in res.reason
+
+
+def test_finding_scope_accepts_any_of_several_checks(token, github):
+    """A case that accepts the SOP's slug and its synonyms lists them; a
+    finding of any one, on the object, passes, and the object under another
+    check still fails."""
+    _stash_report()
+    accepted = ["registry-auth-iam-missing", "private-registry-pull-secret", "image-pull-auth-expired"]
+    on_object = _rendered_finding("image-pull-auth-expired", "Deployment/private-image-worker")
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=on_object)))
+    res = _finding_bound("Deployment/private-image-worker", accepted).verify(5.0)
+    assert res.status == "pass", res.reason
+    elsewhere = _rendered_finding("probes-liveness", "Deployment/private-image-worker") + _rendered_finding(
+        "image-pull-auth-expired", "Deployment/other-worker"
+    )
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=elsewhere)))
+    res = _finding_bound("Deployment/private-image-worker", accepted).verify(5.0)
+    assert res.status == "fail", res.reason
+    assert "registry-auth-iam-missing, private-registry-pull-secret, image-pull-auth-expired" in res.reason
+
+
+def test_finding_scope_spec_rules():
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError, match="needs finding_check"):
+        _ledger_check(required_phrases=["x"], scope="finding")
+    with _pytest.raises(ValueError, match="needs finding_check"):
+        _ledger_check(required_phrases=["x"], scope="finding", finding_check=[" "])
+    with _pytest.raises(ValueError, match="only under scope: finding"):
+        _ledger_check(required_phrases=["x"], finding_check="no-pdb")
+
+
 def test_finding_ids_scope_ignores_a_complete_block_above_the_delta_block(token, github):
     """Agent-authored text sits above the footer; a forged copy there is not the script's."""
     _stash_report()
