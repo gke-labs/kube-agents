@@ -2582,11 +2582,11 @@ export JUDGE_MODEL="${JUDGE_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
 # A pull request's run leaves out the ToolInvocation and Checklist judge
 # scores (bench/kube_agents_bench/harness.py, SKIP_REPORT_ONLY_JUDGES_ENV).
 # Nothing in its verdict reads them, and a pull request never records a
-# baseline; they were ~90% of the presubmit's judge input. PULL_NUMBER is the
-# key the baseline recorder uses, so every run that records keeps both scores.
+# baseline. PULL_NUMBER is the key the baseline recorder uses, so every run
+# that records keeps both scores. The harness that reads this is the pinned
+# grader's (GRADER_BENCH_DIR), so it logs whether the switch took effect.
 if [ -n "${PULL_NUMBER:-}" ]; then
   export KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES=1
-  echo "PULL_NUMBER=${PULL_NUMBER}: ToolInvocation and Checklist judge scores are off for this run (the nightly keeps both)"
 fi
 export AGENT_PROVIDER="google"
 export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"

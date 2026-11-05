@@ -209,7 +209,7 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # ToolInvocation "for reporting only", and ChecklistScore only feeds
 # OutcomeScore when a record has no VerificationCorrectness. A pull request
 # never records a baseline, so the nightly, which keeps both, is where their
-# trend lives. Between them they were ~90% of the presubmit's judge input.
+# trend lives.
 SKIP_REPORT_ONLY_JUDGES_ENV = "KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES"
 
 # The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
