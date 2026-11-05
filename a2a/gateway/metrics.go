@@ -97,7 +97,8 @@ const (
 	platformConsole    = "console"
 	// The answer label's values: what the rated message answered with, the
 	// chain's own reply or a card's report that settled the ask (TaskRef.CardsAnswer).
-	// A rating whose session record could not be read is counted as other.
+	// A rating no session record names the rated task for (unreadable, reaped,
+	// or the root aged out of its history) is counted as other.
 	answerReply = "reply"
 	answerCard  = "card"
 	// The window label's values: peopleWindowShort and peopleWindowLong.
@@ -278,7 +279,7 @@ func NewMetrics() *Metrics {
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
 			Name:      answerFeedbackName,
-			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, the session record could not be read); a rating changed is counted again.",
+			Help:      "Ratings verified chat users gave the gateway's answers, by platform (googlechat, slack, discord, console, other), rating (up, down, other) and answer (reply, the chain's own; card, a card's report that settled the ask; other, no session record names the rated task); a rating changed is counted again.",
 		}, []string{labelPlatform, labelRating, labelAnswer}),
 		sessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,

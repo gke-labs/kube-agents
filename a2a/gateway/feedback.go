@@ -370,7 +370,7 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 	// and the context id joins the rating to the stream's copy of the
 	// conversation; both best effort, since a reaped session has neither.
 	// The same root says what answered the ask, for the metric's answer
-	// label.
+	// label; without one it is other.
 	contextID, ask, answer := "", "", metricsLabelOther
 	if session, err := g.reg.Get(ctx, r.Conversation); err != nil {
 		g.log.Warn("answer feedback: the session record could not be read; the rating is kept without its ask", "conversation", r.Conversation, "err", err)
