@@ -38,6 +38,7 @@ import http.client
 import json
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -99,6 +100,11 @@ DEFAULT_DATA_MAX_BYTES = 0
 # segment is checked for its age.
 DATA_BUDGET_INTERVAL_SECONDS = 30.0
 SEGMENT_ROLL_CHECK_SECONDS = 1.0
+# How long a TERM'd proxy spends logging what is queued before it closes the
+# open segment and exits. The chart gives the pod 90 s of grace of which the
+# preStop hook spends 75 (templates/litellm.yaml), so this has to fit in the
+# remaining 15 with room for the interpreter to exit.
+SHUTDOWN_CLOSE_SECONDS = 10.0
 
 # Request headers not forwarded: hop-by-hop ones, and Accept-Encoding so the
 # upstream answers uncompressed and the usage block can be read.
@@ -442,6 +448,10 @@ class ShadowProxy:
             except OSError as exc:  # stdout still carries every line
                 self.segments_error = type(exc).__name__
         self._stopping = threading.Event()
+        # Set, under the log lock, once the open segment is closed for good:
+        # a line logged after that goes to stdout only, so a worker still busy
+        # past close()'s deadline cannot open a segment nobody will close.
+        self._segments_closed = False
         self._roller: Optional[threading.Thread] = None
         if self.segments is not None:
             self._roller = threading.Thread(target=self._roll, name="replay-shadow-segments", daemon=True)
@@ -466,18 +476,32 @@ class ShadowProxy:
         """Wait until every queued analysis has been logged (tests, shutdown)."""
         self._queue.join()
 
-    def close(self) -> None:
-        """Log what is queued, stop the worker, and close the open segment."""
-        self._queue.put(_STOP)
-        self._worker.join()
+    def close(self, timeout: Optional[float] = None) -> None:
+        """Log what is queued, stop the worker, and close the open segment.
+
+        With `timeout`, gives the queued analyses at most that long; what is
+        still queued then is not logged, and the segment is closed anyway.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+
+        def left() -> Optional[float]:
+            return None if deadline is None else max(0.0, deadline - time.monotonic())
+
+        try:
+            self._queue.put(_STOP, timeout=left())
+        except queue.Full:
+            pass
+        self._worker.join(left())
         self._stopping.set()
         if self._roller is not None:
-            self._roller.join()
-        if self.segments is not None:
-            try:
-                self.segments.close()
-            except OSError:
-                self.metrics.add("log_file_errors")
+            self._roller.join(left())
+        with self._log_lock:
+            self._segments_closed = True
+            if self.segments is not None:
+                try:
+                    self.segments.close()
+                except OSError:
+                    self.metrics.add("log_file_errors")
         if self.budget is not None:
             self.budget.close()
 
@@ -514,7 +538,7 @@ class ShadowProxy:
         with self._log_lock:
             self.out.write(line + "\n")
             self.out.flush()
-            if self.segments is not None:
+            if self.segments is not None and not self._segments_closed:
                 # The segment is a copy for the collector; failing to write it
                 # never costs the stdout line or the worker.
                 try:
@@ -832,11 +856,35 @@ def make_server(config: Config, host: str = DEFAULT_BIND_HOST, out=None) -> Thre
 
 
 def main() -> None:
+    """Serve until TERM or INT, then log what is queued and close the open segment.
+
+    The handlers go in before anything else, so a TERM at any point after the
+    first line ends in the same orderly close: a segment left `.open` when the
+    pod goes is lost with its emptyDir.
+    """
+    state: Dict[str, Any] = {"server": None, "stopping": False}
+
+    def on_signal(_signum: int, _frame: Any) -> None:
+        state["stopping"] = True
+        server = state["server"]
+        if server is not None:
+            # shutdown() waits for serve_forever to return, which runs on this
+            # thread, so it is called from another one.
+            threading.Thread(target=server.shutdown, name="replay-shadow-shutdown", daemon=True).start()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
     config = Config.from_env(dict(os.environ))
     server = make_server(config)
+    state["server"] = server
     proxy = server.proxy  # type: ignore[attr-defined]
-    proxy.log(proxy.startup_line())
-    server.serve_forever()
+    try:
+        proxy.log(proxy.startup_line())
+        if not state["stopping"]:
+            server.serve_forever()
+    finally:
+        server.server_close()
+        proxy.close(SHUTDOWN_CLOSE_SECONDS)
 
 
 if __name__ == "__main__":

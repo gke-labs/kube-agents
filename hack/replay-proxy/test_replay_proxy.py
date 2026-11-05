@@ -5,8 +5,11 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -824,6 +827,95 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(config.job_kind, "nightly")
         self.assertGreaterEqual(replay_proxy.Config.from_env({}).upstream_timeout_seconds, 600)
 
+
+
+class ShutdownTest(unittest.TestCase):
+    """replay_proxy.py as the pod runs it: TERM closes the open segment before exit."""
+
+    PROCESS_WAIT_SECONDS = 30
+
+    def setUp(self):
+        FakeLiteLLM.calls = []
+        FakeLiteLLM.mode = "normal"
+        FakeLiteLLM.custom_body = None
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeLiteLLM)
+        threading.Thread(target=self.upstream.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
+        self.addCleanup(self.upstream.server_close)
+        self.addCleanup(self.upstream.shutdown)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.logs = os.path.join(self.tmp, "logs")
+        with socket.socket() as probe:  # a free port for the proxy
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
+        env = dict(os.environ, REPLAY_LISTEN_PORT=str(self.port), REPLAY_UPSTREAM_HOST="127.0.0.1",
+                   REPLAY_UPSTREAM_PORT=str(self.upstream.server_address[1]),
+                   REPLAY_STORE_DIR=os.path.join(self.tmp, "store"), REPLAY_LOG_DIR=self.logs,
+                   REPLAY_REDACTOR_PATH=REDACTOR, REPLAY_TRANSCRIPT_RULES_PATH=RULES,
+                   REPLAY_JOB_KIND="nightly")
+        self.proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(__file__), "replay_proxy.py")],
+                                     env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self._reap)
+
+    def _reap(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.communicate()
+
+    def _read_line(self, event):
+        deadline = time.monotonic() + self.PROCESS_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            line = self.proc.stdout.readline()
+            if not line:
+                self.fail(f"the proxy exited: {self.proc.stderr.read()}")
+            if json.loads(line).get("event") == event:
+                return json.loads(line)
+        self.fail(f"no {event} line")
+
+    def test_term_closes_the_open_segment_with_the_request_line_in_it(self):
+        self._read_line("replay_shadow_start")
+        deadline = time.monotonic() + self.PROCESS_WAIT_SECONDS
+        while True:
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=LOG_WAIT_SECONDS)
+                conn.request("POST", "/v1/chat/completions", body=json.dumps(chat("t_11111111", stream=False)),
+                             headers={"Content-Type": "application/json"})
+                self.assertEqual(conn.getresponse().status, 200)
+                conn.close()
+                break
+            except ConnectionRefusedError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(POLL_SECONDS)
+        request = self._read_line("replay_shadow_request")
+        # Still open: the segment age is 60 s.
+        self.assertTrue(any(n.endswith(".jsonl.open") for n in os.listdir(self.logs)), os.listdir(self.logs))
+        started = time.monotonic()
+        self.proc.send_signal(signal.SIGTERM)
+        self.proc.wait(timeout=self.PROCESS_WAIT_SECONDS)
+        self.assertLess(time.monotonic() - started, replay_proxy.SHUTDOWN_CLOSE_SECONDS + 5)
+        self.assertEqual(self.proc.returncode, 0)
+        names = os.listdir(self.logs)
+        self.assertTrue(names)
+        self.assertFalse([n for n in names if n.endswith(".open")], names)
+        with open(os.path.join(self.logs, sorted(names)[-1]), encoding="utf-8") as handle:
+            ids = [json.loads(l).get("request_id") for l in handle if l.strip()]
+        self.assertIn(request["request_id"], ids)
+
+    def test_close_with_a_deadline_returns_while_the_worker_is_busy(self):
+        self._reap()
+        proxy = replay_proxy.ShadowProxy(replay_proxy.Config(store_dir=os.path.join(self.tmp, "s2"),
+                                                             log_dir=os.path.join(self.tmp, "l2")),
+                                         out=io.StringIO())
+        release = threading.Event()
+        with unittest.mock.patch.object(proxy, "analyze", side_effect=lambda *a, **k: release.wait(30) or {}):
+            proxy.submit({"messages": []}, time.time(), {"status": 200}, 0)
+            started = time.monotonic()
+            proxy.close(timeout=0.5)
+            self.assertLess(time.monotonic() - started, 3)
+            proxy.log({"event": "late"})  # after close: stdout only, no new segment
+            release.set()
+        self.assertFalse([n for n in os.listdir(os.path.join(self.tmp, "l2")) if n.endswith(".open")])
 
 if __name__ == "__main__":
     unittest.main()
