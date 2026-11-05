@@ -65,6 +65,14 @@ type ProfileWorkerConfig struct {
 	// task's lifetime (CREDENTIAL_PROXY_TASK_TOKEN_FILE, a tmpfs emptyDir),
 	// for the kubectl and gcloud shims to send to the broker. Empty skips it.
 	TaskTokenFile string
+	// ResetPaths are the writable directories the harness can reach that
+	// outlive a task on a warm pod (its working directory, $HOME, /tmp, the
+	// config root, the token directory). Their contents are removed after
+	// every task, before the outcome is reported, so one task's files never
+	// reach the next. The operator names them (lib.EnvProfileResetPaths);
+	// the worker never guesses, so it can't empty a directory it wasn't
+	// given.
+	ResetPaths []string
 	// readyListener, when set, is a listener already bound to ReadyAddr,
 	// which serveReadiness uses instead of binding one. Tests set it, so no
 	// other process can take the port between choosing it and listening.
@@ -80,6 +88,10 @@ type ProfileWorkerConfig struct {
 // deadline has to leave room for the harness to be stopped and its terminal
 // and final renewal sent before the dispatcher's own deadline.
 const defaultDeadlineMargin = 5 * time.Second
+
+// declineUnreset is the reason a worker gives for every offer once a reset
+// between tasks has failed: what the last task left may still be there.
+const declineUnreset = "unreset: a reset between tasks failed, so this pod takes no more tasks"
 
 // declineBusy is the reason a worker gives for an offer while it holds a
 // task. The dispatcher tracks busy pods itself, so this is the race where
@@ -149,6 +161,9 @@ type profileWorker struct {
 	b     *busConns
 	msgs  chan *nats.Msg
 	ready atomic.Bool
+	// unreset is set for good when a reset between tasks fails: the pod
+	// stops being Ready and declines every offer after.
+	unreset atomic.Bool
 	// persona is the persona as rendered for the harness, or nil.
 	persona *persona.Output
 }
@@ -339,6 +354,10 @@ func (w *profileWorker) loop(ctx context.Context) error {
 			case lib.DispatchOffer:
 				if cur != nil {
 					w.answer(m.TaskID, false, declineBusy)
+					continue
+				}
+				if w.unreset.Load() {
+					w.answer(m.TaskID, false, declineUnreset)
 					continue
 				}
 				origin, why := w.admitOffer(m)
@@ -544,9 +563,53 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 		removeConfig()
 		removeToken()
 		closeTaskBus()
+		w.resetWorkspace(h.offer.TaskID)
 		h.done <- out
 	}()
 	return h.done
+}
+
+// resetWorkspace empties each of the reset paths after a task: everything
+// inside goes, the directory itself stays (it's a mount). A path that can't
+// be emptied marks the worker unreset, which fails closed: not Ready, and
+// every later offer declined.
+func (w *profileWorker) resetWorkspace(task string) {
+	if len(w.pw.ResetPaths) == 0 {
+		return
+	}
+	var errs []error
+	for _, dir := range w.pw.ResetPaths {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		for _, e := range entries {
+			if err := removeAllWritable(filepath.Join(dir, e.Name())); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		w.unreset.Store(true)
+		w.cfg.Logger.Error("workspace reset failed; this pod takes no more tasks", "task", task, "paths", len(w.pw.ResetPaths), "err", err)
+		return
+	}
+	w.cfg.Logger.Info("workspace reset", "task", task, "paths", len(w.pw.ResetPaths), "ok", true)
+}
+
+// removeAllWritable removes path and everything under it, first making
+// directories writable again: the persona's rendered files are locked
+// read-only (lockRendered), and a directory without its write bit can't
+// have its entries removed.
+func removeAllWritable(path string) error {
+	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			_ = os.Chmod(p, 0o700)
+		}
+		return nil
+	})
+	return os.RemoveAll(path)
 }
 
 // writeTaskToken writes the proxy token where the shims read it, for the
@@ -628,7 +691,7 @@ func (w *profileWorker) serveReadiness(addr string, ln net.Listener) (func(), er
 	mux.HandleFunc("/readyz", func(rw http.ResponseWriter, _ *http.Request) {
 		// Listening, and still connected: a pod that lost the bus can't
 		// hear an offer, so it stops being Ready until it reconnects.
-		if !w.ready.Load() || !w.b.nc.IsConnected() {
+		if !w.ready.Load() || w.unreset.Load() || !w.b.nc.IsConnected() {
 			http.Error(rw, "not listening", http.StatusServiceUnavailable)
 			return
 		}

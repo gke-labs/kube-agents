@@ -197,6 +197,7 @@ func run() int {
 			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
+			ResetPaths:    resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)
@@ -226,13 +227,19 @@ func run() int {
 	}
 }
 
-// configFromEnv is the whole environment contract in one place, split out of
-// run so a test can reach it: run's next move is to chdir and dial, so every
-// assertion about what the environment maps to had to be made against a
-// Config the test built itself, which is an assertion about the test. The
-// capability switch is the one that matters — see CapabilityOptional below.
-// The bool is false when the required trio is missing or A2A_AUTHORITY_SCOPE
-// is malformed, which run reports as exit 1.
+// resetPaths splits lib.EnvProfileResetPaths, dropping empty entries and any
+// that isn't absolute: a relative path would empty whatever directory the
+// worker happened to start in.
+func resetPaths(v string) []string {
+	var out []string
+	for _, p := range strings.Split(v, ":") {
+		if p != "" && filepath.IsAbs(p) && filepath.Clean(p) != "/" {
+			out = append(out, filepath.Clean(p))
+		}
+	}
+	return out
+}
+
 // profileModeConfig is cfg for a profile worker. The persona supplies the
 // tool flags, so the base argv carries none, and the delegate tool is not
 // among them, so no delegate socket is bound for a harness that would never
@@ -244,6 +251,13 @@ func profileModeConfig(cfg workeradapter.Config) workeradapter.Config {
 	return cfg
 }
 
+// configFromEnv is the whole environment contract in one place, split out of
+// run so a test can reach it: run's next move is to chdir and dial, so every
+// assertion about what the environment maps to had to be made against a
+// Config the test built itself, which is an assertion about the test. The
+// capability switch is the one that matters — see CapabilityOptional below.
+// The bool is false when the required trio is missing or A2A_AUTHORITY_SCOPE
+// is malformed, which run reports as exit 1.
 func configFromEnv(log *slog.Logger) (workeradapter.Config, bool) {
 	taskID := os.Getenv("TASK_ID")
 	profile := os.Getenv("PROFILE")

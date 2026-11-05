@@ -139,3 +139,9 @@ const (
 	EnvProfileConfigRoot = "A2A_PROFILE_CONFIG_ROOT"
 	ProfileConfigRoot    = "/var/run/kube-agents/harness-config"
 )
+
+// EnvProfileResetPaths lists, colon-separated, the writable directories a
+// profile worker empties after every task, so one task's files never reach
+// the next on a warm pod. The operator renders it from the pod's writable
+// mounts; the worker empties only what it names.
+const EnvProfileResetPaths = "A2A_PROFILE_RESET_PATHS"
