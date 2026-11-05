@@ -8,6 +8,51 @@ locals {
   # enclosing region — the same derivation as derive_kms_location in
   # scripts/installer/installer_common.sh.
   kms_location = replace(var.location, "/-[a-z]$/", "")
+
+  # The shape each sizing profile gives the Standard cluster's two node pools
+  # when the caller sets no explicit value. "small" is the rendering the
+  # module produced before profiles existed, so the default changes nothing;
+  # "medium" resolves like "small" until a later change gives it a shape of
+  # its own; "fleet" is the fleet-tier footprint. Every profile keeps GKE's
+  # own default disk type, pd-balanced.
+  sizing_profiles = {
+    small = {
+      standard_machine_type = "e2-standard-4"
+      standard_disk_size_gb = 100
+      gvisor_machine_type   = "e2-standard-4"
+      gvisor_disk_size_gb   = 100
+    }
+    medium = {
+      standard_machine_type = "e2-standard-4"
+      standard_disk_size_gb = 100
+      gvisor_machine_type   = "e2-standard-4"
+      gvisor_disk_size_gb   = 100
+    }
+    fleet = {
+      standard_machine_type = "n2-standard-8"
+      standard_disk_size_gb = 200
+      gvisor_machine_type   = "n2-standard-4"
+      gvisor_disk_size_gb   = 150
+    }
+  }
+  profile_disk_type = "pd-balanced"
+  # The profile the pools resolve under. "" means the default, as on the
+  # string inputs below: a blanked TF_VAR_sizing_profile= line in install.env
+  # exports "", and coalesce folds "" as it folds null. The variable's own
+  # default is the same literal, which Terraform cannot read from a local.
+  default_sizing_profile = "small"
+  sizing_profile_name    = coalesce(var.sizing_profile, local.default_sizing_profile)
+  sizing_profile         = local.sizing_profiles[local.sizing_profile_name]
+
+  # An explicit value always wins over the profile: the variables default to
+  # null so that a value written into a tfvars file, even one equal to the
+  # small shape, is never silently overridden by sizing_profile = "fleet".
+  standard_machine_type = coalesce(var.standard_machine_type, local.sizing_profile.standard_machine_type)
+  standard_disk_size_gb = coalesce(var.standard_disk_size_gb, local.sizing_profile.standard_disk_size_gb)
+  standard_disk_type    = coalesce(var.standard_disk_type, local.profile_disk_type)
+  gvisor_machine_type   = coalesce(var.gvisor_machine_type, local.sizing_profile.gvisor_machine_type)
+  gvisor_disk_size_gb   = coalesce(var.gvisor_disk_size_gb, local.sizing_profile.gvisor_disk_size_gb)
+  gvisor_disk_type      = coalesce(var.gvisor_disk_type, local.profile_disk_type)
 }
 
 # The module predates cluster_mode; the Autopilot cluster used to be the only
@@ -155,13 +200,15 @@ resource "google_container_cluster" "autopilot" {
   ]
 }
 
-# A GKE Standard cluster: e2-standard-4 default node pool (one node per
-# zone), Workload Identity, CMEK database encryption, the Filestore CSI and
-# BackupRestore addons, and Dataplane V2 with FQDN NetworkPolicy. The one
-# piece with no first-class field below is the managed OpenTelemetry
-# collection scope (gcloud's --managed-otel-scope), which neither google
-# provider knows (checked against 7.45): it stays a post-create
-# `gcloud container clusters update` step for callers that want it.
+# A GKE Standard cluster: a default node pool sized by sizing_profile and the
+# standard_* variables (e2-standard-4 with a 100 GB pd-balanced boot disk, one
+# node per zone, at the defaults), Workload Identity, CMEK database
+# encryption, the Filestore CSI and BackupRestore addons, and Dataplane V2
+# with FQDN NetworkPolicy. The one piece with no first-class field below is
+# the managed OpenTelemetry collection scope (gcloud's --managed-otel-scope),
+# which neither google provider knows (checked against 7.45): it stays a
+# post-create `gcloud container clusters update` step for callers that want
+# it.
 resource "google_container_cluster" "standard" {
   #checkov:skip=CKV_GCP_12:Dataplane V2 (ADVANCED_DATAPATH) enforces NetworkPolicy without the addon
   #checkov:skip=CKV_GCP_13:Client certificate authentication is disabled by default on current GKE
@@ -189,7 +236,15 @@ resource "google_container_cluster" "standard" {
   initial_node_count = var.standard_node_count
 
   node_config {
-    machine_type = var.standard_machine_type
+    machine_type = local.standard_machine_type
+    # machine_type and both disk fields update the default pool in place
+    # (a rolling node recreation) on the providers this module admits. At the
+    # defaults they render the values GKE has created pools with since 1.24
+    # (100 GB, pd-balanced), which such a cluster's state already holds, so
+    # adding them plans nothing there; a pool created when GKE still
+    # defaulted to pd-standard plans an in-place disk-type change instead.
+    disk_size_gb = local.standard_disk_size_gb
+    disk_type    = local.standard_disk_type
     # gcloud's default "gke-default" scope set.
     oauth_scopes = [
       "https://www.googleapis.com/auth/devstorage.read_only",
@@ -320,11 +375,25 @@ resource "google_container_node_pool" "gvisor" {
   location = var.location
   project  = var.project_id
 
-  # Per zone: a regional location yields one node per zone.
-  initial_node_count = 1
+  # Per zone: a regional location yields this many nodes per zone. The pool
+  # starts at the autoscaling floor and the autoscaler takes it from there.
+  # initial_node_count forces replacement, so it is read once at creation
+  # and ignored after (lifecycle below): a later change to the floor is an
+  # autoscaling update in place, not a destroy and create of the only
+  # sandbox pool.
+  initial_node_count = var.gvisor_min_node_count
+
+  # Per-zone bounds, as GKE counts them on a regional pool. min == max keeps
+  # the pool at a fixed size.
+  autoscaling {
+    min_node_count = var.gvisor_min_node_count
+    max_node_count = var.gvisor_max_node_count
+  }
 
   node_config {
-    machine_type = "e2-standard-4"
+    machine_type = local.gvisor_machine_type
+    disk_size_gb = local.gvisor_disk_size_gb
+    disk_type    = local.gvisor_disk_type
     image_type   = "COS_CONTAINERD"
     sandbox_config {
       type = "GVISOR"
@@ -335,6 +404,13 @@ resource "google_container_node_pool" "gvisor" {
   }
 
   lifecycle {
+    ignore_changes = [initial_node_count]
+
+    precondition {
+      condition     = var.gvisor_min_node_count <= var.gvisor_max_node_count
+      error_message = "gvisor_min_node_count (${var.gvisor_min_node_count}) must not exceed gvisor_max_node_count (${var.gvisor_max_node_count})."
+    }
+
     precondition {
       # The second clause covers create_cluster = false, where cluster_mode
       # only describes what would have been created: the pre-existing cluster

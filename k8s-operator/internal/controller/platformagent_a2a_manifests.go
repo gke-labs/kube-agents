@@ -4035,9 +4035,7 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the MCP
 	// door and the dispatcher follow the operator's flags.
 	n += int64(credentialProxyExecTierReplicas(agent))
-	if a2aMCPDoorEnabled() {
-		n += int64(ptr.Deref(buildA2AMCPDeployment(agent).Spec.Replicas, 1))
-	}
+	n += a2aMCPStandingPods(agent)
 	if a2aDispatcherEnabled() {
 		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
 	}

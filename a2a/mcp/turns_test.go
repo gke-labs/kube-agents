@@ -792,6 +792,18 @@ func TestASlotWithNothingToReapGoesBackAtOnce(t *testing.T) {
 	}
 }
 
+// shortWaitRead is the whole wait the short-wait test gives WaitForTask on
+// a running task. The wait opens the task's consumer first, two JetStream
+// calls that took past the test's former 50 ms under the race detector on a
+// loaded runner, so the read failed before any fetch. The floor itself is
+// checked on a watch that is already open, with no time left, up to
+// floorFetchAttempts times: one floor's fetch on a loaded runner can end
+// before the server delivers, and without the floor no attempt reads at all.
+const (
+	shortWaitRead      = 2 * time.Second
+	floorFetchAttempts = 20
+)
+
 // A wait with less left than one fetch's floor still returns what it read,
 // not an error: the read's end is a deadline like any other.
 func TestAShortWaitKeepsWhatItRead(t *testing.T) {
@@ -799,9 +811,35 @@ func TestAShortWaitKeepsWhatItRead(t *testing.T) {
 	publishSubmission(t, js, fakeAddressee, "task-short", "console:x", "q", "")
 	publishStatus(t, js, fakeAddressee, "task-short", lib.StateWorking, false)
 	b := dial(t, url)
-	got, err := b.WaitForTask(context.Background(), TaskRef{Addressee: fakeAddressee, TaskID: "task-short"}, 50*time.Millisecond)
+	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-short"}
+
+	// The floor: with no time left at all, what is pending still arrives.
+	w, err := b.watchTask(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spent, cancel := context.WithDeadline(context.Background(), time.Now())
+	defer cancel()
+	<-spent.Done()
+	for i := 0; i < floorFetchAttempts && len(w.events) == 0; i++ {
+		if err := w.next(spent); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a fetch with no time left: %v", err)
+		}
+	}
+	folded, err := w.fold()
+	w.close()
+	if err != nil || len(w.events) == 0 {
+		t.Fatalf("%d fetches with no time left read %d events, fold err %v; want the pending ones",
+			floorFetchAttempts, len(w.events), err)
+	}
+	if folded.Final {
+		t.Error("the running task folded as final")
+	}
+
+	// The end of the wait: the running task as read, not an error.
+	got, err := b.WaitForTask(context.Background(), ref, shortWaitRead)
 	if err != nil || got == nil {
-		t.Fatalf("a 50ms wait on a running task: task %v, err %v", got, err)
+		t.Fatalf("a %s wait on a running task: task %v, err %v", shortWaitRead, got, err)
 	}
 	if got.Final {
 		t.Error("the running task folded as final")

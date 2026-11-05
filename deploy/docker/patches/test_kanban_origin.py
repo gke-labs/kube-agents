@@ -1,0 +1,918 @@
+"""Unit tests for a kanban card's origin stamp (kanban_origin.py, apply_kanban_origin.py).
+
+The runtime is exercised through the applier: a synthetic ``hermes_cli``
+package shaped like upstream's insert path (``create_task`` and
+``_insert_decomposed_child`` calling ``inherit_creator_origin`` inside the
+insert's transaction, the CLI's ``_cmd_create`` dispatched through
+``_HANDLERS``) is patched by ``apply_kanban_origin.apply`` and imported, so the
+trailers' rebinding is what the tests drive. ``verify_kanban_origin.py`` runs
+the same checks against the real Hermes tree at build time.
+
+Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_kanban_origin.py'
+"""
+
+from __future__ import annotations
+
+import ast
+import contextlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import textwrap
+import unittest
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+import apply_kanban_origin as applier
+import kanban_origin
+
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parents[2]
+SCRIPTS = REPO / "agents" / "platform" / "scripts"
+SESSION_KV_SERVER = SCRIPTS / "session_kv_server.py"
+DOCKERFILE = HERE.parent / "Dockerfile"
+
+CHAT_SESSION = "20261103_101500_ab12cd34"
+
+# ---------------------------------------------------------------------------
+# A synthetic hermes_cli, shaped like upstream's insert path
+# ---------------------------------------------------------------------------
+
+DB_SOURCE = textwrap.dedent('''
+    import contextlib
+    import sqlite3
+    import time
+    import uuid
+
+    SCHEMA = (
+        "CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, title TEXT, assignee TEXT,"
+        " status TEXT, created_by TEXT, created_at INTEGER, session_id TEXT, idempotency_key TEXT)"
+    )
+
+
+    def connect(path):
+        conn = sqlite3.connect(path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute(SCHEMA)
+        return conn
+
+
+    @contextlib.contextmanager
+    def write_txn(conn, allow_nested=False):
+        if conn.in_transaction:
+            yield
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+
+
+    def create_task(conn, *, title, assignee=None, created_by=None, idempotency_key=None,
+                    creator_task_id=None, session_id=None, triage=False):
+        from hermes_cli.kanban_db_graph import inherit_creator_origin
+
+        if idempotency_key:
+            row = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if row:
+                return row["id"]
+        now = int(time.time())
+        task_id = "t_" + uuid.uuid4().hex[:8]
+        with write_txn(conn, allow_nested=True):
+            conn.execute(
+                "INSERT INTO tasks (id, title, assignee, status, created_by, created_at,"
+                " session_id, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (task_id, title, assignee, "triage" if triage else "ready", created_by, now,
+                 session_id, idempotency_key),
+            )
+            inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
+        return task_id
+
+
+    def get_task(conn, task_id):
+        return dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+''')
+
+GRAPH_SOURCE = textwrap.dedent('''
+    import time
+
+
+    def inherit_creator_origin(conn, task_id, creator_task_id, *, created_at):
+        """Copy durable origin inside creation's transaction, never adding dependencies."""
+        if not creator_task_id:
+            return
+        conn.execute(
+            "UPDATE tasks SET session_id = COALESCE(session_id, "
+            "(SELECT session_id FROM tasks WHERE id = ?)) WHERE id = ?",
+            (creator_task_id, task_id),
+        )
+
+
+    def decompose_triage_task(conn, task_id, *, children, author=None):
+        from hermes_cli.kanban_db import write_txn
+
+        now = int(time.time())
+        with write_txn(conn):
+            return [
+                _insert_decomposed_child(conn, task_id, child, author, now) for child in children
+            ]
+
+
+    def _insert_decomposed_child(conn, root_id, child, author, now):
+        new_id = root_id + "-" + child["title"]
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at, created_by) VALUES (?, ?, 'todo', ?, ?)",
+            (new_id, child["title"], now, author or "decomposer"),
+        )
+        inherit_creator_origin(conn, new_id, root_id, created_at=now)
+        return new_id
+''')
+
+CLI_SOURCE = textwrap.dedent('''
+    import argparse
+    import contextlib
+    import io
+    import json
+    import os
+    import shlex
+
+    from hermes_cli import kanban_db as kb
+
+    BOARD_ENV = "KANBAN_TEST_BOARD"
+
+
+    def build_parser():
+        parser = argparse.ArgumentParser(prog="/kanban", exit_on_error=False)
+        sub = parser.add_subparsers(dest="action")
+        create = sub.add_parser("create", exit_on_error=False)
+        create.add_argument("title")
+        create.add_argument("--body")
+        create.add_argument("--assignee")
+        create.add_argument("--idempotency-key")
+        create.add_argument("--created-by", default="user")
+        create.add_argument("--json", action="store_true")
+        swarm = sub.add_parser("swarm", exit_on_error=False)
+        swarm.add_argument("goal")
+        swarm.add_argument("--worker", action="append")
+        swarm.add_argument("--created-by", default=None)
+        return parser
+
+
+    def _cmd_create(args):
+        with contextlib.closing(kb.connect(os.environ[BOARD_ENV])) as conn:
+            task_id = kb.create_task(
+                conn, title=args.title, assignee=args.assignee, created_by=args.created_by,
+                idempotency_key=args.idempotency_key,
+                creator_task_id=os.environ.get("HERMES_KANBAN_TASK"),
+            )
+            task = kb.get_task(conn, task_id)
+        print(json.dumps(task) if args.json else f"Created {task_id}")
+        return 0
+
+
+    def _cmd_swarm(args):
+        with contextlib.closing(kb.connect(os.environ[BOARD_ENV])) as conn:
+            with kb.write_txn(conn):
+                ids = [
+                    kb.create_task(conn, title=f"{args.goal}: {worker}", assignee=worker,
+                                   created_by=args.created_by or "user")
+                    for worker in ["root", *(args.worker or []), "verifier", "synthesizer"]
+                ]
+        print(json.dumps({"id": ids[0], "ids": ids}))
+        return 0
+
+
+    _HANDLERS = {
+        "create": _cmd_create, "swarm": _cmd_swarm,
+    }
+
+
+    def kanban_command(args):
+        return _HANDLERS.get(args.action)(args)
+
+
+    def run_slash(rest):
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                args = build_parser().parse_args(shlex.split(rest))
+        except (SystemExit, argparse.ArgumentError) as exc:
+            return f"usage error: {exc} {err.getvalue()}"
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            kanban_command(args)
+        return (out.getvalue() + err.getvalue()).strip()
+''')
+
+PRISTINE = {
+    applier.DB_RELATIVE: DB_SOURCE,
+    applier.GRAPH_RELATIVE: GRAPH_SOURCE,
+    applier.CLI_RELATIVE: CLI_SOURCE,
+}
+
+
+def _write_tree(root: Path, bodies: dict | None = None) -> dict:
+    targets = {}
+    for relative, source in PRISTINE.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = (bodies or {}).get(relative)
+        target.write_text(source if body is None else body)
+        targets[relative] = target
+    (root / "hermes_cli" / "__init__.py").write_text("")
+    return targets
+
+
+def _purge_hermes_modules() -> None:
+    for name in [n for n in sys.modules if n == "hermes_cli" or n.startswith("hermes_cli.")]:
+        del sys.modules[name]
+
+
+class Hermes(unittest.TestCase):
+    """A patched synthetic Hermes, imported fresh for each test."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        _write_tree(self.root)
+        shutil.copy(HERE / "kanban_origin.py", self.root / "hermes_cli" / "kanban_origin.py")
+        applier.apply(self.root)
+        self.board = self.root / "kanban.db"
+        self.home = self.root / "home"
+        self.home.mkdir()
+        env = {
+            "KANBAN_TEST_BOARD": str(self.board),
+            "HERMES_HOME": str(self.home),
+        }
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("HERMES_KANBAN_TASK", "HERMES_SESSION_ID"):
+            os.environ.pop(name, None)
+        _purge_hermes_modules()
+        sys.path.insert(0, str(self.root))
+        self.addCleanup(_purge_hermes_modules)
+        self.addCleanup(sys.path.remove, str(self.root))
+        from hermes_cli import kanban, kanban_db, kanban_db_graph, kanban_origin as ko
+
+        self.kanban, self.kb, self.graph, self.ko = kanban, kanban_db, kanban_db_graph, ko
+        self.records: dict = {}
+        self.session = ""
+        # The Session KV server's ticket routes, in memory: a ticket redeems
+        # once; anything else is the server's 404.
+        self.tickets: dict = {}
+        self.minted: list = []
+        for name, fake in (
+            ("_session_id", lambda: self.session),
+            ("_fetch_session_origin", lambda sid: self.records.get(sid)),
+            ("_cron_origin", lambda: None),
+            ("_session_kv", self._ticket_server),
+        ):
+            patcher = mock.patch.object(ko, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    # -- helpers --------------------------------------------------------------
+
+    def _ticket_server(self, path, payload=None):
+        if path == kanban_origin.STAMP_TICKETS_PATH:
+            ticket = os.urandom(16).hex()
+            self.minted.append(ticket)
+            self.tickets[ticket] = {"origin": payload["origin"], "platform": payload.get("platform", "")}
+            return {"ticket": ticket}
+        match = re.fullmatch(r"/v1/board/stamp-tickets/([^/]+)/redeem", path)
+        if match and match.group(1) in self.tickets:
+            return self.tickets.pop(match.group(1))
+        raise LookupError("HTTP 404: no live stamp ticket by that value")
+
+    def conn(self):
+        return closing(self.kb.connect(str(self.board)))
+
+    def in_chat_turn(self, platform="slack"):
+        self.session = CHAT_SESSION
+        self.records[CHAT_SESSION] = {"origin": "chat", "platform": platform}
+
+    def create(self, **kwargs):
+        kwargs.setdefault("title", "a card")
+        kwargs.setdefault("assignee", "platform")
+        with self.conn() as conn:
+            return self.kb.create_task(conn, **kwargs)
+
+    def slash(self, rest):
+        out = self.kanban.run_slash(rest)
+        start, end = out.find("{"), out.rfind("}")
+        return json.loads(out[start : end + 1])["id"] if start != -1 else out
+
+    def origin(self, task_id):
+        with self.conn() as conn:
+            return self.ko.origin_of(conn, task_id)
+
+    def stamped(self, task_id):
+        with self.conn() as conn:
+            conn.execute(kanban_origin._TABLE_DDL)
+            return conn.execute(
+                "SELECT COUNT(*) FROM kanban_task_origins WHERE task_id = ?", (task_id,)
+            ).fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# The brief's seven
+# ---------------------------------------------------------------------------
+
+
+class StampAtInsertTest(Hermes):
+    def test_a_fresh_insert_is_stamped_with_the_turns_origin(self):
+        self.in_chat_turn("googlechat")
+        tool_card = self.create()
+        slash_card = self.slash("create --json --assignee platform from-chat")
+        self.assertEqual(self.origin(tool_card), ("chat", "googlechat"))
+        self.assertEqual(self.origin(slash_card), ("chat", "googlechat"))
+
+    def test_a_worker_child_inherits_the_workers_card(self):
+        self.records["k8s-evt-0a1b"] = {"origin": "event"}
+        self.session = "k8s-evt-0a1b"
+        worker_card = self.create(title="triage")
+        self.assertEqual(self.origin(worker_card), ("event", ""))
+        # The worker runs later, inside whatever turn context; its card wins.
+        self.in_chat_turn()
+        with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": worker_card}):
+            # kanban_create passes HERMES_KANBAN_TASK as creator_task_id ...
+            tool_child = self.create(creator_task_id=os.environ["HERMES_KANBAN_TASK"])
+            # ... and so does `hermes kanban create`.
+            cli_child = self.slash("create --json --assignee platform child")
+        self.assertEqual(self.origin(tool_child), ("event", ""))
+        self.assertEqual(self.origin(cli_child), ("event", ""))
+
+    def test_a_decomposed_child_inherits_its_parent(self):
+        self.records["20261103_api"] = {"origin": "api"}
+        self.session = "20261103_api"
+        root = self.create(title="root", triage=True)
+        self.in_chat_turn()
+        with self.conn() as conn:
+            children = self.graph.decompose_triage_task(
+                conn, root, children=[{"title": "a"}, {"title": "b"}]
+            )
+        for child in children:
+            self.assertEqual(self.origin(child), ("api", ""))
+
+    def test_a_dedupe_hit_keeps_the_first_stamp(self):
+        gate = _import_gate()
+        key = "issue-resolve-example-fleet-42-20261103T10"
+        self.in_chat_turn()
+        first = self.slash(f"create --json --assignee platform --idempotency-key {key} squat")
+        self.assertEqual(self.origin(first), ("chat", "slack"))
+        self.session = ""  # the gate's tick has no turn
+        got = gate.file_card(gate.Card(title="t", body="b", idempotency_key=key, origin="issue"))
+        self.assertEqual(got, first)
+        self.assertEqual(len(self.minted), 1, "the gate minted its ticket")
+        self.assertEqual(self.origin(first), ("chat", "slack"))
+
+    def test_no_create_argument_can_set_the_origin(self):
+        out = self.kanban.run_slash("create --json --origin issue --assignee platform x")
+        self.assertIn("usage error", out)
+        self.assertIn("--origin", out)
+        with self.conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            with self.assertRaises(TypeError):
+                self.kb.create_task(conn, title="x", origin="issue")
+        # `--created-by` is an argument too: it does not make a card the dashboard's.
+        card = self.slash("create --json --created-by dashboard --assignee platform y")
+        self.assertFalse(self.stamped(card))
+
+    def test_a_swarms_created_by_does_not_make_its_cards_the_dashboards(self):
+        out = self.kanban.run_slash("swarm --created-by dashboard --worker a --worker b goal")
+        ids = json.loads(out[out.find("{") :])["ids"]
+        self.assertEqual(len(ids), 5)
+        for task_id in ids:
+            self.assertFalse(self.stamped(task_id), task_id)
+
+    def test_a_swarm_under_one_transaction_pays_one_session_lookup(self):
+        self.in_chat_turn()
+        fetch = self.ko._fetch_session_origin
+        out = self.kanban.run_slash("swarm --worker a --worker b --worker c goal")
+        ids = json.loads(out[out.find("{") :])["ids"]
+        self.assertEqual(len(ids), 6)
+        self.assertEqual([self.origin(t) for t in ids], [("chat", "slack")] * 6)
+        self.assertEqual(fetch.call_count, 1, "one lookup for the whole swarm")
+
+    def test_the_gate_stamps_issue_and_scheduled(self):
+        gate = _import_gate()
+        now = datetime(2026, 11, 3, 10, tzinfo=timezone.utc)
+        issue = gate._issue_card({"repository": "example/fleet", "issue_number": 42, "title_plain": "Fix"}, now=now)
+        pr = SimpleNamespace(number=7, head_ref="kage/fix")
+        trigger = SimpleNamespace(
+            trigger=SimpleNamespace(ref="c-1", kind="review", summary="please rename"),
+            comment=SimpleNamespace(author="ada"),
+            pr=pr,
+        )
+        follow_up = gate._pr_card(pr, [trigger], "example/fleet", now=now)
+        self.assertEqual((issue.origin, follow_up.origin), ("issue", "scheduled"))
+        issue_id = gate.file_card(issue)
+        pr_id = gate.file_card(follow_up)
+        self.assertEqual(self.origin(issue_id), ("issue", ""))
+        self.assertEqual(self.origin(pr_id), ("scheduled", ""))
+        self.assertEqual(len(self.minted), 2, "one ticket per create")
+        self.assertEqual(self.tickets, {}, "each ticket was spent by its insert")
+
+    def test_the_console_convention_resolves_portal_and_web_console_ids(self):
+        ko = self.ko
+        for session, want in (
+            ("web-console-0123456789abcdef0123456789abcdef", ("console", "")),
+            ("portal_eval_0a1b2c", ("console", "")),
+            ("20261103_101500_ab12cd34", ("other", "")),
+            ("", ("other", "")),
+        ):
+            with self.subTest(session=session):
+                self.session = session
+                self.assertEqual(ko.turn_origin(), want)
+        self.session = "web-console-abc"
+        self.records["web-console-abc"] = {"origin": "api"}
+        self.assertEqual(ko.turn_origin(), ("api", ""), "a record beats the convention")
+        self.session = "portal_x"
+        self.assertEqual(self.origin(self.create()), ("console", ""))
+
+
+
+# ---------------------------------------------------------------------------
+# The trusted writers' stamp ticket
+# ---------------------------------------------------------------------------
+
+
+class TicketTest(Hermes):
+    def test_an_unknown_ticket_is_the_turns_origin(self):
+        self.in_chat_turn()
+        for planted in ("issue", "0" * 32, "drift:"):
+            with self.subTest(planted=planted):
+                token = self.ko._writer_ticket.set(planted)
+                try:
+                    self.assertEqual(self.origin(self.slash("create --json --assignee platform x")), ("chat", "slack"))
+                finally:
+                    self.ko._writer_ticket.reset(token)
+
+    def test_a_minted_ticket_stamps_once(self):
+        self.in_chat_turn()
+        with self.ko.writer_ticket("drift"):
+            first = self.slash("create --json --assignee platform first")
+            second = self.slash("create --json --assignee platform second")
+        self.assertEqual(self.origin(first), ("drift", ""))
+        self.assertEqual(self.origin(second), ("chat", "slack"), "a spent ticket is the turn's origin")
+
+    def test_writer_ticket_never_touches_the_process_environment(self):
+        with self.ko.writer_ticket("issue") as ticket:
+            self.assertIsNotNone(ticket)
+            card = self.slash("create --json --assignee platform gate")
+        self.assertIsNone(self.ko._writer_ticket.get(), "reset after the call")
+        self.assertEqual(self.origin(card), ("issue", ""))
+
+    def test_overlapping_in_process_creates_each_get_their_own_ticket(self):
+        import contextvars
+        import threading
+
+        both_minted = threading.Barrier(2)
+        cards: dict = {}
+        errors: list = []
+
+        def writer(origin):
+            try:
+                with self.ko.writer_ticket(origin):
+                    both_minted.wait(timeout=5)  # both tickets live before either create
+                    # create_task, not run_slash: run_slash captures output by
+                    # swapping the process-wide sys.stdout, which two threads share.
+                    cards[origin] = self.create(title=f"{origin}-card")
+            except Exception as exc:  # surfaced below
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=contextvars.copy_context().run, args=(writer, origin))
+            for origin in ("issue", "chat")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(self.origin(cards["issue"]), ("issue", ""))
+        self.assertEqual(self.origin(cards["chat"]), ("chat", ""))
+        self.assertEqual(self.tickets, {}, "each create spent its own ticket")
+
+    def test_a_ticket_that_cannot_be_minted_leaves_the_create_to_its_context(self):
+        with mock.patch.object(self.ko, "_session_kv", side_effect=OSError("refused")):
+            with self.ko.writer_ticket("issue") as ticket:
+                self.assertIsNone(ticket)
+                card = self.slash("create --json --assignee platform x")
+        self.assertFalse(self.stamped(card))
+
+
+# ---------------------------------------------------------------------------
+# The rest of the contract
+# ---------------------------------------------------------------------------
+
+
+class ContractTest(Hermes):
+    def test_an_unresolved_create_writes_no_stamp_so_a_writer_can(self):
+        card = self.create()
+        self.assertFalse(self.stamped(card))
+        self.assertEqual(self.origin(card), ("other", ""))
+        with self.conn() as conn:
+            self.assertTrue(self.ko.stamp(conn, card, "drift"))
+            self.assertFalse(self.ko.stamp(conn, card, "issue"), "the first stamp wins")
+        self.assertEqual(self.origin(card), ("drift", ""))
+
+    def test_the_dashboard_route_files_console(self):
+        self.assertEqual(self.origin(self.create(created_by="dashboard")), ("console", ""))
+
+    def test_a_tick_started_run_stamps_its_context_when_hermes_has_it(self):
+        with mock.patch.object(self.ko, "_cron_origin", return_value=("audit", "")):
+            self.assertEqual(self.origin(self.create()), ("audit", ""))
+
+    def test_the_session_lookup_runs_before_the_insert_transaction(self):
+        seen = []
+
+        def lookup(sid):
+            with self.conn() as probe:
+                seen.append(probe.in_transaction)
+                probe.execute("BEGIN IMMEDIATE")  # would fail under the insert's write lock
+                probe.execute("ROLLBACK")
+            return {"origin": "chat", "platform": "slack"}
+
+        self.session = CHAT_SESSION
+        with mock.patch.object(self.ko, "_fetch_session_origin", side_effect=lookup):
+            self.assertEqual(self.origin(self.create()), ("chat", "slack"))
+        self.assertEqual(seen, [False])
+
+    def test_a_failing_stamp_never_fails_the_create(self):
+        self.in_chat_turn()
+        with mock.patch.object(self.ko, "stamp", side_effect=sqlite3.OperationalError("locked")):
+            card = self.create()
+        with self.conn() as conn:
+            self.assertEqual(self.kb.get_task(conn, card)["title"], "a card")
+        with mock.patch.object(self.ko, "_session_id", side_effect=RuntimeError("no context")):
+            self.assertFalse(self.stamped(self.create()))
+
+    def test_a_rolled_back_insert_leaves_no_stamp(self):
+        self.in_chat_turn()
+        with self.conn() as conn:
+            with self.assertRaises(RuntimeError):
+                with self.kb.write_txn(conn):
+                    tid = self.kb.create_task(conn, title="nested", assignee="platform")
+                    raise RuntimeError("the outer graph builder fails")
+            self.assertEqual(self.ko.origin_of(conn, tid), ("other", ""))
+            self.assertIsNone(conn.execute("SELECT 1 FROM tasks WHERE id = ?", (tid,)).fetchone())
+
+    def test_origin_of_reads_a_board_that_predates_the_table(self):
+        with self.conn() as conn:
+            self.assertEqual(self.ko.origin_of(conn, "t_old"), ("other", ""))
+
+    def test_a_stamp_outside_the_vocabulary_is_refused(self):
+        with self.conn() as conn, self.assertRaises(ValueError):
+            self.ko.stamp(conn, "t_x", "eval")
+
+
+class WorkerCardTest(unittest.TestCase):
+    """A dispatcher worker's turn resolves as its card's stamp, read from the board every call."""
+
+    def setUp(self):
+        kanban_origin._ORIGIN_CACHE.clear()
+        self.addCleanup(kanban_origin._ORIGIN_CACHE.clear)
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        self.board = root / "kanban.db"
+        with closing(sqlite3.connect(self.board)) as conn:
+            kanban_origin.stamp(conn, "t_slack", "chat", "slack")
+            kanban_origin.stamp(conn, "t_drift", "drift", "")
+            conn.commit()
+        board_path = self.board
+        connect = SimpleNamespace()
+
+        @contextlib.contextmanager
+        def connect_closing(db_path=None, *, board=None):
+            with closing(sqlite3.connect(board_path)) as conn:
+                yield conn
+
+        connect.connect_closing = connect_closing
+        package = SimpleNamespace(kanban_db_connect=connect)
+        for patcher in (
+            mock.patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db_connect": connect}),
+            mock.patch.object(kanban_origin, "_session_id", return_value=CHAT_SESSION),
+            mock.patch.object(kanban_origin, "_cron_origin", return_value=("scheduled", "")),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.fetch = mock.patch.object(kanban_origin, "_fetch_session_origin", return_value={"origin": "api"}).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def worker(self, task_id):
+        return mock.patch.dict(os.environ, {kanban_origin.WORKER_TASK_ENV: task_id})
+
+    def test_the_card_comes_first_and_an_unstamped_card_falls_through(self):
+        with self.worker("t_slack"):
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", "slack"), "the card beats the run and the record")
+        with self.worker("t_unstamped"):
+            self.assertEqual(kanban_origin.turn_origin(), ("scheduled", ""), "an unstamped card is the turn's own")
+        with self.worker(""):
+            self.assertEqual(kanban_origin.turn_origin(), ("scheduled", ""), "not a worker")
+
+    def test_two_cards_in_one_process_each_read_their_own_stamp(self):
+        kanban_origin._cron_origin.return_value = None
+        with self.worker("t_slack"):
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", "slack"))
+        with self.worker("t_drift"):
+            self.assertEqual(kanban_origin.turn_origin(), ("drift", ""))
+        with self.worker("t_slack"):
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", "slack"))
+        with self.worker("t_unstamped"):
+            self.assertEqual(kanban_origin.turn_origin(), ("api", ""), "the session record, below the card")
+        self.assertEqual(self.fetch.call_count, 1, "the card step never fills or reads the session cache")
+
+    def test_an_unreadable_board_falls_through_and_is_logged(self):
+        sys.modules["hermes_cli.kanban_db_connect"].connect_closing = mock.Mock(side_effect=sqlite3.OperationalError("locked"))
+        with self.worker("t_slack"), self.assertLogs(kanban_origin.logger, "WARNING") as logs:
+            self.assertEqual(kanban_origin.turn_origin(), ("scheduled", ""))
+        self.assertIn("the worker's card", "\n".join(logs.output))
+
+
+class SessionRecordTest(unittest.TestCase):
+    """The HTTP read, with the real ``_fetch_session_origin``."""
+
+    def setUp(self):
+        kanban_origin._ORIGIN_CACHE.clear()
+        self.addCleanup(kanban_origin._ORIGIN_CACHE.clear)
+
+    def test_the_session_record_is_reused_within_the_ttl_and_read_again_after(self):
+        clock = [100.0]
+        with mock.patch.object(kanban_origin, "_cron_origin", return_value=None), \
+                mock.patch.object(kanban_origin, "_session_id", return_value="s-cached"), \
+                mock.patch.object(kanban_origin.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(kanban_origin, "_fetch_session_origin", return_value={"origin": "chat"}) as fetch:
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", ""))
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", ""))
+            self.assertEqual(fetch.call_count, 1)
+            clock[0] += kanban_origin.ORIGIN_CACHE_TTL_SECONDS + 1
+            fetch.return_value = None  # a miss is reused too
+            self.assertEqual(kanban_origin.turn_origin(), ("other", ""))
+            self.assertEqual(kanban_origin.turn_origin(), ("other", ""))
+            self.assertEqual(fetch.call_count, 2)
+
+    @staticmethod
+    def _ticket(value):
+        """``value`` as :func:`writer_ticket`'s ContextVar for the block."""
+        import contextlib
+
+        @contextlib.contextmanager
+        def held():
+            token = kanban_origin._writer_ticket.set(value)
+            try:
+                yield
+            finally:
+                kanban_origin._writer_ticket.reset(token)
+
+        return held()
+
+    def _answer(self, status=200, body=b"{}"):
+        import io
+        import urllib.error
+
+        if status != 200:
+            return mock.patch.object(
+                kanban_origin.urllib.request, "urlopen",
+                side_effect=urllib.error.HTTPError("u", status, "x", {}, io.BytesIO(b"")),
+            )
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = body
+        return mock.patch.object(kanban_origin.urllib.request, "urlopen", return_value=response)
+
+    def test_the_record_is_read_with_the_pods_key(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), self._answer(
+            body=b'{"origin": "chat", "platform": "slack"}'
+        ) as urlopen:
+            self.assertEqual(kanban_origin._record_origin("s/1"), ("chat", "slack"))
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:8699/v1/sessions/s%2F1/origin")
+        self.assertEqual(request.get_header("Authorization"), "Bearer k")
+
+    def test_a_timed_out_session_lookup_still_reaches_the_console_convention(self):
+        import socket
+        import urllib.error
+
+        session = "web-console-0123456789abcdef0123456789abcdef"
+        for failure in (socket.timeout("timed out"), urllib.error.URLError("refused")):
+            with self.subTest(failure=failure), mock.patch.object(
+                kanban_origin, "_session_id", return_value=session
+            ), mock.patch.object(kanban_origin, "_cron_origin", return_value=None), mock.patch.object(
+                kanban_origin.urllib.request, "urlopen", side_effect=failure
+            ):
+                self.assertIsNone(kanban_origin._fetch_session_origin(session))
+                self.assertEqual(kanban_origin.turn_origin(), ("console", ""))
+
+    def test_a_failing_cron_scope_does_not_skip_the_session_lookup(self):
+        scope = SimpleNamespace(current_cron_origin=mock.Mock(side_effect=RuntimeError("broken")))
+        with mock.patch.object(kanban_origin, "_first_module", return_value=scope), mock.patch.object(
+            kanban_origin, "_session_id", return_value="s"
+        ), mock.patch.object(kanban_origin, "_fetch_session_origin", return_value={"origin": "chat"}):
+            self.assertIsNone(kanban_origin._cron_origin())
+            self.assertEqual(kanban_origin.turn_origin(), ("chat", ""))
+        with mock.patch.object(kanban_origin, "_cron_origin", side_effect=RuntimeError("worse")), mock.patch.object(
+            kanban_origin, "_session_id", return_value="portal_x"
+        ), mock.patch.object(kanban_origin, "_fetch_session_origin", return_value=None):
+            self.assertEqual(kanban_origin.turn_origin(), ("console", ""))
+
+    def test_no_record_and_an_other_record_are_unresolved(self):
+        with self._answer(status=404):
+            self.assertIsNone(kanban_origin._record_origin("s"))
+        with self._answer(body=b'{"origin": "other"}'):
+            self.assertIsNone(kanban_origin._record_origin("s"))
+        with self._answer(body=b'{"chat_id": "c"}'):
+            self.assertIsNone(kanban_origin._record_origin("s"))
+
+    def test_the_reader_asks_the_origin_route_which_follows_compression(self):
+        # A loopback server shaped like the Session KV server: the origin route
+        # answers a compression child with its parent's record (the server's
+        # `_session_origin` walk); the child's own metadata row has none.
+        import http.server
+        import threading
+
+        answers = {"/v1/sessions/child-1/origin": {"origin": "event", "platform": ""}}
+        metadata = {"/v1/sessions/child-1/metadata": {"chat_id": "c"}}
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - the stdlib's name
+                seen.append((self.path, self.headers.get("Authorization")))
+                body = answers.get(self.path) or metadata.get(self.path)
+                if body is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                payload = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.addCleanup(server.server_close)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        with mock.patch.object(kanban_origin, "SESSION_KV_URL", url), \
+                mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}):
+            self.assertEqual(kanban_origin._record_origin("child-1"), ("event", ""))
+            self.assertIsNone(kanban_origin._record_origin("nobody"), "a 404 is no record")
+        self.assertEqual(
+            seen,
+            [("/v1/sessions/child-1/origin", "Bearer k"), ("/v1/sessions/nobody/origin", "Bearer k")],
+        )
+
+    def test_a_stale_process_env_session_is_no_turn(self):
+        # Hermes writes HERMES_SESSION_ID process-wide for every root agent;
+        # outside a bound turn it names the last turn, so it is never read.
+        with mock.patch.dict(os.environ, {"HERMES_SESSION_ID": "20261103_090000_lastturn"}), \
+                mock.patch.object(kanban_origin, "_cron_origin", return_value=None), \
+                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+            self.assertEqual(kanban_origin._session_id(), "")
+            self.assertEqual(kanban_origin.turn_origin(), ("other", ""))
+        urlopen.assert_not_called()
+
+    def test_an_absent_cron_scope_is_no_run(self):
+        with mock.patch.object(kanban_origin, "_first_module", return_value=None):
+            self.assertIsNone(kanban_origin._cron_origin())
+
+    def test_a_ticket_is_redeemed_over_loopback_with_the_pods_key(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), self._ticket("ab"), \
+                self._answer(body=b'{"origin": "issue", "platform": ""}') as urlopen:
+            self.assertEqual(kanban_origin.ticket_origin(), ("issue", ""))
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://127.0.0.1:8699/v1/board/stamp-tickets/ab/redeem")
+        self.assertEqual(request.get_method(), "POST")
+        self.assertEqual(request.get_header("Authorization"), "Bearer k")
+
+    def test_an_unredeemable_ticket_is_no_ticket(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), self._ticket("ab"):
+            with self._answer(status=404):
+                self.assertIsNone(kanban_origin.ticket_origin())
+            with mock.patch.object(kanban_origin.urllib.request, "urlopen", side_effect=OSError("down")):
+                self.assertIsNone(kanban_origin.ticket_origin())
+            with self._answer(body=b'{"origin": "other"}'):
+                self.assertIsNone(kanban_origin.ticket_origin())
+        with mock.patch.dict(os.environ), self._ticket("ab"), \
+                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+            os.environ.pop(kanban_origin.SESSION_KV_KEY_ENV, None)
+            self.assertIsNone(kanban_origin.ticket_origin(), "no key, no redemption")
+        urlopen.assert_not_called()
+
+    def test_a_ticket_in_the_process_environment_is_not_read(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k", "KUBE_AGENTS_CARD_STAMP_TICKET": "ab"}), \
+                mock.patch.object(kanban_origin.urllib.request, "urlopen") as urlopen:
+            self.assertIsNone(kanban_origin.ticket_origin())
+        urlopen.assert_not_called()
+
+    def test_minting_never_raises(self):
+        with mock.patch.dict(os.environ, {kanban_origin.SESSION_KV_KEY_ENV: "k"}), \
+                mock.patch.object(kanban_origin.urllib.request, "urlopen", side_effect=OSError("refused")):
+            self.assertIsNone(kanban_origin.mint_ticket("issue"))
+
+
+class PinTest(unittest.TestCase):
+    def test_the_vocabulary_and_schema_match_the_session_kv_server(self):
+        tree = ast.parse(SESSION_KV_SERVER.read_text())
+        values = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in tree.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in ("ORIGINS", "KANBAN_TASK_ORIGINS_SCHEMA")
+        }
+        self.assertEqual(values["ORIGINS"], kanban_origin.ORIGINS)
+        squash = lambda sql: re.sub(r"\s+", " ", sql).replace("( ", "(").replace(" )", ")").strip()
+        self.assertEqual(squash(values["KANBAN_TASK_ORIGINS_SCHEMA"]), squash(kanban_origin._TABLE_DDL))
+        source = SESSION_KV_SERVER.read_text()
+        self.assertIn(f'@app.post("{kanban_origin.STAMP_TICKETS_PATH}"', source)
+        self.assertIn(f'@app.post("{kanban_origin.STAMP_TICKET_REDEEM_PATH}"', source)
+
+    def test_the_dockerfile_installs_applies_and_verifies_the_patch(self):
+        text = DOCKERFILE.read_text()
+        self.assertIn("deploy/docker/patches/kanban_origin.py", text)
+        self.assertIn(
+            "install -m 0644 /tmp/latency-patches/kanban_origin.py /opt/hermes/hermes_cli/kanban_origin.py", text
+        )
+        self.assertIn("/tmp/latency-patches/apply_kanban_origin.py /opt/hermes", text)
+        self.assertIn("/tmp/latency-patches/verify_kanban_origin.py", text)
+        self.assertLess(
+            text.index("/tmp/latency-patches/apply_kanban_priority.py /opt/hermes"),
+            text.index("/tmp/latency-patches/apply_kanban_origin.py /opt/hermes"),
+        )
+
+
+class ApplierTest(unittest.TestCase):
+    def _tree(self, bodies=None):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        return root, _write_tree(root, bodies)
+
+    def test_the_fixtures_carry_the_insert_sites(self):
+        for relative, function, call in applier.INSERT_SITES:
+            self.assertEqual(PRISTINE[relative].count(call), 1, function)
+
+    def test_every_locator_is_load_bearing(self):
+        # Each rename keeps the fixture parsing, so the exit is the locator's, never the parser's.
+        db_call, graph_call = applier.INSERT_SITES[0][2], applier.INSERT_SITES[1][2]
+        for relative, anchor, renamed, names in (
+            (applier.DB_RELATIVE, db_call, db_call.replace("origin(", "origin_moved(", 1), "inside create_task()"),
+            (applier.GRAPH_RELATIVE, graph_call, graph_call.replace("origin(", "origin_moved(", 1),
+             "inside _insert_decomposed_child()"),
+            (applier.GRAPH_RELATIVE, "def inherit_creator_origin(", "def inherit_creator_origin_moved(",
+             "def inherit_creator_origin() for the creator-origin inheritance"),
+            (applier.CLI_RELATIVE, "def _cmd_create(", "def _cmd_create_moved(",
+             "def _cmd_create() for the CLI create command"),
+            (applier.CLI_RELATIVE, applier.HANDLERS_ENTRY, '"made": _cmd_create',
+             f"_HANDLERS no longer maps {applier.HANDLERS_ENTRY!r}"),
+            (applier.CLI_RELATIVE, "def _cmd_swarm(", "def _cmd_swarm_moved(",
+             "def _cmd_swarm() for the CLI swarm command"),
+            (applier.CLI_RELATIVE, applier.HANDLERS_SWARM_ENTRY, '"swarmed": _cmd_swarm',
+             f"_HANDLERS no longer maps {applier.HANDLERS_SWARM_ENTRY!r}"),
+        ):
+            with self.subTest(anchor=anchor):
+                broken = PRISTINE[relative].replace(anchor, renamed, 1)
+                self.assertNotEqual(broken, PRISTINE[relative], "the anchor is in the fixture")
+                compile(broken, relative, "exec")
+                root, targets = self._tree({relative: broken})
+                with self.assertRaises(SystemExit) as caught:
+                    applier.apply(root)
+                said = str(caught.exception)
+                self.assertIn(names, said)
+                self.assertNotIn("does not parse", said)
+                for rel, target in targets.items():
+                    self.assertEqual(target.read_text(), broken if rel == relative else PRISTINE[rel], "nothing written")
+
+    def test_a_second_run_is_refused(self):
+        root, _ = self._tree()
+        applier.apply(root)
+        with self.assertRaises(SystemExit):
+            applier.apply(root)
+
+
+def _import_gate():
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
+    import github_scan_gate
+
+    return github_scan_gate
+
+
+if __name__ == "__main__":
+    unittest.main()

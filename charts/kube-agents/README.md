@@ -1194,7 +1194,10 @@ its TTL removes it, with the rest of the release standing), and the
 sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less than the agent
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
-rather than re-implementing it, so it can over-count; it never fails the render on them. The mode is read from the values, so a mode set
+rather than re-implementing it, so it can over-count; it never fails the render on them.
+When `operator.extraEnv` sets `A2A_MCP_DOOR` to `true`, or in a form the chart cannot read (a
+`valueFrom`, a non-string value), the check also counts the MCP server's pod, at the console's
+size, since the operator sizes the two alike. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own

@@ -13,6 +13,15 @@ keeps running on a cluster this state did not create (#2246).
 Nothing else catches a regression here. `terraform validate`, plan and apply
 all treat a count-0 resource as an empty list and accept the fold, and
 `terraform test` has no destroy run. The HCL is pinned here instead.
+
+What is pinned is the shape across the sources: a conditional that selects the
+one source whose count is 1, so the count-0 sources are never evaluated. How a
+selected source's attribute is then read is the per-source read below, and the
+CA certificate's is `one(<source>.master_auth[*].cluster_ca_certificate)`: on a
+real cluster master_auth always has one element, so it reads as `[0]` does, and
+the splat lets a mocked provider, whose master_auth is empty, plan the module
+under `terraform test`. That `one()` is inside a branch and over an attribute of
+a resource that exists, not over the sources, so it is known during the destroy.
 """
 
 import pathlib
@@ -30,6 +39,14 @@ _SOURCES = {
     'resource "google_container_cluster" "standard"': 'var.create_cluster && var.cluster_mode == "standard"',
     'data "google_container_cluster" "existing"': "var.create_cluster ? 0 : 1",
 }
+
+# The three source references as the conditionals name them, in the order the
+# conditionals try them: the adopted cluster, then Autopilot, then Standard.
+_SOURCE_REFS = (
+    "data.google_container_cluster.existing[0]",
+    "google_container_cluster.autopilot[0]",
+    "google_container_cluster.standard[0]",
+)
 
 
 def _uncommented(text):
@@ -65,14 +82,15 @@ class GkeClusterDestroyWalkTest(unittest.TestCase):
             r'^output "cluster_ca_certificate" \{(.*?)^\}', outputs_tf, re.MULTILINE | re.DOTALL
         )
         assert ca_output is not None, "no cluster_ca_certificate output in outputs.tf"
+        # Each value with the read it makes of the one selected source.
         self.expressions = {
             "local.cluster_endpoint": (
                 _expression(self.main_tf, r"^\s*cluster_endpoint", "main.tf"),
-                "endpoint",
+                "{source}.endpoint",
             ),
             "output.cluster_ca_certificate": (
                 _expression(ca_output.group(1), r"^\s*value", "outputs.tf"),
-                "master_auth[0].cluster_ca_certificate",
+                "one({source}.master_auth[*].cluster_ca_certificate)",
             ),
         }
 
@@ -89,12 +107,17 @@ class GkeClusterDestroyWalkTest(unittest.TestCase):
                 )
 
     def test_the_provider_inputs_are_not_folded_over_the_count_zero_sources(self):
-        for name, (expression, _) in self.expressions.items():
+        for name, (expression, read) in self.expressions.items():
             with self.subTest(value=name):
+                # Each per-source read collapsed to its source reference, so any
+                # fold still in the text is one that spans the sources.
+                across_sources = expression
+                for source in _SOURCE_REFS:
+                    across_sources = across_sources.replace(read.format(source=source), source)
                 for fold in ("one(", "concat(", "try(", "coalesce("):
                     self.assertNotIn(
                         fold,
-                        expression,
+                        across_sources,
                         f"{name} must not fold over the cluster sources with {fold}...): one"
                         " of them always has count 0, which is unknown during terraform"
                         " destroy, and an unknown host makes the helm provider skip the"
@@ -102,14 +125,15 @@ class GkeClusterDestroyWalkTest(unittest.TestCase):
                     )
 
     def test_the_provider_inputs_select_the_source_that_exists(self):
-        for name, (expression, attr) in self.expressions.items():
+        for name, (expression, read) in self.expressions.items():
             with self.subTest(value=name):
                 flat = " ".join(expression.split()).removeprefix("( ").removesuffix(" )")
+                existing, autopilot, standard = (read.format(source=source) for source in _SOURCE_REFS)
                 self.assertEqual(
                     flat,
-                    f"!var.create_cluster ? data.google_container_cluster.existing[0].{attr} :"
-                    f' var.cluster_mode == "autopilot" ? google_container_cluster.autopilot[0].{attr} :'
-                    f" google_container_cluster.standard[0].{attr}",
+                    f"!var.create_cluster ? {existing} :"
+                    f' var.cluster_mode == "autopilot" ? {autopilot} :'
+                    f" {standard}",
                     f"{name} must pick the one cluster source that exists by the same"
                     " conditions as the sources' count expressions. Only the selected"
                     " branch is evaluated, so a count-0 source never makes it unknown during"

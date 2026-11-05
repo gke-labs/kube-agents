@@ -67,7 +67,10 @@ a card the front door's create returned that was created before the run started,
 clock read before the agent is invoked, is not this run's and stays, files included; this holds on
 both waits below. When the clock or the board cannot be read, such a card is taken like the run's
 own. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
-other than a follow-up linked to its creator. A card still running when the wait ran out is archived
+other than a follow-up linked to its creator. What a purge keeps, or all of it when the board step
+fails, is written down in the agent pod, and the next repetition retries it before its agent is
+invoked, each purge under its own start time, so a card an earlier purge owes goes even when a later
+run's create returned it; anything owed for over a day is given up. A card still running when the wait ran out is archived
 first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
 store reads, or the collecting turn, which is a model call the customer never made.

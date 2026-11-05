@@ -1579,6 +1579,13 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if want := 2 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin; pods.Value() != want {
 		t.Fatalf("tuned quota = %d, want %d", pods.Value(), want)
 	}
+
+	// The MCP server is one more standing pod, only while its flag is on (#3869).
+	without := pods.Value()
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
+		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
+	}
 }
 
 // The chart's standing pods come from the annotation the chart stamps on the
