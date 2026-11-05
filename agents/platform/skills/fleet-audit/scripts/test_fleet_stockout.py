@@ -1266,6 +1266,20 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         index = fs.pool_label_index(pools, [node("n1", "default-pool", self.STAMPED)])
         self.assertEqual(fs.pinned_pool(pod("a", {"seeded-role": "pinned-inference"}), pools, index), "pinned-inference-pool")
 
+    def test_a_pool_at_zero_nodes_is_found_by_the_pool_name_label_too(self):
+        """A stocked-out autoscaled pool sits at 0 nodes with no `config.labels`;
+        GKE's documented pin, the pool-name label, must still find it, with
+        the pool's taints still applied. A stamped label it would carry at one
+        node is not knowable from the record and is not resolved."""
+        gpu = {"name": "gpu-pool", "locations": ["us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 4}, "config": {"machineType": "a2-highgpu-1g", "accelerators": [{"acceleratorType": "nvidia-tesla-a100", "acceleratorCount": "1"}], "taints": [{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}]}}
+        pools = [self.DEFAULT_POOL, gpu]
+        index = fs.pool_label_index(pools, [node("n1", "default-pool", self.STAMPED)])
+        by_name = {"cloud.google.com/gke-nodepool": "gpu-pool"}
+        tolerates = ({"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},)
+        self.assertEqual(fs.pinned_pool(pod("a", by_name, tolerations=tolerates), pools, index), "gpu-pool")
+        self.assertIsNone(fs.pinned_pool(pod("b", by_name, tolerations=()), pools, index))
+        self.assertIsNone(fs.pinned_pool(pod("c", {"cloud.google.com/gke-accelerator": "nvidia-tesla-a100"}, tolerations=tolerates), pools, index))
+
     def test_on_a_cluster_with_one_pool_every_selected_pod_is_that_pool_s(self):
         """The common Standard shape: one pool with nodes, or one beside pools
         scaled to zero. The question is where the pod can go, so a selector

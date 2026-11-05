@@ -1350,10 +1350,25 @@ def pool_label_index(node_pools: list[dict], nodes: list[dict]) -> dict[tuple[st
     # The retrospective's label reader, shared rather than copied.
     from upgrade_retrospective import pool_labels
 
-    return pool_labels({"nodePools": node_pools}, nodes)
+    index = pool_labels({"nodePools": node_pools}, nodes)
+    # A pool with no live node has no node to stamp its own name on; the
+    # record names it, so a selector on the pool label still finds it.
+    for pool in node_pools:
+        name = str(pool.get("name", ""))
+        if name:
+            index.setdefault((NODEPOOL_LABEL, name), set()).add(name)
+    return index
 
 
-def pinned_pool(pod: dict, node_pools: list[dict], label_index: dict[tuple[str, str], set[str]]) -> str | None:
+def pool_taint_records(node_pools: list[dict]) -> dict[str, dict]:
+    """Each pool's config taints in the scheduler's shape, the retrospective's
+    reader, built once per cluster."""
+    from upgrade_retrospective import pool_records_of
+
+    return pool_records_of({"nodePools": node_pools})
+
+
+def pinned_pool(pod: dict, node_pools: list[dict], label_index: dict[tuple[str, str], set[str]], records: dict[str, dict] | None = None) -> str | None:
     """The one pool the scheduler could place the pod on, or None. A pool is a
     candidate when its nodes carry every pair of the pod's `nodeSelector` and
     the pod tolerates the pool's blocking taints; the pod is this pool's
@@ -1361,15 +1376,17 @@ def pinned_pool(pod: dict, node_pools: list[dict], label_index: dict[tuple[str, 
     neither. On a cluster with one pool, every selected pod is that pool's.
     An empty selector pins the pod nowhere; a pod held by affinity alone is
     not read here. The question is where the pod can go, not which pool it
-    prefers, so the retrospective's narrowing rule does not apply."""
-    from upgrade_retrospective import _tolerates, pod_tolerations, pool_records_of
+    prefers, so the retrospective's narrowing rule does not apply. `records`
+    is `pool_taint_records(node_pools)`, built once per cluster by the caller."""
+    from upgrade_retrospective import _tolerates, pod_tolerations
 
     spec = pod.get("spec") or {}
     selector = spec.get("nodeSelector") or {}
     if not selector:
         return None
     tolerations = pod_tolerations(spec)
-    records = pool_records_of({"nodePools": node_pools})
+    if records is None:
+        records = pool_taint_records(node_pools)
     candidates = []
     for pool in node_pools:
         name = str(pool.get("name", ""))
@@ -2166,9 +2183,10 @@ def collect_cluster(cluster: dict, *, run: RunFn) -> dict:
         # Each pod resolves to one pool at most, once, so two pools never
         # share a backlog.
         label_index = pool_label_index(node_pools, [i for i in items if i.get("kind") == "Node"])
+        taint_records = pool_taint_records(node_pools)
         pinned_by_pool: dict[str, list[dict]] = {}
         for pending_pod in unschedulable_pods:
-            pinned_to = pinned_pool(pending_pod, node_pools, label_index)
+            pinned_to = pinned_pool(pending_pod, node_pools, label_index, taint_records)
             if pinned_to is not None:
                 pinned_by_pool.setdefault(pinned_to, []).append(pending_pod)
         # A tainted multi-zone pool is no fallback: the zonal pool's pods do
