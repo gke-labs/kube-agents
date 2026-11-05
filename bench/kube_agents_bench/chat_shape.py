@@ -45,13 +45,13 @@ _FLAGS = (OPENS_ON_VERDICT, APOLOGY)
 # question and artifact with in the final message (_RESULT_SECTION,
 # _QUESTION_SECTION, _append_artifacts). A result or a question is a message
 # the thread received; an artifact is a file read back from the pod, which no
-# one was sent.
-_DELIVERED_HEADER = re.compile(
+# one was sent. verifiers.py reads the same two names.
+DELIVERED_HEADER = re.compile(
     r"^(?:Result of delegated task \S+|Question from delegated task \S+"
     r"|Artifact [^\n]* produced by delegated task \S+):\n",
     re.MULTILINE,
 )
-_RESULT_HEADER_PREFIX = "Result of delegated task "
+RESULT_HEADER_PREFIX = "Result of delegated task "
 _QUESTION_HEADER_PREFIX = "Question from delegated task "
 _ARTIFACT_HEADER_PREFIX = "Artifact "
 _ATX_HEADING = re.compile(r"^ {0,3}#{1,6}(?:\s|$)")
@@ -84,7 +84,7 @@ _MAX_PREAMBLE_UNITS = 3
 
 def _sections(final_message: str) -> tuple[str, list[tuple[str, str]]]:
     """The reply ahead of any delivered section, then each section's header and body."""
-    headers = list(_DELIVERED_HEADER.finditer(final_message))
+    headers = list(DELIVERED_HEADER.finditer(final_message))
     opening = final_message[: headers[0].start()] if headers else final_message
     sections = [
         (h.group(0), final_message[h.end() : headers[i + 1].start() if i + 1 < len(headers) else len(final_message)])
@@ -97,7 +97,7 @@ def answer_text(final_message: str) -> str:
     """The answer in ``final_message``: its last delivered card result, else the
     last question a paused card asked, else the reply ahead of any section."""
     opening, sections = _sections(final_message)
-    results = [body for header, body in sections if header.startswith(_RESULT_HEADER_PREFIX)]
+    results = [body for header, body in sections if header.startswith(RESULT_HEADER_PREFIX)]
     questions = [body for header, body in sections if header.startswith(_QUESTION_HEADER_PREFIX)]
     return (results or questions or [opening])[-1].strip()
 
