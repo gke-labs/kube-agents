@@ -26,6 +26,7 @@ printed one.
 from __future__ import annotations
 
 import base64
+import contextlib
 import functools
 import io
 import json
@@ -130,6 +131,12 @@ SAFE_BARE_REPOSITORY = "safe.bareRepository=explicit"
 # does not answer with a screenful and bury the instruction under it.
 UNTRACKED_FILES_NAMED = 10
 
+DECISION_MEMORY_DIRS = ("knowledge/decisions", "knowledge/lessons")
+DECISION_MEMORY_SCRIPT_REL = Path("decision-memory/scripts/decision_memory.py")
+DECISION_MEMORY_HEADING = "### Prior decisions and lessons"
+DECISION_MEMORY_VALID_EXIT_CODES = (0, 2)
+DECISION_MEMORY_BLOCKED = "DECISION_MEMORY_BLOCKED"
+
 
 class VcsError(RuntimeError):
     """A refusal the caller is meant to read, as JSON on stdout.
@@ -159,6 +166,13 @@ class VcsError(RuntimeError):
         if self.revision:
             answer["revision"] = self.revision
         return answer
+
+
+class DecisionMemoryBlockedError(VcsError, PermissionError):
+    """Raise when an active Decision Memory guard blocks a change."""
+
+    def __init__(self, message: str, *, detail: str | None = None):
+        super().__init__(message, code=DECISION_MEMORY_BLOCKED, detail=detail)
 
 
 # ---- the broker -----------------------------------------------------------
@@ -1352,12 +1366,131 @@ def already_published(session: dict, branch: str | None = None) -> bool:
     return (session.get("published") or {}).get(branch) == tip.stdout.strip()
 
 
+def _find_decision_memory_script() -> Path | None:
+    """Locate `decision_memory.py` in a checkout or container image."""
+    candidates = (
+        Path(__file__).resolve().parents[1] / "skills" / DECISION_MEMORY_SCRIPT_REL,
+        Path("/opt/defaults/skills") / DECISION_MEMORY_SCRIPT_REL,
+        Path("/opt/data/skills") / DECISION_MEMORY_SCRIPT_REL,
+        Path("/opt/data/profiles/platform/skills") / DECISION_MEMORY_SCRIPT_REL,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _resolve_decision_memory_base(session: dict, ws: Path, base: str) -> str:
+    """Return a revision in `ws` to diff against `HEAD` for Decision Memory checks."""
+    git_bin = LOCAL_GIT if Path(LOCAL_GIT).exists() else "git"
+    for candidate in (base, f"origin/{base}", session.get("baseRevision", "")):
+        if not candidate:
+            continue
+        chk = subprocess.run(
+            [
+                git_bin,
+                "-C",
+                str(ws),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"{candidate}^{{commit}}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if chk.returncode == 0 and chk.stdout.strip():
+            return candidate
+    return session.get("baseRevision") or base
+
+
+def _check_decision_memory(
+    session: dict,
+    base: str,
+    override: str | None = None,
+    repo: str | None = None,
+    copy_key: str | None = None,
+    *,
+    log_fn=None,
+) -> dict | None:
+    """Run Decision Memory check on the committed change before publishing."""
+    ws = Path(session["path"])
+    if not any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS):
+        return None
+    dm_script = _find_decision_memory_script()
+    if dm_script is None:
+        return None
+    diff_base = _resolve_decision_memory_base(session, ws, base)
+    res = subprocess.run(
+        [
+            sys.executable,
+            str(dm_script),
+            "--repo",
+            str(ws),
+            "check",
+            "--base",
+            diff_base,
+            "--head",
+            "HEAD",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if res.returncode not in DECISION_MEMORY_VALID_EXIT_CODES or not res.stdout.strip():
+        detail = (res.stderr or res.stdout or f"exit code {res.returncode}").strip()
+        raise RuntimeError(
+            f"Decision Memory check failed on {ws} (base {diff_base}): {detail}"
+        )
+    try:
+        out = json.loads(res.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Decision Memory check returned invalid JSON: {exc}") from exc
+    session["decisionMemoryMarkdown"] = (
+        out.get("markdown", "") if out.get("findings") else ""
+    )
+    if session.get("forge") and session.get("repo"):
+        with contextlib.suppress(Exception):
+            save_session(session)
+    if out.get("verdict") == "block":
+        blocking_ids = [
+            f["id"] for f in out.get("findings", []) if f.get("severity") == "block"
+        ]
+        overrides = {s.strip() for s in str(override or "").split(",") if s.strip()}
+        if not blocking_ids or not set(blocking_ids).issubset(overrides):
+            if repo and copy_key:
+                with contextlib.suppress(Exception):
+                    discard(repo, key=copy_key)
+            msg = (
+                "DECISION MEMORY GUARD BLOCKED THIS CHANGE:\n\n"
+                f"{out.get('markdown', '')}\n\n"
+                "Do NOT open this Pull Request. The working copy has been discarded. "
+                "In your final response (and kanban_complete result), you MUST quote the record IDs "
+                "(DEC-... / LES-...), Breaking PR (#...), Incident Issue (#...), Revert/Fix PR (#...), "
+                "and the technical root-cause details from the block above verbatim."
+            )
+            if log_fn is not None:
+                log_fn(msg)
+            raise DecisionMemoryBlockedError(msg, detail=out.get("markdown", ""))
+    elif out.get("findings") and log_fn is not None:
+        log_fn(
+            "DECISION MEMORY CONTEXT (include the record IDs, superseding PR #, and superseded incident/PR # in your final summary):\n"
+            f"{out.get('markdown', '')}"
+        )
+    return out
+
+
+check_decision_memory = _check_decision_memory
+
+
 def publish(
     spec: str | None = None,
     target: str | None = None,
     *,
     advance: bool = False,
     key: str | None = None,
+    override_decision: str | None = None,
 ) -> dict:
     """Send the revisions made since `clone` to the shared repository.
 
@@ -1445,6 +1578,8 @@ def publish(
             "with `--advance`."
         )
 
+    _check_decision_memory(session, base, override_decision)
+
     handle, name = tempfile.mkstemp(dir=str(ROOT), suffix=".bundle")
     bundle_file = Path(name)
     os.close(handle)
@@ -1518,8 +1653,24 @@ def forge(verb: str, payload: dict, repository: str | None = None) -> dict:
     this is, what it calls a change proposal, how to reach its API — is decided
     on the credential side and arrives already translated.
     """
+    payload = dict(payload)
     if repository:
         payload["repository"] = repository
     else:
         payload["repository"] = resolve_session(None)["spec"]
+    if (
+        verb.replace("_", "-") in ("proposal-create", "proposal-update")
+        and isinstance(payload.get("body"), str)
+        and DECISION_MEMORY_HEADING not in payload["body"]
+    ):
+        dm_markdown = ""
+        with contextlib.suppress(Exception):
+            sess = resolve_session(payload["repository"], key=payload.get("source"))
+            dm_markdown = str(sess.get("decisionMemoryMarkdown") or "")
+        if not dm_markdown:
+            with contextlib.suppress(Exception):
+                sess = resolve_session(payload["repository"])
+                dm_markdown = str(sess.get("decisionMemoryMarkdown") or "")
+        if dm_markdown:
+            payload["body"] = payload["body"].rstrip() + "\n\n" + dm_markdown + "\n"
     return call(verb, {key: value for key, value in payload.items() if value is not None})

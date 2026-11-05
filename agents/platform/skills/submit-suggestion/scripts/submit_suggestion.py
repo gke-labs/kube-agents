@@ -72,6 +72,10 @@ PROTECTED_BRANCH_PREFIXES = ("run/",)
 # same reason: what the file holds is posted publicly, so a path the model
 # supplies is a way to publish any file the agent container can read.
 SCRATCH_DIR = "/opt/data/scratch"
+DECISION_MEMORY_DIRS = vcs_client.DECISION_MEMORY_DIRS
+DECISION_MEMORY_SCRIPT_REL = vcs_client.DECISION_MEMORY_SCRIPT_REL
+DECISION_MEMORY_HEADING = vcs_client.DECISION_MEMORY_HEADING
+DECISION_MEMORY_VALID_EXIT_CODES = vcs_client.DECISION_MEMORY_VALID_EXIT_CODES
 
 
 def _short_branch(branch: str) -> str:
@@ -562,20 +566,49 @@ def handle_prepare(args) -> int:
                 )
         started_from = base
 
-    print(json.dumps({
+    ws = Path(cloned["path"])
+    has_dm = any((ws / rel).is_dir() for rel in DECISION_MEMORY_DIRS)
+    if has_dm:
+        log(
+            "Decision Memory records exist in knowledge/. Run "
+            '`python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py '
+            f"--repo {ws} why <path>` before modifying governed files."
+        )
+    out_payload = {
         "workspace": cloned["path"],
         "repo": repo,
         "branch": branch,
         "base": base,
         "started_from": started_from,
         "proposal": (proposal or {}).get("url", ""),
-    }))
+    }
+    if has_dm:
+        out_payload["decision_memory"] = True
+    print(json.dumps(out_payload))
     return 0
 
 
 def pending_changes(session: dict) -> str:
     """What the working copy holds that its revision does not."""
     return vcs_client.local(session, ["status", "--porcelain"], "status")["stdout"].strip()
+
+
+def _resolve_decision_memory_base(session: dict, ws: Path, base: str) -> str:
+    """Return a revision in `ws` to diff against `HEAD` for Decision Memory checks."""
+    return vcs_client._resolve_decision_memory_base(session, ws, base)
+
+
+def _check_decision_memory(
+    session: dict,
+    base: str,
+    override: str | None = None,
+    repo: str | None = None,
+    copy_key: str | None = None,
+) -> dict | None:
+    """Run Decision Memory check on the staged/committed change before publishing."""
+    return vcs_client._check_decision_memory(
+        session, base, override, repo=repo, copy_key=copy_key, log_fn=log
+    )
 
 
 def handle_submit(args) -> int:
@@ -748,6 +781,14 @@ def handle_submit(args) -> int:
         log(f"Recording {len(pending.splitlines())} pending change(s)...")
         vcs_client.commit(args.title, spec=repo, key=copy_key)
 
+    dm_out = _check_decision_memory(
+        session, base, getattr(args, "override_decision", None), repo=repo, copy_key=copy_key
+    )
+    if dm_out and dm_out.get("findings") and not args.keep_description:
+        md_section = dm_out.get("markdown", "")
+        if md_section and DECISION_MEMORY_HEADING not in body:
+            body = body.rstrip() + "\n\n" + md_section + "\n"
+
     if vcs_client.already_published(session, branch):
         # The state a retry has to be able to walk back into: the publish landed
         # and the forge call after it did not — a rate limit, a 5xx, a body the
@@ -801,7 +842,11 @@ def handle_submit(args) -> int:
         # to write to the branch a copy came down on otherwise, and that refusal
         # is the one that caught a worker fast-forwarding a branch it had cloned.
         vcs_client.publish(
-            repo, target=base, advance=session["branch"] == branch, key=copy_key
+            repo,
+            target=base,
+            advance=session["branch"] == branch,
+            key=copy_key,
+            override_decision=getattr(args, "override_decision", None),
         )
 
     url = _land_proposal(repo, branch, base, args.title, body, proposal, args.keep_description)
@@ -1004,6 +1049,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--base", default=None,
         help="The branch this merges into (default: the open proposal's, else "
              "the base the broker pins, else the branch the copy was taken of)",
+    )
+    submit.add_argument(
+        "--override-decision", default=None,
+        help="Explicitly override a blocking Decision Memory record ID when instructed by an operator",
     )
 
     for command in (prepare, submit):

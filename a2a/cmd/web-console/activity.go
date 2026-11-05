@@ -667,6 +667,7 @@ var knownPlatformSkills = []string{
 	"upgrade-readiness-brief",
 	"support-escalation-bundle",
 	"topology-drift",
+	"decision-memory",
 }
 
 var (

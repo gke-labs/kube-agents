@@ -72,6 +72,12 @@ Verb names are the version-control concept; the spelling you know is an alias.
 
 - **Anything about the past.** When a value changed, which revision removed a
   flag, who last touched a file, what a file looked like three revisions ago.
+  When the question asks _why_ a file or field in a managed GitOps repository is
+  configured a certain way and the checkout contains `knowledge/decisions/` or
+  `knowledge/lessons/`, also run
+  `python3 "$HERMES_HOME"/skills/decision-memory/scripts/decision_memory.py --repo <clone> why <path>`
+  and cite the matching `DEC-YYYY-NNN` and `LES-YYYY-NNN` record IDs alongside
+  the commit and pull request history.
 - **File modes.** Whether a script is executable is a tree-entry property;
   `files` reports it and it survives the round trip.
 - **Changing a repository** and opening the change proposal for it.

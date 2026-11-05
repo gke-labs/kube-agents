@@ -1756,5 +1756,333 @@ class PrCommentsSweepOnGiteaTest(unittest.TestCase):
         self.assertEqual(self.sweep(Fork()).cards, [])
 
 
+class MemoryProposalsSweepTest(unittest.TestCase):
+    """Tests for ``sweep_memory_proposals`` (PR filing, merge approval, and close refusal)."""
+
+    def test_pending_record_without_pr_files_card_for_platform_agent(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pr_markdown": "---\ntype: decision\nid: DEC-2026-010\nstatus: active\n---\n\n## Decision\n\nRequire ttl-hours.",
+                }
+            ],
+        })
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", return_value=_completed(pending_json)), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(forge, "call", return_value={"proposals": []}):
+            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(len(result.cards), 1)
+        card = result.cards[0]
+        self.assertEqual(card.idempotency_key, "memory-pr-dshnayder-org-infra-DEC-2026-010")
+        self.assertIn("submit_suggestion.py prepare", card.body)
+        self.assertIn("platform-agent/memory/DEC-2026-010", card.body)
+        self.assertIn("status: active", card.body)
+
+    def test_merged_pr_emits_approved_to_curator(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pull_request": "https://github.com/dshnayder-org/infra/pull/295 (#295)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(
+                 forge,
+                 "call",
+                 return_value={
+                     "proposal": {
+                         "number": 295,
+                         "state": "merged",
+                         "url": "https://github.com/dshnayder-org/infra/pull/295",
+                     }
+                 },
+             ):
+            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("approved", emit_cmd)
+        self.assertIn("DEC-2026-010", emit_cmd)
+
+    def test_closed_unmerged_pr_emits_refused_with_reviewer_reason(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-010",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-010-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-010",
+                    "pull_request": "https://github.com/dshnayder-org/infra/pull/295 (#295)",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(
+                 forge,
+                 "call",
+                 return_value={
+                     "proposal": {
+                         "number": 295,
+                         "state": "closed",
+                         "url": "https://github.com/dshnayder-org/infra/pull/295",
+                     },
+                     "comments": [
+                         {"author": "alice", "body": "Stateful preview namespaces cannot use automatic TTL deletion."}
+                     ],
+                 },
+             ):
+            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("refused", emit_cmd)
+        self.assertIn("DEC-2026-010", emit_cmd)
+        self.assertIn("Stateful preview namespaces cannot use automatic TTL deletion.", emit_cmd)
+
+    def test_merged_pr_modified_by_reviewer_emits_modified_merged(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "DEC-2026-011",
+                    "type": "decision",
+                    "status": "proposed",
+                    "title": "Require ttl-hours annotation on preview namespaces",
+                    "path": "knowledge/decisions/DEC-2026-011-require-ttl-hours.md",
+                    "branch": "platform-agent/memory/DEC-2026-011",
+                    "pull_request": "https://github.com/dshnayder-org/infra/pull/296 (#296)",
+                    "guard_rule": "require annotation preview.example.com/ttl-hours in [1..48]",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+             mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             mock.patch("subprocess.run", side_effect=fake_run), \
+             mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+             mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+             mock.patch.object(
+                 forge,
+                 "call",
+                 return_value={
+                     "proposal": {
+                         "number": 296,
+                         "state": "merged",
+                         "url": "https://github.com/dshnayder-org/infra/pull/296",
+                         "edited_guard_rule": "require annotation preview.example.com/ttl-hours in [1..168]",
+                         "commits": [
+                             {"author": "dshnayder"},
+                             {"author": "alice"},
+                         ],
+                     },
+                     "comments": [
+                         {"author": "alice", "body": "Extended maximum preview TTL to 168h for multi-day QA."}
+                     ],
+                 },
+             ):
+            bp_cls.return_value.viewer_login.return_value = "dshnayder"
+            result = gate.sweep_memory_proposals()
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("modified-merged", emit_cmd)
+        self.assertIn("DEC-2026-011", emit_cmd)
+        self.assertIn("--initial-proposal", emit_cmd)
+        self.assertIn("require annotation preview.example.com/ttl-hours in [1..48]", emit_cmd)
+        self.assertIn("--rule", emit_cmd)
+        self.assertIn("require annotation preview.example.com/ttl-hours in [1..168]", emit_cmd)
+        self.assertIn("Extended maximum preview TTL to 168h for multi-day QA.", emit_cmd)
+
+    def test_merged_lesson_pr_holds_while_soaking_then_emits_resolved_merged_after_24h(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "LES-2026-012",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Bump memory limit to 1Gi on checkout-worker",
+                    "path": "knowledge/lessons/LES-2026-012-checkout-oom.md",
+                    "branch": "platform-agent/memory/LES-2026-012",
+                    "pull_request": "https://github.com/dshnayder-org/infra/pull/297 (#297)",
+                    "finding_id": "checkout/Deployment/checkout-worker:OOMKilled",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        merged_view = {
+            "proposal": {
+                "number": 297,
+                "state": "merged",
+                "merged_at": "2026-11-01T12:00:00Z",
+                "url": "https://github.com/dshnayder-org/infra/pull/297",
+                "sync_status": "Synced",
+                "health_status": "Healthy",
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            events_path = Path(td) / "events.jsonl"
+            events_path.write_text("", encoding="utf-8")
+            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch.object(gate, "INTERCEPTED_EVENTS_PATH", events_path), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", return_value=merged_view):
+                bp_cls.return_value.viewer_login.return_value = "dshnayder"
+                # At T+10m (12:10 UTC), the 24h soak is still in progress: no emit call.
+                t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
+                result_early = gate.sweep_memory_proposals(now=t_10m)
+                self.assertEqual(result_early.cards, [])
+                self.assertEqual(len(calls), 1)  # only `curator pending`
+
+                # At T+25h (next day 13:00 UTC), the 24h soak window is complete: emits resolved-merged.
+                calls.clear()
+                t_25h = datetime(2026, 11, 2, 13, 0, 0, tzinfo=timezone.utc)
+                result_ready = gate.sweep_memory_proposals(now=t_25h)
+                self.assertEqual(result_ready.cards, [])
+                self.assertEqual(len(calls), 2)
+                emit_cmd = calls[1]
+                self.assertIn("resolved-merged", emit_cmd)
+                self.assertIn("LES-2026-012", emit_cmd)
+                self.assertIn("--soak-window", emit_cmd)
+                self.assertIn("24h", emit_cmd)
+
+    def test_merged_lesson_pr_emits_pr_merged_persists_when_finding_recurs_in_events(self):
+        pending_json = json.dumps({
+            "repo": "dshnayder-org/infra",
+            "records": [
+                {
+                    "id": "LES-2026-013",
+                    "type": "lesson",
+                    "status": "proposed",
+                    "title": "Bump memory limit to 512Mi on payment-worker",
+                    "path": "knowledge/lessons/LES-2026-013-payment-oom.md",
+                    "branch": "platform-agent/memory/LES-2026-013",
+                    "pull_request": "https://github.com/dshnayder-org/infra/pull/298 (#298)",
+                    "finding_id": "payments/Deployment/payment-worker:OOMKilled",
+                    "soak_window": "24h",
+                }
+            ],
+        })
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[1] == "pending":
+                return _completed(pending_json)
+            return _completed("{}")
+
+        merged_view = {
+            "proposal": {
+                "number": 298,
+                "state": "merged",
+                "merged_at": "2026-11-01T12:00:00Z",
+                "url": "https://github.com/dshnayder-org/infra/pull/298",
+                "sync_status": "Synced",
+                "health_status": "Healthy",
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            events_path = Path(td) / "events.jsonl"
+            events_path.write_text(
+                json.dumps({
+                    "timestamp": "2026-11-01T12:08:00Z",
+                    "finding_id": "payments/Deployment/payment-worker:OOMKilled",
+                    "reason": "OOMKilled (exit 137) under peak traffic",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict("os.environ", {"NATS_URL": "nats://localhost:4222"}), \
+                 mock.patch.object(gate, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+                 mock.patch.object(gate, "INTERCEPTED_EVENTS_PATH", events_path), \
+                 mock.patch("subprocess.run", side_effect=fake_run), \
+                 mock.patch("gitops_workspace.get_managed_repos", return_value=["dshnayder-org/infra"]), \
+                 mock.patch.object(forge, "BrokerProvider") as bp_cls, \
+                 mock.patch.object(forge, "call", return_value=merged_view):
+                bp_cls.return_value.viewer_login.return_value = "dshnayder"
+                t_10m = datetime(2026, 11, 1, 12, 10, 0, tzinfo=timezone.utc)
+                result = gate.sweep_memory_proposals(now=t_10m)
+
+        self.assertEqual(result.cards, [])
+        self.assertEqual(len(calls), 2)
+        emit_cmd = calls[1]
+        self.assertIn("pr-merged-persists", emit_cmd)
+        self.assertIn("LES-2026-013", emit_cmd)
+        self.assertIn("--finding-id", emit_cmd)
+        self.assertIn("payments/Deployment/payment-worker:OOMKilled", emit_cmd)
+        self.assertIn("OOMKilled (exit 137) under peak traffic", " ".join(emit_cmd))
+
+
 if __name__ == "__main__":
     unittest.main()
