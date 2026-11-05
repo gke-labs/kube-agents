@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import os
@@ -400,6 +401,35 @@ class FitTest(unittest.TestCase):
         self.assertFalse(unrelated.excluded(hl.RESPONSE))
 
 
+class StallWatchRateTest(unittest.TestCase):
+    def test_the_pass_time_is_the_median_of_an_even_count(self):
+        records = parse(
+            *(
+                record(
+                    "clusters",
+                    clusters,
+                    operation=hl.STALL_WATCH_OPERATION,
+                    metrics=((hl.JOB_SECONDS, None, seconds),),
+                    totals={"clusters": clusters},
+                )
+                for clusters, seconds in ((2, 120.0), (8, 400.0))
+            )
+        )
+
+        self.assertAlmostEqual(hl.stall_watch_seconds_per_cluster(records), 55.0)
+
+
+class DefaultCommitTest(unittest.TestCase):
+    def test_a_newer_commit_with_one_fleet_point_is_not_the_default(self):
+        records = clusters_line() + parse(
+            record("combined", 1, operation="first_run", commit="b" * 40, started="2026-11-01T00:00:00Z"),
+        )
+        available = hl.commits(records)
+
+        self.assertEqual(available[0], "b" * 40)
+        self.assertEqual(available[hl.default_commit_index(records, available)], "a" * 40)
+
+
 class PredictionTest(unittest.TestCase):
     def fleet(self, records, **inputs: float) -> dict[str, float]:
         return {**hl.base_fleet(records), **inputs}
@@ -411,6 +441,26 @@ class PredictionTest(unittest.TestCase):
 
         self.assertAlmostEqual(prediction.value, 100)
         self.assertEqual(hl.basis(prediction), "measured at the base point")
+
+    def test_an_operation_without_a_base_run_grows_from_the_data_s_base_point(self):
+        # The second operation was run only at 24 and 32 clusters, falling as the fleet grows; anchored at
+        # its own lowest run, it would add 22 clusters of its slope at the base point itself.
+        records = clusters_line() + parse(
+            *(
+                record(
+                    "clusters",
+                    clusters,
+                    operation="daily_fan_out",
+                    metrics=((RUN_METRIC, None, value),),
+                    totals={"clusters": clusters},
+                )
+                for clusters, value in ((24, 300.0), (32, 100.0))
+            )
+        )
+
+        prediction = hl.predict(records, RUN_METRIC, None, hl.base_fleet(records))
+
+        self.assertAlmostEqual(prediction.value, 100)
 
     def test_inside_the_measured_range_the_line_interpolates(self):
         records = clusters_line()
@@ -704,7 +754,7 @@ class CheckTest(unittest.TestCase):
         fan_out_chart = hl.metric_charts(records, "fan_out", hl.CLUSTERS, [], fleet)[0]
 
         self.assertEqual((check.status, check.prediction.value), (hl.PASS, 25.0))
-        self.assertEqual(check.name, "Response time (fan_out)")
+        self.assertEqual(check.name, "Response time (fan_out, daily_fan_out)")
         self.assertEqual(audit_chart.lines, ())
         self.assertEqual(fan_out_chart.lines, hl.RESPONSE_LINES)
 
@@ -902,7 +952,8 @@ class PlanTest(unittest.TestCase):
 class MetricContractTest(unittest.TestCase):
     def readme_metrics(self) -> set[str]:
         """The metric names in bench/scale/README.md, the runner's documented output."""
-        section = SCALE_README.read_text().split("Metric names:", 1)[1]
+        # The list ends at the first blank line, so a later paragraph's identifiers are not read as metrics.
+        section = SCALE_README.read_text().split("Metric names:", 1)[1].strip().split("\n\n", 1)[0]
         return set(re.findall(r"`([a-z0-9_]+)`", section))
 
     def test_every_metric_the_runner_writes_has_a_spec_and_no_other(self):
@@ -989,6 +1040,20 @@ class ChartTest(unittest.TestCase):
         self.assertIn("this fleet", names)
         self.assertEqual(figure.data[0].marker.color, "#000001")
 
+    def test_a_series_with_every_run_excluded_still_has_a_legend_entry(self):
+        chart = self.memory_chart()
+        first = chart.series[0]
+        excluded = dataclasses.replace(
+            first, points=tuple(dataclasses.replace(point, excluded=True) for point in first.points)
+        )
+        chart = dataclasses.replace(chart, series=(excluded, *chart.series[1:]))
+        colors = hl.container_colors(self.containers, ("#000001", "#000002"), "#999999")
+
+        figure = harness_limit_chart(chart, colors)
+
+        shown = [trace for trace in figure.data if trace.legendgroup == first.name and trace.showlegend]
+        self.assertEqual(len(shown), 1)
+
     def test_colours_follow_the_container_not_the_selection(self):
         palette = ("#000001", "#000002")
 
@@ -1071,6 +1136,17 @@ class HarnessLimitsPageTest(unittest.TestCase):
         self.assertIn("Part 2: Empirical evidence", parts)
         self.assertIn("Can this fleet be handled?", " ".join(str(item.value) for item in app.subheader))
         self.assertNotIn("Raw records", [item.label for item in app.expander])
+
+    def test_a_capacity_from_the_model_is_not_reported_as_measured(self):
+        with patch.object(hl, "measured_install_capacity", return_value=None):
+            app = self.open_page()
+
+        self.assertEqual(len(app.exception), 0, [item.value for item in app.exception])
+        verdict = " ".join(str(item.value) for item in [*app.success, *app.error])
+        self.assertIn("(the model's line)", verdict)
+        self.assertNotIn("(measured)", verdict)
+        text = " ".join(str(item.value) for item in app.markdown)
+        self.assertNotIn("the shell peaked at 0%", text)
 
     def test_the_custom_fleet_starts_at_the_measured_base(self):
         app = self.custom_fleet(self.open_page())
@@ -1441,10 +1517,6 @@ class UsualLimitsTest(unittest.TestCase):
         self.assertEqual(hl.usual_limits(records)["envoy-credential-proxy"], default)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ForecastNumbersTest(unittest.TestCase):
     """The Limits forecast's numbers, asserted, on a small fleet whose answers can be worked by hand."""
 
@@ -1521,3 +1593,7 @@ class ForecastNumbersTest(unittest.TestCase):
         self.assertEqual(summary.runs, 3)
         [clusters] = [item for item in summary.inputs if item.label == "Clusters"]
         self.assertEqual((clusters.low, clusters.high, clusters.levels), (2, 16, 3))
+
+
+if __name__ == "__main__":
+    unittest.main()

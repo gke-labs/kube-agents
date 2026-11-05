@@ -187,6 +187,30 @@ spec:
     stallWatch:
       {{- $stallWatchFields | nindent 6 }}
     {{- end }}
+    {{- $alertExcludeValues := .Values.platformAgent.harness.eventWatcher | default dict }}
+    {{- /*
+      Rendered only when an install sets a rule: with none the operator writes
+      no WATCHER_ALERT_EXCLUDE, so an absent block and an empty list are the
+      same. The same CRD guard as stallWatch's above, one level down:
+      spec.harness.eventWatcher is older than its alertExclude field.
+    */}}
+    {{- if $alertExcludeValues.alertExclude }}
+    {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+    {{- if $crd }}
+    {{- $eventWatcherProps := dict }}
+    {{- range $crd.spec.versions }}
+    {{- if .storage }}
+    {{- $eventWatcherProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "eventWatcher" "properties" (dict) . }}
+    {{- end }}
+    {{- end }}
+    {{- if not (hasKey $eventWatcherProps "alertExclude") }}
+    {{- fail "platformAgent.harness.eventWatcher.alertExclude is set, but the installed PlatformAgent CRD predates spec.harness.eventWatcher.alertExclude and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the rules silently while the release record keeps them" }}
+    {{- end }}
+    {{- end }}
+    eventWatcher:
+      alertExclude:
+        {{- toYaml $alertExcludeValues.alertExclude | nindent 8 }}
+    {{- end }}
     {{- $retention := .Values.platformAgent.harness.retention | default dict }}
     {{- /*
       Rendered only when an install sets sessionDays: the operator renders its own

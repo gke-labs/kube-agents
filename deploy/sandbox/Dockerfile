@@ -83,19 +83,23 @@ RUN apt-get update && \
 # k9s did not come across: it is a full-screen terminal UI, and every command
 # here arrives over a non-interactive `ssh host -- cmd` with no tty, so it
 # could not run even if a skill asked for it. Nothing in agents/ does.
-# kubectl 1.34 is the floor, not a preference: the kube-proxy kubeconfigs
-# (entrypoint.sh write_kube_proxy_kubeconfig) name the cluster in the server
-# URL's path, `${KUBE_PROXY_URL}/clusters/<ctx>`, and `kubectl get --raw`
-# before 1.34 replaced that path with the raw path (client-go's
-# `Request.RequestURI` set `pathPrefix = locator.Path`; since v0.34.0 it goes
-# through `AbsPath`, which prepends the server's path). On 1.32 every paged
-# collection read (collector_run.paged_list) reached the proxy's default
-# cluster, whatever cluster its kubeconfig named, and nothing failed.
-# smoke-test.sh section 5 proves the path survives with the installed binary,
-# and tests/test_sandbox_kubectl_pin.py holds the pin at or above the floor.
-ARG KUBECTL_VERSION=1.34.13
-ARG KUBECTL_SHA256_AMD64=b4bb494e9466a7a94bb851414548bc0d3e2f8da90757e6eccc3371e648648591
-ARG KUBECTL_SHA256_ARM64=66e8283d52d9bc1f9c0e9daade7c971cd20db5a379306862897dfb25395f3e03
+# kubectl 1.34 is the floor: the kube-proxy kubeconfigs (entrypoint.sh
+# write_kube_proxy_kubeconfig) name the cluster in the server URL's path,
+# `${KUBE_PROXY_URL}/clusters/<ctx>`, and `kubectl get --raw` before 1.34
+# replaced that path with the raw path (client-go's `Request.RequestURI` set
+# `pathPrefix = locator.Path`; since v0.34.0 it goes through `AbsPath`). On 1.32
+# every --raw read reached the proxy with no cluster in it (#4739), which the
+# proxy now refuses. The pin is 1.35 rather than the floor because the fleet runs
+# GKE 1.35 and 1.36 (REGULAR's default), and kubectl is supported within one
+# minor of the server: 1.34 would be outside it for 1.36. Keep it within one
+# minor of the fleet. check_kubectl_base_path.py below fails the build for a
+# kubectl that drops the path, smoke-test.sh section 5 proves it against the
+# running image, and tests/test_sandbox_kubectl_pin.py holds the pin at or above
+# the floor.
+ARG KUBECTL_VERSION=1.35.10
+ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
+ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
+COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
@@ -108,6 +112,8 @@ RUN ARCH=$(dpkg --print-architecture) && \
     curl -sSLf --retry 5 --retry-all-errors -o /usr/local/libexec/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" && \
     echo "${KUBECTL_SHA256}  /usr/local/libexec/kubectl" | sha256sum -c - && \
     chmod 0755 /usr/local/libexec/kubectl && \
+    python3 -I /tmp/check_kubectl_base_path.py /usr/local/libexec/kubectl && \
+    rm /tmp/check_kubectl_base_path.py && \
     printf '%s\n' \
       '#!/bin/sh' \
       'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
