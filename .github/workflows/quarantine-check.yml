@@ -2,8 +2,9 @@ name: Quarantine Check
 
 # Once a day, read the issue each quarantined test cites and fail when one is
 # closed, unlabelled, unowned, or missing its suspected cause, so a test does
-# not stay skipped after its fix lands. The run summary lists every quarantine
-# and its age. `scripts/check_quarantine.py` holds the checks;
+# not stay skipped after its fix lands. Each issue with a problem gets one
+# comment naming its assignees (once per kind of problem, never repeated), and
+# the run summary lists every quarantine and its age. `scripts/check_quarantine.py` holds the checks;
 # `docs/pull-request-workflow.md` ("Quarantining a flaky test") holds the
 # policy. The offline half of the check runs on every pull request with the
 # Python unit tests.
@@ -19,12 +20,12 @@ jobs:
   check:
     name: Check quarantined tests
     # Required of any workflow that starts on its own (AGENTS.md, Pull Request
-    # Hygiene): a fork inherits the schedule, not the issues.
+    # Hygiene): a fork inherits the schedule, and would comment on its own copies.
     if: github.repository == 'gke-labs/kube-agents'
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the tree to find the quarantines
-      issues: read # read each cited issue, its comments and its timeline
+      issues: write # read each cited issue, its comments and timeline; comment on one with a problem; create the label
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,4 +40,4 @@ jobs:
       - name: Check the quarantines against their issues
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/check_quarantine.py --github
+        run: python3 scripts/check_quarantine.py --github --notify

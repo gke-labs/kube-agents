@@ -850,9 +850,10 @@ the bug. Quarantine a test only when all of these hold:
 - The issue carries the `ci:quarantined` label and is assigned to the person who owns the fix: the
   area's primary owner in [`ownership.md`](ownership.md) when one is known. Reuse the `ci:flaky`
   issue when one exists.
-- The test is not under `tests/conformance/`, not an auth-callout account-boundary or grant test in
-  `a2a/authcallout/`, and not any other security or isolation test. Those are fixed, not skipped,
-  unless bnaylor agrees on the issue.
+- The test is not a conformance test, an auth-callout account-boundary or grant test, or any other
+  security or isolation test. Those are fixed, not skipped, unless one of `APPROVERS` in the check
+  script comments `Quarantine approved` on the issue; the daily check requires that comment for
+  anything under `PROTECTED_PREFIXES`.
 
 The skip names the issue in a fixed form and checks `KA_RUN_QUARANTINED`, so whoever fixes it can
 run the test without editing it:
@@ -873,10 +874,12 @@ pull request removes the skip and closes the issue.
 
 [`scripts/check_quarantine.py`](../scripts/check_quarantine.py) checks both halves. Its offline
 check runs with the Python unit tests and fails a quarantine string that is malformed or does not
-check `KA_RUN_QUARANTINED`. [`quarantine-check.yml`](../.github/workflows/quarantine-check.yml) runs
-it daily with `--github`. That run fails when a cited issue is closed, unlabelled, unassigned, or
-missing either line above. Its summary lists every quarantine with its age and flags any older than
-`STALE_DAYS` (14). It also flags an open `ci:quarantined` issue that no test cites any more.
+read `KA_RUN_QUARANTINED`. [`quarantine-check.yml`](../.github/workflows/quarantine-check.yml) runs
+it daily with `--github --notify`. That run fails when a cited issue is closed, unlabelled,
+unassigned, missing either line above, or missing a needed approval, and comments once on that
+issue naming its assignees. Its summary lists every quarantine with its age. A quarantine older
+than `STALE_DAYS` (14) gets one comment too. The summary also flags an open `ci:quarantined` issue
+that no test cites any more.
 
 ## Who owns an open pull request
 

@@ -44,9 +44,15 @@ class FakeAPI:
         self.comments = comments or {}
         self.timelines = timelines or {}
         self.labelled = list(labelled)
+        self.got = []
+        self.posted = []
 
     def get(self, path):
+        self.got.append(path)
         return self.issues[int(path.rsplit("/", 1)[1])]
+
+    def post(self, path, payload=None, tolerate=()):
+        self.posted.append((path, payload))
 
     def get_all(self, path):
         if path.endswith("/comments"):
@@ -102,6 +108,10 @@ class ScanTest(unittest.TestCase):
                 self.assertEqual([], report.quarantines)
                 self.assertEqual(1, len(report.failures))
                 self.assertIn("malformed", report.failures[0])
+
+    def test_a_comment_naming_the_override_is_not_a_gate(self):
+        text = '\t// see KA_RUN_QUARANTINED\n\tt.Skip("quarantined: gke-labs/kube-agents#9")\n'
+        self.assertEqual(1, len(scanned(("a_test.go", text)).failures))
 
     def test_the_override_more_than_the_window_above_does_not_count(self):
         text = 'os.Getenv("KA_RUN_QUARANTINED")\n\n\n\tt.Skip("quarantined: gke-labs/kube-agents#9")\n'
@@ -166,6 +176,43 @@ class GitHubTest(unittest.TestCase):
         report = self.run_check(api, files=(("test_b.py", PY_GATED), ("a_test.go", GO_GATED)))
         self.assertEqual([], report.failures)
         self.assertEqual(2, len(report.quarantines))
+        self.assertEqual([f"/repos/{cq.REPO}/issues/4357"], api.got)
+
+    def test_a_protected_test_needs_an_approvers_comment(self):
+        approval = {"user": {"login": sorted(cq.APPROVERS)[0]}, "body": "Quarantine approved, flake is in the fake."}
+        stranger = {"user": {"login": "someone-else"}, "body": "Quarantine approved"}
+        go = ("a2a/authcallout/grant_test.go", GO_GATED)
+        cases = (([], 1), ([stranger], 1), ([approval], 0))
+        for comments, failures in cases:
+            with self.subTest(comments=comments):
+                api = FakeAPI({4357: issue(4357)}, comments={4357: comments})
+                report = self.run_check(api, files=(go,))
+                self.assertEqual(failures, len(report.failures), report.failures)
+
+
+class NotifyTest(unittest.TestCase):
+    def test_each_kind_of_problem_is_told_once_naming_the_assignees(self):
+        api = FakeAPI({4357: issue(4357, body="")}, timelines={4357: [labelled_event(cq.STALE_DAYS + 3)]})
+        report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
+        self.assertEqual(2, cq.notify(api, report))
+        paths = [path for path, _ in api.posted]
+        self.assertEqual(f"/repos/{cq.REPO}/labels", paths[0])
+        bodies = [payload["body"] for path, payload in api.posted[1:]]
+        self.assertTrue(all("@someone" in body for body in bodies))
+        self.assertIn(cq.COMMENT_MARKER.format(kind=cq.KIND_INCOMPLETE), bodies[0])
+        self.assertIn(cq.COMMENT_MARKER.format(kind=cq.KIND_STALE), bodies[1])
+
+    def test_a_problem_already_told_is_not_told_again(self):
+        told = {"body": cq.COMMENT_MARKER.format(kind=cq.KIND_CLOSED) + "\nearlier"}
+        api = FakeAPI({4357: issue(4357, state="closed")}, comments={4357: [told]})
+        report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
+        self.assertEqual(1, len(report.failures))
+        self.assertEqual(0, cq.notify(api, report))
+
+    def test_nothing_wrong_posts_nothing(self):
+        api = FakeAPI({4357: issue(4357)})
+        report = cq.check_github(api, scanned(("test_b.py", PY_GATED)), NOW)
+        self.assertEqual((0, []), (cq.notify(api, report), api.posted))
 
 
 if __name__ == "__main__":

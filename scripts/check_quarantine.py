@@ -23,10 +23,18 @@ the test without editing it first.
 cited issue and fails when one is closed (the fix landed and the skip stayed),
 lacks the `ci:quarantined` label, has no assignee to own the fix, or never
 states a suspected cause and that a product race was ruled out. A flake that
-was really a product race is a bug, and skipping its test hides it. The
-script also reports how many tests are quarantined and for how long, flags any
-quarantined longer than `STALE_DAYS`, and flags any open `ci:quarantined`
-issue whose skip is no longer in the tree.
+was really a product race is a bug, and skipping its test hides it. A test
+under `PROTECTED_PREFIXES` (conformance, auth-callout) also needs a
+`Quarantine approved` comment from one of `APPROVERS`: a flaky security test is
+fixed, not skipped, unless they say otherwise. The script also reports how many
+tests are quarantined and for how long, flags any quarantined longer than
+`STALE_DAYS`, and flags any open `ci:quarantined` issue whose skip is no longer
+in the tree.
+
+`--notify` tells the people who can act: it comments on each issue with a
+problem, naming its assignees, once per issue per kind of problem (closed,
+incomplete, stale), so a standing problem is not re-told every day. It creates
+the label the first time it needs one.
 """
 
 from __future__ import annotations
@@ -54,6 +62,9 @@ MARKER_RE = re.compile(r"quarantined: gke-labs/kube-agents#(\d+)")
 LOOSE_MARKER_RE = re.compile(r"quarantined:\s*\S*#")
 #: The variable that runs quarantined tests anyway.
 RUN_ENV = "KA_RUN_QUARANTINED"
+#: The read of `RUN_ENV` that counts as a gate: Go `Getenv("...")`, Python `environ.get("...")` or
+#: `getenv("...")`. A bare mention (a comment) does not.
+GATE_RE = re.compile(r"""(?:Getenv|environ\.get|getenv)\(\s*["']""" + RUN_ENV + r"""["']""")
 #: How many lines above the marker may hold the `RUN_ENV` check (the Go `if` sits one above
 #: `t.Skip`; a Python decorator split over lines puts it one above the reason).
 GATE_WINDOW = 2
@@ -61,6 +72,18 @@ SOURCE_GLOBS = ("*.go", "*.py")
 #: This script and its tests quote the marker in prose and fixtures.
 SELF_FILES = frozenset({"scripts/check_quarantine.py", "scripts/test_check_quarantine.py"})
 LABEL = "ci:quarantined"
+LABEL_COLOR = "fbca04"
+LABEL_DESCRIPTION = "A test is skipped in source until this issue is fixed (scripts/check_quarantine.py)"
+#: Tests that are fixed, not skipped: a quarantine under one of these needs an `APPROVERS` comment
+#: on its issue carrying `APPROVAL_RE`.
+PROTECTED_PREFIXES = ("tests/conformance/", "a2a/authcallout/")
+APPROVERS = frozenset({"bnaylor"})
+APPROVAL_RE = re.compile(r"^\s*quarantine approved\b", re.IGNORECASE | re.MULTILINE)
+#: Opens each comment the daily run posts; one per issue per kind, so a standing problem is told once.
+COMMENT_MARKER = "<!-- quarantine-check:{kind} -->"
+KIND_CLOSED = "closed"
+KIND_INCOMPLETE = "incomplete"
+KIND_STALE = "stale"
 #: A quarantine older than this is flagged in the report.
 STALE_DAYS = 14
 #: Lines the tracking issue (body or a comment) must carry, matched at the start of a line.
@@ -85,6 +108,18 @@ class Report:
     warnings: list[str] = field(default_factory=list)
     #: issue number -> days since the label went on, when known
     ages: dict[int, int] = field(default_factory=dict)
+    #: issue number -> kind -> the problems to tell its assignees about
+    notices: dict[int, dict[str, list[str]]] = field(default_factory=dict)
+    #: issue number -> the assignees and comments read, for `notify`
+    issues: dict[int, dict] = field(default_factory=dict)
+
+    def fail(self, number: int, kind: str, text: str) -> None:
+        self.failures.append(text)
+        self.notices.setdefault(number, {}).setdefault(kind, []).append(text)
+
+    def warn(self, number: int, kind: str, text: str) -> None:
+        self.warnings.append(text)
+        self.notices.setdefault(number, {}).setdefault(kind, []).append(text)
 
 
 def source_files(root: Path = REPO_ROOT) -> list[str]:
@@ -107,7 +142,7 @@ def scan_text(path: str, text: str, report: Report) -> None:
             continue
         report.quarantines.append(Quarantine(path, index + 1, int(match.group(1))))
         window = lines[max(0, index - GATE_WINDOW) : index + 1]
-        if not any(RUN_ENV in candidate for candidate in window):
+        if not any(GATE_RE.search(candidate) for candidate in window):
             report.failures.append(
                 f"{path}:{index + 1}: quarantine of #{match.group(1)} does not check {RUN_ENV}, "
                 "so nobody can run the test without editing it"
@@ -141,28 +176,46 @@ def labeled_at(api, number: int) -> datetime | None:
 def check_issue(api, number: int, sites: list[Quarantine], report: Report, now: datetime) -> None:
     where = ", ".join(f"{q.path}:{q.line}" for q in sites)
     issue = api.get(f"/repos/{api.repo}/issues/{number}")
+    comments = api.get_all(f"/repos/{api.repo}/issues/{number}/comments")
+    report.issues[number] = {"assignees": issue.get("assignees") or [], "comments": comments}
     if issue.get("state") == "closed":
-        report.failures.append(f"#{number} is closed but still quarantines {where}; remove the skip")
+        report.fail(number, KIND_CLOSED, f"#{number} is closed but still quarantines {where}; remove the skip")
         return
     labels = {label.get("name") for label in issue.get("labels") or []}
     if LABEL not in labels:
-        report.failures.append(f"#{number} quarantines {where} but lacks the `{LABEL}` label")
+        report.fail(number, KIND_INCOMPLETE, f"#{number} quarantines {where} but lacks the `{LABEL}` label")
     if not issue.get("assignees"):
-        report.failures.append(f"#{number} quarantines {where} but has no assignee to own the fix")
-    texts = [issue.get("body") or ""]
-    texts += [c.get("body") or "" for c in api.get_all(f"/repos/{api.repo}/issues/{number}/comments")]
+        report.fail(number, KIND_INCOMPLETE, f"#{number} quarantines {where} but has no assignee to own the fix")
+    texts = [issue.get("body") or ""] + [c.get("body") or "" for c in comments]
     if not any(CAUSE_RE.search(t) for t in texts):
-        report.failures.append(f"#{number} never states `Suspected cause:`; a quarantine needs one")
+        report.fail(number, KIND_INCOMPLETE, f"#{number} never states `Suspected cause:`; a quarantine needs one")
     if not any(RACE_RE.search(t) for t in texts):
-        report.failures.append(
-            f"#{number} never states `Product race ruled out: yes`; until it is, the test stays live"
+        report.fail(
+            number,
+            KIND_INCOMPLETE,
+            f"#{number} never states `Product race ruled out: yes`; until it is, the test stays live",
+        )
+    protected = [q for q in sites if q.path.startswith(PROTECTED_PREFIXES)]
+    approved = any(
+        (c.get("user") or {}).get("login") in APPROVERS and APPROVAL_RE.search(c.get("body") or "")
+        for c in comments
+    )
+    if protected and not approved:
+        report.fail(
+            number,
+            KIND_INCOMPLETE,
+            f"#{number} quarantines a security or conformance test "
+            f"({', '.join(f'{q.path}:{q.line}' for q in protected)}) without a `Quarantine approved` "
+            f"comment from {', '.join(sorted(APPROVERS))}",
         )
     since = labeled_at(api, number) if LABEL in labels else None
     if since is not None:
         days = int((now - since).total_seconds() // SECONDS_PER_DAY)
         report.ages[number] = days
         if days > STALE_DAYS:
-            report.warnings.append(f"#{number} has quarantined {where} for {days} days (over {STALE_DAYS})")
+            report.warn(
+                number, KIND_STALE, f"#{number} has quarantined {where} for {days} days (over {STALE_DAYS})"
+            )
 
 
 def check_github(api, report: Report, now: datetime) -> Report:
@@ -180,6 +233,31 @@ def check_github(api, report: Report, now: datetime) -> Report:
                 "remove the label or restore the skip"
             )
     return report
+
+
+def notify(api, report: Report) -> int:
+    """Comment once per issue per kind of problem, naming its assignees. Returns comments posted."""
+    posted = 0
+    if report.notices:
+        api.post(
+            f"/repos/{api.repo}/labels",
+            {"name": LABEL, "color": LABEL_COLOR, "description": LABEL_DESCRIPTION},
+            tolerate=(422,),
+        )
+    for number, kinds in sorted(report.notices.items()):
+        read = report.issues.get(number, {})
+        bodies = [c.get("body") or "" for c in read.get("comments", [])]
+        owners = " ".join(f"@{a['login']}" for a in read.get("assignees", []) if a.get("login"))
+        for kind, items in sorted(kinds.items()):
+            marker = COMMENT_MARKER.format(kind=kind)
+            if any(marker in body for body in bodies):
+                continue
+            lines = [marker, f"{owners}".strip() or "Unassigned.", "", "The daily quarantine check found:", ""]
+            lines += [f"- {item}" for item in items]
+            lines += ["", "Policy: `docs/pull-request-workflow.md`, \"Quarantining a flaky test\"."]
+            api.post(f"/repos/{api.repo}/issues/{number}/comments", {"body": "\n".join(lines)})
+            posted += 1
+    return posted
 
 
 def render(report: Report, online: bool) -> str:
@@ -207,6 +285,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--github", action="store_true", help="also read each cited issue (needs GITHUB_TOKEN)")
     parser.add_argument("--repo", default=REPO)
+    parser.add_argument("--notify", action="store_true", help="with --github, comment on each issue with a problem")
     args = parser.parse_args(argv)
 
     report = scan_tree()
@@ -215,7 +294,10 @@ def main(argv=None) -> int:
         if not token:
             log("GITHUB_TOKEN is not set")
             return 2
-        check_github(GitHubAPI(args.repo, token, user_agent=USER_AGENT), report, datetime.now(timezone.utc))
+        api = GitHubAPI(args.repo, token, user_agent=USER_AGENT)
+        check_github(api, report, datetime.now(timezone.utc))
+        if args.notify:
+            log(f"posted {notify(api, report)} comment(s)")
 
     text = render(report, args.github)
     print(text)
