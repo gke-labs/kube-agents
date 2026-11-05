@@ -67,16 +67,23 @@ np_plant() {
   np_planted_ns=""
   # A plant that fails after the namespace exists removes it on the way out:
   # Terraform taints the resource and skips its destroy provisioner, so
-  # nothing else would. np_planted_ns is set only after a successful create,
-  # so a stop in the pre-clear or a refused create deletes nothing. `set +e`
-  # inside the trap: errexit stays in force there, and the first failing
-  # command would otherwise skip the delete.
+  # nothing else would. np_planted_ns is set before the create is sent: a
+  # signal during the create (bash runs the trap once the child exits) or a
+  # lost response can leave the namespace committed with no success seen.
+  # The trap therefore reads the owner label and deletes only a namespace
+  # this stack created, so a refused create over a foreign namespace deletes
+  # nothing. `set +e` inside the trap: errexit stays in force there, and the
+  # first failing command would otherwise skip the delete.
   np_on_exit() {
     local status=$?
     set +e
     if [ "$status" -ne 0 ] && [ -n "$np_planted_ns" ]; then
-      echo "Plant failed (exit $status); deleting $NP_NAMESPACE so the next run starts clean." >&2
-      kubectl delete namespace "$NP_NAMESPACE" --ignore-not-found --wait=false >&2
+      local owner
+      owner="$(np_owner 2>/dev/null)"
+      if [ "$owner" = "$NP_NAMESPACE/$NP_STACK" ]; then
+        echo "Plant failed (exit $status); deleting $NP_NAMESPACE so the next run starts clean." >&2
+        kubectl delete namespace "$NP_NAMESPACE" --ignore-not-found --wait=false >&2
+      fi
     fi
     rm -rf "$np_kubeconfig_dir"
   }
@@ -103,6 +110,7 @@ np_plant() {
 
   # Created with its labels in one request; `create` stops on AlreadyExists
   # rather than adopting a namespace the pre-clear did not see.
+  np_planted_ns=1
   kubectl create -f - <<MANIFEST
 apiVersion: v1
 kind: Namespace
@@ -114,7 +122,6 @@ metadata:
     $NP_LABEL_PULL_NUMBER: "$NP_PULL_NUMBER"
     $NP_LABEL_OWNER: "$NP_STACK"
 MANIFEST
-  np_planted_ns=1
   printf '%s\n' "$NP_MANIFEST" | kubectl --namespace "$NP_NAMESPACE" create -f -
   echo "Planted $NP_STACK in $NP_NAMESPACE on $NP_HOST_CLUSTER."
 }

@@ -42,13 +42,17 @@ _MANIFEST = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: planted\n"
 
 #: `kubectl` records every invocation to $CALLS, with stdin appended for the
 #: create calls, and answers from the environment. NS_OWNER_OUT is what the
-#: ownership read prints: empty for an absent namespace, "<name>/<label>" for
-#: a present one. NS_READ_RC makes the read itself fail.
+#: ownership read prints before the Namespace create: empty for an absent
+#: namespace, "<name>/<label>" for a present one; once the create was sent,
+#: the read prints NS_OWNER_AFTER_CREATE (default: this stack's namespace,
+#: committed), so a create that failed after the object existed is distinct
+#: from one the API server refused. NS_READ_RC makes the read itself fail.
 _KUBECTL_STUB = """#!/bin/bash
 echo "kubectl $*" >> "$CALLS"
 case "$*" in
   *"get namespace"*--ignore-not-found*)
     if [ "${NS_READ_RC:-0}" != "0" ]; then echo "Unable to connect to the server: getting credentials: exec: executable gke-gcloud-auth-plugin failed" >&2; exit "$NS_READ_RC"; fi
+    if grep -q "kind: Namespace" "$CALLS"; then printf '%s' "${NS_OWNER_AFTER_CREATE-$NP_NAMESPACE/$NP_STACK}"; exit 0; fi
     printf '%s' "${NS_OWNER_OUT-}"; exit 0 ;;
   *"delete namespace"*)  exit "${NS_DELETE_RC:-0}" ;;
   *"create -f -"*)
@@ -212,9 +216,24 @@ class NamespacedPlantTest(unittest.TestCase):
         self.assertGreater(calls.index(deletes[0]), calls.index(self._creates(calls)[0]))
 
     def test_a_refused_namespace_create_deletes_nothing(self):
+        # Refused with nothing committed, and refused with AlreadyExists over a
+        # namespace another stack owns: the trap's owner read keeps both.
+        for after_create in ("", f"{_NAMESPACE}/{_OTHER_STACK}"):
+            self._calls.unlink(missing_ok=True)
+            completed, calls = self._run("plant", NS_CREATE_RC=1, NS_OWNER_AFTER_CREATE=after_create)
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertEqual(self._deletes(calls), [], (after_create, calls))
+
+    def test_a_namespace_create_that_fails_after_the_object_exists_is_still_deleted(self):
+        # A signal during the create, or a lost response to a committed
+        # request: the create exits non-zero and the namespace carries this
+        # stack's label, so the trap removes it.
         completed, calls = self._run("plant", NS_CREATE_RC=1)
         self.assertNotEqual(completed.returncode, 0)
-        self.assertEqual(self._deletes(calls), [], "planted_ns is set only after a successful create")
+        deletes = self._deletes(calls)
+        self.assertEqual(len(deletes), 1, calls)
+        reads = [c for c in calls if "get namespace" in c]
+        self.assertEqual(len(reads), 2, "the trap reads the owner before it deletes")
 
     def test_a_credentials_failure_stops_before_any_read(self):
         completed, calls = self._run("plant", GCLOUD_FAILS=1)
