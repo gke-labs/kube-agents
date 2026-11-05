@@ -5304,6 +5304,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
+  progressDeadlineSeconds: 1800
   replicas: 1
   selector:
     matchLabels:
@@ -5390,6 +5391,11 @@ spec:
           ports:
             - containerPort: 9096
               name: a2a-metrics
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: a2a-metrics
+            periodSeconds: 5
           resources:
             limits:
               cpu: 500m
