@@ -258,6 +258,12 @@ readonly EVAL_LITELLM_SESSION_AFFINITY="${EVAL_LITELLM_SESSION_AFFINITY:-true}"
 # minutes, about as long as a replica keeps the prompt, so splitting them over
 # two ids lets more of them land on a replica that has already dropped it.
 readonly EVAL_LITELLM_SESSION_AFFINITY_SLOTS="${EVAL_LITELLM_SESSION_AFFINITY_SLOTS:-1}"
+# The Secret Manager secret, in the leased project, that holds the agent's Gemini
+# Developer API key under MODEL_PROVIDER=gemini. scripts/provision_ci_pool_gemini_key.sh
+# writes it.
+readonly EVAL_AGENT_GEMINI_KEY_SECRET="${EVAL_AGENT_GEMINI_KEY_SECRET:-kube-agents-eval-gemini-api-key}"
+# The MODEL_PROVIDER value under which the agent reads that key.
+readonly MODEL_PROVIDER_GEMINI="gemini"
 # Both reach `helm --set` and the chart's schema, which refuses anything but a
 # boolean and a positive integer only at step 5c, after the image build. This
 # check is stricter than Helm: lowercase true/false, at most three digits.
@@ -669,8 +675,10 @@ readonly BUILD_FAILED_STATUSES="FAILURE INTERNAL_ERROR TIMEOUT CANCELLED EXPIRED
 readonly BUILD_ID_RE='^[0-9a-fA-F-]+$'
 
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
-# Still required with the agent path on vertex_ai below: the judge reads it
-# (JUDGE_API_KEY in ci-eval-pr.sh) and the chart's credentials secret carries it.
+# Required on every provider: the judge reads it (JUDGE_API_KEY in
+# ci-eval-pr.sh). Under vertex_ai the chart's credentials secret also carries it;
+# under gemini the agent uses the leased project's own key instead
+# (resolve_agent_gemini_api_key below).
 if [ -z "${GEMINI_API_KEY:-}" ]; then
   echo "ERROR: GEMINI_API_KEY environment variable is required"
   exit 1
@@ -878,19 +886,51 @@ else
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
 
-# vertex_ai, not gemini. On 2026-09-02 every smoke run redded on 429s from the
-# Gemini Developer API key's fixed paid-tier-3 quota -- 8,000,000 input
-# tokens/minute for gemini-3.1-pro, named in the error body -- with five
-# concurrent builds drawing ~94k-token turns from one shared minute window
-# (#1097; the full diagnosis with build artifacts is on #1184). Vertex AI
-# serves the same Gemini models under dynamic shared quota, with no fixed
-# per-minute wall, and authenticates the LiteLLM pod through Workload Identity
-# (the kubeagents-litellm KSA annotation below) instead of the API key.
+# vertex_ai stays the default, for the presubmits' concurrency. On 2026-09-02
+# every smoke run redded on 429s from one shared Gemini Developer API key's
+# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for gemini-3.1-pro,
+# named in the error body -- with five concurrent builds drawing ~94k-token
+# turns from one shared minute window (#1097; the full diagnosis with build
+# artifacts is on #1184). Vertex AI serves the same Gemini models under dynamic
+# shared quota, with no fixed per-minute wall, and authenticates the LiteLLM pod
+# through Workload Identity (the kubeagents-litellm KSA annotation below)
+# instead of an API key.
+# When a job exports MODEL_PROVIDER=gemini, the agent reads the leased
+# project's own key from that project's Secret Manager
+# (resolve_agent_gemini_api_key below). Each project's key has its own quota,
+# so the shared-minute 429 storm cannot recur there. The job env's
+# GEMINI_API_KEY stays the judge's key.
 # Overridable so a rollout problem is a job-env flip rather than a revert.
 # Anyone flipping MODEL_DEFAULT_NAME: ci-eval-pr.sh stamps records with its
 # own AGENT_MODEL_OVERRIDE, so flip both or the eval version key names a
 # model the install is not serving.
 export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
+# --- agent key: begin
+# Sets AGENT_GEMINI_API_KEY, the key the agent's credentials secret carries.
+# Under gemini it is the leased project's own key, and an unreadable or empty
+# secret stops the deploy here, before any Helm call: no fallback to the job
+# env's key, whose shared quota is what the per-project key replaces. Under any
+# other provider it is GEMINI_API_KEY unchanged. The key is never echoed. A
+# whitespace-only value counts as empty, and the surrounding whitespace of a
+# stored value (a trailing newline, a CRLF's \r) is dropped.
+resolve_agent_gemini_api_key() {
+  if [ "${MODEL_PROVIDER}" != "${MODEL_PROVIDER_GEMINI}" ]; then
+    AGENT_GEMINI_API_KEY="${GEMINI_API_KEY}"
+    return 0
+  fi
+  local key=""
+  if ! key="$(gcloud secrets versions access latest --secret="${EVAL_AGENT_GEMINI_KEY_SECRET}" --project="${PROJECT_ID}")" || [[ -z "${key//[[:space:]]/}" ]]; then
+    echo "FATAL: MODEL_PROVIDER=gemini but Secret Manager ${PROJECT_ID}/${EVAL_AGENT_GEMINI_KEY_SECRET} cannot be read as this runner or is empty. Run scripts/provision_ci_pool_gemini_key.sh ${PROJECT_ID} to mint the project's key and grant the runner access." >&2
+    exit 1
+  fi
+  # A real key holds no whitespace: drop what surrounds it, a CRLF's \r included.
+  key="${key#"${key%%[![:space:]]*}"}"
+  key="${key%"${key##*[![:space:]]}"}"
+  AGENT_GEMINI_API_KEY="${key}"
+  echo "Agent key: Secret Manager ${PROJECT_ID}/${EVAL_AGENT_GEMINI_KEY_SECRET} (MODEL_PROVIDER=${MODEL_PROVIDER})"
+}
+# --- agent key: end
+resolve_agent_gemini_api_key
 export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.1-pro-preview}"
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
 # Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
@@ -1997,7 +2037,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     "${GITHUB_MINTER_ARGS[@]}" \
     --set "platformAgent.credentials.create=true" \
     --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
-    --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${AGENT_GEMINI_API_KEY}" \
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${SANDBOX_KEY_DIR}/id_sandbox" \
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
