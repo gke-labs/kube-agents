@@ -1,8 +1,11 @@
 # Inference replay for evals
 
-> **STATUS — proposal; measured, not built.** A prototype proxy was run against a dev install on
-> 2026-10-31 to 2026-11-02. Nothing here is wired into `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or
-> the chart. The first stage proposed is shadow mode, which changes no verdict.
+> **STATUS — proposal; measured; part of shadow mode built, not deployed.** A prototype proxy was
+> run against a dev install on 2026-10-31 to 2026-11-02. [`hack/replay-proxy/`](../../hack/replay-proxy/README.md)
+> has the shadow-mode proxy, its fingerprint log, the scrubbed request store and the hit-rate
+> script; the join with run verdicts and the collision report (Rollout step 1) are not built yet.
+> Nothing here is wired into `hack/ci-deploy.sh`, `hack/ci-eval-pr.sh` or the chart. Shadow mode
+> changes no verdict.
 
 **Scope:** serving recorded model answers to eval runs whose model input has not changed, so a
 presubmit pays for inference only from the first point where a run differs from one already graded.
@@ -123,21 +126,42 @@ The rules that keep this safe:
   past or the future can be the whole finding (an expired certificate, a CronJob that hasn't run for
   a month). So timestamps, both dates and epoch seconds, become a token for roughly how far from now
   they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
-  matches a valid one. IP addresses stay as they are whenever the request mentions a network range
-  (like `10.0.0.0/16`), because then which range an IP falls in can matter.
-- **Opaque fields are never touched.** Fields named for signatures, `provider_specific_fields`,
+  matches a valid one. Anything in the last hour is one token and anything in the next hour
+  another, so run-to-run timing jitter (a card read 50 or 70 seconds after it was claimed) doesn't change the
+  key. A spelled-out date with no time of day, like the "Conversation started: Thursday, November
+  05, 2026" line Hermes puts in the system prompt, becomes how many calendar days it is from the
+  request's own day instead ("today", "yesterday", "days ago", ...), counted in the time zone
+  written after it, so a nightly recorded on Wednesday still matches a presubmit on Thursday. A
+  date-only `2026-11-05` and an `ls -l` date with a year are counted the same way. An answer that
+  names one of these dates isn't saved, since replayed the next day it would carry the wrong date.
+  The answer is read for dates in any common shape (`memory/2026-11-04.md`, `20261104`,
+  `11/04/2026`, "4 November", "nov-04"), and today's date also counts without the year or by its
+  weekday ("findings for November 04"). In the dev-install trials that was 1 of 153 saved answers. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
+  `timestamp`); any other 10-digit number, like `memory: 1717986918`, isn't read as a time. IP
+  addresses stay as they are whenever the request mentions a network range (like `10.0.0.0/16`),
+  because then which range an IP falls in can matter.
+- **Opaque fields are never edited.** Fields named for signatures, `provider_specific_fields`,
   and the `id`/`tool_call_id` of tool calls: LiteLLM embeds Gemini's thought signature in
   tool-call ids (`call_…__thought__<base64>`), and rewriting a digit inside it corrupts the
-  signature. The prototype did exactly this before it was fixed.
+  signature. The prototype did exactly this before it was fixed. In the key, each of these
+  becomes one placeholder for the whole value, numbered by first appearance, so a tool result
+  still points at the same call. Live runs get new signatures every time, so keeping them as they
+  are would stop almost every match after the first tool call. The cost is that two requests that
+  differ only in a signature count as the same. Only the `id` of an entry in a message's
+  `tool_calls` list is treated this way, whatever its prefix (`call_…` from Gemini, `toolu_…` from
+  Claude); any other `id` field, like a card or a cluster, goes through the normal rules.
 - **Answers are rewritten by whole token only, and never for bare numbers.** An unrelated `99`
   in an answer must not become this run's row id.
 - **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
   request but can't safely be put back in an answer: bare numbers like a `pid`, a row `id`,
-  `resourceVersion` or `generation`, and the epoch timestamps that all become one fixed token. If
-  the model's answer repeats one of those values (say it answers `kill 4821` after reading
-  `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
+  `resourceVersion` or `generation`, and epoch timestamps, which become an unnumbered
+  how-far-from-now time token. If the model's answer repeats one of those values (say it answers
+  `kill 4821` after reading `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
   saving it, and if it repeats any of those values, it doesn't save it. That request just goes to
-  the model next time, which is always safe.
+  the model next time, which is always safe. A short swapped number (under 4 digits, like
+  `generation: 1` or a kanban `run_id: 190`) only counts as repeated next to its key
+  (`generation=1`, "the run_id is 190"): the dev-install dry run showed that counting any bare `1`
+  (`2>&1`, "revision 1") marked about one answer in seven unsaveable.
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
   `## Recent work by @<assignee>`, the assignee's last five runs on other cards, so the first
   card read differs between otherwise identical runs. The same block leaks earlier repetitions'
@@ -146,12 +170,12 @@ The rules that keep this safe:
 
 Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task id, A2A task id,
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
-`resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages. Epoch seconds are
-replaced by a fixed token, because two events in one second would otherwise shift every later
-number. Known gaps from the measurements: `ls -l` dates (`Nov  2 04:13`) and Hermes'
-terminal-output cache file suffixes (`…-89b0.log`). The rules above change two of these classes:
-timestamps get a how-far-from-now token, and IPs stay as they are when a network range is in the
-request.
+`resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages. Epoch seconds
+become an unnumbered how-far-from-now time token rather than a numbered placeholder, because two
+events in one second would otherwise shift every later number. The measurements found two gaps,
+`ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`); the
+normalizer handles both now. The rules above change two of these classes: timestamps get a how-far-from-now token, and IPs stay as
+they are when a network range is in the request.
 
 ## Measurements
 
@@ -172,7 +196,7 @@ recording. That happened in three ways:
 
 - the GCP capacity advisor returned a different score and zone (real data that changes);
 - a `sleep 60` in a polling loop timed out in one run and finished normally in another;
-- `ls -l` printed different file timestamps (a normalizer gap, listed above).
+- `ls -l` printed different file timestamps (a normalizer gap then, handled now).
 
 The provisioning case's verdict flipped because of the third one. Every replay of it reached the
 same `ls -la`, ran live from there, and so finished as an ordinary live run, and that case passes
@@ -266,9 +290,10 @@ the proxy stores anything, it runs the same cleanup that `worker_trajectory.py` 
 install's `AuditRedactor`, then the rules in `worker_transcript.py`). That cleanup already runs on the
 full tool output in today's eval records, but only the first 2,000 characters of each result are
 kept, so nobody has looked at what it leaves in the rest. We need to check it on full-length output,
-like a Secret dump or a token, before storing any request text. And if the cleanup would change an
-answer, that answer isn't saved: replaying it would put `[REDACTED]` into a tool call, and saving it
-uncleaned would put a secret in the bucket.
+like a Secret dump or a token, before storing any request text. And if the cleanup would mask a
+credential in an answer, that answer isn't saved: replaying it would put `[REDACTED]` into a tool
+call, and saving it uncleaned would put a secret in the bucket. Reformatting, or masking an email or
+an IP, doesn't count.
 
 ### Who can write to the cache
 
@@ -359,10 +384,11 @@ request would pass without anything being written to the cache. So:
   "Pinning and baselines");
 - the key includes a version hash of the normalizer, so answers saved by a different normalizer
   never match;
-- the proxy's files need eval-crew approval in `hack/OWNERS`, wherever the code ends up.
+- the proxy's files, in `hack/replay-proxy/`, need eval-crew approval in `hack/OWNERS`.
 
-Like the scorer's pin, this still relies on eval-crew reviewing changes to the deploy scripts that
-do the pinning, since those run from the pull request's code.
+Like the scorer's pin, this still relies on review of changes to the deploy scripts that do the
+pinning, since those run from the pull request's code: a root approver's approval (self-approval on
+their own change) and one `lgtm` from anyone `OWNERS` lists.
 
 ### What goes into the cache key
 
@@ -468,7 +494,7 @@ When runs replay, the three runs of a case are no longer independent. And becaus
 passing runs, a case a pull request didn't touch will pass on replay. So the "all three runs failed"
 rule can only be triggered by the parts of a run that ran live. That's what we want for a pull
 request that didn't cause the failure. But it raises three things the eval crew needs to decide
-before stage 2 of the rollout:
+before stage 3 of the rollout (turning replay on):
 
 - **Comparisons with `main` get biased.** Two checks compare a pull request with `main`'s numbers
   from the nightly: the overall pass rate (advisory for now, until `EVAL_AGGREGATE_ARMED` is set),
@@ -489,30 +515,71 @@ before stage 2 of the rollout:
 1. **Shadow mode (logs only, no cache).** The proxy runs in the presubmit and the nightly but still
    calls the model for every request, so no pass or fail changes. For each request it logs a
    fingerprint (a hash of the normalized request), the prompt tokens and how long the model took.
-   Fingerprints don't contain anything sensitive, so they go in the job's normal Prow artifacts. The
-   cleaned-up request text goes to a private, eval-only bucket instead, because anyone can read Prow
-   artifacts through the public Prow website. Both are copied out while the job runs, not at the end,
-   because the last two nightlies ran into Prow's 14-hour timeout and by the time the end-of-run step
-   ran, LiteLLM was already gone. After a week, a script goes through all the logs in time order and
-   checks, for each request, whether the same fingerprint showed up earlier. Matches against nightly
-   fingerprints give us a low estimate (those can be a day old), and matches against pull request
-   fingerprints a high one. How many matches came from a different project tells us whether one
-   shared cache makes sense. For normalizer fixes, the script compares each miss with the closest
-   earlier request, and since we kept the cleaned-up text, we can test a new normalizer rule on the
-   same week of data without redeploying anything.
+   The fingerprint log and the cleaned-up request text both go to a private, eval-only bucket, never
+   to Prow artifacts, which anyone can read through the public Prow website: the log holds no text,
+   but a hash of request content can be guessed against. Both are copied out while the job runs, not
+   at the end, because the last two nightlies ran into Prow's 14-hour timeout and by the time the
+   end-of-run step ran, LiteLLM was already gone. After a week, a script goes through all the logs
+   in time order and checks, for each request, whether the same fingerprint showed up earlier.
+   Matches against nightly fingerprints give us a low estimate (those can be a day old). Adding
+   matches against the same pull request's earlier finished builds, and against a merged pull
+   request's last build once it merged, gives a high one. How many matches came from a different
+   project tells us whether one shared cache makes sense. For normalizer fixes, the script compares
+   each miss with the closest earlier request, and since we kept the cleaned-up text, we can test a
+   new normalizer rule on the same week of data without redeploying anything.
+
+   Shadow mode's numbers are a floor, not the answer. In shadow mode every model answer is a fresh
+   live answer, while under replay it would be the saved one. That changes more than the answer
+   itself:
+   - the next request contains the live answer, so exact matches stop after the model's first
+     reply. The **simulated** estimate ignores the model's own replies to get past this;
+   - in a multi-agent run, one agent's answer becomes another agent's input: the card text the
+     platform agent writes is what the Cluster Agent reads. Under replay that text would match;
+     in shadow mode it's worded differently every run;
+   - an agent's live answer can pick a different action (open a different skill, call a different
+     tool), and the result of that action differs too. Under replay the saved action would run
+     and return the same result.
+
+   The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
+   two builds of one pull request and a second pull request) showed how big the gap is: the
+   simulated estimate was 12%, ignoring other agents' kanban text as well raised it to 22%, and most
+   of the remaining misses were tool results after a differently chosen action. Real record and
+   replay of the same cases, in "Measurements", reused 46–100%. So the deciding measurement comes
+   from real replay, in the replay lane below. Shadow mode stays for what only it can measure: how
+   often pull requests start on a saved recording at all (prompt changes, project rotation), and the
+   stored text for normalizer work.
 
    Shadow mode also checks that hits would be safe, not just how many there are. For each request
    it logs a hash of the model's live answer, and once the run is done, whether that run passed. For
    every match, the script compares the two cleaned-up requests and lists what the normalizer
    swapped to make them match, by type. If two matching requests got answers that led to different
    results, or a swap hid something that looks like real state, that's a collision. A reviewed
-   collision report is the bar for stage 2. This stage needs no shared cache and no new permissions
+   collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
 
-2. **Turn on replay for pull requests**, once the collision report from shadow mode has been reviewed,
-   the eval crew has decided the three gate questions above, and #1730 is fixed (or they're happy with
-   stripping the recent-work section from the key).
-3. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
+2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
+   without changing their results, so it gets its own job: a periodic, non-blocking job that runs a
+   set of cases on `main`'s code with replay on, served from the nightly's recordings. Its results
+   don't block anything and aren't written to the evidence store. For this the nightly saves its
+   answers, keyed by fingerprint, as the trusted writer in "Who can write to the cache"; the lane
+   only reads them. For each conversation it records
+   how many messages and tokens were replayed before the first miss, what caused that miss (the
+   proxy has the cache, so it logs the closest saved request and the message and field that
+   differed), and whether the run's verdict matched the live nightly's. Every miss here is real: a
+   normalizer gap to fix, or a real difference in the cluster or the code. Because a conversation
+   runs live after its first miss, each one tells us its first miss only, which is what replay would
+   actually save.
+
+   Run it on a dev install first, with a few cases recorded and replayed several times, to check the
+   mechanics; then as the periodic job for the measurement week. The estimate the decision rests on
+   combines both: what replay saves per conversation (this lane) times how often pull request
+   conversations start on a saved recording (shadow mode).
+
+3. **Turn on replay for pull requests**, once the replay lane shows it's worth it and its verdicts
+   match the live ones, the collision report
+   from shadow mode has been reviewed, the eval crew has decided the three gate questions above, and
+   #1730 is fixed (or they're happy with stripping the recent-work section from the key).
+4. **Look at polling.** If shadow mode shows most of the remaining misses come from the `sleep 60`
    polling loop, fix the polling rather than the cache.
 
 ## Open questions
@@ -524,7 +591,7 @@ before stage 2 of the rollout:
 - **Should the judge be cached too?** When a whole run is replayed, the judge gets exactly the same
   input as before. The judge takes 11 to 19% of a run's time. The same key rules would apply.
 - **How do we keep a pull request's answers safe until it merges?** See "The tricky part" above. We
-  need to check the two options and pick one before stage 2.
+  need to check the two options and pick one before stage 3.
 - **How big does the cache get, and when do entries expire?** Answers recorded for an old version of
   a prompt can never be hit again, so entries should expire by age. Expiry also limits one thing the
   key can't see: a model update on the provider's side (Vertex) doesn't change our requests or our

@@ -62,9 +62,15 @@ report and terminal commands are read back with `kubectl exec` from
 deleted. So are the board rows of the card and of every card its worker, or theirs, filed, since
 Hermes shows the assignee's recent completed runs on every card and would hand the next repetition
 this one's summary. A worker's card counts only when Hermes recorded the run as its creator, so a
-card a worker's create handed back by an existing idempotency key stays, files included. A card
-keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
-other than a follow-up linked to its creator. A card still running when the wait ran out is archived
+card a worker's create handed back by an existing idempotency key stays, files included. Likewise
+a card the front door's create returned that was created before the run started, by the agent pod's
+clock read before the agent is invoked, is not this run's and stays, files included; this holds on
+both waits below. When the clock or the board cannot be read, such a card is taken like the run's
+own. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
+other than a follow-up linked to its creator. What a purge keeps, or all of it when the board step
+fails, is written down in the agent pod, and the next repetition retries it before its agent is
+invoked, each purge under its own start time, so a card an earlier purge owes goes even when a later
+run's create returned it; anything owed for over a day is given up. A card still running when the wait ran out is archived
 first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
 store reads, or the collecting turn, which is a model call the customer never made.
@@ -350,7 +356,7 @@ the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
-the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` and `execute_code` entries
+the kanban worker logs by card id (for the required checks, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
 the harness appends to the trajectory from the workers' sessions as well, present when the
 wait found the cards and the door showed the trace); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
@@ -484,12 +490,13 @@ lane what names a write is the reply and the workers' calls the harness reads ba
 once the delegation wait has found the cards; a write neither names is recorded as unattributed
 and charged to nobody. The wait holds a case until the cards it filed are terminal, so a pull
 request the card's worker opens lands in its own case's window. What the wait does not follow is
-a worker's own fan-out, the child cards a worker files, nor a card still running when the case
-reaches the delegation ceiling or when the wait falls back. A write from one of those that lands
-in a later first-phase unit's window is unattributed there; one that lands in a requesting
-case's window, which runs alone and is marked exclusive, is charged to that case, so read a block
-on a requesting case's later repetitions as transport when the earlier case fanned out or ended
-at the ceiling. Parity in
+a worker's own fan-out, the child cards a worker files, a card still running when the case
+reaches the delegation ceiling or when the wait falls back, nor a card whose exchange the
+transport cut before the wait began. A write from one of those that lands in a later first-phase
+unit's window is unattributed there. A second-phase unit (a requesting case, a stopped ask, a
+`writes_alone` case) runs alone and its window is marked exclusive, so the CI script archives
+every card still live before each such unit, then settles. A fence that could not run is a
+`Card fence` warning in the run log; read a block on that unit after one as transport. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation
@@ -633,7 +640,7 @@ which the conversation shows as the needs-you message, is appended under
 returned, and the worker logs are read by those ids for `worker_commands` without `after_result_pattern`. A card still running at
 the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
 result) is not its answer, so the repetition is recorded at the ceiling and the card is only
-archived and purged. A door that reports no `contextId`, a session the store does not hold (the
+archived and purged (a card created before the run started is left, as above). A door that reports no `contextId`, a session the store does not hold (the
 `cli` executor), or a first read of the store that fails three times running, before any card is
 found, falls back to the status-turn wait. That wait takes its card ids from the trajectory, which
 holds none on this path, so it settles at once on the reply and sends no status turn; the last of
@@ -734,7 +741,7 @@ listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking 
 the batch runs Tide started, the main nightly's three parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
 `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
-under next, the GHES lane's nightly under next (`ci-kube-agents-eval-nightly-ghes-next`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+under next, the GHES lane's nightly under next (`ci-kube-agents-eval-nightly-ghes-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
 install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),

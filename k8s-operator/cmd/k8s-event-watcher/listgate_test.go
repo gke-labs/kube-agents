@@ -280,8 +280,12 @@ func TestRun_RelistAfterGoneIsGated(t *testing.T) {
 	client := fake.NewClientset()
 	allowPreflight(client)
 	var lists atomic.Int64
-	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
-		lists.Add(1)
+	client.PrependReactor("list", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		// The mark pass's field-selected lists are not the reflector's list;
+		// a real server answers them with the matching subset, here none.
+		if !isMarkPass(action) {
+			lists.Add(1)
+		}
 		return true, &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: "10"}}, nil
 	})
 	var openWatch atomic.Pointer[watch.FakeWatcher]

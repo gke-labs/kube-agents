@@ -119,13 +119,16 @@ LABEL_FIELDS: tuple[str, ...] = ("labels", "labelsAdd", "labelsRemove", "exclude
 # `branch-view` and `branch-delete` are the broker's rather than a forge's for the
 # reason `publish` is: which refs a remote holds, and removing one, is git
 # against a URL on every forge. `snapshot` is git against a URL too.
+# `proposal-claim` is the broker's because the claim token it burns is the
+# broker's: no forge has one.
 BROKER_VERBS: tuple[str, ...] = (
     "capabilities", "clone", "snapshot", "publish", "identity", "branch-view", "branch-delete",
+    "proposal-claim",
 )
-# Served to library callers only (`vcs_client.snapshot`), so `capabilities` does
-# not advertise them: no `vcs.py` command runs them, and an advertised verb sends
-# the agent to a command that does not exist.
-LIBRARY_VERBS: frozenset[str] = frozenset({"snapshot"})
+# Served to library callers only (`vcs_client.snapshot`, the `pr_opened` hook's
+# claim), so `capabilities` does not advertise them: no `vcs.py` command runs
+# them, and an advertised verb sends the agent to a command that does not exist.
+LIBRARY_VERBS: frozenset[str] = frozenset({"snapshot", "proposal-claim"})
 
 
 

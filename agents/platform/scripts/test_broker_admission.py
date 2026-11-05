@@ -126,9 +126,66 @@ class ReadReportTest(unittest.TestCase):
             self.assertIsNone(broker_admission.read_report(self.ENDPOINT))
 
     def test_no_broker_url_reads_as_unknown_without_a_request(self):
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}), self._reading({"admitted": 8}):
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "", "CREDENTIAL_PROXY_EXEC_URL": ""}), \
+                self._reading({"admitted": 8}):
             self.assertIsNone(broker_admission.read_report())
         self.assertEqual([], self.seen)
+
+    def test_it_reads_the_exec_tier_when_its_url_is_set_and_the_stateful_broker_otherwise(self):
+        stateful, exec_tier = "http://credential-proxy:8080", "http://credential-proxy-exec-tier:8765"
+        for name, environ, endpoint in (
+            ("exec url set", {"CREDENTIAL_PROXY_URL": stateful, "CREDENTIAL_PROXY_EXEC_URL": exec_tier}, exec_tier),
+            ("exec url empty", {"CREDENTIAL_PROXY_URL": stateful, "CREDENTIAL_PROXY_EXEC_URL": " "}, stateful),
+            ("exec url alone", {"CREDENTIAL_PROXY_URL": "", "CREDENTIAL_PROXY_EXEC_URL": exec_tier}, exec_tier),
+        ):
+            with self.subTest(case=name), mock.patch.dict(os.environ, environ), \
+                    mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
+                    self._reading({"admitted": 8}):
+                self.assertEqual((8, 2, None), broker_admission.read_report())
+                self.assertEqual([endpoint + "/v1/exec/admission"], [request.full_url for request, _ in self.seen])
+
+    def test_an_explicit_endpoint_wins_over_both_urls(self):
+        environ = {"CREDENTIAL_PROXY_URL": "http://stateful:8080", "CREDENTIAL_PROXY_EXEC_URL": "http://exec:8765"}
+        with mock.patch.dict(os.environ, environ), \
+                mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
+                self._reading({"admitted": 8}):
+            broker_admission.read_report(self.ENDPOINT)
+        self.assertEqual([self.ENDPOINT + "/v1/exec/admission"], [request.full_url for request, _ in self.seen])
+
+    def test_an_explicit_empty_endpoint_wins_over_both_urls_without_a_request(self):
+        environ = {"CREDENTIAL_PROXY_URL": "http://stateful:8080", "CREDENTIAL_PROXY_EXEC_URL": "http://exec:8765"}
+        for endpoint in ("", "  "):
+            with self.subTest(endpoint=endpoint), mock.patch.dict(os.environ, environ), \
+                    mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
+                    self._reading({"admitted": 8}):
+                self.assertIsNone(broker_admission.read_report(endpoint))
+                self.assertEqual([], self.seen)
+
+    TIER = {
+        "slot_cap": 8, "budget_admits": 9, "admitted": 8, "interactive_cap": 7, "session_cap": 2,
+        "replicas": 2, "tier_admitted": 16, "tier_interactive_cap": 14,
+    }
+
+    def test_it_reads_the_tiers_totals_with_the_session_cap_on_each_replica(self):
+        with mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
+                self._reading(self.TIER):
+            report = broker_admission.read_report(self.ENDPOINT)
+        self.assertEqual((16, 4, 14), report)
+        # Five per replica, the width one pod gives at the 2Gi default.
+        self.assertEqual(10, broker_admission.width_for(*report))
+
+    def test_a_report_without_all_three_tier_numbers_reads_per_replica(self):
+        for key in ("replicas", "tier_admitted", "tier_interactive_cap"):
+            for bad in ("missing", 0, "2", True):
+                body = dict(self.TIER)
+                if bad == "missing":
+                    del body[key]
+                else:
+                    body[key] = bad
+                with self.subTest(key=key, value=bad), \
+                        mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
+                        self._reading(body):
+                    self.assertEqual((8, 2, 7), broker_admission.read_report(self.ENDPOINT))
 
 
 class SweepWidthTest(unittest.TestCase):
@@ -147,6 +204,16 @@ class SweepWidthTest(unittest.TestCase):
     def test_it_keeps_the_session_cap_the_broker_reports(self):
         with mock.patch.object(broker_admission, "read_report", return_value=(8, 3, None)):
             self.assertEqual(5, broker_admission.sweep_width())
+
+    def test_it_sizes_to_the_tier_when_the_broker_reports_it_and_per_replica_otherwise(self):
+        per_replica = {"slot_cap": 8, "budget_admits": 9, "admitted": 8, "interactive_cap": 7, "session_cap": 2}
+        tier = dict(per_replica, replicas=3, tier_admitted=24, tier_interactive_cap=21)
+        for body, width in ((tier, 15), (per_replica, 5)):
+            broker_admission._cached_width = None
+            with self.subTest(body=body), mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": "http://broker:8080", "CREDENTIAL_PROXY_EXEC_URL": ""}), \
+                    mock.patch.object(credential_proxy_client, "authorization_headers", return_value={}), \
+                    mock.patch.object(broker_admission._OPENER, "open", return_value=_Response(json.dumps(body).encode())):
+                self.assertEqual(width, broker_admission.sweep_width())
 
     def test_it_falls_back_to_four_when_the_broker_cannot_say(self):
         with mock.patch.object(broker_admission, "read_report", return_value=None):

@@ -148,6 +148,20 @@ different route and lose a different tie: the provider's defaults are passed as 
 `bench/tasks/autoops-warning-event-triage/task.yaml` sets everything else there and deliberately
 not those.
 
+A stack that writes to the GitOps repository, or plants a Config Connector object, gets more inputs,
+in its own unit only. It asks for them by declaring the marker `variable "bench_gitops_write_token_file"`,
+a name no other stack uses. The unit then gets a write token narrowed to the leased repository (contents,
+pull requests and issues write), in a file that `TF_VAR_bench_gitops_write_token_file` names, renewed until
+devops-bench returns; `TF_VAR_gitops_repo`, the leased project's GitOps repository as `owner/name`;
+`TF_VAR_kcc_cluster_name` and `TF_VAR_kcc_cluster_location`, seeded slot a, the cluster that runs Config
+Connector, read from the fleet's `.fleet-context`; and `TF_VAR_kcc_google_service_account`,
+`kcc-eval-context@<project>.iam.gserviceaccount.com`, a service account with no project role, for a
+ConfigConnectorContext. A value the run does not know is left unset. A stack without the marker sees none
+of these. A writing stack must remove what it writes at destroy. devops-bench logs a teardown error and
+goes on, so for a file a failed or killed teardown leaves, the repository reset is the backstop, for the
+paths it knows
+([`docs/ci-pool-projects.md`](../docs/ci-pool-projects.md#55-the-repository-reset-and-the-sweep-behind-it)).
+
 Declare each of these in your stack's `variables.tf` to receive it. An injected variable the stack
 does not declare is dropped with nothing but a log warning, so a missing declaration surfaces as a
 stack built with the wrong defaults rather than as an error. A variable the _task_ sets and the
@@ -783,8 +797,10 @@ than every case running at the time; a write no repetition names fails none, and
 leftovers listing still names it. The script also runs the cases that request a pull request
 (the same leaf count as the allowance), the stopped asks and the cases that declare
 `writes_alone: true` in a second phase, after every first-phase unit has
-finished (a case that declares `scope_exclude:` runs after them, in a phase of its own), one unit at a time, each after a settle as long as the check's clock-skew tolerance, so no window
-reaches back into the unit before. The lane marks those cases' windows `exclusive_window`, and a
+finished, one unit at a time. Before each of those units the script archives every kanban card
+still live that was filed since the fan-out began, then settles as long as the check's clock-skew
+tolerance, so no window reaches back into the unit before. A case that declares `scope_exclude:`
+runs after them, in a phase of its own. The lane marks those cases' windows `exclusive_window`, and a
 write in one is charged whether the repetition names it or not, since nothing else was writing;
 each is allowed the pull requests its own reply names. A pull request that was only
 commented on, labelled or closed in the window is not a write: an `updated_at` moved without a

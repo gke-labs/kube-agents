@@ -108,12 +108,16 @@ it is discussed below in its own right.
 
 `fixtures` is a list of fixture role slugs from `bench/tf/fleet/fixtures.json` — the
 seeded defects the case depends on. (`docs/designs/fleet-fixtures.yaml` overlays the
-day-N gates and the project-scoped fixtures on that catalogue, and contributes the roles
-that have no cluster slot; it may not rename one.) It is documentation the validator
+day-N gates on that catalogue, and contributes only the roles the catalogue does not
+probe, such as `orphan-disks`; it may not rename one.) It is documentation the validator
 enforces: it makes a case's fixture dependencies greppable, so the fleet owner replacing
 a cluster knows which cases go quiet. The same slugs name a `fleet_resource_property`
 check's `fixture_role:`, and a check naming a role the case does not list is rejected —
-one planted defect, one name, however the case refers to it. Cases address fixtures by
+one planted defect, one name, however the case refers to it. A project-scoped catalogue
+role (`cluster_slot: null`, a Compute Engine object such as `startup-fail-vm`) may appear in
+`fixtures:` but not in `fixture_role:` or `fixture_roles:`: the runner writes no kubeconfig
+and records no slot for it, and the validator refuses it there in a case that is not in
+`FIXTURE_NOT_READY`. Cases address fixtures by
 role and never by cluster name or project id; `docs/designs/bench-fleet-catalog.md` is
 the contract for why.
 
@@ -305,7 +309,7 @@ the repetition's reply, or its or its workers' call that created the write, name
 a case wraps it in `none` to say the agent wrote nothing it was not asked for,
 and both lanes append exactly that entry to every case they run), `worker_commands` (regular expressions over the terminal commands
 the delegated workers ran, read from the worker log of each card the front agent filed before the harness
-purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory, and with `after_result_pattern` set from every card's tagged calls as typed, beside the logs when the check has no forbidden set; each of its `exempt_patterns` removes the text it matches from a
+purges it and, for any card with no log line (the cards those workers filed in turn, or a filed card that ran only code), from its tagged `terminal` and `execute_code` calls in the trajectory; the required patterns and runs also read a logged card's tagged calls; with `after_result_pattern` set, the check reads every card's tagged calls as typed, beside the logs when the check has no forbidden set; each of its `exempt_patterns` removes the text it matches from a
 command, a log line or a tagged call alike, before the forbidden list reads it, and nothing else, and takes a
 command it touched out of the required list, for a command that can fetch and
 send nothing but carries a forbidden word as its argument, such as a plain
@@ -434,8 +438,9 @@ filed is read from the trajectory, as far as the capture reached it) — a route
 answered without delegating leaves it nothing to read, which is `status: "error"`, not a
 pass. For a card the front agent filed it reads the one-line rendering hermes writes to the card
 log, not the command as typed: a newline becomes a space, a chain joined by `;`, `&&` or `||`
-arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a pattern
-never sees a command chained behind another, and the quotes stay, so a listed word the command
+arrives as its first command plus ` + N command(s)`, and a redirection is dropped, so a forbidden pattern or
+run never sees a command chained behind another (a required pattern or run also reads that
+card's tagged calls as typed, so it does), and the quotes stay, so a listed word the command
 splits with an empty quote inside it is one word to the shell and none to the pattern. For a card a
 worker filed it reads the tagged call, which is the command as typed, so a `^`-anchored pattern
 written against the rendering can miss that card's command behind a `cd … &&` or on a second
@@ -536,8 +541,9 @@ reason and what would close it. An entry there is a debt with a name on it.
 ## Registration
 
 `hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
-job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and only those.
-Cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
+job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and, under
+`EVAL_TIER=certification`, the cases in `hack/eval/certification-cases.txt` alone. A case
+runs because one of those files names it; cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
 the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
 purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
 case for months.
@@ -562,6 +568,11 @@ seat, or because what they grade is not one of the core journeys the presubmit g
 for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`. A case the agent cannot pass
 yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
 is what the record is for.
+
+The one exception is a case with `suite: certification` in its task file: it registers in
+`hack/eval/certification-cases.txt`, runs only under `EVAL_TIER=certification`, and never
+in the presubmit or nightly files
+([`bench/README.md`](../../bench/README.md#certification-suite)).
 
 The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
 the parking state for a case whose fixture or blocker was not ready, and it was

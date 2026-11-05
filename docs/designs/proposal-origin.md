@@ -69,7 +69,8 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   that, or a continuation whose parent row is gone, resolves as `other`, which is accepted. The web console and the admin console's chat page run outside the pod and mint their session ids themselves (`web-console-*` and `portal_*`), so they write no record: the in-pod reader takes `console` from those id prefixes, the convention the web console's activity view already reads for its own, until the agent-API door writes a record for the sessions it admits. Any caller holding the external agent-API key can mint such an id and count as `console` rather than `api`; both are operator-side callers, the sandbox holds no such key, and the bridge forces its own prefix, so that is accepted until the door's record replaces the convention. A caller holding that key can also join an existing session by id (an alert's `k8s-evt-*` session, a chat session), and its work then counts as that session's origin; the sandbox holds no key, so that too is accepted as operator-side. The `session_store` plugin runs only on gateway dispatch, which an agent-API turn may
   not pass through; `api` for agent-API turns is therefore written by that door when its design
   lands, and until then such work resolves as `other`. A person who replies in an alert's thread runs in the gateway's own chat session (the alert's report is pasted in; nothing maps the reply to the `k8s-evt-*` session), so a proposal they ask for there counts as `chat`.
-- **A card**, as two columns the board patch writes at insert, beside the priority
+- **A card**, as a row of the board side table `kanban_task_origins` (task id, origin, platform)
+  that the board patch writes at insert, in the insert's own transaction, beside the priority
   `kanban_priority` already stamps from trusted context and never from the `session_id` argument
   the model passes. The origin is never an argument of a create command: the `/kanban create`
   parser serves chat users and in-pod scripts alike, so a flag on it would let anyone who can
@@ -83,11 +84,13 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   stamp, so a chat user who files a card under the gate's predictable key before the gate's tick
   gets a `chat` card, not an `issue` one. That endpoint is reachable with the pod's Session KV key, which the sandbox and chat commands do not hold and the platform MCP server and the hermes-bridge do; no MCP tool exposes it, and none may. A card with no stamp, one filed before this lands, is `other`.
   A worker's origin is its card's, so a cron job dispatched as a worker counts under its card,
-  which the run stamped.
+  which the run stamped. A worker reads its card's stamp first; an unstamped card falls through
+  to the turn's own resolution (the run's context, the session record, the console convention).
+  A cron job that a worker creates or runs directly therefore records its card's origin.
 - **A cron run**, as a trusted per-run context the Hermes scheduler sets for a run its own tick
   started (the run ledger already tells a tick's run from a direct one, `source` other than
   `direct`), `audit` or `scheduled` only for a job whose definition equals the image's template
-  entry in `/opt/platform-template/cron/jobs.json` (same id, same prompt and skills; the profile's
+  entry in `/opt/platform-template/cron/jobs.json` (same id, prompt, skills and script; the profile's
   own jobs file is the agent's to write, so an id alone proves nothing), the way the api_server
   sets the request-scoped session id `trusted_origin_session` reads. The Platform Agent's model
   can create jobs, edit them, and run any job directly, synchronously or in the background, so:
@@ -96,7 +99,8 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   or editing session's, in a table of the Session KV server written by the in-pod handler of the
   `cronjob` tool from trusted context, never in the jobs file the agent writes; a job id with no
   such record and no template match resolves as `other`; a direct run is not tick-started and
-  resolves as the session that asked for it.
+  resolves as the session that asked for it. A job created inside a tick-started run records
+  that run's origin, so a job that a scheduled audit run creates records `audit`.
   A tick-started run has no Session KV metadata row of its own and no gateway dispatch, so
   neither of the other two records can reach it.
 
@@ -131,7 +135,11 @@ is the agent's, not that this process opened it, so a worker that echoed another
 record line could claim that proposal for its own origin. The broker therefore mints a one-time claim token with each `proposal-create` answer and keeps it
 with the url for the window; `vcs_client` takes the token out of the answer it returns and prints
 (so `vcs.py`'s stdout never carries it) and puts it on the stderr record line alone; the hook
-presents the tokens it sees to a new `proposal-claim` verb, which does the forge check itself
+presents each token it sees to a new `proposal-claim` verb, addressed to the record line's `repo`
+field. That field is the managed repository the broker resolved for the create, taken from the
+`proposal-create` answer, so the hook needs no grammar for each forge's url shape. A record with
+no `repo` (one an older client wrote) falls back to the repository its GitHub- or GitLab-shaped url
+names, and a record with neither takes no claim. The verb does the forge check itself
 with the credential it holds and accepts each token once, so the hook no longer makes its own
 forge reads. The claim is one broker call through the sandbox hop per record line, made in line
 before the command returns, so the hook keeps today's cap of five record lines per output: the
@@ -165,7 +173,11 @@ terminal; its session record then resolves it, `chat` with its platform. A Prome
 
 What the count misses, stated so the numbers are read right: a pull request opened by a
 background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
-instead of `vcs_client.call`. So the origin counts sit at or below
+instead of `vcs_client.call`. Three windows in the mechanism lose a count too. A claim that
+succeeds and a ledger write that then fails loses that proposal's count, since the token is
+spent. A broker restart between the mint and the claim loses the claims in flight, since the
+broker holds its tokens in memory. During a rollout, a broker older than the claim token answers
+without one, so a worker's record line stays in the output with no card event and no count. So the origin counts sit at or below
 `remediationsProposedTotal` in the usual case, and the difference reads as "proposals the agent
 did not see itself open"; it is approximate, since the broker's total is itself folded from a
 counter the poller can under-read across a gap while the ledger is durable.
@@ -228,8 +240,8 @@ holds as it stands.
   key (with the platform) and its write for `k8s-evt-*` sessions at the first inject; the parent
   walk for continuations; the `proposals_opened` table and the endpoint the hook writes it
   through; the stamped-insert endpoint for cards; the drift backlog's `drift` stamp; the per-job-id origin table the `cronjob` handler writes.
-- **Board patch** (`deploy/docker/patches/`, beside `kanban_priority.py`): the card's `origin`
-  and `origin_platform` columns written at insert from the creating turn's session record, run
+- **Board patch** (`deploy/docker/patches/`, beside `kanban_priority.py`): the card's origin and
+  platform, a row of the side table `kanban_task_origins` written at insert from the creating turn's session record, run
   context or dashboard, the worker's and the child's inheritance, and the insert-only stamp a
   trusted writer passes.
 - **Credential broker** (`agents/platform/scripts/credential_proxy.py`) and `vcs_client`: the

@@ -156,6 +156,12 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 		}
 		w := newWatcher(tc.Client, delivery, tc)
 		w.gate = s.gate
+		// A relist after the sync is the loop a slow batch can fall into (a
+		// watch the API server would not resume, a watch-list stream that
+		// failed); the counter makes it visible beside cluster_up.
+		w.onRelist = func() {
+			s.m.relists.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Inc()
+		}
 		log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
 			tc.Name, tc.Profile, tc.ProjectID, tc.Location)
 		// The gauge follows every transition the watcher reports: 1 on the

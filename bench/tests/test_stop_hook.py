@@ -69,8 +69,8 @@ def _no_pod(monkeypatch):
     advance a fake clock instead of waiting."""
     PURGED.clear()
     ARCHIVED.clear()
-    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, timeout: PURGED.extend(ids))
-    monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, timeout: ARCHIVED.extend(ids))
+    monkeypatch.setattr(harness, "_purge_card_state", lambda ids, timeout, floor=None: PURGED.extend(ids))
+    monkeypatch.setattr(harness, "_archive_stalled_cards", lambda ids, timeout, floor=None: ARCHIVED.extend(ids))
     clock = [0.0]
     monkeypatch.setattr(harness.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(harness.time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s))
@@ -113,6 +113,38 @@ def test_a_filed_card_is_stopped_and_recorded(monkeypatch):
     assert result.metadata["stop_card_statuses"] == {"t_1": "archived"}
     assert ARCHIVED == [] and PURGED == ["t_1"]
     assert _entry(result, stop_hook.CARDS_STOPPED_ENTRY)["status"] == "completed"
+
+
+def test_the_stop_purges_with_the_run_start_floor(monkeypatch):
+    """The stop path's purge carries the floor :meth:`run` read (#4591)."""
+    floors = []
+    monkeypatch.setattr(
+        harness, "_purge_card_state", lambda ids, timeout, floor=None: floors.append((list(ids), floor))
+    )
+    monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: _cards({"t_1": "archived"}))
+    h = harness.KubeAgentsHarness()
+    h._pod_floor = 1_700_000_000
+    h._stop_after_first_card(
+        AgentResult(output="on it", trajectory=[]), "a2a-ctx-1", stop_hook.Stop(prompt="ask", observe_seconds=0.0),
+        send_stop=lambda: (True, "stopped"), poll_interval=0.0,
+    )
+    assert floors == [(["t_1"], 1_700_000_000)]
+
+
+def test_the_stop_archives_with_the_run_start_floor(monkeypatch):
+    """A card the stop could not settle is archived only if it is the run's (#4591)."""
+    floors = []
+    monkeypatch.setattr(
+        harness, "_archive_stalled_cards", lambda ids, timeout, floor=None: floors.append((list(ids), floor))
+    )
+    monkeypatch.setattr(harness.board, "read_session_cards", lambda *a, **k: _cards({"t_1": "running"}))
+    h = harness.KubeAgentsHarness()
+    h._pod_floor = 1_700_000_000
+    h._stop_after_first_card(
+        AgentResult(output="on it", trajectory=[]), "a2a-ctx-1", stop_hook.Stop(prompt="ask", observe_seconds=0.0),
+        send_stop=lambda: (True, "stopped"), poll_interval=0.0,
+    )
+    assert floors == [(["t_1"], 1_700_000_000)]
 
 
 def test_the_stop_goes_before_any_read(monkeypatch):

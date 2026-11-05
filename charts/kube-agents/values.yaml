@@ -999,6 +999,26 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The k8s event watcher. alertExclude lists events that open no incident:
+    # no alert, no triage card, no share of the daily alert ceiling. Their
+    # clusters stay in scope, so the agent still reads them when asked. A rule
+    # sets one or more of cluster ({projectId, location, clusterName}, only
+    # clusterName required), namespace, reason, kind and name (a trailing *
+    # is a prefix), and matches when every part it sets matches; an event is
+    # excluded when any rule matches. At most 64 rules. Empty omits the block.
+    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
+    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
+    # removes the CR's whole eventWatcher block, so an enabled: false set there
+    # with kubectl patch is lost too; set it again afterwards. The watcher's
+    # tuning settings are under platformAgent.deployment.eventWatcher.
+    eventWatcher:
+      alertExclude: []
+        # - namespace: payments
+        # - reason: FailedScheduling
+        #   cluster: { clusterName: batch }
+        # - namespace: shop
+        #   kind: Pod
+        #   name: inventory-api-*
     # The controller stall watch, the stall-watch cron job that alerts on
     # controllers that stopped making progress. Empty omits the block and
     # keeps the watch's defaults. A change rolls the agent pod. The
@@ -1203,6 +1223,35 @@ platformAgent:
     # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
     # buckets and a sizing method.
     alertDailyLimits: {}
+    # The event watcher's tuning settings. Each key that you set becomes one
+    # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to
+    # the agent-api-auth container, which runs the watcher. A key that you do
+    # not set keeps the watcher's default (in brackets below). An entry with the
+    # same name in env above wins over the key, a valueFrom entry included.
+    #
+    #   eventWatcher:
+    #     dedupWindow: 24h                # WATCHER_DEDUP_WINDOW [24h]
+    #     backoffMinCount: 3              # WATCHER_BACKOFF_MIN_COUNT [3]
+    #     imagePullTransientMinCount: 3   # WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT [3]
+    #     failedSchedulingMinCount: 5     # WATCHER_FAILEDSCHEDULING_MIN_COUNT [5]
+    #     failedSchedulingMinSpan: 2m     # WATCHER_FAILEDSCHEDULING_MIN_SPAN [2m]
+    #     scaleUpHold: 15m                # WATCHER_SCALEUP_HOLD [15m]
+    #     settle: 2m                      # WATCHER_SETTLE [2m]
+    #     quietAfter: 15m                 # WATCHER_QUIET_AFTER [15m]
+    #     autopilotScaleToZeroHold: true  # WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD [true]
+    #
+    # A duration is a Go duration such as 90s, 2m or 1h30m, up to 1000000h.
+    # "0" turns off failedSchedulingMinSpan, settle and quietAfter.
+    # dedupWindow and scaleUpHold must be above zero, and a count at least 1.
+    # A count of 1 fires on the first event only with its gate off:
+    # failedSchedulingMinSpan "0" for failedSchedulingMinCount, and settle "0"
+    # for backoffMinCount. The watcher README
+    # (k8s-operator/cmd/k8s-event-watcher/README.md, the flag table) says what
+    # each setting does. A duration that the watcher cannot read keeps its
+    # default, and the container log names it. A change rolls the agent pod
+    # and the credential-proxy pod, which also gets spec.deployment.env.
+    # Alert excludes are under platformAgent.harness.eventWatcher.alertExclude.
+    eventWatcher: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests, or 2 CPU
@@ -1243,6 +1292,14 @@ platformAgent:
     # does).
     credentialProxy:
       resources: {}
+      # The exec tier: stateless broker replicas beside the stateful broker that
+      # answer /v1/exec and /v1/gcp/ only, forwarded to the CR as
+      # spec.deployment.credentialProxy.exec.replicas when above 0. 0 renders
+      # none. Each replica requests and is limited to 2 CPU and 2Gi. On an
+      # existing install the chart fails the upgrade when the installed CRD
+      # predates the field; apply crds/ first (upgrade.sh does).
+      exec:
+        replicas: 0
     # The agent-api-auth sidecar's requests and limits, forwarded to the CR as
     # spec.deployment.agentAPIAuth.resources when any key is set. Each key merges
     # over the operator's defaults (150m CPU and 384Mi requests; 1 CPU, 2Gi memory

@@ -631,9 +631,8 @@ type EventWatcherSpec struct {
 	// events arrive faster than the agent can triage them — a fleet-wide rollout
 	// gone wrong, a node pool flapping — and the cheapest way to get the agent back
 	// is to cut the inflow rather than to chase the cards it has already been given.
-	// It is all-or-nothing across every watched cluster: the watcher's reason and
-	// namespace filters are fixed by the sidecar's entrypoint and not exposed here,
-	// so there is no way to silence one noisy namespace through this field.
+	// It is all-or-nothing across every watched cluster. To silence one noisy
+	// namespace, cluster, reason or workload, use alertExclude below.
 	//
 	// Three consequences to know before pressing it:
 	//
@@ -649,6 +648,89 @@ type EventWatcherSpec struct {
 	// +kubebuilder:default=true
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
+
+	// AlertExclude lists events that open no incident: no alert, no triage card,
+	// no share of the daily alert ceiling. Their clusters stay in scope, so the
+	// agent still reads them when asked; spec.scope.exclude is what hides a
+	// cluster. An event is excluded when any rule matches it.
+	//
+	// The watcher counts what the rules hold back in
+	// k8s_event_watcher_events_filtered_total{gate="alert_excluded"}; the
+	// end-of-day report does not count them. A change rolls the gateway pod. When
+	// this list is set, it replaces a WATCHER_ALERT_EXCLUDE entry in
+	// spec.deployment.env.
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=64
+	// +optional
+	AlertExclude []EventWatcherAlertExcludeRule `json:"alertExclude,omitempty"`
+}
+
+// EventWatcherAlertExcludeRule is one alertExclude entry. Every part is
+// optional, and the rule matches an event when every part it sets matches.
+// Each string part has a length bound and a pattern of characters that JSON
+// writes as themselves, so the whole list, which reaches the watcher as one
+// environment value, stays well under the kernel's 128 KiB limit on one.
+// There is no label selector: an event carries its own labels, not the
+// labels of the object it is about.
+// +kubebuilder:validation:XValidation:rule="has(self.cluster) || has(self.namespace) || has(self.reason) || has(self.kind) || (has(self.name) && self.name != '*')",message="an alertExclude rule sets at least one of cluster, namespace, reason, kind or name (a bare * is not enough): a rule with none would silence every alert, and enabled: false is the emergency stop"
+type EventWatcherAlertExcludeRule struct {
+	// Cluster limits the rule to one cluster.
+	// +optional
+	Cluster *EventWatcherAlertExcludeCluster `json:"cluster,omitempty"`
+
+	// Namespace limits the rule to events from one namespace. Matched exactly.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Reason limits the rule to one event reason, matched without regard to
+	// case. It matches the event's reason or the family the watcher groups it
+	// in, so CrashLoopBackOff also matches kubelet's BackOff events for a
+	// restarting container, and ImagePullBackOff matches ErrImagePull.
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^[A-Za-z][-_.A-Za-z0-9]*$`
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Kind limits the rule to events about one kind of object, such as Pod or
+	// Node. Matched without regard to case.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[A-Za-z][A-Za-z0-9]*$`
+	// +optional
+	Kind string `json:"kind,omitempty"`
+
+	// Name limits the rule to events about one object, by its name. A trailing
+	// * makes the rest a prefix, since a pod's name carries generated suffixes:
+	// payments-api-* matches every pod of that Deployment. A bare * is written
+	// by leaving name out.
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|[a-z0-9][-.a-z0-9]*\*)$`
+	// +optional
+	Name string `json:"name,omitempty"`
+}
+
+// EventWatcherAlertExcludeCluster names a cluster by the keys spec.scope uses.
+// A projectId or location the event does not carry is not compared: the
+// watcher's own cluster has neither until its Cluster Agent profile exists.
+type EventWatcherAlertExcludeCluster struct {
+	// ProjectID is the cluster's Google Cloud project, plain (my-project) or
+	// domain-scoped (example.com:my-project).
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^([a-z0-9.-]+:)?[a-z]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	ProjectID string `json:"projectId,omitempty"`
+
+	// Location is the cluster's region or zone.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	Location string `json:"location,omitempty"`
+
+	// ClusterName is the cluster's name.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	ClusterName string `json:"clusterName"`
 }
 
 // DriftDetectorSpec configures the drift-detector, which runs as a peer service
@@ -1289,6 +1371,26 @@ type CredentialProxySpec struct {
 	// declared limits stand.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// Exec configures the exec tier: stateless broker replicas beside the
+	// stateful broker that answer /v1/exec and /v1/gcp/ only.
+	// +optional
+	Exec *CredentialProxyExecSpec `json:"exec,omitempty"`
+}
+
+// CredentialProxyExecSpec sizes the credential broker's exec tier.
+type CredentialProxyExecSpec struct {
+	// Replicas is the number of exec-tier pods. Unset or 0 renders no exec
+	// tier. Each replica requests and is limited to 2 CPU and 2Gi of memory,
+	// with no override. A change between two positive values rewrites the
+	// count the pods read and does not restart them. The operator does not
+	// derive the count from the fleet size. Above 0 the agent's name must be
+	// at most 36 characters, so the tier's objects fit a 63-character name;
+	// a longer one is refused, the tier is not rendered, and Degraded says so.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=32
+	Replicas *int32 `json:"replicas,omitempty"`
 }
 
 // AgentAPIAuthSpec configures the agent-api-auth sidecar in the gateway pod.
@@ -1303,6 +1405,13 @@ type AgentAPIAuthSpec struct {
 	// reads the memory limit through the Downward API and sets its Go soft
 	// memory limit to half of it, so raising the memory limit is the knob for an
 	// install whose fleet of watched clusters outgrows the 2Gi default (#2648).
+	// The startup peak depends on the control plane: with the WatchList
+	// feature gate (on at 1.32 and from 1.34) the reflector holds a cluster's
+	// whole initial stream until its bookmark, so up to four of the largest
+	// backlogs (the initial-list concurrency) are resident at once; without
+	// the gate the watcher reads the backlog in pages of 500 Events and holds
+	// one page per cluster. Steady state scales with the number of watched
+	// clusters and their open incidents.
 	// Only cpu, memory and ephemeral-storage are accepted, the quantities the
 	// container declares. The operator refuses a request above its limit, a
 	// negative quantity, a zero limit, an unrepresentable byte or CPU count and

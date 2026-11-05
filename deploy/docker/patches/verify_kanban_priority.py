@@ -237,6 +237,24 @@ check(
     f"{free}",
 )
 
+# --- B2. The per-turn session ContextVar the origin reader depends on -----------
+print("session context:")
+import contextvars  # noqa: E402
+import importlib  # noqa: E402
+
+SC = importlib.import_module(KP.SESSION_CONTEXT_MODULE)
+check("session_context has the ContextVar", isinstance(getattr(SC, KP.SESSION_ID_VAR_ATTR, None), contextvars.ContextVar))
+check("the ContextVar is HERMES_SESSION_ID", getattr(getattr(SC, KP.SESSION_ID_VAR_ATTR, None), "name", "") == "HERMES_SESSION_ID")
+check("session_context has the unset sentinel", hasattr(SC, KP.SESSION_UNSET_ATTR))
+os.environ["HERMES_SESSION_ID"] = "stale-process-wide"
+check("a stale process env is not a session", KP.trusted_origin_session() == "", repr(KP.trusted_origin_session()))
+_token = getattr(SC, KP.SESSION_ID_VAR_ATTR).set("turn-bound")
+try:
+    check("the bound ContextVar is the session", KP.trusted_origin_session() == "turn-bound", repr(KP.trusted_origin_session()))
+finally:
+    getattr(SC, KP.SESSION_ID_VAR_ATTR).reset(_token)
+    os.environ.pop("HERMES_SESSION_ID", None)
+
 # --- C. The notifier delivers the queued notice --------------------------------
 print("notifier:")
 import gateway.kanban_watchers_notifier as N  # noqa: E402

@@ -35,9 +35,6 @@ type Config struct {
 	Authenticator CallerAuthenticator
 	// Upstream forwards an approved request to its target cluster. Required.
 	Upstream UpstreamTransport
-	// DefaultClusterID is the cluster used when the request path does not start with
-	// /clusters/{id}; InClusterID when empty.
-	DefaultClusterID string
 	// Policy decides which requests are forwarded. Its Mode must be set.
 	Policy Policy
 	// Audit receives an AuditEvent for every request; NewSlogAuditSink(Logger) when nil.
@@ -55,14 +52,13 @@ type Config struct {
 type auditEventKey struct{}
 
 type handler struct {
-	authenticator    CallerAuthenticator
-	defaultClusterID string
-	policy           Policy
-	audit            AuditSink
-	metrics          *Metrics
-	tracerProvider   trace.TracerProvider
-	factory          *request.RequestInfoFactory
-	proxy            *httputil.ReverseProxy
+	authenticator  CallerAuthenticator
+	policy         Policy
+	audit          AuditSink
+	metrics        *Metrics
+	tracerProvider trace.TracerProvider
+	factory        *request.RequestInfoFactory
+	proxy          *httputil.ReverseProxy
 }
 
 // NewHandler returns an http.Handler that authenticates the caller, resolves the target
@@ -79,9 +75,6 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	if !cfg.Policy.Mode.valid() {
 		return nil, fmt.Errorf("k8sapiproxy: invalid Config.Policy.Mode %q", cfg.Policy.Mode)
 	}
-	if cfg.DefaultClusterID != "" && !validClusterID.MatchString(cfg.DefaultClusterID) {
-		return nil, fmt.Errorf("k8sapiproxy: invalid Config.DefaultClusterID %q", cfg.DefaultClusterID)
-	}
 
 	logger := cfg.Logger
 	if logger == nil {
@@ -96,13 +89,12 @@ func NewHandler(cfg Config) (http.Handler, error) {
 	metrics := cfg.Metrics
 	tp := cfg.TracerProvider
 	return &handler{
-		authenticator:    cfg.Authenticator,
-		defaultClusterID: cfg.DefaultClusterID,
-		policy:           cfg.Policy,
-		audit:            audit,
-		metrics:          metrics,
-		tracerProvider:   tp,
-		factory:          NewRequestInfoFactory(),
+		authenticator:  cfg.Authenticator,
+		policy:         cfg.Policy,
+		audit:          audit,
+		metrics:        metrics,
+		tracerProvider: tp,
+		factory:        NewRequestInfoFactory(),
 		proxy: &httputil.ReverseProxy{
 			// Rewrite rather than Director: the reverse proxy then also drops the caller's
 			// Forwarded, X-Forwarded-For, X-Forwarded-Host and X-Forwarded-Proto headers. The
@@ -120,8 +112,9 @@ func NewHandler(cfg Config) (http.Handler, error) {
 				// Redacting here rather than in ModifyResponse keeps the plan off resp.Request,
 				// which a transport may replace with a request of its own.
 				if plan, ok := req.Context().Value(secretRedactionKey{}).(*secretRedaction); ok && resp != nil {
-					redactSecretResponse(resp, plan, func(cause error) { ev.Err = cause })
-					metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
+					if redactSecretResponse(resp, plan, func(cause error) { ev.Err = cause }) {
+						metrics.recordSecretRedaction(SecretActionPayloadScrubbed)
+					}
 				}
 				return resp, err
 			}),
@@ -207,6 +200,9 @@ func (h *handler) recordObservability(r *http.Request, info *request.RequestInfo
 		}
 		spanReason = ev.Reason
 		h.metrics.recordRejection(ev.Reason, verbLabel, resLabel, subLabel, h.policy.Mode)
+	// Neither is the upstream failing: the TokenReview did (503), or the caller left, before or during the copy.
+	case ev.Outcome == OutcomeAuthUnavailable, ev.Outcome == OutcomeCanceled:
+		metricOutcome = string(ev.Outcome)
 	case ev.Outcome == OutcomeUpstreamError || ev.Outcome == OutcomeAborted || ev.StatusCode >= http.StatusInternalServerError:
 		metricOutcome = string(OutcomeUpstreamError)
 	default:
@@ -233,7 +229,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	}
 	ev.Caller = caller
 
-	clusterID, apiPath, perr := SplitClusterPath(r.URL, h.defaultClusterID)
+	clusterID, apiPath, perr := SplitClusterPath(r.URL)
 	if perr != nil {
 		refuse(w, ev, perr)
 		return

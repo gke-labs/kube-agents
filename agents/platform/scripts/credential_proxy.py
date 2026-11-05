@@ -88,14 +88,24 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 from credential_proxy_client import (  # noqa: F401  (re-export)
     ADMISSION_BOUND_BACKGROUND,
     ADMISSION_BOUND_DRAINING,
+    ADMISSION_REPLICAS_KEY,
+    ADMISSION_TIER_ADMITTED_KEY,
+    ADMISSION_TIER_INTERACTIVE_CAP_KEY,
     API_RELAY_PREFIX,
+    AUDIT_BROKER_POD,
+    AUDIT_BROKER_TIER,
+    AUDIT_CLASS,
     BACKGROUND_NICE,
+    BROKER_TIER_EXEC,
+    BROKER_TIER_STATEFUL,
     BUSY_BOUND_KEY,
     CLASS_BACKGROUND,
     CLASS_INTERACTIVE,
     CLASS_LABEL,
     CONTEXT_FLAG,
     END_OF_FLAGS,
+    EXEC_REPLICAS_FILE,
+    EXEC_REPLICAS_FILE_ENV,
     EXEC_ROLE,
     KUBECONFIG_FLAG,
     ClusterTarget,
@@ -790,10 +800,15 @@ HEALTHZ_PATH = "/healthz"
 # worker pools by (`broker_admission.sweep_width`). Read-only: the slot cap, the
 # count the child memory budget fits at this container's effective limit, the
 # smaller of the two, the interactive cap inside it, and the session role's own
-# cap. Only the broker knows the
-# effective limit: on GKE Autopilot without bursting it is the memory request,
-# rewritten after the operator rendered the pod.
+# cap; on an exec pod, also the tier's totals (`exec_tier_replicas`). Only the
+# broker knows the effective limit: on GKE Autopilot without bursting it is the
+# memory request, rewritten after the operator rendered the pod.
 ADMISSION_PATH = "/v1/exec/admission"
+# The largest exec-tier replica count the report multiplies by: the CR field's
+# bound (credential-broker-exec-tier.md §12). A larger count in the replicas
+# file is held to it.
+EXEC_REPLICAS_MAX = 32
+EXEC_REPLICAS_RE = re.compile(r"[0-9]+")
 # Requests that keep serving while the broker drains (SHUTDOWN_DRAIN_SECONDS),
 # by method and path: the health probe; a relay's settle routes, so the
 # gateway's acks for pulls already answered land; and the event pulls. Slack's
@@ -972,6 +987,17 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 VCS_PROVIDER_LABEL = "provider"
 VCS_PROVIDER_NONE = "none"
+# The one-time claim token minted with each `proposal-create` answer, under
+# CLAIM_TOKEN_FIELD, and burned by the first `proposal-claim` that presents it
+# (`ClaimTokens`). It lives CLAIM_TOKEN_TTL_SECONDS, the window
+# `vcs_broker.CLAIM_WINDOW_SECONDS` holds the proposal's creation time to, and
+# is CLAIM_TOKEN_BYTES of os.urandom, spelled in hex.
+PROPOSAL_CREATE_VERB = "proposal-create"
+PROPOSAL_CLAIM_VERB = "proposal-claim"
+CLAIM_TOKEN_FIELD = "claim"
+CLAIM_URL_FIELD = "url"
+CLAIM_TOKEN_TTL_SECONDS = vcs_broker.CLAIM_WINDOW_SECONDS
+CLAIM_TOKEN_BYTES = 32
 # The provider label's closed set: the names of the forge classes this image
 # ships (providers.AVAILABLE), which is also the set the registry admits a
 # configured forge from, so a configured forge's name is always in it.
@@ -1583,6 +1609,15 @@ SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
     "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
     "--limit-bytes", "--chunk-size", "--limit", "--for", "--types", "--verbs",
     "--api-group", "--template",
+    # A paged collection read. Its value is judged by command_policy's
+    # `kubernetes.raw-path` rule downstream, the same gate the shell's raw
+    # reads pass: a relative collection path on an allowlisted kind, on `get`.
+    # The rule's exact endpoints (`/metrics`, `KUBECTL_RAW_ENDPOINTS`) are
+    # not a session's: the rule takes no role, so `_session_value_refused`
+    # refuses a `--raw` whose decoded path names one, and the API server's
+    # own metrics stay the shell role's, as they were when `--raw` was
+    # refused here by name.
+    command_policy.KUBECTL_RAW_FLAG,
 })
 # Verbs a session may not run even though they are reads: both wait by
 # default (`rollout status` watches until the rollout completes, `wait` until
@@ -1617,6 +1652,19 @@ def _session_output_permitted(value: str) -> bool:
     return value in SESSION_KUBECTL_OUTPUT_FORMATS or value.startswith(SESSION_KUBECTL_OUTPUT_PREFIXES)
 
 
+def _session_value_refused(name: str, value: str) -> bool:
+    """Whether a value-taking flag on the session allowlist carries a value
+    the allowlist does not admit: an output format that reads a file on the
+    broker, or a `--raw` whose percent-decoded path is one of the raw-path
+    rule's exact endpoints (`/metrics`), decoded as the rule decodes it so an
+    encoded spelling is the same path here."""
+    if name == "--output":
+        return not _session_output_permitted(value)
+    if name == command_policy.KUBECTL_RAW_FLAG:
+        return command_policy.kubectl_raw_endpoint(value) is not None
+    return False
+
+
 def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
     """The first kubectl flag a session caller may not pass, or None.
 
@@ -1635,7 +1683,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
         token = tokens[index]
         index += 1
         if pending is not None:
-            if pending == "--output" and not _session_output_permitted(token):
+            if _session_value_refused(pending, token):
                 return pending
             pending = None
             continue
@@ -1647,7 +1695,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 continue
             if name in SESSION_KUBECTL_VALUE_FLAGS:
                 if separator:
-                    if name == "--output" and not _session_output_permitted(value):
+                    if _session_value_refused(name, value):
                         return name
                 else:
                     pending = name
@@ -1668,7 +1716,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 if attached.startswith("="):
                     attached = attached[1:]
                 if attached:
-                    if long_name == "--output" and not _session_output_permitted(attached):
+                    if _session_value_refused(long_name, attached):
                         return long_name
                 else:
                     pending = long_name
@@ -1710,8 +1758,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # rather than /v1/exec's roles. A sweep run under any other role is refused
     # here and falls back to four (broker_admission.sweep_width).
     (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
-    # The profile role reaches this route and no other: the Cloud API relay,
-    # the MCP relay, the watcher and Pub/Sub routes all stay closed to it.
+    # The profile role reaches this route and the MCP relay's profile set: the
+    # Cloud API relay, the watcher and Pub/Sub routes all stay closed to it.
     # The scope role reaches it alone too (scope_policy).
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),
     # The feedback form verb: the sandbox's one way to file a report about
@@ -1726,8 +1774,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The remote MCP relay belongs to the gateway, where Hermes runs the
     # mcp-remote children; the sandbox has no MCP client. Session pods are not
     # admitted here yet: that is a new read path for them, argued in the change
-    # that wires them, not by default.
-    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),
+    # that wires them, not by default. Profile workers are, for a task in hand
+    # and only for mcp_policy.PROFILE_SERVER_TOOLS (_handle_mcp_relay, #3658).
+    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),
     # The watchers' Google calls: theirs alone. The Hermes container beside
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
@@ -1869,6 +1918,28 @@ def exec_pod_serves(method: str, path: str) -> bool:
     if method == "POST":
         return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
     return path in (HEALTHZ_PATH, ADMISSION_PATH) or path.startswith(API_RELAY_PREFIX)
+
+
+def exec_tier_replicas() -> int | None:
+    """The exec tier's replica count from the file the operator mounts, or None.
+
+    Read on each call, because a scale change rewrites the ConfigMap and does
+    not restart the pod (§3.5). A file that is absent (as on the stateful pod),
+    cannot be read or holds no positive integer gives None, with a debug line
+    only, because the admission route reads it on each request.
+    """
+    path = os.environ.get(EXEC_REPLICAS_FILE_ENV) or EXEC_REPLICAS_FILE
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        LOGGER.debug("could not read the exec tier's replica count path=%s: %s", path, type(exc).__name__)
+        return None
+    replicas = int(text) if EXEC_REPLICAS_RE.fullmatch(text) else 0
+    if replicas < 1:
+        LOGGER.debug("the exec tier's replica count is not a positive integer path=%s", path)
+        return None
+    return min(replicas, EXEC_REPLICAS_MAX)
 
 
 # How long a managed-repository allowlist read is reused.
@@ -3567,6 +3638,65 @@ class _CacheEntry:
     principal: Principal
 
 
+@dataclass(frozen=True)
+class _ClaimEntry:
+    expires_at: float
+    url: str
+    repository: Any
+    number: int
+
+
+class ClaimTokens:
+    """The claim tokens `proposal-create` answers have minted and no claim has burned.
+
+    Keyed by the token's SHA-256, as the authenticator's cache is, so the
+    process holds no token it could leak. Each keeps the proposal's url and
+    number and the repository the create resolved, for the claim to check in
+    place of anything its caller sends. Expiry is on the monotonic clock;
+    expired entries are pruned on every mint and never served.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = CLAIM_TOKEN_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._entries: dict[str, _ClaimEntry] = {}
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    @staticmethod
+    def _key(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def mint(self, url: str, repository: Any, number: int) -> str:
+        """A new token for the proposal at ``url``, kept for ``ttl_seconds``."""
+        token = os.urandom(CLAIM_TOKEN_BYTES).hex()
+        now = self._clock()
+        with self._lock:
+            self._entries = {
+                key: entry for key, entry in self._entries.items() if entry.expires_at > now
+            }
+            self._entries[self._key(token)] = _ClaimEntry(now + self.ttl_seconds, url, repository, number)
+        return token
+
+    def burn(self, token: Any) -> _ClaimEntry | None:
+        """Spend ``token``: its entry if it was live, None if unknown, burned or expired."""
+        if not isinstance(token, str) or not token:
+            return None
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.pop(self._key(token), None)
+        if entry is None or entry.expires_at <= now:
+            return None
+        return entry
+
+
 class ServiceAccountAuthenticator:
     """Verify a projected ServiceAccount token with a Kubernetes TokenReview.
 
@@ -3802,8 +3932,9 @@ class ServiceAccountAuthenticator:
 
 
 # The profile role's configuration (#3889). All four are reserved against
-# spec.deployment.env (mergeCredentialProxyEnv). The operator renders the first
-# three; it doesn't render the max lifetime yet, so the 6h default holds.
+# spec.deployment.env (mergeCredentialProxyEnv), and the operator renders all
+# four: the max lifetime is the same value the callout and the dispatcher get
+# (a2aTaskCredentialMaxLifetimeEnv). The 6h default holds only without it.
 PROFILE_AUDIENCE_ENV = "CREDENTIAL_PROXY_PROFILE_AUDIENCE"
 # JSON: {"system:serviceaccount:<ns>:<sa>": {"profile": ..., "tier": ...}}.
 PROFILE_IDENTITIES_ENV = "CREDENTIAL_PROXY_PROFILE_IDENTITIES"
@@ -5823,6 +5954,14 @@ class ExecutionResult:
     # The caller's connection closed while the command ran, and the command was
     # killed for it. There is nobody to answer; the handler logs and returns.
     abandoned: bool = False
+    # How much of stdout the caller receives, in UTF-8 bytes, and the per-stream
+    # cap it was held to. Answered with `truncated` so a caller that was cut can
+    # say how much it kept and page the rest, rather than only that it was cut.
+    stdout_bytes: int = 0
+    output_limit: int = 0
+    # Whether the cut fell on stdout. `truncated` covers either stream; the
+    # shim's non-zero exit is for a cut payload, not for cut diagnostics.
+    stdout_truncated: bool = False
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -7553,6 +7692,9 @@ class _CapturedOutput:
     truncated: bool
     timed_out: bool
     abandoned: bool
+    # Whether the cut fell on stdout: the caller's payload, as against its
+    # diagnostics. `truncated` covers either stream.
+    stdout_truncated: bool = False
     # The child's own peak resident set from the rusage its reap returned, in
     # bytes; None when the reap did not go through `_reap` (already reaped).
     peak_rss_bytes: int | None = None
@@ -7769,6 +7911,7 @@ def _capture_output(
     deadline = time.monotonic() + timeout
     outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
     truncated = False
+    stdout_truncated = False
     pending = memoryview(stdin) if stdin else None
     written = 0
     stopped = False
@@ -7793,7 +7936,7 @@ def _capture_output(
 
         Returns (timed_out, abandoned).
         """
-        nonlocal truncated, written
+        nonlocal truncated, stdout_truncated, written
         if not watch_caller and caller is not None:
             with contextlib.suppress(KeyError, ValueError):
                 selector.unregister(caller)
@@ -7851,6 +7994,8 @@ def _capture_output(
                     buffer += data[:room]
                 if len(data) > room:
                     truncated = True
+                    if stream is process.stdout:
+                        stdout_truncated = True
         return False, False
 
     try:
@@ -7902,6 +8047,7 @@ def _capture_output(
         abandoned=abandoned,
         peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
         stopped=stopped,
+        stdout_truncated=stdout_truncated,
     )
 
 
@@ -10863,6 +11009,11 @@ class CommandExecutor:
             truncated=captured.truncated or stdout_cut or stderr_cut,
             timed_out=captured.timed_out,
             abandoned=captured.abandoned and not drained,
+            # Text that decoded cleanly is the captured bytes, measured once;
+            # only a cut re-decode is re-encoded to be measured.
+            stdout_bytes=len(stdout_text.encode("utf-8")) if stdout_cut else len(captured.stdout),
+            output_limit=self.max_output_bytes,
+            stdout_truncated=captured.stdout_truncated or stdout_cut,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -11511,6 +11662,18 @@ class JsonLineFormatter(logging.Formatter):
         return json.dumps(payload, default=str, separators=(",", ":"))
 
 
+def broker_tier_of(role: str) -> str:
+    """The `broker_tier` audit field of a broker process in ``role``."""
+    return BROKER_TIER_EXEC if role == EXEC_ROLE else BROKER_TIER_STATEFUL
+
+
+@functools.lru_cache(maxsize=None)
+def _broker_pod() -> str:
+    """This broker's pod name, for the `broker_pod` audit field. Kubernetes
+    sets a pod's hostname to its name. Read once for the life of the process."""
+    return socket.gethostname()
+
+
 def _tool_audit(
     status: str,
     request_id: str,
@@ -11522,12 +11685,15 @@ def _tool_audit(
     duration_ms: int | None = None,
     rule: str | None = None,
     pod: str = "",
+    broker_tier: str,
+    klass: str,
 ) -> dict[str, Any]:
     """The `audit` mapping of one tool-execution record.
 
     Only identifiers and outcomes: the request id, the verified principal, the
     tool and subcommand as the metrics label them (a closed vocabulary, never the
-    argv), the outcome and, where there is one, the exit code, the duration and
+    argv), the outcome, the broker's tier (`broker_tier_of`), the admission class,
+    this broker's pod and, where there is one, the exit code, the duration and
     the policy rule. No argument, path, stdin or output is ever here, so there is
     nothing in the record for a `--token` to leak through.
     """
@@ -11538,6 +11704,9 @@ def _tool_audit(
         "tool": tool,
         "subcommand": subcommand,
         "status": status,
+        AUDIT_BROKER_TIER: broker_tier,
+        AUDIT_CLASS: klass,
+        AUDIT_BROKER_POD: _broker_pod(),
     }
     if pod:
         # The caller's pod, from the TokenReview's pod-name extra: every
@@ -12098,6 +12267,34 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
+def mcp_relay_decision(
+    principal: Principal | None, server_name: str, message: dict[str, Any] | None
+) -> tuple[command_policy.Decision, frozenset[str] | None]:
+    """The MCP relay's decision for one message, and the tools its caller is offered.
+
+    The second value narrows a ``tools/list`` reply: None for the table's own
+    set, or a profile worker's set (empty for a server outside it, so a later
+    change to the decision can't hand a profile worker the table's list).
+
+    A profile worker (#3658) reaches the relay only inside a task: a warm pod
+    between tasks holds no task credential, so it gets no reads. With one, it
+    is held to mcp_policy.PROFILE_SERVER_TOOLS. Everyone else gets the table.
+    """
+    if principal is None or principal.role != CALLER_ROLE_PROFILE:
+        return mcp_policy.evaluate(server_name, message), None
+    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())
+    if principal.task is None:
+        return (
+            command_policy.Decision(
+                allowed=False,
+                rule_id=RULE_TASK_CREDENTIAL,
+                message="Profile workers reach MCP servers only with a task credential.",
+            ),
+            offered,
+        )
+    return mcp_policy.evaluate_for_profile(server_name, message), offered
+
+
 class CredentialProxyHandler(BaseHTTPRequestHandler):
     policy: Policy
     executor: CommandExecutor
@@ -12174,6 +12371,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # the sandbox reaches a repository at all. It is None on an exec pod, which
     # answers /v1/vcs/* with 404 (exec_pod_serves), and on no other broker.
     vcs: vcs_broker.VcsBroker | None = None
+    # The claim tokens `proposal-create` answers carry and `proposal-claim`
+    # burns. One store per process, shared by every handler thread.
+    claim_tokens: ClaimTokens = ClaimTokens()
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
@@ -12356,17 +12556,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return False
 
     def _admission_report(self) -> dict[str, int | None]:
-        """The five numbers ADMISSION_PATH answers with, and nothing else of the
-        budget's internals. `interactive_cap` is what interactive work, the
-        shell's sweeps included, may hold at once (`class_cap`), which a sweep
-        sizes itself inside (`broker_admission.width_for`)."""
-        return {
+        """The five per-replica numbers ADMISSION_PATH answers with, and nothing
+        else of the budget's internals. `interactive_cap` is what interactive
+        work, the shell's sweeps included, may hold at once (`class_cap`), which
+        a sweep sizes itself inside (`broker_admission.width_for`). When the exec
+        tier's replicas file holds a count, the report adds it and the tier's
+        admitted count and interactive cap, each the per-replica one times the
+        count; the per-replica numbers stay as they are."""
+        report = {
             "slot_cap": self.executor.max_concurrent_commands,
             "budget_admits": self.executor.requests_the_budget_admits(),
             "admitted": self.executor.admitted_requests(),
             "interactive_cap": self.executor.class_cap(CLASS_INTERACTIVE),
             "session_cap": getattr(self.session_slots, "limit", DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS),
         }
+        replicas = exec_tier_replicas()
+        if replicas is not None:
+            report[ADMISSION_REPLICAS_KEY] = replicas
+            report[ADMISSION_TIER_ADMITTED_KEY] = report["admitted"] * replicas
+            report[ADMISSION_TIER_INTERACTIVE_CAP_KEY] = report["interactive_cap"] * replicas
+        return report
 
     def _refused_while_shutting_down(self, **fields: Any) -> bool:
         """Answer a Chat event pull 503 SHUTDOWN_ERROR while the stop is under way."""
@@ -12644,7 +12853,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
-            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod, **fields)}
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod,
+                    broker_tier=broker_tier_of(self.broker_role), klass=admission_class(principal.role), **fields,
+                )
+            }
 
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
@@ -12722,8 +12936,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "rule": RULE_CALLER_KUBECTL_FLAG,
                     "message": (
                         f"The {principal.role} caller may pass only kubectl's inspection flags; {refused_flag} "
-                        "is not one of them (file inputs, file-backed output formats and streaming flags are "
-                        "not available to a session)."
+                        "is not one of them (file inputs, file-backed output formats, streaming flags and the "
+                        "API server's own endpoints under --raw are not available to a session)."
                     ),
                 },
             )
@@ -13004,6 +13218,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "stderr": result.stderr,
                     "durationMs": result.duration_ms,
                     "truncated": result.truncated,
+                    # Beside `truncated`: how much of stdout survived the cap,
+                    # and the cap. The shim prints both on a cut, so a caller
+                    # knows how much it holds and that the rest is to be paged.
+                    "bytesWritten": result.stdout_bytes,
+                    "limit": result.output_limit,
+                    "stdoutTruncated": result.stdout_truncated,
                     "timedOut": result.timed_out,
                 }
                 # Only `get-credentials` fills this, and only when the caller
@@ -13423,7 +13643,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         message = mcp_policy.parse(self.rfile.read(content_length))
-        decision = mcp_policy.evaluate(server_name, message)
+        decision, offered = mcp_relay_decision(principal, server_name, message)
         if not decision.allowed:
             LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
             reply = mcp_policy.refusal(message, decision) if entry is not None else None
@@ -13508,7 +13728,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             and decision.rule_id == mcp_policy.METHOD_TOOLS_LIST
             and upstream.status < HTTPStatus.MULTIPLE_CHOICES
         ):
-            filtered = mcp_policy.filter_tools_list(server_name, upstream.body)
+            filtered = mcp_policy.filter_tools_list(server_name, upstream.body, offered)
             if filtered is None:
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:
@@ -14229,8 +14449,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         def audit(status: str) -> dict[str, Any]:
             return {
+                # Interactive: the class of the request slot below.
                 AUDIT_EXTRA_KEY: _tool_audit(
-                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND
+                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND,
+                    broker_tier=broker_tier_of(self.broker_role), klass=CLASS_INTERACTIVE,
                 )
             }
 
@@ -14303,6 +14525,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.vcs_provider = VCS_PROVIDER_NONE
         status = self._dispatch_vcs_post(verb)
         self.metrics.record_vcs(_vcs_verb_label(verb), status, self.vcs_provider)
+
+    def _mint_claim(self, result: Any, repository: Any) -> None:
+        """Add a one-time claim token to a `proposal-create` answer that names its proposal.
+
+        Kept with the proposal's url and number and the repository the
+        request resolved, for `proposal-claim` to check. An answer with no url
+        or number gets none: there is nothing a claim could be checked against.
+        """
+        proposal = result.get("proposal") if isinstance(result, dict) else None
+        if not isinstance(proposal, dict):
+            return
+        url, number = proposal.get("url"), proposal.get("number")
+        if not isinstance(url, str) or not url or isinstance(number, bool) or not isinstance(number, int):
+            return
+        result[CLAIM_TOKEN_FIELD] = self.claim_tokens.mint(url, repository, number)
 
     def _dispatch_vcs_post(self, verb: str) -> str:
         """Answer one version-control request and return its outcome label.
@@ -14409,6 +14646,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 # verb will read it (`snapshot_bare_name_fallback`): lifted
                 # onto the install's GitHub forge, or, when it is read from a
                 # host outside the table with no credential, not at all.
+                if verb == PROPOSAL_CLAIM_VERB:
+                    # Burned before anything else is asked, so a claim whose
+                    # forge check fails below has spent its token too. What
+                    # the broker checks is what the create kept with the
+                    # token, never the caller's repository or number.
+                    entry = self.claim_tokens.burn(payload.get(CLAIM_TOKEN_FIELD))
+                    if entry is None or entry.url != payload.get(CLAIM_URL_FIELD):
+                        self._json(
+                            HTTPStatus.NOT_FOUND,
+                            {
+                                "error": "no live claim for that proposal: unknown, already claimed, or expired",
+                                "code": "CLAIM_UNKNOWN",
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
+                    payload = {"repository": entry.repository, CLAIM_URL_FIELD: entry.url, "number": entry.number}
                 role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS
                 named, outside = payload.get("repository"), None
                 if role_selected:
@@ -14434,6 +14687,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                             return TOOL_STATUS_ERROR
                         return TOOL_STATUS_BLOCKED
                 result = route(payload)
+                if verb == PROPOSAL_CREATE_VERB:
+                    self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)
                 return TOOL_STATUS_SUCCESS
         except CallerHungUp as exc:

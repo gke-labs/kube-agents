@@ -268,6 +268,9 @@ const (
 	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// watcherAlertExcludeEnv carries spec.harness.eventWatcher.alertExclude to
+	// the watcher as JSON; start-services.sh passes it as --alert-exclude.
+	watcherAlertExcludeEnv = "WATCHER_ALERT_EXCLUDE"
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
@@ -1455,8 +1458,9 @@ var frontDoorPlugins = []string{
 // profile's config.yaml leaves the entrypoint's force-sync and is only back-filled, and the
 // back-fill never extends a list the live file already holds, so a plugin the image
 // enabled after that volume was first written stays off there. The front-door overlay
-// unions these in so the flag cannot hide one. pr_opened records each pull request a
-// worker opens on its card, which is what posts the thread's PR message.
+// unions these in so the flag cannot hide one. pr_opened claims each pull request record
+// through the broker, strips its token and writes the origin ledger; in a worker it also
+// records the pull request on the card, which is what posts the thread's PR message.
 var frontDoorBackfillPlugins = []string{
 	"pr_opened",
 }
@@ -4479,10 +4483,30 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
+	// Managed, so reserved by the merge below, only when the list is set: an
+	// install with no rules here keeps a WATCHER_ALERT_EXCLUDE it set through
+	// spec.deployment.env, which the watcher read before this field existed.
+	if rules := eventWatcherAlertExclude(agent); len(rules) > 0 {
+		envVars = append(envVars, corev1.EnvVar{Name: watcherAlertExcludeEnv, Value: rules})
+	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// eventWatcherAlertExclude renders spec.harness.eventWatcher.alertExclude as
+// the JSON list the watcher's --alert-exclude reads, or "" when it is empty.
+// The CRD's JSON keys are the watcher's, so the list is passed as it is.
+func eventWatcherAlertExclude(agent *agentv1alpha1.PlatformAgent) string {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.EventWatcher == nil || len(harness.EventWatcher.AlertExclude) == 0 {
+		return ""
+	}
+	// A list of plain strings and one pointer to a struct of strings cannot
+	// fail to marshal.
+	rules, _ := json.Marshal(harness.EventWatcher.AlertExclude)
+	return string(rules)
 }
 
 // sessionKVApiKeySecretRef resolves the Secret key holding the bearer token for
@@ -4889,6 +4913,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyProfileIdentitiesEnvVar,
 		credentialProxyTaskSigningKeysEnvVar,
 		credentialProxyTaskCredentialMaxLifetimeEnvVar,
+		// The dispatcher's seed path, which no broker-side container
+		// reads; reserved so a CR can't hand one a seed file of its choosing.
+		a2aTaskSigningSeedFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;
@@ -5179,6 +5206,17 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// positive integer reads as the default, so an arbitrary value bounds
 		// how many profiles a run creates and reaches nothing else.
 		"BOOTSTRAP_MAX_CREATES_PER_TICK": {},
+
+		// The group size above which the front door's injected roster counts
+		// a shared-role group (the Cluster Agents) by project and location
+		// instead of naming each (agents/chat/scripts/agent_roster.py,
+		// summary_threshold; default 20). Parsed as a whole number of zero
+		// or more, and any other value means the default, so it changes how
+		// many names one block of prompt text carries and reaches nothing
+		// else: the names it withholds come back through the same module's
+		// list_agents filter, and no value adds an agent, a path or a
+		// destination.
+		"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same

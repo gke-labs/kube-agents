@@ -41,6 +41,9 @@ const PAGE = {
   inlineBrief: "inline-brief",
   inlineHealth: "inline-health",
   refreshMs: 60000,
+  // Rows a section of several forges lists per table (forge_lane.py caps
+  // each lane at RUNS_LISTED; this caps their merge at one lane's worth).
+  laneRowsListed: 20,
   // The ci-health workflow's cron: how old the inlined copy can be at most.
   republishMinutes: 15,
   tz: "America/Toronto",
@@ -83,6 +86,12 @@ const PAGE = {
   // The lede prints it verbatim, so it is shape-checked and not only typed.
   poolDayRe: /^\d{4}-\d{2}-\d{2}$/,
   spyglass: "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents",
+  // Where a run that records its build directory (gcs_base) links: the smoke
+  // lanes' bucket is not Deck-readable, so Spyglass shows nothing for it,
+  // while a project reader opens the directory in the Console's bucket
+  // browser and a transcript as an object.
+  gcsBrowser: "https://console.cloud.google.com/storage/browser/",
+  gcsObject: "https://storage.cloud.google.com/",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
@@ -464,10 +473,15 @@ const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 const prText = (pr) => (pr == null ? "no PR" : `PR #${pr}`);
 const prLink = (pr) => (pr == null ? prText(pr) : `<a href="${PAGE.prUrl}/${esc(pr)}">${esc(prText(pr))}</a>`);
-const buildUrl = (run) => (run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
+// A run that records where it lives (gcs_base) links there; a record from
+// before the field keeps the Spyglass link under the old bucket.
+const gcsPath = (base) => String(base).replace(/^gs:\/\//, "").replace(/\/+$/, "");
+const buildUrl = (run) => (run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
 const transcriptUrl = (run, kase, n = 1) => {
+  const rel = `artifacts/eval_${enc(kase)}_rep${enc(n)}.log`;
+  if (run.gcs_base) return `${PAGE.gcsObject}${gcsPath(run.gcs_base)}/${rel}`;
   const base = buildUrl(run);
-  return base ? `${base}/artifacts/eval_${enc(kase)}_rep${enc(n)}.log` : null;
+  return base ? `${base}/${rel}` : null;
 };
 // The repetition whose reason and quote a case row shows (classify.py's
 // rep_n); rep 1, as the pages always linked, when the row names none.
@@ -1005,12 +1019,13 @@ function releasesHtml() {
   return `<div class="sec" id="releases"><h2>Release candidates</h2>${body}</div>`;
 }
 
-/* ---- the GitLab lane (SCHEMA.md: brief.json's gitlab block) ---- */
-// The lane's runs are nobody's gate verdict: tier gitlab (tiers.py) keeps
-// them out of every count above, so this section is the only place they
-// show. Each row links Spyglass under the lane's own job name.
-const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
-function laneRow(run) {
+/* ---- the forge lanes (SCHEMA.md: brief.json's lanes block) ---- */
+// A forge lane's runs are nobody's gate verdict: their tier (tiers.py,
+// FORGE_TIERS) keeps them out of every count above, so each lane's section
+// is the only place they show. Each row links the build where it lives (log_url for a night,
+// gcs_base for a run that records it), else Spyglass under the lane's own job name.
+const laneBuildUrl = (run) => (run.log_url ? run.log_url : run.gcs_base ? `${PAGE.gcsBrowser}${gcsPath(run.gcs_base)}` : run.pr == null || !run.job ? null : `${PAGE.spyglass}/${enc(run.pr)}/${enc(run.job)}/${enc(run.build)}`);
+function laneRow(run, withForge, withJob) {
   const url = laneBuildUrl(run);
   const build = url ? `<a href="${esc(url)}" rel="noopener">${esc(run.build)}</a>` : esc(run.build);
   const pr = run.pr == null ? "—" : `<a href="${PAGE.prUrl}/${enc(run.pr)}" rel="noopener">#${esc(run.pr)}</a>`;
@@ -1018,33 +1033,87 @@ function laneRow(run) {
   const cases = `${t.pass || 0} passed · ${t.fail || 0} failed${t.infra ? ` · ${t.infra} infra` : ""}`;
   const verdict = run.eval_verdict ? esc(run.eval_verdict) : `<span class="mut">no eval banner</span>`;
   const when = run.started ? et(parseIso(run.started)) : "—";
-  return `<tr><td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
+  return `<tr>${withForge ? `<td>${esc(run.forge || "")}</td>` : ""}${withJob ? `<td><code>${esc(run.job || "")}</code></td>` : ""}<td>${build}</td><td>${pr}</td><td><span class="${run.green ? "p-pass" : "p-fail"}">${esc(run.result || "unknown")}</span></td><td>${verdict}</td><td>${esc(cases)}</td><td class="mut">${esc(when)}</td><td class="mut">${run.duration_s != null ? esc(minutesText(run.duration_s * 1000)) : "—"}</td></tr>`;
 }
-function gitlabLaneHtml() {
-  const lane = brief.gitlab && typeof brief.gitlab === "object" ? brief.gitlab : null;
-  const job = lane && lane.job || "pull-kube-agents-smoke-test-gitlab";
-  const runs = lane && Array.isArray(lane.runs) ? lane.runs.filter((r) => r && typeof r === "object" && r.build != null) : [];
-  const inFlight = lane && Array.isArray(lane.running) ? lane.running.length : 0;
+const laneTable = (rows, withForge, withJob) => `<table class="rel"><thead><tr>${withForge ? "<th>Forge</th>" : ""}${withJob ? "<th>Job</th>" : ""}<th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${rows.map((r) => laneRow(r, withForge, withJob)).join("")}</tbody></table>`;
+const laneRows = (list) => (Array.isArray(list) ? list.filter((r) => r && typeof r === "object" && r.build != null) : []);
+function laneHtml(lane) {
+  const tier = String(lane.tier || "");
+  const title = lane.title || `${tier} lane`;
+  const noun = title.replace(/ lane$/, "");
+  const job = lane.job || "";
+  const runs = laneRows(lane.runs);
+  const inFlight = Array.isArray(lane.running) ? lane.running.length : 0;
   const flight = inFlight ? `<p class="mut small">${plural(inFlight, "build")} of the lane in flight, not yet recorded.</p>` : "";
   let body;
   if (!runs.length) {
-    body = `<p class="mut">No GitLab run on record. <code>${esc(job)}</code> runs the smoke matrix against a pool project's GitLab repository (<code>EVAL_FORGE=gitlab</code>), on demand with <code>/test ${esc(job)}</code>; its runs are listed here and counted nowhere else.</p>${flight}`;
+    body = `<p class="mut">No ${esc(noun)} run on record. <code>${esc(job)}</code> runs the lane's list (<code>EVAL_FORGE=${esc(tier)}</code>) on demand with <code>/test ${esc(job)}</code>; its runs are listed here and counted nowhere else.</p>${flight}`;
   } else {
     const c = lane.counts || {};
-    body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>` +
-      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${runs.map(laneRow).join("")}</tbody></table>${flight}`;
+    body = `<p class="mut small">${plural(c.on_record || runs.length, "run")} on record: ${c.green || 0} green, ${c.red || 0} not. These runs are the lane's own and sit outside the gate's numbers above.</p>${laneTable(runs)}${flight}`;
   }
-  const nightlyJob = lane && lane.nightly_job || "ci-kube-agents-eval-nightly-gitlab";
-  const nights = lane && Array.isArray(lane.nights) ? lane.nights.filter((r) => r && typeof r === "object" && r.build != null) : [];
+  const jobs = Array.isArray(lane.nightly_jobs) ? lane.nightly_jobs.filter((j) => j && typeof j === "object" && j.job) : [];
+  const anyNight = jobs.some((j) => laneRows(j.nights).length);
   let nightsHtml;
-  if (!nights.length) {
-    nightsHtml = `<p class="mut small">No GitLab night on record. <code>${esc(nightlyJob)}</code> runs the same list once a night on its own leased project.</p>`;
+  if (!anyNight) {
+    const names = jobs.map((j) => `<code>${esc(j.job)}</code>`).join(" and ");
+    nightsHtml = `<p class="mut small">No ${esc(noun)} night on record.${names ? ` ${names} ${jobs.length > 1 ? "run" : "runs"} the same list once a night on ${jobs.length > 1 ? "their own leased projects" : "its own leased project"}.` : ""}</p>`;
   } else {
-    const nc = lane.night_counts || {};
-    nightsHtml = `<h3>Nights</h3><p class="mut small">${plural(nc.on_record || nights.length, "night")} on record: ${nc.green || 0} green, ${nc.red || 0} not (<code>${esc(nightlyJob)}</code>).</p>` +
-      `<table class="rel"><thead><tr><th>Build</th><th>PR</th><th>Prow</th><th>Eval verdict</th><th>Cases</th><th>Started</th><th>Took</th></tr></thead><tbody>${nights.map(laneRow).join("")}</tbody></table>`;
+    nightsHtml = `<h3>Nights</h3>` + jobs.map((j) => {
+      const nights = laneRows(j.nights);
+      if (!nights.length) return `<p class="mut small">No night of <code>${esc(j.job)}</code> on record yet.</p>`;
+      const nc = j.night_counts || {};
+      return `<p class="mut small">${plural(nc.on_record || nights.length, "night")} on record: ${nc.green || 0} green, ${nc.red || 0} not (<code>${esc(j.job)}</code>).</p>${laneTable(nights)}`;
+    }).join("");
   }
-  return `<div class="sec" id="gitlab"><h2>GitLab lane</h2>${body}${nightsHtml}</div>`;
+  return `<div class="sec" id="${esc(tier)}"><h2>${esc(title)}</h2>${body}${nightsHtml}</div>`;
+}
+// A section of several forges (the self-managed ones): one table of their
+// pull-request runs and one of their scheduled runs, newest first, each row
+// naming its forge, so a red row says which forge broke.
+const forgeName = (lane) => String(lane.title || lane.tier || "").replace(/ lane$/, "");
+const startedMs = (run) => (run.started ? parseIso(run.started) : 0) || 0;
+function forgeSectionHtml(section, lanes) {
+  const title = lanes[0].section_title || section;
+  const tagged = (pick) => lanes.flatMap((l) => pick(l).map((r) => ({ ...r, forge: forgeName(l) }))).sort((a, b) => startedMs(b) - startedMs(a));
+  const runs = tagged((l) => laneRows(l.runs));
+  const inFlight = lanes.reduce((n, l) => n + (Array.isArray(l.running) ? l.running.length : 0), 0);
+  const flight = inFlight ? `<p class="mut small">${plural(inFlight, "build")} in flight, not yet recorded.</p>` : "";
+  const tally = (key, rows) => lanes.map((l) => {
+    const c = l[key] || {};
+    return `${esc(forgeName(l))} ${plural(c.on_record || 0, rows)}, ${c.green || 0} green`;
+  }).join("; ");
+  let body;
+  if (!runs.length) {
+    const tests = lanes.map((l) => `<code>/test ${esc(l.job || "")}</code>`).join(" or ");
+    body = `<p class="mut">No run on record. Each forge's pull-request job runs on demand (${tests}); its runs are listed here and counted nowhere else.</p>${flight}`;
+  } else {
+    body = `<p class="mut small">${tally("counts", "run")}. These runs sit outside the gate's numbers above.</p>${laneTable(runs.slice(0, PAGE.laneRowsListed), true)}${flight}`;
+  }
+  const scheduled = tagged((l) => (Array.isArray(l.nightly_jobs) ? l.nightly_jobs : []).flatMap((j) => laneRows(j && j.nights)));
+  const cadence = lanes[0].cadence === "weekly" ? "week" : "night";
+  // A lane's reason its scheduled jobs are off (forge_lane.LANES' `off`), as the digest says it.
+  const offs = lanes.filter((l) => l.off).map((l) => `<p class="mut small">${esc(forgeName(l))}'s scheduled jobs are off: ${esc(l.off)}.</p>`).join("");
+  let schedHtml;
+  if (!scheduled.length) {
+    const names = lanes.flatMap((l) => (Array.isArray(l.nightly_jobs) ? l.nightly_jobs : []).map((j) => j && j.job).filter(Boolean)).map((j) => `<code>${esc(j)}</code>`).join(" and ");
+    schedHtml = `<p class="mut small">No scheduled run on record.${names ? ` ${names} run the same list once a ${cadence}.` : ""}</p>${offs}`;
+  } else {
+    // The Job column names each row's job, so a retired job's run reads as its own.
+    schedHtml = `<h3>Scheduled runs</h3>${offs}<p class="mut small">${tally("night_counts", "run")}.</p>${laneTable(scheduled.slice(0, PAGE.laneRowsListed), true, true)}`;
+  }
+  return `<div class="sec" id="${esc(section)}"><h2>${esc(title)}</h2>${body}${schedHtml}</div>`;
+}
+function lanesHtml() {
+  const lanes = Array.isArray(brief.lanes) ? brief.lanes.filter((l) => l && typeof l === "object" && l.tier) : [];
+  const sections = [];
+  for (const lane of lanes) {
+    const key = String(lane.section || lane.tier);
+    const found = sections.find((s) => s.key === key);
+    if (found) found.lanes.push(lane);
+    else sections.push({ key, lanes: [lane] });
+  }
+  return sections.map((s) => (s.lanes.length > 1 ? forgeSectionHtml(s.key, s.lanes) : laneHtml(s.lanes[0]))).join("");
 }
 
 function briefHtml(link) {
@@ -1077,7 +1146,7 @@ function briefHtml(link) {
       `<div class="sec" id="agent"><h2>Last 24 hours</h2>${numbersHtml(sinceMs, null)}</div>` +
       (healthy || noVerdict ? `<div class="sec"><h2>Last incident</h2>${lastIncidentHtml()}</div>` : "") +
       runsListHtml(windowRuns(sinceMs, null), inc, "Runs in the last 24 hours") +
-      nightlyBriefHtml() + gitlabLaneHtml() + releasesHtml() + footHtml();
+      nightlyBriefHtml() + lanesHtml() + releasesHtml() + footHtml();
   }
   const inWindow = windowRuns(incidentStartMs(inc), inc.untilMs);
   if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death || r.cls === "deadline-kill")) {
@@ -1099,7 +1168,7 @@ function briefHtml(link) {
     changedBeforeHtml(inc, inWindow) +
     beingDoneHtml(inc) +
     runsListHtml(inWindow, inc, "Runs in this window") +
-    nightlyBriefHtml() + gitlabLaneHtml() + releasesHtml() + footHtml();
+    nightlyBriefHtml() + lanesHtml() + releasesHtml() + footHtml();
 }
 
 function footHtml() {

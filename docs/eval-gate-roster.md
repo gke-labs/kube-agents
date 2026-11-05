@@ -11,16 +11,11 @@ only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNE
 `hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
 alias with `no_parent_owners`, so a root approver does not count for either, and the inject
 lane's `hack/eval/inject-lane-exclusions.txt` and `hack/eval/inject-lane-safeguards.yaml` with
-them, since the merge-blocking presubmit runs on that lane (below). The script, `hack/ci-eval-pr.sh`,
-carries it too: it grades every pull request with `main`'s `bench/` at `PULL_BASE_SHA` and the change's
-own cases, and the rule keeps a root approval alone from editing that step out. So do the files that
-run inside it or decide whether it runs: `hack/ci-env.sh` and `hack/fleet-kubeconfigs.sh` (sourced),
-`hack/ci-deploy.sh` (its functions are evaluated), `hack/ci-revalidate.sh` (step 0, which can reuse a
-verdict in place of a run), `hack/fleet-fixture-state.py` (its report excuses cases) and
-`scripts/installer/gke_dns_endpoint.sh` (sourced by `ci-env.sh`, under `scripts/installer/OWNERS`)
-([`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2, "Pinning and baselines").
-Nothing else carries the rule:
-`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+them, since the merge-blocking presubmit runs on that lane (below).
+`hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
+recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
+Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
+`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -851,7 +846,15 @@ api and inject lanes are graded against the same bar. The door's task can reach 
 cluster safeguards see nothing of GitHub; the file holds one entry, a none-wrapped `github_writes` at catastrophic severity, which
 `hack/ci-eval-pr.sh` appends to a copy of every task file in the matrix before devops-bench reads
 it, so a repetition that wrote a pull request or branch the case did not request is a tripped
-catastrophic safeguard at rung 1, as a cluster mutation is. A write is charged to a repetition
+catastrophic safeguard at rung 1, as a cluster mutation is. A repetition that ended on an
+infrastructure failure with an empty reply, whose only catastrophic trip is this write safeguard, and
+whose case requested a pull request, grades infra rather than rung 1 when the safeguard charged no more
+writes than the case requested: the safeguard credits a requested pull request only when the reply names its
+URL, and an infrastructure failure empties the reply, so the pull request the case asked for,
+opened in its own exclusive window, reads as unrequested (#4743). A real forbidden action trips a
+safeguard this carve-out does not name, or this one beside it, and still blocks at rung 1; so does a
+write on a case that requested no pull request, which has no requested write to be mischarged, an extra
+write charged beside the requested one, and a repetition whose reply could name the pull request. The carve-out reads the case's own requesting checks, which the pinned grader has; a case that requests a pull request only through the lane `requesting:` listing is not distinguished (the grader is pinned to `bench/` and cannot read this file), so its infra-ended repetition blocks (#4778). A write is charged to a repetition
 whose reply, or whose call that created the write (a `submit-suggestion`, `vcs.py` or raw
 push or create, its own or a delegated worker's; never a read's argument), names it (its URL or
 its branch); a write in the window that the repetition does not name is recorded under
@@ -895,6 +898,13 @@ lane keeps the sweep on, where a sweep's pull request names no repetition and la
 `platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
 `bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
+Once the `oss-test-infra` change that exports `MODEL_PROVIDER=gemini` on the five nightlies
+merges, they move the agent from Vertex AI to the Gemini Developer API, each with the leased pool
+project's own key ([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3); the judge does
+not move. The version key does not carry the serving provider, so rung 6 compares nights on both
+sides of the switch at the same key. Date that night here when it happens, because a step in cost
+or latency from that night has this cause.
+
 ## The GitLab lane
 
 The GitLab eval job (`pull-kube-agents-smoke-test-gitlab`, `EVAL_FORGE=gitlab`,
@@ -906,7 +916,7 @@ presubmit. On a pull request it runs `hack/eval/gitlab-cases.txt`, not
 issue), since a chat probe passes the same on either forge and the GitHub run already grades it.
 Every entry is a registered case, from `presubmit-cases.txt` or `nightly-cases.txt`; the lane picks
 from the catalogue and registers nothing. The same list runs on a self-managed GitLab
-(`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its two nightlies, around the
+(`EVAL_FORGE=gitlab-ce`: `pull-kube-agents-smoke-test-gitlab-ce` and its next-mode nightly, around the
 per-run GitLab CE that `hack/ci-forge.sh` stands up, `docs/ci-pool-projects.md` 5.8), since the cases grade the forge and not where it is; a GitHub Enterprise
 Server run (`EVAL_FORGE=ghes`) reads `hack/eval/ghes-cases.txt`, named by `lane_cases_file()` in
 `hack/ci-eval-pr.sh` (below). `hack/ci-eval-pr.sh` refuses an entry in neither file,
@@ -920,9 +930,9 @@ nightly runs the same list once a night on its own leased project
 (`ci-kube-agents-eval-nightly-gitlab`, #2832), and never appends to the evidence store, since a
 case's record is per case, not per forge; nothing runs the cases this file leaves out against
 GitLab. `ci-kube-agents-eval-nightly-gitlab-next` runs the same list under `spec.mode: next`
-(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its runs
-show in Prow only, as the dashboard collects the GitLab lane's today-mode nightly alone and the GitLab
-lane never records.
+(`EVAL_MODE_NEXT=1`, through the inject door), so the forge is graded on both stacks; its nights are
+listed under the Brief's GitLab lane section beside the today-mode nightly's, in no gate number or case
+record, and the GitLab lane never records.
 
 The roster above is still the roster, intersected with the lane's list: a roster case in the lane
 arms rung 4 there, and a held-out seat runs and reports without arming it, exactly as on the GitHub
@@ -943,8 +953,8 @@ a pull request.
 
 ## The GHES lane
 
-The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand, `ci-kube-agents-eval-nightly-ghes`
-and, under `spec.mode: next`, `ci-kube-agents-eval-nightly-ghes-next`; `EVAL_FORGE=ghes`,
+The GHES eval jobs (`pull-kube-agents-smoke-test-ghes` on demand and `ci-kube-agents-eval-nightly-ghes-next`
+nightly, both under `spec.mode: next`; `EVAL_FORGE=ghes`,
 [#3684](https://github.com/gke-labs/kube-agents/issues/3684)) deploy the agent against a GitHub
 Enterprise Server at a private host with a private CA: the forwarding proxy in `hack/ghes-proxy`,
 on a VM the job stands up per run in front of the leased project's github.com repository
@@ -958,6 +968,25 @@ GHES-only case `ghes-pdb-remediation-pr` (the same task with a writes safeguard 
 appends anyway) stays unregistered, since a nightly registration would run it on the github.com
 nightly as a second copy of `pdb-remediation-pr`; it joins the list when the registration rules
 grow a lane-only seat.
+
+## The certification suite
+
+The certification suite, the cases behind the certified-capabilities page, is the one list
+under `hack/eval/` that is not a view of the catalogue: `hack/eval/certification-cases.txt`
+registers its own cases, each a top-level case under
+`bench/tasks/` with `suite: certification` in its task file, and `EVAL_TIER=certification` in
+`hack/ci-eval-pr.sh` runs that file alone, in `# part N` sections under `EVAL_CERTIFICATION_PART`,
+one Prow periodic per section, rerun from Deck and never on a cron. The script refuses an entry
+that is also in `presubmit-cases.txt` or `nightly-cases.txt`, and `scripts/validate_bench_cases.py`
+refuses a rostered case without the suite line, so a case holds one record on one lane. The roster
+above never reaches it: the blocking roster is a subset of the presubmit, so rung 4 is disarmed on
+the lane by construction and the script exports no roster name there; rungs 1 to 3 red a run like
+every case, as does rung 5 (an `expected_fail: true` case that passes every repetition), and a
+failing certification case is a record for the page rather than a red. The lane appends nothing to
+the evidence store and publishes no dashboard; its record is its logs bucket. A certification case never
+earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
+The file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
+meets are in [`bench/README.md`](../bench/README.md#certification-suite).
 
 ## Demoting a flaky case
 
