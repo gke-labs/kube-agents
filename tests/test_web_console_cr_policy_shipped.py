@@ -33,8 +33,9 @@ CHART_HELPERS = REPO_ROOT / "charts" / "kube-agents" / "templates" / "_helpers.t
 WEB_CONSOLE_TEMPLATE = REPO_ROOT / "charts" / "kube-agents" / "templates" / "web-console.yaml"
 SYNC_SCRIPT = REPO_ROOT / "hack" / "sync-chart-manifests.sh"
 CONSOLE_DIR = REPO_ROOT / "a2a" / "cmd" / "web-console"
-# The console files that write annotations on the CR (the issue's list).
-CONSOLE_WRITERS = ("models.go", "patches.go", "repositories.go")
+# The console file that writes spec.integration, and the map it writes.
+INTEGRATION_WRITER = CONSOLE_DIR / "repositories.go"
+INTEGRATION_MAP = "integrationPatch"
 
 POLICY_NAME = "kube-agents-web-console-cr"
 HELPER = "kube-agents.webConsoleCRPolicyEnabled"
@@ -63,11 +64,29 @@ def helper_body(name: str) -> str:
 
 
 def console_keys() -> set[str]:
-    """Every annotation-key constant in the console files that write the CR."""
+    """Every `kubeagents.x-k8s.io/` constant in the console's non-test Go files.
+
+    Every file, not only the ones that write the CR today: any handler can call
+    the console's Kubernetes client, so a key added anywhere is one the policy
+    must allow or refuse on purpose.
+    """
     keys = set()
-    for name in CONSOLE_WRITERS:
-        text = (CONSOLE_DIR / name).read_text(encoding="utf-8")
+    for path in CONSOLE_DIR.glob("*.go"):
+        if path.name.endswith("_test.go"):
+            continue
+        text = path.read_text(encoding="utf-8")
         keys |= set(re.findall(r'=\s*"(' + re.escape(CONSOLE_KEY_PREFIX) + r'[^"]+)"', text))
+    return keys
+
+
+def console_integration_keys() -> set[str]:
+    """The spec.integration keys the console writes: the keys of its integration map."""
+    text = INTEGRATION_WRITER.read_text(encoding="utf-8")
+    literal = re.search(INTEGRATION_MAP + r" := map\[string\]any\{(.*?)\n\t+\}", text, re.S)
+    if literal is None:
+        raise AssertionError(f"{INTEGRATION_MAP} not found in {INTEGRATION_WRITER}")
+    keys = set(re.findall(r'"(\w+)":', literal.group(1)))
+    keys |= set(re.findall(INTEGRATION_MAP + r'\["(\w+)"\]', text))
     return keys
 
 
@@ -124,9 +143,7 @@ class PolicyContentTest(unittest.TestCase):
         variable = next(v for v in self.policy["spec"]["variables"] if v["name"] == "consoleIntegrationKeys")
         allowed = set(re.findall(r"'([^']+)'", variable["expression"]))
         self.assertEqual(allowed, {"forges", "repositories", "github"})
-        text = (CONSOLE_DIR / "repositories.go").read_text(encoding="utf-8")
-        for key in allowed:
-            self.assertIn(f'"{key}"', text)
+        self.assertEqual(allowed, console_integration_keys())
 
     def test_it_selects_the_chart_s_console_service_account(self):
         (condition,) = self.policy["spec"]["matchConditions"]
