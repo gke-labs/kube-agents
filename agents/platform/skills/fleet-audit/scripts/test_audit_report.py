@@ -24105,6 +24105,26 @@ metadata:
                 self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
                 self.assertNotIn(path, note)
 
+    def test_the_paragraph_never_pushes_out_a_location_note(self):
+        """Review finding: a paragraph step was accepted as shorter although
+        it pushed out the location note (here the declared file), and only the
+        reconciler note was held. Every route note already on the note stays."""
+        prose = (f"This object is declared in the GitOps repository at `clusters/c1/pool.yaml`, whose spec sets "
+                 f"`autoscaling`. {audit_report.KCC_REVERTED_NOTE_MARK}, so the command below is reverted on the next "
+                 "reconcile and this finding returns on the next run. Make the change in that file instead.")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/c1/pool.yaml")
+        for repeats in range(20, 40):
+            command = "gcloud container node-pools update pinned-inference-pool --cluster c1 " + "--node-locations us-central1-a " * repeats
+            note = f"{prose}\n\n```bash\n{command.strip()}\n```" + "\n\n" + declared + "\n\n" + reconciled
+            finding = self.harness_finding(note)
+            audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+            with self.subTest(repeats=repeats):
+                result = finding["remediation"]["note"]
+                self.assertIn(declared, result)
+                self.assertIn(reconciled, result)
+                self.assertIn(audit_report.KCC_STALLED_MARK_PREFIX, result)
+
     def test_the_paragraph_never_pushes_out_the_reconciler_note(self):
         """A note of a reverted gcloud command (about 1,400 characters), which
         `finish` wrote and never cuts, leaves room for the reconciler note or

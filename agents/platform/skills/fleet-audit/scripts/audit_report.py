@@ -19636,12 +19636,12 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     worker's own text and never the text `finish` wrote (the Kustomize note
     and its copied file, the closing text of `degrade_missing_remediations`,
     the note of `degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`),
-    and never inside a code block. The route notes already on the note stay,
-    and a paragraph that would push out the reconciler note does not fit, so
-    the reconciler note is always shown. When even the core does not fit
-    beside the text `finish` wrote and the note carries the Kustomize note's
-    copied file, that block is made shorter by whole lines, with its fences
-    closed, to make room for the core and the reconciler note, as
+    and never inside a code block. Every route note already on the note
+    stays: a paragraph step that would push one out (a location note or the
+    reconciler note) does not fit. When even the core does not fit beside the
+    text `finish` wrote and the note carries the Kustomize note's copied file,
+    that block is made shorter by whole lines, with its fences closed, to make
+    room for the core and the route notes, as
     `_fit_route_notes` does for the reconciler note (`_sized_manifest_block`).
     Only when that does not fit either does the core go after the text
     `finish` wrote, past `MAX_NOTE_CHARS`. The worker's note before a cut goes
@@ -19655,7 +19655,6 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     uncut = remediation.get(ROUTE_UNCUT_NOTE_FIELD)
     route = [found.group(0) for found in ROUTE_NOTE_PATTERN.finditer(note)]
     worker = uncut if isinstance(uncut, str) else ROUTE_NOTE_SPACED_PATTERN.sub("", note).strip()
-    reconciler = [text for text in route if text.startswith(RECONCILED_NOTE_LEDE)]
     fitted, added = _fit_route_notes(worker, route)
     outcome = KCC_FIT_PAST_CAP
     for step, paragraph in enumerate(paragraphs):
@@ -19663,12 +19662,14 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
         # strip of it (`KCC_STALLED_NOTE_PATTERN`) leaves them whole.
         shown = ROUTE_PARAGRAPH_BREAK + paragraph if route else paragraph
         candidate, candidate_added = _fit_route_notes(worker, [*route, shown])
-        if shown in candidate_added and all(text in candidate_added for text in reconciler):
+        # Every route note already on the note stays: a step that pushes one
+        # out (a location note or the reconciler note) does not fit.
+        if shown in candidate_added and all(text in candidate_added for text in route):
             fitted, added = candidate, candidate_added.replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
             outcome = KCC_FIT_WHOLE if step == 0 else KCC_FIT_SHORTER
             break
     else:
-        shortened = _kcc_core_with_shorter_block(worker, reconciler, paragraphs[-1])
+        shortened = _kcc_core_with_shorter_block(worker, route, paragraphs[-1])
         if shortened is not None:
             fitted, added = shortened
             outcome = KCC_FIT_SHORTER
@@ -19684,18 +19685,19 @@ def _fit_kcc_paragraph(remediation: dict, paragraphs: list[str]) -> str:
     return outcome
 
 
-def _kcc_core_with_shorter_block(worker: str, reconciler: list[str], core: str) -> "tuple[str, str] | None":
+def _kcc_core_with_shorter_block(worker: str, route: list[str], core: str) -> "tuple[str, str] | None":
     """The worker's note with its Kustomize copied file made shorter by whole
-    lines (`_sized_manifest_block`, fences closed) so that the reconciler
-    note and the paragraph's `core` fit `MAX_NOTE_CHARS`, as `(note, added)`;
+    lines (`_sized_manifest_block`, fences closed) so that every route note
+    already on the note (`route`) and the paragraph's `core` fit
+    `MAX_NOTE_CHARS`, as `(note, added)`;
     None when the note has no copied file or even an empty block leaves no
     room. Only the block is shortened; the Kustomize note's own text stays
     whole, and the worker's text after it is cut as needed."""
     head = _split_kustomize_head(worker)
     if head.lines is None:
         return None
-    shown = ROUTE_PARAGRAPH_BREAK + core if reconciler else core
-    added = NOTE_SEPARATOR.join([*reconciler, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
+    shown = ROUTE_PARAGRAPH_BREAK + core if route else core
+    added = NOTE_SEPARATOR.join([*route, shown]).replace(NOTE_SEPARATOR + ROUTE_PARAGRAPH_BREAK, ROUTE_PARAGRAPH_BREAK)
     block = _sized_manifest_block(
         head.lines, head.whole, lambda shorter: _cut_worker_note(head.rest, "", added, head.prefix + shorter) is not None
     )
