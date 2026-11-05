@@ -22,10 +22,13 @@ DEFAULT_RELAY_READY_TIMEOUT = 120.0
 # tool chunks text at the registry entry's ``max_message_length`` and the
 # gateway's reply path at the adapter's ``MAX_MESSAGE_LENGTH``, both character
 # counts, and a character is one to four bytes once serialized (the broker
-# writes UTF-8, not ``\uXXXX`` escapes). So the character cap is a first cut
-# only: ``send`` measures the activity it is about to post, drops a card to
-# plain text, and truncates the text with a marker when even that is over.
-TEAMS_MAX_MESSAGE_LENGTH = 16000
+# writes UTF-8, not ``\uXXXX`` escapes). The cap is sized for four bytes per
+# character, so every chunk the chunkers hand ``send`` fits as plain text
+# whatever the script; a card adds a TextBlock per line, so ``send`` still
+# measures what it is about to post, drops a card to plain text, and only
+# truncates text (with a marker) that escapes to more than that, which no
+# chunked reply does.
+TEAMS_MAX_MESSAGE_LENGTH = 7000
 TEAMS_MAX_ACTIVITY_BYTES = 28 * 1024
 TEAMS_TRUNCATION_MARKER = "\n… (message truncated to fit Teams' size limit)"
 # Each pass cuts at least the overshoot in raw bytes, and a raw byte is at least
@@ -34,12 +37,18 @@ TEAMS_FIT_ATTEMPTS = 8
 # Where the bot posts when an activity did not say: the public Bot Framework
 # endpoint. TEAMS_DEFAULT_SERVICE_URL overrides it in a hand-run gateway only.
 DEFAULT_TEAMS_SERVICE_URL = "https://smba.trafficmanager.net/teams/"
-# How much of a broker error body the gateway reads to name the cause.
+# How much of a broker error body the gateway reads to name the cause, and
+# how much of each field it keeps for the log and the delivery record.
 TEAMS_RELAY_ERROR_BODY_MAX_BYTES = 4096
+TEAMS_RELAY_ERROR_FIELD_MAX_CHARS = 256
 # One relay call can cost the broker an identity-provider round trip (20 s)
 # and then the Bot Framework post (30 s), so the gateway waits longer than
 # their sum; a shorter wait reports a post that then lands as a failure.
 TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS = 60
+# A typing indicator is fire-and-forget: the base abandons it after about a
+# second, and a worker thread left blocking for the full relay timeout on a
+# stalled broker would hold an executor slot the reply itself needs.
+TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS = 5
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
 # Bot Framework `conversation.conversationType` -> gateway `chat_type`. The
 # memory providers treat only "dm" as single-person, so a Teams 1:1 chat
@@ -266,7 +275,11 @@ def relayed_teams_error(exc: urllib.error.HTTPError) -> TeamsRelayError:
     body = body if isinstance(body, dict) else {}
     fields = body.get("teams") if isinstance(body.get("teams"), dict) else {}
     if not fields:
-        fields = {k: str(body[k])[:256] for k in ("error", "detail") if body.get(k)}
+        fields = {
+            k: str(body[k])[:TEAMS_RELAY_ERROR_FIELD_MAX_CHARS]
+            for k in ("error", "detail")
+            if body.get(k)
+        }
     detail = " ".join(str(v) for v in fields.values() if v) or str(exc.reason)
     return TeamsRelayError(f"HTTP {exc.code}: {detail}", exc.code, fields)
 
@@ -387,7 +400,12 @@ def _build_teams_adapter_and_sender(
         platform_config_cls,
     ) = _resolve_base_classes()
 
-    def request(path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def request(
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float = TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json", **authorization_headers()}
         req = urllib.request.Request(
@@ -397,7 +415,7 @@ def _build_teams_adapter_and_sender(
             method="GET" if body is None else "POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS) as response:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             raise relayed_teams_error(exc) from exc
@@ -596,6 +614,7 @@ def _build_teams_adapter_and_sender(
                         "method": "POST",
                         "payload": payload,
                     },
+                    timeout=TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS,
                 )
             except Exception:
                 LOGGER.debug("Failed to send typing indicator to Teams", exc_info=True)

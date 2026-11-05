@@ -5469,8 +5469,13 @@ TEAMS_MAX_DELIVERY_ATTEMPTS = 3
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
 TEAMS_OAUTH_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 # How much of a Microsoft error body the broker reads for its log line and the
-# ``teams`` field it answers with: enough for ``error.code`` and ``error.message``.
+# ``teams`` field it answers with: enough for ``error.code`` and ``error.message``,
+# and how much of each it keeps.
 TEAMS_UPSTREAM_BODY_MAX_BYTES = 4096
+TEAMS_UPSTREAM_CODE_MAX_CHARS = 128
+TEAMS_UPSTREAM_MESSAGE_MAX_CHARS = 256
+# What the identity provider's answer is taken to mean when it names no expiry.
+TEAMS_TOKEN_DEFAULT_EXPIRES_IN_SECONDS = 3600
 # Case-insensitive, and percent-escapes and backslashes are refused in a
 # segment, because the Bot Connector routes case-insensitively on the decoded
 # path: `/activities/History` or `/activities/%68istory` would otherwise reach
@@ -5567,11 +5572,11 @@ def _teams_upstream_error(exc: urllib.error.HTTPError) -> TeamsUpstreamError:
         body = {}
     err = body.get("error") if isinstance(body, dict) else None
     if isinstance(err, dict):
-        fields["code"] = str(err.get("code", ""))[:128]
-        fields["message"] = str(err.get("message", ""))[:256]
+        fields["code"] = str(err.get("code", ""))[:TEAMS_UPSTREAM_CODE_MAX_CHARS]
+        fields["message"] = str(err.get("message", ""))[:TEAMS_UPSTREAM_MESSAGE_MAX_CHARS]
     elif isinstance(err, str):
-        fields["code"] = err[:128]
-        fields["message"] = str(body.get("error_description", ""))[:256]
+        fields["code"] = err[:TEAMS_UPSTREAM_CODE_MAX_CHARS]
+        fields["message"] = str(body.get("error_description", ""))[:TEAMS_UPSTREAM_MESSAGE_MAX_CHARS]
     detail = " ".join(str(fields[k]) for k in ("code", "message") if fields.get(k))
     return TeamsUpstreamError(f"HTTP {exc.code}: {detail or exc.reason}", fields)
 
@@ -5668,7 +5673,7 @@ class TeamsRelay:
             if not token:
                 raise RuntimeError("no access_token returned by Microsoft identity provider")
             try:
-                expires_in = int(result.get("expires_in", 3600))
+                expires_in = int(result.get("expires_in", TEAMS_TOKEN_DEFAULT_EXPIRES_IN_SECONDS))
             except (TypeError, ValueError) as exc:
                 raise TeamsUpstreamError("Microsoft identity provider returned a bad expires_in") from exc
             self._token = str(token)
