@@ -14,10 +14,13 @@ forge and names no forge at all.
 """
 
 from .base import (
+    TALLY_TOTAL,
+    tally_with_open,
     BROKER_VERBS,
     COLLABORATION_VERBS,
     ISSUE_VERBS,
     LABEL_FIELDS,
+    LIBRARY_VERBS,
     Forge,
     ForgeUnsupported,
     IdentityUnknown,
@@ -66,6 +69,7 @@ __all__ = [
     "BRANCH_RE",
     "BROKER_VERBS",
     "COLLABORATION_VERBS",
+    "LIBRARY_VERBS",
     "BrokeredCredential",
     "CliTransport",
     "HttpTransport",
@@ -80,6 +84,8 @@ __all__ = [
     "LabelsUnsupported",
     "Guidance",
     "MAX_PAGE_SIZE",
+    "TALLY_TOTAL",
+    "tally_with_open",
     "MintedReadCredential",
     "MintedWriteCredential",
     "NoCredential",

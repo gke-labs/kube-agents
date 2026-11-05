@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 import unittest
@@ -1187,11 +1188,11 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args for c in alert.call_args_list],
                          [("google_chat", "alert", "s1"), ("slack", "slack alert", "s1")])
-        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
 
     def test_the_title_is_recorded_before_the_turn_starts(self):
         def start(*_args):
-            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
             return STARTED
 
         session_kv_server._start_agent_turn.side_effect = start
@@ -1202,6 +1203,31 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert", "s1")])
         session_kv_server._record_alert_title.assert_not_called()
+
+    def test_a_drift_kind_is_recorded_with_the_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title="the title", alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", session_kv_server.ALERT_KIND_DRIFT)
+
+    def test_a_drift_kind_is_recorded_without_a_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title=None, alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", None, session_kv_server.ALERT_KIND_DRIFT)
+
+    def test_under_next_a_google_chat_thread_gets_the_title(self):
+        # The title heads the plan the cards draw, which the gateway lays out on
+        # Google Chat under next.
+        with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat"}):
+            self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
+        session_kv_server._record_alert_title.assert_called_once()
 
 
 class TestAlertTitleRecord(unittest.TestCase):
@@ -1230,6 +1256,28 @@ class TestAlertTitleRecord(unittest.TestCase):
     def test_a_missing_row_is_not_an_error(self):
         session_kv_server._record_alert_title("k8s-evt-none", "x")
 
+    def test_a_kind_joins_the_routing_row_beside_the_title(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", "checkout HPA drift in seeded-b", "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {
+            "platform": "slack", "thread_id": "1.0", "title": "checkout HPA drift in seeded-b", "alert_kind": "drift",
+        })
+
+    def test_a_kind_without_a_title_is_still_recorded(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", None, "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {"platform": "slack", "thread_id": "1.0", "alert_kind": "drift"})
+
     def test_the_gateway_reads_the_title_recorded(self):
         import importlib.util
         import sqlite3
@@ -1245,6 +1293,13 @@ class TestAlertTitleRecord(unittest.TestCase):
             )
         session_kv_server._record_alert_title("k8s-evt-t2", "payments-api crashloop in seeded-debug")
         self.assertEqual(reader.alert_title("C1", "2.0", temp_db_path), "payments-api crashloop in seeded-debug")
+        self.assertFalse(reader.is_drift_alert("C1", "2.0", temp_db_path))
+        session_kv_server._record_alert_title("k8s-evt-t2", "checkout HPA drift", session_kv_server.ALERT_KIND_DRIFT)
+        self.assertTrue(reader.is_drift_alert("C1", "2.0", temp_db_path))
+        self.assertEqual(
+            (reader.ALERT_KIND_KEY, reader.ALERT_KIND_DRIFT),
+            (session_kv_server.ALERT_KIND_KEY, session_kv_server.ALERT_KIND_DRIFT),
+        )
 
 
 class TestSessionKvServerAuth(unittest.TestCase):
@@ -1265,6 +1320,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/sessions", None),
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
+        ("POST", "/v1/incidents/apply", {"chat_id": "c", "thread_id": "t"}),
         ("GET", "/v1/incidents/by-thread?chat_id=c&thread_id=t", None),
         ("GET", "/v1/incidents/recent?chat_id=c", None),
         ("GET", "/v1/alert-quota", None),
@@ -1284,8 +1340,17 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/intercepted-events", None),
         ("GET", "/v1/sessions/sess-1/tasks", None),
         ("POST", "/v1/sessions/sess-1/cards/stop", {"context_id": "c"}),
+        ("POST", "/v1/board/actions", {"action": "retry", "tasks": ["t-1"]}),
         ("GET", "/v1/tasks", None),
         ("GET", "/v1/tasks/t-1", None),
+        ("PUT", "/v1/sessions/sess-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("GET", "/v1/sessions/sess-1/origin", None),
+        ("PUT", "/v1/cron/jobs/j-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("GET", "/v1/cron/jobs/j-1/origin", None),
+        ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
+        ("GET", "/v1/proposals/opened/counts", None),
+        ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
+        ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
 
     def setUp(self):
@@ -1335,6 +1400,8 @@ class TestSessionKvServerAuth(unittest.TestCase):
                 .replace("sess-1", "{session_id}")
                 .replace("f-1", "{finding_id}")
                 .replace("t-1", "{task_id}")
+                .replace("j-1", "{job_id}")
+                .replace("tk-1", "{ticket}")
                 .replace("publication/backlog", "publication/{publisher}"),
             )
             for method, path, _ in self.PROTECTED_ROUTES
@@ -2000,6 +2067,28 @@ class TestSlackHomeChannelResolution(unittest.TestCase):
         # degrades to "" rather than raising.
         self.assertEqual(session_kv_server._slack_home_channel(), "")
 
+    def test_a_mounted_projection_outranks_the_config_files(self):
+        # Under `next` the operator projects the home channel into a file the
+        # kubelet refreshes in place, and the gateway posts into that value. A
+        # `/sethome` channel left in the data volume by today mode must not
+        # make the agent name a different channel than the gateway, so a
+        # mounted file decides, empty or not; the config files count only
+        # where no file is mounted.
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, chat_notify.HOME_FILE_KEY)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("C0PROJECTED\n")
+            self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory), patch.dict(os.environ, {}):
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0PROJECTED")
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("")
+                self.assertEqual(session_kv_server._slack_home_channel(), "")
+                os.environ["SLACK_HOME_CHANNEL"] = "C0ENV"
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0ENV")
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
+                self.assertEqual(session_kv_server._slack_home_channel(), "C0FILE")
+
     def test_a_hostile_config_shape_costs_the_lookup_and_not_the_caller(self):
         self._point("CONFIG_PATH", "platforms: slack\n")
         self.assertEqual(session_kv_server._slack_home_channel(), "")
@@ -2290,6 +2379,336 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                     "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE id = ?",
                     (f"-{seconds} seconds", row_id),
                 )
+
+    # --- held for an open fix (_open_fix_pull_request) ----------------------
+
+    FIX_URL = "https://github.com/acme/fleet/pull/7"
+
+    def _board(self, cards=(), subs=(), legacy=False):
+        """A kanban board with `cards` and `subs` (task_id, chat_id, thread_id).
+
+        A card is (task_id, session_id, pr_url or None), optionally followed by
+        its assignee and created_at (epoch seconds). `legacy` builds a tasks
+        table with neither column, as an older board has.
+        """
+        import sqlite3
+        board = os.path.join(tempfile.mkdtemp(), "kanban.db")
+        with sqlite3.connect(board) as conn:
+            if legacy:
+                conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT)")
+            else:
+                conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, session_id TEXT, assignee TEXT, created_at REAL)")
+            conn.execute(
+                "CREATE TABLE task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, kind TEXT, "
+                "payload TEXT, created_at INTEGER)"
+            )
+            conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, thread_id TEXT)")
+            for card in cards:
+                task_id, session_id, url = card[:3]
+                if legacy:
+                    conn.execute("INSERT INTO tasks VALUES (?, ?)", (task_id, session_id))
+                else:
+                    assignee, created_at = (card[3], card[4]) if len(card) > 3 else ("", 0)
+                    conn.execute("INSERT INTO tasks VALUES (?, ?, ?, ?)", (task_id, session_id, assignee, created_at))
+                if url:
+                    conn.execute(
+                        "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'pr_opened', ?, 1)",
+                        (task_id, json.dumps({"url": url, "number": 7, "title": "fix"})),
+                    )
+            for task_id, chat_id, thread_id in subs:
+                conn.execute("INSERT INTO kanban_notify_subs VALUES (?, 'slack', ?, ?)", (task_id, chat_id, thread_id))
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", board)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _first_incident(self, pod, reason="BackOff"):
+        """Inject `pod`'s event, then age its row past the fold window; returns (row id, session id)."""
+        self.assertEqual(self._inject(pod, reason=reason)["status"], "injected")
+        workload = pod.rsplit("-", 2)[0]
+        row_id = self._rows(workload)[-1][0]
+        self._age(row_id, self.WINDOW + 60)
+        return row_id, f"sess-{pod}-{reason}"
+
+    def test_a_workload_that_breaks_again_while_its_fix_is_open_is_held(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request") as remind:
+            anchor_id, session = self._first_incident("heldfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            reply = self._inject("heldfix-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+        self.assertEqual(self.trigger.call_count, 1, "a second investigation started")
+        self.assertEqual([r[3] for r in self._rows("heldfix-api")], [None, anchor_id])
+        remind.assert_called_once_with(session, "heldfix-api", "BackOff", self.FIX_URL)
+        events = [
+            e for e in self.client.get("/v1/intercepted-events", params={"limit": 200}).json()["events"]
+            if e["name"] == "heldfix-api"
+        ]
+        self.assertEqual([e["pull_request"] for e in events], [self.FIX_URL, ""])
+
+    def test_a_pull_request_from_a_card_only_subscribed_to_the_thread_does_not_hold(self):
+        # Anything asked for in the incident's thread files a card carrying the
+        # thread's subscription, so its pull request need not be the fix.
+        import sqlite3
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            _anchor, session = self._first_incident("threadfix-api-6cfdb6b98b-aaaaa")
+            with sqlite3.connect(temp_db_path) as conn, conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "1700.1"})),
+                )
+            self._board(cards=[("t-label", "a2a-elsewhere", self.FIX_URL)], subs=[("t-label", "C1", "1700.1")])
+            self.assertEqual(self._inject("threadfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def _apply_in_thread(self, session, thread_id):
+        """Route `session` to Slack thread C1/`thread_id`, store its report and an `apply` there; returns the apply's time."""
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": thread_id})),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO incidents (chat_id, thread_id, report) VALUES ('C1', ?, 'report')", (thread_id,)
+            )
+        self.assertEqual(
+            self.client.post("/v1/incidents/apply", json={"chat_id": "C1", "thread_id": thread_id}).json(),
+            {"status": "recorded"},
+        )
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT MAX(applied_at) FROM incident_applies WHERE chat_id = 'C1' AND thread_id = ?", (thread_id,)
+            ).fetchone()[0]
+
+    def test_the_card_an_apply_in_the_thread_files_holds(self):
+        # The front door files the `apply`'s fix card in its own session, so
+        # only the apply mark ties it to the incident.
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request") as remind:
+            anchor_id, session = self._first_incident("applyfix-api-6cfdb6b98b-aaaaa")
+            applied_at = self._apply_in_thread(session, "1700.2")
+            self._board(
+                cards=[("t-apply", "a2a-front-door", self.FIX_URL, assignee, applied_at + 60)],
+                subs=[("t-apply", "C1", "1700.2")],
+            )
+            reply = self._inject("applyfix-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+        remind.assert_called_once_with(session, "applyfix-api", "BackOff", self.FIX_URL)
+
+    def test_only_the_first_fix_card_after_an_apply_counts(self):
+        # A later card in the thread is something else asked there.
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"):
+            _anchor, session = self._first_incident("firstcard-api-6cfdb6b98b-aaaaa")
+            applied_at = self._apply_in_thread(session, "1700.3")
+            self._board(
+                cards=[
+                    ("t-fix", "a2a-front-door", None, assignee, applied_at + 30),
+                    ("t-later", "a2a-front-door", self.FIX_URL, assignee, applied_at + 90),
+                ],
+                subs=[("t-fix", "C1", "1700.3"), ("t-later", "C1", "1700.3")],
+            )
+            self.assertEqual(self._inject("firstcard-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_thread_card_that_is_not_an_applys_fix_card_does_not_hold(self):
+        assignee = session_kv_server.INCIDENT_PR_ASSIGNEE
+        window = session_kv_server.INCIDENT_APPLY_CARD_WINDOW_S
+        # (name, assignee, seconds after the apply, thread the card is subscribed to or None for the apply's)
+        cases = (
+            ("before", assignee, -10, None),
+            ("past", assignee, window + 10, None),
+            ("other", "chat", 30, None),
+            ("elsewhere", assignee, 30, "1700.not-the-incident"),
+        )
+        for name, card_assignee, offset, card_thread in cases:
+            with self.subTest(name), \
+                    patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                    patch.object(session_kv_server, "_proposal_state", return_value="open"):
+                _anchor, session = self._first_incident(f"{name}apply-api-6cfdb6b98b-aaaaa")
+                thread = f"1700.{name}"
+                applied_at = self._apply_in_thread(session, thread)
+                self._board(
+                    cards=[("t-card", "a2a-front-door", self.FIX_URL, card_assignee, applied_at + offset)],
+                    subs=[("t-card", "C1", card_thread or thread)],
+                )
+                self.assertEqual(self._inject(f"{name}apply-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_a_board_the_apply_read_cannot_use_still_finds_the_incident_sessions_fix(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            anchor_id, session = self._first_incident("legacyboard-api-6cfdb6b98b-aaaaa")
+            self._apply_in_thread(session, "1700.4")
+            self._board(cards=[("t-pr", session, self.FIX_URL)], legacy=True)
+            reply = self._inject("legacyboard-api-6cfdb6b98b-bbbbb")
+        self.assertEqual(reply, {"status": "folded", "duplicate_of": str(anchor_id), "pull_request": self.FIX_URL})
+
+    def test_an_apply_is_recorded_only_in_an_incidents_thread(self):
+        self.assertEqual(
+            self.client.post("/v1/incidents/apply", json={"chat_id": "C1", "thread_id": "no-incident-here"}).status_code,
+            404,
+        )
+        self.assertEqual(self.client.post("/v1/incidents/apply", json={"chat_id": "C1"}).status_code, 400)
+
+    def test_a_merged_or_closed_fix_or_none_starts_a_new_incident(self):
+        for state, prefix in (("merged", "mergedfix"), ("closed", "closedfix"), (None, "nofix")):
+            with self.subTest(state=state), \
+                    patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                    patch.object(session_kv_server, "_proposal_state", return_value=state):
+                _anchor, session = self._first_incident(f"{prefix}-api-6cfdb6b98b-aaaaa")
+                self._board(cards=[("t-pr", session, self.FIX_URL)])
+                self.assertEqual(self._inject(f"{prefix}-api-6cfdb6b98b-bbbbb")["status"], "injected")
+
+    def test_an_incident_with_no_pull_request_on_the_board_starts_a_new_one(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _anchor, session = self._first_incident("nopr-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-triage", session, None)])
+            self.assertEqual(self._inject("nopr-api-6cfdb6b98b-bbbbb")["status"], "injected")
+        state.assert_not_called()
+
+    def test_a_critical_is_not_held_by_a_warning_incident_with_an_open_fix(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"):
+            _anchor, session = self._first_incident("critfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            self.assertEqual(self._inject("critfix-api-6cfdb6b98b-bbbbb", reason="CrashLoopBackOff")["status"], "injected")
+
+    def test_another_reason_is_a_new_incident_while_the_fix_is_open(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _anchor, session = self._first_incident("reasonfix-api-6cfdb6b98b-aaaaa")
+            self._board(cards=[("t-pr", session, self.FIX_URL)])
+            self.assertEqual(self._inject("reasonfix-api-6cfdb6b98b-bbbbb", reason="Unhealthy")["status"], "injected")
+        state.assert_not_called()
+
+    def test_a_reason_folded_into_the_incident_is_held_too(self):
+        # A cascade: the incident's BackOff, then another replica's Unhealthy
+        # folded into it inside the window. A replacement pod replays both.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open"), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"):
+            self.assertEqual(self._inject("cascade-api-6cfdb6b98b-aaaaa")["status"], "injected")
+            self.assertEqual(self._inject("cascade-api-6cfdb6b98b-bbbbb", reason="Unhealthy")["status"], "folded")
+            anchor_id = self._rows("cascade-api")[0][0]
+            self._age(anchor_id, self.WINDOW + 60)
+            self._board(cards=[("t-pr", "sess-cascade-api-6cfdb6b98b-aaaaa-BackOff", self.FIX_URL)])
+            reply = self._inject("cascade-api-6cfdb6b98b-ccccc", reason="Unhealthy")
+        self.assertEqual(reply["status"], "folded")
+        self.assertEqual(reply["duplicate_of"], str(anchor_id))
+
+    def test_with_folding_off_nothing_is_held_or_looked_up(self):
+        with patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            self.assertEqual(self._inject("offfix-api-6cfdb6b98b-aaaaa")["status"], "injected")
+            self.assertEqual(self._inject("offfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
+        state.assert_not_called()
+
+    def test_the_thread_is_reminded_at_most_once_a_window(self):
+        import sqlite3
+        session = "sess-remind"
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                (session, json.dumps({"platform": "slack", "chat_id": "C1", "thread_id": "1700.2"})),
+            )
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_send_to_chat", return_value="1700.2") as send:
+            session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            self.assertEqual(send.call_count, 1)
+            platform, message, chat_id, thread_id = send.call_args.args
+            self.assertEqual((platform, chat_id, thread_id), ("slack", "C1", "1700.2"))
+            self.assertIn(self.FIX_URL, message)
+            self.assertIn("still failing", message)
+            with patch.object(session_kv_server.time, "time", return_value=time.time() + self.WINDOW + 1):
+                session_kv_server._remind_fix_pull_request(session, "remind-api", "BackOff", self.FIX_URL)
+            self.assertEqual(send.call_count, 2)
+
+    def test_an_incident_with_no_thread_is_not_reminded(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_send_to_chat") as send:
+            session_kv_server._remind_fix_pull_request("sess-headless-nothread", "x", "BackOff", self.FIX_URL)
+        send.assert_not_called()
+
+    def test_the_newest_incident_with_an_open_fix_holds_it(self):
+        older_url, newer_url = self.FIX_URL, "https://github.com/acme/fleet/pull/8"
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "_remind_fix_pull_request"), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+            _older, older_session = self._first_incident("newest-api-6cfdb6b98b-aaaaa")
+            newer, newer_session = self._first_incident("newest-api-6cfdb6b98b-bbbbb")
+            self._board(cards=[("t-old", older_session, older_url), ("t-new", newer_session, newer_url)])
+            reply = self._inject("newest-api-6cfdb6b98b-ccccc")
+        self.assertEqual(reply["duplicate_of"], str(newer))
+        self.assertEqual(reply["pull_request"], newer_url)
+        self.assertEqual(state.call_args_list[0].args[0], newer_url)
+
+    def test_the_search_stops_at_its_deadline(self):
+        def slow_closed(_url, _timeout):
+            time.sleep(0.1)
+            return "closed"
+
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW), \
+                patch.object(session_kv_server, "FIX_PR_LOOKUP_TIMEOUT_S", 0.05), \
+                patch.object(session_kv_server, "_proposal_state", side_effect=slow_closed) as state:
+            _older, older_session = self._first_incident("deadline-api-6cfdb6b98b-aaaaa")
+            _newer, newer_session = self._first_incident("deadline-api-6cfdb6b98b-bbbbb")
+            self._board(cards=[("t-old", older_session, self.FIX_URL), ("t-new", newer_session, self.FIX_URL)])
+            self.assertEqual(self._inject("deadline-api-6cfdb6b98b-ccccc")["status"], "injected")
+        self.assertEqual(state.call_count, 1)
+
+    def test_the_forge_is_asked_for_the_pull_request_and_its_state_read(self):
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(session_kv_server._proposal_state(self.FIX_URL, 5), "open")
+            forge.call.assert_called_once_with(
+                "proposal-view", {"number": 7}, "https://github.com/acme/fleet", retry_transient=True
+            )
+            forge.call.reset_mock()
+            mr = "https://gitlab.example.com/acme/fleet/-/merge_requests/12"
+            self.assertEqual(session_kv_server._proposal_state(mr, 5), "open")
+            self.assertEqual(forge.call.call_args.args[1:], ({"number": 12}, "https://gitlab.example.com/acme/fleet"))
+
+    def test_a_forge_that_fails_or_overruns_reads_as_no_state(self):
+        forge = MagicMock()
+        with patch.dict(sys.modules, {"forge": forge}):
+            forge.call.side_effect = RuntimeError("forge down")
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 5))
+            forge.call.side_effect = lambda *a, **k: time.sleep(0.5) or {"proposal": {"state": "open"}}
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
+            forge.call.reset_mock()
+            self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
+            forge.call.assert_not_called()
+
+    def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
+        release = threading.Event()
+        forge = MagicMock()
+        forge.call.side_effect = lambda *a, **k: release.wait(5) and {}
+        self.addCleanup(release.set)
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
+        workers = [t for t in threading.enumerate() if t.name == "fix-pr-lookup"]
+        self.assertTrue(workers, "the overrunning call has no thread left to inspect")
+        self.assertTrue(all(t.daemon for t in workers), "a non-daemon worker is joined at interpreter exit")
+
+    def test_the_pull_request_constants_match_the_plugin_that_writes_them(self):
+        plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
+        spec = importlib.util.spec_from_file_location("pr_opened_constants", plugin_path)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        self.assertEqual(session_kv_server.PR_OPENED_EVENT_KIND, plugin.PR_OPENED_KIND)
+        # The forge check moved from the plugin to the broker's `proposal-claim`;
+        # the broker now holds the open state the fold waits for.
+        import vcs_broker
+
+        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, vcs_broker.OPEN_PROPOSAL_STATE)
+        self.assertEqual(session_kv_server.PROPOSAL_URL_RE.pattern, plugin.PROPOSAL_URL.pattern)
 
     def test_off_by_default(self):
         self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 0)
@@ -3027,6 +3446,21 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(loaded["COMMENTED"], "value")
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
 
+    def test_a_mirrored_home_channel_yields_to_a_mounted_projection(self):
+        # A today-era /sethome left SLACK_HOME_CHANNEL in the PVC .env. With
+        # the operator's projection mounted the file is the home channel the
+        # gateway posts into, so the mirror is skipped; without it, it loads.
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+                handle.write("")
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory):
+                loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\nSAFE_KEY=1\n", ("SLACK_HOME_CHANNEL", "SAFE_KEY"))
+            self.assertIsNone(loaded["SLACK_HOME_CHANNEL"])
+            self.assertEqual(loaded["SAFE_KEY"], "1")
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
+                loaded = self._load_dotenv(b"SLACK_HOME_CHANNEL=C0OLD\n", ("SLACK_HOME_CHANNEL",))
+            self.assertEqual(loaded["SLACK_HOME_CHANNEL"], "C0OLD")
+
     def test_an_undecodable_pvc_dotenv_does_not_stop_the_import(self):
         loaded = self._load_dotenv(b"# caf\xe9\nSAFE_KEY=1\n", ("SAFE_KEY",))
         self.assertIsNone(loaded["SAFE_KEY"])
@@ -3053,8 +3487,9 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
             self.assertIn(
                 "**Who acts on this:**\n"
                 "A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
-                "Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
-                "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+                "Your job is to make that possible: name the change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+                + session_kv_server.TRIAGE_FIX_AGAINST_LIVE_OBJECT
+                + "Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
                 "(no `kubectl scale`, `patch`, or `apply`).",
                 body,
             )
@@ -3096,7 +3531,7 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(kanban_board_health.TRIAGE_OPEN_PR_MARKER, session_kv_server.TRIAGE_OPEN_PR_MARKER)
         self.assertIn(f"'%{session_kv_server.TRIAGE_OPEN_PR_MARKER}%'", kanban_board_health.MISSING_PR_CHILD_SQL)
         slack = (Path(__file__).resolve().parents[3] / "deploy/docker/patches/slack_ux_incident.py").read_text()
-        self.assertIn(r"\bis\s+being\s+opened\s+automatically\b", slack)
+        self.assertIn(r"is\s+being\s+opened\s+automatically", slack)
         task = (Path(__file__).resolve().parents[3] / "bench/tasks/autoops-warning-event-triage-open-pr/task.yaml").read_text()
         self.assertIn(session_kv_server.TRIAGE_OPEN_PR_MARKER, task)
         off = session_kv_server._triage_task_body(self.PAYLOAD, open_pull_request=False)
@@ -5151,6 +5586,151 @@ class TestSchedulerFailureLine(unittest.TestCase):
         self.assertEqual(sent, [self.QUOTA])
 
 
+class TestBoardHealthCardRelay(unittest.TestCase):
+    """The kanban-board-health job's Slack leg posts its card, with Retry and Drop on each row.
+
+    Only for the report the card was said with, with KAGE_SLACK_UX on: as Block
+    Kit through the Slack relay, or under next as a chat message through the
+    gateway. Everywhere else, and whenever the card does not post, the report
+    goes out as written.
+    """
+
+    SLACK_THREAD = "1712345678.000100"
+    HOME = "C0123456789"
+    BLOCKS_TS = "1712345999.000200"
+    REPORT = "**1 task is stuck and needs someone to decide.**\n\n**Triage x**\nStopped 1 day ago before finishing."
+    CARD = {
+        "version": 1,
+        "text": REPORT,
+        "headline": "1 task is stuck and needs someone to decide.",
+        "rows": [{"title": "Triage x", "count": 1, "status": "Stopped 1 day ago before finishing.", "held": "",
+                  "tasks": ["t_1"]}],
+        "more": "",
+    }
+
+    def setUp(self):
+        import sqlite3
+
+        from fastapi.testclient import TestClient
+
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in PLATFORM_SIGNAL_KEYS + ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM"):
+            os.environ.pop(key, None)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        os.environ["SLACK_HOME_CHANNEL"] = self.HOME
+        os.environ["KAGE_SLACK_UX"] = "1"
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        os.environ["KANBAN_HEALTH_STATE"] = str(Path(tmp.name) / "kanban_board_health.json")
+        Path(tmp.name, "kanban_board_health.card.json").write_text(json.dumps(self.CARD))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn, conn:
+            conn.execute("DELETE FROM session_metadata")
+            conn.execute("DELETE FROM incidents")
+
+    def _post(self, report=REPORT, platforms=("slack",), job_id="kanban-board-health", blocks_post=None):
+        answers = {"slack": self.SLACK_THREAD, "google_chat": "spaces/AAA/threads/T1"}
+
+        def send(platform, message, chat_id="", thread_id="", timeout=None):
+            return answers[platform]
+
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=list(platforms)), \
+             patch.object(session_kv_server.slack_blocks_post, "post", side_effect=blocks_post) as poster, \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=send) as sender:
+            response = self.client.post("/v1/cron-reports", json={"job_id": job_id, "report": report})
+        self.posts = poster.call_args_list
+        return response, sender.call_args_list
+
+    def _stored(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute("SELECT chat_id, thread_id, report FROM incidents").fetchall()
+
+    def test_with_a_relay_the_card_posts_as_blocks_with_its_buttons(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        response, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        (args, _kwargs), = [(c.args, c.kwargs) for c in self.posts]
+        channel, text, blocks, _thread = args
+        self.assertEqual((channel, text), (self.HOME, self.REPORT))
+        self.assertEqual(blocks, session_kv_server.board_health_card.blocks_from_card(self.CARD)[0])
+        self.assertIn({"kage_board.retry", "kage_board.drop"}, [
+            {e["action_id"] for e in b["elements"]} for b in blocks if b["type"] == "actions"
+        ])
+        self.assertEqual(self._stored(), [(self.HOME, self.BLOCKS_TS, self.REPORT)])
+
+    def test_under_next_the_card_goes_to_the_gateway_on_google_chat_too(self):
+        # The gateway lays the card out on Google Chat under next; under today the
+        # report goes as text there (test_flag_off_another_job_or_google_chat_posts_the_report).
+        os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("spaces/H/threads/T")
+        ) as via:
+            response, calls = self._post(platforms=("google_chat",))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "google_chat")
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
+        self.assertEqual(text, self.REPORT)
+
+    def test_under_next_the_card_goes_to_the_gateway_with_its_rows_actions(self):
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["rows"][0]["tasks"], ["t_1"])
+        self.assertEqual(chat["rows"][0]["actions"], ["retry", "drop"])
+        self.assertEqual(text, self.REPORT)
+
+    def test_the_card_is_found_under_the_agent_home_with_no_override(self):
+        """Production: no KANBAN_HEALTH_STATE, the card beside the record under PLATFORM_AGENT_HOME."""
+        os.environ.pop("KANBAN_HEALTH_STATE", None)
+        os.environ.pop("KANBAN_HEALTH_HOME", None)
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        cron = Path(home.name, "profiles", "platform", "cron")
+        cron.mkdir(parents=True)
+        (cron / "kanban_board_health.card.json").write_text(json.dumps(self.CARD))
+        os.environ["PLATFORM_AGENT_HOME"] = home.name
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(self.posts), 1)
+    def test_a_refused_card_posts_the_report(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+
+        def refuse(*args, **kwargs):
+            raise session_kv_server.slack_blocks_post.Refused("invalid_blocks")
+
+        _, calls = self._post(blocks_post=refuse)
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+
+    def test_a_card_said_with_other_text_is_not_used(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        other = self.REPORT.replace("1 day", "2 days")
+        _, calls = self._post(report=other, blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(self.posts, [])
+        self.assertEqual([c.args for c in calls], [("slack", other, "", "")])
+
+    def test_flag_off_another_job_or_google_chat_posts_the_report(self):
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        _, calls = self._post(job_id="stall-watch", blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
+        _, calls = self._post(platforms=("google_chat",), blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual([c.args[:2] for c in calls], [("google_chat", self.REPORT)])
+        os.environ["KAGE_SLACK_UX"] = "false"
+        _, calls = self._post(blocks_post=lambda *a, **k: self.BLOCKS_TS)
+        self.assertEqual(self.posts, [])
+        self.assertEqual([c.args for c in calls], [("slack", self.REPORT, "", "")])
 class TestSlackAuditHeadline(unittest.TestCase):
     """With KAGE_SLACK_UX on, a fleet-audit report leads with a headline in Slack.
 
@@ -5376,7 +5956,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
             response, calls = self._post(composed=self.FAILED, job_id="reliability")
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
-        chat, text = via.call_args.args[2:4]
+        chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["detail"], self.FAILED_LINE)
         self.assertEqual(chat["fold"], {"title": "why", "text": self.FAILED.strip()})
         self.assertEqual(text, self.FAILED.strip())
@@ -5467,11 +6047,43 @@ class TestSlackAuditHeadline(unittest.TestCase):
             self.assertIsNone(session_kv_server._fetch_ledger_issue(ref))
 
     def test_flag_on_leaves_google_chat_alone(self):
+        # Under today Google Chat is Hermes's own adapter, which takes text.
         os.environ["KAGE_SLACK_UX"] = "1"
         os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/AAA"
         _, calls = self._post(platforms=("google_chat", "slack"))
         gchat = [c.args for c in calls if c.args[0] == "google_chat"]
         self.assertEqual(gchat, [("google_chat", self.COMPOSED, "", "")])
+
+    def test_under_next_a_slack_leg_with_no_home_channel_or_thread_still_sends_the_card(self):
+        # The gateway holds the home channel for the platform it routes, so a routed
+        # Slack leg needs neither a thread nor SLACK_HOME_CHANNEL to send the card;
+        # before, it fell back to text without one.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "slack"
+        os.environ.pop("SLACK_HOME_CHANNEL", None)
+        with patch.object(session_kv_server, "_slack_home_channel", return_value=""), patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("7.7")
+        ) as via:
+            response, calls = self._post()
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "slack")
+
+    def test_under_next_the_headline_card_goes_to_the_gateway_on_google_chat(self):
+        # The gateway lays the card out on Google Chat under next, as on Slack, and
+        # posts into its home space itself, so no home channel env is needed here.
+        os.environ["KAGE_SLACK_UX"] = "1"
+        os.environ["A2A_NOTIFY_PLATFORM"] = "google_chat"
+        with patch.object(
+            session_kv_server, "_post_audit_chat_via_gateway", return_value=session_kv_server.AuditPost("spaces/H/threads/T")
+        ) as via:
+            response, calls = self._post(platforms=("google_chat",))
+        self.assertEqual(response.json()["status"], "delivered")
+        self.assertEqual(calls, [])
+        self.assertEqual(via.call_args.args[0], "google_chat")
+        chat, text = via.call_args.args[3:5]
+        self.assertEqual(chat["schema"], "kube-agents.chat/v1")
+        self.assertTrue(text)
 
     def test_flag_on_a_report_that_is_not_an_audit_is_unchanged(self):
         os.environ["KAGE_SLACK_UX"] = "1"
@@ -5534,7 +6146,7 @@ class TestSlackAuditHeadline(unittest.TestCase):
             response, calls = self._post(composed=self.SUMMARY)
         self.assertEqual(response.json()["status"], "delivered")
         self.assertEqual(calls, [])
-        chat, text = via.call_args.args[2:4]
+        chat, text = via.call_args.args[3:5]
         self.assertEqual(chat["rows"], [{"text": "seeded-a: control plane is public", "severity": "critical"}])
         self.assertEqual(text, session_kv_server.slack_audit_report.headline_from_summary(self.SUMMARY))
 
@@ -6129,11 +6741,24 @@ class TestFindingsQueueApi(unittest.TestCase):
     def test_a_decision_on_one_id_covers_its_gathered_line(self):
         self._register(self._finding(), self._finding(object="Deployment/cart"))
         first, second = sorted(f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"])
+        for fid in (first, second):
+            self.client.post(f"/v1/findings/{fid}/surfaced", json={})
 
         dismissed = self.client.patch(f"/v1/findings/{first}", json={"state": "dismissed"}).json()
 
         self.assertEqual(dismissed["item_rows_decided"], [second])
+        self.assertEqual(dismissed["item_rows_left_open"], [])
         self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+    def test_a_decision_leaves_a_never_named_row_of_the_line_open(self):
+        self._register(self._finding(), self._finding(object="Deployment/cart"))
+        first, second = sorted(f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"])
+        self.client.post(f"/v1/findings/{first}/surfaced", json={})
+
+        dismissed = self.client.patch(f"/v1/findings/{first}", json={"state": "dismissed"}).json()
+
+        self.assertEqual((dismissed["item_rows_decided"], dismissed["item_rows_left_open"]), ([], [second]))
+        self.assertEqual([f["id"] for f in self.client.get("/v1/findings/ranked").json()["findings"]], [second])
 
     def test_additions_refuse_a_day_that_is_not_a_date(self):
         for day in ("yesterday", "2026-99-99"):
@@ -6434,6 +7059,30 @@ class TestDriftInject(unittest.TestCase):
         self.assertNotIn("Unknown", alert_msg)
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_drift_alert_carries_its_title_and_kind(self, trigger):
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {
+            "alert_title": "checkout Deployment drift in prod-us-east1",
+            "alert_kind": session_kv_server.ALERT_KIND_DRIFT,
+        })
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {"alert_title": None, "alert_kind": ""})
+
+    def test_the_drift_title_names_the_object_its_kind_and_cluster(self):
+        payload = {**self.DRIFT_PAYLOAD, "cluster": "seeded-b", "resource": {
+            "group": "autoscaling", "namespace": "shop", "resource": "horizontalpodautoscalers", "name": "checkout-gateway"}}
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            self.assertEqual(session_kv_server._drift_session_title(payload), "checkout-gateway HPA drift in seeded-b")
+            unlisted = {**payload, "cluster": "", "resource": {"resource": "leases", "name": "l1"}}
+            with patch.dict(os.environ, {"GKE_CLUSTER_NAME": "host-a"}):
+                self.assertEqual(session_kv_server._drift_session_title(unlisted), "l1 leases drift in host-a")
+            self.assertIsNone(session_kv_server._drift_session_title({**payload, "resource": {"resource": "pods"}}))
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self.assertIsNone(session_kv_server._drift_session_title(payload))
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_an_event_payload_still_takes_the_event_path(self, trigger):
         """The other half of the same dispatch: the watcher is unaffected."""
         event = {
@@ -6578,6 +7227,47 @@ class TestDriftInject(unittest.TestCase):
             / "SKILL.md"
         )
         self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
+
+    def test_the_card_handles_an_object_git_does_not_declare(self):
+        """No declared state means no revert, and the card has to say so twice.
+
+        Once as the instruction, and once in **Done when**, which otherwise
+        demands revert-or-codify and so makes a report that correctly offers no
+        revert unfinishable. The card defers the list of GitOps markers to the
+        skill ("the skill lists them"), so the skill has to carry one: the
+        worker has no repository to check, and the markers are all it has.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("establish whether git declares this object at all", card)
+        self.assertIn("no declared state to revert to", card)
+        # A delete leaves no live object, so no markers proves nothing and the
+        # revert has to survive: gitops-drift-deleted-policy-triage expects it.
+        # No pull request can delete an object git never held, and chat turns
+        # every lettered option into an 'apply' button, so deletion is an
+        # unlettered Manual step (observed: a lettered "Delete unmanaged
+        # namespace" option with "apply Option B" beside it).
+        self.assertIn("never a lettered option, never the recommendation", card)
+        self.assertIn("- **Manual step (<title>):**", card)
+        # Only a person's kubectl subcommands read as "not in git"; a manager
+        # the card cannot name may be a pipeline's and keeps the revert.
+        self.assertIn("its only field managers are a person's `kubectl` subcommands", card)
+        self.assertIn("a field manager you do not recognise", card)
+        self.assertIn("A deleted object carries nothing to read", card)
+        self.assertIn("keep the revert", card)
+        done_when = card.split("**Done when:**", 1)[1].split("\n\n", 1)[0]
+        self.assertIn("for an object git does not declare", done_when)
+        self.assertIn("proposes codifying it", done_when)
+
+        skill = (
+            Path(__file__).resolve().parents[3]
+            / "agents"
+            / "cluster"
+            / "skills"
+            / "gke-load-bearing-change"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        for marker in ("argocd-controller", "kustomize-controller", "configsync.gke.io"):
+            self.assertIn(marker, skill, f"the skill the card defers to no longer names {marker}")
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_drift_has_its_own_ceiling(self, trigger):
@@ -8305,8 +8995,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(cleaned, crafted_line)
 
     def test_secret_read_command_detector_covers_every_output_form(self):
-        # The detector keys on "get secret" plus any output shaping or pipe,
-        # not on an enumerated list of formatters an agent may not pick.
+        # The detector fails closed: a `kubectl get` of a secret is served only
+        # as the bare list, a store's command only as one of its named lists,
+        # and a form no list named withholds (the grammar's own cases live in
+        # test_worker_transcript.py; this test reads it through the wrapper).
         withheld = [
             "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
             "kubectl get secret db -o=go-template='{{.data.password}}'",
@@ -8343,9 +9035,23 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "sops --decrypt secrets.enc.yaml",
             "kubectl exec deploy/api -- cat /etc/db-creds/password",
             "kubectl exec -n prod api-0 -- head -c 64 /var/secrets/token",
+            # a form no list named fails closed (the grammar's own cases
+            # live in test_worker_transcript.py)
+            "kubectl get secret db -n prod --some-flag-added-next-release",
+            "kubectl get secrets -n $NS",
+            "KUBECTL=/usr/bin/kubectl; $KUBECTL get secret db -o json",
+            "printf secret/db | xargs kubectl get -n prod -o yaml",
+            "aws secretsmanager batch-get-secret-value --secret-id-list db",
+            "gcloud secrets list | xargs -I{} gcloud secrets versions access latest --secret={}",
         ]
         served = [
             "kubectl get secrets -n kube-system",
+            "kubectl get secret db -n prod --ignore-not-found",
+            "kubectl get secrets -A 2>/dev/null",
+            "kubectl get secrets -n prod | wc -l",
+            "kubectl get pods -n external-secrets",
+            "kubectl get pods -n prod -l app=kubectl-proxy",
+            "kubectl get pods -n vault",
             "kubectl describe secret db",
             "kubectl get pods -o json | jq '.items[].metadata.name'",
             "kubectl get secrets -n kube-system --show-labels",
@@ -10439,6 +11145,78 @@ class TestCardStop(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
 
+class AliveHelperTest(unittest.TestCase):
+    """The test helper `_alive` against a process reaped mid-check (#4828)."""
+
+    PID = 4242
+
+    def _with_proc(self, stat):
+        """Run `_alive(PID)` as on Linux, with `stat` standing in for opening
+        /proc/PID/stat: an exception to raise, or the file's text. The pid
+        answers os.kill, and ps must not be asked. os.path.exists says the
+        file is there, which only the pre-#4828 helper asked."""
+        import io
+
+        path = f"/proc/{self.PID}/stat"
+        real_open, real_kill = open, os.kill
+        real_isdir, real_exists = os.path.isdir, os.path.exists
+
+        def fake_open(p, *args, **kwargs):
+            if str(p) != path:
+                return real_open(p, *args, **kwargs)
+            if isinstance(stat, BaseException):
+                raise stat
+            if callable(stat):
+                return stat()
+            return io.StringIO(stat)
+
+        def no_ps(*args, **kwargs):
+            raise AssertionError("with a /proc, the stat file decides and ps is never asked")
+
+        with patch.object(os, "kill", lambda pid, sig: None if pid == self.PID else real_kill(pid, sig)), \
+                patch("builtins.open", fake_open), \
+                patch.object(os.path, "exists", lambda p: True if p == path else real_exists(p)), \
+                patch.object(os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                patch("subprocess.run", no_ps):
+            return _alive(self.PID)
+
+    def test_a_process_reaped_after_the_signal_check_is_not_alive(self):
+        # os.kill(pid, 0) still succeeds, then the process is reaped before its
+        # stat file is opened: the race CI hit.
+        self.assertFalse(self._with_proc(FileNotFoundError(2, "No such file or directory")))
+
+    def test_a_process_that_exits_while_its_stat_is_read_is_not_alive(self):
+        class Gone:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                raise ProcessLookupError(3, "No such process")
+
+        self.assertFalse(self._with_proc(Gone))
+
+    def test_the_stat_state_decides_on_linux(self):
+        self.assertTrue(self._with_proc("4242 (sleep) S 1 4242 4242 0 -1"))
+        self.assertFalse(self._with_proc("4242 (sleep) Z 1 4242 4242 0 -1"), "a zombie has exited")
+        # A ")" inside the command name: the state is after the last one.
+        self.assertTrue(self._with_proc("4242 (a) b) R 1 4242"))
+        self.assertFalse(self._with_proc("4242 (sleep"), "a stat with no state field")
+
+    def test_a_running_process_is_alive_and_an_exited_one_is_not(self):
+        import subprocess
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(_alive(child.pid))
+        finally:
+            child.kill()
+            child.wait(5)
+        self.assertFalse(_alive(child.pid))
+
+
 def _alive(pid):
     """True while `pid` runs; a zombie is not running."""
     import subprocess
@@ -10447,9 +11225,17 @@ def _alive(pid):
         os.kill(pid, 0)
     except OSError:
         return False
-    if os.path.exists(f"/proc/{pid}/stat"):
+    # One open, no exists() first: a process reaped between the two used to
+    # raise FileNotFoundError out of the test (#4828). With a /proc, a missing
+    # entry is a process that's gone; without one (macOS), ask ps.
+    try:
         with open(f"/proc/{pid}/stat") as fh:
             return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except IndexError:  # a stat with no state field: as production's _proc_alive reads it
+        return False
+    except (FileNotFoundError, ProcessLookupError):
+        if os.path.isdir("/proc/self"):
+            return False
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return bool(state) and not state.startswith("Z")
 
@@ -10460,6 +11246,153 @@ def closing_conn(conn):
     return closing(conn)
 
 
+class TestBoardAction(unittest.TestCase):
+    """POST /v1/board/actions: Retry and Drop on the board-health card's rows.
+
+    The board is a temporary SQLite file through `KANBAN_DB_PATH`, and Hermes'
+    kanban module is a stub whose `unblock_task` and `archive_task` move the
+    row as the real ones do: unblock only a blocked card, to ready; archive any
+    card that is not already archived.
+    """
+
+    def setUp(self):
+        import sqlite3
+        import types
+        from fastapi.testclient import TestClient
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.board = Path(self._tmpdir.name) / "kanban.db"
+        with sqlite3.connect(self.board) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, worker_pid INTEGER);
+                CREATE TABLE task_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT, run_id INTEGER, kind TEXT
+                );
+                """
+            )
+        self.calls = []
+        self.raise_on = set()
+        test = self
+        kanban = types.ModuleType("hermes_cli.kanban_db")
+
+        def unblock_task(conn, task_id, new_status="ready"):
+            test.calls.append(("unblock", task_id))
+            if task_id in test.raise_on:
+                raise RuntimeError("database is locked")
+            cur = conn.execute("UPDATE tasks SET status = ? WHERE id = ? AND status = 'blocked'", (new_status, task_id))
+            conn.commit()
+            return cur.rowcount == 1
+
+        def archive_task(conn, task_id, *, signal_fn=None):
+            test.calls.append(("archive", task_id))
+            cur = conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ? AND status <> 'archived'", (task_id,))
+            conn.execute("INSERT INTO task_events (task_id, kind) VALUES (?, 'archived')", (task_id,))
+            conn.commit()
+            return cur.rowcount == 1
+
+        kanban.unblock_task = unblock_task
+        kanban.archive_task = archive_task
+        package = types.ModuleType("hermes_cli")
+        package.__path__ = []
+        package.kanban_db = kanban
+        modules = patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.kanban_db": kanban})
+        modules.start()
+        self.addCleanup(modules.stop)
+        patcher = patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.board))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+
+    def card(self, task_id, status, title=None):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("INSERT INTO tasks (id, title, status) VALUES (?, ?, ?)", (task_id, title or f"card {task_id}", status))
+
+    def status(self, task_id):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            return conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()[0]
+
+    def act(self, action, tasks, by="Jayanti"):
+        return self.client.post("/v1/board/actions", json={"action": action, "tasks": tasks, "by": by})
+
+    def test_retry_unblocks_a_blocked_card(self):
+        self.card("t_a", "blocked", "Investigate payments-api")
+        response = self.act("retry", ["t_a"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["results"],
+            [{"id": "t_a", "title": "Investigate payments-api", "status": "ready", "outcome": "done"}],
+        )
+        self.assertEqual(self.status("t_a"), "ready")
+
+    def test_drop_archives_a_blocked_card(self):
+        self.card("t_a", "blocked")
+        response = self.act("drop", ["t_a"])
+        self.assertEqual(response.json()["results"][0]["outcome"], "done")
+        self.assertEqual(self.status("t_a"), "archived")
+
+    def test_a_card_no_longer_blocked_is_left_alone(self):
+        """A stale button: the card was unblocked and claimed, or finished, since the post."""
+        for task_id, status in (("t_run", "running"), ("t_done", "done"), ("t_ready", "ready")):
+            self.card(task_id, status)
+        for action in ("retry", "drop"):
+            with self.subTest(action=action):
+                results = self.act(action, ["t_run", "t_done", "t_ready"]).json()["results"]
+                self.assertEqual([r["outcome"] for r in results], ["moved"] * 3)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.status("t_run"), "running")
+
+    def test_a_missing_or_archived_card_is_gone(self):
+        self.card("t_old", "archived")
+        results = self.act("drop", ["t_old", "t_nope"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_old", "outcome": "gone"}, {"id": "t_nope", "outcome": "gone"}])
+
+    def test_a_row_of_several_cards_acts_on_each(self):
+        self.card("t_a", "blocked")
+        self.card("t_b", "blocked")
+        results = self.act("retry", ["t_a", "t_b", "t_a"]).json()["results"]
+        self.assertEqual([(r["id"], r["outcome"]) for r in results], [("t_a", "done"), ("t_b", "done")])
+
+    def test_one_card_raising_does_not_stop_the_rest(self):
+        self.card("t_a", "blocked")
+        self.card("t_b", "blocked")
+        self.raise_on.add("t_a")
+        results = self.act("retry", ["t_a", "t_b"]).json()["results"]
+        self.assertEqual([(r["id"], r["outcome"]) for r in results], [("t_a", "failed"), ("t_b", "done")])
+        self.assertEqual(self.status("t_b"), "ready")
+
+    def test_bad_requests_are_refused(self):
+        self.card("t_a", "blocked")
+        for body in (
+            {"action": "delete", "tasks": ["t_a"]},
+            {"action": "retry", "tasks": []},
+            {"action": "retry", "tasks": "t_a"},
+            {"action": "retry", "tasks": [""]},
+            {"action": "retry", "tasks": ["x" * 65]},
+            {"action": "retry", "tasks": [f"t_{i}" for i in range(51)]},
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(self.client.post("/v1/board/actions", json=body).status_code, 400)
+        self.assertEqual(self.status("t_a"), "blocked")
+
+    def test_cards_the_deadline_leaves_unstarted_answer_failed(self):
+        self.card("t_a", "blocked")
+        with patch.object(session_kv_server, "CARD_STOP_DEADLINE_S", 0.0):
+            results = self.act("retry", ["t_a"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_a", "outcome": "failed"}])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.status("t_a"), "blocked")
+    def test_no_board_answers_every_card_gone(self):
+        self.board.unlink()
+        results = self.act("retry", ["t_a"]).json()["results"]
+        self.assertEqual(results, [{"id": "t_a", "outcome": "gone"}])
 class TestDriftBacklog(unittest.TestCase):
     """`POST /v1/drift-backlog` and the digest that follows it."""
 
@@ -10645,6 +11578,33 @@ class TestDriftBacklog(unittest.TestCase):
         drift = self.client.get("/v1/alert-quota").json()["severities"][session_kv_server.DRIFT_QUOTA_KEY]
         self.assertEqual(drift["sent"], 0)
         self.trigger.assert_not_called()
+
+    def test_the_backlog_card_is_stamped_drift_in_the_board_never_through_the_subprocess(self):
+        import sqlite3
+
+        self._headless()
+        self._burst()
+        board = Path(tempfile.mkdtemp()) / "kanban.db"
+        sqlite3.connect(board).close()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run, patch.object(
+            session_kv_server, "KANBAN_DB_PATH", str(board)
+        ), patch.object(session_kv_server, "_hermes_kanban", return_value=(None, None)):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("KUBE_AGENTS_CARD_ORIGIN", env)
+        self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
+        with closing_state(board) as conn:
+            rows = conn.execute("SELECT task_id, origin, origin_platform FROM kanban_task_origins").fetchall()
+        self.assertEqual(rows, [("t_digest1", "drift", "")])
+
+    def test_a_stamp_that_fails_still_files_the_card(self):
+        self._headless()
+        self._burst()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()), patch.object(
+            session_kv_server, "_stamp_board_task_origin", side_effect=FileNotFoundError("no board")
+        ) as stamp:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        stamp.assert_called_once_with("t_digest1", "drift", "")
 
     def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
         """The platform walk itself, not a patched answer: `spec.mode: next`,
@@ -11515,6 +12475,384 @@ class TestTriageStartBurst(unittest.TestCase):
         self.assertEqual(len(started), self.BURST, f"{self.BURST - len(started)} triage starts were lost")
         self.assertEqual(len(self.turns), len(started), "a session got a second /chat turn")
         self.assertEqual(len(probe_timeouts), 0, "the readiness request timed out during the burst")
+
+
+class TestDataVolumeWarning(unittest.TestCase):
+    """The home-channel warning when the data volume fills: once per crossing
+    of DATA_VOLUME_WARN_PERCENT, re-armed below DATA_VOLUME_REARM_PERCENT."""
+
+    TOTAL = 10 * (1 << 30)
+
+    def setUp(self):
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM data_volume_warning")
+        self.used_percent = 0
+        usage = patch.object(
+            session_kv_server,
+            "_data_volume_usage",
+            side_effect=lambda path: (self.TOTAL, self.TOTAL * (100 - self.used_percent) // 100),
+        )
+        usage.start()
+        self.addCleanup(usage.stop)
+        self.post = patch.object(session_kv_server, "_post_initial_alert", return_value="thread-1").start()
+        self.addCleanup(patch.stopall)
+        patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]).start()
+
+    def _check_at(self, percent):
+        self.used_percent = percent
+        session_kv_server.check_data_volume()
+
+    def test_posts_once_per_crossing_and_rearms_below_the_lower_line(self):
+        for percent in (50, 89):
+            self._check_at(percent)
+        self.post.assert_not_called()
+
+        self._check_at(90)
+        self.post.assert_called_once()
+        platform, message = self.post.call_args.args
+        self.assertEqual(platform, "slack")
+        self.assertEqual(
+            message,
+            "The agent's data volume is 90% full (9.0 of 10.0 GiB). "
+            "Remove unused cluster profiles, or ask an admin to raise spec.storage.size on the PlatformAgent.",
+        )
+
+        # Above the lower line it stays quiet, however long it sits there.
+        for percent in (95, 100, 87, 85, 92):
+            self._check_at(percent)
+        self.assertEqual(self.post.call_count, 1)
+
+        # Below it, the warning is re-armed and the next crossing posts again.
+        self._check_at(84)
+        self._check_at(89)
+        self.assertEqual(self.post.call_count, 1)
+        self._check_at(91)
+        self.assertEqual(self.post.call_count, 2)
+
+    def test_a_restart_above_the_line_does_not_post_again(self):
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 1)
+        # The warned flag is on the session database, not in this process.
+        self.assertTrue(session_kv_server._data_volume_warned())
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 1)
+
+    def test_a_refused_post_is_tried_again_at_the_next_check(self):
+        self.post.return_value = None
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+        self.assertTrue(any("not accepted by any enabled chat platform" in line for line in logs.output))
+        self.assertFalse(session_kv_server._data_volume_warned())
+        self.post.return_value = "thread-2"
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 2)
+        self.assertTrue(session_kv_server._data_volume_warned())
+
+    def test_a_post_cut_off_before_it_returns_does_not_silence_the_crossing(self):
+        # A pod roll can kill the process during the send. An exception out of
+        # the send leaves the same state: nothing posted.
+        self.post.side_effect = RuntimeError("killed during the send")
+        with self.assertRaises(RuntimeError):
+            self._check_at(95)
+        self.assertFalse(session_kv_server._data_volume_warned())
+        self.post.side_effect = None
+        self._check_at(95)
+        self.assertEqual(self.post.call_count, 2)
+        self.assertTrue(session_kv_server._data_volume_warned())
+
+    def test_no_chat_platform_logs_the_warning_and_stops(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=[session_kv_server.DEFAULT_CHAT_PLATFORM]), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=True), \
+                self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+            self._check_at(96)
+        self.post.assert_not_called()
+        self.assertEqual(sum("data volume is 95% full" in line for line in logs.output), 1)
+        self.assertTrue(any("in this log and nowhere else" in line for line in logs.output))
+
+    def test_an_unreadable_volume_does_nothing(self):
+        with patch.object(session_kv_server, "_data_volume_usage", return_value=None):
+            session_kv_server.check_data_volume()
+        self.post.assert_not_called()
+        self.assertFalse(session_kv_server._data_volume_warned())
+
+    def test_reads_a_real_filesystem(self):
+        patch.stopall()
+        usage = session_kv_server._data_volume_usage(tempfile.gettempdir())
+        self.assertIsNotNone(usage)
+        total, free = usage
+        self.assertGreater(total, 0)
+        self.assertLessEqual(free, total)
+        self.assertIsNone(session_kv_server._data_volume_usage("/nonexistent/data-volume"))
+
+
+
+class TestProposalOrigin(unittest.TestCase):
+    """The origin record, the per-job origin table and the proposals ledger: docs/designs/proposal-origin.md §2.1-§2.2."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM proposals_opened")
+                conn.execute("DELETE FROM cron_job_origins")
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _meta(self, session_id):
+        return session_kv_server._session_metadata(session_id)
+
+    def test_set_session_origin_writes_once(self):
+        sid = "a2a-origin-once"
+        self.assertTrue(session_kv_server._set_session_origin(sid, "chat", "slack"))
+        self.assertFalse(session_kv_server._set_session_origin(sid, "api", ""))
+        self.assertEqual(session_kv_server._session_origin(sid), ("chat", "slack"))
+        meta = self._meta(sid)
+        self.assertEqual(meta[session_kv_server.ORIGIN_KEY], "chat")
+        self.assertEqual(meta[session_kv_server.ORIGIN_PLATFORM_KEY], "slack")
+
+    def test_set_session_origin_keeps_the_other_keys(self):
+        created = self.client.post("/sessions").json()["sessionID"]
+        self.assertTrue(session_kv_server._set_session_origin(created, "event"))
+        meta = self._meta(created)
+        self.assertEqual(meta.get("platform"), "k8s-watcher")
+        self.assertEqual(meta[session_kv_server.ORIGIN_KEY], "event")
+
+    def test_session_origin_inherits_through_compression_parent(self):
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('orig-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('orig-mid', 'orig-root', 'compression');
+                INSERT INTO sessions VALUES ('orig-leaf', 'orig-mid', NULL);
+                INSERT INTO sessions VALUES ('orig-branch', 'orig-lone', NULL);
+                INSERT INTO sessions VALUES ('orig-lone', NULL, 'user_exit');
+                """
+            )
+        session_kv_server._set_session_origin("orig-root", "chat", "googlechat")
+        session_kv_server._set_session_origin("orig-lone", "api")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            self.assertEqual(session_kv_server._session_origin("orig-leaf"), ("chat", "googlechat"))
+            # A parent that did not end in compression is another conversation.
+            self.assertEqual(session_kv_server._session_origin("orig-branch"), ("other", ""))
+            self.assertEqual(session_kv_server._session_origin("orig-nobody"), ("other", ""))
+
+    def test_get_origin_route_answers_through_compression(self):
+        # A mid-turn compression rotates the session id; the child's row has no
+        # record, so the route answers the parent's.
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('a2a-route-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('a2a-route-child', 'a2a-route-root', NULL);
+                """
+            )
+        session_kv_server._set_session_origin("a2a-route-root", "chat", "slack")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            child = self.client.get("/v1/sessions/a2a-route-child/origin")
+            self.assertEqual(child.status_code, 200, child.text)
+            self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
+            self.assertEqual(self.client.get("/v1/sessions/a2a-route-root/origin").json(), {"origin": "chat", "platform": "slack"})
+
+    def test_session_origin_walks_the_gateway_profiles_store_on_a_front_door_install(self):
+        # With HERMES_GATEWAY_PROFILE=platform the gateway's sessions are in
+        # profiles/platform/state.db; this server's own store does not know them.
+        own = self.tmp / "state.db"
+        with closing_state(own) as conn:
+            conn.executescript("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);")
+        profile_db = self.tmp / "profiles" / "platform" / "state.db"
+        profile_db.parent.mkdir(parents=True)
+        with closing_state(profile_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('fd-origin-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('fd-origin-child', 'fd-origin-root', NULL);
+                """
+            )
+        session_kv_server._set_session_origin("fd-origin-root", "chat", "slack")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(own)), \
+                patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.tmp / "kanban.db")):
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: "platform"}):
+                self.assertEqual(session_kv_server._session_origin("fd-origin-child"), ("chat", "slack"))
+                child = self.client.get("/v1/sessions/fd-origin-child/origin")
+                self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
+            # Without the front door the profile's store is not read.
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: ""}):
+                self.assertEqual(session_kv_server._session_origin("fd-origin-child"), ("other", ""))
+            # A profile name that leaves the profiles directory names no store.
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: "../platform"}):
+                self.assertEqual(session_kv_server._origin_state_dbs(), [str(own)])
+
+    def test_get_origin_route_is_404_without_a_record_and_401_without_the_key(self):
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(self.client.get("/v1/sessions/a2a-route-nobody/origin").status_code, 404)
+        session_kv_server._set_session_origin("a2a-route-keyed", "event")
+        self.assertEqual(self.client.get("/v1/sessions/a2a-route-keyed/origin").json(), {"origin": "event", "platform": ""})
+        self.assertEqual(TestClient(session_kv_server.app).get("/v1/sessions/a2a-route-keyed/origin").status_code, 401)
+
+    def test_put_origin_route_refuses_a_second_record_with_409(self):
+        sid = "a2a-origin-route"
+        first = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": "chat", "platform": "slack"})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": "api", "platform": ""})
+        self.assertEqual(second.status_code, 409, second.text)
+        self.assertEqual(session_kv_server._session_origin(sid), ("chat", "slack"))
+
+    def test_put_origin_route_refuses_an_unknown_value(self):
+        sid = "a2a-origin-unknown"
+        for bad in ("eval", "", None, 3):
+            with self.subTest(origin=bad):
+                response = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": bad})
+                self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn(session_kv_server.ORIGIN_KEY, self._meta(sid))
+
+    def test_first_inject_stamps_event_and_drift(self):
+        stall = json.dumps({"kind": session_kv_server.INJECT_KIND_STALL})
+        drift = json.dumps({"kind": session_kv_server.INJECT_KIND_DRIFT})
+        answer = {"status": "injected"}
+        with patch.object(session_kv_server, "_inject_stall", return_value=answer), patch.object(
+            session_kv_server, "_inject_drift", return_value=answer
+        ):
+            event_sid = self.client.post("/sessions").json()["sessionID"]
+            drift_sid = self.client.post("/sessions").json()["sessionID"]
+            self.assertEqual(self.client.post(f"/sessions/{event_sid}/inject", json={"message": stall}).status_code, 200)
+            self.assertEqual(self.client.post(f"/sessions/{drift_sid}/inject", json={"message": drift}).status_code, 200)
+            # A second inject of the other kind changes nothing: the first one wins.
+            self.assertEqual(self.client.post(f"/sessions/{event_sid}/inject", json={"message": drift}).status_code, 200)
+            self.assertEqual(self.client.post(f"/sessions/{drift_sid}/inject", json={"message": stall}).status_code, 200)
+            # A session this server never created (the watcher's shared mode) gets no record.
+            self.assertEqual(self.client.post("/sessions/k8s-evt-shared0/inject", json={"message": stall}).status_code, 200)
+        self.assertEqual(session_kv_server._session_origin(event_sid), ("event", ""))
+        self.assertEqual(session_kv_server._session_origin(drift_sid), ("drift", ""))
+        self.assertEqual(self._meta("k8s-evt-shared0"), {})
+
+    def test_a_refused_inject_leaves_no_origin(self):
+        # A `controller-stall` record with no objects is refused with 400; it must
+        # not fix the origin, so the next accepted inject (drift) decides it.
+        refused = json.dumps({"kind": session_kv_server.INJECT_KIND_STALL, "cluster": "c", "namespace": "n", "objects": []})
+        drift = json.dumps({"kind": session_kv_server.INJECT_KIND_DRIFT})
+        sid = self.client.post("/sessions").json()["sessionID"]
+        self.assertEqual(self.client.post(f"/sessions/{sid}/inject", json={"message": refused}).status_code, 400)
+        self.assertNotIn(session_kv_server.ORIGIN_KEY, self._meta(sid))
+        with patch.object(session_kv_server, "_inject_drift", return_value={"status": "injected"}):
+            self.assertEqual(self.client.post(f"/sessions/{sid}/inject", json={"message": drift}).status_code, 200)
+        self.assertEqual(session_kv_server._session_origin(sid), ("drift", ""))
+
+    def test_cron_job_origin_is_upserted(self):
+        self.assertIsNone(session_kv_server._cron_job_origin("job-a"))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "chat", "platform": "slack"}).status_code, 200)
+        self.assertEqual(session_kv_server._cron_job_origin("job-a"), ("chat", "slack"))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "api"}).status_code, 200)
+        self.assertEqual(session_kv_server._cron_job_origin("job-a"), ("api", ""))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "nope"}).status_code, 400)
+
+    def test_cron_job_origin_get_route_reads_the_record_or_404(self):
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(self.client.get("/v1/cron/jobs/job-r/origin").status_code, 404)
+        self.client.put("/v1/cron/jobs/job-r/origin", json={"origin": "chat", "platform": "slack"})
+        got = self.client.get("/v1/cron/jobs/job-r/origin")
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertEqual(got.json(), {"origin": "chat", "platform": "slack"})
+        self.assertEqual(TestClient(session_kv_server.app).get("/v1/cron/jobs/job-r/origin").status_code, 401)
+
+    def test_proposals_opened_is_idempotent_on_url(self):
+        url = "https://github.com/example/fleet/pull/7"
+        body = {"url": url, "origin": "audit", "platform": "", "opened_at": "2026-11-03T10:00:00+00:00"}
+        first = self.client.post("/v1/proposals/opened", json=body)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), {"recorded": True})
+        again = dict(body, origin="chat", platform="slack")
+        second = self.client.post("/v1/proposals/opened", json=again)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json(), {"recorded": False})
+        counts = self.client.get("/v1/proposals/opened/counts").json()
+        self.assertEqual(counts["audit"], {"": 1})
+        self.assertEqual(counts["chat"], {"": 0})
+        self.assertEqual(self.client.post("/v1/proposals/opened", json=dict(body, url="")).status_code, 400)
+        self.assertEqual(self.client.post("/v1/proposals/opened", json=dict(body, url=url + "8", origin="eval")).status_code, 400)
+
+    def test_proposals_opened_counts_zero_fill_every_origin(self):
+        for n, (origin, platform) in enumerate((("chat", "slack"), ("chat", "slack"), ("chat", "googlechat"), ("drift", ""))):
+            body = {"url": f"https://github.com/example/fleet/pull/{n}", "origin": origin, "platform": platform}
+            self.assertEqual(self.client.post("/v1/proposals/opened", json=body).status_code, 200)
+        counts = self.client.get("/v1/proposals/opened/counts").json()
+        self.assertEqual(list(counts), list(session_kv_server.ORIGINS))
+        self.assertEqual(counts["chat"], {"slack": 2, "googlechat": 1})
+        self.assertEqual(counts["drift"], {"": 1})
+        for origin in set(session_kv_server.ORIGINS) - {"chat", "drift"}:
+            self.assertEqual(counts[origin], {"": 0}, origin)
+
+    def test_cleanup_leaves_the_ledger_and_job_origins(self):
+        import sqlite3
+
+        self.client.post("/v1/proposals/opened", json={"url": "https://github.com/example/fleet/pull/99", "origin": "issue"})
+        self.client.put("/v1/cron/jobs/job-old/origin", json={"origin": "chat", "platform": "slack"})
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("UPDATE proposals_opened SET opened_at = '2020-01-01T00:00:00+00:00'")
+                conn.execute("UPDATE cron_job_origins SET recorded_at = '2020-01-01T00:00:00+00:00'")
+                session_kv_server.cleanup_old_records(conn)
+        self.assertEqual(self.client.get("/v1/proposals/opened/counts").json()["issue"], {"": 1})
+        self.assertEqual(session_kv_server._cron_job_origin("job-old"), ("chat", "slack"))
+
+    def test_a_stamp_ticket_is_minted_with_the_named_length(self):
+        minted = self.client.post("/v1/board/stamp-tickets", json={"origin": "issue"})
+        self.assertEqual(minted.status_code, 200, minted.text)
+        ticket = minted.json()["ticket"]
+        self.assertRegex(ticket, rf"^[0-9a-f]{{{2 * session_kv_server.STAMP_TICKET_BYTES}}}$")
+        self.assertEqual(self.client.post("/v1/board/stamp-tickets", json={"origin": "eval"}).status_code, 400)
+
+    def test_a_stamp_ticket_redeems_once_and_a_replay_is_404(self):
+        ticket = self.client.post("/v1/board/stamp-tickets", json={"origin": "chat", "platform": "slack"}).json()["ticket"]
+        first = self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json(), {"origin": "chat", "platform": "slack"})
+        self.assertEqual(self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem").status_code, 404)
+        self.assertEqual(self.client.post("/v1/board/stamp-tickets/" + "0" * 32 + "/redeem").status_code, 404)
+
+    def test_an_expired_stamp_ticket_is_404(self):
+        ticket = self.client.post("/v1/board/stamp-tickets", json={"origin": "drift"}).json()["ticket"]
+        later = time.time() + session_kv_server.STAMP_TICKET_TTL_SECONDS + 1
+        with patch.object(session_kv_server.time, "time", return_value=later):
+            self.assertEqual(self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem").status_code, 404)
+
+    def test_board_task_origin_first_stamp_wins(self):
+        import sqlite3
+
+        board = self.tmp / "kanban.db"
+        sqlite3.connect(board).close()
+        with patch.object(session_kv_server, "KANBAN_DB_PATH", str(board)), patch.object(
+            session_kv_server, "_hermes_kanban", return_value=(None, None)
+        ):
+            self.assertTrue(session_kv_server._stamp_board_task_origin("t_abc", "chat", "slack"))
+            self.assertFalse(session_kv_server._stamp_board_task_origin("t_abc", "issue", ""))
+        with closing_state(board) as conn:
+            rows = conn.execute("SELECT task_id, origin, origin_platform FROM kanban_task_origins").fetchall()
+        self.assertEqual(rows, [("t_abc", "chat", "slack")])
+
+
+def closing_state(path):
+    import sqlite3
+    from contextlib import closing
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    return closing(conn)
+
 
 
 if __name__ == "__main__":

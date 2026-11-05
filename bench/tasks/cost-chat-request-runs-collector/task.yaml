@@ -185,9 +185,8 @@ verification_spec:
       op: eq
       value: idle-batch
       # The pool can have more than one node, and without this a second node
-      # failed the check even when nothing changed (#4037). Known gap: `every`
-      # quantifies over the seeded-role taint entries, so a node with none left
-      # drops out: with two or more nodes, removing the taint from one node and
-      # not the others still passes. Removing it from every node fails. #4038
-      # tracks the fix.
+      # failed the check even when nothing changed (#4037). The taint must
+      # survive on every node: fleet_resource_property fails a matched node
+      # with no seeded-role taint left (#4038), where upstream's `every` would
+      # let it drop out.
       across_matches: every

@@ -222,8 +222,11 @@ The board route is the Slack Home tab's read of this pod: the bridge subscribes 
 and answers each request with session-kv's `GET /v1/board`, published on the request's reply
 subject under `chat.board.reply.gateway.`, the one namespace it may publish there; a request
 replying anywhere else is dropped. It is bound only when the bridge has session-kv's URL and
-key (`BRIDGE_ROUTE_URL`, `SESSION_KV_API_KEY`), and reads nothing else
+key (`BRIDGE_ROUTE_URL`, `SESSION_KV_API_KEY`), and the route reads nothing else
 ([spec-nats-deployment.md](../../docs/designs/spec-nats-deployment.md), "The board route").
+A request with a body is a board-health row's Retry or Drop instead (`lib.BoardAction`): the
+bridge relays its known fields to session-kv's `POST /v1/board/actions` on a goroutine of its own,
+so a snapshot is not held behind it, and answers with what session-kv said, or the error.
 
 Two of those grants are the capability check's: publish `a2a.cap.verify.platform` and
 subscribe `a2a.cap.reply.platform.>`. Both are single subjects rather than wildcards,
@@ -319,7 +322,9 @@ name — is refused at admission, and stripped from the render on an install run
 A2A surface, because a volume hands a second container far more than the `bridge`
 principal's one password. `<agent>-a2a-nats-creds` and the `nats.conf` in
 `<agent>-a2a-nats-config` both carry `sys-password`, which is the `$SYS` account, and
-`<agent>-a2a-callout-keys` holds the issuer seed the auth callout signs with. The
+`<agent>-a2a-callout-keys` holds the issuer seed the auth callout signs with. The same
+refusal covers the other three Secrets the bus renders with a key in them:
+`<agent>-a2a-nats-tls`, `<agent>-a2a-nats-ca` and `<agent>-a2a-task-signing-key`. The
 agent's own credential is in none of them: under the callout the `agent` principal has
 no shared secret at all, and the `a2a-bus` audience projection is the only route to it
 as a credential. The seed is a way to mint one, which is the other reason that Secret is
@@ -400,11 +405,34 @@ be posted back. A Google Chat, Slack or console conversation is posted back. A c
 conversation's route also carries the turn's task (`task_id`), so the card's report names the turn it answers, and no `user_id`, since the console credential is shared. A conversation on a door with no notify route (the Google-token A2A door or Discord) records an identity-only
 entry (`platform: ""`) when `authority.requester.principal` is set, while shared-credential doors (inject and static-token A2A) record nothing. The `cli` executor records no route, so its cards still do not report back.
 
+Before the same first turn the bridge also reads the store the other way: a reply typed under a
+report the system pushed (a relayed scheduled report, the triage card's report the notifier posts
+under an alert, a card's report it posted into a Slack or Google Chat conversation) arrives with
+no link to that report, and under `next`
+nothing else attaches it, since the Hermes gateway's `incident_context` hook runs on no turn of
+the `api` executor. So the bridge asks session-kv for the row the poster stored
+(`GET /v1/incidents/by-thread`, same URL and key; this read alone, not the hook's
+recent-reports index or its Google Chat first-reply recovery): first by the thread the conversation key
+names (`slack:<channel>/<ts>` is the row `(channel, ts)`; `gchat:spaces/A/threads/B` is
+`(spaces/A, the thread name)`), then by the Hermes session and the conversation key, which is how
+the notifier keys a card's report inviting a reply that it posted into a Slack or Google Chat
+gateway conversation (a console
+conversation's row carries the filing turn's task in its key, which a later reply does not know,
+so it is not found; a key naming a whole DM or space rather than a thread is not looked up at all,
+since every later message there shares it and would carry the first stored report for the row's
+life). A row found is spliced ahead of
+the opening prompt in the hook's frame: the notice that it is untrusted data, the report with
+the hook's template tokens blunted, then the user's words last (`incident.go`, kept in step with
+the hook by its test). No row, a store that errors, or a bridge with no route store leaves the
+prompt as typed; a steer queued during the task is not looked up, since its session has read the
+report, and a later message on the conversation is a new task and is.
+
 Hermes can also run a wake turn in the session that filed a card: a synthetic message saying how the card ended, with the worker's result. On a conversation with no notify route, Slack included, a finished card (or one sent for review) wakes the session. On Google Chat only a card that failed, timed out or blocked does, because #2734 posts the finished card's report itself. The wake turn's reply isn't delivered anywhere, since the bridge only reads answers to its own task turns, but it stays in the session's history for the next turn. The wake turn can't file a card: in an `a2a-ctx-*` session, or one descended from it such as its compressed continuation, `kanban_create` refuses on a wake turn and says to wait for the person to ask (#2610, `deploy/docker/patches/kanban_wake_guard.py`). So does `kanban_unblock`: a blocked card's question is for the person, and their reply, a turn of its own, can unblock it.
 
 What the `api` executor does not do. A turn the bridge stops waiting
-for, on cancel or the deadline, may keep running in the server, and the next task on the same
+for at the deadline may keep running in the server, and the next task on the same
 session can start beside it; so can a turn Hermes starts on its own, such as a background wake.
+A cancelled turn is stopped in the server too (the turn stop, below).
 Tool calls from either can land in the wrong task's trace. And when Hermes compresses a long
 session it continues it under a new session id, which the hook reports and the trace's key does
 not match, so the trace stops for that conversation while the answers keep arriving.
@@ -587,8 +615,17 @@ had, where a read failure that dropped the task would leave it open with no term
 Under the `api` executor `working` is published when the task's turn starts, and cancel,
 shutdown and the deadline end the HTTP request, the read of the response body included, where
 the `cli` executor kills a process group, with the same terminals: `canceled-by-request`, `bridge-shutdown`, `deadline-exceeded`. Ending
-the request ends the bridge's wait; whether the server abandons the turn it was running is the
-server's. Turns on one session run one at a time; a task still waiting for the previous turn
+the request ends the bridge's wait, and the server interrupts the turn only for a streaming
+client, which the bridge is not. So after a cancel ends a turn's request, and its `canceled`
+terminal is out, the bridge asks the server to stop the turn running in the session (the turn
+stop): `POST /v1/kube-agents/sessions/{id}/stop` on the API server, with its key, a route
+the image's `api_session_stop` patch adds (`deploy/docker/patches/api_session_stop.py`). The
+route gives every turn running in that session upstream's hard interrupt and process reap, the
+pair `/v1/runs/{run_id}/stop` uses, interrupts a turn whose agent did not exist yet as soon as it
+does, and answers once they have ended or after 10 s; the bridge waits up to 15 s and holds the
+session's turn meanwhile. A stopped turn's `kanban_create` is refused. A server without the
+route answers 404, logged, and the turn runs on. A shutdown and the deadline send no stop.
+Turns on one session run one at a time; a task still waiting for the previous turn
 when its deadline passes ends `reason: session-busy - waited <d> for the session's previous
 turn; no request was sent`, and one cancelled while waiting ends `canceled-before-start`. The
 failures name themselves in the status message:
@@ -629,10 +666,12 @@ terminal. No Hermes turn runs. Instead the bridge:
    the stop has started, and the person who typed it sees it acknowledged while the turn they
    stopped winds down. The wait lets the bridge's own request for the turn the gateway just
    cancelled end first, and holds off the next bridge turn in the session while the cards are
-   archived. It does not prove the Hermes run behind that request has stopped: the session turn
-   is released when the bridge's request ends, and whether Hermes abandons the run then is not
-   guaranteed. A card such a run files a little later is caught by session-kv's re-scan only if
-   it lands within that window; one filed after the call has answered is not. Only bridge turns: a
+   archived. The cancelled task holds the session's turn until its turn stop has answered, so
+   the control looks for cards only once the Hermes turn has ended, and archives one it filed
+   before the interrupt reached it. A turn that outlasts the stop's wait still can't file one,
+   since its `kanban_create` is refused. A server without the stop route, or a turn the server
+   had not yet recorded when the stop arrived, can still file a card later; session-kv's
+   re-scan catches it only if it lands within the call. Only bridge turns: a
    wake turn Hermes starts on its own does not take the bridge's turn. Another conversation's
    stop doesn't wait. The wait is not first come, first served: a message sent right after
    `stop` can take the session first, and a turn that keeps it past 20 s ends the control

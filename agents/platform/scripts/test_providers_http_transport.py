@@ -32,9 +32,12 @@ BASE = "https://forge.example.test/api/v4"
 
 
 class _Response(io.BytesIO):
-    def __init__(self, body: bytes, status: int = 200) -> None:
+    def __init__(self, body: bytes, status: int = 200, headers: dict | None = None) -> None:
         super().__init__(body)
         self.status = status
+        self.headers = http.client.HTTPMessage()
+        for name, value in (headers or {}).items():
+            self.headers[name] = value
 
     def __enter__(self):
         return self
@@ -121,6 +124,24 @@ class RequestTest(unittest.TestCase):
         text = transport(opener).api("GET", "projects/1/merge_requests/2/raw_diffs", raw="text/plain")
         self.assertEqual("diff --git a/x b/x\n", text)
         self.assertEqual("text/plain", opener.requests[0].get_header("Accept"))
+
+    def test_headers_come_back_beside_the_answer_only_when_asked(self):
+        # A forge that counts in a header (GitLab's `X-Total`, Gitea's
+        # `X-Total-Count`) reads it here, by its lower-case name.
+        answer = _Response(b'[{"iid": 1}]', headers={"X-Total": "41", "Content-Type": "application/json"})
+        payload, headers = transport(Opener(answer)).api("GET", "projects/1/merge_requests", with_headers=True)
+        self.assertEqual([{"iid": 1}], payload)
+        self.assertEqual("41", headers["x-total"])
+        self.assertEqual("application/json", headers["content-type"])
+        plain = _Response(b"[]", headers={"X-Total": "0"})
+        self.assertEqual([], transport(Opener(plain)).api("GET", "projects/1/merge_requests"))
+
+    def test_the_cli_transport_refuses_to_answer_headers(self):
+        runner = mock.Mock()
+        with self.assertRaises(providers.ForgeUnsupported) as caught:
+            providers.CliTransport(runner, "gh").api("GET", "search/issues", with_headers=True)
+        self.assertIn("with-headers", str(caught.exception))
+        runner.assert_not_called()
 
     def test_a_path_that_names_a_host_or_climbs_out_is_not_sent(self):
         # The credential header goes wherever the URL does.

@@ -97,6 +97,16 @@ func TestParseIdentityMapRejectsMapsItCannotServe(t *testing.T) {
 			want: "has no account",
 		},
 		{
+			name: "a narrowed entry in the control account",
+			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a","account":"TRUSTED","narrowing":"pod"}]}`,
+			want: `must land in account "APP"`,
+		},
+		{
+			name: "an entry in the console account",
+			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a","account":"CONSOLE","grants":{"publish":["x.>"],"subscribe":["s.>"]}}]}`,
+			want: "will not mint into",
+		},
+		{
 			name: "no grants at all",
 			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a","account":"APP","grants":{}}]}`,
 			want: "unrestricted on that side",
@@ -117,7 +127,7 @@ func TestParseIdentityMapRejectsMapsItCannotServe(t *testing.T) {
 		},
 		{
 			name: "a field the renderer does not know about",
-			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a","account":"APP","grants":{"publish":["x.>"],"subscribe":["s.>"]},"tier":"admin"}]}`,
+			raw:  `{"version":"v1","identities":[{"serviceAccount":"system:serviceaccount:ns:a","user":"a","account":"APP","grants":{"publish":["x.>"],"subscribe":["s.>"]},"clearance":"admin"}]}`,
 			want: "decoding identity map",
 		},
 		{

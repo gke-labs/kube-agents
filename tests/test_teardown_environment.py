@@ -30,7 +30,16 @@ _TEARDOWN_SCRIPT = _REPO_ROOT / "scripts" / "release" / "teardown_environment.sh
 
 
 class TeardownEnvironmentTest(unittest.TestCase):
-    def _run(self, uninstall_exit, extra_env=None, uninstall_stdout=""):
+    def _run(self, uninstall_exit, extra_env=None, uninstall_stdout="",
+             later_exit=None):
+        """Runs the teardown against a mock uninstall.sh.
+
+        The mock exits ``uninstall_exit`` on its first call and ``later_exit``
+        on every later one (``uninstall_exit`` again when unset), so a test
+        can stage a failure that a retry recovers from.
+        """
+        if later_exit is None:
+            later_exit = uninstall_exit
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         tmp_dir = pathlib.Path(tmp.name)
@@ -48,7 +57,8 @@ echo "{MOCK_UNINSTALL_FAIL_SIGNAL} $*" >> "{recorded_calls}"
 cat <<'UNINSTALL_STDOUT_EOF'
 {uninstall_stdout}
 UNINSTALL_STDOUT_EOF
-exit {uninstall_exit}
+if [ "$(wc -l < "{recorded_calls}")" -le 1 ]; then exit {uninstall_exit}; fi
+exit {later_exit}
 """)
         mock_uninstall.chmod(0o755)
 
@@ -60,6 +70,8 @@ exit {uninstall_exit}
                 # get_isolated_test_env strips GITHUB_*, so the job-summary path
                 # only exists when a test asks for it.
                 "GITHUB_STEP_SUMMARY": str(summary),
+                # The retry's wait, off: a test checks the attempts, not the clock.
+                "TEARDOWN_RETRY_WAIT_SECONDS": "0",
                 **(extra_env or {}),
             }
         )
@@ -140,6 +152,74 @@ exit {uninstall_exit}
     def test_the_exit_status_is_uninstalls_own(self):
         proc, _, _ = self._run(uninstall_exit=4)
         self.assertEqual(proc.returncode, 4, proc.stdout)
+
+    def test_a_failed_teardown_is_run_again_and_a_pass_is_clean(self):
+        """A transient Google API error fails one uninstall.sh, not the job.
+
+        Run 41106670355 lost the pre-install teardown of its today-mode
+        provision step to a 17-second credentials 503, and run 40901145889 its
+        step-5 teardown to a 503 from the GKE API server during the Helm
+        uninstall; a second uninstall.sh minutes later had nothing in its way.
+        """
+        proc, calls, summary = self._run(uninstall_exit=1, later_exit=0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertIn("attempt 2 of 2", proc.stderr)
+        self.assertIn("Teardown complete", proc.stdout)
+        self.assertNotIn("::error", proc.stdout + proc.stderr)
+        self.assertEqual(summary, "")
+
+    def test_a_retry_that_finds_no_state_is_not_a_failure(self):
+        proc, calls, _ = self._run(uninstall_exit=1, later_exit=3)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertIn("Nothing to tear down", proc.stdout)
+
+    def test_a_failure_that_persists_is_fatal_after_the_last_attempt(self):
+        proc, calls, summary = self._run(uninstall_exit=1, uninstall_stdout="destroy blew up here")
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertEqual(len(calls), 2, calls)
+        self.assertIn("still running (exit 1)", summary)
+        # The summary is rendered from the teed log, which holds both runs: the
+        # second appended behind a marker line, the first not overwritten.
+        marker = "--- uninstall.sh run 2 of 2 ---"
+        self.assertIn(marker, summary)
+        # Both runs' own output is in the summary, the first before the marker
+        # and the second after it; an overwrite would leave one copy, after it.
+        self.assertEqual(2, summary.count("destroy blew up here"), summary)
+        self.assertLess(summary.index("destroy blew up here"), summary.index(marker), summary)
+        self.assertGreater(summary.rindex("destroy blew up here"), summary.index(marker), summary)
+
+    def test_the_attempt_count_is_an_override(self):
+        proc, calls, _ = self._run(
+            uninstall_exit=1, extra_env={"TEARDOWN_ATTEMPTS": "1"}
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertEqual(len(calls), 1, calls)
+
+    def test_a_clean_teardown_or_no_state_runs_once(self):
+        for code in (0, 3):
+            with self.subTest(code=code):
+                proc, calls, _ = self._run(uninstall_exit=code, later_exit=1)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(len(calls), 1, calls)
+
+    def test_a_retry_knob_that_is_not_a_plain_decimal_is_refused(self):
+        """Refused before uninstall.sh runs, by the check provision_environment.sh
+        shares: a word breaks the attempt comparison, and a leading zero is
+        refused so every knob of the pipeline reads one way."""
+        for name, value in (
+            ("TEARDOWN_ATTEMPTS", "two"),
+            ("TEARDOWN_ATTEMPTS", "0"),
+            ("TEARDOWN_ATTEMPTS", "-1"),
+            ("TEARDOWN_RETRY_WAIT_SECONDS", "060"),
+            ("TEARDOWN_RETRY_WAIT_SECONDS", "9999999"),
+        ):
+            with self.subTest(name=name, value=value):
+                proc, calls, _ = self._run(uninstall_exit=0, extra_env={name: value})
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertIn(f"{name} is not", proc.stderr)
+                self.assertEqual(calls, [])
 
     def test_strict_mode_does_not_make_a_failure_survivable(self):
         """RC_TEARDOWN_STRICT governs the pre-install teardown, not this one.

@@ -26,9 +26,10 @@ notes:
   cluster-agent-stalled-controller-healthy-silence:
     note: new case, earning its record
   compliance-rbac-overgrant:
-    issues: ["#998", "#985", "#1171", "#2013"]
+    # #1171: demoted 09-02; held out 09-29 (#2013); on the roster 11-02 (#4094).
+    issues: ["#998", "#985", "#1171", "#2013", "#4094"]
   consistency-authorized-networks-probe:
-    # #3598: demoted 10-21; waits on #3448 (the 429s) and the agent-side fix, #3605.
+    # #3598: demoted 10-21; fixed by #3609, stays nightly by the decision on #3975.
     issues: ["#3598"]
   gpu-stress-test-diagnosis:
     note: reuse regression under investigation

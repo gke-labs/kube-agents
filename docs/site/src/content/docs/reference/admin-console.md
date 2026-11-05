@@ -1,8 +1,8 @@
 ---
 title: Admin console
-description: The Kube Agents Console, a local Streamlit prototype started from a repository checkout that chats with the agent, browses its activity, and shows the inference gateway's status. The install does not deploy it.
+description: The Kube Agents Console, a local Streamlit prototype started from a repository checkout that chats with the agent, browses its activity, shows the inference gateway's status, and sizes an install for a fleet. The install does not deploy it.
 sidebar:
-  order: 9
+  order: 10
 ---
 
 The Kube Agents Console is a web interface for one operator's machine. `./scripts/admin_portal.sh` starts it from a repository checkout; it listens on loopback only, and the gcloud login the launcher verifies is its authentication boundary. It is a prototype: the install does not deploy it, and nothing reaches it from another machine. [`admin_console/README.md`](https://github.com/gke-labs/kube-agents/blob/main/admin_console/README.md) is the operating guide and [`docs/designs/admin-console.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/admin-console.md) the design of record; this page is the summary, and the README is canonical where the two differ.
@@ -23,14 +23,17 @@ ADMIN_PORTAL_PORT=8601 ./scripts/admin_portal.sh
 
 Streamlit runs on a second, private loopback port, the public port plus one by default; `ADMIN_PORTAL_STREAMLIT_PORT` overrides it when that one is taken. `ADMIN_PORTAL_THEME=google-cloud` switches the console from its default dark theme to a light one in Google Cloud's colours. Ctrl-C stops the console.
 
+Each of the console's two processes holds for 30 seconds the cluster's answers to which PlatformAgent is canonical and which gateway pod runs it, instead of asking before every read; `ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS` changes that window, and `0` turns the reuse off. The data behind each page is read live every time.
+
 Past the launcher, you need an account with read access to the project and the cluster. The Connection page verifies the rest with bounded read-only checks and reports each one: project access and the required APIs, GKE discovery, recent Cloud Logging and Cloud Trace data, and the agent runtime. Cloud Trace is read with Application Default Credentials, so a failing Trace check is fixed with `gcloud auth application-default login`.
 
 ## The pages
 
 In navigation order:
 
-- **Setup → Connection.** Pick the project, then the cluster. Project Connect verifies the gcloud identity, project access and GKE discovery; Cluster Connect verifies the kube-agents runtime. A single cluster labelled `kube-agents-host=true` is preselected. Every other page reads the target verified here and points back to this page until both levels connect.
+- **Setup → Connection.** Pick the project, then the cluster. Project Connect verifies the gcloud identity, project access and GKE discovery; Cluster Connect verifies the kube-agents runtime. A single cluster labelled `kube-agents-host=true` is preselected. Every other page except Harness limits reads the target verified here and points back to this page until both levels connect.
 - **Setup → LLM Gateway.** Reads the install's LiteLLM resources and runs one bounded request from the Platform Agent through `model-default`, the same path the agents use. The LiteLLM this repository's install deploys is Helm-owned, and the console refuses to change a Helm-owned release, so on a stock install the page shows live status with its configuration form disabled; provider changes go through the installer, Terraform or Helm ([Inference gateway](/kube-agents/concepts/inference-gateway/)).
+- **Setup → Harness limits.** Sizing from the repository's load measurements (`bench/scale/harness-limits.json`), with no connection needed. Pick an example fleet (S, M, L or XL) or enter your own. The page answers whether the container limits hold that fleet, and which limits, node pool, data volume and number of installs it needs. A chart shows each key limit as the fleet grows, and the measured runs are in a collapsed section. Predictions past the measured fleet sizes are labelled as such. Until measurements are committed, the page shows a labelled sample.
 - **Agentic → Chat.** A table of recent agent sessions, with the selected session's transcript and a composer below it. A message sent here goes to the Planning Agent, the front door Google Chat and Slack use, so it is planned and delegated the same way, and the kanban tasks it spawns render inline in the thread. Google Chat and Slack sessions are visible but read-only; a follow-up from the console opens a separate `portal_*` session rather than posting into someone else's thread. When the agent asks for a tool approval, the choices are Approve once or Deny.
 - **Observability → Overview.** Activity volume, the split between human-initiated and autonomous work, attention items, attribution coverage and recent outcomes for a time window chosen on the page.
 - **Observability → Activity Explorer.** Structured audit events from Cloud Logging and agent traces from Cloud Trace for the selected window: an aggregate flow diagram, a per-interaction timeline, and a paginated ledger with a Google Cloud evidence link on every record. Truncated or failed source reads are shown as partial rather than treated as complete.

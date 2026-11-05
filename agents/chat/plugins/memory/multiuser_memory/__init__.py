@@ -75,6 +75,11 @@ NO_IDENTITY_NOTICE = (
 )
 
 
+# 7-bit ESC sequences and 8-bit CSI sequences; the same pattern as
+# agents/platform/scripts/untrusted_text.py, pinned equal by test_multiuser_memory.py.
+ANSI_ESCAPE_RE = re.compile(r"(?:\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x9B[0-?]*[ -/]*[@-~])")
+
+
 def _is_safe_char(ch: str) -> bool:
     """Check whether a character is safe from control/zero-width/bidi smuggling."""
     code = ord(ch)
@@ -109,11 +114,7 @@ def _strip_unsafe_chars(text: str) -> str:
     if not text:
         return ""
     cleaned = re.sub(r"\r", "", text)
-    cleaned = re.sub(
-        r"(?:\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])|\x9B[0-?]*[ -/]*[@-~])",
-        "",
-        cleaned,
-    )
+    cleaned = ANSI_ESCAPE_RE.sub("", cleaned)
     return "".join(ch for ch in cleaned if _is_safe_char(ch))
 
 

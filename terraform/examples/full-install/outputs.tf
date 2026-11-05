@@ -18,6 +18,42 @@ output "image_tag" {
   value       = var.image_tag
 }
 
+# The profile the Standard pools were last applied under, for lifecycle.sh's
+# guard_node_pool_shape. A root output persists in state where the module's
+# does not, so the guard can tell a profile the operator changed, which asks
+# for the resize it plans, from one kept beside a lost explicit TF_VAR_ line,
+# which asks for nothing. Resolved by the module: small when sizing_profile is
+# unset or "".
+output "sizing_profile" {
+  description = "Sizing profile the Standard cluster's node pools were last applied under (small, medium or fleet); small when sizing_profile is unset or \"\"."
+  value       = module.gke_cluster.sizing_profile
+}
+
+# The shape inputs that were set at the last apply, for the same guard. The
+# profile above says which profile the pools came from; this says which
+# attributes an explicit input decided instead of it. A changed profile asks
+# for the shape of every attribute a profile decides and nothing about one an
+# explicit line decided, so the guard refuses an apply whose explicit line is
+# gone whatever the profile says, until the line is back or the pool's input
+# names the shape. Names rather than values: the shape each decided is in the
+# pool's node_config in state, where the guard already reads it. One
+# space-separated string, so `terraform output -raw` returns it whole and the
+# guard matches a name without a JSON parser; empty when every attribute came
+# from the profile. "" counts as unset, as the module reads it.
+output "node_pool_shape_inputs" {
+  description = "The standard_* and gvisor_* machine-type and disk inputs that were set (not null, not \"\") at the last apply, space-separated and sorted by name; empty when every pool shape came from sizing_profile."
+  value = join(" ", [
+    for name, value in {
+      standard_machine_type = var.standard_machine_type
+      standard_disk_size_gb = var.standard_disk_size_gb
+      standard_disk_type    = var.standard_disk_type
+      gvisor_machine_type   = var.gvisor_machine_type
+      gvisor_disk_size_gb   = var.gvisor_disk_size_gb
+      gvisor_disk_type      = var.gvisor_disk_type
+    } : name if value != null && tostring(value) != ""
+  ])
+}
+
 output "cluster_location" {
   description = "Region the cluster runs in"
   value       = module.gke_cluster.cluster_location

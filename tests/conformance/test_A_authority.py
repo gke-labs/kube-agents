@@ -434,6 +434,89 @@ class A3TheEvalDoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
         )
 
 
+class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
+    """A3: a profile worker's cluster and project come from its signed task credential.
+
+    The broker's `profile` role (#3889) runs model output from an AgentProfile
+    worker. The cluster and project a call reaches are the ones in the
+    dispatcher's task credential, bound to the attested pod, never ones the
+    caller names; with no credential, nothing credentialed runs at all.
+    """
+
+    TARGET = h.task_confinement.ClusterTarget(project="proj-a", location="us-central1", cluster="cluster-a")
+
+    def test_A3_a_profile_call_outside_its_tasks_target_is_refused(self) -> None:
+        refusal = h.task_confinement.ConfinementRefusal
+        for argv in (
+            ["kubectl", "get", "secrets", "--context=gke_proj-b_us-central1_cluster-b"],
+            ["kubectl", "get", "secrets", "--server=https://127.0.0.1:8443"],
+            ["gcloud", "container", "clusters", "list", "--project=proj-b"],
+            ["gcloud", "projects", "list"],
+            ["gcloud", "config", "set", "project", "proj-b"],
+            ["kubectl", "config", "use-context", "gke_proj-b_us-central1_cluster-b"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(refusal):
+                    h.task_confinement.confine(argv, None, self.TARGET)
+        # And naming nothing reaches the target, not the broker's host.
+        confined = h.task_confinement.confine(["kubectl", "get", "pods"], None, self.TARGET)
+        self.assertEqual(self.TARGET.context_name, confined.kubeconfig_context)
+
+    def test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster(self) -> None:
+        for argv in (["kubectl", "get", "pods"], ["gcloud", "container", "clusters", "list"]):
+            with self.subTest(argv=argv):
+                with self.assertRaises(h.task_confinement.ConfinementRefusal):
+                    h.task_confinement.confine(argv, None, None)
+        self.assertTrue(h.task_confinement.confine(["kubectl", "version", "--client"], None, None).isolated)
+
+    def test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone(self) -> None:
+        profile = h.credential_proxy.CALLER_ROLE_PROFILE
+        reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
+        self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+
+    def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
+        # The relay has no per-task target check, so a profile worker reaches
+        # only the servers whose tools name no cluster: Developer Knowledge's
+        # document reads. The gke server, whose tools take a project and
+        # cluster as arguments, stays out, and so does every write. Driven
+        # through the decision the handler makes (mcp_relay_decision).
+        cp = h.credential_proxy
+        self.assertEqual(
+            {"developer_knowledge": frozenset({"get_documents", "search_documents"})},
+            h.mcp_policy.PROFILE_SERVER_TOOLS,
+        )
+
+        def call(name):
+            return {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": name}}
+
+        listing = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        in_task = cp.Principal(workload="w", role=cp.CALLER_ROLE_PROFILE, task=object())
+        no_task = cp.Principal(workload="w", role=cp.CALLER_ROLE_PROFILE)
+        chat = cp.Principal(workload="w", role=cp.CALLER_ROLE_CHAT)
+
+        for server, message in (("gke", call("get_k8s_resource")), ("gke", listing),
+                                ("developer_knowledge", call("answer_query"))):
+            with self.subTest(server=server, message=message):
+                decision, _ = cp.mcp_relay_decision(in_task, server, message)
+                self.assertFalse(decision.allowed)
+        decision, offered = cp.mcp_relay_decision(in_task, "developer_knowledge", call("search_documents"))
+        self.assertTrue(decision.allowed)
+        self.assertEqual(frozenset({"get_documents", "search_documents"}), offered)
+        self.assertEqual(frozenset(), cp.mcp_relay_decision(in_task, "gke", listing)[1])
+        decision, _ = cp.mcp_relay_decision(no_task, "developer_knowledge", call("search_documents"))
+        self.assertEqual((False, cp.RULE_TASK_CREDENTIAL), (decision.allowed, decision.rule_id))
+        # And the handler takes its decision from there, not from the table.
+        source = h.text("credential_proxy")
+        handler = source[source.index("def _handle_mcp_relay"):]
+        handler = handler[: handler.index("\n    def ", 1)]
+        self.assertIn("mcp_relay_decision(principal, server_name, message)", handler)
+        self.assertNotIn("mcp_policy.evaluate(", handler)
+        self.assertIn("decision.rule_id == mcp_policy.METHOD_TOOLS_LIST", handler)
+        self.assertIn("filter_tools_list(server_name, upstream.body, offered)", handler)
+        # The chat role keeps the table's whole offer.
+        self.assertIsNone(cp.mcp_relay_decision(chat, "gke", call("get_cluster"))[1])
+
+
 class A3TheA2ADoorIsDarkUnlessTheOperatorOpensIt(unittest.TestCase):
     """A3 on the A2A door: the inject door's sibling for an agent caller, held
     to the same two properties by the same two seams.
@@ -980,24 +1063,35 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
     def _session_publish_derivation(cls) -> str:
         """Every executor publish grant the callout derives, as Go source.
 
-        That is the Publish literal `executorGrants` starts both narrowings
-        from (session pods and AgentProfile pods), plus the bodies of
-        `sessionGrants` and `profileGrants`, which append to it. The literal
-        alone, not all of `executorGrants`: its consumer filters name `…in`
-        as a READ, which is what the assertions here distinguish. Each
-        narrowing is required to call `executorGrants`, so one that stopped
-        would not silently fall out of what is read.
+        That is the Publish literal `executorTaskGrants` starts both
+        narrowings from (session pods, through `executorGrants`, and
+        AgentProfile pods' task connections), plus the bodies of
+        `sessionGrants`, `profileTaskGrants`, `profileWorkerGrants` and
+        `profileGrants`, which append to it or stand beside it. The literal
+        alone, not all of `executorTaskGrants`: its consumer filters name
+        `…in` as a READ, which is what the assertions here distinguish. Each
+        executor narrowing is required to call it (the session through
+        `executorGrants`), so one that stopped would not silently fall out of
+        what is read. A profile pod's own connection (`profileWorkerGrants`,
+        through `profileGrants`) keeps its profile-wide task plane until
+        #3889's worker PR removes it; it is read too, so a task-plane publish
+        added there is caught.
         """
-        body = h.go_function_body(h.text("a2a_session_grants"), "executorGrants")
+        sessions = h.text("a2a_session_grants")
+        body = h.go_function_body(sessions, "executorTaskGrants")
         block = re.search(r"Publish:\s*\[\]string\{(.*?)\n\t*\},", body, re.DOTALL)
-        assert block is not None, "executorGrants no longer starts from a Publish literal"
-        narrowings = [
-            h.go_function_body(h.text("a2a_session_grants"), "sessionGrants"),
-            h.go_function_body(h.text("a2a_profile_grants"), "profileGrants"),
-        ]
-        for narrowing in narrowings:
-            assert "executorGrants(" in narrowing, "a narrowing no longer starts from executorGrants"
-        return block.group(1) + "\n".join(narrowings)
+        assert block is not None, "executorTaskGrants no longer starts from a Publish literal"
+        assert "executorTaskGrants(" in h.go_function_body(sessions, "executorGrants"), (
+            "executorGrants no longer derives from executorTaskGrants"
+        )
+        session = h.go_function_body(sessions, "sessionGrants")
+        task = h.go_function_body(h.text("a2a_profile_grants"), "profileTaskGrants")
+        worker = h.go_function_body(h.text("a2a_profile_grants"), "profileWorkerGrants")
+        profile = h.go_function_body(h.text("a2a_profile_grants"), "profileGrants")
+        assert "executorGrants(" in session, "sessionGrants no longer starts from executorGrants"
+        assert "executorTaskGrants(" in task, "profileTaskGrants no longer starts from executorTaskGrants"
+        assert "profileWorkerGrants(" in profile, "profileGrants no longer starts from profileWorkerGrants"
+        return block.group(1) + "\n".join((session, task, worker, profile))
 
     def test_A3_precondition_the_bus_principals_are_still_rendered_as_data(self) -> None:
         """The principals the writer-set tests iterate, so a moved one is loud.
@@ -1201,23 +1295,24 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 f"addressee's in subject",
             )
         # The task-plane half, the per-session consumer's read filter among
-        # it, is built by executorGrants, which AgentProfile pods share
-        # (gke-labs#2469). The session reaches it only as
-        # executorGrants(pod, pod), and inside it every TaskInSubject names
-        # the addressee argument, so the session's calls still name pod.
+        # it, is built by executorTaskGrants, which AgentProfile pods share
+        # (gke-labs#2469, and the task connection since #3889). The session
+        # reaches it only as executorGrants(pod, pod), a wrapper passing "*"
+        # for the task, and inside executorTaskGrants every TaskInSubject
+        # names the addressee argument, so the session's calls still name pod.
         self.assertEqual(
             ["pod, pod"],
             [a.strip() for a in re.findall(r"executorGrants\(([^)]*)\)", body)],
             "sessionGrants no longer derives its task-plane grants as executorGrants(pod, pod)",
         )
-        executor = h.go_function_body(src, "executorGrants")
+        executor = h.go_function_body(src, "executorTaskGrants")
         calls = re.findall(r"TaskInSubject\(\s*([^,]+),", executor)
-        self.assertTrue(calls, "executorGrants calls TaskInSubject nowhere; the probe above is vacuous")
+        self.assertTrue(calls, "executorTaskGrants calls TaskInSubject nowhere; the probe above is vacuous")
         for arg in calls:
             self.assertEqual(
                 "addressee",
                 arg.strip(),
-                f"executorGrants calls TaskInSubject({arg.strip()}, ...): every "
+                f"executorTaskGrants calls TaskInSubject({arg.strip()}, ...): every "
                 f"executor, sessions included, would hold a grant on that "
                 f"addressee's in subject",
             )

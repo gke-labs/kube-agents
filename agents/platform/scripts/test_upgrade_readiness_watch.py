@@ -582,6 +582,7 @@ class Retired(Base):
                     self.assertIsInstance(self.ledger()["announced"], dict)
                 else:
                     self.assertIn("has a malformed announced block; refusing to overwrite it", out)
+                    self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)), out)
                     self.assertEqual(sandbox.calls, [])
 
 
@@ -1292,6 +1293,7 @@ class Failures(Base):
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertIn("is not this job's ledger; refusing to overwrite it", out)
+        self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)))
         self.assertEqual(sandbox.calls, [])
         self.assertEqual((self.home / watch.LEDGER_FILE_NAME).read_text(), '{"something": "else"}')
 
@@ -1305,6 +1307,7 @@ class Failures(Base):
                 code, out = self.run_tick(sandbox)
                 self.assertEqual(code, 0)
                 self.assertIn(f"has a malformed entry for {TARGET}; refusing to overwrite it", out)
+                self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)), out)
                 self.assertEqual(sandbox.calls, [])
 
     def test_a_sentinel_inside_tenant_text_does_not_shift_the_envelope(self) -> None:
@@ -1319,6 +1322,20 @@ class Failures(Base):
         self.assertEqual(code, 0)
         self.assertIn("dry run: would report", out.getvalue())
 
+    def test_a_report_script_missing_from_the_image_needs_an_admin(self) -> None:
+        """No retry puts the script back, so the line says the image is missing it and an admin has to act."""
+        empty = Path(self.tmp.name) / "no-skill-scripts"
+        empty.mkdir()
+        sandbox = FakeSandbox(envelope([member("a", "lagging")]))
+        with mock.patch.dict(os.environ, {watch.SKILL_SCRIPTS_DIR_ENV: str(empty)}):
+            code, out = self.run_tick(sandbox)
+        self.assertEqual(code, 0)
+        self.assertEqual(sandbox.calls, [])
+        self.assertTrue(
+            out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_SCRIPT_MISSING, next=watch.FAILED_NEEDS_ADMIN)), out
+        )
+        self.assertIn(f"{watch.REPORT_MODULE}.py not found under {empty}", out)
+
     def test_an_unparsable_ledger_is_refused_not_overwritten(self) -> None:
         self.home.mkdir(parents=True)
         (self.home / watch.LEDGER_FILE_NAME).write_text('{"targets": {')
@@ -1326,6 +1343,7 @@ class Failures(Base):
         code, out = self.run_tick(sandbox)
         self.assertEqual(code, 0)
         self.assertIn("is not valid JSON", out)
+        self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)), out)
         self.assertEqual(sandbox.calls, [])
         self.assertEqual((self.home / watch.LEDGER_FILE_NAME).read_text(), '{"targets": {')
 
@@ -1352,7 +1370,8 @@ class Failures(Base):
         ), mock.patch.object(watch.sandbox_exec, "run", side_effect=unset), redirect_stdout(out), redirect_stderr(out):
             code = watch.main([])
         self.assertEqual(code, 0)
-        self.assertIn("the tick failed: RuntimeError: no GCP project: set UPGRADE_READINESS_PROJECTS or GCP_PROJECT_ID", out.getvalue())
+        self.assertIn("the tick failed: NoProject: no GCP project: set UPGRADE_READINESS_PROJECTS or GCP_PROJECT_ID", out.getvalue())
+        self.assertTrue(out.getvalue().startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_NO_PROJECT, next=watch.FAILED_NEEDS_ADMIN)))
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
 
     def test_a_persisting_failure_is_announced_once_and_its_recovery_once(self) -> None:
@@ -1401,6 +1420,7 @@ class Failures(Base):
                 code, out = self.run_tick(sandbox)
                 self.assertEqual(code, 0)
                 self.assertIn(f"has a malformed entry for {key.strip()}", out)
+                self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_LEDGER, next=watch.FAILED_NEEDS_ADMIN)), out)
                 self.assertEqual(sandbox.calls, [])
                 self.assertFalse((self.home / "reports").exists())
 
@@ -2547,6 +2567,7 @@ class DeclaredScope(Base):
         self.assertEqual(code, 0)
         self.assertEqual(sandbox.calls, [])
         self.assertIn("the roster names 'p1 p2', which is not a project id or number; spell each project as its id, in UPGRADE_READINESS_PROJECTS separated by commas", out)
+        self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_ROSTER, next=watch.FAILED_NEEDS_ADMIN)), out)
 
     def test_a_management_project_spelling_with_a_space_fails_the_tick_before_any_sandbox_call(self) -> None:
         """Every source of the roster is held to the same grammar: spec.harness.projectId
@@ -2562,6 +2583,7 @@ class DeclaredScope(Base):
                 self.assertEqual(code, 0)
                 self.assertEqual(sandbox.calls, [])
                 self.assertIn(f"the roster names {spelling!r}, which is not a project id or number", out)
+                self.assertTrue(out.startswith(watch.FAILED_TICK_LINE.format(reason=watch.FAILED_REASON_ROSTER, next=watch.FAILED_NEEDS_ADMIN)), out)
 
     def test_the_argv_is_the_tool_s_collector_args_whatever_the_spelling(self) -> None:
         scope = scope_targets("p1", "p2", unread=(("p3", "denied"),))
@@ -2937,11 +2959,25 @@ class PlainFailureLine(unittest.TestCase):
             (watch.ProjectUnresolved("number"), watch.FAILED_REASON_UNRESOLVED),
             (watch.SandboxTimedOut("slow"), watch.FAILED_REASON_TIMED_OUT),
             (watch.WriteFailed("disk full"), watch.FAILED_REASON_WRITE),
+            (watch.RosterMisspelled("spelling"), watch.FAILED_REASON_ROSTER),
+            (watch.NoProject("none"), watch.FAILED_REASON_NO_PROJECT),
+            (watch.LedgerUnusable("not JSON"), watch.FAILED_REASON_LEDGER),
+            (watch.ReportScriptMissing("not found"), watch.FAILED_REASON_SCRIPT_MISSING),
             (OSError("cannot fork"), watch.FAILED_REASON_ERROR),
         )
         for error, reason in cases:
             with self.subTest(error=error):
                 self.assertEqual(watch.failure_reason(error), reason)
+
+    def test_a_configuration_fault_ends_on_the_admin_sentence(self) -> None:
+        """A retry does not change the roster, the project or the ledger, so none promises one."""
+        self.roster("10 10 * * *")
+        for error in (watch.RosterMisspelled("spelling"), watch.NoProject("none"), watch.LedgerUnusable("not JSON")):
+            with self.subTest(error=type(error).__name__):
+                (Path(self.tmp.name) / watch.FAILURE_MARKER_FILE_NAME).unlink(missing_ok=True)
+                out, _ = self.run_main(error)
+                self.assertTrue(out.endswith(watch.FAILED_NEEDS_ADMIN + "\n"), out)
+                self.assertNotIn(watch.FAILED_REASON_ERROR, out)
 
     def test_a_refusal_that_clears_on_its_own_promises_a_retry(self) -> None:
         self.roster("10 10 * * *")

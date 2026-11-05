@@ -59,7 +59,19 @@ every card has settled or
 six full-audit units). The delivered card results are appended to the answer, and the worker's
 report and terminal commands are read back with `kubectl exec` from
 `/opt/data/kanban/attachments/<id>/` and `/opt/data/kanban/logs/<id>.log` in the agent pod, then
-deleted; a card still running when the wait ran out is archived first, which stops its worker, and so are the cards its worker fanned out (#3019). A
+deleted. So are the board rows of the card and of every card its worker, or theirs, filed, since
+Hermes shows the assignee's recent completed runs on every card and would hand the next repetition
+this one's summary. A worker's card counts only when Hermes recorded the run as its creator, so a
+card a worker's create handed back by an existing idempotency key stays, files included. Likewise
+a card the front door's create returned that was created before the run started, by the agent pod's
+clock read before the agent is invoked, is not this run's and stays, files included; this holds on
+both waits below. When the clock or the board cannot be read, such a card is taken like the run's
+own. A card keeps its rows while it runs, or while a card in the fan-out it made or belongs to can still run,
+other than a follow-up linked to its creator. What a purge keeps, or all of it when the board step
+fails, is written down in the agent pod, and the next repetition retries it before its agent is
+invoked, each purge under its own start time, so a card an earlier purge owes goes even when a later
+run's create returned it; anything owed for over a day is given up. A card still running when the wait ran out is archived
+first, which stops its worker, and so are the cards its worker fanned out. A
 customer sees the card result relayed to their thread; they never see the files, the
 store reads, or the collecting turn, which is a model call the customer never made.
 
@@ -112,7 +124,7 @@ the presubmit exports nothing new until it chooses to. The exchange:
    failing to publish it, infrastructure. The prompt is routed like any text, the gateway's
    literal affordances included, `Delegate` among them; the harness sends none as a prompt, and a
    case whose prompt opens with one is the case's defect. The one it sends itself is the `stop`
-   after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
+   during or after a stopped ask's opening turn (`bench/kube_agents_bench/stop_hook.py`). The adapter dedupes on the backend message id,
    bounded the way the Chat adapter bounds its seen set: a repeated `POST` with an id it has
    already accepted gets the answer the first one got, the record's task id or the same refusal,
    and starts nothing. Because the id
@@ -148,12 +160,16 @@ the presubmit exports nothing new until it chooses to. The exchange:
 4. Map the `result` artifact's text to the answer the verifiers read (`output` and
    `final_message`); map `activity` artifacts into the trajectory when the executor publishes them
    (the `progress` artifact's last line goes to the harness result's `metadata`, which devops-bench
-   does not write to the record, so it reaches the log and nothing graded). Token counts are not
-   on the bus, and the scorer's liveness rule
+   does not write to the record, so it reaches the log and nothing graded). The front door's
+   token counts come from one probed read after the terminal (`usage=chain`), which sums the `usage` artifact of the root
+   turn and every wake that continued its chain
+   (`input` and `output` and their `total`; Hermes reports no cached or reasoning split), reports
+   the chain's child tasks apart (`tokens.children`, added into `total` with the workers'), and
+   leaves them null when it carries none. The scorer's liveness rule
    fails a record whose token total is null, so the inject record is written the way the
    diagnostic transport below writes its own: every lifecycle event of the task, `submitted`,
-   `working` and the terminal, is a trajectory entry under the status-event name, the token
-   buckets are null, the latency is set, and the scorer's rung-3 rule accepts a `working` or a
+   `working` and the terminal, is a trajectory entry under the status-event name, the latency
+   is set, and the scorer's rung-3 rule accepts a `working` or a
    final status entry as liveness evidence in place of a token total; `working` counts because
    a graded timeout, canceled at the budget with the cancel unconfirmed, has no final entry and
    would otherwise block as not a real run, and a `submitted` entry alone still blocks. A task
@@ -254,8 +270,8 @@ other; an active task with no executor event, nobody took it, infrastructure, wh
 gateway has released the conversation yet; an active task at `submitted` and never `working`, an
 executor accepted it and queued it for the whole budget, infrastructure; an active task at
 `working`, a graded timeout; and an active task whose stream already folds to a terminal, which
-is the relay's lost record write, the event acked when the relay enqueued it, before the queued
-write cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
+is the relay's lost record write: the relay acks a terminal once it has rendered it, whether or
+not the record write after it cleared `ActiveTask`, and an acked event is never redelivered. That fifth outcome is graded
 like the first, with the answer read from the fold rather than the posted message, and gets no
 cancel, because there is nothing left to cancel; the record then holds a finished task until
 something releases it, which on a key never reused is nothing and costs nothing. The sixth is
@@ -340,7 +356,7 @@ the Hermes bridge from hermes's outbound
 webhooks (`a2a/docs/hermes-bridge.md`, "Activity"), one entry per invocation with the tool and
 its input; the bridge's entries also carry the call's status, and the bridge alone publishes a
 `progress` heartbeat. `worker_commands` reads
-the kanban worker logs by card id (with `after_result_pattern`, the tagged `terminal` and `execute_code` entries
+the kanban worker logs by card id (for the required checks, and for every check with `after_result_pattern`, also the tagged `terminal` and `execute_code` entries
 the harness appends to the trajectory from the workers' sessions as well, present when the
 wait found the cards and the door showed the trace); on
 this path it has data when the case runner's delegation wait finds the cards in the session store
@@ -468,24 +484,28 @@ session store rather than from the trajectory (Completion signals), so a case wh
 delegated worker's report is graded on that report, as on the api lane. Two differences from the
 api lane remain, and both are the transport's rather than the agent's. A router-scope
 `tool_called` reads the Planning Agent's calls through the door's trace, which carries no worker's
-calls. And the GitHub-write safeguard dates a
-write rather than signing it, and keeps by-design writes apart by running requesting cases one at a
-time. The delegation wait holds a case until the cards it filed are terminal, so a pull request
-the card's worker opens lands in its own case's window. What the wait does not follow is a
-worker's own fan-out, the child cards a worker files, nor a card still running when the case
-reaches the delegation ceiling or when the wait falls back; a write from one of those can land in
-the next unit's window and charge the next unit for it. Attributing each write to its case is
-[#2611](https://github.com/gke-labs/kube-agents/issues/2611)'s fix. Until it lands, read a block
-on a requesting case's later repetitions as transport when the earlier case fanned out or ended
-at the ceiling. Parity in
+calls. And the GitHub-write safeguard charges a write to the repetition whose reply or creating
+call names it, and the door's trace sends the Planning Agent's arguments as shapes, so on this
+lane what names a write is the reply and the workers' calls the harness reads back from the pod
+once the delegation wait has found the cards; a write neither names is recorded as unattributed
+and charged to nobody. The wait holds a case until the cards it filed are terminal, so a pull
+request the card's worker opens lands in its own case's window. What the wait does not follow is
+a worker's own fan-out, the child cards a worker files, a card still running when the case
+reaches the delegation ceiling or when the wait falls back, nor a card whose exchange the
+transport cut before the wait began. A write from one of those that lands in a later first-phase
+unit's window is unattributed there. A second-phase unit (a requesting case, a stopped ask, a
+`writes_alone` case) runs alone and its window is marked exclusive, so the CI script archives
+every card still live before each such unit, then settles. A fence that could not run is a
+`Card fence` warning in the run log; read a block on that unit after one as transport. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation
 composition rather than the executor's answer gets a persona-aware check or leaves the lane
-through the exclusion list with its reason. And the lane carries a safeguard of its own, applied
-by the CI flag's script to every case it runs (`hack/eval/inject-lane-safeguards.yaml`, a
-none-wrapped `github_writes` at catastrophic severity over the leased project's GitOps
-repository), because the platform persona can open a pull request where the cluster safeguards
+through the exclusion list with its reason. And every case carries a GitHub-write safeguard,
+applied by the CI script to every case it runs on both lanes so the two face the same bar
+(`hack/eval/inject-lane-safeguards.yaml`, a none-wrapped `github_writes` at catastrophic
+severity over the leased project's GitOps repository, charging a write only to the repetition
+that made it), because the platform persona can open a pull request where the cluster safeguards
 see nothing (in the turn under `cli`, from a card the Planning Agent files under `api`), and the
 first run left several on the pool repository that no case had asked for. The
 lane moves to the session agent's front door when the delegation primitive lands, and the
@@ -620,7 +640,7 @@ which the conversation shows as the needs-you message, is appended under
 returned, and the worker logs are read by those ids for `worker_commands` without `after_result_pattern`. A card still running at
 the ceiling delivers nothing: whatever text it carries (an earlier run's summary, a stashed
 result) is not its answer, so the repetition is recorded at the ceiling and the card is only
-archived and purged. A door that reports no `contextId`, a session the store does not hold (the
+archived and purged (a card created before the run started is left, as above). A door that reports no `contextId`, a session the store does not hold (the
 `cli` executor), or a first read of the store that fails three times running, before any card is
 found, falls back to the status-turn wait. That wait takes its card ids from the trajectory, which
 holds none on this path, so it settles at once on the reply and sends no status turn; the last of
@@ -674,16 +694,17 @@ changes nothing else about the run except what hangs off that transport switch: 
 lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
 than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
 (`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
-lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases grade; the lane's
-safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
-remaining task file, which the unit hands devops-bench, over the leased project's GitOps
-repository exported as `BENCH_GITOPS_REPO` (the lane refuses to start without one), with the
-cases that request a pull request, and the stopped asks, run in a second phase after every
-other unit, one at a time and each after a settle, so no repetition that requests nothing shares the repository with one
-that writes by design and no window reaches back into the unit before; and after the
-fan-out the script lists in the job log what the run left on that repository, closing nothing.
-With the flag unset both scripts are byte for byte what
-they were, and the presubmit's own tests hold that.
+lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases
+grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
+nor the transport: on both lanes they are appended to a scratch copy of every remaining task
+file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
+`BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
+request, the stopped asks and the cases that declare `writes_alone: true`, run in a second phase after every first-phase unit (a case that
+declares `scope_exclude:` runs after them, in a phase of its own), one at a time and each after a settle, so no repetition that requests nothing shares the repository with one that
+writes by design and no window reaches back into the unit before; and after the fan-out the
+script lists in the job log what the run left on that repository, closing nothing. With the flag
+unset, the transport, the inject lane's exclusion list, the card stop and the rollback check
+below are off; the api lane's exclusion list and the lane safeguards still apply.
 
 Under the flag a run on `main` also checks the rollback path once the suite verdict is computed and
 before the final line announces it (a pull request's run, `JOB_TYPE` presubmit or batch, skips it,
@@ -706,8 +727,7 @@ they come from.
 Where the flag is set is the Prow job's choice, not a script default, and since `next` became the
 mode a new install gets, the merge-blocking presubmit sets it: every pull request is graded on
 `next` through the door. `today` stays supported as the rollback, so a second lane proves that
-path. The today lane (`pull-kube-agents-smoke-test-today` on demand, and
-the six-hourly periodic `ci-kube-agents-eval-today` on `main`) sets the flag together with
+path. The today lane (`pull-kube-agents-smoke-test-today`, on pull requests that touch the round trip, or on demand) sets the flag together with
 `EVAL_ROLLBACK_LANE=1`: the deploy is the flagged one, and `hack/ci-eval-pr.sh` then runs
 `hack/rollback-roundtrip.sh` with `ROLLBACK_END_MODE=today` before the matrix, which adds a third
 leg (`next` to `today` again, with the first leg's checks) and leaves the install rolled back. The
@@ -718,10 +738,10 @@ refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
 The flag admits those jobs by name and nothing else without a pull request: section 2b of the
 deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
 listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-its Tide batch runs, the today lane's periodic, the main nightly's three parts
+the batch runs Tide started, the main nightly's three parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` and
 `ci-kube-agents-eval-nightly-writers`, the GitLab lane's nightly
-under next, and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
+under next, the GHES lane's nightly under next (`ci-kube-agents-eval-nightly-ghes-next`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
 install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
@@ -730,8 +750,8 @@ inject lane compares only with next-mode history at its own key (agent model inc
 nightly and the presubmit run the same one). The today lane is the rollback check, and it stays
 out of the recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`,
 but it grades a rolled-back install. No job appends today's window now. The dashboard's Trend page
-keeps a series per mode, drawing today's from the lines the store already holds until they age
-out of its window; its Nightly page
+keeps a series per mode: it draws `next` by default, and today's stays selectable from the lines
+the store already holds until they age out of its window; its Nightly page
 reads the main nightly's runs, so it shows `next`.
 
 ## Open questions

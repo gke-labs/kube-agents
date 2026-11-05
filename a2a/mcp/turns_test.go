@@ -53,10 +53,34 @@ func authorityFor(t *testing.T, conversation, viaTask string) json.RawMessage {
 	return mustJSON(t, a)
 }
 
+// pub publishes for the fake gateway and the tests' background publishers,
+// which run on goroutines the test does not wait for. Once the test has
+// ended, its context is done and the bus is being torn down, so a publish
+// that fails then is the teardown, not a finding; and a Fatal from any
+// goroutine after the test ended panics the whole test binary, so no later
+// test in the package runs. While the test runs, a failed publish is
+// reported with Error, on every path: FailNow is only for the test's own
+// goroutine, and these helpers also run on the subscription's.
 func pub(t *testing.T, js jetstream.JetStream, subject string, env *lib.Envelope) {
 	t.Helper()
-	if _, err := js.Publish(context.Background(), subject, mustJSON(t, env)); err != nil {
-		t.Fatal(err)
+	ctx := t.Context()
+	if _, err := js.Publish(ctx, subject, mustJSON(t, env)); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		t.Error(err)
+	}
+}
+
+// pause waits d on a goroutine the test does not wait for, and reports false
+// as soon as the test ends instead, so the caller can stop rather than touch
+// a bus that is being torn down.
+func pause(t *testing.T, d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-t.Context().Done():
+		return false
 	}
 }
 
@@ -111,14 +135,47 @@ func publishRun(t *testing.T, js jetstream.JetStream, addressee, taskID, answer 
 
 // gatewayScenario says what the fake gateway does with an ordinary turn.
 type gatewayScenario struct {
-	finish   bool // the root task completes with answerText
-	delegate bool // the root delegates; a child runs and a wake task carries the answer
-	handoff  bool // the root acknowledges and hands its work to kanban cards (no wake task ever)
-	bigChild bool // with delegate: the child's events total more than readMaxBytes, and no wake task comes
-	decoys   bool // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
+	finish   bool      // the root task completes with answerText
+	delegate bool      // the root delegates; a child runs and a wake task carries the answer
+	handoff  bool      // the root acknowledges and hands its work to kanban cards (no wake task ever)
+	bigChild bool      // with delegate: the child's events total more than readMaxBytes, and no wake task comes
+	decoys   bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
+	frames   *frameLog // when set, every frame the gateway reads is recorded
+	// after, when set, runs once the turn's tasks are published, on its
+	// own goroutine, with the gateway's connection: a card's posts come
+	// from there (publishNotify).
+	after func(nc *nats.Conn, token string, turn int32)
+	// root, when set, names the turn's task and says whether it finishes:
+	// a turn given an earlier turn's task is the gateway steering it.
+	root func(turn int32) (id string, finish bool)
 	// lateStart delays the root's first event after its submission, as an
 	// executor's cold start does.
 	lateStart time.Duration
+	// lateNotice, when set, posts the acknowledgement notice after the
+	// root's submission, by this much: the order the two connections the
+	// gateway publishes on can produce. A delay inside noticeSettle is the
+	// notice the window exists to catch; past it, the notice is dropped.
+	lateNotice time.Duration
+}
+
+// sentFrame is one console frame as the fake gateway read it.
+type sentFrame struct{ token, text string }
+
+type frameLog struct {
+	mu     sync.Mutex
+	frames []sentFrame
+}
+
+func (l *frameLog) add(f sentFrame) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.frames = append(l.frames, f)
+}
+
+func (l *frameLog) all() []sentFrame {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]sentFrame(nil), l.frames...)
 }
 
 // runFakeGateway answers console frames the way the console door does: a
@@ -139,15 +196,24 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 		if json.Unmarshal(m.Data, &f) != nil {
 			return
 		}
+		if sc.frames != nil {
+			sc.frames.add(sentFrame{token, f.Text})
+		}
 		notice := func(text string) {
 			_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "n1", Text: text}))
 		}
 		switch f.Text {
-		case statusQuery:
+		case statusQuery, statusText:
 			notice("Nothing is running in this conversation.")
 			return
 		case stopText:
 			notice("Stopped the running task.")
+			return
+		case sessionOnText:
+			notice("Session started.")
+			return
+		case sessionOffText:
+			notice("Session ended.")
 			return
 		}
 		i := n.Add(1)
@@ -155,8 +221,13 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 		// console relay does (kind "result"), is not a notice about this
 		// turn and must not be taken for one.
 		_ = nc.Publish(fmt.Sprintf(consoleOutSubject, token), mustJSON(t, ConsoleOutFrame{MessageID: "r-task-earlier", Text: "an earlier answer", Kind: "result"}))
-		notice("Working on it…")
-		root := fmt.Sprintf("task-root%d", i)
+		if sc.lateNotice == 0 {
+			notice("Working on it…")
+		}
+		root, finish := fmt.Sprintf("task-root%d", i), sc.finish
+		if sc.root != nil {
+			root, finish = sc.root(i)
+		}
 		text := f.Text
 		if rest, ok := strings.CutPrefix(text, "delegate "); ok {
 			text = rest
@@ -169,6 +240,10 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			pub(t, js, lib.TaskInSubject(fakeAddressee, "task-running"), cancel)
 		}
 		publishSubmission(t, js, fakeAddressee, root, conv, text, "")
+		if sc.lateNotice > 0 {
+			time.Sleep(sc.lateNotice)
+			notice("Working on it…")
+		}
 		switch {
 		case sc.delegate:
 			publishRun(t, js, fakeAddressee, root, "", false)
@@ -193,8 +268,13 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			publishResult(t, js, fakeAddressee, root, ackText)
 			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
 		default:
-			time.Sleep(sc.lateStart)
-			publishRun(t, js, fakeAddressee, root, answerText, sc.finish)
+			if !pause(t, sc.lateStart) {
+				return
+			}
+			publishRun(t, js, fakeAddressee, root, answerText, finish)
+		}
+		if sc.after != nil {
+			go sc.after(nc, token, i)
 		}
 	})
 	if err != nil {
@@ -216,8 +296,8 @@ func turnServer(t *testing.T, sc gatewayScenario) (*Server, jetstream.JetStream,
 	url, js := testBus(t)
 	n := runFakeGateway(t, url, js, sc)
 	b := dial(t, url)
-	convs := NewConversations()
-	return mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs)), js, n, b
+	convs := NewConversations().WithEvents(b.Events())
+	return mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs), PollEventsTool(b.Events(), convs)), js, n, b
 }
 
 func mustContain(t *testing.T, text string, want ...string) {
@@ -387,6 +467,44 @@ func TestARunningTurnReturnsItsTaskForTaskControl(t *testing.T) {
 	got = callTool(t, s, ToolTaskControl, map[string]any{"action": "get", "task": ref, "wait_seconds": 10})
 	if got.IsError || !strings.Contains(got.Content[0].Text, answerText) {
 		t.Errorf("get after finish = %+v", got)
+	}
+}
+
+// The profile dispatcher writes the terminal of a profile task it fails or
+// refuses on the task's supervisor subject, under its own session. The task
+// read folds it as final, as the gateway's fold does; anyone else's terminal
+// there is still dropped.
+func TestADispatcherTerminalFoldsAsFinal(t *testing.T) {
+	url, js := testBus(t)
+	b := dial(t, url)
+	const profile, taskID = "tse", "task-d"
+	publishSubmission(t, js, profile, taskID, "console:x", "q", "")
+	publishRun(t, js, profile, taskID, "", false)
+	terminal := func(from lib.Party) {
+		p := mustJSON(t, lib.StatusUpdate{TaskID: taskID, ContextID: "ctx-" + taskID,
+			Status: lib.TaskStatus{State: lib.StateFailed}, Final: true})
+		env, err := lib.NewStatusUpdateEnvelope(from, taskID, "ctx-"+taskID, "corr-"+taskID, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pub(t, js, lib.TaskSupervisorSubject(profile, taskID), env)
+	}
+	ref := TaskRef{Addressee: profile, TaskID: taskID}
+	terminal(lib.Party{Session: otherSession, AgentType: "a2a-dispatcher"})
+	task, err := b.ReadTask(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != lib.StateWorking || task.Final {
+		t.Fatalf("a terminal from %q was folded: state %s, final %v", otherSession, task.State, task.Final)
+	}
+	terminal(lib.Party{Session: lib.DispatcherSession, AgentType: "a2a-dispatcher"})
+	task, err = b.WaitForTask(context.Background(), ref, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.State != lib.StateFailed || !task.Final {
+		t.Errorf("the dispatcher's terminal was not folded: state %s, final %v", task.State, task.Final)
 	}
 }
 
@@ -674,6 +792,18 @@ func TestASlotWithNothingToReapGoesBackAtOnce(t *testing.T) {
 	}
 }
 
+// shortWaitRead is the whole wait the short-wait test gives WaitForTask on
+// a running task. The wait opens the task's consumer first, two JetStream
+// calls that took past the test's former 50 ms under the race detector on a
+// loaded runner, so the read failed before any fetch. The floor itself is
+// checked on a watch that is already open, with no time left, up to
+// floorFetchAttempts times: one floor's fetch on a loaded runner can end
+// before the server delivers, and without the floor no attempt reads at all.
+const (
+	shortWaitRead      = 2 * time.Second
+	floorFetchAttempts = 20
+)
+
 // A wait with less left than one fetch's floor still returns what it read,
 // not an error: the read's end is a deadline like any other.
 func TestAShortWaitKeepsWhatItRead(t *testing.T) {
@@ -681,9 +811,35 @@ func TestAShortWaitKeepsWhatItRead(t *testing.T) {
 	publishSubmission(t, js, fakeAddressee, "task-short", "console:x", "q", "")
 	publishStatus(t, js, fakeAddressee, "task-short", lib.StateWorking, false)
 	b := dial(t, url)
-	got, err := b.WaitForTask(context.Background(), TaskRef{Addressee: fakeAddressee, TaskID: "task-short"}, 50*time.Millisecond)
+	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-short"}
+
+	// The floor: with no time left at all, what is pending still arrives.
+	w, err := b.watchTask(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spent, cancel := context.WithDeadline(context.Background(), time.Now())
+	defer cancel()
+	<-spent.Done()
+	for i := 0; i < floorFetchAttempts && len(w.events) == 0; i++ {
+		if err := w.next(spent); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a fetch with no time left: %v", err)
+		}
+	}
+	folded, err := w.fold()
+	w.close()
+	if err != nil || len(w.events) == 0 {
+		t.Fatalf("%d fetches with no time left read %d events, fold err %v; want the pending ones",
+			floorFetchAttempts, len(w.events), err)
+	}
+	if folded.Final {
+		t.Error("the running task folded as final")
+	}
+
+	// The end of the wait: the running task as read, not an error.
+	got, err := b.WaitForTask(context.Background(), ref, shortWaitRead)
 	if err != nil || got == nil {
-		t.Fatalf("a 50ms wait on a running task: task %v, err %v", got, err)
+		t.Fatalf("a %s wait on a running task: task %v, err %v", shortWaitRead, got, err)
 	}
 	if got.Final {
 		t.Error("the running task folded as final")
@@ -797,7 +953,9 @@ func TestASecondMessageWaitsForTheRunningTurn(t *testing.T) {
 	}
 
 	go func() {
-		time.Sleep(time.Second)
+		if !pause(t, time.Second) {
+			return
+		}
 		publishResult(t, js, fakeAddressee, "task-root1", answerText)
 		publishStatus(t, js, fakeAddressee, "task-root1", lib.StateCompleted, true)
 	}()
@@ -949,6 +1107,18 @@ func TestATurnWhoseFirstEventIsLateIsWaitedOn(t *testing.T) {
 	}
 	mustContain(t, res.Content[0].Text, answerText)
 	mustNotContain(t, res.Content[0].Text, "no events yet")
+}
+
+// The gateway's acknowledgement can reach the server after the submission it
+// precedes (two connections, one of them unflushed); a turn whose notice trails
+// its submission still shows the notice.
+func TestANoticeThatTrailsTheSubmissionIsStillShown(t *testing.T) {
+	s, _, _, _ := turnServer(t, gatewayScenario{finish: true, lateNotice: noticeSettle / 4})
+	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "hi", "wait_seconds": 10})
+	if res.IsError {
+		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, "Working on it", fakeAddressee+"/task-root1", answerText)
 }
 
 // A turn whose task was read as nothing yet is still the conversation's

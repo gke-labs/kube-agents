@@ -33,15 +33,19 @@ from drifting apart.
 
 from __future__ import annotations
 
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+from devops_bench.tasks.schema import Task as DevopsBenchTask
 
-from kube_agents_bench import stop_hook
+from kube_agents_bench import pushed_report, scope_exclude, stop_hook
+from kube_agents_bench.lane import requested_pull_requests as _lane_requested_pull_requests
 
 __all__ = [
+    "CASE_KEYS",
     "HARNESS_WRITTEN_ENTRIES",
     "TRACE_GRADABLE_CHECK_TYPES",
     "TRANSPORT_BLIND_CHECK_TYPES",
@@ -50,6 +54,38 @@ __all__ = [
     "CaseSpecError",
     "load_case",
 ]
+
+# Every top-level key a task.yaml may carry, which is this grader's schema for
+# the top level: neither loader rejects a key it does not know -- devops-bench
+# and load_case read the keys they want and drop the rest -- so
+# hack/ci-eval-pr.sh reds a pull request's case carrying a key outside main's
+# copy of this set ("land the grader change first"), and tests/test_cases.py
+# holds every task in the tree to it. Two halves:
+#
+# - devops-bench's: its task model's fields, read off the installed model so a
+#   bump that adds one is allowed without an edit here (``folder`` is set by
+#   the loader from the directory, never written), plus the three aliases its
+#   loader maps onto them (``Task.from_dict``: ``task_id`` for ``id``,
+#   ``goal`` and ``input`` for ``prompt``), which the model cannot list.
+# - this repository's: what this package and the case tooling read --
+#   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
+#   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
+#   ``scope_exclude.py``), ``writes_alone`` (read by ``lane.py``) -- and ``task_version``, a
+#   case's own revision note that nothing reads. A new one is added here, in a
+#   pull request before any case a pull-request job grades uses it (the
+#   presubmit roster, or a lane list such as hack/eval/gitlab-cases.txt).
+_DEVOPS_BENCH_LOADER_FIELDS = frozenset({"folder"})
+_DEVOPS_BENCH_ALIASES = frozenset({"task_id", "goal", "input"})
+DEVOPS_BENCH_CASE_KEYS = (
+    frozenset(DevopsBenchTask.model_fields) - _DEVOPS_BENCH_LOADER_FIELDS
+) | _DEVOPS_BENCH_ALIASES
+REPOSITORY_CASE_KEYS = frozenset(
+    {
+        "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
+        "audit_streams", scope_exclude.KEY, "task_version", "writes_alone",
+    }
+)
+CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
 
 # A task that provisions nothing has no infra excuse for a missing record, so
 # the scorer refuses to classify its failures as INFRA. Matches the carve-out
@@ -87,10 +123,13 @@ TRACE_GRADABLE_CHECK_TYPES = frozenset({"tool_called"})
 # outputs, so it is blind the same way.
 WORKER_BLIND_CHECK_TYPES = frozenset({"worker_commands", "worker_agents", "worker_budget", "report_times_in_window"})
 TRANSPORT_BLIND_CHECK_TYPES = TRACE_GRADABLE_CHECK_TYPES | WORKER_BLIND_CHECK_TYPES
-# Entries the harness writes on the trajectory itself (``stop_hook.py``), not
-# calls read off the door's trace, so a lossy trace says nothing about them:
-# a ``tool_called`` leaf naming only these is graded on every record.
-HARNESS_WRITTEN_ENTRIES = frozenset({stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY})
+# Entries the harness writes on the trajectory itself (``stop_hook.py``,
+# ``pushed_report.py``), not calls read off the door's trace, so a lossy
+# trace says nothing about them: a ``tool_called`` leaf naming only these is
+# graded on every record.
+HARNESS_WRITTEN_ENTRIES = frozenset(
+    {stop_hook.STOP_ENTRY, stop_hook.CARDS_STOPPED_ENTRY, pushed_report.PLANT_ENTRY}
+)
 _TOOL_CALLED_NAMES_KEY = "tool_names"
 # ``tool_called``'s scope key and the one scope the door's trace serves
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
@@ -197,6 +236,17 @@ class CaseSpec:
     case that sets it, a non-empty reply stands in for the trajectory as the
     run evidence, beside the billed tokens and latency every case needs.
     Absent means False."""
+
+    requested_pull_requests: int = 0
+    """How many pull requests the case's own requesting checks ask for (leaves
+    of a type in ``lane.REQUESTING_CHECK_TYPES``). The infra carve-out in
+    ``scoring.classify_rep`` fires only when this is non-zero: an empty report
+    on an infra-ended rep mischarges a *requested* pull request as unrequested,
+    but on a case that requested none a write is a genuine forbidden action and
+    still blocks. A case that requests a pull request only through the lane
+    ``requesting:`` listing (its own checks ask for none) is not distinguished
+    here: the scorer is pinned to the ``bench/`` tree and cannot read the lane
+    file, so its infra-ended rep still blocks (tracked in #4778)."""
 
 
 def _leaves(node: Any) -> list[dict[str, Any]]:
@@ -321,6 +371,10 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     directory. Raises :class:`CaseSpecError` on anything the scorer cannot
     grade honestly — a missing file, a document that is not a mapping, or a
     declared id that disagrees with the directory.
+
+    The case's ``requested_pull_requests`` is the count of its own requesting
+    checks. A lane-only ``requesting:`` listing is not read here; see that
+    field's note.
     """
     path = Path(task_yaml)
     if not path.is_file():
@@ -388,7 +442,6 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     name = str(name_raw).strip() if name_raw is not None else case_id
 
     trace_blind, negated_trace_blind, worker_blind = _transport_blind_checks(spec)
-
     return CaseSpec(
         case_id=case_id,
         name=name,
@@ -402,4 +455,5 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         negated_trace_blind_checks=negated_trace_blind,
         worker_blind_checks=worker_blind,
         tool_calls_optional=tool_calls_optional,
+        requested_pull_requests=_lane_requested_pull_requests(spec),
     )

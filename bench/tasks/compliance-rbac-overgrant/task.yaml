@@ -1,10 +1,12 @@
-# PRESUBMIT-ACTIVE, HELD OUT — an entry in hack/eval/presubmit-cases.txt
-# without a blocking-roster.txt line since 2026-09-29 (#2013 step 2), the
-# documented exception to the blocking-only rule: it runs on every pull
-# request, cannot red one on rungs 4 or 6, and reds one on rungs 1-3 like
-# every case. A presubmit entry from 2026-08-25 to 2026-09-22, nightly
-# 2026-09-22 to 2026-09-29, and from 2026-08-26 THE AUDIT-MACHINERY CANARY:
-# the one full audit scenario the presubmit kept.
+# PRESUBMIT-ACTIVE, ON THE BLOCKING ROSTER since 2026-11-02 (#2013 step 4,
+# #4094): a graded failure of all three repetitions reds a pull request.
+# Held out in hack/eval/presubmit-cases.txt without a blocking-roster.txt
+# line from 2026-09-29 to 2026-11-02 (#2013 step 2, the documented exception
+# to the blocking-only rule: it ran on every pull request, could not red one
+# on rungs 4 or 6, and did red one on rungs 1-3 like every case). A
+# presubmit entry from 2026-08-25 to 2026-09-22, nightly 2026-09-22 to
+# 2026-09-29, and from 2026-08-26 THE AUDIT-MACHINERY CANARY: the one full
+# audit scenario the presubmit kept.
 # Demoted from the blocking roster on 2026-09-02 (#1171) and, when the
 # presubmit became the blocking roster only (#1023), moved to the nightly
 # with the other held-out cases (413/677 graded presubmit repetitions
@@ -18,7 +20,8 @@
 # 2092638061140643840, project kube-agents-evals-3), every exact check green.
 # The other audit domains are covered by snappy probes instead (a full audit
 # costs 600-1300s each, which six domains cannot spend in one presubmit); the
-# other full audits are recast to the nightly tier. This is why the task
+# other full audits are recast to the nightly tier (consistency's is back on
+# the roster since 2026-10-26, consistency-drift-outlier). This is why the task
 # carries the `fleet-audits` domain rather than `security`: what it uniquely
 # covers in presubmit is the machinery, while the planted over-grant itself is
 # probed by security-overgrant-probe. It was held by A1, A4 and A5
@@ -93,7 +96,8 @@
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
 # blocker A1, now closed. Eligible tier: presubmit; active there 2026-08-25
-# to 2026-09-22, nightly 2026-09-22 to 2026-09-29, presubmit held out since.
+# to 2026-09-22, nightly 2026-09-22 to 2026-09-29, presubmit held out
+# 2026-09-29 to 2026-11-02, on the blocking roster since.
 id: compliance-rbac-overgrant
 name: Security sweep finds the cluster-admin over-grant
 # The prompt no longer asks for a summary in the final answer: the SOP's

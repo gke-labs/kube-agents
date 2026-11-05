@@ -488,8 +488,16 @@ def read_limits(path: str) -> fq.PacingLimits:
     if not isinstance(raw, dict):
         sys.stderr.write(f"select: {path} is not a JSON object; using the default limits\n")
         return fq.PacingLimits()
-    # Through the parser the environment goes through, so a bad value here
-    # falls back to its default the same way.
+    return limits_from(raw)
+
+
+def limits_from(raw: dict) -> fq.PacingLimits:
+    """The limits a parsed limits file sets; the defaults for an empty one.
+
+    Through the parser the environment goes through, so a bad value here
+    falls back to its default the same way. The delivery stage reads the file
+    through this too, so it recomputes `select`'s choice under the same limits.
+    """
     return fq.pacing_limits({fq.PACING_ENV[name]: str(value) for name, value in raw.items() if name in fq.PACING_ENV})
 
 

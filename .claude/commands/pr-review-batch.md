@@ -518,12 +518,13 @@ an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in
 
 One thing the skill has no way to know about:
 
-- **Merge mechanics are part of this review.** Run `gh pr checks <N> --repo "$REPO"` and read the
-  `tide` status on the head commit, which states its reason outright. Do not read
-  `mergeStateStatus`: every open pull request in this repository reads `BLOCKED` or `DIRTY` and
-  none reads `CLEAN`, so it distinguishes nothing —
-  `docs/pull-request-workflow.md`, "How a change merges", says why. `DIRTY` is the one signal it
-  does carry, and it means the conflict you have probably already found.
+- **Merge mechanics are part of this review.** Run `gh pr checks <N> --repo "$REPO"`, then read
+  the `Smoke gate`, `Merge labels` and smoke statuses on the head commit, the labels, and whether
+  auto-merge is on. A gate shows on the head only when it is green.
+  `docs/pull-request-workflow.md`, "How a change merges", has the commands, says what each one
+  means, and links the queue page that lists the queued pull requests. Do not read `mergeStateStatus` as a verdict: open pull requests here commonly read
+  `BLOCKED`. `DIRTY` is the one signal it does carry, and it means the conflict you have probably
+  already found.
 
 The skill's step 6 does not apply: dispositions belong to the author, and you fix nothing here. Its
 "single confident first pass" constraint does, and it covers the saved file, the PR comment, and
@@ -540,8 +541,8 @@ the files already in that directory:
   read, so a narrowed pass that records only the SHA reads exactly like a full one and cancels it;
 - **Intent** — the one-sentence claim from Phase 2b, so the next reader knows what the findings were
   measured against;
-- **Verdict** — can this merge as is, yes or no, with the blocking items named, and what `tide`
-  says it is waiting for. When the PR conflicts with its base, say so here and state
+- **Verdict** — can this merge as is, yes or no, with the blocking items named, and what the merge
+  queue is waiting for: a gate, a label, or a required check. When the PR conflicts with its base, say so here and state
   that the review covers the PR as authored, not as merged. In `since` mode say that too: the
   verdict speaks for the commits you read, not for the pull request;
 - **Checks run** — commands executed and what they showed;
@@ -602,8 +603,8 @@ The rules that decide whether it lands:
 
 - `event` is `COMMENT`. Never `APPROVE`, never `REQUEST_CHANGES` — that is the human's signature,
   not yours.
-- **`/lgtm` is the same signature by another route, and here it is the merge itself.** Tide merges
-  on labels, and an `APPROVE` review sets `lgtm` — so does the bare command, from an account the
+- **`/lgtm` is the same signature by another route, and here it is the merge itself.** The merge
+  queue takes a pull request on labels, and an `APPROVE` review sets `lgtm` — so does the bare command, from an account the
   `OWNERS` files name under `reviewers` or `approvers` for one of the changed paths; Prow ignores
   collaborator status here (`owners.skip_collaborators`). `/approve` sets the other label. Neither
   goes out on my behalf unless I asked for it, and nor does `/hold`, which blocks somebody else's

@@ -77,6 +77,12 @@ func startPodClaimHarness(t *testing.T) *podClaimHarness {
 	if err != nil {
 		t.Fatalf("NewTokenValidator: %v", err)
 	}
+	// Every Validate here must reach the API server. The validator remembers
+	// a success for reviewCacheTTL, and the revocation test below validates
+	// the token once before the delete, so with the cache on its polling loop
+	// would be answered from memory for thirty seconds and the window it logs
+	// would be the cache's, not Kubernetes'.
+	v.cacheTTL = 0
 	return &podClaimHarness{k8s: admin, namespace: envtestNamespace, validator: v}
 }
 
@@ -330,7 +336,7 @@ func TestLiveASessionTokenWithNoPodBindingIsRefusedByTheRealCallout(t *testing.T
 	h := startLiveHarness(t)
 
 	unbound := h.mintToken(t, sessionSAName, busAudience)
-	nc, err := nats.Connect(h.nats.ClientURL(), h.tls, nats.Token(unbound), nats.Name("unbound-session"))
+	nc, err := nats.Connect(h.nats.ClientURL(), h.dial, nats.Token(unbound), nats.Name("unbound-session"))
 	if err == nil {
 		nc.Close()
 		t.Fatal("an unbound token for the session ServiceAccount authenticated to the bus")

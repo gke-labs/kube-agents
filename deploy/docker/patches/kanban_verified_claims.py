@@ -10,7 +10,7 @@ wired in by ``deploy/docker/patches/apply_kanban_verified_claims.py``:
 
 ``tools/kanban_tools.py``
     :func:`apply_completion_rules` runs each rule in :data:`RULES` before the
-    card closes. The first, :func:`verified_claims_rule`, checks
+    card closes. One, :func:`verified_claims_rule`, checks
     ``kanban_complete``'s new ``verified_claims`` parameter against that
     record, or against the claims the gate already accepted on the cards this
     card created. Another rule can read the record through
@@ -66,10 +66,11 @@ rewrites, so a ``kanban_complete`` call cannot put unchecked claims there.
 Other writers of a completed run's metadata (``hermes kanban edit`` or
 ``complete --metadata``, the dashboard) bypass the gate, and a parent reads
 what they wrote as accepted. They are also
-rendered as an evidence section at the end of ``result``, the text the notifier
+rendered as an evidence section below the text of ``result``, above any step
+line that ends it, the text the notifier
 posts to chat. The notifier keeps the head of ``result`` and clips it at
-``kanban_notifier.RESULT_LIMIT``: a body near that limit pushes the section out
-of the chat message, though the card still holds it.
+``kanban_notifier.RESULT_LIMIT``: a body near that limit pushes the step line,
+then the section, out of the chat message, though the card still holds them.
 
 Never wedging the card
 ----------------------
@@ -172,6 +173,10 @@ QUOTE_CHARS = 80
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 EVIDENCE_HEADING = "**Evidence for verified claims**"
+#: ``slack_moments.NEXT_STEP_LINE``: a line of its own reading ``[next: <label>]``,
+#: the one next step an answer declares, which Slack draws as a button only
+#: when it is the answer's last and only step line.
+NEXT_STEP_LINE = re.compile(r"\[next:[^\]\n]*\]", re.IGNORECASE)
 FENCE = "```"
 #: The other fence opener Markdown and the Slack renderers read.
 TILDE_FENCE = "~~~"
@@ -190,9 +195,9 @@ PARAM_DESCRIPTION = (
     f"failed. "
     "You may also repeat a verified claim from a card you created, with its "
     "command and excerpt as that card gave them. The tool checks each claim, "
-    "adds the exit code and the time the command ran, and appends the evidence "
-    "to ``result``. A claim that fails the check is refused, and is dropped on "
-    "the retry. Do not call anything verified in ``result`` unless it is listed "
+    "adds the exit code and the time the command ran, and adds the evidence to "
+    "``result`` below your text (a closing ``[next: ...]`` line stays last). A "
+    "claim that fails the check is refused, and is dropped on the retry. Do not call anything verified in ``result`` unless it is listed "
     "here."
 )
 
@@ -369,6 +374,14 @@ def _check_claim(calls: list, item: object, child_claims) -> tuple[dict | None, 
         return None, f"excerpt is longer than {MAX_EXCERPT_CHARS} characters; keep the lines that prove the claim"
     if any(fence in part for part in (claim, command, excerpt) for fence in (FENCE, TILDE_FENCE)):
         return None, f"holds a {FENCE} or {TILDE_FENCE} fence; cite lines without one"
+    # A step-shaped line inside the section would be a second step line in the
+    # answer, which the presenter reads as no step at all.
+    if any(
+        NEXT_STEP_LINE.fullmatch(line.strip())
+        for part in (claim, command, excerpt)
+        for line in part.split("\n")
+    ):
+        return None, "holds a `[next: ...]` line; cite the lines above it"
     wanted, needle = _collapse(command), _collapse(excerpt)
     accepted = {"claim": claim, "command": command, "excerpt": excerpt}
     runs = [call for call in calls if call["command"] == wanted]
@@ -397,7 +410,7 @@ def _check_claim(calls: list, item: object, child_claims) -> tuple[dict | None, 
 
 
 def render_evidence(claims: list) -> str:
-    """The section appended to ``result``: each claim, its command in one fence, its excerpt in the next.
+    """The section ``append_section`` adds to ``result``: each claim, its command in one fence, its excerpt in the next.
 
     Two fences keep a multi-line command apart from its output. No field can
     hold a fence of its own (:func:`_check_claim` refuses one), and the claim
@@ -409,6 +422,25 @@ def render_evidence(claims: list) -> str:
         failed = ", the command failed" if claim["exit_code"] not in (0, None) else ""
         parts.append(f"{claim['claim']} (exit {claim['exit_code']}{failed}, {claim['ran_at']}{where})")
         parts.append(f"{FENCE}\n$ {claim['command']}\n{FENCE}\n{FENCE}\n{claim['excerpt']}\n{FENCE}")
+    return "\n\n".join(parts)
+
+
+def append_section(result: object, section: str) -> str:
+    """``result`` with ``section`` below its text and above any step lines that end it.
+
+    The report-format stanza has a worker end its answer on ``[next: <label>]``,
+    and ``slack_moments.next_step`` and the bridge read that line only as the
+    last one, so a section added after it costs the user the button. The lines
+    taken off the end are the ones ``slack_moments.visible_text`` takes off: every
+    trailing step-shaped line, blank lines between them included.
+    """
+    lines = (str(result).rstrip() if result else "").split("\n")
+    end = len(lines)
+    while end and (not lines[end - 1].strip() or NEXT_STEP_LINE.fullmatch(lines[end - 1].strip())):
+        end -= 1
+    steps = [line for line in lines[end:] if line.strip()]
+    body = "\n".join(lines[:end]).rstrip()
+    parts = [part for part in (body, section, "\n".join(steps)) if part]
     return "\n\n".join(parts)
 
 
@@ -465,10 +497,7 @@ def verified_claims_rule(
         for claim in accepted
     ]
     metadata = {**(metadata or {}), METADATA_KEY: stored}
-    section = render_evidence(stored)
-    body = str(result).rstrip() if result else ""
-    result = f"{body}\n\n{section}" if body else section
-    return reasons, result, metadata
+    return reasons, append_section(result, render_evidence(stored)), metadata
 
 
 #: The rules :func:`apply_completion_rules` runs, in order. Each is called with

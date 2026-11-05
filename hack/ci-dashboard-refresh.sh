@@ -5,7 +5,7 @@
 # collect -> render -> publish for the live eval dashboard, INCREMENTALLY:
 # download the currently published data.json, hand it to collect.py's
 # --merge-with so the GCS scan only reads builds newer than the newest one on
-# record, then re-render and republish. A cold sweep is ~3 gsutil calls per
+# record, then re-render and republish. A cold sweep is ~3 gcloud storage calls per
 # archived build -- tens of minutes over two weeks of history -- so the
 # watermark is what makes a 15-minute cadence possible at all; only the first
 # armed run (no data.json published yet) pays a sweep, and even that one is
@@ -42,11 +42,22 @@
 #                              dormant. (Live: gs://kube-agents-dashboards/evals/)
 #   EVAL_DASHBOARD_PR_GLOB     Prow build-dir glob(s) for collect.py; default
 #                              below is the smoke-test presubmit's archive.
+#   EVAL_DASHBOARD_PR_GLOB_PREVIOUS  the archive the presubmit wrote before it
+#                              moved buckets, read alongside until its runs
+#                              leave the window; empty disables it
 #   EVAL_DASHBOARD_GITLAB_PR_GLOB  the GitLab lane's build-dir glob (tier
 #                              gitlab, its own watermark); empty disables it
+#   EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS  that lane's archive before the
+#                              move, read alongside; empty disables it
 #   EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX  the GitLab lane's nightly periodic's
 #                              log prefix (tier gitlab, no pull request, its
 #                              own watermark); empty disables it
+#   EVAL_DASHBOARD_LANE_PR_GLOBS  the other forge lanes' build-dir globs,
+#                              space-separated TIER=GLOB (collect.py
+#                              --lane-pr-glob); empty disables them
+#   EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES  the forge lanes' other nightlies,
+#                              space-separated TIER=PREFIX (collect.py
+#                              --lane-nightly-prefix); empty disables them
 #   EVAL_DASHBOARD_NIGHTLY_PREFIX  the nightly periodic's Prow log prefix,
 #                              collected beside the presubmit as tier
 #                              "nightly" (default below: the live job's).
@@ -143,12 +154,23 @@ trap cleanup EXIT
 # own; converting it to an exit is what preserves the log above.
 trap 'exit 143' TERM INT
 
-EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
-EVAL_DASHBOARD_GITLAB_PR_GLOB="${EVAL_DASHBOARD_GITLAB_PR_GLOB-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*}"
+EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
+# The archive the presubmit wrote before it moved buckets (2026-11); its last
+# runs there stay in the window for EVAL_DASHBOARD_SINCE_DAYS, so both
+# archives are read (collect.py keeps one watermark across them). Delete it
+# that many days after the move.
+EVAL_DASHBOARD_PR_GLOB_PREVIOUS="${EVAL_DASHBOARD_PR_GLOB_PREVIOUS-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
+EVAL_DASHBOARD_GITLAB_PR_GLOB="${EVAL_DASHBOARD_GITLAB_PR_GLOB-gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*}"
+EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS="${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab/*}"
 EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/}"
 EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX="${EVAL_DASHBOARD_NIGHTLY_WRITERS_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-writers/}"
 EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX="${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-main-b/}"
 EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX="${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly-gitlab/}"
+# The self-managed forge lanes (kube-agents#3682) with their weekly jobs,
+# and the GitLab lane's next-mode nightly, as .github/workflows/ci-health.yml
+# lists them.
+EVAL_DASHBOARD_LANE_PR_GLOBS="${EVAL_DASHBOARD_LANE_PR_GLOBS-ghes=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-ghes/* gitlab-ce=gs://kube-agents-evals-presubmit-logs/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test-gitlab-ce/*}"
+EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES="${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES-gitlab=gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly-gitlab-next/ ghes=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-ghes-next/ gitlab-ce=gs://kube-agents-prow/logs/ci-kube-agents-eval-weekly-gitlab-ce-next/}"
 # The release-candidate archive, which feeds the Brief's release-candidate table.
 # post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
 # rather than pr-logs/. Set to the empty string to leave the section on its
@@ -170,7 +192,7 @@ PRIOR="${WORK}/prior-data.json"
 PRIOR_SRC="${EVAL_DASHBOARD_TARGET%/}/data.json"
 case "${EVAL_DASHBOARD_TARGET}" in
   gs://*)
-    if ! gsutil cp "${PRIOR_SRC}" "${PRIOR}" >>"${REFRESH_LOG}" 2>&1; then
+    if ! gcloud storage cp "${PRIOR_SRC}" "${PRIOR}" >>"${REFRESH_LOG}" 2>&1; then
       rm -f "${PRIOR}"
       echo "no existing data.json at ${PRIOR_SRC} (first armed run, or a transient read failure): falling back to a fresh sweep bounded to ${EVAL_DASHBOARD_SINCE_DAYS} days"
     fi
@@ -198,9 +220,9 @@ HISTORY_PRIOR="${WORK}/health-history.jsonl"
 STORE_PRIOR="${WORK}/store.json"
 case "${EVAL_DASHBOARD_TARGET}" in
   gs://*)
-    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HEALTH_PRIOR}"
-    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HISTORY_PRIOR}"
-    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/store.json" "${STORE_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${STORE_PRIOR}"
+    gcloud storage cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HEALTH_PRIOR}"
+    gcloud storage cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HISTORY_PRIOR}"
+    gcloud storage cp "${EVAL_DASHBOARD_TARGET%/}/store.json" "${STORE_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${STORE_PRIOR}"
     ;;
   *)
     [ -f "${EVAL_DASHBOARD_TARGET%/}/health.json" ] && cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}"
@@ -210,9 +232,9 @@ case "${EVAL_DASHBOARD_TARGET}" in
 esac
 
 # ─── Steps 2-5: collect (incremental) -> floor -> render -> publish ─────────
-# One timeout over the whole pipeline so a hung gsutil cannot eat the job.
+# One timeout over the whole pipeline so a hung gcloud storage call cannot eat the job.
 # The budget must stay LARGER than the 300s collect.py grants each individual
-# gsutil call (same arithmetic as the hook); 900s covers the incremental path
+# gcloud storage call (same arithmetic as the hook); 900s covers the incremental path
 # with room, and EVAL_DASHBOARD_TIMEOUT raises it from the job config for the
 # first-run sweep if that ever needs it. No `timeout` binary (a laptop)
 # degrades to running unbounded.
@@ -220,11 +242,12 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..${14} are the child bash's own positionals, so
+# Single quotes on purpose: $1..${18} are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself. The nightly prefixes and the
-# GitLab glob ride only with the GCS source: the from-dir path is the offline one.
+# forge lanes' globs and prefixes ride only with the GCS source: the from-dir
+# path is the offline one.
 rc=0
 # shellcheck disable=SC2016
 ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
@@ -233,11 +256,18 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     src_args=(--from-dir "$6")
   else
     src_args=(--pr-glob "$4")
+    [ -n "${15}" ] && src_args+=(--pr-glob "${15}")
     [ -n "$8" ] && src_args+=(--nightly-prefix "$8")
     [ -n "${11}" ] && src_args+=(--nightly-writers-prefix "${11}")
     [ -n "${12}" ] && src_args+=(--gitlab-pr-glob "${12}")
+    [ -n "${16}" ] && src_args+=(--gitlab-pr-glob "${16}")
     [ -n "${13}" ] && src_args+=(--gitlab-nightly-prefix "${13}")
     [ -n "${14}" ] && src_args+=(--nightly-main-b-prefix "${14}")
+    # Split on blanks by read, which expands no glob in the values.
+    read -r -a lane_globs <<<"${17}"
+    for g in ${lane_globs[@]+"${lane_globs[@]}"}; do src_args+=(--lane-pr-glob "$g"); done
+    read -r -a lane_prefixes <<<"${18}"
+    for p in ${lane_prefixes[@]+"${lane_prefixes[@]}"}; do src_args+=(--lane-nightly-prefix "$p"); done
   fi
   # The RC source. ${10} is the offline one and wins outright; the bucket glob
   # in $9 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
@@ -276,6 +306,10 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   "${EVAL_DASHBOARD_GITLAB_PR_GLOB}" \
   "${EVAL_DASHBOARD_GITLAB_NIGHTLY_PREFIX}" \
   "${EVAL_DASHBOARD_NIGHTLY_MAIN_B_PREFIX}" \
+  "${EVAL_DASHBOARD_PR_GLOB_PREVIOUS}" \
+  "${EVAL_DASHBOARD_GITLAB_PR_GLOB_PREVIOUS}" \
+  "${EVAL_DASHBOARD_LANE_PR_GLOBS}" \
+  "${EVAL_DASHBOARD_LANE_NIGHTLY_PREFIXES}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

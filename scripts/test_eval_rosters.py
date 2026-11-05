@@ -13,7 +13,8 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) and the held-out seats a coverage tracker
 puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
-the documented exception: #2013; #2016's seat took its roster line 2026-10-14) and the
+the documented exception: #2016's seat took its roster line 2026-10-14 and
+#2013's on 2026-11-02, RESEATED_FROM_HELD_OUT) and the
 cases demoted since (DEMOTED_AFTER_THE_SPLIT) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
@@ -93,7 +94,7 @@ NIGHTLY_AT_SPLIT = [
     "obtainability-planted-pdb",
     "stockout-pinned-pool",
     "upgrade-readiness-lagging-cluster",
-    "consistency-drift-outlier",
+    "consistency-drift-outlier",  # promoted 2026-10-26 on its nightly record, consistency's roster seat after its probe's demotion (#3598)
     "obtainability-direct-query",
     "gpu-stress-test-diagnosis",
     "autoops-warning-event-triage",
@@ -114,6 +115,7 @@ ADDED_AFTER_THE_SPLIT = [
     "incident-triage-oom-event-probe",  # #1023's incident-triage second case, PR #1625; promoted 2026-09-22
     "ai-security-planted-model-audit",  # #1023's fleet-audits second case, PR #1103
     "autoops-crashloop-config-triage",  # #1023's other incident-triage second case, PR #1103
+    "autoops-missing-service-triage",  # gke-labs#3078: a triage worker reports a found cause, not a source hunt
     "consistency-no-environment-label",  # the drift collector's §4.14 check, with fleet_drift.py
     "gitops-drift-out-of-band-triage",  # the drift half of incident-triage, PR #1827
     "cluster-agent-delegation-profile-lookup",  # #1840's delegation route, PR #1917
@@ -239,6 +241,12 @@ ADMITTED_AFTER_THE_SPLIT = [
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
     # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the claude-opus-5-5 key of 10-19), the store at collecting.
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
+    # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the claude-opus-5-5 key of 10-19, 5/5 under spec.mode next), the store at collecting.
+    ("consistency-drift-outlier", "cost-idle-pool-probe"),
+    # 2026-11-02 (#2013 step 4, #4094): 36/36 on the twelve graded main nightlies 10-20 to 11-02, 15/15 at the gemini-4-argon next key (the store at collecting), 1068/1117 graded presubmit repetitions 10-27 to 11-02 with no all-reps collapse.
+    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),
+    # 2026-11-02 (#4095): 21/21 on the seven main-b nightlies 10-27 to 11-02, every one under spec.mode next (15/15 at the gemini-4-argon key of 10-29), the store at collecting.
+    ("monitoring-alert-policy-read", "incident-triage-oom-event-probe"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -248,6 +256,8 @@ PROMOTED_AFTER_THE_SPLIT = [
     ("incident-triage-oom-event-probe", "cluster-agent-healthy-workload-no-finding"),  # 2026-09-22 (#1023)
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat; again 2026-10-26, from the nightly file (#3120)
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),  # 2026-10-23, from the nightly file's frozen part
+    ("consistency-drift-outlier", "cost-idle-pool-probe"),  # 2026-10-26, from the nightly file's frozen part
+    ("monitoring-alert-policy-read", "incident-triage-oom-event-probe"),  # 2026-11-02 (#4095), from the nightly file's sorted section, which pins no history
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
@@ -261,7 +271,7 @@ HELD_OUT_TO_NIGHTLY = [
     "obtainability-fleet-exposure-sweep",  # #1049, never admitted
     "obtainability-healthy-namespace-silence",  # #1049, never admitted
     "rca-remediation-pr",  # demoted 2026-09-02, #1189
-    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171; seated back in the presubmit 2026-09-29 (HELD_OUT_IN_PRESUBMIT)
+    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171; seated back in the presubmit 2026-09-29, its roster line 2026-11-02 (RESEATED_FROM_HELD_OUT)
     "cluster-agent-healthy-workload-no-finding",  # held out on #1010
 ]
 
@@ -276,9 +286,23 @@ HELD_OUT_TO_NIGHTLY = [
 # roster-line step deletes the entry here and adds the name to
 # blocking-roster.txt. roster <= presubmit holds; presubmit == roster holds
 # less exactly this list.
-HELD_OUT_IN_PRESUBMIT = [
-    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),  # #2013 step 2, seated 2026-09-29 after agent-kanban-smoke; the roster line is step 4
+HELD_OUT_IN_PRESUBMIT: list[tuple[str, str]] = []
+# A held-out seat that took its roster line without ever leaving the
+# presubmit file, as (case, the presubmit line it follows): its line moved
+# up out of the held-out section and its name joined blocking-roster.txt in
+# one edit. It is in the presubmit and on the roster like a promoted case,
+# but it is pinned here rather than in PROMOTED_AFTER_THE_SPLIT because its
+# split-time presubmit line is also in HELD_OUT_TO_NIGHTLY, so the
+# presubmit expectation drops that line and re-inserts this one, and the
+# nightly expectation leaves it out. pdb-remediation-pr's seat could take
+# the PROMOTED_AFTER_THE_SPLIT route on 2026-10-14 because its split-time
+# line was not in HELD_OUT_TO_NIGHTLY. A later demotion of a case here is
+# the ordinary one: the entry stays, DEMOTED_AFTER_THE_SPLIT records it
+# with None, and the DEMOTED filter removes it from every expectation.
+RESEATED_FROM_HELD_OUT = [
+    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),  # #2013 step 2 seated it 2026-09-29; step 4, the roster line, 2026-11-02 (#4094)
 ]
+RESEATED = {case for case, _ in RESEATED_FROM_HELD_OUT}
 
 
 # Demoted after the split under docs/eval-gate-roster.md "Demoting a flaky
@@ -464,9 +488,13 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [
             c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
-            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED
+            if c not in HELD_OUT_TO_NIGHTLY
         ]
-        self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
+        # The DEMOTED filter runs last, after the reseated and held-out
+        # insertions, so a demotion of any of them is the ordinary edit.
+        self.assertEqual(
+            eval_rosters.presubmit_cases(),
+            [c for c in with_insertions(expected, RESEATED_FROM_HELD_OUT + HELD_OUT_IN_PRESUBMIT) if c not in DEMOTED])
 
     def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
         # Decided 2026-09-22 (#1023): a case that cannot red a pull request
@@ -490,12 +518,26 @@ class SplitLostNothingTest(unittest.TestCase):
                 # A seat for a case registered after the freeze came from the
                 # sorted section, which pins no history; its seat cites its record.
         for case in HELD_OUT_TO_NIGHTLY:
-            if case in seated:
+            if case in seated or case in RESEATED:
                 continue
             with self.subTest(case=case):
                 self.assertNotIn(case, eval_rosters.presubmit_cases())
                 self.assertNotIn(case, eval_rosters.blocking_roster())
                 self.assertIn(case, eval_rosters.nightly_cases())
+
+    def test_a_reseated_case_sits_after_its_line_and_is_pinned_once(self):
+        # A seat that took its roster line in place (RESEATED_FROM_HELD_OUT):
+        # its membership is held with the promoted cases below; what is new
+        # here is its place in the presubmit file and the cross-list pins.
+        for case, follows in RESEATED_FROM_HELD_OUT:
+            if case in DEMOTED:
+                continue  # demoted since; test_a_demoted_case_is_in_the_nightly_only holds it
+            with self.subTest(case=case):
+                presubmit = eval_rosters.presubmit_cases()
+                self.assertEqual(presubmit.index(case), presubmit.index(follows) + 1)
+                self.assertIn(case, HELD_OUT_TO_NIGHTLY, "a reseated case is one that left for the nightly on 2026-09-22 and came back held out")
+                self.assertNotIn(case, {c for c, _ in HELD_OUT_IN_PRESUBMIT})
+                self.assertIn(case, {c for c, _ in ADMITTED_AFTER_THE_SPLIT})
 
     def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
         self.assertEqual(
@@ -519,7 +561,7 @@ class SplitLostNothingTest(unittest.TestCase):
             [
                 c
                 for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                if c not in seated and c not in PARKED_AFTER_THE_MOVE
+                if c not in seated and c not in RESEATED and c not in PARKED_AFTER_THE_MOVE
             ],
             DEMOTED_AFTER_THE_SPLIT,
         )
@@ -548,7 +590,7 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertNotIn(case, eval_rosters.blocking_roster())
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
-        for case, _ in PROMOTED_AFTER_THE_SPLIT:
+        for case, _ in PROMOTED_AFTER_THE_SPLIT + RESEATED_FROM_HELD_OUT:
             if case in DEMOTED:
                 continue  # demoted since its promotion; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):
@@ -607,6 +649,30 @@ def positive_check_types(node, negations: int = 0) -> set:
             found |= positive_check_types(item, negations)
         return found
     return set()
+
+
+class GHESLaneTest(unittest.TestCase):
+    """hack/eval/ghes-cases.txt: what the GHES lane runs (kube-agents#3684),
+    under the GitLab lane's rules: registered cases that grade the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.ghes_cases(), self.PINNED)
+
+    def test_every_lane_case_is_registered_and_grades_the_forge(self):
+        import yaml
+
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
+        for case in eval_rosters.ghes_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge")
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GHES_CASES_FILE.read_text(encoding="utf-8")), [])
 
 
 class GitLabLaneTest(unittest.TestCase):
@@ -727,7 +793,9 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 # inject door can carry. An edit to the file edits this set.
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
+    "chat-stop-mid-turn-files-no-card",  # #3263: the same, while the opening turn runs
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
+    "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
 ]
 
 
@@ -774,6 +842,24 @@ class ApiLaneExclusionsTest(unittest.TestCase):
                 with self.subTest(case=case):
                     self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
+    def test_every_registered_reply_under_pushed_report_is_excluded(self):
+        # The same rule for the pushed-report replay: it errors on the api
+        # transport, and its directive is read from the harness's module.
+        import yaml
+
+        sys.path.insert(0, str(REPO_ROOT / "bench"))
+        from kube_agents_bench.pushed_report import is_reply_under_pushed_report
+
+        excluded = eval_rosters.api_lane_exclusions()
+        found = []
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if is_reply_under_pushed_report(str(doc.get("prompt") or "")):
+                found.append(case)
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} replays a pushed report but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+        self.assertIn("chat-reply-under-pushed-report", found)
+
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
 # one entry every case on the lane carries beside its own. An edit to the
@@ -784,7 +870,7 @@ INJECT_LANE_SAFEGUARDS = [
 ]
 # The registered cases whose checks request a pull request, at the
 # safeguard's introduction: what hack/ci-eval-pr.sh runs in the fan-out's
-# second phase on the inject lane, after every other unit has finished. A
+# second phase on both lanes, after every other unit has finished. A
 # new requesting case edits this set in the same pull request; the check
 # types that count are lane.REQUESTING_CHECK_TYPES.
 INJECT_LANE_REQUESTING = [
@@ -808,6 +894,10 @@ INJECT_LANE_REQUESTING = [
     # the change as a pull request; its objective's pull_request_opened leaf
     # allows one.
     "scale-request-proposes-pr",
+    # stop-on-permission-refusal: refused or declined the kubectl scale the
+    # user asked for, it may propose the change as a pull request (#4224);
+    # its objective's pull_request_opened leaf allows one.
+    "stop-on-permission-refusal",
     "vcs-review-feedback-read-back",
     # Also listed in `requesting:`, for the pull request it opens and closes
     # beside the one its check grades.
@@ -829,12 +919,11 @@ def _leaf_types(node) -> list[str]:
 
 class InjectLaneSafeguardsTest(unittest.TestCase):
     """hack/eval/inject-lane-safeguards.yaml: the entries hack/ci-eval-pr.sh
-    appends to every case it runs on the inject lane (#2079).
+    appends to every case it runs, on the api and inject lanes alike (#2079,
+    #2611).
 
-    A lane-level list rather than fifty per-case edits, for the reason the
-    exclusions are: a per-case entry would change what the api lane grades.
-    What has to hold: the file is the pinned set; every entry is a
-    none-wrapped `github_writes` safeguard at catastrophic severity (a leaf
+    A lane-level list rather than fifty per-case edits. What has to hold:
+    the file is the pinned set; every entry is a none-wrapped `github_writes` safeguard at catastrophic severity (a leaf
     that PASSES on a write, so `none` is what makes it a safeguard); no
     registered case declares an entry of the same name, since devops-bench
     refuses a duplicate name as a parse error on every repetition of that
@@ -1226,29 +1315,41 @@ class PresubmitWallTimeTest(unittest.TestCase):
         self.assertEqual([int(n) for n in out], [hints.get(c, default) for c in cases])
 
     def test_the_text_read_of_a_stopped_ask_agrees_with_stop_hook(self):
-        """A stopped ask runs in the serial phase too (unit_phase reads
-        STOPPED_ASK_CASES); hold the stdlib read to stop_hook's on every
-        registered case, and price one in phase two."""
+        """A stopped ask and a writes_alone case run in the serial phase too
+        (unit_phase reads STOPPED_ASK_CASES); hold the stdlib reads to
+        stop_hook's and lane.runs_alone on every registered case, and price
+        one of each in phase two."""
         import yaml
         from unittest import mock
 
         sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench import stop_hook
+        from kube_agents_bench import lane, stop_hook
 
         self.assertEqual(eval_rosters.STOP_DIRECTIVE, stop_hook.STOP_DIRECTIVE)
+        self.assertEqual(eval_rosters.MID_TURN_DIRECTIVE, stop_hook.MID_TURN_DIRECTIVE)
         stopped = []
+        alone = []
         for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
             with self.subTest(case=case):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
                 self.assertEqual(eval_rosters.is_stopped_ask(case), stop_hook.is_stopped_ask(str(doc.get("prompt") or "")))
+                self.assertEqual(eval_rosters.runs_alone(case), lane.runs_alone(doc))
                 if eval_rosters.is_stopped_ask(case):
                     stopped.append(case)
+                if eval_rosters.declares_writes_alone(case):
+                    alone.append(case)
         self.assertTrue(stopped, "no registered stopped ask left to price")
         base = eval_rosters.presubmit_wall_estimate()
         with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + stopped[:1]):
             grown = eval_rosters.presubmit_wall_estimate()
         self.assertEqual(grown["phase one"], base["phase one"])
         self.assertIn(stopped[0], grown["requesting"])
+        # A writes_alone case is priced in phase two the same way.
+        self.assertTrue(alone, "no registered writes_alone case left to price")
+        with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + alone[:1]):
+            grown = eval_rosters.presubmit_wall_estimate()
+        self.assertEqual(grown["phase one"], base["phase one"])
+        self.assertIn(alone[0], grown["requesting"])
 
     def test_a_requesting_case_adds_its_serial_chain_and_settles(self):
         from unittest import mock

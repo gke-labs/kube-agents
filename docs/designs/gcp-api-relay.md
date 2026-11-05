@@ -18,7 +18,8 @@ already has, with the same caller authentication, refusal shape and audit line a
 
 The first table entries are the Monitoring `timeSeries` and `metricDescriptors` reads and the
 Managed Prometheus query endpoints; the Cloud Trace `traces` list and single-trace get followed,
-for the observability skill's trace helpers. A collector's one-function change is to obtain its
+for the observability skill's trace helpers, and then the GKE `projects.locations.clusters` list and
+get, for the Cluster Agent reconcile (#3703), with their answers projected. A collector's one-function change is to obtain its
 `requests`-shaped session from the broker client (`credential_proxy_client.ApiSession`)
 instead of from `google.auth`.
 
@@ -114,7 +115,10 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    forwarded byte-for-byte (`strip_credential_query_keys` splits on `&` and rejoins rather
    than parsing and re-encoding); the filter grammar is Google's to validate.
 5. Forwards with a connect timeout and a total deadline, reads at most the response cap, and
-   returns the upstream status code, `Content-Type` and body unchanged. What the broker
+   returns the upstream status code, `Content-Type` and body unchanged, except on a route
+   that carries a projection (the two GKE cluster reads below): its 2xx body is cut down to
+   the fields the route names, and a 2xx body the projection cannot read is a 502
+   `UPSTREAM_UNEXPECTED` rather than relayed. What the broker
    answers on its own account, each with a `code` the caller can branch on:
 
    | Condition                                                                         | Status | `code`                         |
@@ -126,6 +130,7 @@ it saw must be what is forwarded; the query check is also what keeps a byte`http
    | `API_RELAY_DEADLINE_S` passed after the connect                                   | 504    | `UPSTREAM_TIMEOUT`             |
    | The broker could not obtain its own credential                                    | 503    | `RELAY_CREDENTIAL_UNAVAILABLE` |
    | No relay armed on the handler (only a test reaches this)                          | 503    | `API_RELAY_DISABLED`           |
+   | A projected route's 2xx body the projection cannot read                           | 502    | `UPSTREAM_UNEXPECTED`          |
 
    The over-cap remedy is a smaller `pageSize`, which every listed endpoint supports; the
    message says so.
@@ -180,6 +185,7 @@ class ApiRoute:
     method: str          # API_READ_METHOD, "GET", in this version
     path: re.Pattern     # anchored at both ends, fullmatched against the whole path
     rule_id: str         # what the audit line and the 403 name
+    project: Callable[[bytes], bytes | None] | None = None  # 2xx body -> what is relayed
 
 # One entry, as an example of the shape; the table is in api_policy.py.
 ApiRoute("monitoring.googleapis.com", API_READ_METHOD,
@@ -190,7 +196,10 @@ ApiRoute("monitoring.googleapis.com", API_READ_METHOD,
 `API_READ_ROUTES` in that file is the table and the only place it is written down; today it
 holds the Monitoring `timeSeries` and `metricDescriptors` lists, the Managed Prometheus
 `query`, `query_range`, `series` and `labels` reads, and the Cloud Trace `traces` list and
-`traces/<id>` get (the id held to 32 lower-case hex characters), each with a comment saying
+`traces/<id>` get (the id held to 32 lower-case hex characters), and the GKE
+`projects.locations.clusters` list and get the Cluster Agent reconcile reads (#3703; location
+`-` or a region or zone, cluster name in GKE's grammar, both answers projected to each
+cluster's `name`, `location`, `status` and `id`, so `masterAuth` is never relayed), each with a comment saying
 which consumer needs it. `REFUSED_HOSTS` beside it names the hosts whose responses are credentials
 or that turn a read into a write elsewhere — the token, STS, OAuth, IAM, Secret Manager, KMS
 and metadata endpoints — and is checked before the table and never overridable by it; the
@@ -273,15 +282,16 @@ class ApiSession:
     """A requests-shaped session whose GETs to a Google API go through the broker."""
 
     def __init__(self, endpoint: str | None = None, http=None) -> None:
-        ...  # endpoint defaults to CREDENTIAL_PROXY_URL; http to a lazily imported requests.Session()
+        ...  # endpoint defaults to the exec tier's URL, else CREDENTIAL_PROXY_URL; http to a lazily imported requests.Session()
 
     def get(self, url: str, *, params=None, timeout=None):
-        return self._http.get(self.relay_url(url), params=params,
-                              headers=authorization_headers(), timeout=timeout)
+        ...  # self._http.get(self.relay_url(url), params=params, headers=authorization_headers(), timeout=timeout), with the exec tier's fallback
 ```
 
-`relay_url` rewrites `https://<host>/<path>?<query>` onto
-`{CREDENTIAL_PROXY_URL}/v1/gcp/<host>/<path>?<query>`. `requests` is imported inside the
+`relay_url` rewrites `https://<host>/<path>?<query>` onto `{broker}/v1/gcp/<host>/<path>?<query>`,
+where the broker is the exec tier when `CREDENTIAL_PROXY_EXEC_URL` is set and well-formed, else
+`CREDENTIAL_PROXY_URL` ([credential-broker-exec-tier.md](credential-broker-exec-tier.md) §3.2
+has the routing and the fallback). `requests` is imported inside the
 constructor and nowhere at module scope, so the broker and every other importer of the module
 stay free of it; `http` is injectable for tests and for a caller that already holds a session.
 
@@ -310,12 +320,15 @@ records it as its `limitations` string for a cluster gives the model something i
 
 ## Security review
 
-**What the model's code gains.** `GET` on the path shapes the table names, on two hosts,
-executed with the platform service account: metric data from Monitoring and Managed
-Prometheus, and every trace and span from Cloud Trace that the account can read. A
+**What the model's code gains.** `GET` on the path shapes the table names, executed with the
+platform service account: metric data from Monitoring and Managed Prometheus, every trace and
+span from Cloud Trace that the account can read, and each GKE cluster's name, location, status
+and id. The two GKE routes return only those four fields: the projection drops the rest of the
+cluster object, `masterAuth` included, and an answer it cannot read is a 502, not the raw body. A
 prompt-injected turn can read any project's metrics and traces that the account can read. It
 could already read the same clusters' objects through proxied `kubectl` and the same projects'
-resources through proxied `gcloud`; this adds Monitoring metric data and Trace to that set. The
+resources through proxied `gcloud`; this adds Monitoring metric data and Trace to that set, and
+the GKE fields above, which proxied `gcloud` already returns. The
 Trace-console writes `roles/cloudtrace.user` carries (analysis-report tasks, trace scopes) are
 not in it: the method check refuses everything but `GET` before the host is read.
 
@@ -376,7 +389,9 @@ standing in for `monitoring.googleapis.com` and the real `GoogleApiRelay.fetch` 
 
 - A permitted `GET` reaches the fake upstream with exactly `Host`, `Authorization` and `Accept`, the caller's `Authorization` replaced by the broker's, the stripped query keys absent and every other pair byte-for-byte — including `match[]=up` and `up[5m]` on the Prometheus routes and a bare `[b]`, with the brackets sent raw.
 - The upstream's status, `Content-Type` and body come back unchanged, including a 403, a 429,
-  a 404 and a front-end 414 with `Connection: close` from upstream, a body with no
+  a 404 (the sandbox's `ApiSession` hands these back as they are, and re-sends only a reply
+  whose top-level `code` is the broker's own busy or resource-pressure code: the exec-tier
+  design, §4.3) and a front-end 414 with `Connection: close` from upstream, a body with no
   `Content-Type`, a close-delimited response, and an HTTP/1.0 response without a
   `Content-Length` read to EOF.
 - A caller with the `chat` role gets `CALLER_ROLE_FORBIDDEN` before an `api` line is written;
@@ -452,10 +467,11 @@ tests above, and the route's mention in the documents that enumerate the broker'
 site's `reference/security-and-iam.md` and `reference/credential-isolation.md`,
 `docs/credential-isolation-design.md`, `docs/security-requirements.md` and the role table
 paragraph of `agent-shell-sandboxing.md`. Any script in the sandbox can read the Monitoring,
-Managed Prometheus and Trace reads the table names through it.
+Managed Prometheus, Trace and GKE cluster reads the table names through it.
 
 The first consumer is `agents/platform/skills/fleet-audit/scripts/fleet_waste.py`, the cost audit's collector
-(`fleet_health.py`, the chat-only fleet health sweep, reads the Managed Prometheus `query` route the same way),
+(`fleet_health.py`, the chat-only fleet health sweep, reads the Managed Prometheus `query` route the same way,
+and `gke_cluster_reads.py` makes the Cluster Agent reconcile's GKE list and get reads),
 and the contract it follows binds any later one: a collector that needs Monitoring history obtains its `requests`-shaped session from
 `ApiSession()` instead of from `google.auth`, keeps its URL literals as the real endpoints,
 and treats a relay 403 — whose body names the `gcp.api.*` rule — as that cluster's

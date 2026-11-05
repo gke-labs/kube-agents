@@ -22,6 +22,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,7 +110,7 @@ func letTheGatewayThrough(t *testing.T, ctx context.Context, cl client.Client, r
 // is there before asserting anything else about it.
 func theCalloutIsServing(t *testing.T, ctx context.Context, cl client.Client, r *PlatformAgentReconciler, agent *agentv1alpha1.PlatformAgent) {
 	t.Helper()
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render the A2A stack so the callout exists to report on: %v", err)
 	}
 	reportCalloutServing(t, ctx, cl, agent)
@@ -749,7 +750,7 @@ func TestTheReadyWriterCountsAConsoleOnlyGateway(t *testing.T) {
 	if !busProvisioned(stored) {
 		t.Error("the completion was not recorded on the Ready path")
 	}
-	state, err := r.reconcileA2A(ctx, stored)
+	state, err := r.reconcileA2A(ctx, stored, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -782,7 +783,7 @@ func TestAFailedJobPassClearsTheLegacyCondition(t *testing.T) {
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	// The Job's creation waits on the callout, so it is the pass after the
 	// callout reports that creates it. The gateway is created on this pass.
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	jobs := &batchv1.JobList{}
@@ -921,7 +922,7 @@ func TestAHeldProvisionJobReadsProvisioningNamingTheCallout(t *testing.T) {
 	if err := cl.Status().Update(ctx, gw); err != nil {
 		t.Fatal(err)
 	}
-	state, err := r.reconcileA2A(ctx, stored)
+	state, err := r.reconcileA2A(ctx, stored, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -965,7 +966,7 @@ func TestARunningGatewayReadsTheSecretOncePerPass(t *testing.T) {
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
@@ -979,7 +980,7 @@ func TestARunningGatewayReadsTheSecretOncePerPass(t *testing.T) {
 	secretReads = 0
 	const passes = 3
 	for i := 0; i < passes; i++ {
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatalf("reconcileA2A %d with the gateway running: %v", i+1, err)
 		}
 	}
@@ -1016,7 +1017,7 @@ func TestARunningDoorGatewayPaysNoSecretRead(t *testing.T) {
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	const passes = 3
 	for i := 0; i < passes; i++ {
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatalf("reconcileA2A %d: %v", i+1, err)
 		}
 	}
@@ -1040,7 +1041,7 @@ func TestAGatewayIsRenderedWithoutAChatBackend(t *testing.T) {
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 
-	state, err := r.reconcileA2A(ctx, agent)
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
@@ -1065,7 +1066,7 @@ func TestTheInjectDoorRendersTheGatewayWithoutASecret(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
@@ -1083,7 +1084,7 @@ func TestTheA2ADoorRendersTheGatewayWithoutASecret(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
@@ -1109,7 +1110,7 @@ func TestTheA2ADoorFlagOffRemovesTheDoorWithoutABackend(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("precondition: the door-only gateway renders: %v", err)
 	}
 	gw := &appsv1.Deployment{}
@@ -1126,7 +1127,7 @@ func TestTheA2ADoorFlagOffRemovesTheDoorWithoutABackend(t *testing.T) {
 	}
 
 	t.Setenv(a2aAgentDoorEnvVar, "")
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A with the flag off and no gateway: %v", err)
 	}
 	if err := cl.Get(ctx, key, &appsv1.Deployment{}); err != nil {
@@ -1136,6 +1137,92 @@ func TestTheA2ADoorFlagOffRemovesTheDoorWithoutABackend(t *testing.T) {
 		if err := cl.Get(ctx, doorKey, obj); !errors.IsNotFound(err) {
 			t.Errorf("%T %s survived the flag going off (err=%v)", obj, doorKey.Name, err)
 		}
+	}
+}
+
+// TestAnUnownedObjectUnderADoorNameIsSkippedWithTheFlagOff (#3871): with a
+// door's flag off its removal runs on every next reconcile, and an object
+// under the door's name, in any of its four kinds, that this PlatformAgent
+// does not own is somebody else's: a copy made by hand, or the previous CR's
+// while the garbage collector runs after a delete and re-create. The pass
+// skips it and completes, so the status write behind reconcileA2A is
+// reached, and the object is left as found. The flag-on refusal
+// (ensureA2AInjectTokenSecret, ensureA2ADoorTokenSecret) is unchanged;
+// TestA2AInjectTokenIsNotAdoptedFromAnUnownedSecret pins the inject half.
+func TestAnUnownedObjectUnderADoorNameIsSkippedWithTheFlagOff(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+
+	var planted []client.Object
+	for _, name := range []string{a2aInjectName(agent), a2aDoorName(agent)} {
+		for _, obj := range a2aDoorRenderedKinds() {
+			obj.SetName(name)
+			obj.SetNamespace(agent.Namespace)
+			if err := cl.Create(ctx, obj); err != nil {
+				t.Fatalf("plant an unowned %T %s: %v", obj, name, err)
+			}
+			planted = append(planted, obj)
+		}
+	}
+
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+	if err != nil {
+		t.Fatalf("an unowned object under a door's reserved name stopped the reconcile: %v", err)
+	}
+	// The removals run after the gateway apply on an unheld pass; a pass
+	// that ended before them would leave the objects alone for the wrong
+	// reason.
+	if state.gatewayHeld {
+		t.Fatalf("the pass was held, so the removals this test is about did not run")
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
+		t.Fatalf("the gateway was not applied, so the pass did not reach the removals: %v", err)
+	}
+	for _, obj := range planted {
+		got := obj.DeepCopyObject().(client.Object)
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(obj), got); err != nil {
+			t.Errorf("the unowned %T %s is gone: %v", obj, obj.GetName(), err)
+			continue
+		}
+		if refs := got.GetOwnerReferences(); len(refs) != 0 {
+			t.Errorf("the unowned %T %s was adopted: owner references %+v", obj, obj.GetName(), refs)
+		}
+	}
+}
+
+// TestAnUnownedGatewayFenceIsSkippedOnAHeldPass (#3871): the held pass
+// removes the gateway's own fence on every reconcile until the callout
+// serves, and a NetworkPolicy under that name that this PlatformAgent does
+// not own (the previous CR's, after a delete and re-create) must not stop
+// it. The pass completes, still held, and the policy is left as found.
+func TestAnUnownedGatewayFenceIsSkippedOnAHeldPass(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	t.Setenv(a2aAgentDoorEnvVar, "")
+	agent := a2aTestAgent()
+	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
+	ctx := context.Background()
+	key := types.NamespacedName{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}
+	if err := cl.Create(ctx, &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: key.Name, Namespace: key.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+	if err != nil {
+		t.Fatalf("an unowned gateway fence stopped the held pass: %v", err)
+	}
+	if !state.gatewayHeld {
+		t.Fatalf("the pass was not held, so the fence removal this test is about did not run")
+	}
+	got := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(ctx, key, got); err != nil {
+		t.Fatalf("the unowned fence is gone: %v", err)
+	}
+	if refs := got.GetOwnerReferences(); len(refs) != 0 {
+		t.Errorf("the unowned fence was adopted: owner references %+v", refs)
 	}
 }
 
@@ -1149,7 +1236,7 @@ func TestAnExistingGatewayStaysUpWithoutABackend(t *testing.T) {
 	r, cl, _ := a2aGateTestReconciler(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	key := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
@@ -1161,7 +1248,7 @@ func TestAnExistingGatewayStaysUpWithoutABackend(t *testing.T) {
 	if err := cl.Delete(ctx, discordBotSecret(agent)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A after the Secret went away: %v", err)
 	}
 	got := &appsv1.Deployment{}
@@ -1185,7 +1272,7 @@ func TestChatUnderNextRendersTheGatewayWithoutASecret(t *testing.T) {
 	r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
-	if _, err := r.reconcileA2A(ctx, agent); err != nil {
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("reconcileA2A: %v", err)
 	}
 	if err := cl.Get(ctx, types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}, &appsv1.Deployment{}); err != nil {
@@ -1218,7 +1305,7 @@ func TestAChatInstallPaysNoSecretRead(t *testing.T) {
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	for i := 0; i < 2; i++ {
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatalf("reconcileA2A %d: %v", i+1, err)
 		}
 	}

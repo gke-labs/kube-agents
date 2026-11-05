@@ -1,6 +1,6 @@
 # Recorded GitLab API responses, one file per collaboration verb
 
-The same contract `test_providers_contract.py` holds every forge to, and the same file shape as `../github/README.md` describes: `payload` is the request the broker receives, and `responses` are the API answers in the order the forge asks for them. `{"__status__": N}` is a recorded refusal.
+The same contract `test_providers_contract.py` holds every forge to, and the same file shape as `../github/README.md` describes: `payload` is the request the broker receives, and `responses` are the API answers in the order the forge asks for them. `{"__status__": N}` is a recorded refusal. `{"__headers__": {...}, "__body__": ...}` is an answer whose headers the forge reads: `proposal-list-by-author.json` and `proposal-tally.json` count in `X-Total`, recorded under its lower-case name as the transport hands it over.
 
 `config.json` is what this forge is built from for the contract. GitLab is configured per host and builds nothing from an empty configuration, so it ships the entry the registry would hand `for_config`: gitlab.com, a token path, and an explicit empty `allowed_paths`: the whole host, which GitLab is only given when asked for.
 

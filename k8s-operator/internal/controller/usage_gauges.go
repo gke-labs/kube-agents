@@ -39,6 +39,19 @@ const (
 	// The two cluster gauges' field names, which share one pruning record.
 	usageExportClustersRegistered = "clustersRegistered"
 	usageExportClustersMonitored  = "clustersMonitored"
+	// The six broker proposal readings' field names (usageReadingSpecs), which
+	// share one pruning record (usageNewerFieldReadings); the two people
+	// readings below share another.
+	usageExportRemediationsMerged         = "remediationsMergedTotal"
+	usageExportRemediationsOpen           = "remediationsOpen"
+	usageExportProposalsAuthored          = "proposalsAuthored"
+	usageExportRemediationsClosedUnmerged = "remediationsClosedUnmergedTotal"
+	usageExportProposalHumanTouches       = "proposalHumanTouches"
+	usageExportProposalsMergedUntouched   = "proposalsMergedUntouched"
+	// The two people readings' field names, which share one pruning record
+	// (usageNewerFieldPeople).
+	usageExportPeopleSeen7d  = "peopleSeen7d"
+	usageExportPeopleSeen30d = "peopleSeen30d"
 	// usageCreatedTimeField is the one time sample that is not status.usage's:
 	// the CR's creation timestamp, so a rule can read an install's age before
 	// anyone has spoken to it. Published beside the phase, outside every hold.
@@ -61,7 +74,8 @@ var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, degraded
 type usageExportField struct {
 	name string
 	read func(*agentv1alpha1.AgentUsageStatus) (int64, bool)
-	// pointer marks a cluster gauge, whose presence at 0 is a reading.
+	// pointer marks a cluster gauge, a proposal reading or a people reading,
+	// whose presence at 0 is a reading.
 	pointer bool
 }
 
@@ -87,20 +101,26 @@ func usageGaugeField(name string, get func(*agentv1alpha1.AgentUsageStatus) *int
 // struct.
 var usageExportFields = []usageExportField{
 	{name: "sessionsTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.SessionsTotal })},
+	{name: "chatSessionsTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ChatSessionsTotal })},
 	{name: "eventsIngestedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.EventsIngestedTotal })},
 	{name: "toolExecutionsTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ToolExecutionsTotal })},
 	{name: "remediationsProposedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsProposedTotal })},
-	{name: "remediationsAppliedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsAppliedTotal })},
-	{name: "remediationsMergedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsMergedTotal })},
 	{name: "chatMessagesInboundTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ChatMessagesInboundTotal })},
 	{name: "toolExecutionsBlockedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ToolExecutionsBlockedTotal })},
 	{name: "brokerFailuresTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.BrokerFailuresTotal })},
 	{name: "chatTurnsErroredTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.ChatTurnsErroredTotal })},
 	{name: "backgroundTasksGaveUpTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.BackgroundTasksGaveUpTotal })},
 	{name: "negativeFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.NegativeFeedbackTotal })},
-	{name: "remediationsClosedUnmergedTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.RemediationsClosedUnmergedTotal })},
 	usageGaugeField(usageExportClustersRegistered, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersRegistered }),
 	usageGaugeField(usageExportClustersMonitored, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ClustersMonitored }),
+	usageGaugeField(usageExportRemediationsMerged, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsMergedTotal }),
+	usageGaugeField(usageExportRemediationsOpen, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsOpen }),
+	usageGaugeField(usageExportProposalsAuthored, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsAuthored }),
+	usageGaugeField(usageExportRemediationsClosedUnmerged, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.RemediationsClosedUnmergedTotal }),
+	usageGaugeField(usageExportProposalHumanTouches, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalHumanTouches }),
+	usageGaugeField(usageExportProposalsMergedUntouched, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.ProposalsMergedUntouched }),
+	usageGaugeField(usageExportPeopleSeen7d, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.PeopleSeen7d }),
+	usageGaugeField(usageExportPeopleSeen30d, func(u *agentv1alpha1.AgentUsageStatus) *int64 { return u.PeopleSeen30d }),
 }
 
 type usageExportTimeField struct {
@@ -223,11 +243,20 @@ func usageExportFieldSet(extra []string) map[string]bool {
 }
 
 // usageExportFieldsOfRecord maps one of the poller's per-field pruning records
-// to the exported fields it covers: the cluster gauges share one record, and
-// every other record is named for its field.
+// to the exported fields it covers: the cluster gauges share one record, the
+// six proposal readings another, the two people readings a third, and every
+// other record is named for its field.
 func usageExportFieldsOfRecord(record string) []string {
-	if record == usageNewerFieldGauges {
+	switch record {
+	case usageNewerFieldGauges:
 		return []string{usageExportClustersRegistered, usageExportClustersMonitored}
+	case usageNewerFieldReadings:
+		return []string{
+			usageExportRemediationsMerged, usageExportRemediationsOpen, usageExportProposalsAuthored,
+			usageExportRemediationsClosedUnmerged, usageExportProposalHumanTouches, usageExportProposalsMergedUntouched,
+		}
+	case usageNewerFieldPeople:
+		return []string{usageExportPeopleSeen7d, usageExportPeopleSeen30d}
 	}
 	return []string{record}
 }

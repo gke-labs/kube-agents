@@ -53,14 +53,23 @@ contract; this page does not restate it.
 **Check:** `make bench-case-check` locally, `scripts/test_task_registration.py` in CI. The CI
 lint asserts that the validator returned nothing at all, so every rule in it gates.
 
+A pull request's eval jobs grade its cases with `main`'s `bench/`, so a new check type, case key
+or fleet role lands before any case those jobs run uses it, including a nightly case on a lane list
+such as `hack/eval/gitlab-cases.txt` ([`testing-strategy.md`](../docs/designs/testing-strategy.md#pinning-and-baselines)).
+
 What review holds a case to beyond the validator: the objective names a thing the fixture
 planted, and a run that did not do the work cannot reach it; the safeguard names the thing
 the case must not do; and the stack is the cheapest one that plants the defect. A case with
-its own `deployer: tofu` stack costs every pull request a multi-minute provision on top of
-the agent run, which is why the two tofu-provisioned incumbents were moved to the nightly
+its own `deployer: tofu` stack costs every pull request the stack's apply and destroy on top of
+the agent run, minutes for a cluster, which is why the two tofu-provisioned incumbents were moved to the nightly
 tier ([#1218](https://github.com/gke-labs/kube-agents/pull/1218)). Prefer a seeded-fleet
 fixture from `bench/tf/fleet/fixtures.json` or `deployer: noop`; a case that needs its own
-stack says in the pull request why neither would do, and stays in the nightly.
+stack says in the pull request why neither would do, and stays in the nightly. A stack of
+seconds is the exception the roster has taken once: `monitoring-alert-policy-read` plants
+one alert policy (about 2 s to apply, 1 s to destroy), contends with no other presubmit case
+for the infra lock, and took its seat on its record on 2026-11-02 with that cost named
+([`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md), "The five rules a seat meets",
+rule (e)).
 
 ## Fixture sanitization
 

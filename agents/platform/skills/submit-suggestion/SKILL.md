@@ -1,6 +1,6 @@
 ---
 name: submit-suggestion
-description: Propose declarative configuration updates securely by committing file changes and submitting pull requests (merge requests on GitLab) for SRE review, including a request to delete a resource, which its "Deleting a resource" section answers with a pull request that removes the declaring manifest, or a stated stop when the repository does not declare it. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
+description: Open a pull request (a merge request on GitLab) when the request asked for one, committing declarative configuration changes for SRE review; not for a request to "propose a manifest", which is answered in the reply. Covers a request to delete a resource, which its "Deleting a resource" section answers with a pull request that removes the declaring manifest, or a stated stop when the repository does not declare it. Not for fleet-audit finding fixes — the fleet-audit skill opens and tracks those PRs itself.
 ---
 
 # submit-suggestion - Secure GitOps Pull Request Orchestrator
@@ -216,6 +216,12 @@ or optional hardening into the same pull request, and never touch unrelated
 manifests or infrastructure definitions.
 
 Generate or edit the files **inside the returned `workspace`**.
+
+When modifying an existing Kubernetes object, edit the file that declares it in place. When
+creating a new Kubernetes object (such as a `PodDisruptionBudget` for a `Deployment` or a
+`NetworkPolicy` for a `Namespace`), write it to a new, standalone file in that same directory.
+Never append a new object to an existing manifest file. If that directory uses Kustomize, add the
+new filename to `resources:` in `kustomization.yaml` in the same pull request.
 
 `git` here holds no credential and cannot reach a forge; it works on the
 working copy and nothing else, and `submit` is what sends the result.

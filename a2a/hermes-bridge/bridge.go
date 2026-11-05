@@ -429,6 +429,19 @@ type Bridge struct {
 	// part the last chunk carries: the kube-agents.chat/v1 DataPart (chat.go)
 	// for a turn, or the cardStop result part (cardstop.go) for a control.
 	resultPublish func(ctx context.Context, run *taskRun, output string, chat []byte) error
+	// chatPart folds a completed task's answer into the chat message its
+	// result carries, resultChatPart by default; a field so a test can see
+	// when the fold returns against the publish window finalizeResult opens
+	// after it, without an answer whose fold is slow enough to time.
+	chatPart func(answer string) (lib.Part, bool)
+	// responseCap bounds the API executor's answer read, apiResponseCap by
+	// default; a field so a test can put an answer exactly at the cap
+	// without reading, folding and publishing 8 MiB under the race detector.
+	responseCap int
+	// afterDeadline arms the CLI executor's task deadline, time.AfterFunc by
+	// default; a field so a test can hold the kill until the stub has done
+	// what the test needs done before the deadline.
+	afterDeadline func(d time.Duration, f func()) *time.Timer
 
 	// apiClient is the API executor's HTTP client (api.go).
 	apiClient *http.Client
@@ -448,6 +461,10 @@ type Bridge struct {
 	// lib.Client.TasksGetOpened; nil means the client's. Tests set it to
 	// drive the retry without a bus fault.
 	tasksGet func(ctx context.Context, addressee, taskID string) (*lib.Task, bool, error)
+	// stopping ends when Run begins its shutdown, so a turn stop already in
+	// flight (turnstop.go) does not hold the shutdown up; nil reads as never.
+	stopping     context.Context
+	stopStopping context.CancelFunc
 }
 
 // New connects and sweeps but does not consume yet; Run does.
@@ -475,10 +492,14 @@ func New(ctx context.Context, cfg Config) (*Bridge, error) {
 		apiClient:   newAPIClient(),
 		routeClient: newAPIClient(),
 	}
+	b.stopping, b.stopStopping = context.WithCancel(context.Background())
 	b.lookAhead = b.cancelInStream
 	b.holdReplaySlot = func(release func()) { time.AfterFunc(lib.EphemeralConsumerInactiveThreshold, release) }
 	b.deliver = b.handle
 	b.resultPublish = b.publishResult
+	b.chatPart = resultChatPart
+	b.responseCap = apiResponseCap
+	b.afterDeadline = time.AfterFunc
 	b.publishTurn = func(ctx context.Context, run *taskRun, artifactID, text string) error {
 		return b.publishTextArtifact(ctx, run, artifactID, lib.ArtifactTurn, text)
 	}
@@ -596,6 +617,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 	b.mu.Lock()
 	b.closing.Store(true)
 	b.mu.Unlock()
+	b.stopStopping()
 	sub.Stop()
 	// The queue is never closed: Stop does not join an in-flight handler
 	// callback, and a handler mid-accept sending into a closed channel would
@@ -1506,7 +1528,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	}
 	run.mu.Unlock()
 
-	deadline := time.AfterFunc(b.cfg.TaskDeadline, func() {
+	deadline := b.afterDeadline(b.cfg.TaskDeadline, func() {
 		run.deadlineHit.Store(true)
 		run.mu.Lock()
 		if run.state == stateRunning && run.proc != nil && run.proc.Process != nil {
@@ -1780,17 +1802,23 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	// complete and nothing of it can follow the final event.
 	b.drainActivity(run)
 	run.state = stateDone
-	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	// The answer folded for a chat renderer, on a completed task only: any
+	// other state's result is a copy beside the terminal's reason. A
+	// caller's own data part (finalizeData) takes its place. Folded before
+	// the publish window opens: the fold is CPU only, and scanning an answer
+	// at the read cap under load would otherwise spend the window the
+	// result and terminal publishes need.
+	var chat []byte
 	if resultOutput != nil {
-		// The answer folded for a chat renderer, on a completed task only:
-		// any other state's result is a copy beside the terminal's reason.
-		// A caller's own data part (finalizeData) takes its place.
-		chat := data
+		chat = data
 		if chat == nil && state == lib.StateCompleted {
-			if part, ok := resultChatPart(*resultOutput); ok {
+			if part, ok := b.chatPart(*resultOutput); ok {
 				chat = part.Data
 			}
 		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
+	if resultOutput != nil {
 		// The chat message is read from the answer as the agent wrote it; the text a
 		// person sees carries no step line (visibleText).
 		if err := b.resultPublish(ctx, run, visibleOr(*resultOutput), chat); err != nil && copyOnly {

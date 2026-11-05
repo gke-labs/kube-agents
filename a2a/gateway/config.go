@@ -47,10 +47,39 @@ const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
 // route posts to; the operator renders it from slack.homeChannel.
 const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
 
+// The learned-home contract (slack_home_channel.go): the operator renders the
+// policy from slack.homeChannelPolicy, the record ConfigMap's name, the
+// gateway's own image for the record's writer and reader keys, and the one
+// switch that arms the learn, which only an operator that also admits the
+// record renders.
+const (
+	envSlackHomePolicy    = "A2A_SLACK_HOME_POLICY"
+	envHomeChannelRecord  = "A2A_HOME_CHANNEL_RECORD"
+	envSelfImage          = "A2A_SELF_IMAGE"
+	envHomeChannelLearn   = "A2A_HOME_CHANNEL_LEARN"
+	slackHomePolicyManual = "manual"
+	envTrue               = "true"
+)
+
+// The election (election.go): the Lease the gateway campaigns for, and its
+// identity there, the pod's own name. The operator renders both together.
+// With no Lease the gateway runs unelected at term 0, as it did before the
+// election, which is what every install runs until the operator renders
+// the Lease and its Role.
+const (
+	envGatewayLease = "A2A_GATEWAY_LEASE"
+	envPodName      = "POD_NAME"
+)
+
 // envSlackAnswerFeedback turns answer feedback off when "false"
 // (feedback.go); the operator renders it only from
 // slack.answerFeedback=false.
 const envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+
+// envPeopleSeen turns the people bucket's records off when "false"
+// (people.go); the operator renders it only from
+// spec.telemetry.peopleSeen=false.
+const envPeopleSeen = "A2A_PEOPLE_SEEN"
 
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
@@ -179,10 +208,27 @@ type Config struct {
 	// the one place a Slack chat.notify home post may land (notify.go). Empty
 	// leaves the route serving conversation requests only.
 	SlackHomeChannel string
+	// SlackHomePolicy is slack.homeChannelPolicy as the operator renders it:
+	// "manual" keeps the home channel the CR's alone; anything else is auto.
+	SlackHomePolicy string
+	// HomeChannelRecord names the ConfigMap a learned home channel is
+	// recorded in, and SelfImage the gateway's own image reference, which it
+	// stamps into that record. HomeChannelLearn is the switch that arms the
+	// learn at all (HomeLearnArmed).
+	HomeChannelRecord string
+	SelfImage         string
+	HomeChannelLearn  bool
+	// GatewayLease names the Lease this gateway campaigns for (Elected), and
+	// PodName is its identity there. Empty runs the gateway unelected.
+	GatewayLease string
+	PodName      string
 	// AnswerFeedbackOff is the install's slack.answerFeedback=false: no
 	// rating controls are drawn and nothing is kept, whatever the feedback
 	// bucket holds.
 	AnswerFeedbackOff bool
+	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
+	// gateway records no one it sees in the people bucket.
+	PeopleSeenOff bool
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -610,6 +656,19 @@ func (c *Config) Backend() string {
 // InjectArmed reports whether the side door is open.
 func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 
+// HomeLearnArmed reports whether the gateway may learn the Slack home channel
+// from the first admitted channel mention and record it: the backend is
+// Slack, the CR names no home channel (a set one is the CR's, malformed or
+// not), the policy is auto, a record is named, and the operator has armed the
+// learn. Every gate holds, or nothing is read, written or posted.
+func (c *Config) HomeLearnArmed() bool {
+	return c.Backend() == slackBackend && c.SlackHomeChannel == "" &&
+		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
+}
+
+// Elected reports whether this gateway runs under the election (election.go).
+func (c *Config) Elected() bool { return c.GatewayLease != "" }
+
 // A2ADoorArmed reports whether the A2A door is open.
 func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 
@@ -648,7 +707,19 @@ func FromEnv() (*Config, error) {
 	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
 	cfg.GchatHomeChannel = strings.TrimSpace(os.Getenv(envGchatHomeChannel))
 	cfg.SlackHomeChannel = strings.TrimSpace(os.Getenv(envSlackHomeChannel))
+	cfg.SlackHomePolicy = strings.TrimSpace(os.Getenv(envSlackHomePolicy))
+	cfg.HomeChannelRecord = strings.TrimSpace(os.Getenv(envHomeChannelRecord))
+	cfg.SelfImage = strings.TrimSpace(os.Getenv(envSelfImage))
+	cfg.HomeChannelLearn = os.Getenv(envHomeChannelLearn) == envTrue
+	cfg.GatewayLease = strings.TrimSpace(os.Getenv(envGatewayLease))
+	cfg.PodName = strings.TrimSpace(os.Getenv(envPodName))
+	if cfg.GatewayLease != "" && cfg.PodName == "" {
+		// The pod name is the election's identity; without it every replica
+		// would campaign as the same holder.
+		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
+	}
 	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false)
+	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for

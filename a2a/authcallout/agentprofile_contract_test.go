@@ -2,6 +2,7 @@ package authcallout
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -28,7 +29,7 @@ const (
 	agentClosedFixturePath = "testdata/rendered-agent-closed.json"
 
 	renderedOperatorSA = "system:serviceaccount:kubeagents-operator:kubeagents-controller-manager"
-	renderedAuditorSA  = "system:serviceaccount:kubeagents-system:agentprofile-auditor"
+	renderedAuditorSA  = "system:serviceaccount:kubeagents-system-profiles:agentprofile-auditor-read"
 
 	tokenRenderedOperator = "token-for-the-operator-serviceaccount-padded-to-a-realistic-len"
 	tokenRenderedAuditor  = "token-for-the-rendered-auditor-profile-sa-bound-to-pod-padding"
@@ -56,7 +57,7 @@ func TestTheOperatorsProfilesMapParses(t *testing.T) {
 	}
 	want := map[string]string{
 		"provision": "", "session": NarrowingPod, "agent": "", "verifier": "",
-		"operator": "", "profile-auditor": NarrowingProfile, "profile-cluster-a": NarrowingProfile,
+		"operator": "", "profile-auditor-read": NarrowingProfile, "profile-cluster-a-read": NarrowingProfile,
 	}
 	for _, id := range m.Identities {
 		narrowing, ok := want[id.User]
@@ -141,15 +142,27 @@ func TestTheRenderedOperatorReachesTheDirectoryAndNothingElse(t *testing.T) {
 		}
 	}
 
-	// And the profile pod from the same render: its own events, never the
-	// directory.
+	// And the profile pod from the same render: its own events and its own
+	// tier's dispatch replies, never the directory or another pod's or
+	// tier's dispatch subjects.
 	pod, podViolations := h.connectAs(t, renderedAuditorPod, tokenRenderedAuditor)
 	checkPublish(t, pod, podViolations, map[string]bool{
-		lib.TaskEventsSubject(cardProfile, "t"): false,
-		"a2a.agents." + cardProfile:             true,
-		"a2a.topics.agent.auditor.findings":     false,
-		"a2a.topics.shared.annotations":         true,
+		lib.TaskEventsSubject(cardProfile, "t"):                                                    false,
+		lib.DispatchAcceptSubject(cardProfile, "read", renderedAuditorPod):                         false,
+		lib.DispatchLeaseSubject(cardProfile, "read", renderedAuditorPod):                          false,
+		lib.DispatchLeaseSubject(cardProfile, "unattended", renderedAuditorPod):                    true,
+		lib.DispatchLeaseSubject(cardProfile, "read", "auditor-task-8-other"):                      true,
+		lib.ProfileLeaseSubject(lib.ProfileLeaseKey(cardProfile, "read", renderedAuditorPod, "t")): true,
+		"a2a.agents." + cardProfile:                                                                true,
+		"a2a.topics.agent.auditor.findings":                                                        false,
+		"a2a.topics.shared.annotations":                                                            true,
 	})
+	if subscribeRefused(t, pod, podViolations, lib.DispatchSubject(cardProfile, "read", renderedAuditorPod)) {
+		t.Error("the rendered read-tier pod can't take work sent to it")
+	}
+	if !subscribeRefused(t, pod, podViolations, lib.DispatchSubject(cardProfile, "unattended", renderedAuditorPod)) {
+		t.Error("the rendered read-tier pod may take unattended-tier work")
+	}
 }
 
 // The card and tombstone the operator renders are envelopes this library
@@ -176,5 +189,41 @@ func TestTheOperatorsCardFixturesAreDirectoryEnvelopes(t *testing.T) {
 		if err := lib.CheckSubjectAgreement("a2a.agents.someone-else", env, lib.AgreementPolicy{}); err == nil || !strings.Contains(err.Error(), "profile") {
 			t.Errorf("%s agrees with another profile's directory subject: %v", path, err)
 		}
+	}
+}
+
+// The operator's card decodes into lib.AgentCard with its routing fields:
+// the operator module can't import lib, so this is what holds the two sets
+// of JSON names equal. A field renamed on either side decodes as empty here.
+func TestTheOperatorsCardCarriesTheRoutingFieldsLibReads(t *testing.T) {
+	raw, err := os.ReadFile(agentCardFixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := lib.ParseEnvelope(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var card lib.AgentCard
+	if err := json.Unmarshal(env.Payload, &card); err != nil {
+		t.Fatal(err)
+	}
+	if card.Name != cardProfile || card.Description == "" {
+		t.Errorf("name/description = %q/%q", card.Name, card.Description)
+	}
+	if len(card.Tiers) != 1 || card.Tiers[0] != "read" {
+		t.Errorf("tiers = %v, want [read]", card.Tiers)
+	}
+	want := []lib.ProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
+	if len(card.Parameters) != len(want) {
+		t.Fatalf("parameters = %+v, want %+v", card.Parameters, want)
+	}
+	for i := range want {
+		if card.Parameters[i] != want[i] {
+			t.Errorf("parameter %d = %+v, want %+v", i, card.Parameters[i], want[i])
+		}
+	}
+	if card.ClusterRef != nil {
+		t.Errorf("an unpinned profile's card has clusterRef %+v", card.ClusterRef)
 	}
 }

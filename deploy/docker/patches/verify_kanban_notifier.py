@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 FAILURES: list[str] = []
 
@@ -145,6 +146,11 @@ check(
 check(
     "the notifier resolved the delivery import",
     hasattr(notifier, "_kanban_handoff_with_result"),
+    "the trailer import did not execute",
+)
+check(
+    "the notifier resolved the wake-handoff delivery import",
+    hasattr(notifier, "_kanban_wake_handoff_with_result"),
     "the trailer import did not execute",
 )
 check(
@@ -277,6 +283,70 @@ check(
     "Cataloged all 9" not in notifier._kanban_handoff_with_result(
         "\nCataloged all 9 cron jobs.", _ClippedTask()
     ),
+)
+check(
+    "the wake handoff is promoted on no-send paths by the patch",
+    "wake_handoff = _kanban_wake_handoff_with_result(wake_handoff, handoff, n)"
+    in NOTIFIER_SOURCE,
+    "without this hook, api_server and delivery_mode='wake' drop task.result "
+    "whenever a worker also supplies a summary",
+)
+check(
+    "a push notification with send_passive=True keeps the short wake handoff",
+    notifier._kanban_wake_handoff_with_result(
+        "Cataloged all 9 cron jobs.",
+        no_summary_tail,
+        type("_PushN", (), {"send_passive": True, "wake_agent": True, "is_push_adapter": True})(),
+    )
+    == "Cataloged all 9 cron jobs.",
+)
+check(
+    "a non-push notification promotes the full report into wake_handoff",
+    "60. cron-job-60"
+    in (
+        notifier._kanban_wake_handoff_with_result(
+            "Cataloged all 9 cron jobs.",
+            no_summary_tail,
+            type("_ApiN", (), {"send_passive": True, "wake_agent": True, "is_push_adapter": False})(),
+        )
+        or ""
+    ),
+)
+check(
+    "a wake-only subscription promotes the full report into wake_handoff",
+    "60. cron-job-60"
+    in (
+        notifier._kanban_wake_handoff_with_result(
+            "Cataloged all 9 cron jobs.",
+            no_summary_tail,
+            type("_WakeOnlyN", (), {"send_passive": False, "wake_agent": True, "is_push_adapter": True})(),
+        )
+        or ""
+    ),
+)
+_fmt_ev = SimpleNamespace(payload={"summary": "Cataloged all 9 cron jobs."})
+_fmt_push_card = SimpleNamespace(
+    head="[kage-management] Kanban t_1",
+    title="cron-catalog",
+    task=_ClippedTask(),
+    platform_str="slack",
+    send_passive=True,
+    wake_agent=True,
+    is_push_adapter=True,
+)
+_fmt_api_card = SimpleNamespace(
+    head="[kage-management] Kanban t_1",
+    title="cron-catalog",
+    task=_ClippedTask(),
+    platform_str="api_server",
+    send_passive=True,
+    wake_agent=True,
+    is_push_adapter=False,
+)
+check(
+    "patched _fmt_completed keeps wake_handoff[1] short on push adapters and promotes task.result on api_server",
+    notifier._fmt_completed(_fmt_ev, _fmt_push_card)[1] == "Cataloged all 9 cron jobs."
+    and "60. cron-job-60" in (notifier._fmt_completed(_fmt_ev, _fmt_api_card)[1] or ""),
 )
 
 # --- 4. The whitelist still covers every kind the notifier knows about --------

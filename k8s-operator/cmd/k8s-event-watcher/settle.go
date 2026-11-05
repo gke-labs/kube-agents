@@ -27,8 +27,8 @@ const (
 	// them cleared, never a forward.
 	defaultSettleEntries = 4096
 	// settleOutcomeForwarded and settleOutcomeSelfResolved are the two
-	// readings of k8s_event_watcher_settle_outcomes_total: a held key that
-	// was sighted again past the period and forwarded, and one that was never
+	// readings of k8s_event_watcher_settle_outcomes_total: a held key whose
+	// family was sighted again past the period and forwarded, and one that was never
 	// sighted again inside the period plus the slack.
 	settleOutcomeForwarded    = "forwarded"
 	settleOutcomeSelfResolved = "self_resolved"

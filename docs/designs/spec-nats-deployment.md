@@ -45,12 +45,13 @@ window, not the delivery lifecycle. Concretely:
 
 Streams bind to the payload spec's subjects and topic classes:
 
-| Stream           | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| :--------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
-| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Stream            | Subjects             | Retention                                                        | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| :---------------- | :------------------- | :--------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKS`           | `a2a.tasks.>`        | Age window W (72h dev default), `max_msgs_per_subject: 4096`, R3 | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
+| `PROFILE_SUBMITS` | `a2a.submit.>`       | 72h, `max_msgs_per_subject: 1`, 1GiB (amended 10/28, #4121)      | The AgentProfile submissions. One durable per (profile, tier, kind), made only by the operator and read only by the dispatcher, which holds each submission for its task's life. No other principal holds a consumer verb here; the console holds direct get by subject, to show a profile task's prompt. `max_consumers` is the durables' allowance (64).                                                                                                               |
+| `DIRECTORY`       | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3                                    | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `TOPICS-STATE`    | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3                      | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `TOPICS-JOURNAL`  | journal-class topics | `max_age: 30d`, R3                                               |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
@@ -191,7 +192,7 @@ Job, which reaches the CR as `Degraded`/`A2AProvisionFailed`.
 
 W is TBD - see Open questions. It is not just a cost knob; see the audit section.
 
-Four KV buckets ride the same JetStream deployment:
+Six KV buckets ride the same JetStream deployment:
 
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
@@ -224,8 +225,8 @@ Four KV buckets ride the same JetStream deployment:
   asserted of one. 09 §3 owns the entry shape; the permissions are asserted in
   `a2a/authcallout` against the config the operator renders.
 - `feedback` - the 👍 and 👎 ratings chat users gave the gateway's answers, each with the
-  exchange it rated: user content that can hold cluster data. The one bucket with a max
-  age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
+  exchange it rated: user content that can hold cluster data. One of the two buckets with a
+  max age (`--ttl=720h`), which is its retention, and capped at 64MiB, which 👍 and 👎 share:
   past it a new rating is refused until older ones expire. The gateway's user is
   the only reader and writer of its records by grant, with the registry's four verbs on
   `KV_feedback`; provision and seed hold STREAM.INFO on it, which can list its keys (task
@@ -233,6 +234,25 @@ Four KV buckets ride the same JetStream deployment:
   and the session-state deliver-subject residue above applies to `$KV.feedback.>` the
   same way. The gateway keeps nothing in a bucket without a max age. The chatops gateway
   design owns what a record holds ("Answer feedback").
+- `people` - one hashed key and a last-put time per chat person the gateway has seen. The
+  other bucket with a max age (`--ttl=720h`), which is its retention: NATS deletes a person
+  30 days after their last turn. Capped at 32MiB, about a hundred thousand entries: past it
+  a put is refused and the count under-counts. The gateway's user is the only reader and
+  writer of its records by grant, with the registry's four verbs on `KV_people`; provision
+  and seed hold STREAM.INFO on it, which can list its keys (the hashed key alone), and the
+  session-state deliver-subject residue above applies to `$KV.people.>` the same way. The
+  gateway counts nobody in a bucket without a max age. The
+  [human interaction readings design](human-interaction-readings.md) owns what a record holds
+  ("People").
+- `PROFILE_LEASES` - each AgentProfile task's liveness lease, keyed
+  `<profile>.<tier>.<pod>.<task>` (#3655). The dispatcher is its only writer, by grant.
+  Workers renew by publishing on their own `a2a.dispatch.<profile>.<tier>.<pod>.lease`
+  subject and hold nothing on the bucket, because a put on a KV bucket can carry
+  `Nats-Rollup: all`, which purges every key, so any worker with a put grant could wipe
+  every lease. No max age: the dispatcher reads expiry from each record, so a restarted
+  dispatcher can still read every lease it has to re-adopt or fail. Provision and seed
+  hold CREATE and INFO on it for the info-then-add guard. The dispatcher design owns
+  what a record holds (`lib.LeaseRecord`).
 
 ## Accounts and connection-time authorization
 
@@ -253,7 +273,10 @@ short-lived, kubelet-rotated) and returns the account and the permission set.
 Revocation is the issuer's problem for the credential, and the issuer has solved it: a
 projected token is bound to its pod, so the API server stops authenticating it once the
 pod object is gone - measured at about ten seconds behind the delete, which is the
-TokenReview success cache rather than the token's hour. That governs the NEXT connection
+TokenReview success cache rather than the token's hour. The callout adds a cache of its
+own in front of that, thirty seconds on a successful review and nothing on a failure, so
+a deleted pod's token can open a new connection for up to about forty seconds after the
+delete. That governs the NEXT connection
 and only the next one. An ALREADY-OPEN connection is not revoked by anything above: the
 callout is consulted once, at CONNECT, and the server holds the grants it issued in a
 signed user JWT until that JWT expires - the callout's grant TTL, an hour less jitter.
@@ -269,7 +292,14 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 `worker` retired; amended 9/9, the verifier added): the render now carries the
 `auth_callout` block, and a principal authenticates one of two ways. **Through the
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
-every spawned session pod, the platform agent container, and the capability verifier. **Statically**, from `nats.conf` and listed in `auth_users`:
+every spawned session pod, the platform agent container, the capability verifier, and
+(amended 10/28, #3655) the AgentProfile dispatcher, when the operator has its image
+(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end).
+The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
+profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
+running across the reconnect. With a dispatcher the
+operator principal also creates and deletes those durables, and it is the only principal
+with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
 gateway, purely as sequencing, since it has a ServiceAccount and its client program
 lands separately from this render; `web` and `console`, because a browser never can;
@@ -325,28 +355,37 @@ Layout:
   radius container. Stage 1 exercises exactly one; the multi-scope split (and any
   cross-account exports) is designed but deliberately unexercised until a second scope
   exists.
-- **One user per agent identity** inside the account. Permissions are exact subject
-  lists, deny by default: publish only to the subjects its role emits on, subscribe only
-  to its own addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the
-  shared topics it is granted. That is an upper bound, not the shape every principal has:
-  a pull-only principal may hold no task-subject subscribe at all, which is what the
-  session grants do. The addressee token in the task subjects (payload spec
-  0.4) is what makes these grants expressible - executor-granularity at connect time,
-  with per-task scoping still the parked tightening (9/9): the authority work landed
-  the capability envelope, which scopes the task's AUTHORITY per task without narrowing
-  the subject grants, and narrowing those remains separate and unstarted. **Amended
-  10/1:** "deny by default" holds per side, and only while that side has entries in
-  it. An empty allow list is nats-server's spelling of _unrestricted_, not of
-  _nothing_ (`buildPermissionsFromJwt` builds a side's permission object only when
-  that side's allow or deny list is non-empty, and the two sides are independent), so
-  a rendered entry that lost its publish list would grant the whole subject space on
-  that side while its subscribes stayed narrow. Neither side of a non-narrowed entry
-  may therefore be empty: in the callout identity map the operator refuses such a
-  render and the callout refuses it again at the mint, and in the static `nats.conf`
-  users - which have no validator - a side left empty beside a populated one renders
-  an explicit `deny = [">"]` rather than an absent key. A user with NEITHER side,
-  which is how `sys` ships, still gets no permissions block at all. A principal that
-  must not publish cannot be expressed by omission - there is no deny list in the map
+  Amended 11/3: within a scope, the application side is three accounts, joined only by
+  explicit exports and imports, so control-plane writers are isolated from worker
+  credentials. `TRUSTED` holds the control-plane services (the gateway, provision, the
+  verifier, the operator, seed and the dispatcher) and the JetStream store. `CONSOLE` holds
+  the web console and its MCP server (`console-mcp`). `APP` holds agent and session workers
+  and the read-only principals. The static user blocks are rendered per account, still from
+  `platformagent_a2a_identities.go`, so where this document says the config's APP and `$SYS`
+  static user blocks, read the `TRUSTED`, `CONSOLE`, `APP` and `$SYS` blocks.
+- **One user per agent identity** inside the account. Permissions are exact subject lists,
+  deny by default: publish only to the subjects its role emits on, subscribe only to its own
+  addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the shared topics it
+  is granted. That is an upper bound, not the shape every principal has: a pull-only
+  principal may hold no task-subject subscribe at all, which is what the session grants do.
+  The addressee token in the task subjects (payload spec 0.4) is what makes these grants
+  expressible - executor-granularity at connect time, with per-task scoping still the parked
+  tightening (9/9): the authority work landed the capability envelope, which scopes the
+  task's AUTHORITY per task without narrowing the subject grants. Narrowing those is staged
+  under #3889: its first PR adds a profile worker's task connection, granted one task's
+  subjects on a dispatcher-signed task credential, and the worker PR removes the pod
+  connection's profile-wide task reach. **Amended 10/1:** "deny by default" holds per side,
+  and only while that side has entries in it. An empty allow list is nats-server's spelling
+  of _unrestricted_, not of _nothing_ (`buildPermissionsFromJwt` builds a side's permission
+  object only when that side's allow or deny list is non-empty, and the two sides are
+  independent), so a rendered entry that lost its publish list would grant the whole subject
+  space on that side while its subscribes stayed narrow. Neither side of a non-narrowed
+  entry may therefore be empty: in the callout identity map the operator refuses such a
+  render and the callout refuses it again at the mint, and in the static `nats.conf` users -
+  which have no validator - a side left empty beside a populated one renders an explicit
+  `deny = [">"]` rather than an absent key. A user with NEITHER side, which is how `sys`
+  ships, still gets no permissions block at all. A principal that must not publish cannot be
+  expressed by omission - there is no deny list in the map
   - so it has to be left unrendered rather than rendered empty.
 - **Three task-subject classes, and the publish grants split along them** (9/9, payload
   spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
@@ -412,8 +451,8 @@ Layout:
   path.
 - **The web read surface (amended 8/31; rewritten the same day after review).** One
   `web` user for the read-only web UI, one of the two bus credentials published to a
-  browser by design (the other is `console`, below). Subscribe on `a2a.>` and its own
-  inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
+  browser by design (the other is `console`, below). Subscribe on `a2a.>` (less `a2a.cap.>`,
+  so it cannot join the verifier's queue group) and its own inbox; publish only the JetStream read API - account-level `INFO`, and `STREAM.INFO`,
   `CONSUMER.CREATE`, `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` **enumerated per stream** over
   the four message streams - plus its own inbox. It rides a websocket listener on 9222
   ~~rendered plain (`no_tls: true`)~~ **amended 10/21 (#3651):** on TLS (see "Transport
@@ -534,7 +573,8 @@ Layout:
   Amended 8/31: the pod network is fenced too. The operator renders an ingress
   NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
   (the auth callout, the agent pod - whose sidecars, the Hermes bridge included, share
-  its labels - the A2A gateway, the capability verifier, session pods by the spawner's
+  its labels - the A2A gateway, the capability verifier, the AgentProfile dispatcher (when
+  rendered), session pods by the spawner's
   labels, the provision Job,
   and the hand-applied seed Job; **amended 10/6:** and the operator's own pod, by the
   `kubeagents.x-k8s.io/a2a-bus-client: operator` label from the operator's namespace,
@@ -615,6 +655,10 @@ Layout:
   and the pod's ingress is deny-all. Reading the token needs `get` on that Secret, so the
   access gate is the Secret's RBAC plus `pods/portforward`. That is a gate the console does
   not have: its pod hands the password to whoever forwards to it.
+  **Amended 11/3:** the MCP server no longer shares `console`. It holds its own principal,
+  `console-mcp`, in the `CONSOLE` account, with its own password (`console-mcp-password` in
+  the creds Secret) and its own inbox prefix (`_INBOX.console-mcp.>`). Its grants are the
+  console's read surface and `chat.console.*.in`, without the console's confirmation subject.
 
 - **The notify route.** The agent's proactive posts to the chat home channel under `next`, and a
   kanban card's report back to the gateway conversation it was filed in
@@ -634,7 +678,11 @@ Layout:
   agent pod that holds session-kv's bearer. No other principal holds either subject, and the
   reply namespace is its own for the notify route's reason. The bridge's password is reachable
   from the agent's terminal like every grant in that pod, so a forged board can reach the Home
-  tab of an admitted member; it carries no authority beyond what it shows. Core NATS.
+  tab of an admitted member; it carries no authority beyond what it shows. Core NATS. A request
+  with a body is a board-health row's Retry or Drop (spec-chatops-gateway.md, "The board-health
+  card's buttons"), which the bridge relays to session-kv's `POST /v1/board/actions`: the same
+  subjects and grants, and only the gateway may publish the request, so no other principal can
+  ask the bridge to act; session-kv acts only on cards still `blocked`.
 
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
@@ -675,7 +723,13 @@ operator has one for itself, keyed on the manager's own ServiceAccount: publish 
 profile gets one narrowed entry, `narrowing: "profile"`, carrying the profile's name and topic
 grants and no subjects. The callout derives that profile pod's task subjects from the
 profile, and its consumer names and inbox from the attested pod name (see the subagent
-profiles spec for why a static entry cannot work there).
+profiles spec for why a static entry cannot work there). **Amended 11/2:** the map is cut
+into numbered ConfigMaps, `<agent>-a2a-authmap-0` through `-<n-1>`, each under a byte budget
+that keeps it below the API server's 1 MiB object limit (the single object crossed it near
+640 bound profiles); every shard carries the whole map's version and `shard`/`shards`
+stamps, the callout is told the count and watches each name under a Role naming each, and
+it serves a new version only once every shard of it has arrived. A map that fits is one
+shard.
 
 The session entry is a different kind of entry and the difference is load-bearing. Every
 session pod runs as one shared ServiceAccount, so the ServiceAccount alone cannot tell two
@@ -741,6 +795,10 @@ profiles need the same refusal, from a set that follows them, when the CRD lands
 A reaped session's credential stops working because the pod object is gone, not because
 the token expired: measured on envtest 1.36, a zero-grace pod delete invalidated the token
 10.1 seconds later, the API server's successful-authentication cache being the delay. The
+callout's own thirty-second memory of a successful review (below, "The throughput
+ceiling") sits in front of that, so a new connection on the reaped pod's token is refused
+within about forty seconds of the delete rather than ten; a connection already open is
+bounded by the grant TTL either way. The
 one-hour token lifetime is not the revocation story and must not be read as one.
 Profiles come and go at runtime, so the map cannot be a static gitops artifact; the CRs
 are the declarative source and admission bounds what a profile may grant. The agents
@@ -858,6 +916,24 @@ exposes. Rolling the callout pods on every map change would close the gap and wa
 rejected: the callout is on the connection path, so a rolling restart is a window in
 which new connections fail, which is the thing the informer exists to avoid.
 
+**Amended 11/3:** the bus has an ordering of its own with the callout. When the bus restarts
+on a new config, every client reconnects, and whichever callout replica answers a reconnect
+places it by the map that replica holds. A connection placed by the previous map stays in
+that map's account until it next reconnects. So a running bus moves to a new config only
+once the callout's current spec is observed and no pod of an older ReplicaSet can still answer
+(`a2aBusWaitsForCallout`). Readiness does not hold it: a current replica that is not ready places
+nobody, and a callout cannot be ready while the bus it connects to is down. The config Secret waits with the StatefulSet, and the callout is
+reconciled ahead of both. A fresh install is not held, since there is no running bus. The
+wait is bounded. A rollout the Deployment controller has given up on (its progress deadline,
+600s by default) does not hold the bus, because the config can carry a credential repair or a
+key change. The release records a Warning event, and the `A2ACalloutRolloutStalled` condition
+stays on the PlatformAgent while the rollout is past its deadline. A stall counts only once the
+Deployment controller has observed the current spec. Only pods an older ReplicaSet of the callout controls are counted, and a
+terminating one only until its deletion deadline.
+While the bus waits, a reconnect is placed by the current map, which can name an account the
+running config does not have yet. That connection is refused until the bus moves, which
+fails closed.
+
 Three numbers in the render are load-bearing and none of them is a preference.
 
 **`max_control_line: 65536`.** A ServiceAccount token travels inside the client's CONNECT
@@ -873,7 +949,17 @@ first-ping timer on a connection that has not yet authenticated at roughly two s
 and the Go client aborts the connect on a PING where it required a PONG - reporting
 "expected 'PONG', got 'PING'", which names nothing about authorization and sends whoever
 is debugging it to the network layer. A merely _slow_ callout hits this too, so the real
-budget for a TokenReview round trip is under two seconds whatever this number says.
+budget for a TokenReview round trip is under two seconds whatever this number says. The
+client has ceilings of its own on the same handshake: nats.go gives the TCP dial one budget
+of its `Timeout` option, split across the resolved hosts, and then the TLS handshake and the
+CONNECT round trip a fresh deadline of the same length, on the first connect and on every
+reconnect alike. The library sets that option to ten seconds by default (`lib.DialTimeout`)
+on every connection it opens, and the worker adapter gives the raw `nats.Conn` it opens
+beside its library client the same option, so a session pod's two connections
+re-authenticate under one budget; left at nats.go's two-second default, a loaded host spends
+enough of each budget before the CONNECT that the attempt at a grant expiry fails, and the
+connection's consumers are gone until an attempt succeeds. The other raw connections under
+the callout, the verifier's and the operator's card publisher, keep nats.go's default.
 
 **The token contract.** Audience `a2a-bus`, mounted at `/var/run/secrets/a2a-bus/token`,
 3600s expiry, kubelet-rotated. The audience is the load-bearing part: a TokenReview that
@@ -889,15 +975,18 @@ ServiceAccount, so any container in that pod presenting a token for this audienc
 authenticates as `agent` - and `spec.deployment.sidecarVolumes` and `.extraVolumes` are
 copied into the pod verbatim. The operator therefore refuses and strips user-authored
 volumes by SOURCE as well as by name: a projection of this audience under any name, and a
-`secret` volume or projected `secret` source naming one of the three Secrets the bus
-renders. (Those two source fields only - the ones that mount the Secret into the
-container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef` hand it to a
-node plugin instead, and are not matched.) The three are `<agent>-a2a-nats-creds`,
-which holds the static users' passwords; `<agent>-a2a-nats-config`, whose `nats.conf`
-interpolates every one of those passwords in clear text; and `<agent>-a2a-callout-keys`,
-which signs the bus's own tokens. The Secrets are cheaper than the projection, because
-reading one needs no token at all. All of them are closed together, because closing one
-narrows the expensive route, leaves the cheap ones, and names the class while doing it.
+`secret` volume or projected `secret` source naming one of the six Secrets the bus renders
+with a credential or key in it. (Those two source fields only - the ones that mount the
+Secret into the container. `csi.nodePublishSecretRef` and the storage drivers' `secretRef`
+hand it to a node plugin instead, and are not matched.) The first three are
+`<agent>-a2a-nats-creds`, which holds the static users' passwords;
+`<agent>-a2a-nats-config`, whose `nats.conf` interpolates every one of those passwords in
+clear text; and `<agent>-a2a-callout-keys`, which signs the bus's own tokens. The other
+three are `<agent>-a2a-nats-tls` and `<agent>-a2a-nats-ca`, the bus's serving key and the CA
+key that can mint another, and `<agent>-a2a-task-signing-key`, the dispatcher's task-signing
+seed (#3889). The Secrets are cheaper than the projection, because reading one needs no
+token at all. All of them are closed together, because closing one narrows the expensive
+route, leaves the cheap ones, and names the class while doing it.
 
 Two layers, and they are not the same layer. The admission refusal is unconditional, is
 the only one that tells the CR's author why, and covers mounts as well as volumes:
@@ -936,20 +1025,38 @@ not gracefully degraded. Established sessions and the resilience contract below 
 what make that acceptable at this stage; a hardened HA callout is production posture,
 not part of stage 1.
 
-**The throughput ceiling, so it is known rather than discovered.** A replica answers
-authorization requests one at a time: the subscription is a queue-group subscription with
-an async handler, the client library dispatches one subscription's callbacks from one
-goroutine, and the handler does its TokenReview round trip inline. Two replicas is
-therefore two authorizations in flight for the whole fabric, and a slow API server sets
-the rate directly: two divided by the TokenReview latency, which is about 20 connections a
-second at a 100ms round trip. The queue behind it is bounded by the same under-two-second
-budget as everything else on this path. Measured, not read off the code, by
-`TestTheCalloutAnswersOneAuthorizationAtATime` in `a2a/authcallout`, which makes the
-TokenReview slow and observes that no two overlap. It is adequate for the connection rate
-this stage has - connections are rare compared to messages - and it is the first thing to
-look at if a fleet reconnecting at once is slow to come back. Raising it means handling
-each request in its own goroutine with a bound, which is a change to make against a
-measurement rather than in advance of one.
+**The throughput ceiling, so it is known rather than discovered.** A replica decides
+sixteen authorization requests at once: the subscription is a queue-group subscription
+with an async handler, the client library dispatches one subscription's callbacks from
+one goroutine, and the handler hands each request to a goroutine that decodes it, then
+takes one of sixteen worker slots before it reviews, mints and responds (the decode comes
+first because a refusal has to be addressed to the decoded user nkey). The under-two-second
+budget starts at receipt, so time spent waiting for a slot counts against it, and a
+request whose budget lapses before it gets one is refused rather than decided late. Two
+bounds then set the rate of fresh reviews per replica: sixteen divided by the TokenReview
+latency (160 a second at a 100ms round trip), and the TokenReview client's own limit of
+50 requests a second with a burst of 100, raised from client-go's defaults of 5 and 10,
+which the serial handler never reached and the pool would have hit before the API server
+was asked. So a replica sustains about 50 fresh reviews a second and absorbs a burst of
+100, and two replicas twice that. In front of the API server the callout remembers a
+successful review for thirty seconds, keyed by an HMAC-SHA-256 of the token under a key
+each replica draws at start (the API server's own token cache uses the same construction),
+so the token itself is not held and a cache key says nothing about its token outside that
+process, with concurrent presentations of one token sharing one review; a failure is
+never remembered, and the identity-map lookup is not cached, so a map change reaches the
+next connection as before. A reconnecting fleet therefore costs one review per distinct
+token per thirty seconds, its retries are free, and the log line for an authorized
+connection says whether its review was `fresh` or `cached`. Measured, not read off the
+code, by two tests in `a2a/authcallout`: `TestTheCalloutAnswersSixteenAuthorizationsAtOnce`
+connects sixty-four clients with distinct tokens to the operator's rendered server, holds
+every review until sixteen are in flight, and asserts the peak is exactly sixteen; and
+`TestSixtyFourCallbacksFinishInsideASecondSixteenAbreast` hands sixty-four requests to the
+handler directly with a 50ms review each and asserts every one is answered inside a
+second, sixteen abreast. Before this the
+handler did its TokenReview inline and a replica answered one request at a time, and
+twelve A2A workers reconnecting per replica were enough to queue past the first-ping
+timer, each failed connect reconnecting and reviewing again; that outage was the
+measurement this paragraph had said to wait for before raising the ceiling.
 
 ## Transport encryption
 

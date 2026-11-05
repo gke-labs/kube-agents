@@ -4,10 +4,11 @@ outlasts the node's deregistration wait.
 
 When a node pool upgrade removes a node that is a backend of a load balancer, GKE
 deregisters the node from the backend service and waits for the service's connection
-draining, up to DEREGISTRATION_WAIT_SECONDS per node, before it deletes the node. A backend
-service whose `connectionDraining.drainingTimeoutSec` is above that wait holds every node's
-removal for the whole wait and then times out: the upgrade spends the wait on each surge
-node, and the node leaves the pool with its drain unfinished. The rule reads the project's
+draining, up to DEREGISTRATION_WAIT_SECONDS per node. A backend service whose
+`connectionDraining.drainingTimeoutSec` is above that wait outlasts it: GKE stops waiting at
+DEREGISTRATION_WAIT_SECONDS, but the instance group's delete of the old VM waits out the full
+drain, so each node's removal takes the whole drain and, past about 30 minutes, GKE fails the
+node step (`Failed to update node pool`), leaving the pool in ERROR. The rule reads the project's
 backend services (the report's `backend_services` read) and files one blocker per backend
 service, naming every matched pool and NEG once (a multi-zone pool has one instance group per
 zone, and a NEG one per zone), whose backends include one of the cluster's node-pool instance groups
@@ -41,7 +42,7 @@ CAN_BLOCK = True
 HOLDS = (HOLDS_NODE_POOL,)  # the drain holds a node's removal; a control-plane move removes none
 
 # GKE's per-node deregistration wait during a pool upgrade: the longest it waits for a backend
-# service's connection draining before it deletes the node.
+# service's connection draining before stopping its wait (while Compute Engine waits out the full drain).
 DEREGISTRATION_WAIT_SECONDS = 600
 # Where a backend's group and a pool's manager URL carry the zone and the group name:
 # `.../zones/<zone>/instanceGroups/<name>` and `.../zones/<zone>/instanceGroupManagers/<name>`;

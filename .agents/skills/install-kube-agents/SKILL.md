@@ -118,6 +118,18 @@ in, where the operator sets it.
    with `--gitops-forge=gitlab`: the installer refuses them. On a GitHub Enterprise Server, pass the
    GitHub flags and `--gitops-host` (and `--gitops-ca-file` for a private CA); see
    [GitHub Enterprise Server](#github-enterprise-server).
+6. **Whether scale-up failures get investigated** — `--enable-stockout-investigator` (default
+   `false`; it also turns on the Pub/Sub adapter). Always offer it. On, the cluster autoscaler's
+   `noScaleUp` logs for the install's own cluster reach the Platform Agent, which diagnoses the
+   Pending workload (quota, ComputeClass fallbacks, capacity advice) and opens a remediation pull
+   request. Off, an unschedulable pod is still triaged from its `FailedScheduling` events, but
+   nothing reads the autoscaler's verdicts or proposes a fix. It adds a Log Router sink, a Pub/Sub
+   topic and subscription, and grants (publisher for the sink, subscriber and viewer for the
+   agent); setting `ENABLE_STOCKOUT_INVESTIGATOR=false` in `install.env` removes them on the next
+   run. A pull request needs the GitOps repository from decision 5, and a chat post needs a home
+   channel (`--google-chat-home-channel` or `--slack-home-channel`): under `next`, a proactive post
+   with no home channel is dropped; the gateway logs the refusal and the `PlatformAgent` carries
+   `HomeChannelUnset`.
 
 Leave `--permission-set` at `read-only` unless the operator asks for `custom`. The flags in
 [Adopting a cluster the operator already owns](#adopting-a-cluster-the-operator-already-owns) are
@@ -373,8 +385,9 @@ outlives the report. Relay it to the operator in either of the last two cases.
 
 Chat is opt-in and both platforms default off, and a non-interactive run with no
 `--enable-google-chat` or `--enable-slack` selects "None" — so the common agent-driven install
-has no chat and the operator has no way to reach the agent unless you give them one. The
-installer prints it at the chat-configuration step and again when it finishes, under
+has no chat and the operator has no way to reach the agent unless you give them one. Under
+`spec.mode: next` the `PlatformAgent` carries the `NoChatPlatform` condition, which says where the
+findings go instead. The installer prints the way in at the chat-configuration step and again when it finishes, under
 `--- [Talking to the Agent from a Terminal] ---`, with the cluster, region, project and namespace
 already substituted. Relay those two commands verbatim (plus the `Web Console` `kubectl port-forward`
 command and `http://localhost:8080` URL when `--enable-web-console` was enabled):
@@ -394,7 +407,8 @@ kubectl exec -it deployment/platform-agent-gateway -n kubeagents-system -c platf
   reached via the `kubectl port-forward svc/kube-agents-web-console -n kubeagents-system 8080:8080`
   command the installer prints.)
 - Say what the operator does not get until they enable a platform: scheduled reports and
-  alert-driven triage are delivered to chat only, and the first-run inventory report waits on a
+  alert-driven triage reach chat only; meanwhile the audit reports stay in the report store on the
+  data volume and the triage runs on the board (the `NoChatPlatform` condition says so), and the first-run inventory report waits on a
   human connecting over chat — read it with
   `kubectl exec platform-agent-shell-0 -n kubeagents-system -c shell -- cat /opt/data/INVENTORY.md`
   (the report is on the shell sandbox pod, not the agent pod).
@@ -603,6 +617,9 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--slack-allowed-users=USERS`             | Comma-separated Slack member IDs (`U0123ABCD`, not emails) allowed to reach the agent; empty allows everyone                                                                                                                                                                                                                                                                      | _unset_                                                                                                                                            |
 | `--slack-home-channel=CHANNEL`            | Slack channel ID for unsolicited alerts/messages (e.g. `C01234567`)                                                                                                                                                                                                                                                                                                               | _unset_                                                                                                                                            |
 | `--slack-home-channel-name=NAME`          | Display name of that channel (e.g. `#gke-alerts`)                                                                                                                                                                                                                                                                                                                                 | _unset_                                                                                                                                            |
+| `--google-chat-home-channel=SPACE`        | Google Chat space (`spaces/<id>`) for unsolicited alerts and reports; under `next` a proactive post with no home channel is dropped (`HomeChannelUnset`)                                                                                                                                                                                                                          | _unset_                                                                                                                                            |
+| `--enable-stockout-investigator`          | Investigate cluster-autoscaler scale-up failures and open remediation pull requests; also enables the Pub/Sub adapter. Recorded as `ENABLE_STOCKOUT_INVESTIGATOR` on a new `install.env`; later, turn it off in `install.env`                                                                                                                                                     | `false`                                                                                                                                            |
+| `--enable-pubsub-platform`                | Enable the Pub/Sub platform adapter on its own; `--enable-stockout-investigator` already implies it                                                                                                                                                                                                                                                                               | `false`                                                                                                                                            |
 | `--enable-gvisor=true\|false`             | Enable GKE Sandbox (gVisor) runtime isolation                                                                                                                                                                                                                                                                                                                                     | `true`                                                                                                                                             |
 | `--enable-hermes-dashboard=true\|false`   | Enable the Hermes Web UI on port 9119                                                                                                                                                                                                                                                                                                                                             | `false`                                                                                                                                            |
 | `--enable-web-console=true\|false`        | Deploy the web console, a browser page for the agent reached by `kubectl port-forward`: chat threads, event triage and scheduled checks, and usage. Requires NetworkPolicy enforcement (cannot be combined with `--accept-no-network-policy`)                                                                                                                                     | `false`                                                                                                                                            |

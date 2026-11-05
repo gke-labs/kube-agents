@@ -160,7 +160,7 @@ func TestToolsMapToClaudeCodeNames(t *testing.T) {
 	if i < 0 {
 		t.Fatalf("no %s in %v", AllowedToolsFlag, out.Args)
 	}
-	want := "Read,Glob,Grep,mcp__gke__get_cluster,mcp__gke__list_clusters,mcp__docs__search,Skill"
+	want := "Read,Glob,Grep,LS,NotebookRead,mcp__gke__get_cluster,mcp__gke__list_clusters,mcp__docs__search,Skill"
 	if out.Args[i+1] != want {
 		t.Errorf("%s = %s, want %s", AllowedToolsFlag, out.Args[i+1], want)
 	}
@@ -240,7 +240,7 @@ func TestUngrantedBuiltinsAreDenied(t *testing.T) {
 			t.Errorf("%s is not denied: %v", tool, deny)
 		}
 	}
-	for _, tool := range []string{"Read", "Glob", "Grep"} {
+	for _, tool := range []string{"Read", "Glob", "Grep", "LS", "NotebookRead"} {
 		if slices.Contains(deny, tool) {
 			t.Errorf("%s is denied though read_file grants it", tool)
 		}
@@ -248,7 +248,7 @@ func TestUngrantedBuiltinsAreDenied(t *testing.T) {
 	p := load(t, exampleDir)
 	p.Manifest.Tools = []string{persona.ToolShell}
 	deny = flagValue(t, render(t, p, persona.Target{}).Args, DisallowedToolsFlag)
-	for _, tool := range []string{"Read", "Glob", "Grep"} {
+	for _, tool := range []string{"Read", "Glob", "Grep", "LS", "NotebookRead"} {
 		if !slices.Contains(deny, tool) {
 			t.Errorf("%s is not denied without read_file: %v", tool, deny)
 		}

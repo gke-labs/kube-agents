@@ -769,6 +769,10 @@ func TestReapOnceResumableCursorAfterDelete(t *testing.T) {
 // task routing index instead of entering an unbounded 2-second requeue loop.
 func TestLateTaskEventForPrunedSessionDroppedWithoutRequeueLoop(t *testing.T) {
 	r := startRig(t)
+	// This test calls relayBatch itself, and relayBatch reads g.runCtx, which
+	// Run writes first and the relay durable follows; a call before Run got
+	// that far is a data race the detector reports on a loaded runner.
+	waitForRelayDurable(t, r)
 	ctx := context.Background()
 
 	conv := "discord:g1/pruned-conv"

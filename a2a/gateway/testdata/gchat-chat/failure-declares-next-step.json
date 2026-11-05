@@ -1,0 +1,33 @@
+[
+  {
+    "expected": 0,
+    "carrier": "result",
+    "text": "*I couldn't find seeded-z.*\n\nThe fleet has seeded-a, -b and -c. checkout-gateway runs on seeded-a. Check it there?",
+    "widgets": [
+      {
+        "buttonList": {
+          "buttons": [
+            {
+              "onClick": {
+                "action": {
+                  "function": "kage.choice",
+                  "parameters": [
+                    {
+                      "key": "reply",
+                      "value": "check seeded-a"
+                    },
+                    {
+                      "key": "choice",
+                      "value": "0"
+                    }
+                  ]
+                }
+              },
+              "text": "check seeded-a"
+            }
+          ]
+        }
+      }
+    ]
+  }
+]

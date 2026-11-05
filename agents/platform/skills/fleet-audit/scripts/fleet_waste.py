@@ -59,6 +59,7 @@ grant it needs.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import math
@@ -66,7 +67,7 @@ import os
 import random
 import re
 import shlex
-import subprocess
+import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -77,8 +78,11 @@ from typing import Any, Callable, NamedTuple
 MANIFEST_VERSION = 1
 # The manifest's `audit` field: the stream this collector feeds.
 AUDIT_NAME = "fleet-wide-cost-analysis"
-# The one `kubectl get` each collected cluster costs. The SOP quotes this list
-# to tell the model which kinds not to read again.
+# The kinds each collected cluster is read for, one paged `kubectl get --raw`
+# read per kind (collector_run.paged_dump) rather than one `-A -o json` dump,
+# which a cluster of a few hundred nodes takes past the credential proxy's
+# output cap. The SOP quotes this list to tell the model which kinds not to
+# read again.
 CLUSTER_DUMP_KINDS = "nodes,pods,pvc,pv,svc,jobs,cronjobs,pdb,ns,resourcequota,sts,deploy,hpa,limitrange,ingress"
 
 # A digest of this file, published as `checks_revision`. The manifest contract
@@ -98,18 +102,15 @@ KUBECONFIG_DIR = Path(os.environ.get("HERMES_HOME") or "/opt/data") / ".kubeconf
 # result: gcloud was not run through it, and the note is the error.
 KUBECONFIG_REFUSED_RC = 1
 DEFAULT_TIMEOUT_S = 60
-# The exit status a `Run` reports for a command `subprocess.run` killed on
-# its timeout -- coreutils `timeout`'s, and the one collect.py, fleet_drift.py
-# and patch_readiness.py report, so a timeout reads the same in every manifest.
-TIMEOUT_RC = 124
 # Was 64, sized so every cluster's ten-minute sampling window ran
 # concurrently rather than queuing behind an earlier one. Nothing sleeps any
 # more -- per-cluster work is a handful of subprocess reads and a few HTTP
-# reads -- so this is the figure every other collector in the stream uses,
-# the credential proxy's admitted count at the operator's default limit
-# (collect.py's MAX_WORKERS comment has the reasoning), which also keeps the
-# shared Monitoring session inside urllib3's default connection pool.
-MAX_WORKERS = 4
+# reads -- so the width is the one every other collector in the stream uses,
+# broker_admission.sweep_width(), resolved in collect_fleet (collect.py's
+# comment above its own collect_fleet has the reasoning). Five at the default
+# broker, inside urllib3's default connection pool of ten for the shared
+# Monitoring session; a broker configured past twelve slots makes urllib3 warn
+# that the pool is full and open the extra connections anyway.
 
 # What the manifest calls a target. A GKE name is unique only inside one
 # project and location, so every cluster is `<project>/<location>/<name>`, and
@@ -153,6 +154,8 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 from collect import declaration_for, indexed_workspace, release_declaration_for, release_declarations, workload_declarations  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
@@ -871,12 +874,11 @@ def log(msg: str) -> None:
     print(f"[fleet_waste] {msg}", file=sys.stderr, flush=True)
 
 
-class Run(NamedTuple):
-    argv: list[str]
-    rc: int
-    stdout: str
-    stderr: str
-    duration_s: float
+Run = collector_run.Run
+run_and_gate = collector_run.run_and_gate
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
+default_run = functools.partial(collector_run.default_run, timeout=DEFAULT_TIMEOUT_S)
 
 
 RunFn = Callable[..., Run]
@@ -884,35 +886,6 @@ RunFn = Callable[..., Run]
 # structural rather than typed to `AuthorizedSession` so tests can hand in a
 # stub without importing google.auth, which is not a test-time dependency.
 SessionFn = Any
-
-
-def _text(output: str | bytes | None) -> str:
-    return output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
-
-
-def default_run(argv: list[str], *, env: dict | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> Run:
-
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=timeout)
-        return Run(argv, proc.returncode, proc.stdout, proc.stderr, time.monotonic() - t0)
-    except subprocess.TimeoutExpired as exc:
-        # `TimeoutExpired` carries whatever the child wrote as bytes, `text=True`
-        # notwithstanding, and every consumer of `Run` searches and slices it as
-        # str. `collect.py`'s `_text` does the same.
-        return Run(argv, TIMEOUT_RC, _text(exc.stdout), _text(exc.stderr), time.monotonic() - t0)
-    except Exception as exc:
-        return Run(argv, -1, "", str(exc), time.monotonic() - t0)
-
-
-def run_and_gate(argv: list[str], *, run: RunFn, env: dict | None = None) -> tuple[object | None, Run]:
-    result = run(argv, env=env)
-    if result.rc != 0 or not result.stdout.strip():
-        return None, result
-    try:
-        return json.loads(result.stdout), result
-    except json.JSONDecodeError:
-        return None, result
 
 
 def object_list(parsed: object) -> list | None:
@@ -4635,16 +4608,14 @@ def collect_cluster(cluster: dict, *, run: RunFn, session: SessionFn, now: datet
         return {"name": target, "project": project, "location": location, **mode, "outcome": UNREACHABLE_OUTCOME, "error": f"get-credentials rc={cred_run.rc}: {cred_run.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
 
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
-    dump_argv = ["kubectl", "get", CLUSTER_DUMP_KINDS, "-A", "-o", "json"]
-    parsed, result = run_and_gate(dump_argv, run=run, env=env)
+    # Any kind's page failing fails the whole cluster closed: read as empty,
+    # it would be a cluster with no Services or volumes -- which 3.4 and 3.6
+    # then take as proof a project's disks and rules are nobody's.
+    dump_kinds = CLUSTER_DUMP_KINDS.split(",")
+    parsed, result = paged_dump(dump_kinds, run=run, env=env)
     if parsed is None:
         return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": f"object dump gate failed (rc={result.rc}): {result.stderr.strip()[:ERROR_EXCERPT_CHARS]}"}, empty_facts
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("items"), list):
-        # Read as empty, it would be a cluster with no Services or volumes --
-        # which 3.4 and 3.6 then take as proof a project's disks and rules are
-        # nobody's.
-        return {"name": target, "project": project, "location": location, **mode, "outcome": "gate-failed", "error": "object dump gate failed: the answer has no `items` list"}, empty_facts
-    dump_record = _record(f"KUBECONFIG={kubeconfig} {shlex.join(dump_argv)}", result)
+    dump_record = _record(paged_command_text(dump_kinds, kubeconfig=kubeconfig), result)
     context = build_context(parsed)
     fleet_facts = _fleet_facts(context)
     release_index = _releases_by_object(parsed, releases, name)
@@ -5840,7 +5811,8 @@ def _only_a_scope_note(entry: dict, project: str | None) -> bool:
     return bool(project) or entry["error"].startswith(FILTERED_LISTING_NOTE) or entry["error"].startswith(fleet_scope_args.DECLARED_SCOPE_NOTE_PREFIX)
 
 
-def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int = MAX_WORKERS, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
+def collect_fleet(project: str | None = None, *, run: RunFn = default_run, session: SessionFn = None, max_workers: int | None = None, now: datetime | None = None, workspace: Path | None = None, project_budget_s: float = PROJECT_READ_DEADLINE_S) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     now = now or datetime.now(timezone.utc)
     started_at = time.strftime(MONITORING_TIME_FORMAT, time.gmtime())
     deadline = time.monotonic() + project_budget_s

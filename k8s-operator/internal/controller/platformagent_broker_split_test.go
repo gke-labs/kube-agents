@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,10 +33,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -416,7 +420,7 @@ func TestAPluginCannotDisableCallerAuthentication(t *testing.T) {
 	envVars := buildCredentialProxyEnv(agent)
 	expected := map[string]string{
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
-		"CREDENTIAL_PROXY_ALLOWED_CALLERS": allowedBrokerCallers(agent),
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS": allowedBrokerCallers(agent, allBrokerCallersOwned),
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
@@ -899,6 +903,229 @@ func TestTheBrokerDeclaresItsMetricsListener(t *testing.T) {
 	}
 }
 
+// TestTheBrokerReadinessProbeIsOnTheHealthListener: the probe reads Envoy's
+// health listener, declared as its own container port, and nothing else
+// reaches that port. On the credentialed port the probe shared the upstream
+// breaker with every open cluster watch, so a fleet at the ceiling removed
+// the pod from the Service. No livenessProbe: the start script supervises
+// both processes, and a probe-driven restart would drop every open watch.
+func TestTheBrokerReadinessProbeIsOnTheHealthListener(t *testing.T) {
+	agent := brokerPodAgent()
+	container := buildCredentialProxyContainer(agent)
+
+	probe := container.ReadinessProbe
+	if probe == nil || probe.ProbeHandler.HTTPGet == nil {
+		t.Fatalf("the broker container has no HTTP readinessProbe: %#v", probe)
+	}
+	if got := probe.ProbeHandler.HTTPGet; got.Path != "/healthz" || got.Port != intstr.FromString(credentialProxyHealthPortName) {
+		t.Fatalf("readinessProbe is %s on port %v; want /healthz on %q, the health listener, so open watches cannot fail it", got.Path, got.Port, credentialProxyHealthPortName)
+	}
+	if container.LivenessProbe != nil || container.StartupProbe != nil {
+		t.Fatalf("the broker container declares a liveness or startup probe (%#v, %#v); a probe-driven restart drops every open watch", container.LivenessProbe, container.StartupProbe)
+	}
+
+	var declared []corev1.ContainerPort
+	for _, p := range container.Ports {
+		if p.Name == credentialProxyHealthPortName || p.ContainerPort == credentialProxyHealthPort {
+			declared = append(declared, p)
+		}
+	}
+	if len(declared) != 1 || declared[0].Name != credentialProxyHealthPortName || declared[0].ContainerPort != credentialProxyHealthPort {
+		t.Fatalf("want exactly one %s container port on %d, got %#v", credentialProxyHealthPortName, credentialProxyHealthPort, container.Ports)
+	}
+	for _, other := range []int32{credentialProxyPort, credentialProxyMetricsPort} {
+		if other == credentialProxyHealthPort {
+			t.Fatalf("the health port %d collides with another broker port", credentialProxyHealthPort)
+		}
+	}
+
+	for _, port := range buildCredentialProxyService(agent).Spec.Ports {
+		if port.Port == credentialProxyHealthPort || port.TargetPort == intstr.FromString(credentialProxyHealthPortName) || port.TargetPort == intstr.FromInt32(credentialProxyHealthPort) {
+			t.Fatalf("the Service exposes the health listener: %#v", port)
+		}
+	}
+	for _, rule := range buildCredentialProxyNetworkPolicy(agent).Spec.Ingress {
+		for _, port := range rule.Ports {
+			if port.Port != nil && (*port.Port == intstr.FromInt32(credentialProxyHealthPort) || *port.Port == intstr.FromString(credentialProxyHealthPortName)) {
+				t.Fatalf("the NetworkPolicy admits a peer on the health listener: %#v", rule)
+			}
+		}
+	}
+}
+
+// The Envoy config baked into the broker image, as far as the operator's side
+// of the contract reads it: the listeners' ports, the routes, and the breakers.
+type envoyCredentialProxyConfig struct {
+	StaticResources struct {
+		Listeners []struct {
+			Name    string `json:"name"`
+			Address struct {
+				SocketAddress *struct {
+					Address   string `json:"address"`
+					PortValue int32  `json:"port_value"`
+				} `json:"socket_address"`
+			} `json:"address"`
+			FilterChains []struct {
+				Filters []struct {
+					TypedConfig struct {
+						RouteConfig struct {
+							VirtualHosts []struct {
+								Routes []struct {
+									Match struct {
+										Prefix string `json:"prefix"`
+										Path   string `json:"path"`
+									} `json:"match"`
+									Route struct {
+										Cluster string `json:"cluster"`
+									} `json:"route"`
+								} `json:"routes"`
+							} `json:"virtual_hosts"`
+						} `json:"route_config"`
+					} `json:"typed_config"`
+				} `json:"filters"`
+			} `json:"filter_chains"`
+		} `json:"listeners"`
+		Clusters []struct {
+			Name            string `json:"name"`
+			CircuitBreakers struct {
+				Thresholds []struct {
+					Priority           string `json:"priority"`
+					MaxConnections     int    `json:"max_connections"`
+					MaxPendingRequests int    `json:"max_pending_requests"`
+					MaxRequests        int    `json:"max_requests"`
+				} `json:"thresholds"`
+			} `json:"circuit_breakers"`
+			LoadAssignment struct {
+				Endpoints []struct {
+					LBEndpoints []struct {
+						Endpoint struct {
+							Address struct {
+								Pipe *struct {
+									Path string `json:"path"`
+								} `json:"pipe"`
+							} `json:"address"`
+						} `json:"endpoint"`
+					} `json:"lb_endpoints"`
+				} `json:"endpoints"`
+			} `json:"load_assignment"`
+		} `json:"clusters"`
+	} `json:"static_resources"`
+	Admin struct {
+		Address struct {
+			Pipe          *struct{} `json:"pipe"`
+			SocketAddress *struct{} `json:"socket_address"`
+		} `json:"address"`
+	} `json:"admin"`
+}
+
+// The numbers the Envoy config has to carry. The credentialed cluster's
+// breaker is what a fleet of open watches fills; Envoy's default per priority
+// is 1024 connections and 1024 requests, and a thousand watched clusters sat
+// at it. The health cluster's is a kubelet's probes many times over and no
+// more, so that nothing arriving on the health listener can hold the socket.
+const (
+	envoyRuntimeMaxConnections     = 4096
+	envoyRuntimeMaxPendingRequests = 1024
+	envoyRuntimeMaxRequests        = 4096
+	envoyHealthThreshold           = 64
+	envoyLoopbackAddress           = "127.0.0.1"
+)
+
+// TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker reads the config the
+// image bakes, since the operator renders none of it and `go test` would
+// otherwise pass with a probe pointed at a port Envoy does not open: the
+// health listener's port is the constant the probe is declared on, its one
+// route is /healthz to a cluster of its own on the broker's socket with its
+// own small breaker, the credentialed cluster declares the raised breaker on
+// both priorities, every listener binds loopback for start-services.sh to
+// rebind, and admin stays on its unix socket.
+func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "shared", "envoy-credential-proxy.yaml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var config envoyCredentialProxyConfig
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		t.Fatalf("parsing %s: %v", path, err)
+	}
+
+	listeners := map[string]int32{}
+	for _, listener := range config.StaticResources.Listeners {
+		if listener.Address.SocketAddress == nil {
+			t.Fatalf("listener %s is not a socket listener", listener.Name)
+		}
+		if listener.Address.SocketAddress.Address != envoyLoopbackAddress {
+			t.Fatalf("listener %s binds %s in the image; start-services.sh rebinds %s to the address the operator passes and nothing else, so a listener baked on any other address stays where it is in every Pod, the sidecar arrangement's loopback-only one included", listener.Name, listener.Address.SocketAddress.Address, envoyLoopbackAddress)
+		}
+		listeners[listener.Name] = listener.Address.SocketAddress.PortValue
+	}
+	if got := listeners["credential_proxy"]; got != credentialProxyPort {
+		t.Fatalf("the credentialed listener is on %d; the operator declares %d", got, credentialProxyPort)
+	}
+	if got := listeners["credential_health"]; got != credentialProxyHealthPort {
+		t.Fatalf("the health listener is on %d; the readinessProbe is declared on %d", got, credentialProxyHealthPort)
+	}
+	if listeners["credential_health"] == listeners["credential_proxy"] || listeners["credential_health"] == credentialProxyMetricsPort {
+		t.Fatalf("the health listener shares a port with another broker listener: %v", listeners)
+	}
+
+	var healthRoutes int
+	for _, listener := range config.StaticResources.Listeners {
+		if listener.Name != "credential_health" {
+			continue
+		}
+		for _, chain := range listener.FilterChains {
+			for _, filter := range chain.Filters {
+				for _, host := range filter.TypedConfig.RouteConfig.VirtualHosts {
+					for _, route := range host.Routes {
+						healthRoutes++
+						if route.Match.Path != "/healthz" || route.Match.Prefix != "" || route.Route.Cluster != "credential_health" {
+							t.Fatalf("the health listener routes %#v; want exactly /healthz to credential_health, so that nothing credentialed is reachable on the probe's port", route)
+						}
+					}
+				}
+			}
+		}
+	}
+	if healthRoutes != 1 {
+		t.Fatalf("the health listener has %d routes; want one, /healthz", healthRoutes)
+	}
+
+	sockets := map[string]string{}
+	for _, cluster := range config.StaticResources.Clusters {
+		want := [3]int{envoyRuntimeMaxConnections, envoyRuntimeMaxPendingRequests, envoyRuntimeMaxRequests}
+		if cluster.Name == "credential_health" {
+			want = [3]int{envoyHealthThreshold, envoyHealthThreshold, envoyHealthThreshold}
+		}
+		priorities := map[string]bool{}
+		for _, threshold := range cluster.CircuitBreakers.Thresholds {
+			priorities[threshold.Priority] = true
+			got := [3]int{threshold.MaxConnections, threshold.MaxPendingRequests, threshold.MaxRequests}
+			if got != want {
+				t.Fatalf("cluster %s priority %s has connections/pending/requests %v; want %v", cluster.Name, threshold.Priority, got, want)
+			}
+		}
+		if !priorities["DEFAULT"] || !priorities["HIGH"] {
+			t.Fatalf("cluster %s declares breakers for %v; both DEFAULT and HIGH must be declared or one inherits Envoy's 1024", cluster.Name, priorities)
+		}
+		for _, endpoint := range cluster.LoadAssignment.Endpoints {
+			for _, lb := range endpoint.LBEndpoints {
+				if lb.Endpoint.Address.Pipe == nil {
+					t.Fatalf("cluster %s has an endpoint that is not the broker's unix socket: %#v", cluster.Name, lb.Endpoint.Address)
+				}
+				sockets[cluster.Name] = lb.Endpoint.Address.Pipe.Path
+			}
+		}
+	}
+	if sockets["credential_runtime"] == "" || sockets["credential_health"] != sockets["credential_runtime"] {
+		t.Fatalf("the health cluster reaches %q and the credentialed cluster %q; ready has to mean the same broker answers", sockets["credential_health"], sockets["credential_runtime"])
+	}
+	if config.Admin.Address.Pipe == nil || config.Admin.Address.SocketAddress != nil {
+		t.Fatalf("Envoy's admin interface is not on a unix socket alone: %#v", config.Admin.Address)
+	}
+}
+
 // TestTheSessionCallerIsNamedOnlyUnderTheFlag: the session pod becomes a
 // broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true on a
 // mode-next install, and never otherwise.
@@ -914,7 +1141,7 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	sessionCaller := "system:serviceaccount:test-ns:test-agent-a2a-session"
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
-	if strings.Contains(allowedBrokerCallers(agent), sessionCaller) {
+	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), sessionCaller) {
 		t.Fatal("the session ServiceAccount is a broker caller with the flag unset")
 	}
 	off := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -927,7 +1154,7 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	want := "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell," + sessionCaller
-	if got := allowedBrokerCallers(agent); got != want {
+	if got := allowedBrokerCallers(agent, allBrokerCallersOwned); got != want {
 		t.Fatalf("callers = %q, want %q", got, want)
 	}
 	on := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec.Containers[0]
@@ -952,7 +1179,7 @@ func TestSessionClusterViewIsInertOutsideModeNext(t *testing.T) {
 	if a2aSessionClusterViewEnabled(agent) {
 		t.Fatal("enabled outside mode next")
 	}
-	if strings.Contains(allowedBrokerCallers(agent), "a2a-session") {
+	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), "a2a-session") {
 		t.Fatal("session caller named on a today install")
 	}
 	for _, v := range []string{"", "false", "TRUE", "1"} {

@@ -1,0 +1,154 @@
+{
+  "payload": {
+    "number": 7
+  },
+  "responses": [
+    {
+      "size": 4,
+      "limit": 100,
+      "isLastPage": true,
+      "values": [
+        {
+          "id": 25,
+          "createdDate": 1793643184604,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
+          },
+          "action": "COMMENTED",
+          "commentAction": "ADDED",
+          "comment": {
+            "properties": {
+              "repositoryId": 1
+            },
+            "id": 2,
+            "version": 0,
+            "text": "Looks right to me.",
+            "author": {
+              "name": "example-maintainer",
+              "emailAddress": "maintainer@acme.example",
+              "active": true,
+              "displayName": "Example Maintainer",
+              "id": 2,
+              "slug": "example-maintainer",
+              "type": "NORMAL",
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bitbucket.acme.example/users/example-maintainer"
+                  }
+                ]
+              }
+            },
+            "createdDate": 1793643184599,
+            "updatedDate": 1793643184599,
+            "comments": [],
+            "threadResolved": false,
+            "severity": "NORMAL",
+            "state": "OPEN",
+            "permittedOperations": {
+              "editable": false,
+              "transitionable": true,
+              "deletable": false
+            }
+          }
+        },
+        {
+          "id": 23,
+          "createdDate": 1793643184536,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
+          },
+          "action": "UPDATED",
+          "addedReviewers": [
+            {
+              "name": "example-maintainer",
+              "emailAddress": "maintainer@acme.example",
+              "active": true,
+              "displayName": "Example Maintainer",
+              "id": 2,
+              "slug": "example-maintainer",
+              "type": "NORMAL",
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bitbucket.acme.example/users/example-maintainer"
+                  }
+                ]
+              }
+            }
+          ],
+          "removedReviewers": []
+        },
+        {
+          "id": 24,
+          "createdDate": 1793643184494,
+          "user": {
+            "name": "example-maintainer",
+            "emailAddress": "maintainer@acme.example",
+            "active": true,
+            "displayName": "Example Maintainer",
+            "id": 2,
+            "slug": "example-maintainer",
+            "type": "NORMAL",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/users/example-maintainer"
+                }
+              ]
+            }
+          },
+          "action": "APPROVED"
+        },
+        {
+          "id": 20,
+          "createdDate": 1793643122459,
+          "user": {
+            "name": "access-token-user/1/1",
+            "active": true,
+            "displayName": "Access Token User - acme",
+            "emailAddress": null,
+            "id": 4,
+            "slug": "access-token-user_1_1",
+            "type": "SERVICE",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bitbucket.acme.example/bots/access-token-user_1_1"
+                }
+              ]
+            }
+          },
+          "action": "OPENED"
+        }
+      ],
+      "start": 0
+    }
+  ]
+}

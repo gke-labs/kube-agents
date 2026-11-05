@@ -174,11 +174,22 @@ on_error() {
   # function it was in, or this script and `main` at top level. $LINENO alone
   # counts from the top of whichever file the command sat in, so a bare line
   # number sent the reader to that line of install.sh instead. Piped through
-  # stdin, bash labels this script's frames `main` or not at all, and $0 is
-  # `bash`; both read as the script by name.
+  # stdin, bash labels this script's frames `main` (bash 5.2), after $0 (bash
+  # 5.3, measured: `bash` for the documented one-liner, `/bin/bash` when the
+  # interpreter is invoked by path, `sh` where that is bash), or not at all
+  # (bash 3.2); all read as the script by name. The $0 of a stdin or -c
+  # script is the shell as invoked, and resolves to the running interpreter,
+  # $BASH; a frame run from a file (`bash ./install.sh`) is labelled $0 on
+  # every bash too, and that $0 is the script, not $BASH, which keeps its
+  # path. A sourced file is never $0, whatever it is named.
   local source_file="${BASH_SOURCE[1]:-}"
   case "$source_file" in
-    ""|main|bash) source_file="$INSTALL_SCRIPT_NAME" ;;
+    ""|main) source_file="$INSTALL_SCRIPT_NAME" ;;
+    "$0")
+      if [ "$(command -v -- "$0" 2>/dev/null || true)" = "$BASH" ]; then
+        source_file="$INSTALL_SCRIPT_NAME"
+      fi
+      ;;
   esac
   local func_name="${FUNCNAME[1]:-main}"
   echo -e "\n\033[91m\033[1m✗ Error encountered at ${source_file}:${line_no} in ${func_name} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
@@ -687,6 +698,7 @@ PARAM_SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}"
 PARAM_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS:-}"
 PARAM_SLACK_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}"
 PARAM_SLACK_HOME_CHANNEL_NAME="${SLACK_HOME_CHANNEL_NAME:-}"
+PARAM_SLACK_HOME_CHANNEL_POLICY="${SLACK_HOME_CHANNEL_POLICY:-}"
 # bootstrap_install_env clears NAMESPACE before reading
 # install.env, so this seeds from the file alone; --agent-namespace is the
 # other way in.
@@ -955,6 +967,10 @@ Flags for AI Agents & Automation:
   --slack-home-channel=CHANNEL  Slack channel ID for unsolicited alerts/messages (e.g. C01234567)
   --slack-home-channel-name=NAME
                                 Display name of that channel (e.g. #gke-alerts)
+  --slack-home-channel-policy=POLICY
+                                auto (the default, also empty) or manual: sets
+                                spec.integration.slack.homeChannelPolicy on the PlatformAgent;
+                                the CRD reference describes the field
   --migrate-node-pools          Authorize migrating an existing cluster's legacy node pools to
                                 GKE_METADATA. Recreates those nodes and restarts every workload on
                                 them, kube-agents' or not. Without it a cluster with legacy pools is
@@ -1277,6 +1293,10 @@ parse_args() {
       --slack-home-channel-name=*)
         PARAM_SLACK_HOME_CHANNEL_NAME="${1#*=}"
         note_install_env_flag SLACK_HOME_CHANNEL_NAME "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_NAME
+        shift ;;
+      --slack-home-channel-policy=*)
+        PARAM_SLACK_HOME_CHANNEL_POLICY="${1#*=}"
+        note_install_env_flag SLACK_HOME_CHANNEL_POLICY "${1%%=*}" "$INSTALL_ENV_FLAG_KIND_STRING" PARAM_SLACK_HOME_CHANNEL_POLICY
         shift ;;
       --chat-topic-name=*)
         PARAM_CHAT_TOPIC_NAME="${1#*=}"
@@ -2377,7 +2397,7 @@ record_gitops_forge_keys() {
 # running install reads from Terraform state.
 install_env_toggle_companions() {
   case "${1:-}" in
-    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME" ;;
+    SLACK_ENABLED) printf '%s' "SLACK_ALLOWED_USERS SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME SLACK_HOME_CHANNEL_POLICY" ;;
     GOOGLE_CHAT_ENABLED) printf '%s' "ALLOWED_USERS CHAT_TOPIC_NAME GOOGLE_CHAT_HOME_CHANNEL GOOGLE_CHAT_MODE" ;;
     *) ;;
   esac
@@ -2924,6 +2944,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" SLACK_ALLOWED_USERS "${SLACK_ALLOWED_USERS:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL "${SLACK_HOME_CHANNEL:-}"
   write_env_var "$tmp" SLACK_HOME_CHANNEL_NAME "${SLACK_HOME_CHANNEL_NAME:-}"
+  write_env_var "$tmp" SLACK_HOME_CHANNEL_POLICY "${SLACK_HOME_CHANNEL_POLICY:-}"
   write_secret_env_var "$tmp" API_SERVER_KEY "${API_SERVER_KEY:-}"
   write_env_var "$tmp" PLATFORM_AGENT_PERMISSION_SET "${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
@@ -5893,7 +5914,8 @@ validate_non_interactive_minter_config() {
 
   if [ -z "$pem_path" ]; then
     print_error "GitHub App ID ('${app_id}') was provided in non-interactive mode, but no ENABLED KMS key exists in ${keyring}/${key} and no --github-pem-path was provided."
-    print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
+    print_minter_restore_advice "$key" "$keyring" "$kms_loc" "$project_id" ||
+      print_info "To enable the token minter, provide --github-pem-path=<path-to-pem> for automated import, or pre-import the private key into Cloud KMS (AOT)."
     print_info "To install without the token minter, omit --github-app-id."
     return 1
   fi
@@ -5941,8 +5963,10 @@ resolve_missing_pem_against_kms() {
   fi
 
   print_error "GitHub App private key PEM file does not exist: '${PARAM_GITHUB_PEM_PATH}'."
-  print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
-  print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  print_minter_restore_advice "$pem_key" "$pem_keyring" "$pem_kms_loc" "$project_id" || {
+    print_info "Cloud KMS key ${pem_keyring}/${pem_key} has no ENABLED version, so the import still needs that file."
+    print_info "Point --github-pem-path at the downloaded key, or clear GITHUB_PEM_PATH from install.env to install without the token minter."
+  }
   return 1
 }
 
@@ -6033,7 +6057,7 @@ summarize_existing_cluster_mutations() {
 
   # 5. gVisor pool
   if [ "$is_autopilot" != "True" ] && is_truthy "$enable_gvisor"; then
-    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} ${C_YELLOW}Will create${C_RESET} 'gvisor-pool' (1 e2-standard-4 per zone; new billable capacity)"
+    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} ${C_YELLOW}Will create${C_RESET} 'gvisor-pool' (shape from sizing_profile and the gvisor_* inputs, small unless install.env sets their TF_VAR_ lines, see terraform/modules/gke-cluster/README.md; new billable capacity)"
   else
     echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} None (not requested or native on Autopilot)"
   fi
@@ -6830,6 +6854,15 @@ main() {
   # the flag or install.env, before the interview and any --dry-run preview.
   validate_github_app_id "${PARAM_GITHUB_APP_ID:-}" \
     "$([ "${PARAM_GITHUB_APP_ID_FROM_FLAG:-false}" = "true" ] && echo "--github-app-id" || echo "GITHUB_APP_ID in ${INSTALL_ENV_FILE:-install.env}")" || exit 1
+  # SLACK_HOME_CHANNEL_POLICY, from the flag or install.env, before the file
+  # check below: a flag outside the enum would otherwise be refused as a
+  # disagreement with the file, with a remedy that records a value the
+  # generator and the CRD refuse. The generator checks again on every route.
+  # The remedy names the flag only when this run typed it (note_install_env_flag):
+  # a flag cannot correct a value the file carries, the file check below would
+  # refuse the disagreement, so that value is sent back to the file.
+  require_slack_home_channel_policy "${PARAM_SLACK_HOME_CHANNEL_POLICY:-}" \
+    "$([[ $'\n'"$INSTALL_ENV_FLAGS_TYPED" == *$'\n'"SLACK_HOME_CHANNEL_POLICY|"* ]] && echo "flags" || echo "")" || exit 1
   # The chat flags and --mode against an existing install.env, as soon as
   # is_truthy and the defaults are loaded: a flag that disagrees with the file
   # stops the run here, before the interview and long before anything is
@@ -7134,6 +7167,7 @@ main() {
   local slack_allowed_users="${PARAM_SLACK_ALLOWED_USERS:-}"
   local slack_home_channel="${PARAM_SLACK_HOME_CHANNEL:-}"
   local slack_home_channel_name="${PARAM_SLACK_HOME_CHANNEL_NAME:-}"
+  local slack_home_channel_policy="${PARAM_SLACK_HOME_CHANNEL_POLICY:-}"
 
   # No Slack token check here. The obvious place for one is this step -- Slack
   # is asked for here and the relay cannot open a socket without both tokens --
@@ -7308,7 +7342,16 @@ main() {
     # after_summary is true for the repeat at the end of main(), where the
     # component summary has already printed the web console command.
     local after_summary="${1:-false}"
+    # The resolved PlatformAgent mode: after the apply as the closing summary
+    # reads it, and at the chat step (before main() has resolved its own
+    # copy) from the flag or the fallback the mode check settled. Under next
+    # the CR carries the NoChatPlatform condition, which says where the
+    # agent's findings go.
+    local mode="${PLATFORM_AGENT_MODE_AFTER_APPLY:-${platform_agent_mode:-${PARAM_PLATFORM_AGENT_MODE:-${PLATFORM_AGENT_MODE_FALLBACK:-}}}}"
     print_info "Chat integrations disabled. Agent will operate via CLI / REST API Gateway."
+    if [ "$mode" = "next" ]; then
+      print_info "The PlatformAgent carries the NoChatPlatform condition, which says where the agent's findings go instead of chat."
+    fi
 
     # gcloud rejects --dns-endpoint on clusters without an external DNS
     # endpoint, so print the resolved flag rather than a literal one. Resolved
@@ -8213,6 +8256,7 @@ main() {
   export SLACK_ALLOWED_USERS="$slack_allowed_users"
   export SLACK_HOME_CHANNEL="$slack_home_channel"
   export SLACK_HOME_CHANNEL_NAME="$slack_home_channel_name"
+  export SLACK_HOME_CHANNEL_POLICY="$slack_home_channel_policy"
   export API_SERVER_KEY="$api_server_key"
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
@@ -8479,6 +8523,16 @@ main() {
       echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
     fi
   fi
+  # What the release asks of the cluster and what that costs at list price,
+  # rendered from the chart's own template over the tfvars just written, so
+  # the figures are the ones the chart's notes carry for the values the
+  # generator wrote (extra_helm_values is outside the render, and the helper
+  # says so when one is set). The apply goes through Terraform, which shows
+  # no notes, so this is where the front door prints them; `helm get notes`
+  # does after the apply. On the dry run too: the number is the point of
+  # previewing.
+  echo -e "  • ${C_CYAN}Cluster Footprint & Modeled Cost:${C_RESET}"
+  print_footprint_summary "$repo_dir" "$tfvars_file"
   echo -e "${C_CYAN}${C_BOLD}"
   draw_separator
   echo -e "${C_RESET}"
@@ -8686,7 +8740,9 @@ main() {
     "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" "$(derive_kms_location "$region")" "$project_id")"
   if grep -q '^enable_github_minter = true$' "$tfvars_file" 2>/dev/null && [ -z "$minter_enabled_version" ]; then
     print_error "The GitHub minter is enabled in the generated configuration, but its KMS signing key still has no ENABLED version — the apply would wait on a minter that can never become ready."
-    print_info "Fix the App key import (see the messages above) and re-run, or unset GITHUB_APP_ID to install without the minter."
+    print_minter_restore_advice "${KMS_KEY:-$DEFAULT_KMS_KEY}" "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
+      "$(derive_kms_location "$region")" "$project_id" ||
+      print_info "Fix the App key import (see the messages above) and re-run, or unset GITHUB_APP_ID to install without the minter."
     exit 1
   fi
 

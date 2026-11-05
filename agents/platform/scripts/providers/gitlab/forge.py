@@ -35,7 +35,7 @@ from urllib.parse import quote
 
 import repo_ref
 
-from ..base import COLLABORATION_VERBS, Forge, WorkspaceError, listing
+from ..base import COLLABORATION_VERBS, TALLY_TOTAL, Forge, WorkspaceError, listing, tally_with_open
 from ..credentials import Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
@@ -45,6 +45,7 @@ from ..validate import (
     validate_comment_limit,
     validate_labels,
     validate_limit,
+    validate_login,
     validate_number,
     validate_page,
     validate_state,
@@ -83,11 +84,34 @@ RESERVED_LABEL_FILTERS = frozenset({"none", "any"})
 #: The validation message GitLab sends, as a 404, for an emoji already awarded.
 ALREADY_AWARDED = "has already been taken"
 
+#: The header GitLab counts a listing's rows in. It leaves it off a listing
+#: past ten thousand rows, which is then no count.
+TOTAL_HEADER = "x-total"
+
+#: How an author's merge requests are asked for: every state, newest activity
+#: first, as GitHub's search is asked.
+AUTHORED_STATE = "all"
+AUTHORED_ORDER_BY = "updated_at"
+AUTHORED_SORT = "desc"
+
+#: GitLab's state filter for each count a tally makes: the two terminal
+#: outcomes and `all`, every state together, from which `open` is the remainder
+#: (the three counts are separate requests, not one snapshot).
+TALLY_STATES = {"merged": "merged", "closed": "closed", TALLY_TOTAL: "all"}
+
 
 def _states(neutral: str) -> str:
     """The neutral state as GitLab's `state` parameter."""
     return {"open": "opened", "closed": "closed", "all": "all"}[neutral]
 
+
+
+def _total(headers: Mapping[str, str]) -> int | None:
+    """The row count GitLab sent in `X-Total`, or None when it sent none."""
+    try:
+        return int(headers.get(TOTAL_HEADER, ""))
+    except ValueError:
+        return None
 
 
 def _filter_labels(raw: Any) -> list[str]:
@@ -709,6 +733,67 @@ class GitLabForge(Forge):
                 break
         commits = [translate.commit(node) for node in reversed(nodes[: self.COMMIT_CAP])]
         return listing(commits[(page - 1) * limit : page * limit], limit, "commits")
+
+    # -- the readings sweep's calls -------------------------------------------
+
+    def _authored(
+        self, api: Callable, repo: str, author: str, state: str, per_page: int, page: int
+    ) -> tuple[list, int | None]:
+        # Filtered on the username: `author_username` and the `author_id` of
+        # the same account answer the same merge requests.
+        nodes, headers = api(
+            "GET",
+            f"{self._project(repo)}/merge_requests",
+            params={
+                "author_username": author,
+                "state": state,
+                "order_by": AUTHORED_ORDER_BY,
+                "sort": AUTHORED_SORT,
+                "per_page": per_page,
+                "page": page,
+            },
+            with_headers=True,
+        )
+        return nodes or [], _total(headers)
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        author = validate_login(payload.get("author"))
+        limit = validate_limit(payload.get("limit"))
+        page = validate_page(payload.get("page"))
+        nodes, total = self._authored(api, repo, author, AUTHORED_STATE, limit, page)
+        answer = listing([translate.authored(node) for node in nodes], limit, "proposals")
+        answer["total"] = total
+        return answer
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # One row a state is enough: the count is in the header.
+        author = validate_login(payload.get("author"))
+        tally: dict[str, Any] = {}
+        for neutral, state in TALLY_STATES.items():
+            _, total = self._authored(api, repo, author, state, 1, 1)
+            if total is None:
+                raise WorkspaceError(
+                    f"GitLab answered the {neutral} merge requests with no `X-Total` count",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
+                )
+            tally[neutral] = total
+        return tally_with_open(tally)
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        # GitLab has approvals, not reviews: one unpaged answer naming every
+        # approver. Its comments are notes, which the conversation reader has.
+        number = validate_number(payload.get("number"))
+        limit = validate_comment_limit(payload.get("limit"))
+        answer = api("GET", f"{self._project(repo)}/merge_requests/{number}/approvals") or {}
+        entries = [entry for entry in answer.get("approved_by") or [] if isinstance(entry, dict)]
+        reviews = [translate.approval(entry) for entry in entries[:limit]]
+        return {"reviews": reviews, "count": len(reviews), "truncated": len(entries) > limit}
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        number = validate_number(payload.get("number"))
+        node = api("GET", f"{self._project(repo)}/merge_requests/{number}") or {}
+        return translate.closer(node)
 
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         # Best-effort by contract. Any note -- conversation or diff -- takes an

@@ -166,8 +166,9 @@ resource "google_service_account_iam_member" "fleet_reader_token_creators" {
 # read-only checks against every pool project as the bot itself, so it needs
 # project-level read here: the project and its IAM policy, the service
 # accounts' policies, the service listing, the cluster listing, the
-# repository, the key and its policy, the state bucket's metadata. These
-# roles cover every read those checks make on the project; none writes. The
+# repository, the key and its policy, the state bucket's metadata, the forge
+# pieces' zone, records, addresses and firewall rules. These roles cover
+# every read those checks make on the project; none writes. The
 # warm-cache repository's policy in the Prow project stays unread. They live in this
 # stack, beside the reader's token-creator grant, because this is the one
 # stack every pool project applies: a project provisioned after this landed
@@ -182,6 +183,8 @@ locals {
     "roles/artifactregistry.reader",
     "roles/cloudkms.viewer",
     "roles/storage.bucketViewer",
+    "roles/compute.networkViewer",
+    "roles/dns.reader",
   ]
   pool_state_reader_grants = {
     for pair in setproduct(var.pool_state_readers, local.pool_state_reader_roles) :
@@ -219,22 +222,23 @@ resource "google_project_iam_member" "pool_state_readers" {
 # ForceNew nor ignored, and the provider answers a raised value with
 # clusters.update carrying desiredMasterVersion, upgrading only when the
 # recorded master is lower (resource_container_cluster.go). So the reconcile
-# CARRIES THE MASTER FORWARD: a new REGULAR patch inside the held minor moves
-# the master to it, and the day REGULAR's default rolls a minor the pin
-# recomputes and the next apply walks the master to the new
+# MOVES THE MASTER BETWEEN MINORS: the day REGULAR's default rolls a minor
+# the pin recomputes and the next apply walks the master to the new
 # default-minus-one, one minor per apply (GKE's control-plane rule), so a
-# master further behind reaches the target over the applies that follow.
-# Both are manual upgrades in GKE's sense, which the
-# exclusion does not gate; the channel rule above does. So when the running
-# patch is one REGULAR does not carry, the script HOLDS the pin instead of
-# asking for the refused bump: the newest REGULAR patch of the running minor
-# above it when there is one (the one upgrade GKE allows), else the running
-# version, and the rest of the project applies; the apply after the step does
-# the minor bump from an on-channel patch. As of 2026-10-14 REGULAR's newest
-# 1.34 is below seeded-b's 1.34.12-gke.1011000, so the hold lasts until
-# REGULAR ships a 1.34 patch above it; if REGULAR drops 1.34 first, no pin
-# can recover and the cluster is upgraded by hand or destroyed and
-# re-created (the recovery below).
+# master further behind reaches the lag minor over the applies that follow.
+# Inside the lag minor the pin is the running version, so the patch does not
+# move: a pin at REGULAR's newest patch put seeded-b back on the channel's
+# list every morning, and the upgrades cases that read seeded-b for a patch
+# REGULAR has moved past never saw one. A provider upgrade is a
+# manual upgrade in GKE's sense, which the exclusion does not gate; the
+# channel rule above does. So when a cluster below the lag minor runs a
+# patch REGULAR does not carry, the script steps it first instead of asking
+# for the refused bump: the newest REGULAR patch of the running minor above
+# it when there is one (the one upgrade GKE allows), else the running
+# version, and the rest of the project applies; the apply after the step
+# does the minor bump from an on-channel patch. If REGULAR drops the minor
+# first, no pin can recover and the cluster is upgraded by hand or destroyed
+# and re-created (the recovery below).
 #
 # The provider only ever upgrades (cur < des) and a control plane cannot be
 # downgraded, so the pin is one-way: if the master ever gets AHEAD of it --
@@ -288,6 +292,10 @@ resource "google_container_cluster" "seeded_a" {
   # The fleet is standing, but deletion protection stays off: the scheduled
   # re-apply must be able to replace a cluster when a facet change requires
   # it, and the label plus README are the guard against accidental sweeps.
+  # This cluster is the exception: the scaled-zero gateway fixture's
+  # kubernetes_manifest resources (defects-a.tf) cannot plan while its endpoint
+  # is unknown, so creating or replacing seeded-a is the README's two-apply
+  # hand recovery, not a reconcile.
   deletion_protection = false
 
   logging_config {
@@ -523,8 +531,9 @@ resource "google_container_cluster" "seeded_b" {
   resource_labels          = local.held_cluster_labels
   deletion_protection      = false
 
-  # REGULAR's own newest previous-minor patch, or the hold when the running
-  # patch is one REGULAR does not carry: the comment above the data source.
+  # REGULAR's own newest previous-minor patch on a create; the running
+  # version once the cluster is in that minor, listed by REGULAR or not;
+  # the comment above the data source has the rest.
   min_master_version = local.lagging_version
   release_channel {
     channel = "REGULAR"
@@ -564,7 +573,7 @@ resource "google_container_cluster" "seeded_b" {
 
   # The other peer of the consistency majority: B matches A (authorized
   # networks ON, open block -- see seeded_a for why this is safe), so C is
-  # the single outlier on a single facet.
+  # the single outlier on the authorized-networks facet.
   master_authorized_networks_config {
     cidr_blocks {
       cidr_block   = "0.0.0.0/0"
@@ -588,15 +597,15 @@ resource "google_container_node_pool" "seeded_b_default" {
   version    = local.lagging_version
 
   # The pool takes the SAME derived pin as the master, and is deliberately
-  # not ignore_changes'd: min_master_version carries the control plane
-  # forward on every reconcile (see the block above), so a frozen pool
-  # would skew against it. Freezing it costs a finding in both directions:
+  # not ignore_changes'd: min_master_version moves the control plane at a
+  # minor roll (see the block above), so a frozen pool would skew against
+  # it. Freezing it costs a finding in both directions:
   # at the next REGULAR minor roll the master moves and the pool does not,
   # which is upgrade SOP 3.2 `pool-skew` -- exactly one minor behind with
   # autoUpgrade true, severity minor -- and even without a minor roll the
-  # same asymmetry leaks at patch level, because GKE auto-upgrades the pool
-  # to the channel's default patch while the pin pushes the master to the
-  # freshest patch of the minor, which 3.2 flags as patch-only drift.
+  # same asymmetry leaks at patch level, because GKE's own patch
+  # auto-upgrade may move the master in its window while a frozen pool
+  # waits for node auto-upgrade, which 3.2 flags as patch-only drift.
   # Either would be an undeclared finding on a fleet whose whole premise is
   # that a correct audit's findings are known in advance. Driving both from
   # local.lagging_version keeps them equal at steady state; the pool
@@ -636,9 +645,12 @@ resource "google_container_node_pool" "seeded_b_default" {
 # normalizes to OFF -- absence on one cluster against an ON majority is the
 # finding (SOP 4.5, base critical, the severity that survives a
 # three-cluster cohort's two ladder steps). Two agree, one differs: the
-# reason this fleet is at least three clusters and not two. Everything else on C
-# deliberately matches its peers, so C is an outlier on exactly one facet
-# and the split-cluster guard never mistakes it for an uncohorted cluster.
+# reason this fleet is at least three clusters and not two. Everything else
+# on C's control plane deliberately matches its peers; its default pool
+# differs on boot-disk size and kubelet config (seeded_c_default below),
+# which no facet reads today and two will. One facet today, three once
+# those land, either count under the six at which the split-cluster guard
+# (SOP 3.6) stops calling C drift and calls it a different kind of cluster.
 resource "google_container_cluster" "seeded_c" {
   name     = "${var.cluster_prefix}-c"
   location = var.zone
@@ -653,7 +665,8 @@ resource "google_container_cluster" "seeded_c" {
   }
 
   # Upgrade-SOP background closure, as on seeded-a: REGULAR channel and a
-  # window. The consistency defect above is authorized networks alone.
+  # window. The consistency defects are authorized networks on the control
+  # plane (above) and the default pool's disk and kubelet config (below).
   release_channel {
     channel = "REGULAR"
   }
@@ -674,6 +687,20 @@ resource "google_container_cluster" "seeded_c" {
   }
 }
 
+# Defect (consistency, pool-level): the same cluster's default pool is the
+# outlier on two node facets the drift SOP does not read yet, `boot-disk`
+# and `kubelet-config`. Every other pool in this stack runs a 20 GB boot
+# disk of the default type with no kubelet block; this one runs 50 GB (type
+# unchanged: size alone differed in the incident behind the facets) and
+# sets one kubelet key, cpu_cfs_quota, to false. False rather than the
+# default true, so the facet reads a difference whether it treats an absent
+# key as unset or as the default; CFS quota off on a node that runs only
+# system pods changes nothing anyone measures. Both fields update in place
+# on the pinned provider (8.4.0): GKE recreates the pool's one node, the
+# pool keeps its identity, and the cluster's createTime does not move, so
+# the drift SOP's 24-hour cohort gate is untouched and no reconcile-allow
+# entry is needed. The fixture role is drift-pool-outlier (fixtures.json);
+# the facets and the case that reads it are the follow-up.
 resource "google_container_node_pool" "seeded_c_default" {
   name       = "default-pool"
   location   = var.zone
@@ -682,10 +709,14 @@ resource "google_container_node_pool" "seeded_c_default" {
 
   node_config {
     machine_type    = "e2-small"
-    disk_size_gb    = 20
+    disk_size_gb    = 50
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    kubelet_config {
+      cpu_cfs_quota = false
+    }
 
     workload_metadata_config {
       mode = "GKE_METADATA"

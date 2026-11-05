@@ -241,7 +241,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         relayed = json.loads(h.watcher_policy.project_cluster(answer))
         self.assertEqual(relayed["masterAuth"], {"clusterCaCertificate": "CA"})
 
-    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads(self) -> None:
+    def test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists(self) -> None:
         policy = h.watcher_policy
         target = "kagents-dev/us-east4/fleet-a/"
         for method in ("POST", "PUT", "PATCH", "DELETE"):
@@ -282,6 +282,56 @@ class C1IsolationIsStructural(unittest.TestCase):
         for path in ("api/v1/namespaces/default/secrets/db", "apis/example.com/v1/namespaces/default/secrets/db"):
             decision = policy.evaluate_k8s("GET", target + path, {})
             self.assertEqual(decision.rule_id, policy.RULE_K8S_SECRETS, f"GET {path} is not refused as a Secret")
+
+    def test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only(self) -> None:
+        """The watcher's fleet-shape probe counts workloads through the broker
+        as one-item lists plus the server's remainingItemCount. The rule that
+        admits them is held to three things at once: five cluster-scoped paths
+        and no other (no namespaced form, no Secret, no Node), a query that is
+        exactly limit=1 (a larger limit or a selector is a list, not a count),
+        and an Accept every range of which asks for a PartialObjectMetadataList
+        (one plain range beside it and the server may answer with the item's
+        whole body: a pod's environment, a CronJob's template)."""
+        policy = h.watcher_policy
+        target = "kagents-dev/us-east4/fleet-a/"
+        metadata = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+        one = {"limit": ["1"]}
+        five = {"api/v1/pods", "apis/apps/v1/deployments", "apis/apps/v1/statefulsets",
+                "apis/apps/v1/daemonsets", "apis/batch/v1/cronjobs"}
+        self.assertEqual(set(policy.COUNT_LIST_PATHS), five, "the count-list rule admits a path this test does not know")
+        for path in sorted(five):
+            decision = policy.evaluate_k8s("GET", target + path, one, metadata)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_COUNT_LIST, f"GET {path}?limit=1 is not a count list")
+        for path in (
+            "api/v1/namespaces/default/pods",
+            "apis/apps/v1/namespaces/default/deployments",
+            "api/v1/secrets",
+            "api/v1/nodes",
+            "api/v1/configmaps",
+            "apis/batch/v1/jobs",
+            "apis/example.com/v1/deployments",
+        ):
+            decision = policy.evaluate_k8s("GET", target + path, one, metadata)
+            self.assertFalse(decision.allowed, f"GET {path}?limit=1 is relayed as a count list")
+        for query in (
+            {}, {"limit": ["0"]}, {"limit": ["2"]}, {"limit": ["1"], "labelSelector": ["app=web"]}, {"limit": ["1"], "watch": ["true"]},
+        ):
+            decision = policy.evaluate_k8s("GET", target + "api/v1/pods", query, metadata)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_QUERY, f"GET api/v1/pods with {query} is relayed")
+        # The API server keeps the last duplicate parameter, so a second `as`
+        # behind the metadata one would answer a Table whose columns are spec
+        # and status; the parse is the server's, and a repeat is refused.
+        for accept in (
+            "",
+            "application/json",
+            "application/vnd.kubernetes.protobuf,application/json",
+            metadata + ",application/json",
+            metadata + ";as=Table",
+            metadata + ";as = Table",
+            "application/json;as=PartialObjectMetadataList",
+        ):
+            decision = policy.evaluate_k8s("GET", target + "api/v1/pods", one, accept)
+            self.assertEqual(decision.rule_id, policy.RULE_K8S_ACCEPT, f"GET api/v1/pods?limit=1 with Accept {accept!r} is relayed whole")
 
     def test_C1_the_watcher_pubsub_routes_reach_only_the_configured_subscription(self) -> None:
         policy = h.watcher_policy
@@ -2822,6 +2872,35 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         chart = h.text("chart_admission_policy")
         self.assertIn("failurePolicy: Fail", chart)
         self.assertNotIn("failurePolicy: Ignore", chart)
+
+    def test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account(self) -> None:
+        """The A2A gateway's `create` on pods is confined by admission, not by RBAC.
+
+        RBAC cannot see a PodSpec, so buildA2AGatewayRole's grant would let a
+        compromised gateway run a pod as any ServiceAccount in its namespace.
+        kube-agents-a2a-gateway-pod holds those pods to `<name>-a2a-session`
+        and the session token audiences. This is the static half: the policy
+        fails closed, denies, keeps the identity rule, and is tied to the
+        chart copy. k8s-operator's a2a_gateway_pod_policy_envtest_test.go runs
+        it in an API server.
+        """
+        documents = h.yaml_documents("gateway_pod_policy")
+        policy = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicy")
+        binding = next(d for d in documents if d.get("kind") == "ValidatingAdmissionPolicyBinding")
+        self.assertEqual("Fail", policy["spec"].get("failurePolicy"))
+        self.assertEqual(["Deny"], binding["spec"].get("validationActions"))
+        self.assertEqual(policy["metadata"]["name"], binding["spec"]["policyName"])
+        self.assertTrue(
+            any(
+                "object.spec.serviceAccountName == variables.sessionAccount" in v["expression"]
+                for v in policy["spec"]["validations"]
+            ),
+            "the policy no longer holds the gateway's pods to the session account",
+        )
+        sync = (h.REPO_ROOT / "hack/sync-chart-manifests.sh").read_text()
+        for tied in (h.SOURCES["gateway_pod_policy"].path, h.SOURCES["chart_gateway_pod_policy"].path):
+            self.assertIn(tied, sync, "the sync script no longer ties the chart copy to the source")
+        self.assertNotIn("failurePolicy: Ignore", h.text("chart_gateway_pod_policy"))
 
 
 def _executor():
