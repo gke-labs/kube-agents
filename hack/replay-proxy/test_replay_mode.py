@@ -28,17 +28,11 @@ SUBPROCESS_TIMEOUT_SECONDS = 30
 
 
 def sse_message(payload):
-    """The answer and usage a client assembles from an SSE body."""
-    message, usage, finish = {}, None, None
-    for line in payload.decode().split("\n"):
-        if not line.startswith("data: ") or line == "data: [DONE]":
-            continue
-        chunk = json.loads(line[len("data: "):])
-        usage = chunk.get("usage") or usage
-        for choice in chunk.get("choices") or []:
-            replay_proxy.merge_delta(message, choice.get("delta") or {})
-            finish = choice.get("finish_reason") or finish
-    return message, usage, finish
+    """The answer, usage and finish reason a client assembles from an SSE body, read as the proxy reads one."""
+    observer = replay_proxy.ResponseObserver(streaming=True)
+    observer.feed(payload)
+    observer.finish()
+    return observer.message, observer.usage, observer.finish_reason
 
 
 class GuardTest(unittest.TestCase):
