@@ -1570,6 +1570,12 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if pods.Value() != 19 {
 		t.Fatalf("tuned quota = %d, want 19 (cap 2 + headroom 17)", pods.Value())
 	}
+
+	// The MCP server is one more standing pod, only while its flag is on (#3869).
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != 20 {
+		t.Fatalf("tuned quota with the MCP server = %d, want 20 (cap 2 + headroom 17 + 1)", pods.Value())
+	}
 }
 
 // The CR field reaches the gateway as an explicit env value even when unset:
