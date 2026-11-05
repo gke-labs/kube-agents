@@ -96,10 +96,10 @@ entries:
     measure: 2
     detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
     issue: 4341
-  # The next-mode golden's A2A stack: the callout, the verifier, the A2A
-  # gateway and the NATS server declare cpu and memory but no ephemeral-storage
-  # figures, the console declares no cpu limit either, and the hermes-bridge
-  # sidecar the gateway pod carries in that mode declares no ephemeral-storage.
+  # The next-mode golden's A2A stack: the callout, the console, the verifier,
+  # the A2A gateway and the NATS server declare cpu and memory but no
+  # ephemeral-storage figures, and the hermes-bridge sidecar the gateway pod
+  # carries in that mode declares no ephemeral-storage.
   - workload: "golden Deployment/platformagent-a2a-callout"
     container: callout
     rule: resources-declared
@@ -109,8 +109,8 @@ entries:
   - workload: "golden Deployment/platformagent-a2a-console"
     container: console
     rule: resources-declared
-    measure: 3
-    detail: "missing limits.cpu, limits.ephemeral-storage, requests.ephemeral-storage"
+    measure: 2
+    detail: "missing limits.ephemeral-storage, requests.ephemeral-storage"
     issue: 4341
   - workload: "golden Deployment/platformagent-a2a-gateway"
     container: gateway
