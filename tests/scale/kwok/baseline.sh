@@ -56,8 +56,10 @@ readonly BASELINE_WATCHER_TIMEOUT="${BASELINE_WATCHER_TIMEOUT:-15m}"
 # exists to see, so it ends as a recorded exit 124 rather than as the job's
 # own timeout, which would take the direct-path numbers down with it.
 readonly BASELINE_READ_TIMEOUT="${BASELINE_READ_TIMEOUT:-30m}"
-# One unit only (15m, 900s, 2h); duration_seconds has no parser for 1h30m.
-readonly DURATION_PATTERN='^[0-9]+[smh]?$'
+# One unit only (15m, 900s, 2h) and no leading zero: duration_seconds has no
+# parser for 1h30m, bash arithmetic reads 08 as octal, and 0 would disable
+# the read timeout rather than shorten it.
+readonly DURATION_PATTERN='^[1-9][0-9]*[smh]?$'
 readonly BASELINE_PROXY_PORT="${BASELINE_PROXY_PORT:-18443}"
 readonly BASELINE_PROXY_METRICS_PORT="${BASELINE_PROXY_METRICS_PORT:-18444}"
 readonly BASELINE_WATCHER_METRICS_PORT="${BASELINE_WATCHER_METRICS_PORT:-19095}"
@@ -83,7 +85,9 @@ readonly PROXY_NODES_RESOURCE="nodes"
 readonly VIEW_CLUSTERROLE="view"
 readonly TOKENREVIEW_CLUSTERROLE="system:auth-delegator"
 readonly PROXY_AUDIENCE="kubeagents-credential-proxy"
-readonly PROXY_DEFAULT_CLUSTER="in-cluster"
+# The proxy routes by the /clusters/<id> prefix of every request path; the
+# host cluster behind --kube-api-server is InClusterID in its policy.go.
+readonly PROXY_CLUSTER_ID="in-cluster"
 readonly TOKEN_DURATION="2h"
 # client-go sends a bearer token over TLS only, so the proxy serves a
 # self-signed loopback certificate, as the operator mints one for the install.
@@ -171,6 +175,10 @@ mem_json() {
 
 # prom_samples FILE FAMILY: the samples of one metric family (its _sum and
 # _count series included, buckets left out) as a JSON array of {metric, labels, value}.
+# Labels are read pair by pair with their quotes respected, so a value that
+# carries '=' or ',' (an Event reason the watcher counts, say) stays whole. A
+# sample with a trailing timestamp does not match the value pattern and is
+# skipped; promhttp emits none for these families.
 prom_samples() {
   { grep -E "^$2(_sum|_count)?\{" "$1" || true; } | awk '
     {
@@ -178,12 +186,17 @@ prom_samples() {
       name = substr($0, 1, open - 1)
       rest = substr($0, open + 1)
       close_at = match(rest, /\} [^ ]+$/)
+      if (close_at == 0) next
       labels = substr(rest, 1, close_at - 1)
       value = substr(rest, close_at + 2)
-      gsub(/=/, "\":", labels)
-      gsub(/,/, ",\"", labels)
-      if (labels != "") labels = "\"" labels
-      printf "{\"metric\":\"%s\",\"labels\":{%s},\"value\":\"%s\"}\n", name, labels, value
+      out = ""
+      while (match(labels, /[A-Za-z_][A-Za-z0-9_]*="([^"\\]|\\.)*"/)) {
+        pair = substr(labels, RSTART, RLENGTH)
+        eq = index(pair, "=")
+        out = out (out == "" ? "" : ",") "\"" substr(pair, 1, eq - 1) "\":" substr(pair, eq + 1)
+        labels = substr(labels, RSTART + RLENGTH)
+      }
+      printf "{\"metric\":\"%s\",\"labels\":{%s},\"value\":\"%s\"}\n", name, out, value
     }' | jq -s 'map(.value as $v | .value = (($v | tonumber?) // $v))'
 }
 
@@ -375,7 +388,7 @@ kind: Config
 clusters:
 - name: $PROXY_CONTEXT
   cluster:
-    server: https://$LOOPBACK:$BASELINE_PROXY_PORT
+    server: https://$LOOPBACK:$BASELINE_PROXY_PORT/clusters/$PROXY_CLUSTER_ID
     certificate-authority: $PROXY_CERT
 contexts:
 - name: $PROXY_CONTEXT
@@ -391,7 +404,6 @@ log "starting $PROXY_BINARY on $LOOPBACK:$BASELINE_PROXY_PORT (metrics port $BAS
 OTEL_SDK_DISABLED=true "$PROXY_BIN" \
   --listen-addr="$LOOPBACK:$BASELINE_PROXY_PORT" --metrics-port="$BASELINE_PROXY_METRICS_PORT" \
   --tls-cert-file="$PROXY_CERT" --tls-key-file="$PROXY_KEY" \
-  --default-cluster="$PROXY_DEFAULT_CLUSTER" \
   --kube-api-server="$SERVER" --kube-ca-file="$CA" --kube-token-file="$PROXY_TOKEN_FILE" \
   --audience="$PROXY_AUDIENCE" --allowed-callers="system:serviceaccount:$RBAC_NAMESPACE:$CALLER_SA" \
   >"$PROXY_LOG" 2>&1 &

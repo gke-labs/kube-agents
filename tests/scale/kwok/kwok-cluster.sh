@@ -135,14 +135,16 @@ up() {
   kc="$(kubeconfig_path "$name")"
   ctx="$CONTEXT_PREFIX$name"
   mkdir -p "$KWOK_STATE_DIR"
+  # An existing cluster is checked the way a new one is, below: a first `up`
+  # that died after kwokctl created it leaves the cluster listed, and a reboot
+  # leaves it listed with nothing running.
   if cluster_exists "$name"; then
-    log "kwok cluster $name already exists (kubeconfig $kc)"
-    [ -f "$kc" ] || echo "WARNING: $kc is missing; run '$0 down $name' and then 'up $name' to recreate it" >&2
-    return 0
-  fi
-  log "creating kwok cluster $name (Kubernetes $KWOK_KUBE_VERSION, kwok $KWOK_VERSION, binary runtime, workdir $KWOK_WORKDIR)"
-  options_file="$KWOK_STATE_DIR/$KWOK_OPTIONS_FILE_NAME"
-  cat >"$options_file" <<EOF
+    log "kwok cluster $name already exists; checking it"
+    [ -f "$kc" ] || die "$kc is missing for the existing cluster $name; run '$0 down $name' and then 'up $name' to recreate it"
+  else
+    log "creating kwok cluster $name (Kubernetes $KWOK_KUBE_VERSION, kwok $KWOK_VERSION, binary runtime, workdir $KWOK_WORKDIR)"
+    options_file="$KWOK_STATE_DIR/$KWOK_OPTIONS_FILE_NAME"
+    cat >"$options_file" <<EOF
 apiVersion: config.kwok.x-k8s.io/v1alpha1
 kind: KwokConfiguration
 options:
@@ -150,25 +152,26 @@ options:
   nodePlayStageParallelism: $KWOK_STAGE_PARALLELISM
   nodeLeaseParallelism: $KWOK_NODE_LEASE_PARALLELISM
 EOF
-  # The scheduler is off because the seeder places every pod itself through
-  # spec.nodeName; kwok-controller still marks the pods Running.
-  # shellcheck disable=SC2086 # KWOK_EXTRA_CREATE_ARGS is a space-separated flag list by contract.
-  kwokctl create cluster --name "$name" --runtime binary --kubeconfig "$kc" \
-    --config "$options_file" \
-    --disable kube-scheduler \
-    --extra-args "kube-apiserver=event-ttl=$EVENT_TTL" \
-    --extra-args "kube-apiserver=service-cluster-ip-range=$SERVICE_CIDR" \
-    --kwok-controller-binary "$(command -v kwok)" \
-    --quiet-pull --wait "$CREATE_WAIT" --timeout "$CREATE_TIMEOUT" $KWOK_EXTRA_CREATE_ARGS
+    # The scheduler is off because the seeder places every pod itself through
+    # spec.nodeName; kwok-controller still marks the pods Running.
+    # shellcheck disable=SC2086 # KWOK_EXTRA_CREATE_ARGS is a space-separated flag list by contract.
+    kwokctl create cluster --name "$name" --runtime binary --kubeconfig "$kc" \
+      --config "$options_file" \
+      --disable kube-scheduler \
+      --extra-args "kube-apiserver=event-ttl=$EVENT_TTL" \
+      --extra-args "kube-apiserver=service-cluster-ip-range=$SERVICE_CIDR" \
+      --kwok-controller-binary "$(command -v kwok)" \
+      --quiet-pull --wait "$CREATE_WAIT" --timeout "$CREATE_TIMEOUT" $KWOK_EXTRA_CREATE_ARGS
+  fi
   [ "$(kubectl --kubeconfig "$kc" --context "$ctx" get --raw "$READYZ_PATH")" = "$READYZ_OK" ] \
-    || die "cluster $name came up but $READYZ_PATH did not answer $READYZ_OK"
+    || die "cluster $name is up but $READYZ_PATH did not answer $READYZ_OK; run '$0 down $name' and then 'up $name'"
   # kwokctl's --wait covers the API server only. A kwok-controller that died
   # at start (an unknown flag through KWOK_EXTRA_CREATE_ARGS, for one) leaves
   # a cluster whose pods never turn Running, which the seeder would report as
   # a timeout twenty minutes later.
   controller_pid_file="$(cluster_dir "$name")/$CONTROLLER_PID_FILE"
   if ! [ -f "$controller_pid_file" ] || ! kill -0 "$(cat "$controller_pid_file")" 2>/dev/null; then
-    die "cluster $name came up but kwok-controller is not running (see $(cluster_dir "$name")/logs/)"
+    die "cluster $name is up but kwok-controller is not running (see $(cluster_dir "$name")/logs/); run '$0 down $name' and then 'up $name'"
   fi
   log "cluster $name is ready at $(server_url "$name") (context $ctx, kubeconfig $kc)"
 }

@@ -36,8 +36,8 @@ def _script_constants() -> dict:
 
 
 def _go_string_constant(path: pathlib.Path, name: str) -> str:
-    """The value of `name = "..."` in a Go const block."""
-    match = re.search(rf'^\s*{re.escape(name)}\s*=\s*"([^"]*)"', path.read_text(), re.MULTILINE)
+    """The value of `name = "..."`, in a Go const block or as a one-line const."""
+    match = re.search(rf'^\s*(?:const\s+)?{re.escape(name)}\s*=\s*"([^"]*)"', path.read_text(), re.MULTILINE)
     if match is None:
         raise AssertionError(f"{path.relative_to(_REPO_ROOT)} no longer declares {name}")
     return match.group(1)
@@ -69,6 +69,13 @@ class ScaleLaneWiringTest(unittest.TestCase):
         self.assertEqual(
             self.script["PROXY_DURATION_METRIC"],
             prefix + _go_string_constant(metrics, "requestDurationSecondsName"),
+        )
+
+    def test_proxy_cluster_id_is_the_in_cluster_route(self):
+        """The caller kubeconfig's /clusters/<id> prefix names the host-cluster route."""
+        self.assertEqual(
+            self.script["PROXY_CLUSTER_ID"],
+            _go_string_constant(_PROXY_DIR / "policy.go", "InClusterID"),
         )
 
     def test_proxy_audience_matches_the_install(self):
