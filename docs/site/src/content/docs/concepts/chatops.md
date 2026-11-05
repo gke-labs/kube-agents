@@ -206,7 +206,7 @@ A set-aside plan with no card waiting on you or failed is dropped four hours aft
 
 When the agent restarts, a card's next note, its settling, or the next liveness signal from a card still running starts a new plan. A card that settles there, other than by being archived, closes the thread's session, or pauses it while the card waits on you, so Working… from before the restart does not stay. It can also clear Working… for another card from before the restart that is still running, until that card's next liveness signal or note. Past 20 cards the oldest finished ones leave the plan first.
 
-A channel thread is titled after its first ask, up to the ask's first question, as a DM thread is titled after its ask. A thread a crash-looping workload's alert started is titled for the incident instead, such as `payments-api crashloop in prod-east`. If Slack refuses the plan, the thread falls back to a rolling progress message per card until those cards settle, or for half an hour after the last of them goes quiet. A card settling still updates its row on the plan, and Working… holds while those cards run and pauses while they wait on you.
+A channel thread is titled after its first ask, up to the ask's first question, as a DM thread is titled after its ask. A thread that a crash-looping workload's alert or a drift alert started is titled for it instead, such as `payments-api crashloop in prod-east` or `checkout-gateway HPA drift · prod-east`. If Slack refuses the plan, the thread falls back to a rolling progress message per card until those cards settle, or for half an hour after the last of them goes quiet. A card settling still updates its row on the plan, and Working… holds while those cards run and pauses while they wait on you.
 
 #### Collapsed cards and option buttons
 
@@ -275,6 +275,8 @@ In a thread, the Planning Agent posts nothing after carrying your answer to the 
 #### Alert buttons
 
 With `KAGE_SLACK_UX` on, the alert for a crash-looping workload reads as one line on Slack, such as "🚨 **payments-api in prod-east keeps crashing.** Looking now."; alerts for other reasons, and alerts on other platforms, read as before. An incident's triage edits its alert in place instead of replying under it. The alert becomes a one-line headline, then a button per proposed option showing its title, with the recommended one highlighted and marked "(recommended)", and a button for each console link on the report's 🔗 line. The report, up to its first horizontal rule, is folded underneath.
+
+A drift alert's triage adds a line under the headline saying what changed, who changed it and when, and marks the recommended button by its highlight alone.
 
 Clicking an option answers as if you had replied in the thread yourself with `apply Option B: <its title>`, or `apply: <its title>` when there is a single fix. The agent replaces the option buttons with a line such as "✓ <your name>: <its title>", your Slack name in plain text (or, if Slack refuses that edit, posts that line in the thread). Your reply passes the same user and channel checks a typed reply does. A click never needs an @-mention.
 
