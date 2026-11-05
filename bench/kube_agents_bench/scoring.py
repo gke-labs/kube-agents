@@ -101,6 +101,16 @@ MISSING = "MISSING"
 _TIMING_FILE = "timing.json"
 _TIMING_TURN1_KEY = "turn1_s"
 
+#: The record's prompt-split buckets (devops_bench TOKEN_BUCKETS): ``cached``
+#: is cache reads, ``cache_write`` cache writes, and ``input`` the prompt
+#: that is neither; ``reasoning`` rides inside ``output``. The harness fills
+#: them from hermes' session rows; ``front_door`` is the router's own row
+#: once workers are folded in (harness._fold_worker_tokens).
+_TOKENS_CACHED_KEY = "cached"
+_TOKENS_CACHE_WRITE_KEY = "cache_write"
+_TOKENS_REASONING_KEY = "reasoning"
+_TOKENS_FRONT_DOOR_KEY = "front_door"
+
 #: ``VerificationCorrectness`` at or above this is a passing repetition. The
 #: existing presubmit floor, unchanged; the CLI reads it from the environment.
 DEFAULT_CORRECTNESS_FLOOR = 1.0
@@ -632,6 +642,27 @@ def _tokens_partial(tokens: dict[str, Any]) -> bool:
     return tokens.get("usage_partial") is True or bool(unbilled)
 
 
+def _tokens_split(tokens: dict[str, Any]) -> bool:
+    """Whether the record's top-level ``input`` excludes cache reads, so
+    ``cached`` beside it gives a hit rate: the front door's session row was
+    read (``cached`` a count, and ``front_door.cached`` one too when workers
+    were folded in). The inject transport leaves ``cached`` null, its
+    ``input`` counting cache reads; an api run whose row lookup failed keeps
+    the envelope's prompt total as ``input``, and its folded-in workers'
+    ``cached`` alone would read as a hit rate it does not have."""
+    if token_count(tokens.get(_TOKENS_CACHED_KEY)) is None:
+        return False
+    front_door = tokens.get(_TOKENS_FRONT_DOOR_KEY)
+    return not isinstance(front_door, dict) or token_count(front_door.get(_TOKENS_CACHED_KEY)) is not None
+
+
+def _split_count(tokens: dict[str, Any] | None, key: str) -> int | None:
+    """``key`` of the record's prompt split, or None when there is no split."""
+    if not tokens or not _tokens_split(tokens):
+        return None
+    return token_count(tokens.get(key))
+
+
 @dataclass(frozen=True)
 class RepResult:
     """One repetition's verdict.
@@ -662,6 +693,12 @@ class RepResult:
     input_tokens: int | None = None
     output_tokens: int | None = None
     tokens_partial: bool = False
+    #: The record's ``cached``, ``cache_write`` and ``reasoning`` buckets,
+    #: only when its ``input`` excludes cache reads (:func:`_tokens_split`),
+    #: for the same line. None otherwise.
+    cached_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    reasoning_tokens: int | None = None
     #: The agent's final report, verbatim, for the build log's excerpt line.
     #: Not in the hand-off: the dashboard reads it from the log.
     report: str = ""
@@ -1179,6 +1216,9 @@ def classify_rep(
             input_tokens=token_count(record.tokens.get("input")) if record else None,
             output_tokens=token_count(record.tokens.get("output")) if record else None,
             tokens_partial=_tokens_partial(record.tokens) if record else False,
+            cached_tokens=_split_count(record.tokens, _TOKENS_CACHED_KEY) if record else None,
+            cache_write_tokens=_split_count(record.tokens, _TOKENS_CACHE_WRITE_KEY) if record else None,
+            reasoning_tokens=_split_count(record.tokens, _TOKENS_REASONING_KEY) if record else None,
             report=record.output if record else "",
             not_applicable_checks=list(lane.not_applicable) if lane else [],
         )
