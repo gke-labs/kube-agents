@@ -2201,10 +2201,14 @@ KCC_READABLE_STATUSES = frozenset({"RUNNING", "RECONCILING"})
 KCC_DEPENDENCY_PATTERN = re.compile(
     r"\breference (?P<kind>[A-Za-z0-9]+) (?:(?P<namespace>[A-Za-z0-9.-]+)/)?(?P<name>[A-Za-z0-9.-]+) is not ready\b"
 )
+# How every first sentence of the Config Connector paragraph starts, in all
+# its forms. The strip-and-rewrite pattern and the log look for it.
+KCC_STALLED_MARK_PREFIX = "**Config Connector is not applying "
 # The note `disclose_stalled_kcc_remediations` adds after a `manifest` fix
 # whose file declares an object Config Connector does not apply. One line, so
-# `KCC_STALLED_NOTE_PATTERN` removes all of it.
-KCC_STALLED_NOTE_MARK = "**Config Connector is not applying this file.**"
+# `KCC_STALLED_NOTE_PATTERN` removes all of it. Only this form says "this
+# file": the fix edits the declaring file.
+KCC_STALLED_NOTE_MARK = KCC_STALLED_MARK_PREFIX + "this file.**"
 # Each paragraph is a core and a tail. The tail is the part a note can lose
 # when the core does not fit otherwise (`_fit_kcc_paragraph`).
 KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}."
@@ -2216,13 +2220,13 @@ KCC_STALLED_NOTE_TAIL = (
 KCC_STALLED_NOTE = KCC_STALLED_NOTE_CORE + " " + KCC_STALLED_NOTE_TAIL
 # The paragraph for any other fix of a finding whose own object Config
 # Connector does not apply: a `manual` or `gcloud` fix, a fix degraded to
-# `manual`, or a `manifest` fix to another file. When exactly one file in the
-# repository declares the object, the paragraph keeps the first sentence above
-# and names that file; otherwise it starts with `KCC_STALLED_OBJECT_MARK` and
-# names no file.
-KCC_STALLED_DECLARED_CORE = (
-    KCC_STALLED_NOTE_MARK + " The declaration is {path}. When the audit ran, Config Connector reported {objects}."
-)
+# `manual`, or a `manifest` fix to another file. The fix's file is not the
+# declaration, so the first sentence does not say "this file". When exactly
+# one file in the repository declares the object, the first sentence names
+# that file (`KCC_STALLED_DECLARED_MARK`); otherwise it is
+# `KCC_STALLED_OBJECT_MARK` and the paragraph names no file.
+KCC_STALLED_DECLARED_MARK = KCC_STALLED_MARK_PREFIX + "{path}.**"
+KCC_STALLED_DECLARED_CORE = KCC_STALLED_DECLARED_MARK + " When the audit ran, Config Connector reported {objects}."
 KCC_STALLED_OBJECT_TAIL = (
     "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
     "does not take effect before then, and this finding comes back on each run until then."
@@ -2230,7 +2234,7 @@ KCC_STALLED_OBJECT_TAIL = (
 KCC_STALLED_DECLARED_NOTE = (
     KCC_STALLED_DECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct it there."
 )
-KCC_STALLED_OBJECT_MARK = "**Config Connector is not applying the declaration of this object.**"
+KCC_STALLED_OBJECT_MARK = KCC_STALLED_MARK_PREFIX + "the declaration of this object.**"
 KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. {search}"
 # What the paragraph says when it names no file: that more than one file
 # declares the object, or only that it names none. It never says that no
@@ -2243,8 +2247,8 @@ KCC_STALLED_UNDECLARED_NOTE = (
 )
 # How the paragraph names a declaration in a context repository.
 KCC_DECLARATION_IN_REPO = "{path} in the repository {repo}"
-# The first sentences of both paragraphs, which the strip-and-rewrite pattern
-# and the log look for.
+# The fixed first sentences. A first sentence that names a file is
+# `KCC_STALLED_DECLARED_MARK`; `KCC_STALLED_MARK_PREFIX` finds them all.
 KCC_STALLED_NOTE_MARKS = (KCC_STALLED_NOTE_MARK, KCC_STALLED_OBJECT_MARK)
 # The finding field that holds the paragraph of a `gcloud` fix: its note is
 # the command, which renders in a bash block, so the paragraph renders after
@@ -2253,9 +2257,7 @@ KCC_STALLED_PARAGRAPH_FIELD = "kcc_stalled_paragraph"
 # An earlier copy of either paragraph, which a worker can copy from the
 # previous ledger. The pass removes it from every note and writes it again
 # when the stall is still there, as the route-note pass does with its notes.
-KCC_STALLED_NOTE_PATTERN = re.compile(
-    r"[ \t]*(?:" + "|".join(re.escape(mark) for mark in KCC_STALLED_NOTE_MARKS) + r")[^\n]*"
-)
+KCC_STALLED_NOTE_PATTERN = re.compile(r"[ \t]*" + re.escape(KCC_STALLED_MARK_PREFIX) + r"[^\n]*")
 # What the merged-but-persisting line and comment say in place of the two
 # causes they guess at, when the finding's object is one of those objects.
 # They state the fact and the reason only: the merged change itself can be
@@ -7558,7 +7560,7 @@ def _strip_route_notes(remediation: object) -> None:
     # The Config Connector note is stripped and written again the same way
     # (`disclose_stalled_kcc_remediations`), so a carried note never keeps a
     # stall that this run's manifest does not show.
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_MARK_PREFIX in note:
         note = KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     if isinstance(uncut, str) or note != remediation.get("note"):
         remediation["note"] = note
@@ -19611,7 +19613,7 @@ def kcc_stalled_objects(
 def _without_kcc_paragraph(note: str) -> str:
     """`note` with either paragraph of `disclose_stalled_kcc_remediations`
     removed."""
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_MARK_PREFIX in note:
         return KCC_STALLED_NOTE_PATTERN.sub("", note).strip()
     return note
 
@@ -19622,7 +19624,7 @@ def _strip_kcc_stalled_note(remediation: object) -> None:
     if not isinstance(remediation, dict):
         return
     note = str(remediation.get("note") or "")
-    if any(mark in note for mark in KCC_STALLED_NOTE_MARKS):
+    if KCC_STALLED_MARK_PREFIX in note:
         remediation["note"] = _without_kcc_paragraph(note)
 
 
@@ -19834,7 +19836,7 @@ def disclose_stalled_kcc_and_log(
                 f"{prefix}WARNING: {fid}: Config Connector is not applying the finding's own object, and the "
                 "paragraph that says so does not fit beside the text the audit wrote; the renderer cuts its end."
             )
-        elif any(mark in note for mark in KCC_STALLED_NOTE_MARKS) or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
+        elif KCC_STALLED_MARK_PREFIX in note or by_id[fid].get(KCC_STALLED_PARAGRAPH_FIELD):
             log(f"{prefix}{fid}: Config Connector is not applying the finding's own object; the fix says so.")
         else:
             log(f"{prefix}{fid}: removed a Config Connector note that its remediation copied from an earlier ledger.")

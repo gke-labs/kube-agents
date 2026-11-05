@@ -49,10 +49,11 @@ prompt: >-
 expected_output: >-
   The ledger issue carries a finding on pinned-inference-pool. Its fix, of
   any kind, ends with a paragraph that says Config Connector is not applying
-  this file, names the ContainerNodePool in eval-kcc-stalled and its
-  DependencyNotFound reason, and the ledger row names the planted declaration
-  clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml (as the fix's
-  file, or in the paragraph when the fix is not a manifest fix of that file). Nothing on
+  the declaration: "this file" when the fix edits the planted declaration
+  clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml, or that file
+  by name when the fix is of another kind or another file. The paragraph
+  names the ContainerNodePool in eval-kcc-stalled and its DependencyNotFound
+  reason. Nothing on
   the clusters is changed. The closing response is the SOP's one line,
   carrying the ledger URL in full.
 infrastructure:
@@ -83,10 +84,14 @@ fixtures:
   - hpa-saturated
 
 verification_spec:
-  # The deciding check: the first sentence of `finish`'s note
-  # (audit_report.KCC_STALLED_NOTE_MARK), the object as the note names it,
-  # and the planted declaration's file, which the row names either as the
-  # manifest fix's file or in the paragraph ("The declaration is ...").
+  # The deciding check: the object as the note names it, the planted
+  # declaration's file, and a first sentence that is correct for the fix. A
+  # manifest fix of the planted file says "this file"
+  # (audit_report.KCC_STALLED_NOTE_MARK); any other fix, the live run's
+  # degraded manual one included, names the file in the first sentence
+  # (audit_report.KCC_STALLED_DECLARED_MARK). The forbidden phrase is the old
+  # text that said "this file" about a fix of another file and then named the
+  # declaration, so the case is red where the first sentence is wrong.
   - name: the-fix-says-config-connector-is-not-applying-its-file
     role: objective
     mode: assert
@@ -95,9 +100,13 @@ verification_spec:
       audit: stockout-prevention
       scope: body
       required_phrases:
-        - "**Config Connector is not applying this file.**"
         - "`ContainerNodePool eval-kcc-stalled/pinned-inference-pool`"
         - "/provisioning/pinned-inference-pool.yaml`"
+      any_of_phrases:
+        - "**Config Connector is not applying this file.**"
+        - "**Config Connector is not applying `clusters/"
+      forbidden_phrases:
+        - "**Config Connector is not applying this file.** The declaration is"
   # Tells a red from a broken run: the stockout finding on the pool was filed.
   - name: a-finding-was-filed-against-the-planted-pool
     role: objective
