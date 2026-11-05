@@ -103,7 +103,9 @@ const (
 	wireContentType        = runtime.ContentTypeProtobuf
 	wireAcceptContentTypes = runtime.ContentTypeProtobuf + "," + runtime.ContentTypeJSON
 
-	summaryFileMode = 0o644
+	// summaryFileMode is owner-only: gosec's G306 asks for 0600 or less on a
+	// written file, and only the run that wrote the summary reads it back.
+	summaryFileMode = 0o600
 
 	phaseNamespaces = "namespaces"
 	phaseNodes      = "nodes"

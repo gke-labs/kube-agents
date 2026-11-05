@@ -67,7 +67,7 @@ type profile struct {
 // loadProfile reads a profile file. An unknown key is an error rather than
 // a silent zero, so a misspelt count fails with its name.
 func loadProfile(path string) (profile, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the profile the command line names; reading it is the point
 	if err != nil {
 		return profile{}, fmt.Errorf("profile: %w", err)
 	}
