@@ -27,7 +27,8 @@ readonly GEMINI_KEY_DISPLAY_NAME="kube-agents-eval-gemini"
 readonly GEMINI_KEY_SECRET_NAME="kube-agents-eval-gemini-api-key"
 readonly GEMINI_KEY_API_TARGET="generativelanguage.googleapis.com"
 readonly GEMINI_KEY_APIS="apikeys.googleapis.com secretmanager.googleapis.com generativelanguage.googleapis.com"
-# The Prow job identity that deploys the nightlies, and the baseline recorder.
+# The two runners: prowjob-default-sa runs the presubmits, eval-baseline-recorder
+# runs the nightlies.
 readonly GEMINI_KEY_SECRET_ACCESSORS="prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 # The health bot: it checks the secret exists and has a version, never the value.
 readonly GEMINI_KEY_SECRET_VIEWERS="eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com"
