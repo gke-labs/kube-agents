@@ -1079,6 +1079,11 @@ DRIFT_ALERT_EMOJI = "🔀"
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
 
+# The titles a drift triage gives its two usual options. A title is the button
+# slack_ux_incident draws for the option, so these are what a person presses.
+DRIFT_REVERT_TITLE = "Put Git's version back"
+DRIFT_KEEP_TITLE = "Keep it · update Git"
+
 # What a drift card says when the install has no usable GitOps repository
 # registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
 # that are all unusable). The object may well be synced from a repository by a
@@ -3817,6 +3822,10 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"declares, or change git to declare what is now live — and both are worth stating even when one is "
         f"obviously right, because the reader is deciding which state wins. For an object git does not declare "
         f"they are the ones above.\n\n"
+        f"**Title those two with these exact words,** because each title becomes the button a person presses in "
+        f"chat: the revert is `{DRIFT_REVERT_TITLE}`, and changing git to declare what is now live is "
+        f"`{DRIFT_KEEP_TITLE}`. The same words title a lone **Proposed fix** that does one of them. Any other "
+        f"option gets a short title of its own.\n\n"
         f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
         f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
         f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
@@ -3835,8 +3844,14 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
-        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"<object> on <cluster> was changed outside Git.\n\n"
+        f"<1-2 sentences: which field went from what to what, at what time and by whom, then whether the change "
+        f"still stands and what it means now>\n\n"
         f"## Why\n\n"
+        f"```diff\n"
+        f"- <field>: <its value before the change, or 'not shown by the cluster'>\n"
+        f"+ <field>: <its value now>\n"
+        f"```\n\n"
         f"- <What the live object shows now, and how it differs from what git declares (or that git declares "
         f"nothing for it), with the evidence>\n"
         f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"

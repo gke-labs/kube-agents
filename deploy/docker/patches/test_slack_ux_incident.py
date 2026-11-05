@@ -71,6 +71,7 @@ DRIFT = (
     "maxReplicas went from 10 to 3 at 13:38 (ops-oncall@). Nothing is failing yet, but it can't scale past 3 "
     "under load.\n\n"
     "## Why\n\n"
+    "```diff\n- maxReplicas: 10\n+ maxReplicas: 3\n```\n\n"
     "- The live HPA has `maxReplicas: 3`; the GitOps manager last set 10.\n\n"
     "## What to do\n\n"
     "- **Option A (Put Git's version back):** Re-sync the HPA to the manifest in Git.\n"
@@ -960,6 +961,7 @@ class RuntimeTest(unittest.TestCase):
         triage = runtime.drift_triage(runtime.parse_triage(DRIFT), DRIFT)
         self.assertEqual(triage["headline"], "checkout-gateway's autoscaler on seeded-b was changed outside Git.")
         self.assertEqual(triage["detail"], DRIFT_DETAIL)
+        self.assertEqual(triage["fold_title"], "diff")
         self.assertEqual(triage["choices"], [
             ("Put Git's version back", "apply Option A: Put Git's version back", True),
             ("Keep it · update Git", "apply Option B: Keep it · update Git", False),
@@ -982,6 +984,7 @@ class RuntimeTest(unittest.TestCase):
         buttons = actions["elements"]
         self.assertEqual([b["text"]["text"] for b in buttons], ["Put Git's version back", "Keep it · update Git"])
         self.assertEqual([b.get("style") for b in buttons], ["primary", None])
+        self.assertEqual(update["blocks"][2]["title"]["text"], "diff")
         self.assertIn(DRIFT_DETAIL, update["text"])
 
     def test_an_event_alert_keeps_its_layout(self):
@@ -1003,6 +1006,8 @@ class RuntimeTest(unittest.TestCase):
         (_kind, _chat_id, text, chat, update), = adapter.log
         self.assertEqual(update, "alert-k8s-evt-0000abcd")
         self.assertEqual(chat["detail"], DRIFT_DETAIL)
+        self.assertEqual(chat["fold"]["title"], "diff")
+        self.assertIn("+ maxReplicas: 3", chat["fold"]["text"])
         self.assertEqual([(c["text"], c.get("primary", False)) for c in chat["choices"]],
                          [("Put Git's version back", True), ("Keep it · update Git", False)])
         self.assertIn(DRIFT_DETAIL, text)

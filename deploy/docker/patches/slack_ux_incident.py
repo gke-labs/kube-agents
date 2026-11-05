@@ -45,9 +45,10 @@ on, also records the thread's session title on its routing row, read back by
 drift · seeded-b") and marks the row as drift (:func:`is_drift_alert`), and its
 triage is laid out by :func:`drift_triage`: the rest of the "What's wrong"
 paragraph, which says what changed, who changed it and when, goes on a line
-under the headline, and no button carries the `` (recommended)`` suffix, the
-primary style alone marking the recommended one. Any other alert records
-neither.
+under the headline, no button carries the `` (recommended)`` suffix, the
+primary style alone marking the recommended one, and the fold is titled
+"diff", since the drift report's "Why" opens on a diff of the changed field.
+Any other alert records neither.
 
 Only the first report in a thread takes the alert. ``POST /v1/incidents``
 keeps the first report per thread, and a second one edited over it would
@@ -127,6 +128,8 @@ ALERT_SESSION_LIKE = "k8s-evt-%"
 ACTION_PREFIX = "kage_incident"
 FOLD_TITLE_OPTIONS = "why · what each option does"
 FOLD_TITLE_SINGLE = "why · what the fix does"
+#: A drift triage's fold, which opens on the report's diff of the changed field.
+FOLD_TITLE_DRIFT = "diff"
 OPTION_LABEL = "{title}"
 SINGLE_LABEL = "{title}"
 RECOMMENDED_SUFFIX = " (recommended)"
@@ -411,12 +414,15 @@ def drift_triage(triage: dict, report: str) -> dict:
 
     The detail is the rest of the report's "What's wrong" paragraph, as plain
     text. The recommended choice keeps its primary style and loses its
-    `` (recommended)`` suffix, so each button reads as the choice it is.
+    `` (recommended)`` suffix, so each button reads as the choice it is. The
+    fold is titled :data:`FOLD_TITLE_DRIFT`: the drift report's "Why" opens on
+    a diff of the field that changed.
     """
     _headline, body = _presenter.split_answer(_section(_sections(report), WHATS_WRONG))
     detail = _presenter._plain(body[0]).strip() if body else ""
     return {
         **triage,
+        "fold_title": FOLD_TITLE_DRIFT,
         "detail": _presenter._clip(" ".join(detail.split()), _presenter.ROW_TEXT_MAX) if detail else "",
         "choices": [(label.removesuffix(RECOMMENDED_SUFFIX), reply, recommended)
                     for label, reply, recommended in triage["choices"]],
