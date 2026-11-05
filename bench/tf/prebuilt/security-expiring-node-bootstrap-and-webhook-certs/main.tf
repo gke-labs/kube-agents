@@ -76,17 +76,24 @@ resource "null_resource" "scenario" {
 
       # A plant that fails must not leave the configuration behind: Terraform
       # taints a resource whose create-time provisioner failed and skips the
-      # destroy-time provisioner on a tainted resource. `planted` is set only
-      # after a successful create, so the trap removes only what this run made;
-      # `set +e` keeps errexit from aborting the trap at its first failing
-      # command, and the TERM/INT trap makes a Prow deadline run it too.
+      # destroy-time provisioner on a tainted resource. `planted` is set right
+      # before the create, so a kill during the create or a committed request
+      # whose response was lost still reaches the delete; the delete keys on
+      # this stack's label, so a foreign object the create refused to adopt is
+      # never removed. `set +e` keeps errexit from aborting the trap at its
+      # first failing command, and the TERM/INT trap makes a Prow deadline run
+      # it too.
       planted=""
       on_exit() {
         status=$?
         set +e
         if [ "$status" -ne 0 ] && [ -n "$planted" ]; then
-          echo "Plant failed (exit $status); deleting ${local.name} so the next run starts clean." >&2
-          kubectl delete validatingwebhookconfiguration "${local.name}" --ignore-not-found >&2
+          owner="$(kubectl get validatingwebhookconfiguration "${local.name}" --ignore-not-found \
+            -o jsonpath='{.metadata.name}/{.metadata.labels.created-by-stack}' 2>/dev/null)"
+          if [ "$owner" = "${local.name}/security-expiring-node-bootstrap-and-webhook-certs" ]; then
+            echo "Plant failed (exit $status); deleting ${local.name} so the next run starts clean." >&2
+            kubectl delete validatingwebhookconfiguration "${local.name}" --ignore-not-found >&2
+          fi
         fi
         rm -rf "$kubeconfig_dir"
       }
@@ -109,6 +116,7 @@ resource "null_resource" "scenario" {
       fi
       # `create`, not `apply`: a configuration that appears between the read
       # and the write (AlreadyExists) stops the plant instead of being adopted.
+      planted=1
       kubectl create -f - <<'MANIFEST'
       apiVersion: admissionregistration.k8s.io/v1
       kind: ValidatingWebhookConfiguration
@@ -142,7 +150,6 @@ resource "null_resource" "scenario" {
               port: 443
             caBundle: ${local.ca_bundle}
       MANIFEST
-      planted=1
       echo "Planted scenario security-expiring-node-bootstrap-and-webhook-certs on ${var.host_cluster_name}."
     EOT
   }
