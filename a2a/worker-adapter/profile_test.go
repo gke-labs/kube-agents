@@ -959,8 +959,9 @@ echo '{"type":"result","subtype":"success","result":"should never run"}'
 // the worker's selects order them, the task gets no terminal and no final
 // renewal. The stub's child holds stdout past the kill, so the harness is
 // still draining when the SIGTERM lands. (An abandon still on the wire when
-// the SIGTERM lands can't be seen by any worker; the dispatcher's terminal is
-// then the first, and a fold drops the eviction's.)
+// the SIGTERM lands can't be seen by any worker. The dispatcher sends the
+// abandon before it writes its terminal, so either terminal can land first;
+// for a running task's abandons today both are failed.)
 func TestAnAbandonBesideASigtermPublishesNoTerminal(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
