@@ -1954,14 +1954,20 @@ def _post_home_line(data_dir: Path, ref: str, now: float) -> None:
         return
     text = REPORT_ISSUE_HOME_POST.format(ref=ref, date=_utc(now))
     argv = chat_notify.command(platform, text, wait_seconds=chat_notify.NOTIFY_WAIT_SECONDS)
-    try:
-        res = subprocess.run(
-            argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=HOME_LINE_FAILED.format(code="none", detail=e)))
-        return
+    # A route that is not there right now (a gateway roll) is waited out as
+    # the conversation path waits it out; one that stays away is a log line.
+    for delay in (*chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS, None):
+        try:
+            res = subprocess.run(
+                argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=HOME_LINE_FAILED.format(code="none", detail=e)))
+            return
+        if not chat_notify.route_unavailable(res.returncode) or delay is None:
+            break
+        time.sleep(delay)
     if res.returncode == 0:
         outcome = HOME_LINE_POSTED
     elif chat_notify.kept(res.returncode):

@@ -1963,6 +1963,28 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             self._note_texts(),
         )
 
+    def test_a_route_that_comes_back_gets_the_home_line(self):
+        self._filed(self.DAY + self.HOUR)
+        codes = [chat_notify.NOTIFY_ROUTE_UNAVAILABLE, 0]
+        def run(argv, **_kwargs):
+            self.runs.append(argv)
+            return subprocess.CompletedProcess(argv, codes.pop(0), "{}\n", "")
+        with mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual(len(self.runs), 2, "one retry after the route was not there")
+        self.assertIn(
+            bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
+            self._note_texts(),
+        )
+
+    def test_a_route_that_stays_away_is_a_log_line(self):
+        self._filed(self.DAY + self.HOUR)
+        self.run_code = chat_notify.NOTIFY_ROUTE_UNAVAILABLE
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(len(self.runs), len(chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS) + 1)
+        self.assertTrue((self.d / COMPLETED).exists(), "the issue is the record; the line is best effort")
+        self.assertTrue(any("exited 4" in n for n in self._note_texts()))
+
     def test_no_routed_platform_posts_no_home_line(self):
         self._filed(self.DAY + self.HOUR)
         with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
