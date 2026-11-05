@@ -78,6 +78,29 @@ Slack back to the credential broker, and the Slack app back to its `today` setti
 that section gives, instead of leaving you to find the app without its slash commands after the
 rollback.
 
+### A bus left down by a rollback under `next`
+
+From 0.24.0 the bus keeps its stored streams under a `TRUSTED` account that earlier releases do not
+configure, and `upgrade.sh` refuses a direct rollback to an earlier release unless it is given
+`--allow-breaking-downgrade`. If one ran under `next` anyway, the bus pod `<name>-a2a-nats-0` stays
+not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, and the auth callouts,
+the A2A gateway and the agent's bridge fail behind it.
+
+Upgrade forward to the release you came from. That renders the right configuration, but the
+StatefulSet does not replace a pod that never became Ready. Wait until the StatefulSet's update
+revision changes, which can take up to ten minutes while the auth callouts roll, then delete the
+pod (the default agent name is `platform-agent`):
+
+```bash
+kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system \
+  -o jsonpath='{.status.currentRevision} {.status.updateRevision}{"\n"}'
+kubectl delete pod platform-agent-a2a-nats-0 -n kubeagents-system
+```
+
+Then roll back as this page says: switch to `today` first, and move the bus's store back as the
+0.24.0 entry under [Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
+says before you return to `next`.
+
 ## The rollback
 
 From the `N-1` checkout, a dry run, then operator and harness back to back:
