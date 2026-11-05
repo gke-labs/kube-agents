@@ -337,9 +337,12 @@ func TestDeskCountsOnlyARatingChange(t *testing.T) {
 // A rating the bucket did not keep is not counted.
 func TestDeskDoesNotCountARatingItCouldNotKeep(t *testing.T) {
 	r := startRig(t)
+	// A completed turn first, so the gateway is running (Rate reads its run
+	// context) and the rated task has a session record.
+	origin := completeTurn(t, r, "discord:g1/fb14", "d-1", "it is OOMKilled")
 	desk := &feedbackDesk{g: r.g, ttl: time.Hour}
 	_, err := desk.Rate(FeedbackRating{Platform: platformSlack, Backend: "discord", Rater: "1001",
-		Conversation: "discord:g1/fb14", TaskID: "t-5", Rating: FeedbackDown, Answer: "x"})
+		Conversation: "discord:g1/fb14", TaskID: origin.TaskID, Rating: FeedbackDown, Answer: "x"})
 	if err == nil {
 		t.Fatal("Rate with no feedback bucket succeeded")
 	}
