@@ -148,9 +148,9 @@ LS_DATE_RE = re.compile(r"\b(" + MONTH_ALT + r") {1,2}(\d{1,2}) {1,2}(?:(\d{2}):
 # offset after it, when one is given, else UTC): a nightly recorded on
 # Wednesday and a presubmit on Thursday both read `today`. The weekday name is
 # dropped with it; the parenthesised zone (Hermes writes zone names, then
-# `UTC±HH:MM`) stays as written. A spelled-out date followed by a time of day
-# is left alone: day counting would lose its time. A date-only ISO value and an
-# `ls -l` date with a year are day-counted the same way.
+# `UTC±HH:MM`) stays as written. A date-only ISO value and an `ls -l` date
+# with a year are day-counted the same way. Any of them with a time of day near
+# it (TIME_OF_DAY_RE) is left alone: day counting would lose its time.
 LONG_MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
                "October", "November", "December")
 LONG_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
@@ -558,8 +558,6 @@ class Normalizer:
 
     def long_date(self, m: "re.Match[str]") -> str:
         month, day, year, sign, hours, minutes = m.groups()
-        if time_near(m.string, m.start(), m.end()):
-            return m.group(0)
         try:
             when = datetime(int(year), LONG_MONTHS.index(month) + 1, int(day)).date()
         except ValueError:
@@ -567,10 +565,16 @@ class Normalizer:
         offset = 0
         if sign:
             offset = (-1 if sign == ZONE_NEGATIVE else 1) * (int(hours) * SECONDS_PER_HOUR + int(minutes) * SECONDS_PER_MINUTE)
-        return self.date_token(when, offset)
+        return self.date_token(m, when, offset)
 
-    def date_token(self, when: "date", offset: int = 0) -> str:
-        """A date with no time of day: days from the request's day (at `offset` from UTC), noted as unrestorable."""
+    def date_token(self, m: "re.Match[str]", when: "date", offset: int = 0) -> str:
+        """The date `m` matched: days from the request's day (at `offset` from UTC), noted as unrestorable.
+
+        Left as written when a time of day is near it: day counting would drop
+        what the time says. The check is here so no date rule can skip it.
+        """
+        if time_near(m.string, m.start(), m.end()):
+            return m.group(0)
         days = (when - datetime.fromtimestamp(self.now + offset, timezone.utc).date()).days
         self.mapping.add_date(when, today=days == 0)
         return day_bucket(days)
@@ -582,9 +586,7 @@ class Normalizer:
         except ValueError:
             return m.group(0)
         if hour is None:
-            if time_near(m.string, m.start(), m.end()):
-                return m.group(0)
-            return self.date_token(when.date())
+            return self.date_token(m, when.date())
         offset = 0
         if zone and zone != UTC_ZONE:
             sign = -1 if zone[0] == ZONE_NEGATIVE else 1
@@ -615,7 +617,9 @@ class Normalizer:
         now_year = datetime.fromtimestamp(self.now, timezone.utc).year
         try:
             if year:
-                return self.date_token(datetime(int(year), MONTHS.index(month) + 1, int(day)).date())
+                # Old files show a year and no time; a time beside it (`Nov  5
+                # 2026 10:42:01`) means it is not an ls date and keeps the date.
+                return self.date_token(m, datetime(int(year), MONTHS.index(month) + 1, int(day)).date())
             else:
                 when = calendar.timegm(
                     datetime(now_year, MONTHS.index(month) + 1, int(day), int(hour), int(minute)).timetuple()

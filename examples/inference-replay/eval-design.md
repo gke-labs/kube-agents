@@ -132,7 +132,8 @@ The rules that keep this safe:
   05, 2026" line Hermes puts in the system prompt, becomes how many calendar days it is from the
   request's own day instead ("today", "yesterday", "days ago", ...), counted in the time zone
   written after it, so a nightly recorded on Wednesday still matches a presubmit on Thursday. A
-  date-only `2026-11-05` and an `ls -l` date with a year are counted the same way. An answer that
+  date-only `2026-11-05` and an `ls -l` date with a year are counted the same way. Any of these
+  with a time of day near it stays as written, since counting days would drop the time. An answer that
   names one of these dates isn't saved, since replayed the next day it would carry the wrong date.
   The answer is read for dates in any common shape (`memory/2026-11-04.md`, `20261104`,
   `11/04/2026`, "4 November", "nov-04"), and today's date also counts without the year or by its

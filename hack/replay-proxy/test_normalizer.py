@@ -250,6 +250,20 @@ class LongDateTest(unittest.TestCase):
         self.assertEqual(self.norm_at("-rw-r--r-- 1 root root 12 Nov  5  2026 a", self.at(2026, 11, 5)),
                          "-rw-r--r-- 1 root root 12 ⟦TIME_today⟧ a")
 
+    def test_a_year_ls_date_with_a_time_keeps_two_moments_apart(self):
+        # Day counting would give both `⟦TIME_today⟧ 10:42:01`: one key for two moments a day apart.
+        self.assertNotEqual(fp(request("Built Nov  5 2026 10:42:01"), now=self.at(2026, 11, 5)),
+                            fp(request("Built Nov  6 2026 10:42:01"), now=self.at(2026, 11, 6)))
+
+    def test_a_real_ls_l_listing_still_counts_days(self):
+        # ls prints a year, and no time, for a file older than about six months;
+        # the time on the line above does not reach it.
+        listing = ("-rw-r--r-- 1 root root  4096 Nov  4 10:42 new.conf\n"
+                   "-rw-r--r-- 1 root root 12288 Apr 12  2026 old.conf\n")
+        self.assertEqual(self.norm_at(listing, self.at(2026, 11, 5)),
+                         "-rw-r--r-- 1 root root  4096 ⟦TIME_past_days⟧ new.conf\n"
+                         "-rw-r--r-- 1 root root 12288 ⟦TIME_past_months⟧ old.conf\n")
+
     def test_a_date_with_a_time_of_day_is_left_alone(self):
         now = self.at(2026, 11, 5)
         for text in ("November 05, 2026 at 10:42:01", "Thursday, November 05, 2026 10:42 AM",
@@ -262,6 +276,9 @@ class LongDateTest(unittest.TestCase):
                      "November 05, 2026 UTC 10:42",
                      # A date-only ISO value with a time beside it that the ISO rule doesn't join.
                      "2026-11-05 at 10:42", "2026-11-05, 10:42:00"):
+            self.assertEqual(self.norm_at(text, now), text)
+        # An `ls -l`-shaped date with a year and a time beside it.
+        for text in ("Built Nov  5 2026 10:42:01", "Built Nov  5  2026 10:42", "10:42 Nov  5  2026"):
             self.assertEqual(self.norm_at(text, now), text)
         # Hermes's zone suffix is not a time of day.
         self.assertEqual(self.norm_at("November 05, 2026 (UTC, UTC+00:00)", now), "⟦TIME_today⟧ (UTC, UTC+00:00)")
