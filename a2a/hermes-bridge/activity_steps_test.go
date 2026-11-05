@@ -485,6 +485,12 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 			forbidden: []string{"abc", "def"},
 			wantSub:   []string{`\"password\": \"[redacted]\"`},
 		},
+		{
+			name:      "values containing equals or colons (base64, URLs, compound values)",
+			in:        `password="c2VjcmV0==" {"password": "c2VjcmV0=="} webhook_secret="https://hooks.example.com/T00/B00/X00" password: c2VjcmV0== password=abc=def`,
+			forbidden: []string{"c2VjcmV0==", "https://hooks.example.com/T00/B00/X00", "T00/B00/X00", "abc=def"},
+			wantSub:   []string{`password="[redacted]"`, `{"password": "[redacted]"}`, `webhook_secret="[redacted]"`, `password: [redacted]`, `password=[redacted]`},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -825,4 +831,48 @@ func TestBatchKanban_PlansAllCallIDsAndSuppressesFallbackSteps(t *testing.T) {
 		}
 	}
 }
+
+func TestWorkerHooks_DoNotMutateCoordinatorStepsOrCardsFiled(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord-main"
+	a.waitingCard.Store(true)
+
+	// Unplanned worker pre_tool_call must not open a fallback KindPlan step on the coordinator.
+	workerPre := hookDelivery{
+		Event:      hookPreToolCall,
+		SessionID:  "s-worker",
+		DeliveryID: "w-pre-1",
+		ToolName:   "terminal",
+		ToolInput:  json.RawMessage(`{"command":"kubectl get pods"}`),
+	}
+	workerPre.Extra.ToolCallID = "w-call-1"
+	if _, _, steps, _ := a.observeWithThinking(workerPre); len(steps) != 0 {
+		t.Fatalf("worker unplanned pre_tool_call emitted steps: %+v", steps)
+	}
+	if a.openStep != nil {
+		t.Fatalf("worker unplanned pre_tool_call opened fallback step on coordinator: %+v", a.openStep)
+	}
+
+	// Worker post_tool_call for kanban_create must not flip coordinator cardsFiled/turnCardsFiled or increment turnCalls.
+	workerPost := hookDelivery{
+		Event:      hookPostToolCall,
+		SessionID:  "s-worker",
+		DeliveryID: "w-post-1",
+		ToolName:   kanbanCreateTool,
+		ToolInput:  json.RawMessage(`{"title":"Child worker card"}`),
+	}
+	workerPost.Extra.ToolCallID = "w-call-2"
+	workerPost.Extra.Status = hookStatusOK
+	workerPost.Extra.Result = json.RawMessage(`{"id":"t_child1"}`)
+	if _, ok, steps, _ := a.observeWithThinking(workerPost); !ok || len(steps) != 0 {
+		t.Fatalf("worker post_tool_call ok=%v steps=%+v", ok, steps)
+	}
+	if a.cardsFiled.Load() || a.trace.turnCardsFiled {
+		t.Fatalf("worker kanban_create mutated coordinator card-filing flags: cardsFiled=%v turnCardsFiled=%v", a.cardsFiled.Load(), a.trace.turnCardsFiled)
+	}
+	if a.turnCalls != 0 {
+		t.Fatalf("worker post_tool_call incremented coordinator turnCalls = %d, want 0", a.turnCalls)
+	}
+}
+
 

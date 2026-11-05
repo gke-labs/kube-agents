@@ -633,3 +633,164 @@ func TestFormatTurnCustomToolEnvelopePrefersUnfinishedFollowedTaskWhileRunning(t
 		t.Errorf("in-progress wait card did not attribute to running child cluster-b/t-child2:\n%s", md)
 	}
 }
+
+func TestSynthesizeWaitStepTitleAndEnvelopeSelectActiveFollowedTask(t *testing.T) {
+	rootRef := TaskRef{Addressee: "platform", TaskID: "t-root"}
+	child1Ref := TaskRef{Addressee: "cluster-a", TaskID: "t-child1"}
+	child2Ref := TaskRef{Addressee: "cluster-b", TaskID: "t-child2"}
+
+	rootDoneWithStaleProgress := &lib.Task{
+		ID:    rootRef.TaskID,
+		State: lib.StateCompleted,
+		Final: true,
+		Artifacts: []lib.Artifact{
+			{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "stale root progress"}}},
+		},
+	}
+	child1Running := &lib.Task{
+		ID:    child1Ref.TaskID,
+		State: lib.StateWorking,
+		Final: false,
+		Artifacts: []lib.Artifact{
+			{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "inspecting cluster-a nodes"}}},
+		},
+	}
+	child2Done := &lib.Task{
+		ID:    child2Ref.TaskID,
+		State: lib.StateCompleted,
+		Final: true,
+		Artifacts: []lib.Artifact{
+			{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "finished cluster-b progress"}}},
+		},
+	}
+
+	// 1. child1 is still running while child2 (later in slice) is already finished.
+	out1 := TurnOutcome{
+		Root: rootRef,
+		Task: rootDoneWithStaleProgress,
+		Followed: []FollowedTask{
+			{Ref: child1Ref, Task: child1Running},
+			{Ref: child2Ref, Task: child2Done},
+		},
+	}
+	if got := synthesizeWaitStepTitle(out1, nil, 3*time.Second, ""); got != "inspecting cluster-a nodes" {
+		t.Errorf("synthesizeWaitStepTitle() = %q, want running child1 progress %q", got, "inspecting cluster-a nodes")
+	}
+	title1, md1, _ := FormatTurnCustomToolEnvelope(TurnStepOutcome{
+		Outcome:      out1,
+		StillRunning: true,
+		Elapsed:      3 * time.Second,
+	})
+	if title1 != "inspecting cluster-a nodes" {
+		t.Errorf("title1 = %q, want %q", title1, "inspecting cluster-a nodes")
+	}
+	if !strings.Contains(md1, "`@cluster-a`") {
+		t.Errorf("md1 missing @cluster-a badge:\n%s", md1)
+	}
+
+	// 2. Pending delegated child (Task == nil, Err == ErrTaskNotFound) while root is finished with stale progress.
+	out2 := TurnOutcome{
+		Root:       rootRef,
+		Task:       rootDoneWithStaleProgress,
+		AnswerFrom: &rootRef,
+		Answer:     rootDoneWithStaleProgress,
+		Followed: []FollowedTask{
+			{Ref: child1Ref, Task: nil, Err: ErrTaskNotFound},
+		},
+	}
+	rootDetails := []StepDetail{
+		{
+			Step:  stepmsg.Step{Kind: stepmsg.KindPlan, Title: "Delegating to cluster-a"},
+			Agent: "platform",
+		},
+	}
+	waitTitle2 := synthesizeWaitStepTitle(out2, rootDetails, 4*time.Second, "")
+	if waitTitle2 != "Waiting for @cluster-a response (elapsed 4s)" {
+		t.Errorf("synthesizeWaitStepTitle(pending child) = %q, want %q", waitTitle2, "Waiting for @cluster-a response (elapsed 4s)")
+	}
+	title2, md2, _ := FormatTurnCustomToolEnvelope(TurnStepOutcome{
+		Outcome:           out2,
+		StepDetails:       rootDetails,
+		PrevReportedSteps: 1,
+		LastReportedSteps: 1,
+		StillRunning:      true,
+		Elapsed:           4 * time.Second,
+	})
+	if strings.Contains(title2, "stale root progress") || strings.Contains(md2, "stale root progress") {
+		t.Errorf("pending child envelope leaked finished root's stale progress: title=%q md=%q", title2, md2)
+	}
+	if !strings.Contains(md2, "cluster-a/t-child1") {
+		t.Errorf("pending child md2 did not attribute to cluster-a/t-child1:\n%s", md2)
+	}
+}
+
+func TestCollectTaskStepDetailsUnmatchedActivitiesAndTruncationMarker(t *testing.T) {
+	ref := TaskRef{Addressee: "platform", TaskID: "t-unmatched"}
+	stepPart1 := mustStepPart(t, stepmsg.Step{
+		Kind:    stepmsg.KindPlan,
+		Title:   "Analyzing cluster topology",
+		Thought: "I will analyze the topology before running commands.",
+	})
+	stepPart2 := mustStepPart(t, stepmsg.Step{
+		Kind:    stepmsg.KindPlan,
+		Title:   "Checking nodes",
+		CallIDs: []string{"c1"},
+	})
+
+	task := &lib.Task{
+		ID:    ref.TaskID,
+		State: lib.StateWorking,
+		Artifacts: []lib.Artifact{
+			{
+				Name:  stepmsg.ArtifactName,
+				Parts: []lib.Part{stepPart1, stepPart2},
+			},
+			{
+				Name: lib.ArtifactActivity,
+				Parts: []lib.Part{
+					mustDataPart(t, map[string]any{
+						"tool":   "kubectl",
+						"callId": "c1",
+						"title":  "kubectl get nodes",
+						"worker": "platform",
+					}),
+					mustDataPart(t, map[string]any{
+						"tool":   "kubectl",
+						"callId": "c-sub",
+						"title":  "kubectl get pods -A",
+						"worker": "subagent-1",
+					}),
+					mustDataPart(t, map[string]any{
+						"tool":    "activity-budget",
+						"status":  "truncated",
+						"dropped": 7,
+					}),
+				},
+			},
+		},
+	}
+
+	details, _ := CollectTaskStepDetails(ref, task)
+	if len(details) != 3 {
+		t.Fatalf("len(details) = %d, want 3 (thought step, matched tool step, synthesized unmatched tool step)", len(details))
+	}
+	if len(details[0].Activities) != 0 {
+		t.Errorf("thought-only step 0 should have 0 activities, got %d", len(details[0].Activities))
+	}
+	if details[0].Agent != "platform" {
+		t.Errorf("step 0 Agent = %q, want %q", details[0].Agent, "platform")
+	}
+	if details[1].Agent != "platform" || len(details[1].Activities) != 1 || details[1].Activities[0].CallID != "c1" {
+		t.Errorf("step 1 = %+v, want platform with c1 activity", details[1])
+	}
+	if details[2].Agent != "subagent-1" {
+		t.Errorf("step 2 Agent = %q, want %q", details[2].Agent, "subagent-1")
+	}
+	md := FormatStepDetailMarkdown(details[2])
+	if !strings.Contains(md, "*(activity trace truncated: 7 entries omitted)*") {
+		t.Errorf("step 2 markdown missing truncation note:\n%s", md)
+	}
+	if strings.Contains(md, "`activity-budget`") {
+		t.Errorf("step 2 markdown should not render raw `activity-budget` tool call:\n%s", md)
+	}
+}

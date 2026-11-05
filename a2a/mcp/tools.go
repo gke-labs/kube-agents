@@ -143,7 +143,9 @@ func sendAndStreamStep(ctx context.Context, bus TurnBus, convs *Conversations, a
 	convs.initTaskStepState(*res.Task, token, alias, byToken, res.Notices, w)
 	stepOut, err := bus.WaitForTurnStep(ctx, convs, w, *res.Task, max(wait-time.Since(start), minAnswerWait))
 	if err != nil {
-		convs.closeTaskStepState(*res.Task)
+		if tooLargeToRead(err) {
+			convs.closeTaskStepState(*res.Task)
+		}
 		var sb strings.Builder
 		writeConversation(&sb, alias, token, byToken)
 		writeNotices(&sb, res.Notices)

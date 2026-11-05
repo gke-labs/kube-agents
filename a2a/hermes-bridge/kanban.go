@@ -815,9 +815,6 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 				}
 
 				if settledCount == totalCount {
-					if act != nil {
-						act.cardsFiled.Store(false)
-					}
 					var parts []string
 					for _, c := range relevant {
 						b.markKanbanCardDeliveredForStatus(c.ID, c.Status, c.BlockEventID)
@@ -842,6 +839,9 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 						run.mu.Unlock()
 						if !turnFiledCards {
 							cardReport := b.synthesizeCardAnswer(run, taskCtx, sessionID, turn, "", relevant, parts)
+							if act != nil {
+								act.cardsFiled.Store(false)
+							}
 							if taskCtx.Err() != nil {
 								b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
 								return "", false
@@ -861,11 +861,16 @@ func (b *Bridge) waitForKanbanCards(run *taskRun, taskCtx context.Context, act *
 								synthAck = ""
 							}
 							ackText = b.synthesizeCardAnswer(run, taskCtx, sessionID, turn, synthAck, relevant, parts)
+							if act != nil {
+								act.cardsFiled.Store(false)
+							}
 							if taskCtx.Err() != nil {
 								b.finalizeAPIError(run, taskCtx, taskCtx.Err(), turn)
 								return "", false
 							}
 						}
+					} else if act != nil {
+						act.cardsFiled.Store(false)
 					}
 					break
 				}

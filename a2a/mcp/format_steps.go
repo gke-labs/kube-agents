@@ -17,15 +17,17 @@ const (
 	// when a task is still running and more steps remain to be streamed.
 	StreamingStepContinuePrefix = "STREAMING_STEP_CONTINUE: "
 
-	defaultStepAgent    = "platform"
-	defaultThoughtTitle = "Thinking"
-	defaultStepTitle    = "Working on cluster task"
-	silentTurnMarker    = "[SILENT]"
-	emptyVerdictCell    = "—"
-	ellipsisText        = "..."
-	ellipsisLen         = len(ellipsisText)
-	chatAgentPrefix     = "chat-"
-	sessionAgentPrefix  = "s-"
+	defaultStepAgent        = "platform"
+	defaultThoughtTitle     = "Thinking"
+	defaultStepTitle        = "Working on cluster task"
+	silentTurnMarker        = "[SILENT]"
+	emptyVerdictCell        = "—"
+	ellipsisText            = "..."
+	ellipsisLen             = len(ellipsisText)
+	chatAgentPrefix         = "chat-"
+	sessionAgentPrefix      = "s-"
+	activityTruncatedTool   = "activity-budget"
+	activityStatusTruncated = "truncated"
 
 	maxThoughtSentenceLen = 90
 	maxThoughtTitleLen    = 80
@@ -67,6 +69,7 @@ type ActivityItem struct {
 	IsError       bool            `json:"isError,omitempty"`
 	Agent         string          `json:"agent,omitempty"`
 	StepID        string          `json:"stepId,omitempty"`
+	Dropped       int             `json:"dropped,omitempty"`
 }
 
 // StepDetail holds the enriched view of a single agent step, pairing its
@@ -237,9 +240,13 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 		}
 	}
 
-	// Pair activities to steps by CallID/StepID first, then by order among plan steps.
+	// Pair activities to steps by CallID/StepID first, then by order among eligible ID-less plan steps.
 	unmatchedActs := make([]ActivityItem, 0, len(activities))
 	for _, act := range activities {
+		if isTruncatedActivityMarker(act) {
+			unmatchedActs = append(unmatchedActs, act)
+			continue
+		}
 		matched := false
 		for _, id := range []string{act.CallID, act.StepID} {
 			if id == "" {
@@ -261,28 +268,41 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 		}
 	}
 
-	if len(unmatchedActs) > 0 && len(planStepIndices) > 0 {
-		actCursor := 0
-		for _, stepIdx := range planStepIndices {
-			if actCursor >= len(unmatchedActs) {
-				break
-			}
-			if len(details[stepIdx].Activities) == 0 {
-				act := unmatchedActs[actCursor]
-				details[stepIdx].Activities = append(details[stepIdx].Activities, act)
-				if w := strings.TrimSpace(act.Worker); w != "" {
-					details[stepIdx].Agent = w
-				} else if a := strings.TrimSpace(act.Agent); a != "" {
-					details[stepIdx].Agent = a
+	if len(unmatchedActs) > 0 && len(steps) > 0 {
+		for _, act := range unmatchedActs {
+			if isTruncatedActivityMarker(act) {
+				attached := false
+				for i := len(details) - 1; i >= 0; i-- {
+					if len(details[i].Activities) > 0 {
+						details[i].Activities = append(details[i].Activities, act)
+						attached = true
+						break
+					}
 				}
-				actCursor++
+				if !attached {
+					details = append(details, synthesizeActivityStepDetail(act, "", agentDefault))
+				}
+				continue
 			}
-		}
-		for actCursor < len(unmatchedActs) {
-			lastPlanStep := planStepIndices[len(planStepIndices)-1]
-			act := unmatchedActs[actCursor]
-			details[lastPlanStep].Activities = append(details[lastPlanStep].Activities, act)
-			actCursor++
+			if act.CallID == "" && act.StepID == "" {
+				paired := false
+				for _, stepIdx := range planStepIndices {
+					if len(details[stepIdx].Activities) == 0 && len(details[stepIdx].Step.CallIDs) == 0 && details[stepIdx].Thought == "" {
+						details[stepIdx].Activities = append(details[stepIdx].Activities, act)
+						if w := strings.TrimSpace(act.Worker); w != "" {
+							details[stepIdx].Agent = w
+						} else if a := strings.TrimSpace(act.Agent); a != "" {
+							details[stepIdx].Agent = a
+						}
+						paired = true
+						break
+					}
+				}
+				if paired {
+					continue
+				}
+			}
+			details = append(details, synthesizeActivityStepDetail(act, "", agentDefault))
 		}
 	}
 
@@ -317,36 +337,7 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 				if i < len(thinking) {
 					thought = thinking[i]
 				}
-				title := strings.TrimSpace(act.Title)
-				if title == "" {
-					title = strings.TrimSpace(act.Summary)
-				}
-				if title == "" {
-					title = strings.TrimSpace(act.Tool)
-				}
-				agent := strings.TrimSpace(act.Worker)
-				if agent == "" {
-					agent = strings.TrimSpace(act.Agent)
-				}
-				if agent == "" {
-					agent = agentDefault
-				}
-				var callIDs []string
-				if act.CallID != "" {
-					callIDs = []string{act.CallID}
-				}
-				details = append(details, StepDetail{
-					Step: stepmsg.Step{
-						Schema:  stepmsg.Schema,
-						Kind:    stepmsg.KindPlan,
-						Title:   title,
-						Thought: thought,
-						CallIDs: callIDs,
-					},
-					Agent:      agent,
-					Thought:    thought,
-					Activities: []ActivityItem{act},
-				})
+				details = append(details, synthesizeActivityStepDetail(act, thought, agentDefault))
 			}
 		} else {
 			for _, th := range thinking {
@@ -365,6 +356,54 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 	}
 
 	return details, len(activities)
+}
+
+func isTruncatedActivityMarker(act ActivityItem) bool {
+	return act.Status == activityStatusTruncated || act.Tool == activityTruncatedTool
+}
+
+func formatTruncatedActivityTitle(act ActivityItem) string {
+	if act.Dropped > 0 {
+		return fmt.Sprintf("Activity trace truncated (%d entries omitted)", act.Dropped)
+	}
+	return "Activity trace truncated"
+}
+
+func synthesizeActivityStepDetail(act ActivityItem, thought, agentDefault string) StepDetail {
+	title := strings.TrimSpace(act.Title)
+	if title == "" {
+		title = strings.TrimSpace(act.Summary)
+	}
+	if title == "" {
+		if isTruncatedActivityMarker(act) {
+			title = formatTruncatedActivityTitle(act)
+		} else {
+			title = strings.TrimSpace(act.Tool)
+		}
+	}
+	agent := strings.TrimSpace(act.Worker)
+	if agent == "" {
+		agent = strings.TrimSpace(act.Agent)
+	}
+	if agent == "" || isTruncatedActivityMarker(act) {
+		agent = agentDefault
+	}
+	var callIDs []string
+	if act.CallID != "" {
+		callIDs = []string{act.CallID}
+	}
+	return StepDetail{
+		Step: stepmsg.Step{
+			Schema:  stepmsg.Schema,
+			Kind:    stepmsg.KindPlan,
+			Title:   title,
+			Thought: thought,
+			CallIDs: callIDs,
+		},
+		Agent:      agent,
+		Thought:    thought,
+		Activities: []ActivityItem{act},
+	}
 }
 
 // CollectTurnStepDetails aggregates StepDetails across the root task and all
@@ -592,6 +631,9 @@ func humanizeStepTitle(d StepDetail) string {
 	}
 	if len(d.Activities) > 0 {
 		act := d.Activities[0]
+		if isTruncatedActivityMarker(act) {
+			return formatTruncatedActivityTitle(act)
+		}
 		actTitle := collapseInlineWhitespace(act.Title)
 		if actTitle == "" {
 			actTitle = collapseInlineWhitespace(act.Summary)
@@ -624,6 +666,12 @@ func isBareToolName(s string) bool {
 }
 
 func describeActivityForMarkdown(act ActivityItem) string {
+	if isTruncatedActivityMarker(act) {
+		if act.Dropped > 0 {
+			return fmt.Sprintf("*(activity trace truncated: %d entries omitted)*", act.Dropped)
+		}
+		return "*(activity trace truncated)*"
+	}
 	tool := sanitizeInlineBackticks(act.Tool)
 	summary := normalizeUnquotedInlineCode(act.Title)
 	if summary == "" {
@@ -769,40 +817,7 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 		newDetails = details[prevSteps:lastSteps]
 	}
 
-	activeRef := out.Root
-	activeTask := out.Task
-	if stepOut.StillRunning {
-		foundUnfinished := false
-		for i := len(out.Followed) - 1; i >= 0; i-- {
-			if t := out.Followed[i].Task; t != nil && !t.Final {
-				activeRef = out.Followed[i].Ref
-				activeTask = t
-				foundUnfinished = true
-				break
-			}
-		}
-		if !foundUnfinished && out.Task != nil && !out.Task.Final {
-			activeRef = out.Root
-			activeTask = out.Task
-		} else if !foundUnfinished && out.AnswerFrom != nil && out.Answer != nil {
-			activeRef = *out.AnswerFrom
-			activeTask = out.Answer
-		}
-	} else if out.AnswerFrom != nil && out.Answer != nil && *out.AnswerFrom != out.Root {
-		activeRef = *out.AnswerFrom
-		activeTask = out.Answer
-	} else if len(out.Followed) > 0 {
-		for i := len(out.Followed) - 1; i >= 0; i-- {
-			if out.Followed[i].Task != nil {
-				activeRef = out.Followed[i].Ref
-				activeTask = out.Followed[i].Task
-				break
-			}
-		}
-	} else if out.AnswerFrom != nil && out.Answer != nil {
-		activeRef = *out.AnswerFrom
-		activeTask = out.Answer
-	}
+	activeRef, activeTask := selectActiveTurnTask(out, stepOut.StillRunning)
 	activeAgent := canonicalStepAgent(activeRef.Addressee, stepOut.Alias)
 
 	answerText := taskResultText(activeTask)
@@ -813,7 +828,7 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 	if activeTask != nil {
 		progressText = artifactText(activeTask, lib.ArtifactProgress)
 	}
-	if progressText == "" && out.Task != nil {
+	if progressText == "" && activeRef == out.Root && out.Task != nil {
 		progressText = artifactText(out.Task, lib.ArtifactProgress)
 	}
 
@@ -855,7 +870,7 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 		if waitTitle == "" {
 			if progressText != "" {
 				waitTitle = truncateInlineText(collapseInlineWhitespace(lastLine(progressText)), maxWaitProgressLen)
-			} else if totalSteps > 0 {
+			} else if totalSteps > 0 && (activeTask != nil || activeRef == out.Root) {
 				waitTitle = humanizeStepTitle(details[totalSteps-1])
 			} else {
 				waitTitle = fmt.Sprintf("Waiting for @%s response", activeAgent)
@@ -935,6 +950,43 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 	writeOutcome(&res, out)
 	writeReports(&res, out, stepOut.Token)
 	return title, markdown, res.String()
+}
+
+func selectActiveTurnTask(out TurnOutcome, stillRunning bool) (TaskRef, *lib.Task) {
+	activeRef := out.Root
+	activeTask := out.Task
+	if stillRunning {
+		for i := len(out.Followed) - 1; i >= 0; i-- {
+			f := out.Followed[i]
+			if (f.Task != nil && !f.Task.Final) || (f.Task == nil && !tooLargeToRead(f.Err)) {
+				return f.Ref, f.Task
+			}
+		}
+		if out.Task != nil && !out.Task.Final {
+			return out.Root, out.Task
+		}
+		for i := len(out.Followed) - 1; i >= 0; i-- {
+			if out.Followed[i].Task != nil {
+				return out.Followed[i].Ref, out.Followed[i].Task
+			}
+		}
+		if out.AnswerFrom != nil && out.Answer != nil {
+			return *out.AnswerFrom, out.Answer
+		}
+		return activeRef, activeTask
+	}
+	if out.AnswerFrom != nil && out.Answer != nil && *out.AnswerFrom != out.Root {
+		return *out.AnswerFrom, out.Answer
+	}
+	for i := len(out.Followed) - 1; i >= 0; i-- {
+		if out.Followed[i].Task != nil {
+			return out.Followed[i].Ref, out.Followed[i].Task
+		}
+	}
+	if out.AnswerFrom != nil && out.Answer != nil {
+		return *out.AnswerFrom, out.Answer
+	}
+	return activeRef, activeTask
 }
 
 func terminalStateTitlePrefix(state lib.TaskState) string {

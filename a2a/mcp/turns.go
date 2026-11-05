@@ -594,25 +594,28 @@ func (c *Conversations) runningTask(token string) (TaskRef, bool) {
 }
 
 type taskStepState struct {
-	mu                sync.Mutex
-	active            atomic.Bool
-	ref               TaskRef
-	token             string
-	alias             string
-	byToken           bool
-	notices           []string
-	startedAt         time.Time
-	prevReportedSteps int
-	lastReportedSteps int
-	prevReportedActs  int
-	lastReportedActs  int
-	lastWaitStepTitle string
-	watch             *turnWatch
-	watchTimer        *time.Timer
-	taskWatches       map[TaskRef]*taskWatch
-	finalTasks        map[TaskRef]*lib.Task
-	failedTasks       map[TaskRef]error
-	idleTimer         *time.Timer
+	mu                   sync.Mutex
+	active               atomic.Bool
+	ref                  TaskRef
+	token                string
+	alias                string
+	byToken              bool
+	notices              []string
+	startedAt            time.Time
+	prevReportedSteps    int
+	lastReportedSteps    int
+	prevReportedActs     int
+	lastReportedActs     int
+	lastWaitStepTitle    string
+	followEmptySince     time.Time
+	settledDelegationsAt time.Time
+	settledFollowedCount int
+	watch                *turnWatch
+	watchTimer           *time.Timer
+	taskWatches          map[TaskRef]*taskWatch
+	finalTasks           map[TaskRef]*lib.Task
+	failedTasks          map[TaskRef]error
+	idleTimer            *time.Timer
 }
 
 func (s *taskStepState) isUnsubmittedRootLocked(ref TaskRef) bool {
@@ -1755,7 +1758,6 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	prevActs := st.lastReportedActs
 	callStart := time.Now()
 	firstNewStepAt := time.Time{}
-	settledDelegationsAt := time.Time{}
 
 	var (
 		out          TurnOutcome
@@ -1770,11 +1772,13 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 			err         error
 		)
 		unsubmittedRoot := st.isUnsubmittedRootLocked(root)
-		out, chainSettled, waitedOnBus, err = b.pollTurnStepSnapshotLocked(stepCtx, convs, st, &settledDelegationsAt)
+		out, chainSettled, waitedOnBus, err = b.pollTurnStepSnapshotLocked(stepCtx, convs, st)
 		if err != nil && (unsubmittedRoot || (!errors.Is(err, ErrTaskNotFound) && stepCtx.Err() == nil)) {
-			st.closeAllLocked()
-			if unsubmittedRoot {
-				convs.deleteTaskStepState(root, st)
+			if unsubmittedRoot || tooLargeToRead(err) {
+				st.closeAllLocked()
+				if unsubmittedRoot {
+					convs.deleteTaskStepState(root, st)
+				}
 			}
 			return TurnStepOutcome{}, err
 		}
@@ -1896,7 +1900,7 @@ func stepReadyForDisplay(d StepDetail) bool {
 	return d.Step.Kind != "" && d.Step.Kind != stepmsg.KindPlan
 }
 
-func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Conversations, st *taskStepState, settledAt *time.Time) (TurnOutcome, bool, bool, error) {
+func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Conversations, st *taskStepState) (TurnOutcome, bool, bool, error) {
 	root := st.ref
 	out := TurnOutcome{Root: root}
 	unsubmittedRoot := st.isUnsubmittedRootLocked(root)
@@ -1918,14 +1922,15 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 	waitedAny := waitedRoot
 	followedRefs := st.watch.followedTasks()
 	if len(followedRefs) == 0 {
-		if settledAt.IsZero() {
-			*settledAt = time.Now()
+		if st.followEmptySince.IsZero() {
+			st.followEmptySince = time.Now()
 		}
-		if time.Since(*settledAt) >= delegationFollowGrace {
+		if time.Since(st.followEmptySince) >= delegationFollowGrace {
 			return out, true, waitedAny, nil
 		}
 		return out, false, waitedAny, nil
 	}
+	st.followEmptySince = time.Time{}
 
 	allFollowedFinal := true
 	for _, fRef := range followedRefs {
@@ -1954,14 +1959,16 @@ func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Convers
 	}
 
 	if allFollowedFinal {
-		if settledAt.IsZero() {
-			*settledAt = time.Now()
+		if st.settledDelegationsAt.IsZero() || len(followedRefs) != st.settledFollowedCount {
+			st.settledFollowedCount = len(followedRefs)
+			st.settledDelegationsAt = time.Now()
 		}
-		if time.Since(*settledAt) >= delegationSettleGrace {
+		if time.Since(st.settledDelegationsAt) >= delegationSettleGrace {
 			return out, true, waitedAny, nil
 		}
 	} else {
-		*settledAt = time.Time{}
+		st.settledFollowedCount = 0
+		st.settledDelegationsAt = time.Time{}
 	}
 	return out, false, waitedAny, nil
 }
@@ -2076,17 +2083,7 @@ func (b *NATSBus) gatherStepReports(ctx context.Context, w *turnWatch, out *Turn
 }
 
 func synthesizeWaitStepTitle(out TurnOutcome, details []StepDetail, elapsed time.Duration, lastTitle string) string {
-	activeRef := out.Root
-	activeTask := out.Task
-	if len(out.Followed) > 0 {
-		for i := len(out.Followed) - 1; i >= 0; i-- {
-			if out.Followed[i].Task != nil {
-				activeRef = out.Followed[i].Ref
-				activeTask = out.Followed[i].Task
-				break
-			}
-		}
-	}
+	activeRef, activeTask := selectActiveTurnTask(out, true)
 	if activeTask != nil {
 		if p := artifactText(activeTask, lib.ArtifactProgress); p != "" {
 			line := truncateInlineText(collapseInlineWhitespace(lastLine(p)), maxWaitProgressLen)
@@ -2095,7 +2092,7 @@ func synthesizeWaitStepTitle(out TurnOutcome, details []StepDetail, elapsed time
 			}
 		}
 	}
-	if len(details) > 0 {
+	if len(details) > 0 && (activeTask != nil || activeRef == out.Root) {
 		last := details[len(details)-1]
 		base := humanizeStepTitle(last)
 		candidate := fmt.Sprintf("%s (elapsed %s)", base, elapsed.Round(time.Second))

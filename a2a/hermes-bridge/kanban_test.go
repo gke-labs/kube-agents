@@ -854,3 +854,83 @@ c.commit()
 		t.Fatalf("formatKanbanCardOutput(reblock2) = %q, want %q", gotOut, "Second question?")
 	}
 }
+
+func TestWaitForKanbanCards_FollowUpTurnFilingOwnCardDoesNotInvertCarriedOver(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	since := time.Now().Unix() - 10
+	db := filepath.Join(t.TempDir(), "kanban.db")
+	initScript := `
+import sqlite3, sys
+db, since = sys.argv[1], int(sys.argv[2])
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_turn2_short", "Cluster B check", "done", "cluster-diagnostics", "a2a-ctx-turn2-short", "Cluster B healthy.", "", since + 1, since + 1, None))
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_turn2_sub", "Cluster C check", "done", "cluster-diagnostics", "a2a-ctx-turn2-sub", "Raw card output that should not be appended.", "", since + 2, since + 2, None))
+c.commit()
+`
+	if out, err := exec.Command("python3", "-c", initScript, db, strconv.FormatInt(since, 10)).CombinedOutput(); err != nil {
+		t.Fatalf("init turn2 db: %v\n%s", err, out)
+	}
+
+	_, url := startServer(t)
+	stub := newAPIStub(t, nil)
+	b := startAPIBridge(t, url, stub, nil)
+	t.Setenv(hermesKanbanDBEnv, db)
+
+	// Subcase 1: Turn 2 files its own card (cardsFiled == true), already settled on first poll (sawUnsettled == false),
+	// with a short acknowledgement (< cardAnswerSubstantiveChars). The short ack must be replaced by card output, NOT prepended.
+	sessionShort := "a2a-ctx-turn2-short"
+	runShort := &taskRun{
+		origin: &lib.Envelope{TaskID: "task-turn2-short", ContextID: "ctx-turn2-short", CorrelationID: "corr-turn2-short"},
+		state:  stateRunning,
+	}
+	actShort := newSessionActivityState(sessionShort, false)
+	actShort.cardsFiled.Store(true)
+	runShort.act.Store(actShort)
+
+	gotShort, ok := b.waitForKanbanCards(runShort, context.Background(), actShort, sessionShort, since, 2, "Dispatched card; here is the summary.")
+	if !ok {
+		t.Fatal("waitForKanbanCards (short ack on turn 2) returned ok = false, want true")
+	}
+	if gotShort != "Cluster B healthy." {
+		t.Fatalf("waitForKanbanCards (short ack on turn 2) = %q, want %q (short ack should be replaced, not prepended as carriedOver)", gotShort, "Cluster B healthy.")
+	}
+	if actShort.cardsFiled.Load() {
+		t.Fatal("expected cardsFiled to be cleared after waitForKanbanCards settled all cards")
+	}
+
+	// Subcase 2: Turn 2 files its own card (cardsFiled == true), already settled on first poll (sawUnsettled == false),
+	// with a substantive (>= cardAnswerSubstantiveChars) synthesis. It must be returned directly without appending raw card output.
+	sessionSub := "a2a-ctx-turn2-sub"
+	runSub := &taskRun{
+		origin: &lib.Envelope{TaskID: "task-turn2-sub", ContextID: "ctx-turn2-sub", CorrelationID: "corr-turn2-sub"},
+		state:  stateRunning,
+	}
+	actSub := newSessionActivityState(sessionSub, false)
+	actSub.cardsFiled.Store(true)
+	runSub.act.Store(actSub)
+
+	substantiveAck := strings.Repeat("Detailed synthesis of Cluster C status and findings. ", 15)
+	if len(strings.TrimSpace(substantiveAck)) < cardAnswerSubstantiveChars {
+		t.Fatalf("substantiveAck length = %d, must be >= %d", len(strings.TrimSpace(substantiveAck)), cardAnswerSubstantiveChars)
+	}
+	gotSub, ok := b.waitForKanbanCards(runSub, context.Background(), actSub, sessionSub, since, 2, substantiveAck)
+	if !ok {
+		t.Fatal("waitForKanbanCards (substantive ack on turn 2) returned ok = false, want true")
+	}
+	if gotSub != substantiveAck {
+		t.Fatalf("waitForKanbanCards (substantive ack on turn 2) = %q, want substantiveAck returned directly without appending raw card output", gotSub)
+	}
+	if actSub.cardsFiled.Load() {
+		t.Fatal("expected cardsFiled to be cleared after waitForKanbanCards settled all cards")
+	}
+}

@@ -1371,3 +1371,128 @@ func TestConcurrentStepStateOperationsNoDeadlockOrRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+type errOnFirstStepBus struct {
+	fakeStepTurnBus
+	firstErr error
+}
+
+func (b *errOnFirstStepBus) SendTurn(_ context.Context, convs *Conversations, token, _ string, _ time.Duration) (TurnResult, *turnWatch, error) {
+	r := b.ref
+	convs.setRunning(token, &r)
+	w := &turnWatch{stop: make(chan struct{}), token: token}
+	return TurnResult{Token: token, Task: &r, Notices: []string{"Working on it…"}}, w, nil
+}
+
+func (b *errOnFirstStepBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *turnWatch, root TaskRef, wait time.Duration) (TurnStepOutcome, error) {
+	if b.firstErr != nil {
+		err := b.firstErr
+		b.firstErr = nil
+		if tooLargeToRead(err) {
+			st := convs.getOrCreateTaskStepState(root, w)
+			st.closeAll()
+		}
+		return TurnStepOutcome{}, err
+	}
+	return b.fakeStepTurnBus.WaitForTurnStep(ctx, convs, w, root, wait)
+}
+
+func TestSendAndStreamStepKeepsStepStateOnTransientReadError(t *testing.T) {
+	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-transient-err"}
+	bus := &errOnFirstStepBus{
+		fakeStepTurnBus: fakeStepTurnBus{ref: ref},
+		firstErr:        errReadersBusy,
+	}
+	convs := NewConversations()
+	s := mustServer(t, SendMessageTool(bus, convs), TaskControlTool(bus, convs))
+
+	res := callTool(t, s, ToolSendMessage, map[string]any{
+		"text":         "check cluster",
+		"stream_steps": true,
+	})
+	if res.IsError {
+		t.Fatalf("expected non-error degraded message when turn is running, got error: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, "platform/task-transient-err", "reading it failed")
+
+	// Step state and watch must remain active for follow-up task_control get.
+	convs.mu.Lock()
+	st := convs.steps[ref.TaskID]
+	convs.mu.Unlock()
+	if st == nil || !st.active.Load() {
+		t.Fatalf("expected taskStepState for %s to remain active after transient error, got st=%v", ref, st)
+	}
+
+	// Follow-up task_control get with bare task ID resolves via convs.knownTaskRef and succeeds.
+	res2 := callTool(t, s, ToolTaskControl, map[string]any{
+		"action":       "get",
+		"task_id":      ref.TaskID,
+		"stream_steps": true,
+	})
+	if res2.IsError {
+		t.Fatalf("follow-up task_control get failed: %s", res2.Content[0].Text)
+	}
+	mustContain(t, res2.Content[0].Text, StreamingStepContinuePrefix)
+}
+
+func TestWaitForTurnStepPersistsDelegationSettleAcrossShortPolls(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		root := "task-short-poll-root"
+		publishSubmission(t, js, fakeAddressee, root, conv, f.Text, "")
+		publishRun(t, js, fakeAddressee, root, "", false)
+		publishArtifact(t, js, fakeAddressee, root, lib.ArtifactDelegate, "cluster-a: check")
+		publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
+		publishSubmission(t, js, "cluster-a", "task-short-poll-child", conv, "check", root)
+		publishRun(t, js, "cluster-a", "task-short-poll-child", "child finished answer", true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate short polls", 5*time.Second)
+	if err != nil || res.Task == nil {
+		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+	}
+	convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+
+	// Poll exclusively with a 100ms wait (< delegationSettleGrace = 400ms);
+	// settledDelegationsAt on taskStepState must persist across calls and settle.
+	deadline := time.Now().Add(2 * time.Second)
+	settled := false
+	for time.Now().Before(deadline) {
+		stepOut, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 100*time.Millisecond)
+		if err != nil {
+			t.Fatalf("WaitForTurnStep: %v", err)
+		}
+		if !stepOut.StillRunning {
+			settled = true
+			break
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	if !settled {
+		t.Fatal("delegated turn never settled across short-window WaitForTurnStep polls")
+	}
+}

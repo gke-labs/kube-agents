@@ -704,10 +704,12 @@ func (a *activityState) observeWithThinking(d hookDelivery) (ActivityEntry, bool
 		a.lastTool = capRunes(d.ToolName, activityToolNameCap)
 		openEntry := a.popOpenCallLocked(id, d)
 		a.calls++
-		a.turnCalls++
 		status := activityStatus(d)
-		if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
-			a.cardsFiled.Store(true)
+		if a.sessionID == "" || d.SessionID == "" || d.SessionID == a.sessionID {
+			a.turnCalls++
+			if d.ToolName == kanbanCreateTool && status != ActivityStatusError {
+				a.cardsFiled.Store(true)
+			}
 		}
 		var input json.RawMessage
 		if a.sessionID == "" {

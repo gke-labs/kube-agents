@@ -76,6 +76,9 @@ func (a *activityState) observeStepsAndThinkingLocked(d hookDelivery) ([]stepmsg
 		if callID != "" && a.trace.plannedTitles[callID] != "" {
 			return a.closeStepLocked(), ""
 		}
+		if d.SessionID != "" && d.SessionID != a.sessionID {
+			return nil, ""
+		}
 		return a.observeStepsLocked(d), ""
 	case hookPostAPIRequest:
 		closed := a.closeStepLocked()

@@ -24,8 +24,8 @@ var (
 	inlineAuthHeaderPattern   = regexp.MustCompile(`(?i)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
 	inlineURLCredPattern      = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s/]+(@)`)
 	inlineKVSecretPattern     = regexp.MustCompile(`(?:\\?["'])?([A-Za-z0-9_.-]+)(?:\\?["'])?[ \t]*[=:][ \t]*`)
-	leadingKVTokenPattern     = regexp.MustCompile(`^(?:\\?["'])?[A-Za-z0-9_.-]+(?:\\?["'])?[ \t]*[=:]`)
-	base64PaddingTokenPattern = regexp.MustCompile(`^[A-Za-z0-9_+/.-]+=+(?:[\s"',;)\]}>]|$)`)
+	leadingKVTokenPattern     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*[ \t]*[=:]`)
+	base64PaddingTokenPattern = regexp.MustCompile(`^[A-Za-z0-9+/]+={1,2}(?:[\s,;)\]}>]|\\?["'](?:\s|$)|$)`)
 
 	// envFlagsWithValue are flags to `env` that consume the following
 	// argument before the command name.
@@ -360,7 +360,7 @@ func (a *activityState) enrichPostToolCallLocked(d hookDelivery, openEntry Activ
 		rawToolInput = openEntry.Input
 	}
 	effectiveTool, _ := unwrapHermesToolCall(d.ToolName, rawToolInput)
-	if status != ActivityStatusError && (effectiveTool == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(rawToolInput), kanbanCreateTool))) {
+	if (d.SessionID == "" || d.SessionID == a.sessionID) && status != ActivityStatusError && (effectiveTool == kanbanCreateTool || (d.ToolName == hermesToolCallWrapper && strings.Contains(string(rawToolInput), kanbanCreateTool))) {
 		a.cardsFiled.Store(true)
 		a.trace.turnCardsFiled = true
 	}
@@ -954,7 +954,7 @@ func scrubInlineKVSecrets(s string) string {
 			continue
 		}
 		hadPostSepSpace := matchEnd > 0 && (s[matchEnd-1] == ' ' || s[matchEnd-1] == '\t')
-		if leadingKVTokenPattern.MatchString(rest) && (hadPostSepSpace || !base64PaddingTokenPattern.MatchString(rest)) {
+		if hadPostSepSpace && isFollowingKVAssignment(rest) {
 			pos = matchEnd
 			continue
 		}
@@ -1014,6 +1014,17 @@ func scrubInlineKVSecrets(s string) string {
 		}
 	}
 	return sb.String()
+}
+
+func isFollowingKVAssignment(rest string) bool {
+	loc := leadingKVTokenPattern.FindStringIndex(rest)
+	if loc == nil {
+		return false
+	}
+	if rest[loc[1]-1] == ':' && strings.HasPrefix(rest[loc[1]:], "//") {
+		return false
+	}
+	return !base64PaddingTokenPattern.MatchString(rest)
 }
 
 func findUnescapedQuote(s string, q byte) int {
