@@ -166,6 +166,16 @@ class TestPublishedRuns(Fixture):
         self.assertIsNone(err)
         self.assertEqual(result, "Audit complete, 24 findings.\n\nLedger: " + LEDGER)
 
+    def test_a_missing_ledger_line_goes_above_a_trailing_step_line(self):
+        self.run_tool(START, STARTED)
+        self.run_tool(FINISH, "label-ensure ok\n" + finish_line())
+        err, result = self.complete("Audit complete, 24 findings.\n\n[next: open the critical finding]")
+        self.assertIsNone(err)
+        self.assertEqual(
+            result,
+            "Audit complete, 24 findings.\n\nLedger: " + LEDGER + "\n\n[next: open the critical finding]",
+        )
+
     def test_a_result_that_names_the_ledger_is_unchanged(self):
         self.run_tool(START, STARTED)
         self.run_tool(FINISH, finish_line())

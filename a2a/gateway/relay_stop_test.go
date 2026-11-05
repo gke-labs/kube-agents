@@ -36,9 +36,11 @@ func waitRunning(t *testing.T, r *rig) {
 		_, err := js.Consumer(context.Background(), lib.TasksStream, r.g.relayDurable)
 		return err == nil
 	})
-	// Bound, and then Run starts the adapter: wait for that too, so a stop
+	// Bound, and then Run starts the adapter: wait for the bind to have
+	// returned (the durable exists before the subscription finishes, and a
+	// client closed in between fails the bind and ends the run), so a stop
 	// is answered by the adapter returning.
-	waitFor(t, "the gateway running", func() bool { return strings.Contains(r.logs.String(), "answer feedback") })
+	waitFor(t, "the gateway running", func() bool { return strings.Contains(r.logs.String(), "event relay bound") })
 }
 
 func stoppedBatch() []relayItem {

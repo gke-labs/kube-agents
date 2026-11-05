@@ -147,6 +147,12 @@ mcp_servers:
       GKE_LOCATION: "${GKE_LOCATION}"
       GCP_PROJECT_ID: "${GCP_PROJECT_ID}"
       KUBEAGENTS_SCOPE_FILE: "${KUBEAGENTS_SCOPE_FILE}"
+      # The group size above which the roster counts a shared-role group
+      # instead of naming each agent (agent_roster.summary_threshold; default
+      # 20). spec.deployment.env sets it on the agent container through the
+      # operator's allowlist; unset arrives as the placeholder, which means
+      # the default. Passed so list_agents summarizes where the block does.
+      KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD: "${KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD}"
 
 # Explicitly list platform_toolsets (reserved Hermes key). ONLY the router MCP —
 # no base tool bundle. `mcp-<name>` here maps to `mcp_servers.<name>` above.

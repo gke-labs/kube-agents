@@ -93,9 +93,11 @@ MAX_BUNDLE_BYTES = 64 << 20
 SNAPSHOT_MAX_UNPACKED_BYTES = 64 << 20
 
 # The codes `snapshot` refuses with on this side: a tar member it will not
-# write, a tree over the unpacked ceiling, a destination that is not empty.
+# write, a tree over the unpacked ceiling, a tree with more files than the
+# caller allows, a destination that is not empty.
 SNAPSHOT_MEMBER_REFUSED = "SNAPSHOT_MEMBER_REFUSED"
 SNAPSHOT_TOO_LARGE = "SNAPSHOT_TOO_LARGE"
+SNAPSHOT_TOO_MANY_FILES = "SNAPSHOT_TOO_MANY_FILES"
 DESTINATION_NOT_EMPTY = "DESTINATION_NOT_EMPTY"
 
 # The name a path component must never fold to: a `.git` written into the
@@ -1001,7 +1003,7 @@ def _resolve_link(start: list[str], target: str, links: set[str]) -> tuple[list[
 
 
 def _check_snapshot_members(
-    members: list[tarfile.TarInfo], max_bytes: int
+    members: list[tarfile.TarInfo], max_bytes: int, max_files: int | None = None
 ) -> tuple[list[tarfile.TarInfo], int, int, list[dict]]:
     """Refuse the tar unless every member it writes is safe.
 
@@ -1011,8 +1013,8 @@ def _check_snapshot_members(
     Checked before anything is written, so a refusal leaves nothing behind.
     `extractall(filter="data")` repeats some of this as it writes, but these
     checks do not depend on it. They also refuse what it does not: a `.git`
-    component, a path or a link through a symbolic link, and a tree over the
-    ceiling.
+    component, a path or a link through a symbolic link, a tree over the
+    ceiling, and a tree with more than `max_files` files.
 
     Two kinds of member are not written, and the answer lists them under
     `skipped`, because real repositories hold them and one of them must not
@@ -1103,6 +1105,12 @@ def _check_snapshot_members(
         elif not member.isdir():
             raise _member_refused(member.name, "a device file, a FIFO or another special file")
         kept.append(member)
+    # After the walk, so that the refusal gives the full count.
+    if max_files is not None and files > max_files:
+        raise VcsError(
+            f"the snapshot holds {files} files, more than the limit of {max_files}",
+            code=SNAPSHOT_TOO_MANY_FILES,
+        )
     return kept, files, total, skipped
 
 
@@ -1113,6 +1121,7 @@ def snapshot(
     *,
     into: str | Path,
     max_bytes: int = SNAPSHOT_MAX_UNPACKED_BYTES,
+    max_files: int | None = None,
 ) -> dict:
     """One revision's files, unpacked into `into`, with no history and no `.git`.
 
@@ -1126,6 +1135,7 @@ def snapshot(
     `tarfile`'s `data` filter into a fresh directory beside `into`, and moved
     into place, so a refusal leaves nothing behind. A symbolic link that
     would point out of the tree is left out and named under `skipped`.
+    `max_files`, when given, refuses a tree with more regular files than that.
     """
     destination = Path(into)
     if destination.is_symlink() or (
@@ -1148,7 +1158,7 @@ def snapshot(
         try:
             with tarfile.open(fileobj=io.BytesIO(base64.b64decode(answer["archiveBase64"])), mode="r:") as archive:
                 members, files, total, skipped = _check_snapshot_members(
-                    archive.getmembers(), max_bytes
+                    archive.getmembers(), max_bytes, max_files
                 )
                 archive.extractall(str(staging), members=members, filter="data")
         except tarfile.TarError as exc:

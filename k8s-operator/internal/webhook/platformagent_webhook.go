@@ -296,10 +296,15 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		apiAuthErrs, apiAuthWarnings := controller.ValidateAgentAPIAuthResources(platformAgent.Spec.Deployment, depPath.Child("agentAPIAuth", "resources"))
 		allErrs = append(allErrs, apiAuthErrs...)
 		warnings = append(warnings, apiAuthWarnings...)
+
+		// 2h. The exec tier's objects are named after the agent, so a name too
+		// long for them is refused while the tier is on.
+		allErrs = append(allErrs, controller.ValidateCredentialProxyExec(platformAgent, field.NewPath("metadata", "name"))...)
 	}
 
-	// 2h. The shell container's requests and limits, checked the same way as
-	// the two above: merged over the defaults per key, so the reconciler refuses
+	// 2i. The shell container's requests and limits, checked the same way as
+	// the credential-proxy and agent-api-auth overrides above: merged over the
+	// defaults per key, so the reconciler refuses
 	// at reconcile what this refuses at apply. Outside the deployment block
 	// because the field sits under spec.harness.experimental.shellSandbox.
 	sandboxErrs, sandboxWarnings := controller.ValidateShellSandboxResources(platformAgent,

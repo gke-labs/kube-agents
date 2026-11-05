@@ -153,7 +153,7 @@ func dispatcherIdentity(agent *agentv1alpha1.PlatformAgent, ns string, profiles,
 	}
 	return a2aIdentity{
 		user:    a2aDispatcherUser,
-		account: a2aAccountApp,
+		account: a2aAccountControl,
 		comment: "the AgentProfile dispatcher: reads the profiles' durables, writes PROFILE_LEASES, " +
 			"hands tasks to workers, and fails a task it can't run (#3655)",
 		auth:           a2aAuthCallout,

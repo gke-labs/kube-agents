@@ -91,6 +91,8 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	// the same Deployment with no plugins. Both are pod-bearing builders,
 	// so both pods reach the assertion.
 	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, false)
+	credentialProxyExecTier := buildCredentialProxyExecTierDeployment(agent, credentialProxy)
+	kubeProxy := buildKubeProxyDeployment(agent, "", true, "t")
 	a2aGateway := buildA2AGatewayDeployment(agent)
 	a2aCallout := buildA2ACalloutDeployment(agent, "", 1)
 	a2aVerifier := buildA2AVerifierDeployment(agent)
@@ -109,6 +111,8 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildDeployment", gatewayDeployment.Name, gatewayDeployment.Spec.Template.Spec},
 		{"buildCredentialProxyDeployment", credentialProxy.Name, credentialProxy.Spec.Template.Spec},
 		{"buildCredentialProxyDeploymentForPlugins", credentialProxyWithPlugins.Name, credentialProxyWithPlugins.Spec.Template.Spec},
+		{"buildCredentialProxyExecTierDeployment", credentialProxyExecTier.Name, credentialProxyExecTier.Spec.Template.Spec},
+		{"buildKubeProxyDeployment", kubeProxy.Name, kubeProxy.Spec.Template.Spec},
 		{"buildA2AGatewayDeployment", a2aGateway.Name, a2aGateway.Spec.Template.Spec},
 		{"buildA2ACalloutDeployment", a2aCallout.Name, a2aCallout.Spec.Template.Spec},
 		{"buildA2AVerifierDeployment", a2aVerifier.Name, a2aVerifier.Spec.Template.Spec},

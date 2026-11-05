@@ -79,6 +79,7 @@ func TestAgentsGolden(t *testing.T) {
 		expectedPath  string
 		newAgent      func() client.Object
 		newReconciler func(client.Client, *runtime.Scheme) reconcile.Reconciler
+		settled       bool
 	}{
 		{
 			name:         "PlatformAgent",
@@ -119,6 +120,28 @@ func TestAgentsGolden(t *testing.T) {
 			name:         "PlatformAgentScopedServiceAccounts",
 			inputPath:    filepath.Join("testdata", "platform", "platformagent-scoped-sa.yaml"),
 			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-scoped-sa.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
+			// The credential broker's exec tier at 1 replica: the tier's
+			// objects beside platformagent-tagged.yaml's, and nothing else.
+			name:         "PlatformAgentExecTierOneReplica",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-exec-1.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-exec-1.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
+			// The credential broker's exec tier at 2 replicas: the tier's
+			// objects beside platformagent-tagged.yaml's, and nothing else.
+			name:         "PlatformAgentExecTierTwoReplicas",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-exec-2.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-exec-2.yaml"),
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
@@ -168,6 +191,18 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
+			// spec.mode: next renders the A2A stack beside the agent; the chart's
+			// footprint.yaml sums it from this golden for a next-mode install.
+			name:         "PlatformAgentNextMode",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-next.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-next.yaml"),
+			settled:      true,
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s, OperatorNamespace: goldenOperatorNamespace}
+			},
+		},
+		{
 			// A shellSandbox.resources override that raises the memory pair.
 			// Diff this against platformagent-tagged.yaml and the whole of what
 			// the field renders is the shell container's requests.memory and
@@ -185,7 +220,11 @@ func TestAgentsGolden(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			testutil.RunGoldenTest(
+			run := testutil.RunGoldenTest
+			if tt.settled {
+				run = testutil.RunSettledGoldenTest
+			}
+			run(
 				t,
 				tt.inputPath,
 				tt.expectedPath,

@@ -208,6 +208,6 @@ def test_the_list_check_reads_the_recorded_command_as_typed():
     check = _list_check()
     assert check["after_result_pattern"] == "(?!)"
     assert _listed(check)
-    # Without the switch the check reads the card-log row, where the list
-    # verb is behind `+ 2 commands`: the recorded false fail (#3128).
-    assert not _listed({k: v for k, v in check.items() if k != "after_result_pattern"})
+    # The card-log row hides the list verb behind `+ 2 commands` (#3128).
+    # Without the switch the required check still reads the typed call (#4620).
+    assert _listed({k: v for k, v in check.items() if k != "after_result_pattern"})

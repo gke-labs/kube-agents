@@ -12,7 +12,7 @@
 #                         and reports the ones a person made outside git
 #
 # CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
-# run in the same pod. It is the same variable and the same three values
+# run in the same pod. It is the same variable and the same four values
 # credential_proxy.py's resolve_role() reads; this script decides which
 # processes to launch and that function decides which halves of the runtime to
 # serve. `broker` is the credential pod: Envoy and the credential runtime, which
@@ -22,7 +22,9 @@
 # the Hermes gateway on the same loopback. None of those is a credential path
 # the agent container can drive, which is the point of the split. `combined` is
 # the sidecar arrangement and stays the default so an image paired with an older
-# operator behaves as it did.
+# operator behaves as it did. `exec` is the exec tier's pod
+# (docs/designs/credential-broker-exec-tier.md): Envoy and the credential
+# runtime, as in `broker`, and no watcher or detector.
 #
 # They differ in how their failure is treated. Envoy and the credential runtime
 # are the container's reason to exist: if either dies the agent loses every
@@ -59,7 +61,7 @@ readonly SIGNAL_EXIT_BASE=128
 # defaulted here. Two defaults that have to agree is a way for them not to.
 export CREDENTIAL_PROXY_ROLE="${CREDENTIAL_PROXY_ROLE:-combined}"
 case "${CREDENTIAL_PROXY_ROLE}" in
-  combined | broker | api-proxy) ;;
+  combined | broker | api-proxy | exec) ;;
   *)
     echo "start-services: unknown CREDENTIAL_PROXY_ROLE=${CREDENTIAL_PROXY_ROLE}" >&2
     exit 1
@@ -402,9 +404,9 @@ clamp_at_least DRIFT_SHORT_EXIT_ALERT_COUNT
 # may spend up to 56s (50s drain plus lease release calls), leaving this drain
 # about 4s; resizing it is tracked in #3407. An older operator's `combined`
 # sidecar keeps the 30s default, which 15s fits. The standalone broker pod
-# (CREDENTIAL_PROXY_ROLE=broker) starts no watcher or detector, so only the
-# runtime drain below runs there. The poll is whole seconds: the drain is
-# bounded by the settle, not by how often it is checked.
+# (CREDENTIAL_PROXY_ROLE=broker) and the exec pod (exec) start no watcher or
+# detector, so only the runtime drain below runs there. The poll is whole
+# seconds: the drain is bounded by the settle, not by how often it is checked.
 readonly SHUTDOWN_DRAIN_SECONDS=15
 readonly SHUTDOWN_DRAIN_POLL_SECONDS=1
 # The credential runtime's own drain budget. In the combined role the runtime
@@ -576,6 +578,12 @@ normalize_duration WATCHER_QUIET_AFTER "${WATCHER_QUIET_AFTER_DEFAULT}"
 readonly WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT=true
 WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD:-${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}}"
 normalize_boolean WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD "${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}"
+
+# Alert-exclude rules: a JSON list, passed to the watcher as it is. Events a
+# rule matches open no incident, while their clusters stay in scope for reads.
+# Not normalised here: the watcher parses the list, and a malformed one is
+# logged as an ALERT and ignored there, so it never stops the watcher.
+WATCHER_ALERT_EXCLUDE="${WATCHER_ALERT_EXCLUDE:-}"
 
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
@@ -949,7 +957,8 @@ start_event_watcher() {
         --scaleup-hold="${WATCHER_SCALEUP_HOLD}" \
         --settle="${WATCHER_SETTLE}" \
         --quiet-after="${WATCHER_QUIET_AFTER}" \
-        --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" || true
+        --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" \
+        --alert-exclude="${WATCHER_ALERT_EXCLUDE}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh
@@ -1202,9 +1211,10 @@ start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
   start_envoy
 fi
-if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]]; then
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" && "${CREDENTIAL_PROXY_ROLE}" != "exec" ]]; then
   # The same guard as the watcher, and for the same reason: both post to the
-  # Session KV server on this pod's loopback, which the broker pod does not run.
+  # Session KV server on this pod's loopback, which the broker and exec pods do
+  # not run.
   start_event_watcher
   start_drift_detector
 fi
