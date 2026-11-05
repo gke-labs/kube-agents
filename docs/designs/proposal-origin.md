@@ -207,6 +207,9 @@ The fields, named like the block's other readings: `proposalsFromChat`,
 `proposalsFromAudit`, `proposalsFromScheduled`, `proposalsFromIssue`, `proposalsFromOther`. Each
 is a pointer field: a 0 is a reading; absent until the first reading, after two polls in a row
 without one, and while the served CRD predates it. They move neither `lastActiveTime` nor `lastHumanActiveTime`, as readings do not.
+A ledger read that fails after the plugin's first success keeps serving the last counts, so the
+fields hold a stale count until the plugin restarts; a staleness signal beside the series is a
+plugin follow-up, not part of this design.
 Each gets a row in the per-field gauge `kubeagents_platformagent_usage{field=...}`, so a shared
 Prometheus reads the split with one `sum by (field)`.
 
