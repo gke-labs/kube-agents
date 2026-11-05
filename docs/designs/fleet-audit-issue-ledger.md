@@ -876,7 +876,8 @@ files that name any Config Connector group (`every_kind`), so every kind is inde
 with a stall of its kind and name on its cluster. When the `gcloud` check also runs, it takes this
 index, so the snapshot and each clone are read once. The fix's file is not the declaration, so the
 paragraph does not say "this file": when exactly one file declares the object, its first sentence
-names that file ("**Config Connector is not applying `<path>`.**", `KCC_STALLED_DECLARED_MARK`).
+names that file ("**Config Connector is not applying `<path>`.**", `KCC_STALLED_DECLARED_MARK`, or
+"`<path>` in the repository `<repo>`" for a declaration in a context repository).
 Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
 says that more than one file declares the object, or only that the audit names no declaration file
 for it. It never says that no file declares the object: the index skips a file it cannot parse (a

@@ -53,8 +53,7 @@ neither into the document. `finish` reads them: any fix whose finding's own obje
 gets a last paragraph. It starts "**Config Connector is not applying this file.**" for a manifest
 fix of the declaring file, "**Config Connector is not applying `<path>`.**" for any other fix when
 one file declares the object, or "**Config Connector is not applying the declaration of this
-object.**". The fix keeps its kind. Write your own text for the fix as usual; `finish` puts the
-paragraph after it. Do not write the paragraph yourself, and do not copy it from an earlier ledger:
+object.**". The fix keeps its kind. Do not write the paragraph yourself, and do not copy it from an earlier ledger:
 `finish` removes it and writes it again from this run's manifest.
 
 The script validates the document, reconciles every finding against the pull requests already open

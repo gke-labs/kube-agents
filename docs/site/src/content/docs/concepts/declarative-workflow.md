@@ -163,7 +163,7 @@ For these fixes, the audit looks for the object's declaration in the `.yaml`, `.
 
 The paragraph does not say that the change is correct: the reason can reject the change itself, for example a node pool change that sets both `spec.autoscaling.maxNodeCount` and `spec.autoscaling.totalMaxNodeCount`. When the reason is `DependencyNotReady`, the paragraph also names the unready object at the root of the chain.
 
-To fit the [note cap of 2,000 characters](#where-a-manual-fix-belongs), the audit cuts only the fix's own text, which then ends with `…(truncated)`. The text of a Kustomize note, a note that a fix fell back to `manual`, a note about a reverted `gcloud` command, the location note and the reconciler note is never cut or pushed out.
+To fit the [note cap of 2,000 characters](#where-a-manual-fix-belongs), the audit cuts only the fix's own text, which then ends with `…(truncated)`. The text of a Kustomize note, a note that a fix fell back to `manual`, a note about a reverted `gcloud` command, and the reconciler note are never cut. The paragraph never pushes out a location note or reconciler note that is already on the fix.
 
 When there is still no room, the paragraph becomes shorter, and the copy of the file in a Kustomize note can become shorter by whole lines. When even the shortest paragraph does not fit, it goes after the other text, past the cap, and the `finish` log has a warning. The next run after the stall clears shows the fix's whole text again.
 

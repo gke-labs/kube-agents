@@ -23662,13 +23662,14 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(), self.root, declarations)
         self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
 
-    def test_the_workers_own_text_stays_before_the_paragraph(self):
-        """Live finding: two ledger rows showed only the paragraph as the
-        fix's text. The pass keeps the worker's own text, when there is any,
-        before the paragraph, for a manifest fix of the declaring file, a fix
-        of another file, a manual fix and a note long enough to be cut; with
-        no worker text, the paragraph is the whole note and nothing is made
-        up in its place."""
+    def test_guard_the_workers_own_text_stays_before_the_paragraph(self):
+        """A guard, not a fix test: it passed before any change. Two live
+        ledger rows showed only the paragraph as the fix's text, because the
+        worker gave no note. The pass keeps the worker's own text, when there
+        is any, before the paragraph, for a manifest fix of the declaring
+        file, a fix of another file, a manual fix and a note long enough to
+        be cut; with no worker text, the paragraph is the whole note and
+        nothing is made up in its place."""
         self.write(self.PLANTED, self.PLANTED_DECLARATION)
         declarations = audit_report.kcc_declarations(self.root)
         long_text = ("Append us-central1-b and us-central1-c to the pool's node locations. " * 40).strip()
