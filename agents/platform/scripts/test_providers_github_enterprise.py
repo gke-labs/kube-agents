@@ -747,7 +747,6 @@ class ProviderForgeTest(unittest.TestCase):
 
 
 WRITE_TOKEN = "mock-write-token-0002"
-READ_TOKEN = "mock-read-token-0003"
 EXTRAHEADER = f"http.https://{HOST}/.extraheader"
 
 

@@ -93,6 +93,9 @@ class StandaloneRulesTest(unittest.TestCase):
             ".git/config",
             "manifests/.git/hooks/pre-commit",
             "GIT~1/config",
+            ".git./config",
+            ".git /config",
+            ".g\u200cit/config",  # zero-width non-joiner, ignored by HFS+
         ):
             with self.subTest(path=path):
                 with self.assertRaises(workspace_paths.WorkspaceError):
@@ -113,7 +116,7 @@ class StandaloneRulesTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(path, workspace_paths.validate_path(path))
 
-    def test_the_dotgit_rule_is_public_because_another_module_calls_it(self):
+    def test_the_dotgit_rule_is_public(self):
         """Public, so a caller that filters a tree walk imports the one rule
         rather than copying it, which is the two implementations the module
         header argues against."""
