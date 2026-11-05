@@ -35,14 +35,18 @@ from scripts.check_bounded_concurrency import (  # noqa: E402
 
 # A FastAPI module with every spawn and bounded shape the check distinguishes
 # and every edge it follows, in one spelling each: `post`/`get` of the nine
-# route decorators, `Thread` and `Timer` as bases, `self` and `cls` as
-# receivers, one `async def` route. The checker's tables list the rest.
+# route decorators and `middleware` of the two hook decorators, `Thread` and
+# `Timer` as bases, `self` and `cls` as receivers, one `async def` route,
+# `partial` of the callback positions that are not a spawn's own, a `while`
+# and a list comprehension of the loops under a guard. The checker's tables
+# list the rest.
 PYTHON_FIXTURE = textwrap.dedent(
     '''
     import _thread
     import threading
     from concurrent.futures import ThreadPoolExecutor
     from fastapi import Depends
+    from functools import partial
     from http.server import BaseHTTPRequestHandler
 
     app = object()
@@ -176,7 +180,7 @@ PYTHON_FIXTURE = textwrap.dedent(
 
     class Worker(threading.Thread):
         def run(self):
-            pass
+            threading.Thread(target=_work, daemon=True).start()
 
 
     @app.post("/subclass")
@@ -258,6 +262,39 @@ PYTHON_FIXTURE = textwrap.dedent(
         return {}
 
 
+    @app.post("/guard-while-inside")
+    def post_guard_while_inside(payload):
+        global _digest_thread
+        if _digest_thread is None or not _digest_thread.is_alive():
+            while payload["rows"]:
+                threading.Thread(target=_work, args=(payload["rows"].pop(),), daemon=True).start()
+        return {}
+
+
+    @app.post("/guard-comprehension-inside")
+    def post_guard_comprehension_inside(payload):
+        global _digest_thread
+        if _digest_thread is None or not _digest_thread.is_alive():
+            _digest_thread = [threading.Thread(target=_work, args=(row,), daemon=True) for row in payload["rows"]]
+        return {}
+
+
+    @app.post("/partial")
+    def post_partial(payload):
+        threading.Thread(target=partial(_partialled, payload), daemon=True).start()
+        return {}
+
+
+    def _partialled(payload):
+        threading.Thread(target=_work, daemon=True).start()
+
+
+    @app.middleware("http")
+    async def stamp_request(request, call_next):
+        threading.Thread(target=_work, daemon=True).start()
+        return await call_next(request)
+
+
     @app.post("/guard-in-loop")
     def post_guard_in_loop(payload):
         global _digest_thread
@@ -292,6 +329,9 @@ PYTHON_FIXTURE = textwrap.dedent(
 
         def _proxy(self):
             threading.Thread(target=_work, daemon=True).start()
+
+        def do_PUT(self):
+            threading.Thread(target=self._proxy, daemon=True).start()
 
         def do_GET(self):
             self._arm()
@@ -395,12 +435,17 @@ GO_FIXTURE = textwrap.dedent(
 
     func liveHandlerOneLine() { mux.HandleFunc("/livez", func(w, r) { go audit(r) }) }
 
-    func quick(x struct{}) { go serve() }
+    func quick(x struct{}, cb func()) { go serve() }
+
+    func delayed(m string) {
+    \ttime.AfterFunc(budget, func() { work(m) })
+    }
 
     func work(m string) {}
 
     func main() {
     \tgo serve()
+    \ttime.AfterFunc(budget, serve)
     \tif err := run(); err != nil {
     \t\tpanic(err)
     \t}
@@ -420,7 +465,7 @@ GO_FIXTURE = textwrap.dedent(
     \tstatusHandler()
     \tliveHandler()
     \tliveHandlerOneLine()
-    \tquick(struct{}{})
+    \tquick(struct{}{}, nil)
     \treturn nil
     }
 
@@ -490,11 +535,14 @@ ALLOWLIST_NAME = "allow.txt"
 FLAGGED_PYTHON = (
     "Door._proxy",
     "Door._watch",
+    "Door.do_PUT",
+    "Worker.run",
     "_SizedWorkers.__init__",
     "_chained",
     "_deferred",
     "_dependency",
     "_lookup",
+    "_partialled",
     "_started",
     "_submitted",
     "_timed",
@@ -502,19 +550,24 @@ FLAGGED_PYTHON = (
     "post_chained",
     "post_fanout",
     "post_fixed_fanout",
+    "post_guard_comprehension_inside",
     "post_guard_loop_inside",
     "post_guard_orelse",
     "post_guard_then_fanout",
     "post_guard_then_loop",
+    "post_guard_while_inside",
+    "post_partial",
     "post_pool_per_request",
     "post_start_new_thread",
     "post_subclass",
     "post_timer",
     "post_timer_keyword",
     "post_unbounded",
+    "stamp_request",
 )
 FLAGGED_GO = (
     ("callout.go", "assembled", 1),
+    ("callout.go", "delayed", 1),
     ("callout.go", "dispatched", 1),
     ("callout.go", "fanout", 1),
     ("callout.go", "handle", 1),
@@ -584,7 +637,14 @@ class FixtureTest(unittest.TestCase):
     def test_a_request_handler_method_is_an_entry_point(self):
         spawn = self._python("Door._proxy")
         self.assertTrue(spawn.flagged)
-        self.assertEqual(("Door._proxy", "Door.do_POST"), spawn.reachable_from)
+        # do_POST calls it; do_PUT hands it to a spawn as `target=self._proxy`.
+        self.assertEqual(("Door._proxy", "Door.do_POST", "Door.do_PUT"), spawn.reachable_from)
+        self.assertTrue(self._python("Door.do_PUT").flagged)
+
+    def test_a_fastapi_middleware_is_an_entry_point(self):
+        spawn = self._python("stamp_request")
+        self.assertEqual(("stamp_request",), spawn.reachable_from)
+        self.assertTrue(spawn.flagged)
 
     def test_a_module_level_executor_is_not_a_spawn(self):
         self.assertNotIn("post_pooled", [s.function for s in scan_python(self.py, self.root)])
@@ -593,6 +653,10 @@ class FixtureTest(unittest.TestCase):
         for function in ("post_timer", "post_pool_per_request", "post_subclass"):
             with self.subTest(function=function):
                 self.assertTrue(self._python(function).flagged)
+        # The subclass's `run` is what the thread executes: an edge from the constructor's caller.
+        run = self._python("Worker.run")
+        self.assertEqual(("post_subclass",), run.reachable_from)
+        self.assertTrue(run.flagged)
 
     def test_the_is_alive_guard_is_bounded_only_where_it_guards(self):
         early_exit = self._python("_arm_digest")
@@ -614,9 +678,15 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(1, sum(s.flagged for s in spawns))
 
     def test_a_loop_between_the_guard_and_the_spawn_breaks_the_bound(self):
-        # A per-row loop in the guard's body, and one after an early return
-        # (here under the lock, the KV server's shape): both spawn per row.
-        for function in ("post_guard_loop_inside", "post_guard_then_loop"):
+        # A per-row loop in the guard's body (a `for`, a `while`, a list
+        # comprehension), and one after an early return (here under the lock,
+        # the KV server's shape): each spawns per row.
+        for function in (
+            "post_guard_loop_inside",
+            "post_guard_while_inside",
+            "post_guard_comprehension_inside",
+            "post_guard_then_loop",
+        ):
             with self.subTest(function=function):
                 spawn = self._python(function)
                 self.assertIsNone(spawn.bounded_by)
@@ -663,8 +733,13 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(("post_sized_pool_per_request",), sized.reachable_from)
         self.assertTrue(sized.flagged)
 
-    def test_a_function_handed_to_add_task_submit_or_a_spawn_is_followed(self):
-        for function, route in (("_deferred", "post_deferred"), ("_submitted", "post_submitted"), ("_chained", "post_chained")):
+    def test_a_function_handed_to_add_task_submit_partial_or_a_spawn_is_followed(self):
+        for function, route in (
+            ("_deferred", "post_deferred"),
+            ("_submitted", "post_submitted"),
+            ("_chained", "post_chained"),
+            ("_partialled", "post_partial"),
+        ):
             with self.subTest(function=function):
                 spawn = self._python(function)
                 self.assertEqual((route,), spawn.reachable_from)
@@ -685,6 +760,13 @@ class FixtureTest(unittest.TestCase):
         self.assertEqual(BOUND_STARTUP, by_function["main"].bounded_by)
         self.assertEqual(BOUND_GO_STARTUP, by_function["run"].bounded_by)
         self.assertNotIn("grouped", by_function)
+
+    def test_an_after_func_call_is_a_spawn_read_like_a_go_statement(self):
+        # `time.AfterFunc(d, f)` starts a goroutine when it fires: per call in
+        # `delayed`, flagged; in `main` beside the `go` statement, startup.
+        self.assertTrue(self._go()["delayed"].flagged)
+        main_spawns = [s for s in scan_go(go_files(self.root / GO_DIR), self.root) if s.function == "main"]
+        self.assertEqual([BOUND_STARTUP, BOUND_STARTUP], [s.bounded_by for s in main_spawns])
 
     def test_a_semaphore_bounds_only_a_statement_in_its_own_block(self):
         by_function = self._go()
@@ -721,7 +803,9 @@ class FixtureTest(unittest.TestCase):
         # A one-line HandleFunc closure on the startup path: a literal, flagged.
         self.assertIsNone(by_function["liveHandlerOneLine"].bounded_by)
         self.assertTrue(by_function["liveHandlerOneLine"].flagged)
-        # A one-line function run reaches, with a `struct{}` in its signature: startup.
+        # A one-line function run reaches, with a `struct{}` and then a `func()`
+        # type in its signature: startup. Read from the struct's brace instead,
+        # the walk would take the func type's `{` for a literal and flag it.
         self.assertEqual(BOUND_GO_STARTUP, by_function["quick"].bounded_by)
 
     def test_set_limit_does_not_bound_a_go_statement(self):
@@ -765,7 +849,7 @@ class FixtureTest(unittest.TestCase):
     def test_an_unpinned_finding_fails_and_names_the_handler(self):
         code, _, err = _run(self.root, FULL_ALLOWLIST.replace(f"{PYTHON_TARGET} post_unbounded 1\n", ""))
         self.assertEqual(EXIT_FAIL, code)
-        self.assertIn("server.py:17: post_unbounded starts a thread per request, reachable from post_unbounded", err)
+        self.assertIn("server.py:18: post_unbounded starts a thread per request, reachable from post_unbounded", err)
 
     def test_a_rise_above_the_entry_fails(self):
         spawn = "    threading.Thread(target=_work, args=(payload,), daemon=True).start()\n"

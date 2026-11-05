@@ -10,18 +10,26 @@ This check reads the source instead and fails a pull request that adds one.
 
 Python (`PYTHON_TARGETS`), by AST. The entry points are request handlers: every
 method of a class whose base name ends in `RequestHandler`, and every function
-carrying a FastAPI route decorator (`@app.get(...)`, `@router.post(...)`). A
+carrying a FastAPI route decorator (`@app.get(...)`, `@router.post(...)`) or a
+per-request hook decorator (`@app.middleware("http")`, which runs on every
+request, `@app.exception_handler(...)`, which runs on every failed one). A
 call graph is built per module from direct calls: a bare `name(...)`, a class
-instantiation (an edge to its `__init__`), `self.name(...)` or `cls.name(...)`
-to the same class's method, and a function handed on as a value where the
-handing is itself how a request's work continues: the first argument of
-`.add_task(...)` (Starlette's `BackgroundTasks`) or `.submit(...)` (an executor
-or a queue), a FastAPI dependency (`Depends(fn)`, in a route's `dependencies=`
-or a parameter default, which runs before every request the route serves), and
-the callable a spawn is given (`target=`, a `Timer`'s function,
-`start_new_thread`'s). A call through any other receiver (a module-level
-singleton, a callback stored in one call and invoked in another) is not
-followed; that is the check's blind spot, named here so a reviewer knows it. A
+instantiation (an edge to its `__init__`, and to its `run` when the class
+subclasses `Thread` or `Timer`, since `run` is what the thread executes),
+`self.name(...)` or `cls.name(...)` to the same class's method, and a function
+handed on as a value where the handing is itself how a request's work
+continues: the first argument of `.add_task(...)` (Starlette's
+`BackgroundTasks`), `.submit(...)` (an executor or a queue), `partial(...)`
+(whatever the partial is then handed to), `to_thread(...)` or `Security(...)`,
+the second of `run_in_executor(...)`, a FastAPI dependency (`Depends(fn)`, in a
+route's `dependencies=` or a parameter default, which runs before every request
+the route serves), and the callable a spawn is given (`target=`, a `Timer`'s
+function, `start_new_thread`'s). A call through any other receiver (a
+module-level singleton, a callback stored in one call and invoked in another)
+is not followed, and a function registered by value from the module body
+(`app.add_api_route(path, fn)`, `app.add_middleware(cls)`) sits in no function
+the scan reads and is not an entry point; those are the check's blind spots,
+named here so a reviewer knows them. A
 spawn is a call that starts one or more threads inside the function: a
 `threading.Thread(...)` or `threading.Timer(...)`, `_thread.start_new_thread(...)`,
 a `ThreadPoolExecutor(...)` built inside the function (its workers are the
@@ -51,7 +59,8 @@ file first, a raw string or block comment spanning lines included, and the rest
 is read as code. Every `go` statement in a non-test file, whatever call
 expression follows the keyword (`go f(m)`, `go s.handlers[i](m)`, `go (&w{}).run()`),
 at the start of a line or after a `{`, `;` or `:` on it, each one on a line
-counted on its own, is a finding
+counted on its own, and every `time.AfterFunc(...)` or `context.AfterFunc(...)`
+call, which starts a goroutine when it fires, is a spawn, and a spawn is a finding
 unless it sits in a startup function, or a semaphore gates it in the same block
 before the statement (a send on a channel whose name starts with `sem` or
 carries `Sem`, or an `Acquire(...)`, written between the `{` that opens the
@@ -73,9 +82,10 @@ function type, `var cb func()` or `map[string]func()`, opens none); the body is
 the brace pair that `{` starts, and the literal is found by brace nesting, so a
 goroutine a startup function starts inside another of its own closures
 (`go func() { go work() }()`) is read the same way and is pinned rather than
-bounded. An `errgroup` with `SetLimit(...)` bounds its own `Go(...)` calls,
-which are not `go` statements and are not read; it does not bound a `go`
-statement near it.
+bounded. A goroutine started through a method call, an `errgroup.Group`'s or a
+`sync.WaitGroup`'s `Go(...)`, is not read (an `errgroup` with `SetLimit(...)`
+bounds its own, one without does not, and the text scan cannot tell them
+apart); `SetLimit(...)` does not bound a `go` statement near it.
 
 ``scripts/bounded_concurrency_allowlist.txt``: one line per function that
 carried a finding when the check arrived, `<file> <function> <count>`, with the
@@ -125,23 +135,39 @@ COMMENT_PREFIX = "#"
 # Python entry points: a class whose base name ends like this is a request
 # handler (BaseHTTPRequestHandler, StreamRequestHandler), and every method of it
 # runs per request; a function decorated with one of these FastAPI attributes
-# is a route.
+# is a route, and one decorated with a FastAPI hook attribute runs per request
+# (`middleware`) or per failed request (`exception_handler`).
 REQUEST_HANDLER_BASE_SUFFIX = "RequestHandler"
-ROUTE_DECORATOR_ATTRS = frozenset({"get", "post", "put", "patch", "delete", "head", "options", "api_route", "websocket"})
+ROUTE_DECORATOR_ATTRS = frozenset(
+    {"get", "post", "put", "patch", "delete", "head", "options", "api_route", "websocket", "middleware", "exception_handler"}
+)
 # The callee names that start one or more threads. `Thread` and `Timer` cover
 # `threading.Thread(...)` and a bare import; `start_new_thread` is the `_thread`
 # primitive; a `ThreadPoolExecutor` built inside a function starts its workers
 # for that call. A class in the module whose base is one of THREAD_BASES is a
-# spawn too when instantiated.
+# spawn too when instantiated, and its `run` is what the thread executes.
 THREAD_SPAWN_CALLEES = frozenset({"Thread", "Timer", "start_new_thread", "ThreadPoolExecutor"})
 THREAD_BASES = frozenset({"Thread", "Timer"})
+THREAD_RUN_METHOD = "run"
 # Calls that hand a function on as a value and run it as the request's work:
 # the callee name, and the position of the function among the positional
 # arguments. `add_task` is Starlette's `BackgroundTasks`, `submit` an executor
-# or a queue, `Depends(fn)` a FastAPI dependency the route runs before its body,
-# `Timer(interval, function)` and `start_new_thread(function, args)` the
-# spawns' own callables.
-CALLBACK_POSITIONS: dict[str, int] = {"add_task": 0, "submit": 0, "Depends": 0, "start_new_thread": 0, "Timer": 1}
+# or a queue, `Depends(fn)` a FastAPI dependency the route runs before its body
+# and `Security(fn)` the same with scopes, `partial(fn, ...)` a callable built
+# to be handed on, `to_thread(fn)` and `run_in_executor(executor, fn)` the
+# asyncio hand-offs to a thread, `Timer(interval, function)` and
+# `start_new_thread(function, args)` the spawns' own callables.
+CALLBACK_POSITIONS: dict[str, int] = {
+    "add_task": 0,
+    "submit": 0,
+    "Depends": 0,
+    "Security": 0,
+    "partial": 0,
+    "to_thread": 0,
+    "run_in_executor": 1,
+    "start_new_thread": 0,
+    "Timer": 1,
+}
 # A loop between a liveness guard and a spawn runs the spawn per row, so the
 # guard bounds nothing under it; comprehensions are loops too.
 LOOP_NODES = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
@@ -161,14 +187,15 @@ QUALIFIED_SEPARATOR = "."
 
 # Go, by text, on lines with comments and strings removed. A spawn is a `go`
 # statement at the start of a line or after a `{`, `;` or `:` on it, whatever
-# call expression follows the keyword (group 1 is the statement, so its column
-# is known; `go` is a keyword, so after stripping nothing else reads `go `
-# there); a function starts at column 0 with `func`, optionally with a
-# receiver, its body opens at the first `{` on that line outside parentheses
+# call expression follows the keyword (`go` is a keyword, so after stripping
+# nothing else reads `go ` there), or a `time.AfterFunc(` or
+# `context.AfterFunc(` call anywhere on the line; the group that matched is the
+# spawn, so its column is known. A function starts at column 0 with `func`,
+# optionally with a receiver, its body opens at the first `{` on that line outside parentheses
 # and brackets that no `struct` or `interface` precedes, and it ends on the
 # declaration line when that line's braces balance, else at the first `}` at
 # column 0 (gofmt's shapes, which `go vet` in CI holds).
-GO_SPAWN_RE = re.compile(r"(?:^|[{;:])\s*(go\s+(?=\S))")
+GO_SPAWN_RE = re.compile(r"(?:^|[{;:])\s*(go\s+(?=\S))|\b((?:time|context)\.AfterFunc\()")
 GO_FUNC_RE = re.compile(r"^func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)")
 GO_FUNC_END = "}"
 GO_NEST_OPEN = frozenset({"(", "["})
@@ -371,6 +398,9 @@ def _read_unit(node: ast.AST, name: str, class_name: str | None, entry_point: bo
                 else:
                     bound = None
                 unit.spawns.append((current.lineno, bound))
+                if callee in facts.thread_classes:
+                    # The subclass's `__init__` and `run` are reached through the instantiation.
+                    unit.calls.add(callee)
             elif callee is not None:
                 receiver = current.func.value if isinstance(current.func, ast.Attribute) else None
                 if receiver is None:
@@ -419,7 +449,7 @@ def _units_of(module: ast.Module) -> list[_Unit]:
     return units
 
 
-def _reachability(units: list[_Unit]) -> dict[str, set[str]]:
+def _reachability(units: list[_Unit], facts: _ModuleFacts) -> dict[str, set[str]]:
     """For every unit name, the entry points whose direct-call closure contains it."""
     by_simple: dict[str, list[_Unit]] = {}
     by_class: dict[str, dict[str, _Unit]] = {}
@@ -437,6 +467,10 @@ def _reachability(units: list[_Unit]) -> dict[str, set[str]]:
             constructor = by_class.get(callee, {}).get(CONSTRUCTOR)
             if constructor is not None:
                 targets.add(constructor.name)
+            # A Thread or Timer subclass runs its `run` on the thread it starts.
+            runner = by_class.get(callee, {}).get(THREAD_RUN_METHOD) if callee in facts.thread_classes else None
+            if runner is not None:
+                targets.add(runner.name)
         if unit.class_name is not None:
             own = by_class.get(unit.class_name, {})
             targets.update(own[c].name for c in unit.self_calls if c in own)
@@ -459,7 +493,7 @@ def scan_python(path: Path, root: Path) -> list[Spawn]:
     """Every thread start in one Python module, with the handlers that reach it."""
     module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     units = _units_of(module)
-    reached = _reachability(units)
+    reached = _reachability(units, _module_facts(module))
     shown = path.relative_to(root).as_posix()
     spawns: list[Spawn] = []
     for unit in units:
@@ -689,7 +723,7 @@ def scan_go(paths: Iterable[Path], root: Path) -> list[Spawn]:
                 if enclosing is None:
                     spawns.append(Spawn(shown, number, GO_NO_FUNCTION, KIND_GOROUTINE, (GO_NO_GRAPH,), None))
                     continue
-                position = _go_walk(enclosing, number, match.start(1))
+                position = _go_walk(enclosing, number, match.start(match.lastindex))
                 if enclosing.name == STARTUP_FUNCTION and not position.in_literal:
                     bound: str | None = BOUND_STARTUP
                 elif enclosing.name in startup and not position.in_literal:
