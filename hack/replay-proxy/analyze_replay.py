@@ -42,6 +42,7 @@ VERDICT_MATCH = "match"
 VERDICT_MISMATCH = "mismatch"
 VERDICT_UNKNOWN = "unknown"
 NO_SIGNATURE = ""
+ASSISTANT_ROLE = "assistant"
 
 
 @dataclass
@@ -58,6 +59,8 @@ class Line:
     served_via: str
     # A line whose analysis was dropped or failed: no fingerprint, no hashes.
     lost: bool = False
+    # Whether the request holds an assistant message: a conversation already under way.
+    continues: bool = False
 
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
@@ -78,6 +81,7 @@ class Line:
             miss=entry.get(F.MISS) or {},
             served_from_build=str(served_from.get(F.JOB_BUILD)) if served_from.get(F.JOB_BUILD) else None,
             lost=not entry.get(F.FINGERPRINT),
+            continues=ASSISTANT_ROLE in (entry.get(F.ROLES) or []),
         )
 
 
@@ -126,6 +130,11 @@ def conversations(lines: List[Line]) -> List[Conversation]:
     conversations can end at the same request; each continuation takes the
     earliest of them still waiting there, and only when none is waiting does
     it join the first conversation that ended there (a retry or a branch).
+
+    A request identical to one a conversation ends at is a retry of it, when it
+    holds an assistant message: it stays in that conversation rather than
+    taking a sibling waiting at its prefix. An identical opening (no assistant
+    message yet) is another worker's, a conversation of its own.
     """
     out: List[Conversation] = []
     # Conversations by the request they currently end at, earliest first.
@@ -135,6 +144,9 @@ def conversations(lines: List[Line]) -> List[Conversation]:
     tips: Dict[int, Tuple[Tuple[str, str, str], str]] = {}
     for line in lines:
         if line.lost:
+            continue
+        if line.continues and line.chain and waiting.get((line.scope, line.chain[-1])):
+            waiting[(line.scope, line.chain[-1])][0].lines.append(line)
             continue
         found = None
         for prefix in reversed(line.chain[:-1]):

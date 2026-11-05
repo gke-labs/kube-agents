@@ -28,6 +28,8 @@ def line(request_id, ts, messages, served, tokens=100, build="b1", miss=None, se
         "job": {"kind": "nightly", "project": "p", "build": build},
         "fingerprint": "fp-" + request_id, "diag_settings_hash": "s", "diag_message_hashes": list(messages),
         "served": served, "prompt_tokens": tokens,
+        # In these fixtures an assistant message's name starts with "a".
+        "roles": ["assistant" if m.startswith("a") else "user" for m in messages],
     }
     if miss is not None:
         entry["miss"] = miss
@@ -79,6 +81,14 @@ class ConversationTest(unittest.TestCase):
         # the two continuations must still land in different conversations.
         self.assertEqual(sorted(len(c.lines) for c in convs), [2, 3])
         self.assertFalse(any({"a2", "b2"} <= {l.request_id for l in c.lines} for c in convs))
+
+    def test_a_retry_stays_in_its_own_conversation(self):
+        convs = analyze_replay.conversations(analyze_replay.load([write([
+            line("a1", 1, ["s", "u"], True), line("b1", 1.1, ["s", "u"], True),
+            line("a2", 2, ["s", "u", "aa", "ta"], True), line("a2r", 2.1, ["s", "u", "aa", "ta"], True),
+            line("b2", 3, ["s", "u", "ab", "tb"], True),
+        ])]))
+        self.assertEqual(sorted(sorted(l.request_id for l in c.lines) for c in convs), [["a1", "a2", "a2r"], ["b1", "b2"]])
 
     def test_a_branch_from_an_earlier_request_rejoins_its_conversation(self):
         convs = analyze_replay.conversations(analyze_replay.load([write([
