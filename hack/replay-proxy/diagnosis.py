@@ -16,6 +16,12 @@ earlier one. The settings (tools, model, parameters) get their own hash with a
 fresh mapping, IPs kept literal only for a CIDR in the settings themselves,
 and the conversation's first-seen time (its first message's) as "now". This
 runs on the proxy's background analysis thread, off the agent's path.
+
+Replay mode also reads the first-seen times to decide a match: before a
+lookup, on the request's path, it notes each message's (first_seen_times),
+and checks a slot's recorded answer against the slot's prefix normalized as
+of when the prefix's last message arrived, as record mode normalized that
+request (normalizer.answer_variant).
 """
 
 from __future__ import annotations
