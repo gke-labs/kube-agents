@@ -6325,3 +6325,45 @@ def test_the_sorted_marker_is_this_processs_alone(tmp_path: Path) -> None:
     mine = harness._purge_sorted_marker(["t_1"])
     assert len(others) == 2 and mine not in others
     assert all(m.endswith("-t_1") for m in {*others, mine})
+
+
+def _report_only_judge_context() -> Any:
+    """A record both report-only evaluators apply to: MCP on, a bulleted checklist."""
+    from devops_bench.metrics.pipeline import _build_context
+
+    record = {"input": "prompt", "output": "answer", "expected_output": "Critical requirements:\n- names the node pool"}
+    return _build_context(record, judge_model=None, use_mcp=True)
+
+
+@pytest.fixture
+def report_only_judges(monkeypatch: pytest.MonkeyPatch) -> tuple[type, type]:
+    """The two evaluator classes, with ``applies`` restored after the test, as the switch patches the class."""
+    from devops_bench.metrics.checklist import ChecklistMetric
+    from devops_bench.metrics.tool_invocation import ToolInvocationMetric
+
+    for evaluator in (ToolInvocationMetric, ChecklistMetric):
+        monkeypatch.setattr(evaluator, "applies", evaluator.applies)
+    return ToolInvocationMetric, ChecklistMetric
+
+
+def test_report_only_judges_run_when_the_switch_is_unset(
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type]
+) -> None:
+    monkeypatch.delenv(harness.SKIP_REPORT_ONLY_JUDGES_ENV, raising=False)
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert all(evaluator().applies(ctx) for evaluator in report_only_judges)
+
+
+def test_a_pull_request_run_skips_the_report_only_judges(
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type]
+) -> None:
+    """hack/ci-eval-pr.sh sets the switch on a pull request; OutcomeValidity, which rung 6 reads, still runs."""
+    from devops_bench.metrics.base import METRICS
+
+    monkeypatch.setenv(harness.SKIP_REPORT_ONLY_JUDGES_ENV, "1")
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert not any(evaluator().applies(ctx) for evaluator in report_only_judges)
+    assert METRICS["outcome_validity"]().applies(ctx)
+    assert {"tool_invocation", "checklist"} <= set(METRICS)
