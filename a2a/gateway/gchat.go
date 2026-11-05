@@ -521,7 +521,8 @@ func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
 // message with accessory buttons (renderGchatChat, gchat_chat.go), with
 // m.Text as the fallback the gateway posts when the layout is refused; one
 // with no chat message is Post, or postStopLine for a running task's line
-// (gchat_stop.go). A layout this renderer will not send, or one Chat's API
+// (gchat_stop.go; a laid-out line is only ever an edit, so m.Stop is read
+// on EditMessage alone for one). A layout this renderer will not send, or one Chat's API
 // refuses, is ErrLayoutRefused, so the gateway posts the text instead
 // (Gateway.chatOutcome); a failed call is returned as it is.
 func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
@@ -554,9 +555,7 @@ func (a *GoogleChatAdapter) PostNotifyMessage(space, thread string, m OutMessage
 
 // createLaidOut lays m.Chat out and creates it in space, as a reply on
 // thread when one is given, and remembers it when it carries choices,
-// bound to conversation (empty for a home post). A running task's line
-// (m.Stop) takes the Stop button after its own buttons, and is created once
-// more without it when Chat refuses it with the button.
+// bound to conversation (empty for a home post).
 func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m OutMessage) (message, landed string, err error) {
 	layout, err := renderGchatChat(m.Chat)
 	if err != nil {
@@ -565,17 +564,9 @@ func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m 
 	if conversation == "" {
 		layout = gchatHomeButtons(layout)
 	}
-	if m.Stop {
-		layout = gchatStopButtons(layout, conversation)
-	}
 	message, landed, err = a.create(space, thread, gchatLayoutBody(layout))
 	if err != nil {
-		if err = gchatLayoutError(err, false); m.Stop && errors.Is(err, ErrLayoutRefused) {
-			a.log.Warn("gchat: the Stop button was refused; laying the line out without it", "conversation", conversation, "err", err)
-			m.Stop = false
-			return a.createLaidOut(space, thread, conversation, m)
-		}
-		return "", "", err
+		return "", "", gchatLayoutError(err, false)
 	}
 	a.trackQuestion(message, conversation, m.Chat, layout)
 	return message, landed, nil

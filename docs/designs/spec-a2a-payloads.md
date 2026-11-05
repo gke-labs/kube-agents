@@ -703,7 +703,8 @@ and the first 5 `after` lines, which the presenter leaves uncapped.
 choice's `reply` names whatever the answer needs to reach (a card, an option). The
 renderer adds only what is its backend's own: a "✓ name: choice" rewrite of an answered
 question (#2346), a "waiting on you" context line under an open one, which emoji a mark
-shows.
+shows, and the control a backend draws on a running task's line when the gateway asks for one
+(Google Chat's Stop button, spec-chatops-gateway, "The Google Chat adapter").
 
 ### `mark`
 

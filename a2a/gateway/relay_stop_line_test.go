@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
@@ -36,6 +38,43 @@ func TestTheLiveLineCarriesStopUntilTheTerminal(t *testing.T) {
 	for _, l := range lines {
 		if l.Conversation != "discord:g1/stop-line" || strings.Contains(l.Text, "completed") {
 			t.Errorf("the terminal edit, or another conversation's line, carried Stop: %+v", l)
+		}
+	}
+}
+
+// A task the heal ends (here one that never started inside the grace) ends
+// its live message too: the terminal line, with no Stop on it, so a line
+// that read working with a Stop control does not outlive its task.
+func TestTheHealEndsTheLiveLineWithoutStop(t *testing.T) {
+	r, spawn := startRigWithSpawnerCap(t, RouteSession, 0, func(c *Config) {
+		c.SessionReuse = true
+		c.FirstEventGrace = time.Second
+	})
+	ctx := context.Background()
+	pod := "chat-heron-line"
+	rec := &SessionRecord{Key: "discord:g1/t-heal-line", ContextID: "ctx-hl", Kind: "group",
+		Addressee: pod, BusSession: pod, PodName: pod, PodReuse: true, SessionRouted: true, Profile: "chat",
+		ActiveTask: &ActiveTask{TaskID: "task-hl", CorrelationID: "corr-hl", StatusMsgID: "m-stale", LineNote: "(note)", SubmittedAt: time.Now().Add(-time.Minute)},
+		Tasks:      []TaskRef{{ID: "task-hl", Addressee: pod}}}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	spawn.setReusable(pod)
+	say(r, rec.Key, "m1", "hello?")
+	waitFor(t, "the stale line ended", func() bool {
+		r.adapter.mu.Lock()
+		edits := append([]fakePost(nil), r.adapter.edits...)
+		r.adapter.mu.Unlock()
+		for _, e := range edits {
+			if e.MessageID == "m-stale" && strings.Contains(e.Text, "failed") && strings.HasSuffix(e.Text, "(note)") {
+				return true
+			}
+		}
+		return false
+	})
+	for _, l := range r.adapter.stopLinesCopy() {
+		if l.MessageID == "m-stale" {
+			t.Fatalf("the heal's terminal edit carried Stop: %+v", l)
 		}
 	}
 }

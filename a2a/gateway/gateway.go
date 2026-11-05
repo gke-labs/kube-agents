@@ -1528,6 +1528,18 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 			g.retireTaskRoute(ctx, active.TaskID)
 		}
 		unmarkOnSupervisorTerminal(rec, active.TaskID, healedSource)
+		// The task's live message ends with the task, as relayTerminal
+		// ends it: the terminal line for the state the heal found, or
+		// failed for a task that never started, and no Stop control on it
+		// (OutMessage.Stop). Without this the line read working, with a
+		// Stop button on Google Chat, for a task that had ended.
+		if active.StatusMsgID != "" {
+			state := lib.StateFailed
+			if healedTask != nil {
+				state = healedTask.State
+			}
+			g.editLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(state, ""), active.LineNote), false)
+		}
 		rec.ActiveTask = nil
 		// The same rule as relayTerminal's, for the same terminal reaching
 		// the record by the other route: an executor's end of the task is

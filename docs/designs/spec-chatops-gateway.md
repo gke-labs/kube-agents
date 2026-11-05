@@ -136,8 +136,9 @@ _injected_ as steering - a follow-up `message` on the same `taskId`, forwarded t
 harness stdin, absorbed at its next turn boundary. That matches what `kanban_comment`
 gives users today, the adapter owes the same stdin path to `input-required` anyway, and
 each steer carries its own `authority` block, so group-room attribution stays clean. A
-cancel affordance ("stop") maps to `kind: cancel` and stays the hard interrupt; wiring it
-to a chat gesture is adapter polish, later.
+cancel affordance ("stop") maps to `kind: cancel` and stays the hard interrupt; its chat
+gesture is Slack's native Stop on an Agent Session and the drawn Stop button on Google Chat's
+status line (the adapter sections; amended 11/5), and none on the console or Discord.
 
 **The deterministic interceptors (amended 8/31).** The gateway holds no model, so its
 affordances are literal: a small set of normalized phrases and prefixes, deterministic
@@ -149,7 +150,8 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   history, and the latest `progress` line, labeled as replay so nobody reads it as a
   live claim about the executor. It never reaches the executor.
 - **Stop.** "stop" / "cancel" / "abort", exact after normalization - the text form of
-  the cancel affordance above; a backend-native gesture stays adapter polish, later.
+  the cancel affordance above; the backend gestures above land on the same path as
+  `IntentCancel` (amended 11/5).
   A stopped task whose terminal event has not yet arrived DETACHES: it stops
   serializing the conversation - new turns start new tasks - while its events, if
   they ever arrive, still relay. "Detached" and "non-detached" below mean exactly
