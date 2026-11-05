@@ -55,7 +55,7 @@ func newBreakers() *breakers { return &breakers{m: map[ptKey]*breaker{}} }
 // ends with queue-timeout if the breaker never closes. A refusal would let
 // one input that keeps killing workers fail every other user's task on that
 // tier for the cooldown.
-func (b *breakers) wait(profile, tier string, now time.Time, busy, older bool) (wait, open bool) {
+func (b *breakers) wait(profile, tier string, now time.Time, busy, older func() bool) (wait, open bool) {
 	if b == nil {
 		return false, false
 	}
@@ -68,7 +68,14 @@ func (b *breakers) wait(profile, tier string, now time.Time, busy, older bool) (
 	case now.Before(br.openUntil):
 		return true, true
 	}
-	return br.halfOpen && (busy || older), false
+	if !br.halfOpen {
+		return false, false
+	}
+	// Called only here, half open: while closed or open nothing reads them,
+	// and each takes the dispatcher's lock and walks its holdings.
+	b.mu.Unlock()
+	defer b.mu.Lock()
+	return busy() || older(), false
 }
 
 // probeEpoch is the epoch of profile's breaker at tier if it is half open at
@@ -119,14 +126,23 @@ func (b *breakers) expired(cfg lib.DispatchConfig, profile, tier string, now tim
 	}
 }
 
-// finished closes profile's breaker at tier: a task there ran to its end.
-func (b *breakers) finished(profile, tier string) {
+// finished records that a task of profile at tier ran to its end, reserved
+// as the probe of opening probe (0 for none). Below the threshold it resets
+// the run of expiries. Once the breaker has opened, only that opening's
+// probe closes it: a task admitted before it opened, ending during the
+// cooldown or the half-open phase, says nothing about whether the tier has
+// recovered, and closing on it would cut the cooldown short.
+func (b *breakers) finished(profile, tier string, probe int) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	delete(b.m, ptKey{profile, tier})
+	k := ptKey{profile, tier}
+	if br, ok := b.m[k]; ok && br.halfOpen && probe != br.epoch {
+		return
+	}
+	delete(b.m, k)
 }
 
 // open lists the (profile, tier) pairs whose breaker is open at now, and

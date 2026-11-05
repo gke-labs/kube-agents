@@ -10,23 +10,32 @@ import (
 // A breaker opens at its threshold of expiries in a row and holds until its
 // cooldown ends, then is half open: the next expiry opens it at once, and a
 // finished task closes it. Each (profile, tier) has its own.
+// never and is are wait's gates as constants.
+func never() bool { return false }
+
+func is(v bool) func() bool { return func() bool { return v } }
+
 func TestABreakerOpensHoldsAndCloses(t *testing.T) {
 	b := newBreakers()
 	cfg := lib.DispatchConfig{BreakerThreshold: 2, BreakerCooldownSeconds: 60}
 	t0 := time.Unix(1_000_000, 0)
-	held := func(at time.Time) bool { w, _ := b.wait("tse", "read", at, false, false); return w }
+	held := func(at time.Time) bool { w, _ := b.wait("tse", "read", at, never, never); return w }
 
 	b.expired(cfg, "tse", "read", t0)
 	if held(t0) {
 		t.Fatal("held after one expiry of two")
 	}
 	b.expired(cfg, "tse", "read", t0)
-	if w, open := b.wait("tse", "read", t0.Add(time.Second), false, false); !w || !open {
+	if w, open := b.wait("tse", "read", t0.Add(time.Second), never, never); !w || !open {
 		t.Fatalf("after two expiries: wait %v, open %v; want both", w, open)
 	}
-	if w, _ := b.wait("tse", "unattended", t0.Add(time.Second), false, false); w {
+	if w, _ := b.wait("tse", "unattended", t0.Add(time.Second), never, never); w {
 		t.Error("another tier's breaker opened too")
 	}
+	// Open, the half-open gates aren't evaluated: each takes the dispatcher's
+	// lock and walks its holdings, on every held submission's retry.
+	called := func() bool { t.Error("a half-open gate was evaluated while the breaker is open"); return false }
+	b.wait("tse", "read", t0.Add(time.Second), called, called)
 	if open, halfOpen := b.open(t0.Add(time.Second)); len(open) != 1 || open[0] != "tse/read" || len(halfOpen) != 0 {
 		t.Errorf("open = %v, half open = %v", open, halfOpen)
 	}
@@ -43,7 +52,13 @@ func TestABreakerOpensHoldsAndCloses(t *testing.T) {
 		t.Fatal("a half-open breaker didn't open again on an expiry")
 	}
 
-	b.finished("tse", "read")
+	// A task admitted before this opening ends: the breaker stays open.
+	b.finished("tse", "read", 0)
+	if !held(half.Add(time.Second)) {
+		t.Fatal("a task from before the opening closed the breaker")
+	}
+	// This opening's probe ends: closed.
+	b.finished("tse", "read", b.epoch("tse", "read"))
 	later := half.Add(2 * time.Second)
 	if held(later) {
 		t.Fatal("held after a finished task")
@@ -66,7 +81,7 @@ func TestAHalfOpenBreakerTriesTheOldestOneAtATime(t *testing.T) {
 	for _, c := range []struct {
 		busy, older, want bool
 	}{{true, false, true}, {false, true, true}, {false, false, false}} {
-		if w, open := b.wait("tse", "read", half, c.busy, c.older); w != c.want || open {
+		if w, open := b.wait("tse", "read", half, is(c.busy), is(c.older)); w != c.want || open {
 			t.Errorf("busy %v older %v: wait %v open %v; want wait %v, not open", c.busy, c.older, w, open, c.want)
 		}
 	}
@@ -145,7 +160,7 @@ func TestAProbeOfAnEarlierOpeningDoesNotHoldTheBreaker(t *testing.T) {
 	if !d.probing("tse", "read") {
 		t.Fatal("precondition: the probe isn't counted while its breaker is half open")
 	}
-	d.breakers.finished("tse", "read")
+	d.breakers.finished("tse", "read", probe.probe)
 	d.breakers.expired(cfg, "tse", "read", half)
 	if d.probing("tse", "read") {
 		t.Error("a probe of the earlier opening holds the breaker opened again")
@@ -264,10 +279,19 @@ func TestAHalfOpenProbesChildRunsAndAStrangersChildWaits(t *testing.T) {
 // worker dying after the stop still counts as an expiry and re-opens it, so
 // stopping each poisoned task can't hide the workers it kills.
 func TestAStoppedTaskEndingOnItsOwnLeavesTheBreakerAsItWas(t *testing.T) {
-	for name, end := range map[string]func(w *fakeWorker){
-		"ends itself": func(w *fakeWorker) { w.finish("task-probe", lib.StateCanceled) },
-		"worker dies": func(w *fakeWorker) { w.kill() },
+	for name, c := range map[string]struct {
+		end          func(w *fakeWorker)
+		grace, lease int
+		counted      bool
+	}{
+		"ends itself": {func(w *fakeWorker) { w.finish("task-probe", lib.StateCanceled) }, 3600, 0, false},
+		// The lease runs out before the grace does.
+		"worker dies": {func(w *fakeWorker) { w.kill() }, 3600, 0, true},
+		// The defaults' order: the grace (30s) ends before the lease (90s)
+		// would, so the silence is counted when the grace ends.
+		"worker dies, grace before the lease": {func(w *fakeWorker) { w.kill() }, 2, 6, true},
 	} {
+		end := c.end
 		t.Run(name, func(t *testing.T) {
 			b := newBus(t, "tse-0", "tse-1")
 			withStopStream(t, b)
@@ -276,8 +300,11 @@ func TestAStoppedTaskEndingOnItsOwnLeavesTheBreakerAsItWas(t *testing.T) {
 			dead.noRenew = true
 			probe := b.worker("tse", "read", "tse-1", answerAccept, time.Hour)
 			ti := oneProfile("tse", 2, "tse-0")
-			ti.update(func(c *lib.DispatchConfig) {
-				c.BreakerThreshold, c.BreakerCooldownSeconds, c.StopGraceSeconds = 1, 1, 3600
+			ti.update(func(cfg *lib.DispatchConfig) {
+				cfg.BreakerThreshold, cfg.BreakerCooldownSeconds, cfg.StopGraceSeconds = 1, 1, c.grace
+				if c.lease > 0 {
+					cfg.LeaseSeconds = c.lease
+				}
 			})
 			d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 
@@ -306,15 +333,11 @@ func TestAStoppedTaskEndingOnItsOwnLeavesTheBreakerAsItWas(t *testing.T) {
 				return ok
 			})
 			got := d.breakers.epoch("tse", "read")
-			switch name {
-			case "ends itself":
-				if got != epoch {
-					t.Errorf("breaker epoch %d after the stopped probe ended itself, want %d (not closed)", got, epoch)
-				}
-			case "worker dies":
-				if got == epoch || got == 0 {
-					t.Errorf("breaker epoch %d after the stopped probe's worker died, want a new opening past %d", got, epoch)
-				}
+			switch {
+			case !c.counted && got != epoch:
+				t.Errorf("breaker epoch %d after the stopped probe ended itself, want %d (not closed)", got, epoch)
+			case c.counted && (got == epoch || got == 0):
+				t.Errorf("breaker epoch %d after the stopped probe's worker died, want a new opening past %d", got, epoch)
 			}
 		})
 	}

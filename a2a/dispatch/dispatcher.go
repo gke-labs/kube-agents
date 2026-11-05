@@ -1162,7 +1162,7 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			if r.final {
 				log.Info("task finished", "pod", rec.Pod)
 				if !d.stopRequestedOn(h) {
-					d.breakers.finished(h.profile, h.tier)
+					d.breakers.finished(h.profile, h.tier, h.probe)
 				}
 				d.settle(ctx, log, del, h, key, rec)
 				return
@@ -1177,16 +1177,23 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			now := d.now()
 			switch {
 			case !stopAt.IsZero() && now.After(stopAt):
+				// The grace usually ends before the lease would (30s
+				// against 90s), so a worker that went silent on the stop is
+				// counted here: silent for a renewal and a tick is a worker
+				// lost, and a stop must not hide one.
+				if !now.Before(graceUntil) && now.Sub(rec.RenewedAt) > h.renew+max(h.renew/ticksPerRenewal, minTick) {
+					d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
+				}
 				d.stopHeld(ctx, log, del, h, key, rec)
 				return
 			case now.After(rec.Deadline):
 				log.Warn("task passed its deadline; failing it", "pod", rec.Pod, "deadline", rec.Deadline)
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonDeadline})
-				// Its worker renewed to the end, so it was no worker loss:
-				// a half-open breaker closes as on a finish. A stopped one is
-				// neutral (stopHeld).
+				// Its worker renewed to the end, so it was no worker loss: the
+				// probe of this opening closes the breaker as on a finish. A
+				// stopped task never closes it.
 				if !d.stopRequestedOn(h) {
-					d.breakers.finished(h.profile, h.tier)
+					d.breakers.finished(h.profile, h.tier, h.probe)
 				}
 				d.fail(ctx, log, del, h, key, rec, ReasonDeadlineExceeded,
 					fmt.Sprintf("ran past the profile's %s limit", deadlineLimit(rec)))

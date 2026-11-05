@@ -89,8 +89,8 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	// attempt, not a fresh one: holding it would hold the probe until its
 	// deadline. Every other child waits as a top task does.
 	if !d.probesChild(prof.Name, tier, hk.kind, env.CorrelationID) {
-		if wait, _ := d.breakers.wait(prof.Name, tier, now, d.probing(prof.Name, tier),
-			d.olderWaiting(hk, queued)); wait {
+		if wait, _ := d.breakers.wait(prof.Name, tier, now, func() bool { return d.probing(prof.Name, tier) },
+			func() bool { return d.olderWaiting(hk, queued) }); wait {
 			return nil, errHeldBack
 		}
 	}

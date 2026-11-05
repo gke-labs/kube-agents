@@ -141,8 +141,10 @@ func TestARunningTaskThatDoesNotStopIsAbandoned(t *testing.T) {
 	b.ensure("tse", 1, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
 	ti := oneProfile("tse", 1, "tse-0")
-	ti.update(func(c *lib.DispatchConfig) { c.StopGraceSeconds = 1 })
-	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	// A threshold of 1: counting this still-renewing worker as lost would
+	// open the breaker.
+	ti.update(func(c *lib.DispatchConfig) { c.StopGraceSeconds, c.BreakerThreshold = 1, 1 })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "task-1 running", func() bool { return w.startedTask("task-1") })
@@ -160,6 +162,9 @@ func TestARunningTaskThatDoesNotStopIsAbandoned(t *testing.T) {
 		_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")]
 		return ok
 	})
+	if open := d.Health().OpenBreakers; len(open) != 0 {
+		t.Errorf("breakers %v open after abandoning a worker that kept renewing; it wasn't lost", open)
+	}
 }
 
 // A worker that answers the stop's abandon with its own failed terminal (an
