@@ -911,8 +911,8 @@ class Fold:
         """The answer this task produced, as a customer would have read it.
 
         Ordinarily that is everything the conversation received for the task
-        that nothing rewrote, reassembled. The window is decided here rather
-        than while folding: whether a post belongs to this task is only
+        that nothing rewrote, reassembled. The window (:attr:`window_posts`)
+        is decided when read rather than while folding: whether a post belongs to this task is only
         answerable once it is known whether this task's marker appeared at
         all, and a fold reading a bounded transcript may never see one. With a
         marker, the posts between it and the next task's; without, every post,

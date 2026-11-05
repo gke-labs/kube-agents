@@ -1729,6 +1729,31 @@ def test_no_shape_file_without_the_variable(
     assert list(tmp_path.iterdir()) == []
 
 
+def test_no_shape_file_for_a_silence_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gateway posts nothing for the marker, so there is no reply to measure."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+
+    harness._write_chat_shape(AgentResult(output="[SILENT]", trajectory=[], metadata={"final_message": "[SILENT]"}))
+
+    assert not target.exists()
+
+
+def test_no_shape_file_for_an_answer_adopted_from_the_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The relay posted nothing; the thread shows only the placeholder."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    metadata = {"final_message": "**Two pods are OOMKilled.**", "outcome": harness.inject.OUTCOME_STREAM_TERMINAL, "window_posts": 1}
+
+    harness._write_chat_shape(AgentResult(output="", trajectory=[], metadata=metadata))
+
+    assert not target.exists()
+
+
 def test_no_shape_file_when_nothing_was_delivered(
     stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

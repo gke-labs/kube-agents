@@ -2113,13 +2113,18 @@ def _write_turn_timing(turn1_s: float) -> None:
 def _write_chat_shape(result: AgentResult) -> None:
     """Write the delivered reply's shape to ``KUBE_AGENTS_SHAPE_FILE``.
 
-    Nothing is written for a run that delivered no reply. The inject
-    transport counts the posts it saw; the api transport leaves the count
-    to the final message's delivered sections.
+    Nothing is written for a run whose reply the thread never showed: none
+    at all, a silence marker the gateway swallows, or an inject answer
+    adopted from the stream because the relay posted nothing. The inject
+    transport counts the posts it saw; the api transport leaves the count to
+    the final message's delivered sections.
     """
+    final_message = str(result.metadata.get("final_message") or "")
+    if is_intentional_silence_response(final_message) or result.metadata.get("outcome") == inject.OUTCOME_STREAM_TERMINAL:
+        return
     posts = result.metadata.get("window_posts")
     shape = chat_shape.measure(
-        str(result.metadata.get("final_message") or ""),
+        final_message,
         posts if isinstance(posts, int) and not isinstance(posts, bool) else None,
     )
     if shape is not None:

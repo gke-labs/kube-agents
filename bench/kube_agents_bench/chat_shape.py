@@ -22,8 +22,8 @@ judged score. Reported, never scored: nothing here reaches a verdict.
 The answer is the last card result delivered into the thread when the ask was
 delegated, and the whole reply otherwise. The checks are structural on
 purpose: an opening line that is a heading, ends on a colon, or starts with
-one of a short list of lead-in phrases, and an apology word anywhere. A
-sentence that merely sounds hedged is the judge's to notice.
+one of a short list of lead-in phrases, and an apology word anywhere outside
+quoted code. A sentence that merely sounds hedged is the judge's to notice.
 """
 
 from __future__ import annotations
@@ -65,10 +65,16 @@ _LEAD_IN = re.compile(
     re.IGNORECASE,
 )
 _APOLOGY = re.compile(r"\b(?:sorry|apologi[sz]e[sd]?|apologies)\b", re.IGNORECASE)
-# The end of the first sentence on a line: a stop and the whitespace after it.
-_FIRST_SENTENCE = re.compile(r"^(.+?[.!?:])(?:\s+|$)")
+# The typographic apostrophe a model writes as often as the ASCII one; folded
+# before the lead-in match, as verifiers.py's _MARKDOWN_NOISE folds it.
+_CURLY_APOSTROPHE = "\u2019"
+# The end of the first sentence on a line: a stop, any emphasis or quote
+# closing over it ("**Sure!**"), and the whitespace after.
+_FIRST_SENTENCE = re.compile(r"^(.+?[.!?:])[*_\"'\u201d)]*(?:\s+|$)")
 _WORD = re.compile(r"\S+")
 _FENCE = re.compile(r"```.*?```", re.DOTALL)
+# Inline code: a quoted log line or HTTP body, not the agent's own words.
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
 # Leading units read for a preamble before the answer is taken to have started.
 _MAX_PREAMBLE_UNITS = 3
 
@@ -98,6 +104,12 @@ def _posted(final_message: str) -> list[str]:
     return [text for text in [opening, *posted] if text.strip()]
 
 
+def _quoted_out(text: str) -> str:
+    """``text`` without its fenced blocks and inline code, which quote what
+    something else said."""
+    return _INLINE_CODE.sub("", _FENCE.sub("", text))
+
+
 def bot_messages(final_message: str) -> int:
     """How many messages the thread received: the reply itself, then one per result or question."""
     return len(_posted(final_message))
@@ -120,7 +132,7 @@ def _preamble_words(answer: str) -> tuple[bool, int]:
     units = 0
     while lines and units < _MAX_PREAMBLE_UNITS:
         line = lines[0].strip()
-        bare = _LEADING_MARKUP.sub("", line)
+        bare = _LEADING_MARKUP.sub("", line).replace(_CURLY_APOSTROPHE, "'")
         if _ATX_HEADING.match(line) or line.rstrip("*_ ").endswith(":"):
             spent, rest = line, ""
         elif _LEAD_IN.match(bare):
@@ -149,7 +161,7 @@ def measure(final_message: str, posts: int | None = None) -> dict[str, Any] | No
     first_is_preamble, before = _preamble_words(answer)
     return {
         OPENS_ON_VERDICT: not first_is_preamble,
-        APOLOGY: any(_APOLOGY.search(text) for text in _posted(final_message)),
+        APOLOGY: any(_APOLOGY.search(_quoted_out(text)) for text in _posted(final_message)),
         BOT_MESSAGES: posts if posts is not None else bot_messages(final_message),
         WORDS_BEFORE_ANSWER: before,
         ANSWER_WORDS: _words(answer),

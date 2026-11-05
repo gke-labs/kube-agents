@@ -107,6 +107,10 @@ def test_a_plain_verdict_line_followed_by_a_section_label_opens_on_it():
         ("**Pod status:**\nTwo pods are OOMKilled.", 2),
         ("✅ Okay, checking now.\nTwo pods are OOMKilled.", 4),
         ("Sure. Let me check.\n## Findings\nTwo pods are OOMKilled.", 6),
+        ("**Sure!** Two pods are OOMKilled.", 1),
+        ('"Got it." Two pods are OOMKilled.', 2),
+        ("I\u2019ll look into this. Two pods are OOMKilled.", 4),
+        ("Let\u2019s see. Two pods are OOMKilled.", 2),
     ],
 )
 def test_a_lead_in_before_the_answer_is_counted(reply: str, before: int):
@@ -147,6 +151,17 @@ def test_an_answer_that_is_all_preamble_stops_counting():
 )
 def test_an_apology_is_flagged(reply: str):
     assert chat_shape.measure(reply)[chat_shape.APOLOGY] is True
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "**payments-api is failing readiness.**\n```\nHTTP 503: sorry, upstream unavailable\n```",
+        "**payments-api is failing readiness:** the probe gets `503 sorry, upstream unavailable`.",
+    ],
+)
+def test_an_apology_inside_quoted_code_is_not_the_replys(reply: str):
+    assert chat_shape.measure(reply)[chat_shape.APOLOGY] is False
 
 
 def test_an_apology_in_the_ack_counts_too():
