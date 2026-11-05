@@ -1,7 +1,10 @@
 """Seam: cron relay adapter → session KV relay → chat_delivery_watch, with no chat route.
 
-A `next` install whose gateway holds Slack with no home channel (#3385). The
-relay must post nowhere, and the refusal must survive the trip it takes to the
+A `next` install whose gateway holds Slack while nothing routes the agent's
+posts to it (`A2A_NOTIFY_PLATFORM` empty, both Hermes platforms off; #3385).
+The operator now routes a single-platform install with no home channel, so the
+gateway keeps what it refuses, but a pod the operator has not re-rendered yet
+still has this shape. The relay must post nowhere, and the refusal must survive the trip it takes to the
 reader: the route's 502 `detail`, the adapter's `last_delivery_error`, and the
 ledger issue's platform column, which `chat_delivery_watch` parses out of it.
 The cronjob tool repeats the first 200 characters of the same string in chat,

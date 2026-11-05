@@ -524,3 +524,32 @@ def test_every_shipped_blind_check_is_named(path):
         )
     }
     assert load_case(path).transport_blind_checks == all_blind
+
+
+def test_requested_pull_requests_counts_the_cases_requesting_checks(write_task):
+    """CaseSpec carries the count the inject lane's write safeguard gates on."""
+    requesting = load_case(
+        write_task(
+            "pr-case",
+            {
+                "id": "pr-case",
+                "name": "x",
+                "verification_spec": [
+                    {"name": "opens-a-pr", "role": "objective", "mode": "assert", "check": {"type": "pull_request_opened"}}
+                ],
+            },
+        )
+    )
+    assert requesting.requested_pull_requests == 1
+
+    none = load_case(
+        write_task(
+            "no-pr-case",
+            {
+                "id": "no-pr-case",
+                "name": "x",
+                "verification_spec": [{"check": {"type": "report_contains", "phrases": ["x"]}}],
+            },
+        )
+    )
+    assert none.requested_pull_requests == 0

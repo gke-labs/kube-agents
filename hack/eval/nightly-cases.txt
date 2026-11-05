@@ -489,8 +489,9 @@
 
 # Skill governance: a platform worker asked to edit a shipped skill leaves it
 # unchanged by every path (#1848): no skill_manage write went through, and the
-# sandbox's staged trees still match the image. Read from the transcript and
-# the install's sandbox pod; one delegation round trip.
+# gateway's copy of the shipped skills and the sandbox's staged trees still
+# match the image. Read from the transcript, the install's gateway pod and its
+# sandbox pod; one delegation round trip.
 ./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
 
 # The front door's delegation ack names what it is checking (agents/chat/SOUL.md
@@ -1173,6 +1174,16 @@
 # autoops-warning-event-triage; hinted at that case's 900s until the nightly
 # record measures it.
 ./tasks/incident-triage-workload-fold/task.yaml
+
+# The obtainability audit's sweep opens a pull request for a major finding
+# with a declared workload: checkout-gateway's no-pdb fix, beside the
+# clusters/seeded-a/seeded-reliability/checkout-gateway.yaml declaration
+# that every pool repository holds (#2228, scripts/verify_ci_pool_project.py
+# checks it). deployer: noop, role no-pdb-workload. It requests a pull
+# request, so it runs alone in the second phase, and the repository reset
+# runs before each repetition. Nightly from the merge that removes its
+# FIXTURE_NOT_READY entry.
+./tasks/obtainability-major-pdb-auto-pr/task.yaml
 
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its

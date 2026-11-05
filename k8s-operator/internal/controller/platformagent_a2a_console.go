@@ -107,6 +107,13 @@ const (
 	a2aConsoleCPURequest    = "50m"
 	a2aConsoleMemoryRequest = "64Mi"
 	a2aConsoleMemoryLimit   = "128Mi"
+	// A namespace ResourceQuota on limits.cpu refuses a pod with a container
+	// that declares no CPU limit, so the console needs one (#3847). Measured
+	// over seven days on the dev installs (2026-10-30, 1-minute rates, five
+	// next-mode installs): p99 0.4m, peak 10m. A limit only throttles, and a
+	// 1-minute rate hides sub-minute bursts, so it takes the band the callout
+	// and verifier use rather than a multiple of that near-zero peak.
+	a2aConsoleCPULimit = "500m"
 )
 
 func a2aConsoleImage() string {
@@ -252,6 +259,7 @@ func buildA2AConsoleDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 								corev1.ResourceMemory: resource.MustParse(a2aConsoleMemoryRequest),
 							},
 							Limits: corev1.ResourceList{
+								corev1.ResourceCPU:    resource.MustParse(a2aConsoleCPULimit),
 								corev1.ResourceMemory: resource.MustParse(a2aConsoleMemoryLimit),
 							},
 						},

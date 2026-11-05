@@ -23,8 +23,10 @@ page shows how many repetitions opened on the answer, the apologies and the answ
 median length ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
-plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)), plus one when runs start waiting to be scheduled or
+which also carries the slow-gate and close-to-the-deadline notes
+([below](#a-slow-gate)), plus one line, once per episode, when a
+close-to-the-deadline note's window holds a run killed at the deadline
+([below](#close-to-the-deadline)), plus one when runs start waiting to be scheduled or
 are refused a project and one when they stop ([below](#a-backed-up-pool)),
 plus, for the watched Prow
 periodics, one when a run fails or a job stops and one when it passes again
@@ -105,7 +107,7 @@ project reader; a run in the old bucket keeps its Prow link, which still renders
 Most messages end with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
-digest, and the bare `index.html#view=agent` for the slow-gate and pool notes,
+digest, and the bare `index.html#view=agent` for the pool notes,
 which report no incident and so have no window to scope a link to. The two
 that say the pool check itself is not reporting — `wait unknown` and `pool
 check stopped` — link to the periodic's job history instead, the one place
@@ -244,13 +246,22 @@ Only presubmit runs reach these rules and the digest's numbers. `data.json`
 also carries the nightly periodics' runs (`runs[].tier`, see
 `scripts/eval_dashboard/SCHEMA.md`); a nightly has no pull request to count
 towards a distinct-PR floor, and a nightly collapsing is a case's record on
-`main`, not a gate incident. It carries the GitLab lane's runs too
-(`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`): on a pull request the
-forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones; the GitLab
-nightly, `ci-kube-agents-eval-nightly-gitlab`, runs the same list and lands as the
-section's nights, read from its own log prefix), against a pool project's GitLab repository, listed in the Brief's "GitLab
-lane" section with its own counts and links, and in no gate number, case
-history or digest line. The GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, their two nightlies each; `docs/ci-pool-projects.md` 5.8) are not collected yet: their runs show in Prow only until the dashboard reads a lane per forge.
+`main`, not a gate incident. It carries the forge lanes' runs too, one tier
+each (`tiers.FORGE_TIERS`): the GitLab lane (`pull-kube-agents-smoke-test-gitlab`, `tier: gitlab`), on a pull request the
+forge-grading cases of `hack/eval/gitlab-cases.txt` (registered cases, not only presubmit ones) against a pool project's
+GitLab repository, with its nightlies `ci-kube-agents-eval-nightly-gitlab` and `ci-kube-agents-eval-nightly-gitlab-next`
+running the same list; and the self-managed GHES and GitLab CE lanes (`pull-kube-agents-smoke-test-ghes`, `tier: ghes`;
+`pull-kube-agents-smoke-test-gitlab-ce`, `tier: gitlab-ce`; `docs/ci-pool-projects.md` 5.8), each with a next-mode
+weekly job (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`). The GitLab lane has a
+section of the Brief, its pull-request runs and then each nightly's nights; the GHES and GitLab CE lanes share one
+"Self-managed lanes" section, a table of their pull-request runs and one of their weekly runs, each row naming its forge.
+All carry their own counts and links, and none is in a gate number or case history. The daily digest carries one line on
+them (`forge_lane.digest_line`): the last night's or week's result per scheduled job, by the lane's cadence, green, red
+or none in that time; a lane with a reason (`forge_lane.LANES`' `off`) as off, with the reason, whatever its runs; and a
+job with no run on record.
+Nothing alerts on a forge run. Each job is read from
+its own log prefix above its own watermark. The GHES and GitLab CE sources are wired for the jobs those lanes run
+(`GoogleCloudPlatform/oss-test-infra` adds them); a source lists nothing, as a note, until its job has run.
 
 ## Hysteresis
 
@@ -299,20 +310,21 @@ clock of the last 5 full runs — a concluded run of at least one case fewer tha
 finished in the last 6 hours — is at least 1.2× the median of the trailing 7
 days' full runs (at least 20 of them), and stays set until that median is back
 under 1.1×. Wall clock is a run's finish minus its start, the digest's
-measure. The poster sends one line the first tick the note appears:
+measure. The note is not a break and /retest does not help, so the poster
+sends no message of its own for it; the digest carries one line while it
+lasts:
 
 ```text
-🐢 Smoke gate: slow — the last 5 full runs took 152–213 min (median 183)
+🐢 Slow since 2:00 PM ET: the last 5 full runs took 152–213 min (median 183)
 against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s or empty
-records. Not a break, and /retest won't make yours faster.
+records.
 ```
 
-and not again until the note has cleared and come back. The digest repeats
-the line while it lasts, the Brief's healthy headline carries the same
-sentence, and the state, the advice and the gate comment do not move. The
+The Brief's healthy headline carries the same sentence, and the state, the
+advice and the gate comment do not move. The
 note reads finished runs, so it trails the slowdown by about one run's
 length: on 2026-09-14 the pod count rose from 11:30 AM ET and the note
-would have gone out at 2:00 PM ET. The ages of the running pods would show
+would have appeared at 2:00 PM ET. The ages of the running pods would show
 it sooner and are not read: the adjudicate step runs as the dashboard
 publisher, which holds nothing on the Prow build cluster, and the tick
 carries no `kubectl`. The rule the issue proposed — three consecutive full
@@ -342,20 +354,23 @@ recorded (`run.deadline_kill and run.full`); a kill finished at or before the
 current GREEN episode began does not count. If the window has no qualifying runs
 (such as over a quiet weekend), the note holds its previous value across ticks.
 
-The poster sends one line when the note appears:
-
-```text
-⏱ *Smoke gate: close to the deadline* — slowest run 327 min in the last 24h, 33 min under the 360-minute Prow timeout. Not a break. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.
-```
-
-and repeats it in the daily digest for as long as it lasts:
+The daily digest carries one line for as long as it lasts:
 
 ```text
 ⏱ Close to the deadline since 12:00 PM ET: slowest run 327 min, 33 min of headroom.
 ```
 
-When qualifying runs in the window include a deadline kill, the alert omits the
-"Not a break" assurance since a run was killed without an evaluation verdict.
+Without a kill in the window it has no message of its own, like the slow note.
+A run killed at the deadline counts here too, and it reached no verdict, so the
+first tick a note's window holds one, the poster sends one line, and not again
+until the note has cleared and come back:
+
+```text
+⏱ *Smoke gate: close to the deadline* — slowest run 365 min in the last 24h, 5 min past the 360-minute Prow timeout. Check the run cost before adding a case to `hack/eval/presubmit-cases.txt`.
+```
+
+That covers kills below the `deadline_kill` OUTAGE's threshold (3 kills on 2
+pull requests within 2 hours); the OUTAGE is the message for a wave of them.
 Headroom is reported from the slowest qualifying run as `timeout − slowest run`,
 floored at 0 (or overrun minutes past the timeout).
 
@@ -506,12 +521,16 @@ Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
-daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
+not a pool job but the certification lane's weekly slice, watched here because
+its record is its logs bucket and nothing else reads a failed build of it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
-`gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
-identities cannot write the Prow archive),
+`gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
+identities cannot write the Prow archive), or from the nightlies' bucket
+`gs://kube-agents-evals-nightly-logs` for the certification slice, which is
+decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
 `fleet-reconcile.json`, the sweep's `pull-sweep.json`, and beside it the
@@ -543,7 +562,7 @@ notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -1169,7 +1188,8 @@ the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
 per graded repetition and, when the week has a trend, its change from last
 week on the same scenarios, which the text says because it is not measured
-against that median), a "Needs attention" box, one row per area with
+against that median; and its cache hit rate when repetitions carry the prompt
+split), a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -1182,8 +1202,12 @@ are left out of the median and their number is shown. The change compares
 the two weeks' figures over the scenarios with a full count in both weeks.
 Each such scenario's median is taken over its full counts in each week, and a
 week's figure is the median of those per-scenario medians, so every scenario
-weighs the same and its partial counts do not move it. The tokens tile and the Chat line are
-left out when no repetition the week compared carries a count.
+weighs the same and its partial counts do not move it. When full counts carry the prompt
+split, the tile and the Chat line add the cache hit rate: their cache reads over their
+whole prompt (`cached / (input + cached + cache_write)`), summed over those repetitions so
+a long run weighs by its tokens; the tile also gives how many repetitions it covers. The
+tokens tile and the Chat line are left out when no repetition the week compared carries a
+count.
 
 The page is written only when every check passes; otherwise the script prints
 each reason and exits 1, the step logs a warning, and the last published copy
@@ -1291,9 +1315,12 @@ the adjudicator can ask "drifted last scan too?" from one file.
 **The identity and the one grant.** Every read runs as that project's
 read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
-impersonate it for the cluster listing, the credentials and the control-plane
-describes, and `FLEET_READONLY_SA` makes the runner rewrite each kubeconfig so
-`kubectl`'s token is minted as it too. The bot,
+impersonate it for the cluster listing, the credentials, the control-plane
+describes and the `gcloud compute instances list` and `gcloud compute
+firewall-rules list` reads of the project-scoped roles (`startup-fail-vm` and
+`world-open-ingress`, which have no cluster slot; the account holds
+`roles/compute.viewer` for them), and `FLEET_READONLY_SA` makes the runner
+rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
 grant #1238 gave the presubmit's identity — and, for this scan, nothing on the project itself.
@@ -1415,7 +1442,7 @@ The verifier is the one implementation; the scan runs it and reads its report.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
 Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
-(`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout).
+(`github_repo_and_app`, `gitops_declaration`, `gitops_workload_manifest`, `ledger_read_credential`; each needs a credential the bot must not hold), the GitLab read of the same fixture (`gitlab_workload_manifest`, the pool's GitLab token), the minter check's signing half (`token_minter`; the scan runs `token_minter_kms`), the mapping (about the checkout), the Gemini Developer API key (`gemini_api_key`; lease-silent, and kept out until the registered projects carry the key, because until then it reports drift on every one).
 
 **The document.** `pool-state.json` has the fleet scan's shape. Per project,
 `checks` holds one `{state, detail}` per verifier check (`healthy`, `drifted`,

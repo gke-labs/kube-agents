@@ -10,7 +10,12 @@ jobs, ``nightly.py``) against ``main`` with
 no pull request; and the GitLab lane's, one per build of
 ``pull-kube-agents-smoke-test-gitlab``, the forge-grading cases of the
 catalogue driven against a pool project's GitLab repository
-(``EVAL_FORGE=gitlab``, kube-agents#2394). Every
+(``EVAL_FORGE=gitlab``, kube-agents#2394), with its nightlies. The two
+self-managed forge lanes (``EVAL_FORGE=ghes`` and ``EVAL_FORGE=gitlab-ce``,
+kube-agents#3682) are tiers of the same kind, one each: a forge lane's runs
+are listed on the Brief (the two self-managed lanes share a section), and the
+digest names their scheduled jobs' last results, but they are counted nowhere
+else. Every
 gate verdict -- the health adjudicator's rules, the "is this red mine?"
 classification, the Brief's runs list -- is a statement about the presubmit,
 so each of those consumers filters through ``presubmit_runs`` before it
@@ -27,9 +32,14 @@ from __future__ import annotations
 TIER_PRESUBMIT = "presubmit"
 TIER_NIGHTLY = "nightly"
 TIER_GITLAB = "gitlab"
-TIERS = (TIER_PRESUBMIT, TIER_NIGHTLY, TIER_GITLAB)
+TIER_GHES = "ghes"
+TIER_GITLAB_CE = "gitlab-ce"
+# The forge lanes, in the order the Brief lists them; each tier's value is
+# the lane's EVAL_FORGE.
+FORGE_TIERS = (TIER_GITLAB, TIER_GHES, TIER_GITLAB_CE)
+TIERS = (TIER_PRESUBMIT, TIER_NIGHTLY) + FORGE_TIERS
 # The tiers whose runs feed the per-case record (cases[], the Cases page's
-# rates): the GitLab lane feeds it nothing, so it has no rate.
+# rates): the forge lanes feed it nothing, so they have no rate.
 CASE_TIERS = (TIER_PRESUBMIT, TIER_NIGHTLY)
 
 # The key on a data.json run, and what an ABSENT value reads as: the
@@ -69,3 +79,13 @@ def is_gitlab(run) -> bool:
 def gitlab_runs(runs) -> list:
     """The GitLab lane's runs: the Brief's own section, never the gate's."""
     return [run for run in runs or [] if is_gitlab(run)]
+
+
+def is_forge(run) -> bool:
+    """Whether a run (or pending entry) belongs to any forge lane."""
+    return run_tier(run) in FORGE_TIERS
+
+
+def forge_runs(runs, tier: str) -> list:
+    """One forge lane's runs: listed on the Brief, never the gate's."""
+    return [run for run in runs or [] if run_tier(run) == tier]

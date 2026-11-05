@@ -539,8 +539,8 @@ WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-${WATCHER_SCALEUP_HOLD_DEFAULT}}"
 normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
 
 # The settle period: how long a failure in the settle family (the crash-loop
-# family, FailedMount, Unhealthy; the reasons kubelet re-emits while they
-# last) has to have lasted, by the
+# family, FailedMount, Unhealthy, a Failed saying "host IP unknown"; the
+# reasons kubelet re-emits while they last) has to have lasted, by the
 # event's own first and last sighting, before the watcher forwards it. It
 # runs after the count debounces above: a failure has to have repeated AND
 # lasted. A BackOff that clears inside it, kubelet warming its object cache on

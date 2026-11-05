@@ -58,9 +58,10 @@ on:
       # keep the bridge's copy of its frame and token list in step; an edit
       # to the hook alone has to run that test.
       - "agents/platform/plugins/incident_context/**"
-      # lib/chatmsg validates every shared chat case, so a case-only change
-      # has to run it.
+      # lib/chatmsg validates every shared chat case, and lints every shared
+      # lint case, so a case-only change has to run it.
       - "tests/conformance/chat/**"
+      - "tests/conformance/chat-ux/**"
   workflow_dispatch:
 
 # A re-push supersedes this pull request's earlier run instead of stacking a
@@ -118,6 +119,7 @@ jobs:
               - "agents/platform/skills/gke-workload-security/scripts/audit_cluster.sh"
               - "agents/platform/plugins/incident_context/**"
               - "tests/conformance/chat/**"
+              - "tests/conformance/chat-ux/**"
 
       - name: Set up Go
         if: steps.filter.outputs.a2a == 'true'

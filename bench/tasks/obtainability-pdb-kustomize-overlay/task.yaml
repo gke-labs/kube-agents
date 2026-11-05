@@ -1,6 +1,6 @@
 # FIXTURE NOT READY -- an entry in scripts/validate_bench_cases.py
 # FIXTURE_NOT_READY (#2686), in no roster file under hack/eval/ until its
-# fixture is in the pool. Red on main and green on the branch that adds
+# stack has run on the pool. Red on main and green on the branch that adds
 # `degrade_unlisted_kustomize_additions` to `audit_report.py finish`, on a dev
 # install that carries the fixture below.
 #
@@ -73,6 +73,17 @@
 #             - name: gateway
 #               image: registry.k8s.io/pause:3.9
 #
+# THE STACK. bench/tf/prebuilt/kustomize-overlay-declaration plants the
+# kustomization.yaml above for the run only, beside the checkout-gateway.yaml
+# that every pool repository holds, and removes it at destroy, after it
+# closes the pull requests the audit opened under the directory (labelled
+# `audit:stale-closed` first). It writes with the token hack/ci-eval-pr.sh
+# mints for a stack that declares `bench_gitops_write_token_file`.
+# `writes_alone` runs the case alone in the second phase, so no other unit
+# sees the kustomization, and the repository reset runs before each
+# repetition and deletes a kustomization that a failed or killed teardown
+# left.
+#
 # CONFLICT WITH obtainability-major-pdb-auto-pr (#2228). That case plants
 # checkout-gateway.yaml at the same path without a kustomization, and needs
 # the generated PodDisruptionBudget. The two fixtures cannot share one
@@ -82,10 +93,10 @@
 # are checkout-gateway and notification-relay (seeded-intent). A repository
 # declaration covers notification-relay, so the collector produces no
 # finding for it, and obtainability-declared-intent-no-finding needs it that
-# way. Every other multi-replica workload has a budget. So plant this
-# fixture in a second repository, or on a branch the install pins as its
-# base, or add an unbudgeted workload to the fleet. #2686 records the
-# decision.
+# way. Every other multi-replica workload has a budget. So the two cases
+# share the repository in time, not in space: the stack above puts the
+# kustomization there only while this case runs, alone, and removes it
+# before the next unit. #2686 records the decision.
 #
 # CONTENT MODE. A declaration in content mode needs the collector to copy
 # the repository's YAML out of the broker (#2233). Without it no candidate
@@ -93,8 +104,13 @@
 # case shows nothing.
 #
 # Isolation class: read-only on the cluster; writes the ledger issue only.
-# A remediation pull request is the red.
+# A remediation pull request is the red. The stack writes one file to the
+# GitOps repository's default branch for the run.
 id: obtainability-pdb-kustomize-overlay
+# The lane runs this case alone in its second phase, so a pull request the
+# reply does not name is still charged to it by the write safeguard, and no
+# other unit runs while the stack's kustomization is in the repository.
+writes_alone: true
 name: A new PodDisruptionBudget in a Kustomize overlay is manual and names the resources line
 prompt: >-
   Run the workload reliability audit against the fleet, following the
@@ -118,7 +134,12 @@ expected_output: >-
   the cluster. The closing response is the SOP's one line, carrying the
   ledger URL.
 infrastructure:
-  deployer: noop
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/kustomize-overlay-declaration"
+  teardown: true
+  # gitops_repo, bench_gitops_write_token_file and host_cluster_* arrive from the
+  # environment (TF_VAR_*, exported by hack/ci-eval-pr.sh).
 validated: false
 
 domain: reliability

@@ -61,13 +61,16 @@ CR — `spec.integration.googleChat.homeChannel`, which the operator renders int
 field is the only way. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
 `spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
-only chat platform is the gateway's and has no home channel gets no send at all: the error names the
-platform and the field, as in
-`composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`.
-A malformed home channel gets the same refusal without the platform. Every entry
+only chat platform is the gateway's and has no home channel sends anyway: the gateway refuses the
+recap, keeps it, and names it in the digest it posts once a home channel is set; the recorded error
+is the relay's `composed but not delivered to <platform>`, as above. Alerts on such an install are
+sent too, refused and kept, and the recap lists each as not delivered with the keep as the reason
+(`kept by the gateway for its digest`); the headless class below is the install with no chat platform
+at all. A malformed home channel
+leaves the agent unrouted: the relay answers that no route exists and the gateway is never asked. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
 `no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
-so an install without a home channel loses those events entirely rather than seeing them late.
+so an install without a home channel sees those events late, in the digest, rather than never.
 Check before relying on the recap:
 
 ```bash

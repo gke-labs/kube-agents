@@ -1,0 +1,65 @@
+# Functions that started an unbounded thread or goroutine per request when
+# scripts/check_bounded_concurrency.py arrived, pinned at the count they had
+# that day. One entry per line: `<file> <function> <count>`, the file relative
+# to the repository root, the function as the check names it (`Class.method`
+# for a method), the count above zero. The comment above an entry names the
+# issue that owns the fix, or the bound the check cannot see. The rules (the
+# list only shrinks: a rise, a drop, a stale entry, an entry for a file the
+# check does not read, and a line that is not an entry all fail) are in the
+# script's docstring; this file states only what is pinned and why.
+
+# #4331: the fix-pull-request lookup starts one daemon thread per forge call so
+# the call can be abandoned at its deadline; the inject route reaches it.
+agents/platform/scripts/session_kv_server.py _proposal_state 1
+
+# The same abandon-at-deadline shape as _proposal_state, as a one-worker
+# executor per call with shutdown(wait=False); the cron-report route reaches
+# it. #4331 owns the KV server's per-request threads, so the fix for the
+# lookup above is the pattern for this one.
+agents/platform/scripts/session_kv_server.py _fetch_ledger_issue 1
+
+# One executor of CARD_STOP_PARALLEL workers per stop request, left to finish
+# stragglers after the answer; per request, so the count grows with callers.
+# #4331 owns the KV server's per-request threads.
+agents/platform/scripts/session_kv_server.py stop_session_cards 1
+
+# One daemon Timer per alert, armed for TRIAGE_WATCHDOG_SECONDS before the
+# gateway is contacted, on the triage path every inject route hands to
+# BackgroundTasks; per alert, so the count grows with callers. #4331 owns the
+# KV server's per-request threads.
+agents/platform/scripts/session_kv_server.py _schedule_triage_watchdog 1
+
+# TRIAGE_START_WORKERS daemon threads for the process, built once on first use
+# under _TRIAGE_START_POOL_LOCK by _triage_start_pool, which the triage path
+# reaches. Bounded by that `is None` guard, which the check does not read.
+agents/platform/scripts/session_kv_server.py _TriageStartPool.__init__ 1
+
+# One thread per late drift row the digest cards, started on the digest thread
+# that _arm_drift_backlog_digest holds to one; each start first claims the
+# daily drift-alert quota, which caps the count per day. Neither the singleton
+# upstream nor the quota is a shape the check reads. #4331 owns the KV server's
+# per-request threads.
+agents/platform/scripts/session_kv_server.py _card_drift_backlog_minorities 1
+
+# One deadline timer per metrics connection, cancelled when the connection
+# ends. Bounded by MetricsServer, which admits at most METRICS_MAX_CONNECTIONS
+# live connections; that cap is a server attribute the check does not read.
+agents/platform/scripts/credential_proxy.py MetricsHandler.handle 1
+
+# One goroutine per identity-map shard, started once: run() starts
+# WatchConfigMapShards inside a `go func() { ... }()` literal, and the shard
+# count is fixed when NewShardedStore builds the store from the operator's
+# A2A_AUTHMAP_SHARDS. A startup function's bound stops at its function literals
+# (the check cannot tell this closure, run once, from a handler's), so the
+# docstring says this shape is pinned rather than bounded.
+a2a/authcallout/store.go WatchConfigMapShards 1
+
+# One goroutine per authorization request, handed off by the subscription
+# callback so the callback returns at once. Each lives for at most
+# authDecisionBudget (the context handle() starts it under), and the work it
+# does takes a slot on the calloutWorkers-sized `slots` channel inside
+# decide(), so at most calloutWorkers decisions run at once and a burst
+# holds at most its own arrival count of goroutines for one budget. The
+# semaphore sits in decide(), not in the block of the `go` statement, which
+# is the only place the check reads one from.
+a2a/authcallout/service.go handle 1

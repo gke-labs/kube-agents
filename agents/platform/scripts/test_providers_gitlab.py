@@ -773,6 +773,20 @@ class TranslationTest(unittest.TestCase):
         issue = forge().issue_view(Api({"state": "opened", "iid": 2}), "acme/infra", {"number": 2})["issue"]
         self.assertEqual("open", issue["state"])
 
+    def test_merge_commit_prefers_the_merge_then_the_squash(self):
+        merge, squash = "a" * 40, "b" * 40
+        cases = (
+            ({"state": "merged", "merge_commit_sha": merge, "squash_commit_sha": squash}, merge),
+            ({"state": "merged", "merge_commit_sha": None, "squash_commit_sha": squash}, squash),
+            # A fast-forward merge leaves no single commit to name.
+            ({"state": "merged", "merge_commit_sha": None, "squash_commit_sha": None}, None),
+            ({"state": "opened", "merge_commit_sha": merge}, None),
+        )
+        for node, expected in cases:
+            with self.subTest(node=node):
+                proposal = forge().proposal_view(Api(dict(node, iid=3)), "acme/infra", {"number": 3})["proposal"]
+                self.assertEqual(expected, proposal["mergeCommit"])
+
 
 class ReachTest(unittest.TestCase):
     def test_reach_lists_every_project_the_tokens_account_belongs_to(self):
