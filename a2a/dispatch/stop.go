@@ -34,10 +34,16 @@ const (
 )
 
 func stopGrace(cfg lib.DispatchConfig) time.Duration {
+	g := defaultStopGrace
 	if cfg.StopGraceSeconds > 0 {
-		return seconds(cfg.StopGraceSeconds)
+		g = seconds(cfg.StopGraceSeconds)
 	}
-	return defaultStopGrace
+	// Never shorter than a renewal and two ticks: hold counts a worker
+	// silent for a renewal and a tick when the grace ends, so one silent
+	// since before the stop is always counted, whatever renewSeconds is.
+	renew := seconds(cfg.RenewSeconds)
+	tick := max(renew/ticksPerRenewal, minTick)
+	return max(g, renew+2*tick)
 }
 
 // stopFor reads a stop record (contract addendum 9): the task it stops,

@@ -400,7 +400,9 @@ leave open:
   resets the run; once it has opened, only that opening's probe closes it, by finishing or
   by running to its deadline still renewing. A stop never opens or closes the breaker by
   itself, but its worker's silence counts as a loss: a worker that stops renewing, after a
-  stop or not, is counted, whether the lease runs out first or the stop's grace does. The
+  stop or not, is counted, whether the lease runs out first or the stop's grace does (the
+  grace is never shorter than a renewal and two ticks, so one silent since before the stop is
+  always past the count's threshold when it ends). The
   state is in memory, and the dispatcher's health lists open and half-open breakers. A held
   task isn't told it is held yet (#4362).
 

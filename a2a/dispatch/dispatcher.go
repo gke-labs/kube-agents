@@ -652,6 +652,10 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 
+	// The probe's own child was admitted as part of the probe's attempt, not
+	// as a probe: it is never stamped as one, so its end can't close the
+	// breaker while the probe runs.
+	family := d.probesChild(prof.Name, tier, kind, del.Envelope().CorrelationID)
 	h, why := d.reserve(snap, prof, tier, kind, taskID)
 	if h != nil {
 		// A stop heard since admission read the stream (onStop marks only
@@ -662,6 +666,9 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 			h.stopRequested = true
 		}
 		h.correlation = del.Envelope().CorrelationID
+		if family {
+			h.probe = 0
+		}
 		d.mu.Unlock()
 	}
 	if h == nil {

@@ -272,6 +272,38 @@ func TestAHalfOpenProbesChildRunsAndAStrangersChildWaits(t *testing.T) {
 	if ts := b.waitTerminal("task-child", 15*time.Second); ts.state != lib.StateCompleted {
 		t.Errorf("the probe's child: terminal %+v, want completed while the probe runs", ts)
 	}
+	// The child isn't the probe: its end leaves the breaker half open, and
+	// the stranger's child still held.
+	waitFor(t, 5*time.Second, "task-child settled", func() bool {
+		_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", "tse-2", "task-child")]
+		return ok
+	})
+	time.Sleep(time.Second)
+	if d.breakers.epoch("tse", "read") == 0 {
+		t.Error("the probe's child closed the breaker while the probe still runs")
+	}
+	if ts := b.terminalsOf("task-stranger"); len(ts) != 0 {
+		t.Errorf("the stranger's child ended %+v after the probe's child; want it still held", ts)
+	}
+}
+
+// The stop grace is never shorter than a renewal and two ticks, so a worker
+// silent since before the stop is past the silence threshold (a renewal and
+// a tick) when the grace ends, whatever renewSeconds is.
+func TestTheStopGraceCoversARenewal(t *testing.T) {
+	for _, c := range []struct {
+		renew, grace int
+		want         time.Duration
+	}{
+		{20, 0, 30 * time.Second},  // the defaults: 30s already covers 20+5+5
+		{60, 0, 90 * time.Second},  // a long renewal lifts the default
+		{20, 10, 30 * time.Second}, // and a short configured grace
+		{1, 0, 30 * time.Second},
+	} {
+		if got := stopGrace(lib.DispatchConfig{RenewSeconds: c.renew, StopGraceSeconds: c.grace}); got != c.want {
+			t.Errorf("renew %ds, grace %ds: stopGrace %s, want %s", c.renew, c.grace, got, c.want)
+		}
+	}
 }
 
 // A stopped task never closes the breaker: the executor ending it within
