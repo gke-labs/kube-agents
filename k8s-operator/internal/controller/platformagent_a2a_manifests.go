@@ -3928,11 +3928,13 @@ const (
 	// from kube-agents.chartQuotaPods).
 	a2aChartPodsAnnotation = "kubeagents.x-k8s.io/a2a-quota-chart-pods"
 	// a2aDefaultChartPods stands in when that annotation is absent (a
-	// PlatformAgent written without the chart) or unreadable: the chart's
+	// PlatformAgent the chart did not render) or unreadable: the chart's
 	// default release, the operator and two LiteLLM replicas, and a surge pod
-	// for each of the two Deployments. It errs high for
-	// a CR in a namespace with no chart pods, which only loosens the bound.
-	// tests/test_quota_preflight.py ties it to a default chart render.
+	// for each of the two Deployments. It errs high for a CR in a namespace
+	// with no chart pods, which only loosens the bound, and low for a
+	// hand-written CR beside a chart release that runs more than the default
+	// (platformAgent.enabled=false), which must carry the annotation itself
+	// (#4883). tests/test_quota_preflight.py ties it to a default chart render.
 	a2aDefaultChartPods = 5
 	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
 	// enforcement half of the session bound, and anyone who can annotate the
