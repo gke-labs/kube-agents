@@ -268,7 +268,10 @@ a poll it adds, for each pod and counter it scraped:
   (the process restarted inside the same pod); or, for a Sum counter, when the pod UID is new
   and the body's start time is later than the document was first recorded, whatever the pod's
   own age (the standby that took the lease: its Hermes began after the baseline did, so none of
-  its count was seen);
+  its count was seen). Neither applies to a counter first asked of a listener the document
+  already read under another counter of the same body, as when an upgrade starts reading a
+  new family from a pod it already scrapes: that sample predates the asking, so it is the
+  baseline and adds nothing, unless the migration marked the counter unfolded;
 - nothing, when the body carries a start time earlier than the recorded one, or shows the
   sample falling under an unchanged start time: a counter cannot fall inside one process, so
   each of those is a body that is not the listener's. The body is refused, and because it

@@ -168,6 +168,24 @@ func usageFieldFloor(floors map[string]int64, counter string) int64 {
 	return floors[counter]
 }
 
+// usageBodyRead reports whether one of read, the counters a pod has entries
+// for, comes from the same listener body as counter: some pod group's list
+// holds both. A body is read whole or not at all, so such an entry means the
+// listener was read before and counter was not asked of it then.
+func usageBodyRead(read []string, counter string) bool {
+	for _, group := range [][]string{usageGatewayCounters, usageChatCounters, usageA2AChatCounters, usageBrokerCounters} {
+		if !slices.Contains(group, counter) {
+			continue
+		}
+		for _, other := range read {
+			if other != counter && slices.Contains(group, other) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // usagePodEntryKey is the document key of one pod's entry for one counter.
 func usagePodEntryKey(uid, counter string) string {
 	return uid + usagePodEntryKeySeparator + counter
@@ -485,8 +503,15 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	// set is the live pods the document already knew, so an entry recorded
 	// this poll, whose marker is this poll, resets no sibling.
 	markers := make(map[string]metav1.Time, len(doc.Pods))
+	// The counters the document already read on each pod, before this poll
+	// records anything: a counter first asked of a body the document already
+	// read under another counter (an upgrade that reads a new family from a
+	// listener it already scrapes) finds a sample that predates the asking,
+	// not one the pod started from zero.
+	readPods := map[string][]string{}
 	for key, entry := range doc.Pods {
 		markers[key] = entry.Marker
+		readPods[entry.PodUID] = append(readPods[entry.PodUID], entry.Counter)
 	}
 
 	candidates := map[string][]usageCandidate{}
@@ -506,7 +531,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// first recorded, it started from zero and none of it was seen, so
 			// the whole sample adds, under the ceiling; so does a sample for a
 			// counter the migration added unfolded, which no document and no
-			// status has seen any of; older on any other counter, or past the
+			// status has seen any of; older on any other counter, its listener
+			// already read under another counter (usageBodyRead), or past the
 			// ceiling, it is recorded and adds nothing.
 			entry = &usagePodEntry{Name: s.Name, PodUID: s.UID, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 			doc.Pods[key] = entry
@@ -551,7 +577,8 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// interval of messages counts. Max counters are read on every
 			// replica from the first poll, so none reaches here that way.
 			youngProcess := usageAggregationFor(s.Counter) == usageAggregateSum && s.StartTime != nil && *s.StartTime > float64(doc.FirstRecorded.Unix())
-			if (s.Created.After(doc.FirstRecorded.Time) || unfolded || youngProcess) && s.Sample <= usageDeltaCeiling {
+			fresh := !usageBodyRead(readPods[s.UID], s.Counter) && (s.Created.After(doc.FirstRecorded.Time) || youngProcess)
+			if (fresh || unfolded) && s.Sample <= usageDeltaCeiling {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue

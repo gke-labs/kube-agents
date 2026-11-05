@@ -2556,6 +2556,44 @@ func TestUsagePoller_AnswerRatingsCountFromTheA2AGateway(t *testing.T) {
 	}
 }
 
+// An upgrade that starts asking a listener the document already reads for a
+// family it never asked before finds the pod's history, not a pod that
+// started from zero: the first sample is the baseline even for a pod created
+// after the document, so weeks of thumbs-downs do not land in one poll.
+func TestUsagePoller_AFamilyFirstAskedOfAKnownListenerIsBaselined(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	a2a := usageA2AGatewayPod("agent-a2a-gateway-ccc", "a2a-c", usageTestA2AIP, usageClock(2))
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), a2a)...)
+	moved := metav1.NewTime(usageClock(3))
+	totals := usageZeroTotals()
+	totals[usageCounterChatMessagesInbound] = 10
+	h.writeDocument(&usageDocument{
+		Version:       usageDocumentVersion,
+		AgentUID:      usageTestAgentUID,
+		FirstRecorded: metav1.NewTime(usageClock(1)),
+		Totals:        totals,
+		LastMoved:     &moved,
+		Pods: map[string]*usagePodEntry{
+			usagePodEntryKey("a2a-c", usageCounterChatMessagesInbound): {Name: "agent-a2a-gateway-ccc", PodUID: "a2a-c", Counter: usageCounterChatMessagesInbound, Sample: 10, Marker: moved},
+		},
+	})
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(a2aAddr(), 10, ptr.To(1.0))
+	h.stub.setSample(a2aAddr(), usageCounterNegativeFeedback, 5)
+	h.stub.setSample(a2aAddr(), usageCounterPositiveFeedback, 4)
+	h.poll(10)
+	if doc := h.document(); doc.Totals[usageCounterNegativeFeedback] != 0 || doc.Totals[usageCounterPositiveFeedback] != 0 {
+		t.Fatalf("totals after the first asking = %v, want both feedback counters baselined at 0", doc.Totals)
+	}
+	h.stub.setSample(a2aAddr(), usageCounterNegativeFeedback, 6)
+	h.stub.setSample(a2aAddr(), usageCounterPositiveFeedback, 5)
+	h.poll(15)
+	if doc := h.document(); doc.Totals[usageCounterNegativeFeedback] != 1 || doc.Totals[usageCounterPositiveFeedback] != 1 {
+		t.Fatalf("totals after one more of each = %v, want 1 and 1", doc.Totals)
+	}
+}
+
 // A served CRD from the release before this one prunes positiveFeedbackTotal
 // alone: its absence is recorded against it, and the thumbs-downs beside it
 // keep landing.
