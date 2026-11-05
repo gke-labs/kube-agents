@@ -201,6 +201,11 @@ func TestBridgeSharedCases(t *testing.T) {
 			if out := c.Expected[0]; !ok || out.Carrier != string(chatmsg.Result) || !sameChat(t, part, out.Chat) {
 				t.Errorf("%s: result chat = %s, want %s", c.Name, part.Data, out.Chat)
 			}
+			if m, err := chatmsg.Parse(part.Data); err != nil {
+				t.Errorf("%s: %v", c.Name, err)
+			} else if findings := chatmsg.Lint(m); len(findings) > 0 {
+				t.Errorf("%s: the answer breaks the chat UX rules: %v", c.Name, findings)
+			}
 			continue
 		}
 		ask := ""
