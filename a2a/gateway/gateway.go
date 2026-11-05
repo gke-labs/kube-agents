@@ -1525,6 +1525,17 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		g.observeEnded(rec, active.TaskID, lib.StateFailed, TerminalNeverStarted, "")
 		g.applyTerminalMark(rec, active.TaskID, lib.StateFailed)
 		healed, healedSource = true, TerminalNeverStarted
+		// One thing is published, for a task submitted to an AgentProfile:
+		// its stop record. The dispatcher may still hold the submission
+		// queued (over a cap, or with no free worker), and would run it
+		// later into a conversation that has moved on, or for a parent
+		// that was told its child never started. The record drops it
+		// there; a worker that had taken it would have produced a first
+		// event. No cancel goes on .in, which nothing reads before a
+		// worker takes the task.
+		if ref, ok := rec.TaskRefFor(active.TaskID); ok {
+			g.publishDispatchStop(ctx, ref)
+		}
 		// A pod that never started this task is not handed the next one:
 		// it may yet run the abandoned task first, after the person has
 		// moved on, or never run anything. Unmarked, the next turn retires
@@ -2953,7 +2964,7 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		if rule := g.authorRefusal(rec.Addressee, author, ruleDelegationChildSteer); rule != "" {
 			g.log.Warn("steer refused", "rule", rule, "taskId", active.TaskID, "conversation", rec.Key,
 				"addressee", rec.Addressee, "steerBackend", author.Backend, "steerAuthor", author.Subject)
-			g.post(rec.Key, noticeDelegationNotAllowed)
+			g.post(rec.Key, fmt.Sprintf(noticeDelegationNotAllowed, rec.Addressee))
 			return
 		}
 	}
@@ -3126,6 +3137,10 @@ func (g *Gateway) cancelNamedTask(ctx context.Context, rec *SessionRecord, taskI
 		return
 	}
 	rec.MarkCanceled(taskID)
+	// And its stop record, for a task submitted to an AgentProfile: the
+	// heal released it, so the dispatcher may still hold the submission
+	// queued, and the cancel on .in is not something it reads.
+	g.publishDispatchStop(ctx, ref)
 	g.log.Info("cancel published for a task the conversation no longer holds",
 		"conversation", rec.Key, "taskId", taskID, "addressee", ref.Addressee)
 	// The post before the signal, as in cancelTask.
