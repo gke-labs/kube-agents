@@ -79,11 +79,12 @@ const (
 	invalidExecTierReplicasMsgFmt             = "Invalid spec.deployment.credentialProxy.exec.replicas (%s); the exec tier is not rendered, and every command goes to the stateful broker until it is corrected"
 	// The broker's token for the github-token-minter: a projected
 	// ServiceAccount token, so the by-source Secret filter keeps it, and the
-	// exec role has no use for it (no TOKEN_BROKER_URL, and the minter refuses
-	// a pod without has-credential-proxy). Dropped by name. Named without
+	// exec role has no use for it (no TOKEN_BROKER_URL, and the minter's
+	// NetworkPolicy admits only pods with has-credential-proxy). Dropped by
+	// name; the broker's volume and mount use the same constant. Named without
 	// credential words, which gosec's G101 reads as a hardcoded credential.
-	execTierDroppedMinterVolume = "credential-proxy-ksa-token"
-	execTierDroppedMinterEnv    = "KSA_TOKEN_FILE"
+	brokerMinterVolume       = "credential-proxy-ksa-token"
+	execTierDroppedMinterEnv = "KSA_TOKEN_FILE"
 )
 
 // credentialProxyExecTierEnvDropped names the broker env the exec tier does
@@ -203,7 +204,7 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 	dep.Spec.Template.Labels = podLabels
 	delete(dep.Spec.Template.Annotations, secretEnvHashAnnotation)
 
-	dropped := map[string]bool{execTierDroppedMinterVolume: true}
+	dropped := map[string]bool{brokerMinterVolume: true}
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if volumeHoldsSecret(v) {
 			dropped[v.Name] = true
