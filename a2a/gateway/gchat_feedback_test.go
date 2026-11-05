@@ -671,6 +671,55 @@ func TestGchatRapidTapsWhoseNewerWriteFailsKeepTheOlderOneDrawn(t *testing.T) {
 	}
 }
 
+// An older 👎 whose Rate is running when a newer 👍 comes in patches, and
+// the 👍 repaints after it; the 👎 asks for no note.
+func TestGchatATapTakenDuringAnotherWritePatchesAndIsRepainted(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	buttons, cards := rapidTaps(t, a, f, rec, "down", "up", true)
+	if got := recordedRatings(rec); len(got) != 2 || got[0].Rating != "down" || got[1].Rating != "up" {
+		t.Errorf("ratings = %+v, want down then up", got)
+	}
+	patches := 0
+	for i := range relayCallCount(f) {
+		if f.call(i).method == "patch" {
+			patches++
+		}
+	}
+	if patches != 2 {
+		t.Errorf("patches = %d, want the 👎's and the 👍's", patches)
+	}
+	checkFilled(t, buttons, "up")
+	if cards != 0 {
+		t.Errorf("note cards = %d, want none", cards)
+	}
+}
+
+// Taps C (oldest), A, B (newest) by one rater: B is taken while A's Rate
+// runs and its own write fails, so A's time is the newest again, and C,
+// arriving last, is superseded by it.
+func TestGchatAFailedTapWriteRestoresTheTimeItDisplaced(t *testing.T) {
+	a, f, rec := newFeedbackGchatAdapter(t)
+	rec.failRating = "down"
+	rapidTaps(t, a, f, rec, "up", "down", true)
+	rec.mu.Lock()
+	rec.failRating = ""
+	rec.mu.Unlock()
+	late := gchatRatingEvent(t, "down")
+	late.click.EventTime = "2026-10-29T20:03:00Z"
+	a.classify(late)
+	a.rewrites.Wait()
+	if got := recordedRatings(rec); len(got) != 1 || got[0].Rating != "up" {
+		t.Errorf("ratings = %+v, want A's 👍 alone", got)
+	}
+	if r := a.ratingOf(gchatRatedMessage); r.chosen != "up" {
+		t.Errorf("ratingOf = %+v, want up", r)
+	}
+	if n := relayCallCount(f); n != 1 {
+		t.Fatalf("relay calls = %d, want A's patch alone", n)
+	}
+	checkFilled(t, bodyButtons(t, checkPatch(t, f, 0, gchatRatedMessage)), "up")
+}
+
 // A tap with no event time is never superseded, and never supersedes: a
 // timed tap after a timeless one is recorded and drawn.
 func TestGchatTapWithoutEventTimeIsNeverSuperseded(t *testing.T) {

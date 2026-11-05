@@ -301,6 +301,10 @@ func (a *GoogleChatAdapter) rememberRating(message string, r gchatRating) {
 	remember(&ux.ratedOrder, message, func(k string) { delete(ux.rated, k) })
 }
 
+// gchatTapTimes is a rater's newest tap time on a message, and the time it
+// displaced, which a failed write of the newest restores (forgetTap).
+type gchatTapTimes struct{ at, displaced string }
+
 // gchatTapKey keys a rater's taps on a message in ux.tapped.
 func gchatTapKey(message, rater string) string {
 	return message + gchatTapKeySep + rater
@@ -317,8 +321,9 @@ func gchatTapOlder(at, recorded string) bool {
 	return terr == nil && rerr == nil && t.Before(r)
 }
 
-// takeTap records at as rater's newest tap on message, unless a newer one
-// is on record. A tap with no event time records nothing.
+// takeTap records at as rater's newest tap on message, keeping the time it
+// displaces, unless a newer one is on record. A tap with no event time
+// records nothing.
 func (a *GoogleChatAdapter) takeTap(message, rater, at string) {
 	if at == "" {
 		return
@@ -327,14 +332,16 @@ func (a *GoogleChatAdapter) takeTap(message, rater, at string) {
 	defer a.mu.Unlock()
 	ux := a.uxLocked()
 	key := gchatTapKey(message, rater)
-	if recorded, ok := ux.tapped[key]; ok && !gchatTapOlder(recorded, at) {
+	recorded, ok := ux.tapped[key]
+	if ok && !gchatTapOlder(recorded.at, at) {
 		return
 	}
-	ux.tapped[key] = at
+	ux.tapped[key] = gchatTapTimes{at: at, displaced: recorded.at}
 	remember(&ux.tappedOrder, key, func(k string) { delete(ux.tapped, k) })
 }
 
-// forgetTap drops at as rater's newest tap on message, when it still is.
+// forgetTap undoes takeTap for at, when it is still rater's newest tap on
+// message: the time it displaced is newest again, or none is.
 func (a *GoogleChatAdapter) forgetTap(message, rater, at string) {
 	if at == "" {
 		return
@@ -343,7 +350,12 @@ func (a *GoogleChatAdapter) forgetTap(message, rater, at string) {
 	defer a.mu.Unlock()
 	ux := a.uxLocked()
 	key := gchatTapKey(message, rater)
-	if ux.tapped[key] == at {
+	recorded := ux.tapped[key]
+	switch {
+	case recorded.at != at:
+	case recorded.displaced != "":
+		ux.tapped[key] = gchatTapTimes{at: recorded.displaced}
+	default:
 		delete(ux.tapped, key)
 		forget(&ux.tappedOrder, key)
 	}
@@ -354,7 +366,7 @@ func (a *GoogleChatAdapter) forgetTap(message, rater, at string) {
 func (a *GoogleChatAdapter) tapSuperseded(message, rater, at string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return gchatTapOlder(at, a.uxLocked().tapped[gchatTapKey(message, rater)])
+	return gchatTapOlder(at, a.uxLocked().tapped[gchatTapKey(message, rater)].at)
 }
 
 // rememberTap records r, a recorded tap, as the rating buttons message
@@ -419,11 +431,12 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 // message is patched with the tapped button filled. A failed write logs and
 // leaves the message as it was. Rate, the layout and the patch run under the
 // message's rewrite lock (lockRewrite), so taps on one message take effect
-// in turn. A tap older than one the same rater made on the same message is
-// superseded and dropped before Rate. One taken while the later tap's Rate
-// ran is recorded and patched, and the later tap repaints after it; it posts
-// no note card. A failed Rate forgets the tap's time. A tap with no event
-// time is never superseded. A kept 👎 then asks for a note (askForNote). The
+// in turn. A tap older than one the same rater has made on the same message
+// is superseded and dropped before Rate. An older tap whose Rate was already
+// running when the newer one came in is recorded and patched, the newer one
+// repaints after it, and its 👎 asks for no note while the newer one stands.
+// A failed Rate restores the tap time this tap displaced. A tap with no
+// event time is never superseded. A kept 👎 then asks for a note (askForNote). The
 // tap claims no question: a choice click on the message is still a turn.
 func (a *GoogleChatAdapter) feedbackClick(ev *gchatEvent) string {
 	click := ev.click
