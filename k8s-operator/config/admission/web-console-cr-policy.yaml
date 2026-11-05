@@ -1,0 +1,104 @@
+# Admission control on what the web console may change on the PlatformAgent CR: one
+# ValidatingAdmissionPolicy and its binding.
+#
+# This file is the source of truth. charts/kube-agents/templates/web-console-cr-admission-policy.yaml
+# holds a generated copy (`make chart-sync`, verified by `make chart-check`), and the chart is what
+# the install engine applies. Edit it here. It is not in config/default's kustomization: the web
+# console ships only in the chart, so the manual install path (INSTALL.md Method 2) has no console
+# for it to hold.
+#
+# WHY. The web console's Role (charts/kube-agents/templates/web-console.yaml) grants `get` and
+# `patch` on this install's PlatformAgent, and RBAC cannot limit a verb to fields, so that `patch`
+# reaches the whole spec: `spec.deployment.env` (which reaches the gateway's sidecars, including the
+# event watcher's alert-exclude setting), `spec.harness.eventWatcher`, `spec.scope`, images and
+# tags. Whatever drives the console, or takes over its pod, could change any of them. This policy
+# holds the console to what a2a/cmd/web-console writes: its own annotations and `spec.integration`.
+#
+# WHAT IT CHECKS, for an UPDATE of a PlatformAgent whose requester is a ServiceAccount named
+# `<release>-web-console` in the CR's own namespace (the console's identity):
+#
+#   1. Every `spec` field except `integration` is unchanged: none added, removed or changed.
+#   2. Every annotation except the console's own keys (the list below, the constants in
+#      a2a/cmd/web-console models.go, patches.go and repositories.go) is unchanged.
+#   3. Labels, finalizers and owner references are unchanged.
+#
+# Server-set fields (resourceVersion, generation, managedFields) are not compared. The status
+# subresource is a separate resource, which the console's Role does not grant and this policy does
+# not match. Helm, the operator and people are other requesters and are not selected.
+#
+# A test in k8s-operator (web_console_cr_policy_envtest_test.go) runs this file in a real API
+# server, and tests/test_web_console_cr_policy_shipped.py holds the key list to the console's
+# constants.
+#
+# Requires Kubernetes >= 1.30, where ValidatingAdmissionPolicy reached v1.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kube-agents-web-console-cr
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["kubeagents.x-k8s.io"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["platformagents"]
+  matchConditions:
+    - name: is-the-web-console
+      expression: >-
+        request.userInfo.username.startsWith('system:serviceaccount:') &&
+        request.userInfo.username.split(':').size() == 4 &&
+        request.userInfo.username.split(':')[2] == request.namespace &&
+        request.userInfo.username.split(':')[3].endsWith('-web-console')
+  variables:
+    # The annotation keys a2a/cmd/web-console writes.
+    - name: consoleAnnotations
+      expression: >-
+        ['kubeagents.x-k8s.io/active-model', 'kubeagents.x-k8s.io/active-model-target',
+         'kubeagents.x-k8s.io/reasoning-level', 'kubeagents.x-k8s.io/applied-prs',
+         'kubeagents.x-k8s.io/repository-topology', 'kubeagents.x-k8s.io/repository-metadata']
+    - name: oldSpec
+      expression: "has(oldObject.spec) ? oldObject.spec : {}"
+    - name: newSpec
+      expression: "has(object.spec) ? object.spec : {}"
+    - name: oldAnnotations
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    - name: newAnnotations
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+  validations:
+    - expression: >-
+        variables.newSpec.all(k, k == 'integration' ||
+          (k in variables.oldSpec && variables.newSpec[k] == variables.oldSpec[k])) &&
+        variables.oldSpec.all(k, k == 'integration' || k in variables.newSpec)
+      message: "the web console may change only spec.integration on a PlatformAgent"
+      reason: Forbidden
+    - expression: >-
+        variables.newAnnotations.all(k, k in variables.consoleAnnotations ||
+          (k in variables.oldAnnotations && variables.newAnnotations[k] == variables.oldAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k in variables.consoleAnnotations || k in variables.newAnnotations)
+      message: "the web console may change only its own annotations on a PlatformAgent"
+      reason: Forbidden
+    - expression: >-
+        (has(object.metadata.labels) ? object.metadata.labels : {}) ==
+          (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) &&
+        (has(object.metadata.finalizers) ? object.metadata.finalizers : []) ==
+          (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) &&
+        (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) ==
+          (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : [])
+      message: "the web console may not change the labels, finalizers or owner references of a PlatformAgent"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kube-agents-web-console-cr
+  labels:
+    app.kubernetes.io/name: kube-agents
+    app.kubernetes.io/part-of: kube-agents
+spec:
+  policyName: kube-agents-web-console-cr
+  validationActions: ["Deny"]
+  # No paramRef / matchResources selector: every namespace; the matchCondition selects the requester.

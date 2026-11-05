@@ -174,6 +174,17 @@ true
 {{- end }}
 
 {{/*
+Whether the web console's PlatformAgent policy renders: the admissionPolicy values
+gate, on Kubernetes >= 1.30, where the console's ServiceAccount and its Role on the
+CR render (webConsole.enabled and webConsole.environment.enabled).
+*/}}
+{{- define "kube-agents.webConsoleCRPolicyEnabled" -}}
+{{- if and .Values.admissionPolicy.enabled (semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version) .Values.webConsole.enabled .Values.webConsole.environment.enabled -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the Hindsight memory store renders. hindsight.enabled is a tri-state:
 true and false are answers, and null (the default) follows the agent's memory
 provider — the providers that need the Hindsight API get it, everything else

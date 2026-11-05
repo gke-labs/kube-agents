@@ -17,6 +17,10 @@
 # holds the pods the A2A gateway creates to the session pod shape, and sets
 # A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both.
 #
+# It also installs templates/web-console-cr-admission-policy.yaml where the web
+# console and its environment page are on: the console's ServiceAccount may
+# change only its own annotations and spec.integration on the PlatformAgent.
+#
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
 # on a default install with no GitOps overlay, the content policy matches
