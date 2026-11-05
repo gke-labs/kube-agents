@@ -257,11 +257,6 @@ class PrefixIndex:
             return [], 0
         return list(best.values()), matched
 
-    def closest(self, diag_settings_hash: str, diag_hashes: List[str]) -> Tuple[Optional[Dict[str, Any]], int]:
-        """The first saved entry sharing the longest prefix, and how many messages match (settings first)."""
-        found, matched = self.candidates(diag_settings_hash, diag_hashes)
-        return (found[0] if found else None), matched
-
 
 def message_text(text: str) -> str:
     """A saved message's words: its content and tool calls, without the JSON around them.

@@ -90,19 +90,18 @@ class AnswerCacheTest(unittest.TestCase):
 
 
 class PrefixIndexTest(unittest.TestCase):
-    def test_closest_by_longest_prefix_settings_first(self):
+    def test_candidates_by_longest_prefix_settings_first(self):
         entries = [
             {"fingerprint": "a", "diag_settings_hash": "s", "diag_message_hashes": ["m1", "m2"]},
             {"fingerprint": "b", "diag_settings_hash": "s", "diag_message_hashes": ["m1", "m2", "m3", "m4"]},
         ]
         index = replay_cache.PrefixIndex(iter(entries))
-        best, matched = index.closest("s", ["m1", "m2", "m3", "x"])
-        self.assertEqual((best["fingerprint"], matched), ("b", 3))
-        best, matched = index.closest("s", ["z"])
+        found, matched = index.candidates("s", ["m1", "m2", "m3", "x"])
+        self.assertEqual(([e["fingerprint"] for e in found], matched), (["b"], 3))
+        found, matched = index.candidates("s", ["z"])
         self.assertEqual(matched, 0)
-        self.assertIsNotNone(best)
-        self.assertEqual(index.closest("other", ["m1"]), (None, 0))
-
+        self.assertTrue(found)
+        self.assertEqual(index.candidates("other", ["m1"]), ([], 0))
 
     def test_a_long_conversation_costs_one_fixed_size_key_per_prefix(self):
         hashes = [f"m{i}" for i in range(500)]
@@ -110,7 +109,7 @@ class PrefixIndexTest(unittest.TestCase):
                                                 "diag_message_hashes": hashes}]))
         self.assertEqual(len(index.by_prefix), 501)
         self.assertEqual({len(key) for key in index.by_prefix}, {64})
-        self.assertEqual(index.closest("s", hashes[:200] + ["x"])[1], 200)
+        self.assertEqual(index.candidates("s", hashes[:200] + ["x"])[1], 200)
 
 
 class ModuleLayoutTest(unittest.TestCase):
