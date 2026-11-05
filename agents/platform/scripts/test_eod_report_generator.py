@@ -2021,10 +2021,15 @@ class TestAlertExcludedEventsAreCountedApart(unittest.TestCase):
 
     def test_an_excluded_namespace_is_out_of_the_line(self):
         with exclude("kube-system"):
-            _, report = recap([self._excluded(namespace="kube-system", workload="kube-dns", object_uid="u1")])
+            summary, report = recap([self._excluded(namespace="kube-system", workload="kube-dns", object_uid="u1",
+                                                    occurrences=4)])
 
         self.assertNotIn(eod_report_generator.ALERT_EXCLUDED_EMOJI, report)
         self.assertNotIn("kube-dns", report)
+        # Counted as removed by the filter, so the scope line still says the
+        # namespace is outside the recap.
+        self.assertEqual(summary["excluded_occurrences"], 4)
+        self.assertIn("EOD_EXCLUDE_NAMESPACES", report)
 
     def test_an_excluded_namespace_keeps_its_cluster_in_the_scope(self):
         with exclude("kube-system"):

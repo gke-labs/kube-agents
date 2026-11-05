@@ -67,20 +67,24 @@ var errExcludedUnsupported = errors.New("the daemon does not take excluded event
 // after a failed call: the sightings are kept for the next record.
 var errExcludedBackoff = errors.New("backing off after a failed call to the daemon")
 
-// excludedKey is a memo key: the event's own dedup key, or, for an event whose
-// involved object has no UID, the object's namespace, kind and name too, so
-// two nameless objects are not counted as one (the daemon folds such rows the
-// same way).
+// excludedKey is a memo key: the event's own dedup key and its container,
+// since kubelet records one Event per container and the replay check reads one
+// stamp sequence per key; and, for an event whose involved object has no UID,
+// the object's namespace, kind and name too, so two nameless objects are not
+// counted as one (the daemon folds such rows the same way). The daemon still
+// writes one row per object and reason.
 type excludedKey struct {
 	EventKey
+	Container             string
 	Namespace, Kind, Name string
 }
 
 func excludedKeyFor(ev TriageEvent) excludedKey {
-	if ev.Key.UID != "" {
-		return excludedKey{EventKey: ev.Key}
+	key := excludedKey{EventKey: ev.Key, Container: ev.Container}
+	if ev.Key.UID == "" {
+		key.Namespace, key.Kind, key.Name = ev.Namespace, ev.KindOfObject, ev.Name
 	}
-	return excludedKey{EventKey: ev.Key, Namespace: ev.Namespace, Kind: ev.KindOfObject, Name: ev.Name}
+	return key
 }
 
 // excludedRecord is the body of POST /v1/excluded-events: the event fields
@@ -290,7 +294,7 @@ func (p *excludedPoster) Post(ctx context.Context, rec excludedRecord) error {
 		features, err := p.inj.Features(callCtx)
 		cancel()
 		if err != nil {
-			p.fail(now)
+			p.fail(ctx, now)
 			return err
 		}
 		supported = hasFeature(features, daemonFeatureAlertExcluded)
@@ -304,13 +308,19 @@ func (p *excludedPoster) Post(ctx context.Context, rec excludedRecord) error {
 	callCtx, cancel := context.WithTimeout(ctx, excludedPostTimeout)
 	defer cancel()
 	if err := p.inj.PostExcluded(callCtx, rec); err != nil {
-		p.fail(now)
+		p.fail(ctx, now)
 		return err
 	}
 	return nil
 }
 
-func (p *excludedPoster) fail(now time.Time) {
+// fail arms the back-off, unless the caller's context had ended: a stop's
+// cancel says nothing about the daemon, and a back-off armed by it would
+// refuse the final Flush the stop makes next.
+func (p *excludedPoster) fail(ctx context.Context, now time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
 	p.mu.Lock()
 	p.backoffUntil = now.Add(excludedFailureBackoff)
 	p.mu.Unlock()

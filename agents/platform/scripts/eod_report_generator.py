@@ -433,12 +433,14 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
             # namespaces included, as for every other row.
             if event.get("cluster"):
                 clusters_seen.add(event["cluster"])
-            # Out of the 🔇 line in an excluded namespace, as in the
-            # breakdown: the scope line says those namespaces are outside the
-            # recap, and the rules most often mute exactly that noise.
-            if ns and ns in exclude_ns:
-                continue
             sightings = int(event.get("occurrences", 1))
+            # Out of the 🔇 line in an excluded namespace, as in the
+            # breakdown, and counted in `excluded_occurrences` like any row
+            # the filter removed, so the scope line says those namespaces are
+            # outside the recap even when a rule muted all their traffic.
+            if ns and ns in exclude_ns:
+                excluded_occurrences += sightings
+                continue
             alert_excluded_events += sightings
             stored_workload = event.get("workload", "") or ""
             uid = event.get("object_uid", "") or ""
@@ -491,11 +493,11 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # and those are occurrences. `alerts_posted` stays a row count on
         # purpose — it is printed as "*N alerts* went to chat", and chat
         # received one post per row however many sightings that row stands
-        # for. Every row this version writes carries `occurrences = 1`, since
-        # the watcher's payload count comes from `Observe`'s new-incident
-        # branch and duplicates never reach the dispatch, so the two units
-        # agree today; they are written apart so they keep agreeing if a
-        # future writer batches sightings into one row.
+        # for. Every forwarded row carries `occurrences = 1`, since the
+        # watcher's payload count comes from `Observe`'s new-incident branch
+        # and duplicates never reach the dispatch, so the two units agree for
+        # these rows. The alert-exclude rows above batch sightings into one
+        # row, which is why the units are kept apart.
         cap_row = False
         event_delivery_failed = bool(event.get("delivery_error"))
         notified_val = event.get("notified")

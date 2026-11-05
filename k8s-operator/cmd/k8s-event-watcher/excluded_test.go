@@ -307,17 +307,86 @@ func TestExcludedRecorderFlushSendsEverythingPending(t *testing.T) {
 	}
 }
 
-// A cluster that stops sends its pending sightings before the memo goes.
-func TestAStoppedClusterFlushesItsExcludedSightings(t *testing.T) {
+// stoppableClusterSet is a cluster set holding one stopped-ready run whose
+// recorder has a pending sighting, for the two call sites that flush it.
+func stoppableClusterSet(t *testing.T) (*clusterSet, *fakeExcludedPost) {
+	t.Helper()
 	now := time.Unix(1_700_000_000, 0)
 	r, fake := newTestExcludedRecorder(&now)
 	r.Note(excludedSighting("pod-1", now))
+	cache, err := newDedupCache(time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	close(done)
+	run := &clusterRun{cluster: targetCluster{Name: "c1", Profile: "p1"}, cache: cache, excluded: r, cancel: func() {}, done: done}
+	s := &clusterSet{m: newMetrics(), running: map[string]*clusterRun{"p1": run}}
+	s.stopped = sync.NewCond(&s.mu)
+	return s, fake
+}
 
-	(&clusterRun{excluded: r}).flushExcluded()
-	(&clusterRun{}).flushExcluded()
+// A cluster that stops sends its pending sightings before the memo goes.
+func TestAStoppedClusterFlushesItsExcludedSightings(t *testing.T) {
+	s, fake := stoppableClusterSet(t)
+
+	s.stop("p1")
 
 	if got := fake.occurrences(); len(got) != 1 || got[0] != 1 {
-		t.Fatalf("sent %v; want the pending sighting", got)
+		t.Fatalf("stop sent %v; want the pending sighting", got)
+	}
+}
+
+// The shutdown snapshot sends every running cluster's pending sightings.
+func TestTheShutdownSnapshotFlushesExcludedSightings(t *testing.T) {
+	s, fake := stoppableClusterSet(t)
+
+	s.snapshotAll()
+
+	if got := fake.occurrences(); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("snapshotAll sent %v; want the pending sighting", got)
+	}
+}
+
+// Two containers of one pod each send their own sightings: one per
+// container's Event stamp sequence, not one pod-wide sequence.
+func TestExcludedRecorderCountsEachContainer(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	r, fake := newTestExcludedRecorder(&now)
+
+	app := excludedSighting("pod-1", now)
+	app.Container = "app"
+	sidecar := excludedSighting("pod-1", now)
+	sidecar.Container = "sidecar"
+	r.Note(app)
+	r.Note(sidecar)
+	r.Sweep(context.Background())
+
+	if got := fake.occurrences(); len(got) != 2 {
+		t.Fatalf("sent %v; want one record per container", got)
+	}
+}
+
+// A call cut short by the caller's own cancel (a stopping cluster) arms no
+// back-off, so the final Flush still reaches the daemon.
+func TestExcludedPosterDoesNotBackOffOnTheCallersCancel(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	d := &excludedDaemon{features: []string{daemonFeatureAlertExcluded}}
+	p := &excludedPoster{inj: d.start(t), now: func() time.Time { return now }}
+	rec := excludedRecordFor(excludedSighting("pod-1", now), 1)
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := p.Post(cancelled, rec); err == nil {
+		t.Fatal("Post with a cancelled context succeeded")
+	}
+	if err := p.Post(context.Background(), rec); err != nil {
+		t.Fatalf("Post after the caller's cancel: %v; want no back-off", err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.posted) != 1 {
+		t.Errorf("posted %d records; want 1", len(d.posted))
 	}
 }
 
