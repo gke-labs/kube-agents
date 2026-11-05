@@ -27,12 +27,24 @@ UPSTREAM_INCOMPLETE = "upstream_incomplete"
 OBSERVE_FAILED = "observe_failed"
 LITELLM_MODEL_GROUP = "litellm_model_group"
 LITELLM_ATTEMPTED_FALLBACKS = "litellm_attempted_fallbacks"
+# The deployment's model behind the alias (x-litellm-model-name), the retries
+# LiteLLM made inside this request (x-litellm-attempted-retries), and its own
+# cost for the request in USD: usage.cost, else x-litellm-response-cost on a
+# non-streamed response only (a stream's headers go out before the cost is
+# known and say 0.0).
+LITELLM_MODEL_NAME = "litellm_model_name"
+LITELLM_ATTEMPTED_RETRIES = "litellm_attempted_retries"
+LITELLM_COST_USD = "litellm_cost_usd"
 PROMPT_TOKENS = "prompt_tokens"
 # True when the response carried no usage and prompt_tokens is estimated from
 # the request's size.
 TOKENS_ESTIMATED = "tokens_estimated"
 CACHED_TOKENS = "cached_tokens"
 COMPLETION_TOKENS = "completion_tokens"
+# From usage.completion_tokens_details.reasoning_tokens; part of completion_tokens.
+REASONING_TOKENS = "reasoning_tokens"
+# From usage.cache_creation_input_tokens (Anthropic-style prompt cache writes).
+CACHE_WRITE_TOKENS = "cache_write_tokens"
 FINGERPRINT = "fingerprint"
 SETTINGS_HASH = "settings_hash"
 MESSAGE_HASHES = "message_hashes"

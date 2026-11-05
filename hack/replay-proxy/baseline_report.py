@@ -16,8 +16,10 @@ Inputs:
 - `--eval-data data.json` (repeatable): the dashboard's runs, joined to the
   lines on the Prow build id (`job.build` == `runs[].build_id`);
 - `--prices`: the dated price table (default: model-prices.json beside this
-  script); `--price-as GROUP=MODEL` prices a logged model group (the LiteLLM
-  alias, `model-default` on an eval install) as a model in the table.
+  script), used for lines without LiteLLM's own cost; `--price-as GROUP=MODEL`
+  prices a logged model group (the LiteLLM alias, `model-default` on an eval
+  install) as a model in the table when the line's litellm_model_name is not
+  in it.
 
 Every metric is defined once, in METRICS and CASE_METRICS below; the README's
 table of them is generated from those (`make docs-generate`).
@@ -68,6 +70,9 @@ LONG_CONTEXT = "long_context"
 LONG_CONTEXT_THRESHOLD = "above_prompt_tokens"
 UNPRICED_NO_MODEL = "(no model)"
 PRICE_AS_SEPARATOR = "="
+COST_SOURCE_LITELLM, COST_SOURCE_TABLE, COST_SOURCE_MIXED = "litellm", "price table", "both"
+# LiteLLM names a deployment's model `<provider>/<model>`.
+PROVIDER_SEPARATOR = "/"
 
 SEGMENT_SUFFIXES = (".jsonl", ".jsonl.open")
 MANIFEST_NAME = re.compile(r"^job-\d+\.json$")
@@ -143,8 +148,15 @@ METRICS: Tuple[Metric, ...] = (
     Metric("uncached_prompt_tokens", TOKENS,
            "Sum over status-200 lines of max(prompt_tokens - cached_tokens, 0).", True),
     Metric("completion_tokens", TOKENS,
-           "Sum of completion_tokens over status-200 lines. The proxy logs no separate reasoning count; on "
-           "OpenAI-shaped usage completion_tokens includes reasoning tokens.", True),
+           "Sum of completion_tokens over status-200 lines; reasoning tokens are part of it.", True),
+    Metric("reasoning_tokens", TOKENS,
+           "Sum of reasoning_tokens (usage.completion_tokens_details.reasoning_tokens) over status-200 lines.", True),
+    Metric("reasoning_token_share", FRACTION,
+           "reasoning_tokens / completion_tokens, both over the status-200 lines that log reasoning_tokens (a line "
+           "written before the field existed would read as no reasoning)."),
+    Metric("cache_write_tokens", TOKENS,
+           "Sum of cache_write_tokens (usage.cache_creation_input_tokens, Anthropic-style cache writes) over "
+           "status-200 lines."),
     Metric("prompt_tokens_per_build", TOKENS, "prompt_tokens / builds.", True),
     Metric("cache_hit_rate", FRACTION,
            "cached / prompt tokens, token-weighted, over status-200 lines whose usage was reported (not "
@@ -152,11 +164,23 @@ METRICS: Tuple[Metric, ...] = (
     Metric("estimated_prompt_token_share", FRACTION,
            "Prompt tokens on status-200 lines with tokens_estimated, over prompt_tokens."),
     Metric("cost_usd", USD,
-           "Sum over priced status-200 lines of (uncached x input + cached x cached_input + completion x output) "
-           "price per 1M tokens, at the long-context price when the line's prompt_tokens exceed the table's "
-           "above_prompt_tokens. Excludes unpriced lines; a partial figure when unpriced_requests > 0.", True),
+           "Sum over status-200 lines of LiteLLM's own cost (litellm_cost_usd) where the line has it, else the "
+           "price-table estimate (see table_cost_usd); cost_from_table_requests says how many lines took the "
+           "table. Lines with neither are left out: a partial figure when unpriced_requests > 0.", True),
     Metric("cost_per_build_usd", USD, "cost_usd / builds.", True),
-    Metric("unpriced_requests", COUNT, "Status-200 lines whose model has no entry in the price table."),
+    Metric("litellm_cost_usd", USD, "Sum of litellm_cost_usd over the status-200 lines that carry it."),
+    Metric("litellm_costed_requests", COUNT, "Status-200 lines that carry litellm_cost_usd."),
+    Metric("table_cost_usd", USD,
+           "Sum over status-200 lines the price table prices (with or without a LiteLLM cost) of (uncached x "
+           "input + cached x cached_input + completion x output) per 1M tokens, at the long-context price when "
+           "the line's prompt_tokens exceed the table's above_prompt_tokens. Cache writes are not priced."),
+    Metric("table_priced_requests", COUNT, "Status-200 lines the price table prices."),
+    Metric("cost_from_table_requests", COUNT,
+           "Status-200 lines whose cost_usd came from the price table (no LiteLLM cost)."),
+    Metric("table_to_litellm_cost_ratio", FRACTION,
+           "The table estimate over LiteLLM's cost, both over the status-200 lines that have both: the cross-check "
+           "of the price table (1.0 is agreement)."),
+    Metric("unpriced_requests", COUNT, "Status-200 lines with neither a LiteLLM cost nor a price-table price."),
     Metric("model_time_s", SECONDS,
            "Sum of latency_ms over lines that carry one, any status, in seconds. Concurrent requests add up, so "
            "this can exceed wall clock.", True),
@@ -166,6 +190,11 @@ METRICS: Tuple[Metric, ...] = (
     Metric("non_200_requests", COUNT, "Lines whose status is not 200 (status_counts breaks them down).", True),
     Metric("rate_limited_requests", COUNT, "Lines with status 429.", True),
     Metric("rate_limited_rate", FRACTION, "rate_limited_requests / requests.", True),
+    Metric("retried_requests", COUNT,
+           "Lines, any status, whose litellm_attempted_retries (x-litellm-attempted-retries) is above 0: retries "
+           "LiteLLM made inside one request, apart from the client's own retries, which are lines of their own.",
+           True),
+    Metric("litellm_retries", COUNT, "Sum of litellm_attempted_retries over lines that carry it.", True),
     Metric("fallback_attempted_requests", COUNT,
            "Lines whose x-litellm-attempted-fallbacks header was present and not 0.", True),
     Metric("upstream_incomplete_requests", COUNT, "Lines with upstream_incomplete true (the answer broke off)."),
@@ -223,6 +252,12 @@ class Line:
     fallback_attempted: bool
     upstream_incomplete: bool
     error: Optional[str]
+    # Fields a line written before they existed lacks: None.
+    reasoning_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    model_name: Optional[str] = None
+    attempted_retries: Optional[int] = None
+    litellm_cost_usd: Optional[float] = None
 
     @property
     def key(self) -> Tuple[str, str]:
@@ -302,15 +337,21 @@ class Prices:
         return cls(json.loads(raw), hashlib.sha256(raw).hexdigest(), price_as)
 
     def model_for(self, line: Line) -> Tuple[Optional[str], str]:
-        """(the table's model, or None when unpriced; the label the line is reported under)."""
-        for name in (line.model_group, line.model):
-            if not name:
-                continue
-            if name in self.price_as:
-                return self.price_as[name], name
+        """(the table's model, or None when unpriced; the label the line is reported under).
+
+        The deployment's model (litellm_model_name, with and then without its
+        provider prefix) is looked up before the alias and the request's model;
+        --price-as is consulted only when none of them is in the table.
+        """
+        names = [name for name in (line.model_name, strip_provider(line.model_name), line.model_group, line.model)
+                 if name]
+        for name in names:
             if name in self.models:
                 return name, name
-        return None, line.model_group or line.model or UNPRICED_NO_MODEL
+        for name in names:
+            if name in self.price_as:
+                return self.price_as[name], name
+        return None, names[1 if line.model_name else 0] if names else UNPRICED_NO_MODEL
 
     def cost(self, model: str, line: Line) -> float:
         entry = self.models[model]
@@ -327,6 +368,13 @@ class Prices:
     def describe(self) -> Dict[str, Any]:
         return {"as_of": self.as_of, "source": self.source, "sha256": self.digest,
                 "models": sorted(self.models), "price_as": dict(sorted(self.price_as.items()))}
+
+
+def strip_provider(model_name: Optional[str]) -> Optional[str]:
+    """`vertex_ai/gemini-x` -> `gemini-x`: LiteLLM's model name without its provider prefix."""
+    if not model_name or PROVIDER_SEPARATOR not in model_name:
+        return model_name
+    return model_name.split(PROVIDER_SEPARATOR, 1)[1]
 
 
 def _is_price(value: Any) -> bool:
@@ -396,6 +444,11 @@ def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
     fallbacks = entry.get(F.LITELLM_ATTEMPTED_FALLBACKS)
     group = entry.get(F.LITELLM_MODEL_GROUP)
     model = entry.get(F.MODEL)
+    model_name = entry.get(F.LITELLM_MODEL_NAME)
+    cost = entry.get(F.LITELLM_COST_USD)
+    litellm_cost_usd = _as_seconds(cost)
+    if cost is not None and litellm_cost_usd is None:
+        quality.bad(F.LITELLM_COST_USD)
     return Line(
         kind=job[F.JOB_KIND],
         build=str(job.get(F.JOB_BUILD) or ""),
@@ -413,6 +466,11 @@ def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
         fallback_attempted=fallbacks is not None and str(fallbacks) != NO_FALLBACKS,
         upstream_incomplete=entry.get(F.UPSTREAM_INCOMPLETE) is True,
         error=str(error) if error else None,
+        reasoning_tokens=_field(entry, F.REASONING_TOKENS, quality),
+        cache_write_tokens=_field(entry, F.CACHE_WRITE_TOKENS, quality),
+        model_name=model_name if isinstance(model_name, str) and model_name else None,
+        attempted_retries=_field(entry, F.LITELLM_ATTEMPTED_RETRIES, quality),
+        litellm_cost_usd=litellm_cost_usd,
     )
 
 
@@ -544,14 +602,28 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
     measured = [line for line in ok if not line.tokens_estimated and line.prompt_tokens is not None]
     measured_prompt = sum(line.prompt_tokens or 0 for line in measured)
     measured_cached = sum(min(line.cached_tokens or 0, line.prompt_tokens or 0) for line in measured)
-    cost = 0.0
+    cost = litellm_cost = table_cost = both_litellm = both_table = 0.0
+    litellm_costed = table_priced = from_table = 0
     unpriced: Dict[str, int] = {}
     for line in ok:
         model, label = prices.model_for(line)
-        if model is None:
-            unpriced[label] = unpriced.get(label, 0) + 1
+        estimate = prices.cost(model, line) if model is not None else None
+        if estimate is not None:
+            table_cost += estimate
+            table_priced += 1
+        if line.litellm_cost_usd is not None:
+            cost += line.litellm_cost_usd
+            litellm_cost += line.litellm_cost_usd
+            litellm_costed += 1
+            if estimate is not None:
+                both_litellm += line.litellm_cost_usd
+                both_table += estimate
+        elif estimate is not None:
+            cost += estimate
+            from_table += 1
         else:
-            cost += prices.cost(model, line)
+            unpriced[label] = unpriced.get(label, 0) + 1
+    with_reasoning = [line for line in ok if line.reasoning_tokens is not None]
     latencies = [line.latency_ms for line in lines if line.latency_ms is not None]
     model_s = sum(latencies) / MS_PER_SECOND
     statuses: Dict[str, int] = {}
@@ -588,12 +660,22 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
         "cached_prompt_tokens": cached,
         "uncached_prompt_tokens": prompt - cached,
         "completion_tokens": sum(line.completion_tokens or 0 for line in ok),
+        "reasoning_tokens": sum(line.reasoning_tokens or 0 for line in ok),
+        "reasoning_token_share": ratio(sum(line.reasoning_tokens or 0 for line in with_reasoning),
+                                       sum(line.completion_tokens or 0 for line in with_reasoning)),
+        "cache_write_tokens": sum(line.cache_write_tokens or 0 for line in ok),
         "prompt_tokens_per_build": ratio(prompt, len(builds), PER_BUILD_DECIMALS),
         "cache_hit_rate": ratio(measured_cached, measured_prompt),
         "estimated_prompt_token_share": ratio(sum(line.prompt_tokens or 0 for line in ok if line.tokens_estimated),
                                               prompt),
         "cost_usd": round(cost, USD_DECIMALS),
         "cost_per_build_usd": ratio(cost, len(builds), USD_DECIMALS),
+        "litellm_cost_usd": round(litellm_cost, USD_DECIMALS),
+        "litellm_costed_requests": litellm_costed,
+        "table_cost_usd": round(table_cost, USD_DECIMALS),
+        "table_priced_requests": table_priced,
+        "cost_from_table_requests": from_table,
+        "table_to_litellm_cost_ratio": ratio(both_table, both_litellm),
         "unpriced_requests": sum(unpriced.values()),
         "model_time_s": round(model_s, SECONDS_DECIMALS),
         "model_time_per_build_s": ratio(model_s, len(builds), PER_BUILD_DECIMALS),
@@ -602,6 +684,8 @@ def aggregate(lines: List[Line], runs: Dict[str, EvalRun], prices: Prices) -> Di
         "non_200_requests": sum(statuses.values()),
         "rate_limited_requests": sum(1 for line in lines if line.status == HTTP_TOO_MANY_REQUESTS),
         "rate_limited_rate": None,
+        "retried_requests": sum(1 for line in lines if (line.attempted_retries or 0) > 0),
+        "litellm_retries": sum(line.attempted_retries or 0 for line in lines),
         "fallback_attempted_requests": sum(1 for line in lines if line.fallback_attempted),
         "upstream_incomplete_requests": sum(1 for line in lines if line.upstream_incomplete),
         "eval_builds_joined": len(joined),
@@ -778,6 +862,17 @@ def render(report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def cost_source(values: Dict[str, Any]) -> Optional[str]:
+    """Where a scope's cost_usd came from: LiteLLM, the price table, both, or nowhere (None)."""
+    litellm = bool(values.get("litellm_costed_requests"))
+    table = bool(values.get("cost_from_table_requests"))
+    if litellm and table:
+        return COST_SOURCE_MIXED
+    if litellm:
+        return COST_SOURCE_LITELLM
+    return COST_SOURCE_TABLE if table else None
+
+
 def compare(baseline: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]:
     """Headline deltas per scope: current - baseline, and that as a percent of the baseline."""
     notes = []
@@ -789,9 +884,16 @@ def compare(baseline: Dict[str, Any], current: Dict[str, Any]) -> Dict[str, Any]
         notes.append("price tables or --price-as differ: cost deltas mix price changes with usage changes")
     for side, report in (("baseline", baseline), ("current", current)):
         for scope in SCOPES:
-            if report["scopes"][scope].get("unpriced_requests"):
-                notes.append(f"{side} {scope}: cost is partial ({report['scopes'][scope]['unpriced_requests']}"
-                             " unpriced requests)")
+            values = report["scopes"][scope]
+            if values.get("unpriced_requests"):
+                notes.append(f"{side} {scope}: cost is partial ({values['unpriced_requests']} unpriced requests)")
+            if cost_source(values) == COST_SOURCE_MIXED:
+                notes.append(f"{side} {scope}: cost_usd takes LiteLLM's cost for {values['litellm_costed_requests']}"
+                             f" requests and the price table for {values['cost_from_table_requests']}")
+    for scope in SCOPES:
+        sources = (cost_source(baseline["scopes"][scope]), cost_source(current["scopes"][scope]))
+        if None not in sources and sources[0] != sources[1]:
+            notes.append(f"{scope}: cost_usd comes from {sources[0]} in the baseline and {sources[1]} now")
     scopes: Dict[str, Dict[str, Any]] = {}
     for scope in SCOPES:
         rows = {}

@@ -398,6 +398,101 @@ class Compare(unittest.TestCase):
         self.assertIn("-50.0%", text)
 
 
+class LiteLLMAccounting(unittest.TestCase):
+    def test_litellm_cost_is_preferred_and_the_table_is_the_fallback(self):
+        r = report([
+            line("a", 1, group="m2", prompt=1_000_000, completion=0, litellm_cost_usd=0.5),
+            line("b", 2, group="m2", prompt=1_000_000, completion=0),
+            line("c", 3, group="mystery", prompt=1_000_000, completion=0, litellm_cost_usd=0.25),
+            line("d", 4, group="mystery"),
+            line("e", 5, status=429, group="m2", litellm_cost_usd=9.0),
+        ])
+        total = r["scopes"]["total"]
+        self.assertAlmostEqual(total["cost_usd"], 0.5 + 1.0 + 0.25)
+        self.assertAlmostEqual(total["litellm_cost_usd"], 0.75)
+        self.assertEqual(total["litellm_costed_requests"], 2)
+        self.assertAlmostEqual(total["table_cost_usd"], 2.0)
+        self.assertEqual(total["table_priced_requests"], 2)
+        self.assertEqual(total["cost_from_table_requests"], 1)
+        # Over line a only, the one with both: $1.00 by the table against $0.50 by LiteLLM.
+        self.assertEqual(total["table_to_litellm_cost_ratio"], 2.0)
+        self.assertEqual((total["unpriced_requests"], total["unpriced"]), (1, {"mystery": 1}))
+
+    def test_no_litellm_cost_means_no_ratio(self):
+        total = report([line("a", 1, group="m2")])["scopes"]["total"]
+        self.assertIsNone(total["table_to_litellm_cost_ratio"])
+        self.assertEqual(total["litellm_costed_requests"], 0)
+
+    def test_the_deployments_model_is_priced_before_the_alias_and_price_as(self):
+        r = report([line("a", 1, group="model-default", litellm_model_name="vertex_ai/m2", prompt=1_000_000,
+                         completion=0)], price_as={"model-default": "m1"})
+        self.assertAlmostEqual(r["scopes"]["total"]["cost_usd"], 1.0)
+
+    def test_a_model_name_without_a_prefix_matches_as_it_is(self):
+        self.assertEqual(br.strip_provider("m2"), "m2")
+        self.assertEqual(br.strip_provider("hosted_vllm/org/m"), "org/m")
+        self.assertIsNone(br.strip_provider(None))
+        r = report([line("a", 1, group="nope", litellm_model_name="m2", prompt=1_000_000, completion=0)])
+        self.assertAlmostEqual(r["scopes"]["total"]["cost_usd"], 1.0)
+
+    def test_price_as_is_the_fallback_and_unpriced_lines_carry_the_model_name(self):
+        r = report([line("a", 1, group="model-default", litellm_model_name="vertex_ai/new", prompt=1_000_000,
+                         completion=0)], price_as={"model-default": "m2"})
+        self.assertAlmostEqual(r["scopes"]["total"]["cost_usd"], 1.0)
+        # Even a --price-as naming the deployment's model loses to the table's entry for it.
+        r = report([line("a", 1, group="model-default", litellm_model_name="vertex_ai/m2", prompt=1_000_000,
+                         completion=0)], price_as={"vertex_ai/m2": "m1"})
+        self.assertAlmostEqual(r["scopes"]["total"]["cost_usd"], 1.0)
+        r = report([line("a", 1, group="model-default", litellm_model_name="vertex_ai/new")])
+        self.assertEqual(r["scopes"]["total"]["unpriced"], {"new": 1})
+
+    def test_reasoning_and_cache_write_tokens(self):
+        total = report([
+            line("a", 1, completion=100, reasoning_tokens=80, cache_write_tokens=30),
+            line("b", 2, completion=100, reasoning_tokens=20),
+            line("c", 3, completion=1000),
+            line("d", 4, status=429, reasoning_tokens=500, cache_write_tokens=500),
+        ])["scopes"]["total"]
+        self.assertEqual(total["reasoning_tokens"], 100)
+        # Line c logs no reasoning count, so it stays out of the share.
+        self.assertEqual(total["reasoning_token_share"], 0.5)
+        self.assertEqual(total["cache_write_tokens"], 30)
+
+    def test_litellm_retries(self):
+        r = report([
+            line("a", 1, litellm_attempted_retries=2),
+            line("b", 2, status=429, litellm_attempted_retries=1),
+            line("c", 3, litellm_attempted_retries=0),
+            line("d", 4),
+            line("e", 5, litellm_attempted_retries="two", litellm_cost_usd="free"),
+            line("f", 6, litellm_cost_usd=-1.0),
+        ])
+        total = r["scopes"]["total"]
+        self.assertEqual((total["retried_requests"], total["litellm_retries"]), (2, 3))
+        self.assertEqual(total["rate_limited_requests"], 1)
+        self.assertEqual(r["data_quality"]["bad_field_values"],
+                         {"litellm_attempted_retries": 1, "litellm_cost_usd": 2})
+        self.assertEqual(total["litellm_costed_requests"], 0)
+
+    def test_compare_notes_mixed_and_changed_cost_sources(self):
+        table_only = report([line("a", 1, group="m2")])
+        mixed = report([line("a", 1, group="m2"), line("b", 2, group="m2", litellm_cost_usd=0.1)])
+        litellm_only = report([line("a", 1, group="m2", litellm_cost_usd=0.1)])
+        self.assertEqual(br.compare(table_only, table_only)["notes"], [])
+        notes = " | ".join(br.compare(table_only, litellm_only)["notes"])
+        self.assertIn("total: cost_usd comes from price table in the baseline and litellm now", notes)
+        notes = " | ".join(br.compare(mixed, litellm_only)["notes"])
+        self.assertIn("baseline total: cost_usd takes LiteLLM's cost for 1 requests and the price table for 1", notes)
+        for name in ("reasoning_tokens", "retried_requests", "litellm_retries"):
+            self.assertIn(name, br.HEADLINE_METRICS)
+
+    def test_a_line_written_before_the_fields_existed_reads_as_before(self):
+        total = report([line("a", 1, group="m2", prompt=1_000_000, completion=0)])["scopes"]["total"]
+        self.assertEqual((total["reasoning_tokens"], total["cache_write_tokens"], total["litellm_retries"]), (0, 0, 0))
+        self.assertIsNone(total["reasoning_token_share"])
+        self.assertAlmostEqual(total["cost_usd"], 1.0)
+
+
 class MalformedInput(unittest.TestCase):
     def test_skips_and_bad_values_are_counted_not_fatal(self):
         r = report([

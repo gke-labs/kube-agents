@@ -39,6 +39,8 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
     calls = []
     fallbacks = "0"
     model_group = "model-default"
+    # More response headers, on every answer (a test sets and resets them).
+    extra_headers = {}
     # "normal", "stall_reset" (one chunk, a pause, then a TCP reset),
     # "early_close" (two chunks, then the connection closes without the last
     # chunk), "short_body" (a non-streamed answer cut short of its
@@ -75,12 +77,15 @@ class FakeLiteLLM(BaseHTTPRequestHandler):
         task = body["messages"][-1]["content"].split()[-1]
         # A fixed value, not the request's `model`: a response header is never
         # built from request data, even in this fake.
-        headers = {"x-litellm-model-group": self.model_group, "x-litellm-attempted-fallbacks": self.fallbacks}
+        headers = {"x-litellm-model-group": self.model_group, "x-litellm-attempted-fallbacks": self.fallbacks,
+                   **self.extra_headers}
         if not body.get("stream") and self.custom_body is not None:
             data = self.custom_body
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            for key, value in self.extra_headers.items():
+                self.send_header(key, value)
             self.end_headers()
             self.wfile.write(data)
             return
@@ -747,6 +752,76 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual((config.litellm_config_checksum, config.litellm_image, config.store_dir), ("c", "img", "/s"))
         self.assertEqual(config.job_kind, "nightly")
         self.assertGreaterEqual(replay_proxy.Config.from_env({}).upstream_timeout_seconds, 600)
+
+
+class LiteLLMAccountingTest(ProxyTestCase):
+    """Reasoning and cache-write tokens, the real model, LiteLLM's retries and its cost."""
+
+    MODEL_NAME = "vertex_ai/gemini-3.1-pro-preview"
+
+    def answer_with(self, headers, usage=None, stream=False):
+        FakeLiteLLM.extra_headers = headers
+        self.addCleanup(setattr, FakeLiteLLM, "extra_headers", {})
+        if usage is not None:
+            message = {"role": "assistant", "content": "ok"}
+            if stream:
+                FakeLiteLLM.custom_body = sse(json.dumps(
+                    {"choices": [{"index": 0, "delta": message, "finish_reason": "stop"}], "usage": usage}))
+            else:
+                FakeLiteLLM.custom_body = json.dumps(
+                    {"choices": [{"index": 0, "message": message}], "usage": usage}).encode()
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=stream))
+        return self.lines(1)[0]
+
+    def test_non_streamed_reads_the_headers_and_the_usage_details(self):
+        line = self.answer_with(
+            {"x-litellm-model-name": self.MODEL_NAME, "x-litellm-attempted-retries": "2",
+             "x-litellm-response-cost": "0.0123"},
+            usage={"prompt_tokens": 600, "completion_tokens": 59, "cache_creation_input_tokens": 40,
+                   "completion_tokens_details": {"reasoning_tokens": 57, "text_tokens": 2}},
+        )
+        self.assertEqual(line["litellm_model_name"], self.MODEL_NAME)
+        self.assertEqual(line["litellm_attempted_retries"], 2)
+        self.assertEqual(line["litellm_cost_usd"], 0.0123)
+        self.assertEqual((line["reasoning_tokens"], line["cache_write_tokens"]), (57, 40))
+
+    def test_usage_cost_wins_over_the_header(self):
+        line = self.answer_with({"x-litellm-response-cost": "0.5"},
+                                usage={"prompt_tokens": 6, "completion_tokens": 1, "cost": 0.25})
+        self.assertEqual(line["litellm_cost_usd"], 0.25)
+
+    def test_a_streams_zero_cost_header_is_not_a_cost(self):
+        line = self.answer_with({"x-litellm-model-name": self.MODEL_NAME, "x-litellm-attempted-retries": "0",
+                                 "x-litellm-response-cost": "0.0"}, stream=True)
+        self.assertIsNone(line["litellm_cost_usd"])
+        self.assertEqual(line["litellm_model_name"], self.MODEL_NAME)
+        self.assertEqual(line["litellm_attempted_retries"], 0)
+        self.assertEqual(line["prompt_tokens"], 2000)
+
+    def test_a_streams_final_usage_carries_the_cost(self):
+        line = self.answer_with(
+            {"x-litellm-response-cost": "0.0"},
+            usage={"prompt_tokens": 6, "completion_tokens": 61, "cost": 0.000744,
+                   "completion_tokens_details": {"reasoning_tokens": 61, "text_tokens": 0}},
+            stream=True,
+        )
+        self.assertEqual(line["litellm_cost_usd"], 0.000744)
+        self.assertEqual(line["reasoning_tokens"], 61)
+
+    def test_absent_or_unreadable_values_are_null_or_as_sent(self):
+        line = self.answer_with({"x-litellm-attempted-retries": "two", "x-litellm-response-cost": "free"})
+        self.assertEqual(line["litellm_attempted_retries"], "two")
+        self.assertIsNone(line["litellm_cost_usd"])
+        for name in ("litellm_model_name", "reasoning_tokens", "cache_write_tokens"):
+            self.assertIsNone(line[name], name)
+
+    def test_cost_helpers(self):
+        self.assertIsNone(replay_proxy.litellm_cost({"cost": True}, {}, streamed=False))
+        self.assertIsNone(replay_proxy.litellm_cost({"cost": -1}, {}, streamed=False))
+        self.assertIsNone(replay_proxy.litellm_cost(None, {"x-litellm-response-cost": "nan"}, streamed=False))
+        self.assertEqual(replay_proxy.litellm_cost(None, {"x-litellm-response-cost": "0.0"}, streamed=False), 0.0)
+        self.assertIsNone(replay_proxy.litellm_cost(None, {"x-litellm-response-cost": "0.3"}, streamed=True))
+        self.assertEqual(replay_proxy.attempted_retries({}), None)
 
 
 if __name__ == "__main__":
