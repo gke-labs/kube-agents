@@ -186,7 +186,7 @@ The agent's labels are `agent_namespace` and `agent`, not `namespace` and `name`
 
 #### Answer feedback across installs
 
-Answer ratings leave an install only as counts, through a collector you run. Two series carry them. Neither carries a note, a question, an answer or a user; the collector adds the project, location and cluster it scraped:
+Two metric series carry answer ratings as counts, read by a collector you run. Neither carries a note, a question, an answer or a user; the collector adds the project, location and cluster it scraped. The text of a rating stays on the install unless you take it out with the gateway's [feedback export](/kube-agents/concepts/chatops/#answer-feedback), which writes the question, answer and note:
 
 - `kubeagents_platformagent_usage{field="negativeFeedbackTotal"}`, the operator's gauge of each install's thumbs-down reactions on Slack through the Hermes gateway, beside `{field="chatMessagesInboundTotal"}` for its chat messages. It reads 0 on Google Chat, which delivers no reactions. One scrape of the operator covers every install in its cluster.
 - `kubeagents_a2a_gateway_answer_feedback_total{platform, rating}`, each 👍 and 👎 tap on a `next` install's [answer feedback](/kube-agents/concepts/chatops/#answer-feedback) controls, straight from its A2A gateway, a changed rating counted again. On a `next` install with Slack through the A2A gateway, `negativeFeedbackTotal` reads 0 and this series is the count.
@@ -195,16 +195,16 @@ Managed Prometheus writes every cluster's samples to its project with `project_i
 
 ```promql
 # Thumbs-downs per install over the last day
-sum by (project_id, cluster, agent_namespace, agent) (
+sum by (project_id, location, cluster, agent_namespace, agent) (
   increase(kubeagents_platformagent_usage{field="negativeFeedbackTotal"}[1d]))
 
 # Thumbs-downs per 100 chat messages, per install with any, last 7 days
-100 * sum by (project_id, cluster, agent_namespace, agent) (increase(kubeagents_platformagent_usage{field="negativeFeedbackTotal"}[7d]) > 0)
-  / sum by (project_id, cluster, agent_namespace, agent) (increase(kubeagents_platformagent_usage{field="chatMessagesInboundTotal"}[7d]))
+100 * sum by (project_id, location, cluster, agent_namespace, agent) (increase(kubeagents_platformagent_usage{field="negativeFeedbackTotal"}[7d]) > 0)
+  / sum by (project_id, location, cluster, agent_namespace, agent) (increase(kubeagents_platformagent_usage{field="chatMessagesInboundTotal"}[7d]))
 
-# Share of next-mode ratings that were 👍, per cluster, last 7 days
-sum by (project_id, cluster) (increase(kubeagents_a2a_gateway_answer_feedback_total{rating="up"}[7d]))
-  / sum by (project_id, cluster) (increase(kubeagents_a2a_gateway_answer_feedback_total{rating=~"up|down"}[7d]))
+# Share of next-mode rating taps that were 👍, per cluster, last 7 days
+sum by (project_id, location, cluster) (increase(kubeagents_a2a_gateway_answer_feedback_total{rating="up"}[7d]))
+  / sum by (project_id, location, cluster) (increase(kubeagents_a2a_gateway_answer_feedback_total{rating=~"up|down"}[7d]))
 ```
 
 An install whose metrics you cannot reach still has the counters in `status.usage`. This prints the two counts per install across every context in your kubeconfig, with no names; `<none>` is 0:
