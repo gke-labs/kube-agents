@@ -479,7 +479,7 @@ Old agent pods continue routing through `Service/litellm` until the operator upd
 kubectl delete svc litellm -n <namespace>
 ```
 
-**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on.
+**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on. When Hindsight is enabled alongside `litellm.enabled=false`, the chart omits the `hindsight-api` `NetworkPolicy` (whose inference-gateway egress rule pins `app: litellm` / `app: standalone-replay` pods in the release namespace) while still rendering `hindsight-postgresql`; apply a `NetworkPolicy` of your own for `hindsight-api` if you want to restrict its egress to your custom gateway.
 
 #### Upgrade notes: static to dynamic NetworkPolicy
 

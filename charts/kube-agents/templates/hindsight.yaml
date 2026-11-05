@@ -351,6 +351,7 @@ spec:
           requests:
             storage: {{ .Values.hindsight.postgresql.storage }}
 {{- if .Values.hindsight.networkPolicy }}
+{{- if .Values.litellm.enabled }}
 ---
 # Confines hindsight-api's ingress to pods in the release namespace (the agent
 # gateway and its workers) and the GKE Managed Prometheus collector namespace
@@ -359,6 +360,9 @@ spec:
 # 80, 4000, and 8080. Models are baked into the image (HF_HUB_OFFLINE=1,
 # TRANSFORMERS_OFFLINE=1) and the pod holds no cloud identity, so neither
 # external HTTPS nor the metadata server's credential ports are permitted.
+# Gated on litellm.enabled as well as hindsight.networkPolicy so a bring-your-own
+# gateway install (litellm.enabled=false) keeps the hindsight-postgresql guard
+# below without having its custom inference-gateway egress dropped (#4946).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -449,6 +453,7 @@ spec:
         - podSelector:
             matchLabels:
               app: standalone-replay
+{{- end }}
 ---
 # The database takes no password, so this is what keeps it private: only the
 # Hindsight API pod may open a connection to it. Ingress only — Postgres makes

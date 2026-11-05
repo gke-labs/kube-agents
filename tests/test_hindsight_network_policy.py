@@ -51,15 +51,16 @@ def _kustomize_policies():
 def _chart_netpol_policies():
     """Extract the NetworkPolicy documents from the chart template without helm.
 
-    The NetworkPolicy block inside templates/hindsight.yaml has only two Helm
-    actions (`namespace: {{ .Release.Namespace }}` and the label helper
-    `{{- include "kube-agents.labels" . | nindent 4 }}`); stripping lines that
-    contain `{{` leaves valid multi-document YAML whose `spec` can be parsed
-    directly and compared to k8s-operator/config/integrations/hindsight/networkpolicy.yaml.
+    The NetworkPolicy block inside templates/hindsight.yaml has only Helm
+    control flow (`{{- if ... }}` / `{{- end }}`), `namespace: {{ .Release.Namespace }}`,
+    and the label helper `{{- include "kube-agents.labels" . | nindent 4 }}`;
+    stripping lines that contain `{{` leaves valid multi-document YAML whose
+    `spec` can be parsed directly and compared to
+    k8s-operator/config/integrations/hindsight/networkpolicy.yaml.
     """
     text = _CHART_HINDSIGHT.read_text()
     start = text.index("{{- if .Values.hindsight.networkPolicy }}")
-    end = text.index("{{- end }}", start)
+    end = text.index("{{- if .Values.hindsight.podMonitoring }}", start)
     block = text[start:end]
     clean_lines = [line for line in block.splitlines() if "{{" not in line]
     docs = [d for d in yaml.safe_load_all("\n".join(clean_lines)) if d]
@@ -222,6 +223,15 @@ class HindsightNetworkPolicyTest(unittest.TestCase):
             and d["metadata"]["name"] in self.kustomize
         ]
         self.assertEqual([], disabled_netpols)
+
+        byo_gateway_docs = _render_chart("--set", "litellm.enabled=false")
+        byo_gateway_netpols = [
+            d["metadata"]["name"]
+            for d in byo_gateway_docs
+            if d.get("kind") == "NetworkPolicy"
+            and d["metadata"]["name"] in self.kustomize
+        ]
+        self.assertEqual([_HINDSIGHT_POSTGRESQL_POLICY], byo_gateway_netpols)
 
 
 if __name__ == "__main__":
