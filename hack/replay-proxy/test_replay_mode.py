@@ -84,9 +84,9 @@ class AnalyzeCase(unittest.TestCase):
                 "headers": {"x-litellm-model-group": "m", "x-litellm-attempted-fallbacks": "0"},
                 "message": answer, "finish_reason": "stop"}
 
-    def recorded(self, body, answer, at=None, build="x"):
+    def recorded(self, body, answer, at=None):
         """Record mode's log line for `body` answered with `answer`."""
-        return self.proxy("record", build).analyze(body, time.time() if at is None else at, self.upstream(answer))
+        return self.proxy("record", "x").analyze(body, time.time() if at is None else at, self.upstream(answer))
 
 
 class SlotCacheCase(AnalyzeCase):

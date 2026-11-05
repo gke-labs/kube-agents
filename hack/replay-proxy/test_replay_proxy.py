@@ -179,7 +179,6 @@ class ProxyTestCase(unittest.TestCase):
     upstream_timeout = replay_proxy.DEFAULT_UPSTREAM_TIMEOUT_SECONDS
     store_is_file = False
     mode = "shadow"
-    allow_serve = False
 
     def config(self, **overrides):
         values = dict(
@@ -188,7 +187,7 @@ class ProxyTestCase(unittest.TestCase):
             upstream_timeout_seconds=self.upstream_timeout,
             litellm_config_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
             job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
-            mode=self.mode, cache_dir=self.cache_dir, allow_serve=self.allow_serve,
+            mode=self.mode, cache_dir=self.cache_dir,
         )
         values.update(overrides)
         return replay_proxy.Config(**values)

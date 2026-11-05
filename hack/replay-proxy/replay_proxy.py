@@ -8,7 +8,7 @@ fingerprint (replay_cache.py). Replay mode serves a saved answer on a hit,
 restored with the current request's values, and forwards live on a miss; it
 refuses to start unless REPLAY_ALLOW_SERVE=yes. For each
 `/v1/chat/completions` request, once the response has gone back to the
-client, the proxy:
+client, the background analysis:
 
 - normalizes the request and computes its fingerprint (normalizer.py);
 - writes one JSON line to stdout: the fingerprint, per-message hashes, token
@@ -22,8 +22,11 @@ client, the proxy:
   (request_store.py), or keeps nothing if the scrubbers cannot load.
 
 All of that runs on one background thread fed by a bounded queue
-(ANALYSIS_QUEUE_SIZE); the handler only enqueues, and drops the analysis (an
-`analysis_dropped` line) rather than wait when the queue is full. Memory is
+(ANALYSIS_QUEUE_SIZE); the handler enqueues, and drops the analysis (an
+`analysis_dropped` line) rather than wait when the queue is full. In replay
+mode the handler also, before forwarding, notes each message's first-seen
+time, normalizes and fingerprints the request, and looks it up (lookup); the
+analysis reuses that normalization and fingerprint. Memory is
 bounded: a request body over MAX_REQUEST_BYTES gets a 413, and the proxy stops
 observing a response after MAX_OBSERVED_BYTES (its bytes still flow).
 
@@ -841,11 +844,9 @@ class ShadowProxy:
             F.OBSERVE_FAILED: upstream["observe_failed"],
             F.LITELLM_MODEL_GROUP: upstream["headers"].get(MODEL_GROUP_HEADER),
             F.LITELLM_ATTEMPTED_FALLBACKS: upstream["headers"].get(ATTEMPTED_FALLBACKS_HEADER),
-            F.MODE: self.config.mode,
-            F.SERVED: served is not None,
+            **self.served_fields(served),
         }
         if served is not None:
-            entry[F.SERVED_FROM] = served.get(replay_cache.ENTRY_RECORDED_BY)
             entry[F.SERVED_VIA] = upstream.get("served_via")
         entry.update(usage_tokens(upstream["usage"]))
         entry[F.TOKENS_ESTIMATED] = entry[F.PROMPT_TOKENS] is None
