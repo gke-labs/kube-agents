@@ -885,8 +885,11 @@ cannot see, one that leaves `BRIDGE_CONCURRENCY` unset or takes it through `envF
 bridge with the door open and no key logs a warning at start, and so does one whose door is not
 where the hook posts; either reports `tool trace off`. Every hermes
 process in the pod now posts to the door, and a delivery's `session_id` is what attributes it:
-it counts for the task whose session id matches and which holds that session's turn at the
-moment — or, while a task is in its Kanban card wait (`waitingCard`), a non-`a2a_` worker delivery matched by `matchWorkerDeliveryRun` through a claimed worker session id, a known `cardId` in the workspace path or tool arguments, or a card title in `input_preview` — and is dropped otherwise, so another chat conversation's or an unrelated worker's tool calls, which
+it counts for the task whose session id matches and which holds that session's turn (`inTurn`) or
+its Kanban card wait (`waitingCard`) at the moment — or, while a task is in `waitingCard`, a
+non-`a2a-` worker delivery matched by `matchWorkerDeliveryRun` through a claimed worker session id
+or a known `cardId` in the workspace path or `kanban_*` tool arguments — and is dropped otherwise,
+so another chat conversation's or an unrelated worker's tool calls, which
 carry their own session ids, never reach the task's trace. The `cli`
 executor still uses a per-task key, and a child it spawns drops the pod-wide entry from the
 managed config it is given, so a delivery is never signed twice. The managed scope merges per

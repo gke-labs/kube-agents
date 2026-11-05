@@ -424,10 +424,11 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	go b.runActivity(run)
 	run.mu.Unlock()
 
+	carriedCards := false
 	if waitKanbanInTurn {
 		b.beginKanbanWait(sessionID)
 		defer func() {
-			if run.canceled.Load() && act.cardsFiled.Load() {
+			if run.canceled.Load() && (act.cardsFiled.Load() || carriedCards) {
 				b.markSessionCanceled(sessionID)
 			}
 			b.endKanbanWait(sessionID)
@@ -439,16 +440,20 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 	for turn := 1; ; turn++ {
 		// A follow-up's synthesis step needs work of its own (beginTurn).
 		act.beginTurn()
+		if waitKanbanInTurn {
+			act.cardsFiled.Store(false)
+		}
 		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
 		if !ok {
 			return
 		}
-		if waitKanbanInTurn {
+		if waitKanbanInTurn && (act.cardsFiled.Load() || carriedCards || (!run.canceled.Load() && taskCtx.Err() == nil)) {
 			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
 			if !ok {
 				return
 			}
-			if !act.cardsFiled.Load() {
+			carriedCards = act.cardsFiled.Load()
+			if !carriedCards {
 				taskStartUnix = time.Now().Unix() - kanbanStartGraceSeconds
 			}
 		}

@@ -617,6 +617,21 @@ func (s *taskStepState) isUnsubmittedRootLocked(ref TaskRef) bool {
 	return ref == s.ref && s.watch == nil && s.lastReportedSteps == 0 && s.lastReportedActs == 0 && s.finalTasks[ref] == nil && s.failedTasks[ref] == nil
 }
 
+func (s *taskStepState) hasFollowedTaskID(wantIDs map[string]bool) bool {
+	s.mu.Lock()
+	w := s.watch
+	s.mu.Unlock()
+	if w == nil {
+		return false
+	}
+	for _, f := range w.followedTasks() {
+		if wantIDs[f.TaskID] {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *taskStepState) closeTaskWatchesLocked() {
 	if s.idleTimer != nil {
 		s.idleTimer.Stop()
@@ -769,19 +784,32 @@ func (c *Conversations) knownTaskRef(taskID string) (TaskRef, bool) {
 }
 
 func (c *Conversations) stopTaskStepState(token string, refs ...TaskRef) {
-	if c == nil || token == "" {
+	if c == nil || (token == "" && len(refs) == 0) {
 		return
 	}
+	wantIDs := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		if r.TaskID != "" {
+			wantIDs[r.TaskID] = true
+		}
+	}
 	c.mu.Lock()
-	var toClose []*taskStepState
+	matched := map[*taskStepState]bool{}
 	for k, st := range c.steps {
-		if st != nil && st.token == token && (len(refs) == 0 || slices.Contains(refs, st.ref)) {
-			toClose = append(toClose, st)
+		if st == nil || (token != "" && st.token != token) {
+			continue
+		}
+		if len(wantIDs) == 0 || wantIDs[k] || wantIDs[st.ref.TaskID] || st.hasFollowedTaskID(wantIDs) {
+			matched[st] = true
+		}
+	}
+	for k, st := range c.steps {
+		if matched[st] {
 			delete(c.steps, k)
 		}
 	}
 	c.mu.Unlock()
-	for _, st := range toClose {
+	for st := range matched {
 		st.closeAll()
 	}
 }
@@ -798,25 +826,49 @@ func (c *Conversations) deleteTaskStepState(ref TaskRef, st *taskStepState) {
 }
 
 func (c *Conversations) activeStepFollowedTasks(token string, ref TaskRef) []TaskRef {
-	if c == nil || token == "" {
+	if c == nil || (token == "" && ref.TaskID == "") {
 		return nil
 	}
+	var wantRef map[string]bool
+	if ref.TaskID != "" {
+		wantRef = map[string]bool{ref.TaskID: true}
+	}
 	c.mu.Lock()
+	seenState := map[*taskStepState]bool{}
 	var candidates []*taskStepState
-	for _, st := range c.steps {
-		if st != nil && st.token == token && st.ref == ref {
+	for k, st := range c.steps {
+		if st == nil || seenState[st] || (token != "" && st.token != token) {
+			continue
+		}
+		if ref.TaskID == "" || k == ref.TaskID || st.ref.TaskID == ref.TaskID || c.steps[ref.TaskID] == st || st.hasFollowedTaskID(wantRef) {
+			seenState[st] = true
 			candidates = append(candidates, st)
 		}
 	}
 	c.mu.Unlock()
+	seenRef := map[string]bool{}
+	if ref.TaskID != "" {
+		seenRef[ref.TaskID] = true
+	}
 	var out []TaskRef
 	for _, st := range candidates {
 		st.mu.Lock()
 		w := st.watch
-		st.mu.Unlock()
+		var followed []TaskRef
 		if w != nil {
-			out = append(out, w.followedTasks()...)
+			followed = w.followedTasks()
 		}
+		for _, f := range followed {
+			if f.TaskID == "" || seenRef[f.TaskID] {
+				continue
+			}
+			if st.finalTasks[f] != nil || st.failedTasks[f] != nil {
+				continue
+			}
+			seenRef[f.TaskID] = true
+			out = append(out, f)
+		}
+		st.mu.Unlock()
 	}
 	return out
 }
@@ -827,7 +879,13 @@ func (c *Conversations) closeTaskStepState(ref TaskRef) {
 	}
 	c.mu.Lock()
 	st := c.steps[ref.TaskID]
-	delete(c.steps, ref.TaskID)
+	if st != nil {
+		for k, cur := range c.steps {
+			if cur == st {
+				delete(c.steps, k)
+			}
+		}
+	}
 	c.mu.Unlock()
 	if st != nil {
 		st.closeAll()
@@ -839,9 +897,11 @@ func (c *Conversations) hasActiveStepState(token string) (TaskRef, bool) {
 		return TaskRef{}, false
 	}
 	c.mu.Lock()
+	seen := map[*taskStepState]bool{}
 	var candidates []*taskStepState
 	for _, st := range c.steps {
-		if st != nil && st.token == token {
+		if st != nil && !seen[st] && st.token == token {
+			seen[st] = true
 			candidates = append(candidates, st)
 		}
 	}
@@ -1200,11 +1260,9 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 		t, err := b.waitForSubmittedTask(ctx, ref, time.Until(deadlineOf(ctx)))
 		switch {
 		case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final:
-			if t != nil && delegated(t) {
-				for _, fRef := range convs.activeStepFollowedTasks(token, ref) {
-					if err := b.awaitSingleTask(ctx, convs, token, fRef); err != nil {
-						return err
-					}
+			for _, fRef := range convs.activeStepFollowedTasks(token, ref) {
+				if err := b.awaitSingleTask(ctx, convs, token, fRef); err != nil {
+					return err
 				}
 			}
 			convs.clearRunning(token, ref)
@@ -1219,6 +1277,9 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 			// later message, so let this one go.
 			convs.clearRunning(token, ref)
 			convs.stopTaskStepState(token, ref)
+			if _, active := convs.hasActiveStepState(token); active {
+				continue
+			}
 			return nil
 		case ctx.Err() != nil:
 			return convs.busy(token, ctx.Err())

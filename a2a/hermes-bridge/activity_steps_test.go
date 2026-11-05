@@ -449,6 +449,30 @@ func TestScrubInlineSecrets_JSONQuotedMultiWordAndNonHTTPURLs(t *testing.T) {
 			forbidden: []string{"my-db-pass", "redispass", "natspass", "mysqlpass"},
 			wantSub:   []string{"postgresql://admin:[redacted]@db.internal:5432/prod", "redis://default:[redacted]@10.0.0.1:6379", "nats://user:[redacted]@nats:4222", "mysql://root:[redacted]@db/app"},
 		},
+		{
+			name:      "compound secret keys",
+			in:        `auth_token=xyz123 refresh_token: "abc def" GITHUB_TOKEN=ghp_123 webhook_secret=whsec_123 secret_access_key=AKIA123 MYSQL_PASSWORD=mysecret`,
+			forbidden: []string{"xyz123", "abc def", "ghp_123", "whsec_123", "AKIA123", "mysecret"},
+			wantSub:   []string{`auth_token=[redacted]`, `refresh_token: "[redacted]"`, `GITHUB_TOKEN=[redacted]`, `webhook_secret=[redacted]`, `secret_access_key=[redacted]`, `MYSQL_PASSWORD=[redacted]`},
+		},
+		{
+			name:      "escaped json quotes in shell command",
+			in:        `curl -d "{\"user\": \"alice\", \"password\": \"hunter2\", \"auth_token\": \"tok_secret\"}"`,
+			forbidden: []string{"hunter2", "tok_secret"},
+			wantSub:   []string{`\"user\": \"alice\"`, `\"password\": \"[redacted]\"`, `\"auth_token\": \"[redacted]\"`},
+		},
+		{
+			name:      "redis password-only URLs",
+			in:        `redis-cli -u redis://:redispass1@host:6379/0 && redis-cli -u rediss://:redispass2@host:6379`,
+			forbidden: []string{"redispass1", "redispass2"},
+			wantSub:   []string{"redis://:[redacted]@host:6379/0", "rediss://:[redacted]@host:6379"},
+		},
+		{
+			name:      "unclosed truncated quoted secret",
+			in:        `password="multi word secret that was truncated`,
+			forbidden: []string{"multi word secret", "truncated"},
+			wantSub:   []string{`password="[redacted]`},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -707,3 +731,86 @@ func TestExtractLeadingCommand_SkipsFlagArgumentsAndEnvFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestRunForSignature_RoutesCoordinatorSessionWhileWaitingCard(t *testing.T) {
+	const secret = "pod-wide-shared-secret"
+	b := &Bridge{
+		cfg:   Config{ActivitySecret: secret},
+		tasks: make(map[string]*taskRun),
+	}
+	a := newActivityState(false)
+	a.sessionID = "a2a-coord-wait"
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-coord-wait"}}
+	run.act.Store(a)
+	b.tasks["task-coord-wait"] = run
+
+	body := []byte(`{"hook_event_name":"post_api_request","session_id":"a2a-coord-wait","delivery_id":"d-wait-1"}`)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	sig := hookSignaturePrefix + hex.EncodeToString(mac.Sum(nil))
+
+	// Neither inTurn nor waitingCard: not routed.
+	if got := b.runForSignature(sig, body); got != nil {
+		t.Fatalf("runForSignature matched idle task: %+v", got)
+	}
+
+	// inTurn=false, waitingCard=true (during Kanban wait / synthesis): routed to run.
+	a.waitingCard.Store(true)
+	if got := b.runForSignature(sig, body); got != run {
+		t.Fatalf("runForSignature with waitingCard=true returned %+v, want %+v", got, run)
+	}
+}
+
+func TestBatchKanban_PlansAllCallIDsAndSuppressesFallbackSteps(t *testing.T) {
+	a := newActivityState(false)
+	a.sessionID = "a2a-batch-kanban"
+
+	var apiReq hookDelivery
+	reqBody, _ := json.Marshal(map[string]any{
+		"hook_event_name": hookPostAPIRequest,
+		"session_id":      "a2a-batch-kanban",
+		"delivery_id":     "api-kb-batch",
+		"extra": map[string]any{
+			"api_call_count": 1,
+			"finish_reason":  "tool_calls",
+			"response": map[string]any{
+				"finish_reason": "tool_calls",
+				"assistant_message": map[string]any{
+					"tool_calls": []map[string]any{
+						{"id": "c1", "function": map[string]any{"name": kanbanCreateTool, "arguments": json.RawMessage(`{"title":"Inspect cluster-1"}`)}},
+						{"id": "c2", "function": map[string]any{"name": kanbanCreateTool, "arguments": json.RawMessage(`{"title":"Inspect cluster-2"}`)}},
+					},
+				},
+			},
+		},
+	})
+	if err := json.Unmarshal(reqBody, &apiReq); err != nil {
+		t.Fatal(err)
+	}
+	_, _, steps, _ := a.observeWithThinking(apiReq)
+	wantTitle := "Dispatching 2 specialist tasks on the Kanban board."
+	if len(steps) != 1 || steps[0].Title != wantTitle || !slices.Equal(steps[0].CallIDs, []string{"c1", "c2"}) {
+		t.Fatalf("batch kanban planned steps = %+v, want single step %q with CallIDs [c1 c2]", steps, wantTitle)
+	}
+	if a.trace.plannedTitles["c1"] != wantTitle || a.trace.plannedTitles["c2"] != wantTitle {
+		t.Fatalf("plannedTitles = %+v, want both c1 and c2 mapped to %q", a.trace.plannedTitles, wantTitle)
+	}
+
+	// Subsequent pre_tool_call deliveries for c1 and c2 must not open fallback raw "kanban_create" steps.
+	for _, cid := range []string{"c1", "c2"} {
+		pre := hookDelivery{
+			Event:     hookPreToolCall,
+			SessionID: "a2a-batch-kanban",
+			ToolName:  kanbanCreateTool,
+			ToolInput: json.RawMessage(`{"title":"Inspect cluster"}`),
+		}
+		pre.Extra.ToolCallID = cid
+		if _, _, preSteps, _ := a.observeWithThinking(pre); len(preSteps) != 0 {
+			t.Fatalf("pre_tool_call for %s emitted unexpected steps: %+v", cid, preSteps)
+		}
+		if a.openStep != nil {
+			t.Fatalf("pre_tool_call for %s opened fallback step: %+v", cid, a.openStep)
+		}
+	}
+}
+

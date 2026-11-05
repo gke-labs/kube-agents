@@ -40,8 +40,9 @@ const (
 )
 
 var (
-	inlineWhitespaceRe = regexp.MustCompile(`\s+`)
-	quotedFlagArgRe    = regexp.MustCompile(`^([A-Za-z0-9_.-]+=)"([^"]*)"$`)
+	inlineWhitespaceRe   = regexp.MustCompile(`\s+`)
+	quotedFlagArgRe      = regexp.MustCompile(`^([A-Za-z0-9_.-]+=)"([^"]*)"$`)
+	thoughtAbbreviations = []string{"e.g.", "i.e.", "etc.", "vs.", "cf."}
 )
 
 // ActivityItem is one structured tool activity entry from a task's activity artifact.
@@ -285,19 +286,25 @@ func CollectTaskStepDetails(ref TaskRef, t *lib.Task) ([]StepDetail, int) {
 		}
 	}
 
-	// Backfill thoughts from task thinking chunks if any steps lack an inline Thought.
+	// Backfill thoughts from task thinking chunks only when steps carry no inline Thought.
 	if len(thinking) > 0 {
-		thinkCursor := 0
+		hasInlineThought := false
 		for i := range details {
-			if details[i].Thought != "" {
-				continue
+			if details[i].Step.Kind != stepmsg.KindSubtask && details[i].Thought != "" {
+				hasInlineThought = true
+				break
 			}
-			if details[i].Step.Kind == stepmsg.KindSubtask {
-				continue
-			}
-			if thinkCursor < len(thinking) {
-				details[i].Thought = thinking[thinkCursor]
-				thinkCursor++
+		}
+		if !hasInlineThought {
+			thinkCursor := 0
+			for i := range details {
+				if details[i].Step.Kind == stepmsg.KindSubtask {
+					continue
+				}
+				if thinkCursor < len(thinking) {
+					details[i].Thought = thinking[thinkCursor]
+					thinkCursor++
+				}
 			}
 		}
 	}
@@ -420,10 +427,32 @@ func summarizeThoughtTitle(thought string) string {
 	if clean == "" {
 		return defaultThoughtTitle
 	}
-	if idx := strings.IndexAny(clean, ".!?"); idx > 0 && idx < maxThoughtSentenceLen {
-		return clean[:idx+1]
+	limit := min(len(clean), maxThoughtSentenceLen)
+	for i := 1; i < limit; i++ {
+		ch := clean[i]
+		if ch != '.' && ch != '!' && ch != '?' {
+			continue
+		}
+		if i+1 < len(clean) && clean[i+1] != ' ' {
+			continue
+		}
+		if ch == '.' && isAbbrevPeriod(clean[:i+1]) {
+			continue
+		}
+		return clean[:i+1]
 	}
 	return truncateInlineText(clean, maxThoughtTitleLen)
+}
+
+func isAbbrevPeriod(prefix string) bool {
+	start := strings.LastIndexAny(prefix, " ([{")
+	word := strings.ToLower(prefix[start+1:])
+	for _, abbr := range thoughtAbbreviations {
+		if word == abbr {
+			return true
+		}
+	}
+	return false
 }
 
 func collapseInlineWhitespace(s string) string {
@@ -742,7 +771,7 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 
 	activeRef := out.Root
 	activeTask := out.Task
-	if out.AnswerFrom != nil && out.Answer != nil {
+	if out.AnswerFrom != nil && out.Answer != nil && *out.AnswerFrom != out.Root {
 		activeRef = *out.AnswerFrom
 		activeTask = out.Answer
 	} else if len(out.Followed) > 0 {
@@ -753,6 +782,9 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 				break
 			}
 		}
+	} else if out.AnswerFrom != nil && out.Answer != nil {
+		activeRef = *out.AnswerFrom
+		activeTask = out.Answer
 	}
 	activeAgent := canonicalStepAgent(activeRef.Addressee, stepOut.Alias)
 
@@ -788,9 +820,6 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 		if totalSteps > 0 {
 			lastD := details[totalSteps-1]
 			title = humanizeStepTitle(lastD)
-			if activeTask != nil && activeTask.State != "" && activeTask.State != lib.StateCompleted {
-				title = fmt.Sprintf("%s (%d steps): %s", terminalStateTitlePrefix(activeTask.State), totalSteps, title)
-			}
 			markdown = FormatStepDetailMarkdownWithOptions(lastD, false)
 		} else {
 			state := string(lib.StateCompleted)
@@ -826,6 +855,13 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 		markdown = strings.TrimSpace(md.String())
 	}
 
+	if !stepOut.StillRunning && totalSteps > 0 && activeTask != nil && activeTask.State != "" && activeTask.State != lib.StateCompleted {
+		prefix := fmt.Sprintf("%s (%d steps): ", terminalStateTitlePrefix(activeTask.State), totalSteps)
+		if !strings.HasPrefix(title, prefix) {
+			title = prefix + title
+		}
+	}
+
 	// If completed and there are Kanban cards, append a concise summary table to markdown.
 	if !stepOut.StillRunning && len(cards) > 0 {
 		var kb strings.Builder
@@ -850,7 +886,9 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 	if stepOut.StillRunning {
 		fmt.Fprintf(&res, "%sTask `%s` is actively running (`working`, elapsed %s).\n\n",
 			StreamingStepContinuePrefix, out.Root, stepOut.Elapsed.Round(time.Second))
-		writeConversation(&res, stepOut.Alias, stepOut.Token, stepOut.ByToken)
+		if stepOut.Token != "" {
+			writeConversation(&res, stepOut.Alias, stepOut.Token, stepOut.ByToken)
+		}
 		writeNotices(&res, stepOut.Notices)
 		if len(newDetails) > 0 {
 			for _, d := range newDetails {
@@ -867,7 +905,9 @@ func FormatTurnCustomToolEnvelope(stepOut TurnStepOutcome) (title, markdown, res
 	}
 
 	// Terminal result: include standard conversation, notices, task/outcome, step summary, and card reports.
-	writeConversation(&res, stepOut.Alias, stepOut.Token, stepOut.ByToken)
+	if stepOut.Token != "" {
+		writeConversation(&res, stepOut.Alias, stepOut.Token, stepOut.ByToken)
+	}
 	writeNotices(&res, stepOut.Notices)
 	if len(newDetails) > 0 {
 		for _, d := range newDetails {

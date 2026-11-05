@@ -22,8 +22,8 @@ var (
 
 	inlineTokenValuePattern = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|ya29\.[A-Za-z0-9._-]{16,}|AIza[A-Za-z0-9_-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|(?:AKIA|ASIA)[A-Z0-9]{12,}|glpat-[A-Za-z0-9_-]{12,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,})`)
 	inlineAuthHeaderPattern = regexp.MustCompile(`(?i)(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}`)
-	inlineURLCredPattern    = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:)[^@\s/]+(@)`)
-	inlineKVSecretPattern   = regexp.MustCompile(`(?i)\b(token|secret|password|passwd|passphrase|api[_-]?key|private[_-]?key|access[_-]?token|client[_-]?secret|pgpassword|dbpassword)(['"]?\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|['"]?[^\s"',;})\]>]+['"]?)`)
+	inlineURLCredPattern    = regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]*:)[^@\s/]+(@)`)
+	inlineKVSecretPattern   = regexp.MustCompile(`(?:\\?["'])?([A-Za-z0-9_.-]+)(?:\\?["'])?\s*[=:]\s*`)
 
 	// envFlagsWithValue are flags to `env` that consume the following
 	// argument before the command name.
@@ -322,7 +322,7 @@ func (a *activityState) entryTitleLocked(callID, toolName string, rawInput json.
 	if t := a.trace.plannedTitles[strings.TrimSpace(callID)]; t != "" {
 		return t
 	}
-	titles := expandPlannedToolCall(toolName, rawInput, true, 0, nil)
+	titles := expandPlannedToolCall(toolName, rawInput, true, 0)
 	if len(titles) == 0 {
 		return ""
 	}
@@ -550,7 +550,6 @@ func buildAPIRequestSteps(d hookDelivery, fallbackStep, completedTools int, deta
 	// One plan step per distinct title, in plan order, each carrying the
 	// ids of the tool calls it was titled from.
 	var planned []stepmsg.Step
-	addedBatchKanban := false
 	for _, tc := range msg.ToolCalls {
 		name := firstNonEmptyToolName(tc.Function.Name, tc.Name)
 		argsRaw := tc.Function.Arguments
@@ -558,7 +557,7 @@ func buildAPIRequestSteps(d hookDelivery, fallbackStep, completedTools int, deta
 			argsRaw = tc.Arguments
 		}
 		callID := capBytes(strings.TrimSpace(tc.ID), activityCallIDCap)
-		for _, title := range expandPlannedToolCall(name, argsRaw, detailed, kanbanCreateCount, &addedBatchKanban) {
+		for _, title := range expandPlannedToolCall(name, argsRaw, detailed, kanbanCreateCount) {
 			title = capBytes(strings.TrimSpace(title), maxStepTitleBytes)
 			if title == "" {
 				continue
@@ -640,7 +639,7 @@ func countKanbanCreateCalls(toolName string, argsRaw json.RawMessage) int {
 	return 0
 }
 
-func expandPlannedToolCall(toolName string, argsRaw json.RawMessage, detailed bool, kanbanCreateCount int, addedBatchKanban *bool) []string {
+func expandPlannedToolCall(toolName string, argsRaw json.RawMessage, detailed bool, kanbanCreateCount int) []string {
 	toolName = capRunes(strings.TrimSpace(toolName), activityToolNameCap)
 	if toolName == "" {
 		return nil
@@ -649,12 +648,6 @@ func expandPlannedToolCall(toolName string, argsRaw json.RawMessage, detailed bo
 		if !detailed {
 			pa = nil
 		} else if tn == kanbanCreateTool && kanbanCreateCount > 1 {
-			if addedBatchKanban != nil && *addedBatchKanban {
-				return ""
-			}
-			if addedBatchKanban != nil {
-				*addedBatchKanban = true
-			}
 			return fmt.Sprintf("Dispatching %d specialist tasks on the Kanban board.", kanbanCreateCount)
 		}
 		return describePlannedTool(tn, pa)
@@ -933,26 +926,96 @@ func scrubInlineSecrets(s string) string {
 	s = inlineTokenValuePattern.ReplaceAllString(s, redactedValue)
 	s = inlineAuthHeaderPattern.ReplaceAllString(s, "$1 "+redactedValue)
 	s = inlineURLCredPattern.ReplaceAllString(s, "${1}"+redactedValue+"${2}")
-	s = inlineKVSecretPattern.ReplaceAllStringFunc(s, func(m string) string {
-		sepIdx := strings.IndexAny(m, "=:")
-		if sepIdx < 0 {
-			return m
+	return scrubInlineKVSecrets(s)
+}
+
+func scrubInlineKVSecrets(s string) string {
+	var sb strings.Builder
+	pos := 0
+	for pos < len(s) {
+		loc := inlineKVSecretPattern.FindStringSubmatchIndex(s[pos:])
+		if loc == nil {
+			sb.WriteString(s[pos:])
+			break
 		}
-		valStart := sepIdx + 1
-		for valStart < len(m) && (m[valStart] == ' ' || m[valStart] == '\t') {
-			valStart++
+		matchEnd := pos + loc[1]
+		key := s[pos+loc[2] : pos+loc[3]]
+		if !secretLookingKey(key) {
+			sb.WriteString(s[pos:matchEnd])
+			pos = matchEnd
+			continue
 		}
-		prefix := m[:valStart]
-		val := m[valStart:]
-		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
-			return prefix + string(val[0]) + redactedValue + string(val[len(val)-1])
+		sb.WriteString(s[pos:matchEnd])
+		rest := s[matchEnd:]
+		switch {
+		case strings.HasPrefix(rest, `\"`), strings.HasPrefix(rest, `\'`):
+			q := rest[:2]
+			afterOpen := rest[2:]
+			if closeIdx := strings.Index(afterOpen, q); closeIdx >= 0 {
+				sb.WriteString(q + redactedValue + q)
+				pos = matchEnd + 2 + closeIdx + 2
+			} else {
+				lineEnd := len(afterOpen)
+				if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
+					lineEnd = nl
+				}
+				sb.WriteString(q + redactedValue)
+				pos = matchEnd + 2 + lineEnd
+			}
+		case strings.HasPrefix(rest, `"`), strings.HasPrefix(rest, `'`):
+			q := rest[0]
+			afterOpen := rest[1:]
+			if closeIdx := findUnescapedQuote(afterOpen, q); closeIdx >= 0 {
+				sb.WriteByte(q)
+				sb.WriteString(redactedValue)
+				sb.WriteByte(q)
+				pos = matchEnd + 1 + closeIdx + 1
+			} else {
+				lineEnd := len(afterOpen)
+				if nl := strings.IndexAny(afterOpen, "\r\n"); nl >= 0 {
+					lineEnd = nl
+				}
+				sb.WriteByte(q)
+				sb.WriteString(redactedValue)
+				pos = matchEnd + 1 + lineEnd
+			}
+		case strings.HasPrefix(rest, redactedValue):
+			sb.WriteString(redactedValue)
+			pos = matchEnd + len(redactedValue)
+		default:
+			valLen := 0
+			for valLen < len(rest) {
+				if strings.HasPrefix(rest[valLen:], `\"`) || strings.HasPrefix(rest[valLen:], `\'`) {
+					break
+				}
+				c := rest[valLen]
+				if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '"' || c == '\'' || c == ',' || c == ';' || c == ')' || c == '}' || c == ']' || c == '>' {
+					break
+				}
+				valLen++
+			}
+			if valLen == 0 {
+				pos = matchEnd
+				continue
+			}
+			sb.WriteString(redactedValue)
+			pos = matchEnd + valLen
 		}
-		if len(val) >= 1 && (val[0] == '"' || val[0] == '\'') {
-			return prefix + string(val[0]) + redactedValue
+	}
+	return sb.String()
+}
+
+func findUnescapedQuote(s string, q byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
 		}
-		return prefix + redactedValue
-	})
-	return s
+		if s[i] == q {
+			return i
+		}
+	}
+	return -1
 }
 
 func redactInputDetailed(tool string, raw json.RawMessage) json.RawMessage {

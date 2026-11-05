@@ -1387,7 +1387,7 @@ func (b *Bridge) runForSignature(sig string, body []byte) *taskRun {
 		return nil
 	}
 	for _, r := range runs {
-		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && a.inTurn.Load() {
+		if a := r.act.Load(); a != nil && a.sessionID == d.SessionID && (a.inTurn.Load() || a.waitingCard.Load()) {
 			return r
 		}
 	}

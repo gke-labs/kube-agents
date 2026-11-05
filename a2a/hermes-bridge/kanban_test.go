@@ -256,6 +256,7 @@ func TestCancelActiveKanbanWait_MarksSessionCanceledBeforeWaitEnds(t *testing.T)
 		state:  stateRunning,
 	}
 	act := newSessionActivityState(sessionID, false)
+	act.cardsFiled.Store(true)
 
 	waitDone := make(chan struct{})
 	go func() {
@@ -326,8 +327,15 @@ func TestOutOfTurnWatcher_LazyDBCreationAndSlidingWindow(t *testing.T) {
 
 	b := &Bridge{}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go b.watchOutOfTurnKanbanCards(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.watchOutOfTurnKanbanCards(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 
 	// Give the watcher a couple ticks while kanban.db does not exist yet.
 	time.Sleep(70 * time.Millisecond)
@@ -495,5 +503,229 @@ func TestSynthesizeCardAnswer_CancelStopsHermesTurn(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("synthesizeCardAnswer did not return after cancel")
+	}
+}
+
+func TestKanbanBlockedCard_UnblockedCompletionDeliveredAndSyntheticTaskFinalized(t *testing.T) {
+	_, url := startServer(t)
+	stub := newAPIStub(t, nil)
+	b := startAPIBridge(t, url, stub, nil)
+	c := gatewayClient(t, url)
+
+	sessionID := "a2a-ctx-unblock"
+	origin := &lib.Envelope{
+		TaskID:        "task-origin-unblock",
+		ContextID:     "ctx-unblock",
+		CorrelationID: "corr-unblock",
+		Authority:     authorityFor(t, mintFor(t, c, "task-card-t-unblock", "platform")),
+	}
+	b.rememberConsoleSession(sessionID, origin)
+	b.kanban.rememberCardOrigin("t_unblock", origin.TaskID)
+
+	blockedRow := kanbanCardRow{
+		ID:           "t_unblock",
+		Title:        "Approve prod rollout",
+		Status:       "blocked",
+		SessionID:    sessionID,
+		BlockPayload: `{"question":"Approve prod rollout?"}`,
+	}
+
+	// First confirm poll records pendingSettle; second confirm poll delivers the "blocked" state.
+	if _, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(blockedRow.ID, blockedRow.Status, sessionID); ok {
+		t.Fatal("expected first confirm poll for blocked card to wait for confirmation")
+	}
+	meta, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(blockedRow.ID, blockedRow.Status, sessionID)
+	if !ok {
+		t.Fatal("expected second confirm poll for blocked card to deliver")
+	}
+	b.publishOutOfTurnKanbanCard(testCtx(t), blockedRow, meta)
+
+	// While still "blocked", the card must not be re-delivered.
+	if !b.isKanbanCardDeliveredForStatus(blockedRow.ID, "blocked") {
+		t.Fatal("isKanbanCardDeliveredForStatus(t_unblock, blocked) = false, want true")
+	}
+	if _, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(blockedRow.ID, "blocked", sessionID); ok {
+		t.Fatal("blocked card was re-delivered while still blocked")
+	}
+
+	synthTaskID := sanitizeKanbanTaskToken(blockedRow.ID)
+	blockedTask := fold(t, c, synthTaskID)
+	if blockedTask.State != lib.StateInputRequired || blockedTask.Final {
+		t.Fatalf("blocked synthetic task state=%s final=%v, want state=input-required final=false", blockedTask.State, blockedTask.Final)
+	}
+
+	// Once the card is unblocked and finishes "done", it is not yet delivered for "done".
+	doneRow := kanbanCardRow{
+		ID:        "t_unblock",
+		Title:     "Approve prod rollout",
+		Status:    "done",
+		SessionID: sessionID,
+		Result:    "Rollout completed across all prod clusters.",
+	}
+	if b.isKanbanCardDeliveredForStatus(doneRow.ID, doneRow.Status) {
+		t.Fatal("isKanbanCardDeliveredForStatus(t_unblock, done) = true before terminal delivery, want false")
+	}
+	if _, ok := b.shouldDeliverOutOfTurnKanbanCardForStatus(doneRow.ID, doneRow.Status, sessionID); ok {
+		t.Fatal("expected first confirm poll for done state to wait for confirmation")
+	}
+	meta, ok = b.shouldDeliverOutOfTurnKanbanCardForStatus(doneRow.ID, doneRow.Status, sessionID)
+	if !ok {
+		t.Fatal("expected second confirm poll for unblocked done card to deliver")
+	}
+	b.publishOutOfTurnKanbanCard(testCtx(t), doneRow, meta)
+
+	finalTask := fold(t, c, synthTaskID)
+	if finalTask.SubmittedMissing {
+		t.Fatal("final synthetic task fold has SubmittedMissing = true")
+	}
+	if finalTask.PostFinalDropped != 0 {
+		t.Fatalf("final synthetic task fold has PostFinalDropped = %d, want 0", finalTask.PostFinalDropped)
+	}
+	if finalTask.State != lib.StateCompleted || !finalTask.Final {
+		t.Fatalf("final synthetic task state=%s final=%v, want state=completed final=true", finalTask.State, finalTask.Final)
+	}
+	if got := finalTask.Artifact(lib.ArtifactResult).Parts[0].Text; got != doneRow.Result {
+		t.Fatalf("final synthetic task result = %q, want %q", got, doneRow.Result)
+	}
+}
+
+func TestWaitForKanbanCards_CarriedOverCardAcrossSteerPreservesFollowUpAnswer(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	since := time.Now().Unix() - 10
+	db := filepath.Join(t.TempDir(), "kanban.db")
+	initScript := `
+import sqlite3, sys
+db, since = sys.argv[1], int(sys.argv[2])
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_carry", "Cluster audit", "running", "cluster-diagnostics", "a2a-ctx-carry", "", "", since + 1, since + 1, None))
+c.commit()
+`
+	if out, err := exec.Command("python3", "-c", initScript, db, strconv.FormatInt(since, 10)).CombinedOutput(); err != nil {
+		t.Fatalf("init carry db: %v\n%s", err, out)
+	}
+	t.Setenv(hermesKanbanDBEnv, db)
+
+	_, url := startServer(t)
+	stub := newAPIStub(t, nil)
+	b := startAPIBridge(t, url, stub, nil)
+
+	sessionID := "a2a-ctx-carry"
+	run := &taskRun{
+		origin: &lib.Envelope{TaskID: "task-carry", ContextID: "ctx-carry", CorrelationID: "corr-carry"},
+		state:  stateRunning,
+		steers: []*lib.Envelope{{EnvelopeID: "steer-1"}},
+	}
+	act := newSessionActivityState(sessionID, false)
+	act.cardsFiled.Store(true)
+	run.act.Store(act)
+
+	// Turn 1 breaks out early because a steer is queued while t_carry is still running.
+	gotTurn1, ok := b.waitForKanbanCards(run, context.Background(), act, sessionID, since, 1, "Dispatched cluster audit card.")
+	if !ok || gotTurn1 != "Dispatched cluster audit card." {
+		t.Fatalf("Turn 1 waitForKanbanCards = (%q, %v), want (\"Dispatched cluster audit card.\", true)", gotTurn1, ok)
+	}
+	if !act.cardsFiled.Load() {
+		t.Fatal("expected cardsFiled to remain true when Turn 1 broke out early with unsettled card")
+	}
+
+	// Simulate Turn 2: no steers left, Turn 2 did not file cards itself, and t_carry settles after Turn 2's first poll.
+	run.mu.Lock()
+	run.steers = nil
+	run.mu.Unlock()
+	act.beginTurn()
+	act.cardsFiled.Store(false)
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		updateScript := `
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute("UPDATE tasks SET status = 'done', result = 'Card report: all 3 clusters healthy.' WHERE id = 't_carry'")
+c.commit()
+`
+		_ = exec.Command("python3", "-c", updateScript, db).Run()
+	}()
+
+	followUpAnswer := "Answer to your follow-up question: maintenance window is 02:00 UTC."
+	gotTurn2, ok := b.waitForKanbanCards(run, context.Background(), act, sessionID, since, 2, followUpAnswer)
+	if !ok {
+		t.Fatal("Turn 2 waitForKanbanCards returned ok = false, want true")
+	}
+	if !strings.Contains(gotTurn2, followUpAnswer) {
+		t.Fatalf("Turn 2 final answer dropped follow-up response: got %q, want it to contain %q", gotTurn2, followUpAnswer)
+	}
+	if !strings.Contains(gotTurn2, "Card report: all 3 clusters healthy.") {
+		t.Fatalf("Turn 2 final answer missing carried-over card report: got %q", gotTurn2)
+	}
+}
+
+func TestWaitForKanbanCards_CompletedTurnWithNoCardsWinsCancelRace(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	since := time.Now().Unix() - 10
+	// Fixture DB has cards for a2a-ctx-1, NOT for a2a-ctx-nocards.
+	db := kanbanFixtureDB(t, since)
+	t.Setenv(hermesKanbanDBEnv, db)
+
+	var stopCalls atomic.Int32
+	routeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/cards/stop") {
+			stopCalls.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer routeSrv.Close()
+
+	_, url := startServer(t)
+	c := gatewayClient(t, url)
+	var origin *lib.Envelope
+	var bridge *Bridge
+
+	stub := newAPIStub(t, func(w http.ResponseWriter, _ *http.Request, call apiCall) {
+		writeCompletion(w, call.sessionID, "completed answer before cancel")
+	})
+	bridge = startAPIBridge(t, url, stub, func(cfg *Config) {
+		cfg.RouteURL = routeSrv.URL
+		cfg.RouteKey = "route-key"
+	})
+
+	// Also verify waitForKanbanCards directly when taskCtx is already canceled on a turn that filed no cards.
+	sessionID := "a2a-ctx-nocards"
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	run := &taskRun{
+		origin: &lib.Envelope{TaskID: "task-nocards-direct", ContextID: "ctx-nocards", CorrelationID: "corr-nocards"},
+		state:  stateRunning,
+	}
+	run.canceled.Store(true)
+	act := newSessionActivityState(sessionID, false)
+
+	gotText, ok := bridge.waitForKanbanCards(run, canceledCtx, act, sessionID, since, 1, "completed answer before cancel")
+	if !ok || gotText != "completed answer before cancel" {
+		t.Fatalf("waitForKanbanCards on canceled context with no cards = (%q, %v), want (\"completed answer before cancel\", true)", gotText, ok)
+	}
+	if bridge.isSessionCanceled(sessionID) {
+		t.Fatal("session was marked canceled even though no cards were filed or tracked")
+	}
+	if got := stopCalls.Load(); got != 0 {
+		t.Fatalf("session-kv /cards/stop calls = %d, want 0", got)
+	}
+
+	// End-to-end via runTaskAPI: cancel arrives just as apiTurn finishes its response on a turn with no cards.
+	origin = submitIn(t, c, "task-nocards-e2e", "ctx-nocards-e2e", "quick question")
+	task := waitTerminal(t, c, origin.TaskID)
+	if task.State != lib.StateCompleted {
+		t.Fatalf("task state = %s, want completed", task.State)
 	}
 }

@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -418,28 +419,179 @@ func TestFormatTurnCustomToolEnvelopeTerminalStates(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(string(tc.state), func(t *testing.T) {
-			task := &lib.Task{
-				ID:    ref.TaskID,
-				State: tc.state,
-				Final: true,
-			}
-			title, _, _ := FormatTurnCustomToolEnvelope(TurnStepOutcome{
-				Outcome:           TurnOutcome{Root: ref, Task: task},
-				Token:             "mcp0123456789abcdef01234567",
-				Alias:             "default",
-				StepDetails:       details,
-				PrevReportedSteps: 2,
-				LastReportedSteps: 2,
-				Elapsed:           3 * time.Second,
-				StillRunning:      false,
+		for _, prevSteps := range []int{0, 1, 2} {
+			t.Run(fmt.Sprintf("%s_prev%d", tc.state, prevSteps), func(t *testing.T) {
+				task := &lib.Task{
+					ID:    ref.TaskID,
+					State: tc.state,
+					Final: true,
+				}
+				title, _, _ := FormatTurnCustomToolEnvelope(TurnStepOutcome{
+					Outcome:           TurnOutcome{Root: ref, Task: task},
+					Token:             "mcp0123456789abcdef01234567",
+					Alias:             "default",
+					StepDetails:       details,
+					PrevReportedSteps: prevSteps,
+					LastReportedSteps: 2,
+					Elapsed:           3 * time.Second,
+					StillRunning:      false,
+				})
+				if title != tc.wantTitle {
+					t.Errorf("title for %s (prevSteps=%d) = %q, want %q", tc.state, prevSteps, title, tc.wantTitle)
+				}
+				if strings.HasPrefix(title, "Completed") {
+					t.Errorf("title for %s (prevSteps=%d) should not start with Completed: %q", tc.state, prevSteps, title)
+				}
 			})
-			if title != tc.wantTitle {
-				t.Errorf("title for %s = %q, want %q", tc.state, title, tc.wantTitle)
-			}
-			if strings.HasPrefix(title, "Completed") {
-				t.Errorf("title for %s should not start with Completed: %q", tc.state, title)
-			}
-		})
+		}
+	}
+}
+
+func TestFormatTurnCustomToolEnvelopeUsesRunningFollowedTask(t *testing.T) {
+	rootRef := TaskRef{Addressee: "platform", TaskID: "t-root"}
+	rootTask := &lib.Task{
+		ID:    rootRef.TaskID,
+		State: lib.StateCompleted,
+		Final: true,
+		Artifacts: []lib.Artifact{
+			{
+				Name:  lib.ArtifactProgress,
+				Parts: []lib.Part{{Kind: "text", Text: "delegated to cluster-a"}},
+			},
+		},
+	}
+	childRef := TaskRef{Addressee: "cluster-a", TaskID: "t-child1"}
+	childTask := &lib.Task{
+		ID:    childRef.TaskID,
+		State: lib.StateWorking,
+		Final: false,
+		Artifacts: []lib.Artifact{
+			{
+				Name:  lib.ArtifactProgress,
+				Parts: []lib.Part{{Kind: "text", Text: "inspecting checkout pods"}},
+			},
+		},
+	}
+
+	out := TurnOutcome{
+		Root:       rootRef,
+		Task:       rootTask,
+		AnswerFrom: &rootRef,
+		Answer:     rootTask,
+		Followed: []FollowedTask{
+			{Ref: childRef, Task: childTask},
+		},
+	}
+
+	title, markdown, _ := FormatTurnCustomToolEnvelope(TurnStepOutcome{
+		Outcome:      out,
+		Token:        "mcp0123456789abcdef01234567",
+		Alias:        "default",
+		Elapsed:      2 * time.Second,
+		StillRunning: true,
+	})
+
+	if title != "inspecting checkout pods" {
+		t.Errorf("title = %q, want running child progress 'inspecting checkout pods'", title)
+	}
+	if !strings.Contains(markdown, "cluster-a") {
+		t.Errorf("markdown = %q, want running child agent cluster-a", markdown)
+	}
+	if !strings.Contains(markdown, "inspecting checkout pods") {
+		t.Errorf("markdown = %q, want running child progress 'inspecting checkout pods'", markdown)
+	}
+}
+
+func TestCollectTaskStepDetailsDoesNotMisattributeThinkingToToolOnlyStep(t *testing.T) {
+	ref := TaskRef{Addressee: "platform", TaskID: "t-mixed-thoughts"}
+	stepPart1 := mustStepPart(t, stepmsg.Step{
+		Kind:    stepmsg.KindPlan,
+		Title:   "Checking cluster nodes",
+		Thought: "Checking cluster nodes across zones.",
+		CallIDs: []string{"c1"},
+	})
+	stepPart2 := mustStepPart(t, stepmsg.Step{
+		Kind:    stepmsg.KindPlan,
+		Title:   "Inspecting pod logs",
+		CallIDs: []string{"c2"},
+	})
+
+	task := &lib.Task{
+		ID:    ref.TaskID,
+		State: lib.StateWorking,
+		Artifacts: []lib.Artifact{
+			{
+				Name:  stepmsg.ArtifactName,
+				Parts: []lib.Part{stepPart1, stepPart2},
+			},
+			{
+				Name:  lib.ArtifactThinking,
+				Parts: []lib.Part{{Kind: "text", Text: "Checking cluster nodes across zones."}},
+			},
+		},
+	}
+
+	details, _ := CollectTaskStepDetails(ref, task)
+	if len(details) != 2 {
+		t.Fatalf("len(details) = %d, want 2", len(details))
+	}
+	if details[0].Step.Thought != "Checking cluster nodes across zones." {
+		t.Errorf("step 1 Thought = %q, want inline thought", details[0].Step.Thought)
+	}
+	if details[1].Step.Thought != "" {
+		t.Errorf("step 2 Thought = %q, want empty (must not inherit thinking[0])", details[1].Step.Thought)
+	}
+}
+
+func TestFormatTurnCustomToolEnvelopeOmitsEmptyConversationLine(t *testing.T) {
+	ref := TaskRef{Addressee: "platform", TaskID: "t-bare"}
+	runningTask := &lib.Task{ID: ref.TaskID, State: lib.StateWorking}
+	_, _, runningJSON := FormatTurnCustomToolEnvelope(TurnStepOutcome{
+		Outcome:      TurnOutcome{Root: ref, Task: runningTask},
+		Token:        "",
+		Alias:        "default",
+		Elapsed:      time.Second,
+		StillRunning: true,
+	})
+	if strings.Contains(runningJSON, "Conversation `") {
+		t.Errorf("running envelope with empty token should not include Conversation line:\n%s", runningJSON)
+	}
+
+	doneTask := &lib.Task{ID: ref.TaskID, State: lib.StateCompleted, Final: true}
+	_, _, doneJSON := FormatTurnCustomToolEnvelope(TurnStepOutcome{
+		Outcome:      TurnOutcome{Root: ref, Task: doneTask},
+		Token:        "",
+		Alias:        "default",
+		Elapsed:      time.Second,
+		StillRunning: false,
+	})
+	if strings.Contains(doneJSON, "Conversation `") {
+		t.Errorf("completed envelope with empty token should not include Conversation line:\n%s", doneJSON)
+	}
+}
+
+func TestSummarizeThoughtTitlePreservesDottedTokensAndAbbreviations(t *testing.T) {
+	cases := []struct {
+		thought string
+		want    string
+	}{
+		{
+			thought: "Checking v1.29 cluster nodes. Everything is healthy.",
+			want:    "Checking v1.29 cluster nodes.",
+		},
+		{
+			thought: "Inspecting values.yaml in 10.0.0.1",
+			want:    "Inspecting values.yaml in 10.0.0.1",
+		},
+		{
+			thought: "Checking pods (e.g. kube-dns) in kube-system. Next I will check logs.",
+			want:    "Checking pods (e.g. kube-dns) in kube-system.",
+		},
+	}
+
+	for _, tc := range cases {
+		if got := summarizeThoughtTitle(tc.thought); got != tc.want {
+			t.Errorf("summarizeThoughtTitle(%q) = %q, want %q", tc.thought, got, tc.want)
+		}
 	}
 }

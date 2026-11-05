@@ -1182,3 +1182,119 @@ func TestStreamingStepsFollowedTaskTooLargeToReadIsReadOnceAndSettles(t *testing
 		t.Errorf("read the over-budget child task %d times during step streaming; want once", n)
 	}
 }
+
+// When a streamed delegated turn has aliased step state under root R and
+// followed children C1, C2 while running[token] points to C1, a follow-up
+// send_message's awaitRunningTurn waits for the children once without
+// multiplying readers, stops the aliased step state across all keys, and does
+// not loop again on R.
+func TestAwaitRunningTurnStopsAliasedDelegatedStepState(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	var turnNum atomic.Int32
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		i := turnNum.Add(1)
+		root := fmt.Sprintf("task-root%d", i)
+		publishSubmission(t, js, fakeAddressee, root, conv, f.Text, "")
+		if i == 1 {
+			publishRun(t, js, fakeAddressee, root, "", false)
+			publishArtifact(t, js, fakeAddressee, root, lib.ArtifactDelegate, "cluster-a, cluster-b: inspect")
+			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
+			publishSubmission(t, js, "cluster-a", "task-deleg1", conv, "inspect a", root)
+			publishRun(t, js, "cluster-a", "task-deleg1", "", false)
+			publishSubmission(t, js, "cluster-b", "task-deleg2", conv, "inspect b", root)
+			publishRun(t, js, "cluster-b", "task-deleg2", "", false)
+			return
+		}
+		publishRun(t, js, fakeAddressee, root, answerText, true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	s := mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs))
+
+	res1 := callTool(t, s, ToolSendMessage, map[string]any{
+		"text":         "first delegated turn",
+		"wait_seconds": 1,
+		"stream_steps": true,
+	})
+	if res1.IsError {
+		t.Fatalf("first send_message failed: %s", res1.Content[0].Text)
+	}
+	mustContain(t, res1.Content[0].Text, StreamingStepContinuePrefix)
+
+	// Verify the step state is aliased under root and both children, while
+	// running[token] tracks an unfinished child rather than the root.
+	convs.mu.Lock()
+	if len(convs.steps) < 3 {
+		t.Fatalf("expected aliased step state under root + 2 children, got %d keys", len(convs.steps))
+	}
+	convs.mu.Unlock()
+
+	// Complete both delegated children on the bus without calling task_control get.
+	publishResult(t, js, "cluster-a", "task-deleg1", "child a done")
+	publishStatus(t, js, "cluster-a", "task-deleg1", lib.StateCompleted, true)
+	publishResult(t, js, "cluster-b", "task-deleg2", "child b done")
+	publishStatus(t, js, "cluster-b", "task-deleg2", lib.StateCompleted, true)
+
+	var rootReads, c1Reads, c2Reads atomic.Int32
+	sub, err := js.Conn().Subscribe("$JS.API.CONSUMER.CREATE.>", func(m *nats.Msg) {
+		data := string(m.Data)
+		switch {
+		case strings.Contains(data, "task-root1"):
+			rootReads.Add(1)
+		case strings.Contains(data, "task-deleg1"):
+			c1Reads.Add(1)
+		case strings.Contains(data, "task-deleg2"):
+			c2Reads.Add(1)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	// Send the second turn; awaitRunningTurn must settle the prior delegated turn cleanly.
+	res2 := callTool(t, s, ToolSendMessage, map[string]any{
+		"text":         "second turn after delegated finish",
+		"wait_seconds": 5,
+	})
+	if res2.IsError {
+		t.Fatalf("second send_message failed: %s", res2.Content[0].Text)
+	}
+	mustContain(t, res2.Content[0].Text, fakeAddressee+"/task-root2", answerText)
+
+	if r := rootReads.Load(); r != 0 {
+		t.Errorf("awaitRunningTurn re-read finished root task-root1 %d times, want 0", r)
+	}
+	if c1 := c1Reads.Load(); c1 != 1 {
+		t.Errorf("awaitRunningTurn read task-deleg1 %d times, want 1", c1)
+	}
+	if c2 := c2Reads.Load(); c2 != 1 {
+		t.Errorf("awaitRunningTurn read task-deleg2 %d times, want 1", c2)
+	}
+
+	convs.mu.Lock()
+	remainingSteps := len(convs.steps)
+	convs.mu.Unlock()
+	if remainingSteps != 0 {
+		t.Errorf("len(convs.steps) after awaitRunningTurn = %d, want 0", remainingSteps)
+	}
+}

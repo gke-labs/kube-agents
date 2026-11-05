@@ -574,7 +574,11 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}
 	b.serveActivity(ctx)
 	if b.cfg.Executor == ExecutorAPI {
-		go b.watchOutOfTurnKanbanCards(ctx)
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			b.watchOutOfTurnKanbanCards(ctx)
+		}()
 	}
 	for i := 0; i < b.cfg.Concurrency; i++ {
 		b.wg.Add(1)
