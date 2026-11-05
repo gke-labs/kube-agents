@@ -4253,7 +4253,7 @@ def check_gemini_api_key(project_id: str) -> CheckResult:
                 read_any = True
                 details.append(f"{what} absent: its API is disabled in {project_id}")
                 return None, True
-            if _record_unreadable(err, f"{what} absent: {err.strip()[:200]}", f"Could not read {what} in {project_id}", details, warnings):
+            if _record_unreadable(err, f"{what} absent: {err.strip()[:GEMINI_KEY_ERR_EXCERPT]}", f"Could not read {what} in {project_id}", details, warnings):
                 return None, False
             read_any = True
             return None, True

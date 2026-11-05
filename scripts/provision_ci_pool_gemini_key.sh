@@ -147,7 +147,7 @@ update_key() {
   if ! gcloud services api-keys update "${KEY_NAME}" --project="${PROJECT_ID}" "$@" \
     >/dev/null 2>"${ERR_FILE}"; then
     show_err
-    die "could not update the restriction of API key ${KEY_NAME}"
+    die "could not update the restriction of API key ${KEY_NAME}: $1"
   fi
 }
 if [[ -n "${KEY_CLIENTS}" ]]; then
@@ -156,6 +156,8 @@ if [[ -n "${KEY_CLIENTS}" ]]; then
 fi
 if [[ -n "${KEY_CLIENTS}" || "${KEY_TARGETS}" != "${GEMINI_KEY_API_TARGET}" ]]; then
   echo "[${PROJECT_ID}] Restricting API key ${KEY_NAME} to ${GEMINI_KEY_API_TARGET}"
+  # Between the two calls the key is unrestricted; a failure here leaves it so
+  # until a re-run, and the verifier reports apikeys/gemini/restriction meanwhile.
   update_key --api-target="service=${GEMINI_KEY_API_TARGET}"
 fi
 
