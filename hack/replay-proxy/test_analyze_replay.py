@@ -68,6 +68,25 @@ class ConversationTest(unittest.TestCase):
         convs = analyze_replay.conversations(analyze_replay.load([write(entries())]))
         self.assertEqual(sorted(len(c.lines) for c in convs), [1, 1, 4])
 
+    def test_parallel_workers_with_the_same_opening_keep_their_own_conversations(self):
+        convs = analyze_replay.conversations(analyze_replay.load([write([
+            line("a1", 1, ["s", "u"], True), line("b1", 1.1, ["s", "u"], True),
+            line("b2", 2, ["s", "u", "ab", "tb"], True), line("a2", 2.1, ["s", "u", "aa", "ta"], True),
+            line("b3", 3, ["s", "u", "ab", "tb", "ab2", "tb2"], True),
+        ])]))
+        # The two openings are indistinguishable, so which worker is which is arbitrary;
+        # the two continuations must still land in different conversations.
+        self.assertEqual(sorted(len(c.lines) for c in convs), [2, 3])
+        self.assertFalse(any({"a2", "b2"} <= {l.request_id for l in c.lines} for c in convs))
+
+    def test_a_branch_from_an_earlier_request_rejoins_its_conversation(self):
+        convs = analyze_replay.conversations(analyze_replay.load([write([
+            line("a1", 1, ["s", "u"], True), line("a2", 2, ["s", "u", "a", "t"], True),
+            line("a3", 3, ["s", "u", "a", "t", "a2", "t2"], True),
+            line("a4", 4, ["s", "u", "a", "t", "a2x", "t2x"], True),
+        ])]))
+        self.assertEqual(len(convs), 1)
+
     def test_the_same_messages_in_another_build_are_another_conversation(self):
         convs = analyze_replay.conversations(analyze_replay.load([write([
             line("a1", 1, ["s", "u"], True), line("a2", 2, ["s", "u", "a"], True, build="b2"),

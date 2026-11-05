@@ -114,21 +114,42 @@ def load(paths: Iterable[str]) -> List[Line]:
 
 
 def conversations(lines: List[Line]) -> List[Conversation]:
-    """Group lines: a request extending an earlier request's messages joins its conversation."""
+    """Group lines: a request extending an earlier request's messages joins its conversation.
+
+    A request joins the conversation whose last request is the longest prefix
+    of its messages. Parallel workers open with identical requests, so several
+    conversations can end at the same request; each continuation takes the
+    earliest of them still waiting there, and only when none is waiting does
+    it join the first conversation that ended there (a retry or a branch).
+    """
     out: List[Conversation] = []
-    by_chain: Dict[Tuple[Tuple[str, str, str], str], Conversation] = {}
+    # Conversations by the request they currently end at, earliest first.
+    waiting: Dict[Tuple[Tuple[str, str, str], str], List[Conversation]] = {}
+    # The first conversation each request ended, for a request that branches.
+    ended: Dict[Tuple[Tuple[str, str, str], str], Conversation] = {}
+    tips: Dict[int, Tuple[Tuple[str, str, str], str]] = {}
     for line in lines:
         found = None
         for prefix in reversed(line.chain[:-1]):
-            found = by_chain.get((line.scope, prefix))
-            if found is not None:
+            key = (line.scope, prefix)
+            if waiting.get(key):
+                found = waiting[key].pop(0)
+                break
+            if key in ended:
+                found = ended[key]
+                old_tip = tips.get(id(found))
+                if old_tip is not None and found in waiting.get(old_tip, []):
+                    waiting[old_tip].remove(found)
                 break
         if found is None:
             found = Conversation()
             out.append(found)
         found.lines.append(line)
         if line.chain:
-            by_chain.setdefault((line.scope, line.chain[-1]), found)
+            tip = (line.scope, line.chain[-1])
+            waiting.setdefault(tip, []).append(found)
+            ended.setdefault(tip, found)
+            tips[id(found)] = tip
     return out
 
 
