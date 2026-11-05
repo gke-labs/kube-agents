@@ -116,6 +116,10 @@ func (v scaleUpVerdict) String() string {
 	}
 }
 
+// scaleUpMarkReasons is the two reasons recordMark admits, in the order the
+// paged list's mark pass asks the API server for them.
+var scaleUpMarkReasons = [...]string{reasonTriggeredScaleUp, reasonNotTriggerScaleUp}
+
 // scaleUpVerdictFor maps the two autoscaler reasons onto a verdict, and
 // everything else onto scaleUpNone.
 func scaleUpVerdictFor(reason string) scaleUpVerdict {
