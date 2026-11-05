@@ -31,8 +31,16 @@ const ProfileLeaseBucket = "PROFILE_LEASES"
 // PROFILE_SUBMITS (a limits-retention stream). A durable re-created with
 // DeliverAll replays everything inside it, so the dispatcher keeps a
 // finished task's tombstone (LeaseRecord.FinishedAt) at least this long
-// when the dispatch config carries no SubmitRetentionSeconds.
+// when the dispatch config carries no SubmitRetentionSeconds, and never
+// less than this when it does. It is a compiled value, not the live
+// stream's: the operator never edits an existing stream, so don't lower it
+// below any max age an operator has created PROFILE_SUBMITS with (#4948).
 const ProfileSubmitRetention = 72 * time.Hour
+
+// MaxSubmitRetention is the longest SubmitRetentionSeconds a dispatch
+// config may carry. It keeps the retention, and a tombstone's keep-until
+// time, well inside a time.Duration.
+const MaxSubmitRetention = 365 * 24 * time.Hour
 
 // ProfileLeaseRefusedPod is the pod token of the tombstone the dispatcher
 // writes for a submission it refused at admission, which no pod ever held.
@@ -377,8 +385,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
-	case c.SubmitRetentionSeconds < 0:
-		return fmt.Errorf("dispatch config: submitRetentionSeconds %d", c.SubmitRetentionSeconds)
+	case c.SubmitRetentionSeconds < 0 || c.SubmitRetentionSeconds > int(MaxSubmitRetention/time.Second):
+		return fmt.Errorf("dispatch config: submitRetentionSeconds %d is outside 0 to %d", c.SubmitRetentionSeconds, int(MaxSubmitRetention/time.Second))
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Profiles {

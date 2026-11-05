@@ -367,9 +367,11 @@ leave open:
   re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
   once it is older than the stream's retention plus an hour. The retention is the dispatch
   config's `submitRetentionSeconds`, which the operator renders from the constant it creates
-  the stream with, and never less than `lib.ProfileSubmitRetention`: the operator never edits
-  an existing stream, so a lowered constant would leave an older stream longer than the
-  config says.
+  the stream with, and never less than `lib.ProfileSubmitRetention` (72h). Both are compiled
+  values, not the live stream's max age, and the operator never edits an existing stream: a
+  release that raises the max age and a later one that lowers it leave the streams created
+  in between longer than the retention, so the constant isn't lowered below any max age a
+  release has shipped (#4948).
 - **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.

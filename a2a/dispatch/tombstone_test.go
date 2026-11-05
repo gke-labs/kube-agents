@@ -360,9 +360,8 @@ func TestLeasedPodsReadsTheTombstonesInOnePass(t *testing.T) {
 }
 
 // The configured retention counts when it is longer than the fixed value,
-// and never shortens it: the operator doesn't edit an existing stream, so a
-// lowered constant would leave an older stream longer than the config says.
-// No value gets the fixed value.
+// and a config never takes it below the fixed value. No value gets the
+// fixed value.
 func TestSubmitRetentionIsTheConfiguredMaxAgeButNeverLess(t *testing.T) {
 	long := 2 * lib.ProfileSubmitRetention
 	for name, tc := range map[string]struct {
