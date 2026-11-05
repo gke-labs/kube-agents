@@ -59,9 +59,9 @@ domain: upgrades
 
 # report_contains: a chat prompt, so the sections are the reply. Three
 # objectives, one for each thing the report must do: name its source, give a
-# verdict, invent nothing; and three for the route it must take: delegate, run
-# the scan, and keep its files to this run. Split rather than one check so a
-# red says which.
+# verdict, invent nothing; and four for the route it must take: delegate, run
+# the scan, keep its files to this run, and read the repository through the
+# scan, not a local copy. Split rather than one check so a red says which.
 verification_spec:
   - name: the-section-names-its-source
     role: objective
@@ -122,6 +122,23 @@ verification_spec:
             ]
         - script: fleet_upgrade_report.py
           word_patterns: *unsuffixed_scratch_name
+  # The scan reads the repository itself. When its read fails, a worker can
+  # clone the repository another way and scan that copy as a local tree, then
+  # copy the clone's revision into the "manifests as of" line: every other
+  # check here passes, and the scan's own read path is never graded. A worker
+  # whose scan printed "not scanned" did exactly that: a `--manifests-dir` scan
+  # of a `vcs.py clone` copy produced the clean report. Any `--manifests-dir`
+  # run fails this check, also one beside `--repo` (a rendered chart, which the
+  # eval repository does not carry). A scan chained after another command on
+  # one log line of a filed card is not read, a limit of `worker_commands`.
+  - name: the-scan-read-the-repository-itself
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_runs:
+        - script: api_deprecation_scan.py
+          word_patterns: ["^--manifests-dir(=.*)?$"]
   - name: the-section-gives-a-verdict
     role: objective
     mode: assert

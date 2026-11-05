@@ -541,16 +541,20 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertTrue(argv[argv.index("--") + 1].startswith(reshaped.rstrip("\n")))
         self.assertIn("no INVENTORY.items.json", stage_log(self.d))
 
-    def test_a_google_chat_conversation_gets_the_text_and_the_log_says_why(self):
+    def test_a_google_chat_conversation_under_next_gets_the_card(self):
+        # The gateway lays the card out on Google Chat under next, so the conversation
+        # door sends it as a chat message there as it does on Slack.
         conversation = dict(CONVERSATION, platform="google_chat", conversation="google_chat:spaces/A/threads/B")
         (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(conversation), encoding="utf-8")
-        plant_card_files(self.d)
+        card = plant_card_files(self.d)
         with mock.patch.dict(os.environ, {"KAGE_SLACK_UX": "true", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
             self._run()
-        (argv,) = self.calls
-        self.assertNotIn("--chat-file", argv)
-        self.assertTrue(argv[argv.index("--") + 1].startswith(self.REPORT.rstrip("\n")))
-        self.assertIn("the report goes to google_chat, which takes text", stage_log(self.d))
+        argv = self.calls[0]
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertIn("--chat-file", argv)
+        self.assertEqual(argv[-1], inventory_card.chat(card)[1])
+        self.assertNotIn("which takes text", stage_log(self.d))
+
 
     def test_a_failed_note_after_the_card_keeps_the_report_delivered(self):
         self._answer()
@@ -1650,6 +1654,57 @@ class DeliveryCardTest(unittest.TestCase):
         self.assertEqual(chat["choices"][0]["text"], "Fix the first one")
         self.assertFalse(os.path.exists(argv[argv.index("--chat-file") + 1]))
 
+    def test_a_google_chat_origin_under_next_gets_the_card_through_the_gateway(self):
+        # The home door on Google Chat: the card goes to the gateway with the thread's
+        # resource name as it is, no channel qualifier, and nothing to the Slack relay.
+        origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM")}
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "google_chat"})
+        self.notifies = []
+
+        def run(argv, **_kwargs):
+            with open(argv[argv.index("--chat-file") + 1], encoding="utf-8") as handle:
+                self.notifies.append((argv, json.load(handle)))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post") as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        self.assertEqual(out.getvalue(), RUNNING_NOTE + "\n")
+        poster.assert_not_called()
+        ((argv, chat),) = self.notifies
+        self.assertEqual(argv[:4], ["a2a", "notify", "--platform", "google_chat"])
+        self.assertEqual(argv[argv.index("--thread") + 1], "spaces/A/threads/B")
+        self.assertEqual(chat, inventory_card.chat(self.card)[0])
+
+    def test_a_google_chat_origin_with_no_routed_home_gets_the_text_and_the_log_says_why(self):
+        # A conversations-only gateway serves Google Chat, so the card is built, but the
+        # home door has nowhere to send it: the report prints as text and the log says so.
+        origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
+        environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")}
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_CONVERSATIONS": "google_chat"})
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, environ, clear=True),
+            mock.patch.object(bootstrap_delivery, "_origin", lambda: dict(origin)),
+            mock.patch.object(self.sbp, "post") as poster,
+            mock.patch.object(bootstrap_delivery.subprocess, "run") as run,
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(bootstrap_delivery.main(self.d), 0)
+        poster.assert_not_called()
+        run.assert_not_called()
+        self.assertTrue(out.getvalue().startswith(self.text.rstrip("\n")[:40]))
+        self.assertIn("the gateway routes no home posts to google_chat", stage_log(self.d))
+
     def test_a_skip_goes_out_as_its_own_message_after_the_card(self):
         (self.d / oobe.SCAN_FILED_MARKER).write_text("task_id=t_sweep\n", encoding="utf-8")
         with contextlib.redirect_stderr(io.StringIO()):
@@ -2335,6 +2390,75 @@ class ScanGateTest(unittest.TestCase):
             self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
         self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 2)
         self.assertEqual(bootstrap_scan_gate._reconcile_since(self.d), started)
+
+    def test_a_reconcile_that_deferred_creates_defers_the_sweep_and_ends_the_failure_streak(self):
+        # EXIT_CREATES_DEFERRED: the run created its cap's worth and left the rest for
+        # the next tick. Progress, not failure: the sweep waits, the streak of failed
+        # ticks before it is over, as on exit 0, and the counts the reconcile logged
+        # are repeated for the gate's reader.
+        import cluster_agent_reconcile as rec
+        self.assertEqual(bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, rec.EXIT_CREATES_DEFERRED)
+        started = time.time()
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, 2, started)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, "",
+                "[CLUSTER-RECONCILE] Done: created=100 failed=0 deferred=150 pruned=0 kept=0 no_identity=0 unknown=0.\n")
+
+        err = io.StringIO()
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+        self.assertIsNone(bootstrap_scan_gate._reconcile_since(self.d))
+        self.assertIn("deferred the rest to the next tick", err.getvalue())
+        self.assertIn("created=100 failed=0 deferred=150", err.getvalue())
+
+    def test_a_failure_streak_before_the_first_batch_does_not_give_up_mid_fleet(self):
+        # A fresh install fails its first ticks while IAM propagates, then the fleet
+        # starts arriving in batches that run past the give-up window those failures
+        # opened. The first batch ended the streak, so the clock has nothing to fire
+        # on: every deferred tick waits, and the finishing one files the sweep.
+        t0 = 1_700_000_000.0
+        clock = [t0 + 60.0]
+        bootstrap_scan_gate._record_reconcile_attempt(self.d, bootstrap_scan_gate.MAX_RECONCILE_ATTEMPTS, t0)
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        err = io.StringIO()
+        ticks = []
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(bootstrap_scan_gate.time, "time", lambda: clock[0]), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(err):
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+            clock[0] = t0 + bootstrap_scan_gate.RECONCILE_GIVE_UP_SECONDS + 60.0
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+            ticks.append(bootstrap_scan_gate.ensure_cluster_agents(self.d))
+        self.assertEqual(ticks, [False, False, True])
+        self.assertNotIn("filing the sweep anyway", err.getvalue())
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
+
+    def test_a_fleet_of_three_batches_files_the_sweep_on_the_third_tick(self):
+        # 250 clusters at the default cap: two ticks that defer, then the one that
+        # finishes; no attempt is spent along the way, so the ceiling never fires.
+        codes = iter([bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED,
+                      bootstrap_scan_gate.RECONCILE_CREATES_DEFERRED, 0])
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, next(codes), "", "")
+
+        with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                mock.patch.object(Path, "exists", lambda self: True), \
+                contextlib.redirect_stderr(io.StringIO()):
+            ticks = [bootstrap_scan_gate.ensure_cluster_agents(self.d) for _ in range(3)]
+        self.assertEqual(ticks, [False, False, True])
+        self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 0)
 
     def test_body_forbids_creating_profiles_by_hand(self):
         """The regression that made the first roster fix worse than the bug.

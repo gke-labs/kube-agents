@@ -66,10 +66,25 @@ const (
 	envTrue               = "true"
 )
 
+// The election (election.go): the Lease the gateway campaigns for, and its
+// identity there, the pod's own name. The operator renders both together.
+// With no Lease the gateway runs unelected at term 0, as it did before the
+// election, which is what every install runs until the operator renders
+// the Lease and its Role.
+const (
+	envGatewayLease = "A2A_GATEWAY_LEASE"
+	envPodName      = "POD_NAME"
+)
+
 // envSlackAnswerFeedback turns answer feedback off when "false"
 // (feedback.go); the operator renders it only from
 // slack.answerFeedback=false.
 const envSlackAnswerFeedback = "A2A_SLACK_ANSWER_FEEDBACK"
+
+// envPeopleSeen turns the people bucket's records off when "false"
+// (people.go); the operator renders it only from
+// spec.telemetry.peopleSeen=false.
+const envPeopleSeen = "A2A_PEOPLE_SEEN"
 
 // defaultInjectPrincipalMapPath is where the operator mounts the inject
 // door's own principal map when the door is armed. A file of "id principal"
@@ -208,10 +223,17 @@ type Config struct {
 	HomeChannelRecord string
 	SelfImage         string
 	HomeChannelLearn  bool
+	// GatewayLease names the Lease this gateway campaigns for (Elected), and
+	// PodName is its identity there. Empty runs the gateway unelected.
+	GatewayLease string
+	PodName      string
 	// AnswerFeedbackOff is the install's slack.answerFeedback=false: no
 	// rating controls are drawn and nothing is kept, whatever the feedback
 	// bucket holds.
 	AnswerFeedbackOff bool
+	// PeopleSeenOff is the install's spec.telemetry.peopleSeen=false: the
+	// gateway records no one it sees in the people bucket.
+	PeopleSeenOff bool
 	// SlackAllowedUsers is the Slack backend's ingress allowlist, carried
 	// from spec.integration.slack.allowedUsers the way GchatAllowedUsers is
 	// from Chat's: the gate the legacy path enforces as SLACK_ALLOWED_USERS.
@@ -662,6 +684,9 @@ func (c *Config) HomeLearnArmed() bool {
 		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
 }
 
+// Elected reports whether this gateway runs under the election (election.go).
+func (c *Config) Elected() bool { return c.GatewayLease != "" }
+
 // A2ADoorArmed reports whether the A2A door is open.
 func (c *Config) A2ADoorArmed() bool { return c.A2ADoorListen != "" }
 
@@ -706,7 +731,15 @@ func FromEnv() (*Config, error) {
 	cfg.HomeChannelRecord = strings.TrimSpace(os.Getenv(envHomeChannelRecord))
 	cfg.SelfImage = strings.TrimSpace(os.Getenv(envSelfImage))
 	cfg.HomeChannelLearn = os.Getenv(envHomeChannelLearn) == envTrue
+	cfg.GatewayLease = strings.TrimSpace(os.Getenv(envGatewayLease))
+	cfg.PodName = strings.TrimSpace(os.Getenv(envPodName))
+	if cfg.GatewayLease != "" && cfg.PodName == "" {
+		// The pod name is the election's identity; without it every replica
+		// would campaign as the same holder.
+		return nil, fmt.Errorf("%s is set but %s is empty: the election needs the pod's name as its identity", envGatewayLease, envPodName)
+	}
 	cfg.AnswerFeedbackOff = strings.TrimSpace(os.Getenv(envSlackAnswerFeedback)) == strconv.FormatBool(false)
+	cfg.PeopleSeenOff = strings.TrimSpace(os.Getenv(envPeopleSeen)) == strconv.FormatBool(false)
 	cfg.TargetAllowedUsers = map[string]map[string][]string{}
 	platformLists := map[string][]string{}
 	// Set is a list, even set empty: the operator renders the var empty for

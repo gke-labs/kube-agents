@@ -169,8 +169,8 @@ func (a *GoogleChatAdapter) uxLocked() *gchatUX {
 // trackQuestion remembers a laid-out message with choices, keyed by its
 // name and bound to conversation, so a click or a typed reply can rewrite
 // it. A home post has no conversation here (its space's kind is not known
-// without a read), so its click is bound by the event and a typed reply in
-// its thread does not answer it. Laying
+// without a read), so its click binds to the event's surface (classifyClick),
+// and a typed reply in its thread does not answer it. Laying
 // choices out on a message opens it, even one answered before: a card
 // asking again on its update key is a fresh question, so the earlier answer
 // and its line are forgotten. Laying a message out again without choices
@@ -322,8 +322,8 @@ func (a *GoogleChatAdapter) classifyClick(ev *gchatEvent) (InboundMessage, strin
 	bound := ""
 	if q, ok := ux.questions[ev.Message.Name]; ok {
 		// A remembered question binds its click to the conversation it was
-		// posted in; the event's surface is read only for one it does not
-		// remember (a home post, or one from before a restart).
+		// posted in; the event's surface binds any other click (a home post,
+		// which has no conversation, or one from before a restart).
 		bound = q.conversation
 		p.text, p.links = q.layout.Text, q.links
 		if index >= 0 && index < len(q.choices) {
@@ -494,11 +494,10 @@ func (a *GoogleChatAdapter) answeredLayout(messageID string, m OutMessage, layou
 // thread in it to one session; no thread in a space whose threading state
 // does not support replies or in a group chat, where every message has its
 // own thread resource and binding those would fragment the chat into one
-// session per ask; and in a DM, which Chat threads too, only a message
-// typed inside an existing thread (threadReply) has one, so top-level DMs
-// share the space's one conversation and are answered top-level, the
-// default-mode Hermes Google Chat rule read from Chat's own flag
-// (spec-chatops-gateway.md, "The Google Chat adapter").
+// session per ask; and a DM message keys on the thread Chat attached to it,
+// top-level or reply, as a Slack DM keys on its thread timestamp, so each
+// top-level ask is its own conversation and a reply typed in its thread
+// joins it (spec-chatops-gateway.md, "The Google Chat adapter").
 func gchatSurface(ev *gchatEvent) (kind, thread string) {
 	kind = sessionKindGroup
 	if ev.Space.SpaceType == gchatSpaceTypeDM || ev.Space.Type == gchatLegacySpaceTypeDM {
@@ -506,9 +505,6 @@ func gchatSurface(ev *gchatEvent) (kind, thread string) {
 	}
 	thread = ev.Message.Thread.Name
 	if ev.Space.SpaceThreadingState == gchatThreadingUnthreaded || ev.Space.SpaceType == gchatSpaceTypeGroupChat {
-		thread = ""
-	}
-	if kind == sessionKindDM && !ev.Message.ThreadReply {
 		thread = ""
 	}
 	return kind, thread

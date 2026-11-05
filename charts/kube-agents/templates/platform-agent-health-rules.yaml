@@ -63,7 +63,7 @@ the operator's scrape, so enabling them without it is refused at render.
 {{- $fell := "kubeagents:platformagent:proposals_fell_14d" }}
 {{- $times := "kubeagents_platformagent_usage_time_seconds" }}
 {{- $phase := "kubeagents_platformagent_phase" }}
-{{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
+{{- $jobs := list (printf "%s-gateway-monitoring" $agent) (printf "%s-gateway-chat-monitoring" $agent) (printf "%s-credential-proxy-monitoring" $agent) (printf "%s-kube-proxy-monitoring" $agent) (printf "%s-a2a-gateway-monitoring" $agent) (printf "%s-operator-monitoring" .Release.Name) }}
 {{- $who := "{{ $labels.agent_namespace }}/{{ $labels.agent }}" }}
 apiVersion: monitoring.googleapis.com/v1
 kind: Rules

@@ -75,6 +75,19 @@ class DenialClassifierTest(unittest.TestCase):
         '"container.clusters.list" permission(s) for "projects/kube-agents-evals-6".',
         "ERROR: (gcloud.storage.buckets.describe) HTTPError 403: x@google.com does not have "
         "storage.buckets.get access to the Google Cloud Storage bucket.",
+        # The Compute API's form, as the pool scan saw it on every project after
+        # the forge pieces check landed (#4430): no status code, no "denied".
+        "ERROR: (gcloud.compute.addresses.describe) Could not fetch resource:\n"
+        " - Required 'compute.addresses.get' permission for "
+        "'projects/kube-agents-evals-6/regions/us-central1/addresses/forge-ghes'",
+        # The DNS API's form, from the same scan.
+        "ERROR: (gcloud.dns.managed-zones.describe) HTTPError 403: Forbidden. This command is "
+        "authenticated as x@y.iam.gserviceaccount.com using the credentials in ...",
+        # The KMS and Service Usage entries are the gRPC form those APIs
+        # print, as the checks' own tests below stub it; the scan has not met
+        # either refusal, so these are the stubs and not observed lines.
+        "ERROR: (gcloud.kms.keys.versions.list) PERMISSION_DENIED: Permission denied on resource",
+        "ERROR: (gcloud.services.list) PERMISSION_DENIED: Permission denied to list services",
         "ERROR: (gcloud.projects.describe) User [x] does not have permission to access projects "
         "instance [y] (or it may not exist)",
         # Observed on 2026-08-27 against an existing SA in kube-agents-evals-6.
@@ -96,6 +109,12 @@ class DenialClassifierTest(unittest.TestCase):
         "ERROR: (gcloud.storage.buckets.describe) HTTPError 404: The specified bucket does not exist.",
         "ERROR: (gcloud.artifacts.repositories.describe) NOT_FOUND: Repository does not exist",
         "ERROR: (gcloud.kms.keys.describe) NOT_FOUND: CryptoKey not found",
+        # The Compute and DNS not-found forms, which the Compute refusal
+        # pattern must not reach.
+        "ERROR: (gcloud.compute.addresses.describe) Could not fetch resource:\n"
+        " - The resource 'projects/kube-agents-evals-6/regions/us-central1/addresses/forge-ghes' was not found",
+        "ERROR: (gcloud.dns.managed-zones.describe) HTTPError 404: The 'parameters.managedZone' "
+        "resource named 'eval-internal' does not exist.",
         # Observed on 2026-08-27. An absent service account answers NOT_FOUND
         # even when the caller cannot read the project it would live in, so the
         # two SA checks may still report a genuinely missing GSA as missing.
@@ -5648,6 +5667,27 @@ class PoolStateReaderMatchesTerraformTest(unittest.TestCase):
         block = re.search(r"pool_state_reader_roles\s*=\s*\[(.*?)\]", main, re.S)
         self.assertIsNotNone(block, "pool_state_reader_roles is gone from main.tf")
         self.assertEqual(sorted(re.findall(r'"([^"]+)"', block.group(1))), sorted(checker.POOL_STATE_READER_ROLES))
+
+    def test_every_gcloud_surface_read_names_a_granted_role(self):
+        # The surfaces the checks call, as the argv prefix `"gcloud", "<surface>"`
+        # (every read goes through run_cmd with a list). A new surface fails
+        # here until GCLOUD_SURFACE_READ_ROLES names its role and
+        # POOL_STATE_READER_ROLES carries it; a compute and a dns read landed
+        # without either, and the scan reported the pieces as drift.
+        source = (checker._ROOT / "scripts" / "verify_ci_pool_project.py").read_text()
+        surfaces = set(re.findall(r'"gcloud",\s*"([a-z-]+)"', source))
+        self.assertEqual(surfaces, set(checker.GCLOUD_SURFACE_READ_ROLES))
+        for surface, roles in checker.GCLOUD_SURFACE_READ_ROLES.items():
+            with self.subTest(surface=surface):
+                self.assertTrue(roles or surface == "auth", f"{surface} names no role")
+                self.assertLessEqual(set(roles), checker.POOL_STATE_READER_ROLES)
+                if surface != "auth":
+                    # A refusal fixture per API, so the denial patterns are
+                    # checked against that API's wording and not assumed.
+                    self.assertTrue(
+                        any(f"(gcloud.{surface}." in err for err in DenialClassifierTest.REFUSALS),
+                        f"no refusal fixture from gcloud {surface}",
+                    )
 
     def test_the_member_matches_the_variable_default(self):
         variables = _without_hcl_comments((checker._ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text())

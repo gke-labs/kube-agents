@@ -159,6 +159,15 @@ RECONCILE_SETTLE_SECONDS = 30
 # script, because the hourly `cluster-agent-reconcile` job runs it too and the
 # gateway's cron lock is per job id — a lock held here would not keep the two apart.
 RECONCILE_ALREADY_RUNNING = 4
+# `cluster_agent_reconcile.EXIT_CREATES_DEFERRED`: the run created its cap's worth of
+# profiles (BOOTSTRAP_MAX_CREATES_PER_TICK there, 100 by default) and left the rest for
+# the next run, so a fleet too large to scaffold inside the ceiling below arrives in
+# batches, one tick apart, rather than being killed mid-run every tick. Nothing failed,
+# so the attempt is given back as for a held lock.
+RECONCILE_CREATES_DEFERRED = 5
+# How much of the reconcile's stderr a deferral line repeats: its last lines carry the
+# created/deferred counts.
+RECONCILE_STDERR_TAIL_CHARS = 500
 # After this many failed reconciles, AND this much wall clock since the first of them,
 # the sweep proceeds anyway. A reconcile that cannot succeed (no IAM to list clusters)
 # must not hold onboarding shut forever — a solo sweep is a worse report, no report is
@@ -555,6 +564,20 @@ def ensure_cluster_agents(data_dir: Path) -> bool:
         # is expected. Give the attempt back: nothing was learned about the roster, and
         # counting it would spend the ceiling on contention.
         _record_reconcile_attempt(data_dir, attempts, since)
+        return False
+
+    if proc.returncode == RECONCILE_CREATES_DEFERRED:
+        # The run made progress and stopped at its cap; the next tick continues from
+        # the profiles it left. The listing succeeded and a cap's worth of creates did,
+        # so the reconcile can succeed here: the streak ends as it does on exit 0, and
+        # the give-up clock starts over. Carrying the old streak through would let the
+        # IAM-propagation failures a fresh install starts with trip the clock while the
+        # batches were still landing, and file the sweep against a partial roster.
+        _record_reconcile_attempt(data_dir, 0)
+        sys.stderr.write(
+            "bootstrap_scan_gate: reconcile created a batch of Cluster Agents and deferred the rest "
+            f"to the next tick. stderr: {proc.stderr.strip()[-RECONCILE_STDERR_TAIL_CHARS:]}\n"
+        )
         return False
 
     if proc.returncode != 0:

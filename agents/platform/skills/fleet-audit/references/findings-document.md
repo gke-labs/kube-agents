@@ -233,7 +233,7 @@ field, and publishes nothing:
   one declares an object you observed on the target cluster** before writing beside it. A `grep` for
   a name is kind-blind and matches label lines and shared prefixes, so a hit is not a declaration
   until you have read it. In directory mode that search is a `grep` over the clone; in content mode
-  it is the `grep` subcommand, which the broker runs over its own checkout, and `fetch` to read the
+  it is the `grep` subcommand, which searches a snapshot of the repository, and `fetch` to read the
   hits it named.
   **The parent directory must already exist in the repository**; if no sibling
   can be confirmed, or the hits straddle two directories you cannot tell apart, the finding is
@@ -241,7 +241,7 @@ field, and publishes nothing:
   you: it validates the shape of a path, not whether anything reconciles it, and it will create
   missing parents and commit the file happily. A manifest in a directory the deploying tool does not
   apply merges clean, closes the finding for exactly one run, and changes nothing on the cluster —
-  then returns next run as `pr-merged-persists`, where neither documented explanation fits.
+  then returns next run as `pr-merged-persists`, where none of the documented explanations fits.
 - **`finish` adds to each `manual` `note` where the fix belongs, from the collector's candidate.**
   It names the `declaration` file, or else the `release_declaration` file (its next sync or upgrade
   can revert a patch to the live object), or else the `namespace_directory` for a new object (with
@@ -400,7 +400,7 @@ What `finish` does with it:
 
 Where the sha comes from is the SOP's §4a, and it is the same for the harness and the worker: in
 content mode `list`, `grep` and `fetch` print it for the GitOps repository and
-`inspect_repository.py clone` and `open` print it for a context copy; in directory mode it is
+`inspect_repository.py clone` prints it for a context copy; in directory mode it is
 `git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that `clone` named for
 the context copy.
 

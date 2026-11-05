@@ -119,6 +119,14 @@ const (
 	// the platform label.
 	chatSessionsSeries = "kubeagents_chat_sessions_total"
 	a2aSessionsSeries  = "kubeagents_a2a_gateway_sessions_total"
+	// a2aPeopleSeenSeries is the A2A gateway's count of the distinct people
+	// it saw speak in each trailing window, by the window label: a gauge it
+	// serves for both windows together or for neither. The people reading
+	// (usageReadingPeople) maps the two windows to status.usage.
+	a2aPeopleSeenSeries  = "kubeagents_a2a_gateway_people_seen"
+	a2aPeopleWindowLabel = "window"
+	a2aPeopleWindowShort = "7d"
+	a2aPeopleWindowLong  = "30d"
 	// The broker's proposal readings (vcs_readings.py), gauges its readings
 	// sweep sets from what the forge reports now: the install's proposals by
 	// state; the closed ones by who closed them; the touches by anyone but
@@ -161,6 +169,15 @@ const (
 	// (GKE's own per-project quotas keep a fleet far below it) and refused, not
 	// clamped, so a body past it reads as the hostile or broken one it is.
 	usageClusterGaugeCeiling int64 = 10000
+	// dataVolumeSeries is the watcher's reading of the agent's data volume,
+	// one series per dataVolumeKindLabel value: the filesystem's size and the
+	// space a non-root writer has left. Read from the watcher's body beside
+	// the cluster gauge, and projected to status.storageStatus
+	// (usage_storage.go).
+	dataVolumeSeries    = "kubeagents_data_volume_bytes"
+	dataVolumeKindLabel = "kind"
+	dataVolumeKindTotal = "total"
+	dataVolumeKindFree  = "free"
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
@@ -270,16 +287,18 @@ func usageSiblingsFor(counter string) []usageSibling {
 	return nil
 }
 
-// usageReadingKind names one of the broker's two proposal readings, the value
-// of vcsReadingsAgeSeries's reading label: the outcomes, the proposals by
-// state, and the details, everything the sweep's second step reads. A sweep
-// can serve the first without the second, so each has its own presence and
-// its own miss streak.
+// usageReadingKind names one reading a target serves. Two are the broker's
+// proposal readings, the value of vcsReadingsAgeSeries's reading label: the
+// outcomes, the proposals by state, and the details, everything the sweep's
+// second step reads. A sweep can serve the first without the second, so each
+// has its own presence and its own miss streak. The third is the A2A
+// gateway's people reading, the people it saw in each window.
 type usageReadingKind string
 
 const (
 	usageReadingOutcomes usageReadingKind = "outcomes"
 	usageReadingDetails  usageReadingKind = "details"
+	usageReadingPeople   usageReadingKind = "people"
 )
 
 // usageReadingSpec is one status field a reading lands in: the family it is
@@ -287,8 +306,7 @@ const (
 // whether it is a sum over every matching sample or one sample's value. A
 // sum over no matching sample is a zero, since the broker serves only the
 // touch label sets it has seen; a single-sample field resolves only on its
-// sample, and a reading is present only when every field of it resolved and
-// its age series is in the body.
+// sample. When a reading is present is its kind's rule (usageReadingPresence).
 type usageReadingSpec struct {
 	field   string
 	family  string
@@ -306,18 +324,70 @@ var usageReadingSpecs = []usageReadingSpec{
 	{field: usageExportRemediationsClosedUnmerged, family: vcsProposalsClosedBySeries, filter: usageLabelFilter{vcsReadingsActorLabel: {vcsActorHuman: true, vcsActorBot: true}}, reading: usageReadingDetails, sum: true},
 	{field: usageExportProposalHumanTouches, family: vcsTouchesSeries, filter: usageLabelFilter{vcsReadingsActorLabel: {vcsActorHuman: true}}, reading: usageReadingDetails, sum: true},
 	{field: usageExportProposalsMergedUntouched, family: vcsTouchesPerProposalSeries, filter: usageLabelFilter{vcsReadingsOutcomeLabel: {vcsOutcomeMerged: true}, vcsReadingsLeLabel: {vcsLeUntouched: true}}, reading: usageReadingDetails},
+	{field: usageExportPeopleSeen7d, family: a2aPeopleSeenSeries, filter: usageLabelFilter{a2aPeopleWindowLabel: {a2aPeopleWindowShort: true}}, reading: usageReadingPeople},
+	{field: usageExportPeopleSeen30d, family: a2aPeopleSeenSeries, filter: usageLabelFilter{a2aPeopleWindowLabel: {a2aPeopleWindowLong: true}}, reading: usageReadingPeople},
 }
 
 // usageReadingKinds is every reading, in a fixed order.
-var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails}
+var usageReadingKinds = []usageReadingKind{usageReadingOutcomes, usageReadingDetails, usageReadingPeople}
+
+// usageReadingKindsOf is the entries of specs whose reading is one of kinds,
+// in their order.
+func usageReadingKindsOf(specs []usageReadingSpec, kinds ...usageReadingKind) []usageReadingSpec {
+	var out []usageReadingSpec
+	for _, spec := range specs {
+		if slices.Contains(kinds, spec.reading) {
+			out = append(out, spec)
+		}
+	}
+	return out
+}
+
+// usageReadingAged reports whether kind is one of the broker's readings, whose
+// presence needs its age series in the body.
+func usageReadingAged(kind usageReadingKind) bool {
+	return kind == usageReadingOutcomes || kind == usageReadingDetails
+}
+
+// usageReadingPresence is kind's rule for whether a body carried it. A
+// broker reading is present when its age series was in the body and every
+// single-sample field of it resolved, a sum resolving on no sample at all,
+// since the broker serves only the label sets it has seen. The people
+// reading is present when both its windows resolved, with no age series:
+// the gateway serves both windows together or neither, so one alone is no
+// reading.
+func usageReadingPresence(kind usageReadingKind) func(f *usageReadingFold) bool {
+	if usageReadingAged(kind) {
+		return func(f *usageReadingFold) bool {
+			if !f.aged[kind] {
+				return false
+			}
+			for i, spec := range f.specs {
+				if spec.reading == kind && !spec.sum && !f.resolved[i] {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return func(f *usageReadingFold) bool {
+		for i, spec := range f.specs {
+			if spec.reading == kind && !f.resolved[i] {
+				return false
+			}
+		}
+		return true
+	}
+}
 
 // usageReading is what one scrape yields: each wanted counter summed over its
 // label sets, the start time the body carried, nil when it carried none, and,
 // for the watcher's body alone, its cluster gauges; nil for any other body, so
 // that a poll can tell a watcher reporting no clusters from no watcher read.
-// For the broker's body alone, Readings holds the reading fields of every
-// reading present in it, by status field, and ReadingsPresent says which
-// readings those are; both nil for any other body. Neither is folded: the poll
+// For a target that serves readings, Readings holds the reading fields of
+// every requested reading present in its body, by status field, and
+// ReadingsPresent says, for each requested reading, whether it was; both nil
+// for any other body. Neither is folded: the poll
 // projects them as they stand.
 type usageReading struct {
 	Samples         map[string]int64
@@ -325,6 +395,16 @@ type usageReading struct {
 	Clusters        *usageClusterGauges
 	Readings        map[string]int64
 	ReadingsPresent map[usageReadingKind]bool
+	// DataVolume is the watcher's data volume reading, nil when the body
+	// carried no complete one: not the watcher's, or a watcher whose statfs
+	// failed, or one built before it exported the series.
+	DataVolume *usageDataVolume
+}
+
+// usageDataVolume is one reading of the agent's data volume, in bytes.
+type usageDataVolume struct {
+	Total int64
+	Free  int64
 }
 
 // usageClusterGauges is the watcher's view of the fleet in one body: the
@@ -396,7 +476,7 @@ func usageTimedOut(err error) bool {
 // test supplies a stub, and a deployment that cannot admit operator-to-pod
 // traffic could gain another without changing the accumulation or the writer.
 type usageSource interface {
-	Scrape(ctx context.Context, addr string, counters []string) (usageReading, error)
+	Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error)
 }
 
 // podUsageSource reads /metrics at a pod IP and port over the pod network.
@@ -425,9 +505,9 @@ func newPodUsageSource() *podUsageSource {
 }
 
 // Scrape GETs the listener at addr and folds the body for each of counters,
-// one sample per counter from the one body. Any status other than 200 is a
-// failed scrape.
-func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []string) (usageReading, error) {
+// one sample per counter from the one body, and for each of kinds. Any status
+// other than 200 is a failed scrape.
+func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+usageMetricsPath, nil)
 	if err != nil {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
@@ -440,25 +520,26 @@ func (s *podUsageSource) Scrape(ctx context.Context, addr string, counters []str
 	if resp.StatusCode != http.StatusOK {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindStatus, Status: resp.StatusCode}
 	}
-	return foldUsageBody(resp.Body, counters)
+	return foldUsageBody(resp.Body, counters, kinds)
 }
 
 // foldUsageBody scans body line by line and keeps none of it: a line that could
 // be a wanted family -- each counter's own, the start-time gauge, and for the
-// watcher's body the per-cluster up gauge, one that contains a wanted name as a
-// substring -- is parsed on its own with expfmt, and a metric expfmt names as
-// one of them is folded as it is read, a counter's into its running sum under
-// its label filter and the up gauge into the cluster counts; every other line
-// is skipped unread. The substring is only a prefilter: the parser,
+// watcher's body the per-cluster up gauge and the data volume pair, one that
+// contains a wanted name as a substring -- is parsed on its own with expfmt,
+// and a metric expfmt names as one of them is folded as it is read, a
+// counter's into its running sum under its label filter, the up gauge into the
+// cluster counts and the volume pair into one reading; every other line is
+// skipped unread. The substring is only a prefilter: the parser,
 // not a hand-read of the line, names the metric, so the name in a comment or a
 // label value adds nothing and a UTF-8 name the parser accepts is not dropped by
 // a stricter hand-read. A candidate line that does not parse, or a sample that
 // is negative or not finite, is a failed scrape; a wanted line past the bound is
 // too, but a line of any other family past the bound is skipped, not a failure
-// (usageReadScrapeLine). The broker's body, the one whose counters include the
-// proposals counter, is read for the proposal readings as well
-// (usageReadingSpecs), each field folded under its filter.
-func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
+// (usageReadScrapeLine). A body asked for readings, kinds, is read for the
+// fields of those readings as well (usageReadingSpecs), each field folded under
+// its filter.
+func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) (usageReading, error) {
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	sums := make(map[string]float64, len(counters))
 	var start *float64
@@ -468,6 +549,8 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 	// each through its own filter: the broker's tool counter is read into
 	// two, over disjoint statuses.
 	var clusters *usageClusterGauges
+	// volume collects the data volume series; a reading needs both kinds.
+	var volume map[string]float64
 	// readsOf is every (counter, filter) pair a family feeds, so a sibling
 	// family takes its own filter, not the one its counter's own family takes.
 	readsOf := make(map[string][]usageRead, len(counters))
@@ -487,16 +570,21 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 		}
 		if family == eventsInjectedSeries {
 			clusters = &usageClusterGauges{}
-			wanted = append(wanted, clusterUpSeries)
+			volume = map[string]float64{}
+			wanted = append(wanted, clusterUpSeries, dataVolumeSeries)
 		}
 	}
-	// The reading slot, for the broker's body alone: a running sum per spec,
-	// whether a sample resolved it, and the readings whose age series the
-	// body carries.
+	// The reading slot, for a body asked for readings: a running sum per spec
+	// of the kinds asked for, whether a sample resolved it, and the readings
+	// whose age series the body carries.
 	var readings *usageReadingFold
-	if slices.Contains(counters, usageCounterRemediationsProposed) {
-		readings = newUsageReadingFold()
-		for _, family := range append([]string{vcsReadingsAgeSeries}, usageReadingFamilies()...) {
+	if len(kinds) > 0 {
+		readings = newUsageReadingFold(kinds)
+		families := readings.families()
+		if slices.ContainsFunc(kinds, usageReadingAged) {
+			families = append([]string{vcsReadingsAgeSeries}, families...)
+		}
+		for _, family := range families {
 			if !slices.Contains(wanted, family) {
 				wanted = append(wanted, family)
 			}
@@ -556,6 +644,12 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 						start = &captured
 						continue
 					}
+					if name == dataVolumeSeries {
+						if kind := usageLabelValue(metric, dataVolumeKindLabel); kind == dataVolumeKindTotal || kind == dataVolumeKindFree {
+							volume[kind] = value
+						}
+						continue
+					}
 					if name == clusterUpSeries {
 						clusters.Registered++
 						if clusters.Registered > usageClusterGaugeCeiling {
@@ -588,7 +682,7 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 		}
 		samples[counter] = int64(sum)
 	}
-	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters}
+	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume)}
 	if readings != nil {
 		var ok bool
 		if out.Readings, out.ReadingsPresent, ok = readings.result(); !ok {
@@ -598,25 +692,47 @@ func foldUsageBody(body io.Reader, counters []string) (usageReading, error) {
 	return out, nil
 }
 
-// usageReadingFold is the reading slot's state through one broker body.
+// usageDataVolumeReading turns the data volume series a body carried into a
+// reading, or nil when it carried neither kind, only one, or a pair no statfs
+// produces (free past total, or a size past int64). Nil rather than a failed
+// scrape, so such a pair costs the volume fields and not the counters and
+// cluster gauges read from the same body. A NaN or negative sample fails the
+// whole scrape in foldUsageBody's sample check, as it does for any series.
+func usageDataVolumeReading(volume map[string]float64) *usageDataVolume {
+	total, hasTotal := volume[dataVolumeKindTotal]
+	free, hasFree := volume[dataVolumeKindFree]
+	if !hasTotal || !hasFree || total >= float64(math.MaxInt64) || free > total {
+		return nil
+	}
+	return &usageDataVolume{Total: int64(total), Free: int64(free)}
+}
+
+// usageReadingFold is the reading slot's state through one body: the kinds
+// asked for, their specs, and per spec its running sum and whether a sample
+// resolved it.
 type usageReadingFold struct {
+	kinds    []usageReadingKind
+	specs    []usageReadingSpec
 	sums     []float64
 	resolved []bool
 	aged     map[usageReadingKind]bool
 }
 
-func newUsageReadingFold() *usageReadingFold {
+func newUsageReadingFold(kinds []usageReadingKind) *usageReadingFold {
+	specs := usageReadingKindsOf(usageReadingSpecs, kinds...)
 	return &usageReadingFold{
-		sums:     make([]float64, len(usageReadingSpecs)),
-		resolved: make([]bool, len(usageReadingSpecs)),
+		kinds:    kinds,
+		specs:    specs,
+		sums:     make([]float64, len(specs)),
+		resolved: make([]bool, len(specs)),
 		aged:     map[usageReadingKind]bool{},
 	}
 }
 
-// usageReadingFamilies is every family a reading field is read from.
-func usageReadingFamilies() []string {
+// families is every family a field of the fold's readings is read from.
+func (f *usageReadingFold) families() []string {
 	var families []string
-	for _, spec := range usageReadingSpecs {
+	for _, spec := range f.specs {
 		if !slices.Contains(families, spec.family) {
 			families = append(families, spec.family)
 		}
@@ -627,15 +743,15 @@ func usageReadingFamilies() []string {
 // fold takes one sample of family name into the reading fields it feeds, or
 // marks a reading aged, and reports whether name is a readings family.
 func (f *usageReadingFold) fold(name string, metric *dto.Metric, value float64) bool {
-	if name == vcsReadingsAgeSeries {
+	if name == vcsReadingsAgeSeries && slices.ContainsFunc(f.kinds, usageReadingAged) {
 		kind := usageReadingKind(usageLabelValue(metric, vcsReadingsReadingLabel))
-		if slices.Contains(usageReadingKinds, kind) {
+		if slices.Contains(f.kinds, kind) && usageReadingAged(kind) {
 			f.aged[kind] = true
 		}
 		return true
 	}
 	matched := false
-	for i, spec := range usageReadingSpecs {
+	for i, spec := range f.specs {
 		if spec.family != name {
 			continue
 		}
@@ -657,22 +773,17 @@ func (f *usageReadingFold) fold(name string, metric *dto.Metric, value float64) 
 	return matched
 }
 
-// result is the readings present in the body and their fields' values: a
-// reading is present when its age series was in the body and every field of
-// it resolved, a sum resolving on no sample at all. ok is false when a value
-// is past the float64-exact ceiling, which no forge's count reaches.
+// result is, for each reading asked for, whether the body carried it by its
+// kind's rule (usageReadingPresence), and the fields' values of those it
+// carried. ok is false when a value is past the float64-exact ceiling, which
+// no count reaches.
 func (f *usageReadingFold) result() (values map[string]int64, present map[usageReadingKind]bool, ok bool) {
 	present = map[usageReadingKind]bool{}
-	for _, kind := range usageReadingKinds {
-		present[kind] = f.aged[kind]
-	}
-	for i, spec := range usageReadingSpecs {
-		if !spec.sum && !f.resolved[i] {
-			present[spec.reading] = false
-		}
+	for _, kind := range f.kinds {
+		present[kind] = usageReadingPresence(kind)(f)
 	}
 	values = map[string]int64{}
-	for i, spec := range usageReadingSpecs {
+	for i, spec := range f.specs {
 		if f.sums[i] > float64(usageTotalCeiling) {
 			return nil, nil, false
 		}

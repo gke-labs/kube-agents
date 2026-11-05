@@ -81,7 +81,7 @@ class GcpTest(unittest.TestCase):
         body = json.dumps({
             "name": "c", "location": "us-east4", "status": "RUNNING", "endpoint": "1.2.3.4",
             "controlPlaneEndpointsConfig": {"dnsEndpointConfig": {"endpoint": "c.example"}},
-            "autopilot": {"enabled": True},
+            "autopilot": {"enabled": True}, "currentNodeCount": 3,
             "masterAuth": {"clusterCaCertificate": "CA", "clientCertificate": "CERT", "clientKey": "KEY",
                            "username": "admin", "password": "pw"},
             "nodePools": [{}], "legacyAbac": {"enabled": True},
@@ -270,6 +270,133 @@ class K8sTest(unittest.TestCase):
             self.evaluate("api/v1/namespaces/default/configmaps/app", query={"watch": ["1"]}).rule_id, w.RULE_K8S_QUERY
         )
 
+    COUNT_ACCEPT = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+
+    def count(self, path, query=None, accept=COUNT_ACCEPT):
+        return w.evaluate_k8s("GET", TARGET + path, {"limit": ["1"]} if query is None else query, accept)
+
+    def test_the_five_count_lists_are_allowed_with_limit_one_and_the_metadata_accept(self):
+        for path in sorted(w.COUNT_LIST_PATHS):
+            with self.subTest(path=path):
+                self.assertEqual(self.count(path).rule_id, w.RULE_K8S_COUNT_LIST)
+        self.assertEqual(
+            w.COUNT_LIST_PATHS,
+            {"api/v1/pods", "apis/apps/v1/deployments", "apis/apps/v1/statefulsets",
+             "apis/apps/v1/daemonsets", "apis/batch/v1/cronjobs"},
+        )
+
+    def test_a_count_list_takes_any_accept_whose_every_range_is_metadata_only(self):
+        for accept in (
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            "application/vnd.kubernetes.protobuf;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            "application/vnd.kubernetes.protobuf;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,"
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            "application/json; as=PartialObjectMetadataList; g=meta.k8s.io; v=v1",
+        ):
+            with self.subTest(accept=accept):
+                self.assertEqual(self.count("api/v1/pods", accept=accept).rule_id, w.RULE_K8S_COUNT_LIST)
+
+    def test_a_count_list_without_the_metadata_accept_is_refused(self):
+        # The one item would come back whole: a pod's environment, a CronJob's
+        # template. One plain range beside the metadata one is enough for the
+        # server to pick it.
+        for accept in (
+            "",
+            "application/json",
+            "application/vnd.kubernetes.protobuf,application/json",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1,application/json",
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+            "application/json;as=Table;g=meta.k8s.io;v=v1",
+            'application/json;as="PartialObjectMetadataList";g=meta.k8s.io;v=v1',
+            "application/json;AS=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            "application/json;as=partialobjectmetadatalist;g=meta.k8s.io;v=v1",
+            ",application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            # The server keeps the last duplicate, so a second `as` after the
+            # metadata one would answer a Table: printer columns are spec and
+            # status.
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;as=Table",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;as = Table",
+            "application/json;as=Table;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;v=v1beta1",
+            # Missing, extra or valueless parameters: not the table the Go
+            # client sends.
+            "application/json;as=PartialObjectMetadataList",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;charset=utf-8",
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1;q",
+            "application/json;as=PartialObjectMetadataList;g=example.com;v=v1",
+        ):
+            with self.subTest(accept=accept):
+                self.assertEqual(self.count("api/v1/pods", accept=accept).rule_id, w.RULE_K8S_ACCEPT)
+
+    def test_a_count_list_carries_exactly_limit_one(self):
+        # The query is compared whole, so a limit below one (0, blank, -1: a
+        # "limit at most 1" would take them, and the server reads 0 and blank
+        # as no limit) and a spelling of one that is not "1" are refused too.
+        for query in (
+            {},
+            {"limit": ["0"]},
+            {"limit": [""]},
+            {"limit": ["-1"]},
+            {"limit": ["01"]},
+            {"limit": ["2"]},
+            {"limit": ["500"]},
+            {"limit": ["1", "1"]},
+            {"limit": ["1"], "labelSelector": ["app=web"]},
+            {"limit": ["1"], "fieldSelector": ["spec.nodeName=n1"]},
+            {"limit": ["1"], "continue": ["abc"]},
+            {"limit": ["1"], "watch": ["true"]},
+            {"limit": ["1"], "resourceVersion": ["0"]},
+            {"watch": ["true"]},
+        ):
+            with self.subTest(query=query):
+                self.assertEqual(self.count("api/v1/pods", query=query).rule_id, w.RULE_K8S_QUERY)
+
+    def test_a_count_of_anything_but_the_five_is_refused(self):
+        # The namespaced forms, the kinds a count would be a dump of, the
+        # plurals under another group or version, and a trailing slash.
+        for path in (
+            "api/v1/namespaces/default/pods",
+            "apis/apps/v1/namespaces/default/deployments",
+            "api/v1/secrets",
+            "api/v1/nodes",
+            "api/v1/configmaps",
+            "api/v1/serviceaccounts",
+            "apis/apps/v1/replicasets",
+            "apis/batch/v1/jobs",
+            "apis/apps/v1beta1/deployments",
+            "apis/example.com/v1/deployments",
+            "apis/batch/v1/pods",
+            "api/v1/pods/",
+            "api/v1/watch/pods",
+        ):
+            with self.subTest(path=path):
+                decision = self.count(path)
+                self.assertFalse(decision.allowed)
+                self.assertNotEqual(decision.rule_id, w.RULE_K8S_COUNT_LIST)
+        self.assertEqual(self.count("api/v1/events").rule_id, w.RULE_K8S_EVENTS)
+
+    def test_the_metadata_accept_changes_nothing_for_events_and_named_reads(self):
+        self.assertEqual(
+            w.evaluate_k8s("GET", TARGET + "api/v1/events", {"limit": ["500"]}, self.COUNT_ACCEPT).rule_id,
+            w.RULE_K8S_EVENTS,
+        )
+        self.assertEqual(
+            w.evaluate_k8s("GET", TARGET + "api/v1/namespaces/default/configmaps/app", {}, self.COUNT_ACCEPT).rule_id,
+            w.RULE_K8S_NAMED_GET,
+        )
+        self.assertEqual(
+            w.evaluate_k8s("GET", TARGET + "api/v1/namespaces/default/pods", {"limit": ["1"]}, self.COUNT_ACCEPT).rule_id,
+            w.RULE_K8S_PATH,
+        )
+
+    def test_the_cluster_projection_keeps_the_node_count_and_drops_the_rest(self):
+        relayed = json.loads(w.project_cluster(json.dumps({
+            "name": "c", "currentNodeCount": 7, "nodePools": [{"name": "default-pool"}],
+            "masterAuth": {"clusterCaCertificate": "CA", "clientKey": "KEY"},
+        }).encode()))
+        self.assertEqual(relayed, {"name": "c", "currentNodeCount": 7, "masterAuth": {"clusterCaCertificate": "CA"}})
+
     def test_a_malformed_target_is_refused(self):
         for rest in ("kagents-dev/us-east4/Fleet_A/api/v1/events", "KAGENTS/us-east4/c/api/v1/events", "a/b/c"):
             with self.subTest(rest=rest):
@@ -279,6 +406,8 @@ class K8sTest(unittest.TestCase):
         for decision in (
             w.evaluate_k8s("GET", TARGET + "api/v1/MARKER", {}),
             w.evaluate_k8s("MARKER", TARGET + "api/v1/events", {}),
+            w.evaluate_k8s("GET", TARGET + "api/v1/pods", {"limit": ["MARKER"]}),
+            w.evaluate_k8s("GET", TARGET + "api/v1/pods", {"limit": ["1"]}, "MARKER"),
             w.evaluate_gcp("GET", "MARKER.googleapis.com", "MARKER", b"", SUB),
         ):
             with self.subTest(rule=decision.rule_id):

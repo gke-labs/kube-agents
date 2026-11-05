@@ -13,6 +13,7 @@ profile copy that would otherwise keep exporting to the old collector forever.
 import importlib.util
 import io
 import pathlib
+import re
 import shutil
 import sys
 import tempfile
@@ -29,6 +30,13 @@ sys.modules["otel_config"] = oc
 _spec.loader.exec_module(oc)
 
 BAKED = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces"
+# The plugin's orphan-sweep TTL the image bakes (deploy/docker/Dockerfile,
+# HERMES_OTEL_ROOT_SPAN_TTL_MS): 4 h, a ceiling chosen well above any observed
+# turn. Pinned here as a literal so a Dockerfile edit that shrinks it back under a
+# fleet audit's length (the plugin's own default is 10 min, #3220) fails this file
+# rather than Cloud Trace.
+ROOT_SPAN_TTL_MS = 14_400_000
+_DOCKERFILE = pathlib.Path(__file__).resolve().parents[1] / "deploy" / "docker" / "Dockerfile"
 CUSTOM = "http://otel-collector.otel-collector.svc.cluster.local:4318"
 
 
@@ -67,7 +75,7 @@ class ApplyTest(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         backend = {"name": "gke-managed-otel", "type": "otlp", "endpoint": BAKED}
         backend.update(extra)
-        path.write_text(yaml.safe_dump({"backends": [backend]}))
+        path.write_text(yaml.safe_dump({"backends": [backend], "root_span_ttl_ms": ROOT_SPAN_TTL_MS}))
         return path
 
     def load(self, path=None):
@@ -219,6 +227,32 @@ class ApplyTest(unittest.TestCase):
         self.assertTrue(oc.apply(self.config, service_name="agent-gateway", source_path=pristine))
         self.assertEqual(self.load()["backends"][0]["endpoint"], BAKED)
 
+    def test_source_path_carries_the_baked_span_ttl_into_a_stale_copy(self):
+        """A PVC copy baked before the TTL existed gains it on the next start (#3220)."""
+        pristine = self.write_baked(self.tmp / "defaults" / "hermes_otel" / "config.yaml")
+        self.config.write_text(yaml.safe_dump({"backends": [{"name": "gke-managed-otel", "type": "otlp", "endpoint": BAKED}]}))
+
+        self.assertTrue(oc.apply(self.config, service_name="agent-gateway", source_path=pristine))
+        self.assertEqual(self.load()["root_span_ttl_ms"], ROOT_SPAN_TTL_MS)
+
+
+class BakedSpanTTLTest(unittest.TestCase):
+    """The Dockerfile bakes the sweep TTL the tests above assume, and checks it back."""
+
+    def setUp(self):
+        self.dockerfile = _DOCKERFILE.read_text()
+
+    def test_the_arg_is_pinned(self):
+        found = re.search(r"^ARG HERMES_OTEL_ROOT_SPAN_TTL_MS=(\d+)$", self.dockerfile, re.M)
+        self.assertIsNotNone(found, "the Dockerfile no longer declares HERMES_OTEL_ROOT_SPAN_TTL_MS")
+        self.assertEqual(int(found.group(1)), ROOT_SPAN_TTL_MS)
+
+    def test_the_plugin_step_writes_and_greps_the_arg(self):
+        """The ARG reaches the baked file and is read back, whatever the one-liner's quoting."""
+        lines = [line for line in self.dockerfile.splitlines() if "${HERMES_OTEL_ROOT_SPAN_TTL_MS}" in line]
+        self.assertTrue(any("root_span_ttl_ms" in line and "write_text" in line for line in lines), "no write of root_span_ttl_ms from the ARG")
+        self.assertTrue(any("grep" in line and "root_span_ttl_ms" in line and "hermes_otel/config.yaml" in line for line in lines), "no grep of the baked root_span_ttl_ms")
+
 
 class ApplyAllTest(unittest.TestCase):
     def setUp(self):
@@ -230,7 +264,7 @@ class ApplyAllTest(unittest.TestCase):
 
     def baked(self, path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(yaml.safe_dump({"backends": [{"name": "gke-managed-otel", "type": "otlp", "endpoint": BAKED}]}))
+        path.write_text(yaml.safe_dump({"backends": [{"name": "gke-managed-otel", "type": "otlp", "endpoint": BAKED}], "root_span_ttl_ms": ROOT_SPAN_TTL_MS}))
         return path
 
     def endpoint_of(self, path):

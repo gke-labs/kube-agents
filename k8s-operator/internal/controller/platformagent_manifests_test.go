@@ -958,8 +958,11 @@ func TestBuildDeployment(t *testing.T) {
 	if _, ok := volumesMap["fluent-bit-config"]; !ok {
 		t.Errorf("expected fluent-bit-config volume, not found")
 	}
-	if _, ok := volumesMap["fluent-bit-state"]; !ok {
-		t.Errorf("expected fluent-bit-state volume, not found")
+	if _, ok := volumesMap["fluent-bit-state"]; ok {
+		// The tail cursors live on the system-metadata claim now
+		// (TestFluentBitKeepsItsCursorsOnTheMetadataClaim); an emptyDir here would
+		// lose them with the pod again.
+		t.Errorf("fluent-bit-state emptyDir is back; the tail cursors belong on the system-metadata claim")
 	}
 	if _, ok := volumesMap["system-metadata"]; !ok {
 		t.Errorf("expected system-metadata volume, not found")
@@ -1264,6 +1267,21 @@ func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
+	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
+	// reconcile run scaffolds; the site documents it as a spec.deployment.env
+	// entry, which only reaches the agent container through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "BOOTSTRAP_MAX_CREATES_PER_TICK", Value: "25"},
+		{Name: "BOOTSTRAP_MAX_CREATES_PER_TICK", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{Key: "cap"},
+		}},
+	})
+	if len(got) != 1 || got[0].Name != "BOOTSTRAP_MAX_CREATES_PER_TICK" || got[0].Value != "25" || got[0].ValueFrom != nil {
+		t.Fatalf("expected only the literal BOOTSTRAP_MAX_CREATES_PER_TICK=25 to pass, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without
@@ -1478,6 +1496,25 @@ func TestSafeSandboxEnvOverridesPassesWorkloadDedupWindow(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
+	// agent_roster.py reads the threshold from the agent container's own
+	// environment (and the router MCP child's, through the chat config's env
+	// block); off the allowlist, the documented spec.deployment.env entry never
+	// reaches either.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD", Value: "1"}})
+	if len(got) != 1 || got[0].Name != "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD" || got[0].Value != "1" {
+		t.Errorf("expected KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD=1 to pass, got %#v", got)
+	}
+	// Literal values only, as for every name on the list.
+	got = safeSandboxEnvOverrides([]corev1.EnvVar{{
+		Name:      "KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD",
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "n"}},
+	}})
+	if len(got) != 0 {
+		t.Errorf("a ValueFrom KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD must not pass, got %#v", got)
+	}
+}
+
 func TestBuildCredentialProxyContainer(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -1509,19 +1546,18 @@ func TestBuildCredentialProxyContainer(t *testing.T) {
 	}
 	// Pinned here as well as in the goldens: a golden regeneration blesses
 	// whatever the builder renders, so a request that drifted back down would
-	// otherwise pass every test. 500m is what lets a mint finish inside its
-	// five-second timeouts while an evicted pod's replacement warms up, and
-	// 1Gi is the memory the child memory budget needs when Autopilot without
-	// bursting makes the request the limit: above the 512Mi the CPU:memory
-	// band would admit a 500m pod at, and above the budget's 672Mi floor.
+	// otherwise pass every test. This is the Standard render: 500m lets a mint
+	// finish inside its timeouts while an evicted pod's replacement warms up,
+	// 1Gi is above the budget's 672Mi floor, and the 2 CPU limit is the load
+	// measurement's figure (#4106), which the broker bursts to.
 	if got := container.Resources.Requests.Cpu().String(); got != "500m" {
 		t.Errorf("expected a 500m CPU request on the proxy container, got %s", got)
 	}
 	if got := container.Resources.Requests.Memory().String(); got != "1Gi" {
 		t.Errorf("expected a 1Gi memory request on the proxy container, got %s", got)
 	}
-	if got := container.Resources.Limits.Cpu().String(); got != "1" {
-		t.Errorf("expected the proxy CPU limit left at 1, got %s", got)
+	if got := container.Resources.Limits.Cpu().String(); got != "2" {
+		t.Errorf("expected a 2 CPU limit on the proxy container, got %s", got)
 	}
 	env := make(map[string]corev1.EnvVar)
 	for _, item := range container.Env {
@@ -2554,6 +2590,86 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 	if !strings.Contains(fbConf, "Name              tail") {
 		t.Errorf("expected fluent-bit.conf to contain Input Name tail")
+	}
+}
+
+// The tail cursors survive the pod. The sidecar keeps both DB files in a
+// per-agent directory on the system-metadata claim, read-write, and the
+// rendered config points each input at that directory; an emptyDir would start
+// every replacement pod from byte zero, and the agent's data claim is mounted
+// at its root by containers that run model-authored code, which could rewrite
+// a cursor into a file SQLite cannot open. So the claim's only other mounts
+// stay at subPath session, which is the isolation this test holds.
+func TestFluentBitKeepsItsCursorsOnTheMetadataClaim(t *testing.T) {
+	// The dashboard is on by default, so the isolation check below sees it.
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	if !isDashboardEnabled(agent) {
+		t.Fatal("the dashboard must render here for the isolation check to cover it")
+	}
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
+	pod := dep.Spec.Template.Spec
+
+	const wantSubPath = "fluent-bit-state/my-agent"
+	fb := containerByName(t, pod.Containers, "fluent-bit")
+	var stateMounts []corev1.VolumeMount
+	for _, m := range fb.VolumeMounts {
+		if m.Name == "system-metadata" {
+			stateMounts = append(stateMounts, m)
+		}
+	}
+	if len(stateMounts) != 1 {
+		t.Fatalf("fluent-bit mounts system-metadata %d times, want 1: %+v", len(stateMounts), fb.VolumeMounts)
+	}
+	got := stateMounts[0]
+	if got.MountPath != "/var/lib/fluent-bit" || got.SubPath != wantSubPath || got.ReadOnly {
+		t.Errorf("fluent-bit's system-metadata mount is %+v, want /var/lib/fluent-bit at subPath %s, read-write", got, wantSubPath)
+	}
+
+	// The per-agent directory is reached by this container alone. Every other
+	// container in the pod, init containers included, mounts the claim at
+	// subPath session or not at all; a root mount or a second subPath into
+	// fluent-bit-state would hand the cursors to a container the sidecar does not
+	// trust.
+	all := append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...)
+	for _, c := range all {
+		if c.Name == "fluent-bit" {
+			continue
+		}
+		for _, m := range c.VolumeMounts {
+			if m.Name == "system-metadata" && m.SubPath != "session" {
+				t.Errorf("container %s mounts system-metadata at subPath %q; only fluent-bit may leave session", c.Name, m.SubPath)
+			}
+		}
+	}
+
+	// Both inputs keep their positions under the mount, each in its own locked
+	// file; a DB on the read-only root or on a path that is not mounted would
+	// fail to open at start. The journal mode is the rollback journal, not WAL:
+	// the claim is a gofer-backed mount under a runtime class, where WAL mode
+	// corrupts (sqliteJournalModeDelete), and a corrupt cursor on a claim
+	// outlives the pod.
+	fbConf := buildFluentBitConfigMap(agent).Data["fluent-bit.conf"]
+	inputs := fluentBitSections(fbConf, "[INPUT]")
+	if len(inputs) != 2 {
+		t.Fatalf("fluent-bit.conf has %d [INPUT] sections, want 2:\n%s", len(inputs), fbConf)
+	}
+	wantDB := map[string]string{
+		"agent.logs":  "/var/lib/fluent-bit/fluent-bit.db",
+		"agent.audit": "/var/lib/fluent-bit/fluent-bit-audit.db",
+	}
+	for _, section := range inputs {
+		tag := fluentBitField(section, "Tag")
+		if db := fluentBitField(section, "DB"); db != wantDB[tag] {
+			t.Errorf("the %s input's DB is %q, want %q:\n%s", tag, db, wantDB[tag], section)
+		}
+		if locking := fluentBitField(section, "DB.locking"); locking != "true" {
+			t.Errorf("the %s input's DB.locking is %q, want true:\n%s", tag, locking, section)
+		}
+		if mode := fluentBitField(section, "DB.journal_mode"); mode != "delete" {
+			t.Errorf("the %s input's DB.journal_mode is %q, want delete:\n%s", tag, mode, section)
+		}
 	}
 }
 
@@ -5931,6 +6047,34 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 	}
 }
 
+// The chart's platformAgent.deployment.eventWatcher renders the watcher's tuning
+// settings as WATCHER_* entries in spec.deployment.env, and
+// deploy/shared/start-services.sh reads them in this container. So each entry,
+// a valueFrom entry included, has to arrive here once and unchanged: a reserved
+// name or a prefix filter would make every chart setting do nothing.
+func TestDeploymentEnvReachesTheEventWatcherSettings(t *testing.T) {
+	fromConfigMap := &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "watcher"}, Key: "span",
+	}}
+	custom := []corev1.EnvVar{
+		{Name: "WATCHER_SETTLE", Value: "3m"},
+		{Name: "WATCHER_BACKOFF_MIN_COUNT", Value: "4"},
+		{Name: "WATCHER_FAILEDSCHEDULING_MIN_SPAN", ValueFrom: fromConfigMap},
+	}
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: custom}
+
+	got := map[string][]corev1.EnvVar{}
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		got[e.Name] = append(got[e.Name], e)
+	}
+	for _, want := range custom {
+		if entries := got[want.Name]; len(entries) != 1 || !reflect.DeepEqual(entries[0], want) {
+			t.Errorf("agent-api-auth env %s = %+v, want exactly %+v", want.Name, entries, want)
+		}
+	}
+}
+
 // agentWithDriftDetector builds a PlatformAgent whose harness names the drift
 // detector. The harness triple is filled in, because the detector's own gate
 // requires it and a fixture without it would make every "enabled" case look
@@ -7743,5 +7887,61 @@ func TestLeaderRolePodsRuleVerbsAboveOneReplica(t *testing.T) {
 		if slices.Contains(r.Resources, "pods") {
 			t.Errorf("a pods rule at one replica: %v", r)
 		}
+	}
+}
+
+// The gateway's startup and readiness probes run the same curl against the
+// Hermes API on loopback. curl carries its own --max-time under kubelet's
+// TimeoutSeconds, so a hung listener is reported as curl's exit 28 rather
+// than cut off by kubelet's exec kill; each timeout stays within its probe's
+// period so a slow check never delays the next tick; and the startup probe's
+// budget is the 905s cold boot gatewayProgressDeadlineSeconds is sized over.
+// The golden manifests pin the exact numbers; this test holds the relations
+// between them.
+func TestAgentAPIProbesTimeOutUnderKubeletAndKeepTheStartupBudget(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+	}
+	dep := buildDeployment(agent, "hash1", "hash2", "hash3", "hash4", nil, renderOptions{imageVolumeSupported: true})
+	c, ok := findContainer(dep.Spec.Template.Spec, "platform-agent")
+	if !ok {
+		t.Fatal("the platform-agent container is missing")
+	}
+	maxTime := regexp.MustCompile(`--max-time (\d+)`)
+	probes := map[string]*corev1.Probe{"startup": c.StartupProbe, "readiness": c.ReadinessProbe}
+	for name, probe := range probes {
+		if probe == nil || probe.Exec == nil || len(probe.Exec.Command) == 0 {
+			t.Fatalf("%s probe = %+v, want an exec probe", name, probe)
+		}
+		cmd := strings.Join(probe.Exec.Command, " ")
+		for _, want := range []string{
+			`http://127.0.0.1:8642/api/sessions?limit=1`,
+			`-H "Authorization: Bearer $API_SERVER_KEY"`,
+			`[ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION" = "true" ] && exit 0`,
+		} {
+			if !strings.Contains(cmd, want) {
+				t.Errorf("%s probe command %q lacks %q", name, cmd, want)
+			}
+		}
+		m := maxTime.FindStringSubmatch(cmd)
+		if m == nil {
+			t.Errorf("%s probe command %q has no curl --max-time: a hung listener would run to kubelet's kill", name, cmd)
+		} else if secs, _ := strconv.Atoi(m[1]); secs <= 0 || int32(secs) >= probe.TimeoutSeconds {
+			t.Errorf("%s probe --max-time %d must sit under TimeoutSeconds %d", name, secs, probe.TimeoutSeconds)
+		}
+		if probe.TimeoutSeconds > probe.PeriodSeconds {
+			t.Errorf("%s probe TimeoutSeconds %d exceeds PeriodSeconds %d: a slow check would skip the next tick", name, probe.TimeoutSeconds, probe.PeriodSeconds)
+		}
+	}
+	startup, readiness := probes["startup"], probes["readiness"]
+	budget := startup.InitialDelaySeconds + startup.PeriodSeconds*startup.FailureThreshold
+	if budget != 905 {
+		t.Errorf("startup probe budget = %ds, want the 905s cold boot gatewayProgressDeadlineSeconds is sized over", budget)
+	}
+	if budget >= gatewayProgressDeadlineSeconds {
+		t.Errorf("startup probe budget %ds must stay under gatewayProgressDeadlineSeconds %d", budget, gatewayProgressDeadlineSeconds)
+	}
+	if window := readiness.PeriodSeconds * readiness.FailureThreshold; window >= budget {
+		t.Errorf("readiness withdraws after %ds, which is not quicker than the %ds startup budget", window, budget)
 	}
 }
