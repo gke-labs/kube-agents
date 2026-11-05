@@ -1197,7 +1197,8 @@
 # root-cause attribution across the three planted zonal-skew roles on slot d
 # (zonal-skew-scheduling, zonal-skew-volume, zonal-skew-capacity in namespace
 # seeded-topology) plus the capacity role's sponge, the single-zone node-pool
-# case leeway reports nothing for, and that `leeway report` ran. deployer:
+# case (`selector_confined` under `--topology-tier-c-signals`, silent without
+# it), and that `leeway report` ran. deployer:
 # noop, read-only, off the infra lock.
 ./tasks/topology-zonal-skew-probe/task.yaml
 
