@@ -2211,7 +2211,9 @@ func TestWaitForTurnStepFollowsDelegatedChildAfterTurnWatchCloses(t *testing.T) 
 	publishResult(t, js, "cluster-a", childID, wakeAnswer)
 	publishStatus(t, js, "cluster-a", childID, lib.StateCompleted, true)
 
-	deadline := time.Now().Add(2 * time.Second)
+	// Settling waits out delegationSettle after the child's end, so the
+	// deadline has to outlast it.
+	deadline := time.Now().Add(delegationSettle + 3*time.Second)
 	var finalOut TurnStepOutcome
 	for time.Now().Before(deadline) {
 		finalOut, err = b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 150*time.Millisecond)
