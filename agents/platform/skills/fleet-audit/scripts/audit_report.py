@@ -1800,6 +1800,7 @@ PRECHECK_REASON_PERIODIC_REFRESH = "the last full synthesis is a week or more ol
 PRECHECK_CONTINUES_SUFFIX = "; the SOP continues as a full run"
 PRECHECK_PENDING_REQUESTS_REASON = "a /remediate request is pending on the ledger for {ids}"
 PRECHECK_LEDGER_UNREAD_REASON = "the ledger's requests could not be read ({error})"
+PRECHECK_CONVERSATION_UNREAD = "the conversation could not be read whole"
 PRECHECK_RECORD_MISMATCH_REASON = (
     "the digest record was written for the scheduled run that finished at {recorded}, and the newest "
     "stored run finished at {stored}"
@@ -23510,13 +23511,14 @@ def stored_scheduled_document(audit_id: str, repo: str | None, record: dict | No
     skipping a diverted one) has to be a scheduled run's (`RUN_SCHEDULED_KEY`),
     under this id scheme, with a `document` that has a findings list, and the
     run the digest `record` names (`envelope_finished_at`), so the digest and
-    the document are one run's. The ledger must carry no pending `/remediate`
-    request: the stored document answers none, and `finish` opens a fix only
-    for a `manifest` remediation, so a request on a `manual` finding would wait
-    until the fleet changed. A newer on-demand run, a store that holds nothing,
-    a document from another scheme, a mismatched record, a pending request or
-    a ledger that cannot be read is a reason to run the audit in full, never an
-    error: the gate costs a full run when it cannot vouch for a close.
+    the document are one run's. The ledger must carry no `/remediate` request
+    still owed an answer (`pending_ledger_requests`): the stored document
+    answers none, and `finish` opens a fix only for a `manifest` remediation,
+    so a request on a `manual` finding would wait until the fleet changed. A
+    newer on-demand run, a store that holds nothing, a document from another
+    scheme, a mismatched record, a pending request or a ledger that cannot be
+    read is a reason to run the audit in full, never an error: the gate costs
+    a full run when it cannot vouch for a close.
     """
     try:
         store_repo = resolve_repo_or_no_forge(audit_id, repo)
@@ -23622,11 +23624,21 @@ def stored_document_replay_problem(document: dict, audit_id: str, store_repo: st
 
 
 def pending_ledger_requests(audit_id: str, store_repo: str) -> tuple[list[str], str | None]:
-    """The `/remediate` targets pending on the stream's open ledger issue, or why they are unknown.
+    """The `/remediate` targets still owed an answer on the stream's open ledger issue, or why they are unknown.
 
-    Read the way `start` reads them. A ledger that is not an issue (no forge,
-    or a forge with no issue tracker) carries no requests; a lookup that fails
-    is unknown, and the caller runs in full rather than close over a request.
+    A request a writer made that no acked or refused marker has answered
+    (`unanswered_remediate_comments`, which reads the markers and keeps
+    `all`): those are the requests a full run acts on and the stored document
+    answers none of; one already answered holds nothing, since the markers
+    are permanent and the comment is never edited, and a non-writer's is
+    refused the same on either path. A ledger that is not an issue (no
+    forge, or a forge with no issue tracker) carries no requests. The
+    conversation is read, not fetched: `read_comments` answers None for one
+    it could not read whole (a refusal, a truncated thread, an identity or a
+    standing it could not get), and that is unknown, as any other lookup
+    failure is, so the caller runs in full rather than close over a request.
+    A lost broker is neither: it is raised as from any command, so the SOP
+    waits for the broker and runs the same `precheck` again.
     """
     if _ledger_key(store_repo) == _ledger_key(NO_FORGE_REPO):
         return [], None
@@ -23638,9 +23650,26 @@ def pending_ledger_requests(audit_id: str, store_repo: str) -> tuple[list[str], 
         number, _, _, _ = find_existing_issue(store_repo, audit_id)
         if number is None:
             return [], None
-        return pending_remediate_targets(fetch_issue_comments(store_repo, number)), None
+        comments = read_comments("issue-view", store_repo, number, standing=True)
+    except BrokerUnavailable:
+        raise
     except Exception as exc:  # noqa: BLE001 -- unknown requests are a reason to run in full
+        raise_if_broker_lost(exc, "precheck")
         return [], str(exc)
+    if comments is None:
+        return [], PRECHECK_CONVERSATION_UNREAD
+    standing_of = {
+        str(comment.get("id", "") or ""): str(comment.get("authorAssociation", "") or "").upper()
+        for comment in comments
+        if isinstance(comment, dict)
+    }
+    pending = {
+        target
+        for request in unanswered_remediate_comments(comments)
+        if standing_of.get(str(request.get("comment_id", "") or "")) in WRITE_ASSOCIATIONS
+        for target in request.get("targets") or []
+    }
+    return sorted(pending), None
 
 
 def _close_from_stored_document(
