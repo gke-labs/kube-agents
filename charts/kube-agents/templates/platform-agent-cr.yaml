@@ -532,8 +532,15 @@ spec:
     {{- /* The row the override merges over is the sizing profile's
            (kube-agents.credentialProxyRow): the defaults under small, unset and
            auto, so a pair valid on the chosen row is not refused against the
-           small one, as the operator admits it. */}}
+           small one, as the operator admits it. A request set without its limit
+           is checked against the ceiling row's limit
+           (kube-agents.credentialProxyCeilingRow): the same row, and under auto
+           the fleet row, since the operator renders the latched tier, which the
+           chart cannot read, and a request under the fleet row's limit is one
+           the webhook admits at a latch that has reached it. */}}
     {{- $proxyDefaults := include "kube-agents.credentialProxyRow" . | fromJson }}
+    {{- $proxyCeiling := include "kube-agents.credentialProxyCeilingRow" . | fromJson }}
+    {{- $proxyAuto := eq (((.Values.platformAgent.deployment | default dict).sizingProfile) | default "") "auto" }}
     {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
     {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
     {{- range $side := list "requests" "limits" }}
@@ -587,15 +594,20 @@ spec:
     {{- range $name, $rawRequest := $proxyMerged.requests }}
       {{- if hasKey $proxyMerged.limits $name }}
       {{- $isCpu := eq $name "cpu" }}
-      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
-      {{- $limit := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
-      {{- if gt $request $limit }}
       {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
       {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
-      {{- $req := index $proxyMerged.requests $name }}
       {{- $lim := index $proxyMerged.limits $name }}
+      {{- if not $setLimit }}
+      {{- $lim = index $proxyCeiling.limits $name }}
+      {{- end }}
+      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
+      {{- $limit := include "kube-agents.quantityExact" (dict "raw" $lim "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
+      {{- if gt $request $limit }}
+      {{- $req := index $proxyMerged.requests $name }}
       {{- if and $setRequest $setLimit }}
       {{- fail (printf "%s.requests.%s (%s) exceeds limits.%s (%s); a request above its limit is refused by the API server, and by the operator" $proxyPrefix $name $req $name $lim) }}
+      {{- else if $proxyAuto }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the fleet row's limits.%s (%s), the highest row auto reaches, which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- else }}
       {{- fail (printf "%s.requests.%s (%s) exceeds the sizing profile row's limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- end }}

@@ -2408,6 +2408,19 @@ the request buys CPU; the quota preflight counts them where kube-agents.gkeAutop
 {{- include "kube-agents.sizingTierOverlay" (dict "defaults" (include "kube-agents.agentAPIAuthDefaults" . | fromJson) "tier" (include "kube-agents.sizingTier" .) "container" "agentAPIAuth") -}}
 {{- end }}
 
+{{- /* The row the CR template reads a request-only proxy override against when it
+       checks the request against a limit the override does not set: the profile's
+       row, and under auto the fleet row, the highest the operator's latch reaches.
+       The chart cannot read the latch (status.effectiveSizingTier), so under auto
+       the template refuses only a request no row's limit admits, and leaves the row
+       the install runs to the webhook and the reconciler, which read the latch. */ -}}
+{{- define "kube-agents.credentialProxyCeilingRow" -}}
+{{- $profile := ((.Values.platformAgent.deployment | default dict).sizingProfile) | default "" -}}
+{{- $tier := include "kube-agents.sizingTier" . -}}
+{{- if eq $profile "auto" -}}{{- $tier = "fleet" -}}{{- end -}}
+{{- include "kube-agents.sizingTierOverlay" (dict "defaults" (include "kube-agents.credentialProxyDefaults" . | fromJson) "tier" $tier "container" "credentialProxy") -}}
+{{- end }}
+
 {{- /* A footprint entry at a sizing tier: the entry's six numbers with the tier row's
        requests and limits written over them, parsed as the footprint records them, so the
        override helpers merge over the row the operator renders. An ephemeral-storage

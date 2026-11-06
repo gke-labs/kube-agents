@@ -903,7 +903,11 @@ significant digits is refused at render as well: the chart compares quantities a
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
-decimal one can compare equal to it; the operator decides that pair. The quota
+decimal one can compare equal to it; the operator decides that pair. A request
+set without its limit is checked against the sizing profile row's limit, and
+under `auto` against the fleet row's, the highest the operator's latch reaches:
+the chart cannot read the latch, so it refuses only a request no row admits and
+leaves the row the install runs to the webhook. The quota
 preflight sums the
 override merged over the operator's defaults. On an existing install, apply the
 chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
