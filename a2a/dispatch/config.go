@@ -72,6 +72,11 @@ const (
 	// tombstone is not swept on this clock: it is kept for the submit
 	// stream's retention plus a margin.
 	DefaultSweepAfter = 30 * time.Minute
+	// DefaultDroppedTerminalGiveUp is how long a failed task's terminal is
+	// retried once its profile is gone from the install config. Its publish
+	// grant goes with the profile at the next reconnect, so past this the
+	// task is settled without one rather than hold its slot for good.
+	DefaultDroppedTerminalGiveUp = 2 * time.Minute
 	// DefaultSubmitter is the one principal whose submissions are held.
 	DefaultSubmitter = "gateway"
 	// DefaultStream is the stream the durables are on: profile submissions
@@ -109,8 +114,11 @@ type Config struct {
 	// records nothing holds.
 	SweepInterval time.Duration
 	SweepAfter    time.Duration
-	Submitter     string
-	Stream        string
+	// DroppedTerminalGiveUp bounds the retries of a terminal whose profile
+	// the install config no longer lists (DefaultDroppedTerminalGiveUp).
+	DroppedTerminalGiveUp time.Duration
+	Submitter             string
+	Stream                string
 	// UnattendedTiers are the tiers on the unattended side of the
 	// interactive reserve.
 	UnattendedTiers []string
@@ -134,18 +142,19 @@ func DefaultConfig() Config {
 		StallAfter:      DefaultStallAfter,
 		RefreshInterval: DefaultRefreshInterval,
 
-		RegrantAttempts:    DefaultRegrantAttempts,
-		RegrantBackoff:     DefaultRegrantBackoff,
-		BindAttemptTimeout: DefaultBindAttemptTimeout,
-		ReconnectTimeout:   DefaultReconnectTimeout,
-		RegrantCooldown:    DefaultRegrantCooldown,
-		BindRetryBase:      DefaultBindRetryBase,
-		BindRetryMax:       DefaultBindRetryMax,
-		SweepInterval:      DefaultSweepInterval,
-		SweepAfter:         DefaultSweepAfter,
-		Submitter:          DefaultSubmitter,
-		Stream:             DefaultStream,
-		UnattendedTiers:    []string{DefaultUnattendedTier},
+		RegrantAttempts:       DefaultRegrantAttempts,
+		RegrantBackoff:        DefaultRegrantBackoff,
+		BindAttemptTimeout:    DefaultBindAttemptTimeout,
+		ReconnectTimeout:      DefaultReconnectTimeout,
+		RegrantCooldown:       DefaultRegrantCooldown,
+		BindRetryBase:         DefaultBindRetryBase,
+		BindRetryMax:          DefaultBindRetryMax,
+		SweepInterval:         DefaultSweepInterval,
+		SweepAfter:            DefaultSweepAfter,
+		DroppedTerminalGiveUp: DefaultDroppedTerminalGiveUp,
+		Submitter:             DefaultSubmitter,
+		Stream:                DefaultStream,
+		UnattendedTiers:       []string{DefaultUnattendedTier},
 	}
 }
 
@@ -160,6 +169,8 @@ func (c Config) Validate() error {
 		return fmt.Errorf("dispatch config: bind retry base must be positive and at most the max")
 	case c.SweepInterval <= 0 || c.SweepAfter <= 0:
 		return fmt.Errorf("dispatch config: sweep interval and sweep age must be positive")
+	case c.DroppedTerminalGiveUp <= 0:
+		return fmt.Errorf("dispatch config: the dropped profile's terminal give-up must be positive")
 	case c.Submitter == "" || c.Stream == "":
 		return fmt.Errorf("dispatch config: submitter and stream are required")
 	case c.TaskCredentialMaxLifetime < 0:

@@ -1380,11 +1380,30 @@ func (d *Dispatcher) failAs(ctx context.Context, log *slog.Logger, del lib.Deliv
 }
 
 // publishTerminalRetry publishes a held task's terminal until it lands or
-// ctx ends, and says whether it landed.
+// ctx ends, and says whether the task may be settled: it landed, or its
+// profile has been gone from the install config for DroppedTerminalGiveUp.
+// A dropped profile's .supervisor grant goes at the next reconnect, so its
+// terminal could be refused for good; it is given up on, logged as an
+// error, and the task settled anyway, rather than hold its slot until a
+// restart. A profile still listed is retried for as long as it takes.
 func (d *Dispatcher) publishTerminalRetry(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, state lib.TaskState, reason, detail string) bool {
+	var droppedAt time.Time
 	for {
-		err := d.publishTerminal(ctx, h.key(), del.Envelope(), state, reason, detail)
+		// Each attempt is bounded on its own: a refused publish is never
+		// acked, and the caller's context may have no deadline at all.
+		actx, cancel := context.WithTimeout(ctx, kvOpTimeout)
+		err := d.publishTerminal(actx, h.key(), del.Envelope(), state, reason, detail)
+		cancel()
 		if err == nil {
+			return true
+		}
+		if _, listed := profileOf(d.src.Config(), h.profile); listed {
+			droppedAt = time.Time{}
+		} else if droppedAt.IsZero() {
+			droppedAt = d.now()
+		} else if d.now().Sub(droppedAt) >= d.cfg.DroppedTerminalGiveUp {
+			log.Error("gave up on the terminal of a task whose profile left the install config; settling it without one",
+				"state", state, "reason", reason, "after", d.cfg.DroppedTerminalGiveUp, "err", err)
 			return true
 		}
 		log.Warn("publish the failure terminal; retrying", "err", err)

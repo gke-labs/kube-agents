@@ -163,3 +163,47 @@ func TestALeaseWatchPassReadsEveryRecordOrSaysWhyNot(t *testing.T) {
 		t.Errorf("a pass with no time left reported no error")
 	}
 }
+
+// A failed task's terminal goes on its profile's .supervisor, a grant fixed
+// per connection from the profiles the config lists. Once the profile has
+// left the config the publish can be refused for good, so it is given up on
+// after DroppedTerminalGiveUp and the task settled anyway (#4813). A profile
+// still listed is retried for as long as it takes.
+func TestADroppedProfilesTerminalIsGivenUpOnAfterABound(t *testing.T) {
+	b := newBusWith(t, dispatcherUsers(), "tse-0")
+	var g grantSwitch
+	g.set("disp-old") // may not publish on tse2's .supervisor
+	cfg := testConfig()
+	cfg.DroppedTerminalGiveUp = time.Second
+	h := &holding{profile: "tse2", tier: "read", kind: lib.SubmitKindTop, taskID: "task-1"}
+	del := &envDelivery{env: submissionEnv(t, "tse2", "task-1", "", map[string]string{})}
+
+	dropped := oneProfile("tse", 2, "tse-0") // tse2 is not in the config
+	d, err := New(cfg, b.connectAs(&g), dropped.src, dropped.pool, &fakeVerifier{}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	if !d.publishTerminalRetry(ctx, quietLog(), del, h, lib.StateFailed, "lease expired", "") {
+		t.Fatalf("a dropped profile's refused terminal was not given up on")
+	}
+	if took := time.Since(start); took < cfg.DroppedTerminalGiveUp {
+		t.Errorf("given up after %v, before the %v bound", took, cfg.DroppedTerminalGiveUp)
+	}
+
+	listed := oneProfile("tse", 2, "tse-0")
+	listed.update(func(c *lib.DispatchConfig) { c.Profiles = append(c.Profiles, testProfile("tse2", 2)) })
+	d2, err := New(cfg, b.connectAs(&g), listed.src, listed.pool, &fakeVerifier{}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Room for several attempts (each bounded by kvOpTimeout), so a give-up
+	// past the bound would have happened.
+	short, cancelShort := context.WithTimeout(b.ctx, 3*kvOpTimeout)
+	defer cancelShort()
+	if d2.publishTerminalRetry(short, quietLog(), del, h, lib.StateFailed, "lease expired", "") {
+		t.Errorf("a listed profile's refused terminal was given up on")
+	}
+}
