@@ -5,7 +5,7 @@ sidebar:
   order: 11
 ---
 
-The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page can. It is off by default and renders nothing under `today`.
+The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject. It is off by default and renders nothing under `today`.
 
 ## Turning it on
 
@@ -17,7 +17,11 @@ The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`, an
 
 If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Unset the flag and all of it is removed, the token included.
 
+Its pod adds one to the namespace's session pod quota, and the chart's quota check counts it when `operator.extraEnv` sets the flag ([Prerequisites](/kube-agents/install/prerequisites/)).
+
 ## Connecting a client
+
+To connect Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents from Antigravity](/kube-agents/install/antigravity-mcp/). A client that talks to the server directly connects as below.
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
@@ -38,6 +42,8 @@ The match fails closed. The bridge renames a deployment to `<kube-context>/<name
 The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
 
 The bridge relays `notifications/progress` frames from an NDJSON reply as live progress, but this server sends none yet: each call gets one JSON answer, so the bridge shows a turn's result when it ends, with no progress before it.
+
+The bridge offers `poll_events` too and forwards it to this server, so card reports that arrive after a `send_message` answer can be read with the `conversation_token` and `since` the answer gives.
 
 To rotate the token, write a new value into the Secret. The server reads the mounted file on every request, so the new token is accepted and the old one refused as soon as the kubelet updates the mount, usually within a minute. A blank value, or one holding a byte no request header could carry, is replaced: the operator mints a new token over it.
 

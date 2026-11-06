@@ -389,6 +389,36 @@ func (i *injector) Features(ctx context.Context) ([]string, error) {
 	return parsed.Features, nil
 }
 
+// excludedEventsPath is the daemon's route for the events alert-exclude rules
+// hold back (session_kv_server post_excluded_event).
+const excludedEventsPath = "/v1/excluded-events"
+
+// PostExcluded sends one excluded-event record. No session: the daemon writes
+// a ledger row for the daily recap and nothing else.
+func (i *injector) PostExcluded(ctx context.Context, rec excludedRecord) error {
+	body, err := json.Marshal(rec)
+	if err != nil {
+		return fmt.Errorf("injector: marshal excluded record: %w", err)
+	}
+	// #nosec G704 -- the daemon URL is the operator's own loopback address from --daemon-url, not a request's input
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, i.cfg.daemonURL+excludedEventsPath, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("injector: build POST excluded: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+i.cfg.bearerToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := i.client.Do(req) // #nosec G704 -- same URL as above
+	if err != nil {
+		return fmt.Errorf("injector: POST excluded: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, healthzBodyMax))
+		return fmt.Errorf("injector: POST excluded: status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
 // hasFeature reports whether feature is in the list.
 func hasFeature(features []string, feature string) bool {
 	for _, f := range features {

@@ -291,6 +291,14 @@ type GoogleChatSpec struct {
 	// +kubebuilder:default:="default"
 	// +optional
 	Mode string `json:"mode,omitempty"`
+
+	// AnswerFeedback draws thumbs-up and thumbs-down buttons under each
+	// final answer on Google Chat under spec.mode next, and keeps each rating
+	// with its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
+	// False hides the buttons and keeps nothing.
+	// +kubebuilder:default=true
+	// +optional
+	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
 }
 
 // SlackSpec contains the configuration for the Slack integration.

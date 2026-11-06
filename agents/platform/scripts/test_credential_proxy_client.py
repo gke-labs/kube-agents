@@ -2097,18 +2097,166 @@ class TestExecTierRouting(unittest.TestCase):
                 self.assertEqual(1, len(calls))
                 self.assertIn("the command may have run", stderr)
 
-    def test_a_malformed_url_is_reported_not_raised_and_not_as_a_drop(self):
+    def test_a_malformed_url_is_reported_not_raised_and_not_as_a_drop_with_no_fallback(self):
         """A bad port is raised bare by urllib, before a socket opens, and a URL
-        with no scheme fails while the request is built: nothing was sent."""
+        with no scheme fails while the request is built: nothing was sent. With
+        no stateful broker to fall back on, the line says so."""
         for url in ("http://broker:abc", "agent-credential-proxy-exec-tier"):
             with self.subTest(url=url):
                 stderr = io.StringIO()
                 with patch.dict("os.environ", self.environ, clear=False), \
                         patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
-                    code = credential_proxy_client.execute(url, ["kubectl", "get", "pods"], fallback=self.STATEFUL)
+                    code = credential_proxy_client.execute(url, ["kubectl", "get", "pods"], fallback=None)
                 self.assertEqual(1, code)
                 self.assertIn("credential proxy unavailable", stderr.getvalue())
                 self.assertNotIn("may have run", stderr.getvalue())
+
+
+class TestExecUrlShape(unittest.TestCase):
+    """A malformed CREDENTIAL_PROXY_EXEC_URL is ignored for the stateful broker,
+    with one line, rather than failing every exec-role call (#4534)."""
+
+    STATEFUL = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+    BAD = {
+        "a port that is not a number": "http://broker:abc",
+        "a bare Service name": "agent-credential-proxy-exec-tier",
+        "no scheme, with a port": "broker:8765",
+        "https": "https://agent-credential-proxy-exec-tier:8765",
+        "no host": "http://",
+        "a port out of range": "http://broker:99999",
+        "a bracketed host that is not IPv6": "http://[::1",
+        "a space in the host": "http://bro ker:8765",
+        "a tab in the host": "http://bro\tker:8765",
+        "an escaped tab in the host": "http://bro%09ker:8765",
+        "an empty label in the host": "http://name..svc:8765",
+        "a label longer than 63 characters": "http://" + "a" * 64 + ".svc:8765",
+        "a space in the path": "http://broker:8765/a b",
+        "a query": "http://broker:8765?x=1",
+        "a fragment": "http://broker:8765#f",
+        "an empty query": "http://broker:8765?",
+        "an empty fragment": "http://broker:8765#",
+        "a host that is not latin-1": "http://brok\u00e9r\u4e2d:8765",
+    }
+
+    def resolve(self, exec_url, stateful=STATEFUL):
+        environ = {"CREDENTIAL_PROXY_EXEC_URL": exec_url}
+        if stateful:
+            environ["CREDENTIAL_PROXY_URL"] = stateful
+        stderr = io.StringIO()
+        with patch.dict("os.environ", environ, clear=False), \
+                patch.object(credential_proxy_client, "_exec_url_notice_written", False), \
+                patch("sys.stderr", new=stderr):
+            if not stateful:
+                os.environ.pop("CREDENTIAL_PROXY_URL", None)
+            resolved = credential_proxy_client.exec_endpoints()
+        return resolved, stderr.getvalue()
+
+    def test_each_malformed_url_is_ignored_for_the_stateful_broker_with_one_line(self):
+        for name, url in self.BAD.items():
+            with self.subTest(name):
+                resolved, stderr = self.resolve(url)
+                self.assertEqual((self.STATEFUL, None), resolved)
+                self.assertEqual(1, stderr.count("CREDENTIAL_PROXY_EXEC_URL ignored ("), stderr)
+                self.assertIn("commands go to the stateful broker", stderr)
+
+    def test_a_valid_url_is_used_with_no_line(self):
+        for url in ("http://agent-credential-proxy-exec-tier.kubeagents-system.svc.cluster.local:8765",
+                    "http://agent-credential-proxy-exec-tier", "HTTP://exec:8765", "http://[::1]:8765",
+                    "http://exec:8765/prefix"):
+            with self.subTest(url=url):
+                resolved, stderr = self.resolve(url)
+                self.assertEqual((url, self.STATEFUL), resolved)
+                self.assertEqual("", stderr)
+
+    def test_the_line_is_written_once_per_process(self):
+        stderr = io.StringIO()
+        environ = {"CREDENTIAL_PROXY_EXEC_URL": "agent-credential-proxy-exec-tier", "CREDENTIAL_PROXY_URL": self.STATEFUL}
+        with patch.dict("os.environ", environ, clear=False), \
+                patch.object(credential_proxy_client, "_exec_url_notice_written", False), \
+                patch("sys.stderr", new=stderr):
+            for _ in range(3):
+                self.assertEqual((self.STATEFUL, None), credential_proxy_client.exec_endpoints())
+        self.assertEqual(1, stderr.getvalue().count("ignored"), stderr.getvalue())
+
+    def test_with_no_stateful_broker_a_malformed_url_is_kept_as_before(self):
+        """Nothing to use instead: the call reports the URL when it is made."""
+        for name, url in self.BAD.items():
+            with self.subTest(name):
+                resolved, stderr = self.resolve(url, stateful=None)
+                self.assertEqual((url, None), resolved)
+                self.assertEqual("", stderr)
+
+    def test_a_named_endpoint_writes_no_malformed_url_line(self):
+        """The line says where commands go; with --endpoint they go there."""
+        stderr = io.StringIO()
+        environ = {"CREDENTIAL_PROXY_EXEC_URL": "http://broker:abc", "CREDENTIAL_PROXY_URL": self.STATEFUL}
+        with patch.dict("os.environ", environ, clear=False), \
+                patch.object(credential_proxy_client, "_exec_url_notice_written", False), \
+                patch("sys.stderr", new=stderr), \
+                patch("sys.argv", ["credential_proxy_client.py", "--endpoint", "http://named:8765", "kubectl", "get", "pods"]):
+            args = credential_proxy_client.parse_args()
+        self.assertEqual("http://named:8765", args.endpoint)
+        self.assertEqual("", stderr.getvalue())
+
+    def test_with_no_url_at_all_an_endpoint_is_required(self):
+        with patch.dict("os.environ", {}, clear=False), \
+                patch("sys.argv", ["credential_proxy_client.py", "kubectl", "get", "pods"]), \
+                patch("sys.stderr", new=io.StringIO()):
+            os.environ.pop("CREDENTIAL_PROXY_URL", None)
+            os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)
+            with self.assertRaises(SystemExit):
+                credential_proxy_client.parse_args()
+
+    def test_the_line_keeps_kubectls_failure_classifiers_right(self):
+        import cluster_agent_profile
+
+        for name, url in self.BAD.items():
+            with self.subTest(name):
+                _, stderr = self.resolve(url)
+                self.assertIsNone(cluster_agent_profile.NOT_A_CONNECTION_FAILURE_RE.search(stderr), stderr)
+                self.assertIsNone(cluster_agent_profile.CONNECTIVITY_FAILURE_RE.search(stderr), stderr)
+
+
+class TestExecPreSendFallback(unittest.TestCase):
+    """A URL that fails before a byte is sent falls back whatever its shape,
+    so a shape the check above does not know still reaches the stateful broker."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "token").write_text("caller-token\n", encoding="utf-8")
+        self.environ = {"CREDENTIAL_PROXY_TOKEN_FILE": str(self.tmp / "token"), "KUBECONFIG": "", "HERMES_HOME": str(self.tmp)}
+
+    def run_with(self, endpoint):
+        calls = []
+        real_open = credential_proxy_client.open_broker_request
+
+        def open_or_answer(request, *args, **kwargs):
+            if request.full_url.startswith("http://stateful:8765"):
+                calls.append(request.full_url)
+                return RecordingResponse(json.dumps({"exitCode": 0, "stdout": "ok\n"}).encode("utf-8"))
+            return real_open(request, *args, **kwargs)
+
+        stderr = io.StringIO()
+        with patch.dict("os.environ", self.environ, clear=False), \
+                patch.object(credential_proxy_client, "open_broker_request", open_or_answer), \
+                patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=stderr):
+            code = credential_proxy_client.execute(endpoint, ["kubectl", "get", "pods"], fallback="http://stateful:8765")
+        return code, calls, stderr.getvalue()
+
+    def test_each_pre_send_failure_falls_back_once(self):
+        for name, url in {
+            "no scheme": "exec-tier",
+            "a space in the host": "http://bro ker:8765",
+            "a space in the path": "http://broker:8765/a b",
+            "an empty label in the host": "http://name..svc:8765",
+            "a host that is not latin-1": "http://brok\u00e9r\u4e2d:8765",
+        }.items():
+            with self.subTest(name):
+                code, calls, stderr = self.run_with(url)
+                self.assertEqual(0, code, stderr)
+                self.assertEqual(["http://stateful:8765/v1/exec"], calls)
+                self.assertEqual(1, stderr.count(credential_proxy_client.EXEC_FALLBACK_NOTICE), stderr)
 
 
 class TestBrokerUnreachable(unittest.TestCase):
@@ -2172,6 +2320,37 @@ class TestApiSessionExecTier(unittest.TestCase):
         http_ = self.FlakyHttp()
         credential_proxy_client.ApiSession(http=http_).get(self.URL)
         self.assertTrue(http_.calls[0].startswith(self.EXEC + credential_proxy_client.API_RELAY_PREFIX))
+
+    def test_a_malformed_exec_url_leaves_the_relay_on_the_stateful_broker(self):
+        """`requests` raises MissingSchema for a URL with no scheme, which is not a
+        connection error, so without the check the relay never fell back."""
+        http_ = self.FlakyHttp()
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_EXEC_URL": "exec-tier"}), \
+                patch.object(credential_proxy_client, "_exec_url_notice_written", False), \
+                patch("sys.stderr", new=io.StringIO()):
+            credential_proxy_client.ApiSession(http=http_).get(self.URL)
+        self.assertTrue(http_.calls[0].startswith(self.STATEFUL + credential_proxy_client.API_RELAY_PREFIX), http_.calls)
+
+    def test_a_url_requests_refuses_before_sending_moves_the_relay_to_the_fallback(self):
+        """A host `requests` refuses while it prepares the request (a leading
+        `*`) is raised before a byte is sent, like a connection error."""
+        try:
+            import requests
+        except ImportError:
+            self.skipTest("requests is not installed")
+        http_ = requests.Session()
+        calls = []
+
+        def get(url, **kwargs):
+            calls.append(url)
+            if url.startswith(self.STATEFUL):
+                return "upstream-response"
+            return requests.Session.get(http_, url, **kwargs)
+
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_EXEC_URL": "http://*.svc:8765"}), \
+                patch.object(http_, "get", side_effect=get), patch("sys.stderr", new=io.StringIO()):
+            self.assertEqual("upstream-response", credential_proxy_client.ApiSession(http=http_).get(self.URL))
+        self.assertEqual(["*.svc:8765", "stateful:8765"], [urllib.parse.urlsplit(url).netloc for url in calls])
 
     def test_an_unreachable_exec_tier_falls_back_once_and_stays_there(self):
         http_ = self.FlakyHttp(unreachable_hosts={"exec-tier:8765"})

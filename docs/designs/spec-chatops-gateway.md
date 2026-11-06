@@ -70,7 +70,9 @@ a reap/resume cycle, which is the normal lifecycle, not an edge case. Per-space 
 mix unrelated conversations into one context and make the room the unit of history,
 which nobody wants from a busy channel.
 
-Session state lives in a NATS KV bucket, keyed by session key: `contextId`, current pod
+Session state lives in a NATS KV bucket, keyed by session key (the bucket also holds the
+gateway's kept refused home posts under `refused.<backend>.`, bounded in count and age,
+"Proactive posts" below): `contextId`, current pod
 name, bus session name, last-activity timestamp, roster, the task history with each
 task's own addressee (session addressees rotate per incarnation, so a straggler's
 replay must use the addressee its subjects carried, not the record's current one), and
@@ -384,6 +386,12 @@ public feedback form, and starts no task; with text after it, the gateway passes
 through as typed, and the Planning Agent composes the report and asks for a yes before the
 platform worker files it through the credential broker. The command, the persona flow and the
 broker verb are designed in [`chat-feedback-command.md`](chat-feedback-command.md). `/feedback summary` (added 2026-10-21) is the one text form the gateway answers itself: the install's identifier-free usage and feedback summary, from the `PlatformAgent` resource and the gateway's task records, with no task started (part 7 of the same document).
+
+A typed `@bot /sethome` (or `/hermes sethome`) on Slack is the Slack adapter's own, not a gateway
+command: `answerSetHome` answers an author the gateway's own admission rule admits, in the thread, with
+the Home tab panel's state and where the home channel moves, before the text becomes a turn, so no task
+starts, no question is marked answered and no home is learned from it; the post runs off the event
+pump. An author the rule does not admit is refused as any turn is.
 
 Delegation on a human's behalf keeps the human's bound, and the gateway is where it is kept.
 A session does not mint a child task itself: it asks the gateway to, over the same local
@@ -1232,7 +1240,7 @@ classifies the executors' own reasons (`bridge-shutdown`, `bridge-queue-overflow
 `bus-publish-failed`, `spawn-failed`, `bridge-died-without-terminal-event`, `hermes-rate-limited`,
 `hermes-api-unreachable`, `hermes-api-refused`, `session-busy`, `worker-evicted`, `bus-subscribe-failed`), a `rejected` terminal and a `canceled-before-start` as infrastructure,
 and grades the persona's (`hermes-exited-nonzero`, `deadline-exceeded`, `hermes-api-failed`,
-`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
+`hermes-api-unreadable`, `hermes-api-read-failed`, `hermes-api-oversize`, `hermes-cli-oversize`, `hermes-unstructured-reasoning`) and any reason it does not
 know; a `canceled` after the harness's own cancel is the graded timeout. An eval install's bridge
 runs at least the harness's parallelism (`EVAL_TASK_PARALLELISM`) in workers - the operator
 renders the bridge, so the setting is the operator's `A2A_BRIDGE_CONCURRENCY`, or
@@ -1520,7 +1528,24 @@ under `chat.notify.reply.agent.`; the gateway posts the text into the home space
 (`googleChat.homeChannel`, carried as `A2A_GCHAT_HOME_CHANNEL`), as a new thread or as a reply
 on a thread of that space, and answers with `message_id` (the field `hermes send --json`
 prints) and `thread_id`, the thread it landed in, or an `error` naming why nothing was
-posted. The answer goes out once the first part has landed; a long text is chunked, and
+posted. A home request on a gateway that has no home channel is refused that way and kept
+(`a2a/gateway/notify_refused.go`): the text goes into the session-state bucket under the
+gateway's `refused.<backend>.` keys, at most fifty per backend, each pruned past thirty days
+at the next refusal, with a meta entry counting the refusals since the last digest and their
+last five subjects. When a home channel arrives, the gateway posts one digest into it (the
+count, the span, the last subjects, how many of those texts it still holds) and takes what it
+named off the count; the texts stay until pruned. The arrival is seen where the home channel is
+read: at a start that has one (the CR's, or on Slack the projected file's), or at the first
+home request that finds the projected file naming one (Slack, with the learn armed). The
+requester's answer is the same refusal, worded to say the post is kept and carrying `kept`;
+the relay records its own undelivered line as before, and the alert path records the alert as
+kept. For the posts to reach the route at all the agent has to be
+routed with no home channel: the operator names the route (`A2A_NOTIFY_PLATFORM`, below)
+whenever the gateway's backend is the install's only chat platform, home channel or not
+(`a2aGchatHomeRouted`, `a2aSlackHomeRouted`); on a Chat-and-Slack install with no Chat home
+the agent stays unrouted and posts to Slack through its Hermes platform, as before. The
+`HomeChannelUnset` condition says which of the two holds. The gateway writes nothing to the
+home-channel record, and the operator does not yet read the count. The answer goes out once the first part has landed; a long text is chunked, and
 the rest follows into the same thread. A request the gateway took and did not answer in
 time may still post, so `a2a notify` exits with its own status then, and the alert path
 treats that as sent rather than sending again. `wait_ms` is how long the requester waits:
@@ -1528,9 +1553,14 @@ a request that fails or is refused after it has nobody to tell and is already re
 possibly posted, so the gateway logs it as lost, at error, with its first line. When the
 route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` exits with
 a third status, nothing posted; the alert path, which has one shot, waits through about
-half a minute of those before giving up. The agent-side callers
+half a minute of those before giving up. A home post the gateway refused and kept answers
+with `kept` beside the error, and `a2a notify` exits with a fourth status for it: the
+senders that re-send on failure (the drift-backlog digest, the data-volume warning) take
+it as handled, so the keep holds one copy, and the alert path records the alert as kept
+rather than lost. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `routed_platform()`, `A2A_NOTIFY_PLATFORM` when set, else the projected file; the env is what the operator
-renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, and send to every
+renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, or is unset with
+Slack not enabled (`a2aGchatHomeRouted`), and send to every
 other platform through `hermes send` as before. The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
@@ -1583,8 +1613,10 @@ arrive.
 
 Slack has the same route on its own subject, `chat.notify.slack`. Home posts are armed when the
 gateway holds Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as
-`A2A_SLACK_HOME_CHANNEL`, is a channel id (`C...`, or `G...` for a private channel);
-`A2A_NOTIFY_PLATFORM` is then `slack`. Conversation posts are armed whenever the gateway holds
+`A2A_SLACK_HOME_CHANNEL`, is a channel id (`C...`, or `G...` for a private channel). The agent
+is routed to the subject (`A2A_NOTIFY_PLATFORM` is `slack`) with that id, and with the field
+unset (`a2aSlackHomeRouted`: Slack is then the only chat platform, and the gateway keeps what it
+refuses until a channel is set or learned). Conversation posts are armed whenever the gateway holds
 Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` is then `slack`
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
 route off, as on Chat. Chat holds the single-backend gateway when both are enabled, so at most
@@ -1630,8 +1662,8 @@ Slack Connect, not archived, the app a member) and written once (`slack`, `slack
 channel; the gateway's own home posts follow within one kubelet sync, about a minute, during which a
 home post is refused as having no home. A candidate the check refuses is written to `slack.refused`
 as one of the words the operator matches, `shared`, `archived`, `not-member` or `malformed` (the
-post-time check also writes `direct-message` for a hand-edited group DM id, which an operator without
-that word renders as a reason it does not know),
+post-time check also writes `direct-message` for a hand-edited group DM id, which the operator
+matches too and an operator older than that word renders as a reason it does not know),
 while the record names no channel and does not name that reason already (a write that fails is tried
 again at the next refusal; while a channel is recorded, a refusal beside it is the post-time check's
 or an older gateway's, and a learn that adopts or replaces the channel clears it) and the next
@@ -1776,7 +1808,7 @@ rewrite that fails posts the line in the conversation instead. The questions and
 are held in the process: after a restart a question keeps its buttons until clicked, the click
 is still a turn, and the rewrite reads the message the event carries, its text, its link
 buttons and the clicked button's label. A click on a button the adapter did not draw is
-logged and acked.
+logged and acked. A click on a rating button or the note card is never a turn ([Answer feedback](#answer-feedback-added-1016)).
 
 ## The Slack adapter (added 9/4)
 
@@ -2299,7 +2331,7 @@ one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the 
 block, inside its side bar when it has one (an attachment draws after every top-level block, and
 Slack draws the block there too, seen live). The block's id carries the task id
 (`kage.feedback.<task>`). A text chunk carrying the mark is posted as sections (more than one when
-escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. Every other backend ignores the mark. A tap is never a turn,
+escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat adapter draws it too (below); Discord and the console ignore it. A tap is never a turn,
 and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
 another workspace's member, changes nothing.
 
@@ -2329,7 +2361,7 @@ No new scope: `chat:write` covers the ephemeral line, and `views.open` takes onl
 
 A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
-member id, the conversation and rated message, the task and context ids, the ask and the answer.
+member id or Google Chat email, the conversation and rated message, the task and context ids, the ask and the answer.
 It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
 creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
 the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
@@ -2362,11 +2394,83 @@ the last seven days (`FeedbackRecorder.Tally`, every current record read over on
 reused for five minutes (one minute after a failed read) and left out when feedback is off or the
 tally cannot be read; a new rating shows once the count is read again.
 
+The Google Chat adapter (added 11/4, [`gchat-answer-feedback.md`](gchat-answer-feedback.md)) draws
+the mark as two buttons at the end of the message's one
+button list, after its choice and link buttons: `👍` (alt text "Good answer") and `👎` ("Bad
+answer"), each calling `kage.feedback` with the parameters `task` (the root task id) and `rating`
+(`up` or `down`). A text answer carries them as accessory widgets on the chunk the mark is on, its
+last. They are drawn only once the gateway has handed the adapter its recorder, and only on a post
+in a conversation: a home post (`PostNotifyMessage`) never carries them. A post Chat refuses with
+them (a `400`) is posted once more without them, a laid-out one as its layout and a text one as
+text. The adapter remembers in the process the buttons each rated message carries (`rated`).
+
+A tap on Google Chat is never a turn and claims no question, so a choice click on the same message
+is still one. The adapter logs and drops a tap when feedback is off, when it has no `task`, a
+rating other than `up` or `down`, no clicker email, or no space or message name, when it is a
+redelivery (the message name and event time, under its own dedupe prefix), and when the recorder
+does not admit the sender (`Admits`). Otherwise it records the rating off the pull loop
+(`platform: googlechat`, the rater's address, the conversation a choice click there binds to, the
+message name, and the message's text as the event carries it as the answer), then patches the
+answer with the tapped button `type: FILLED` and the other plain. The patch takes its text and
+its other buttons from the adapter's record when it has one (`ratedLayout`): a question not yet
+answered keeps its own layout; an answered one keeps the layout its answered rewrite put on it,
+the `✓` line included (`shown`, held without the rating buttons), and, while that rewrite has not
+landed, takes the event's text and link buttons only. Any other message, one from before a
+restart, takes the event's text and its choice and link buttons. A tap therefore never restores
+the choices an answer removed. A failed write logs and patches nothing; a failed patch logs and
+keeps the rating. Taps on one message are ordered by event time. The adapter records each
+rater's newest tap on a message when it takes the tap. It records the rating and patches the
+message under the message's rewrite lock, and asks for the note after it releases the lock. A tap
+older than one the same rater has already made is superseded: it is dropped before it is
+recorded, with no patch and no note card. An older tap whose write was already running when the
+newer tap came in is recorded and patched, and the newer tap repaints after it. That older 👎
+asks for no note while the newer tap stands. A failed write leaves the rater's newest tap
+time as it is, so a late older tap stays dropped and the rater's next tap, newer, proceeds. When
+the newer tap's write fails, the older 👎 stays recorded and drawn, with no note card; a tap
+after that opens a new card. An older tap from
+another rater is kept, and leaves the buttons as the newest tap drew them. A tap with no event
+time is never superseded.
+
+A kept 👎 then posts the note card, the adapter's one `cardsV2` message (card id
+`kage.feedback-note`), in the answer's thread: "What went wrong?", a single-line text input
+named `note` labelled "Anything else?" with a 500-character limit, the kept line the Slack box
+shows, and Send and Cancel, both calling `kage.feedback-note` with `task` and `rating=down`, and
+Cancel adding `cancel=1`. In a one-to-one DM the card posts plainly, since the DM has one reader.
+Anywhere else it is private to the clicker (`privateMessageViewer`), and it is not posted when
+the event names the clicker by no `users/` name, since it would then be public. A private thread
+reply Chat refuses is posted once more at the space's top level, still private; a second refusal
+logs and leaves the 👎 kept without a note. A repeat 👎 by the same rater posts another note
+card, as Slack opens its box again. Send and Cancel are never turns either: they are
+dropped on the tap's checks (a `rating` other than `down` included) and handled off the pull
+loop. Cancel collapses the card (a `cards_v2` patch) to the thanks line and the form link. Send
+reads the note from `formInputs`, telling a click with no `formInputs` object from one whose value
+is empty. An empty value is an empty note, kept and thanked as on Slack. No object keeps no note,
+logs a warning, and collapses the card to "The note did not reach me; your rating stands as it
+was." A kept note, trimmed and cut to 500 code points, collapses the card to the thanks line and
+the form link; `errFeedbackNotKept` (a 👍 replaced the 👎) collapses it to "This answer's rating
+changed, so the note was not kept."; any other failed write leaves the card for another Send.
+When Chat refuses the collapse patch, the adapter posts the line as a new card to the same viewer
+in the same thread.
+
+The Google Chat rewrites keep the rating buttons. The answered rewrite a choice click or typed
+reply makes (`gchatAnsweredLayout`) and a later edit that lays out no choices (`answeredLayout`)
+put them back after the link buttons, filled as last rated, from the adapter's record. For a
+message from before a restart the click's rewrite reads them from the event's copy
+(`gchatMessageButtons`, which reads the `task` parameter and the `FILLED` button) and remembers
+them, so a later edit draws the same. Buttons are told
+apart by function (`kage.choice`, `kage.feedback`, `kage.feedback-note`) or link
+(`classifyGchatButton`), never by position. Google Chat has no Home tab, so the weekly count
+above is Slack's only; it shows nothing more after a 👍, as Slack does not.
+
 An install turns it off with `spec.integration.slack.answerFeedback: false` (default `true`). The
 operator renders `A2A_SLACK_ANSWER_FEEDBACK=false` on the gateway only for an explicit `false`, so an
 install that never set the field keeps its gateway pod unchanged; the gateway then never looks for
 the bucket, marks no answer and hands the adapter no recorder, so a tap on a button already posted
-is acked and changes nothing (Slack still fills the tapped icon; no box opens).
+is acked and changes nothing (Slack still fills the tapped icon; no box opens). A Google Chat install
+turns it off with `spec.integration.googleChat.answerFeedback: false` (default `true`), which the
+operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. The gateway holds one
+chat backend, so either name turns off the one global flag (`AnswerFeedbackOff`); a tap or note
+click on a Google Chat message already posted is logged and acked and changes nothing.
 
 ## The console adapter (added 9/23)
 
@@ -2387,9 +2491,17 @@ and `messageId` `r-<taskId>-<state>`, so a repeated end (a redelivery, a heal) r
 a different end of the same task (a never-started heal, then its late completion) is a new frame. An
 end the gateway declared itself (the bus unreachable, a task released for producing nothing) is
 worded as the page's notice is. A completed
-task that handed work to kanban cards (the bridge's `handoff` artifact) carries `"cardsPending":
-true`, so a client waits for the cards' notify frames; without it, no handoff was seen and the
-client need not wait. Its text is the deliverable for a completed task and the gateway's notice
+task that handed work to kanban cards and left them unsettled at turn end (the bridge's `handoff`
+artifact; emitted on routed chat origins such as Slack, Discord, and Google Chat where
+`waitKanbanInTurn` is false and the turn returns immediately so the client receives card completion
+via `chat.notify.*`, or when a turn ends with cards still unsettled) carries `"cardsPending":
+true`, so a client waits for the cards' notify frames; on console and MCP origins
+(`!run.routeRecorded.Load() || isConsoleOrigin(run.origin)`), the bridge's `api` executor instead
+holds the turn open in `waitForKanbanCards`, streams specialist card progress and synthesis steps in
+turn, folds settled card results directly into the task's `result` artifact, and clears `cardsFiled`
+so no `handoff` or `"cardsPending": true` is emitted once the cards settle in turn. Without
+`"cardsPending": true`, no unsettled handoff remains and the client need not wait. Its text is the
+deliverable for a completed task and the gateway's notice
 otherwise. A chain that ends at a child with no wake (the session could not take one) ends failed,
 carrying the notice; a console client reads the child's answer from TASKS. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
 turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A
@@ -2611,11 +2723,13 @@ gone (see the update note under "What it also settles")._
 ## Metrics (added 10/6)
 
 The gateway serves Prometheus counters on a metrics-only listener, the credential broker's
-pattern copied: its own port, `/metrics` and nothing else (any other path is 404, any method
+pattern copied: its own port, `/metrics` and `/readyz` and nothing else (any other path is 404, any method
 but GET or HEAD 405), every interface rather than loopback because its caller is the managed-Prometheus
 collector on the pod network. `A2A_METRICS_PORT` names the port; unset means no listener, and a
 value that is not a port, or is either door's port, refuses the boot. A port that will not bind
-costs the gateway its metrics and logs an `ALERT` line; conversations carry on. The operator
+costs the gateway its metrics and its readiness, and logs an `ALERT` line; conversations carry on,
+though the pod never reads Ready, so the CR stays `Provisioning` naming the Deployment and
+`kubectl rollout status` does not succeed until a restart binds the port. The operator
 renders `A2A_METRICS_PORT=9096` and declares container port `a2a-metrics` on 9096 from one
 constant (`a2aGatewayMetricsPort`), and the chart's `<name>-a2a-gateway-monitoring`
 `PodMonitoring` scrapes 9096 every 30 seconds behind the `platformAgent.podMonitoring` switch. The
@@ -2629,6 +2743,21 @@ name, and the doors' ports admit no pod. The gateway's fence used to render only
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
 with neither door armed; it renders on every `next` install now so that it is not (decided
 10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
+
+`/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200
+once the gateway has bound its event relay and 503 until then, with the reason as the body
+(`waiting for stream TASKS: ...`, or `waiting for the bus: ...` while the NATS connection is down).
+The relay binds before the adapters and doors start, and on an install
+whose provision Job has not created TASKS yet (a three-server bus can take longer to form than
+lib's 45-second bind window) the relay waits for the stream rather than exiting
+(`SubscribeConfig.WaitForStream`, set on the relay alone). A lost connection during that wait does
+not end it either: nats.go reconnects (or lib rebuilds the connection), and the wait goes on there.
+Each wait logs when it starts or changes, then every 30 seconds, and warns every 10 minutes. So a gateway waiting on provisioning reads
+not Ready, and the CR `Provisioning` naming it, instead of crash-looping. The Deployment is
+Recreate, so the probe opens no gap in a roll; it shows the one Recreate already has. Its progress
+deadline is 1800 seconds rather than Kubernetes' 600, so a wait on a slow provision Job does not
+read `ProgressDeadlineExceeded` and end a `kubectl rollout status` early; past 1800 seconds it does,
+while the gateway keeps waiting and the CR keeps reading `Provisioning`.
 
 The site's [Observability page](../site/src/content/docs/concepts/observability.md) is
 canonical for what an operator reads off these series; this section is the design. Every label

@@ -4,6 +4,7 @@ import calendar
 import json
 import unittest
 from datetime import datetime
+from unittest import mock
 
 import normalizer
 
@@ -147,6 +148,283 @@ class AgeTest(unittest.TestCase):
 
     def test_cpu_differs_in_the_key(self):
         self.assertNotEqual(fp(request("cpu: 120m")), fp(request("cpu: 250m")))
+
+
+class LongDateTest(unittest.TestCase):
+    """The date Hermes writes into every system prompt, with no time of day."""
+
+    PROMPT = "Conversation started: {} (UTC, UTC+00:00)\nModel: model-default"
+
+    @staticmethod
+    def at(year, month, day, hour=12):
+        return calendar.timegm(datetime(year, month, day, hour, 0, 0).timetuple())
+
+    def norm_at(self, text, now):
+        return normalizer.Normalizer(now, keep_ips=False).text(text)
+
+    def test_a_run_on_the_next_day_gets_the_same_key(self):
+        # The nightly recorded on Wednesday; the presubmit replays on Thursday.
+        recorded = self.norm_at(self.PROMPT.format("Wednesday, November 04, 2026"), self.at(2026, 11, 4, 23))
+        replayed = self.norm_at(self.PROMPT.format("Thursday, November 05, 2026"), self.at(2026, 11, 5, 0))
+        self.assertEqual(recorded, replayed)
+        self.assertEqual(recorded, "Conversation started: ⟦TIME_today⟧ (UTC, UTC+00:00)\nModel: model-default")
+
+    def test_how_many_days_and_which_way(self):
+        now = self.at(2026, 11, 5)
+        cases = {
+            "November 04, 2026": "⟦TIME_past_day⟧",
+            "October 20, 2026": "⟦TIME_past_days⟧",
+            "March 01, 2026": "⟦TIME_past_months⟧",
+            "January 05, 2020": "⟦TIME_past_years⟧",
+            "November 06, 2026": "⟦TIME_future_day⟧",
+            "December 25, 2026": "⟦TIME_future_months⟧",
+            # The month and year edges match the timestamp buckets' (30 and 365 days).
+            "December 05, 2026": "⟦TIME_future_months⟧",
+            "November 05, 2027": "⟦TIME_future_years⟧",
+            "December 04, 2026": "⟦TIME_future_days⟧",
+        }
+        for date, token in cases.items():
+            self.assertEqual(self.norm_at("renew by " + date, now), "renew by " + token, date)
+
+    def test_the_offset_after_it_picks_the_day(self):
+        # 00:20 UTC on the 5th is still the 4th in New York.
+        now = calendar.timegm(datetime(2026, 11, 5, 0, 20).timetuple())
+        text = "Thursday, November 05, 2026 (America/New_York, UTC-05:00)"
+        self.assertEqual(self.norm_at(text, now), "⟦TIME_future_day⟧ (America/New_York, UTC-05:00)")
+        self.assertEqual(self.norm_at("Thursday, November 05, 2026 (UTC, UTC+00:00)", now),
+                         "⟦TIME_today⟧ (UTC, UTC+00:00)")
+
+    def test_what_is_not_a_date_stays(self):
+        now = self.at(2026, 11, 5)
+        for text in ("February 30, 2026", "May 2026", "November 5th", "Mayday, November 05, 2026x"):
+            self.assertNotIn("⟦TIME", self.norm_at(text, now), text)
+
+    def test_an_answer_naming_the_date_is_not_saved(self):
+        # Replayed on Thursday, Wednesday's answer would write Wednesday's notes.
+        body = {"messages": [{"role": "system", "content": self.PROMPT.format("Wednesday, November 04, 2026")}]}
+        mapping = normalizer.normalize_request(body, self.at(2026, 11, 4)).mapping
+        for answer in ('{"path": "memory/2026-11-04.md"}', "## Findings for November 04, 2026",
+                       "as of November 4, 2026", "started Wednesday, November 04, 2026",
+                       "notes_2026-11-04.md", "2026-11-04_standup.md", "plan_2026-11-04",
+                       "## Findings for November 04", "updated Nov 4", "today is Wednesday",
+                       # Spellings no list of strings caught: any date shape counts.
+                       "report_20261104.md", "backup-20261104.tar", "notes-nov-04.md", "nov04", "11/04/2026",
+                       "11-04-2026", "04.11.2026", "2026/11/04", "november 4", "wednesday", "Nov. 4",
+                       "4 November 2026", "November 4th", "the 4th of Nov"):
+            self.assertTrue(mapping.answer_repeats_date(answer), answer)
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), "a date is not a number: " + answer)
+        for answer in ("memory/2026-11-05.md", "November 14, 2026", "2026-11-04T10:00:00Z",
+                       "Nov 40", "Wednesdays", "renew before November 04, 2027", "11/05/2026", "v2026.11"):
+            self.assertFalse(mapping.answer_repeats_date(answer), answer)
+
+    def test_a_tool_output_date_counts_only_as_itself(self):
+        # An old file in `ls -la` must not make "every Monday" unsaveable for
+        # the rest of the conversation: only the request's own day counts
+        # without a year or by weekday.
+        body = {"messages": [
+            {"role": "system", "content": self.PROMPT.format("Wednesday, November 04, 2026")},
+            {"role": "tool", "content": "-rw-r--r-- 1 root root 1234 Nov  3  2025 passwd\nDate:   2026-10-15"}]}
+        mapping = normalizer.normalize_request(body, self.at(2026, 11, 4)).mapping
+        for answer in ("runs every Monday", "the Thursday run", "due November 3", "Oct 15"):
+            self.assertFalse(mapping.answer_repeats_date(answer), answer)
+        for answer in ("passwd changed 2025-11-03", "commit from 2026-10-15", "November 3, 2025"):
+            self.assertTrue(mapping.answer_repeats_date(answer), answer)
+
+    def test_hermes_zone_names_before_the_offset(self):
+        now = calendar.timegm(datetime(2026, 11, 5, 3, 0).timetuple())
+        text = "Thursday, November 05, 2026 (America/New_York, EST, UTC-05:00)"
+        self.assertEqual(self.norm_at(text, now), "⟦TIME_future_day⟧ (America/New_York, EST, UTC-05:00)")
+
+    def test_an_unrelated_bracket_is_not_read_as_the_zone(self):
+        now = self.at(2026, 11, 5, 23)
+        text = "November 05, 2026 (window, ends UTC+14:00)"
+        self.assertEqual(self.norm_at(text, now), "⟦TIME_today⟧ (window, ends UTC+14:00)")
+
+    def test_date_only_iso_and_ls_dates_count_days_too(self):
+        # Before, both flipped bucket around midnight (within the hour, then hours).
+        self.assertEqual(self.norm_at("notAfter 2026-11-05", self.at(2026, 11, 5, 0)),
+                         self.norm_at("notAfter 2026-11-06", self.at(2026, 11, 6, 13)))
+        self.assertEqual(self.norm_at("notAfter 2026-11-05", self.at(2026, 11, 5, 0)), "notAfter ⟦TIME_today⟧")
+        self.assertEqual(self.norm_at("-rw-r--r-- 1 root root 12 Nov  3  2026 a", self.at(2026, 11, 5)),
+                         "-rw-r--r-- 1 root root 12 ⟦TIME_past_days⟧ a")
+        # The day itself: hours ago by the hour buckets, today by days.
+        self.assertEqual(self.norm_at("-rw-r--r-- 1 root root 12 Nov  5  2026 a", self.at(2026, 11, 5)),
+                         "-rw-r--r-- 1 root root 12 ⟦TIME_today⟧ a")
+
+    def test_a_year_ls_date_with_a_time_keeps_two_moments_apart(self):
+        # Day counting would give both `⟦TIME_today⟧ 10:42:01`: one key for two moments a day apart.
+        self.assertNotEqual(fp(request("Built Nov  5 2026 10:42:01"), now=self.at(2026, 11, 5)),
+                            fp(request("Built Nov  6 2026 10:42:01"), now=self.at(2026, 11, 6)))
+
+    def test_a_real_ls_l_listing_still_counts_days(self):
+        # ls prints a year, and no time, for a file older than about six months;
+        # the time on the line above does not reach it.
+        listing = ("-rw-r--r-- 1 root root  4096 Nov  4 10:42 new.conf\n"
+                   "-rw-r--r-- 1 root root 12288 Apr 12  2026 old.conf\n")
+        self.assertEqual(self.norm_at(listing, self.at(2026, 11, 5)),
+                         "-rw-r--r-- 1 root root  4096 ⟦TIME_past_days⟧ new.conf\n"
+                         "-rw-r--r-- 1 root root 12288 ⟦TIME_past_months⟧ old.conf\n")
+        # With a timed line below as well, at realistic widths.
+        listing += "-rw-r--r-- 1 root root   220 Nov  3 09:15 b\n"
+        self.assertIn("⟦TIME_past_months⟧ old.conf", self.norm_at(listing, self.at(2026, 11, 5)))
+
+    def assert_moments_apart(self, on_5th, on_6th):
+        """The same text a day later, each read on its own day, must not share a key."""
+        self.assertNotEqual(fp(request(on_5th), now=self.at(2026, 11, 5)),
+                            fp(request(on_6th), now=self.at(2026, 11, 6)), on_5th)
+
+    def test_a_time_in_a_sibling_json_field_keeps_two_moments_apart(self):
+        for on_5th, on_6th in (({"date": "2026-11-05", "time": "10:42:01"}, {"date": "2026-11-06", "time": "10:42:01"}),
+                               ({"built": "Nov  5 2026", "at": "10:42:01"}, {"built": "Nov  6 2026", "at": "10:42:01"}),
+                               (["2026-11-05", "10:42:01"], ["2026-11-06", "10:42:01"])):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
+
+    def test_a_time_a_json_level_away_keeps_two_moments_apart(self):
+        for on_5th, on_6th in (
+                # In a nested object beside the date.
+                ({"date": "2026-11-05", "run": {"at": "10:42"}}, {"date": "2026-11-06", "run": {"at": "10:42"}}),
+                # Beside the object the date is in.
+                ({"when": {"date": "2026-11-05"}, "time": "10:42"}, {"when": {"date": "2026-11-06"}, "time": "10:42"}),
+                # Beside a string that holds a JSON document with the date.
+                ({"dates": json.dumps(["2026-11-05"]), "time": "10:42"},
+                 {"dates": json.dumps(["2026-11-06"]), "time": "10:42"}),
+                # In a string beside the date that holds a JSON document.
+                ({"date": "2026-11-05", "run": json.dumps({"at": "10:42"})},
+                 {"date": "2026-11-06", "run": json.dumps({"at": "10:42"})}),
+                # Read as the walk reads it, parsed: the raw text has no `10:42`.
+                ({"date": "2026-11-05", "run": '{"at": "\\u0031\\u0030:42"}'},
+                 {"date": "2026-11-06", "run": '{"at": "\\u0031\\u0030:42"}'})):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
+
+    def test_a_time_after_an_escaped_line_break_inside_a_json_string_is_read(self):
+        # Double-escaped: once parsed, the string still holds a two-character `\n`.
+        for on_5th, on_6th in (
+                # Beside the date in its own string.
+                ({"stdout": "Built 2026-11-05\\n10:42:01 ok"}, {"stdout": "Built 2026-11-06\\n10:42:01 ok"}),
+                # In a sibling string.
+                ({"date": "2026-11-05", "log": "ok\\n10:42 done"}, {"date": "2026-11-06", "log": "ok\\n10:42 done"})):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
+
+    def test_a_time_in_an_object_key_keeps_two_moments_apart(self):
+        for on_5th, on_6th in (
+                ({"date": "2026-11-05", "slots": {"10:42": "booked"}}, {"date": "2026-11-06", "slots": {"10:42": "booked"}}),
+                # The date's own key.
+                ({"10:42": "2026-11-05"}, {"10:42": "2026-11-06"})):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(json.dumps(on_5th), json.dumps(on_6th))
+
+    def test_what_the_key_drops_does_not_decide_a_date(self):
+        def card(events):
+            return {"task": {"id": "t_11111111", "due": "2026-11-05"}, "events": events}
+        claimed = {"kind": "claimed", "payload": None}
+        beat = {"kind": "heartbeat", "payload": {"note": "retrying at 10:42"}}
+        self.assertEqual(fp(request(json.dumps(card([claimed]))), now=self.at(2026, 11, 5)),
+                         fp(request(json.dumps(card([claimed, beat]))), now=self.at(2026, 11, 5)))
+        # Opaque values become placeholders, so a time-like run in one is no time.
+        signed = {"due": "2026-11-05", "signature": "c2lnbmF0dXJl 10:42 PM", "tool_call_id": "call_1__thought__10:42",
+                  "provider_specific_fields": {"at": "10:42"}}
+        self.assertEqual(json.loads(self.norm_at(json.dumps(signed), self.at(2026, 11, 5)))["due"], "⟦TIME_today⟧")
+        calls = {"due": "2026-11-05", "tool_calls": [{"id": "call_1__thought__10:42", "type": "function"}]}
+        self.assertEqual(normalizer.Normalizer(self.at(2026, 11, 5), False).walk(calls)["due"], "⟦TIME_today⟧")
+        # The recent-work digest is stripped from the key.
+        digest = {"due": "2026-11-05", "body": "## Recent work by @bot\n- t_22222222 at 10:42\n\nrest"}
+        self.assertEqual(json.loads(self.norm_at(json.dumps(digest), self.at(2026, 11, 5)))["due"], "⟦TIME_today⟧")
+
+    def test_a_line_of_dates_is_scanned_for_times_once(self):
+        # Each date asks about the same line; scanning it once per date made a
+        # long single-line text cost dates x length.
+        text = " ".join(["2026-11-05"] * 200)
+        with mock.patch.object(normalizer.TimeIndex, "of", wraps=normalizer.TimeIndex.of) as scan:
+            out = self.norm_at(text, self.at(2026, 11, 5))
+        self.assertEqual(out, " ".join(["⟦TIME_today⟧"] * 200))
+        self.assertEqual(scan.call_count, 1)
+
+    def test_a_json_date_with_no_time_beside_it_still_counts_days(self):
+        self.assertEqual(self.norm_at(json.dumps({"date": "2026-11-05", "status": "ok"}), self.at(2026, 11, 5)),
+                         json.dumps({"date": "⟦TIME_today⟧", "status": "ok"}, ensure_ascii=False))
+        doc = {"when": {"date": "2026-11-05"}, "runs": [{"status": "ok", "log": json.dumps({"n": 3})}]}
+        out = self.norm_at(json.dumps(doc), self.at(2026, 11, 5))
+        self.assertEqual(json.loads(out)["when"]["date"], "⟦TIME_today⟧")
+        # A bucketed timestamp beside it carries no extra moment.
+        out = self.norm_at(json.dumps({"date": "2026-11-05", "updated": "2026-11-05 10:42:00Z"}), self.at(2026, 11, 5))
+        self.assertEqual(json.loads(out), {"date": "⟦TIME_today⟧", "updated": "⟦TIME_past_hours⟧"})
+
+    def test_a_bucketed_timestamp_does_not_keep_a_date_as_written(self):
+        # Its bucket keeps the hour, so the date beside it day-counts on both days.
+        cases = {
+            "seen 2026-11-05 10:42:00Z, due 2026-11-06": "seen ⟦TIME_past_hours⟧, due ⟦TIME_future_day⟧",
+            "Nov  5 10:42:01 host logrotate[412]: rotated app.log to app-2026-11-05.log":
+                "⟦TIME_past_hours⟧:01 host logrotate[412]: rotated app.log to app-⟦TIME_today⟧.log",
+            "2026-11-05T10:42:00.123+05:30, due 2026-11-06": "⟦TIME_past_hours⟧, due ⟦TIME_future_day⟧",
+            "Tue, 05 Nov 2026 10:42:01 +0000 then 2026-11-06": "⟦TIME_past_hours⟧ then ⟦TIME_future_day⟧",
+            "notAfter=Nov  5 10:42:01 2026 GMT, renew 2026-11-06": "notAfter=⟦TIME_past_hours⟧, renew ⟦TIME_future_day⟧",
+        }
+        for text, normalized in cases.items():
+            with self.subTest(text):
+                self.assertEqual(self.norm_at(text, self.at(2026, 11, 5)), normalized)
+                on_6th = text.replace("2026-11-06", "2026-11-07").replace("11-05", "11-06").replace("Nov  5", "Nov  6") \
+                    .replace("05 Nov", "06 Nov").replace("Tue,", "Wed,")
+                self.assertEqual(self.norm_at(on_6th, self.at(2026, 11, 6)), normalized)
+
+    def test_a_timestamp_no_rule_buckets_still_keeps_the_date(self):
+        # February 30th is not a timestamp the ISO rule buckets, so its time is read.
+        self.assertEqual(self.norm_at("2026-02-30 10:42 then 2026-11-06", self.at(2026, 11, 5)),
+                         "2026-02-30 10:42 then 2026-11-06")
+
+    def test_a_port_is_not_a_time_of_day(self):
+        self.assertEqual(self.norm_at("listening on 80:8080 since 2026-11-05", self.at(2026, 11, 5)),
+                         "listening on 80:8080 since ⟦TIME_today⟧")
+
+    def test_a_time_just_before_the_window_is_read_with_what_precedes_it(self):
+        # February 30th is no timestamp a rule buckets, so its `T10:42` stays in
+        # the text. The second date starts at 46, so its window starts at
+        # `10:42`: read from there alone, the `T` before it is lost and `10:42`
+        # looks like a time of day.
+        text = "seen 2026-02-30T10:42:00Z, next check due on: 2026-11-06"
+        self.assertEqual(text.index("2026-11-06") - normalizer.TIME_NEAR_DATE_CHARS, text.index("10:42"))
+        self.assertEqual(self.norm_at(text, self.at(2026, 11, 5)),
+                         "seen 2026-02-30T10:42:00Z, next check due on: ⟦TIME_future_day⟧")
+
+    def test_a_time_on_the_line_or_past_the_window_edge_keeps_two_moments_apart(self):
+        for on_5th in ("2026-11-05 | provisioning-cluster-request-never-creates | 10:42:01",
+                       # On the next line, starting inside TIME_NEAR_DATE_CHARS and ending outside it.
+                       "2026-11-05\n" + "x" * 25 + " 10:42:01",
+                       # On the line before, starting outside the window and ending inside it.
+                       "10:42:01" + " " * 24 + "\n2026-11-05",
+                       # A `-` before the time.
+                       "2026-11-05-10:42", "Nov  5 2026-10:42",
+                       # A JSON-escaped line break before the time, in text that is not JSON.
+                       "2026-11-05\\n10:42", '{"stdout": "Built 2026-11-05\\n10:42:01 ok"'):
+            with self.subTest(on_5th):
+                self.assert_moments_apart(on_5th, on_5th.replace("11-05", "11-06").replace("Nov  5", "Nov  6"))
+
+    def test_a_time_on_the_next_line_still_keeps_the_date(self):
+        self.assertEqual(self.norm_at("Date: 2026-11-05\nTime: 10:42", self.at(2026, 11, 5)), "Date: 2026-11-05\nTime: 10:42")
+
+    def test_a_date_with_a_time_of_day_is_left_alone(self):
+        now = self.at(2026, 11, 5)
+        for text in ("November 05, 2026 at 10:42:01", "Thursday, November 05, 2026 10:42 AM",
+                     "November 05, 2026, 9:30 PM", "November 05, 2026 - 10:42", "November 05, 2026 at 10 PM",
+                     "November 05, 2026 (10:42)", "November 05, 2026 10h42", "10:42 on November 05, 2026",
+                     "10pm, November 05, 2026",
+                     # A word between the date and the time.
+                     "November 05, 2026 (Thursday) 10:42", "November 05, 2026 at around 10:42",
+                     "November 05, 2026 at approximately 3 PM", "10:42 UTC on November 05, 2026",
+                     "November 05, 2026 UTC 10:42",
+                     # A date-only ISO value with a time beside it that the ISO rule doesn't join.
+                     "2026-11-05 at 10:42", "2026-11-05, 10:42:00"):
+            self.assertEqual(self.norm_at(text, now), text)
+        # An `ls -l`-shaped date with a year and a time beside it.
+        for text in ("Built Nov  5 2026 10:42:01", "Built Nov  5  2026 10:42", "10:42 Nov  5  2026"):
+            self.assertEqual(self.norm_at(text, now), text)
+        # Hermes's zone suffix is not a time of day.
+        self.assertEqual(self.norm_at("November 05, 2026 (UTC, UTC+00:00)", now), "⟦TIME_today⟧ (UTC, UTC+00:00)")
+        self.assertEqual(self.norm_at("Conversation started: Thursday, November 05, 2026 (America/New_York, EST, UTC-05:00)",
+                                      self.at(2026, 11, 5, 3)),
+                         "Conversation started: ⟦TIME_future_day⟧ (America/New_York, EST, UTC-05:00)")
 
 
 class TimeTest(unittest.TestCase):

@@ -3,6 +3,7 @@ import importlib
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -1188,11 +1189,11 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args for c in alert.call_args_list],
                          [("google_chat", "alert", "s1"), ("slack", "slack alert", "s1")])
-        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
 
     def test_the_title_is_recorded_before_the_turn_starts(self):
         def start(*_args):
-            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
             return STARTED
 
         session_kv_server._start_agent_turn.side_effect = start
@@ -1203,6 +1204,24 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert", "s1")])
         session_kv_server._record_alert_title.assert_not_called()
+
+    def test_a_drift_kind_is_recorded_with_the_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title="the title", alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", session_kv_server.ALERT_KIND_DRIFT)
+
+    def test_a_drift_kind_is_recorded_without_a_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title=None, alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", None, session_kv_server.ALERT_KIND_DRIFT)
 
     def test_under_next_a_google_chat_thread_gets_the_title(self):
         # The title heads the plan the cards draw, which the gateway lays out on
@@ -1238,6 +1257,28 @@ class TestAlertTitleRecord(unittest.TestCase):
     def test_a_missing_row_is_not_an_error(self):
         session_kv_server._record_alert_title("k8s-evt-none", "x")
 
+    def test_a_kind_joins_the_routing_row_beside_the_title(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", "checkout HPA drift in seeded-b", "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {
+            "platform": "slack", "thread_id": "1.0", "title": "checkout HPA drift in seeded-b", "alert_kind": "drift",
+        })
+
+    def test_a_kind_without_a_title_is_still_recorded(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", None, "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {"platform": "slack", "thread_id": "1.0", "alert_kind": "drift"})
+
     def test_the_gateway_reads_the_title_recorded(self):
         import importlib.util
         import sqlite3
@@ -1253,6 +1294,13 @@ class TestAlertTitleRecord(unittest.TestCase):
             )
         session_kv_server._record_alert_title("k8s-evt-t2", "payments-api crashloop in seeded-debug")
         self.assertEqual(reader.alert_title("C1", "2.0", temp_db_path), "payments-api crashloop in seeded-debug")
+        self.assertFalse(reader.is_drift_alert("C1", "2.0", temp_db_path))
+        session_kv_server._record_alert_title("k8s-evt-t2", "checkout HPA drift", session_kv_server.ALERT_KIND_DRIFT)
+        self.assertTrue(reader.is_drift_alert("C1", "2.0", temp_db_path))
+        self.assertEqual(
+            (reader.ALERT_KIND_KEY, reader.ALERT_KIND_DRIFT),
+            (session_kv_server.ALERT_KIND_KEY, session_kv_server.ALERT_KIND_DRIFT),
+        )
 
 
 class TestSessionKvServerAuth(unittest.TestCase):
@@ -1270,6 +1318,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         # A kind the route refuses after the key check, so the authorised half
         # of the test writes no backlog row and starts no digest worker.
         ("POST", "/v1/drift-backlog", {"kind": "not-drift"}),
+        ("POST", "/v1/excluded-events", {"kind": "not-an-event"}),
         ("GET", "/v1/sessions", None),
         ("GET", "/v1/sessions/sess-1/metadata", None),
         ("POST", "/v1/incidents", {"chat_id": "c", "thread_id": "t", "report": "r"}),
@@ -1296,6 +1345,14 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/board/actions", {"action": "retry", "tasks": ["t-1"]}),
         ("GET", "/v1/tasks", None),
         ("GET", "/v1/tasks/t-1", None),
+        ("PUT", "/v1/sessions/sess-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("GET", "/v1/sessions/sess-1/origin", None),
+        ("PUT", "/v1/cron/jobs/j-1/origin", {"origin": "chat", "platform": "slack"}),
+        ("GET", "/v1/cron/jobs/j-1/origin", None),
+        ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
+        ("GET", "/v1/proposals/opened/counts", None),
+        ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
+        ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
 
     def setUp(self):
@@ -1345,6 +1402,8 @@ class TestSessionKvServerAuth(unittest.TestCase):
                 .replace("sess-1", "{session_id}")
                 .replace("f-1", "{finding_id}")
                 .replace("t-1", "{task_id}")
+                .replace("j-1", "{job_id}")
+                .replace("tk-1", "{ticket}")
                 .replace("publication/backlog", "publication/{publisher}"),
             )
             for method, path, _ in self.PROTECTED_ROUTES
@@ -2283,11 +2342,15 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
         self.trigger = trigger.start()
         self.addCleanup(trigger.stop)
+        # The pull request lookup pool caches a state for a minute; a test
+        # that asks the forge must not be answered by the last one's reading.
+        session_kv_server._fix_pr_lookup_pool().forget()
 
     def tearDown(self):
         os.environ.pop("SESSION_KV_API_KEY", None)
 
-    def _inject(self, pod, reason="BackOff", namespace="fold-ns", kind="Pod", cluster="c1", event_type="Warning"):
+    def _inject(self, pod, reason="BackOff", namespace="fold-ns", kind="Pod", cluster="c1", event_type="Warning",
+                controller_ref=None):
         payload = {
             "reason": reason,
             "namespace": namespace,
@@ -2298,6 +2361,8 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             "type": event_type,
             "cluster": cluster,
         }
+        if controller_ref is not None:
+            payload["context"] = {"controller_ref": controller_ref}
         resp = self.client.post(
             f"/sessions/sess-{pod}-{reason}/inject",
             json={"message": json.dumps(payload)},
@@ -2305,6 +2370,99 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         return resp.json()
+
+    def _rows_in(self, namespace):
+        import sqlite3
+        with sqlite3.connect(temp_db_path) as conn:
+            return conn.execute(
+                "SELECT id, notified, duplicate_of FROM intercepted_events WHERE namespace = ? ORDER BY id",
+                (namespace,),
+            ).fetchall()
+
+    # --- folded by the Pod's owning workload (controller_ref) ---------------
+
+    def test_the_pods_of_one_controller_fold_into_one_incident(self):
+        # One namespace per kind, so each subtest's rows are its own.
+        cases = {
+            "StatefulSet/web": ["web-0", "web-1", "web-2"],
+            "DaemonSet/node-exporter": ["node-exporter-x7k2p", "node-exporter-q9w4z"],
+            "Job/db-migrate": ["db-migrate-abcde", "db-migrate-fghij", "db-migrate-klmno"],
+        }
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            for ref, pods in cases.items():
+                with self.subTest(ref=ref):
+                    namespace = "ctrl-" + ref.split("/")[0].lower()
+                    calls = self.trigger.call_count
+                    replies = [self._inject(pod, namespace=namespace, controller_ref=ref) for pod in pods]
+                    rows = self._rows_in(namespace)
+                    self.assertEqual(replies[0]["status"], "injected")
+                    self.assertEqual([r["status"] for r in replies[1:]], ["folded"] * (len(pods) - 1))
+                    self.assertEqual([r[2] for r in rows], [None] + [rows[0][0]] * (len(pods) - 1))
+                    self.assertEqual(self.trigger.call_count - calls, 1, "more than one investigation for one workload")
+
+    def test_pods_without_a_controller_ref_do_not_fold_by_name(self):
+        # Unchanged: a StatefulSet's ordinals are not a replica suffix the name proves.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            replies = [self._inject(pod, namespace="noref-ns") for pod in ("db-0", "db-1")]
+        self.assertEqual([r["status"] for r in replies], ["injected", "injected"])
+
+    def test_a_malformed_controller_ref_is_ignored(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            for i, ref in enumerate(("garbage", "statefulset/web", "StatefulSet/Web_1", "StatefulSet/", 7, "Node/node-a")):
+                with self.subTest(ref=ref):
+                    namespace = f"badref-{i}"
+                    replies = [self._inject(pod, namespace=namespace, controller_ref=ref) for pod in ("web-0", "web-1")]
+                    self.assertEqual([r["status"] for r in replies], ["injected", "injected"])
+
+    def test_kinds_of_one_name_stay_apart(self):
+        # A StatefulSet and a Deployment both named `web` are two workloads.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            first = self._inject("web-6cfdb6b98b-aaaaa", namespace="twokinds", controller_ref="Deployment/web")
+            second = self._inject("web-0", namespace="twokinds", controller_ref="StatefulSet/web")
+        self.assertEqual([first["status"], second["status"]], ["injected", "injected"])
+
+    def test_a_deployment_pod_folds_with_or_without_its_controller_ref(self):
+        # The key is the bare Deployment name either way, so a lookup that
+        # failed for one replica, or a row from an older watcher, still folds.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            first = self._inject("api-6cfdb6b98b-aaaaa", namespace="mixed", controller_ref="Deployment/api")
+            second = self._inject("api-6cfdb6b98b-bbbbb", namespace="mixed")
+            third = self._inject("api-6cfdb6b98b-ccccc", namespace="mixed", controller_ref="Deployment/api")
+        self.assertEqual([first["status"], second["status"], third["status"]], ["injected", "folded", "folded"])
+
+    def test_the_branch_follows_the_controller_and_keeps_its_prefix(self):
+        def branch(pod, ref=None):
+            payload = {"cluster": "c1", "namespace": "ns", "kind_of_object": "Pod", "name": pod, "reason": "BackOff"}
+            if ref is not None:
+                payload["context"] = {"controller_ref": ref}
+            return session_kv_server._incident_branch("sess", payload)
+
+        owned = {branch(pod, "StatefulSet/web") for pod in ("web-0", "web-1", "web-2")}
+        self.assertEqual(len(owned), 1, owned)
+        self.assertTrue(owned.pop().startswith(session_kv_server.INCIDENT_PR_BRANCH_PREFIX))
+        self.assertNotEqual(branch("web-0"), branch("web-1"), "pods without a controller_ref merged by name")
+        self.assertEqual(
+            branch("api-6cfdb6b98b-aaaaa", "Deployment/api"), branch("api-6cfdb6b98b-bbbbb"),
+            "a Deployment's branch moved when the watcher sent its controller_ref",
+        )
+
+    def test_fold_key_reads_controller_ref_only_for_pods(self):
+        fold = session_kv_server._fold_key
+        self.assertEqual(fold("Pod", "web-0", "StatefulSet/web"), "StatefulSet/web")
+        self.assertEqual(fold("Pod", "api-6cfdb6b98b-aaaaa", "Deployment/api"), "api")
+        self.assertEqual(fold("Pod", "x-1", "Job/x"), "Job/x")
+        self.assertEqual(fold("Node", "node-1", "StatefulSet/web"), "node-1")
+        self.assertEqual(fold("Pod", "web-0"), "")
+
+    def test_a_static_pods_node_is_not_a_workload(self):
+        # A mirror Pod's controller is its Node: two static Pods on one node
+        # are two workloads, so a Node controller_ref is ignored.
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", self.WINDOW):
+            replies = [
+                self._inject(pod, namespace="static-ns", controller_ref="Node/node-a")
+                for pod in ("etcd-node-a", "kube-apiserver-node-a")
+            ]
+        self.assertEqual([r["status"] for r in replies], ["injected", "injected"])
 
     def _rows(self, workload):
         import sqlite3
@@ -2546,7 +2704,8 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         self.assertEqual(reply["duplicate_of"], str(anchor_id))
 
     def test_with_folding_off_nothing_is_held_or_looked_up(self):
-        with patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 0), \
+                patch.object(session_kv_server, "_proposal_state", return_value="open") as state:
             self.assertEqual(self._inject("offfix-api-6cfdb6b98b-aaaaa")["status"], "injected")
             self.assertEqual(self._inject("offfix-api-6cfdb6b98b-bbbbb")["status"], "injected")
         state.assert_not_called()
@@ -2605,13 +2764,21 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.assertEqual(self._inject("deadline-api-6cfdb6b98b-ccccc")["status"], "injected")
         self.assertEqual(state.call_count, 1)
 
+    def _lookup_url(self, tag):
+        """A pull request URL no other test asks about, so the pool's cache cannot answer for it."""
+        return f"https://github.com/acme/fleet-{tag}/pull/{abs(hash(tag)) % 9000 + 1}"
+
     def test_the_forge_is_asked_for_the_pull_request_and_its_state_read(self):
         forge = MagicMock()
         forge.call.return_value = {"proposal": {"state": "open"}}
         with patch.dict(sys.modules, {"forge": forge}):
             self.assertEqual(session_kv_server._proposal_state(self.FIX_URL, 5), "open")
             forge.call.assert_called_once_with(
-                "proposal-view", {"number": 7}, "https://github.com/acme/fleet", retry_transient=True
+                "proposal-view",
+                {"number": 7},
+                "https://github.com/acme/fleet",
+                retry_transient=True,
+                timeout_s=session_kv_server.FIX_PR_LOOKUP_TIMEOUT_S,
             )
             forge.call.reset_mock()
             mr = "https://gitlab.example.com/acme/fleet/-/merge_requests/12"
@@ -2619,15 +2786,148 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             self.assertEqual(forge.call.call_args.args[1:], ({"number": 12}, "https://gitlab.example.com/acme/fleet"))
 
     def test_a_forge_that_fails_or_overruns_reads_as_no_state(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
         forge = MagicMock()
         with patch.dict(sys.modules, {"forge": forge}):
             forge.call.side_effect = RuntimeError("forge down")
-            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 5))
-            forge.call.side_effect = lambda *a, **k: time.sleep(0.5) or {"proposal": {"state": "open"}}
-            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
+            self.assertIsNone(session_kv_server._proposal_state(self._lookup_url("down"), 5))
+            forge.call.side_effect = lambda *a, **k: release.wait(5) and {"proposal": {"state": "open"}}
+            self.assertIsNone(session_kv_server._proposal_state(self._lookup_url("slow"), 0.05))
             forge.call.reset_mock()
             self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
             forge.call.assert_not_called()
+
+    # What each forge the broker serves (providers/registry.py AVAILABLE)
+    # answers `proposal-create` with (providers/*/translate.py and the provider
+    # tests' fixtures): the forge, its configured host, the url, the repository
+    # the fold asks the forge about, and the number.
+    FORGE_PROPOSAL_URLS = (
+        ("github", "github.com", "https://github.com/acme/fleet/pull/7", "https://github.com/acme/fleet", 7, "acme/fleet"),
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/sub/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/sub/fleet",
+            7,
+            "group/sub/fleet",
+        ),
+        # A subgroup named like a marker before a numeric subgroup is still the
+        # repository: the last marker before the number is the merge request.
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/pulls/2024/fleet",
+            7,
+            "group/pulls/2024/fleet",
+        ),
+        ("gitea", "gitea.example.com", "https://gitea.example.com/acme/fleet/pulls/7", "https://gitea.example.com/acme/fleet", 7, "acme/fleet"),
+        # An in-cluster Gitea serves http on a .svc host (docs/site install/gitea.md).
+        (
+            "gitea",
+            "gitea-http.gitea.svc.cluster.local",
+            "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet/pulls/7",
+            "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet",
+            7,
+            "demo/fleet",
+        ),
+        (
+            "bitbucket",
+            "bitbucket.org",
+            "https://bitbucket.org/acme/fleet/pull-requests/7/_/diff#comment-42",
+            "https://bitbucket.org/acme/fleet",
+            7,
+            "acme/fleet",
+        ),
+        (
+            "bitbucket-datacenter",
+            "bitbucket.example.com",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/7/overview",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet",
+            7,
+            "ACME/fleet",
+        ),
+    )
+    #: What a forge entry needs beyond provider and host; the in-cluster Gitea
+    #: declares its scheme and port.
+    FORGE_ENTRY_EXTRAS = {"gitea-http.gitea.svc.cluster.local": {"scheme": "http", "port": 3000}}
+
+    def test_the_forge_is_asked_about_a_pull_request_on_every_forge_the_broker_serves(self):
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            for _provider, _host, url, repository, number, _path in self.FORGE_PROPOSAL_URLS:
+                with self.subTest(url=url):
+                    forge.call.reset_mock()
+                    self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+                    forge.call.assert_called_once_with(
+                        "proposal-view",
+                        {"number": number},
+                        repository,
+                        retry_transient=True,
+                        timeout_s=session_kv_server.FIX_PR_LOOKUP_TIMEOUT_S,
+                    )
+
+    def test_the_repository_read_from_each_forges_url_is_one_the_broker_resolves_to_that_forge(self):
+        import providers
+        from providers import registry as registry_module
+
+        forges = [{"provider": "github", "host": "github.com"}] + [
+            {"provider": provider, "host": host, "tokenPath": "/nonexistent/token", "allowedPaths": [], **self.FORGE_ENTRY_EXTRAS.get(host, {})}
+            for provider, host in sorted({(provider, host) for provider, host, *_rest in self.FORGE_PROPOSAL_URLS})
+            if provider != "github"
+        ]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "forges.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"forges": forges}, handle)
+        registry = providers.Registry({"forges": registry_module.load_forge_entries(path)})
+        self.assertEqual(
+            {cls.name for cls in providers.AVAILABLE},
+            {provider for provider, *_rest in self.FORGE_PROPOSAL_URLS},
+            "a forge the broker serves has no url shape here",
+        )
+        for provider, _host, url, repository, _number, repo_path in self.FORGE_PROPOSAL_URLS:
+            with self.subTest(url=url):
+                match = session_kv_server.PROPOSAL_URL_RE.match(url)
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(1), repository)
+                resolved, repo = registry.resolve(match.group(1))
+                self.assertEqual(resolved.name, provider)
+                self.assertEqual(repo, repo_path)
+
+    def test_an_incidents_fix_pull_request_is_found_on_every_forge_and_an_issue_is_not(self):
+        issue = "https://gitea.example.com/acme/fleet/issues/7"
+        cards = [(f"t-{i}", f"sess-{i}", row[2]) for i, row in enumerate(self.FORGE_PROPOSAL_URLS)]
+        self._board(cards=cards + [("t-issue", "sess-issue", issue)])
+        for i, row in enumerate(self.FORGE_PROPOSAL_URLS):
+            with self.subTest(url=row[2]):
+                self.assertEqual(session_kv_server._incident_pull_request_urls(f"sess-{i}"), [row[2]])
+        self.assertEqual(session_kv_server._incident_pull_request_urls("sess-issue"), [])
+        for not_a_proposal in (
+            issue,
+            "https://bitbucket.org/acme/fleet/issues/7",
+            "https://github.com/acme/fleet/commit/7",
+            # A listing, a marker with no number, and a number only in the query.
+            "https://gitea.example.com/acme/fleet/pulls",
+            "https://bitbucket.org/acme/fleet/pull-requests/",
+            "https://gitea.example.com/acme/fleet/pulls?state=open&id=7",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=not_a_proposal):
+                self.assertIsNone(session_kv_server.PROPOSAL_URL_RE.match(not_a_proposal))
+
+    def test_a_failed_read_is_not_cached(self):
+        url = self._lookup_url("retry")
+        forge = MagicMock()
+        forge.call.side_effect = [RuntimeError("forge down"), {"proposal": {"state": "open"}}]
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertIsNone(session_kv_server._proposal_state(url, 5))
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+        self.assertEqual(forge.call.call_count, 2)
 
     def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
         release = threading.Event()
@@ -2635,10 +2935,186 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         forge.call.side_effect = lambda *a, **k: release.wait(5) and {}
         self.addCleanup(release.set)
         with patch.dict(sys.modules, {"forge": forge}):
-            self.assertIsNone(session_kv_server._proposal_state(self.FIX_URL, 0.05))
-        workers = [t for t in threading.enumerate() if t.name == "fix-pr-lookup"]
-        self.assertTrue(workers, "the overrunning call has no thread left to inspect")
+            self.assertIsNone(session_kv_server._proposal_state(self._lookup_url("held"), 0.05))
+        workers = session_kv_server._fix_pr_lookup_pool().threads
+        self.assertEqual(len(workers), session_kv_server.FIX_PR_LOOKUP_WORKERS)
         self.assertTrue(all(t.daemon for t in workers), "a non-daemon worker is joined at interpreter exit")
+        self.assertTrue(all(t.is_alive() for t in workers), "an abandoned call must not end its worker")
+
+    def test_a_cached_state_makes_no_forge_call(self):
+        url = self._lookup_url("cached")
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+        forge.call.assert_called_once()
+
+    def test_a_stale_cache_entry_is_read_again(self):
+        url = self._lookup_url("stale")
+        pool = session_kv_server._fix_pr_lookup_pool()
+        forge = MagicMock()
+        forge.call.side_effect = [{"proposal": {"state": "open"}}, {"proposal": {"state": "merged"}}]
+        with patch.dict(sys.modules, {"forge": forge}):
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+            with pool._lock:
+                expires_at, state = pool._cache[url]
+                self.assertEqual(state, "open")
+                self.assertAlmostEqual(
+                    expires_at - time.monotonic(), session_kv_server.FIX_PR_STATE_CACHE_TTL_S, delta=5
+                )
+                pool._cache[url] = (time.monotonic() - 1, state)
+            self.assertEqual(session_kv_server._proposal_state(url, 5), "merged")
+        self.assertEqual(forge.call.call_count, 2)
+
+    def test_callers_waiting_on_the_same_url_share_one_forge_call(self):
+        url = self._lookup_url("shared")
+        release = threading.Event()
+        self.addCleanup(release.set)
+        forge = MagicMock()
+        forge.call.side_effect = lambda *a, **k: release.wait(5) and {"proposal": {"state": "open"}}
+        answers = []
+        with patch.dict(sys.modules, {"forge": forge}):
+            callers = [
+                threading.Thread(target=lambda: answers.append(session_kv_server._proposal_state(url, 5)))
+                for _ in range(3)
+            ]
+            for caller in callers:
+                caller.start()
+            deadline = time.monotonic() + 5
+            while forge.call.call_count < 1 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            release.set()
+            for caller in callers:
+                caller.join(5)
+        self.assertEqual(answers, ["open"] * 3)
+        forge.call.assert_called_once()
+
+    def test_at_most_four_forge_calls_run_at_once(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        started = threading.Semaphore(0)
+        forge = MagicMock()
+
+        def blocked(*a, **k):
+            started.release()
+            release.wait(5)
+            return {"proposal": {"state": "open"}}
+
+        forge.call.side_effect = blocked
+        urls = [self._lookup_url(f"burst-{i}") for i in range(8)]
+        with patch.dict(sys.modules, {"forge": forge}):
+            callers = [
+                threading.Thread(target=session_kv_server._proposal_state, args=(url, 5)) for url in urls
+            ]
+            for caller in callers:
+                caller.start()
+            for _ in range(session_kv_server.FIX_PR_LOOKUP_WORKERS):
+                self.assertTrue(started.acquire(timeout=5))
+            time.sleep(0.1)
+            in_flight = forge.call.call_count
+            release.set()
+            for caller in callers:
+                caller.join(5)
+        self.assertEqual(in_flight, session_kv_server.FIX_PR_LOOKUP_WORKERS)
+        self.assertEqual(forge.call.call_count, len(urls))
+        self.assertEqual(session_kv_server.FIX_PR_LOOKUP_WORKERS, 4)
+
+    def test_a_full_queue_fails_open(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        started = threading.Event()
+        forge = MagicMock()
+
+        def blocked(*a, **k):
+            started.set()
+            release.wait(5)
+            return {"proposal": {"state": "open"}}
+
+        forge.call.side_effect = blocked
+        pool = session_kv_server._FixPullRequestLookupPool(workers=1, queue_max=1, ttl_s=60)
+        with patch.dict(sys.modules, {"forge": forge}):
+            with patch.object(session_kv_server, "_FIX_PR_LOOKUP_POOL", pool):
+                # The worker takes the first, the queue holds the second, and the
+                # third has nowhere to wait: None at once, not after its budget.
+                threading.Thread(target=session_kv_server._proposal_state, args=(self._lookup_url("q1"), 5)).start()
+                self.assertTrue(started.wait(5))
+                threading.Thread(target=session_kv_server._proposal_state, args=(self._lookup_url("q2"), 5)).start()
+                deadline = time.monotonic() + 5
+                while not pool._queue.full() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pool._queue.full(), "the second lookup never reached the queue")
+                before = time.monotonic()
+                self.assertIsNone(session_kv_server._proposal_state(self._lookup_url("q3"), 5))
+                self.assertLess(time.monotonic() - before, 1)
+                release.set()
+
+    def test_a_queued_lookup_nobody_waits_for_is_dropped_once_stale(self):
+        # A forge brownout leaves the queue full of lookups whose callers have
+        # all given up; when the forge comes back the workers must not spend a
+        # round trip on each before a fresh caller gets its read.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        started = threading.Event()
+        forge = MagicMock()
+
+        def blocked(*a, **k):
+            started.set()
+            release.wait(5)
+            return {"proposal": {"state": "open"}}
+
+        forge.call.side_effect = blocked
+        pool = session_kv_server._FixPullRequestLookupPool(workers=1, queue_max=4, ttl_s=60)
+        stale_url, fresh_url = self._lookup_url("stale-q"), self._lookup_url("fresh-q")
+        with patch.dict(sys.modules, {"forge": forge}), patch.object(session_kv_server, "_FIX_PR_LOOKUP_POOL", pool):
+            threading.Thread(target=session_kv_server._proposal_state, args=(self._lookup_url("busy"), 5)).start()
+            self.assertTrue(started.wait(5))
+            self.assertIsNone(session_kv_server._proposal_state(stale_url, 0.05))
+            with pool._lock:
+                queued = pool._in_flight[stale_url]
+                self.assertEqual(queued.waiters, 0)
+                queued.queued_at -= session_kv_server.FIX_PR_LOOKUP_TIMEOUT_S + 1
+            release.set()
+            self.assertEqual(session_kv_server._proposal_state(fresh_url, 5), "open")
+        urls_read = [call.args[2] for call in forge.call.call_args_list]
+        self.assertNotIn(stale_url.rsplit("/pull/", 1)[0], urls_read)
+        self.assertIn(fresh_url.rsplit("/pull/", 1)[0], urls_read)
+        self.assertNotIn(stale_url, pool._in_flight)
+
+    def test_a_hung_forge_frees_its_worker_at_the_lookup_budget(self):
+        # One worker and a forge that never answers for URL A. The worker's
+        # read carries FIX_PR_LOOKUP_TIMEOUT_S to forge.call, which bounds the
+        # hop by it, so the hop gives up when A's caller does and the worker
+        # is free for URL B; unbounded, it sat on A for forge's
+        # FORWARD_TIMEOUT_S (90 s) while every other caller waited out its
+        # budget behind it and read None.
+        budget = 0.05
+        hung = threading.Event()
+        self.addCleanup(hung.set)
+        hung_url, next_url = self._lookup_url("hung-a"), self._lookup_url("next-b")
+        hung_repo = hung_url.rsplit("/pull/", 1)[0]
+        bounds = []
+
+        def hop(verb, payload, repo, *, retry_transient=False, timeout_s=None):
+            if repo != hung_repo:
+                return {"proposal": {"state": "open"}}
+            bounds.append(timeout_s)
+            hung.wait(timeout_s)  # the hop honours its bound; None would be forge's 90 s
+            raise RuntimeError(f"{verb} on {repo} did not answer within {timeout_s}s")
+
+        forge = MagicMock()
+        forge.call.side_effect = hop
+        pool = session_kv_server._FixPullRequestLookupPool(workers=1, queue_max=4, ttl_s=60)
+        with patch.dict(sys.modules, {"forge": forge}), \
+                patch.object(session_kv_server, "_FIX_PR_LOOKUP_POOL", pool), \
+                patch.object(session_kv_server, "FIX_PR_LOOKUP_TIMEOUT_S", budget):
+            self.assertIsNone(session_kv_server._proposal_state(hung_url, budget))
+            before = time.monotonic()
+            self.assertEqual(session_kv_server._proposal_state(next_url, 5), "open")
+            self.assertLess(time.monotonic() - before, 1)
+        self.assertEqual(bounds, [budget])
 
     def test_the_pull_request_constants_match_the_plugin_that_writes_them(self):
         plugin_path = Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
@@ -2646,13 +3122,35 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         plugin = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(plugin)
         self.assertEqual(session_kv_server.PR_OPENED_EVENT_KIND, plugin.PR_OPENED_KIND)
-        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, plugin.OPEN_STATE)
+        # The forge check moved from the plugin to the broker's `proposal-claim`;
+        # the broker now holds the open state the fold waits for.
+        import vcs_broker
+
+        self.assertEqual(session_kv_server.PROPOSAL_OPEN_STATE, vcs_broker.OPEN_PROPOSAL_STATE)
         self.assertEqual(session_kv_server.PROPOSAL_URL_RE.pattern, plugin.PROPOSAL_URL.pattern)
 
-    def test_off_by_default(self):
-        self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 0)
-        for pod in ("off-api-6cfdb6b98b-aaaaa", "off-api-6cfdb6b98b-bbbbb"):
-            self.assertEqual(self._inject(pod)["status"], "injected")
+    def test_on_by_default_at_an_hour(self):
+        # The daemon's own fallback, which the operator's rendered default and the
+        # chart's key repeat (platformagent_manifests.go, values.yaml).
+        self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS, 3600)
+        self.assertEqual(session_kv_server.INCIDENT_WORKLOAD_DEDUP_SECONDS, 3600)
+        with patch.dict(os.environ, {"INCIDENT_WORKLOAD_DEDUP_SECONDS": ""}):
+            self.assertEqual(
+                session_kv_server._alert_daily_limit(
+                    "INCIDENT_WORKLOAD_DEDUP_SECONDS", session_kv_server.INCIDENT_WORKLOAD_DEDUP_DEFAULT_SECONDS
+                ),
+                3600,
+            )
+        self.assertEqual(self._inject("default-api-6cfdb6b98b-aaaaa")["status"], "injected")
+        self.assertEqual(self._inject("default-api-6cfdb6b98b-bbbbb")["status"], "folded")
+        self.assertEqual(self.trigger.call_count, 1)
+        rows = self._rows("default-api")
+        self.assertEqual([r[3] for r in rows], [None, rows[0][0]])
+
+    def test_zero_turns_folding_off(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 0):
+            for pod in ("off-api-6cfdb6b98b-aaaaa", "off-api-6cfdb6b98b-bbbbb"):
+                self.assertEqual(self._inject(pod)["status"], "injected")
         self.assertEqual(self.trigger.call_count, 2)
         self.assertEqual([r[3] for r in self._rows("off-api")], [None, None])
 
@@ -2770,7 +3268,7 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             ("_chat_platforms_disabled", lambda: False),
             ("_register_session_routing", MagicMock()),
             ("_post_initial_alert", MagicMock(return_value="spaces/A/threads/B")),
-            ("_build_agent_query", lambda payload, session_id="": "q"),
+            ("_build_agent_query", lambda payload, session_id="", **_: "q"),
             ("_triage_sleep", MagicMock()),
         ):
             p = patch.object(session_kv_server, name, value)
@@ -2922,6 +3420,283 @@ class TestWorkloadIncidentFold(unittest.TestCase):
         ]
         self.assertEqual([e["status"] for e in events], ["folded", "injected"])
         self.assertEqual([e["duplicate_of"] for e in events], [events[1]["id"], None])
+
+
+class _RecordingConnection(sqlite3.Connection):
+    """A connection that keeps every statement it ran, for EXPLAIN QUERY PLAN."""
+
+    statements: list = []
+
+    def execute(self, sql, parameters=(), /):
+        type(self).statements.append((sql, tuple(parameters)))
+        return super().execute(sql, parameters)
+
+
+def _table_scans(conn, sql, params):
+    """The EXPLAIN QUERY PLAN lines that walk the ledger itself rather than an index."""
+    plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()]
+    return [line for line in plan if line.startswith("SCAN") and "USING" not in line], plan
+
+
+class TestWorkloadFoldQueryPlans(unittest.TestCase):
+    """The fold's lookups read the ledger through the partial indexes init_db creates.
+
+    Each ran as a scan of the whole table, on the inject route and under
+    _WORKLOAD_FOLD_LOCK, so the route's latency grew with the ledger until the
+    watcher's inject timed out. The plan is read for the statement the code
+    actually runs, recorded off a connection subclass, so a reworded query
+    that loses the index's literal term fails here.
+    """
+
+    def setUp(self):
+        _RecordingConnection.statements = []
+        self.real_connect = sqlite3.connect
+
+        def recording_connect(path, *args, **kwargs):
+            kwargs["factory"] = _RecordingConnection
+            return self.real_connect(path, *args, **kwargs)
+
+        patcher = patch.object(session_kv_server.sqlite3, "connect", side_effect=recording_connect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _recorded(self, verb, fragment):
+        for sql, params in _RecordingConnection.statements:
+            if sql.lstrip().upper().startswith(verb) and fragment in sql:
+                return sql, params
+        self.fail(f"no {verb} statement containing {fragment!r} was run: {_RecordingConnection.statements}")
+
+    def test_the_three_indexes_exist(self):
+        with self.real_connect(temp_db_path) as conn:
+            names = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'intercepted_events'"
+            )}
+        self.assertLessEqual({
+            "idx_intercepted_events_fold_anchor",
+            "idx_intercepted_events_workload_incident",
+            "idx_intercepted_events_duplicate_reason",
+        }, names)
+
+    def test_the_anchor_lookup_searches_the_fold_index(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 900):
+            session_kv_server._workload_incident_anchor("c1", "ns", "Pod", "api", "Warning")
+        sql, params = self._recorded("SELECT", "fold_key = ?")
+        with self.real_connect(temp_db_path) as conn:
+            scans, plan = _table_scans(conn, sql, params)
+        self.assertEqual(scans, [], plan)
+        self.assertTrue(any("idx_intercepted_events_fold_anchor" in line for line in plan), plan)
+
+    def test_the_open_fix_lookup_searches_the_workload_and_duplicate_indexes(self):
+        with patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 900), \
+                patch.object(session_kv_server, "_incident_pull_request_urls", return_value=[]):
+            session_kv_server._open_fix_pull_request("c1", "ns", "Pod", "api", "BackOff", "Warning")
+        sql, params = self._recorded("SELECT", "workload_key = ?")
+        self.assertNotIn(" IN (SELECT", sql)
+        self.assertIn("EXISTS", sql)
+        with self.real_connect(temp_db_path) as conn:
+            scans, plan = _table_scans(conn, sql, params)
+        self.assertEqual(scans, [], plan)
+        self.assertTrue(any("idx_intercepted_events_workload_incident" in line for line in plan), plan)
+        self.assertTrue(any("idx_intercepted_events_duplicate_reason" in line for line in plan), plan)
+
+    def test_the_startup_clear_walks_the_fold_index(self):
+        session_kv_server.init_db()
+        sql, params = self._recorded("UPDATE", "SET fold_key = ''")
+        with self.real_connect(temp_db_path) as conn:
+            scans, plan = _table_scans(conn, sql, params)
+        self.assertEqual(scans, [], plan)
+        self.assertTrue(any("idx_intercepted_events_fold_anchor" in line for line in plan), plan)
+
+    def test_the_indexes_hold_only_rows_that_can_answer(self):
+        # The terms beyond the key: a refused sighting (notified 0, no
+        # delivery error) and a folded row are in neither index, so a miss
+        # walks nothing a workload's refused storm wrote.
+        with self.real_connect(temp_db_path) as conn:
+            sql = dict(conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'intercepted_events'"
+            ).fetchall())
+        self.assertIn(session_kv_server.FOLD_ANCHOR_INDEX_TERM, sql["idx_intercepted_events_fold_anchor"])
+        self.assertIn(
+            session_kv_server.WORKLOAD_INCIDENT_INDEX_TERM, sql["idx_intercepted_events_workload_incident"])
+
+    def test_an_index_built_on_the_key_alone_is_replaced_on_start(self):
+        # An earlier build of the daemon created both indexes on the key
+        # alone, and a later one the incident index without the admission
+        # term; CREATE INDEX IF NOT EXISTS would keep those, terms and all.
+        with self.real_connect(temp_db_path) as conn, conn:
+            conn.execute("DROP INDEX idx_intercepted_events_fold_anchor")
+            conn.execute(
+                "CREATE INDEX idx_intercepted_events_fold_anchor "
+                "ON intercepted_events (cluster, namespace, object_kind, fold_key, id DESC) WHERE fold_key != ''"
+            )
+            conn.execute("DROP INDEX idx_intercepted_events_workload_incident")
+            conn.execute(
+                "CREATE INDEX idx_intercepted_events_workload_incident "
+                "ON intercepted_events (cluster, namespace, object_kind, workload_key, id DESC) "
+                "WHERE workload_key != '' AND duplicate_of IS NULL AND session_id != ''"
+            )
+        session_kv_server.init_db()
+        with self.real_connect(temp_db_path) as conn:
+            sql = dict(conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'intercepted_events'"
+            ).fetchall())
+        self.assertIn(session_kv_server.FOLD_ANCHOR_INDEX_TERM, sql["idx_intercepted_events_fold_anchor"])
+        self.assertIn(
+            session_kv_server.WORKLOAD_INCIDENT_INDEX_TERM, sql["idx_intercepted_events_workload_incident"])
+        # And a second start leaves the right one alone.
+        _RecordingConnection.statements = []
+        session_kv_server.init_db()
+        self.assertFalse(any(
+            sql.lstrip().startswith("DROP INDEX idx_intercepted_events_fold_anchor")
+            or sql.lstrip().startswith("DROP INDEX idx_intercepted_events_workload_incident")
+            for sql, _ in _RecordingConnection.statements
+        ))
+
+
+# The ledger sizes the benchmark compares: a quiet install and the row cap a
+# busy fleet reaches in days (LEDGER_MAX_ROWS).
+_BENCH_SMALL_ROWS = 1_000
+_BENCH_LARGE_ROWS = 200_000
+# Calls counted per size; the count is deterministic, so a few suffice.
+_BENCH_LOOKUPS = 20
+_BENCH_SESSIONS = 5
+# The cost measured is SQLite virtual-machine steps (a progress handler called
+# once per step), not wall time: the machine's load cannot move it, and a
+# scan's growth with the table cannot hide in it. Measured: indexed, the
+# anchor lookup takes 281 steps at both sizes and the open-fix lookup 293 and
+# 654 (the EXISTS runs once per candidate incident), and on the refused storm
+# below 270 and 273 at both sizes; unindexed, 5,149 and 8,180 steps at a
+# thousand rows become 971,930 and 16,772,056 at the cap.
+# A lookup at the cap may cost this many times its cost at a thousand rows,
+# and never more than the ceiling, which an unindexed read at the cap passes
+# by two orders of magnitude.
+_BENCH_GROWTH_LIMIT = 4
+_BENCH_STEP_CEILING = 10_000
+# How many distinct workloads the rows spread over, per cluster and namespace.
+_BENCH_WORKLOADS = 500
+# The one workload a refused storm's rows all belong to.
+_BENCH_STORM_WORKLOAD = "storm"
+
+
+class TestWorkloadFoldLedgerBenchmark(unittest.TestCase):
+    """The fold's lookups and POST /sessions do not grow with the ledger up to its cap.
+
+    Ties the index change to the symptom the fleet saw (inject latency growing
+    with the ledger): the work each lookup does on a 200,000-row ledger is
+    bounded by a multiple of its work on a 1,000-row one, counted in SQLite
+    steps rather than seconds so a loaded runner reads the same as an idle one.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+
+    @classmethod
+    def tearDownClass(cls):
+        os.environ.pop("SESSION_KV_API_KEY", None)
+
+    def _ledger(self, rows, refused_storm=False):
+        """A ledger of `rows` admitted incidents spread over the workloads.
+
+        With `refused_storm`, every row is instead one workload's sighting that
+        its severity's ceiling refused (`notified` 0, no delivery error, and the
+        session the inject arrived on, which record_intercepted_event stamps on
+        every row whatever became of it): the shape a Deployment that keeps
+        failing after the day's budget is spent writes for the rest of the day,
+        and one on which both lookups miss.
+        """
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(lambda: [os.path.exists(p) and os.remove(p) for p in (path, path + "-wal", path + "-shm")])
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", path):
+            session_kv_server.init_db()
+        if refused_storm:
+            rows_to_insert = (
+                ("c1", "ns1", _BENCH_STORM_WORKLOAD, f"uid-{i}", "Pod", "BackOff", "m", "Warning", 0, f"sess-{i}",
+                 _BENCH_STORM_WORKLOAD, _BENCH_STORM_WORKLOAD)
+                for i in range(rows)
+            )
+        else:
+            rows_to_insert = (
+                (
+                    f"c{i % 3}", f"ns{i % 7}", f"w{i % _BENCH_WORKLOADS}", f"uid-{i}", "Pod",
+                    "BackOff" if i % 2 else "Unhealthy", "m", "Warning", 1, f"sess-{i}",
+                    f"w{i % _BENCH_WORKLOADS}", f"w{i % _BENCH_WORKLOADS}",
+                )
+                for i in range(rows)
+            )
+        with sqlite3.connect(path) as conn, conn:
+            conn.executemany(
+                "INSERT INTO intercepted_events (cluster, namespace, workload, object_uid, object_kind, reason, "
+                "message, severity, occurrences, notified, session_id, duplicate_of, fold_key, workload_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, ?, ?)",
+                rows_to_insert,
+            )
+        return path
+
+    def _measure(self, rows, refused_storm=False):
+        """The most SQLite steps one call of each kind took on a ledger of `rows`."""
+        from fastapi.testclient import TestClient
+
+        path = self._ledger(rows, refused_storm)
+        client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        steps = {"n": 0}
+        real_connect = sqlite3.connect
+
+        def counting_connect(db_path, *args, **kwargs):
+            conn = real_connect(db_path, *args, **kwargs)
+
+            def tick():
+                steps["n"] += 1
+                return 0
+
+            conn.set_progress_handler(tick, 1)
+            return conn
+
+        def worst_of(count, call):
+            most = 0
+            for i in range(count):
+                steps["n"] = 0
+                call(i)
+                most = max(most, steps["n"])
+            return most
+
+        with patch.object(session_kv_server, "SESSION_KV_DB_PATH", path), \
+                patch.object(session_kv_server, "INCIDENT_WORKLOAD_DEDUP_SECONDS", 3600), \
+                patch.object(session_kv_server, "_incident_pull_request_urls", return_value=[]), \
+                patch.object(session_kv_server.sqlite3, "connect", side_effect=counting_connect):
+            key = lambda i: _BENCH_STORM_WORKLOAD if refused_storm else f"w{(i * 37) % _BENCH_WORKLOADS}"  # noqa: E731
+            return {
+                "anchor": worst_of(_BENCH_LOOKUPS, lambda i: session_kv_server._workload_incident_anchor(
+                    "c1", "ns1", "Pod", key(i), "Warning")),
+                "open_fix": worst_of(_BENCH_LOOKUPS, lambda i: session_kv_server._open_fix_pull_request(
+                    "c1", "ns1", "Pod", key(i), "BackOff", "Warning")),
+                "sessions": worst_of(_BENCH_SESSIONS, lambda i: self.assertEqual(
+                    client.post("/sessions").status_code, 201)),
+            }
+
+    def _assert_bounded(self, small, large):
+        for name in ("anchor", "open_fix", "sessions"):
+            with self.subTest(lookup=name):
+                detail = f"{name}: {small[name]} steps at {_BENCH_SMALL_ROWS} rows, {large[name]} at {_BENCH_LARGE_ROWS}"
+                self.assertLessEqual(large[name], _BENCH_GROWTH_LIMIT * small[name], detail)
+                self.assertLess(large[name], _BENCH_STEP_CEILING, detail)
+
+    def test_the_work_stays_bounded_from_a_thousand_rows_to_the_cap(self):
+        self._assert_bounded(self._measure(_BENCH_SMALL_ROWS), self._measure(_BENCH_LARGE_ROWS))
+
+    def test_a_miss_against_one_workloads_refused_storm_stays_bounded(self):
+        # The hit path stops at the first index row; a miss walks every row
+        # the index holds for the workload. With the indexes on the key alone
+        # the anchor lookup took 1,600,122 steps and the open-fix lookup
+        # 2,000,156 on a 200,000-row storm, and with the incident index on the
+        # key and the session but not the admission term the open-fix lookup
+        # still took 1,600,273, since the route stamps the inject's session on
+        # a refused row too; 270 and 273 with the admission term in both.
+        self._assert_bounded(
+            self._measure(_BENCH_SMALL_ROWS, refused_storm=True),
+            self._measure(_BENCH_LARGE_ROWS, refused_storm=True),
+        )
 
 
 class TestSessionKvServerQueryBuilding(unittest.TestCase):
@@ -6998,6 +7773,30 @@ class TestDriftInject(unittest.TestCase):
         self.assertNotIn("Unknown", alert_msg)
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_drift_alert_carries_its_title_and_kind(self, trigger):
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {
+            "alert_title": "checkout Deployment drift in prod-us-east1",
+            "alert_kind": session_kv_server.ALERT_KIND_DRIFT,
+        })
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {"alert_title": None, "alert_kind": ""})
+
+    def test_the_drift_title_names_the_object_its_kind_and_cluster(self):
+        payload = {**self.DRIFT_PAYLOAD, "cluster": "seeded-b", "resource": {
+            "group": "autoscaling", "namespace": "shop", "resource": "horizontalpodautoscalers", "name": "checkout-gateway"}}
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            self.assertEqual(session_kv_server._drift_session_title(payload), "checkout-gateway HPA drift in seeded-b")
+            unlisted = {**payload, "cluster": "", "resource": {"resource": "leases", "name": "l1"}}
+            with patch.dict(os.environ, {"GKE_CLUSTER_NAME": "host-a"}):
+                self.assertEqual(session_kv_server._drift_session_title(unlisted), "l1 leases drift in host-a")
+            self.assertIsNone(session_kv_server._drift_session_title({**payload, "resource": {"resource": "pods"}}))
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self.assertIsNone(session_kv_server._drift_session_title(payload))
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_an_event_payload_still_takes_the_event_path(self, trigger):
         """The other half of the same dispatch: the watcher is unaffected."""
         event = {
@@ -11060,6 +11859,78 @@ class TestCardStop(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
 
+class AliveHelperTest(unittest.TestCase):
+    """The test helper `_alive` against a process reaped mid-check (#4828)."""
+
+    PID = 4242
+
+    def _with_proc(self, stat):
+        """Run `_alive(PID)` as on Linux, with `stat` standing in for opening
+        /proc/PID/stat: an exception to raise, or the file's text. The pid
+        answers os.kill, and ps must not be asked. os.path.exists says the
+        file is there, which only the pre-#4828 helper asked."""
+        import io
+
+        path = f"/proc/{self.PID}/stat"
+        real_open, real_kill = open, os.kill
+        real_isdir, real_exists = os.path.isdir, os.path.exists
+
+        def fake_open(p, *args, **kwargs):
+            if str(p) != path:
+                return real_open(p, *args, **kwargs)
+            if isinstance(stat, BaseException):
+                raise stat
+            if callable(stat):
+                return stat()
+            return io.StringIO(stat)
+
+        def no_ps(*args, **kwargs):
+            raise AssertionError("with a /proc, the stat file decides and ps is never asked")
+
+        with patch.object(os, "kill", lambda pid, sig: None if pid == self.PID else real_kill(pid, sig)), \
+                patch("builtins.open", fake_open), \
+                patch.object(os.path, "exists", lambda p: True if p == path else real_exists(p)), \
+                patch.object(os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                patch("subprocess.run", no_ps):
+            return _alive(self.PID)
+
+    def test_a_process_reaped_after_the_signal_check_is_not_alive(self):
+        # os.kill(pid, 0) still succeeds, then the process is reaped before its
+        # stat file is opened: the race CI hit.
+        self.assertFalse(self._with_proc(FileNotFoundError(2, "No such file or directory")))
+
+    def test_a_process_that_exits_while_its_stat_is_read_is_not_alive(self):
+        class Gone:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                raise ProcessLookupError(3, "No such process")
+
+        self.assertFalse(self._with_proc(Gone))
+
+    def test_the_stat_state_decides_on_linux(self):
+        self.assertTrue(self._with_proc("4242 (sleep) S 1 4242 4242 0 -1"))
+        self.assertFalse(self._with_proc("4242 (sleep) Z 1 4242 4242 0 -1"), "a zombie has exited")
+        # A ")" inside the command name: the state is after the last one.
+        self.assertTrue(self._with_proc("4242 (a) b) R 1 4242"))
+        self.assertFalse(self._with_proc("4242 (sleep"), "a stat with no state field")
+
+    def test_a_running_process_is_alive_and_an_exited_one_is_not(self):
+        import subprocess
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(_alive(child.pid))
+        finally:
+            child.kill()
+            child.wait(5)
+        self.assertFalse(_alive(child.pid))
+
+
 def _alive(pid):
     """True while `pid` runs; a zombie is not running."""
     import subprocess
@@ -11068,9 +11939,17 @@ def _alive(pid):
         os.kill(pid, 0)
     except OSError:
         return False
-    if os.path.exists(f"/proc/{pid}/stat"):
+    # One open, no exists() first: a process reaped between the two used to
+    # raise FileNotFoundError out of the test (#4828). With a /proc, a missing
+    # entry is a process that's gone; without one (macOS), ask ps.
+    try:
         with open(f"/proc/{pid}/stat") as fh:
             return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except IndexError:  # a stat with no state field: as production's _proc_alive reads it
+        return False
+    except (FileNotFoundError, ProcessLookupError):
+        if os.path.isdir("/proc/self"):
+            return False
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return bool(state) and not state.startswith("Z")
 
@@ -11228,6 +12107,130 @@ class TestBoardAction(unittest.TestCase):
         self.board.unlink()
         results = self.act("retry", ["t_a"]).json()["results"]
         self.assertEqual(results, [{"id": "t_a", "outcome": "gone"}])
+class TestExcludedEvents(unittest.TestCase):
+    """`POST /v1/excluded-events`: the events alert-exclude rules held back."""
+
+    PAYLOAD = {
+        "kind": "k8s-event",
+        "reason": "BackOff",
+        "namespace": "payments",
+        "kind_of_object": "Pod",
+        "name": "payments-api-7d9f-abcde",
+        "uid": "uid-excluded-1",
+        "message": "Back-off restarting failed container app",
+        "cluster": "seeded-a",
+        "type": "Warning",
+        "occurrences": 3,
+    }
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
+        self.trigger = trigger.start()
+        self.addCleanup(trigger.stop)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM alert_quota")
+                conn.execute("DELETE FROM intercepted_events WHERE excluded != 0")
+
+    def tearDown(self):
+        import sqlite3
+
+        os.environ.pop("SESSION_KV_API_KEY", None)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM intercepted_events WHERE excluded != 0")
+
+    def _post(self, **overrides):
+        return self.client.post("/v1/excluded-events", json=dict(self.PAYLOAD, **overrides))
+
+    def _rows(self):
+        import sqlite3
+        from contextlib import closing
+
+        with closing(sqlite3.connect(temp_db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM intercepted_events WHERE excluded != 0 ORDER BY id")]
+
+    def test_the_daemon_advertises_the_route(self):
+        health = self.client.get("/healthz").json()
+        self.assertIn(session_kv_server.ALERT_EXCLUDED_FEATURE, health["features"])
+
+    def test_a_record_writes_an_excluded_row_with_no_session_alert_or_quota(self):
+        resp = self._post()
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json(), {"status": "excluded"})
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual((row["cluster"], row["namespace"], row["object_uid"], row["reason"]),
+                         ("seeded-a", "payments", "uid-excluded-1", "BackOff"))
+        self.assertEqual(row["occurrences"], 3)
+        self.assertEqual((row["notified"], row["session_id"], row["fold_key"], row["excluded"]), (0, "", "", 1))
+        self.trigger.assert_not_called()
+        quota = self.client.get("/v1/alert-quota").json()
+        self.assertFalse(any(bucket.get("used") for bucket in quota.values() if isinstance(bucket, dict)),
+                         f"an excluded event spent quota: {quota}")
+
+    def test_later_records_add_to_the_same_row(self):
+        self._post(occurrences=2)
+        self._post(occurrences=5)
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["occurrences"], 7)
+
+    def test_another_reason_or_object_gets_its_own_row(self):
+        self._post()
+        self._post(reason="Failed")
+        self._post(uid="uid-excluded-2")
+        self._post(cluster="seeded-b")
+        self.assertEqual(len(self._rows()), 4)
+
+    def test_records_without_a_uid_fold_only_within_their_workload(self):
+        self._post(uid="", name="api-1")
+        self._post(uid="", name="api-1")
+        self._post(uid="", name="billing")
+        rows = self._rows()
+        self.assertEqual(sorted((r["workload"], r["occurrences"]) for r in rows), [("api-1", 6), ("billing", 3)])
+
+    def test_a_row_older_than_the_fold_window_is_not_added_to(self):
+        import sqlite3
+
+        self._post()
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET created_at = datetime('now', ?) WHERE excluded = 1",
+                    (f"-{session_kv_server.EXCLUDED_ROW_FOLD_SECONDS + 60} seconds",),
+                )
+        self._post()
+        self.assertEqual(len(self._rows()), 2)
+
+    def test_the_route_prunes_the_ledger(self):
+        with patch.object(session_kv_server, "cleanup_old_records", wraps=session_kv_server.cleanup_old_records) as cleanup:
+            self._post()
+        cleanup.assert_called_once()
+
+    def test_the_feed_reads_the_row_as_excluded(self):
+        self._post()
+        feed = self.client.get("/v1/intercepted-events").json()
+        statuses = [e["status"] for e in feed["events"] if e["cluster"] == "seeded-a" and e["namespace"] == "payments"]
+        self.assertIn(session_kv_server.FEED_STATUS_EXCLUDED, statuses)
+
+    def test_refused_records(self):
+        too_many = session_kv_server.EXCLUDED_OCCURRENCES_MAX + 1
+        for overrides in ({"kind": "gitops-drift"}, {"occurrences": 0}, {"occurrences": "3"}, {"occurrences": True},
+                          {"occurrences": too_many}, {"occurrences": 2 ** 70}):
+            with self.subTest(overrides=overrides):
+                self.assertEqual(self._post(**overrides).status_code, 400)
+        self.assertEqual(self._rows(), [])
+
+
 class TestDriftBacklog(unittest.TestCase):
     """`POST /v1/drift-backlog` and the digest that follows it."""
 
@@ -11413,6 +12416,33 @@ class TestDriftBacklog(unittest.TestCase):
         drift = self.client.get("/v1/alert-quota").json()["severities"][session_kv_server.DRIFT_QUOTA_KEY]
         self.assertEqual(drift["sent"], 0)
         self.trigger.assert_not_called()
+
+    def test_the_backlog_card_is_stamped_drift_in_the_board_never_through_the_subprocess(self):
+        import sqlite3
+
+        self._headless()
+        self._burst()
+        board = Path(tempfile.mkdtemp()) / "kanban.db"
+        sqlite3.connect(board).close()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()) as run, patch.object(
+            session_kv_server, "KANBAN_DB_PATH", str(board)
+        ), patch.object(session_kv_server, "_hermes_kanban", return_value=(None, None)):
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        env = run.call_args.kwargs["env"]
+        self.assertNotIn("KUBE_AGENTS_CARD_ORIGIN", env)
+        self.assertFalse([a for a in run.call_args.args[0] if "origin" in a.lower()], "no origin argument")
+        with closing_state(board) as conn:
+            rows = conn.execute("SELECT task_id, origin, origin_platform FROM kanban_task_origins").fetchall()
+        self.assertEqual(rows, [("t_digest1", "drift", "")])
+
+    def test_a_stamp_that_fails_still_files_the_card(self):
+        self._headless()
+        self._burst()
+        with patch.object(session_kv_server.subprocess, "run", return_value=self._card_created()), patch.object(
+            session_kv_server, "_stamp_board_task_origin", side_effect=FileNotFoundError("no board")
+        ) as stamp:
+            self.assertTrue(session_kv_server._post_drift_backlog_digest())
+        stamp.assert_called_once_with("t_digest1", "drift", "")
 
     def test_a_next_install_whose_platform_has_no_home_channel_files_the_card(self):
         """The platform walk itself, not a patched answer: `spec.mode: next`,
@@ -11845,7 +12875,7 @@ class TestTriageStartRetry(unittest.TestCase):
         for target, value in (
             ("time", MagicMock(monotonic=self.clock.monotonic, time=time.time)),
             ("_triage_sleep", self.clock.sleep),
-            ("_build_agent_query", lambda payload, session_id="": "q"),
+            ("_build_agent_query", lambda payload, session_id="", **_: "q"),
             ("_gateway_api_token", lambda: "tok"),
         ):
             p = patch.object(session_kv_server, target, value)
@@ -12235,7 +13265,7 @@ class TestTriageStartBurst(unittest.TestCase):
             patch.dict(os.environ, {"PLATFORM_API_URL": f"http://127.0.0.1:{self.server.server_port}"}),
             patch.object(session_kv_server, "enabled_chat_platforms", lambda: [session_kv_server.DEFAULT_CHAT_PLATFORM]),
             patch.object(session_kv_server, "_chat_platforms_disabled", lambda: True),
-            patch.object(session_kv_server, "_build_agent_query", lambda payload, session_id="": "q"),
+            patch.object(session_kv_server, "_build_agent_query", lambda payload, session_id="", **_: "q"),
             patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"),
             # A real pool, not the parked stand-in, and retry waits on the same scale.
             patch.object(session_kv_server, "_TRIAGE_START_POOL", None),
@@ -12395,6 +13425,661 @@ class TestDataVolumeWarning(unittest.TestCase):
         self.assertGreater(total, 0)
         self.assertLessEqual(free, total)
         self.assertIsNone(session_kv_server._data_volume_usage("/nonexistent/data-volume"))
+
+
+class TestIncidentTriagePullRequestLimit(unittest.TestCase):
+    """INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS, the limit on triage pull requests open or being opened.
+
+    With the opt-in on and a limit set, a triage whose pull request would pass
+    the limit gets the default query and a note in its thread. A branch counts
+    while its pull request is open on the forge, and from the routing on while
+    it is reserved, so a burst counts itself before any pull request exists.
+    """
+
+    OPEN = "INCIDENT_TRIAGE_OPEN_PULL_REQUEST"
+    LIMIT = "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS"
+    PREFIX = "platform-agent/incident-"
+
+    def setUp(self):
+        import sqlite3
+        import types
+
+        session_kv_server.init_db()
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute("DELETE FROM triage_pr_reservations")
+        env = patch.dict(os.environ, {self.OPEN: "true", self.LIMIT: "2"}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        # The forge's open list: one page per entry of self.pages, or an exception.
+        self.pages = [[]]
+        self.forge_calls = []
+
+        def call(verb, payload, repo, retry_transient=False):
+            self.forge_calls.append((verb, payload, repo))
+            if isinstance(self.pages, Exception):
+                raise self.pages
+            page = payload["page"]
+            return {
+                "proposals": [p if isinstance(p, dict) else {"source": p} for p in self.pages[page - 1]],
+                "truncated": page < len(self.pages),
+            }
+
+        forge = types.ModuleType("forge")
+        forge.call = call
+        modules = patch.dict(sys.modules, {"forge": forge})
+        modules.start()
+        self.addCleanup(modules.stop)
+        repos = patch.object(session_kv_server.gitops_workspace, "get_managed_repos", return_value=["acme/gitops"])
+        repos.start()
+        self.addCleanup(repos.stop)
+        # A count an earlier test abandoned may still be running; each test starts with none.
+        count_thread = patch.object(session_kv_server, "_TRIAGE_PR_COUNT_THREAD", None)
+        count_thread.start()
+        self.addCleanup(count_thread.stop)
+        self.board = os.path.join(tempfile.mkdtemp(), "kanban.db")
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("CREATE TABLE tasks (id TEXT, session_id TEXT, assignee TEXT, title TEXT, status TEXT)")
+            conn.execute("CREATE TABLE task_events (task_id TEXT, kind TEXT, payload TEXT, created_at REAL)")
+        board = patch.object(session_kv_server, "KANBAN_DB_PATH", self.board)
+        board.start()
+        self.addCleanup(board.stop)
+
+    def payload(self, name, **extra):
+        return {
+            "reason": "BackOff", "namespace": "prod", "kind_of_object": "Pod", "name": name,
+            "message": "restarting", "cluster": "gke-1", **extra,
+        }
+
+    def start(self, session_id, name, notice=None, **extra):
+        return session_kv_server._TriageStart(session_id, self.payload(name, **extra), None, notice, time.monotonic())
+
+    def decide(self, session_id, name, **extra):
+        return session_kv_server._triage_pull_request_decision(self.start(session_id, name, **extra))
+
+    def branch(self, session_id, name):
+        return session_kv_server._incident_branch(session_id, self.payload(name))
+
+    def reservations(self):
+        """{(branch, session_id)} of the rows in triage_pr_reservations."""
+        import sqlite3
+
+        with sqlite3.connect(temp_db_path) as conn:
+            return set(conn.execute("SELECT branch, session_id FROM triage_pr_reservations").fetchall())
+
+    def test_no_limit_unset_zero_negative_or_garbage_changes_nothing(self):
+        for value in (None, "0", "-3", "many"):
+            with self.subTest(value=value), patch.dict(os.environ, {}, clear=False):
+                if value is None:
+                    os.environ.pop(self.LIMIT, None)
+                else:
+                    os.environ[self.LIMIT] = value
+                self.assertEqual(self.decide("k8s-evt-1", "api-0"), (None, None))
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(self.reservations(), set())
+
+    def test_the_limit_needs_the_opt_in_and_an_event(self):
+        with patch.dict(os.environ, {self.OPEN: "false"}, clear=False):
+            self.assertEqual(self.decide("k8s-evt-1", "api-0"), (None, None))
+        for kind in (session_kv_server.INJECT_KIND_DRIFT, session_kv_server.INJECT_KIND_STALL):
+            with self.subTest(kind=kind):
+                self.assertEqual(self.decide("k8s-evt-1", "api-0", kind=kind), (None, None))
+        self.assertEqual(self.forge_calls, [])
+
+    def test_under_the_limit_the_branch_is_reserved_and_the_pull_request_card_filed(self):
+        self.pages = [[self.PREFIX + "other-0123abcd", "feature/unrelated"]]
+        self.assertEqual(self.decide("k8s-evt-1", "api-0"), (True, None))
+        self.assertEqual(self.reservations(), {(self.branch("k8s-evt-1", "api-0"), "k8s-evt-1")})
+        verb, payload, repo = self.forge_calls[0]
+        self.assertEqual((verb, payload["state"], repo), ("proposal-list", "open", "acme/gitops"))
+
+    def test_a_forks_branch_with_the_prefix_is_not_counted(self):
+        """Only a branch on the managed repository is the install's; a fork's
+        proposal names its own repository in sourceRepo."""
+        self.pages = [[
+            {"source": self.PREFIX + "a-1111aaaa", "sourceRepo": "stranger/gitops"},
+            {"source": self.PREFIX + "b-2222bbbb", "sourceRepo": "stranger/gitops"},
+            {"source": self.PREFIX + "c-3333cccc", "sourceRepo": "ACME/gitops"},
+        ]]
+        self.assertEqual(self.decide("k8s-evt-1", "api-0"), (True, None))
+        self.assertIs(self.decide("k8s-evt-2", "web-2")[0], False)
+
+    def test_at_the_limit_the_triage_gets_the_default_query_and_the_note(self):
+        # Two open triage pull requests; the third proposal is not a triage's.
+        self.pages = [[self.PREFIX + "a-1111aaaa", self.PREFIX + "b-2222bbbb", "platform-agent/fix-x"]]
+        open_pull_request, note = self.decide("k8s-evt-1", "api-0")
+        self.assertIs(open_pull_request, False)
+        self.assertEqual(note, session_kv_server.TRIAGE_PR_CAP_NOTE.format(count=2, limit=2))
+        self.assertIn("This install already has 2 triage Pull Requests open or being opened, and its limit is 2.", note)
+        self.assertEqual(self.reservations(), set())
+
+    def test_a_burst_counts_its_own_reservations(self):
+        """No pull request exists yet when a node failure breaks many pods at once."""
+        decisions = [self.decide(f"k8s-evt-{i}", f"web-{i}")[0] for i in range(4)]
+        self.assertEqual(decisions, [True, True, False, False])
+        self.assertEqual(len(self.reservations()), 2)
+
+    def test_an_incident_already_counted_revises_its_pull_request(self):
+        """Its card revises the open pull request on its branch, so it adds nothing."""
+        mine = self.branch("k8s-evt-9", "api-0")
+        self.pages = [[mine, self.PREFIX + "b-2222bbbb"]]
+        self.assertEqual(self.decide("k8s-evt-9", "api-0"), (True, None))
+        # Its branch is no longer open but still reserved, so two branches
+        # count; a new session for the same coordinates reuses the branch.
+        self.pages = [[self.PREFIX + "b-2222bbbb"]]
+        self.assertEqual(self.decide("k8s-evt-10", "api-0"), (True, None))
+        self.assertEqual(self.reservations(), {(mine, "k8s-evt-9"), (mine, "k8s-evt-10")})
+        self.assertIs(self.decide("k8s-evt-3", "web-3")[0], False)
+
+    def test_a_reservation_whose_pull_request_opened_is_counted_once(self):
+        self.decide("k8s-evt-1", "api-0")
+        self.pages = [[self.branch("k8s-evt-1", "api-0")]]
+        self.assertEqual(self.decide("k8s-evt-2", "web-2"), (True, None))
+        self.assertNotIn(self.branch("k8s-evt-1", "api-0"), {branch for branch, _ in self.reservations()})
+
+    def test_a_settled_pull_request_card_releases_its_reservation(self):
+        import sqlite3
+
+        self.decide("k8s-evt-1", "api-0")
+        self.decide("k8s-evt-2", "web-2")
+        with sqlite3.connect(self.board) as conn:
+            conn.executemany(
+                "INSERT INTO tasks VALUES (?, ?, ?, ?, ?)",
+                [
+                    # The triage card settles first; only the pull-request card releases.
+                    ("t1", "k8s-evt-2", "cluster-gke-1", "Triage prod/Pod/web-2", "done"),
+                    ("t2", "k8s-evt-1", "platform", "Open GitOps PR for prod/Pod/api-0 (BackOff) on gke-1", "done"),
+                ],
+            )
+        self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
+        self.assertEqual({session for _, session in self.reservations()}, {"k8s-evt-2", "k8s-evt-3"})
+
+    def _settle_with_pull_request(self, session_id, opened_at):
+        import sqlite3
+
+        with sqlite3.connect(self.board) as conn:
+            conn.execute(
+                "INSERT INTO tasks VALUES (?, ?, 'platform', 'Open GitOps PR for prod/Pod/x (BackOff) on gke-1', 'done')",
+                (f"t-{session_id}", session_id),
+            )
+            conn.execute(
+                "INSERT INTO task_events VALUES (?, 'pr_opened', '{}', ?)", (f"t-{session_id}", opened_at)
+            )
+
+    def test_a_card_that_opened_its_pull_request_after_the_forge_read_keeps_its_reservation(self):
+        """The read did not see that pull request, so only the reservation counts it."""
+        self.decide("k8s-evt-1", "api-0")
+        real = session_kv_server._open_triage_pull_request_branches
+
+        def read_then_open(timeout):
+            branches = real(timeout)
+            # T1's card opens its pull request and settles after this read.
+            self._settle_with_pull_request("k8s-evt-1", time.time() + 1)
+            return branches
+
+        with patch.object(session_kv_server, "_open_triage_pull_request_branches", read_then_open):
+            self.assertIs(self.decide("k8s-evt-2", "web-2")[0], True)
+            self.assertIs(self.decide("k8s-evt-3", "web-3")[0], False)
+
+    def test_a_card_whose_pull_request_opened_before_the_forge_read_is_released(self):
+        """The read saw it: open, it counts there; merged or closed, nothing counts it."""
+        self.decide("k8s-evt-1", "api-0")
+        self.decide("k8s-evt-2", "web-2")
+        self._settle_with_pull_request("k8s-evt-1", time.time() - 60)
+        self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
+        self.assertNotIn("k8s-evt-1", {session for _, session in self.reservations()})
+
+    def test_a_restart_releases_the_reservations_whose_triage_never_started(self):
+        """A process that died between the claim and the start leaves a row
+        nothing else releases; a triage that started keeps its row."""
+        self.decide("k8s-evt-1", "api-0")
+        self.decide("k8s-evt-2", "web-2")
+        row_id = session_kv_server.record_intercepted_event(
+            cluster="gke-1", namespace="prod", workload="web-2", object_uid="u2", object_kind="Pod",
+            reason="BackOff", message="restarting", severity="Warning", occurrences=1, notified=True,
+            session_id="k8s-evt-2",
+        )
+        session_kv_server.mark_triage_state(row_id, session_kv_server.TRIAGE_STATE_STARTED)
+        session_kv_server.init_db()
+        self.assertEqual({session for _, session in self.reservations()}, {"k8s-evt-2"})
+        self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
+
+    def test_a_reservation_past_the_backstop_is_released(self):
+        import sqlite3
+
+        self.decide("k8s-evt-1", "api-0")
+        self.decide("k8s-evt-2", "web-2")
+        with sqlite3.connect(temp_db_path) as conn:
+            conn.execute(
+                "UPDATE triage_pr_reservations SET reserved_at = ? WHERE session_id = 'k8s-evt-1'",
+                (time.time() - session_kv_server.TRIAGE_PR_RESERVATION_MAX_S - 1,),
+            )
+        self.assertEqual(self.decide("k8s-evt-3", "web-3"), (True, None))
+
+    def test_an_uncounted_forge_reads_as_at_the_limit(self):
+        for pages in (RuntimeError("forge down"), [[]] * (session_kv_server.TRIAGE_PR_LIST_MAX_PAGES + 1)):
+            with self.subTest(pages=type(pages).__name__):
+                self.pages = pages
+                open_pull_request, note = self.decide("k8s-evt-1", "api-0")
+                self.assertIs(open_pull_request, False)
+                self.assertEqual(note, session_kv_server.TRIAGE_PR_UNCOUNTED_NOTE.format(limit=2))
+        self.assertEqual(self.reservations(), set())
+
+    def test_with_the_uncounted_switch_off_an_uncounted_forge_counts_reservations_only(self):
+        self.pages = RuntimeError("forge down")
+        with patch.object(session_kv_server, "TRIAGE_PR_UNCOUNTED_AT_LIMIT", False):
+            decisions = [self.decide(f"k8s-evt-{i}", f"web-{i}")[0] for i in range(3)]
+        self.assertEqual(decisions, [True, True, False])
+
+    def test_a_slow_forge_is_abandoned_at_the_timeout(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def slow(*_args, **_kwargs):
+            release.wait(5)
+            return {"proposals": [], "truncated": False}
+
+        sys.modules["forge"].call = slow
+        with patch.object(session_kv_server, "TRIAGE_PR_COUNT_TIMEOUT_S", 0.05):
+            self.assertEqual(self.decide("k8s-evt-1", "api-0")[0], False)
+
+    def test_a_count_still_waiting_on_the_forge_holds_the_next_one_uncounted(self):
+        """One count thread at a time: the next claim does not start a second."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        def slow(*_args, **_kwargs):
+            calls.append(1)
+            release.wait(5)
+            return {"proposals": [], "truncated": False}
+
+        sys.modules["forge"].call = slow
+        with patch.object(session_kv_server, "TRIAGE_PR_COUNT_TIMEOUT_S", 0.05):
+            first = self.decide("k8s-evt-1", "api-0")
+            second = self.decide("k8s-evt-2", "web-2")
+        self.assertEqual(first, (False, session_kv_server.TRIAGE_PR_UNCOUNTED_NOTE.format(limit=2)))
+        self.assertEqual(second, (False, session_kv_server.TRIAGE_PR_UNCOUNTED_NOTE.format(limit=2)))
+        self.assertEqual(len(calls), 1)
+
+    def test_the_query_follows_the_decision(self):
+        payload = self.payload("api-0")
+        with_pr = session_kv_server._build_agent_query(payload, "k8s-evt-1")
+        self.assertIn("Make exactly two `kanban_create` calls", with_pr)
+        self.assertEqual(session_kv_server._build_agent_query(payload, "k8s-evt-1", open_pull_request=True), with_pr)
+        held = session_kv_server._build_agent_query(payload, "k8s-evt-1", open_pull_request=False)
+        with patch.dict(os.environ, {self.OPEN: "false"}, clear=False):
+            self.assertEqual(held, session_kv_server._build_agent_query(payload, "k8s-evt-1"))
+        self.assertIn("Make exactly one `kanban_create` call", held)
+        self.assertNotIn(self.PREFIX, held)
+
+    def _run_start(self, start, urlopen_effects):
+        with patch.object(session_kv_server, "_gateway_api_token", lambda: "tok"), \
+                patch("session_kv_server.urllib.request.urlopen", side_effect=urlopen_effects), \
+                patch.object(session_kv_server, "_triage_sleep", lambda _s: None), \
+                patch.object(session_kv_server, "_send_to_chat", return_value="thread") as send, \
+                patch.object(session_kv_server, "_start_agent_turn", wraps=session_kv_server._start_agent_turn) as turn:
+            session_kv_server._run_triage_start(start)
+        return send, turn
+
+    def test_a_held_triage_posts_the_note_in_its_thread_once_its_turn_starts(self):
+        self.pages = [[self.PREFIX + "a-1111aaaa", self.PREFIX + "b-2222bbbb"]]
+        notice = session_kv_server._TriageNotice("slack", "1700000000.0001", "alert")
+        send, turn = self._run_start(self.start("k8s-evt-1", "api-0", notice=notice), [_answered(), _answered()])
+        self.assertIn("Make exactly one `kanban_create` call", turn.call_args.args[2])
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[1], session_kv_server.TRIAGE_PR_CAP_NOTE.format(count=2, limit=2))
+        self.assertEqual(send.call_args.args[3], "1700000000.0001")
+
+    def test_a_reserved_triage_posts_nothing_and_files_both_cards(self):
+        notice = session_kv_server._TriageNotice("slack", "1700000000.0001", "alert")
+        send, turn = self._run_start(self.start("k8s-evt-1", "api-0", notice=notice), [_answered(), _answered()])
+        self.assertIn("Make exactly two `kanban_create` calls", turn.call_args.args[2])
+        send.assert_not_called()
+
+    def test_a_triage_that_does_not_start_releases_its_reservation(self):
+        send, _ = self._run_start(self.start("k8s-evt-1", "api-0"), [_http_error(401)])
+        self.assertEqual(self.reservations(), set())
+        send.assert_not_called()
+
+    def test_a_triage_that_does_not_start_keeps_another_triages_reservation_on_its_branch(self):
+        self.decide("k8s-evt-1", "api-0")
+        self._run_start(self.start("k8s-evt-2", "api-0"), [_http_error(401)])
+        self.assertEqual(self.reservations(), {(self.branch("k8s-evt-1", "api-0"), "k8s-evt-1")})
+
+    def test_triages_that_start_together_count_each_other(self):
+        """The reservations are read and written under one lock: four starts at
+        once, with the board read between them slowed, reserve two branches."""
+        real = session_kv_server._settled_triage_pull_request_sessions
+
+        def slow(session_ids, listed_at):
+            time.sleep(0.05)
+            return real(session_ids, listed_at)
+
+        results = []
+        with patch.object(session_kv_server, "_settled_triage_pull_request_sessions", slow):
+            threads = [
+                threading.Thread(target=lambda i=i: results.append(self.decide(f"k8s-evt-{i}", f"web-{i}")[0]))
+                for i in range(4)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(sorted(results), [False, False, True, True])
+        self.assertEqual(len(self.reservations()), 2)
+
+    def test_with_no_thread_the_note_quotes_the_alert(self):
+        self.pages = [[self.PREFIX + "a-1111aaaa", self.PREFIX + "b-2222bbbb"]]
+        notice = session_kv_server._TriageNotice("googlechat", "", "⚠️ Warning: BackOff prod/api-0\nsecond line")
+        send, _ = self._run_start(self.start("k8s-evt-1", "api-0", notice=notice), [_answered(), _answered()])
+        send.assert_called_once()
+        self.assertEqual(
+            send.call_args.args,
+            ("googlechat", session_kv_server.TRIAGE_PR_CAP_NOTE.format(count=2, limit=2) + "\n> ⚠️ Warning: BackOff prod/api-0"),
+        )
+
+    def test_the_pvc_dotenv_cannot_set_the_limit(self):
+        with tempfile.NamedTemporaryFile("wb", suffix=".env", delete=False) as f:
+            f.write(b"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS=1000\n")
+            path = f.name
+        self.addCleanup(os.remove, path)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(self.LIMIT, None)
+            session_kv_server._load_dotenv_ignoring_operator_switches(path)
+            self.assertIsNone(os.environ.get(self.LIMIT))
+
+
+class TestProposalOrigin(unittest.TestCase):
+    """The origin record, the per-job origin table and the proposals ledger: docs/designs/proposal-origin.md §2.1-§2.2."""
+
+    def setUp(self):
+        import sqlite3
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("DELETE FROM proposals_opened")
+                conn.execute("DELETE FROM cron_job_origins")
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _meta(self, session_id):
+        return session_kv_server._session_metadata(session_id)
+
+    def test_set_session_origin_writes_once(self):
+        sid = "a2a-origin-once"
+        self.assertTrue(session_kv_server._set_session_origin(sid, "chat", "slack"))
+        self.assertFalse(session_kv_server._set_session_origin(sid, "api", ""))
+        self.assertEqual(session_kv_server._session_origin(sid), ("chat", "slack"))
+        meta = self._meta(sid)
+        self.assertEqual(meta[session_kv_server.ORIGIN_KEY], "chat")
+        self.assertEqual(meta[session_kv_server.ORIGIN_PLATFORM_KEY], "slack")
+
+    def test_set_session_origin_keeps_the_other_keys(self):
+        created = self.client.post("/sessions").json()["sessionID"]
+        self.assertTrue(session_kv_server._set_session_origin(created, "event"))
+        meta = self._meta(created)
+        self.assertEqual(meta.get("platform"), "k8s-watcher")
+        self.assertEqual(meta[session_kv_server.ORIGIN_KEY], "event")
+
+    def test_session_origin_inherits_through_compression_parent(self):
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('orig-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('orig-mid', 'orig-root', 'compression');
+                INSERT INTO sessions VALUES ('orig-leaf', 'orig-mid', NULL);
+                INSERT INTO sessions VALUES ('orig-branch', 'orig-lone', NULL);
+                INSERT INTO sessions VALUES ('orig-lone', NULL, 'user_exit');
+                """
+            )
+        session_kv_server._set_session_origin("orig-root", "chat", "googlechat")
+        session_kv_server._set_session_origin("orig-lone", "api")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            self.assertEqual(session_kv_server._session_origin("orig-leaf"), ("chat", "googlechat"))
+            # A parent that did not end in compression is another conversation.
+            self.assertEqual(session_kv_server._session_origin("orig-branch"), ("other", ""))
+            self.assertEqual(session_kv_server._session_origin("orig-nobody"), ("other", ""))
+
+    def test_get_origin_route_answers_through_compression(self):
+        # A mid-turn compression rotates the session id; the child's row has no
+        # record, so the route answers the parent's.
+        state_db = self.tmp / "state.db"
+        with closing_state(state_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('a2a-route-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('a2a-route-child', 'a2a-route-root', NULL);
+                """
+            )
+        session_kv_server._set_session_origin("a2a-route-root", "chat", "slack")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(state_db)):
+            child = self.client.get("/v1/sessions/a2a-route-child/origin")
+            self.assertEqual(child.status_code, 200, child.text)
+            self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
+            self.assertEqual(self.client.get("/v1/sessions/a2a-route-root/origin").json(), {"origin": "chat", "platform": "slack"})
+
+    def test_session_origin_walks_the_gateway_profiles_store_on_a_front_door_install(self):
+        # With HERMES_GATEWAY_PROFILE=platform the gateway's sessions are in
+        # profiles/platform/state.db; this server's own store does not know them.
+        own = self.tmp / "state.db"
+        with closing_state(own) as conn:
+            conn.executescript("CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);")
+        profile_db = self.tmp / "profiles" / "platform" / "state.db"
+        profile_db.parent.mkdir(parents=True)
+        with closing_state(profile_db) as conn:
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+                INSERT INTO sessions VALUES ('fd-origin-root', NULL, 'compression');
+                INSERT INTO sessions VALUES ('fd-origin-child', 'fd-origin-root', NULL);
+                """
+            )
+        session_kv_server._set_session_origin("fd-origin-root", "chat", "slack")
+        with patch.object(session_kv_server, "CARD_STOP_STATE_DB_PATH", str(own)), \
+                patch.object(session_kv_server, "KANBAN_DB_PATH", str(self.tmp / "kanban.db")):
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: "platform"}):
+                self.assertEqual(session_kv_server._session_origin("fd-origin-child"), ("chat", "slack"))
+                child = self.client.get("/v1/sessions/fd-origin-child/origin")
+                self.assertEqual(child.json(), {"origin": "chat", "platform": "slack"})
+            # Without the front door the profile's store is not read.
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: ""}):
+                self.assertEqual(session_kv_server._session_origin("fd-origin-child"), ("other", ""))
+            # A profile name that leaves the profiles directory names no store.
+            with patch.dict(os.environ, {session_kv_server.GATEWAY_PROFILE_ENV: "../platform"}):
+                self.assertEqual(session_kv_server._origin_state_dbs(), [str(own)])
+
+    def test_get_origin_route_is_404_without_a_record_and_401_without_the_key(self):
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(self.client.get("/v1/sessions/a2a-route-nobody/origin").status_code, 404)
+        session_kv_server._set_session_origin("a2a-route-keyed", "event")
+        self.assertEqual(self.client.get("/v1/sessions/a2a-route-keyed/origin").json(), {"origin": "event", "platform": ""})
+        self.assertEqual(TestClient(session_kv_server.app).get("/v1/sessions/a2a-route-keyed/origin").status_code, 401)
+
+    def test_put_origin_route_refuses_a_second_record_with_409(self):
+        sid = "a2a-origin-route"
+        first = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": "chat", "platform": "slack"})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": "api", "platform": ""})
+        self.assertEqual(second.status_code, 409, second.text)
+        self.assertEqual(session_kv_server._session_origin(sid), ("chat", "slack"))
+
+    def test_put_origin_route_refuses_an_unknown_value(self):
+        sid = "a2a-origin-unknown"
+        for bad in ("eval", "", None, 3):
+            with self.subTest(origin=bad):
+                response = self.client.put(f"/v1/sessions/{sid}/origin", json={"origin": bad})
+                self.assertEqual(response.status_code, 400, response.text)
+        self.assertNotIn(session_kv_server.ORIGIN_KEY, self._meta(sid))
+
+    def test_first_inject_stamps_event_and_drift(self):
+        stall = json.dumps({"kind": session_kv_server.INJECT_KIND_STALL})
+        drift = json.dumps({"kind": session_kv_server.INJECT_KIND_DRIFT})
+        answer = {"status": "injected"}
+        with patch.object(session_kv_server, "_inject_stall", return_value=answer), patch.object(
+            session_kv_server, "_inject_drift", return_value=answer
+        ):
+            event_sid = self.client.post("/sessions").json()["sessionID"]
+            drift_sid = self.client.post("/sessions").json()["sessionID"]
+            self.assertEqual(self.client.post(f"/sessions/{event_sid}/inject", json={"message": stall}).status_code, 200)
+            self.assertEqual(self.client.post(f"/sessions/{drift_sid}/inject", json={"message": drift}).status_code, 200)
+            # A second inject of the other kind changes nothing: the first one wins.
+            self.assertEqual(self.client.post(f"/sessions/{event_sid}/inject", json={"message": drift}).status_code, 200)
+            self.assertEqual(self.client.post(f"/sessions/{drift_sid}/inject", json={"message": stall}).status_code, 200)
+            # A session this server never created (the watcher's shared mode) gets no record.
+            self.assertEqual(self.client.post("/sessions/k8s-evt-shared0/inject", json={"message": stall}).status_code, 200)
+        self.assertEqual(session_kv_server._session_origin(event_sid), ("event", ""))
+        self.assertEqual(session_kv_server._session_origin(drift_sid), ("drift", ""))
+        self.assertEqual(self._meta("k8s-evt-shared0"), {})
+
+    def test_a_refused_inject_leaves_no_origin(self):
+        # A `controller-stall` record with no objects is refused with 400; it must
+        # not fix the origin, so the next accepted inject (drift) decides it.
+        refused = json.dumps({"kind": session_kv_server.INJECT_KIND_STALL, "cluster": "c", "namespace": "n", "objects": []})
+        drift = json.dumps({"kind": session_kv_server.INJECT_KIND_DRIFT})
+        sid = self.client.post("/sessions").json()["sessionID"]
+        self.assertEqual(self.client.post(f"/sessions/{sid}/inject", json={"message": refused}).status_code, 400)
+        self.assertNotIn(session_kv_server.ORIGIN_KEY, self._meta(sid))
+        with patch.object(session_kv_server, "_inject_drift", return_value={"status": "injected"}):
+            self.assertEqual(self.client.post(f"/sessions/{sid}/inject", json={"message": drift}).status_code, 200)
+        self.assertEqual(session_kv_server._session_origin(sid), ("drift", ""))
+
+    def test_cron_job_origin_is_upserted(self):
+        self.assertIsNone(session_kv_server._cron_job_origin("job-a"))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "chat", "platform": "slack"}).status_code, 200)
+        self.assertEqual(session_kv_server._cron_job_origin("job-a"), ("chat", "slack"))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "api"}).status_code, 200)
+        self.assertEqual(session_kv_server._cron_job_origin("job-a"), ("api", ""))
+        self.assertEqual(self.client.put("/v1/cron/jobs/job-a/origin", json={"origin": "nope"}).status_code, 400)
+
+    def test_cron_job_origin_get_route_reads_the_record_or_404(self):
+        from fastapi.testclient import TestClient
+
+        self.assertEqual(self.client.get("/v1/cron/jobs/job-r/origin").status_code, 404)
+        self.client.put("/v1/cron/jobs/job-r/origin", json={"origin": "chat", "platform": "slack"})
+        got = self.client.get("/v1/cron/jobs/job-r/origin")
+        self.assertEqual(got.status_code, 200, got.text)
+        self.assertEqual(got.json(), {"origin": "chat", "platform": "slack"})
+        self.assertEqual(TestClient(session_kv_server.app).get("/v1/cron/jobs/job-r/origin").status_code, 401)
+
+    def test_proposals_opened_is_idempotent_on_url(self):
+        url = "https://github.com/example/fleet/pull/7"
+        body = {"url": url, "origin": "audit", "platform": "", "opened_at": "2026-11-03T10:00:00+00:00"}
+        first = self.client.post("/v1/proposals/opened", json=body)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), {"recorded": True})
+        again = dict(body, origin="chat", platform="slack")
+        second = self.client.post("/v1/proposals/opened", json=again)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json(), {"recorded": False})
+        counts = self.client.get("/v1/proposals/opened/counts").json()
+        self.assertEqual(counts["audit"], {"": 1})
+        self.assertEqual(counts["chat"], {"": 0})
+        self.assertEqual(self.client.post("/v1/proposals/opened", json=dict(body, url="")).status_code, 400)
+        self.assertEqual(self.client.post("/v1/proposals/opened", json=dict(body, url=url + "8", origin="eval")).status_code, 400)
+
+    def test_proposals_opened_counts_zero_fill_every_origin(self):
+        for n, (origin, platform) in enumerate((("chat", "slack"), ("chat", "slack"), ("chat", "googlechat"), ("drift", ""))):
+            body = {"url": f"https://github.com/example/fleet/pull/{n}", "origin": origin, "platform": platform}
+            self.assertEqual(self.client.post("/v1/proposals/opened", json=body).status_code, 200)
+        counts = self.client.get("/v1/proposals/opened/counts").json()
+        self.assertEqual(list(counts), list(session_kv_server.ORIGINS))
+        self.assertEqual(counts["chat"], {"slack": 2, "googlechat": 1})
+        self.assertEqual(counts["drift"], {"": 1})
+        for origin in set(session_kv_server.ORIGINS) - {"chat", "drift"}:
+            self.assertEqual(counts[origin], {"": 0}, origin)
+
+    def test_cleanup_leaves_the_ledger_and_job_origins(self):
+        import sqlite3
+
+        self.client.post("/v1/proposals/opened", json={"url": "https://github.com/example/fleet/pull/99", "origin": "issue"})
+        self.client.put("/v1/cron/jobs/job-old/origin", json={"origin": "chat", "platform": "slack"})
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute("UPDATE proposals_opened SET opened_at = '2020-01-01T00:00:00+00:00'")
+                conn.execute("UPDATE cron_job_origins SET recorded_at = '2020-01-01T00:00:00+00:00'")
+                session_kv_server.cleanup_old_records(conn)
+        self.assertEqual(self.client.get("/v1/proposals/opened/counts").json()["issue"], {"": 1})
+        self.assertEqual(session_kv_server._cron_job_origin("job-old"), ("chat", "slack"))
+
+    def test_a_stamp_ticket_is_minted_with_the_named_length(self):
+        minted = self.client.post("/v1/board/stamp-tickets", json={"origin": "issue"})
+        self.assertEqual(minted.status_code, 200, minted.text)
+        ticket = minted.json()["ticket"]
+        self.assertRegex(ticket, rf"^[0-9a-f]{{{2 * session_kv_server.STAMP_TICKET_BYTES}}}$")
+        self.assertEqual(self.client.post("/v1/board/stamp-tickets", json={"origin": "eval"}).status_code, 400)
+
+    def test_a_stamp_ticket_redeems_once_and_a_replay_is_404(self):
+        ticket = self.client.post("/v1/board/stamp-tickets", json={"origin": "chat", "platform": "slack"}).json()["ticket"]
+        first = self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem")
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(first.json(), {"origin": "chat", "platform": "slack"})
+        self.assertEqual(self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem").status_code, 404)
+        self.assertEqual(self.client.post("/v1/board/stamp-tickets/" + "0" * 32 + "/redeem").status_code, 404)
+
+    def test_an_expired_stamp_ticket_is_404(self):
+        ticket = self.client.post("/v1/board/stamp-tickets", json={"origin": "drift"}).json()["ticket"]
+        later = time.time() + session_kv_server.STAMP_TICKET_TTL_SECONDS + 1
+        with patch.object(session_kv_server.time, "time", return_value=later):
+            self.assertEqual(self.client.post(f"/v1/board/stamp-tickets/{ticket}/redeem").status_code, 404)
+
+    def test_board_task_origin_first_stamp_wins(self):
+        import sqlite3
+
+        board = self.tmp / "kanban.db"
+        sqlite3.connect(board).close()
+        with patch.object(session_kv_server, "KANBAN_DB_PATH", str(board)), patch.object(
+            session_kv_server, "_hermes_kanban", return_value=(None, None)
+        ):
+            self.assertTrue(session_kv_server._stamp_board_task_origin("t_abc", "chat", "slack"))
+            self.assertFalse(session_kv_server._stamp_board_task_origin("t_abc", "issue", ""))
+        with closing_state(board) as conn:
+            rows = conn.execute("SELECT task_id, origin, origin_platform FROM kanban_task_origins").fetchall()
+        self.assertEqual(rows, [("t_abc", "chat", "slack")])
+
+
+def closing_state(path):
+    import sqlite3
+    from contextlib import closing
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    return closing(conn)
+
+
+class TestKeptRefusals(unittest.TestCase):
+    """`a2a notify` exit 5: the gateway kept a home post for its digest. The
+    re-senders treat it as handled, so the keep is not filled with retries."""
+
+    def test_drift_backlog_digest_kept_by_the_gateway_counts_as_sent(self):
+        exc = session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        with patch.object(session_kv_server.subprocess, "run", side_effect=exc), \
+                patch.object(session_kv_server.chat_notify, "routes", return_value=True):
+            self.assertTrue(session_kv_server._send_drift_backlog_digest("slack", "Drift backlog: 3 changes"))
+
+    def test_initial_alert_kept_by_the_gateway_returns_the_kept_marker(self):
+        exc = session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        with patch.object(session_kv_server, "_run_alert_send", side_effect=exc):
+            self.assertEqual(session_kv_server._post_initial_alert("slack", "an alert"), session_kv_server.ALERT_KEPT_FOR_DIGEST)
+
+    def test_report_card_kept_by_the_gateway_posts_no_text(self):
+        res = MagicMock(returncode=chat_notify.NOTIFY_KEPT, stdout="", stderr="kept")
+        with patch.object(session_kv_server.subprocess, "run", return_value=res), \
+                patch.object(session_kv_server.chat_notify, "chat_command", return_value=["a2a"]):
+            posted = session_kv_server._post_audit_chat_via_gateway("slack", "platform", "audit", {"kind": "card"}, "text", "", 30)
+        self.assertIs(posted, session_kv_server.AUDIT_POST_KEPT)
+
+    def test_data_volume_warning_kept_by_the_gateway_stops_retrying(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=False), \
+                patch.object(session_kv_server, "_post_initial_alert", return_value=session_kv_server.ALERT_KEPT_FOR_DIGEST):
+            self.assertTrue(session_kv_server._post_data_volume_warning("data volume at 90%"))
 
 
 if __name__ == "__main__":

@@ -197,7 +197,6 @@ const (
 type Config struct {
 	Authenticator            CallerAuthenticator
 	Upstream                 UpstreamTransport
-	DefaultClusterID         string
 	Mode                     Mode
 	RedactSecrets            bool
 	AllowUpgradeSubresources bool
@@ -232,13 +231,11 @@ sequenceDiagram
 
 ### 3. URL routing and multi-cluster addressing
 
-`kube-proxy` serves both single-cluster and multi-cluster requests from one listener:
+Every request names its cluster in the path: `/clusters/{clusterID}/{k8s-path...}`.
 
-- **Explicit cluster prefix**: `/clusters/{clusterID}/{k8s-path...}`
-  - `{clusterID}` is the keyword `in-cluster`, a GKE context name matching `^gke_[a-z0-9-]+_[a-z0-9-]+_[a-z0-9-]+\z`, or a `kind-<cluster>` context name.
-  - `pkg/k8sapiproxy` extracts `{clusterID}` and rewrites `req.URL.Path` to `/{k8s-path...}` before running `RequestInfoFactory`.
-- **Default cluster root**: `/{k8s-path...}` (any path not starting with `/clusters/`)
-  - Routes to `Config.DefaultClusterID` (set from `KUBE_PROXY_DEFAULT_CLUSTER` or `KUBE_CONTEXT_NAME`, or `in-cluster` when unset).
+- `{clusterID}` is the keyword `in-cluster`, a GKE context name matching `^gke_[a-z0-9-]+_[a-z0-9-]+_[a-z0-9-]+\z`, or a `kind-<cluster>` context name.
+- `pkg/k8sapiproxy` extracts `{clusterID}` and rewrites `req.URL.Path` to `/{k8s-path...}` before running `RequestInfoFactory`.
+- A path that doesn't start with `/clusters/` is refused with `400 Bad Request`, naming the shape it needs. There is no default cluster. Every kubeconfig the sandbox builds already points each context at `/clusters/<context>`, the host's included, so a request without the prefix comes from a server URL configured without it, or from a client that dropped it. kubectl before 1.34 does that on `kubectl get --raw`, and a default cluster used to answer those fleet reads with the host's data and no error ([#4739](https://github.com/gke-labs/kube-agents/issues/4739)).
 
 Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path contains `.` or `..` segments, empty internal segments (`//`), or percent-encoded slashes (`%2f`, `%2F`) with `400 Bad Request`. This guarantees that `RequestInfoFactory` and the upstream `kube-apiserver` interpret the URL path identically.
 
@@ -246,7 +243,7 @@ Before parsing the path, `pkg/k8sapiproxy` rejects any request whose raw path co
 
 In [`deploy/sandbox/Dockerfile`](../../deploy/sandbox/Dockerfile):
 
-- The stock `kubectl` binary is installed at `/usr/local/libexec/kubectl`, with a thin `/usr/local/bin/kubectl` wrapper that invokes `credential_proxy_client.py --ensure-kubectl-context` when `KUBE_PROXY_URL` is set and `--context` is passed before `exec`ing `/usr/local/libexec/kubectl`. The pinned version is 1.34 or later: before 1.34, `kubectl get --raw` replaced the server URL's path with the raw path, so a paged collection read through a `/clusters/<ctx>` kubeconfig reached the proxy's default cluster instead of `<ctx>`; the image's smoke test proves the installed binary keeps the path.
+- The stock `kubectl` binary is installed at `/usr/local/libexec/kubectl`, with a thin `/usr/local/bin/kubectl` wrapper that invokes `credential_proxy_client.py --ensure-kubectl-context` when `KUBE_PROXY_URL` is set and `--context` is passed before `exec`ing `/usr/local/libexec/kubectl`. The pinned version is 1.34 or later: before 1.34, `kubectl get --raw` replaced the server URL's path with the raw path, so a paged collection read through a `/clusters/<ctx>` kubeconfig reached the proxy with no cluster in it, which the proxy now refuses (section 3). The pin is 1.35, inside kubectl's one-minor skew for the GKE 1.35 and 1.36 clusters the fleet runs. The image build (`check_kubectl_base_path.py`) and the image's smoke test both prove the installed binary keeps the path.
 - `/opt/credential-proxy/bin/kubectl` is removed; `/opt/credential-proxy/bin/gcloud` remains a symlink to `/usr/local/bin/credential-proxy-exec`.
 - No client-side `kubectl` `exec` auth plugin (such as `gke-gcloud-auth-plugin`) is installed in the sandbox. Running `gke-gcloud-auth-plugin` inside the sandbox would place the upstream Google Cloud access token (**Asset A1**) inside the untrusted environment. Instead, `kube-proxy` attaches the upstream token outside the sandbox.
 
@@ -415,7 +412,7 @@ Generic agent sandboxes such as NVIDIA OpenShell (`v0.1.2`) isolate agent proces
 `kube-proxy` does not replace generic sandboxes. Instead, it serves as the Kubernetes-aware backend for OpenShell in two ways:
 
 1. **Explicit `tls: skip` proxy endpoint (zero changes to OpenShell)**:
-   - Run `k8s-api-proxy` outside the OpenShell sandbox (on the host or in the cluster) and configure the sandbox `kubeconfig` `server:` to point to `https://<kube-proxy>:8443`.
+   - Run `k8s-api-proxy` outside the OpenShell sandbox (on the host or in the cluster) and configure the sandbox `kubeconfig` `server:` to point to `https://<kube-proxy>:8443/clusters/<context>`. The proxy refuses a path that names no cluster (section 3).
    - In the OpenShell sandbox policy, add a `network_policies` rule for the `kube-proxy` endpoint with `tls: skip` so `kubectl` connects to `kube-proxy` over TLS directly while `kube-proxy` enforces `RequestInfoFactory` verb policy, `Secret` redaction, and upstream GKE authentication.
 2. **OpenShell `SupervisorMiddleware` gRPC adapter**:
    - OpenShell defines a `SupervisorMiddleware` gRPC service (`AuthorizeRequest` and `TransformResponse` in `proto/openshell/sandbox.proto`) for external L7 inspection.

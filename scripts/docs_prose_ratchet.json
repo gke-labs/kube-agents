@@ -10,7 +10,7 @@
     "long-sentence": 16
   },
   "concepts/observability.md": {
-    "long-sentence": 24
+    "long-sentence": 23
   },
   "deploy/kustomize.md": {
     "long-paragraph": 2,
@@ -84,7 +84,7 @@
   },
   "reference/config.md": {
     "long-paragraph": 8,
-    "long-sentence": 24
+    "long-sentence": 23
   },
   "reference/credential-isolation.md": {
     "banned-word": 1,

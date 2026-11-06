@@ -507,10 +507,13 @@ def probe_ledger_main(argv: list[str] | None = None) -> int:
 def empty_record() -> dict:
     """The keys reset_merge_requests fills: hack/ci_reset_agent_pulls.py's
     record shape (new_record there), so the artifact reads the same on either
-    forge; scripts/test_ci_gitlab_forge.py pins the two equal."""
+    forge; scripts/test_ci_gitlab_forge.py pins the two equal. The stack_files
+    lists stay empty here: the GitLab path deletes no file a stack planted, and
+    the one stack that plants one writes to GitHub only."""
     return {
         "open_before": 0, "kept_open": [], "labelled": [], "closed": [], "unclosed": [],
         "branches_before": 0, "deleted": [], "undeleted": [], "kept_branches": [],
+        "stack_files_deleted": [], "stack_files_undeleted": [], "stack_files_kept": [],
         "open_after": None, "branches_after": None, "clean": False,
     }
 

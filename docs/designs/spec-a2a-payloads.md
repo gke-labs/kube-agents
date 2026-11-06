@@ -475,17 +475,17 @@ or unreported at its drain; `dropped` counts them all, and a delivery the execut
 read or refused over its body cap is outside it, logged, the call it belonged to in the trace
 as `interrupted` when its opening delivery arrived and whole from the closing one when the
 opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
-an error), `durationMs` and `at`; the library
+an error), `durationMs`, `at`, and (on the Hermes bridge's `api` executor) `title`, `sessionId`, `worker`, `cardId`, and `resultPreview` (`card_id=<id>` on a successful `kanban_create` only; no other tool output, and no error text (outside the bridge's off-by-default `BRIDGE_DEBUG_ERROR_TEXT` debugging switch), is published - `input` is the argument shape under both executors); the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 One unreserved name has a defined shape: `steps`, `kube-agents.step/v1` data parts
 ([`a2a/lib/stepmsg`](../../a2a/lib/stepmsg/stepmsg.go)), by which an executor may state what a turn
-planned, which of its subtasks settled, and when it synthesized an answer, so a renderer lists a
+planned (`kind: "plan"`), which of its subtasks settled (`kind: "subtask"`, with a `subtask` object carrying `id`, `title`, `status`, `verdict`, `summary`, `settled`, `total`, and `parentTaskId`; the hermes bridge leaves `summary` empty, keeping a card's report off `TASKS`), and when it synthesized an answer (`kind: "synthesis"`), along with an optional single-line `thought` (at most 4,096 UTF-8 bytes) and `callIds` (up to 64 tool call IDs), so a renderer lists a
 turn's steps without parsing them out of `thinking`. It carries no reserved semantics: the relay
 ignores it, the fold keeps it, and a reader that does not know it skips it. A later version of the record is a new
 schema, as with chat messages: a v1 reader skips a `kube-agents.step/v2` part rather than guess
 at it, and skips a v1 part with an unknown `kind`. The Hermes bridge publishes it from its
-tool-call trace and the turn's model requests, structure only
+tool-call trace and the turn's model requests (and, on the `api` executor, settled Kanban cards)
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Activity").
 
 ## Verified identity (added 9/9)
@@ -493,7 +493,7 @@ tool-call trace and the turn's model requests, structure only
 **An envelope's publisher is the principal implied by the subject it arrived on** - the
 stored subject, on replay - and that implication is decision-grade exactly where two
 conditions hold. No signed claim, no signing key on the hot path, no key registry at
-replay: every check is a field-to-token comparison, plus the one supervisor name a
+replay: every check is a field-to-token comparison, plus the supervisor names a
 consumer is configured with. The alternatives this beat - a signed claim per envelope,
 a server-stamped header, a key registry consulted at replay - were taken through
 successive hostile review rounds before it was ratified; this section is the contract, and the
@@ -515,7 +515,7 @@ source, and replay skips and counts it.
 | Subject class                        | Admissible kinds                   | `taskId` | Writer the subject implies, and the check                                                                                                                                                                                                                                                        |
 | ------------------------------------ | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `…events`                            | `status-update`, `artifact-update` | = token  | The addressee: `from.session` for a chat session, `from.profile` for a profile-addressed executor; at least one MUST equal the addressee token. Advisory as shipped; hard only once an operator sets `A2A_STRICT_EVENTS_WRITER=true`.                                                            |
-| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it; one that does not checks the negative form, `from` is not the addressee.                                              |
+| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it (the gateway's names the dispatcher too); one that does not checks the negative form, `from` is not the addressee.     |
 | `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee. `to` is conventionally present here and checked when it is, but is not required; see the note below.                                                                               |
 | `…submit` (10/22)                    | `message`                          | = token  | The submitter, the gateway. A consumer that names it (`Submitter`, as a dispatcher does) checks `from.session` against it; one that names none uses the negative form, `from` is not the profile (neither `from.session` nor `from.profile`). `to`, where present, MUST equal the profile token. |
 | `a2a.agents.{profile}`               | `agent-card`, `agent-closed`       | absent   | The profile's owner; `from.profile` MUST equal the subject token (the profile binding, mandated 9/9 before any card publisher exists). A card MUST NOT be refused for lacking a `taskId`.                                                                                                        |
@@ -775,8 +775,8 @@ through the delegation primitive and the profile dispatcher), at which point car
 ride the carriers above. The plan is on #2149
 ([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
 
-Under `next` the Planning Agent often answers "on it", hands the work to kanban cards, and
-its task ends. The cards keep going outside any A2A task, so none of the carriers above
+Under `next` on chat platforms (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
+its task ends (whereas on non-chat routes or console/MCP origins, `!run.routeRecorded.Load() || isConsoleOrigin(run.origin)`, the `api` executor holds the turn open while polling `kanban.db`, emits `subtask` steps as cards settle, and synthesizes multi-card results into the task's `result` artifact; see `a2a/docs/hermes-bridge.md`). Where the task ends at the acknowledgement, the cards keep going outside that A2A task, so none of the carriers above
 reach them. Their updates reach the conversation on the chat.notify route instead,
 addressed to the asking conversation and checked against the gateway's session record
 (spec-chatops-gateway, the conversation-addressed notify of #2679). A notify request may
@@ -936,13 +936,22 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   message posts the fallback, logged and counted, as for an invalid one, and never clips
   it or sends a card the API will refuse. The same goes for a post the backend's API
   refuses: the renderer retries it once as the fallback.
+- **Wording is linted, not validated.** A headline names no card id (`t_` and eight hex
+  digits), opens with no markdown heading or apology ("Sorry", "I apologize",
+  "Unfortunately") and carries no code fence; a choice's label is no slash command, code
+  span, or command line opening on a CLI's name (`kubectl`, `gcloud`, `git` and the like). Breaking one is an emitter bug, but not one a renderer acts on:
+  dropping the message for its wording would lose the answer. `chatmsg.Lint` and
+  `chat_cases.lint` check them, and the emitters' tests and the shared cases hold the
+  emitters to them. The Slack renderer keeps the buttons to five a row by wrapping.
 
-`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above, the
+`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above but
+the wording one, which `Lint` checks, the
 fallback each carrier pairs with a chat message, and the DataPart encoding. The command
 matchers and the label check it shares with the gateway are in `a2a/lib/chattext`. The shared
 cases in `tests/conformance/chat/` pair inputs from the `today` presenters' tests with the chat
-messages the emitter owes for them; `chatmsg` validates every one, and
+messages the emitter owes for them; `chatmsg` validates and lints every one, and
 `agents/platform/scripts/chat_cases.py` reads them for the Python presenters.
+`tests/conformance/chat-ux/lint.json` holds the lint's own cases, which both lints read.
 
 ## Topics
 

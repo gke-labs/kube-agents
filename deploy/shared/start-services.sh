@@ -539,8 +539,8 @@ WATCHER_SCALEUP_HOLD="${WATCHER_SCALEUP_HOLD:-${WATCHER_SCALEUP_HOLD_DEFAULT}}"
 normalize_duration WATCHER_SCALEUP_HOLD "${WATCHER_SCALEUP_HOLD_DEFAULT}"
 
 # The settle period: how long a failure in the settle family (the crash-loop
-# family, FailedMount, Unhealthy; the reasons kubelet re-emits while they
-# last) has to have lasted, by the
+# family, FailedMount, Unhealthy, a Failed saying "host IP unknown"; the
+# reasons kubelet re-emits while they last) has to have lasted, by the
 # event's own first and last sighting, before the watcher forwards it. It
 # runs after the count debounces above: a failure has to have repeated AND
 # lasted. A BackOff that clears inside it, kubelet warming its object cache on
@@ -556,8 +556,8 @@ normalize_duration WATCHER_SETTLE "${WATCHER_SETTLE_DEFAULT}"
 # quiet: the watcher sends the Session KV server one k8s-event-followup inject
 # for it, which lands in the alert's thread saying the object has emitted
 # nothing since, so a card read hours later says what was true when. Silence,
-# not recovery: the watcher reads events only and reads no object back, and a
-# deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
+# not recovery: the watcher reads events, and of a Pod only its owner, never
+# its state, and a deleted pod goes as quiet as a recovered one. Past kubelet's 5m back-off
 # ceiling with margin, so a crash loop still going is never reported quiet
 # between two of its back-offs. Set to 0 to send none.
 readonly WATCHER_QUIET_AFTER_DEFAULT=15m
@@ -578,6 +578,12 @@ normalize_duration WATCHER_QUIET_AFTER "${WATCHER_QUIET_AFTER_DEFAULT}"
 readonly WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT=true
 WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD:-${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}}"
 normalize_boolean WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD "${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD_DEFAULT}"
+
+# Alert-exclude rules: a JSON list, passed to the watcher as it is. Events a
+# rule matches open no incident, while their clusters stay in scope for reads.
+# Not normalised here: the watcher parses the list, and a malformed one is
+# logged as an ALERT and ignored there, so it never stops the watcher.
+WATCHER_ALERT_EXCLUDE="${WATCHER_ALERT_EXCLUDE:-}"
 
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
@@ -951,7 +957,8 @@ start_event_watcher() {
         --scaleup-hold="${WATCHER_SCALEUP_HOLD}" \
         --settle="${WATCHER_SETTLE}" \
         --quiet-after="${WATCHER_QUIET_AFTER}" \
-        --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" || true
+        --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" \
+        --alert-exclude="${WATCHER_ALERT_EXCLUDE}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh
