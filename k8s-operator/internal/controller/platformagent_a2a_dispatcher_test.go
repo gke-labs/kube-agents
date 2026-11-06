@@ -238,7 +238,7 @@ func TestRenderedDispatcherFixtures(t *testing.T) {
 	})
 	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{tse})
 	checkFixture(t, dispatcherMapFixturePath, cm.Data[a2aAuthMapKey])
-	cfgMap, err := buildA2ADispatchConfigMap(agent, []agentv1alpha1.AgentProfile{tse})
+	cfgMap, err := buildA2ADispatchConfigMap(agent, []agentv1alpha1.AgentProfile{tse}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -400,6 +400,19 @@ leave open:
   had already received still arrive. The NATS spec's `PROFILE_SUBMITS` and callout
   amendments of 10/28 ([`spec-nats-deployment.md`](spec-nats-deployment.md)) say the same
   from the bus's side.
+- **A profile that leaves.** A profile removed from the install, or one whose identity stops
+  rendering, drains (#5074). The operator keeps it in the dispatch config with no durables and
+  `drainingUntil` set to the longest deadline any task can carry (six hours, the ceiling on
+  `maxTaskDeadlineSeconds`) plus fifteen minutes past the moment it left, so nothing new is
+  dispatched for it. A task keeps the deadline it was confirmed with, so a lower limit set since
+  doesn't shorten the window. The dispatcher's identity keeps its `.supervisor` and
+  stop-record grants and drops its durable grants, so the terminals of the tasks it still holds
+  reach their requesters. The applied dispatch config is the state: a profile it lists that the
+  render no longer has starts draining, and one already draining keeps its time until that
+  passes, when it leaves the config and the identity together. The set is read once a pass for
+  both, and only an entry the render could itself produce (subject-token name and tiers) is
+  carried forward, since its name becomes a grant. A held task whose submission goes back to the
+  stream when the dispatcher restarts mid-drain has no durable to come back on.
 - **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
   is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
   identity for one.
