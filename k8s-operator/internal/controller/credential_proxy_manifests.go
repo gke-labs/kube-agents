@@ -746,7 +746,7 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 		// `gcloud container clusters get-credentials`. The watcher moved; the
 		// kubeconfig did not.
 		{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher"},
-		{Name: "credential-proxy-ksa-token", MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
+		{Name: brokerMinterVolume, MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
 		// The default-audience token and the cluster CA, which is what the
 		// TokenReview call needs — a broker off the agent's Pod authenticates
 		// its callers, and it authenticates itself to the API server with this.

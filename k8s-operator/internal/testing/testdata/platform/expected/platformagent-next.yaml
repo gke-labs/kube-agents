@@ -1771,6 +1771,8 @@ spec:
               value: /etc/a2a-nats-ca/ca.crt
             - name: A2A_BUS_USER
               value: agent
+            - name: A2A_NOTIFY_PLATFORM
+              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: A2A_ACTIVITY_SECRET
@@ -2045,6 +2047,8 @@ spec:
               value: example-project
             - name: NATS_CA_FILE
               value: /etc/a2a-nats-ca/ca.crt
+            - name: A2A_NOTIFY_PLATFORM
+              value: google_chat
             - name: A2A_NOTIFY_CONVERSATIONS
               value: google_chat
             - name: PATH
@@ -4639,7 +4643,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "27"
+    pods: "34"
 status: {}
 ---
 apiVersion: v1
@@ -5322,6 +5326,7 @@ metadata:
       name: platformagent
       uid: ""
 spec:
+  progressDeadlineSeconds: 1800
   replicas: 1
   selector:
     matchLabels:
@@ -5408,6 +5413,11 @@ spec:
           ports:
             - containerPort: 9096
               name: a2a-metrics
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: a2a-metrics
+            periodSeconds: 5
           resources:
             limits:
               cpu: 500m

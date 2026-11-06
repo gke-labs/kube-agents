@@ -1154,7 +1154,8 @@ const (
 // a2aGatewayMetricsPort is the A2A gateway's metrics-only listener
 // (a2a/gateway/metrics.go), the gateway's copy of credentialProxyMetricsPort:
 // its own port, so the managed-Prometheus collector is admitted to a listener
-// that serves counters and nothing else, and the doors keep their loopback
+// that serves counters and a readiness line (a2aGatewayReadyzPath) and nothing
+// else, and the doors keep their loopback
 // listeners. One constant for the container port, the value of
 // A2A_METRICS_PORT the gateway binds, and the collector's ingress rule in
 // buildA2AGatewayNetworkPolicy; the chart's PodMonitoring scrapes it by
@@ -1166,7 +1167,23 @@ const (
 	// the metrics port; the usage poller names it to find the port.
 	a2aGatewayContainerName     = "gateway"
 	a2aGatewayMetricsPortEnvVar = "A2A_METRICS_PORT"
+	// a2aGatewayReadyzPath is the gateway's readiness path on the same
+	// listener (gateway.ReadyzPath): 503 until its event relay has bound,
+	// which waits for the provision Job's TASKS stream.
+	a2aGatewayReadyzPath = "/readyz"
 )
+
+// a2aGatewayProgressDeadlineSeconds is the gateway Deployment's progress
+// deadline. With the readiness probe, a gateway waiting for TASKS holds its
+// rollout at zero available replicas, and past the deadline the Deployment
+// reads ProgressDeadlineExceeded and `kubectl rollout status` returns an error
+// however long it was asked to wait. Kubernetes' 600s default is shorter than
+// a slow provision Job (a three-server bus forming, the Job's backoff). 1800s
+// matches the Hermes gateway's gatewayProgressDeadlineSeconds and clears
+// upgrade.sh's 1500s deploy gate. The deadline stops nothing: the gateway
+// keeps waiting and binds when TASKS appears, and the CR reads Provisioning
+// throughout.
+const a2aGatewayProgressDeadlineSeconds int32 = 1800
 
 func a2aNATSImage() string {
 	if override := os.Getenv(a2aNATSImageEnvVar); override != "" {
@@ -1341,6 +1358,34 @@ func a2aSlackNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
 		return false
 	}
 	return strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "" || a2aSlackHomeChannel(agent) != ""
+}
+
+// a2aGchatHomeRouted says the agent routes its home posts (alerts, drift
+// and scheduled reports) to the gateway's Chat backend: the home channel is
+// a space name, or it is empty and Slack is not enabled, so the posts have
+// nowhere else to go and the gateway keeps the refused ones for the digest
+// it posts once a channel is set (a2a/gateway/notify_refused.go). With Slack
+// enabled beside an unset Chat home the posts keep going to Slack through
+// its Hermes platform (legacySlackConsumer) rather than into the keep. A
+// malformed home channel routes nothing: the gateway refuses it at start.
+func a2aGchatHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aChatArmed(agent) {
+		return false
+	}
+	if a2aGchatHomeSpace(agent) != "" {
+		return true
+	}
+	return strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" && !slackEnabled(agent)
+}
+
+// a2aSlackHomeRouted is Slack's half of a2aGchatHomeRouted. Slack holds the
+// gateway only when Chat is not enabled (a2aSlackArmed), so an unset home
+// channel always routes: Slack is the install's one chat platform.
+func a2aSlackHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aSlackArmed(agent) {
+		return false
+	}
+	return a2aSlackHomeChannel(agent) != "" || strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == ""
 }
 
 // a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public
@@ -3929,20 +3974,142 @@ func a2aProvisionTerminationMessage(pods []corev1.Pod) (string, bool) {
 // playground path).
 const defaultA2AMaxSessions = 10
 
+// The namespace pod quota adds headroom above the gateway's cap, because the
+// quota is namespace-wide: that is the only shape a hostile pod-creator cannot
+// dodge (ResourceQuota scopes select on fields the creator writes), so it must
+// leave room for everything else that legitimately runs here. The headroom is
+// derived rather than a constant (#3848): a fixed 16, sized for "roughly ten
+// standing pods plus surge", stopped covering the release once the callouts,
+// verifiers and console arrived and an install could add Hindsight and the
+// GitHub minter, and the gateway's tenth session was refused by admission.
+// a2aQuotaHeadroom is the sum of three parts:
+//
+//   - a2aStandingPods: what this operator keeps running for the agent;
+//   - the chart's pods (the operator, LiteLLM, Hindsight, the GitHub minter and
+//     the web console, plus one surge pod for each that rolls surge-first,
+//     since a chart bump rolls several in one upgrade), which only the chart
+//     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation.
+//     The CR is in the namespace those pods run in, and the chart renders it
+//     whether or not it renders the operator;
+//   - a2aQuotaTransientMargin for what this operator starts beside the
+//     standing pods, and the gateway's overshoot.
+const (
+	// a2aChartPodsAnnotation carries the chart's pod count, standing pods
+	// plus their surges (charts/kube-agents/templates/platform-agent-cr.yaml,
+	// from kube-agents.chartQuotaPods).
+	a2aChartPodsAnnotation = "kubeagents.x-k8s.io/a2a-quota-chart-pods"
+	// a2aDefaultChartPods stands in when that annotation is absent (a
+	// PlatformAgent the chart did not render) or unreadable: the chart's
+	// default release, the operator and two LiteLLM replicas, and a surge pod
+	// for each of the two Deployments. It errs high for a CR in a namespace
+	// with no chart pods, which only loosens the bound, and low for a
+	// hand-written CR beside a chart release that runs more than the default
+	// (platformAgent.enabled=false), which must carry the annotation itself
+	// (#4883). tests/test_quota_preflight.py ties it to a default chart render.
+	a2aDefaultChartPods = 5
+	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
+	// enforcement half of the session bound, and anyone who can annotate the
+	// CR could otherwise lift it as far as an int64 goes (or wrap it); the
+	// chart's own count is a handful of pods, so a figure past this is not one
+	// it wrote, and the default stands in for it.
+	a2aMaxChartPods = 64
+	// a2aChartPodsDiscardedReason is the Warning event a CR carrying an
+	// annotation the operator will not use gets, once per spec generation and
+	// annotation value (a2aChartPodsDiscard): the quota then counts a2aDefaultChartPods, which
+	// can sit below what the namespace runs.
+	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
+	// a2aQuotaTransientMargin is room for pods this operator starts beside the
+	// standing ones, at their worst moment, a helm upgrade: two rollout surge
+	// pods (the callouts and verifiers roll together on the new operator's
+	// reconcile, each surge-first; the chart's own surges are in its count),
+	// one provisioning Job pod (at install, on any spec change and about daily
+	// after its TTL), one scope publisher Job pod (started every
+	// scopePublishInterval, never while another is active; it renders in next
+	// mode, the only mode this quota renders in), and three for the gateway's
+	// count-then-create overshoot (a2a/gateway/spawn.go, refuseAtSessionCap).
+	a2aQuotaTransientMargin = 2 + 1 + 1 + 3
+)
+
 // a2aQuotaHeadroom is what the namespace pod quota adds above the gateway's
-// cap. The quota is namespace-wide because that is the only shape a hostile
-// pod-creator cannot dodge (ResourceQuota scopes select on fields the
-// creator writes), so it must leave room for everything else that
-// legitimately runs here: the rendered stack and its neighbors (operator,
-// agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed,
-// and the scope publisher's, one at a time and only while it runs, since a
-// finished pod counts against no quota), rollout surge doubling a
-// Deployment for a moment, and the gateway's count-then-create overshoot. Fifteen covered roughly ten standing pods plus
-// surge; the console server made it eleven, hence sixteen, and the
-// kube-proxy's second replica seventeen. The MCP server, rendered only under
-// A2A_MCP_DOOR, is counted apart (a2aMCPStandingPods). If the base install grows
-// again, raise this before anything user-visible starts failing admission.
-const a2aQuotaHeadroom = 17
+// cap for agent.
+func a2aQuotaHeadroom(agent *agentv1alpha1.PlatformAgent) int64 {
+	return a2aStandingPods(agent) + a2aChartPods(agent) + a2aQuotaTransientMargin
+}
+
+// a2aChartPodsWarning is what a2aChartPodsWarned last reported for a CR: the
+// spec generation and the discarded annotation value.
+type a2aChartPodsWarning struct {
+	generation int64
+	value      string
+}
+
+// a2aChartPodsDiscard says why the CR's chart-pods annotation is not used,
+// or "" when it is used or absent. An absent one is a CR written without the
+// chart, which the default is for; a present one the operator discards is a
+// figure the chart did not write (the chart refuses to render one past the
+// cap) or one it cannot read, and the default may then sit below what the
+// namespace runs, so the discard is reported rather than silent.
+func a2aChartPodsDiscard(agent *agentv1alpha1.PlatformAgent) string {
+	raw, present := agent.GetAnnotations()[a2aChartPodsAnnotation]
+	if !present {
+		return ""
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("annotation %s=%q is not a number; the session quota counts the default of %d chart pods instead", a2aChartPodsAnnotation, raw, a2aDefaultChartPods)
+	case v < 0 || v > a2aMaxChartPods:
+		return fmt.Sprintf("annotation %s=%q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", a2aChartPodsAnnotation, raw, a2aMaxChartPods, a2aDefaultChartPods)
+	}
+	return ""
+}
+
+// a2aChartPods is the chart's pods in agent's namespace, surges included, as the chart
+// stamped them on the CR, or the default when it did not or stamped a figure
+// outside [0, a2aMaxChartPods].
+func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	raw := strings.TrimSpace(agent.GetAnnotations()[a2aChartPodsAnnotation])
+	if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 && v <= a2aMaxChartPods {
+		return v
+	}
+	return a2aDefaultChartPods
+}
+
+// a2aStandingPods is every pod the operator keeps running for agent in next
+// mode, summed from the builders that render them, so a resized workload is
+// counted at its new size. A new standing workload has to be added here:
+// TestA2AStandingPodsMatchTheNextModeGolden fails until an unconditional one
+// is, and a conditional one needs a row in
+// TestA2AStandingPodsCountTheConditionalWorkloads.
+func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	agentReplicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	n := int64(agentReplicas)
+	for _, dep := range []*appsv1.Deployment{
+		buildCredentialProxyDeployment(agent, ""),
+		buildKubeProxyDeployment(agent, "", false, ""),
+		buildA2ACalloutDeployment(agent, "", 1), // the shard count changes nothing about the replicas
+		buildA2AVerifierDeployment(agent),
+		buildA2AConsoleDeployment(agent),
+		buildA2AGatewayDeployment(agent),
+	} {
+		n += int64(ptr.Deref(dep.Spec.Replicas, 1))
+	}
+	for _, sts := range []*appsv1.StatefulSet{
+		buildShellSandboxStatefulSet(agent, "", "", ""),
+		buildA2ANATSStatefulSet(agent, ""),
+	} {
+		n += int64(ptr.Deref(sts.Spec.Replicas, 1))
+	}
+	// The workloads rendered on a condition, which the next-mode golden (the
+	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
+	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
+	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
+	// workloads behind an operator flag (the MCP door, the dispatcher) come from
+	// a2aFlaggedPods, which the chart's quota preflight mirrors.
+	n += int64(credentialProxyExecTierReplicas(agent))
+	n += a2aFlaggedStandingPods(agent)
+	return n
+}
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
@@ -4386,7 +4553,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 	}
 	return fmt.Sprintf(
-		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and binds once it exists; a bridge restarted early only fails its subscribe, so the bridge's restart is the one that has to follow the stream.",
 		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
 		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }
@@ -4410,7 +4577,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AMaxSessions(agent)+a2aQuotaHeadroom) + a2aMCPStandingPods(agent)
+	limit := int64(resolveA2AMaxSessions(agent)) + a2aQuotaHeadroom(agent)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -5291,8 +5458,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// overlapping during a roll is the wrong shape. Recreate stops
 			// the old one before the new one starts; the gap is the one
 			// the single-backend rule already implies.
-			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
-			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Strategy:                appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+			ProgressDeadlineSeconds: ptr.To(a2aGatewayProgressDeadlineSeconds),
+			Selector:                &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
@@ -5326,6 +5494,18 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Ports: append(injectPorts, corev1.ContainerPort{
 							Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort,
 						}),
+						// Not ready until the event relay binds: the adapters and
+						// doors start only after it, and it waits for TASKS rather
+						// than exiting. Recreate (above) already stops the old
+						// pod before this one starts, so the probe opens no gap
+						// in a roll; it shows the existing one, with the reason
+						// in the probe's failure message.
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{Path: a2aGatewayReadyzPath, Port: intstr.FromString(a2aGatewayMetricsPortName)},
+							},
+							PeriodSeconds: 5,
+						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
 						}, a2aNATSCABundleMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
@@ -5751,6 +5931,20 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
 	// why both exist and why the quota sits above the cap).
 	quota := buildA2ASessionQuota(agent)
+	if why := a2aChartPodsDiscard(agent); why != "" {
+		key := client.ObjectKeyFromObject(agent)
+		// An annotation edit does not bump the generation, so the value is
+		// part of what was reported: a second bad value warns too.
+		seen := a2aChartPodsWarning{generation: agent.Generation, value: agent.Annotations[a2aChartPodsAnnotation]}
+		if warned, ok := r.a2aChartPodsWarned.Load(key); !ok || warned.(a2aChartPodsWarning) != seen {
+			r.recordEvent(agent, corev1.EventTypeWarning, a2aChartPodsDiscardedReason, why)
+			r.a2aChartPodsWarned.Store(key, seen)
+		}
+	} else {
+		// A usable count re-arms the Warning, so a bad value that returns
+		// after it warns again.
+		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
+	}
 	if err := ctrl.SetControllerReference(agent, quota, r.Scheme); err != nil {
 		return state, err
 	}

@@ -1226,3 +1226,91 @@ func TestSubscribeHeldRefusesADurableWithAForgedMark(t *testing.T) {
 		})
 	}
 }
+
+// Stop gives a held delivery back so that the next holder gets it at once,
+// not after the durable's AckWait: a delivery the server sends back to the
+// stopping subscription is given back again rather than dropped (#4849).
+// Each round holds a task on one connection, stops it, and binds a second.
+func TestHeldStopGivesTheDeliveryToTheNextHolderAtOnce(t *testing.T) {
+	h, first := newHeldHarness(t, "handback")
+	h.ensure(1, time.Minute)
+	second, err := Connect(h.ctx, h.url, WithName("second"))
+	if err != nil {
+		t.Fatalf("Connect second: %v", err)
+	}
+	t.Cleanup(second.Close)
+	holders := []*Client{first, second}
+	h.submit("task-handback")
+	for round := 0; round < 100; round++ {
+		held := make(chan struct{}, 1)
+		sub, err := holders[round%2].SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+			select {
+			case held <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+		})
+		if err != nil {
+			t.Fatalf("round %d: SubscribeHeld: %v", round, err)
+		}
+		select {
+		case <-held:
+		case <-time.After(5 * time.Second):
+			sub.Stop()
+			t.Fatalf("round %d: the task wasn't handed back within 5s of the last holder's stop (AckWait is a minute)", round)
+		}
+		sub.Stop()
+		wctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+		err = sub.Wait(wctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("round %d: Wait after Stop: %v", round, err)
+		}
+	}
+}
+
+// StopIntake leaves the handler running, and the give-back it sends after
+// reaches the next holder at once, not after AckWait: what the stopping
+// subscription pulls meanwhile is handed back, not dropped (#4849).
+func TestHeldStopIntakeLetsAGiveBackReachTheNextHolderAtOnce(t *testing.T) {
+	h, first := newHeldHarness(t, "intakeback")
+	h.ensure(1, time.Minute)
+	second, err := Connect(h.ctx, h.url, WithName("second"))
+	if err != nil {
+		t.Fatalf("Connect second: %v", err)
+	}
+	t.Cleanup(second.Close)
+	holders := []*Client{first, second}
+	h.submit("task-intakeback")
+	for round := 0; round < 100; round++ {
+		held := make(chan Delivery, 1)
+		sub, err := holders[round%2].SubscribeHeld(h.ctx, h.cfg(), func(ctx context.Context, d Delivery) {
+			select {
+			case held <- d:
+			default:
+			}
+			<-ctx.Done()
+		})
+		if err != nil {
+			t.Fatalf("round %d: SubscribeHeld: %v", round, err)
+		}
+		var d Delivery
+		select {
+		case d = <-held:
+		case <-time.After(5 * time.Second):
+			sub.Stop()
+			t.Fatalf("round %d: the task wasn't handed back within 5s of the last give-back (AckWait is a minute)", round)
+		}
+		sub.StopIntake()
+		if err := d.Nak(0); err != nil {
+			t.Fatalf("round %d: Nak: %v", round, err)
+		}
+		sub.Stop()
+		wctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+		err = sub.Wait(wctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("round %d: Wait after Stop: %v", round, err)
+		}
+	}
+}
