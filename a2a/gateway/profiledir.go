@@ -92,18 +92,32 @@ func (f *directoryFeed) apply(subject string, raw []byte, fromLive bool) bool {
 // subscription comes first, so a card published between the two is seen.
 func (g *Gateway) startProfileDirectory(ctx context.Context) {
 	f := &directoryFeed{dir: g.profiles, log: g.log, live: map[string]bool{}}
-	sub, err := g.client.SubscribeCore(agentsWildcard, func(m *nats.Msg) { f.apply(m.Subject, m.Data, true) })
-	if err != nil {
-		g.log.Warn("profile directory subscription failed; profiles are unaddressable", "err", err)
-		return
-	}
 	go func() {
-		defer sub.Stop()
+		// The subscription retries as the read does: a core subscribe gets
+		// one attempt from the library, and a gateway that wins the lease
+		// mid-reconnect would otherwise hold no directory for its term.
+		var sub lib.Subscription
+		defer func() {
+			if sub != nil {
+				sub.Stop()
+			}
+		}()
 		for {
 			wait := directoryResyncInterval
-			if err := g.readDirectory(ctx, f); err != nil {
-				g.log.Warn("profile directory read failed; retrying", "err", err, "in", directoryRetryInterval)
-				wait = directoryRetryInterval
+			if sub == nil {
+				s, err := g.client.SubscribeCore(agentsWildcard, func(m *nats.Msg) { f.apply(m.Subject, m.Data, true) })
+				if err != nil {
+					g.log.Warn("profile directory subscription failed; retrying", "err", err, "in", directoryRetryInterval)
+					wait = directoryRetryInterval
+				} else {
+					sub = s
+				}
+			}
+			if sub != nil {
+				if err := g.readDirectory(ctx, f); err != nil {
+					g.log.Warn("profile directory read failed; retrying", "err", err, "in", directoryRetryInterval)
+					wait = directoryRetryInterval
+				}
 			}
 			select {
 			case <-ctx.Done():
@@ -122,13 +136,15 @@ func (g *Gateway) readDirectory(ctx context.Context, f *directoryFeed) error {
 	if err != nil {
 		return err
 	}
+	// A read speaks for every profile the live feed hasn't since it began;
+	// one the read no longer finds is gone (its tombstone was missed). It
+	// begins before the subject list is taken, so a new profile's first card
+	// that the feed applies after the list was computed keeps its claim.
+	f.beginRead()
 	info, err := stream.Info(ctx, jetstream.WithSubjectFilter(agentsWildcard))
 	if err != nil {
 		return err
 	}
-	// A read speaks for every profile the live feed hasn't since it began;
-	// one the read no longer finds is gone (its tombstone was missed).
-	f.beginRead()
 	n := 0
 	seen := map[string]bool{}
 	for subject := range info.State.Subjects {

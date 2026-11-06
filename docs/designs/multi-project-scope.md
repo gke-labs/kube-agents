@@ -198,8 +198,17 @@ Rules:
 
 Resolution turns the declared scope into a set of `(project, cluster, location)` tuples, plus a
 per-project outcome. It runs inside the existing reconcile job under the agent's identity, through
-the credential broker, because that is the only process in the install that talks to GCP on a
-schedule and the operator deliberately holds no GCP credential.
+the credential broker, because the operator deliberately holds no GCP credential. Outside
+`spec.mode: next`, the reconcile is the only process in the install that talks to GCP on a
+schedule.
+
+Under `spec.mode: next` there is a second scheduled caller, the scope publisher. The operator
+starts it as a Job every 15 minutes, and soon after the membership fields of `spec.scope` change,
+while the scope declares a folder, organisation, Shared VPC host or Metrics Scope. It resolves the
+same members through the broker's `scope` role, under a ServiceAccount of its own, and writes them
+to the `<name>-resolved-scope` ConfigMap, which the A2A gateway reads before it admits a target
+that `spec.scope.projects` does not list. The broker confers that role only where the chart
+renders the gateway pod admission policy. The operator still holds no GCP credential.
 
 **Explicit projects** are listed once per project. Since #3703 this is the GKE API's
 `projects.locations.clusters` list (`v1/projects/<P>/locations/-/clusters`), read through the
@@ -385,11 +394,12 @@ listed it and its probe answered `ok`. Explicit projects and the management proj
 A failed source carries its members' rows forward with their outcome and `confirmedAt`, and two
 fields the gateway does not read carry the rest of what the reconcile's own snapshot carries: the
 number-to-ID memo and the members counted against the cap that have no row. The operator starts
-it as a Job every 15 minutes, when the membership fields change, and at creation. Two parts do not
-ship yet: the broker's `scope` caller role, whose only commands are the lookups' five argv
-shapes; and the gateway's check of the document, which admits explicit projects and the
-management project from the declaration and its own environment. The reconcile, its snapshot and
-today-mode installs do not change.
+it as a Job every 15 minutes, when the membership fields change, and at creation. The broker's
+`scope` caller role admits only the lookups' five argv shapes, each on an argument the broker's
+own copy of `scope.json` declares or an earlier lookup returned. The gateway's check of the
+document does not ship yet; it admits explicit projects and the management project from the
+declaration and its own environment. The reconcile, its snapshot and today-mode installs do not
+change.
 
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the

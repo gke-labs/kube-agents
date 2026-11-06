@@ -43,6 +43,7 @@ const (
 	noticeProfilePinnedOther = "%s works only on cluster %s, not %s"
 	noticeProfileNoTarget    = "%s needs a target cluster (project, location and cluster)"
 	noticeProfileTakesNone   = "%s doesn't take a target cluster"
+	noticeProfileTier        = "%s doesn't run at tier %s"
 	noticeProfileAmbiguous   = "more than one agent profile is pinned to cluster %s"
 	noticeProfileNoGeneric   = "no agent profile serves cluster %s"
 	noticeTargetExcluded     = "cluster %s is excluded from this install's scope"
@@ -322,10 +323,12 @@ func resolveProfile(dir *profileDirectory, addressee string, params map[string]s
 // scopeDeclaration is the operator's rendered spec.scope (scope.json, the
 // file the platform agent also reads; renderScopeJSON in the operator).
 type scopeDeclaration struct {
-	Present        bool     `json:"present"`
-	Projects       []string `json:"projects"`
-	Folders        []string `json:"folders"`
-	Organizations  []string `json:"organizations"`
+	Present       bool     `json:"present"`
+	Projects      []string `json:"projects"`
+	Folders       []string `json:"folders"`
+	Organizations []string `json:"organizations"`
+	// SharedVpcHosts and MetricsScopes are selectors whose member projects
+	// the reconcile resolves, like folders and organizations.
 	SharedVpcHosts []string `json:"sharedVpcHosts"`
 	MetricsScopes  []string `json:"metricsScopes"`
 	MaxProjects    *int     `json:"maxProjects"`
@@ -384,6 +387,13 @@ func checkTargetScope(decl *scopeDeclaration, management string, t clusterTarget
 		if excluded {
 			return refused(noticeTargetExcluded, t)
 		}
+		// A number entry also drops the project the number names, which the
+		// reconcile ties to an ID through Metrics Scope naming. The gateway
+		// has no number for an ID, so it can't confirm the target isn't the
+		// project excluded.
+		if !isProjectNumber(t.Project) && slices.ContainsFunc(decl.Exclude.Projects, isProjectNumber) {
+			return refused(noticeTargetUnconfirmed, t)
+		}
 	}
 	for _, c := range decl.Exclude.Clusters {
 		if c.ProjectID == t.Project && c.Location == t.Location && c.ClusterName == t.Cluster {
@@ -407,7 +417,7 @@ func checkTargetScope(decl *scopeDeclaration, management string, t clusterTarget
 // projectExcluded matches a project against exclude.projects as the
 // reconcile's _excluded_by does: an entry is a project ID or a shell-style
 // glob over IDs, and an all-digit project (a number) matches only an equal
-// entry. An entry that can't be compiled is an error, so the caller refuses
+// entry. A number entry against an ID target is checkTargetScope's to refuse. An entry that can't be compiled is an error, so the caller refuses
 // rather than admitting a project the entry may have meant to drop.
 func projectExcluded(project string, patterns []string) (bool, error) {
 	if isProjectNumber(project) {
@@ -523,6 +533,13 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 	if err != nil {
 		return nil, err
 	}
+	// The dispatcher has a durable only for each tier the profile allows
+	// (its card's tiers), so a submission at another tier would sit with
+	// nothing to consume it until the never-started heal. A card with no
+	// tiers is from an operator that predates them, and isn't checked.
+	if card, ok := g.profiles.lookup(profile); ok && len(card.Tiers) > 0 && !slices.Contains(card.Tiers, string(tier)) {
+		return nil, refused(noticeProfileTier, profile, tier)
+	}
 	route := &profileRoute{Profile: profile, Tier: tier, Kind: kind, Params: maps.Clone(params),
 		Scope: capability.NamespaceScope(g.cfg.Namespace)}
 	if target == nil {
@@ -540,20 +557,72 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 		route.Params = map[string]string{}
 	}
 	route.Params[paramProject], route.Params[paramLocation], route.Params[paramCluster] = target.Project, target.Location, target.Cluster
+	// The merge can make a valid set invalid: a pin's cluster added to a set
+	// at the cap, or a clusterRef value the CRD admits and the parameter
+	// grammar doesn't. Refused here, before the mint, with the notice.
+	if err := lib.ValidateTaskParameters(route.Params); err != nil {
+		return nil, refused(noticeTargetParamsInvalid, err)
+	}
 	route.Scope = target.scope()
 	return route, nil
 }
 
 // deliverChildResult hands a child's end to a parent addressed to an
 // AgentProfile: a childResult message on the parent's .in, which the parent
-// reads while it waits open. It reports false for a parent that isn't a
-// profile task (a session parent is woken instead) and for a delivery that
-// failed, which is logged.
+// reads while it waits open. It reports false only for a parent that isn't a
+// profile task, which is woken instead. A delivery that fails is logged and
+// the parent still holds the conversation again, so a stop reaches it.
 func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, child TaskRef, state lib.TaskState, result, reason string) bool {
 	parent, ok := rec.TaskRefFor(child.ParentTaskID)
 	if !ok || parent.Tier == "" {
 		return false
 	}
+	if !parent.Canceled && !parent.TerminalObserved && g.parentEnded(ctx, parent.ID) {
+		// The relay retires a task's index entry on its terminal and sets
+		// no flag on the history entry.
+		parent.TerminalObserved = true
+	}
+	if parent.Canceled || parent.TerminalObserved {
+		// A stop cancelled the parent with its child, or the parent has
+		// ended: nothing reads its .in, and restoring it would hand the
+		// conversation a task the user already saw end, or steer the next
+		// message into one they stopped. Handled, so no session is woken.
+		g.log.Info("child result not delivered: the parent is cancelled or has ended",
+			"child", child.ID, "parent", parent.ID, "canceled", parent.Canceled, "ended", parent.TerminalObserved)
+		return true
+	}
+	if err := g.publishChildResult(ctx, rec, parent, child, state, result, reason); err != nil {
+		g.log.Error("child result not delivered", "child", child.ID, "parent", parent.ID, "err", err)
+	} else {
+		g.log.Info("child result delivered", "child", child.ID, "parent", parent.ID, "state", state)
+	}
+	// The parent is running again: it holds the conversation, so a stop
+	// reaches it, a steer goes to it, and a new ask waits behind it. Its
+	// rolling line comes back from the entry that kept it while the child ran.
+	if rec.ActiveTask == nil || rec.ActiveTask.TaskID == child.ID {
+		rec.ActiveTask = &ActiveTask{TaskID: parent.ID, CorrelationID: parent.CorrelationID,
+			Capability: parent.Capability, SubmittedAt: parent.StartedAt, Ask: truncateRunes(parent.Request, askCap),
+			StatusMsgID: parent.StatusMsgID}
+		setParentLine(rec, parent.ID, "")
+		rec.Addressee = parent.Addressee
+	}
+	return true
+}
+
+// parentEnded reports whether a task's index entry is gone, which the relay
+// does on the task's terminal. A failed read reports false: the delivery
+// goes ahead, as it did before the check.
+func (g *Gateway) parentEnded(ctx context.Context, taskID string) bool {
+	key, err := g.reg.SessionForTask(ctx, taskID)
+	if err != nil {
+		g.log.Warn("parent task index unreadable", "parent", taskID, "err", err)
+		return false
+	}
+	return key == ""
+}
+
+// publishChildResult writes the childResult message on the parent's .in.
+func (g *Gateway) publishChildResult(ctx context.Context, rec *SessionRecord, parent, child TaskRef, state lib.TaskState, result, reason string) error {
 	text := reason
 	if state == lib.StateCompleted {
 		text = result
@@ -563,18 +632,15 @@ func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, ch
 	}
 	part, err := lib.ChildResultPart(lib.ChildResult{ChildTaskID: child.ID, Addressee: child.Addressee, State: state, Text: text})
 	if err != nil {
-		g.log.Error("child result build failed", "child", child.ID, "parent", parent.ID, "err", err)
-		return false
+		return fmt.Errorf("build: %w", err)
 	}
 	payload, err := messagePayloadParts([]lib.Part{part}, parent.ID, rec.ContextID)
 	if err != nil {
-		g.log.Error("child result payload build failed", "err", err)
-		return false
+		return fmt.Errorf("payload: %w", err)
 	}
 	authority, err := AuthorityFromAttribution(parent.Attribution)
 	if err != nil {
-		g.log.Error("child result authority unreadable", "parent", parent.ID, "err", err)
-		return false
+		return fmt.Errorf("authority: %w", err)
 	}
 	// The parent's own capability: the message continues the parent's task,
 	// as a steer does, and is no new request.
@@ -582,22 +648,12 @@ func (g *Gateway) deliverChildResult(ctx context.Context, rec *SessionRecord, ch
 		lib.WithTo(lib.Party{Session: parent.Addressee}),
 		lib.WithAuthority(authority.Render(parent.Capability)))
 	if err != nil {
-		g.log.Error("child result envelope build failed", "err", err)
-		return false
+		return fmt.Errorf("envelope: %w", err)
 	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(parent.Addressee, parent.ID), env); err != nil {
-		g.log.Error("child result publish failed", "child", child.ID, "parent", parent.ID, "err", err)
-		return false
+		return fmt.Errorf("publish: %w", err)
 	}
-	g.log.Info("child result delivered", "child", child.ID, "parent", parent.ID, "state", state)
-	// The parent is running again: it holds the conversation, so a stop
-	// reaches it, a steer goes to it, and a new ask waits behind it.
-	if rec.ActiveTask == nil || rec.ActiveTask.TaskID == child.ID {
-		rec.ActiveTask = &ActiveTask{TaskID: parent.ID, CorrelationID: parent.CorrelationID,
-			Capability: parent.Capability, SubmittedAt: parent.StartedAt, Ask: truncateRunes(parent.Request, askCap)}
-		rec.Addressee = parent.Addressee
-	}
-	return true
+	return nil
 }
 
 // truncateBytes cuts s to at most n bytes without splitting a UTF-8 rune.
@@ -612,9 +668,10 @@ func truncateBytes(s string, n int) string {
 }
 
 // publishDispatchStop writes the stop record for a profile task, beside the
-// cancel already sent on its `…in`: the dispatcher has no read on `…in`, and
-// a task it still holds queued is dropped when its record appears (addendum 9
-// on #3655). A task addressed to platform or a session has no record. A
+// cancel already sent on its `…in`, for the dispatcher, which has no read on
+// `…in` (addendum 9 on #3655). The stream and the dispatcher's reader aren't
+// in this tree yet: until they are, the publish gets no ack and is logged,
+// and a task still queued runs when a slot frees. A task addressed to platform or a session has no record. A
 // failed publish is logged and leaves the cancel standing: a held task still
 // gets the cancel, and only one still queued would run.
 func (g *Gateway) publishDispatchStop(ctx context.Context, ref TaskRef) {
@@ -634,9 +691,14 @@ func (g *Gateway) publishDispatchStop(ctx context.Context, ref TaskRef) {
 // the parent's own chain and grant, and is recorded on its history entry.
 func (g *Gateway) cancelWaitingProfileParents(ctx context.Context, rec *SessionRecord, taskID string, authority Authority) {
 	ref, ok := rec.TaskRefFor(taskID)
+	// Only a child's parent waits on it. A wake's parent link names the
+	// child it continues, which has ended.
+	if !ok || ref.Role != taskRoleChild {
+		return
+	}
 	for steps := 0; ok && ref.ParentTaskID != "" && steps <= taskHistoryCap; steps++ {
 		parent, held := rec.TaskRefFor(ref.ParentTaskID)
-		if !held || parent.Tier == "" {
+		if !held || parent.Tier == "" || parent.TerminalObserved || g.parentEnded(ctx, parent.ID) {
 			return
 		}
 		if !parent.Canceled && parent.CorrelationID != "" {

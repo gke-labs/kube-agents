@@ -7,7 +7,7 @@ GitLab repository. Its
 runs carry ``tier: gitlab`` (tiers.py) and so reach no gate verdict, no case
 history and no digest number; this block is where they are seen at all: the
 newest ``RUNS_LISTED`` runs with Prow's result, the eval's own verdict, how
-many cases passed, and a Spyglass link, plus the lane's builds still in
+many cases passed, and a build link, plus the lane's builds still in
 flight. Only stdlib, like the sibling nightly.py.
 """
 
@@ -70,6 +70,7 @@ def lane_run(run: dict) -> dict:
         "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
         "project": run.get("project") if isinstance(run.get("project"), str) else None,
         "log_url": run.get("log_url") if isinstance(run.get("log_url"), str) else None,
+        "gcs_base": run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None,
         "started": run.get("started"),
         "finished": run.get("finished"),
         "duration_s": run.get("duration_s") if isinstance(run.get("duration_s"), (int, float)) else None,

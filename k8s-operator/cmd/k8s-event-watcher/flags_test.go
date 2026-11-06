@@ -65,6 +65,31 @@ func TestValidate_ClusterNameRequired(t *testing.T) {
 	})
 }
 
+// TestParseFlags_FleetShapeInterval pins the probe's default cadence, the
+// operator's usage poll interval, and that a negative interval is refused
+// while 0 (off) is not.
+func TestParseFlags_FleetShapeInterval(t *testing.T) {
+	f, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if f.fleetShapeInterval != 5*time.Minute {
+		t.Errorf("--fleet-shape-interval default = %s; want 5m", f.fleetShapeInterval)
+	}
+	base := flags{daemonURL: "http://localhost:8699", tokenEnv: "TOKEN", mode: "per-incident", owner: "watcher", dedupWindow: 1, clusterName: "x"}
+	off := base
+	off.fleetShapeInterval = 0
+	if err := off.validate(); err != nil {
+		t.Errorf("--fleet-shape-interval=0 (off) was refused: %v", err)
+	}
+	negative := base
+	negative.fleetShapeInterval = -time.Second
+	err = negative.validate()
+	if err == nil || !strings.Contains(err.Error(), "--fleet-shape-interval") {
+		t.Errorf("--fleet-shape-interval=-1s: err = %v; want a refusal naming the flag", err)
+	}
+}
+
 // TestParseFlags_FailedSchedulingDefaults pins the two knobs the FailedScheduling
 // gate reads, and that they reach the filter as parsed rather than through the
 // shared three-count default.

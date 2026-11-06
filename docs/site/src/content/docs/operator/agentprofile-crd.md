@@ -13,7 +13,7 @@ An `AgentProfile` is not a Hermes profile on its own: the platform and cluster t
 - **Kind**: `AgentProfile`
 - **Short Name**: `apr`
 - **Source**: [`k8s-operator/api/v1alpha1/agentprofile_types.go`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/api/v1alpha1/agentprofile_types.go)
-- **Samples**: [`k8s-operator/examples/agentprofile-chat.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-chat.yaml), [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml)
+- **Samples**: [`k8s-operator/examples/agentprofile-chat.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-chat.yaml), [`k8s-operator/examples/agentprofile-tse.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-tse.yaml), [`k8s-operator/examples/agentprofile-cluster.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/examples/agentprofile-cluster.yaml) (the generic cluster agent and a pinned variant)
 - **Fields**: [AgentProfile fields](/kube-agents/operator/agentprofile-fields/), every `spec` and `status` field with its type, default and constraints, generated from the Go API types.
 
 ## Specification
@@ -96,7 +96,7 @@ Only once that policy is in place does the operator admit the namespace on the b
 
 The profile's ServiceAccounts live there too. While the namespace is missing, or doesn't carry the chart's markers, a profile renders no identity and withdraws its card, and `IdentityReady` says `ProfileNamespaceAbsent`.
 
-Nothing runs a pod from a profile yet. The dispatcher and the warm workers come later.
+Nothing runs a pod from a profile yet. The dispatcher, `<agent>-a2a-dispatcher`, which reads the profiles' submissions and hands each to a ready worker, is off by default until profiles dispatch end to end: a `mode: next` install runs it only when the operator's `A2A_DISPATCHER_IMAGE` names its image. The warm workers come later.
 
 ## Status
 

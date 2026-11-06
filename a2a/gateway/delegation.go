@@ -79,7 +79,7 @@ const requesterGone = "requester is no longer on record"
 
 const (
 	noticeDelegationNoRequester       = "⚠️ delegation refused: this turn's " + requesterGone + "; ask again"
-	noticeDelegationNotAllowed        = "🚫 not allowed to reach " + targetPlatform + " from here"
+	noticeDelegationNotAllowed        = "🚫 not allowed to reach %s from here"
 	noticeDelegationSessionIncomplete = "⚠️ delegation refused: this session's authors can no longer all be checked; ask again in a new turn"
 	noticeDelegationSteerOverflow     = "⚠️ delegation refused: more people steered this turn than can be checked; ask again"
 	noticeWakeNoRequester             = "ℹ️ the delegated task finished, but the delegating turn's " + requesterGone + "; the session was not woken"
@@ -230,11 +230,11 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// which nothing renders yet (gke-labs#2478): an absent list there is
 	// nobody, where on a chat backend it is everyone the ingress admits.
 	if g.doorUnlisted(target, parent.Requester.Backend) {
-		refuse(ruleDelegationDoorUnlisted, noticeDelegationNotAllowed)
+		refuse(ruleDelegationDoorUnlisted, fmt.Sprintf(noticeDelegationNotAllowed, target))
 		return
 	}
 	if !g.targetAllows(target, parent.Requester.Backend, parent.Requester.Subject) {
-		refuse(ruleDelegationAllowedUsers, noticeDelegationNotAllowed)
+		refuse(ruleDelegationAllowedUsers, fmt.Sprintf(noticeDelegationNotAllowed, target))
 		return
 	}
 	// Anyone in the room can steer the turn, so everyone who did is checked
@@ -246,7 +246,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 	for _, a := range parent.SteerAuthors {
 		if rule := g.authorRefusal(target, a, ruleDelegationSteerAuthor); rule != "" {
-			refuse(rule, noticeDelegationNotAllowed, "steerBackend", a.Backend, "steerAuthor", a.Subject)
+			refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "steerBackend", a.Backend, "steerAuthor", a.Subject)
 			return
 		}
 	}
@@ -265,7 +265,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 	for _, a := range sessionAuthors {
 		if rule := g.authorRefusal(target, a, ruleDelegationSessionAuthor); rule != "" {
-			refuse(rule, noticeDelegationNotAllowed, "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
+			refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
 			return
 		}
 	}

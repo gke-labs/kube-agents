@@ -1179,6 +1179,17 @@ class SnapshotTest(unittest.TestCase):
         self.snapshot(tar, max_bytes=20)
         self.assertTrue((self.into / "b.txt").is_file())
 
+    def test_a_tree_over_the_file_limit_is_refused_with_its_count(self):
+        tar = build_tar(special("d", tarfile.DIRTYPE), regular("d/a.txt"), regular("b.txt"), regular("c.txt"))
+        with mock.patch.object(tarfile.TarFile, "extractall", side_effect=AssertionError("unpacked")):
+            refusal = self.refused(tar, code=vcs_client.SNAPSHOT_TOO_MANY_FILES, max_files=2)
+        self.assertIn("3 files", str(refusal))
+        # Paired: at the limit it is unpacked, and with no limit there is none.
+        self.snapshot(tar, max_files=3)
+        self.assertTrue((self.into / "c.txt").is_file())
+        shutil.rmtree(self.into)
+        self.assertEqual(3, self.snapshot(tar)["files"])
+
     def test_a_tar_that_does_not_parse_is_refused(self):
         self.refused(b"not a tar at all" * 64)
 

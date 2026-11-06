@@ -1387,6 +1387,9 @@ class EvalScriptGitLabTest(unittest.TestCase):
                 lifted_forge_setup(),
                 f'PROJECT_ID="{PROJECT}"; BUILD_ID=1; EVAL_LEDGER_APP_KEY_FILE=""; EVAL_LEDGER_APP_ID=1',
                 f'ARTIFACT_DIR="{self.dir}/artifacts"; AGENT_PULLS_RESET_PERMISSIONS=\'{{}}\'',
+                # The ledger reset's helper lines quote ledger titles, so they go
+                # to the grading artifact, never to the job log.
+                f'EVAL_GRADING_LOG="{self.dir}/eval-grading.log"',
                 'EVAL_GITLAB_AGENT_TOKEN=""',
                 lifted("gitlab_token_source"),
                 lifted("read_gitlab_token"),
@@ -1525,15 +1528,18 @@ class EvalScriptGitLabTest(unittest.TestCase):
         )
         proc = self._run(body)
         out = proc.stdout
-        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com"]', out)
-        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com", "--audit", "compliance-audit"]', out)
+        ledger = (self.dir / "eval-grading.log").read_text()
+        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com"]', ledger)
+        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com", "--audit", "compliance-audit"]', ledger)
+        self.assertNotIn("Ledger reset", out, "the ledger helper's lines stay out of the job log")
         record = f"{self.dir}/artifacts/agent-pulls-reset/lease.json"
         self.assertIn(
             f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--scope", "lease", "--record", "{record}", "--forge", "gitlab", "--host", "gitlab.com"]',
             out,
         )
         self.assertIn("HELPER token=glpat-agent", out)
-        self.assertNotIn("glpat-ledger", out.replace("LEDGER=glpat-ledger", ""))
+        self.assertIn("HELPER token=glpat-agent", ledger)
+        self.assertNotIn("glpat-ledger", (out + ledger).replace("LEDGER=glpat-ledger", ""))
         self.assertIn("PULLS_RC=0", out)
 
     def test_the_resets_run_on_a_per_run_gitlab_without_the_app_key(self):
@@ -1555,11 +1561,13 @@ class EvalScriptGitLabTest(unittest.TestCase):
         )
         proc = self._run(body)
         out = proc.stdout
+        ledger = (self.dir / "eval-grading.log").read_text()
         self.assertNotIn("EVAL_LEDGER_APP_KEY_FILE is unset", out)
         per_run = f"gke-agentic/{PROJECT}-infra"
-        self.assertIn(f'HELPER argv=["--repo", "{per_run}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "{state}/ca.crt"]', out)
+        self.assertIn(f'HELPER argv=["--repo", "{per_run}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "{state}/ca.crt"]', ledger)
         self.assertIn("HELPER token=glpat-perrun-agent", out)
-        self.assertEqual(out.count("HELPER argv="), 2)
+        self.assertEqual(out.count("HELPER argv="), 1, "the agent-pulls reset's line")
+        self.assertEqual(ledger.count("HELPER argv="), 1, "the ledger reset's line")
         self.assertIn("PULLS_RC=0", out)
 
     def test_the_forge_switch_refuses_an_unknown_forge(self):

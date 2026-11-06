@@ -453,6 +453,19 @@ def _normalize_lines(text: str, *, fold_decoration: bool = False) -> str:
     return "\n".join(lines)
 
 
+def pattern_surface(text: str, *, fold_decoration: bool = False) -> str:
+    """The text ``report_contains`` searches its ``*_patterns`` over.
+
+    One name for it, so a test that pins a case's pattern runs on the surface
+    the verifier uses rather than on a copy that can drift from it: the report
+    normalized line by line with its line breaks kept, so a space in a pattern
+    does not cross one and a pattern that spells out the line break does.
+    With ``fold_decoration`` each line's decoration is folded first, as the
+    check's own option says.
+    """
+    return _normalize_lines(text, fold_decoration=fold_decoration)
+
+
 @VERIFIERS.register("report_contains")
 class ReportContainsVerifier(BaseVerifier):
     """Exact phrase checks against the agent's answer.
@@ -683,10 +696,9 @@ class ReportContainsVerifier(BaseVerifier):
             )
         raw = snap.final_message if self.scope == "final" else snap.output
         text = _normalize(raw)
-        lines = _normalize_lines(raw)
         missing = [p for p in self.required_phrases if _normalize(p) not in text]
         present = [p for p in self.forbidden_phrases if _normalize(p) in text]
-        lines = _normalize_lines(raw, fold_decoration=self.fold_decoration)
+        lines = pattern_surface(raw, fold_decoration=self.fold_decoration)
         try:
             # Reported in the case's own spelling: the expanded frame is not a
             # thing a reader of results.json can recognise.
@@ -2697,7 +2709,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     from their tagged ``terminal`` and ``execute_code`` calls in the
     trajectory (:func:`_worker_terminal_calls`), joined by card: a card with
     a log line is graded on its log lines, whether or not its calls reached
-    the trajectory, and any other card on its calls. This verifier matches
+    the trajectory, and any other card on its calls; the required patterns
+    and runs also read a logged card's calls. This verifier matches
     Python regular expressions against the union, ``re.search`` on each
     command verbatim, and an exemption reads a tagged call as it reads a log
     line. The two halves are not spelled alike. A log line is hermes's
@@ -2706,8 +2719,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     chain joined by ``;``, ``&&`` or ``||`` arrives as its first command (a
     leading ``cd``, ``export``, ``set``, ``source``, ``true`` or ``false``
     skipped) plus `` + N command(s)``, a redirection is dropped, and a pipe, a
-    substitution and a backtick stay. A pattern reads the rendering there, so a
-    command chained behind another on a log line is not on any line it sees. A
+    substitution and a backtick stay. A forbidden pattern or run reads the
+    rendering there, so a command chained behind another on a log line is not
+    on any line it sees; a required pattern or run also reads the card's
+    tagged calls as typed, so a run behind ``printenv X;`` is credited
+    (#4620), and so is a run written into a heredoc that was never executed
+    (the admitting side, as under ``after_result_pattern``). A
     tagged call is the command as typed (:mod:`kube_agents_bench.worker_trajectory`
     reads each worker session's tool calls after the log scrape; ``tool_called``
     grades them), so a pattern, forbidden or exempt, reads a worker-filed
@@ -2725,8 +2742,9 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``exempt_patterns``: each removes the text it matches from a command,
     and only that text, before the forbidden list reads it; whatever the
     match did not cover stays on the line and is graded. A command an
-    exemption touched is left out of the required list altogether, and the
-    reason says how many were. For a command that can fetch and send nothing
+    exemption touched is left out of the required list altogether, a logged
+    card's typed call in the required read included, and the reason says how
+    many were. For a command that can fetch and send nothing
     but carries a forbidden word as its argument: a worker told the helper
     holds no token may ``grep`` for the word before running it, and a case
     that exempts the ``grep`` invocation through its pattern argument, on a
@@ -2770,8 +2788,9 @@ class WorkerCommandsVerifier(BaseVerifier):
 
     Limits, stated so a case is not written against them: only terminal
     commands and ``execute_code`` text are visible, not MCP tool calls (and,
-    without ``after_result_pattern``, ``execute_code`` text only for a card
-    graded on its calls: a filed card's log shows no program text); only
+    without ``after_result_pattern``, the forbidden set reads
+    ``execute_code`` text only for a card graded on its calls: a filed card's
+    log shows no program text); only
     delegated workers' logs or calls are read, never the router's, and a
     worker-filed card is read only as far as the trajectory capture reached
     it (``worker_capture_gaps`` makes a clean read an error only under
@@ -2806,7 +2825,14 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``bash -s < run.sh``) is not read as one, since the argv names the file or
     the shell and not what was written to it, which no reading of the argv
     recovers -- a case names a run this way where the persona dictates one typed
-    command, and a worker that runs it through a file is not credited. Under
+    command. The exception is a file the worker wrote with a heredoc in a
+    typed call: the typed text splits the heredoc into one argv per body
+    line, so a run written into the file is credited whether or not the file
+    ran. A required pattern or run reads typed calls (a logged card's always,
+    every card's under ``after_result_pattern``), so it credits that line; a
+    forbidden run reads a logged card's row, where the heredoc is one line
+    behind ``cat``, and does not. A card with no log line is read from its
+    typed calls by both. Under
     ``after_result_pattern``: a refused command whose output the call discarded
     prints nothing into its result; a result is clipped in the pod at
     ``worker_trajectory.MAX_RESULT_CHARS``; a read whose output quotes the
@@ -2871,6 +2897,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         window = ""
         sources = ""
         result_hits: list[tuple[str, str]] = []
+        # Logged cards' calls only the required checks read (see the log-row branch).
+        beside_rows: list[str] = []
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
@@ -2892,7 +2920,8 @@ class WorkerCommandsVerifier(BaseVerifier):
             # in the log and no tagged terminal call), so every log line is kept whatever
             # the trajectory holds, and the trajectory's calls join the
             # graded set by card, not by string: a card with a log line contributes its
-            # log lines and none of its calls, so a command a filed card typed is counted
+            # log lines and none of its calls to the forbidden set (the required
+            # checks also take its calls, below), so a command a filed card typed is counted
             # once (its log line and its call need not be spelled alike) and a command
             # typed twice is counted twice. A card with no log line -- a worker filed it,
             # or its log showed no shell command -- contributes its tagged calls, which
@@ -2914,8 +2943,25 @@ class WorkerCommandsVerifier(BaseVerifier):
                     )
             else:
                 children = [command for card, _, command, _, _ in calls if card not in logged]
+                # A log row shows a chain as its first command only (``printenv X + 1
+                # command``), so a run chained behind it is on no row (#4620). The
+                # required patterns and runs also read the logged cards' calls as
+                # typed, a call that repeats a row verbatim excepted. The forbidden set
+                # keeps the rows: a typed heredoc splits into one argv per line, so a
+                # command written into a file and never run would read as a forbidden
+                # run, and an exemption is written against the rendering. An exemption
+                # still takes an exempt call out of the required read, as it does a row.
+                if self.required_patterns or self.required_runs:
+                    rows = set(logged_commands)
+                    beside_rows = [command for card, _, command, _, _ in calls if card in logged and command not in rows]
+                joined = []
                 if children:
-                    sources = f" ({len(logged_commands)} from the filed cards' logs, {len(children)} from the tagged calls of cards with no log line)"
+                    joined.append(f"{len(children)} from the tagged calls of cards with no log line")
+                if beside_rows:
+                    count = len(beside_rows)
+                    joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by the required checks only")
+                if joined:
+                    sources = f" ({len(logged_commands)} from the filed cards' logs, " + ", ".join(joined) + ")"
             typed = logged_commands + children
             windowed = typed
         else:
@@ -2988,8 +3034,9 @@ class WorkerCommandsVerifier(BaseVerifier):
         # of the line is what the forbidden list reads, and a command an
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
-        commands = [c for c in typed if self._without_exempt_text(c) == c]
-        exempted = f" ({len(typed) - len(commands)} exempted)" if len(commands) < len(typed) else ""
+        with_calls = typed + beside_rows
+        commands = [c for c in with_calls if self._without_exempt_text(c) == c]
+        exempted = f" ({len(with_calls) - len(commands)} exempted)" if len(commands) < len(with_calls) else ""
         graded = [(c, self._without_exempt_text(c)) for c in windowed]
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
@@ -3580,18 +3627,22 @@ def _same_command(stored: str, cited: str) -> bool:
 def _terminal_output(result: str) -> tuple[str, bool]:
     """The ``output`` of a terminal result as the trajectory stores it, and whether the pod clipped it.
 
-    The result is the JSON text of ``{"output": ..., "exit_code": ...}``. A
-    clipped one no longer parses; its surviving head is decoded as a JSON
-    string, less any escape the cut split.
+    The result is the JSON text of ``{"output": ..., "exit_code": ...}``.
+    Hermes may append a note after it (a tool-loop warning or hard stop, a
+    repeated-call notice), which is advice to the model and not output, so
+    the leading JSON object is decoded and whatever follows it is left
+    alone; that also reads a result whose clip landed inside the note. A
+    result whose JSON itself was cut no longer parses; its surviving head
+    is decoded as a JSON string, less any escape the cut split.
     """
+    try:
+        parsed, _ = json.JSONDecoder().raw_decode(result)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+        return parsed["output"], False
     clipped = _CLIPPED_RESULT_RE.search(result)
     if not clipped:
-        try:
-            parsed = json.loads(result)
-        except ValueError:
-            return result, False
-        if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
-            return parsed["output"], False
         return result, False
     head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
     for cut in range(_MAX_SPLIT_ESCAPE + 1):
@@ -6515,8 +6566,8 @@ class GitHubWritesVerifier(BaseVerifier):
     listed under ``unattributed`` in ``raw`` and in the reason, so one late
     write fails the repetition that named it rather than every repetition
     running at the time. With ``exclusive_window`` -- set by the lane on a
-    case that requests a pull request or a stopped ask, either of which runs
-    alone -- a write nothing
+    case that requests a pull request, a stopped ask, or a case that declares
+    ``writes_alone: true``, each of which runs alone -- a write nothing
     names is charged all the same, since no other repetition was writing --
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
@@ -6542,9 +6593,10 @@ class GitHubWritesVerifier(BaseVerifier):
     requests its own reply names. That ordering holds while a unit's writes
     land before it ends: a write from a card the harness's delegation wait
     did not follow (a worker's fan-out child, a card at the delegation
-    ceiling) can land in the next unit's window, unattributed there in the
-    first phase and charged to it in the second, whose window is exclusive
-    (#2619).
+    ceiling, a card whose inject exchange was cut) can land in the next
+    unit's window, unattributed there in the first phase (#2619). Before
+    each second-phase unit, whose window is exclusive, the script archives
+    every card still live and then settles (``fence_live_cards``, #4425).
     A pull request that was only commented on, labelled or closed in the
     window is not a write: :func:`kube_agents_bench.github_writes.find_writes`
     reads the head commit before it counts an ``updated_at`` that moved.

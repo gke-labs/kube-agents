@@ -178,7 +178,9 @@ verification_spec:
   # `terminal` call as typed. Without after_result_pattern the check reads
   # Hermes's one-line rendering of the worker's command, which shows a chain
   # as its first command plus `+ N commands` and joins a second line into the
-  # first (#3128). The pattern never matches a result and no forbidden
+  # first (#3128). The default read takes a logged card's calls beside its
+  # rows too; the switch also makes a capture with no readable tagged call
+  # `error`, not a fail on the rows alone. The pattern never matches a result and no forbidden
   # pattern is set, so it opens no window. required_runs reads each shell
   # segment as an argv: `leeway` is the command word, by basename, and a
   # later word is `report`. A `--help`, an echoed or grepped mention of the

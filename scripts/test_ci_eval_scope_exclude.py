@@ -92,6 +92,7 @@ class UnitPhaseTest(unittest.TestCase):
                 "SCOPE_EXCLUDE_NAMES=scoped,scoped-writer",
                 "INJECT_LANE_REQUESTING=writer,scoped-writer",
                 "STOPPED_ASK_CASES=",
+                "WRITES_ALONE_CASES=alone",
                 f"unit_phase {name}",
             ]
         )
@@ -103,6 +104,8 @@ class UnitPhaseTest(unittest.TestCase):
 
     def test_the_other_phases_are_unchanged(self):
         self.assertEqual(self.phase("writer"), "1")
+        # A writes_alone case runs in the serial phase with the writers.
+        self.assertEqual(self.phase("alone"), "1")
         self.assertEqual(self.phase("plain"), "0")
         # A name that only contains a scoped case's name is not one.
         self.assertEqual(self.phase("scope"), "0")
