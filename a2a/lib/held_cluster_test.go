@@ -99,10 +99,11 @@ func tryStartCluster(t *testing.T) ([]*natsserver.Server, *natsserver.Server) {
 		}
 		// A server binds its route port right after its client port, so one
 		// that listens only for clients lost its route port.
-		if s.Addr() != nil && s.ClusterAddr() == nil {
+		client, route := s.Addr(), s.ClusterAddr()
+		if client != nil && route == nil {
 			return servers, s
 		}
-		t.Fatal("nats-server not ready")
+		t.Fatalf("nats-server %s not ready: client listener %v, route listener %v", s.Name(), client, route)
 	}
 	return servers, nil
 }
