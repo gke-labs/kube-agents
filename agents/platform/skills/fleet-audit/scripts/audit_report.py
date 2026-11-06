@@ -23681,7 +23681,10 @@ def _close_from_stored_document(
     `PRECHECK_KEY`); otherwise the reason the SOP continues. The document
     goes in with each remediation's note as the worker wrote it
     (`_strip_route_notes`): the route notes and the Config Connector
-    paragraph are `finish`'s to write again from this run's manifest. On
+    paragraph are `finish`'s to write again from this run's manifest; and
+    without the previous run's search record and with each `declared[]`
+    entry's declaration as this run's `start` filed it, so the ledger's
+    search line and Declared intent rows are this run's. On
     every outcome but a publish the findings file is put back as it was, so
     a `draft` the collector command wrote is still the one the worker fills.
     A rejected
@@ -23695,6 +23698,26 @@ def _close_from_stored_document(
     path = Path(findings_path_for(audit_id))
     previous = path.read_bytes() if path.is_file() else None
     document = copy.deepcopy(document)
+    # This run's reading of the repositories, not the previous run's. The
+    # stored search record goes: `fold_searched_record` unions by slug, so
+    # its `owner/name@sha` would keep this run's sha out of the ledger's
+    # search line, and the gate has already held this run's own record to
+    # every repository the step names. Each `declared[]` entry takes its
+    # declaration's `repo`, `path` and `excerpt` from the file this run's
+    # `start` filed, joined as `apply_declarations` joins, so a note the
+    # owner edited or moved publishes as it stands today; the gate has
+    # already refused an entry no filed declaration matches.
+    document.pop(DECLARED_INTENT_SEARCHED_KEY, None)
+    declared = [entry for entry in document.get("declared") or [] if isinstance(entry, dict)]
+    if declared:
+        store_repo = resolve_repo_or_no_forge(audit_id, getattr(args, "repo", None))
+        scoped, fleet_wide = _declaration_lookup(read_declarations(audit_id, repo=store_repo))
+        for entry in declared:
+            match = scoped.get(_declaration_key(entry, with_cluster=True)) or fleet_wide.get(
+                _declaration_key(entry, with_cluster=False)
+            )
+            if match is not None:
+                entry["declaration"] = {field: str(match.get(field, "")) for field in DECLARATION_FIELDS}
     for finding in document.get("findings") or []:
         if isinstance(finding, dict):
             # The note as the worker wrote it, before the route notes and the

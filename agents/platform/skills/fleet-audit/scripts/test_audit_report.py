@@ -36065,6 +36065,38 @@ class TestPrecheck(BaseTestCase):
         self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
         self.assertEqual(out["declared"], 1)
 
+    def test_a_replayed_declared_entry_takes_the_declaration_this_run_filed(self):
+        """A note the owner edited or moved publishes as it stands today, not as the previous run read it."""
+        entry = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "billing",
+            "object": "Namespace/billing",
+            "title": "declared",
+            "declaration": {"repo": "acme/fleet", "path": "notes/billing.md", "excerpt": "mesh policy"},
+        }
+        filed = {"check": "netpol-missing", "namespace": "billing", "object": "Namespace/billing", "repo": "acme/fleet", "path": "notes/platform/billing.md", "excerpt": "mesh policy, reviewed quarterly"}
+
+        def declared(document):
+            document["declared"] = [entry]
+
+        out = self.refused_close(declared, closes=True, read_declarations={"return_value": [filed]})
+        self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
+        stored = self.latest()["document"]["declared"]
+        self.assertEqual([e["object"] for e in stored], ["Namespace/billing"])
+        self.assertEqual(stored[0]["declaration"], {"repo": "acme/fleet", "path": "notes/platform/billing.md", "excerpt": "mesh policy, reviewed quarterly"})
+
+    def test_a_replayed_close_records_this_runs_search_and_not_the_previous_runs(self):
+        """The stored `owner/name@sha` is the previous run's; the fold would keep it over this run's."""
+        record = {"repo": "no_forge/local", "context_repos": ["acme/notes"], "started_at": "2026-01-01T00:00:00Z", "searched": ["acme/notes@def4567"], "sources": []}
+
+        def searched_yesterday(document):
+            document[audit_report.DECLARED_INTENT_SEARCHED_KEY] = ["acme/notes@abc1234"]
+
+        out = self.refused_close(searched_yesterday, closes=True, read_run_record={"return_value": record})
+        self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertEqual(self.latest()["document"][audit_report.DECLARED_INTENT_SEARCHED_KEY], ["acme/notes@def4567"])
+
     def test_a_repository_this_run_did_not_search_means_a_full_run(self):
         record = {"repo": "no_forge/local", "context_repos": ["acme/notes"], "started_at": "2026-01-01T00:00:00Z", "searched": [], "sources": []}
         out = self.refused_close(None, read_run_record={"return_value": record})
