@@ -54,7 +54,7 @@ def prompt_job(job_id, expr, next_run_at, last_run_at=None, **extra):
     return entry
 
 
-def interval_job(job_id, minutes, next_run_at, last_run_at=None):
+def interval_job(job_id, minutes, next_run_at, last_run_at=None, **extra):
     entry = {
         "id": job_id,
         "enabled": True,
@@ -64,7 +64,15 @@ def interval_job(job_id, minutes, next_run_at, last_run_at=None):
     }
     if last_run_at is not None:
         entry["last_run_at"] = iso(last_run_at)
+    entry.update(extra)
     return entry
+
+
+def marked(job: dict) -> dict:
+    """The job as ``hermes cron run`` leaves it: ``manual_run_at`` stamped
+    with the same string as ``next_run_at``."""
+    job[cip.MANUAL_RUN_FIELD] = job["next_run_at"]
+    return job
 
 
 def script_job(job_id, expr, next_run_at):
@@ -281,11 +289,11 @@ class ThrottleTest(PolicyCase):
         self.assertEqual(self.next_run("two-hourly"), iso(last + timedelta(days=7)))
 
     def test_a_run_asked_for_by_hand_is_not_held(self):
-        # `hermes cron run` marks a job due by moving next_run_at into the
-        # past, off the expression's grid; that run is somebody's request.
+        # `hermes cron run` marks a job due by stamping one timestamp into
+        # next_run_at and manual_run_at; that run is somebody's request.
         asked = NOW - timedelta(minutes=3, seconds=17)
         self.write(
-            prompt_job("compliance-audit", "20 6 * * *", asked, days_ago(2)),
+            marked(prompt_job("compliance-audit", "20 6 * * *", asked, days_ago(2))),
             prompt_job("ai-security-audit", "50 8 * * *", due("50 8 * * *"), days_ago(2)),
         )
         lines = self.run_policy(Reader(days_ago(8)))
@@ -293,11 +301,42 @@ class ThrottleTest(PolicyCase):
         self.assertNotEqual(self.next_run("ai-security-audit"), iso(due("50 8 * * *")))
         self.assertEqual([line for line in lines if "compliance-audit" in line], [])
 
+    def test_a_hand_mark_inside_the_slot_minute_is_not_held(self):
+        # A mark written at 06:20:45 on `20 6 * * *` sits inside a slot minute,
+        # on a job that already ran this morning: still a request.
+        ran = NOW - timedelta(seconds=90)
+        asked = NOW + timedelta(seconds=15)
+        self.write(marked(prompt_job("compliance-audit", "20 6 * * *", asked, ran)))
+        for signal in (days_ago(8), days_ago(15)):
+            self.state_path.unlink(missing_ok=True)  # a fresh reading, not the cached one
+            lines = self.run_policy(Reader(signal), now=asked + timedelta(seconds=5))
+            self.assertEqual([line for line in lines if "held" in line], [])
+            self.assertEqual(self.next_run("compliance-audit"), iso(asked))
+
     def test_a_hand_run_of_an_interval_job_is_not_held(self):
         last = days_ago(2)
-        self.write(interval_job("two-hourly", 120, NOW - timedelta(minutes=1), last))
+        self.write(marked(interval_job("two-hourly", 120, NOW - timedelta(minutes=1), last)))
         self.run_policy(Reader(days_ago(15)))
         self.assertEqual(self.next_run("two-hourly"), iso(NOW - timedelta(minutes=1)))
+
+    def test_a_hand_run_of_an_interval_job_that_never_ran_is_not_held(self):
+        # No last_run_at to be on-period with: the mark alone says so, under
+        # hibernate as under throttle.
+        self.write(marked(interval_job("two-hourly", 120, NOW - timedelta(minutes=1))))
+        for signal in (days_ago(8), days_ago(15)):
+            self.state_path.unlink(missing_ok=True)  # a fresh reading, not the cached one
+            lines = self.run_policy(Reader(signal))
+            self.assertEqual([line for line in lines if "held" in line], [])
+            self.assertEqual(self.next_run("two-hourly"), iso(NOW - timedelta(minutes=1)))
+
+    def test_a_stale_mark_hermes_advanced_past_is_not_a_request(self):
+        # manual_run_at left from an earlier hand run, next_run_at since moved
+        # on by Hermes: the pair differs, so the slot is held like any other.
+        job = prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(2))
+        job[cip.MANUAL_RUN_FIELD] = iso(days_ago(2, NOW))
+        self.write(job)
+        self.run_policy(Reader(days_ago(15)))
+        self.assertEqual(self.next_run("compliance-audit"), "2026-08-07T06:20:00+00:00")
 
     def test_a_period_no_timedelta_can_hold_costs_no_other_job_its_hold(self):
         # A `minutes` the JSON grammar admits but a timedelta cannot hold
@@ -381,8 +420,8 @@ class HibernateTest(PolicyCase):
         self.assertEqual(self.next_run("two-hourly"), iso(last + timedelta(hours=4)))
 
     def test_a_hibernating_interval_job_is_held_again_each_day(self):
-        # Its hold sits a day on, off its period: the policy's own timestamp,
-        # not a hand-marked run, so day two holds it again instead of firing it.
+        # Its hold sits a day on, off its period, and carries no manual mark,
+        # so day two holds it again instead of firing it.
         last = NOW - timedelta(hours=2)
         self.write(interval_job("two-hourly", 120, NOW, last))
         reader = Reader(days_ago(15))
@@ -395,6 +434,7 @@ class HibernateTest(PolicyCase):
         # A hand-marked run on the same job is still a request.
         jobs = json.loads(self.store.read_text())
         jobs["jobs"][0]["next_run_at"] = iso(day_two + timedelta(hours=1))
+        marked(jobs["jobs"][0])
         self.store.write_text(json.dumps(jobs))
         self.assertEqual(self.run_policy(reader, now=day_two + timedelta(hours=1)), [])
         self.assertEqual(self.next_run("two-hourly"), iso(day_two + timedelta(hours=1)))
@@ -502,9 +542,11 @@ class ScheduleZoneTest(PolicyCase):
         self.run_policy(Reader(days_ago(15)), now=local_due + timedelta(seconds=30))
         self.assertEqual(self.next_run("compliance-audit"), "2026-08-07T04:20:00+00:00")
 
-    def test_a_utc_slot_is_a_hand_run_on_another_clock(self):
+    def test_a_hand_mark_is_read_the_same_on_any_clock(self):
+        # The mark, not the timestamp's position on the zone's grid, is what
+        # says a run was asked for.
         (self.profile / "config.yaml").write_text("timezone: Europe/Brussels\n", encoding="utf-8")
-        self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1)))
+        self.write(marked(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(1))))
         self.run_policy(Reader(days_ago(15)))
         self.assertEqual(self.next_run("compliance-audit"), iso(NOW))
 

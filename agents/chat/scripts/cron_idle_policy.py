@@ -47,11 +47,15 @@ than the stored one, which undoes a throttle hold on such a job every day. No
 extra run comes of it (the hold is written again before Hermes scans), but the
 hold line repeats daily and the release on wake finds nothing to rewind.
 
-**A run asked for by hand is not held.** ``hermes cron run <job-id>`` marks a
-job due by moving ``next_run_at`` into the past, off the schedule's own grid;
-a due timestamp that is not one of the expression's slots (or, for an
-``interval`` job, not one period after ``last_run_at``) is such a request and
-is left for the next tick to run.
+**A run asked for by hand is not held.** ``hermes cron run <job-id>`` (and
+``cron.jobs.trigger_job``, the call behind it and behind the first-run
+audits) marks a job due by writing one timestamp into both ``next_run_at``
+and ``manual_run_at``, and Hermes itself reads the two being equal as the
+request; this module reads the same mark and leaves such a job for the next
+tick to run. Where the timestamp sits is not consulted: a mark that happens to
+land inside a slot minute, or on an interval job that has never run, is still
+a request. ``cronjob(action='run')`` runs the job in-process and writes no
+timestamp, so the policy never meets it.
 
 **Wake.** The state file beside the store records each held job with the
 timestamp written. When the stage drops (a person wrote, or the thresholds
@@ -139,10 +143,11 @@ STAGE_RANK = {STAGE_ACTIVE: 0, STAGE_THROTTLE: 1, STAGE_HIBERNATE: 2}
 SCHEDULE_KIND_CRON = "cron"
 SCHEDULE_KIND_INTERVAL = "interval"
 SECONDS_PER_MINUTE = 60
-# How far an interval job's natural `next_run_at` may sit from `last_run_at`
-# plus its period and still count as Hermes' own (it writes both from one
-# clock reading); anything further off is a hand-marked run.
-INTERVAL_SLACK = timedelta(seconds=1)
+# The field `trigger_job` writes beside `next_run_at`, the same string, when a
+# job is marked due by hand; Hermes reads the pair string-equal as a manual
+# run and drops the field when the run completes. Any rewrite of `next_run_at`
+# (Hermes' or this module's) leaves it stale, which is no mark.
+MANUAL_RUN_FIELD = "manual_run_at"
 
 # The zone Hermes evaluates a cron expression in, read the way Hermes does:
 # the variable first, then the profile's own config, else UTC.
@@ -394,27 +399,16 @@ def next_occurrence(
         return None
 
 
-def marked_by_hand(job: dict, due_at: datetime, zone: tzinfo) -> bool:
-    """Whether a due ``next_run_at`` is a request rather than a scheduled slot.
+def marked_by_hand(job: dict) -> bool:
+    """Whether the job's ``next_run_at`` is a request rather than a scheduled slot.
 
-    Every timestamp Hermes writes for a cron expression is one of its slots,
-    and for an interval job one period after ``last_run_at``; ``hermes cron
-    run`` marks a job due by moving the timestamp into the past, off that
-    grid. A job the policy cannot classify is treated as scheduled.
+    ``trigger_job`` stamps one ``isoformat()`` string into ``next_run_at`` and
+    ``manual_run_at``; Hermes' own due scan reads the two string-equal as a
+    manual run, and so does this. The comparison is the raw strings', as in
+    Hermes: any rewrite of ``next_run_at`` is meant to void the mark.
     """
-    expr = _cron_expr(job)
-    if expr is not None:
-        from croniter import croniter
-
-        try:
-            return not croniter.match(expr, due_at.astimezone(zone))
-        except Exception:
-            return False
-    period = _interval(job)
-    last_run = parse_timestamp(job.get("last_run_at"))
-    if period is None or last_run is None:
-        return False
-    return abs((due_at - last_run) - period) > INTERVAL_SLACK
+    mark = job.get(MANUAL_RUN_FIELD)
+    return isinstance(mark, str) and bool(mark) and mark == job.get("next_run_at")
 
 
 # --------------------------------------------------------------------------
@@ -557,10 +551,7 @@ def _apply_locked(
             continue
         if stage == STAGE_ACTIVE or not _due(job, now):
             continue
-        # A due timestamp the policy wrote itself is never a hand mark: an
-        # interval job's hibernate hold sits a day on, off its period.
-        own_hold = record is not None and job.get("next_run_at") == record.get("next_run_at")
-        if not own_hold and marked_by_hand(job, parse_timestamp(job.get("next_run_at")), zone):
+        if marked_by_hand(job):
             continue  # `hermes cron run`: somebody asked for this one
         target = _hold_target(job, stage, now, throttle_days, zone)
         if target is None or target <= now:
