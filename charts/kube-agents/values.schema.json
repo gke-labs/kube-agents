@@ -1737,6 +1737,9 @@
                 },
                 "mode": {
                   "type": "string"
+                },
+                "answerFeedback": {
+                  "type": "boolean"
                 }
               }
             },

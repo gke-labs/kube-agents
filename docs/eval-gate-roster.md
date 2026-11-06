@@ -898,12 +898,17 @@ lane keeps the sweep on, where a sweep's pull request names no repetition and la
 `platform-agent/fix-<audit-id>-…-<digest>` branch the sweep names, `SWEEP_BRANCH` in
 `bench/kube_agents_bench/github_writes.py`), and the job's repository reset closes what it opens ([#3439](https://github.com/gke-labs/kube-agents/issues/3439)).
 
-Once the `oss-test-infra` change that exports `MODEL_PROVIDER=gemini` on the five nightlies
-merges, they move the agent from Vertex AI to the Gemini Developer API, each with the leased pool
-project's own key ([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3); the judge does
-not move. The version key does not carry the serving provider, so rung 6 compares nights on both
-sides of the switch at the same key. Date that night here when it happens, because a step in cost
-or latency from that night has this cause.
+On the night of 2026-11-06 the five nightlies moved the agent from Vertex AI to the Gemini
+Developer API (`MODEL_PROVIDER=gemini`), each with the leased pool project's own key
+([`docs/ci-pool-projects.md`](ci-pool-projects.md), section 3); the judge did not move. The
+version key does not carry the serving provider
+([#4932](https://github.com/gke-labs/kube-agents/issues/4932)), so rung 6 compares nights on both
+sides of the switch at the same key. A step in cost or latency from that night has this cause.
+The first night, 2026-11-06, made about 13,300 agent calls across four leased projects (main-a
+6,355, main-b 4,910, writers 1,121, the two GitLab jobs 951) with 0 rate-limit responses and 11
+transient 503s. The two Argon smoke presubmits and `post-kube-agents-eval-rc` moved the same way on
+2026-11-06, so the blocking gate's record has the same step from that day; the Claude and Flash
+smoke jobs and the forge smoke variants stay on Vertex AI.
 
 ## The GitLab lane
 

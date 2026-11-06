@@ -468,6 +468,7 @@ type Bridge struct {
 	// is not reported as a lost one.
 	routesMu sync.Mutex
 	routes   map[string]rememberedRoute
+	kanban   kanbanTracker
 	// The activity door (activity.go); nil when Config.ActivityListen is "".
 	activityLn   net.Listener
 	activitySrv  *http.Server

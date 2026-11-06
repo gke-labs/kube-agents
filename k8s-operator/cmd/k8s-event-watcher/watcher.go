@@ -1095,11 +1095,10 @@ func toTriageEvent(ev *corev1.Event, cluster targetCluster) TriageEvent {
 	// InvolvedObject.UID is what we key dedup on.
 	uid := string(ev.InvolvedObject.UID)
 
-	// ControllerRef: for a Pod, the parent ReplicaSet /
-	// Deployment / StatefulSet is on OwnerReferences. Populating
-	// this requires an additional Pod GET which we don't have
-	// in-hand here. Left empty; the recipe includes RBAC for
-	// pod GET so the agent can enrich via MCP if needed.
+	// ControllerRef: for a Pod, the owning workload is on the Pod's
+	// OwnerReferences, which the event does not carry. It is filled
+	// after the filter and dedup admit the event (dispatcher.Dispatch,
+	// ownerResolver), so a dropped event costs no Pod read.
 	controllerRef := ""
 
 	return TriageEvent{

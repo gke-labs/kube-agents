@@ -37,12 +37,17 @@ It also removes rotated Hermes log backups (``<name>.log.<n>``) older than the
 period. The live log files keep Hermes' own size cap. ``audit.jsonl`` and its
 rotations are never touched: the audit ledger has its own retention.
 
+``--pins-only`` does the pinning alone. The entrypoint runs it before the gateway
+starts, because Hermes prunes at gateway start and, on the first start after an
+upgrade, that prune would otherwise run before this job had pinned anything.
+
 Prints nothing on a clean run. A store it could not maintain prints one line, so
 the failure reaches chat.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -67,6 +72,9 @@ FAILED_PREFIX = f"⚠️ **{WATCH_NAME}:**"
 # The ids this job pinned, in each store's state_meta, so it only ever unpins its own.
 PIN_LEDGER_KEY = "kube_agents_retention_pins"
 SQLITE_TIMEOUT_SECONDS = 30
+# The entrypoint pins under its bootstrap lock, one store after another; a store
+# busy for longer than this is logged rather than waited on.
+PINS_ONLY_TIMEOUT_SECONDS = 5
 # Hermes' error text goes inside one inline code span in chat; this bounds it.
 ERROR_SPAN_CHARS = 300
 # Hermes skips a store pruned less than min_interval_hours ago, timed from the
@@ -128,7 +136,7 @@ def prune_store(home: Path, days: int) -> dict:
             close()
 
 
-def keep_parents(home: Path) -> None:
+def keep_parents(home: Path, *, timeout: float = SQLITE_TIMEOUT_SECONDS) -> None:
     """Pin every session that still has a child, and unpin the ones this job pinned that have none.
 
     Readers here follow ``parent_session_id`` back to where a conversation
@@ -147,7 +155,7 @@ def keep_parents(home: Path) -> None:
     db_path = home / STATE_DB
     if not db_path.is_file():
         return
-    conn = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT_SECONDS, isolation_level=None)
+    conn = sqlite3.connect(db_path, timeout=timeout, isolation_level=None)
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (PIN_LEDGER_KEY,)).fetchone()
@@ -236,8 +244,33 @@ def tick(agent_home: Path, *, now: float | None = None) -> list[str]:
     return lines
 
 
-def main() -> int:
-    lines = tick(Path(gitops_workspace.agent_home()))
+def pin_parents(agent_home: Path) -> list[str]:
+    """``keep_parents`` for every home, nothing else; one line per home it could not do."""
+    lines = []
+    for home in homes(agent_home):
+        try:
+            keep_parents(home, timeout=PINS_ONLY_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - one store's failure must not stop the rest
+            lines.append(f"pinning session parents in {label(home, agent_home)} failed: {type(exc).__name__}: {span_safe(exc)}")
+    return lines
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--pins-only",
+        action="store_true",
+        help="only pin session parents, for the entrypoint to run before the gateway's first prune",
+    )
+    parser.add_argument("--agent-home", type=Path, help="defaults to the agent home this pod runs with")
+    args = parser.parse_args(argv)
+    agent_home = args.agent_home or Path(gitops_workspace.agent_home())
+    if args.pins_only:
+        failures = pin_parents(agent_home)
+        for line in failures:
+            print(line, file=sys.stderr)
+        return 1 if failures else 0
+    lines = tick(agent_home)
     if lines:
         print("\n".join(lines))
     return 0

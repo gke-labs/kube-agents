@@ -162,7 +162,7 @@ The answer names the conversation and its token, quotes any gateway notices, and
 
 The other tools are `read_topics` (the install's standing topics and agent cards) and `manage_session` (named conversations and `/session` workers). There is also `discover_deployments`, which rescans your kubeconfig, and `connect_deployment`, which connects to a named install. `inspect_pr` fetches a pull request the agent filed and writes its diff to local files. The [MCP server reference](/kube-agents/reference/a2a-mcp/#the-tools) describes what each one does in the cluster.
 
-Card reports that arrive after a `send_message` call returns are not shown by this bridge, which does not offer the server's `poll_events` tool. A question the install hands to a card, which is common for anything that reads a cluster, then comes back as a short acknowledgement such as "checking namespaces on the host cluster." A later `status` message on the same conversation lists the cards and whether each is done, but not what they found.
+A question the install hands to a card, which is common for anything that reads a cluster, can come back first as a short acknowledgement such as "checking namespaces on the host cluster." The card's report arrives after `send_message` has returned. The answer ends with the `conversation_token` and `since` cursor to read it with: call `poll_events` with those two, and it returns the reports posted since that cursor. Set `wait_seconds` (60 at most) to have it wait for a report when none has arrived yet, and pass the cursor it returns on the next call. A `status` message on the same conversation lists the cards and whether each is done, but not what they found.
 
 ## Troubleshooting
 

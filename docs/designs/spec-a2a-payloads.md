@@ -475,17 +475,17 @@ or unreported at its drain; `dropped` counts them all, and a delivery the execut
 read or refused over its body cap is outside it, logged, the call it belonged to in the trace
 as `interrupted` when its opening delivery arrived and whole from the closing one when the
 opening one was unreadable; over the cap the closing delivery is larger still, so that call is absent), `errorType` (the executor's own word for
-an error), `durationMs` and `at`; the library
+an error), `durationMs`, `at`, and (on the Hermes bridge's `api` executor) `title`, `sessionId`, `worker`, `cardId`, and `resultPreview` (`card_id=<id>` on a successful `kanban_create` only; no other tool output, and no error text (outside the bridge's off-by-default `BRIDGE_DEBUG_ERROR_TEXT` debugging switch), is published - `input` is the argument shape under both executors); the library
 validates the part kind (assertion 18), and a reader tolerates the keys it does not know.
 
 One unreserved name has a defined shape: `steps`, `kube-agents.step/v1` data parts
 ([`a2a/lib/stepmsg`](../../a2a/lib/stepmsg/stepmsg.go)), by which an executor may state what a turn
-planned, which of its subtasks settled, and when it synthesized an answer, so a renderer lists a
+planned (`kind: "plan"`), which of its subtasks settled (`kind: "subtask"`, with a `subtask` object carrying `id`, `title`, `status`, `verdict`, `summary`, `settled`, `total`, and `parentTaskId`; the hermes bridge leaves `summary` empty, keeping a card's report off `TASKS`), and when it synthesized an answer (`kind: "synthesis"`), along with an optional single-line `thought` (at most 4,096 UTF-8 bytes) and `callIds` (up to 64 tool call IDs), so a renderer lists a
 turn's steps without parsing them out of `thinking`. It carries no reserved semantics: the relay
 ignores it, the fold keeps it, and a reader that does not know it skips it. A later version of the record is a new
 schema, as with chat messages: a v1 reader skips a `kube-agents.step/v2` part rather than guess
 at it, and skips a v1 part with an unknown `kind`. The Hermes bridge publishes it from its
-tool-call trace and the turn's model requests, structure only
+tool-call trace and the turn's model requests (and, on the `api` executor, settled Kanban cards)
 ([`a2a/docs/hermes-bridge.md`](../../a2a/docs/hermes-bridge.md), "Activity").
 
 ## Verified identity (added 9/9)
@@ -775,8 +775,8 @@ through the delegation primitive and the profile dispatcher), at which point car
 ride the carriers above. The plan is on #2149
 ([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
 
-Under `next` the Planning Agent often answers "on it", hands the work to kanban cards, and
-its task ends. The cards keep going outside any A2A task, so none of the carriers above
+Under `next` on chat platforms (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
+its task ends (whereas on non-chat routes or console/MCP origins, `!run.routeRecorded.Load() || isConsoleOrigin(run.origin)`, the `api` executor holds the turn open while polling `kanban.db`, emits `subtask` steps as cards settle, and synthesizes multi-card results into the task's `result` artifact; see `a2a/docs/hermes-bridge.md`). Where the task ends at the acknowledgement, the cards keep going outside that A2A task, so none of the carriers above
 reach them. Their updates reach the conversation on the chat.notify route instead,
 addressed to the asking conversation and checked against the gateway's session record
 (spec-chatops-gateway, the conversation-addressed notify of #2679). A notify request may
