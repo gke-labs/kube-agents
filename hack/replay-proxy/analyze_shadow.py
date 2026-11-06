@@ -10,12 +10,48 @@ answer" and Rollout step 1):
 - high estimate: also from an earlier, finished build of the same pull
   request (never the same build), and, with `--merged`, from another pull
   request's last build before it merged, once it merged (the merge copy);
-- simulated: high, plus the requests that match when the assistant messages
-  in the history are left out of the comparison. In shadow mode every answer
-  is a fresh sample, so a later request matches exactly only when the model
-  repeated every earlier answer;
-  under replay those answers would have been the recorded ones. It assumes the
-  recorded answer's tool calls would have returned the results this run saw.
+- replayed low and replayed high: what replay would hit if it kept each
+  conversation on its recording. In shadow mode every answer is a fresh
+  sample, so a later request matches exactly only when the model repeated
+  every earlier answer; under replay those answers would have been the saved
+  ones. A request counts when a source the matching estimate allows (nightly
+  for low; the high sources for high) has the same settings (`settings_hash`:
+  the request without its messages, plus the LiteLLM setup and normalizer
+  version the fingerprint also covers), the same number of messages, the same
+  role at each position, and the same message hash at every position that is
+  not a generated answer. An exact match always counts as well.
+
+  A generated answer is an assistant message the logs show the model gave in
+  this conversation: an earlier request of the same build whose messages were
+  exactly the ones before it got an answer that reached the client. The
+  messages are compared by their `diag_message_hashes` when both requests
+  carry them, since those stay the same across one conversation's requests (a
+  CIDR first seen in a later message, or time moving a timestamp into another
+  bucket, changes earlier `message_hashes`), and by `message_hashes` otherwise,
+  where that drift can lose the evidence. Only generated answers
+  would have come from the recording under replay. Any other assistant message
+  (a few-shot example, a prefill, a resumed transcript, an empty reply's
+  continuation) is prompt and keeps its hash. The logged `answer_hash` can't
+  confirm the message is that answer: it hashes the answer's words and tool
+  calls in its own request's mapping, while a message hash covers the whole
+  normalized message in the later request's mapping, so the two never compare.
+  A client that swaps the model's answer for its own text before sending it
+  back is still taken as having sent the answer. Evidence is missing, and the
+  message keeps its hash, when the asking request isn't in the logs, ran in
+  another build, got no answer or lost its client, or (for lines without
+  diagnosis hashes) its message hashes drifted.
+
+  It is an estimate both ways. Where the live model took a different action,
+  shadow mode sees a different tool result and counts a miss, while replay
+  would have run the saved action, so it is low there. It is low too where a
+  live answer named a new ID, IP or CIDR: placeholder numbers run across every
+  message, answers included, and one CIDR anywhere changes how every IP is
+  keyed, so later tool and user hashes shift where replay, serving the saved
+  answer, would not have shifted them. It judges each request
+  on its own, so it is high where an earlier request of the same conversation
+  would have missed (and gone live), or matched a different recording: real
+  replay serves an answer only when the conversation so far, served answers
+  included, matches one recording.
 
 A line's job kind is the top-level bucket folder it was copied from, never
 the line's own `job.kind` tag: the proxy that stamps the tag is built from the
@@ -50,7 +86,10 @@ written, before its run passed or failed. A presubmit line without `pr`
 report counts those lines.
 
 Also reported: the share of hits first seen in another project, the tokens and
-model time hits would save, and for misses the closest earlier request by
+model time hits would save; for replayed-high misses, the tokens by the first
+message that is not an assistant message where no allowed source matches (the
+part of the conversation replay could not have held fixed, so the next
+normalizer target); and for high misses the closest earlier request by
 longest matching per-message-hash prefix (the `diag_message_hashes`, which
 do not drift between requests of one conversation), ranked by tokens lost. The
 stored, scrubbed text of both is under their request_id for a diff.
@@ -89,13 +128,14 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import functools
 import hashlib
 import json
 import os
 import re
 import sys
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, FrozenSet, Iterable, Iterator, List, Optional, Tuple, Union
 
 import request_store
 import schema as F
@@ -145,12 +185,33 @@ UNRANKED_NO_SHARED_WORDS = "no_shared_words"
 UNRANKED_OWN_TEXT_EMPTY = "own_text_empty"
 UNRANKED_ALL_MATCHED = "all_messages_matched"
 ASSISTANT_ROLE = "assistant"
-# Stands in for an assistant message's content in the simulated key: its place
+# Unstorable reasons meaning the client never got the model's answer, so the
+# request is no evidence that the next assistant message was generated.
+ANSWER_NOT_DELIVERED = (F.UNSTORABLE_NO_ANSWER, F.UNSTORABLE_CLIENT_DISCONNECTED)
+# Which hashes an entry of the generated-answer evidence index is filed by.
+BY_DIAG, BY_MESSAGE = "diag", "message"
+# Stands in for an assistant message's content in the replayed key: its place
 # in the conversation counts, its words do not.
 ANSWER_PLACEHOLDER = "assistant-message"
-LOW, HIGH, SIMULATED = "low", "high", "simulated"
-ESTIMATES = (LOW, HIGH, SIMULATED)
+# Joins a message's role to its hash (or the placeholder) in the replayed key.
+ROLE_SEPARATOR = ":"
+LOW, HIGH = "low", "high"
+REPLAYED_LOW, REPLAYED_HIGH = "replayed_low", "replayed_high"
+ESTIMATES = (LOW, HIGH, REPLAYED_LOW, REPLAYED_HIGH)
+# Estimates matched on the replayed key, and those taking nightly sources only.
+REPLAYED_ESTIMATES = (REPLAYED_LOW, REPLAYED_HIGH)
+NIGHTLY_ONLY_ESTIMATES = (LOW, REPLAYED_LOW)
+# What the replayed rows leave out, printed under the estimate table.
+REPLAYED_CAVEAT = (
+    "replayed rows are an estimate, holding to the recording only the answers the logs show the model gave in the"
+    " conversation: a different live action gave a different tool result here, where replay would"
+    " have run the saved one, and a live answer naming a new ID, IP or CIDR shifted later messages' hashes, where"
+    " the saved answer would not have (so low there); each request is judged alone, though an earlier miss in its"
+    " conversation, or answers from two recordings, would end a real replay (so high there)."
+)
 DEFAULT_TOP_MISSES = 20
+# Wide enough for the longest estimate name in the text table.
+ESTIMATE_COLUMN_WIDTH = max(len(name) for name in ESTIMATES) + 1
 PERCENT = 100.0
 PERCENT_DECIMALS = 1
 MS_PER_SECOND = 1000.0
@@ -198,6 +259,10 @@ class Record:
     completion_tokens: int
     latency_ms: int
     unstorable: List[str]
+    answer_hash: Optional[str] = None
+    # Positions of the assistant messages the logs show were generated in this
+    # conversation; set by mark_generated_answers, which load runs.
+    generated_answers: FrozenSet[int] = field(default_factory=frozenset)
     # The store of the build this line was filed under, when it came from the
     # bucket's layout: the only place its stored text is read from (BuildStores).
     store_dir: Optional[str] = None
@@ -205,6 +270,11 @@ class Record:
     @property
     def storable(self) -> bool:
         return not self.unstorable
+
+    @property
+    def answer_delivered(self) -> bool:
+        """Whether the model's answer reached the client, so its next request may carry it."""
+        return self.answer_hash is not None and not any(r in ANSWER_NOT_DELIVERED for r in self.unstorable)
 
     @classmethod
     def from_line(cls, entry: Dict[str, Any], kind: str, store_dir: Optional[str] = None) -> "Record":
@@ -232,6 +302,7 @@ class Record:
             completion_tokens=int(entry.get(F.COMPLETION_TOKENS) or 0),
             latency_ms=int(entry.get(F.LATENCY_MS) or 0),
             unstorable=[str(r) for r in entry.get(F.UNSTORABLE) or []],
+            answer_hash=str(entry[F.ANSWER_HASH]) if entry.get(F.ANSWER_HASH) else None,
             store_dir=store_dir,
         )
 
@@ -254,24 +325,43 @@ class Record:
         """The settings hash the closest-request search roots its chain at: the diagnosis one when logged."""
         return self.diag_settings_hash if self.diag_settings_hash is not None else self.settings_hash
 
-    def chain(
-        self, skip_answers: bool = False, hashes: Optional[List[str]] = None, root: Optional[str] = None
-    ) -> List[str]:
+    def chain(self, hashes: Optional[List[str]] = None, root: Optional[str] = None) -> List[str]:
         """Prefix hashes: element k identifies the settings plus the first k+1 messages."""
         out = []
         current = self.settings_hash if root is None else root
-        for index, message_hash in enumerate((self.message_hashes if hashes is None else hashes) or []):
-            role = self.roles[index] if index < len(self.roles) else ""
-            part = ANSWER_PLACEHOLDER if skip_answers and role == ASSISTANT_ROLE else message_hash
-            current = hashlib.sha256(f"{current}|{part}".encode()).hexdigest()
+        for message_hash in (self.message_hashes if hashes is None else hashes) or []:
+            current = hashlib.sha256(f"{current}|{message_hash}".encode()).hexdigest()
             out.append(current)
         return out
 
+    def replayed_chain(self) -> Iterator[str]:
+        """Prefix hashes of the replayed key: element k covers the settings and messages 0..k.
+
+        Each message counts by its role, and by its hash unless it is a
+        generated answer (`generated_answers`), whose words replay would have
+        taken from the recording. Empty without message hashes. A generator, so a search that
+        stops at the first difference hashes no further.
+        """
+        current = self.settings_hash
+        for index, message_hash in enumerate(self.message_hashes or []):
+            role = self.roles[index] if index < len(self.roles) else ""
+            held = role == ASSISTANT_ROLE and index in self.generated_answers
+            part = f"{role}{ROLE_SEPARATOR}{ANSWER_PLACEHOLDER if held else message_hash}"
+            current = hashlib.sha256(f"{current}|{part}".encode()).hexdigest()
+            yield current
+
+    @functools.cached_property
+    def replayed_key(self) -> str:
+        """The settings and every message, generated answers by their place only."""
+        key = self.settings_hash
+        for key in self.replayed_chain():
+            pass
+        return key
+
     def key(self, estimate: str) -> Optional[str]:
-        if estimate != SIMULATED or self.message_hashes is None:
+        if estimate not in REPLAYED_ESTIMATES or self.message_hashes is None:
             return self.fingerprint
-        chain = self.chain(skip_answers=True)
-        return chain[-1] if chain else self.settings_hash
+        return self.replayed_key
 
 
 @dataclass
@@ -295,13 +385,19 @@ class Miss:
 
     @property
     def first_difference_role(self) -> str:
-        if self.request.search_hashes is None:
-            return DIFF_UNHASHED
-        if self.closest is None:
-            return DIFF_SETTINGS
-        if self.matched_messages < len(self.request.roles):
-            return self.request.roles[self.matched_messages] or DIFF_UNKNOWN_ROLE
-        return DIFF_NONE
+        return difference_role(self.request, self.request.search_hashes, self.closest is not None, self.matched_messages)
+
+
+def difference_role(request: Record, hashes: Optional[List[str]], settings_matched: bool, matched: int) -> str:
+    """What differed first: the settings, the role of the first unmatched message, or nothing."""
+    if hashes is None:
+        return DIFF_UNHASHED
+    if not settings_matched:
+        return DIFF_SETTINGS
+    if matched < len(hashes):
+        role = request.roles[matched] if matched < len(request.roles) else ""
+        return role or DIFF_UNKNOWN_ROLE
+    return DIFF_NONE
 
 
 class Sources:
@@ -326,7 +422,10 @@ class Sources:
                 self.merge_build[pr] = build_key
         self.nightly: Dict[str, Record] = {}
         self.merge_copy: Dict[str, Tuple[float, Record]] = {}
-        self.by_pr: Dict[str, Dict[str, List[Record]]] = {}
+        # Per key and pull request, each build's first source: every source of
+        # one build becomes available together (when the build finishes), so
+        # `find` need not look at the rest.
+        self.by_pr: Dict[str, Dict[str, Dict[Tuple[str, str, str], Record]]] = {}
         for record in records:
             if record.storable or not require_storable:
                 for key in self.keys_of(record):
@@ -350,7 +449,7 @@ class Sources:
             if best_copy is None or merged_at < best_copy[0]:
                 self.merge_copy[key] = (merged_at, record)
         if record.pr:
-            self.by_pr.setdefault(key, {}).setdefault(record.pr, []).append(record)
+            self.by_pr.setdefault(key, {}).setdefault(record.pr, {}).setdefault(record.build_key, record)
 
     def find(self, key: Optional[str], request: Record, nightly_only: bool) -> Optional[Record]:
         """The earliest source of `key` available to `request`, or None."""
@@ -364,7 +463,7 @@ class Sources:
             copy = self.merge_copy.get(key)
             if copy is not None and copy[0] <= request.ts and copy[1].pr != request.pr:
                 candidates.append(copy)
-            for earlier in self.by_pr.get(key, {}).get(request.pr, []) if request.pr else []:
+            for earlier in self.by_pr.get(key, {}).get(request.pr, {}).values() if request.pr else ():
                 if earlier.build != request.build and self.build_end[earlier.build_key] <= request.ts:
                     candidates.append((self.build_end[earlier.build_key], earlier))
         return min(candidates, key=lambda c: c[0])[1] if candidates else None
@@ -377,7 +476,34 @@ class KeySources(Sources):
 
     def keys_of(self, record: Record) -> List[str]:
         key = record.key(self.estimate)
-        return [key]
+        # A replayed estimate also files the fingerprint, so an exact match
+        # (one line without message hashes) is never lost.
+        return [key] if key == record.fingerprint else [key, record.fingerprint]
+
+
+class ReplayedPrefixSources(Sources):
+    """Every prefix of every request's replayed key, for the replayed misses' first difference."""
+
+    def keys_of(self, record: Record) -> List[str]:
+        if record.message_hashes is None:
+            return []
+        return [record.settings_hash, *record.replayed_chain()]
+
+    def first_difference(self, request: Record) -> str:
+        """The role of the first message no allowed high source matches, generated answers' words not compared.
+
+        `assistant`: no allowed source matches at that assistant position (none
+        has a generated answer there, or the message is prompt and differs);
+        `none`: a longer allowed recording passes through, but none stopped here.
+        """
+        if request.message_hashes is None or self.find(request.settings_hash, request, nightly_only=False) is None:
+            return difference_role(request, request.message_hashes, False, 0)
+        matched = 0
+        for prefix in request.replayed_chain():
+            if self.find(prefix, request, nightly_only=False) is None:
+                break
+            matched += 1
+        return difference_role(request, request.message_hashes, True, matched)
 
 
 class StoredText:
@@ -463,7 +589,7 @@ class PrefixSources(Sources):
         if record.search_hashes is None:
             return []
         root = record.search_settings_hash
-        return [root] + record.chain(hashes=record.search_hashes, root=root)
+        return [root] + record.chain(record.search_hashes, root)
 
     def add(self, key: str, record: Record) -> None:
         super().add(key, record)
@@ -493,7 +619,7 @@ class PrefixSources(Sources):
         if best is None:
             return Miss(request, None, 0)
         matched, key = 0, root
-        for prefix in request.chain(hashes=request.search_hashes, root=root):
+        for prefix in request.chain(request.search_hashes, root):
             found = self.find(prefix, request, nightly_only=False)
             if found is None:
                 break
@@ -651,7 +777,57 @@ def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record]
                     continue
                 records.append(Record.from_line(entry, file_kind, store_dir))
     records.sort(key=lambda r: r.ts)
+    mark_generated_answers(records)
     return records, skipped
+
+
+def mark_generated_answers(records: List[Record]) -> None:
+    """Set each record's `generated_answers`, from records in time order.
+
+    Position i holds a generated answer when it is an assistant message and an
+    earlier request of the same build, whose messages are exactly this
+    request's first i, got an answer that reached the client before this
+    request was made. Messages compare by diagnosis hashes when both requests
+    carry them (they don't drift within a conversation), by message hashes
+    when either lacks them.
+    """
+    # Requests whose answer reached the client, by build, message count and
+    # last hash: with diagnosis hashes under BY_DIAG, every request under
+    # BY_MESSAGE. A candidate still has to match every earlier hash.
+    answered: Dict[Tuple[str, Tuple[str, str, str], int, str], List[Record]] = {}
+    for record in records:
+        hashes = record.message_hashes
+        if hashes is None:
+            continue
+        diag = evidence_diag_hashes(record)
+        generated = []
+        for index, role in enumerate(record.roles[:len(hashes)]):
+            if role != ASSISTANT_ROLE:
+                continue
+            if diag is not None and any(
+                asked.available_at <= record.ts and evidence_diag_hashes(asked) == diag[:index]
+                for asked in answered.get((BY_DIAG, record.build_key, index, diag[index - 1] if index else ""), ())
+            ):
+                generated.append(index)
+                continue
+            if any(
+                asked.available_at <= record.ts and asked.message_hashes == hashes[:index]
+                # With both diagnosis hashes, only they decide.
+                and (diag is None or evidence_diag_hashes(asked) is None)
+                for asked in answered.get((BY_MESSAGE, record.build_key, index, hashes[index - 1] if index else ""), ())
+            ):
+                generated.append(index)
+        record.generated_answers = frozenset(generated)
+        if record.answer_delivered:
+            answered.setdefault((BY_MESSAGE, record.build_key, len(hashes), hashes[-1] if hashes else ""), []).append(record)
+            if diag is not None:
+                answered.setdefault((BY_DIAG, record.build_key, len(diag), diag[-1] if diag else ""), []).append(record)
+
+
+def evidence_diag_hashes(record: Record) -> Optional[List[str]]:
+    """A record's diagnosis hashes when it has one per message, for the generated-answer evidence."""
+    diag = record.diag_message_hashes
+    return diag if diag is not None and record.message_hashes is not None and len(diag) == len(record.message_hashes) else None
 
 
 def iter_hits(
@@ -663,13 +839,14 @@ def iter_hits(
     the recording it would have been served from.
     """
     sources = KeySources(records, merged or {}, require_storable, estimate)
-    # Simulated is high plus the matches it adds, never fewer.
-    exact = KeySources(records, merged or {}, require_storable, HIGH) if estimate == SIMULATED else None
+    nightly_only = estimate in NIGHTLY_ONLY_ESTIMATES
     for record in records:
         if record.kind == PRESUBMIT:
-            recording = sources.find(record.key(estimate), record, nightly_only=estimate == LOW)
-            if recording is None and exact is not None:
-                recording = exact.find(record.fingerprint, record, nightly_only=False)
+            key = record.key(estimate)
+            recording = sources.find(key, record, nightly_only)
+            # A replayed estimate is its exact one plus the matches it adds, never fewer.
+            if recording is None and key != record.fingerprint:
+                recording = sources.find(record.fingerprint, record, nightly_only)
             yield record, (Hit(record, recording) if recording is not None else None)
 
 
@@ -684,6 +861,23 @@ def find_misses(
         if hit is None:
             misses.append(prefixes.closest(record, texts))
     return misses
+
+
+def replayed_miss_differences(
+    records: List[Record], require_storable: bool = True, merged: Optional[Dict[str, float]] = None
+) -> List[Tuple[Record, str]]:
+    """Replayed-high misses, each with the role of its first message no allowed source matches."""
+    prefixes = ReplayedPrefixSources(records, merged or {}, require_storable)
+    return [(record, prefixes.first_difference(record))
+            for record, hit in iter_hits(records, REPLAYED_HIGH, require_storable, merged) if hit is None]
+
+
+def tokens_by_label(labelled: Iterable[Tuple[Record, str]]) -> Dict[str, int]:
+    """Prompt tokens per label, largest first."""
+    totals: Dict[str, int] = {}
+    for record, label in labelled:
+        totals[label] = totals.get(label, 0) + record.prompt_tokens
+    return dict(sorted(totals.items(), key=lambda kv: -kv[1]))
 
 
 def percent(part: float, whole: float) -> float:
@@ -755,10 +949,10 @@ def summarize(
             "cross_project_hit_percent": percent(sum(h.request.prompt_tokens for h in cross), hit_tokens),
         }
     misses = sorted(find_misses(records, require_storable, merged, texts), key=lambda m: m.request.prompt_tokens, reverse=True)
-    by_role: Dict[str, int] = {}
-    for miss in misses:
-        by_role[miss.first_difference_role] = by_role.get(miss.first_difference_role, 0) + miss.request.prompt_tokens
-    report["miss_tokens_by_first_difference"] = dict(sorted(by_role.items(), key=lambda kv: -kv[1]))
+    report["miss_tokens_by_first_difference"] = tokens_by_label((m.request, m.first_difference_role) for m in misses)
+    report["replayed_miss_tokens_by_first_difference"] = tokens_by_label(
+        replayed_miss_differences(records, require_storable, merged)
+    )
     report["top_misses"] = [
         {
             "request_id": m.request.request_id,
@@ -802,14 +996,21 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
     lines += [f"  {name}: {value}" for name, value in report["health"].items()]
     lines += [
         "",
-        "estimate    hits   token-weighted   cross-project   saved prompt / completion tokens   saved model time",
+        f"{'estimate':<{ESTIMATE_COLUMN_WIDTH}}  hits   token-weighted   cross-project"
+        "   saved prompt / completion tokens   saved model time",
     ]
     for name, e in report["estimates"].items():
         lines.append(
-            f"{name:<10} {e['hits']:>5}   {e['token_weighted_hit_percent']:>13}%   {e['cross_project_hit_percent']:>12}%"
+            f"{name:<{ESTIMATE_COLUMN_WIDTH}} {e['hits']:>5}   {e['token_weighted_hit_percent']:>13}%"
+            f"   {e['cross_project_hit_percent']:>12}%"
             f"   {e['hit_prompt_tokens']} / {e['saved_completion_tokens']}   {e['saved_model_ms']} ms"
         )
-    lines += ["", f"miss tokens by first differing message: {report['miss_tokens_by_first_difference']}", "",
+    lines += [REPLAYED_CAVEAT, "",
+              f"miss tokens by first differing message: {report['miss_tokens_by_first_difference']}",
+              "replayed_high miss tokens by role of first differing message (assistant: no recording matches that answer"
+              " position;"
+              " none: only longer recordings pass through):"
+              f" {report['replayed_miss_tokens_by_first_difference']}", "",
               "top misses (prompt tokens, matched/total messages, first difference, closest earlier request):"]
     for m in report["top_misses"]:
         detail = m.get("unranked_reason") or m.get("closest_score")
