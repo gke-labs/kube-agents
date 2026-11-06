@@ -155,6 +155,12 @@ SWEEP_FILE_FORMAT = "{project}__{location}__{cluster}.json"
 SWEEP_FILE_STAMP_AT = "collected_at"
 SWEEP_FILE_STAMP_SWEEP = "sweep_id"
 SWEEP_CARD_ENV = "HERMES_KANBAN_TASK"
+# The hand-off refuses a file over this many bytes (bootstrap_handoff.SWEEP_FILE_MAX_BYTES,
+# pinned equal by the tests), so the object is written compact and, when it still
+# will not fit, with its lists cut from the end and a gap naming the count.
+SWEEP_FILE_MAX_BYTES = 1 << 20
+CUT_TO_FIT_LISTS = ("workloads", "findings")
+CUT_TO_FIT = "{key}: {cut} of {total} cut from the end so the file fits the hand-off's cap of {cap} bytes"
 TMP_SUFFIX = ".tmp"
 # bootstrap_handoff.IDENTITY_COMPONENT_RE: the hand-off reads a file only for an
 # identity of bare names, and the file is named from these three arguments.
@@ -532,14 +538,48 @@ def sweep_file_path(project: str, location: str, cluster: str, sweep_dir: str = 
     return Path(sweep_dir) / SWEEP_FILE_FORMAT.format(project=project, location=location, cluster=cluster)
 
 
-def write_sweep_file(metadata: dict, path: Path) -> str | None:
-    """Write the object atomically for the hand-off; the reason when it could not be."""
+def serialise(metadata: dict) -> str:
+    """The object as the file and the printed copy carry it: compact JSON, one line."""
+    return json.dumps(metadata, separators=(",", ":"), ensure_ascii=True) + "\n"
+
+
+def _size(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def fit_to_cap(metadata: dict, cap: int = SWEEP_FILE_MAX_BYTES) -> str:
+    """``metadata`` serialised under ``cap`` bytes, cut in place when it must be.
+
+    The workload list goes first, then the findings, each from the end, by the
+    count the overrun divides into at the list's own bytes per entry; a gap names
+    each cut. A whole audit the reader refuses is worth less than a trimmed one.
+    """
+    text = serialise(metadata)
+    for key in CUT_TO_FIT_LISTS:
+        entries = metadata.get(key)
+        if _size(text) <= cap or not isinstance(entries, list) or not entries:
+            continue
+        total = len(entries)
+        without = _size(serialise({**metadata, key: []}))
+        kept = total
+        while kept > 0 and _size(text) > cap:
+            per_entry = max(1, (_size(text) - without) // kept)
+            kept = max(0, kept - ((_size(text) - cap) // per_entry + 1))
+            metadata[key] = entries[:kept]
+            gaps = [g for g in metadata.get("gaps") or [] if not g.startswith(f"{key}: ")]
+            metadata["gaps"] = gaps + [CUT_TO_FIT.format(key=key, cut=total - kept, total=total, cap=cap)]
+            text = serialise(metadata)
+    return text
+
+
+def write_sweep_file(text: str, path: Path) -> str | None:
+    """Write the serialised object atomically for the hand-off; the reason when it could not be."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         handle, tmp = tempfile.mkstemp(prefix=path.name, suffix=TMP_SUFFIX, dir=path.parent)
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(metadata, indent=2) + "\n")
+                fh.write(text)
             os.replace(tmp, path)
         finally:
             if os.path.exists(tmp):
@@ -571,10 +611,11 @@ def main(argv: list[str] | None = None) -> int:
     metadata = collect_cluster_inventory(args.project, args.location, args.cluster, run=default_run)
     metadata[SWEEP_FILE_STAMP_AT] = int(time.time())
     metadata[SWEEP_FILE_STAMP_SWEEP] = args.sweep_id
-    problem = write_sweep_file(metadata, sweep_file_path(args.project, args.location, args.cluster, args.sweep_dir))
+    text = fit_to_cap(metadata)
+    problem = write_sweep_file(text, sweep_file_path(args.project, args.location, args.cluster, args.sweep_dir))
     if problem:
         metadata["gaps"].append(problem)
-    text = json.dumps(metadata, indent=2) + "\n"
+        text = serialise(metadata)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")
     else:

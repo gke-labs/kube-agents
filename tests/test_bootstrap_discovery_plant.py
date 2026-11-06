@@ -464,6 +464,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertEqual(self._indices(calls, "[rearm]"), [])
         self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 2)
+        self._assert_sandbox_clear_removes_the_sweep_dir(calls)
         self.assertIn("Cleanup incomplete: could not remove the INVENTORY files.", completed.stderr)
 
     def test_a_failed_card_listing_stops_the_apply_before_the_marker_goes(self):
@@ -558,6 +559,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertEqual(self._indices(calls, "[archive]"), [])
         self.assertIn("Cleanup incomplete: could not list the open cards.", completed.stderr)
         self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 2)
+        self._assert_sandbox_clear_removes_the_sweep_dir(calls)
 
     def test_the_destroy_clears_the_inventory_files_when_it_cannot_list_the_cards(self):
         completed, calls = self._run(script=self._destroy_script, FAILED_LISTINGS="1")
@@ -565,6 +567,7 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         self.assertIn("Cleanup incomplete: could not list the open cards.", completed.stderr)
         self.assertEqual(len(self._indices(calls, "[clear deployment/platform-agent-gateway]")), 1)
         self.assertEqual(len(self._indices(calls, "[clear pod/platform-agent-shell-0]")), 1)
+        self._assert_sandbox_clear_removes_the_sweep_dir(calls)
 
     def test_the_destroy_clears_the_sandbox_when_the_agents_rm_fails(self):
         completed, calls = self._run(
@@ -642,6 +645,18 @@ class BootstrapDiscoveryPlantTest(unittest.TestCase):
         # A plant that succeeds leaves it for the verifier; the destroy removes it.
         self.assertEqual(self._indices(calls, "[uncap+unmark]"), [])
         self.assertIn("First-run cluster card cap set to 2", completed.stdout)
+
+    def _assert_sandbox_clear_removes_the_sweep_dir(self, calls):
+        # The sandbox's one exec removes the INVENTORY files and the collector's
+        # sweep directory; a clear that drops the directory leaves the previous
+        # sweep's files for the next hand-off to read.
+        cleared = self._indices(calls, "[clear pod/platform-agent-shell-0]")
+        self.assertTrue(cleared, calls)
+        for i in cleared:
+            self.assertIn(
+                "rm -f /opt/data/INVENTORY.raw.md /opt/data/INVENTORY.md && rm -rf /opt/data/INVENTORY.sweep [clear pod/platform-agent-shell-0]",
+                calls[i],
+            )
 
     def _assert_cap_then_sentinel_removed(self, calls):
         # One exec, cap first: the sentinel's rm runs only after the cap's

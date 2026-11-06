@@ -367,9 +367,36 @@ class SweepFile(unittest.TestCase):
         self.assertEqual(cic.SWEEP_FILE_FORMAT, bootstrap_handoff.SWEEP_FILE_FORMAT)
         self.assertEqual(cic.SWEEP_FILE_STAMP_AT, bootstrap_handoff.SWEEP_FILE_STAMP_AT)
         self.assertEqual(cic.SWEEP_FILE_STAMP_SWEEP, bootstrap_handoff.SWEEP_FILE_STAMP_SWEEP)
+        self.assertEqual(cic.SWEEP_FILE_MAX_BYTES, bootstrap_handoff.SWEEP_FILE_MAX_BYTES)
         self.assertEqual(
             str(cic.sweep_file_path(PROJECT, LOCATION, CLUSTER)), bootstrap_handoff.sweep_file_path(PROJECT, LOCATION, CLUSTER)
         )
+
+    def test_an_object_past_the_cap_is_cut_to_fit_with_a_gap(self):
+        # A cluster with thousands of Jobs: the reader refuses a file over the
+        # cap whole, so the workload list is cut from the end and the gap says so.
+        meta, _ = _collect()
+        row = dict(meta["workloads"][0])
+        meta["workloads"] = [dict(row, name=f"job-{i:05d}") for i in range(12000)]
+        finding = dict(meta["findings"][0]) if meta["findings"] else {"check": "x", "issue": "y", "recommendation": "z"}
+        meta["findings"] = [dict(finding, workload=f"job-{i:05d}") for i in range(1200)]
+        self.assertGreater(len(cic.serialise(meta).encode()), cic.SWEEP_FILE_MAX_BYTES)
+        text = cic.fit_to_cap(meta)
+        self.assertLessEqual(len(text.encode("utf-8")), cic.SWEEP_FILE_MAX_BYTES)
+        self.assertEqual(json.loads(text), meta)
+        self.assertGreater(len(meta["workloads"]), 0)
+        self.assertEqual(len(meta["findings"]), 1200)
+        [gap] = [g for g in meta["gaps"] if g.startswith("workloads: ")]
+        self.assertIn(f"of 12000 cut from the end so the file fits the hand-off's cap of {cic.SWEEP_FILE_MAX_BYTES} bytes", gap)
+        self.assertEqual(int(gap.split()[1]), 12000 - len(meta["workloads"]))
+
+    def test_an_object_under_the_cap_is_written_whole_and_compact(self):
+        meta, _ = _collect()
+        before = json.loads(json.dumps(meta))
+        text = cic.fit_to_cap(meta)
+        self.assertEqual(meta, before)
+        self.assertEqual(text.count("\n"), 1)
+        self.assertEqual(json.loads(text), before)
 
     def test_main_writes_the_stamped_object_for_the_hand_off(self):
         fake = FakeRun()
