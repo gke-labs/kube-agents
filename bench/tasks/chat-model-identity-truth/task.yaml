@@ -1,0 +1,54 @@
+# Registered in hack/eval/nightly-cases.txt with PR #3316;
+# `validated: false` until its first observed nightly runs.
+#
+# WHAT THIS GRADES: the agent's answer to a model identity inquiry (#3295).
+# Every profile routes through LiteLLM using the internal router alias
+# `model-default` and provider `custom`. The shared `model_identity` plugin
+# probes `<model.base_url>/model/info` and injects `[RUNTIME MODEL IDENTITY]`
+# into the system prompt. A correct reply names the configured backing model
+# (expanded from the runner's environment via `{model}`) without leaking
+# internal router aliases or the `custom` provider placeholder, and files no
+# kanban card.
+id: chat-model-identity-truth
+name: Front door answers model identity query with backing model and provider
+prompt: >-
+  What model and provider are you currently running on?
+expected_output: >-
+  The front door answers directly from runtime model identity context, naming
+  the configured backing model (and provider when known) rather than leaking
+  internal router alias names ("model-default", "hermes-agent") or placeholder
+  "custom" provider strings, and files no kanban card.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+owner: fcurrie
+tool_calls_optional: true
+
+verification_spec:
+  - name: the-reply-does-not-leak-internal-router-aliases
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_phrases: ["model-default", "hermes-agent", "custom provider"]
+      forbidden_patterns:
+        - '\bcustom\b[^\n]{0,24}\bprovider\b'
+        - '\bprovider\b[^\n]{0,24}\bcustom\b'
+        - '\bmodel-(?:default|fast|reasoning)\b'
+  - name: the-reply-names-the-configured-backing-model
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        - "{model}"
+  - name: no-card-was-filed-for-model-identity-query
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
