@@ -545,6 +545,12 @@ DEFAULT_SESSION_MAX_IDENTICAL_FAILURES = 5
 # How many session keys the budget remembers; the oldest-touched is dropped
 # past it, so memory stays bounded whatever the shim sends.
 SESSION_TOOL_BUDGET_MAX_SESSIONS = 1024
+# How many of a session's failing commands the loop breaker counts at once.
+# Each keeps its own run of failures, so a loop over two or more failing
+# commands trips on each one's own count rather than resetting the other's;
+# the oldest-failed is dropped past this many, so an entry stays bounded
+# whatever the session sends, and any success clears them all.
+SESSION_LOOP_BREAKER_SIGNATURES = 8
 # The field's grammar, the shim's CALLER_LABEL_RE (and content_workspace's): a
 # body value outside it is a 400, as a malformed kubeconfigContext is.
 SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,64}\Z")
@@ -4050,15 +4056,15 @@ def command_signature(argv: list[str], kubeconfig_context: str | None) -> str:
 
 
 class _SessionCounts:
-    """One session's counts: every call admitted to the gates, and the run of
-    consecutive failures of the one command the session last failed on."""
+    """One session's counts: every call admitted to the gates, and for each of
+    the last SESSION_LOOP_BREAKER_SIGNATURES commands the session failed on
+    since its last success, that command's run of failures (oldest first)."""
 
-    __slots__ = ("total", "streak_signature", "streak")
+    __slots__ = ("total", "failures")
 
     def __init__(self) -> None:
         self.total = 0
-        self.streak_signature: str | None = None
-        self.streak = 0
+        self.failures: collections.OrderedDict[str, int] = collections.OrderedDict()
 
 
 class SessionToolBudget:
@@ -4070,12 +4076,15 @@ class SessionToolBudget:
     counts the call and answers the refusal the
     route sends, or None. The ceiling refuses a session past ``max_calls``
     when ``ceiling`` is set (the route sets it for SESSION_BUDGET_CEILING_ROLES).
-    The loop breaker refuses a signature whose last ``max_identical_failures``
-    outcomes in this session were all failures. ``record`` is told every
-    terminal outcome once, in the metrics' status vocabulary: ``blocked`` and
-    ``error`` extend the streak of the signature they are for (a different
-    signature starts a new streak of one), ``success`` clears it, and ``busy``
-    and ``abandoned``, which say nothing about the command, leave it alone.
+    The loop breaker refuses a signature that failed ``max_identical_failures``
+    times in this session with no success of the session's in between.
+    ``record`` is told every terminal outcome once, in the metrics' status
+    vocabulary: ``blocked`` and ``error`` extend the run of failures of the
+    signature they are for, kept per signature for the session's last
+    ``max_signatures`` failing commands (so a loop over two failing commands
+    trips on each one's own count, and the oldest-failed is forgotten past
+    that many); ``success`` clears every run; and ``busy`` and ``abandoned``,
+    which say nothing about the command, leave them alone.
     ``busy`` also gives the ceiling back the unit ``admit`` charged: the broker
     never started a busy request and the shim re-sends the same body on its
     retry schedule, so without the refund a loaded broker would spend several
@@ -4096,10 +4105,12 @@ class SessionToolBudget:
         max_calls: int = SESSION_MAX_TOOL_CALLS,
         max_identical_failures: int = SESSION_MAX_IDENTICAL_FAILURES,
         max_sessions: int = SESSION_TOOL_BUDGET_MAX_SESSIONS,
+        max_signatures: int = SESSION_LOOP_BREAKER_SIGNATURES,
     ) -> None:
         self.max_calls = max_calls
         self.max_identical_failures = max_identical_failures
         self.max_sessions = max_sessions
+        self.max_signatures = max_signatures
         self._sessions: collections.OrderedDict[str, _SessionCounts] = collections.OrderedDict()
         self._lock = threading.Lock()
 
@@ -4128,11 +4139,7 @@ class SessionToolBudget:
                     RULE_SESSION_TOOL_BUDGET,
                     SESSION_BUDGET_EXCEEDED_MESSAGE.format(code=SESSION_BUDGET_EXCEEDED_CODE, limit=self.max_calls),
                 )
-            if (
-                self.max_identical_failures > 0
-                and counts.streak_signature == signature
-                and counts.streak >= self.max_identical_failures
-            ):
+            if self.max_identical_failures > 0 and counts.failures.get(signature, 0) >= self.max_identical_failures:
                 return SessionRefusal(
                     LOOP_BREAKER_CODE,
                     RULE_SESSION_LOOP_BREAKER,
@@ -4155,19 +4162,18 @@ class SessionToolBudget:
         with self._lock:
             counts = self._counts_locked(session_id)
             if status == TOOL_STATUS_SUCCESS:
-                counts.streak_signature = None
-                counts.streak = 0
-            elif counts.streak_signature == signature:
-                counts.streak += 1
-            else:
-                counts.streak_signature = signature
-                counts.streak = 1
+                counts.failures.clear()
+                return
+            counts.failures[signature] = counts.failures.get(signature, 0) + 1
+            counts.failures.move_to_end(signature)
+            while len(counts.failures) > self.max_signatures:
+                counts.failures.popitem(last=False)
 
-    def streak_of(self, session_id: str) -> int:
-        """The session's current run of identical failures, for the log line."""
+    def streak_of(self, session_id: str, signature: str) -> int:
+        """The session's current run of failures of this command, for the log line."""
         with self._lock:
             counts = self._sessions.get(session_id)
-            return counts.streak if counts is not None else 0
+            return counts.failures.get(signature, 0) if counts is not None else 0
 
 
 # One budget per broker process; the exec route reads it through the module so
@@ -13706,7 +13712,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     request_id,
                     _sanitize_for_logging(session_id),
                     principal.role,
-                    _SESSION_TOOL_BUDGET.streak_of(session_id),
+                    _SESSION_TOOL_BUDGET.streak_of(session_id, session_signature),
                     extra=audit(AUDIT_STATUS_BLOCKED, rule=session_refusal.rule),
                 )
                 count(TOOL_STATUS_BLOCKED)

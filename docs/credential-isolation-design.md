@@ -416,7 +416,9 @@ including:
   a script whose Job sets no key, so its calls are uncounted; a busy reply the wrapper
   re-sends is not charged, since the retries are one invocation), and any keyed session
   is refused the same command, on the same cluster, after it failed or was blocked
-  `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times running, with `403 BROKER_LOOP_BREAKER`;
+  `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times with no success of the session's between
+  (counted per command over the session's last eight failing ones, so a loop over two
+  failing commands trips on each), with `403 BROKER_LOOP_BREAKER`;
   the site's [troubleshooting entries](site/src/content/docs/reference/credential-isolation.md#troubleshooting)
   carry the defaults and the operator's knobs. A key's counts last as long as the broker remembers it: a
   scheduled run's key names one execution, a card's names the card, so a card's ceiling

@@ -20882,7 +20882,7 @@ class SessionToolBudgetTest(unittest.TestCase):
             "session; stop retrying this command and report the refusal/error.",
             refusal.message,
         )
-        self.assertEqual(5, budget.streak_of("run-a"))
+        self.assertEqual(5, budget.streak_of("run-a", self.DELETE))
         # A different command in the same session, and the same command in
         # another session, both run.
         self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
@@ -20897,23 +20897,66 @@ class SessionToolBudgetTest(unittest.TestCase):
         self.assertIsNotNone(budget.admit("run-a", on_a, ceiling=False))
         self.assertIsNone(budget.admit("run-a", on_b, ceiling=False))
 
-    def test_a_success_clears_the_streak_and_a_different_failure_restarts_it(self):
+    def test_a_success_clears_the_counts_and_a_different_failure_keeps_its_own(self):
         budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=3)
         for _ in range(2):
             budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
         budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_SUCCESS)
-        self.assertEqual(0, budget.streak_of("run-a"))
+        self.assertEqual(0, budget.streak_of("run-a", self.DELETE))
         for _ in range(2):
             budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
         self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
-        # A failure of another command interrupts the run.
+        # A failure of another command is counted on its own and leaves the
+        # first command's run where it was: the third failure trips it.
         budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_ERROR)
-        self.assertEqual(1, budget.streak_of("run-a"))
-        for _ in range(2):
-            budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual(1, budget.streak_of("run-a", self.LIST))
+        self.assertEqual(2, budget.streak_of("run-a", self.DELETE))
         self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
         budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
         self.assertIsNotNone(budget.admit("run-a", self.DELETE, ceiling=True))
+        self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=True))
+        # Any success of the session's clears every command's run.
+        budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_SUCCESS)
+        self.assertEqual((0, 0), (budget.streak_of("run-a", self.DELETE), budget.streak_of("run-a", self.LIST)))
+        self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
+
+    def test_two_alternating_failing_commands_each_trip_at_their_own_fifth_failure(self):
+        # `while true; do gcloud A; gcloud B; done` with both failing: neither
+        # command's failures reset the other's count, so the loop is refused
+        # both of them after five failures of each.
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=5)
+        for _ in range(5):
+            self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=False))
+            budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+            self.assertIsNone(budget.admit("run-a", self.LIST, ceiling=False))
+            budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_ERROR)
+        self.assertEqual("BROKER_LOOP_BREAKER", budget.admit("run-a", self.DELETE, ceiling=False).code)
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual("BROKER_LOOP_BREAKER", budget.admit("run-a", self.LIST, ceiling=False).code)
+        budget.record("run-a", self.LIST, credential_proxy.TOOL_STATUS_BLOCKED)
+        # The refusals themselves are recorded as blocked and keep both tripped.
+        self.assertEqual((6, 6), (budget.streak_of("run-a", self.DELETE), budget.streak_of("run-a", self.LIST)))
+        self.assertIsNotNone(budget.admit("run-a", self.DELETE, ceiling=False))
+
+    def test_the_breaker_keeps_a_sessions_last_eight_failing_commands(self):
+        # A session's entry stays bounded whatever it sends: past eight
+        # distinct failing commands the oldest-failed is forgotten, and its
+        # count starts again from one when it fails next.
+        self.assertEqual(8, credential_proxy.SESSION_LOOP_BREAKER_SIGNATURES)
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
+        others = [credential_proxy.command_signature(["gcloud", "projects", "describe", str(n)], None) for n in range(8)]
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        for signature in others:
+            budget.record("run-a", signature, credential_proxy.TOOL_STATUS_ERROR)
+        self.assertEqual(8, len(budget._sessions["run-a"].failures))
+        self.assertEqual(0, budget.streak_of("run-a", self.DELETE))
+        budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual(1, budget.streak_of("run-a", self.DELETE))
+        self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=False))
+        # The most recent of the others is still counted: its second failure trips it.
+        budget.record("run-a", others[-1], credential_proxy.TOOL_STATUS_ERROR)
+        self.assertIsNotNone(budget.admit("run-a", others[-1], ceiling=False))
+        self.assertEqual(8, len(budget._sessions["run-a"].failures))
 
     def test_the_signature_is_a_fixed_size_digest_whatever_the_argv_carried(self):
         # The budget keeps the digest, never the argv: a body as large as the
@@ -20927,9 +20970,9 @@ class SessionToolBudgetTest(unittest.TestCase):
         self.assertEqual(short, credential_proxy.command_signature(["gcloud", "projects", "list"], None))
         budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
         budget.record("run-a", huge, credential_proxy.TOOL_STATUS_BLOCKED)
-        self.assertEqual(huge, budget._sessions["run-a"].streak_signature)
-        self.assertEqual(64, len(budget._sessions["run-a"].streak_signature))
-        self.assertEqual(1, budget.streak_of("run-a"))
+        self.assertEqual([huge], list(budget._sessions["run-a"].failures))
+        self.assertEqual(64, len(next(iter(budget._sessions["run-a"].failures))))
+        self.assertEqual(1, budget.streak_of("run-a", huge))
 
     def test_busy_and_abandoned_say_nothing_about_the_command(self):
         budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
@@ -20938,7 +20981,8 @@ class SessionToolBudgetTest(unittest.TestCase):
         for status in (credential_proxy.TOOL_STATUS_BUSY, credential_proxy.TOOL_STATUS_ABANDONED):
             budget.record("run-a", self.DELETE, status)
             budget.record("run-a", self.LIST, status)
-        self.assertEqual(2, budget.streak_of("run-a"))
+        self.assertEqual(2, budget.streak_of("run-a", self.DELETE))
+        self.assertEqual(0, budget.streak_of("run-a", self.LIST))
         self.assertIsNotNone(budget.admit("run-a", self.DELETE, ceiling=True))
 
     def test_a_busy_answer_gives_the_ceiling_its_unit_back_and_abandoned_keeps_it(self):
@@ -21156,6 +21200,24 @@ class SessionToolBudgetRouteTest(unittest.TestCase):
         # The same command from another session is that session's first.
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
             self.assertEqual("SECURITY_POLICY_BLOCKED", self._post(self.DELETE, session_id="run-b")[1]["code"])
+
+    def test_two_alternating_failing_commands_are_each_short_circuited(self):
+        # The stuck-run shape the single streak let through: try X, try Y,
+        # try X, with both failing. Each is refused at its own sixth call.
+        self._budget(max_calls=0, max_identical_failures=5)
+        self.executor.exit_codes[tuple(self.LIST)] = 1
+        self.executor.exit_codes[tuple(self.DESCRIBE)] = 1
+        for _ in range(5):
+            for argv in (self.LIST, self.DESCRIBE):
+                status, body = self._post(argv)
+                self.assertEqual((200, 1), (status, body["exitCode"]))
+        self.assertEqual(10, len(self.executor.calls))
+        for argv in (self.LIST, self.DESCRIBE):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                status, body = self._post(argv)
+            self.assertEqual((403, "BROKER_LOOP_BREAKER"), (status, body["code"]))
+            self.assertTrue(any("loop broken" in line and "streak=5" in line for line in logs.output), logs.output)
+        self.assertEqual(10, len(self.executor.calls), "neither sixth call may reach the executor")
 
     def test_a_success_clears_the_streak(self):
         self._budget(max_calls=0, max_identical_failures=5)
