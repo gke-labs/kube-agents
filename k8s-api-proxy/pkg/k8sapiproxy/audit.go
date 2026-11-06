@@ -35,6 +35,9 @@ const (
 	// OutcomeCanceled is a request the caller gave up on, by closing the connection or
 	// stopping a watch, before the response was complete.
 	OutcomeCanceled Outcome = "canceled"
+	// OutcomeThrottled is a request answered 429 because MaxInFlight requests were already
+	// in flight.
+	OutcomeThrottled Outcome = "throttled"
 )
 
 const (
@@ -163,7 +166,7 @@ func (s slogAuditSink) Record(ctx context.Context, e AuditEvent) {
 
 func auditLevel(e AuditEvent) slog.Level {
 	switch e.Outcome {
-	case OutcomeUnauthenticated, OutcomeRefused:
+	case OutcomeUnauthenticated, OutcomeRefused, OutcomeThrottled:
 		return slog.LevelWarn
 	case OutcomeAuthUnavailable, OutcomeUpstreamError, OutcomeAborted:
 		return slog.LevelError
