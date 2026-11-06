@@ -10621,6 +10621,14 @@ spec:
                             type: string
                           type: array
                           x-kubernetes-list-type: set
+                        answerFeedback:
+                          default: true
+                          description: |-
+                            AnswerFeedback draws thumbs-up and thumbs-down buttons under each
+                            final answer on Google Chat under spec.mode next, and keeps each rating
+                            with its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
+                            False hides the buttons and keeps nothing.
+                          type: boolean
                         enabled:
                           default: false
                           description: Enabled toggles the Google Chat integration.
@@ -12424,6 +12432,90 @@ spec:
                         record of the proposals it opened, can differ from it. Part of the
                         outcomes reading, absent on the same terms as RemediationsMergedTotal.
                         Does not move LastActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromApi:
+                      description: |-
+                        ProposalsFromApi is ProposalsFromChat for work a caller on an A2A door
+                        started: kubeagents_proposals_opened under origin api. Conversation
+                        turns on the gateway's own agent API port count under ProposalsFromOther
+                        until that door writes a record. A 0 is a reading. Absent on the same
+                        terms as ProposalsFromChat. Moves neither LastActiveTime nor
+                        LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromAudit:
+                      description: |-
+                        ProposalsFromAudit is ProposalsFromChat for a scheduled fleet audit:
+                        kubeagents_proposals_opened under origin audit. A 0 is a reading. Absent
+                        on the same terms as ProposalsFromChat. Moves neither LastActiveTime nor
+                        LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromChat:
+                      description: |-
+                        ProposalsFromChat is the agent pod's count now of the pull requests it
+                        opened for work a person asked for on a chat platform, from its durable
+                        proposals ledger: kubeagents_proposals_opened under origin chat, summed
+                        over the platform label, on the chat plugin's listener. A count is taken
+                        only for a proposal the agent verified with the forge and claimed, so
+                        the nine origin fields usually sum to at most RemediationsProposedTotal.
+                        A reading, not an accumulation: the ledger survives a restart and the
+                        plugin reads it whole; a read that fails after the plugin's first success
+                        keeps serving the last counts, so a stale count reads as current until
+                        the plugin restarts. A 0 is a reading. Absent until the first
+                        reading, after two polls in a row without one, and while the served CRD
+                        predates the field. Moves neither LastActiveTime nor
+                        LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromConsole:
+                      description: |-
+                        ProposalsFromConsole is ProposalsFromChat for work started from the web
+                        console, the admin console's chat page, the A2A gateway's console
+                        backend or the dashboard: kubeagents_proposals_opened under origin
+                        console. A 0 is a reading. Absent on the same terms as
+                        ProposalsFromChat. Moves neither LastActiveTime nor LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromDrift:
+                      description: |-
+                        ProposalsFromDrift is ProposalsFromChat for the drift detector's work:
+                        kubeagents_proposals_opened under origin drift. A 0 is a reading. Absent
+                        on the same terms as ProposalsFromChat. Moves neither LastActiveTime nor
+                        LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromEvent:
+                      description: |-
+                        ProposalsFromEvent is ProposalsFromChat for the event watcher's triage
+                        of a cluster event: kubeagents_proposals_opened under origin event. A 0
+                        is a reading. Absent on the same terms as ProposalsFromChat. Moves
+                        neither LastActiveTime nor LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromIssue:
+                      description: |-
+                        ProposalsFromIssue is ProposalsFromChat for a claimed GitHub issue:
+                        kubeagents_proposals_opened under origin issue. A 0 is a reading. Absent
+                        on the same terms as ProposalsFromChat. Moves neither LastActiveTime nor
+                        LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromOther:
+                      description: |-
+                        ProposalsFromOther is ProposalsFromChat for work whose origin none of
+                        the other eight resolves: kubeagents_proposals_opened under origin
+                        other. A 0 is a reading. Absent on the same terms as ProposalsFromChat.
+                        Moves neither LastActiveTime nor LastHumanActiveTime.
+                      format: int64
+                      type: integer
+                    proposalsFromScheduled:
+                      description: |-
+                        ProposalsFromScheduled is ProposalsFromChat for any other scheduled job
+                        the image ships: kubeagents_proposals_opened under origin scheduled. A 0
+                        is a reading. Absent on the same terms as ProposalsFromChat. Moves
+                        neither LastActiveTime nor LastHumanActiveTime.
                       format: int64
                       type: integer
                     proposalsMergedUntouched:

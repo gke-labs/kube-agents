@@ -32,6 +32,9 @@ type fakeRecorder struct {
 	// onRate runs inside Rate, for a test that checks what had happened
 	// by then.
 	onRate func()
+	// failRating, when set, makes Rate fail for that rating and keep
+	// nothing.
+	failRating string
 }
 
 func (f *fakeRecorder) Admits(_, rater string) bool { return f.admit[rater] }
@@ -43,6 +46,9 @@ func (f *fakeRecorder) Rate(r FeedbackRating) (bool, error) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failRating != "" && r.Rating == f.failRating {
+		return false, errFeedbackContended
+	}
 	f.ratings = append(f.ratings, r)
 	return !f.noAsk, f.rateErr
 }
@@ -309,7 +315,7 @@ func TestSlackDownRatingOpensTheNoteAndKeepsTheExchange(t *testing.T) {
 		t.Fatalf("views = %+v, want the note modal opened on the tap's trigger", api.views)
 	}
 	view, _ := json.Marshal(api.views[0])
-	for _, want := range []string{slackFeedbackTitle, slackFeedbackLabel, `"optional":true`, "Your question and this answer are kept on your install for 30 days", slackFeedbackSubmit, slackFeedbackClose} {
+	for _, want := range []string{feedbackNoteTitle, feedbackNoteLabel, `"optional":true`, "Your question and this answer are kept on your install for 30 days", feedbackNoteSend, feedbackNoteCancel} {
 		if !strings.Contains(string(view), want) {
 			t.Errorf("modal lacks %q: %s", want, view)
 		}

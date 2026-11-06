@@ -575,6 +575,25 @@ func TestAPluginsAPIServerKeyDoesNotReachTheBridge(t *testing.T) {
 	}
 }
 
+// The bridge's debugging switch for error text on TASKS is never on by
+// configuration: an AgentPlugin's env that sets it reaches the agent container
+// but not the bridge, and the bridge's own "false" also beats an envFrom key.
+func TestAPluginCannotTurnOnTheBridgesErrorText(t *testing.T) {
+	c := containersNamed(bridgeTestPod(provisionedAgent()), "platform-agent")[0].DeepCopy()
+	c.Env = append(c.Env, corev1.EnvVar{Name: a2aBridgeDebugErrorTextEnvVar, Value: "true"})
+	c.EnvFrom = append(c.EnvFrom, corev1.EnvFromSource{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "plugin-env"}}})
+	b := buildA2ABridgeContainer(provisionedAgent(), *c)
+	var got []corev1.EnvVar
+	for _, e := range b.Env {
+		if e.Name == a2aBridgeDebugErrorTextEnvVar {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 || got[0].Value != "false" || got[0].ValueFrom != nil {
+		t.Errorf("the bridge's %s = %+v, want its own \"false\" once", a2aBridgeDebugErrorTextEnvVar, got)
+	}
+}
+
 // The gateway's busy-notice threshold is the bridge's worker count: the turn
 // that finds every worker taken is the first one told it waits. It follows
 // the rendered bridge's default and the operator setting that sizes it, and a

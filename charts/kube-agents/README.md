@@ -833,6 +833,16 @@ release is a mode switch rather than a setting: the operator rolls the agent
 and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
 caps the A2A session pods a `next` install runs at once and renders only when set.
 
+### MCP server (`operator.mcpServer.enabled`)
+
+`operator.mcpServer.enabled: true` sets `A2A_MCP_DOOR=true` on the controller manager, which
+then renders the MCP server (`<agent>-a2a-mcp`) beside every `next`-mode `PlatformAgent` it
+manages. It defaults to `false`, and under `today` the operator renders nothing for it. An
+`A2A_MCP_DOOR` entry in `operator.extraEnv`, the way to turn it on before this value existed,
+still works and wins over the value. The
+[MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
+what it renders and how a client connects.
+
 ### Data volume size (`platformAgent.storage.size`)
 
 `platformAgent.storage.size` is the CR's `spec.storage.size`: the request of the agent's
@@ -1166,8 +1176,9 @@ Exactly one owner creates the broker's KSA, depending on
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs four cluster-scoped
-`ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
+`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, and a fourth where the web
+console and its environment page are on. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
 namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
@@ -1189,7 +1200,9 @@ The fourth, `kube-agents-web-console-cr`, is generated from
 web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
-makes.
+makes. Inside `forges`, the console may not move an existing forge's credential to
+another host, add a forge with a credential, add a GitHub forge at a new host, or
+change the install's GitHub host.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
@@ -1264,10 +1277,10 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-It also counts the standing pods the operator renders only behind an `operator.extraEnv` flag,
+It also counts the standing pods the operator renders only behind an operator flag,
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true`, and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but
-blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
+and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
 as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
@@ -1542,7 +1555,7 @@ helm uninstall kube-agents -n kubeagents-system
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 - `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
-  `operator.extraEnv` flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
+  operator flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
   (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
   differ, so edit both together.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from

@@ -20,8 +20,10 @@ import (
 // The gateway marks the one message of a chain that is its answer
 // (OutMessage.Feedback, set by the relay where the DeliverableObserver is
 // handed the same result), and a backend that draws rating controls draws
-// them there; today that is Slack, with its own feedback buttons. A rating
-// from a sender the gateway would not take a turn from changes nothing.
+// them there: Slack with its feedback buttons, Google Chat with rating
+// buttons among the text message's accessory widgets (only its 👎 note box
+// is a card). A rating from a sender the gateway would not take a turn from
+// changes nothing.
 //
 // Each rating is counted (answer_feedback_total) and kept in the feedback
 // bucket: the ask that started the rated chain, the answer and the ids, and
@@ -211,7 +213,7 @@ func (d *feedbackDesk) lockKey(key string) func() {
 // calls retryFeedback after the bind when it did not.
 func (g *Gateway) startFeedback(ctx context.Context) bool {
 	if g.cfg.AnswerFeedbackOff {
-		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback)")
+		g.log.Info("answer feedback is off: turned off on this install (slack.answerFeedback or googleChat.answerFeedback)")
 		return true
 	}
 	return g.tryFeedback(ctx, false)

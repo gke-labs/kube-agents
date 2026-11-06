@@ -597,6 +597,51 @@ func (in *AgentUsageStatus) DeepCopyInto(out *AgentUsageStatus) {
 		*out = new(int64)
 		**out = **in
 	}
+	if in.ProposalsFromChat != nil {
+		in, out := &in.ProposalsFromChat, &out.ProposalsFromChat
+		*out = new(int64)
+		**out = **in
+	}
+	if in.ProposalsFromConsole != nil {
+		in, out := &in.ProposalsFromConsole, &out.ProposalsFromConsole
+		*out = new(int64)
+		**out = **in
+	}
+	if in.ProposalsFromApi != nil {
+		in, out := &in.ProposalsFromApi, &out.ProposalsFromApi
+		*out = new(int64)
+		**out = **in
+	}
+	if in.ProposalsFromEvent != nil {
+		in, out := &in.ProposalsFromEvent, &out.ProposalsFromEvent
+		*out = new(int64)
+		**out = **in
+	}
+	if in.ProposalsFromDrift != nil {
+		in, out := &in.ProposalsFromDrift, &out.ProposalsFromDrift
+		*out = new(int64)
+		**out = **in
+	}
+	if in.ProposalsFromAudit != nil {
+		in, out := &in.ProposalsFromAudit, &out.ProposalsFromAudit
+		*out = new(int64)
+		**out = **in
+	}
+	if in.ProposalsFromScheduled != nil {
+		in, out := &in.ProposalsFromScheduled, &out.ProposalsFromScheduled
+		*out = new(int64)
+		**out = **in
+	}
+	if in.ProposalsFromIssue != nil {
+		in, out := &in.ProposalsFromIssue, &out.ProposalsFromIssue
+		*out = new(int64)
+		**out = **in
+	}
+	if in.ProposalsFromOther != nil {
+		in, out := &in.ProposalsFromOther, &out.ProposalsFromOther
+		*out = new(int64)
+		**out = **in
+	}
 	if in.ClustersRegistered != nil {
 		in, out := &in.ClustersRegistered, &out.ClustersRegistered
 		*out = new(int64)
@@ -1140,6 +1185,11 @@ func (in *GoogleChatSpec) DeepCopyInto(out *GoogleChatSpec) {
 		in, out := &in.AllowedUsers, &out.AllowedUsers
 		*out = make([]string, len(*in))
 		copy(*out, *in)
+	}
+	if in.AnswerFeedback != nil {
+		in, out := &in.AnswerFeedback, &out.AnswerFeedback
+		*out = new(bool)
+		**out = **in
 	}
 }
 

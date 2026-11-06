@@ -154,6 +154,11 @@ spec:
             - name: IMAGE_PULL_SECRETS
               value: {{ . | quote }}
             {{- end }}
+            {{- /* Operator flags turned on by first-class values (operator.mcpServer.enabled
+                   sets A2A_MCP_DOOR). */}}
+            {{- with (include "kube-agents.operatorFlagEnv" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- /* Last occurrence of a name wins in a container's env, so an
                    operator.extraEnv entry still overrides anything above. */}}
             {{- with .Values.operator.extraEnv }}
