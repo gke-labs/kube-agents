@@ -460,8 +460,9 @@ EOF
 - A requested change with no defect: `finding` is the request; `checks` is the
   read that shows the current state.
 - No secret values in any field: name a Secret and its keys, never its
-  `data`. `submit` refuses output holding a Secret manifest or key material and
-  redacts known token shapes; do not rely on either.
+  `data`. `submit` refuses any field holding a Secret manifest, a `data:` value,
+  key material or a `kubectl get secret -o …` read, and redacts known token
+  shapes; do not rely on either.
 - At most five entries per list. JSON escaping applies: `\n` for a newline,
   `\"` for a quote.
 

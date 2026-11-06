@@ -945,6 +945,45 @@ MAX_EVIDENCE_TEXT_CHARS = 1500
 # `kind: Secret` as YAML or JSON prints it, alone on its line.
 SECRET_MANIFEST = re.compile(r'^[ \t]*"?kind"?[ \t]*:[ \t]*"?Secret"?[ \t]*,?[ \t]*$', re.MULTILINE)
 KEY_MATERIAL = re.compile(r"client-key-data|-----BEGIN [A-Z ]*PRIVATE KEY-----")
+# A read that prints a Secret's values: `kubectl get secret … -o yaml|json|
+# jsonpath|go-template`. The plain listing and `describe` print sizes only.
+SECRET_READ = re.compile(
+    r"\bkubectl\b[^|;&\n]*\bget\b[^|;&\n]*\bsecrets?\b[^|;&\n]*"
+    r"(?:-o|--output)[ \t=]*['\"]?(?:yaml|json|jsonpath|go-template|template)",
+    re.IGNORECASE,
+)
+# A `data:` map, YAML or JSON, the excerpt of a manifest the skill asks for.
+DATA_KEY = re.compile(r'^([ \t]*)"?data"?[ \t]*:[ \t]*(\{.*)?$')
+DATA_ENTRY = re.compile(r'"?[\w.-]+"?[ \t]*:[ \t]*"?([A-Za-z0-9+/]+={0,2})"?[ \t]*,?')
+
+
+def _base64_value(value: str) -> bool:
+    return len(value) >= 8 and len(value) % 4 == 0
+
+
+def holds_secret_data(text: str) -> bool:
+    """Whether text carries a `data:` entry whose value reads as base64.
+
+    The excerpt shape, with or without the `kind: Secret` line above it, and
+    the JSON shape `"data": {"key": "…"}`, CRLF line ends included.
+    """
+    lines = text.replace("\r", "").split("\n")
+    for i, line in enumerate(lines):
+        key = DATA_KEY.match(line)
+        if not key:
+            continue
+        if key.group(2):  # JSON, or YAML flow style: the map is on this line.
+            if any(_base64_value(m.group(1)) for m in DATA_ENTRY.finditer(key.group(2).strip("{} "))):
+                return True
+            continue
+        indent = len(key.group(1))
+        for entry in lines[i + 1:]:
+            if entry.strip() and len(entry) - len(entry.lstrip()) <= indent:
+                break
+            m = DATA_ENTRY.fullmatch(entry.strip())
+            if m and _base64_value(m.group(1)):
+                return True
+    return False
 
 
 def _evidence_refusal(problem: str) -> ValueError:
@@ -992,8 +1031,12 @@ def load_evidence(path: str | None) -> dict:
                 raise _evidence_refusal(f"evidence `{key}[{i}]` is not an object")
             entry = {name: text_field(item.get(name), f"{key}[{i}].{name}") for name in required}
             for name in optional:
-                if item.get(name) is not None:
-                    entry[name] = text_field(item.get(name), f"{key}[{i}].{name}")
+                # A blank optional field is absent: the template pre-fills
+                # the key, and blanking it is how an agent says "nothing".
+                value = item.get(name)
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    continue
+                entry[name] = text_field(value, f"{key}[{i}].{name}")
             out.append(entry)
         return out
 
@@ -1003,16 +1046,26 @@ def load_evidence(path: str | None) -> dict:
         "change": text_field(evidence.get("change"), "change"),
         "verify": items("verify", ("command",), ("expect",)),
     }
-    for i, check in enumerate(loaded["checks"]):
-        # Redaction knows token shapes, not a Secret's base64 `data:` or a
-        # kubeconfig's key, and a read-only `kubectl get secret -o yaml` prints
-        # both. The body is published, so these are refused, not passed on.
-        if SECRET_MANIFEST.search(check["output"]) or KEY_MATERIAL.search(check["output"]):
+    # Redaction knows token shapes, not a Secret's base64 `data:` or a
+    # kubeconfig's key, and a read-only `kubectl get secret -o yaml` prints
+    # both. The body is published, so these are refused, not passed on, in
+    # every field the body renders.
+    fields = [("finding", loaded["finding"]), ("change", loaded["change"])]
+    for key in ("checks", "verify"):
+        for i, item in enumerate(loaded[key]):
+            fields += [(f"{key}[{i}].{name}", value) for name, value in item.items()]
+    for where, value in fields:
+        flat = value.replace("\r", "")
+        if (
+            SECRET_MANIFEST.search(flat) or KEY_MATERIAL.search(flat) or holds_secret_data(flat)
+            or (where.endswith(".command") and SECRET_READ.search(flat))
+        ):
             raise ValueError(
-                f"evidence `checks[{i}].output` holds a Secret manifest or key "
-                "material, and the proposal body is published. Quote the "
-                "object's name, type and the key names only, never the "
-                "values, and pass --evidence-file again."
+                f"evidence `{where}` holds a Secret manifest, Secret data or key "
+                "material, or a read that prints them, and the proposal body is "
+                "published. Quote the object's name, type and the key names "
+                "only, never the values (`kubectl get secret` without `-o`, or "
+                "`kubectl describe secret`), and pass --evidence-file again."
             )
     return loaded
 

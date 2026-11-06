@@ -1916,7 +1916,7 @@ class SubmitSuggestionTestCase(unittest.TestCase):
         evidence = {
             **EVIDENCE,
             "checks": [{
-                "command": f"kubectl get secret x -o yaml  # {token}",
+                "command": f"kubectl get deploy x -o yaml  # {token}",
                 "output": "```\nescaped?\n" + "\n".join(f"line {i}" for i in range(100)),
             }],
             "verify": [{"command": "kubectl get pdb -A"}],
@@ -1949,10 +1949,48 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                 evidence = {**EVIDENCE, "checks": [{"command": "kubectl get secret x -o yaml", "output": output}]}
                 with self.assertRaises(ValueError) as caught:
                     submit_suggestion.load_evidence(self.evidence_file(evidence))
-                self.assertIn("Secret manifest or key material", str(caught.exception))
+                self.assertIn("Secret manifest, Secret data or key material", str(caught.exception))
         # A Secret named in prose is not a manifest.
         named = {**EVIDENCE, "checks": [{"command": "kubectl get secret -n app", "output": "NAME   TYPE\ndb     Opaque"}]}
         submit_suggestion.load_evidence(self.evidence_file(named))
+
+    def test_secret_data_excerpts_and_reads_are_refused_in_every_field(self):
+        """The excerpt the skill asks for drops the `kind:` line; the guard
+        reads the `data:` block itself, the command beside it, CRLF output,
+        and every field the body renders, not only checks[].output."""
+        listing = {"command": "kubectl get pdb -A", "output": "No resources found."}
+        for broken, where in (
+            ({"checks": [{"command": "kubectl get pdb -A", "output": "data:\n  password: aHVudGVyMg==\n"}]}, "checks[0].output"),
+            ({"checks": [{"command": "kubectl get pdb -A", "output": "  data:\r\n    password: aHVudGVyMg==\r\n"}]}, "checks[0].output"),
+            ({"checks": [{"command": "kubectl get pdb -A", "output": 'apiVersion: v1\r\nkind: Secret\r\n'}]}, "checks[0].output"),
+            ({"checks": [{"command": "kubectl get pdb -A", "output": '"data": {"password": "aHVudGVyMg=="},'}]}, "checks[0].output"),
+            ({"checks": [{"command": "kubectl get secret db -n app -o jsonpath='{.data}'", "output": "{}"}]}, "checks[0].command"),
+            ({"checks": [{"command": "kubectl get secret/db -o yaml | grep -A3 data:", "output": "x"}]}, "checks[0].command"),
+            ({"checks": [{"command": "kubectl -n app get secrets --output=json", "output": "x"}]}, "checks[0].command"),
+            ({"checks": [listing], "finding": "The Secret holds a stale password:\ndata:\n  password: aHVudGVyMg=="}, "finding"),
+            ({"checks": [listing], "verify": [{"command": "kubectl get pdb", "expect": "data:\n  token: c2VjcmV0dmFsdWU="}]}, "verify[0].expect"),
+        ):
+            with self.subTest(where=where, broken=str(broken)[:60]):
+                with self.assertRaises(ValueError) as caught:
+                    submit_suggestion.load_evidence(self.evidence_file({**EVIDENCE, **broken}))
+                self.assertIn(f"evidence `{where}`", str(caught.exception))
+        for fine in (
+            # A ConfigMap's data with values that are not base64-shaped.
+            {"command": "kubectl get cm app -o yaml", "output": "data:\n  LOG_LEVEL: debug\n  REPLICAS: \"2\"\nkind: ConfigMap"},
+            {"command": "kubectl describe secret db -n app", "output": "Data\n====\npassword:  8 bytes"},
+            {"command": "kubectl get secret -n app -o wide", "output": "NAME TYPE DATA AGE"},
+        ):
+            with self.subTest(fine=fine["command"]):
+                submit_suggestion.load_evidence(self.evidence_file({**EVIDENCE, "checks": [fine]}))
+
+    def test_a_blank_optional_expect_is_absent_not_missing(self):
+        evidence = {**EVIDENCE, "verify": [{"command": "kubectl get pdb -A", "expect": "  "}]}
+        loaded = submit_suggestion.load_evidence(self.evidence_file(evidence))
+        self.assertEqual(loaded["verify"], [{"command": "kubectl get pdb -A"}])
+        # A non-string is still refused by name.
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.load_evidence(self.evidence_file({**EVIDENCE, "verify": [{"command": "x", "expect": 3}]}))
+        self.assertIn("`verify[0].expect`", str(caught.exception))
 
     def test_the_bench_case_grades_the_headings_this_renders(self):
         """pdb-remediation-pr's `body_contains` names strings render_evidence writes;
