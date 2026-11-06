@@ -929,6 +929,19 @@ def resource_group(resource: str) -> str:
     return resource.split(".", 1)[1] if "." in resource else ""
 
 
+def lost_kinds(record: dict | None, candidates: list[str]) -> set[str]:
+    """The kinds a discovery record names whose whole group is absent from
+    the candidates this tick's api-resources listing gave. A listing gap
+    until a listing shows the group again: their rows are held, and they
+    are not read. A kind missing while its group is still served is not in
+    this set: a deleted CRD took its objects with it, and its rows clear."""
+    if not isinstance(record, dict):
+        return set()
+    known = record.get(DISCOVERY_KINDS_KEY) if isinstance(record.get(DISCOVERY_KINDS_KEY), dict) else {}
+    served_groups = {resource_group(c) for c in candidates}
+    return {r for r in set(known) | set(record.get(DISCOVERY_UNKNOWN_KEY) or []) if resource_group(r) not in served_groups}
+
+
 def discovery_due(record: dict | None, now: str, refreshed: int) -> bool:
     """Whether a cluster's wildcard discovery runs this tick: at once with no
     record, after DISCOVERY_RETRY_SECONDS when the record left kinds unknown
@@ -958,10 +971,12 @@ def resource_for(kind: str, api_version: str, batch: list[str]) -> str:
 def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: dict | None = None) -> dict:
     """Which of `candidates` have objects on the cluster, and in which
     namespaces, from DISCOVERY_BATCH_KINDS kinds per `kubectl get`. A kind
-    the `previous` record names whose group is not among the candidates is
-    not listed and goes to the new record's unknown kinds: the api-resources
-    listing lost the group, and a listing gap must not clear a card, on a
-    refresh tick any more than on another. A kind
+    the `previous` record names whose group is not among the candidates
+    (`lost_kinds`) is not listed and is carried into the new record as it
+    was: the api-resources listing lost the group, and a listing gap must not
+    clear a card, on a refresh tick any more than on another. Carried as
+    known rather than unknown, so a group gone for good costs no hourly
+    retry; `wildcard_kinds_for` holds it from the listing each tick. A kind
     that printed an object is read wherever it printed one. Every kind in a
     batch that exited 0 and was not cut is known: empty where it printed
     nothing. Every kind in any other batch is unknown as well, the ones that
@@ -1006,10 +1021,10 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: d
                 kinds.setdefault(resource, [])
             else:
                 unknown.append(resource)
-    served_groups = {resource_group(c) for c in candidates}
     if isinstance(previous, dict):
-        before = set((previous.get(DISCOVERY_KINDS_KEY) or {}) if isinstance(previous.get(DISCOVERY_KINDS_KEY), dict) else []) | set(previous.get(DISCOVERY_UNKNOWN_KEY) or [])
-        unknown += [r for r in before if resource_group(r) not in served_groups and r not in kinds and r not in unknown]
+        before = previous.get(DISCOVERY_KINDS_KEY) if isinstance(previous.get(DISCOVERY_KINDS_KEY), dict) else {}
+        for resource in lost_kinds(previous, candidates):
+            kinds.setdefault(resource, list(before.get(resource) or []))
     return {DISCOVERY_AT_KEY: now, DISCOVERY_KINDS_KEY: kinds, DISCOVERY_UNKNOWN_KEY: sorted(unknown)}
 
 
@@ -1025,8 +1040,7 @@ def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: li
     known = (record or {}).get(DISCOVERY_KINDS_KEY) if isinstance(record, dict) else None
     if not isinstance(known, dict):
         return {}, set(candidates), {}
-    served_groups = {resource_group(c) for c in candidates}
-    stale = {r for r in known if resource_group(r) not in served_groups}
+    stale = lost_kinds(record, candidates)
     held = (set(candidates) - set(known)) | set((record or {}).get(DISCOVERY_UNKNOWN_KEY) or []) | stale
     by_namespace: dict[str, list[str]] = {}
     for resource, namespaces in sorted(known.items()):

@@ -2025,27 +2025,26 @@ class ConfigConnector(Base):
         self.assertEqual(lines, [], "the lost group's row is held across the refresh")
         self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["SQLInstance/orders-db"])
         record = self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")]
-        self.assertEqual(record[stall_watch.DISCOVERY_UNKNOWN_KEY], [KCC_SQL], "carried as unknown, so the hourly retry re-checks it")
-        # The group comes back an hour later: read again, and the row clears
-        # when the object is gone.
-        lines, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], now="2026-11-06T08:00:00+00:00")
+        self.assertEqual(record[stall_watch.DISCOVERY_KINDS_KEY][KCC_SQL], ["payments"], "carried as it was, and held from the listing each tick")
+        self.assertEqual(record[stall_watch.DISCOVERY_UNKNOWN_KEY], [], "a group gone for good costs no hourly retry")
+        # The group comes back at the next refresh: read again, and the row
+        # clears when the object is gone.
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], now="2026-11-06T13:00:00+00:00")
         self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_SQL, KCC_BUCKETS]])
         self.assertEqual(len(self.cleared(lines)), 1)
 
     def test_a_tick_out_of_budget_before_discovery_runs_none(self):
-        exhausted = {"now": False}
-        real_served, real_out_of_budget = stall_watch.served_kinds, stall_watch.Sweep.out_of_budget
+        jump = {"seconds": 0}
+        real_served, real_monotonic = stall_watch.served_kinds, stall_watch.time.monotonic
 
         def served_then_exhaust(kubeconfig):
+            # The clock passes the budget once the listing is in, before
+            # any discovery or scan.
             served = real_served(kubeconfig)
-            exhausted["now"] = True
+            jump["seconds"] = stall_watch.TICK_BUDGET_SECONDS + 1
             return served
 
-        def out_of_budget(self, started, cid, namespace=None):
-            # Past the budget from the first check after the listing.
-            return real_out_of_budget(self, started - (stall_watch.TICK_BUDGET_SECONDS + 1) if exhausted["now"] else started, cid, namespace)
-
-        with patch.object(stall_watch, "served_kinds", served_then_exhaust), patch.object(stall_watch.Sweep, "out_of_budget", out_of_budget):
+        with patch.object(stall_watch, "served_kinds", served_then_exhaust), patch.object(stall_watch.time, "monotonic", lambda: real_monotonic() + jump["seconds"]):
             _, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=KCC_OBJECTS)
         self.assertEqual(fake.discoveries(), [], "no six-command discovery after the budget is spent")
         self.assertEqual(fake.scanned(), [])
