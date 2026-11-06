@@ -592,6 +592,11 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          route, the statuses, the fallback links, the payload's
 #                          normalisation); the same module's broker half files the
 #                          form from the broker pod, which is the side with egress
+#   feedback_summary.py    the usage summary's collect, render and audit, imported
+#                          by the same client for its `summary` subcommand: the
+#                          resource read goes through the kubectl shim, and the
+#                          in-pod sources are left off (exec is a write verb to
+#                          the broker's command policy)
 #   fleet_scope_args.py    the flags (`--scope-projects`, `--scope-unread`,
 #                          `--scope-exclude-clusters`) the
 #                          fleet-audit collectors take the install's declared scope
@@ -681,6 +686,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/credential_shapes.py \
      agents/platform/scripts/feedback_broker.py \
+     agents/platform/scripts/feedback_summary.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \

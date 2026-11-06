@@ -93,6 +93,8 @@ REASON_SKIPPED = "skipped by --no-exec"
 EXIT_OK = 0
 EXIT_COLLECT = 1
 EXIT_LEAK = 3
+#: The one stderr prefix, here and in the feedback client's ``summary`` subcommand.
+LOG_PREFIX = "feedback-summary: "
 UNAVAILABLE = "unavailable"
 NEVER = "never"
 UNKNOWN = "unknown"
@@ -785,6 +787,18 @@ def _origin_line(usage: Mapping[str, Any]) -> str:
     return f"{ORIGIN_LINE_PREFIX}{shown}{USAGE_AGENT_READING_SUFFIX}"
 
 
+def audited_block(snapshot: Snapshot) -> Tuple[str, List[str]]:
+    """The rendered block and the identifiers that leak into it.
+
+    The audit runs over the block less its model line and its origin line, the
+    lines printed by design. ``main`` and the feedback client's ``summary``
+    subcommand both go through here, so the check that guards a pasted block
+    and the check that guards an attached one are one check.
+    """
+    text = render(snapshot)
+    return text, audit(_without_fixed_lines(text), snapshot.identifiers)
+
+
 # --- rendering ------------------------------------------------------------------
 
 def _duration(seconds: float) -> str:
@@ -1131,16 +1145,15 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     try:
         snapshot = collect(options)
     except CollectError as error:
-        print(f"feedback-summary: {error}", file=stderr)
+        print(f"{LOG_PREFIX}{error}", file=stderr)
         return EXIT_COLLECT
-    text = render(snapshot)
+    text, leaked = audited_block(snapshot)
     missing = [name for name, present in snapshot.sources.items() if not present]
     if missing and options.in_pod:
         detail = "; ".join(f"{name}: {snapshot.source_reasons.get(name, REASON_EXEC)}" for name in missing)
-        print(f"feedback-summary: could not be read: {detail}", file=stderr)
-    leaked = audit(_without_fixed_lines(text), snapshot.identifiers)
+        print(f"{LOG_PREFIX}could not be read: {detail}", file=stderr)
     if leaked:
-        print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)
+        print(f"{LOG_PREFIX}refused to print: the block names {', '.join(leaked)}", file=stderr)
         return EXIT_LEAK
     print(text, file=stdout)
     return EXIT_OK
