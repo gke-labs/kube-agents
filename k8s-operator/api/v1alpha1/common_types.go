@@ -1690,6 +1690,18 @@ type SecuritySpec struct {
 	// Ignored for any other egressPolicy value.
 	// +optional
 	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+
+	// DisallowSecretsRead omits core `secrets` (`get`, `list`, `watch`) from the
+	// reader ClusterRole (`kubeagents:minimal:<ns>:<name>`).
+	//
+	// True omits `secrets` from the ClusterRole.
+	// False grants `get`, `list`, and `watch` on `secrets` (`<name>-kube-proxy`
+	// strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+	// Absent (nil) grants `secrets` on a new install where the ClusterRole does
+	// not exist yet (when the operator holds `list` and `watch` on `secrets`).
+	// On an existing install, absent preserves the existing ClusterRole's `secrets` rule.
+	// +optional
+	DisallowSecretsRead *bool `json:"disallowSecretsRead,omitempty"`
 }
 
 // WorkloadIdentityFederationSpec names the pool the proxy federates through and

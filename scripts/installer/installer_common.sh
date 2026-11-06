@@ -5222,6 +5222,10 @@ write_tfvars_from_state() {
     print_error "SCOPED_SA_POOL_ENABLED='${scoped_pool_enabled}' is neither true nor false. Fix it in install.env."
     return 1
   fi
+  if [ -n "${DISALLOW_SECRETS_READ:-}" ] && ! is_bool_spelling "$DISALLOW_SECRETS_READ"; then
+    print_error "DISALLOW_SECRETS_READ='${DISALLOW_SECRETS_READ}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
   require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
   # The same reason, with a sharper edge: read as off, a misspelt value
   # revokes the gateway's role on the serving project at the next apply, and
@@ -5385,6 +5389,9 @@ write_tfvars_from_state() {
     echo "scoped_pool_enabled      = $(hcl_bool "$scoped_pool_enabled")"
     if [ -n "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" ]; then
       echo "scoped_pool_max_accounts = ${SCOPED_SA_POOL_MAX_ACCOUNTS}"
+    fi
+    if [ -n "${DISALLOW_SECRETS_READ:-}" ]; then
+      echo "disallow_secrets_read    = $(hcl_bool "$DISALLOW_SECRETS_READ")"
     fi
     echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then

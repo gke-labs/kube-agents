@@ -563,6 +563,100 @@ func TestReconcileRBAC_DeletesLegacyRBAC_ServiceAccountSwap(t *testing.T) {
 	}
 }
 
+func TestReconcileRBAC_DisallowSecretsReadAndExistingInstallPreservation(t *testing.T) {
+	scheme := setupScheme()
+	roleName := "kubeagents:minimal:test-ns:test-agent"
+
+	t.Run("new install with unset DisallowSecretsRead grants secrets", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if !clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected new install ClusterRole to grant secrets, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("existing install without secrets keeps existing RBAC when DisallowSecretsRead is unset", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, false)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected existing ClusterRole without secrets to omit secrets when DisallowSecretsRead is unset, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("existing install without secrets adds secrets when DisallowSecretsRead is false", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						DisallowSecretsRead: ptr.To(false),
+					},
+				},
+			},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, false)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if !clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected DisallowSecretsRead=false to grant secrets on existing ClusterRole, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("DisallowSecretsRead=true omits secrets on new and existing installs", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						DisallowSecretsRead: ptr.To(true),
+					},
+				},
+			},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, true)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected DisallowSecretsRead=true to omit secrets, got %v", role.Rules[0].Resources)
+		}
+	})
+}
+
 func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	scheme := setupScheme()
 

@@ -3798,13 +3798,50 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	return nil
 }
 
+func clusterRoleGrantsCoreSecrets(role *rbacv1.ClusterRole) bool {
+	if role == nil {
+		return false
+	}
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.APIGroups, "") && slices.Contains(rule.Resources, "secrets") {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *PlatformAgentReconciler) resolveMinimalRoleSecretsRead(ctx context.Context, agent *agentv1alpha1.PlatformAgent, minimalRoleName string) (bool, error) {
+	if agent.Spec.Security != nil && agent.Spec.Security.DisallowSecretsRead != nil {
+		return !*agent.Spec.Security.DisallowSecretsRead, nil
+	}
+	if r.RBAC != nil {
+		denied := r.RBAC.Denied()
+		if slices.Contains(denied, "list secrets") || slices.Contains(denied, "watch secrets") {
+			return false, nil
+		}
+	}
+	var existing rbacv1.ClusterRole
+	err := r.Get(ctx, client.ObjectKey{Name: minimalRoleName}, &existing)
+	if errors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read minimal ClusterRole %s: %w", minimalRoleName, err)
+	}
+	return clusterRoleGrantsCoreSecrets(&existing), nil
+}
+
 func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
 	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
 	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
 
 	// Reconcile minimal read-only audit ClusterRole and ClusterRoleBinding
-	minimalRole := buildMinimalPlatformRole(agent)
+	allowSecretsRead, err := r.resolveMinimalRoleSecretsRead(ctx, agent, minimalBindingName)
+	if err != nil {
+		return err
+	}
+	minimalRole := buildMinimalPlatformRoleWithSecrets(agent, allowSecretsRead)
 	if err := r.applyManaged(ctx, agent, minimalRole); err != nil {
 		return fmt.Errorf("failed to reconcile minimal ClusterRole: %w", err)
 	}

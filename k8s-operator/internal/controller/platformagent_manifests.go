@@ -6002,8 +6002,28 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	}
 }
 
+// agentAllowsSecretsRead returns false when spec.security.disallowSecretsRead is true.
+func agentAllowsSecretsRead(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Spec.Security != nil && agent.Spec.Security.DisallowSecretsRead != nil {
+		return !*agent.Spec.Security.DisallowSecretsRead
+	}
+	return true
+}
+
 // buildMinimalPlatformRole generates the minimal read-only audit ClusterRole manifest
 func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
+	return buildMinimalPlatformRoleWithSecrets(agent, agentAllowsSecretsRead(agent))
+}
+
+func buildMinimalPlatformRoleWithSecrets(agent *agentv1alpha1.PlatformAgent, allowSecretsRead bool) *rbacv1.ClusterRole {
+	coreResources := []string{
+		"nodes", "namespaces", "pods", "pods/log", "services", "endpoints",
+		"events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas",
+		"limitranges", "configmaps", "serviceaccounts",
+	}
+	if allowSecretsRead {
+		coreResources = append(coreResources, "secrets")
+	}
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -6015,7 +6035,7 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts", "secrets"},
+				Resources: coreResources,
 				Verbs:     []string{"get", "list", "watch"},
 			},
 			{

@@ -3249,6 +3249,38 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
 		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
 	}
+
+	// DisallowSecretsRead=true omits secrets from the core group rule.
+	disallowedAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					DisallowSecretsRead: ptr.To(true),
+				},
+			},
+		},
+	}
+	disallowedRole := buildMinimalPlatformRole(disallowedAgent)
+	if slices.Contains(disallowedRole.Rules[0].Resources, "secrets") {
+		t.Errorf("expected DisallowSecretsRead=true to omit secrets, got %v", disallowedRole.Rules[0].Resources)
+	}
+
+	// DisallowSecretsRead=false includes secrets in the core group rule.
+	allowedAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					DisallowSecretsRead: ptr.To(false),
+				},
+			},
+		},
+	}
+	allowedRole := buildMinimalPlatformRole(allowedAgent)
+	if !slices.Contains(allowedRole.Rules[0].Resources, "secrets") {
+		t.Errorf("expected DisallowSecretsRead=false to include secrets, got %v", allowedRole.Rules[0].Resources)
+	}
 }
 
 // The agent reads the GitOps reconcilers' sync objects to learn which repository

@@ -52,6 +52,8 @@ Run:
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -59,6 +61,17 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ROLE_PATH = REPO_ROOT / "k8s-operator" / "config" / "rbac" / "role.yaml"
+CHART_PATH = REPO_ROOT / "charts" / "kube-agents"
+CR_TEMPLATE_PATH = CHART_PATH / "templates" / "platform-agent-cr.yaml"
+REQUIRED_HELM_SETS = [
+    "--set", "platformAgent.harness.clusterName=ci-cluster",
+    "--set", "platformAgent.harness.location=us-central1",
+    "--set", "platformAgent.harness.projectId=ci-project",
+]
+DISALLOW_SECRETS_GUARD = (
+    'include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.security.disallowSecretsRead" '
+    '"path" (list "security") "field" "disallowSecretsRead")'
+)
 CORE_API_GROUP = ""
 SECRETS_RESOURCE = "secrets"
 PERMITTED_SECRET_VERBS = {"get", "list", "watch", "create", "update", "patch", "delete"}
@@ -157,6 +170,41 @@ class OperatorSecretsGrantTest(unittest.TestCase):
                 "k8s-operator/config/rbac/**",
                 "k8s-operator/internal/testing/testdata/platform/expected/**",
             ],
+        )
+
+    def test_chart_guards_and_defaults_disallow_secrets_read_to_null(self):
+        template = CR_TEMPLATE_PATH.read_text(encoding="utf-8")
+        self.assertIn(DISALLOW_SECRETS_GUARD, template)
+        values = yaml.safe_load((CHART_PATH / "values.yaml").read_text(encoding="utf-8"))
+        self.assertIsNone(values["platformAgent"]["security"]["disallowSecretsRead"])
+
+    @unittest.skipUnless(shutil.which("helm"), "helm not installed")
+    def test_chart_renders_disallow_secrets_read_when_set(self):
+        def render_security(*extra: str) -> dict:
+            proc = subprocess.run(
+                [
+                    "helm", "template", "test-release", str(CHART_PATH),
+                    *REQUIRED_HELM_SETS, *extra,
+                    "--show-only", "templates/platform-agent-cr.yaml",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            for doc in yaml.safe_load_all(proc.stdout):
+                if isinstance(doc, dict) and doc.get("kind") == "PlatformAgent":
+                    return doc["spec"]["security"]
+            self.fail("no PlatformAgent in rendered output")
+
+        self.assertNotIn("disallowSecretsRead", render_security())
+        self.assertIs(
+            render_security("--set", "platformAgent.security.disallowSecretsRead=true").get("disallowSecretsRead"),
+            True,
+        )
+        self.assertIs(
+            render_security("--set", "platformAgent.security.disallowSecretsRead=false").get("disallowSecretsRead"),
+            False,
         )
 
 

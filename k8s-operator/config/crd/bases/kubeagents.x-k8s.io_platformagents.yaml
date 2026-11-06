@@ -11307,6 +11307,18 @@ spec:
                     Security configures RBAC, Pod Security, and Workload
                     Identity.
                   properties:
+                    disallowSecretsRead:
+                      description: |-
+                        DisallowSecretsRead omits core `secrets` (`get`, `list`, `watch`) from the
+                        reader ClusterRole (`kubeagents:minimal:<ns>:<name>`).
+
+                        True omits `secrets` from the ClusterRole.
+                        False grants `get`, `list`, and `watch` on `secrets` (`<name>-kube-proxy`
+                        strips secret payloads from every response with `KUBE_PROXY_REDACT_SECRETS=true`).
+                        Absent (nil) grants `secrets` on a new install where the ClusterRole does
+                        not exist yet (when the operator holds `list` and `watch` on `secrets`).
+                        On an existing install, absent preserves the existing ClusterRole's `secrets` rule.
+                      type: boolean
                     egressAllowlist:
                       description: |-
                         EgressAllowlist tunes the destinations egressPolicy: Allowlist permits.
