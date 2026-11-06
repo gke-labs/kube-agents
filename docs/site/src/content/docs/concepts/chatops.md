@@ -97,25 +97,6 @@ Slack shows Working… on the thread from your message until the work, the agent
 
 These need the app to hold `reactions:write`, `users:read` and `assistant:write`, to subscribe `assistant_thread_started` (and `app_home_opened` for agent view), and to have interactivity on; the manifest `hermes slack manifest` prints has all of them unless it was generated with `--no-assistant`. On an app built with only the scopes the gateway needs to read and answer messages, add them and reinstall the app. Otherwise the reactions, the answered line, Working… and the prompts silently do not appear, while the answers still arrive. A button on a message posted before a gateway restart still answers when clicked, but a reply typed under it leaves its buttons in place.
 
-### Answer feedback
-
-Under `next`, the final answer to each ask ends with Slack's 👍 and 👎 buttons. That is the agent's own answer or, when it hands the work to a card, the card's report rather than its acknowledgement, once per ask however many cards it fanned out to. An ask whose cards were still running when the agent restarted gets none. The exception is a card that posts progress after the restart while the thread's latest question was also handed to cards: its report is rated under that question. Plan rows, progress, questions waiting on you and notices have none. A tap from someone the gateway would not answer changes nothing.
-
-Each rating is counted. The gateway keeps your question and the answer with it, and nothing else from the thread, so an operator can turn the exchange into an evaluation case: a 👎 as a case to fix, a 👍 as a good answer to keep. A 👍 shows nothing more. A 👎 opens a box asking what was wrong (optional, one line), kept with it. The box says how long your question and the answer are kept, or only the answer when the question is no longer on record. Cancel keeps the 👎 without a note.
-
-Send thanks you with a line only you see. It also links the project's [feedback form](https://gke-labs.github.io/kube-agents/feedback) if you want to tell the kube-agents maintainers. Nothing is filled in for you, and the form opens a public issue, so leave your install's details out. You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces it, note and all, and the reverse. Under `next`, the Slack Home tab ends with the last seven days' count, such as "This week: 4 👍, 1 👎", refreshed every five minutes. No scope beyond the ones above is needed.
-
-What a rating keeps can include cluster names and whatever else the question and answer held. It is stored in the `feedback` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which name the task and the Slack member who rated it. The bucket drops each record 30 days after it was given. Nothing is sent anywhere else. An install whose NATS server has no such bucket draws no buttons; the gateway checks for one again every minute for half an hour after it starts.
-
-The counts are on the gateway's metrics ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
-
-```bash
-kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
-    /gateway feedback export --since 7d > feedback.tar
-```
-
-To turn it off, set `spec.integration.slack.answerFeedback: false` in the `PlatformAgent` CR, or the chart's `platformAgent.integration.slack.answerFeedback`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={integration={slack={answerFeedback=false}}}}'`. Answers then carry no buttons and nothing is kept. Tapping a button already in Slack still highlights it, but nothing is counted or kept and no box opens. Ratings kept before you turned it off stay until the bucket drops them.
-
 ### Allowed users
 
 Slack ingress is gated by `SLACK_ALLOWED_USERS`, a comma-separated list of Slack member IDs such as `U0123ABCD`, matched exactly: an email or display name matches nobody. [Slack app setup](/kube-agents/install/slack-app/#allowed-users) says how to find a member ID. Under `spec.mode: today` a message from a member not on the list is ignored with no reply; under `next` the A2A gateway answers once with a notice naming the member's ID, so an admin can add it. Leaving the list empty allows every member of the workspace (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case), which in a shared workspace lets anyone there drive the agent.
@@ -365,7 +346,7 @@ Each turn that becomes a task posts a status line, `⏳ submitted…`, which the
 
 The answer posts as a message of its own, and the status line then reads `✅ **completed**`. A task that fails posts `❌ failed: <reason>`; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task: <reason>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer. On Google Chat, the gateway rewrites the markdown Chat's text format has no syntax for. A heading becomes a bold line, a rule is dropped, and a bulleted list's marker becomes the one Chat draws a bullet from. A pipe table becomes a monospace block with its columns lined up.
 
-On Google Chat, the agent's answer posts as one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. A card's progress draws one plan message edited in place, and a card's report, the needs-you question, the pull-request message, the fleet-audit card and the first-run report lay out the same way as on Slack. Google Chat draws no reactions on your message, since the app's credential cannot add one.
+On Google Chat, the agent's answer posts as one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. The final answer to each ask ends with 👍 and 👎 buttons after any others ([Answer feedback](#answer-feedback)). A card's progress draws one plan message edited in place, and a card's report, the needs-you question, the pull-request message, the fleet-audit card and the first-run report lay out the same way as on Slack. Google Chat draws no reactions on your message, since the app's credential cannot add one.
 
 A link button opens its link. A choice button is your reply: clicking it sends the button's answer as your message in the conversation, checked against the allowed-users list like a typed one. A click from someone the gateway would not answer changes nothing. The question then loses its choice buttons and shows `✓ <your name>: <the button>`, by your Chat display name (or "Someone" when Chat gives none), never an @-mention.
 
@@ -437,6 +418,33 @@ On Slack, start the message with the bot's mention, `@bot /session`, because Sla
 | `/session stop`   | `ℹ️ to leave the session route say /session off; to stop a running task say stop`. Nothing is stopped.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 If a task is already running on the `platform` route when you send `/session`, that task finishes there, and the message after it opens the first session pod; `/session <text>` sent then is not run, and the gateway says so. A message that starts with `delegate`, such as `delegate check the node pools`, sends that one task to a fresh session pod and leaves the conversation on the `platform` route.
+
+### Answer feedback
+
+On Slack and Google Chat, the final answer to each ask ends with 👍 and 👎 buttons. That is the agent's own answer or, when it hands the work to a card, the card's report rather than its acknowledgement, once per ask however many cards it fanned out to. An ask whose cards were still running when the agent restarted gets none. The exception is a card that posts progress after the restart while the thread's latest question was also handed to cards: its report is rated under that question. Plan rows, progress, questions waiting on you, notices and home-channel posts have none. A tap from someone the gateway would not answer changes nothing.
+
+Each rating is counted, and the button you tapped fills in. The gateway keeps your question and the answer with it, and nothing else from the thread, so an operator can turn the exchange into an evaluation case: a 👎 as a case to fix, a 👍 as a good answer to keep. A 👍 shows nothing more. A 👎 opens a box asking what was wrong (optional, one line), kept with it. The box says how long your question and the answer are kept, or only the answer when the question is no longer on record. Cancel keeps the 👎 without a note.
+
+On Slack, Send thanks you with a line only you see. It also links the project's [feedback form](https://gke-labs.github.io/kube-agents/feedback) if you want to tell the kube-agents maintainers. Nothing is filled in for you, and the form opens a public issue, so leave your install's details out.
+
+On Google Chat, the box is a card in the answer's thread that only you see. In a group chat or a space without threads, or when Chat will not take it in the thread, the card posts at the top level of the space, still only to you. In a direct message with the app, it is a card in the direct message itself, which only you read.
+
+On Google Chat, Send or Cancel collapses the card to the same thanks line and the form link. If your note did not arrive with Send, the card collapses to "The note did not reach me; your rating stands as it was." If your 👎 was already replaced by a 👍, the card says the rating changed and keeps no note; if the write fails, the card stays for another Send.
+
+In a Google Chat space, the filled button shows the latest tap by anyone, while each person's rating is kept separately.
+
+You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces it, note and all, and the reverse. The last seven days' count, such as "This week: 4 👍, 1 👎", is on the Slack Home tab only, refreshed every five minutes; Google Chat has no Home tab. On Slack, no scope beyond the ones [Slack](#slack) lists is needed.
+
+What a rating keeps can include cluster names and whatever else the question and answer held. It is stored in the `feedback` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which hold the task and a string derived from the rater's Slack member ID or Google Chat address. The bucket drops each record 30 days after it was given. Nothing is sent anywhere else. An install whose NATS server has no such bucket draws no buttons; the gateway checks for one again every minute for half an hour after it starts.
+
+The counts are on the gateway's metrics ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
+
+```bash
+kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
+    /gateway feedback export --since 7d > feedback.tar
+```
+
+To turn it off, set `spec.integration.slack.answerFeedback: false` or `spec.integration.googleChat.answerFeedback: false` in the `PlatformAgent` CR, for the platform the install uses, or the chart's `platformAgent.integration.<slack|googleChat>.answerFeedback`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={integration={googleChat={answerFeedback=false}}}}'`. Answers then carry no buttons and nothing is kept. Tapping a button already posted counts nothing, keeps nothing and opens no box; Slack still highlights the tapped button. Ratings kept before you turned it off stay until the bucket drops them.
 
 ### `/feedback`
 
