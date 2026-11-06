@@ -102,7 +102,7 @@ Every registered project was provisioned before the script ran this step. Measur
     --role="roles/iam.workloadIdentityUser" \
     --member="serviceAccount:${PROJECT_ID}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
   ```
-- **The LiteLLM gateway's Vertex AI identity**: Google Service Account `kubeagents-litellm-gsa@${PROJECT_ID}.iam.gserviceaccount.com` holding `roles/aiplatform.user` on the project, bound to KSA `kubeagents-litellm` in `kubeagents-system`. `hack/ci-deploy.sh` defaults `MODEL_PROVIDER` to `vertex_ai`, which it passes as `litellm.modelProvider`, because one shared `GEMINI_API_KEY`'s fixed paid-tier-3 quota redded every smoke run on 2026-09-02 ([#1097](https://github.com/gke-labs/kube-agents/issues/1097), diagnosis on [#1184](https://github.com/gke-labs/kube-agents/issues/1184)). Since 2026-11-06 the eval lanes whose eval-model pair names provider `gemini` (5.10; the five nightlies, the blocking and today smoke presubmits and `post-kube-agents-eval-rc` as of that date) route the agent through the Gemini Developer API with the leased project's own key, the next bullet; the lanes whose pair names `vertex_ai` stay on Vertex AI. [`designs/eval-nightly-gemini-developer-api.md`](designs/eval-nightly-gemini-developer-api.md) says why. A project missing this pair reds every run on Vertex AI that leases it at the deploy's model-call gate. It is deliberately not the platform agent's GSA — see [Security and IAM](site/src/content/docs/reference/security-and-iam.md)'s "The Vertex AI gateway is a separate identity". `scripts/provision_ci_pool_project.sh` creates it through the full-install composition (`model_provider = "vertex_ai"` in its tfvars instantiates the `litellm_vertex_iam` module), and the verifier checks the binding. For a **registered** project provisioned before that line existed, the hand repair below is the only path: section 8 forbids re-running the provisioning after registration, and a composition re-apply is worse than the key rotation section 8 names — the fresh `api_server_key` rides in through `helm_release.kube_agents`, the same release the leased run's `hack/ci-deploy.sh` upgraded, so the re-apply also carries the composition's whole value set (image tags, `gitRepo`, a credentials map without the run's `GEMINI_API_KEY`) over whatever that run installed. The repair:
+- **The LiteLLM gateway's Vertex AI identity**: Google Service Account `kubeagents-litellm-gsa@${PROJECT_ID}.iam.gserviceaccount.com` holding `roles/aiplatform.user` on the project, bound to KSA `kubeagents-litellm` in `kubeagents-system`. `hack/ci-deploy.sh` defaults `MODEL_PROVIDER` to `vertex_ai`, which it passes as `litellm.modelProvider`, because one shared `GEMINI_API_KEY`'s fixed paid-tier-3 quota redded every smoke run on 2026-09-02 ([#1097](https://github.com/gke-labs/kube-agents/issues/1097), diagnosis on [#1184](https://github.com/gke-labs/kube-agents/issues/1184)). Since 2026-11-06 the eval lanes whose eval-model pair names provider `gemini` (5.10; as of that date the five nightlies, `post-kube-agents-eval-rc` and every smoke presubmit but `-flash` and `-alt`, the GHES and GitLab CE presubmits included) route the agent through the Gemini Developer API with the leased project's own key, the next bullet; the lanes whose pair names `vertex_ai` stay on Vertex AI. [`designs/eval-nightly-gemini-developer-api.md`](designs/eval-nightly-gemini-developer-api.md) says why. A project missing this pair reds every run on Vertex AI that leases it at the deploy's model-call gate. It is deliberately not the platform agent's GSA — see [Security and IAM](site/src/content/docs/reference/security-and-iam.md)'s "The Vertex AI gateway is a separate identity". `scripts/provision_ci_pool_project.sh` creates it through the full-install composition (`model_provider = "vertex_ai"` in its tfvars instantiates the `litellm_vertex_iam` module), and the verifier checks the binding. For a **registered** project provisioned before that line existed, the hand repair below is the only path: section 8 forbids re-running the provisioning after registration, and a composition re-apply is worse than the key rotation section 8 names — the fresh `api_server_key` rides in through `helm_release.kube_agents`, the same release the leased run's `hack/ci-deploy.sh` upgraded, so the re-apply also carries the composition's whole value set (image tags, `gitRepo`, a credentials map without the run's `GEMINI_API_KEY`) over whatever that run installed. The repair:
 
   ```bash
   gcloud iam service-accounts create kubeagents-litellm-gsa --project="${PROJECT_ID}" \
@@ -567,15 +567,27 @@ cluster, not from their public job config: `kube-agents-eval-model` in namespace
 `test-pods` on the GKE cluster `kube-agents-prow` (zone `us-west1-b`, project
 `kube-agents-prow`; the prowjob `cluster:` alias for it is `build-kube-agents`, which
 `get-credentials` does not know, as 5.4 says), mounted at `/etc/eval-model`. It holds
-one pair of keys per kind of lane: `gate.provider` / `gate.name` for the blocking lane,
-the today lane, the forge presubmits and the release-candidate postsubmit; `nightly.*`
-for the nightlies; `flash.*` and `alt.*` for the two lanes that grade another model
-family. A lane reads its pair at the top of its script, before the image build, and
-stops on a missing or empty key; `hack/ci-deploy.sh` refuses a Prow job that arrives
-without the three values (`MODEL_PROVIDER`, `MODEL_DEFAULT_NAME`,
-`AGENT_MODEL_OVERRIDE`) and defaults them only outside Prow. The job config therefore
-names no model; this repository's scripts default one for local runs only, and the eval
-records in the private buckets carry the model each run used.
+one pair of keys per kind of lane, and every Prow job that runs `hack/ci-deploy.sh` reads
+one:
+
+| Pair                          | Jobs                                                                                                                                                                                                                                                                                   |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gate.provider` / `gate.name` | `pull-kube-agents-smoke-test`, `pull-kube-agents-smoke-test-today`, `pull-kube-agents-smoke-test-gitlab`, `pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, `post-kube-agents-eval-rc`                                                                      |
+| `nightly.*`                   | `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b`, `ci-kube-agents-eval-nightly-gitlab`, `ci-kube-agents-eval-nightly-writers`, `ci-kube-agents-eval-nightly-gitlab-next`; the forge weeklies and the certification lane (5.8, 5.9) when their job config is written |
+| `flash.*`                     | `pull-kube-agents-smoke-test-flash`                                                                                                                                                                                                                                                    |
+| `alt.*`                       | `pull-kube-agents-smoke-test-alt`                                                                                                                                                                                                                                                      |
+
+A lane reads its pair at the top of its script, before the image build, and stops on a
+missing or empty key; `hack/ci-deploy.sh` refuses a Prow job that arrives without the
+three values (`MODEL_PROVIDER`, `MODEL_DEFAULT_NAME`, `AGENT_MODEL_OVERRIDE`) at a
+`FATAL` line before the build, and defaults them only outside Prow, so a job added to the
+config without a pair stops at its first run rather than deploying a model nobody chose.
+The job config therefore names no model; this repository's scripts default one for local
+runs only, and the eval records in the private buckets carry the model each run used.
+Two lanes changed provider when their config started reading the Secret: the GHES and
+GitLab CE presubmits ran on the deploy's default, Vertex AI, and now follow `gate.*`,
+which names `gemini` as of 2026-11-06, so they read the leased project's key (section 3)
+like the blocking lane.
 
 Switching a model is one write to the Secret by a project owner or editor, which GKE's
 audit log records; a job that starts after the write uses it. The pairs that must agree

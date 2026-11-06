@@ -951,9 +951,12 @@ fi
 # the lease is not spent on a deploy whose records would stamp the default.
 # A local run keeps the defaults.
 if [ -n "${JOB_NAME:-}" ]; then
-  : "${MODEL_PROVIDER:?a Prow job sets MODEL_PROVIDER from the build cluster's eval-model Secret (the lane's config in oss-test-infra); this script defaults it only outside Prow}"
-  : "${MODEL_DEFAULT_NAME:?a Prow job sets MODEL_DEFAULT_NAME from the build cluster's eval-model Secret (the lane's config in oss-test-infra); this script defaults it only outside Prow}"
-  : "${AGENT_MODEL_OVERRIDE:?a Prow job sets AGENT_MODEL_OVERRIDE from the build cluster's eval-model Secret (the lane's config in oss-test-infra); hack/ci-eval-pr.sh defaults it only outside Prow}"
+  for required_model_var in MODEL_PROVIDER MODEL_DEFAULT_NAME AGENT_MODEL_OVERRIDE; do
+    if [ -z "${!required_model_var:-}" ]; then
+      echo "FATAL: stopping before the build: ${required_model_var} is unset or empty. A Prow job sets it from the build cluster's eval-model Secret (the lane's config in oss-test-infra; docs/ci-pool-projects.md 5.10); this repository's scripts default it only outside Prow." >&2
+      exit 1
+    fi
+  done
 fi
 # --- agent model required in a Prow job: end
 export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
