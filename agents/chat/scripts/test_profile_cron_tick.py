@@ -869,6 +869,7 @@ class IdlePolicyThroughMainTest(unittest.TestCase):
             ("CREDENTIAL_PROXY_WORKSPACE_ROOT", None),
             (cip.THROTTLE_DAYS_ENV, None),
             (cip.HIBERNATE_DAYS_ENV, None),
+            (cip.TIMEZONE_ENV, None),  # the slots below are UTC instants
         ):
             self._patch_env(key, value)
         stub = self.tmp / "hermes"
