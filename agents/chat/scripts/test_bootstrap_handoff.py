@@ -11,6 +11,7 @@ checked with the ranking stage's own parser, inventory_findings.parse_block,
 rather than with a copy of its rules.
 """
 
+import contextlib
 import json
 import os
 import shlex
@@ -587,6 +588,35 @@ class HandOffTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--assignee") + 1], "cluster-t_missing")
         self.assertIn("cluster_inventory_audit_sop.md", argv[argv.index("--body") + 1])
         self.assertEqual(self.filed, [])
+
+    def test_onboarding_cards_are_stamped_chat_by_a_minted_ticket_never_an_argument(self):
+        _board(self.board, clusters=[])
+        sent, seen, minted = [], [], []
+        origin = types.ModuleType("hermes_cli.kanban_origin")
+
+        held = []
+
+        @contextlib.contextmanager
+        def writer_ticket(value):
+            minted.append(value)
+            held.append("t1cket")
+            try:
+                yield "t1cket"
+            finally:
+                held.pop()
+
+        origin.writer_ticket = writer_ticket
+        kanban_stub = self._stub_kanban(sent, reply=json.dumps({"id": "t_new"}))
+        with kanban_stub, mock.patch.dict(sys.modules, {"hermes_cli.kanban_origin": origin}):
+            sys.modules["hermes_cli"].kanban_origin = origin
+            kanban = sys.modules["hermes_cli.kanban"]
+            reply = kanban.run_slash
+            kanban.run_slash = lambda cmd: seen.append(held[-1] if held else None) or reply(cmd)
+            self.assertIsNone(self._run_roster([self._agent("t_a")]))
+        self.assertEqual(minted, ["chat"])
+        self.assertEqual(h.CARD_ORIGIN, "chat")
+        self.assertEqual(seen, ["t1cket"])
+        self.assertNotIn("--origin", sent[0])
 
     def test_a_sweep_that_filed_no_cards_does_not_report_a_clean_fleet(self):
         # The live failure: a done sweep with no cluster cards at all.

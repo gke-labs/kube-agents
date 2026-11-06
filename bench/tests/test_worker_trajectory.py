@@ -1207,6 +1207,8 @@ def test_settle_appends_worker_calls_after_the_routers_and_before_the_purge(
 
     def shell(script: str, timeout: float) -> str:
         scripts.append(script)
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            return "purged\n"
         return reply if worker_trajectory.CAPTURE_PRESENT in script else ""
 
     monkeypatch.setattr(harness, "_agent_shell", shell)

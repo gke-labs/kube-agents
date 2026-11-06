@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -33,10 +34,16 @@ const (
 )
 
 func stopGrace(cfg lib.DispatchConfig) time.Duration {
+	g := defaultStopGrace
 	if cfg.StopGraceSeconds > 0 {
-		return seconds(cfg.StopGraceSeconds)
+		g = seconds(cfg.StopGraceSeconds)
 	}
-	return defaultStopGrace
+	// Never shorter than a renewal and two ticks: hold counts a worker
+	// silent for a renewal and a tick when the grace ends, so one silent
+	// since before the stop is always counted, whatever renewSeconds is.
+	renew := seconds(cfg.RenewSeconds)
+	tick := max(renew/ticksPerRenewal, minTick)
+	return max(g, renew+2*tick)
 }
 
 // stopFor reads a stop record (contract addendum 9): the task it stops,
@@ -174,6 +181,16 @@ func (d *Dispatcher) pruneStoppedLocked(now time.Time) {
 	}
 }
 
+// stopRequestedOn reports whether h has a stop. A stopped task never closes
+// the breaker, however it ends (its own end, its deadline, the grace running
+// out); its worker's loss still counts as an expiry, so a stop can't hide
+// the workers a poisoned input kills.
+func (d *Dispatcher) stopRequestedOn(h *holding) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return h.stopRequested
+}
+
 // requestStopLocked marks h stopped and wakes its hold. d.mu must be held.
 func (d *Dispatcher) requestStopLocked(h *holding) {
 	h.stopRequested = true
@@ -210,6 +227,12 @@ func (d *Dispatcher) stopRequested(ctx context.Context, log *slog.Logger, profil
 	subject := lib.DispatchStopSubject(profile, taskID)
 	msg, err := d.bus.Conn().RequestWithContext(rctx, directGetPrefix+lib.DispatchStopStream+"."+subject, nil)
 	switch {
+	case errors.Is(err, nats.ErrConnectionClosed), errors.Is(err, nats.ErrConnectionDraining),
+		errors.Is(err, nats.ErrInvalidConnection), errors.Is(err, nats.ErrConnectionReconnecting):
+		// The connection, not the stream: mid-reconnect or regrant. No
+		// backoff and no report; the next admission or refresh reads again.
+		log.Debug("the stop stream read found the connection unready; reading again next time", "err", err)
+		return false
 	case err != nil:
 		d.stopStreamFailed(log, err.Error())
 		return false
@@ -275,9 +298,8 @@ func stopDeadline(cfg lib.DispatchConfig, now time.Time) time.Time { return now.
 // lands first is the task's end.
 func (d *Dispatcher) stopHeld(ctx context.Context, log *slog.Logger, del lib.Delivery, h *holding, key string, rec lib.LeaseRecord) {
 	log.Info("the task didn't stop within the grace; abandoning it", "pod", rec.Pod)
-	// Ended by its requester, not by its worker either way: the breaker
-	// neither counts it nor closes on it, so stopping one's own task can't
-	// reset a breaker one's other tasks opened.
+	// Ended by its requester: the breaker doesn't close on it, so stopping
+	// one's own task can't reset a breaker one's other tasks opened.
 	if !d.publishTerminalRetry(ctx, log, del, h, lib.StateCanceled, ReasonStopped,
 		fmt.Sprintf("stopped by the conversation; the worker %s didn't stop within %s", rec.Pod, stopGrace(d.src.Config()))) {
 		return

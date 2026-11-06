@@ -20,6 +20,11 @@
 # dispatcher creates to the operator-rendered template, and A2A_DISPATCHER_JOB_POLICY=true,
 # without which the operator runs no dispatcher Job mode.
 #
+# It also installs templates/web-console-cr-admission-policy.yaml where the web
+# console and its environment page are on: the console's ServiceAccount may
+# change only its own annotations and spec.integration.forges, repositories and
+# github on the PlatformAgent.
+#
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
 # on a default install with no GitOps overlay, the content policy matches
@@ -648,6 +653,59 @@ litellm:
   # . or .. component, no doubled or trailing slash (the gateway container runs
   # with readOnlyRootFilesystem: true and only /tmp is writable).
   traceLogPath: "/tmp/litellm_traces.jsonl"
+  # The shadow-mode inference replay proxy, an eval fixture
+  # (hack/replay-proxy/README.md): it takes the inference-gateway Service, logs
+  # what a replay cache would have keyed on for every request, and forwards
+  # each one unchanged to LiteLLM through the inference-gateway-upstream
+  # Service. It never serves a saved answer. Off on every install;
+  # hack/ci-deploy.sh turns it on for Prow eval runs (EVAL_REPLAY_SHADOW=false keeps it off).
+  # On, the LiteLLM pods also carry kubeagents.x-k8s.io/inference-role: litellm,
+  # and the proxy pods keep app: litellm, so the LiteLLM PodDisruptionBudget,
+  # PodMonitoring and the operator's litellm-policy select them too. Turned on
+  # in an upgrade rather than at install, inference-gateway moves to the proxy
+  # at once while LiteLLM still has to roll to gain the label, so model calls
+  # fail until it has; CI turns it on at install.
+  replayShadow:
+    enabled: false
+    # The image hack/ci-deploy.sh builds from hack/replay-proxy/Dockerfile into
+    # the eval project's registry. Nothing publishes it, so there is no
+    # default, and the reference is used as given: global.imageRegistry and
+    # global.thirdPartyImageRegistry do not rewrite it.
+    image:
+      repository: ""
+      tag: ""
+      pullPolicy: IfNotPresent
+    # Two, so a proxy restart or a node drain leaves one serving; there is no
+    # fallback to LiteLLM, which would split the traffic and lose its lines.
+    replicaCount: 2
+    # Surge first: the proxy is the only path to the model while it is on,
+    # so a rollout never drops below the running count. An eval namespace with
+    # a full ResourceQuota stalls this rollout (litellm.rollingUpdate above says
+    # why); set maxUnavailable: 1 there.
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    # Stamped on every log line (REPLAY_JOB_*). kind is nightly or presubmit,
+    # and is required when the proxy is on: an untagged line counts in no
+    # estimate.
+    job:
+      kind: ""
+      project: ""
+      build: ""
+      pr: ""
+    # Ephemeral storage covers the 2Gi data volume (templates/litellm.yaml)
+    # plus 256Mi of container log. The proxy is one Python process: its
+    # analysis runs on one thread, and memory holds up to 1024 queued request
+    # bodies and a million first-seen message timestamps.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+        ephemeral-storage: 2304Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+        ephemeral-storage: 2304Mi
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
@@ -861,14 +919,17 @@ platformAgent:
     size: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
-  # "PlatformAgent annotations"). Three of them the chart also derives from
+  # "PlatformAgent annotations"). Four of them the chart also derives from
   # values: litellm.networkPolicy=false stamps
   # kubeagents.x-k8s.io/enable-litellm-network-policy: "false",
   # telemetry.collectorNamespace stamps
   # kubeagents.x-k8s.io/otlp-collector-namespace, and
   # litellm.modelProvider=openai_compatible stamps
   # kubeagents.x-k8s.io/litellm-upstream-egress from litellm.openaiCompatible
-  # (unless the endpoint is public on port 443). When the chart stamps a key,
+  # (unless the endpoint is public on port 443), and every render stamps
+  # kubeagents.x-k8s.io/a2a-quota-chart-pods with the chart's pods and their
+  # rollout surges.
+  # When the chart stamps a key,
   # an entry here that disagrees with it fails the render; otherwise the entry
   # passes through, except that with litellm.otel=true an otlp-collector-namespace
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
@@ -1002,6 +1063,26 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The k8s event watcher. alertExclude lists events that open no incident:
+    # no alert, no triage card, no share of the daily alert ceiling. Their
+    # clusters stay in scope, so the agent still reads them when asked. A rule
+    # sets one or more of cluster ({projectId, location, clusterName}, only
+    # clusterName required), namespace, reason, kind and name (a trailing *
+    # is a prefix), and matches when every part it sets matches; an event is
+    # excluded when any rule matches. At most 64 rules. Empty omits the block.
+    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
+    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
+    # removes the CR's whole eventWatcher block, so an enabled: false set there
+    # with kubectl patch is lost too; set it again afterwards. The watcher's
+    # tuning settings are under platformAgent.deployment.eventWatcher.
+    eventWatcher:
+      alertExclude: []
+        # - namespace: payments
+        # - reason: FailedScheduling
+        #   cluster: { clusterName: batch }
+        # - namespace: shop
+        #   kind: Pod
+        #   name: inventory-api-*
     # The controller stall watch, the stall-watch cron job that alerts on
     # controllers that stopped making progress. Empty omits the block and
     # keeps the watch's defaults. A change rolls the agent pod. The
@@ -1206,6 +1287,16 @@ platformAgent:
     # are then lost. Move them to env above first. The site's chatops page, "Daily alert ceiling", gives the
     # buckets and a sizing method.
     alertDailyLimits: {}
+    # The most triage pull requests open or being opened at once, when
+    # INCIDENT_TRIAGE_OPEN_PULL_REQUEST is "true" in env above. A triage whose
+    # pull request would pass the limit still runs, but its report asks for a
+    # reply, and a note in the alert's thread says that the limit held its pull
+    # request back. Rendered as INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+    # spec.deployment.env when above 0. 0 is no limit. An entry with the same
+    # name in env above wins, and a valueFrom entry for it fails the render
+    # while this key is above 0. The site's chatops page, "Limiting the open
+    # triage pull requests", has the rules.
+    incidentMaxOpenPullRequests: 0
     # The event watcher's tuning settings. Each key that you set becomes one
     # WATCHER_<NAME> entry in spec.deployment.env, which the operator passes to
     # the agent-api-auth container, which runs the watcher. A key that you do
@@ -1233,6 +1324,7 @@ platformAgent:
     # each setting does. A duration that the watcher cannot read keeps its
     # default, and the container log names it. A change rolls the agent pod
     # and the credential-proxy pod, which also gets spec.deployment.env.
+    # Alert excludes are under platformAgent.harness.eventWatcher.alertExclude.
     eventWatcher: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
@@ -1248,7 +1340,8 @@ platformAgent:
     # raises the memory limit and keeps the rest. The broker sizes how many
     # commands it admits at once from that limit, so it is the setting to raise
     # when the proxy is OOM-killed under a large fleet. The quota preflight
-    # counts the override, and on Autopilot the Autopilot requests. A cpu or
+    # counts the override, at the sizing profile's row when the operator would
+    # refuse it against that row, and on Autopilot the Autopilot requests. A cpu or
     # memory limit set without its request, below the default request, lowers
     # that request to the limit. On Autopilot a CPU request the override does
     # not set is held to at most one CPU per GiB of the memory request. The operator
@@ -1310,6 +1403,23 @@ platformAgent:
     # apply crds/ first (upgrade.sh does).
     agentAPIAuth:
       resources: {}
+    # The preset the credential proxy, the agent-api-auth sidecar and the shell
+    # container start from, forwarded to the CR as spec.deployment.sizingProfile
+    # when set: small (the operator's defaults, and what an unset value means),
+    # medium, fleet, or auto, which steps the tier up as the fleet the operator
+    # counts grows, from the tier the CR's status last recorded (a count that
+    # falls never lowers it), holding a step the namespace's ResourceQuota has
+    # no room for or a LimitRange bound refuses, stepping back one tier when
+    # admission refuses the pod a step recreated, and saying so in the CR's
+    # SizingCappedByQuota condition. The three
+    # resources overrides above and in harness.experimental.shellSandbox are
+    # applied per key over the preset, so an explicit key always wins. The
+    # quota preflight counts medium and fleet at their rows and auto at the
+    # small row it starts from; a later promotion is the operator's check. The
+    # CRD reference's spec.deployment section has each row's figures. On an
+    # existing install the chart fails the upgrade when the installed CRD
+    # predates the field; apply crds/ first (upgrade.sh does).
+    sizingProfile: ""
   # pre-delete hook that removes the PlatformAgent CR and waits for the operator
   # to clear its finalizer, before Helm deletes the operator itself. Without it,
   # `helm uninstall` and `terraform destroy` strand the CR and hang the namespace

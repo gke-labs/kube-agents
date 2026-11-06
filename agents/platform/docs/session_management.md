@@ -10,7 +10,7 @@ AI agent execution is typically stateless and triggered on-demand. To support pr
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The **drift detector** is a second producer on the watcher's side of that bridge, posting out-of-band cluster changes to the same routes; see [the second producer](#the-second-producer-gitops-drift). The `stall-watch` cron script is a third, posting namespaces whose controllers stopped making progress; see [the third producer](#the-third-producer-controller-stall). The turn it starts runs on the gateway's default profile — the **Planning Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`), stops that conversation's kanban cards (`POST /v1/sessions/{id}/cards/stop`, below), reads the report stored for a conversation a reply arrives on (`GET /v1/incidents/by-thread`, the `incident_context` read on the `api` executor's path), and relays the Slack Home tab's board (`GET /v1/board`). No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`), stops that conversation's kanban cards (`POST /v1/sessions/{id}/cards/stop`, below), reads the report stored for a conversation a reply arrives on (`GET /v1/incidents/by-thread`, the `incident_context` read on the `api` executor's path), and relays the Slack Home tab's board (`GET /v1/board`). The hermes-bridge also records a session's origin (`PUT /v1/sessions/{id}/origin`). The work-origin callers are the rest ([below](#work-origin-tables)): the board's insert-time stamp (`deploy/docker/patches/kanban_origin.py`) reads a turn's origin (`GET /v1/sessions/{id}/origin`) and redeems stamp tickets; the bootstrap hand-off and the GitHub scan gate mint those tickets through it; the cron scheduler's origin patch (`deploy/docker/patches/cron_job_template.py`) reads and records a job's origin; the `pr_opened` plugin writes the proposals ledger; and the `chat_metrics` plugin reads its counts. The `session_store` plugin writes the `origin` keys of `session_metadata` straight into the database, not through a route. No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
@@ -18,7 +18,7 @@ It binds loopback rather than `0.0.0.0` because every one of its callers shares 
 2. **Dynamic Thread Resolution:** Captures the Chat API message ID returned from the first alert, saving it as the persistent thread key.
 3. **Incident Triage Context Preservation:** Persists completed triage reports inside the local SQLite database.
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context. An `apply` among them is also recorded for the recurrence hold ([below](#holding-a-recurrence-while-its-fix-waits-for-review)).
-5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap.
+5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap. Events an alert-exclude rule held back in the watcher arrive on `POST /v1/excluded-events` with no session, as rows marked `excluded = 1` (one per object and reason per hour, with later records added to its `occurrences`), and the recap counts them on a line of their own that names the five noisiest workloads. `GET /v1/intercepted-events` lists them with the status `excluded`. They count toward `LEDGER_MAX_ROWS` like every other row.
 6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
 7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports`, posts it as written (for the scheduled delivery of a fleet-audit job the image ships, it posts the report `finish` rendered for each repository, with a line naming any it did not finish, or a notice that the run did not finish, and on Slack a one-repository report is replaced by a headline linking its ledger issue), and stores the full report against the thread it lands in, so a reply there reaches the Chat Agent with the report attached. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
 8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
@@ -36,6 +36,12 @@ Two more things travel in that prompt since #656. The call is made without `goal
 The address is what used to be wrong. An event-triage turn arrives over the REST gateway, whose single ingress chokepoint stamps `platform="api_server"` and puts the session id in `chat_id`, so the subscription was written well-formed and pointing at no chat platform that exists — the report was produced, stored on the card, and delivered nowhere. That is issue #630. `deploy/docker/patches/kanban_event_routing.py` closes it inside the image: it looks the session id up in `session_metadata`, which `_register_session_routing` wrote before the turn started, and substitutes the alert's real `platform`/`chat_id`/`thread_id` at subscription time. A session with no recorded route, or one recorded as non-chat, falls through unchanged. The hermes-bridge records a route the same way for its `a2a-*` sessions, so a card filed in a gateway conversation reports back to that conversation, and the lookup follows Hermes's compression lineage when the session has since been renamed; [the gateway spec](../../../docs/designs/spec-chatops-gateway.md) has the conversation route.
 
 The session id is therefore the thread key, and `session_metadata` records the `platform` alongside the `thread_id`: a thread belongs to exactly one chat platform, and a report addressed to the other is not degraded to the home channel but refused outright.
+
+#### Limiting the open triage pull requests
+
+With `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` and `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` above `0` (chart: `platformAgent.deployment.incidentMaxOpenPullRequests`; `0`, negative or not a number is no limit), `_attempt_triage_start` asks `_triage_pull_request_decision` before it builds the query, for an event triage only. `_claim_triage_pull_request` counts the branches that start with `INCIDENT_PR_BRANCH_PREFIX` and have an open proposal on the forge from the managed repository itself (a fork's, whose `sourceRepo` names another repository, does not count) (`proposal-list` on each managed repository, `TRIAGE_PR_LIST_MAX_PAGES` pages of 100 at most, within `TRIAGE_PR_COUNT_TIMEOUT_S`, 10 s), plus the branches in `triage_pr_reservations`. The forge is read before the lock, and the reservations are read and written under it, so triages that start together count each other before any pull request exists. Under the limit, or when the incident's own branch is already counted (its card revises that pull request), the branch is reserved and the query is `_build_agent_query_with_pull_request`. At the limit, `_build_agent_query` gets `open_pull_request=False` and writes the default query, and once the turn starts `TRIAGE_PR_CAP_NOTE` is posted where `_triage_not_started` posts its notice: in the alert's thread, or under the alert's quoted first line when it has no thread. With no chat platform the note is only logged. A count the forge does not answer (an error, the timeout, too many pages) is held the same way with `TRIAGE_PR_UNCOUNTED_NOTE` (`TRIAGE_PR_UNCOUNTED_AT_LIMIT`). No text the model reads changes: the held triage gets the query an install without the opt-in gets.
+
+There is one reservation per triage and branch. It is released when its branch shows an open proposal (it then counts as open), when that triage's `Open GitOps PR for …` card assigned to `platform` is `done` or `archived` and opened no pull request after the forge was read (a later one is not in that read, so the reservation still counts it), when the triage does not start (`_triage_not_started`), and after `TRIAGE_PR_RESERVATION_MAX_S` (24 h). The last covers a card never filed, and a card that is `blocked` or held in `todo` behind a blocked triage card: such a card can still open its pull request, so it keeps counting until it settles or the 24 hours pass. Under the watcher's `--mode=shared`, where every incident shares one session, the first settled card, or one triage that does not start, releases every reservation. A daemon start also releases each reservation whose triage never reached `started` (a process that died between the claim and the start), beside the fold anchors. The count goes by the branch prefix alone: a pull request opened by a reply's `apply` counts when the branch `submit-suggestion` names for it (`platform-agent/<change_type>-<target_id>`) takes the prefix, and not otherwise.
 
 ### Daily Alert Ceiling
 
@@ -340,10 +346,52 @@ Stores the mapping between the troubleshooter session and the platform chat thre
 ```sql
 CREATE TABLE session_metadata(
   session_id TEXT PRIMARY KEY,
-  metadata TEXT NOT NULL,         -- JSON object storing platform, chat_id, thread_id, and timestamps
+  metadata TEXT NOT NULL,         -- JSON object storing platform, chat_id, thread_id, origin, origin_platform, and timestamps
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+`origin` and `origin_platform` record where the session's work started. The first writer wins:
+the hermes-bridge (`PUT /v1/sessions/{id}/origin`, which answers 409 when the session already has
+one), this server for a watcher session on its first inject (`drift` or `event`), or the
+`session_store` plugin, which writes `chat` and the platform for a session on a chat platform. A
+session with no `origin` resolves as `other`. `GET /v1/sessions/{id}/origin` follows compression
+parents, so a rotated session id keeps its parent's origin.
+
+#### Work-origin tables
+
+Three tables hold the origin of work that is not a session. `cleanup_old_records` leaves the first
+two: they are durable, not idle-session state.
+
+```sql
+CREATE TABLE cron_job_origins(      -- PUT/GET /v1/cron/jobs/{id}/origin
+  job_id TEXT PRIMARY KEY,
+  origin TEXT,
+  origin_platform TEXT,
+  recorded_at TEXT
+);
+CREATE TABLE proposals_opened(      -- POST /v1/proposals/opened, GET /v1/proposals/opened/counts
+  url TEXT PRIMARY KEY,
+  origin TEXT,
+  origin_platform TEXT,
+  opened_at TEXT
+);
+CREATE TABLE kanban_stamp_tickets(  -- POST /v1/board/stamp-tickets, POST /v1/board/stamp-tickets/{ticket}/redeem
+  ticket TEXT PRIMARY KEY,
+  origin TEXT,
+  origin_platform TEXT,
+  issued_at REAL,
+  redeemed_at REAL NULL
+);
+```
+
+`cron_job_origins` is the origin a cron job was created or last changed under; the cronjob tool
+upserts it on `create` and `update`. `proposals_opened` is the ledger of pull requests the broker
+confirmed this install opened, one row per url, where the first record stands; the counts route
+answers every origin, an origin with no row as zero. `kanban_stamp_tickets` holds one-time tickets
+that stamp one new card's origin at insert; a ticket is spent once, and `cleanup_old_records`
+removes it once it is older than `STAMP_TICKET_TTL_SECONDS` (300). The card's stamp itself is in
+`kanban.db`, in the side table `kanban_task_origins`.
 
 #### `incidents`
 
@@ -447,7 +495,8 @@ CREATE TABLE intercepted_events(
   duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise
   fold_key    TEXT NOT NULL DEFAULT '',    -- what the row folds on: the workload of a pod named like a Deployment's, or a non-Pod object's name; '' when it cannot fold or anchor, was released, or predates the last server start
   workload_key TEXT NOT NULL DEFAULT '',   -- the workload an incident's fix belongs to (_incident_branch_workload); never cleared
-  pull_request TEXT NOT NULL DEFAULT ''    -- the open fix pull request a recurrence was held for; '' otherwise
+  pull_request TEXT NOT NULL DEFAULT '',   -- the open fix pull request a recurrence was held for; '' otherwise
+  excluded    INTEGER NOT NULL DEFAULT 0   -- 1 on a row an alert-exclude rule held back in the watcher (POST /v1/excluded-events); 0 otherwise
 );
 CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id
   ON intercepted_events (session_id);
@@ -488,7 +537,7 @@ stay `pending`.
 
 For installs with no chat platform enabled (or external callers reaching the loopback `127.0.0.1:8699` listener via `kubectl port-forward <agent-pod> 8699:8699`), `session_kv_server.py` also exposes `SESSION_KV_API_KEY`-authenticated read-only feed endpoints (`GET /v1/intercepted-events`, `GET /v1/sessions/{session_id}/tasks`, `GET /v1/tasks`, `GET /v1/tasks/{task_id}`, and the Home tab's `GET /v1/board`) that open `session_kv.db`, `kanban.db`, and the Hermes session stores (`<agent_home>/state.db` and `<agent_home>/profiles/<profile>/state.db`) with `?mode=ro`, scrubbing worker step text through `AuditRedactor` and the shared supplement rules in `agents/platform/scripts/worker_transcript.py` (the same module the bench's trajectory read loads in the pod) before returning it. A `tool_result` whose call read a secret is withheld rather than scrubbed, and the detector fails closed: it reads each simple command of the line on its own and each quoted script (`sh -c '…'`) as a line of its own, serves a `kubectl get` whose resources are other kinds by name, serves one of secrets only when the command is provably the bare list (names, types and ages; no output flag in any spelling, no variable, no substitution), withholds one whose resource it cannot tell (from a file, stdin or a variable), and serves a secret store's command only when its subcommand is one of the store's named lists, so an output form nobody enumerated withholds the result. When `GET /v1/sessions/{session_id}/tasks` is called for a dispatched `intercepted_events` triage session before the front door has filed a kanban card, it returns a sibling `routing` object (`profile = "default"`) beside `tasks: []` (`in_progress` while the front-door turn is active, from the ledger row alone with `live_steps: []` until the gateway session appears in `state.db`, or terminal `completed` / `failed` once `sessions.ended_at` is set for this turn (an `ended_at`, reply or step older than the dispatch belongs to the previous turn of a reused session and is ignored) or the turn — or a ledger row whose gateway session never started in `state.db` — ages past `PRE_KANBAN_STALE_AFTER_SECONDS`, 900 s, measured from the dispatch (`dispatched_at`, stamped by the dispatcher as it creates the gateway session on every path, and by the carding of a drift-backlog row; a row still unstamped when the server starts, from before the column or from a restart between the inject and the stamp, is stamped to `created_at` at startup, so a row unstamped in the running process is queued: `in_progress` from the ledger alone, never aged into `failed`) and the session's start, whichever is later, and the object's `created_at`/`started_at` are that clock; if `<agent_home>/state.db` exists and raises `sqlite3.Error`, `routing` falls back to the ledger-backed object with `live_steps: []` and `routing_error` naming the read error).
 
-Two routes write to `kanban.db`. The first also signals processes: `POST /v1/sessions/{session_id}/cards/stop`. The hermes-bridge calls it when a gateway conversation's `stop` reaches its cards, with the conversation's context id. The route refuses any session but the `a2a-*` one that context id names; that is a consistency check on what the bridge sends, not an authorization. It archives every open card in the conversation through Hermes' own `archive_task`: the cards filed under the session or its compression continuations (not its branches or delegates), every card those cards fanned out, to any depth and whatever session the child carries, and a session-less card subscribed to that session and thread. It kills each running card's worker, and the processes in the worker's group that carry its `HERMES_KANBAN_TASK`, and no others; a command an ssh client already sent to the shell sandbox runs on. Stop doesn't touch cards from other conversations, crons or alerts that depend on this thread's cards: a `task_links` child filed under another session is left alone even though Hermes copies our thread's subscription onto it, and it is promoted once our card is archived, as it would have been when our card finished. The answer names what was stopped, and what it could not finish in time, within 24 seconds (`CARD_STOP_WORST_CASE_S`: a 20-second deadline plus one 3-second busy wait plus a second of slack); an archive still running at the deadline is reported `pending` and finishes on its own. Every holder of `SESSION_KV_API_KEY` can call it for any `a2a-*` session, so anything in the pod that can record a conversation's route can also stop that conversation's cards; the agent itself could already archive cards.
+Two routes write to `kanban.db`, and the drift backlog writes one more table there directly: when it files a card, it stamps the card's origin as `drift` in `kanban_task_origins` (`_stamp_board_task_origin`), and the first stamp wins. The first route also signals processes: `POST /v1/sessions/{session_id}/cards/stop`. The hermes-bridge calls it when a gateway conversation's `stop` reaches its cards, with the conversation's context id. The route refuses any session but the `a2a-*` one that context id names; that is a consistency check on what the bridge sends, not an authorization. It archives every open card in the conversation through Hermes' own `archive_task`: the cards filed under the session or its compression continuations (not its branches or delegates), every card those cards fanned out, to any depth and whatever session the child carries, and a session-less card subscribed to that session and thread. It kills each running card's worker, and the processes in the worker's group that carry its `HERMES_KANBAN_TASK`, and no others; a command an ssh client already sent to the shell sandbox runs on. Stop doesn't touch cards from other conversations, crons or alerts that depend on this thread's cards: a `task_links` child filed under another session is left alone even though Hermes copies our thread's subscription onto it, and it is promoted once our card is archived, as it would have been when our card finished. The answer names what was stopped, and what it could not finish in time, within 24 seconds (`CARD_STOP_WORST_CASE_S`: a 20-second deadline plus one 3-second busy wait plus a second of slack); an archive still running at the deadline is reported `pending` and finishes on its own. Every holder of `SESSION_KV_API_KEY` can call it for any `a2a-*` session, so anything in the pod that can record a conversation's route can also stop that conversation's cards; the agent itself could already archive cards.
 
 The second is `POST /v1/board/actions`, the board-health card's Retry and Drop ([`agents/platform/cron/README.md`](../cron/README.md#kanban-board-health-asks-whether-the-board-is-wedged)). Its body is `action` (`retry` or `drop`), `tasks` (1-50 card ids of at most 64 characters) and `by` (who pressed, for the log line). It acts only on a card still `blocked`: Retry is Hermes' `unblock_task`, Drop the card stop's archive above. It answers each card's outcome, `done`, `moved` (no longer blocked), `gone` or `failed`, and a card its deadline (the card stop's) leaves unstarted answers `failed`. Its callers are the Slack adapter's click handler under today and the hermes-bridge under `spec.mode: next`, each having decided who may press first. Like the card stop, any holder of `SESSION_KV_API_KEY` can call it, and the agent could already unblock and archive cards.
 
@@ -511,9 +560,9 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 ##### Which columns are migrated, and which are not
 
 `init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
-`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key` and `pull_request` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request` and `excluded` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
 databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
-`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request` and `idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request`, `excluded` and `idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that
@@ -572,6 +621,21 @@ The column is named `severity` and three of its four values are one, but the key
 `Warning`. `GET /v1/alert-quota` reports the row as it finds it, so a reader sees four buckets.
 
 Rows age out after `SESSION_KV_CLEANUP_TTL_DAYS`, along with `session_metadata`, `incidents` and `incident_applies`, so roughly two weeks of history is available to answer "what did we drop last week".
+
+#### `triage_pr_reservations`
+
+The branches triages were routed to open a pull request on, which count against `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` ([above](#limiting-the-open-triage-pull-requests)):
+
+```sql
+CREATE TABLE triage_pr_reservations(
+  branch TEXT NOT NULL,           -- platform-agent/incident-<incident>
+  session_id TEXT NOT NULL,       -- the triage that reserved it
+  reserved_at REAL NOT NULL,      -- epoch seconds
+  PRIMARY KEY (branch, session_id)
+);
+```
+
+Not swept by the TTL: each claim releases the rows that no longer count.
 
 The same database also holds `findings` and `queue_publications`, the findings queue's tables. They are exempt from the TTL sweep — a backlog item disappears when its state says it is finished, not when it gets old. [`docs/designs/inventory-findings-queue.md`](../../../docs/designs/inventory-findings-queue.md) §3.1 is the canonical description of both.
 

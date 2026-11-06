@@ -268,6 +268,9 @@ const (
 	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// watcherAlertExcludeEnv carries spec.harness.eventWatcher.alertExclude to
+	// the watcher as JSON; start-services.sh passes it as --alert-exclude.
+	watcherAlertExcludeEnv = "WATCHER_ALERT_EXCLUDE"
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
@@ -1455,8 +1458,9 @@ var frontDoorPlugins = []string{
 // profile's config.yaml leaves the entrypoint's force-sync and is only back-filled, and the
 // back-fill never extends a list the live file already holds, so a plugin the image
 // enabled after that volume was first written stays off there. The front-door overlay
-// unions these in so the flag cannot hide one. pr_opened records each pull request a
-// worker opens on its card, which is what posts the thread's PR message.
+// unions these in so the flag cannot hide one. pr_opened claims each pull request record
+// through the broker, strips its token and writes the origin ledger; in a worker it also
+// records the pull request on the card, which is what posts the thread's PR message.
 var frontDoorBackfillPlugins = []string{
 	"pr_opened",
 }
@@ -3443,12 +3447,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// so the agent-side callers that used to `hermes send` a proactive post
 	// route it to the gateway's chat.notify home channel instead. This names
 	// the platform they reroute; the bus identity above is what sends it.
-	// Only with a home channel the route posts to: otherwise every proactive
-	// post would be refused, and on a Chat-and-Slack install the agent would
-	// count Chat as a platform to post to ahead of Slack.
-	if a2aAgentSurface(agent) && a2aChatArmed(agent) && a2aGchatHomeSpace(agent) != "" {
+	// With a home channel the route posts; without one it refuses and keeps
+	// the post for the digest, so the route is named whenever the backend
+	// is the only platform the posts could reach (a2aGchatHomeRouted). On a
+	// Chat-and-Slack install with no Chat home the agent is not routed, so
+	// it does not count Chat as a platform to post to ahead of Slack.
+	if a2aAgentSurface(agent) && a2aGchatHomeRouted(agent) {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aAgentSurface(agent) && a2aSlackArmed(agent) && a2aSlackHomeChannel(agent) != "" {
+	} else if a2aAgentSurface(agent) && a2aSlackHomeRouted(agent) {
 		// Slack's half of the same rule: the Hermes slack platform is off
 		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
 		// the single-backend gateway, so at most one platform is routed. Only
@@ -3461,7 +3467,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		// audit relay gates its report card on knowing a channel and records
 		// it on the incident's routing row. The Hermes slack platform is off
 		// here, so this arms nothing on the agent but those readers.
-		envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: a2aSlackHomeChannel(agent)})
+		if home := a2aSlackHomeChannel(agent); home != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: home})
+		}
 	}
 	// A kanban card's report back to the gateway conversation it was filed
 	// in, and onboarding's first report into the conversation the user first
@@ -4256,22 +4264,14 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 }
 
 // resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
-// override over the operator's defaults, one key at a time, so a CR that sets
-// only limits.memory keeps every other default. A nil override returns the
-// defaults unchanged, which the goldens and the chart's quota preflight carry.
-// ValidateAgentAPIAuthResources reads the same merged result.
-func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
-	resolved := corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{
-			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-		},
-		Limits: corev1.ResourceList{
-			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-		},
-	}
+// override over the tier's row (agentAPIAuthTierResources; the small row is
+// the operator's defaults), one key at a time, so a CR that sets only
+// limits.memory keeps every other figure of the row. A nil override on the
+// small row returns the defaults unchanged, which the goldens and the chart's
+// quota preflight carry. ValidateAgentAPIAuthResources reads the same merged
+// result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier) corev1.ResourceRequirements {
+	resolved := agentAPIAuthTierResources(tier)
 	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
 		return resolved
 	}
@@ -4429,7 +4429,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		// delivered (watcher.go, Run). The event watcher reads the memory limit
 		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
 		// half of it, so a raised limit raises the soft limit with no other change.
-		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment, renderedSizingTier(agent)),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.
@@ -4479,10 +4479,30 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		{Name: watcherBrokerURLEnvVar, Value: credentialProxyBaseURL(agent)},
 		{Name: watcherBrokerTokenFileEnvVar, Value: watcherTokenMountPath + "/token"},
 	}
+	// Managed, so reserved by the merge below, only when the list is set: an
+	// install with no rules here keeps a WATCHER_ALERT_EXCLUDE it set through
+	// spec.deployment.env, which the watcher read before this field existed.
+	if rules := eventWatcherAlertExclude(agent); len(rules) > 0 {
+		envVars = append(envVars, corev1.EnvVar{Name: watcherAlertExcludeEnv, Value: rules})
+	}
 	if agent.Spec.Deployment != nil {
 		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
 	}
 	return envVars
+}
+
+// eventWatcherAlertExclude renders spec.harness.eventWatcher.alertExclude as
+// the JSON list the watcher's --alert-exclude reads, or "" when it is empty.
+// The CRD's JSON keys are the watcher's, so the list is passed as it is.
+func eventWatcherAlertExclude(agent *agentv1alpha1.PlatformAgent) string {
+	harness := agent.Spec.Harness
+	if harness == nil || harness.EventWatcher == nil || len(harness.EventWatcher.AlertExclude) == 0 {
+		return ""
+	}
+	// A list of plain strings and one pointer to a struct of strings cannot
+	// fail to marshal.
+	rules, _ := json.Marshal(harness.EventWatcher.AlertExclude)
+	return string(rules)
 }
 
 // sessionKVApiKeySecretRef resolves the Secret key holding the bearer token for
@@ -4889,6 +4909,9 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		credentialProxyProfileIdentitiesEnvVar,
 		credentialProxyTaskSigningKeysEnvVar,
 		credentialProxyTaskCredentialMaxLifetimeEnvVar,
+		// The dispatcher's seed path, which no broker-side container
+		// reads; reserved so a CR can't hand one a seed file of its choosing.
+		a2aTaskSigningSeedFileEnvVar,
 		// One that could set the watcher audience would decide who holds the
 		// watcher role; one that could set the subscription would point the
 		// watcher relay at any subscription the broker's credential can pull;
@@ -5173,6 +5196,13 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// request still goes through submit-suggestion and a human merges it.
 		"INCIDENT_TRIAGE_OPEN_PULL_REQUEST": {},
 
+		// The most triage pull requests open or being opened at once while
+		// the switch above is on (INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS in
+		// session_kv_server.py). Parsed as a whole number, and a value that
+		// does not parse, is negative or is 0 means no limit, so it bounds a
+		// count of pull requests and reaches nothing else.
+		"INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS": {},
+
 		// How many Cluster Agent profiles one reconcile run scaffolds before it
 		// leaves the rest for the next run (MAX_CREATES_PER_RUN_ENV in
 		// cluster_agent_reconcile.py). Parsed as a whole number; anything but a
@@ -5190,6 +5220,18 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		// list_agents filter, and no value adds an agent, a path or a
 		// destination.
 		"KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD": {},
+
+		// The idle policy's two thresholds, in days
+		// (agents/chat/scripts/cron_idle_policy.py): after this many days
+		// without a chat message the dispatcher holds the Platform Agent's
+		// model-run cron jobs to once a window, and after the second it holds
+		// them until a message arrives. Each is parsed as a whole number; `0`
+		// turns its stage off and anything else means the default. A value
+		// changes only how often jobs already on the roster run, by moving
+		// their next_run_at in the profile's own store, and adds no job, path,
+		// destination or credential.
+		"CRON_IDLE_HIBERNATE_DAYS": {},
+		"CRON_IDLE_THROTTLE_DAYS":  {},
 	}
 	// KAGE_SLACK_UX also gates Slack's agent-view manifest text and the
 	// default suggested prompts (`apply_slack_agent_view.py`), under the same
@@ -5254,7 +5296,7 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 		{Name: credentialProxyStateVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(credentialProxyStateSizeLimit))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
 		buildEventWatcherKubeconfigVolume(),
-		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+		{Name: brokerMinterVolume, VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 			DefaultMode: ptr.To(int32(0400)),
 			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
 				Audience: credentialProxyAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",

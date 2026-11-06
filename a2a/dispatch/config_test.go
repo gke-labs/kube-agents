@@ -7,10 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nkeys"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	clientfeatures "k8s.io/client-go/features"
 	clientfeaturestesting "k8s.io/client-go/features/testing"
@@ -218,4 +220,90 @@ func TestPodPoolOffersOnlyReadyWorkersOfThePool(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, "the pod turning ready", func() bool { return len(p.Pods("tse", "read")) == 3 })
+}
+
+// The pool reads a pod's UID off the watched pod object (#3889): only for a
+// pod of that (profile, tier), not one being deleted, and the new UID once a
+// pod of the same name is re-created.
+func TestPodPoolReadsAPodsUIDFromTheWatchedPod(t *testing.T) {
+	noWatchList(t)
+	withUID := func(p *corev1.Pod, uid string) *corev1.Pod { p.UID = types.UID(uid); return p }
+	client := fake.NewSimpleClientset(
+		withUID(workerPod("tse-read-a", "tse", "read", true), "uid-a"),
+		withUID(workerPod("tse-read-b", "tse", "read", true), "uid-b"),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := NewPodPool(ctx, client, "kube-agents-profiles", quietLog())
+	go p.Run(ctx)
+	waitFor(t, 5*time.Second, "the pool synced", p.Synced)
+	for _, tc := range []struct{ profile, tier, pod, want string }{
+		{"tse", "read", "tse-read-a", "uid-a"},
+		{"tse", "read", "tse-read-b", "uid-b"},
+		{"tse", "unattended", "tse-read-a", ""},
+		{"chat", "read", "tse-read-a", ""},
+		{"tse", "read", "tse-read-z", ""},
+	} {
+		if got := p.PodUID(tc.profile, tc.tier, tc.pod); got != tc.want {
+			t.Errorf("PodUID(%s, %s, %s) = %q, want %q", tc.profile, tc.tier, tc.pod, got, tc.want)
+		}
+	}
+	pods := client.CoreV1().Pods("kube-agents-profiles")
+	if err := pods.Delete(ctx, "tse-read-a", metav1.DeleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pods.Create(ctx, withUID(workerPod("tse-read-a", "tse", "read", true), "uid-a2"), metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the re-created pod's UID", func() bool { return p.PodUID("tse", "read", "tse-read-a") == "uid-a2" })
+	deleting := withUID(workerPod("tse-read-b", "tse", "read", true), "uid-b")
+	now := metav1.Now()
+	deleting.DeletionTimestamp = &now
+	if _, err := pods.Update(ctx, deleting, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "a deleting pod has no UID", func() bool { return p.PodUID("tse", "read", "tse-read-b") == "" })
+}
+
+// The task-signing settings (#3889): a key must be a cluster key (the
+// callout trusts only those, so any other would mint credentials nothing
+// accepts) and the lifetime cap must not be negative; zero is the callout's
+// default, and no key at all is valid.
+func TestConfigValidateChecksTheTaskSigningSettings(t *testing.T) {
+	cluster, err := nkeys.CreateCluster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, _ := nkeys.CreateAccount()
+	user, _ := nkeys.CreateUser()
+	operator, _ := nkeys.CreateOperator()
+	for name, edit := range map[string]func(*Config){
+		"no key":                  func(c *Config) {},
+		"a cluster key":           func(c *Config) { c.TaskSigningKey = cluster },
+		"a cluster key, zero cap": func(c *Config) { c.TaskSigningKey, c.TaskCredentialMaxLifetime = cluster, 0 },
+		"a cluster key, a 2h cap": func(c *Config) { c.TaskSigningKey, c.TaskCredentialMaxLifetime = cluster, 2*time.Hour },
+		"no key, a positive cap":  func(c *Config) { c.TaskCredentialMaxLifetime = time.Minute },
+	} {
+		c := DefaultConfig()
+		edit(&c)
+		if err := c.Validate(); err != nil {
+			t.Errorf("%s: refused: %v", name, err)
+		}
+	}
+	for name, edit := range map[string]func(*Config){
+		"an account key":         func(c *Config) { c.TaskSigningKey = account },
+		"a user key":             func(c *Config) { c.TaskSigningKey = user },
+		"an operator key":        func(c *Config) { c.TaskSigningKey = operator },
+		"a negative cap":         func(c *Config) { c.TaskSigningKey, c.TaskCredentialMaxLifetime = cluster, -time.Second },
+		"a negative cap, no key": func(c *Config) { c.TaskCredentialMaxLifetime = -time.Hour },
+	} {
+		c := DefaultConfig()
+		edit(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		if _, err := New(c, nil, nil, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "dispatch config") {
+			t.Errorf("%s: New = %v, want the config refusal", name, err)
+		}
+	}
 }

@@ -141,8 +141,10 @@ func TestARunningTaskThatDoesNotStopIsAbandoned(t *testing.T) {
 	b.ensure("tse", 1, 0, "read")
 	w := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
 	ti := oneProfile("tse", 1, "tse-0")
-	ti.update(func(c *lib.DispatchConfig) { c.StopGraceSeconds = 1 })
-	b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+	// A threshold of 1: counting this still-renewing worker as lost would
+	// open the breaker.
+	ti.update(func(c *lib.DispatchConfig) { c.StopGraceSeconds, c.BreakerThreshold = 1, 1 })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 10*time.Second, "task-1 running", func() bool { return w.startedTask("task-1") })
@@ -160,6 +162,9 @@ func TestARunningTaskThatDoesNotStopIsAbandoned(t *testing.T) {
 		_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", "tse-0", "task-1")]
 		return ok
 	})
+	if open := d.Health().OpenBreakers; len(open) != 0 {
+		t.Errorf("breakers %v open after abandoning a worker that kept renewing; it wasn't lost", open)
+	}
 }
 
 // A worker that answers the stop's abandon with its own failed terminal (an
@@ -507,11 +512,30 @@ func TestAFailedHandOffStaysShownWaiting(t *testing.T) {
 
 	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
 	waitFor(t, 20*time.Second, "task-1 shown waiting", func() bool { return d.Health().Waiting[durable] == 1 })
+	if n := d.Health().HandOffFailed[durable]; n != 1 {
+		t.Errorf("health counts %d hand-off failures, want the one waiting", n)
+	}
 	// Through the next retries, each of which offers again and blocks on
 	// the denied lease write.
 	for end := time.Now().Add(2*kvOpTimeout + 2*time.Second); time.Now().Before(end); time.Sleep(100 * time.Millisecond) {
 		if n := d.Health().Waiting[durable]; n != 1 {
 			t.Fatalf("task-1 shown waiting %d times during a retry's offer round, want 1", n)
 		}
+	}
+}
+
+// A read that finds the connection closed (mid-reconnect or regrant) is the
+// connection's fault, not the stream's: no backoff and no stream report.
+func TestAClosedConnectionDoesNotBackTheStopStreamOff(t *testing.T) {
+	b := newBus(t)
+	c := b.connect("dispatcher")
+	c.Close()
+	d := bareDispatcher()
+	d.bus = c
+	if d.stopRequested(context.Background(), quietLog(), "tse", "task-1") {
+		t.Fatal("a stop read on a closed connection reported a stop")
+	}
+	if d.stopStreamErr != "" || !d.stopReadRetry.IsZero() {
+		t.Errorf("stop stream error %q, retry at %v; want neither for a closed connection", d.stopStreamErr, d.stopReadRetry)
 	}
 }

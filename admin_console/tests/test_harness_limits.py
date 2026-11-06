@@ -1388,6 +1388,25 @@ class ProxyCapacityTest(unittest.TestCase):
                          [(4.0, 2, 2.5), (8.0, 1, 3.5)])
         self.assertEqual(levels[0].cpu_cores, 0.7)
 
+    def test_each_load_operation_keeps_its_own_rows_and_adds_no_demand(self):
+        # The broker plan loads one tool per operation, named by the tool.
+        records = parse(
+            *(
+                record("base", 0, operation, 1,
+                       metrics=((hl.PROXY_LOAD_RATE, None, rate), (hl.PROXY_COMMANDS, None, 270.0),
+                                (hl.PROXY_COMMAND_SECONDS, None, 160.0)),
+                       values=planned(proxy_concurrency=1), totals={"clusters": 2})
+                # A load run is known by its rate, whatever the plan named it.
+                for operation, rate in (("proxy_load_kubectl", 1.5), ("proxy_load_gcloud", 0.4),
+                                        ("gcloud_list_soak", 0.3))
+            ),
+        )
+        levels = hl.proxy_levels(records)
+        self.assertEqual([(level.operation, level.workers, level.per_second) for level in levels],
+                         [("gcloud_list_soak", 1.0, 0.3), ("proxy_load_gcloud", 1.0, 0.4),
+                          ("proxy_load_kubectl", 1.0, 1.5)])
+        self.assertEqual(hl.proxy_demand(records), [])
+
     def test_a_proxy_load_run_that_shared_the_broker_is_left_out(self):
         records = parse(
             *(

@@ -1267,6 +1267,21 @@ func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesTheCronIdleThresholds(t *testing.T) {
+	// The site documents CRON_IDLE_THROTTLE_DAYS and CRON_IDLE_HIBERNATE_DAYS
+	// as spec.deployment.env entries, and the opt-out for an install driven
+	// only through the A2A inject door is the throttle at 0; neither reaches
+	// the ticker except through this allowlist.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "CRON_IDLE_THROTTLE_DAYS", Value: "0"},
+		{Name: "CRON_IDLE_HIBERNATE_DAYS", Value: "30"},
+	})
+	if len(got) != 2 || got[0].Name != "CRON_IDLE_THROTTLE_DAYS" || got[0].Value != "0" ||
+		got[1].Name != "CRON_IDLE_HIBERNATE_DAYS" || got[1].Value != "30" {
+		t.Fatalf("expected both cron idle thresholds to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesTheReconcileCreateCap(t *testing.T) {
 	// BOOTSTRAP_MAX_CREATES_PER_TICK bounds how many Cluster Agent profiles one
 	// reconcile run scaffolds; the site documents it as a spec.deployment.env

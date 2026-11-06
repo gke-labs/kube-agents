@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,18 +16,22 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/gke-labs/kube-agents/a2a/authcallout"
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/dispatch"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 // natsUser is the principal this program authenticates as and its inbox
@@ -40,6 +45,14 @@ const (
 	// envConfigMap names the dispatch ConfigMap (<agent>-a2a-dispatch) the
 	// operator renders.
 	envConfigMap = "DISPATCH_CONFIGMAP"
+	// envTaskSigningSeedFile is the path of the task-signing seed (#3889,
+	// a2a/taskcred; a cluster seed, SC...) the dispatcher mints each
+	// confirmed task's credentials with. Unset, confirms carry none.
+	envTaskSigningSeedFile = "A2A_TASK_SIGNING_SEED_FILE"
+	// envTaskCredentialMaxLifetime caps those credentials' expiry: the
+	// callout's setting of the same name, parsed by the callout's parser so
+	// the two never disagree on what a value means.
+	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
 
 	// configWait bounds the wait for the first config at startup: past it
 	// the process exits and the kubelet's restart says so.
@@ -103,6 +116,11 @@ func run(getenv func(string) string) int {
 		log.Error("config", "err", err)
 		return 2
 	}
+	settings.taskKey, settings.taskMaxLifetime, err = taskSigning(getenv, log)
+	if err != nil {
+		log.Error("task signing: refusing to start", "err", err)
+		return 2
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -128,6 +146,46 @@ func run(getenv func(string) string) int {
 type settings struct {
 	natsURL, namespace, configMap string
 	auth                          []nats.Option
+	// taskKey is the task-signing key, nil without one; taskMaxLifetime
+	// caps the credentials it signs (zero is the callout's default).
+	taskKey         nkeys.KeyPair
+	taskMaxLifetime time.Duration
+}
+
+// taskSigning loads the task-signing key from envTaskSigningSeedFile and the
+// credential lifetime cap. Unset, there is no key: a warning says so, once,
+// and the dispatcher runs as before. Set, the file must hold a task-signing
+// seed: one that can't be read or isn't one is an error, and the process
+// refuses to start rather than run minting nothing. An unusable lifetime is
+// an error too. Neither the seed nor any token is ever logged.
+func taskSigning(getenv func(string) string, log *slog.Logger) (nkeys.KeyPair, time.Duration, error) {
+	maxLifetime, err := authcallout.ParseTaskCredentialMaxLifetime(getenv(envTaskCredentialMaxLifetime))
+	if err != nil {
+		return nil, 0, err
+	}
+	path := strings.TrimSpace(getenv(envTaskSigningSeedFile))
+	if path == "" {
+		log.Warn("running without a task-signing key ("+envTaskSigningSeedFile+" is unset): confirms will carry no task credentials, so profile workers keep their profile-wide bus reach",
+			"env", envTaskSigningSeedFile)
+		return nil, maxLifetime, nil
+	}
+	seed, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s: read the task-signing seed: %w", envTaskSigningSeedFile, err)
+	}
+	// The key pair keeps its own copy: the bytes read are zeroed on every
+	// way out, so the seed doesn't linger in this buffer.
+	defer clear(seed)
+	kp, err := taskcred.ParseSigningKey(bytes.TrimSpace(seed))
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s=%s: %w", envTaskSigningSeedFile, path, err)
+	}
+	pub, err := kp.PublicKey()
+	if err != nil {
+		return nil, 0, fmt.Errorf("%s: the task-signing key: %w", envTaskSigningSeedFile, err)
+	}
+	log.Info("task-signing key loaded; confirms carry task credentials", "publicKey", pub)
+	return kp, maxLifetime, nil
 }
 
 func readSettings(getenv func(string) string) (settings, error) {
@@ -183,7 +241,9 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 	}
 	defer client.Close()
 	pr.setBus(func() bool { return client.Conn().IsConnected() })
-	d, err := dispatch.New(dispatch.DefaultConfig(), client, store, pool, busVerifier{conn: client.Conn, log: log}, log)
+	cfg := dispatch.DefaultConfig()
+	cfg.TaskSigningKey, cfg.TaskCredentialMaxLifetime = s.taskKey, s.taskMaxLifetime
+	d, err := dispatch.New(cfg, client, store, pool, busVerifier{conn: client.Conn, log: log}, log)
 	if err != nil {
 		return err
 	}

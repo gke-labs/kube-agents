@@ -16,7 +16,9 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/gke-labs/kube-agents/a2a/authcallout"
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/taskcred"
 )
 
 const (
@@ -52,6 +54,7 @@ const (
 	abandonLeaseExpired = "lease expired: the dispatcher heard no renewal in time"
 	abandonStopping     = "offer withdrawn: the dispatcher is stopping"
 	abandonUnrecorded   = "offer withdrawn: the dispatcher could not record the lease"
+	abandonNoCredential = "offer withdrawn: the dispatcher could not mint the task's credentials"
 
 	// Answers a worker sends for a task this dispatcher doesn't hold for it
 	// (an accept no offer waits on, a renewal for a task not confirmed to
@@ -106,6 +109,9 @@ type holding struct {
 	// lease and renew are what the task was offered (or, re-adopted, what
 	// its record shows): a config change never moves them.
 	lease, renew time.Duration
+	// cluster is the cluster admission checked the task against, nil when
+	// it names none: the target of its credential-proxy token (#3889).
+	cluster *taskcred.Target
 
 	// Guarded by Dispatcher.mu. pod is set from the offer on, so a pod
 	// with an offer out is busy before anything is written; confirmed is
@@ -118,6 +124,9 @@ type holding struct {
 	// probe is the epoch of the half-open breaker this task was reserved
 	// under, as the one task tried at a time, or 0 (breaker.go).
 	probe int
+	// correlation is the submission's correlationId: the user interaction
+	// it serves, which its children carry too (breaker.go's probe family).
+	correlation string
 	// stopRequested is a stop record for the task (stop.go); stopc, made
 	// when hold starts, wakes hold for it.
 	stopRequested bool
@@ -170,6 +179,13 @@ type Dispatcher struct {
 	verifier Verifier
 	log      *slog.Logger
 	now      func() time.Time
+	// mint signs one task credential with the task-signing key, and
+	// taskKeys is that key's public half, which the dispatcher reads back
+	// each credential it mints with. mint is nil with no key: confirms then
+	// carry no credentials. taskMaxLifetime caps their expiry.
+	mint            func(taskcred.Claims) (string, error)
+	taskKeys        []string
+	taskMaxLifetime time.Duration
 
 	mu        sync.Mutex
 	started   time.Time
@@ -181,7 +197,8 @@ type Dispatcher struct {
 	// hold here had them, by when: settled, not failed, when the
 	// submission comes back.
 	released map[string]time.Time
-	// verified is when the verifier last permitted a waiting submission.
+	// verified is the verifier's last permit for a waiting submission:
+	// when, and for which ref and target.
 	verified map[holdKey]permit
 	// answers is each pod's budget of answers for tasks it doesn't hold,
 	// by <profile>.<tier>.<pod>.
@@ -245,8 +262,23 @@ func New(cfg Config, bus *lib.Client, src Source, pool Pool, verifier Verifier, 
 	if log == nil {
 		log = slog.Default()
 	}
+	var mint func(taskcred.Claims) (string, error)
+	var taskKeys []string
+	if key := cfg.TaskSigningKey; key != nil {
+		pub, err := key.PublicKey()
+		if err != nil {
+			return nil, fmt.Errorf("dispatch.New: the task-signing key: %w", err)
+		}
+		mint = func(c taskcred.Claims) (string, error) { return taskcred.Mint(key, c) }
+		taskKeys = []string{pub}
+	}
+	maxLifetime := cfg.TaskCredentialMaxLifetime
+	if maxLifetime == 0 {
+		maxLifetime = authcallout.DefaultTaskCredentialMaxLifetime
+	}
 	return &Dispatcher{
 		cfg: cfg, bus: bus, src: src, pool: pool, verifier: verifier, log: log, now: time.Now,
+		mint: mint, taskKeys: taskKeys, taskMaxLifetime: maxLifetime,
 		active:     map[holdKey]*holding{},
 		offers:     map[offerKey]chan lib.DispatchAccept{},
 		waiting:    map[holdKey]waiting{},
@@ -628,7 +660,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	}
 
 	now := d.now()
-	ref, err := d.admit(ctx, del, snap, prof, hk, now)
+	cluster, ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if errors.Is(err, errStopped) {
 		d.dropUnstartedJob(ctx, log, prof, hk)
 		d.stopQueued(ctx, log, del, hk)
@@ -658,6 +690,10 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 
+	// The probe's own child was admitted as part of the probe's attempt, not
+	// as a probe: it is never stamped as one, so its end can't close the
+	// breaker while the probe runs.
+	family := d.probesChild(prof.Name, tier, kind, del.Envelope().CorrelationID)
 	h, why := d.reserve(snap, prof, tier, kind, taskID)
 	if h != nil {
 		// A stop heard since admission read the stream (onStop marks only
@@ -666,6 +702,10 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		d.mu.Lock()
 		if _, heard := d.stopped[h.profile+"/"+h.taskID]; heard {
 			h.stopRequested = true
+		}
+		h.correlation = del.Envelope().CorrelationID
+		if family {
+			h.probe = 0
 		}
 		d.mu.Unlock()
 	}
@@ -682,6 +722,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		return
 	}
 	d.offeringWaiting(hk)
+	h.cluster = cluster
 
 	// Job mode needs the profile's Job template; without it (the chart
 	// didn't install the Job admission policy) the pool takes the task.
@@ -725,7 +766,6 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	d.mu.Lock()
 	d.lastAdmit[lib.ProfileDurableName(profile, tier, kind)] = d.now()
 	d.mu.Unlock()
-	log.Info("task confirmed to a worker", "pod", rec.Pod)
 	d.hold(ctx, log, del, h, rec, key, time.Time{})
 	d.endJob(ctx, log, h)
 }
@@ -904,8 +944,9 @@ func (d *Dispatcher) release(h *holding, settled bool) {
 // is abandoned on its pod before the task is offered to anyone else, and any
 // accept that comes after (onAccept) is answered with an abandon too, so a
 // lost or late accept never leaves two workers running the task. On an
-// accept the lease record is written, which starts the lease clock, and then
-// the confirm is sent: a record whose confirm is lost costs the task (no
+// accept the task's credentials are minted (with a key; a failed mint
+// withdraws the offer), the lease record is written, which starts the lease
+// clock, and then the confirm is sent: a record whose confirm is lost costs the task (no
 // renewal comes, and it fails lease-expired), never a second run. An empty
 // key with a nil error means no pod took the task.
 func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Delivery, snap lib.DispatchConfig,
@@ -954,12 +995,14 @@ func (d *Dispatcher) handOff(ctx context.Context, log *slog.Logger, del lib.Deli
 type offerOutcome int
 
 const (
-	// offerNotTaken: declined, unanswered in time, or not sent; the pod is
-	// freed and was told to drop the task where there was reason to.
+	// offerNotTaken: declined, unanswered in time, not sent, or accepted
+	// with credentials that could not be minted; the pod is freed and was
+	// told to drop the task where there was reason to.
 	offerNotTaken offerOutcome = iota
 	// offerTaken: accepted, the lease recorded and the confirm sent.
 	offerTaken
-	// offerUnsent: the offer never reached the bus; the pod is free.
+	// offerUnsent: the offer never reached the bus, or was never sent to a
+	// pod with no UID for its credentials to name; the pod is free.
 	offerUnsent
 	// offerStopped: the task was stopped (contract addendum 9) before the
 	// confirm. The offer, if sent, is abandoned on the pod, nothing is
@@ -1007,6 +1050,18 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		giveUp("")
 		return lib.LeaseRecord{}, "", offerStopped, nil
 	}
+	// The pod's UID as the pool sees it at the offer, which its task
+	// credentials name (#3889). With a key and no UID they can't be
+	// minted, so the pod isn't offered the task at all: offered, it
+	// would accept and then never be confirmed, and the task would fail.
+	var uid string
+	if d.mint != nil {
+		if uid = d.pool.PodUID(h.profile, h.tier, pod); uid == "" {
+			giveUp("")
+			log.Warn("the pool has no UID for the pod, so no task credentials can name it; not offering it the task", "pod", pod)
+			return lib.LeaseRecord{}, "", offerUnsent, nil
+		}
+	}
 	deadline := d.now().Add(seconds(prof.ActiveDeadlineSeconds))
 	msg := lib.DispatchMessage{Type: lib.DispatchOffer, TaskID: h.taskID, Kind: h.kind, Envelope: envelope,
 		Deadline: deadline, LeaseSeconds: snap.LeaseSeconds, RenewSeconds: snap.RenewSeconds,
@@ -1040,6 +1095,22 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		giveUp(abandonStopped)
 		return lib.LeaseRecord{}, "", offerStopped, nil
 	case answered && acc.Accepted:
+		// The task's credentials are minted here and only here: for
+		// the one pod that accepted, before anything is recorded. With
+		// a key, a confirm never goes out without them, and one that
+		// can't be minted (the pod's UID changed, or the signer failed)
+		// is an offer withdrawn, as a declined one is: nothing is
+		// written, and the next pod is tried.
+		confirm := lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}
+		if d.mint != nil {
+			var err error
+			confirm.TaskCredential, confirm.ProxyToken, err = d.taskCredentials(log, h, pod, uid, deadline)
+			if err != nil {
+				log.Warn("task credentials not minted; withdrawing the offer", "pod", pod, "err", err)
+				giveUp(abandonNoCredential)
+				return lib.LeaseRecord{}, "", offerNotTaken, nil
+			}
+		}
 		now := d.now()
 		key := lib.ProfileLeaseKey(h.profile, h.tier, pod, h.taskID)
 		rec := lib.LeaseRecord{TaskID: h.taskID, Pod: pod, Kind: h.kind,
@@ -1055,12 +1126,17 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		delete(d.offers, ok)
 		h.confirmed = true
 		d.mu.Unlock()
-		if err := d.send(subject, lib.DispatchMessage{Type: lib.DispatchConfirm, TaskID: h.taskID}); err != nil {
+		if err := d.send(subject, confirm); err != nil {
 			// The lease is running; with no confirm the worker never
 			// starts, no renewal comes, and the task fails
 			// lease-expired. It is never offered again.
 			log.Warn("confirm not sent; the task fails when its lease runs out", "pod", pod, "err", err)
+			return rec, key, offerTaken, nil
 		}
+		// Logged here, where the confirm is known to have gone out:
+		// the caller holds the lease on every path that recorded one,
+		// sent or not, and can't tell them apart.
+		log.Info("task confirmed to a worker", "pod", pod)
 		return rec, key, offerTaken, nil
 	case answered:
 		log.Info("offer declined", "pod", pod, "reason", acc.Reason)
@@ -1070,6 +1146,57 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 		giveUp(abandonTimedOut)
 	}
 	return lib.LeaseRecord{}, "", offerNotTaken, nil
+}
+
+// taskCredentials mints the task credential (audience nats) and, when the
+// task names a cluster, the credential-proxy token for the pod being
+// confirmed (#3889). Both name the task, its profile and tier, the pod and
+// the UID it had at the offer; a pod whose UID has changed since (deleted
+// and re-created under its name) is not the pod that accepted, and gets
+// nothing. Both expire at the offer's deadline plus the callout's clock-skew
+// allowance, capped at the max lifetime from now so the callout never
+// refuses one as too long-lived. Each is read back with the key's public
+// half before it is used, and only its jti is logged, never the token.
+func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid string, deadline time.Time) (natsToken, proxyToken string, err error) {
+	if now := d.pool.PodUID(h.profile, h.tier, pod); now != uid {
+		return "", "", fmt.Errorf("the pod's UID changed since the offer (%q, now %q)", uid, now)
+	}
+	now := d.now()
+	expires := deadline.Add(authcallout.TaskCredentialSkew)
+	if limit := now.Add(d.taskMaxLifetime); expires.After(limit) {
+		expires = limit
+	}
+	base := taskcred.Claims{Task: h.taskID, Profile: h.profile, Tier: h.tier, Pod: pod, PodUID: uid, Expires: expires}
+	natsToken, err = d.mintOne(log, base, taskcred.AudienceNATS, nil, now)
+	if err != nil {
+		return "", "", err
+	}
+	if h.cluster != nil {
+		proxyToken, err = d.mintOne(log, base, taskcred.AudienceCredentialProxy, h.cluster, now)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	return natsToken, proxyToken, nil
+}
+
+// mintOne mints one credential for aud, reads it back and logs its jti.
+func (d *Dispatcher) mintOne(log *slog.Logger, c taskcred.Claims, aud taskcred.Audience, target *taskcred.Target, now time.Time) (string, error) {
+	c.Audience = aud
+	if target != nil {
+		t := *target
+		c.Target = &t
+	}
+	token, err := d.mint(c)
+	if err != nil {
+		return "", fmt.Errorf("mint the %s credential: %w", aud, err)
+	}
+	back, err := taskcred.Verify(token, d.taskKeys, aud, now, d.taskMaxLifetime, authcallout.TaskCredentialSkew)
+	if err != nil {
+		return "", fmt.Errorf("the %s credential just minted does not verify: %w", aud, err)
+	}
+	log.Info("task credential minted", "pod", c.Pod, "audience", string(aud), "jti", back.ID, "expires", back.Expires)
+	return token, nil
 }
 
 // freePodLocked is a pod of the (profile, tier) pool that holds no task
@@ -1183,7 +1310,9 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			}
 			if r.final {
 				log.Info("task finished", "pod", rec.Pod)
-				d.breakers.finished(h.profile, h.tier)
+				if !d.stopRequestedOn(h) {
+					d.breakers.finished(h.profile, h.tier, h.probe)
+				}
 				d.settle(ctx, log, del, h, key, rec)
 				return
 			}
@@ -1197,14 +1326,24 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 			now := d.now()
 			switch {
 			case !stopAt.IsZero() && now.After(stopAt):
+				// The grace usually ends before the lease would (30s
+				// against 90s), so a worker that went silent on the stop is
+				// counted here: silent for a renewal and a tick is a worker
+				// lost, and a stop must not hide one.
+				if !now.Before(graceUntil) && now.Sub(rec.RenewedAt) > h.renew+max(h.renew/ticksPerRenewal, minTick) {
+					d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
+				}
 				d.stopHeld(ctx, log, del, h, key, rec)
 				return
 			case now.After(rec.Deadline):
 				log.Warn("task passed its deadline; failing it", "pod", rec.Pod, "deadline", rec.Deadline)
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonDeadline})
-				// Its worker renewed to the end, so it was no worker loss:
-				// a half-open breaker closes as on a finish.
-				d.breakers.finished(h.profile, h.tier)
+				// Its worker renewed to the end, so it was no worker loss: the
+				// probe of this opening closes the breaker as on a finish. A
+				// stopped task never closes it.
+				if !d.stopRequestedOn(h) {
+					d.breakers.finished(h.profile, h.tier, h.probe)
+				}
 				d.fail(ctx, log, del, h, key, rec, ReasonDeadlineExceeded,
 					fmt.Sprintf("ran past the profile's %s limit", deadlineLimit(rec)))
 				return
@@ -1214,6 +1353,10 @@ func (d *Dispatcher) hold(ctx context.Context, log *slog.Logger, del lib.Deliver
 				// A worker that is alive but unheard must not go on with a
 				// task that has failed.
 				_ = d.send(subject, lib.DispatchMessage{Type: lib.DispatchAbandon, TaskID: h.taskID, Reason: abandonLeaseExpired})
+				// Counted even for a stopped task: a worker lost is a worker
+				// lost, and a stop must not hide one (stopping each poisoned
+				// task would keep the breaker shut). Only closing is denied
+				// a stopped task.
 				d.breakers.expired(d.src.Config(), h.profile, h.tier, now)
 				d.fail(ctx, log, del, h, key, rec, ReasonLeaseExpired,
 					fmt.Sprintf("worker %s stopped renewing at %s", rec.Pod, rec.RenewedAt.UTC().Format(time.RFC3339)))

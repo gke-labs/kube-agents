@@ -121,5 +121,27 @@ class CheckCaseTest(unittest.TestCase):
             self.assertEqual([c["name"] for c in cc.load(Path(tmp))], ["a-case", "a-case-twice"])
 
 
+class LintTest(unittest.TestCase):
+    def test_the_shared_lint_cases(self):
+        cases = json.loads(cc.LINT_CASES.read_text(encoding="utf-8"))["cases"]
+        self.assertGreater(len(cases), 0)
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                cc.check_chat(case["chat"], case["name"])
+                self.assertEqual([rule for rule, _field, _what in cc.lint(case["chat"])], case["findings"])
+
+    def test_every_shared_case_breaks_no_rule(self):
+        for case in cc.load():
+            for i, out in enumerate(case["expected"]):
+                if out is not None:
+                    self.assertEqual(cc.lint(out["chat"]), [], f"{case['name']}.expected[{i}]")
+
+    def test_a_finding_names_the_field(self):
+        chat = {"schema": cc.SCHEMA, "headline": "Done.", "choices": [{"text": "Roll back"}, {"text": "/approve"}]}
+        self.assertEqual(
+            cc.lint(chat), [(cc.LINT_CHOICE_RAW_COMMAND, "choices[1].text", "'/approve' is a slash command")]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

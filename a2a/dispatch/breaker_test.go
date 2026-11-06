@@ -10,23 +10,32 @@ import (
 // A breaker opens at its threshold of expiries in a row and holds until its
 // cooldown ends, then is half open: the next expiry opens it at once, and a
 // finished task closes it. Each (profile, tier) has its own.
+// never and is are wait's gates as constants.
+func never() bool { return false }
+
+func is(v bool) func() bool { return func() bool { return v } }
+
 func TestABreakerOpensHoldsAndCloses(t *testing.T) {
 	b := newBreakers()
 	cfg := lib.DispatchConfig{BreakerThreshold: 2, BreakerCooldownSeconds: 60}
 	t0 := time.Unix(1_000_000, 0)
-	held := func(at time.Time) bool { w, _ := b.wait("tse", "read", at, false, false); return w }
+	held := func(at time.Time) bool { w, _ := b.wait("tse", "read", at, never, never); return w }
 
 	b.expired(cfg, "tse", "read", t0)
 	if held(t0) {
 		t.Fatal("held after one expiry of two")
 	}
 	b.expired(cfg, "tse", "read", t0)
-	if w, open := b.wait("tse", "read", t0.Add(time.Second), false, false); !w || !open {
+	if w, open := b.wait("tse", "read", t0.Add(time.Second), never, never); !w || !open {
 		t.Fatalf("after two expiries: wait %v, open %v; want both", w, open)
 	}
-	if w, _ := b.wait("tse", "unattended", t0.Add(time.Second), false, false); w {
+	if w, _ := b.wait("tse", "unattended", t0.Add(time.Second), never, never); w {
 		t.Error("another tier's breaker opened too")
 	}
+	// Open, the half-open gates aren't evaluated: each takes the dispatcher's
+	// lock and walks its holdings, on every held submission's retry.
+	called := func() bool { t.Error("a half-open gate was evaluated while the breaker is open"); return false }
+	b.wait("tse", "read", t0.Add(time.Second), called, called)
 	if open, halfOpen := b.open(t0.Add(time.Second)); len(open) != 1 || open[0] != "tse/read" || len(halfOpen) != 0 {
 		t.Errorf("open = %v, half open = %v", open, halfOpen)
 	}
@@ -43,7 +52,13 @@ func TestABreakerOpensHoldsAndCloses(t *testing.T) {
 		t.Fatal("a half-open breaker didn't open again on an expiry")
 	}
 
-	b.finished("tse", "read")
+	// A task admitted before this opening ends: the breaker stays open.
+	b.finished("tse", "read", 0)
+	if !held(half.Add(time.Second)) {
+		t.Fatal("a task from before the opening closed the breaker")
+	}
+	// This opening's probe ends: closed.
+	b.finished("tse", "read", b.epoch("tse", "read"))
 	later := half.Add(2 * time.Second)
 	if held(later) {
 		t.Fatal("held after a finished task")
@@ -66,7 +81,7 @@ func TestAHalfOpenBreakerTriesTheOldestOneAtATime(t *testing.T) {
 	for _, c := range []struct {
 		busy, older, want bool
 	}{{true, false, true}, {false, true, true}, {false, false, false}} {
-		if w, open := b.wait("tse", "read", half, c.busy, c.older); w != c.want || open {
+		if w, open := b.wait("tse", "read", half, is(c.busy), is(c.older)); w != c.want || open {
 			t.Errorf("busy %v older %v: wait %v open %v; want wait %v, not open", c.busy, c.older, w, open, c.want)
 		}
 	}
@@ -108,7 +123,9 @@ func TestAHalfOpenBreakerIsNotHeldByATaskRunningBeforeItOpened(t *testing.T) {
 // doesn't hold a child that would fit.
 func TestAnOlderSubmissionWaitingOverACapDoesNotHoldAHalfOpenBreaker(t *testing.T) {
 	d := bareDispatcher()
+	d.breakers = newBreakers()
 	t0 := time.Now()
+	d.breakers.expired(lib.DispatchConfig{BreakerThreshold: 1, BreakerCooldownSeconds: 1}, "tse", "read", t0.Add(-2*time.Second))
 	top := holdKey{"tse", "read", lib.SubmitKindTop, "task-top"}
 	child := holdKey{"tse", "read", lib.SubmitKindChild, "task-child"}
 	d.waiting[top] = waiting{queued: t0, lastSeen: t0, why: "profile concurrency"}
@@ -143,7 +160,7 @@ func TestAProbeOfAnEarlierOpeningDoesNotHoldTheBreaker(t *testing.T) {
 	if !d.probing("tse", "read") {
 		t.Fatal("precondition: the probe isn't counted while its breaker is half open")
 	}
-	d.breakers.finished("tse", "read")
+	d.breakers.finished("tse", "read", probe.probe)
 	d.breakers.expired(cfg, "tse", "read", half)
 	if d.probing("tse", "read") {
 		t.Error("a probe of the earlier opening holds the breaker opened again")
@@ -204,6 +221,157 @@ func TestAStoppedProbeLeavesTheBreakerAsItWas(t *testing.T) {
 	b.submit("tse", "read", lib.SubmitKindTop, "task-next")
 	if ts := b.waitTerminal("task-next", 15*time.Second); ts.state != lib.StateCompleted {
 		t.Errorf("task-next terminal %+v, want it tried as the next probe and completed", ts)
+	}
+}
+
+// With no breaker on a (profile, tier), nothing is held there, so no
+// waiting entry is "older" (and the scan isn't paid on every admission).
+func TestNoBreakerMeansNothingIsOlder(t *testing.T) {
+	d := bareDispatcher()
+	d.breakers = newBreakers()
+	t0 := time.Now()
+	d.waiting[holdKey{"tse", "read", lib.SubmitKindTop, "task-old"}] = waiting{queued: t0, lastSeen: t0, why: waitBreaker}
+	if d.olderWaiting(holdKey{"tse", "read", lib.SubmitKindTop, "task-new"}, t0.Add(time.Second)) {
+		t.Error("an older submission counted with no breaker on the tier")
+	}
+}
+
+// Half open, a child of the probe is part of the probe's attempt and is
+// admitted; a child of any other task (here one serving another user
+// interaction) is held as a top task is.
+func TestAHalfOpenProbesChildRunsAndAStrangersChildWaits(t *testing.T) {
+	b := newBus(t, "tse-0", "tse-1", "tse-2")
+	b.ensure("tse", 3, 0, "read")
+	dead := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+	dead.noRenew = true
+	parent := b.worker("tse", "read", "tse-1", answerAccept, time.Hour)
+	b.worker("tse", "read", "tse-2", answerAccept, 300*time.Millisecond)
+	ti := oneProfile("tse", 3, "tse-0")
+	ti.update(func(c *lib.DispatchConfig) { c.BreakerThreshold, c.BreakerCooldownSeconds = 1, 1 })
+	d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+
+	b.submit("tse", "read", lib.SubmitKindTop, "task-dead")
+	if ts := b.waitTerminal("task-dead", 20*time.Second); !hasReason(ts, ReasonLeaseExpired) {
+		t.Fatalf("task-dead terminal %+v, want lease-expired", ts)
+	}
+	ti.pool.Set("tse", "read", "tse-1")
+	b.submitCorr("tse", "read", lib.SubmitKindTop, "task-parent", "corr-P")
+	waitFor(t, 15*time.Second, "the probe running", func() bool { return parent.startedTask("task-parent") })
+	ti.pool.Set("tse", "read", "tse-1", "tse-2")
+	// First a child serving another interaction: held while the probe runs.
+	b.submitCorr("tse", "read", lib.SubmitKindChild, "task-stranger", "corr-X")
+	durable := lib.ProfileDurableName("tse", "read", lib.SubmitKindChild)
+	waitFor(t, 10*time.Second, "the stranger's child held", func() bool { return d.Health().Breaker[durable] == 1 })
+	time.Sleep(time.Second)
+	if ts := b.terminalsOf("task-stranger"); len(ts) != 0 {
+		t.Fatalf("another task's child ended %+v while the probe runs; want it held", ts)
+	}
+	// Then the probe's own child: admitted at once, though the stranger is
+	// older and still held.
+	b.submitCorr("tse", "read", lib.SubmitKindChild, "task-child", "corr-P")
+	if ts := b.waitTerminal("task-child", 15*time.Second); ts.state != lib.StateCompleted {
+		t.Errorf("the probe's child: terminal %+v, want completed while the probe runs", ts)
+	}
+	// The child isn't the probe: its end leaves the breaker half open, and
+	// the stranger's child still held.
+	waitFor(t, 5*time.Second, "task-child settled", func() bool {
+		_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", "tse-2", "task-child")]
+		return ok
+	})
+	time.Sleep(time.Second)
+	if d.breakers.epoch("tse", "read") == 0 {
+		t.Error("the probe's child closed the breaker while the probe still runs")
+	}
+	if ts := b.terminalsOf("task-stranger"); len(ts) != 0 {
+		t.Errorf("the stranger's child ended %+v after the probe's child; want it still held", ts)
+	}
+}
+
+// The stop grace is never shorter than a renewal and two ticks, so a worker
+// silent since before the stop is past the silence threshold (a renewal and
+// a tick) when the grace ends, whatever renewSeconds is.
+func TestTheStopGraceCoversARenewal(t *testing.T) {
+	for _, c := range []struct {
+		renew, grace int
+		want         time.Duration
+	}{
+		{20, 0, 30 * time.Second},  // the defaults: 30s already covers 20+5+5
+		{60, 0, 90 * time.Second},  // a long renewal lifts the default
+		{20, 10, 30 * time.Second}, // and a short configured grace
+		{1, 0, 30 * time.Second},
+	} {
+		if got := stopGrace(lib.DispatchConfig{RenewSeconds: c.renew, StopGraceSeconds: c.grace}); got != c.want {
+			t.Errorf("renew %ds, grace %ds: stopGrace %s, want %s", c.renew, c.grace, got, c.want)
+		}
+	}
+}
+
+// A stopped task never closes the breaker: the executor ending it within
+// the grace (a final renewal) leaves a half-open breaker as it was. Its
+// worker dying after the stop still counts as an expiry and re-opens it, so
+// stopping each poisoned task can't hide the workers it kills.
+func TestAStoppedTaskEndingOnItsOwnLeavesTheBreakerAsItWas(t *testing.T) {
+	for name, c := range map[string]struct {
+		end          func(w *fakeWorker)
+		grace, lease int
+		counted      bool
+	}{
+		"ends itself": {func(w *fakeWorker) { w.finish("task-probe", lib.StateCanceled) }, 3600, 0, false},
+		// The lease runs out before the grace does.
+		"worker dies": {func(w *fakeWorker) { w.kill() }, 3600, 0, true},
+		// The defaults' order: the grace (30s) ends before the lease (90s)
+		// would, so the silence is counted when the grace ends.
+		"worker dies, grace before the lease": {func(w *fakeWorker) { w.kill() }, 2, 6, true},
+	} {
+		end := c.end
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t, "tse-0", "tse-1")
+			withStopStream(t, b)
+			b.ensure("tse", 2, 0, "read")
+			dead := b.worker("tse", "read", "tse-0", answerAccept, time.Hour)
+			dead.noRenew = true
+			probe := b.worker("tse", "read", "tse-1", answerAccept, time.Hour)
+			ti := oneProfile("tse", 2, "tse-0")
+			ti.update(func(cfg *lib.DispatchConfig) {
+				cfg.BreakerThreshold, cfg.BreakerCooldownSeconds, cfg.StopGraceSeconds = 1, 1, c.grace
+				if c.lease > 0 {
+					cfg.LeaseSeconds = c.lease
+				}
+			})
+			d, _ := b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+
+			b.submit("tse", "read", lib.SubmitKindTop, "task-dead")
+			if ts := b.waitTerminal("task-dead", 20*time.Second); !hasReason(ts, ReasonLeaseExpired) {
+				t.Fatalf("task-dead terminal %+v, want lease-expired", ts)
+			}
+			ti.pool.Set("tse", "read", "tse-1")
+			b.submit("tse", "read", lib.SubmitKindTop, "task-probe")
+			waitFor(t, 15*time.Second, "the probe running", func() bool { return probe.startedTask("task-probe") })
+			epoch := d.breakers.epoch("tse", "read")
+			b.stop("tse", "task-probe")
+			waitFor(t, 5*time.Second, "the stop heard", func() bool {
+				d.mu.Lock()
+				defer d.mu.Unlock()
+				for _, h := range d.active {
+					if h.taskID == "task-probe" {
+						return h.stopRequested
+					}
+				}
+				return false
+			})
+			end(probe)
+			waitFor(t, 20*time.Second, "task-probe settled", func() bool {
+				_, ok := b.tombstones()[lib.ProfileLeaseKey("tse", "read", "tse-1", "task-probe")]
+				return ok
+			})
+			got := d.breakers.epoch("tse", "read")
+			switch {
+			case !c.counted && got != epoch:
+				t.Errorf("breaker epoch %d after the stopped probe ended itself, want %d (not closed)", got, epoch)
+			case c.counted && (got == epoch || got == 0):
+				t.Errorf("breaker epoch %d after the stopped probe's worker died, want a new opening past %d", got, epoch)
+			}
+		})
 	}
 }
 

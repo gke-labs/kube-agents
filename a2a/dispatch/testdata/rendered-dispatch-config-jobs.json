@@ -1,5 +1,5 @@
 {
-  "version": "4e3bb4da6aac5f1b",
+  "version": "019a8edfa5ba603f",
   "namespace": "test-ns",
   "profileNamespace": "test-ns-profiles",
   "ceiling": 6,
@@ -9,6 +9,7 @@
   "renewSeconds": 20,
   "restartGraceSeconds": 60,
   "acceptTimeoutSeconds": 10,
+  "submitRetentionSeconds": 259200,
   "profiles": [
     {
       "name": "tse",
