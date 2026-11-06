@@ -245,6 +245,9 @@ _BOARD_NON_ACTION_TOOLS = frozenset({
 # test_harness.py holds the two equal) and the status it leaves the card in.
 _GUARDRAIL_BLOCK_KIND = "transient"
 _GUARDRAIL_BLOCK_STATUS = "blocked"
+# The one failure reason the guardrail blocks on (its RATE_LIMIT_FAILURE_REASONS;
+# a billing stop is not blocked transient, so a billing reason is not its write).
+_GUARDRAIL_FAILURE_REASON = "rate_limit"
 # The verbs by which a worker closes or blocks its own card. The guardrail
 # blocks from the exit path with no tool call, so a card whose worker made
 # one of these calls was closed by the model, whatever text it carries.
@@ -1003,6 +1006,7 @@ def _guardrail_blocked_cards(
     on_board: dict[str, board.BoardCard] | None,
     captured: worker_trajectory.WorkerCapture | None,
     with_artifact: set[str],
+    front_trajectory: Sequence[Any] = (),
 ) -> list[str]:
     """The awaited cards when EVERY one is the rate-limit guardrail's block, else ``[]``.
 
@@ -1011,30 +1015,30 @@ def _guardrail_blocked_cards(
     rate-limit or billing reason, no artifact was produced for it, and the
     captured worker trajectory (present, or nothing counts) holds no
     ``kanban_block`` or ``kanban_complete`` call for it, nor a wrapper call
-    that could hide one. One card that reads otherwise is a delivery, and the
-    run is graded on it.
+    that could hide one, from its own worker, another card's worker (the
+    call's ``task_id``) or the front door (``front_trajectory``). One card
+    that reads otherwise is a delivery, and the run is graded on it.
     """
     if not awaited or on_board is None or captured is None:
         return []
     # A ``tool_call`` wrapper whose arguments cannot be read (not a dict, a
     # clipped ``raw`` string, no names) may hold the worker's own close, as
     # #3988 counts it as acted; it is read as a close here too, fail closed.
-    closed_by_worker = {
-        str(e.get("task"))
-        for e in captured.entries
-        if isinstance(e, dict)
-        and (
-            ({e.get("name")} | worker_trajectory.wrapped_tool_names(e)) & _WORKER_CARD_VERBS
-            or (
-                e.get("name") == worker_trajectory.TOOL_CALL_WRAPPER
-                and (
-                    not isinstance(e.get("args"), dict)
-                    or isinstance(e.get("args", {}).get("raw"), str)
-                    or not worker_trajectory.wrapped_tool_names(e)
-                )
-            )
+    closed: set[str] = set()
+    for e in [*captured.entries, *front_trajectory]:
+        if not isinstance(e, dict):
+            continue
+        args = e.get("args") if isinstance(e.get("args"), dict) else {}
+        names = {e.get("name")} | worker_trajectory.wrapped_tool_names(e)
+        unreadable_wrapper = e.get("name") == worker_trajectory.TOOL_CALL_WRAPPER and (
+            not isinstance(e.get("args"), dict)
+            or isinstance(args.get("raw"), str)
+            or not worker_trajectory.wrapped_tool_names(e)
         )
-    }
+        if names & _WORKER_CARD_VERBS or unreadable_wrapper:
+            closed.add(str(e.get("task")))
+            if args.get("task_id"):
+                closed.add(str(args["task_id"]))
     blocked: list[str] = []
     for tid in awaited:
         card = on_board.get(tid)
@@ -1042,9 +1046,9 @@ def _guardrail_blocked_cards(
             card is None
             or card.status != _GUARDRAIL_BLOCK_STATUS
             or card.block_kind != _GUARDRAIL_BLOCK_KIND
-            or not _extract_infra_failure_reason(card.summary or "")
+            or _extract_infra_failure_reason(card.summary or "") != _GUARDRAIL_FAILURE_REASON
             or tid in with_artifact
-            or tid in closed_by_worker
+            or tid in closed
         ):
             return []
         blocked.append(tid)
@@ -4852,8 +4856,15 @@ class KubeAgentsHarness(AgentHarness):
         # worker-blind safeguards aside on every record, died or completed,
         # so keeping an acting worker's death graded there would protect
         # nothing the lane has; the mark reads the same on both transports.
-        guardrail_blocked = _guardrail_blocked_cards(awaited, on_board, captured, with_artifact)
-        if guardrail_blocked and trajectory_clean and logs_clean:
+        # The front door is another matter: one that acted after the card
+        # died (a command of its own, an answer it made up) produced
+        # something the judge must see, so it stays graded, as on the path
+        # above. A capture with a gap may have dropped the worker's own
+        # close, so it stays graded too.
+        guardrail_blocked = _guardrail_blocked_cards(
+            awaited, on_board, captured, with_artifact, result.trajectory
+        )
+        if guardrail_blocked and trajectory_clean and logs_clean and not front_door_acted:
             _mark_result_infra_failure(
                 result,
                 "delegated worker hit infrastructure failure (rate_limit): the rate-limit "

@@ -5286,6 +5286,7 @@ def _settle_after_guardrail_block(
     artifact_paths: list[str] = (),
     front_trajectory: list[dict[str, object]] | None = None,
     awaited: list[str] = ("t_1",),
+    summary: dict[str, object] | None = None,
 ) -> harness.AgentResult:
     """Settle the awaited cards (``t_1`` by default) with the board, the capture
     and the artifacts faked; ``entries=None`` is a capture that could not run."""
@@ -5295,7 +5296,9 @@ def _settle_after_guardrail_block(
         "capture",
         lambda shell, awaited, to: None
         if entries is None
-        else harness.worker_trajectory.WorkerCapture(entries=list(entries), tokens={}, unbilled=[], summary={}),
+        else harness.worker_trajectory.WorkerCapture(
+            entries=list(entries), tokens={}, unbilled=[], summary=dict(summary or {})
+        ),
     )
     monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, awaited, to: cards)
     monkeypatch.setattr(harness, "_artifact_paths", lambda task_ids, to: list(artifact_paths))
@@ -5362,6 +5365,49 @@ def test_settle_keeps_a_card_graded_when_a_wrapper_call_could_hide_the_workers_c
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
 
 
+def test_settle_keeps_a_card_graded_when_the_front_door_acted_after_it_died(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A front door that ran a command of its own, or made up an answer, after
+    the card died produced something the judge must see."""
+    res = _settle_after_guardrail_block(
+        monkeypatch,
+        entries=_ACTED,
+        cards=_GUARDRAIL_CARD,
+        front_trajectory=[{"name": "kanban_create"}, {"name": "terminal", "args": {"command": "kubectl delete deploy web"}}],
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+def test_settle_keeps_a_card_graded_when_the_capture_was_clipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A capture that hit a cap may have dropped the worker's own kanban_block,
+    so the guardrail's block and the worker's cannot be told apart: graded."""
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=_ACTED, cards=_GUARDRAIL_CARD, summary={"clipped": ["calls"]}
+    )
+    assert harness.worker_trajectory.gaps(res.metadata["worker_trajectory"])
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "closer",
+    [
+        [_worker_entry("kanban_block", task="t_other", task_id="t_1", reason="x", kind="transient")],
+        [{"name": "kanban_block", "args": {"task_id": "t_1", "reason": "x", "kind": "transient"}}],
+    ],
+    ids=["another-cards-worker", "front-door"],
+)
+def test_settle_keeps_a_card_graded_when_someone_else_blocked_it(
+    closer: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = closer if closer[0].get("agent") else []
+    front = [{"name": "kanban_create"}, *([] if closer[0].get("agent") else closer)]
+    res = _settle_after_guardrail_block(
+        monkeypatch, entries=[*_ACTED, *worker], cards=_GUARDRAIL_CARD, front_trajectory=front
+    )
+    assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
 def test_settle_keeps_a_fan_out_graded_when_one_card_delivered(monkeypatch: pytest.MonkeyPatch) -> None:
     """Every awaited card has to be the guardrail's block: one that completed is
     a delivery the run is graded on."""
@@ -5411,8 +5457,14 @@ def test_settle_keeps_a_guardrail_blocked_card_graded_when_the_capture_is_missin
         harness.board.BoardCard(
             "blocked", "HTTP 429 (failure_reason=rate_limit): TPM quota exhausted", None, "transient"
         ),
+        harness.board.BoardCard(
+            "blocked",
+            "provider rate limit: API retries exhausted (failure_reason=billing): credit wall",
+            None,
+            "transient",
+        ),
     ],
-    ids=["question-kind", "other-reason", "done", "no-kind", "reason-without-the-guardrail-prefix"],
+    ids=["question-kind", "other-reason", "done", "no-kind", "reason-without-the-guardrail-prefix", "billing"],
 )
 def test_settle_keeps_a_card_outside_the_guardrail_shape_graded(
     card: harness.board.BoardCard, monkeypatch: pytest.MonkeyPatch
