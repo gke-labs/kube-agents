@@ -239,6 +239,21 @@ func TestScopeUndeclared_ProjectNumberIsResolvedThroughTheHostsSeries(t *testing
 	if cond == nil || !strings.Contains(cond.Message, "1 cluster(s) beyond the host cluster c") || !strings.Contains(cond.Message, "analytics-dev") || strings.Contains(cond.Message, "c (p/l)") {
 		t.Fatalf("condition = %+v, want the neighbour alone, named under the resolved project", cond)
 	}
+	// The remedy names spec.scope.projects, which refuses a number, so the message
+	// names the project by the ID the series carried, not by the harness's number.
+	if !strings.Contains(cond.Message, "management project p.") || strings.Contains(cond.Message, "123456789012") {
+		t.Fatalf("message names the project by number: %q", cond.Message)
+	}
+
+	// Two clusters named like the host in two projects (the watcher watches both
+	// through their profiles): the number cannot be tied to either, so nothing is
+	// written, whichever sorts first.
+	twin := usageClusterRef{Name: "c", Project: "alpha-team", Location: "l"}
+	h.stub.setClusterRefs(gatewayAddr(), twin, scopeTestHost, scopeTestNeighbourA)
+	h.poll(15)
+	if again := scopeCondition(t, h); again != nil {
+		t.Fatalf("condition with two host-named series = %+v, want it removed", again)
+	}
 }
 
 func TestScopeUndeclaredRemovalCause(t *testing.T) {
@@ -322,14 +337,14 @@ func TestScopeUndeclaredMessage_BoundsAndValidatesNames(t *testing.T) {
 	for i := 0; i < scopeUndeclaredNamesShown+3; i++ {
 		refs = append(refs, usageClusterRef{Name: fmt.Sprintf("n-%02d", i), Project: "p", Location: "l"})
 	}
-	msg := scopeUndeclaredMessage(agent, refs)
+	msg := scopeUndeclaredMessage(agent, "p", refs)
 	if !strings.Contains(msg, fmt.Sprintf("%d cluster(s)", len(refs))) || !strings.Contains(msg, "and 3 more") {
 		t.Errorf("message %q does not bound the list at %d names", msg, scopeUndeclaredNamesShown)
 	}
 	if strings.Contains(msg, fmt.Sprintf("n-%02d", scopeUndeclaredNamesShown)) {
 		t.Errorf("message %q names a cluster past the bound", msg)
 	}
-	hostile := scopeUndeclaredMessage(agent, []usageClusterRef{{Name: "x\ny; rm -rf /", Project: "P R", Location: "l"}})
+	hostile := scopeUndeclaredMessage(agent, "p", []usageClusterRef{{Name: "x\ny; rm -rf /", Project: "P R", Location: "l"}})
 	if strings.Contains(hostile, "rm -rf") || strings.Contains(hostile, "P R") || !strings.Contains(hostile, scopeUndeclaredInvalidName) {
 		t.Errorf("hostile labels reached the message: %q", hostile)
 	}

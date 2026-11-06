@@ -297,8 +297,9 @@ substitutes a placeholder name for it.
 project on each audit record, which is always the ID, so a value that is nothing but digits can
 match nothing. The operator reports the detector as off rather than starting a sidecar that exits on
 every launch. The `ScopeUndeclared` condition reads the ID off the host cluster's own series when
-this field carries a number. Everything else reading `spec.harness` accepts a number, so an
-install can be healthy in every other respect and still be refused here.
+this field carries a number, and says nothing until that series exists. Everything else reading
+`spec.harness` accepts a number, so an install can be healthy in every other respect and still be
+refused here.
 
 `subscription` and `gitopsManagers` are the two knobs worth moving from a CR. Leave `subscription`
 unset unless you renamed the one the module creates.
