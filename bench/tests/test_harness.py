@@ -5381,21 +5381,19 @@ def test_settle_keeps_a_card_outside_the_guardrail_shape_graded(
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
 
 
-def test_settle_keeps_an_acting_worker_graded_on_the_inject_lane(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The inject lane sets the worker-blind safeguards aside, so a worker that
-    acted there stays graded; one that only read before it died is set aside."""
+def test_settle_marks_the_guardrail_block_on_the_inject_lane_whether_or_not_the_worker_acted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The presubmit grades the inject lane, where the scorer sets the
+    worker-blind safeguards aside on every record; the mark reads the same
+    there as on the api transport (#4871's build 2118527973618356224: two
+    workers that ran terminal commands, then died on 429s)."""
     inject_front = [{"name": harness.inject.EVENT_ENTRY_TASK}, {"name": "kanban_create"}]
-    acted = _settle_after_guardrail_block(
-        monkeypatch, entries=_ACTED, cards=_GUARDRAIL_CARD, front_trajectory=inject_front
-    )
-    assert not any(harness.INFRA_FAILURE_MARKER in e for e in acted.errors)
-    only_read = _settle_after_guardrail_block(
-        monkeypatch,
-        entries=[_worker_entry("read_file", path="x")],
-        cards=_GUARDRAIL_CARD,
-        front_trajectory=inject_front,
-    )
-    assert only_read.errors and only_read.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    for entries in (_ACTED, [_worker_entry("read_file", path="x")]):
+        res = _settle_after_guardrail_block(
+            monkeypatch, entries=entries, cards=_GUARDRAIL_CARD, front_trajectory=inject_front
+        )
+        assert res.errors and res.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
 
 
 def test_settle_delegated_worker_rate_limit_with_no_worker_actions_is_infra(

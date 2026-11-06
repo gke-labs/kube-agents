@@ -4830,19 +4830,12 @@ class KubeAgentsHarness(AgentHarness):
         # artifact, for the run to hold no answer; a worker that acted and then
         # died is still set aside, because the answer it never gave is not
         # evidence of the agent under test, and rung 1 grades what it did
-        # before that above this mark. On the inject lane the worker-blind
-        # safeguards are set aside, so there a worker that acted stays graded:
-        # the lane cannot see the damage rung 1 would have caught.
-        inject_lane = any(
-            isinstance(e, dict) and e.get("name") == inject.EVENT_ENTRY_TASK for e in result.trajectory
-        )
+        # before that above this mark. On the inject lane the scorer sets the
+        # worker-blind safeguards aside on every record, died or completed,
+        # so keeping an acting worker's death graded there would protect
+        # nothing the lane has; the mark reads the same on both transports.
         guardrail_blocked = _guardrail_blocked_cards(awaited, on_board, captured, with_artifact)
-        if (
-            guardrail_blocked
-            and trajectory_clean
-            and logs_clean
-            and not (inject_lane and worker_acted)
-        ):
+        if guardrail_blocked and trajectory_clean and logs_clean:
             _mark_result_infra_failure(
                 result,
                 "delegated worker hit infrastructure failure (rate_limit): the rate-limit "
