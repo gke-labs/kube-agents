@@ -649,7 +649,8 @@ def apply_profile(
         error = state["signal"].get("error")
         if error and error != state["signal"].get("reported_error"):
             state["signal"]["reported_error"] = error
-            lines.append(f"{label}: cron idle policy cannot read the PlatformAgent ({error}); nothing held")
+            posture = "nothing held" if when is None else "holding on the last reading until it is a day old"
+            lines.append(f"{label}: cron idle policy cannot read the PlatformAgent ({error}); {posture}")
         elif not error:
             state["signal"].pop("reported_error", None)
         if when is None:

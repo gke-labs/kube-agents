@@ -623,9 +623,12 @@ class SignalCacheTest(PolicyCase):
         later = NOW + timedelta(minutes=30)  # the second audit's due minute
         lines = self.run_policy(failing, now=later)
         self.assertEqual(failing.calls, 1)
-        self.assertEqual(len([line for line in lines if "cannot read the PlatformAgent" in line]), 1)
+        reported = [line for line in lines if "cannot read the PlatformAgent" in line]
+        self.assertEqual(len(reported), 1)
         # Still hibernating on the cached reading: the second audit, due now,
-        # is held.
+        # is held, and the line says that rather than "nothing held".
+        self.assertIn("holding on the last reading until it is a day old", reported[0])
+        self.assertNotIn("nothing held", reported[0])
         self.assertEqual(self.next_run("obtainability-audit"), "2026-08-07T06:50:00+00:00")
         # Said once, not every tick.
         again = self.run_policy(failing, now=later + timedelta(minutes=6))
@@ -669,6 +672,7 @@ class SignalCacheTest(PolicyCase):
         lines = self.run_policy(failing)
         self.assertEqual(self.next_run("compliance-audit"), iso(NOW))
         self.assertIn("no PlatformAgent in namespace kubeagents-system", lines[0])
+        self.assertIn("nothing held", lines[0])
         self.assertIsNone(self.state()["stage"])
 
 
