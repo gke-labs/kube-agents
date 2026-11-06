@@ -472,7 +472,7 @@ fi
 # brief: each store gets a few seconds, since this runs under the bootstrap lock. A store
 # it cannot pin is logged, and the gateway's prune at this start may then delete an aged
 # parent there; the job pins what is left on its next tick.
-SESSION_RETENTION_SCRIPT="${SESSION_RETENTION_SCRIPT:-/opt/defaults/scripts/session_retention.py}"
+SESSION_RETENTION_SCRIPT="/opt/defaults/scripts/session_retention.py"
 if [ -f "$SESSION_RETENTION_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then
     "$INSTALL_DIR/.venv/bin/python3" "$SESSION_RETENTION_SCRIPT" --pins-only --agent-home "$TARGET_DIR" \
         || echo "WARN: pinning session parents did not finish (exit $?); the gateway's prune at this start may delete aged parents in the stores named above" >&2
