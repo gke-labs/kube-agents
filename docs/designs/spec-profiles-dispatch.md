@@ -405,6 +405,22 @@ leave open:
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
   admission, and `lease-expired` and `deadline-exceeded` while it holds.
+- **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
+  (profile, tier), default 3, opens its breaker. While it is open, for
+  `breakerCooldownSeconds` (default 300), new submissions there are held queued, as over a
+  cap, never refused: a refusal would let one input that keeps killing workers fail every
+  other user's task on that tier. They still end with `queue-timeout`. Then it is half open:
+  the oldest held submission is admitted alone as the probe of that opening, and the rest
+  wait while it runs; a child of the probe (sharing its correlationId) is part of its attempt
+  and is admitted. The next expiry opens it again. Below the threshold any finished task
+  resets the run; once it has opened, only that opening's probe closes it, by finishing or
+  by running to its deadline still renewing. A stop never opens or closes the breaker by
+  itself, but its worker's silence counts as a loss: a worker that stops renewing, after a
+  stop or not, is counted, whether the lease runs out first or the stop's grace does (the
+  grace is never shorter than a renewal and two ticks, so one silent since before the stop is
+  always past the count's threshold when it ends). The
+  state is in memory, and the dispatcher's health lists open and half-open breakers. A held
+  task isn't told it is held yet (#4362).
 
 ### Execution
 
