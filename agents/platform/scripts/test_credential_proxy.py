@@ -20839,8 +20839,8 @@ class ServeStartsNoRelayOnAnExecPodTest(unittest.TestCase):
 class SessionToolBudgetTest(unittest.TestCase):
     """The per-session ceiling and loop breaker (SessionToolBudget) on their own."""
 
-    LIST = (("gcloud", "projects", "list"), None)
-    DELETE = (("gcloud", "projects", "delete", "foo"), None)
+    LIST = credential_proxy.command_signature(["gcloud", "projects", "list"], None)
+    DELETE = credential_proxy.command_signature(["gcloud", "projects", "delete", "foo"], None)
 
     def test_the_defaults_are_the_issues_and_the_1501st_call_is_refused(self):
         self.assertEqual(1500, credential_proxy.DEFAULT_SESSION_MAX_TOOL_CALLS)
@@ -20890,8 +20890,8 @@ class SessionToolBudgetTest(unittest.TestCase):
 
     def test_the_context_is_part_of_the_signature(self):
         budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
-        on_a = (("kubectl", "get", "pods"), "gke_p_us-central1_a")
-        on_b = (("kubectl", "get", "pods"), "gke_p_us-central1_b")
+        on_a = credential_proxy.command_signature(["kubectl", "get", "pods"], "gke_p_us-central1_a")
+        on_b = credential_proxy.command_signature(["kubectl", "get", "pods"], "gke_p_us-central1_b")
         for _ in range(2):
             budget.record("run-a", on_a, credential_proxy.TOOL_STATUS_ERROR)
         self.assertIsNotNone(budget.admit("run-a", on_a, ceiling=False))
@@ -20914,6 +20914,22 @@ class SessionToolBudgetTest(unittest.TestCase):
         self.assertIsNone(budget.admit("run-a", self.DELETE, ceiling=True))
         budget.record("run-a", self.DELETE, credential_proxy.TOOL_STATUS_BLOCKED)
         self.assertIsNotNone(budget.admit("run-a", self.DELETE, ceiling=True))
+
+    def test_the_signature_is_a_fixed_size_digest_whatever_the_argv_carried(self):
+        # The budget keeps the digest, never the argv: a body as large as the
+        # broker admits (1 MiB by default) costs an entry the same as a short
+        # one, so the LRU's cap bounds bytes and not only keys.
+        short = credential_proxy.command_signature(["gcloud", "projects", "list"], None)
+        huge = credential_proxy.command_signature(["gcloud", "projects", "list", "x" * (1 << 20)], None)
+        self.assertEqual(64, len(short))
+        self.assertEqual(len(short), len(huge))
+        self.assertNotEqual(short, huge)
+        self.assertEqual(short, credential_proxy.command_signature(["gcloud", "projects", "list"], None))
+        budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)
+        budget.record("run-a", huge, credential_proxy.TOOL_STATUS_BLOCKED)
+        self.assertEqual(huge, budget._sessions["run-a"].streak_signature)
+        self.assertEqual(64, len(budget._sessions["run-a"].streak_signature))
+        self.assertEqual(1, budget.streak_of("run-a"))
 
     def test_busy_and_abandoned_say_nothing_about_the_command(self):
         budget = credential_proxy.SessionToolBudget(max_calls=0, max_identical_failures=2)

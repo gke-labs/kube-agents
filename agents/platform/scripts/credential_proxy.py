@@ -4029,6 +4029,19 @@ class SessionRefusal(NamedTuple):
     message: str
 
 
+def command_signature(argv: list[str], kubeconfig_context: str | None) -> str:
+    """The loop breaker's signature of a command: a digest of the argv and the
+    kubeconfig context as sent, which is what the budget keeps per session.
+
+    A digest rather than the argv itself, so an entry costs the same whatever
+    the body carried: the exec body may be as large as the broker's
+    max_request_bytes, and a request is recorded as ``blocked`` before any gate
+    has looked at its argv, so the argv is the one caller-sized thing the
+    budget would otherwise hold for up to SESSION_TOOL_BUDGET_MAX_SESSIONS keys.
+    """
+    return hashlib.sha256(json.dumps([argv, kubeconfig_context]).encode("utf-8")).hexdigest()
+
+
 class _SessionCounts:
     """One session's counts: every call admitted to the gates, and the run of
     consecutive failures of the one command the session last failed on."""
@@ -4037,7 +4050,7 @@ class _SessionCounts:
 
     def __init__(self) -> None:
         self.total = 0
-        self.streak_signature: tuple[tuple[str, ...], str | None] | None = None
+        self.streak_signature: str | None = None
         self.streak = 0
 
 
@@ -4045,8 +4058,9 @@ class SessionToolBudget:
     """Per-session tool-call counts behind the exec route's two session gates.
 
     ``admit`` is asked once per request after the body parses and before any
-    other gate, with the request's session key and its signature, the argv and
-    kubeconfig context as sent. It counts the call and answers the refusal the
+    other gate, with the request's session key and its signature, the
+    ``command_signature`` digest of the argv and kubeconfig context as sent. It
+    counts the call and answers the refusal the
     route sends, or None. The ceiling refuses a session past ``max_calls``
     when ``ceiling`` is set (the route sets it for SESSION_BUDGET_CEILING_ROLES).
     The loop breaker refuses a signature whose last ``max_identical_failures``
@@ -4057,8 +4071,10 @@ class SessionToolBudget:
     and ``abandoned``, which say nothing about the command, leave it alone.
 
     Sessions are kept in an LRU of ``max_sessions`` keys under one lock: the
-    key is the shim's text, so the bound is what keeps a caller from growing
-    the broker's memory. A session evicted and seen again starts fresh. One
+    key is the shim's short text and the signature a fixed-size digest, so an
+    entry costs the same whatever the body carried and the bound is what keeps
+    a caller from growing the broker's memory. A session evicted and seen
+    again starts fresh. One
     instance per broker process, so each exec-tier replica counts alone.
     """
 
@@ -4089,13 +4105,7 @@ class SessionToolBudget:
             self._sessions.move_to_end(session_id)
         return counts
 
-    def admit(
-        self,
-        session_id: str,
-        signature: tuple[tuple[str, ...], str | None],
-        *,
-        ceiling: bool,
-    ) -> SessionRefusal | None:
+    def admit(self, session_id: str, signature: str, *, ceiling: bool) -> SessionRefusal | None:
         with self._lock:
             counts = self._counts_locked(session_id)
             counts.total += 1
@@ -4117,7 +4127,7 @@ class SessionToolBudget:
                 )
         return None
 
-    def record(self, session_id: str, signature: tuple[tuple[str, ...], str | None], status: str) -> None:
+    def record(self, session_id: str, signature: str, status: str) -> None:
         if status not in (TOOL_STATUS_BLOCKED, TOOL_STATUS_ERROR, TOOL_STATUS_SUCCESS):
             return
         with self._lock:
@@ -13598,8 +13608,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             if session_id is not None and not (isinstance(session_id, str) and SESSION_ID_RE.match(session_id)):
                 raise ValueError(f"{SESSION_ID_FIELD} must be a short token of letters, digits, '.', '_', ':' or '-'")
             # The loop breaker's signature: the command as sent, before a
-            # profile caller's confinement rewrites it.
-            session_signature = (tuple(argv), kubeconfig_context)
+            # profile caller's confinement rewrites it, digested so the budget
+            # keeps a fixed-size value per session rather than a body-sized one.
+            session_signature = command_signature(argv, kubeconfig_context)
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
