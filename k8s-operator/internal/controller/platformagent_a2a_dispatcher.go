@@ -641,8 +641,21 @@ func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles 
 // follow the profile-namespace rule: a failure there is returned for the
 // caller to log, and the rest still lands.
 func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool) (profileErr error, err error) {
+	_, profileErr, err = r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileNamespaceReady)
+	return profileErr, err
+}
+
+// reconcileA2ADispatcherWithJobMode is reconcileA2ADispatcher, also
+// returning what this pass made of Job mode, for the DispatcherJobMode
+// condition Reconcile writes on its way out (syncDispatcherJobMode). nil
+// when the pass made nothing of it: the signal off, the dispatcher disabled,
+// or a read that answered neither way and changed nothing. Returned with the
+// errors too, since a step after the Jobs Role failing doesn't undo what the
+// pass did to it.
+func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool) (jobModeVerdict *metav1.Condition, profileErr error, err error) {
 	if !a2aDispatcherEnabled() {
-		return r.removeA2ADispatcher(ctx, agent)
+		profileErr, err = r.removeA2ADispatcher(ctx, agent)
+		return nil, profileErr, err
 	}
 	// One rendering of each unattended profile's Job template, into the
 	// dispatch config and into the admission policy's params, so the two
@@ -656,12 +669,13 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	if jobMode {
 		ok, why, err := r.dispatcherJobPolicyInPlace(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("check the dispatcher Job admission policy: %w", err)
+			return nil, nil, fmt.Errorf("check the dispatcher Job admission policy: %w", err)
 		}
 		if !ok {
 			jobMode = false
-			r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
-				"A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), so unattended profile tasks have no worker and are refused no-worker at admission", why))
+			msg := fmt.Sprintf("A2A_DISPATCHER_JOB_POLICY is set but the dispatcher Job admission policy is not in place (%s), %s", why, jobModeOffConsequence)
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, msg)
+			jobModeVerdict = jobModeOff(jobModeReasonPolicyMissing, msg)
 		}
 	}
 	// Wanted, the params and the Jobs Role come before the dispatch config
@@ -687,16 +701,23 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	case !profileNamespaceReady:
 		jobTemplates = nil
 		jobErr = r.revokeDispatcherJobsRole(ctx, agent)
+		jobModeVerdict = jobModeOff(jobModeReasonNamespaceNotReady, fmt.Sprintf(
+			"the profile namespace %s is not ready (absent, without the chart's markers, or without its network fence), %s",
+			profileNamespaceName(agent), jobModeOffConsequence))
 	default:
 		selected, err := r.profileNamespaceSelectedByJobPolicy(ctx, agent)
 		if err != nil || !selected {
 			if err == nil {
-				r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, fmt.Sprintf(
-					"the profile namespace %s lacks the %s=%s label the dispatcher Job admission policy selects it by, so unattended profile tasks have no worker and are refused no-worker at admission",
-					profileNamespaceName(agent), labelPartOf, partOfKubeAgents))
+				msg := fmt.Sprintf("the profile namespace %s lacks the %s=%s label the dispatcher Job admission policy selects it by, %s",
+					profileNamespaceName(agent), labelPartOf, partOfKubeAgents, jobModeOffConsequence)
+				r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatcherJobPolicyMissing, msg)
+				jobModeVerdict = jobModeOff(jobModeReasonNamespaceNotSelected, msg)
 			}
 			jobTemplates = nil
 			jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+			if err != nil {
+				jobModeVerdict = jobModeGrantFailed(jobErr)
+			}
 			break
 		}
 		// The NATS CA bundle the Job pods mount, copied before the templates
@@ -706,6 +727,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			if err := r.copyProfileCABundle(ctx, agent); err != nil {
 				jobTemplates = nil
 				jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+				jobModeVerdict = jobModeGrantFailed(jobErr)
 				break
 			}
 			bundleCopied = true
@@ -713,12 +735,21 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 		if err := r.reconcileDispatchJobParams(ctx, agent, jobTemplates); err != nil {
 			jobTemplates = nil
 			jobErr = goerrors.Join(err, r.revokeDispatcherJobsRole(ctx, agent))
+			jobModeVerdict = jobModeGrantFailed(jobErr)
+			// A foreign param stands until somebody removes it, which no
+			// retry does, so it has a reason of its own; its error says
+			// which object.
+			if goerrors.As(err, new(errForeignDispatchJobParam)) {
+				jobModeVerdict = jobModeOff(jobModeReasonForeignJobTemplate, err.Error())
+			}
 			break
 		}
+		jobModeVerdict = jobModeOn(profileNamespaceName(agent))
 		for _, obj := range []client.Object{buildA2ADispatcherJobsRole(agent), buildA2ADispatcherJobsRoleBinding(agent)} {
 			if err := r.applyManaged(ctx, agent, obj); err != nil {
 				jobTemplates = nil
 				jobErr = goerrors.Join(fmt.Errorf("the dispatcher's Jobs %T: %w", obj, err), r.revokeDispatcherJobsRole(ctx, agent))
+				jobModeVerdict = jobModeGrantFailed(jobErr)
 				break
 			}
 		}
@@ -736,7 +767,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	}
 	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, jobTemplates)
 	if err != nil {
-		return nil, fmt.Errorf("failed to render the dispatch config: %w", err)
+		return jobModeVerdict, nil, fmt.Errorf("failed to render the dispatch config: %w", err)
 	}
 	// A ceiling too small for every reserve is said out loud, so nobody
 	// finds out by interactive users waiting.
@@ -763,7 +794,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// only ensures it exists.
 	signingKey, err := r.ensureA2ATaskSigningKeySecret(ctx, agent)
 	if err != nil {
-		return nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
+		return jobModeVerdict, nil, fmt.Errorf("failed to ensure the A2A task-signing key for the dispatcher: %w", err)
 	}
 	dispatcher := buildA2ADispatcherDeployment(agent)
 	// The seed is a file mount, so a repaired key wouldn't reach a running
@@ -781,18 +812,18 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	}
 	for _, obj := range owned {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
-			return nil, err
+			return jobModeVerdict, nil, err
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return nil, fmt.Errorf("failed to apply the A2A dispatcher's %T: %w", obj, err)
+			return jobModeVerdict, nil, fmt.Errorf("failed to apply the A2A dispatcher's %T: %w", obj, err)
 		}
 	}
 	if !profileNamespaceReady {
-		return jobErr, nil
+		return jobModeVerdict, jobErr, nil
 	}
 	for _, obj := range []client.Object{buildA2ADispatcherPodsRole(agent), buildA2ADispatcherPodsRoleBinding(agent)} {
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
-			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
+			return jobModeVerdict, fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
 	// Gated off: what an earlier pass rendered goes, before the pools, so
@@ -814,9 +845,9 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// sweep, once it has deleted the Jobs, lets it go.
 	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved, bundleCopied, signal || sweepErr != nil)
 	if !signal {
-		return goerrors.Join(poolErr, sweepErr), nil
+		return jobModeVerdict, goerrors.Join(poolErr, sweepErr), nil
 	}
-	return goerrors.Join(jobErr, poolErr), nil
+	return jobModeVerdict, goerrors.Join(jobErr, poolErr), nil
 }
 
 // removeA2ADispatcher deletes what reconcileA2ADispatcher rendered: the
