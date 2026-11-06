@@ -1149,7 +1149,9 @@ func (s *Server) CallTool(ctx context.Context, name string, rawArgs json.RawMess
 		}
 	}
 
-	isStreamingStep := strings.HasPrefix(text, StreamingStepContinuePrefix) || strings.Contains(text, "STREAMING_STEP_CONTINUE")
+	// Only the server's own prefix counts: the text goes on to the agent's answer, which may
+	// mention the marker.
+	isStreamingStep := strings.HasPrefix(text, StreamingStepContinuePrefix)
 	if s.host != nil {
 		text, customMarkdown = s.host.OnAfterToolCall(ctx, s, name, isStreamingStep, text, customMarkdown)
 	}
@@ -1706,7 +1708,7 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 		return
 	}
 	extractedTaskID := extractStreamingTaskID(responseText)
-	isContinue := strings.HasPrefix(responseText, StreamingStepContinuePrefix) || strings.Contains(responseText, "STREAMING_STEP_CONTINUE")
+	isContinue := strings.HasPrefix(responseText, StreamingStepContinuePrefix)
 	// The in-cluster server reports a turn still running as its task line (a2a/mcp writeTask).
 	if ref := runningTaskRef(responseText); ref != "" {
 		extractedTaskID, isContinue = ref, true
@@ -1772,7 +1774,8 @@ func (s *Server) finishStreamingCall(key, convAlias, hostConvID, artifactsDir, r
 	}
 	s.mu.Unlock()
 	if callErr == nil && convAlias != "" && s.store != nil {
-		if wid := extractTaskSessionWorkerID(responseText); wid != "" {
+		// A get names the task it read: a worker on another task's line is not this one's.
+		if wid, ref := extractTaskSessionWorkerID(responseText); wid != "" && (entry == nil || entry.TaskID == "" || sameTaskRef(ref, entry.TaskID)) {
 			s.store.SetConversationSessionWorkerID(convAlias, wid)
 		}
 	}
@@ -1816,23 +1819,44 @@ func (s *Server) taskOwnerConversation(taskID string) string {
 // runningTaskRefRegex matches the in-cluster server's line for a task still running
 // (a2a/mcp writeTask or FormatTurnCustomToolEnvelope):
 // "Task `<addressee>/<id>`: **<state>** (still running; ..." or
-// "...Task `<addressee>/<id>` is actively running...".
+// "STREAMING_STEP_CONTINUE: Task `<addressee>/<id>` is actively running...".
+// Both regexes are matched against serverTaskLine only, never the whole text.
 var (
-	runningTaskRefRegex       = regexp.MustCompile("(?m)(?:^Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running|Task `([^`\\s]+)` is actively running)")
-	taskSessionWorkerRefRegex = regexp.MustCompile("(?m)Task `((?:chat|s)-[A-Za-z0-9_-]+)/task-[A-Za-z0-9_-]+`")
+	runningTaskRefRegex       = regexp.MustCompile("^(?:Task `([^`\\s]+)`: \\*\\*[^*\\n]+\\*\\* \\(still running|" + StreamingStepContinuePrefix + "Task `([^`\\s]+)` is actively running)")
+	taskSessionWorkerRefRegex = regexp.MustCompile("^(?:" + StreamingStepContinuePrefix + ")?Task `(((?:chat|s)-[A-Za-z0-9_-]+)/task-[A-Za-z0-9_-]+)`")
 )
 
-func extractTaskSessionWorkerID(text string) string {
-	if m := taskSessionWorkerRefRegex.FindStringSubmatch(text); len(m) == 2 {
-		return m[1]
+// serverTaskLine is the in-cluster server's own task line in a tool response: the line a
+// streamed step opens with (STREAMING_STEP_CONTINUE), else the first line that opens with
+// "Task `" (a2a/mcp writeTask or writeOutcome). What comes before it is the server's too (the
+// conversation line, quoted gateway notices, rendered steps, none opening with "Task `"); the
+// agent's answer comes only after it, so no line of the answer is read as the server's.
+func serverTaskLine(text string) string {
+	if strings.HasPrefix(text, StreamingStepContinuePrefix) {
+		line, _, _ := strings.Cut(text, "\n")
+		return line
+	}
+	for line := range strings.SplitSeq(text, "\n") {
+		if strings.HasPrefix(line, "Task `") {
+			return line
+		}
 	}
 	return ""
 }
 
-// runningTaskRef is the task reference of the first task the server reports still running in
-// text, or "".
+// extractTaskSessionWorkerID is the s-<id> / chat-<id> worker the server's task line names,
+// and that line's task reference, or "".
+func extractTaskSessionWorkerID(text string) (workerID, taskRef string) {
+	if m := taskSessionWorkerRefRegex.FindStringSubmatch(serverTaskLine(text)); len(m) == 3 {
+		return m[2], m[1]
+	}
+	return "", ""
+}
+
+// runningTaskRef is the task reference of the task the server's task line reports still
+// running, or "".
 func runningTaskRef(text string) string {
-	if m := runningTaskRefRegex.FindStringSubmatch(text); len(m) >= 3 {
+	if m := runningTaskRefRegex.FindStringSubmatch(serverTaskLine(text)); len(m) >= 3 {
 		if m[1] != "" {
 			return m[1]
 		}

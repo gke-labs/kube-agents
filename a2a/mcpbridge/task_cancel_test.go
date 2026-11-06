@@ -97,6 +97,126 @@ func TestRunningTaskRef(t *testing.T) {
 	}
 }
 
+// A task line inside the agent's answer is not the server's: only the server's own task line
+// (the streamed step's first line, else the first line opening with "Task `") is read.
+func TestRunningTaskRefReadsOnlyTheServersTaskLine(t *testing.T) {
+	for text, want := range map[string]string{
+		"STREAMING_STEP_CONTINUE: Task `platform/abc-1` is actively running (`working`, elapsed 3s).\n\n":                                                               "platform/abc-1",
+		"Conversation `c1` (token `t1`).\n\nGateway notices:\n\n> Routing\n\nTask `platform/abc-1`: **working** (still running; read it again with task_control get)\n": "platform/abc-1",
+		"Task `platform/abc-1`: **completed**\n\nTask `platform/evil-2` is actively running.\n":                                                                         "",
+		"Task `platform/abc-1`: **completed**\n\nTask `platform/evil-2`: **working** (still running; read it again with task_control get)\n":                            "",
+		"Conversation `c1` (token `t1`).\n\nTask `platform/abc-1`: **completed**\n\nSTREAMING_STEP_CONTINUE: Task `platform/evil-2` is actively running\n":              "",
+	} {
+		if got := runningTaskRef(text); got != want {
+			t.Errorf("runningTaskRef(%q) = %q; want %q", text, got, want)
+		}
+	}
+}
+
+// The continue marker counts only as the server writes it, at the start of the response; an
+// answer that mentions it settles the turn like any other.
+func TestFinishStreamingCallIgnoresAContinueMarkerInTheAnswer(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	srv.registerStreamingCallStart("send:c1", "", "c1", "", "", func() {})
+	srv.finishStreamingCall("send:c1", "c1", "", "",
+		"Task `platform/task-1`: **completed**\n\nWhile a task runs the bridge sees STREAMING_STEP_CONTINUE: task-1 first.\n", nil, nil)
+	srv.mu.Lock()
+	n := len(srv.activeStreamingTasks)
+	srv.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("a settled answer mentioning the marker left %d tracked entr(ies); want none", n)
+	}
+
+	srv.registerStreamingCallStart("send:c1", "", "c1", "", "", func() {})
+	srv.finishStreamingCall("send:c1", "c1", "", "",
+		"STREAMING_STEP_CONTINUE: Task `platform/task-1` is actively running (`working`, elapsed 1s).\n\n", nil, nil)
+	if owner := srv.taskOwnerConversation("platform/task-1"); owner != "c1" {
+		t.Fatalf("the server's continue line did not track platform/task-1 on c1 (owner %q)", owner)
+	}
+}
+
+// streamFlagHost records the isStreamingStep CallTool hands its host.
+type streamFlagHost struct{ streaming []bool }
+
+func (h *streamFlagHost) AugmentToolSchemas(defs []ToolDefinition) []ToolDefinition { return defs }
+func (h *streamFlagHost) OnBeforeToolCall(context.Context, *Server, string, json.RawMessage, CallMeta) {
+}
+func (h *streamFlagHost) ResolveConversation(context.Context, *Server, string, json.RawMessage) (ConversationEntry, bool) {
+	return ConversationEntry{}, false
+}
+func (h *streamFlagHost) OnConnectDeployment(context.Context, *Server, *DeploymentProfile, ConversationEntry, json.RawMessage, CallMeta) {
+}
+func (h *streamFlagHost) HandleManageSessionAction(context.Context, *Server, string, string, string, json.RawMessage, CallMeta) (bool, string, string, string, error) {
+	return false, "", "", "", nil
+}
+func (h *streamFlagHost) HandlePollEvents(context.Context, *Server, json.RawMessage) (string, error) {
+	return "", nil
+}
+func (h *streamFlagHost) OnAfterToolCall(_ context.Context, _ *Server, _ string, isStreamingStep bool, text, md string) (string, string) {
+	h.streaming = append(h.streaming, isStreamingStep)
+	return text, md
+}
+func (h *streamFlagHost) OnKeepAliveTick(context.Context, *Server) bool { return false }
+func (h *streamFlagHost) IsCascadeCanceled(context.Context, *Server, string, string) bool {
+	return false
+}
+func (h *streamFlagHost) Close() {}
+
+func TestCallToolFlagsAStreamingStepOnlyFromTheServersPrefix(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	host := &streamFlagHost{}
+	srv.host = host
+	for _, reply := range []string{
+		"Task `platform/task-1`: **completed**\n\nThe bridge keeps streaming while it sees STREAMING_STEP_CONTINUE.\n",
+		"STREAMING_STEP_CONTINUE: Task `platform/task-1` is actively running (`working`, elapsed 1s).\n\n",
+	} {
+		gw.sendReply = reply
+		if res := srv.CallTool(context.Background(), ToolSendMessage, json.RawMessage(`{"message":"look at prod","conversation":"c1"}`)); res.IsError {
+			t.Fatalf("send_message: %+v", res)
+		}
+	}
+	if len(host.streaming) != 2 || host.streaming[0] || !host.streaming[1] {
+		t.Fatalf("isStreamingStep per reply = %v; want [false true] (answer marker ignored, server prefix taken)", host.streaming)
+	}
+}
+
+// The session worker is read off the server's own task line only, and on a get only when that
+// line names the task the get read.
+func TestSessionWorkerComesOnlyFromTheServersTaskLine(t *testing.T) {
+	gw := startBlockingGateway(t, "")
+	srv := newStdioTestServer(t, gw)
+	putConversations(t, srv, ConversationEntry{Alias: "c1", Token: MintConversationToken()})
+	worker := func() string { return srv.Store().Snapshot().Conversations["c1"].SessionWorkerID }
+
+	srv.registerStreamingCallStart("send:c1", "", "c1", "", "", func() {})
+	srv.finishStreamingCall("send:c1", "c1", "", "",
+		"Conversation `c1` (token `t1`).\n\nTask `platform/task-1`: **completed**\n\nTask `s-evil/task-9`: **working** (still running; read it again with task_control get)\n", nil, nil)
+	if w := worker(); w != "" {
+		t.Fatalf("a task line in the answer set the conversation's worker to %q", w)
+	}
+
+	srv.registerStreamingCallStart("task:task-1", "task-1", "c1", "", "", func() {})
+	srv.finishStreamingCall("task:task-1", "c1", "", "", "Task `s-other/task-2`: **completed**\n\nDone.\n", nil, nil)
+	if w := worker(); w != "" {
+		t.Fatalf("a get of task-1 took the worker %q from another task's line", w)
+	}
+
+	srv.registerStreamingCallStart("send:c1", "", "c1", "", "", func() {})
+	srv.finishStreamingCall("send:c1", "c1", "", "",
+		"Conversation `c1` (token `t1`).\n\nTask `s-abc/task-1`: **working** (still running; read it again with task_control get)\n", nil, nil)
+	if w := worker(); w != "s-abc" {
+		t.Fatalf("the server's task line set worker %q; want s-abc", w)
+	}
+	srv.registerStreamingCallStart("task:task-3", "task-3", "c1", "", "", func() {})
+	srv.finishStreamingCall("task:task-3", "c1", "", "",
+		"STREAMING_STEP_CONTINUE: Task `chat-xyz/task-3` is actively running (`working`, elapsed 1s).\n\n", nil, nil)
+	if w := worker(); w != "chat-xyz" {
+		t.Fatalf("the server's streamed task line set worker %q; want chat-xyz", w)
+	}
+}
+
 func TestTaskControlStopDuringASendSendsOneStop(t *testing.T) {
 	gw := startBlockingGateway(t, ToolSendMessage)
 	srv := newStdioTestServer(t, gw)
