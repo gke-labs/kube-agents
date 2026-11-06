@@ -19,8 +19,10 @@ collector, `draft` and `finish --scheduled`. These tests run it against the real
 `audit_report.py` on the no-forge path and a stub collector, and check what it
 leaves: a stored scheduled envelope that holds the mark, the digest record a
 scheduled `finish` writes, and a `precheck` of the same manifest that closes the
-next run. They also check that the teardown removes the record and only the
-envelopes that hold the mark. `arm.py` is checked for what it records.
+next run. They also check that the teardown removes the record, the envelopes
+that hold the mark and the envelopes stored after the planted run, and that a
+plant which fails after its `start` releases the stream's in-flight note.
+`arm.py` is checked for what it records.
 """
 
 import contextlib
@@ -158,15 +160,43 @@ class PlantTest(unittest.TestCase):
         self.assertEqual(payload["precheck"], "unchanged")
         self.assertEqual(self.latest()["precheck"], "unchanged")
 
-    def test_no_candidate_fails_the_plant(self):
+    def in_flight_note(self):
+        """The note `start` leaves; written by hand here, since the harness stubs the claim."""
+        note = pathlib.Path(self.audit_report.inflight_path_for(self.plant.AUDIT))
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("{}", encoding="utf-8")
+        return note
+
+    def test_no_candidate_fails_the_plant_and_releases_the_in_flight_note(self):
+        note = self.in_flight_note()
         empty = {**_MANIFEST, "clusters": [{**_MANIFEST["clusters"][0], "candidates": []}]}
         self.assertEqual(self.run_plant(empty), 1)
         self.assertIn("no candidate", self.err)
+        self.assertFalse(note.exists())
 
-    def test_a_collector_that_gives_no_manifest_fails_the_plant(self):
+    def test_a_collector_that_gives_no_manifest_fails_the_plant_and_releases_the_in_flight_note(self):
+        note = self.in_flight_note()
         failed = subprocess.CompletedProcess([], 1, stdout="", stderr="boom")
         with mock.patch.object(self.plant.subprocess, "run", return_value=failed), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.plant.plant(self.audit_report, _MARK, str(_SCRIPTS), []), 1)
+        self.assertFalse(note.exists())
+
+    def test_a_collector_that_times_out_fails_the_plant_and_releases_the_in_flight_note(self):
+        note = self.in_flight_note()
+        err = io.StringIO()
+        timed_out = subprocess.TimeoutExpired(cmd=["fleet_drift.py"], timeout=self.plant.COLLECTOR_TIMEOUT_S)
+        with mock.patch.object(self.plant.subprocess, "run", side_effect=timed_out), contextlib.redirect_stderr(err):
+            self.assertEqual(self.plant.plant(self.audit_report, _MARK, str(_SCRIPTS), []), 1)
+        self.assertIn("did not finish within", err.getvalue())
+        self.assertFalse(note.exists())
+
+    def test_a_finish_that_rejects_the_document_releases_the_in_flight_note(self):
+        note = self.in_flight_note()
+        with mock.patch.object(self.audit_report, "_finish", side_effect=self.audit_report.ValidationError("no")):
+            self.assertEqual(self.run_plant(_MANIFEST), 1)
+        self.assertIn("finish exited 2", self.err)
+        self.assertFalse(note.exists())
+        self.assertFalse(self.plant.planted_manifest_path(self.audit_report).exists())
 
     def test_the_teardown_removes_the_record_and_only_marked_envelopes(self):
         self.assertEqual(self.run_plant(_MANIFEST), 0, self.err)
@@ -190,6 +220,23 @@ class PlantTest(unittest.TestCase):
         self.assertFalse((self.store() / "latest.json").exists())
         self.assertEqual(list((self.store() / "runs").glob("*.json")), [])
         self.assertFalse(self.plant.plant_state_path(self.audit_report).exists())
+
+    def test_the_teardown_removes_the_run_the_fire_closed_from_the_planted_one(self):
+        """The fired run's envelope carries the planted wording, so without the mark only its time names it."""
+        self.assertEqual(self.run_plant(_MANIFEST), 0, self.err)
+        runs = self.store() / "runs"
+        planted = self.latest()
+        for path in [self.store() / "latest.json", *runs.glob("*.json")]:
+            path.write_text(path.read_text(encoding="utf-8").replace(_MARK, "carried"), encoding="utf-8")
+        older = runs / "00000000T000000Z.json"
+        older.write_text(json.dumps({**planted, "finished_at": "2000-01-01T00:00:00+00:00"}).replace(_MARK, "carried"), encoding="utf-8")
+        fired = {**planted, "finished_at": "2999-01-01T00:00:00+00:00", "precheck": "unchanged"}
+        (runs / "29990101T000000Z.json").write_text(json.dumps(fired).replace(_MARK, "carried"), encoding="utf-8")
+        (self.store() / "latest.json").write_text(json.dumps(fired).replace(_MARK, "carried"), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.plant.teardown(self.audit_report, _MARK), 0)
+        self.assertFalse((self.store() / "latest.json").exists())
+        self.assertEqual(sorted(runs.glob("*.json")), [older])
 
     def test_an_older_newest_envelope_fails_the_plant(self):
         with mock.patch.object(self.plant, "stored_envelope", return_value=({"scheduled": True, "finished_at": "2020-01-01T00:00:00+00:00"}, "r")):
