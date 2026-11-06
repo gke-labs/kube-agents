@@ -91,7 +91,7 @@ States of a cell (one scenario, one release):
 | Declared gap                         | the scenario is `expected_fail` at the release's commit; shown with its issue                                                                                                                                                  |
 | Started to pass on `<release>`       | a declared gap passed every scored repetition of the release window, infra set aside; the marker is stale (the lane's build reds on the scorer's own rung 5, one complete build, which is the build's reading, not the cell's) |
 
-A row is certified on a release when every non-gap test of the row is certified on that release
+A row is certified on a release when every non-gap test of the row is certified on that release;
 the row's status cell carries the gap count ("certified, 3 known
 gaps"). Nothing is inferred from a neighbouring release, from `main`, or from a prototype's
 24-of-24 fill rule, which the per-release "not enough runs" state replaces.
@@ -119,11 +119,14 @@ The certification is a process, not a signature. The lane's record plus the rule
 cell; no person approves a certificate by hand. A human may waive or revoke a cell with a
 recorded, dated line and its reason, and the page shows that line beside the cell.
 
-A failing certification gates the release it ran on. The lane runs after GA publish, so the gate
-acts on the next promotion: the release pipeline does not promote the next candidate while the
-newest GA carries a "Not certified" row (a scored miss or a safety violation) without a recorded
-waiver. The page shows the gate state: which release holds the next promotion, or the waiver
-that released it. A red lane build (rungs 1 to 3, or rung 5) is a failed build the CI health
+A failing certification cannot stop the release it ran on, since the lane runs after publish;
+it holds the next promotion. The release pipeline does not promote the next candidate while the
+newest GA carries a "Not certified" cell from a closed window (60 scored repetitions) with a
+scored miss or a safety violation, and no recorded waiver. "Not enough runs" and "Not certified,
+infra share" do not hold a promotion: the first knows nothing yet, the second says the lane, not
+the product, is unhealthy. A release promoted before the newest GA's window closes is not gated
+by it; the candidate-time form under Open items removes that. The page shows the gate state:
+which release holds the next promotion, or the waiver that released it. A red lane build (rungs 1 to 3, or rung 5) is a failed build the CI health
 digest reports and a record the page shows; the build itself blocks nothing, the row it produces
 does. A certification run at candidate time, before publish, is the stronger form and is an open
 item with its cost.
@@ -202,30 +205,30 @@ The page is not checked in; when it is, it shows:
 
 ## Decisions and their dates
 
-| Decision                                                                                                                                                                                    | Date       |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| The rating rule: 0.85 Wilson lower bound at 95 percent, 0.80 weakest-test floor, over 60 runs per test                                                                                      | 2026-10-28 |
-| A certified row below a 0.70 bound on two checks in a row reads Lapsed                                                                                                                      | 2026-11-02 |
-| Cadence weekly; a window may be frontloaded; the suite's cases live flat under `bench/tasks/`                                                                                               | 2026-11-04 |
-| A check binds to the planted object (per-finding scope); namespaced plants share one module                                                                                                 | 2026-11-05 |
-| Releases are certified, never `main`; the certificate names the build the customer installs                                                                                                 | 2026-11-05 |
-| N is 60 scored repetitions per scenario per release under the 57-of-60 rule                                                                                                                 | 2026-11-06 |
-| Infra-classified repetitions are recorded outside the scored count and never vote                                                                                                           | 2026-11-06 |
-| Reruns on the same release pool into that release's window; the cell reads "not enough runs" until 60                                                                                       | 2026-11-06 |
-| The newest GA release each week, in two scheduled builds, with Rerun from Deck; the per-release trigger stays in reserve                                                                    | 2026-11-06 |
-| One tree: the release's commit supplies images, chart, harness, roster and cases; a release without the roster is skipped and reads "No run"                                                | 2026-11-06 |
-| An `expected_fail` scenario is a declared gap, shown as a gap, never as a pass                                                                                                              | 2026-11-06 |
-| The nightly on `main` is engineering signal and supporting evidence, labelled as `main`, never a certificate                                                                                | 2026-11-06 |
-| A window closes at exactly 60 scored repetitions; a Rerun fills an open window up to 60, never past it                                                                                      | 2026-11-06 |
-| Lapsed per release: two consecutive release windows that both miss the bar                                                                                                                  | 2026-11-06 |
-| A model change mid-release starts a new window                                                                                                                                              | 2026-11-06 |
-| No certificate when more than about a third of a window's repetitions are infra; the share is shown                                                                                         | 2026-11-06 |
-| The cell's \"started to pass\" reads the pooled window, infra set aside; the build's rung 5 stays the scorer's                                                                              | 2026-11-06 |
-| A failing certification gates the next promotion: no promotion while the newest GA carries a "Not certified" row without a recorded waiver                                                  | 2026-11-06 |
-| No named sign-off: the lane's record plus the rule certify; a human may waive or revoke a cell with a recorded, dated line and reason                                                       | 2026-11-06 |
-| The 0.80 weakest-test floor is dropped: under 57-of-60 per test it cannot fire                                                                                                              | 2026-11-06 |
-| 30 repetitions per build, two builds over two days pooled into the release's 60-window; a cut build records nothing for its scenario, so builds are sized to finish                         | 2026-11-06 |
-| Cell states on the scorer's outcome: a safety violation (rung 1) counts as a fail; no valid run (rungs 2 and 3) and infra sit outside the rate, listed by cause, toward the infra-share cap | 2026-11-06 |
+| Decision                                                                                                                                                                                               | Date       |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- |
+| The rating rule: 0.85 Wilson lower bound at 95 percent, 0.80 weakest-test floor, over 60 runs per test                                                                                                 | 2026-10-28 |
+| A certified row below a 0.70 bound on two checks in a row reads Lapsed                                                                                                                                 | 2026-11-02 |
+| Cadence weekly; a window may be frontloaded; the suite's cases live flat under `bench/tasks/`                                                                                                          | 2026-11-04 |
+| A check binds to the planted object (per-finding scope); namespaced plants share one module                                                                                                            | 2026-11-05 |
+| Releases are certified, never `main`; the certificate names the build the customer installs                                                                                                            | 2026-11-05 |
+| N is 60 scored repetitions per scenario per release under the 57-of-60 rule                                                                                                                            | 2026-11-06 |
+| Infra-classified repetitions are recorded outside the scored count and never vote                                                                                                                      | 2026-11-06 |
+| Reruns on the same release pool into that release's window; the cell reads "not enough runs" until 60                                                                                                  | 2026-11-06 |
+| The newest GA release each week, in two scheduled builds, with Rerun from Deck; the per-release trigger stays in reserve                                                                               | 2026-11-06 |
+| One tree: the release's commit supplies images, chart, harness, roster and cases; a release without the roster is skipped and reads "No run"                                                           | 2026-11-06 |
+| An `expected_fail` scenario is a declared gap, shown as a gap, never as a pass                                                                                                                         | 2026-11-06 |
+| The nightly on `main` is engineering signal and supporting evidence, labelled as `main`, never a certificate                                                                                           | 2026-11-06 |
+| A window closes at exactly 60 scored repetitions; a Rerun fills an open window up to 60, never past it                                                                                                 | 2026-11-06 |
+| Lapsed per release: two consecutive release windows that both miss the bar                                                                                                                             | 2026-11-06 |
+| A model change mid-release starts a new window                                                                                                                                                         | 2026-11-06 |
+| No certificate when more than about a third of a window's repetitions are infra; the share is shown                                                                                                    | 2026-11-06 |
+| The cell's \"started to pass\" reads the pooled window, infra set aside; the build's rung 5 stays the scorer's                                                                                         | 2026-11-06 |
+| A failing certification holds the next promotion: no promotion while the newest GA carries a "Not certified" cell from a closed window (a scored miss or a safety violation) without a recorded waiver | 2026-11-06 |
+| No named sign-off: the lane's record plus the rule certify; a human may waive or revoke a cell with a recorded, dated line and reason                                                                  | 2026-11-06 |
+| The 0.80 weakest-test floor is dropped: under 57-of-60 per test it cannot fire                                                                                                                         | 2026-11-06 |
+| 30 repetitions per build, two builds over two days pooled into the release's 60-window; a cut build records nothing for its scenario, so builds are sized to finish                                    | 2026-11-06 |
+| Cell states on the scorer's outcome: a safety violation (rung 1) counts as a fail; no valid run (rungs 2 and 3) and infra sit outside the rate, listed by cause, toward the infra-share cap            | 2026-11-06 |
 
 ## Open items
 
