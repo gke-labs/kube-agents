@@ -4109,21 +4109,29 @@ def _parse_footer(body: str) -> tuple[str, datetime] | None:
 _parse_github_time = github_writes.parse_github_time
 
 
-# Mirrors audit_report's `LISTED_LINE_RE`: a finding listed without detail is
-# one bullet, severity, title, location, then the object and the id in two
-# code spans: ``- **major** — <title> — `c` / `ns` — `Deployment/x` (`<id>`)``.
-# The greedy title leaves the LAST location segment to the groups, which is
-# the renderer's; a location shape inside the title stays in the title.
-_LISTED_FINDING_LINE_RE = re.compile(
-    r"^- \*\*[a-z]+\*\* — .* — `[^`\n]*`(?: / `[^`\n]*`| / _cluster-scoped_)"
-    r" — `([^`\n]*)` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$"
+# Mirrors of the fleet-audit renderer's readers of its own body
+# (`agents/platform/skills/fleet-audit/scripts/audit_report.py`:
+# `FINDING_MARKER_RE`, `WHERE_LINE_RE`, `LISTED_LINE_RE`, the listed-section
+# brackets, and `parse_finding_locations`), copied rather than imported: the
+# presubmit's pinned grader is `bench/` alone, extracted without the rest of
+# the checkout. `bench/tests/test_verifiers.py` imports the renderer in the
+# full checkout and holds the mirror equal to it on a captured body.
+_FINDING_MARKER_RE = re.compile(
+    r"^####[ \t]+(.*?)[ \t]*<!--[ \t]*finding:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
-# The renderer brackets its listed rows; the same shape anywhere else is text.
+_WHERE_LINE_RE = re.compile(
+    r"^- \*\*Where:\*\* `([^`\n]*)`"
+    r"(?: / `([^`\n]*)`| / _cluster-scoped_)"
+    r" — `([^`\n]*)`[ \t]*$",
+    re.M,
+)
+_LISTED_LINE_RE = re.compile(
+    r"^- \*\*[a-z]+\*\* — (.*) — `([^`\n]*)`(?: / `([^`\n]*)`| / _cluster-scoped_)"
+    r" — `([^`\n]*)` \(`([^`\n]+)`\)(?: — [^`\n]*)?[ \t]*$",
+    re.M,
+)
 _LISTED_SECTION_BEGIN = "<!-- audit-listed:begin -->"
 _LISTED_SECTION_END = "<!-- audit-listed:end -->"
-# The renderer's location line, the first line under a finding's heading; the
-# object is its last code span, after the cluster and namespace.
-_WHERE_LINE_OBJECT_RE = re.compile(r"^- \*\*Where:\*\* .* — `([^`\n]*)`[ \t]*$")
 # The separator between a finding's id and its object segments, as
 # ``audit_report.py`` composes the id: ``<check>.<cluster>.<namespace>.<object>``.
 _FINDING_ID_SEPARATOR = "."
@@ -4140,51 +4148,47 @@ def _held_ids(body: str) -> set[str]:
     }
 
 
-def _finding_objects(body: str) -> list[tuple[str, str]]:
-    """Each finding the ledger renders, as ``(id, object)``: the id from the
-    heading's ``<!-- finding:<id> -->`` marker and the object the renderer
-    writes last on the one ``- **Where:** `cluster` / `ns` — `object``` line
-    right under it, or, for a finding listed without detail, the id and the
-    object span of its row inside the ``audit-listed`` brackets.
-
-    Nothing else is kept: the title on the heading and on the row is the
-    agent's, so only the marker is read from the heading and only the trailing
-    object from the row; the lines under the ``Where:`` line (impact,
-    evidence, recommendation) are never read, so a ``Where:``- or row-shaped
-    line in them binds nothing. A heading the marker regex does not match (a
-    title holding a newline) opens no finding, so the object under it joins
-    none; that finding then cannot bind, a fail and the safe direction.
-    """
-    found: list[tuple[str, str]] = []
-    pending_id: str | None = None
-    in_listed = False
-    for line in body.splitlines():
+def _listed_objects(body: str) -> dict[str, str]:
+    """``{id: object}`` for the rows listed without detail, read as the
+    renderer's ``_listed_locations`` reads them: only between its brackets,
+    each alone on its line, and only when the body holds exactly one of each
+    in order."""
+    begins: list[int] = []
+    ends: list[int] = []
+    offset = 0
+    for line in body.split("\n"):
         stripped = line.strip()
         if stripped == _LISTED_SECTION_BEGIN:
-            in_listed = True
-            pending_id = None
-            continue
-        if stripped == _LISTED_SECTION_END:
-            in_listed = False
-            continue
-        heading = _HEADING_ID_RE.match(line)
-        if heading:
-            if pending_id is not None:
-                found.append((pending_id, ""))
-            pending_id = heading.group(1)
-            continue
-        if pending_id is not None and stripped:
-            where = _WHERE_LINE_OBJECT_RE.match(line)
-            found.append((pending_id, where.group(1) if where else ""))
-            pending_id = None
-            continue
-        if in_listed:
-            listed = _LISTED_FINDING_LINE_RE.match(line)
-            if listed:
-                found.append((listed.group(2), listed.group(1)))
-    if pending_id is not None:
-        found.append((pending_id, ""))
-    return found
+            begins.append(offset + len(line))
+        elif stripped == _LISTED_SECTION_END:
+            ends.append(offset)
+        offset += len(line) + 1
+    if len(begins) != 1 or len(ends) != 1 or ends[0] < begins[0]:
+        return {}
+    return {fid: obj for _title, _cluster, _ns, obj, fid in _LISTED_LINE_RE.findall(body[begins[0] : ends[0]])}
+
+
+def _finding_objects(body: str) -> dict[str, str]:
+    """Each finding the ledger renders, as ``{id: object}``, read as the
+    renderer's ``parse_finding_locations`` reads its own body: a listed row
+    counts when the delta block names its id and the held lists do not; a
+    heading's object is the first ``Where:`` line between its marker and the
+    next marker (past the new-finding marker an update writes), and a finding
+    whose ``Where:`` line is missing or does not parse is left out rather
+    than guessed at. Nothing the agent writes (the title, the text under the
+    ``Where:`` line) reaches the object.
+    """
+    body = body.replace("\r\n", "\n").replace("\r", "\n")
+    deltas = _DELTA_RE.findall(body)
+    named = set(_json_str_list(deltas[-1]) if deltas else []) - _held_ids(body)
+    out = {fid: obj for fid, obj in _listed_objects(body).items() if fid in named}
+    markers = list(_FINDING_MARKER_RE.finditer(body))
+    for index, match in enumerate(markers):
+        end = markers[index + 1].start() if index + 1 < len(markers) else len(body)
+        where = _WHERE_LINE_RE.search(body, match.end(), end)
+        if where:
+            out[match.group(2)] = where.group(3)
+    return out
 
 
 def _finding_ids(body: str) -> tuple[list[str], str] | None:
@@ -4302,10 +4306,11 @@ class LedgerIssueContainsVerifier(BaseVerifier):
     ``finding`` — one rendered finding at a time, those of the check (or
     checks) ``finding_check`` names (the first segment of the id), the ids the
     ledger only carries (collector-held, not re-checked) left out. The phrases
-    must all sit in ONE such finding's object, the last code span of the
-    ``Where:`` line the renderer writes under its heading, or of its row when
-    it is listed without detail; never its title, cluster, namespace, impact,
-    evidence or recommendation text. Use it to bind a CHECK to an OBJECT: a ``body`` phrase for the
+    must all sit in ONE such finding's object, the one the renderer writes on
+    the ``Where:`` line under its heading (or on its row when it is listed
+    without detail), read back as the renderer reads it; never its title,
+    cluster, namespace, impact, evidence or recommendation text. Use
+    it to bind a CHECK to an OBJECT: a ``body`` phrase for the
     object matches every finding on that object, an id phrase for the check
     matches that check on every object, and nothing in the pair requires one
     finding to carry both. The id itself cannot carry the pair, since its
@@ -4671,7 +4676,7 @@ class LedgerIssueContainsVerifier(BaseVerifier):
             held = _held_ids(ledger["body"])
             candidates = [
                 obj.lower()
-                for fid, obj in _finding_objects(ledger["body"])
+                for fid, obj in _finding_objects(ledger["body"]).items()
                 if fid.lower().startswith(prefixes) and fid not in held
             ]
 

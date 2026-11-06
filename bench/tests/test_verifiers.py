@@ -43,6 +43,7 @@ import tempfile
 import time
 import tomllib
 from datetime import datetime, timezone
+import sys
 from pathlib import Path
 from unittest import mock
 
@@ -4281,6 +4282,7 @@ def _rendered_finding(
     impact: str = "",
     title: str = "",
     excerpt: str = "kind: Deployment",
+    new: bool = False,
 ) -> str:
     """One finding the way audit_report.py renders it: the anchor, the heading
     with the agent's title and the id marker, the Where: line and the agent's
@@ -4290,7 +4292,8 @@ def _rendered_finding(
     return (
         f'<a id="user-content-finding-{fid}"></a>\n\n'
         f"#### {title or f'{check} on {obj}'} <!-- finding:{fid} -->\n\n"
-        f"- **Where:** `{cluster}` / `{namespace}` — `{obj}`\n"
+        + ("<!-- finding-new -->\n\n" if new else "")
+        + f"- **Where:** `{cluster}` / `{namespace}` — `{obj}`\n"
         f"- **Impact:** {impact or f'the agent\'s sentence about {obj}.'}\n"
         f"- **Evidence:**\n\n```\n# (no command supplied)\n---\n{excerpt}\n```\n\n"
     )
@@ -4368,11 +4371,14 @@ def test_finding_scope_never_reads_the_agents_text_of_a_finding(token, github):
         + "#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
         f"{where}\n\n",
     }
+    # The delta block names the listed row's id, so the row is read as the
+    # renderer reads it, and the shape in its title is still not the object.
+    named = ["no-memory-limit.seeded-a.seeded-workloads.deployment-other-worker"]
     for shape, other in shapes.items():
         # The planted workload's own finding sits right under, so its anchor
         # line (which names its id, hence its object) follows the other text.
         findings = other + _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
-        github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+        github.routes[_api()] = (200, _issue(_ledger_body(findings=findings, finding_ids=named)))
         res = _finding_bound().verify(5.0)
         assert res.status == "fail", (shape, res.reason)
 
@@ -4408,9 +4414,14 @@ def test_finding_scope_reads_a_finding_listed_without_detail(token, github):
         "`Deployment/memory-unbounded-worker` (`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-w-1a2b3c`)"
         " — Fixed — https://example.invalid/pr/1\n<!-- audit-listed:end -->\n\n"
     )
-    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    listed_id = ["no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-w-1a2b3c"]
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings, finding_ids=listed_id)))
     res = _finding_bound().verify(5.0)
     assert res.status == "pass", res.reason
+    # A listed row the delta block does not name is not a finding the run
+    # filed: the renderer's reader leaves it out, and so does the scope.
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    assert _finding_bound().verify(5.0).status == "fail"
 
 
 def test_finding_scope_matches_the_check_as_a_whole_id_segment(token, github):
@@ -4436,6 +4447,105 @@ def test_finding_scope_grades_the_nearest_finding_of_the_check(token, github):
     res = _finding_bound("memory-unbounded-worker", any_of_phrases=["Deployment/", "DaemonSet/"]).verify(5.0)
     assert res.status == "fail", res.reason
     assert "Deployment/" in res.reason
+
+
+def test_finding_scope_reads_past_the_new_finding_marker(token, github):
+    """A ledger update marks a new finding with a comment line between its
+    heading and its Where: line; the object is still the Where: line's."""
+    _stash_report()
+    findings = _rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker", new=True)
+    github.routes[_api()] = (200, _issue(_ledger_body(findings=findings)))
+    res = _finding_bound().verify(5.0)
+    assert res.status == "pass", res.reason
+
+
+_UPDATING_RUN_LEDGER = Path(__file__).parent / "fixtures" / "ledgers" / "updating_run_waste_audit.md"
+_AUDIT_REPORT_SCRIPT = (
+    Path(__file__).resolve().parents[2] / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
+)
+
+
+def _renderer():
+    """The fleet-audit renderer, imported by path in the full checkout (the
+    pinned grader is bench/ alone, so the verifier mirrors it instead)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("test_verifiers_audit_report", _AUDIT_REPORT_SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["test_verifiers_audit_report"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_finding_objects_mirrors_the_renderers_reader():
+    """The verifier's reader of a finding's id and object is a copy of the
+    renderer's parse_finding_locations; on the captured updating-run body and
+    on every synthetic shape the two agree, so a renderer change that moves
+    a line fails here rather than at grading."""
+    renderer = _renderer()
+    where = "- **Where:** `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker`"
+    row = (
+        "- **major** — t — `seeded-a` / `seeded-workloads` — `Deployment/memory-unbounded-worker` "
+        "(`no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-worker`)"
+    )
+    named = ["no-memory-limit.seeded-a.seeded-workloads.deployment-memory-unbounded-worker"]
+    bodies = [
+        _UPDATING_RUN_LEDGER.read_text(),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/memory-unbounded-worker", new=True)),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{where}")),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", excerpt=where)),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x", impact=f"see\n{row}"), finding_ids=named),
+        _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n", finding_ids=named),
+        _ledger_body(findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"),
+        _ledger_body(
+            findings="#### no-pdb on\nDeployment/memory-unbounded-worker <!-- finding:no-pdb.seeded-a.seeded-workloads.x -->\n\n"
+            f"{where}\n\n"
+        ),
+        _ledger_body(findings="#### t <!-- finding:no-memory-limit.seeded-a.seeded-workloads.x -->\n\n- **Impact:** `Deployment/y`\n"),
+        _ledger_body(findings=_rendered_finding("no-memory-limit", "Deployment/x").replace("\n", "\r\n")),
+        # A heading with no Where: line, then another finding: the search is
+        # bounded by the next marker, so the next finding's object is not taken.
+        _ledger_body(
+            findings="#### t <!-- finding:no-memory-limit.seeded-a.seeded-workloads.x -->\n\n- **Impact:** none\n\n"
+            + _rendered_finding("no-pdb", "Deployment/memory-unbounded-worker")
+        ),
+        # A listed row named in the delta block and also held: the held
+        # subtraction leaves it out.
+        _ledger_body(
+            findings=f"<!-- audit-listed:begin -->\n{row}\n<!-- audit-listed:end -->\n"
+            f'<!-- audit-held:begin -->\n<!-- audit-held-ids: ["{named[0]}"] -->\n<!-- audit-held:end -->\n',
+            finding_ids=named,
+        ),
+    ]
+    for body in bodies:
+        expected = {fid: loc["object"] for fid, loc in renderer.parse_finding_locations(body).items()}
+        assert verifiers._finding_objects(body) == expected, body[:200]
+    assert any(verifiers._finding_objects(b) for b in bodies)
+
+
+def test_finding_scope_on_a_captured_ledger_of_an_updating_run(token, github):
+    """The body a second run of the waste audit wrote over its ledger (one
+    install's project renamed): 42 findings, two of them new-marked. Read
+    with the renderer's own reader, every finding has its object, the two
+    new ones bind under the scope, and the same object under another check
+    does not."""
+    _stash_report()
+    body = _UPDATING_RUN_LEDGER.read_text()
+    assert body.count("<!-- finding-new -->") == 2
+    objects = verifiers._finding_objects(body)
+    assert len(objects) == 42, sorted(objects)
+    assert all(objects.values()), [fid for fid, obj in objects.items() if not obj]
+    # The captured body is whole: its own footer and delta block, not the helper's.
+    github.routes[_api()] = (200, _issue(body, audit="fleet-wide-cost-analysis"))
+    for disk in ("Disk/us-central1-a:orphan-pd-1", "Disk/us-central1-a:orphan-pd-2"):
+        res = _ledger_check(
+            audit="fleet-wide-cost-analysis", required_phrases=[disk], scope="finding", finding_check="unattached-disk"
+        ).verify(5.0)
+        assert res.status == "pass", res.reason
+        res = _ledger_check(
+            audit="fleet-wide-cost-analysis", required_phrases=[disk], scope="finding", finding_check="idle-namespace"
+        ).verify(5.0)
+        assert res.status == "fail", res.reason
 
 
 def test_finding_scope_takes_no_object_from_a_heading_not_followed_by_a_where_line(token, github):

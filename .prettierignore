@@ -27,6 +27,11 @@ agents/*/skills/gke-*/**
 third_party/google-skills/**
 agents/*/skill-overlays/**
 
+# Captured audit ledger bodies, compared byte for byte against the fleet-audit
+# renderer's own reader by bench/tests/test_verifiers.py; a reflow changes what
+# the test reads.
+bench/tests/fixtures/ledgers/
+
 # Monolithic custom semgrep rules bundle
 .github/semgrep-security-audit.yml
 
