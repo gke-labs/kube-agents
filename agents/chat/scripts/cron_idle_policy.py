@@ -23,8 +23,10 @@ whose ``next_run_at`` Hermes has yet to compute. A missing field falls back to
 the CR's creation time while ``chatMessagesInboundTotal`` counts nothing, so
 an install nobody has ever messaged idles from the day it was created; with
 messages counted and the field absent (an operator upgraded, or rolled back
-and returned, since the last message) the signal is unknown and nothing is
-held until the next one. The field counts every chat message the gateway accepted,
+and returned, since the last message) the signal is unknown: that reading
+replaces a cached one at once, so nothing new is held from the next read on,
+and a job already held runs at its pushed slot, since no reading says when
+the person wrote. The field counts every chat message the gateway accepted,
 the agent API's included; turns through the A2A inject door are the one door
 it does not count, so an install driven only through that door opts out with
 ``CRON_IDLE_THROTTLE_DAYS=0`` in ``spec.deployment.env`` (the operator copies
@@ -162,6 +164,12 @@ CRONITER_MODULE = "croniter"
 ERROR_EXCERPT_CHARS = 160
 
 
+class SignalUnknown(RuntimeError):
+    """The CR was read and says no reading can be given: the field is absent
+    while the counter counts messages. A reading, not a fault, so it replaces
+    whatever reading is cached rather than leaving it to stand for a day."""
+
+
 # --------------------------------------------------------------------------
 # settings
 # --------------------------------------------------------------------------
@@ -267,7 +275,7 @@ def read_signal(environ: dict | None = None) -> tuple[datetime, str]:
     except (TypeError, ValueError):
         inbound = 0
     if inbound > 0:
-        raise RuntimeError(
+        raise SignalUnknown(
             f"{SIGNAL_SOURCE_HUMAN} is absent while {INBOUND_COUNTER} counts {inbound}; "
             "the operator writes it on the next message"
         )
@@ -428,7 +436,9 @@ def _signal(
     Returns ``(when, source)``, or ``(None, None)`` when nothing trustworthy is
     known. The attempt time is recorded whether or not it succeeded, so a
     failing ``kubectl`` costs one call per TTL rather than one per minute; the
-    error text is kept so the ticker says it once rather than every tick.
+    error text is kept so the ticker says it once rather than every tick. A
+    read that says the signal is unknown drops the cached reading, which it
+    supersedes; a read that failed leaves it to stand for a day.
     """
     cache = state["signal"]
     checked = parse_timestamp(cache.get("checked_at"))
@@ -436,6 +446,10 @@ def _signal(
         cache["checked_at"] = now.isoformat()
         try:
             when, source = reader()
+        except SignalUnknown as exc:
+            cache["error"] = _excerpt(str(exc))
+            for key in ("read_at", "at", "source"):
+                cache.pop(key, None)
         except Exception as exc:  # the read is the fault; the policy carries on
             cache["error"] = _excerpt(str(exc) or type(exc).__name__)
         else:

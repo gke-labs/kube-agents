@@ -631,6 +631,28 @@ class SignalCacheTest(PolicyCase):
         again = self.run_policy(failing, now=later + timedelta(minutes=6))
         self.assertEqual([line for line in again if "cannot read" in line], [])
 
+    def test_a_counted_but_absent_field_replaces_the_cached_reading(self):
+        # The upgrade and rollback paths: the install hibernated on a reading,
+        # a person wrote, and the CR now counts the message without carrying
+        # the field. That is a reading that says "unknown", not a failed read,
+        # so the cached one goes at once: nothing new is held from this tick,
+        # and the hold already written stands at its pushed slot.
+        self.run_policy(Reader(days_ago(15)))
+        held_at = self.next_run("compliance-audit")
+        unknown = Reader(error=cip.SignalUnknown("lastHumanActiveTime is absent while chatMessagesInboundTotal counts 1"))
+        later = NOW + timedelta(minutes=30)  # the second audit's due minute
+        lines = self.run_policy(unknown, now=later)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("cannot read the PlatformAgent (lastHumanActiveTime is absent", lines[0])
+        self.assertIn("nothing held", lines[0])
+        self.assertEqual(self.next_run("obtainability-audit"), iso(later))
+        self.assertEqual(self.next_run("compliance-audit"), held_at)
+        self.assertNotIn("at", self.state()["signal"])
+        # A failed read after it has no reading left to stand on either.
+        failing = Reader(error=RuntimeError("kubectl exited 1: forbidden"))
+        self.run_policy(failing, now=later + timedelta(minutes=6))
+        self.assertEqual(self.next_run("obtainability-audit"), iso(later))
+
     def test_a_day_without_a_reading_fails_open(self):
         self.run_policy(Reader(days_ago(15)))
         held_at = self.next_run("compliance-audit")
@@ -848,7 +870,7 @@ class ReadSignalTest(unittest.TestCase):
         # message: the field is missing, not never written, so no creation-time
         # fallback and nothing held until the next message.
         self.stub(self.listing({"usage": {"chatMessagesInboundTotal": 14, "lastActiveTime": "2026-08-06T06:00:00Z"}}))
-        with self.assertRaisesRegex(RuntimeError, "lastHumanActiveTime is absent while chatMessagesInboundTotal counts 14"):
+        with self.assertRaisesRegex(cip.SignalUnknown, "lastHumanActiveTime is absent while chatMessagesInboundTotal counts 14"):
             cip.read_signal({})
 
     def test_namespace_comes_from_the_environment_it_is_given(self):
