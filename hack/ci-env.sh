@@ -285,6 +285,10 @@ readonly REPLAY_SHADOW_KUBECTL_TIMEOUT="30s"
 # A postsubmit records only on this branch; a periodic checks out main by its
 # job's extra_refs and carries no PULL_BASE_REF.
 readonly REPLAY_RECORD_BRANCH="main"
+# Prow's JOB_TYPE for a run after a merge, the one job type the branch check applies to.
+readonly REPLAY_SHADOW_JOB_TYPE_POSTSUBMIT="postsubmit"
+# What prepare_replay_lane_cache reports for a Deployment it could not read.
+readonly REPLAY_SHADOW_MODE_UNREADABLE="(unreadable)"
 readonly REPLAY_SHADOW_PULL_REFS=(PULL_NUMBER PULL_BASE_REF PULL_BASE_SHA PULL_PULL_SHA PULL_REFS)
 # A bucket name of 3-63 characters (dotted names past 63 are not accepted),
 # and the shapes of the tags that become object paths.
@@ -761,7 +765,7 @@ resolve_replay_shadow() {
   local mode="${REPLAY_MODE_SHADOW}" cache_bucket="" identity
   if [ "${kind}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ] && [ "${EVAL_REPLAY_RECORD:-${REPLAY_RECORD_DEFAULT}}" = "true" ]; then
     identity="$(_replay_shadow_upload_identity)"
-    if [ "${JOB_TYPE:-}" = "postsubmit" ] && [ "${PULL_BASE_REF:-}" != "${REPLAY_RECORD_BRANCH}" ]; then
+    if [ "${JOB_TYPE:-}" = "${REPLAY_SHADOW_JOB_TYPE_POSTSUBMIT}" ] && [ "${PULL_BASE_REF:-}" != "${REPLAY_RECORD_BRANCH}" ]; then
       if [ -n "${EVAL_REPLAY_RECORD:-}" ]; then
         echo "ERROR: EVAL_REPLAY_RECORD=true on a postsubmit of '${PULL_BASE_REF:-}': only ${REPLAY_RECORD_BRANCH} records into the shared replay cache." >&2
         return 1
@@ -874,7 +878,20 @@ start_replay_shadow_collector() {
   # whatever this shell's own check answers.
   if deployed="$(_replay_shadow_deployed_mode "${namespace}")"; then
     case "${deployed}" in
-    "${REPLAY_MODE_SHADOW}" | "${REPLAY_MODE_RECORD}" | "${REPLAY_MODE_REPLAY}")
+    "${REPLAY_MODE_RECORD}")
+      # Only a nightly may publish: a presubmit or a replay lane facing a
+      # recording proxy collects in shadow and never gets the cache bucket.
+      if [ "${REPLAY_SHADOW_KIND}" = "${REPLAY_SHADOW_KIND_NIGHTLY}" ]; then
+        if [ "${deployed}" != "${mode}" ]; then
+          echo "Replay proxy: the collector runs in record mode, the mode the deploy installed, not ${mode} from this shell's own check." >&2
+        fi
+        mode="${deployed}"
+      else
+        echo "WARNING: ${REPLAY_SHADOW_DEPLOYMENT} records, but this is a ${REPLAY_SHADOW_KIND} run; the collector runs in shadow mode and publishes nothing." >&2
+        mode="${REPLAY_MODE_SHADOW}"
+      fi
+      ;;
+    "${REPLAY_MODE_SHADOW}" | "${REPLAY_MODE_REPLAY}")
       if [ "${deployed}" != "${mode}" ]; then
         echo "Replay proxy: the collector runs in ${deployed} mode, the mode the deploy installed, not ${mode} from this shell's own check." >&2
       fi
@@ -955,7 +972,7 @@ prepare_replay_lane_cache() {
   resolve_replay_shadow || return 1
   [ "${REPLAY_SHADOW_MODE}" = "${REPLAY_MODE_REPLAY}" ] || return 0
   local namespace="${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}" deployed work
-  deployed="$(_replay_shadow_deployed_mode "${namespace}")" || deployed="(unreadable)"
+  deployed="$(_replay_shadow_deployed_mode "${namespace}")" || deployed="${REPLAY_SHADOW_MODE_UNREADABLE}"
   if [ "${deployed}" != "${REPLAY_MODE_REPLAY}" ]; then
     echo "ERROR: the replay lane needs the proxy installed in replay mode; ${REPLAY_SHADOW_DEPLOYMENT} reads '${deployed}'." >&2
     return 1

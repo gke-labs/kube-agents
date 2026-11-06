@@ -626,6 +626,19 @@ class ModeCollectorTest(_LifecycleBase):
         self.assertEqual((pairs["--mode"], pairs["--publish-bucket"]), ("record", "kube-agents-replay-cache"))
         self.assertIn("the mode the deploy installed", proc.stderr)
 
+    def test_a_run_that_is_not_a_nightly_never_publishes_whatever_was_installed(self):
+        # A presubmit or the replay lane facing a recording proxy collects in
+        # shadow. (An untrusted nightly is filed nightly-untrusted once
+        # gke-labs/kube-agents#4982 lands, and the same kind check excludes it.)
+        for overrides in ({"JOB_TYPE": "presubmit", "PULL_NUMBER": "4700"}, {"EVAL_REPLAY_LANE": "true"}):
+            with self.subTest(**overrides):
+                self.argv.unlink(missing_ok=True)
+                proc = self._start(FAKE_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", **overrides)
+                argv, _ = self._argv_pairs()
+                self.assertNotIn("--publish-bucket", argv)
+                self.assertNotIn("record", argv)
+                self.assertIn("publishes nothing", proc.stderr)
+
     def test_a_readable_proxy_without_a_mode_is_shadow_even_when_this_shell_would_record(self):
         # The chart renders REPLAY_MODE only for record and replay: a Deployment
         # read without it is a shadow install, never one to record against.
