@@ -105,6 +105,7 @@ func (s *clusterSet) start(ctx context.Context, tc targetCluster) error {
 	}
 	disp := newDispatcher(s.f, s.filter, cache, s.inj, s.m)
 	disp.cluster = tc
+	disp.owners = newOwnerResolver(tc.Client)
 	cctx, cancel := context.WithCancel(ctx)
 	run := &clusterRun{cluster: tc, cache: cache, excluded: disp.excluded, cancel: cancel, done: make(chan struct{})}
 	// done closes once the watcher and both loops have returned, so a stop

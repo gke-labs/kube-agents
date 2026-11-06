@@ -11,9 +11,10 @@ the same way (examples/inference-replay/eval-design.md, Rollout).
 Inputs:
 
 - LOG paths: segment files and job manifests, or directories searched for
-  `*.jsonl` and `*.jsonl.open` segments and `job-<ms>.json` manifests. A
-  file's job kind is the kind folder it was filed under at the collector's
-  layout (filed_kind: `<kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl` or
+  `*.jsonl` segments (analyze_shadow.log_files) and `job-<ms>.json`
+  manifests. A file's job kind is the kind folder it was filed under at the
+  collector's layout (analyze_shadow.filed_kind:
+  `<kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl` or
   `<kind>/<YYYY-MM-DD>/<build>/job-<ms>.json`, with no other kind-named
   directory in its path), or `--kind`; never its lines' own tags, and a line
   whose tag disagrees is dropped. A file found under a directory off that
@@ -56,14 +57,7 @@ import schema as F
 REPORT_SCHEMA_VERSION = 1
 NIGHTLY = analyze_shadow.NIGHTLY
 PRESUBMIT = analyze_shadow.PRESUBMIT
-# A scheduled run whose shadow logs are filed apart from the trusted nightly's
-# because it did not upload as the baseline recorder (the GitLab nightly, for
-# one). analyze_shadow names it once it knows the kind; until then, the same
-# value here.
-NIGHTLY_UNTRUSTED = getattr(analyze_shadow, "NIGHTLY_UNTRUSTED", "nightly-untrusted")
-# Every kind this report counts, whether or not analyze_shadow.JOB_KINDS lists
-# it yet.
-JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT)
+JOB_KINDS = analyze_shadow.JOB_KINDS
 TOTAL_SCOPE = "total"
 SCOPES = (TOTAL_SCOPE,) + JOB_KINDS
 HTTP_OK = 200
@@ -91,23 +85,11 @@ COST_SOURCE_LITELLM, COST_SOURCE_TABLE, COST_SOURCE_MIXED = "litellm", "price ta
 # LiteLLM names a deployment's model `<provider>/<model>`.
 PROVIDER_SEPARATOR = "/"
 
-SEGMENT_SUFFIX = ".jsonl"
-SEGMENT_SUFFIXES = (SEGMENT_SUFFIX, ".jsonl.open")
+# analyze_shadow.MANIFEST_NAME, with the start time captured (a manifest is
+# job-<collector start ms>.json).
 MANIFEST_NAME = re.compile(r"^job-(\d+)\.json$")
-# Where collect_shadow.py files under the bucket's BUCKET_ROOT: a segment at
-# <kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl and the job manifest at
-# <kind>/<YYYY-MM-DD>/<build>/job-<ms>.json. The build is BUILD_ID's shape
-# (hack/ci-env.sh, REPLAY_SHADOW_BUILD_RE), the segment name the logs/ form of
-# collect_shadow.SAFE_NAME, and the manifest collect_shadow.write_manifest's.
-# The same values as analyze_shadow's (kube-agents#4982), for filed_kind.
-BUCKET_ROOT = "replay-shadow"
-LOGS_DIR = "logs"
-DAY_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-BUILD_DIR = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-SEGMENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$")
-FILED_DEPTH = 5
-MANIFEST_DEPTH = 4
-LAYOUT = f"<{'|'.join(JOB_KINDS)}>/<YYYY-MM-DD>/<build>/{LOGS_DIR}/<segment>.jsonl or <build>/job-<ms>.json"
+MANIFEST_LAYOUT = (f"<{'|'.join(JOB_KINDS)}>/<YYYY-MM-DD>/<build>/job-<ms>.json, with no other directory in its"
+                   " path named for a kind")
 # The listing of lines without a build id: they are no build, and stay out of
 # `builds` and every per-build figure.
 NO_BUILD = "(lines without a build id; not a build)"
@@ -539,28 +521,6 @@ def _field(entry: Dict[str, Any], name: str, quality: Quality, maximum: int = MA
     return count
 
 
-def expand_paths(paths: Iterable[str]) -> Tuple[List[str], List[str]]:
-    """(log files, job manifests). A directory is searched for segments and manifests; a file is a log
-    unless it is named like a manifest."""
-    logs: List[str] = []
-    manifests: List[str] = []
-    for path in paths:
-        if os.path.isdir(path):
-            for root, dirs, names in os.walk(path):
-                dirs.sort()
-                for name in sorted(names):
-                    full = os.path.join(root, name)
-                    if MANIFEST_NAME.match(name):
-                        manifests.append(full)
-                    elif name.endswith(SEGMENT_SUFFIXES):
-                        logs.append(full)
-        elif MANIFEST_NAME.match(os.path.basename(path)):
-            manifests.append(path)
-        else:
-            logs.append(path)
-    return logs, manifests
-
-
 def parse_line(entry: Dict[str, Any], quality: Quality, kind: str) -> Optional[Line]:
     """`kind` is the folder's (or --kind); a line whose own tag disagrees is dropped and counted."""
     job = entry.get(F.JOB)
@@ -616,86 +576,49 @@ def parse_line(entry: Dict[str, Any], quality: Quality, kind: str) -> Optional[L
     )
 
 
-def filed_kind(path: str) -> Optional[str]:
-    """The kind a segment or job manifest was filed under, when it sits at the collector's layout, else None.
-
-    The kind directory must be the only component of the whole absolute path
-    named for a kind, since everything below a kind prefix is the uploader's
-    choice; the build directory may not be named for a kind or the bucket root.
-
-    Mirrors analyze_shadow.filed_kind (kube-agents#4982), copied with its
-    constants; replace it with that import once both are on main.
-    """
-    parts = os.path.normpath(os.path.abspath(path)).split(os.sep)
-    name = parts[-1]
-    if SEGMENT_NAME.match(name):
-        depth = FILED_DEPTH
-        if len(parts) < depth or parts[-2] != LOGS_DIR:
-            return None
-    elif MANIFEST_NAME.match(name):
-        depth = MANIFEST_DEPTH
-        if len(parts) < depth:
-            return None
-    else:
-        return None
-    kind, day, build = parts[-depth:][:3]
-    if kind not in JOB_KINDS or not DAY_DIR.match(day) or not BUILD_DIR.match(build) or build in (*JOB_KINDS, BUCKET_ROOT):
-        return None
-    if any(part in JOB_KINDS for part in parts[:-depth]):
-        return None
-    return kind
+def _manifests_under(path: str) -> List[str]:
+    """The job manifests a directory holds, at any depth."""
+    return sorted(os.path.join(root, name) for root, _, names in os.walk(path)
+                  for name in names if MANIFEST_NAME.match(name))
 
 
 def filed_inputs(
     paths: Iterable[str], kind: Optional[str], quality: Quality
 ) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
-    """(log files, job manifests), each with its job kind: `kind` when given, else filed_kind's, never the
-    lines' own tags, which the proxy built from the commit under test writes.
+    """(log segments, job manifests), each with its job kind: `kind` when given, else
+    analyze_shadow.filed_kind's, never the lines' own tags.
 
-    A file found under a directory but off the layout is skipped and counted in
-    off_layout_files, as is a directory with nothing at the layout (with a note
-    on stderr): an object a presubmit planted under its own prefix must not stop
-    the report on the rest. Raises ValueError for the operator's own argument
-    mistakes: a path that does not exist, a file named outright that is not a
-    segment or a manifest or is off the layout, or a run where files were found
-    and none is at the layout. A run with no files at all reads nothing.
-    Mirrors analyze_shadow.log_files (kube-agents#4982), with manifests too.
+    Segments come from analyze_shadow.log_files, with its rules: a segment off
+    the layout under a directory, or a directory with none at it, is skipped and
+    counted in off_layout_files; a missing path, a file named outright that is
+    not a segment (or a manifest, read here) or is off the layout, or a run whose
+    segments are all off it, is an error. Manifests follow the same rules.
     """
-    logs: List[Tuple[str, str]] = []
+    paths = list(paths)
+    named_manifests = [path for path in paths
+                       if os.path.isfile(path) and MANIFEST_NAME.match(os.path.basename(path))]
+    others = [path for path in paths if path not in named_manifests]
+    logs, off_layout = analyze_shadow.log_files(others, kind)
     manifests: List[Tuple[str, str]] = []
-    off_layout = 0
-    for path in paths:
-        if not os.path.exists(path):
-            raise ValueError(f"{path} does not exist")
-        if not os.path.isdir(path):
-            is_manifest = bool(MANIFEST_NAME.match(os.path.basename(path)))
-            if not is_manifest and not path.endswith(SEGMENT_SUFFIX):
-                raise ValueError(f"{path} is neither a log segment (*{SEGMENT_SUFFIX}) nor a job manifest"
-                                 " (job-<ms>.json); the store is not read")
-            file_kind = kind or filed_kind(path)
-            if file_kind is None:
-                raise ValueError(f"{path} is not at the bucket's layout ({LAYOUT}, with no other directory in its"
-                                 " path named for a kind); pass --kind to name its kind")
-            (manifests if is_manifest else logs).append((path, file_kind))
-            continue
-        found_logs, found_manifests = expand_paths([path])
-        kept = 0
-        for names, out in ((found_logs, logs), (found_manifests, manifests)):
-            for name in names:
-                file_kind = kind or filed_kind(name)
+    for path in named_manifests:
+        file_kind = kind or analyze_shadow.filed_kind(path)
+        if file_kind is None:
+            raise ValueError(f"{path} is not at the bucket's layout ({MANIFEST_LAYOUT}); pass --kind to name"
+                             " its kind")
+        manifests.append((path, file_kind))
+    manifest_off_layout = 0
+    for path in others:
+        if os.path.isdir(path):
+            for name in _manifests_under(path):
+                file_kind = kind or analyze_shadow.filed_kind(name)
                 if file_kind is None:
-                    off_layout += 1
+                    manifest_off_layout += 1
                     continue
-                out.append((name, file_kind))
-                kept += 1
-        found = len(found_logs) + len(found_manifests)
-        if found and not kept:
-            print(f"note: {path} holds no log segment or manifest at the bucket's layout; its {found} are counted"
-                  " as off_layout_files and skipped", file=sys.stderr)
-    quality.off_layout_files += off_layout
-    if off_layout and not logs and not manifests:
-        raise ValueError(f"no log segment or manifest is at the bucket's layout ({LAYOUT}, with no other directory"
-                         " in its path named for a kind); pass the kind folders or their parent, or --kind")
+                manifests.append((name, file_kind))
+    quality.off_layout_files += off_layout + manifest_off_layout
+    if manifest_off_layout and not logs and not manifests:
+        raise ValueError(f"no job manifest is at the bucket's layout ({MANIFEST_LAYOUT}); pass the kind folders"
+                         " or their parent, or --kind")
     return logs, manifests
 
 

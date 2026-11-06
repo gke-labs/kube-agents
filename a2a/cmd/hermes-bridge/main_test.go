@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"testing"
@@ -371,5 +372,53 @@ func TestCardStopTimeoutFromTheEnvironment(t *testing.T) {
 		if cfg.CardStopTimeout != tc.want {
 			t.Errorf("CardStopTimeout = %s with BRIDGE_CARD_STOP_TIMEOUT_SECONDS=%q, want %s", cfg.CardStopTimeout, tc.value, tc.want)
 		}
+	}
+}
+
+// The process applies the limit, not just the helper: realMain has to reach
+// applyMemoryLimit before anything that can fail. An empty NATS_URL stops the
+// run right after it with errUsage, and the runtime's limit and the startup
+// line show whether the call happened. memlimit's own tests cover the
+// derivation; this is the one test that reads the call from the main path.
+func TestRealMainAppliesTheMemoryLimitBeforeReadingTheConfig(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+	t.Setenv("GOMEMLIMIT", "")
+	t.Setenv(memoryLimitEnv, "2147483648")
+	t.Setenv("NATS_URL", "")
+	var logs bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logs, nil))
+
+	if err := realMain(context.Background(), log); !errors.Is(err, errUsage) {
+		t.Fatalf("realMain with empty NATS_URL returned %v, want errUsage", err)
+	}
+	if got := debug.SetMemoryLimit(-1); got != 1932735283 {
+		t.Errorf("runtime soft limit after realMain = %d, want 1932735283, nine tenths of %s", got, memoryLimitEnv)
+	}
+	if !strings.Contains(logs.String(), "Go soft memory limit set from the container's memory limit") ||
+		!strings.Contains(logs.String(), `"bytes":1932735283`) {
+		t.Errorf("realMain logged %q, want the soft-limit line with the derived byte count", logs.String())
+	}
+}
+
+// With GOMEMLIMIT set the runtime's own setting stands, and realMain says so
+// rather than overriding it from the container variable.
+func TestRealMainLeavesAnExplicitGoMemLimitAlone(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+	t.Setenv("GOMEMLIMIT", "3GiB")
+	t.Setenv(memoryLimitEnv, "2147483648")
+	t.Setenv("NATS_URL", "")
+	var logs bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logs, nil))
+
+	if err := realMain(context.Background(), log); !errors.Is(err, errUsage) {
+		t.Fatalf("realMain with empty NATS_URL returned %v, want errUsage", err)
+	}
+	if got := debug.SetMemoryLimit(-1); got != prev {
+		t.Errorf("runtime soft limit = %d with GOMEMLIMIT set, want it untouched at %d", got, prev)
+	}
+	if !strings.Contains(logs.String(), "Go soft memory limit not derived") || !strings.Contains(logs.String(), "GOMEMLIMIT=3GiB is set and takes precedence") {
+		t.Errorf("realMain logged %q, want the not-derived line naming GOMEMLIMIT", logs.String())
 	}
 }

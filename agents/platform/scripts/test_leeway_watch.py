@@ -149,6 +149,10 @@ class GateAndReportingTests(unittest.TestCase):
                 watch.PROJECTS_ENV: "p1",
                 watch.CLUSTERS_ENV: "",
                 watch.REFRESH_DAYS_ENV: "",
+                watch.MIN_SEVERITY_ENV: "",
+                watch.MIN_DRIFT_ENV: "",
+                watch.MIN_MAX_DOMAIN_SHARE_ENV: "",
+                watch.MIN_EXCESS_OVER_FLOOR_ENV: "",
                 watch.NATS_URL_ENV: "",
                 watch.MANAGEMENT_PROJECT_ENV: "",
                 "PLATFORM_AGENT_HOME": str(self.home),
@@ -190,7 +194,11 @@ class GateAndReportingTests(unittest.TestCase):
 
         code, out = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
         self.assertEqual(code, 0)
-        self.assertIn("leeway: 2 finding(s) due (2 new finding) across 1 cluster(s) (p1/us-central1/seeded-d)", out)
+        self.assertIn(
+            "leeway: 2 finding(s) due (2 new finding) across 1 cluster(s) (p1/us-central1/seeded-d): "
+            "ComputeClass/balanced-spot [last-rank, 75%], Deployment/shop/checkout-api [constraint_ignored, 100%]",
+            out,
+        )
         self.assertIn("next refresh after 2026-10-26", out)
 
         # Verify report files and symlinks exist and contain required fields.
@@ -345,6 +353,7 @@ class GateAndReportingTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("dry run: would report 1 finding(s) (1 new finding)", out)
+        self.assertIn("Deployment/shop/checkout-api [constraint_ignored, 100%]", out)
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
         self.assertFalse((self.home / watch.REPORTS_DIR_NAME).exists())
 
@@ -663,6 +672,764 @@ class GateAndReportingTests(unittest.TestCase):
             )
         )
 
+    def test_floor_equal_unknown_findings_are_suppressed_while_real_skew_and_selector_confined_remain(self) -> None:
+        # [0, 1, 1] and [1, 1, 2] have observedSkew == minAchievableSkew == 1 with suspectedCause == "unknown"
+        # and are already at the pigeonhole floor; [4, 0] (`observedSkew: 4, minAchievableSkew: 0, excessSkew: 0`)
+        # and `selector_confined` (`drift: 0, maxDomainShare: 1.0`) must still be surfaced.
+        even_two_of_three = make_topology_finding(
+            name="metrics-server",
+            namespace="kube-system",
+            replicas=2,
+            tier="C",
+            severity="info",
+            cause="unknown",
+        )
+        even_two_of_three["score"] = {
+            "drift": 0.1667,
+            "observedSkew": 1,
+            "minAchievableSkew": 1,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 0.5,
+        }
+        even_four_of_three = make_topology_finding(
+            name="redis",
+            namespace="cache",
+            replicas=4,
+            tier="C",
+            severity="info",
+            cause="unknown",
+        )
+        even_four_of_three["score"] = {
+            "drift": 0.125,
+            "observedSkew": 1,
+            "minAchievableSkew": 1,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 0.5,
+        }
+        stacked_default = make_topology_finding(
+            name="frontend-web",
+            namespace="shop",
+            replicas=4,
+            tier="B",
+            severity="warning",
+            cause="unknown",
+            actual_a=4,
+            actual_b=0,
+        )
+        stacked_default["score"] = {
+            "drift": 0.5,
+            "observedSkew": 4,
+            "minAchievableSkew": 0,
+            "excessSkew": 0,
+            "relocationDistance": 2,
+            "maxDomainShare": 1.0,
+        }
+        selector_confined = make_topology_finding(
+            name="ledger-sync",
+            namespace="finance",
+            replicas=3,
+            tier="C",
+            severity="info",
+            cause="selector_confined",
+            actual_a=3,
+            actual_b=0,
+        )
+        selector_confined["score"] = {
+            "drift": 0.0,
+            "observedSkew": 0,
+            "minAchievableSkew": 0,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 1.0,
+        }
+        rep = make_report(
+            [
+                {
+                    "cluster": "p1/us-central1/seeded-d",
+                    "status": "ok",
+                    "topology_findings": [
+                        even_two_of_three,
+                        even_four_of_three,
+                        stacked_default,
+                        selector_confined,
+                    ],
+                }
+            ],
+            T0,
+        )
+        code, out = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+        self.assertEqual(code, 0)
+        self.assertIn("2 finding(s) due", out)
+        self.assertIn("Deployment/finance/ledger-sync [selector_confined, 100%]", out)
+        self.assertIn("Deployment/shop/frontend-web [unknown, 100%]", out)
+        self.assertNotIn("metrics-server", out)
+        self.assertNotIn("redis", out)
+
+        latest_json = json.loads((self.home / "reports" / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest_json["summary"]["topology_findings"], 2)
+        md_text = (self.home / "reports" / "latest.md").read_text(encoding="utf-8")
+        self.assertNotIn("metrics-server", md_text)
+        self.assertIn("`selector_confined`", md_text)
+
+    def test_threshold_env_overrides_filter_severity_drift_and_share_without_dropping_domain_unavailable(self) -> None:
+        domain_down = {
+            "kind": "leeway.domain_unavailable",
+            "subject": {"kind": "Domain", "name": "us-central1-c"},
+            "topologyKey": "topology.kubernetes.io/zone",
+            "tier": "A",
+            "severity": "warning",
+            "score": {
+                "drift": 0.0,
+                "observedSkew": 0,
+                "minAchievableSkew": 0,
+                "excessSkew": 0,
+                "relocationDistance": 0,
+                "maxDomainShare": 0.0,
+            },
+            "domains": [{"domain": "us-central1-c", "actual": 0, "expected": 0, "delta": 0, "readyNodes": 1}],
+            "suspectedCause": "taint_exclusion",
+            "remediation": {"kind": "cluster_nodes", "summary": "Uncordon nodes in us-central1-c."},
+        }
+        info_finding = make_topology_finding(name="info-app", tier="C", severity="info", cause="constraint_ignored")
+        info_finding["score"]["drift"] = 0.67
+        selector_confined_warn = make_topology_finding(
+            name="confined-app",
+            replicas=3,
+            tier="C",
+            severity="warning",
+            cause="selector_confined",
+            actual_a=3,
+            actual_b=0,
+        )
+        selector_confined_warn["score"]["drift"] = 0.0
+        low_drift = make_topology_finding(
+            name="low-drift",
+            replicas=3,
+            tier="B",
+            severity="warning",
+            cause="constraint_ignored",
+            actual_a=3,
+            actual_b=0,
+        )
+        low_drift["score"]["drift"] = 0.2
+        low_share = make_topology_finding(
+            name="mild-skew",
+            replicas=3,
+            tier="B",
+            severity="warning",
+            cause="constraint_ignored",
+            actual_a=2,
+            actual_b=1,
+        )
+        low_share["score"]["drift"] = 0.5
+        high_share = make_topology_finding(
+            name="full-skew",
+            replicas=3,
+            tier="B",
+            severity="warning",
+            cause="constraint_ignored",
+            actual_a=3,
+            actual_b=0,
+        )
+        high_share["score"]["drift"] = 0.67
+        wedged_rank = make_rank_finding(
+            compute_class="gpu-spot",
+            severity="critical",
+            rule="wedged",
+            last_rank_share=0.0,
+        )
+        wedged_rank["kind"] = "leeway.rank_wedged"
+        info_rank = make_rank_finding(
+            compute_class="unused-tier",
+            severity="info",
+            rule="tier-unused",
+            last_rank_share=0.0,
+        )
+        info_rank["kind"] = "leeway.rank_tier_unused"
+        rep = make_report(
+            [
+                {
+                    "cluster": "p1/us-central1/seeded-d",
+                    "status": "ok",
+                    "topology_findings": [
+                        domain_down,
+                        info_finding,
+                        selector_confined_warn,
+                        low_drift,
+                        low_share,
+                        high_share,
+                    ],
+                    "rank_findings": [wedged_rank, info_rank],
+                }
+            ],
+            T0,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                watch.MIN_SEVERITY_ENV: "warning",
+                watch.MIN_DRIFT_ENV: "0.4",
+                watch.MIN_MAX_DOMAIN_SHARE_ENV: "0.8",
+            },
+            clear=False,
+        ):
+            code, out = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+        self.assertEqual(code, 0)
+        self.assertIn("4 finding(s) due", out)
+        self.assertIn("Domain/us-central1-c [taint_exclusion]", out)
+        self.assertIn("Deployment/shop/confined-app [selector_confined, 100%]", out)
+        self.assertIn("Deployment/shop/full-skew [constraint_ignored, 100%]", out)
+        self.assertIn("ComputeClass/gpu-spot [wedged, 0%]", out)
+        self.assertNotIn("info-app", out)
+        self.assertNotIn("low-drift", out)
+        self.assertNotIn("mild-skew", out)
+        self.assertNotIn("unused-tier", out)
+
+    def test_report_line_prefixes_cluster_short_names_across_multiple_clusters_and_truncates_overflow(self) -> None:
+        c1_findings = [make_topology_finding(name=f"svc-{i}") for i in range(5)]
+        c2_findings = [make_topology_finding(name=f"api-{i}") for i in range(3)]
+        rep = make_report(
+            [
+                {"cluster": "p1/us-central1/alpha", "status": "ok", "topology_findings": c1_findings},
+                {"cluster": "p1/us-east1/beta", "status": "ok", "topology_findings": c2_findings},
+            ],
+            T0,
+        )
+        with mock.patch.dict(
+            os.environ,
+            {watch.CLUSTERS_ENV: "p1/us-central1/alpha,p1/us-east1/beta", watch.PROJECTS_ENV: ""},
+            clear=False,
+        ):
+            code, out = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+        self.assertEqual(code, 0)
+        self.assertIn("8 finding(s) due (8 new finding) across 2 cluster(s)", out)
+        self.assertIn("alpha:Deployment/shop/svc-0 [constraint_ignored, 100%]", out)
+        self.assertIn("beta:Deployment/shop/api-0 [constraint_ignored, 100%]", out)
+        self.assertIn("+2 more", out)
+
+    def test_blackboard_topic_publish_failure_warns_once_and_retries_on_quiet_tick(self) -> None:
+        c_skewed = {
+            "cluster": "p1/us-central1/seeded-d",
+            "status": "ok",
+            "topology_findings": [make_topology_finding()],
+        }
+        rep = make_report([c_skewed], T0)
+        outcomes = [
+            subprocess.CompletedProcess(
+                args=["a2a"],
+                returncode=1,
+                stdout="",
+                stderr="Error:\n  nats: no `TOPICS-STATE` response",
+            ),
+            subprocess.CompletedProcess(
+                args=["a2a"], returncode=1, stdout="", stderr="nats: no response from stream"
+            ),
+            subprocess.CompletedProcess(args=["a2a"], returncode=0, stdout="", stderr=""),
+        ]
+        a2a_calls: list[list[str]] = []
+
+        def fake_a2a(argv, **kw):
+            a2a_calls.append(list(argv))
+            return outcomes.pop(0)
+
+        with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
+            watch.shutil, "which", return_value="/usr/local/bin/a2a"
+        ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
+            # Day 0: finding is due, report writes, topic publish fails -> report line AND single-line warning printed once.
+            code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+            self.assertEqual(code0, 0)
+            lines0 = out0.strip().splitlines()
+            self.assertEqual(len(lines0), 2)
+            self.assertIn("leeway: 1 finding(s) due", lines0[0])
+            self.assertIn("publishing to blackboard topic topology-skew failed", lines0[1])
+            self.assertIn("Error: nats: no 'TOPICS-STATE' response", lines0[1])
+            self.assertIn("TopicsStateSubjectMissing", lines0[1])
+            self.assertIn("nats stream edit TOPICS-STATE", lines0[1])
+            self.assertEqual(len(a2a_calls), 1)
+
+            # Day 1: quiet tick retries latest.json and fails again -> no duplicate warning spam.
+            t1 = T0 + timedelta(days=1)
+            code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t1)
+            self.assertEqual(code1, 0)
+            self.assertEqual(out1, "")
+            self.assertEqual(len(a2a_calls), 2)
+
+            # Day 2: operator added the subject to TOPICS-STATE -> quiet tick retry succeeds and announces recovery.
+            t2 = T0 + timedelta(days=2)
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t2)
+            self.assertEqual(code2, 0)
+            self.assertEqual(out2.strip(), "leeway watch: publishing to blackboard topic topology-skew succeeded again")
+            self.assertEqual(len(a2a_calls), 3)
+            ledger = watch.load_ledger(self.home)
+            self.assertNotIn(watch.ANNOUNCED_KEY, ledger)
+
+        # If a publish failure marker is in ledger.json and NATS_URL is later unconfigured,
+        # the next clean quiet tick drops the stale marker without printing "succeeded again".
+        ledger_with_marker = watch.load_ledger(self.home)
+        ledger_with_marker[watch.ANNOUNCED_KEY] = {watch.ANNOUNCED_TOPIC_PUBLISH_KEY: watch.ERROR_KIND_TOPIC_PUBLISH}
+        watch.save_ledger(self.home, ledger_with_marker)
+        t3 = T0 + timedelta(days=3)
+        code3, out3 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t3)
+        self.assertEqual(code3, 0)
+        self.assertEqual(out3, "")
+        self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
+
+    def test_partial_scan_retirement_defers_report_refresh_and_topic_retry_until_clean_scan(self) -> None:
+        rep_day0 = make_report(
+            [
+                {
+                    "cluster": "p1/us-central1/alpha",
+                    "status": "ok",
+                    "topology_findings": [make_topology_finding()],
+                },
+                {"cluster": "p1/us-east1/beta", "status": "ok", "topology_findings": []},
+            ],
+            T0,
+        )
+        t1 = T0 + timedelta(days=1)
+        rep_day1_partial = make_report(
+            [
+                {"cluster": "p1/us-central1/alpha", "status": "ok", "topology_findings": []},
+                {"cluster": "p1/us-east1/beta", "status": "error", "error": "dial tcp timeout"},
+            ],
+            t1,
+        )
+        t2 = T0 + timedelta(days=2)
+        rep_day2_clean = make_report(
+            [
+                {"cluster": "p1/us-central1/alpha", "status": "ok", "topology_findings": []},
+                {"cluster": "p1/us-east1/beta", "status": "ok", "topology_findings": []},
+            ],
+            t2,
+        )
+        outcomes = [
+            subprocess.CompletedProcess(args=["a2a"], returncode=1, stdout="", stderr="stream missing"),
+            subprocess.CompletedProcess(args=["a2a"], returncode=0, stdout="", stderr=""),
+        ]
+        published_payloads: list[dict] = []
+
+        def fake_a2a(argv, **kw):
+            data_flag = argv.index(watch.A2A_DATA_FLAG)
+            json_arg = argv[data_flag + 1].removeprefix(watch.A2A_DATA_FILE_PREFIX)
+            published_payloads.append(json.loads(Path(json_arg).read_text(encoding="utf-8")))
+            return outcomes.pop(0)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                watch.CLUSTERS_ENV: "p1/us-central1/alpha,p1/us-east1/beta",
+                watch.PROJECTS_ENV: "",
+                watch.NATS_URL_ENV: "nats://nats:4222",
+            },
+            clear=False,
+        ), mock.patch.object(watch.shutil, "which", return_value="/usr/local/bin/a2a"), mock.patch.object(
+            watch.subprocess, "run", side_effect=fake_a2a
+        ):
+            code0, _ = self.run_tick(lambda *a, **kw: completed_json(rep_day0), now=T0)
+            self.assertEqual(code0, 0)
+            self.assertEqual(len(published_payloads), 1)
+
+            # Day 1: alpha's finding retires while beta fails to scan -> do NOT retry stale Day-0 latest.json.
+            code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep_day1_partial), now=t1)
+            self.assertEqual(code1, 0)
+            self.assertIn("1 finding(s) resolved", out1)
+            self.assertIn("the fleet scan was partial (1 error(s))", out1)
+            self.assertEqual(len(published_payloads), 1)
+            ledger1 = watch.load_ledger(self.home)
+            self.assertEqual(
+                ledger1[watch.ANNOUNCED_KEY].get(watch.ANNOUNCED_DEFERRED_REFRESH_KEY),
+                "all findings resolved",
+            )
+
+            # Day 2: clean scan refreshes latest.json with zero findings and publishes the clean snapshot.
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep_day2_clean), now=t2)
+            self.assertEqual(code2, 0)
+            self.assertEqual(len(published_payloads), 2)
+            self.assertEqual(published_payloads[1]["clusters"][0]["topology_findings"], [])
+            self.assertIn("the fleet scan reads every target again", out2)
+            self.assertIn("publishing to blackboard topic topology-skew succeeded again", out2)
+            ledger2 = watch.load_ledger(self.home)
+            self.assertNotIn(watch.ANNOUNCED_KEY, ledger2)
+
+    def test_threshold_filtered_findings_stay_in_ledger_without_false_retirement_or_repage(self) -> None:
+        floor_equal = make_topology_finding(
+            name="metrics-server",
+            namespace="kube-system",
+            replicas=2,
+            tier="C",
+            severity="info",
+            cause="unknown",
+        )
+        floor_equal["score"] = {
+            "drift": 0.1667,
+            "observedSkew": 1,
+            "minAchievableSkew": 1,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 0.5,
+        }
+        warn_skew = make_topology_finding(name="checkout-api", severity="warning", cause="constraint_ignored")
+        rep_both = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [floor_equal, warn_skew]}],
+            T0,
+        )
+
+        # Day 0 (pre-upgrade / explicit excess floor 0): both findings enter ledger.json.
+        with mock.patch.dict(os.environ, {watch.MIN_EXCESS_OVER_FLOOR_ENV: "0"}, clear=False):
+            code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep_both), now=T0)
+        self.assertEqual(code0, 0)
+        self.assertIn("2 finding(s) due", out0)
+
+        # Day 1 (upgrade to default floor filter): floor_equal is suppressed by thresholds while still
+        # emitted by leeway -> must NOT print a false "resolved" line and stays silently in ledger.json.
+        t1 = T0 + timedelta(days=1)
+        code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep_both), now=t1)
+        self.assertEqual(code1, 0)
+        self.assertEqual(out1, "")
+        ledger1 = watch.load_ledger(self.home)
+        self.assertEqual(len(ledger1[watch.FINDINGS_KEY]), 2)
+
+        # Day 2 (operator runs manual tick with LEEWAY_WATCH_MIN_SEVERITY=critical without --dry-run):
+        # warn_skew is threshold-filtered, so it must NOT retire or lose first_seen/last_report_at.
+        t2 = T0 + timedelta(days=2)
+        with mock.patch.dict(os.environ, {watch.MIN_SEVERITY_ENV: "critical"}, clear=False):
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep_both), now=t2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(out2, "")
+
+        # Day 3 (normal cron tick at default thresholds): warn_skew is still within its 7-day window
+        # and was preserved in ledger.json, so it does NOT re-page as a new finding.
+        t3 = T0 + timedelta(days=3)
+        code3, out3 = self.run_tick(lambda *a, **kw: completed_json(rep_both), now=t3)
+        self.assertEqual(code3, 0)
+        self.assertEqual(out3, "")
+        warn_key = next(k for k in watch.load_ledger(self.home)[watch.FINDINGS_KEY] if "checkout-api" in k)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY][warn_key][watch.FIRST_SEEN_KEY], watch.iso(T0))
+
+        # Day 4: leeway stops emitting both findings on a clean scan -> now both genuinely retire.
+        t4 = T0 + timedelta(days=4)
+        rep_empty = make_report([{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": []}], t4)
+        code4, out4 = self.run_tick(lambda *a, **kw: completed_json(rep_empty), now=t4)
+        self.assertEqual(code4, 0)
+        self.assertIn("2 finding(s) resolved", out4)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY], {})
+
+    def test_due_finding_clears_deferred_report_refresh_marker(self) -> None:
+        rep_day0 = make_report(
+            [
+                {
+                    "cluster": "p1/us-central1/alpha",
+                    "status": "ok",
+                    "topology_findings": [make_topology_finding(name="svc-old")],
+                },
+                {"cluster": "p1/us-east1/beta", "status": "ok", "topology_findings": []},
+            ],
+            T0,
+        )
+        t1 = T0 + timedelta(days=1)
+        rep_day1_partial = make_report(
+            [
+                {"cluster": "p1/us-central1/alpha", "status": "ok", "topology_findings": []},
+                {"cluster": "p1/us-east1/beta", "status": "error", "error": "dial tcp timeout"},
+            ],
+            t1,
+        )
+        t2 = T0 + timedelta(days=2)
+        rep_day2_due = make_report(
+            [
+                {"cluster": "p1/us-central1/alpha", "status": "ok", "topology_findings": []},
+                {
+                    "cluster": "p1/us-east1/beta",
+                    "status": "ok",
+                    "topology_findings": [make_topology_finding(name="svc-new")],
+                },
+            ],
+            t2,
+        )
+        t3 = T0 + timedelta(days=3)
+        rep_day3_quiet = make_report(rep_day2_due["clusters"], t3)
+        a2a_calls: list[list[str]] = []
+
+        def fake_a2a(argv, **kw):
+            a2a_calls.append(list(argv))
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                watch.CLUSTERS_ENV: "p1/us-central1/alpha,p1/us-east1/beta",
+                watch.PROJECTS_ENV: "",
+                watch.NATS_URL_ENV: "nats://nats:4222",
+            },
+            clear=False,
+        ), mock.patch.object(watch.shutil, "which", return_value="/usr/local/bin/a2a"), mock.patch.object(
+            watch.subprocess, "run", side_effect=fake_a2a
+        ):
+            self.run_tick(lambda *a, **kw: completed_json(rep_day0), now=T0)
+            self.assertEqual(len(a2a_calls), 1)
+
+            # Day 1: partial-scan retirement sets announced.deferred_report_refresh.
+            self.run_tick(lambda *a, **kw: completed_json(rep_day1_partial), now=t1)
+            self.assertEqual(
+                watch.load_ledger(self.home)[watch.ANNOUNCED_KEY].get(watch.ANNOUNCED_DEFERRED_REFRESH_KEY),
+                watch.REASON_ALL_RESOLVED,
+            )
+            self.assertEqual(len(a2a_calls), 1)
+
+            # Day 2: new due finding writes fresh report, publishes topic, and clears deferred_report_refresh.
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep_day2_due), now=t2)
+            self.assertEqual(code2, 0)
+            self.assertIn("svc-new", out2)
+            self.assertEqual(len(a2a_calls), 2)
+            self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
+
+            # Day 3: quiet clean scan makes zero redundant report refreshes or a2a calls.
+            code3, out3 = self.run_tick(lambda *a, **kw: completed_json(rep_day3_quiet), now=t3)
+            self.assertEqual(code3, 0)
+            self.assertEqual(out3, "")
+            self.assertEqual(len(a2a_calls), 2)
+
+    def test_blackboard_topic_publish_timeout_surfaces_exception_and_recovers(self) -> None:
+        rep = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]}],
+            T0,
+        )
+        attempts = 0
+
+        def fake_a2a(argv, **kw):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=watch.A2A_PUBLISH_TIMEOUT_SECONDS)
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
+            watch.shutil, "which", return_value="/usr/local/bin/a2a"
+        ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
+            code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+            self.assertEqual(code0, 0)
+            self.assertIn(
+                "publishing to blackboard topic topology-skew failed "
+                "(TimeoutExpired: a2a topics write topology-skew timed out after 30s)",
+                out0,
+            )
+            warn_line = [ln for ln in out0.splitlines() if "publishing to blackboard topic" in ln][0]
+            self.assertNotIn("--text", warn_line)
+            self.assertNotIn("--data", warn_line)
+            self.assertNotIn("finding(s) due", warn_line)
+
+            t1 = T0 + timedelta(days=1)
+            code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t1)
+            self.assertEqual(code1, 0)
+            self.assertEqual(out1.strip(), "leeway watch: publishing to blackboard topic topology-skew succeeded again")
+
+        with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
+            watch.shutil, "which", return_value="/usr/local/bin/a2a"
+        ), mock.patch.object(
+            watch.subprocess,
+            "run",
+            side_effect=OSError("bad `socket`\n" + ("x" * 400)),
+        ):
+            ok, detail = watch.publish_blackboard_topic("summary", self.home / "r.json")
+            self.assertFalse(ok)
+            assert detail is not None
+            self.assertTrue(detail.startswith("OSError: bad 'socket' "))
+            self.assertNotIn("\n", detail)
+            self.assertNotIn("`", detail)
+            self.assertLessEqual(len(detail), len("OSError: ") + watch.STDERR_EXCERPT_CHARS)
+
+    def test_unknown_cause_without_score_and_unrecognized_severity_pass_default_thresholds(self) -> None:
+        no_score_concentrated = {
+            "kind": "leeway.placement_drift",
+            "subject": {"kind": "Deployment", "namespace": "shop", "name": "legacy-api", "replicas": 4},
+            "topologyKey": "topology.kubernetes.io/zone",
+            "tier": "C",
+            "severity": "urgent",
+            "suspectedCause": "unknown",
+            "domains": [
+                {"domain": "us-central1-a", "actual": 4},
+                {"domain": "us-central1-b", "actual": 0},
+            ],
+        }
+        novel_rank = make_rank_finding(compute_class="novel-class", severity="high", rule="last-rank")
+        rep = make_report(
+            [
+                {
+                    "cluster": "p1/us-central1/seeded-d",
+                    "status": "ok",
+                    "topology_findings": [no_score_concentrated],
+                    "rank_findings": [novel_rank],
+                }
+            ],
+            T0,
+        )
+        code, out = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+        self.assertEqual(code, 0)
+        self.assertIn("2 finding(s) due", out)
+        self.assertIn("Deployment/shop/legacy-api [unknown, 100%]", out)
+        self.assertIn("ComputeClass/novel-class [last-rank, 75%]", out)
+
+        # Even when non-zero drift/share/excess floors are active, a finding that omits
+        # score and replica/domain counts (`has_drift=False, has_max_domain_share=False, excess_over_floor=None`)
+        # is not dropped by metric gates that have no metric to compare against.
+        bare_norm = watch.normalize_topology_finding(
+            "p1/us-central1/seeded-d",
+            {
+                "kind": "leeway.placement_drift",
+                "subject": {"kind": "Deployment", "namespace": "shop", "name": "bare", "replicas": 0},
+                "topologyKey": "topology.kubernetes.io/zone",
+                "tier": "C",
+                "severity": "urgent",
+                "suspectedCause": "unknown",
+                "domains": [],
+            },
+        )
+        self.assertFalse(bare_norm[watch.HAS_DRIFT_KEY])
+        self.assertFalse(bare_norm[watch.HAS_MAX_DOMAIN_SHARE_KEY])
+        self.assertIsNone(bare_norm[watch.EXCESS_OVER_FLOOR_KEY])
+        self.assertTrue(
+            watch.passes_topology_thresholds(
+                bare_norm,
+                min_sev_rank=watch.SEVERITY_RANKS["warning"],
+                min_d=0.4,
+                min_share=0.8,
+                min_excess=1,
+            )
+        )
+
+    def test_rebalancing_skew_down_to_pigeonhole_floor_retires_and_realerts_on_restack(self) -> None:
+        stacked = make_topology_finding(name="kube-dns", namespace="kube-system", cause="unknown", severity="warning")
+        stacked["subject"]["replicas"] = 2
+        stacked["domains"] = [
+            {"domain": "us-central1-a", "actual": 2, "expected": 1},
+            {"domain": "us-central1-b", "actual": 0, "expected": 1},
+            {"domain": "us-central1-f", "actual": 0, "expected": 0},
+        ]
+        stacked["score"] = {
+            "drift": 0.5,
+            "observedSkew": 2,
+            "minAchievableSkew": 1,
+            "excessSkew": 1,
+            "relocationDistance": 1,
+            "maxDomainShare": 1.0,
+        }
+        rebalanced = json.loads(json.dumps(stacked))
+        rebalanced["domains"] = [
+            {"domain": "us-central1-a", "actual": 1, "expected": 1},
+            {"domain": "us-central1-b", "actual": 1, "expected": 1},
+            {"domain": "us-central1-f", "actual": 0, "expected": 0},
+        ]
+        rebalanced["score"] = {
+            "drift": 0.0,
+            "observedSkew": 1,
+            "minAchievableSkew": 1,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 0.5,
+        }
+
+        rep0 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [stacked]}], T0)
+        code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep0), now=T0)
+        self.assertEqual(code0, 0)
+        self.assertIn("Deployment/kube-system/kube-dns [unknown, 100%]", out0)
+
+        t1 = T0 + timedelta(days=1)
+        rep1 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [rebalanced]}], t1)
+        code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep1), now=t1)
+        self.assertEqual(code1, 0)
+        self.assertIn("1 finding(s) resolved (ap-mcp:kube-system/kube-dns)", out1)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY], {})
+        latest1 = json.loads((self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME).read_text())
+        self.assertEqual(latest1["summary"]["topology_findings"], 0)
+
+        t2 = T0 + timedelta(days=2)
+        rep2 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [stacked]}], t2)
+        code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep2), now=t2)
+        self.assertEqual(code2, 0)
+        self.assertIn("1 finding(s) due (1 new finding)", out2)
+        self.assertIn("Deployment/kube-system/kube-dns [unknown, 100%]", out2)
+
+        # Pre-existing ledger fallback: strip `excess_over_floor` from the ledger entry (matching
+        # the pre-upgrade ledger schema that stored only `observed_skew: 2`) and confirm rebalancing
+        # to `observedSkew: 1, minAchievableSkew: 1` still retires the finding via `observed_skew` comparison.
+        legacy_ledger = watch.load_ledger(self.home)
+        for entry in legacy_ledger[watch.FINDINGS_KEY].values():
+            entry.pop(watch.EXCESS_OVER_FLOOR_KEY, None)
+        watch.save_ledger(self.home, legacy_ledger)
+
+        t3 = T0 + timedelta(days=3)
+        rep3 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [rebalanced]}], t3)
+        code3, out3 = self.run_tick(lambda *a, **kw: completed_json(rep3), now=t3)
+        self.assertEqual(code3, 0)
+        self.assertIn("1 finding(s) resolved (ap-mcp:kube-system/kube-dns)", out3)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY], {})
+
+        # Non-`unknown` cause (`prior_cause != "unknown"`) at `observedSkew == minAchievableSkew == 1`
+        # that resolves into a balanced `unknown` floor-equal finding also retires cleanly.
+        constrained_odd = json.loads(json.dumps(rebalanced))
+        constrained_odd["suspectedCause"] = "constraint_ignored"
+        constrained_odd["score"]["drift"] = 0.25
+        t4 = T0 + timedelta(days=4)
+        rep4 = make_report(
+            [{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [constrained_odd]}], t4
+        )
+        code4, out4 = self.run_tick(lambda *a, **kw: completed_json(rep4), now=t4)
+        self.assertEqual(code4, 0)
+        self.assertIn("Deployment/kube-system/kube-dns [constraint_ignored, 50%]", out4)
+
+        t5 = T0 + timedelta(days=5)
+        rep5 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [rebalanced]}], t5)
+        code5, out5 = self.run_tick(lambda *a, **kw: completed_json(rep5), now=t5)
+        self.assertEqual(code5, 0)
+        self.assertIn("1 finding(s) resolved (ap-mcp:kube-system/kube-dns)", out5)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY], {})
+
+    def test_non_dry_run_threshold_override_report_refreshes_on_next_default_tick(self) -> None:
+        warn_skew = make_topology_finding(name="checkout-api", severity="warning", cause="constraint_ignored")
+        crit_skew = make_topology_finding(name="payments-db", severity="critical", cause="volume_pinned")
+        rep_day0 = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [warn_skew]}],
+            T0,
+        )
+        t1 = T0 + timedelta(days=1)
+        rep_day1 = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [warn_skew, crit_skew]}],
+            t1,
+        )
+        t2 = T0 + timedelta(days=2)
+        rep_day2 = make_report(rep_day1["clusters"], t2)
+        a2a_calls: list[list[str]] = []
+
+        def fake_a2a(argv, **kw):
+            a2a_calls.append(list(argv))
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
+            watch.shutil, "which", return_value="/usr/local/bin/a2a"
+        ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
+            self.run_tick(lambda *a, **kw: completed_json(rep_day0), now=T0)
+            self.assertEqual(len(a2a_calls), 1)
+
+            # Day 1: operator omits --dry-run with MIN_SEVERITY=critical when crit_skew is due.
+            with mock.patch.dict(os.environ, {watch.MIN_SEVERITY_ENV: "critical"}, clear=False):
+                code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep_day1), now=t1)
+            self.assertEqual(code1, 0)
+            self.assertIn("payments-db", out1)
+            latest_override = json.loads((self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME).read_text())
+            self.assertEqual(latest_override["summary"]["topology_findings"], 1)
+            self.assertEqual(len(a2a_calls), 2)
+
+            # Day 2: default cron tick has no due/retired findings, yet refreshes latest.json and topic to full set.
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep_day2), now=t2)
+            self.assertEqual(code2, 0)
+            self.assertEqual(out2, "")
+            latest_restored = json.loads((self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME).read_text())
+            self.assertEqual(latest_restored["summary"]["topology_findings"], 2)
+            self.assertEqual(len(a2a_calls), 3)
+            self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
+
 
 class DiscoveryTests(unittest.TestCase):
     def test_project_with_roster_profile_triples_uses_clusters_flag(self) -> None:
@@ -689,7 +1456,17 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual(
             seen_argv,
-            [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-central1/c1,p1/us-east1/c2"]],
+            [
+                [
+                    "leeway",
+                    "report",
+                    "--topology-tier-c-signals",
+                    "--parallelism",
+                    "2",
+                    "--clusters",
+                    "p1/us-central1/c1,p1/us-east1/c2",
+                ]
+            ],
         )
     def test_project_without_profiles_is_enumerated_with_gcloud_and_swept_by_triples(self) -> None:
         # `--clusters-from <project>` is never used: in the sandbox it would go
@@ -719,7 +1496,15 @@ class DiscoveryTests(unittest.TestCase):
             seen_argv,
             [
                 ["gcloud", "container", "clusters", "list", "--format=value(name,location)", "--project", "p1"],
-                ["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-east1-b/east,p1/us-west1/west"],
+                [
+                    "leeway",
+                    "report",
+                    "--topology-tier-c-signals",
+                    "--parallelism",
+                    "2",
+                    "--clusters",
+                    "p1/us-east1-b/east,p1/us-west1/west",
+                ],
             ],
         )
         self.assertNotIn("--clusters-from", " ".join(" ".join(a) for a in seen_argv))
@@ -767,7 +1552,17 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual(
             seen_argv,
-            [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-central1/c1,p2/us-east1/c2"]],
+            [
+                [
+                    "leeway",
+                    "report",
+                    "--topology-tier-c-signals",
+                    "--parallelism",
+                    "2",
+                    "--clusters",
+                    "p1/us-central1/c1,p2/us-east1/c2",
+                ]
+            ],
         )
 
     def test_fails_closed_when_no_project_or_cluster_configured(self) -> None:
@@ -832,7 +1627,17 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             seen_argv,
-            [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p-scoped/us-central1/c-included"]],
+            [
+                [
+                    "leeway",
+                    "report",
+                    "--topology-tier-c-signals",
+                    "--parallelism",
+                    "2",
+                    "--clusters",
+                    "p-scoped/us-central1/c-included",
+                ]
+            ],
         )
 
     def test_declared_scope_drops_excluded_clusters_from_explicit_clusters_flag(self) -> None:
@@ -860,7 +1665,17 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(
             seen_argv,
-            [["leeway", "report", "--topology-tier-c-signals", "--clusters", "p1/us-central1/c-ok"]],
+            [
+                [
+                    "leeway",
+                    "report",
+                    "--topology-tier-c-signals",
+                    "--parallelism",
+                    "2",
+                    "--clusters",
+                    "p1/us-central1/c-ok",
+                ]
+            ],
         )
 
     def test_unreadable_declared_scope_fails_tick_via_record_tick_failure(self) -> None:

@@ -48,16 +48,28 @@ def tearDownModule():
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
 
-def write(lines):
-    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
+def write_file(lines, kind):
+    """One segment under a fresh replay-shadow/<kind>/<day>/<build>/logs/, as the collector files it."""
+    logs = os.path.join(tempfile.mkdtemp(dir=TEMP_DIR), "replay-shadow", kind, "2026-11-05", "1", "logs")
+    os.makedirs(logs)
+    handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=logs)
     with handle:
         for entry in lines:
             handle.write((entry if isinstance(entry, str) else json.dumps(entry)) + "\n")
     return handle.name
 
 
+def write(lines):
+    """Each line into the folder its own tag names, as an honest run files it; untagged ones under presubmit/."""
+    by_kind = {}
+    for entry in lines:
+        tag = (entry.get("job") or {}).get("kind") if isinstance(entry, dict) else None
+        by_kind.setdefault(tag if tag in analyze_shadow.JOB_KINDS else "presubmit", []).append(entry)
+    return [write_file(kind_lines, kind) for kind, kind_lines in by_kind.items()] or [write_file([], "presubmit")]
+
+
 def report(lines, **kwargs):
-    records, skipped = analyze_shadow.load([write(lines)])
+    records, skipped = analyze_shadow.load(write(lines))
     return analyze_shadow.summarize(records, **kwargs), skipped
 
 
@@ -107,7 +119,7 @@ class EstimateTest(unittest.TestCase):
         rep, _ = report(lines, merged={"10": 10.0})
         self.assertEqual(rep["estimates"]["high"]["hits"], 1)
         hit_ids = [h.request.request_id for _, h in analyze_shadow.iter_hits(
-            analyze_shadow.load([write(lines)])[0], "high", merged={"10": 10.0}) if h]
+            analyze_shadow.load(write(lines))[0], "high", merged={"10": 10.0}) if h]
         self.assertEqual(hit_ids, ["p4"])
 
     def test_a_build_finishing_after_the_merge_is_not_copied(self):
@@ -119,7 +131,7 @@ class EstimateTest(unittest.TestCase):
             presubmit("p5", 21, "12", "b3", "B", ["b"]),
         ]
         hit_ids = [h.request.request_id for _, h in analyze_shadow.iter_hits(
-            analyze_shadow.load([write(lines)])[0], "high", merged={"10": 10.0}) if h]
+            analyze_shadow.load(write(lines))[0], "high", merged={"10": 10.0}) if h]
         self.assertEqual(hit_ids, ["p4"])
 
     def test_lines_with_the_litellm_accounting_fields_read_as_before(self):
@@ -172,6 +184,20 @@ class EstimateTest(unittest.TestCase):
         rep, _ = report([line("n1", 1, "nightly", "n", "A", ["a"], tokens=10_000)])
         self.assertEqual(rep["presubmit_prompt_tokens"], 0)
         self.assertEqual(rep["estimates"]["high"]["token_weighted_hit_percent"], 0.0)
+
+    def test_a_nightly_untrusted_line_is_never_a_source(self):
+        # Written by an account presubmits also run as, so pull-request code could have forged it.
+        for pr in ("", "10"):
+            with self.subTest(pr=pr):
+                lines = [line("u1", 1, "nightly-untrusted", "u", "A", ["a", "b"], pr=pr),
+                         presubmit("p1", 2, "10", "b1", "A", ["a", "b"])]
+                rep, skipped = report(lines, merged={"10": 1.5})
+                for estimate in analyze_shadow.ESTIMATES:
+                    self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+                self.assertIsNone(rep["top_misses"][0]["closest_request_id"])
+                self.assertEqual((rep["nightly_requests"], rep["nightly_untrusted_requests"]), (0, 1))
+                self.assertEqual(rep["health"]["lines_by_kind"]["nightly-untrusted"], 1)
+                self.assertEqual(skipped["untagged"], 0)
 
     def test_cross_project_share(self):
         rep, _ = report([
@@ -311,11 +337,26 @@ class MissTest(unittest.TestCase):
         self.assertEqual(p2["matched_messages"], 1)
 
 
-def write_store(requests):
+def build_store(segment):
+    """The store collect_shadow.py copies out beside a build's logs/: <build>/store/."""
+    return os.path.join(os.path.dirname(os.path.dirname(segment)), "store")
+
+
+def write_with_stores(lines, texts):
+    """write(lines), plus each segment's build store holding the texts of the requests in it."""
+    paths = write(lines)
+    for path in paths:
+        with open(path) as handle:
+            ids = {json.loads(l).get("request_id") for l in handle if l.strip().startswith("{")}
+        write_store({rid: texts[rid] for rid in ids if rid in texts}, build_store(path))
+    return paths
+
+
+def write_store(requests, root=None):
     """A REPLAY_STORE_DIR holding `requests`: request_id -> list of message texts."""
-    root = tempfile.mkdtemp(dir=TEMP_DIR)
-    os.makedirs(os.path.join(root, "blobs"))
-    os.makedirs(os.path.join(root, "requests"))
+    root = root or tempfile.mkdtemp(dir=TEMP_DIR)
+    os.makedirs(os.path.join(root, "blobs"), exist_ok=True)
+    os.makedirs(os.path.join(root, "requests"), exist_ok=True)
     for request_id, messages in requests.items():
         blobs = []
         for text in messages:
@@ -350,6 +391,32 @@ class ClosestByTextTest(unittest.TestCase):
         texts = analyze_shadow.StoredText(write_store(self.TEXTS))
         miss = report(self.LINES, texts=texts)[0]["top_misses"][0]
         self.assertEqual((miss["closest_request_id"], miss["matched_messages"]), ("n2", 2))
+
+    def test_a_nightly_untrusted_request_is_never_closest(self):
+        # n1 is a real source for the prefix, so the search reaches the text ranking,
+        # where the untrusted n2 has the most alike next message. Its tags are the
+        # proxy's, so it can claim to be an earlier build of p1's pull request.
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        lines = [dict(l) for l in self.LINES]
+        lines[1] = dict(lines[1], job={"kind": "nightly-untrusted", "project": "p1", "build": "b0", "pr": "10"})
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
+    def _untrusted_claiming_the_pull_request(self):
+        lines = [line("u1", 1, "nightly-untrusted", "b0", "A", ["s", "w", "ta"], pr="10"),
+                 presubmit("p1", 2, "10", "b1", "C", ["s", "w", "tc"])]
+        records, _ = analyze_shadow.load(write(lines))
+        return {r.request_id: r for r in records}, analyze_shadow.PrefixSources(records, {}, True, by_text=True)
+
+    def test_usable_refuses_an_untrusted_record_on_its_own(self):
+        records, sources = self._untrusted_claiming_the_pull_request()
+        self.assertFalse(sources.usable(records["u1"], records["p1"]))
+
+    def test_an_untrusted_record_is_never_a_text_candidate(self):
+        records, sources = self._untrusted_claiming_the_pull_request()
+        self.assertTrue(sources.members, "the presubmit's own prefixes are there")
+        for key, members in sources.members.items():
+            self.assertNotIn("u1", [r.request_id for r in members], key)
 
     def test_a_request_replay_could_not_have_used_is_never_closest(self):
         # n2 finished after p1 started, so it was not available to p1.
@@ -484,7 +551,7 @@ class ClosestByTextRulesTest(unittest.TestCase):
                  presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            analyze_shadow.main([write(lines), "--store", root])
+            analyze_shadow.main([*write_with_stores(lines, self.TEXTS), "--by-text"])
         self.assertIn("closest request ranked by text for 1 of 1 misses", out.getvalue())
         self.assertRegex(out.getvalue(), r"\(nightly, by text 0\.\d+\)")
 
@@ -513,22 +580,54 @@ class ClosestByTextRulesTest(unittest.TestCase):
 
     def test_an_empty_store_path_is_refused(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            analyze_shadow.main([write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", ""])
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store", ""])
 
     def test_a_store_without_blobs_is_refused(self):
         root = write_store(self.TEXTS)
         shutil.rmtree(os.path.join(root, "blobs"))
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            analyze_shadow.main([write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", root])
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store", root])
 
     def test_a_store_without_requests_is_refused(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            analyze_shadow.main([write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", TEMP_DIR + "/typo"])
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store",
+                                 TEMP_DIR + "/typo"])
+
+    def test_one_store_for_every_input_needs_kind_and_by_text_refuses_it(self):
+        root = write_store(self.TEXTS)
+        paths = write([line("n1", 1, "nightly", "n", "A", ["a"])])
+        for extra in (["--store", root], ["--by-text", "--kind", "nightly"], ["--by-text", "--kind", "nightly", "--store", root]):
+            with self.subTest(extra=extra):
+                err = io.StringIO()
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                    analyze_shadow.main([*paths, *extra])
+                self.assertIn("--kind", err.getvalue())
+
+    def test_text_planted_in_another_build_never_stands_in_for_a_trusted_candidate(self):
+        # n1 and x are nightly; x's next message is the closer one. A presubmit that read the bucket
+        # plants store/requests/n1.json under its own build with p1's exact text, which a merged
+        # store would rank first.
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        paths = write_with_stores(lines, self.TEXTS)
+        presubmit_segment = next(p for p in paths if os.sep + "presubmit" + os.sep in p)
+        write_store({"n1": self.TEXTS["p1"]}, build_store(presubmit_segment))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(analyze_shadow.main([*paths, "--by-text", "--json"]), 0)
+        [miss] = json.loads(out.getvalue())["top_misses"]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"]), ("x", "text"))
+        # The same files with every store merged into one, as the old recipe did: the planted text wins.
+        merged = write_store({**self.TEXTS, "n1": self.TEXTS["p1"]})
+        records, _ = analyze_shadow.load(paths)
+        miss = analyze_shadow.summarize(records, texts=analyze_shadow.StoredText(merged))["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
 
 
 class HealthTest(unittest.TestCase):
     def test_health_counts(self):
-        records, skipped = analyze_shadow.load([write([
+        records, skipped = analyze_shadow.load(write([
             line("n1", 1, "nightly", "n", "A", ["a"]),
             presubmit("p1", 2, "", "b1", "A", None, unstorable=["upstream_incomplete"]),
             presubmit("p2", 3, "10", "b1", "B", ["b"], unstorable=["observe_failed"]),
@@ -536,10 +635,10 @@ class HealthTest(unittest.TestCase):
             presubmit("p4", 4, "10", "b1", "D", ["d"], unstorable=["observe_too_large"]),
             {"event": "replay_shadow_request", "ts": 5, "error": "RuntimeError", "job": {"kind": "presubmit"}},
             {"event": "replay_shadow_request", "ts": 6, "error": "analysis_dropped", "job": {"kind": "presubmit"}},
-        ])])
+        ]))
         rep = analyze_shadow.summarize(records, skipped=skipped)
         h = rep["health"]
-        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "presubmit": 4})
+        self.assertEqual(h["lines_by_kind"], {"nightly": 1, "nightly-untrusted": 0, "presubmit": 4})
         self.assertEqual(h["observe_too_large"], 1)
         self.assertEqual(h["error_lines"], 1)
         self.assertEqual(h["analysis_dropped"], 1)
@@ -553,34 +652,204 @@ class HealthTest(unittest.TestCase):
 
 class LoadTest(unittest.TestCase):
     def test_skips_other_lines_and_untagged_jobs(self):
-        records, skipped = analyze_shadow.load([write([
+        records, skipped = analyze_shadow.load(write([
             "not json",
             {"event": "replay_shadow_start"},
             line("x", 1, "", "b", "A", ["a"]),
             {"event": "replay_shadow_request", "ts": 1, "error": "RuntimeError", "job": {"kind": "presubmit"}},
             {"event": "replay_shadow_request", "ts": 1, "job": {"kind": "presubmit"}},
             presubmit("p", 2, "10", "b", "A", ["a"]),
-        ])])
+        ]))
         self.assertEqual([r.request_id for r in records], ["p"])
         self.assertEqual(records[0].pr, "10")
-        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1})
+        self.assertEqual(skipped, {"not_json": 1, "other_event": 1, "untagged": 1, "error": 1, "analysis_dropped": 0, "no_fingerprint": 1,
+                                   "kind_mismatch": 0, "off_layout_files": 0})
 
     def test_records_from_several_files_are_merged_in_time_order(self):
         a = write([presubmit("p2", 5, "10", "b2", "A", ["a"])])
         b = write([line("n1", 1, "nightly", "n", "A", ["a"])])
-        records, _ = analyze_shadow.load([a, b])
+        records, _ = analyze_shadow.load(a + b)
         self.assertEqual([r.request_id for r in records], ["n1", "p2"])
 
     def test_main_prints_text_and_json_and_reads_merge_times(self):
         path = write([presubmit("p1", 1, "10", "b", "A", ["a"]), presubmit("p2", 5, "11", "c", "A", ["a"])])
-        merged = write([])
+        merged = os.path.join(tempfile.mkdtemp(dir=TEMP_DIR), "merged.json")
         with open(merged, "w") as handle:
             json.dump({"10": 2}, handle)
-        for args in ([path, "--merged", merged], [path, "--merged", merged, "--json"]):
+        for args in ([*path, "--merged", merged], [*path, "--merged", merged, "--json"]):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertEqual(analyze_shadow.main(args), 0)
             self.assertIn("50.0", out.getvalue())
+
+
+class FolderKindTest(unittest.TestCase):
+    """The folder a line was filed under is its kind; its own tag is only checked against it."""
+
+    def test_a_presubmit_line_tagged_nightly_is_never_a_nightly_source(self):
+        forged = line("f1", 1, "nightly", "n", "A", ["a"], tokens=10_000)
+        files = [write_file([forged], "presubmit"), write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")]
+        records, skipped = analyze_shadow.load(files)
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        self.assertEqual(skipped["kind_mismatch"], 1)
+        rep = analyze_shadow.summarize(records, skipped=skipped, merged={"10": 1.5})
+        for estimate in analyze_shadow.ESTIMATES:
+            self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+        self.assertEqual((rep["nightly_requests"], rep["health"]["kind_mismatch_lines"]), (0, 1))
+
+    def test_a_nightly_untrusted_line_tagged_nightly_is_dropped(self):
+        records, skipped = analyze_shadow.load([write_file([line("f1", 1, "nightly", "n", "A", ["a"])], "nightly-untrusted")])
+        self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
+
+    def test_the_kind_is_the_top_level_folder_and_a_nested_kind_folder_is_skipped(self):
+        # IAM governs only the replay-shadow/<kind>/ prefix: a presubmit names everything below it,
+        # so it uploads replay-shadow/presubmit/<day>/nightly/<day>/<build>/logs/seg.jsonl tagged nightly.
+        week = tempfile.mkdtemp(dir=TEMP_DIR)
+        honest = os.path.join(week, "presubmit", "2026-11-05", "1790", "logs")
+        forged = os.path.join(week, "presubmit", "2026-11-05", "nightly", "2026-11-05", "1790", "logs")
+        for directory, entry in ((honest, presubmit("p1", 2, "10", "b1", "A", ["a"])),
+                                 (forged, line("f1", 1, "nightly", "n", "A", ["a"], tokens=10_000))):
+            os.makedirs(directory)
+            with open(os.path.join(directory, "seg.jsonl"), "w") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        for argument in (week, os.path.join(week, "presubmit")):
+            with self.subTest(argument=argument):
+                records, skipped = analyze_shadow.load([argument])
+                self.assertEqual([(r.request_id, r.kind) for r in records], [("p1", "presubmit")])
+                self.assertEqual(skipped["off_layout_files"], 1)
+                rep = analyze_shadow.summarize(records, skipped=skipped)
+                for estimate in analyze_shadow.ESTIMATES:
+                    self.assertEqual(rep["estimates"][estimate]["hits"], 0, estimate)
+                self.assertEqual(rep["health"]["off_layout_files"], 1)
+        # Named outright, the forged file is refused, not trusted.
+        with self.assertRaises(ValueError):
+            analyze_shadow.load([os.path.join(forged, "seg.jsonl")])
+
+    def test_a_kind_folder_its_parent_or_a_file_inside_one_all_work(self):
+        path = write_file([line("n1", 1, "nightly", "n", "A", ["a"])], "nightly")
+        kind_folder = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        for argument in (path, kind_folder, os.path.dirname(kind_folder), os.path.dirname(os.path.dirname(kind_folder))):
+            with self.subTest(argument=argument):
+                records, skipped = analyze_shadow.load([argument])
+                self.assertEqual([(r.request_id, r.kind) for r in records], [("n1", "nightly")])
+                self.assertEqual(skipped["off_layout_files"], 0)
+
+    def test_a_file_off_the_layout_inside_a_kind_folder_is_skipped(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        kind_folder = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(path))))
+        for relative in ("stray.jsonl", "2026-11-05/stray.jsonl", "not-a-day/1/logs/seg.jsonl",
+                         "2026-11-05/1/notlogs/seg.jsonl", "2026-11-05/replay-shadow/logs/seg.jsonl"):
+            with self.subTest(relative=relative):
+                stray = os.path.join(kind_folder, relative)
+                os.makedirs(os.path.dirname(stray), exist_ok=True)
+                with open(stray, "w") as handle:
+                    handle.write(json.dumps(presubmit("s1", 1, "10", "b0", "A", ["a"])) + "\n")
+                records, skipped = analyze_shadow.load([kind_folder])
+                self.assertEqual([r.request_id for r in records], ["p1"])
+                self.assertEqual(skipped["off_layout_files"], 1)
+                os.remove(stray)
+
+    def test_a_run_with_nothing_at_the_layout_is_refused(self):
+        loose = tempfile.mkdtemp(dir=TEMP_DIR)
+        with open(os.path.join(loose, "seg.jsonl"), "w") as handle:
+            handle.write(json.dumps(presubmit("p1", 2, "10", "b1", "A", ["a"])) + "\n")
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaisesRegex(ValueError, "no log segment is at the bucket's layout"):
+            analyze_shadow.load([loose])
+        records, _ = analyze_shadow.load([loose], kind="presubmit")
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        # No segments at all is an empty run, not a mistake.
+        records, skipped = analyze_shadow.load([tempfile.mkdtemp(dir=TEMP_DIR)])
+        self.assertEqual((records, skipped["off_layout_files"]), ([], 0))
+
+    def test_a_planted_folder_with_nothing_at_the_layout_does_not_stop_the_recipe(self):
+        # The reviewer's reproduction: week/nightly-untrusted holds only 2026-11-05/x.jsonl.
+        week = tempfile.mkdtemp(dir=TEMP_DIR)
+        for kind, relative, entry in (
+                ("nightly", "2026-11-05/1790/logs/seg.jsonl", line("n1", 1, "nightly", "n", "A", ["a"])),
+                ("presubmit", "2026-11-05/1791/logs/seg.jsonl", presubmit("p1", 2, "10", "b1", "A", ["a"])),
+                ("nightly-untrusted", "2026-11-05/x.jsonl", line("u1", 1, "nightly-untrusted", "u", "A", ["a"]))):
+            target = os.path.join(week, kind, relative)
+            os.makedirs(os.path.dirname(target))
+            with open(target, "w") as handle:
+                handle.write(json.dumps(entry) + "\n")
+        folders = [os.path.join(week, kind) for kind in ("nightly", "nightly-untrusted", "presubmit")]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(analyze_shadow.main([*folders, "--json"]), 0)
+        rep = json.loads(out.getvalue())
+        self.assertEqual(rep["health"]["off_layout_files"], 1)
+        self.assertEqual((rep["requests"], rep["estimates"]["low"]["hits"]), (2, 1))
+        self.assertIn(f"note: {folders[1]} holds no log segment at the bucket's layout", err.getvalue())
+
+    def test_a_named_job_manifest_is_not_read_as_a_log(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        manifest = os.path.join(os.path.dirname(os.path.dirname(path)), "job-1762300000000.json")
+        with open(manifest, "w") as handle:
+            json.dump({"kind": "presubmit", "build": "1"}, handle)
+        self.assertEqual(analyze_shadow.filed_kind(manifest), "presubmit")
+        for kind in (None, "presubmit"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, "is not a log segment"):
+                    analyze_shadow.load([manifest], kind=kind)
+
+    def test_a_folder_inside_a_kind_folder_keeps_that_kind(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        records, _ = analyze_shadow.load([os.path.dirname(os.path.dirname(os.path.dirname(path)))])
+        self.assertEqual([(r.request_id, r.kind) for r in records], [("p1", "presubmit")])
+
+    def test_filed_kind_reads_segments_and_job_manifests_at_the_layout_only(self):
+        top = os.path.join(os.sep, "data", "week")
+        cases = {
+            "presubmit/2026-11-05/1790/logs/p-1-000001.jsonl": "presubmit",
+            "nightly-untrusted/2026-11-05/1790/job-1762300000000.json": "nightly-untrusted",
+            "replay-shadow/nightly/2026-11-05/1790/job-1762300000000.json": "nightly",
+            "presubmit/2026-11-05/1790/logs/job-1762300000000.json": None,
+            "presubmit/2026-11-05/1790/job-1.jsonl": None,
+            "presubmit/2026-11-05/1790/job-x.json": None,
+            "presubmit/2026-11-05/nightly/job-1762300000000.json": None,
+            "presubmit/2026-11-05/nightly/2026-11-05/1790/job-1762300000000.json": None,
+            "presubmit/2026-11-05/nightly/2026-11-05/1790/logs/seg.jsonl": None,
+            "presubmit/2026-11-05/replay-shadow/logs/seg.jsonl": None,
+        }
+        for relative, kind in cases.items():
+            with self.subTest(relative=relative):
+                self.assertEqual(analyze_shadow.filed_kind(os.path.join(top, relative)), kind)
+
+    def test_a_missing_path_is_named_with_or_without_a_kind(self):
+        missing = os.path.join(TEMP_DIR, "no-such", "presubmit")
+        for kind in (None, "presubmit"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(ValueError, f"{missing} does not exist"):
+                    analyze_shadow.load([missing], kind=kind)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exit_:
+                    analyze_shadow.main([missing] + (["--kind", kind] if kind else []))
+                self.assertEqual(exit_.exception.code, 2)
+                self.assertIn(f"{missing} does not exist", err.getvalue())
+
+    def test_a_directory_is_searched_for_segments(self):
+        path = write_file([presubmit("p1", 2, "10", "b1", "A", ["a"])], "presubmit")
+        with open(os.path.join(os.path.dirname(path), "job-1.json"), "w") as handle:
+            handle.write("{}")
+        records, skipped = analyze_shadow.load([os.path.dirname(path)])
+        self.assertEqual([r.request_id for r in records], ["p1"])
+        self.assertEqual(skipped["not_json"], 0)
+
+    def test_a_file_under_no_kind_folder_is_refused_unless_a_kind_is_given(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, dir=TEMP_DIR)
+        with handle:
+            handle.write(json.dumps(line("n1", 1, "nightly", "n", "A", ["a"])) + "\n")
+        with self.assertRaises(ValueError):
+            analyze_shadow.load([handle.name])
+        records, _ = analyze_shadow.load([handle.name], kind="nightly")
+        self.assertEqual([r.kind for r in records], ["nightly"])
+        records, skipped = analyze_shadow.load([handle.name], kind="presubmit")
+        self.assertEqual((records, skipped["kind_mismatch"]), ([], 1))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            analyze_shadow.main([handle.name])
+        self.assertIn("--kind", err.getvalue())
 
 
 if __name__ == "__main__":

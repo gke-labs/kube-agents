@@ -866,11 +866,12 @@ cache contract.
        not kill it before the drain and the exit end. Chat receipts still unsettled go back to
        Pub/Sub; Slack and Teams events the gateway did not pull before the exit end with the
        process, and the Slack count is logged. This half is implemented (`install_shutdown_handler`
-       in `credential_proxy.py`, the broker role only).
+       in `credential_proxy.py`, the broker and exec roles).
      - On the exec tier, `RollingUpdate` keeps another replica serving, so the drain is long: a
-       `terminationGracePeriodSeconds` longer than the longest command it admits. A
-       PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or more; at 1
-       replica it protects nothing.
+       `terminationGracePeriodSeconds` longer than the longest command it admits. Today an exec
+       pod runs the broker's 30 s drain inside the broker's 45 s grace period; the longer drain is
+       #4780. A PodDisruptionBudget with `maxUnavailable: 1` applies only when replicas are 2 or
+       more; at 1 replica it protects nothing.
 1. **Off by default.** New CR field `spec.deployment.credentialProxy.exec.replicas`. The value 0
    (the default) means no exec tier and no `CREDENTIAL_PROXY_EXEC_URL`, so every install behaves
    as today. The operator sets N. It is not derived from the fleet size and not an autoscaling

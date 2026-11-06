@@ -734,7 +734,8 @@ class NightlyUntrusted(unittest.TestCase):
         self.assertIn("nightly-untrusted", br.render(r).splitlines()[3])
         self.assertIn("nightly-untrusted", br.compare(r, r)["scopes"])
 
-    def test_the_kinds_do_not_depend_on_analyze_shadow_listing_it(self):
+    def test_the_kinds_are_analyze_shadows(self):
+        self.assertIs(br.JOB_KINDS, br.analyze_shadow.JOB_KINDS)
         self.assertEqual(br.JOB_KINDS, ("nightly", "nightly-untrusted", "presubmit"))
         self.assertEqual(br.SCOPES, ("total",) + br.JOB_KINDS)
 
@@ -768,11 +769,13 @@ class KindFromFolder(unittest.TestCase):
             self.assertEqual(manifests, [], folder)
             self.assertEqual(quality.off_layout_files, 2, folder)
 
-    def test_filed_kind_is_analyze_shadows_rule(self):
+    def test_the_layout_rule_is_analyze_shadows(self):
+        self.assertFalse(hasattr(br, "filed_kind"), "baseline_report must import the rule, not copy it")
+        filed_kind = br.analyze_shadow.filed_kind
         root = tempfile.mkdtemp(dir=TEMP_DIR)
         good = os.path.join(root, "nightly-untrusted", "2026-11-05", "b1", "logs", "seg.jsonl")
-        self.assertEqual(br.filed_kind(good), "nightly-untrusted")
-        self.assertEqual(br.filed_kind(os.path.join(root, "presubmit", "2026-11-05", "b1", "job-1.json")),
+        self.assertEqual(filed_kind(good), "nightly-untrusted")
+        self.assertEqual(filed_kind(os.path.join(root, "presubmit", "2026-11-05", "b1", "job-1.json")),
                          "presubmit")
         for bad in (
             os.path.join(root, "presubmit", "2026-11-05", "nightly", "2026-11-05", "b1", "logs", "seg.jsonl"),
@@ -787,7 +790,7 @@ class KindFromFolder(unittest.TestCase):
             os.path.join(root, "nightly", "2026-11-05", "b1", "logs", "job-1.json"),
             os.path.join(root, "nightly", "2026-11-05", "b1", "notes.json"),
         ):
-            self.assertIsNone(br.filed_kind(bad), bad)
+            self.assertIsNone(filed_kind(bad), bad)
 
     def test_off_layout_files_under_a_folder_are_skipped_and_counted(self):
         root = tempfile.mkdtemp(dir=TEMP_DIR)
@@ -812,7 +815,7 @@ class KindFromFolder(unittest.TestCase):
         self.assertIn("is not at the bucket's layout", err)
         code, _, err = run_main([loose])
         self.assertEqual(code, 2)
-        self.assertIn("no log segment or manifest is at the bucket's layout", err)
+        self.assertIn("no log segment is at the bucket's layout", err)
         code, out, err = run_main([path, "--kind", "presubmit", "--json"])
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(json.loads(out)["scopes"]["presubmit"]["requests"], 1)
@@ -831,7 +834,7 @@ class KindFromFolder(unittest.TestCase):
         doc = json.loads(out)
         self.assertEqual(doc["scopes"]["total"]["requests"], 1)
         self.assertEqual(doc["data_quality"]["off_layout_files"], 1)
-        self.assertIn("holds no log segment or manifest at the bucket's layout", err)
+        self.assertIn("holds no log segment at the bucket's layout", err)
 
     def test_no_files_at_all_is_an_empty_report(self):
         empty = tempfile.mkdtemp(dir=TEMP_DIR)
@@ -855,7 +858,7 @@ class KindFromFolder(unittest.TestCase):
             for extra in ([], ["--kind", "nightly"]):
                 code, _, err = run_main([path] + extra)
                 self.assertEqual(code, 2, (name, extra))
-                self.assertIn("is neither a log segment (*.jsonl) nor a job manifest", err)
+                self.assertIn("is not a log segment (*.jsonl)", err)
         manifest = write_json({"kind": "nightly", "build": "n9"}, name="job-5.json", directory=build_dir())
         quality = br.Quality()
         _, manifests = br.load_lines([manifest], quality)
@@ -937,10 +940,10 @@ class MalformedInput(unittest.TestCase):
         quality = br.Quality()
         lines, manifests = br.load_lines([root], quality)
         r = br.build_report(lines, manifests, {}, prices(), quality)
-        # A .jsonl.open segment is not a name the collector uploads: off the layout.
+        # A .jsonl.open segment is not a name the collector uploads, and is not searched for.
         self.assertEqual(r["scopes"]["total"]["requests"], 1)
         self.assertEqual((r["data_quality"]["log_files"], r["data_quality"]["manifests"]), (1, 4))
-        self.assertEqual(r["data_quality"]["off_layout_files"], 1)
+        self.assertEqual(r["data_quality"]["off_layout_files"], 0)
         self.assertEqual(r["data_quality"]["bad_manifests"], 2)
         self.assertEqual(r["data_quality"]["manifest_builds_without_lines"], ["presubmit/b9"])
 

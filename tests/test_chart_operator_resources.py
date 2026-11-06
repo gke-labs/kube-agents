@@ -14,16 +14,21 @@ import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 import yaml
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _autopilot import gib_per_vcpu, gib_per_vcpu_in_band  # noqa: E402
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
 _VALUES = _CHART / "values.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _OPERATOR_TEMPLATE = "templates/operator-deployment.yaml"
+_MANAGER = _REPO_ROOT / "k8s-operator" / "config" / "manager" / "manager.yaml"
 _HELM = shutil.which("helm")
 _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
@@ -39,6 +44,10 @@ _MIB = 1024**2
 # What releases up to 0.16.0 shipped for the manager, the pair --reuse-values carries forward.
 _LEGACY_LIMIT = "128Mi"
 _LEGACY_REQUEST = "64Mi"
+# The requests the manager runs under where GKE Autopilot without bursting clamps the
+# limits to them, inside the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged.
+_PINNED_REQUESTS = {"cpu": "100m", "memory": "256Mi"}
+_PINNED_LIMITS = {"cpu": "500m", "memory": "512Mi"}
 
 
 def _floor_bytes():
@@ -49,6 +58,40 @@ def _floor_bytes():
 
 def _default_limit():
     return yaml.safe_load(_VALUES.read_text())["operator"]["resources"]["limits"]["memory"]
+
+
+def _chart_resources():
+    return yaml.safe_load(_VALUES.read_text())["operator"]["resources"]
+
+
+def _manager_resources():
+    for doc in yaml.safe_load_all(_MANAGER.read_text()):
+        if doc and doc.get("kind") == "Deployment":
+            for container in doc["spec"]["template"]["spec"]["containers"]:
+                if container["name"] == _MANAGER_CONTAINER:
+                    return container["resources"]
+    raise AssertionError(f"no {_MANAGER_CONTAINER} container in {_MANAGER}")
+
+
+class RequestsAreLivableAsLimitsTest(unittest.TestCase):
+    """GKE Autopilot without Pod bursting sets each limit to its request, so the request is
+    what the manager runs under there. Both install paths declare the pinned pair, and the
+    requests sit in the band Autopilot admits unchanged, so the manifest is the admitted pod."""
+
+    def test_both_install_paths_declare_the_same_pair(self):
+        self.assertEqual(_chart_resources(), _manager_resources())
+
+    def test_the_pair_is_the_pinned_one(self):
+        self.assertEqual(_chart_resources()["requests"], _PINNED_REQUESTS)
+        self.assertEqual(_chart_resources()["limits"], _PINNED_LIMITS)
+
+    def test_the_requests_pair_is_in_the_autopilot_band(self):
+        requests = _chart_resources()["requests"]
+        ratio = gib_per_vcpu(requests["cpu"], requests["memory"])
+        self.assertTrue(
+            gib_per_vcpu_in_band(ratio),
+            f"the operator requests {ratio} GiB per vCPU, outside the band",
+        )
 
 
 class FloorIsTheDefaultTest(unittest.TestCase):

@@ -42,6 +42,15 @@ func gaugeTestAgent() *agentv1alpha1.PlatformAgent {
 		ProposalsMergedUntouched:        ptr.To(int64(0)),
 		PeopleSeen7d:                    ptr.To(int64(6)),
 		PeopleSeen30d:                   ptr.To(int64(8)),
+		ProposalsFromChat:               ptr.To(int64(7)),
+		ProposalsFromConsole:            ptr.To(int64(1)),
+		ProposalsFromApi:                ptr.To(int64(0)),
+		ProposalsFromEvent:              ptr.To(int64(5)),
+		ProposalsFromDrift:              ptr.To(int64(2)),
+		ProposalsFromAudit:              ptr.To(int64(6)),
+		ProposalsFromScheduled:          ptr.To(int64(8)),
+		ProposalsFromIssue:              ptr.To(int64(9)),
+		ProposalsFromOther:              ptr.To(int64(10)),
 		LastActiveTime:                  &metav1.Time{Time: usageClock(10)},
 	}
 	return agent
@@ -81,10 +90,10 @@ func TestUsageGauges_PointerRowsForTheSixReadings(t *testing.T) {
 	g.usage.Reset()
 	g.publishUsage(agent)
 	// One pointer row present: the counters' int rows always publish, the
-	// other nine pointer rows (two gauges, five readings, two people
-	// readings) publish nothing.
-	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-9 {
-		t.Errorf("%d usage samples, want %d: an absent reading has no sample", n, len(usageExportFields)-9)
+	// other eighteen pointer rows (two gauges, five readings, two people
+	// readings, nine origin readings) publish nothing.
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-18 {
+		t.Errorf("%d usage samples, want %d: an absent reading has no sample", n, len(usageExportFields)-18)
 	}
 }
 
@@ -119,17 +128,69 @@ func TestUsageGauges_PointerRowsForTheTwoPeopleReadings(t *testing.T) {
 	if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", "peopleSeen30d")); got != 0 {
 		t.Errorf("peopleSeen30d = %v, want 0", got)
 	}
-	// Both people rows present, the other eight pointer rows absent.
-	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-8 {
-		t.Errorf("%d usage samples, want %d: a people reading at 0 is a sample", n, len(usageExportFields)-8)
+	// Both people rows present, the other seventeen pointer rows absent.
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-17 {
+		t.Errorf("%d usage samples, want %d: a people reading at 0 is a sample", n, len(usageExportFields)-17)
 	}
 
 	g.usage.Reset()
 	agent.Status.Usage.PeopleSeen7d = nil
 	agent.Status.Usage.PeopleSeen30d = nil
 	g.publishUsage(agent)
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-19 {
+		t.Errorf("%d usage samples, want %d: an absent people reading has no sample", n, len(usageExportFields)-19)
+	}
+}
+
+// The nine origin readings are pointer rows under one pruning record of
+// their own: a reading at zero is a sample, an absent one publishes none.
+func TestUsageGauges_PointerRowsForTheNineOriginReadings(t *testing.T) {
+	origins := []string{
+		"proposalsFromChat", "proposalsFromConsole", "proposalsFromApi", "proposalsFromEvent", "proposalsFromDrift",
+		"proposalsFromAudit", "proposalsFromScheduled", "proposalsFromIssue", "proposalsFromOther",
+	}
+	if got := usageExportFieldsOfRecord(usageNewerFieldOrigins); !slices.Equal(got, origins) {
+		t.Fatalf("the origins record covers %v, want %v", got, origins)
+	}
+	rows := map[string]usageExportField{}
+	for _, f := range usageExportFields {
+		rows[f.name] = f
+	}
+	for _, name := range origins {
+		if f, ok := rows[name]; !ok || !f.pointer {
+			t.Errorf("%s: row %+v, want a pointer row", name, f)
+		}
+	}
+
+	reg := prometheus.NewRegistry()
+	g := newUsageGauges(reg)
+	agent := &agentv1alpha1.PlatformAgent{}
+	agent.Name = "pa"
+	agent.Namespace = "ns"
+	for i, name := range origins {
+		*usageReadingStatusField(&agent.Status.Usage, name) = ptr.To(int64(i))
+	}
+	if usageBlockEmpty(&agent.Status.Usage) {
+		t.Error("a block holding the origin readings reads as empty")
+	}
+	g.publishUsage(agent)
+	for i, name := range origins {
+		if got := testutil.ToFloat64(g.usage.WithLabelValues("ns", "pa", name)); got != float64(i) {
+			t.Errorf("%s = %v, want %d", name, got, i)
+		}
+	}
+	// The nine origin rows present, the other ten pointer rows absent.
 	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-10 {
-		t.Errorf("%d usage samples, want %d: an absent people reading has no sample", n, len(usageExportFields)-10)
+		t.Errorf("%d usage samples, want %d: an origin reading at 0 is a sample", n, len(usageExportFields)-10)
+	}
+
+	g.usage.Reset()
+	for _, name := range origins {
+		*usageReadingStatusField(&agent.Status.Usage, name) = nil
+	}
+	g.publishUsage(agent)
+	if n := testutil.CollectAndCount(g.usage, usageGaugeName); n != len(usageExportFields)-19 {
+		t.Errorf("%d usage samples, want %d: an absent origin reading has no sample", n, len(usageExportFields)-19)
 	}
 }
 
@@ -241,7 +302,9 @@ func TestUsageGauges_CoverEveryNumericAndTimeFieldOfTheStatus(t *testing.T) {
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
 		tag := strings.Split(field.Tag.Get("json"), ",")[0]
-		if tag == "" || tag == "activeInterfaces" {
+		// The two lists are not gauges: the interfaces are words, and the
+		// top tools are rows the summary block prints from the status.
+		if tag == "" || tag == "activeInterfaces" || tag == "topTools" {
 			continue
 		}
 		if !named[tag] {
@@ -424,6 +487,41 @@ func TestReconcile_PublishesAUsageBlockThatHoldsAnyValue(t *testing.T) {
 	}
 	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != len(usageExportFields)-pointers+1 {
 		t.Errorf("%d usage samples, want %d: a block with a gauge in it is published", n, len(usageExportFields)-pointers+1)
+	}
+}
+
+// A usage block whose only content is topTools is a poll that landed, not an
+// unpolled or pruned status: the first poll baselines a broker that already
+// ran commands without moving a counter, while it projects that broker's tool
+// table. Its zero counters publish as idle.
+func TestReconcile_PublishesAUsageBlockThatHoldsOnlyTopTools(t *testing.T) {
+	usage := agentv1alpha1.AgentUsageStatus{TopTools: []agentv1alpha1.ToolUsageSummary{{Tool: "kubectl", Subcommand: "get", Total: 6, Blocked: 6}}}
+	if usageBlockEmpty(&usage) {
+		t.Fatal("a block holding only topTools reads as empty")
+	}
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "tools-only", Namespace: "reconcile-tools-only"},
+		Status:     agentv1alpha1.AgentStatus{Phase: readyPhase, Usage: usage},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if held := r.heldUsageFields(agent); held != nil {
+		t.Errorf("held fields %v, want none for a block holding topTools", held)
+	}
+	// Every int row publishes; the pointer rows are all absent.
+	pointers := 0
+	for _, f := range usageExportFields {
+		if f.pointer {
+			pointers++
+		}
+	}
+	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != len(usageExportFields)-pointers {
+		t.Errorf("%d usage samples, want %d: a block with topTools in it is published", n, len(usageExportFields)-pointers)
 	}
 }
 

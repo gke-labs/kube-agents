@@ -101,6 +101,15 @@
             }
           }
         },
+        "mcpServer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -431,7 +440,7 @@
               "properties": {
                 "kind": {
                   "type": "string",
-                  "enum": ["", "nightly", "presubmit"]
+                  "enum": ["", "nightly", "nightly-untrusted", "presubmit"]
                 },
                 "project": {
                   "type": "string"
@@ -474,7 +483,7 @@
                 "required": ["kind"],
                 "properties": {
                   "kind": {
-                    "enum": ["nightly", "presubmit"]
+                    "enum": ["nightly", "nightly-untrusted", "presubmit"]
                   }
                 }
               }
@@ -1295,6 +1304,11 @@
                 }
               }
             },
+            "incidentWorkloadDedupSeconds": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "maximum": 86400
+            },
             "credentialProxy": {
               "type": "object",
               "additionalProperties": false,
@@ -1626,6 +1640,9 @@
                 },
                 "mode": {
                   "type": "string"
+                },
+                "answerFeedback": {
+                  "type": "boolean"
                 }
               }
             },
