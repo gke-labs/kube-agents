@@ -690,6 +690,23 @@ type PlatformAgentReconciler struct {
 // Without the enumeration verbs a cached Secret read cannot be added by accident.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// `dispatchjobtemplates` are the dispatcher Job admission policy's params in
+// <ns>-profiles (agentprofile_job_template.go), which the operator alone
+// writes; no Role it renders grants the kind, and the built-in admin and edit
+// roles don't aggregate it. `podtemplates` create only: the server-side dry
+// run that defaults a Job template (defaultedJobTemplate), which stores
+// nothing. ClusterRole rules, not Roles: the profile namespace is created at
+// runtime, and RBAC escalation prevention stops the operator granting itself
+// a Role there with verbs it does not already hold. No watch: every read goes
+// through a2aReader(), uncached. Approved by @bnaylor, 2026-10-30 and
+// 2026-10-31 (#3655 PR 6).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create
+// `get` on the dispatcher Job admission policy and its binding: before the
+// dispatcher gets its Jobs Role, the operator checks both are in the cluster
+// as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
+// watch or write. Pending @bnaylor's sign-off (#3655 PR 6).
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,resourceNames=kube-agents-a2a-dispatcher-job,verbs=get
 // `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
 // ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
@@ -896,25 +913,35 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// below), so the bus a newer CRD rendered is still standing; clearing the
 	// condition would report it gone, and rewriting it would claim this binary
 	// knows what it describes. Both are worse than leaving it.
+	//
+	// DispatcherJobMode is written on the way out for the same reasons, from
+	// the dispatcher step's verdict (syncDispatcherJobMode), or cleanupA2A's
+	// below. A pass that reached neither leaves it as it was.
 	busCredsMapVersion := ""
+	var dispatcherJobMode *metav1.Condition
 	if modeErr == nil {
 		wantNext := renderMode(instance, "nats") == ModeNext
-		defer func() {
-			if err := r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion); err != nil {
-				if retErr == nil {
-					retErr = err
-					return
-				}
-				// The reconcile is already failing and will requeue. If the
-				// failure is already a PlatformAgent conflict being requeued cleanly,
-				// a subsequent conflict writing BusCredentialsReady is the same race
-				// and should not log an Error with a stack trace.
-				if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
-					log.Info("Conflict writing BusCredentialsReady; pass already requeuing on conflict", "error", err)
-				} else {
-					log.Error(err, "could not write BusCredentialsReady")
-				}
+		exitWrite := func(condition string, err error) {
+			if err == nil {
+				return
 			}
+			if retErr == nil {
+				retErr = err
+				return
+			}
+			// The reconcile is already failing and will requeue. If the
+			// failure is already a PlatformAgent conflict being requeued cleanly,
+			// a subsequent conflict writing the condition is the same race
+			// and should not log an Error with a stack trace.
+			if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
+				log.Info("Conflict writing "+condition+"; pass already requeuing on conflict", "error", err)
+			} else {
+				log.Error(err, "could not write "+condition)
+			}
+		}
+		defer func() {
+			exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion))
+			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
 		}()
 	}
 
@@ -1192,13 +1219,19 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	var a2aState a2aProvisionState
 	a2aNext := a2aStackRendering(instance)
 	if a2aNext {
-		if a2aState, err = r.reconcileA2A(ctx, instance, homeRec); err != nil {
+		a2aState, err = r.reconcileA2A(ctx, instance, homeRec)
+		// For the deferred write at 2d, failed pass or not: a step after
+		// the dispatcher's failing doesn't undo what it did to Job mode.
+		dispatcherJobMode = a2aState.dispatcherJobMode
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if modeErr == nil {
 		if err := r.cleanupA2A(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
+		// The dispatcher and its Job mode went with the stack.
+		dispatcherJobMode = jobModeTornDown
 	}
 	// The record travelled into the render (the projection) and travels on
 	// the state to every status writer below, the failed and parked paths
