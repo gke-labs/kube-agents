@@ -224,6 +224,32 @@ func TestTheSweepKeepsATombstoneForTheRetention(t *testing.T) {
 	}
 }
 
+// The retention is the install config's when it carries one (#4873): with
+// the stream's max age raised to twice the default, a tombstone past the
+// default but inside the longer retention stays, and one past the longer
+// retention goes.
+func TestTheSweepKeepsATombstoneForTheConfiguredRetention(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	now := time.Now()
+	long := 2 * lib.ProfileSubmitRetention
+	pastDefault := b.putTombstone("tse", "read", "tse-0", "task-past-default", now.Add(-lib.ProfileSubmitRetention-2*tombstoneMargin))
+	pastLong := b.putTombstone("tse", "read", "tse-0", "task-past-long", now.Add(-long-2*tombstoneMargin))
+	cfg := testConfig()
+	cfg.SweepAfter = time.Second
+	install := oneProfile("tse", 2, "tse-0")
+	install.update(func(c *lib.DispatchConfig) { c.SubmitRetentionSeconds = int(long / time.Second) })
+	b.runDispatcher(cfg, install, &fakeVerifier{})
+	waitFor(t, 10*time.Second, "the tombstone past the configured retention swept", func() bool {
+		_, ok := b.records()[pastLong]
+		return !ok
+	})
+	time.Sleep(time.Second) // several more sweeps
+	if _, ok := b.tombstones()[pastDefault]; !ok {
+		t.Errorf("the sweep removed %s, past the default retention but inside the configured one", pastDefault)
+	}
+}
+
 // A tombstone whose lease would still run keeps no pod busy: its task is
 // over, so the pod is offered new work at once.
 func TestATombstoneDoesNotKeepItsPodBusy(t *testing.T) {
@@ -331,4 +357,24 @@ func TestLeasedPodsReadsTheTombstonesInOnePass(t *testing.T) {
 		t.Errorf("leased pods %v, want only tse-live", pods)
 	}
 	t.Logf("leasedPods over %d tombstones took %v", tombstones, took)
+}
+
+// The configured retention counts when it is longer than the fixed value,
+// and a config never takes it below the fixed value. No value gets the
+// fixed value.
+func TestSubmitRetentionIsTheConfiguredMaxAgeButNeverLess(t *testing.T) {
+	long := 2 * lib.ProfileSubmitRetention
+	for name, tc := range map[string]struct {
+		seconds int
+		want    time.Duration
+	}{
+		"none":            {0, lib.ProfileSubmitRetention},
+		"longer":          {int(long / time.Second), long},
+		"shorter":         {int(time.Hour / time.Second), lib.ProfileSubmitRetention},
+		"the fixed value": {int(lib.ProfileSubmitRetention / time.Second), lib.ProfileSubmitRetention},
+	} {
+		if got := submitRetention(lib.DispatchConfig{SubmitRetentionSeconds: tc.seconds}); got != tc.want {
+			t.Errorf("%s: submitRetention = %v, want %v", name, got, tc.want)
+		}
+	}
 }
