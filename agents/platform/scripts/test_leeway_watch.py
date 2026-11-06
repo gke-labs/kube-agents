@@ -792,8 +792,28 @@ class GateAndReportingTests(unittest.TestCase):
             "suspectedCause": "taint_exclusion",
             "remediation": {"kind": "cluster_nodes", "summary": "Uncordon nodes in us-central1-c."},
         }
-        info_finding = make_topology_finding(name="info-app", tier="C", severity="info", cause="selector_confined")
-        info_finding["score"]["drift"] = 0.0
+        info_finding = make_topology_finding(name="info-app", tier="C", severity="info", cause="constraint_ignored")
+        info_finding["score"]["drift"] = 0.67
+        selector_confined_warn = make_topology_finding(
+            name="confined-app",
+            replicas=3,
+            tier="C",
+            severity="warning",
+            cause="selector_confined",
+            actual_a=3,
+            actual_b=0,
+        )
+        selector_confined_warn["score"]["drift"] = 0.0
+        low_drift = make_topology_finding(
+            name="low-drift",
+            replicas=3,
+            tier="B",
+            severity="warning",
+            cause="constraint_ignored",
+            actual_a=3,
+            actual_b=0,
+        )
+        low_drift["score"]["drift"] = 0.2
         low_share = make_topology_finding(
             name="mild-skew",
             replicas=3,
@@ -803,7 +823,7 @@ class GateAndReportingTests(unittest.TestCase):
             actual_a=2,
             actual_b=1,
         )
-        low_share["score"]["drift"] = 0.2
+        low_share["score"]["drift"] = 0.5
         high_share = make_topology_finding(
             name="full-skew",
             replicas=3,
@@ -833,7 +853,14 @@ class GateAndReportingTests(unittest.TestCase):
                 {
                     "cluster": "p1/us-central1/seeded-d",
                     "status": "ok",
-                    "topology_findings": [domain_down, info_finding, low_share, high_share],
+                    "topology_findings": [
+                        domain_down,
+                        info_finding,
+                        selector_confined_warn,
+                        low_drift,
+                        low_share,
+                        high_share,
+                    ],
                     "rank_findings": [wedged_rank, info_rank],
                 }
             ],
@@ -850,11 +877,13 @@ class GateAndReportingTests(unittest.TestCase):
         ):
             code, out = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
         self.assertEqual(code, 0)
-        self.assertIn("3 finding(s) due", out)
+        self.assertIn("4 finding(s) due", out)
         self.assertIn("Domain/us-central1-c [taint_exclusion]", out)
+        self.assertIn("Deployment/shop/confined-app [selector_confined, 100%]", out)
         self.assertIn("Deployment/shop/full-skew [constraint_ignored, 100%]", out)
         self.assertIn("ComputeClass/gpu-spot [wedged, 0%]", out)
         self.assertNotIn("info-app", out)
+        self.assertNotIn("low-drift", out)
         self.assertNotIn("mild-skew", out)
         self.assertNotIn("unused-tier", out)
 
@@ -935,6 +964,17 @@ class GateAndReportingTests(unittest.TestCase):
             self.assertEqual(len(a2a_calls), 3)
             ledger = watch.load_ledger(self.home)
             self.assertNotIn(watch.ANNOUNCED_KEY, ledger)
+
+        # If a publish failure marker is in ledger.json and NATS_URL is later unconfigured,
+        # the next clean quiet tick drops the stale marker without printing "succeeded again".
+        ledger_with_marker = watch.load_ledger(self.home)
+        ledger_with_marker[watch.ANNOUNCED_KEY] = {watch.ANNOUNCED_TOPIC_PUBLISH_KEY: watch.ERROR_KIND_TOPIC_PUBLISH}
+        watch.save_ledger(self.home, ledger_with_marker)
+        t3 = T0 + timedelta(days=3)
+        code3, out3 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t3)
+        self.assertEqual(code3, 0)
+        self.assertEqual(out3, "")
+        self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
 
     def test_partial_scan_retirement_defers_report_refresh_and_topic_retry_until_clean_scan(self) -> None:
         rep_day0 = make_report(
@@ -1231,6 +1271,34 @@ class GateAndReportingTests(unittest.TestCase):
         self.assertIn("Deployment/shop/legacy-api [unknown, 100%]", out)
         self.assertIn("ComputeClass/novel-class [last-rank, 75%]", out)
 
+        # Even when non-zero drift/share/excess floors are active, a finding that omits
+        # score and replica/domain counts (`has_drift=False, has_max_domain_share=False, excess_over_floor=None`)
+        # is not dropped by metric gates that have no metric to compare against.
+        bare_norm = watch.normalize_topology_finding(
+            "p1/us-central1/seeded-d",
+            {
+                "kind": "leeway.placement_drift",
+                "subject": {"kind": "Deployment", "namespace": "shop", "name": "bare", "replicas": 0},
+                "topologyKey": "topology.kubernetes.io/zone",
+                "tier": "C",
+                "severity": "urgent",
+                "suspectedCause": "unknown",
+                "domains": [],
+            },
+        )
+        self.assertFalse(bare_norm[watch.HAS_DRIFT_KEY])
+        self.assertFalse(bare_norm[watch.HAS_MAX_DOMAIN_SHARE_KEY])
+        self.assertIsNone(bare_norm[watch.EXCESS_OVER_FLOOR_KEY])
+        self.assertTrue(
+            watch.passes_topology_thresholds(
+                bare_norm,
+                min_sev_rank=watch.SEVERITY_RANKS["warning"],
+                min_d=0.4,
+                min_share=0.8,
+                min_excess=1,
+            )
+        )
+
     def test_rebalancing_skew_down_to_pigeonhole_floor_retires_and_realerts_on_restack(self) -> None:
         stacked = make_topology_finding(name="kube-dns", namespace="kube-system", cause="unknown", severity="warning")
         stacked["subject"]["replicas"] = 2
@@ -1282,6 +1350,41 @@ class GateAndReportingTests(unittest.TestCase):
         self.assertEqual(code2, 0)
         self.assertIn("1 finding(s) due (1 new finding)", out2)
         self.assertIn("Deployment/kube-system/kube-dns [unknown, 100%]", out2)
+
+        # Pre-existing ledger fallback: strip `excess_over_floor` from the ledger entry (matching
+        # the pre-upgrade ledger schema that stored only `observed_skew: 2`) and confirm rebalancing
+        # to `observedSkew: 1, minAchievableSkew: 1` still retires the finding via `observed_skew` comparison.
+        legacy_ledger = watch.load_ledger(self.home)
+        for entry in legacy_ledger[watch.FINDINGS_KEY].values():
+            entry.pop(watch.EXCESS_OVER_FLOOR_KEY, None)
+        watch.save_ledger(self.home, legacy_ledger)
+
+        t3 = T0 + timedelta(days=3)
+        rep3 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [rebalanced]}], t3)
+        code3, out3 = self.run_tick(lambda *a, **kw: completed_json(rep3), now=t3)
+        self.assertEqual(code3, 0)
+        self.assertIn("1 finding(s) resolved (ap-mcp:kube-system/kube-dns)", out3)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY], {})
+
+        # Non-`unknown` cause (`prior_cause != "unknown"`) at `observedSkew == minAchievableSkew == 1`
+        # that resolves into a balanced `unknown` floor-equal finding also retires cleanly.
+        constrained_odd = json.loads(json.dumps(rebalanced))
+        constrained_odd["suspectedCause"] = "constraint_ignored"
+        constrained_odd["score"]["drift"] = 0.25
+        t4 = T0 + timedelta(days=4)
+        rep4 = make_report(
+            [{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [constrained_odd]}], t4
+        )
+        code4, out4 = self.run_tick(lambda *a, **kw: completed_json(rep4), now=t4)
+        self.assertEqual(code4, 0)
+        self.assertIn("Deployment/kube-system/kube-dns [constraint_ignored, 50%]", out4)
+
+        t5 = T0 + timedelta(days=5)
+        rep5 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [rebalanced]}], t5)
+        code5, out5 = self.run_tick(lambda *a, **kw: completed_json(rep5), now=t5)
+        self.assertEqual(code5, 0)
+        self.assertIn("1 finding(s) resolved (ap-mcp:kube-system/kube-dns)", out5)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY], {})
 
     def test_non_dry_run_threshold_override_report_refreshes_on_next_default_tick(self) -> None:
         warn_skew = make_topology_finding(name="checkout-api", severity="warning", cause="constraint_ignored")

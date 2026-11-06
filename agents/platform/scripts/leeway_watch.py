@@ -246,7 +246,6 @@ SEVERITY_FIELD = "severity"
 TIER_FIELD = "tier"
 SUSPECTED_CAUSE_FIELD = "suspected_cause"
 OBSERVED_SKEW_FIELD = "observed_skew"
-MIN_ACHIEVABLE_SKEW_KEY = "min_achievable_skew"
 EXCESS_OVER_FLOOR_KEY = "excess_over_floor"
 DRIFT_KEY = "drift"
 HAS_DRIFT_KEY = "has_drift"
@@ -738,7 +737,6 @@ def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[st
         "suspected_cause": str(finding.get("suspectedCause") or DEFAULT_UNKNOWN),
         "contributing_factors": _str_list(finding.get("contributingFactors")),
         "observed_skew": _int(raw_observed_skew, 0),
-        MIN_ACHIEVABLE_SKEW_KEY: _int(raw_min_skew, 0),
         EXCESS_OVER_FLOOR_KEY: (
             raw_observed_skew - raw_min_skew
             if raw_observed_skew is not None and raw_min_skew is not None
@@ -931,14 +929,8 @@ def filter_report_findings(report: dict[str, Any]) -> dict[str, Any]:
 
 def extract_findings(
     report: dict[str, Any],
-    *,
-    already_filtered: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, str]]:
     """Extract normalized findings, ok clusters, and per-cluster errors from a report."""
-    min_sev_rank = min_severity_rank() if not already_filtered else 0
-    min_d = min_drift() if not already_filtered else ZERO_FLOAT
-    min_share = min_max_domain_share() if not already_filtered else ZERO_FLOAT
-    min_excess = min_excess_over_floor() if not already_filtered else 0
     findings: dict[str, dict[str, Any]] = {}
     ok_clusters: set[str] = set()
     cluster_errors: dict[str, str] = {}
@@ -953,19 +945,11 @@ def extract_findings(
             for tf in cr.get(TOPOLOGY_FINDINGS_FIELD) or []:
                 if isinstance(tf, dict):
                     norm = normalize_topology_finding(cluster, tf)
-                    if already_filtered or passes_topology_thresholds(
-                        norm,
-                        min_sev_rank=min_sev_rank,
-                        min_d=min_d,
-                        min_share=min_share,
-                        min_excess=min_excess,
-                    ):
-                        findings[norm[KEY_FIELD]] = norm
+                    findings[norm[KEY_FIELD]] = norm
             for rf in cr.get(RANK_FINDINGS_FIELD) or []:
                 if isinstance(rf, dict):
                     norm = normalize_rank_finding(cluster, rf)
-                    if already_filtered or passes_rank_thresholds(norm, min_sev_rank=min_sev_rank):
-                        findings[norm[KEY_FIELD]] = norm
+                    findings[norm[KEY_FIELD]] = norm
         else:
             cluster_errors[cluster] = str(cr.get(ERROR_FIELD) or DEFAULT_CLUSTER_SCAN_FAILED)
     return findings, ok_clusters, cluster_errors
@@ -1279,9 +1263,10 @@ def record_topic_publish_result(
                 )
             )
         announced[ANNOUNCED_TOPIC_PUBLISH_KEY] = ERROR_KIND_TOPIC_PUBLISH
-    elif published and ANNOUNCED_TOPIC_PUBLISH_KEY in announced:
+    elif ANNOUNCED_TOPIC_PUBLISH_KEY in announced:
         del announced[ANNOUNCED_TOPIC_PUBLISH_KEY]
-        lines.append(TOPIC_PUBLISH_CLEARED_LINE.format(prefix=LINE_PREFIX, topic=A2A_TOPIC_NAME))
+        if published:
+            lines.append(TOPIC_PUBLISH_CLEARED_LINE.format(prefix=LINE_PREFIX, topic=A2A_TOPIC_NAME))
 
 
 # --- failure marker ----------------------------------------------------------
@@ -1450,9 +1435,9 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
 
     lines: list[str] = []
 
-    raw_findings, ok_clusters, cluster_errors = extract_findings(report, already_filtered=True)
+    raw_findings, ok_clusters, cluster_errors = extract_findings(report)
     report = filter_report_findings(report)
-    active_findings, _, _ = extract_findings(report, already_filtered=True)
+    active_findings, _, _ = extract_findings(report)
     all_errors: dict[str, str] = {**scan_errors, **cluster_errors}
     all_error_kinds: dict[str, str] = {
         **error_kinds,
@@ -1668,6 +1653,8 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
                     A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX), latest_json
                 )
                 record_topic_publish_result(published, err_detail, announced, lines)
+            else:
+                del announced[ANNOUNCED_TOPIC_PUBLISH_KEY]
 
         updated_ledger: dict[str, Any] = {
             LEDGER_SCHEMA_KEY: LEDGER_SCHEMA_VERSION,
