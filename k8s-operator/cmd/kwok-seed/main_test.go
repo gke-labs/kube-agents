@@ -77,6 +77,9 @@ func defaultServiceAccounts(lay layout) []runtime.Object {
 	return objs
 }
 
+// seededNamespaces is where runningPods puts its pods.
+var seededNamespaces = []string{"team-000"}
+
 // runningPods is n Pods as a count of the Running ones would list them.
 func runningPods(n int) []runtime.Object {
 	objs := make([]runtime.Object, 0, n)
@@ -424,7 +427,7 @@ func TestWaitRunning(t *testing.T) {
 	quietLog(t)
 
 	t.Run("satisfied at once", func(t *testing.T) {
-		seconds, err := waitRunning(context.Background(), newMetadataClient(t, runningPods(3)...), 3, time.Hour)
+		seconds, err := waitRunning(context.Background(), newMetadataClient(t, runningPods(3)...), seededNamespaces, 3, time.Hour)
 		if err != nil {
 			t.Fatalf("err = %v, want none", err)
 		}
@@ -432,8 +435,18 @@ func TestWaitRunning(t *testing.T) {
 			t.Errorf("seconds = %v, want the wait's wall time", seconds)
 		}
 	})
+	t.Run("counts only the seeded namespaces", func(t *testing.T) {
+		// Two Running pods elsewhere (the cluster's own, or an earlier run's
+		// under another prefix) do not stand in for the third seeded one.
+		objects := append(runningPods(2), partialObject("Pod", "kube-system", "coredns"), partialObject("Pod", "other-000", "pod-0"))
+		_, err := waitRunning(context.Background(), newMetadataClient(t, objects...), seededNamespaces, 3, time.Nanosecond)
+		want := "2 of 3 pods Running after 1ns"
+		if err == nil || err.Error() != want {
+			t.Fatalf("err = %v, want %q", err, want)
+		}
+	})
 	t.Run("times out", func(t *testing.T) {
-		seconds, err := waitRunning(context.Background(), newMetadataClient(t, runningPods(2)...), 3, time.Nanosecond)
+		seconds, err := waitRunning(context.Background(), newMetadataClient(t, runningPods(2)...), seededNamespaces, 3, time.Nanosecond)
 		want := "2 of 3 pods Running after 1ns"
 		if err == nil || err.Error() != want {
 			t.Fatalf("err = %v, want %q", err, want)
@@ -445,7 +458,7 @@ func TestWaitRunning(t *testing.T) {
 	t.Run("cancelled context", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err := waitRunning(ctx, newMetadataClient(t), 3, time.Hour)
+		_, err := waitRunning(ctx, newMetadataClient(t), seededNamespaces, 3, time.Hour)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("err = %v, want %v", err, context.Canceled)
 		}
@@ -455,7 +468,7 @@ func TestWaitRunning(t *testing.T) {
 		client.PrependReactor("list", podsResource, func(k8stesting.Action) (bool, runtime.Object, error) {
 			return true, nil, errors.New("boom")
 		})
-		_, err := waitRunning(context.Background(), client, 3, time.Hour)
+		_, err := waitRunning(context.Background(), client, seededNamespaces, 3, time.Hour)
 		if want := "count Running pods: boom"; err == nil || err.Error() != want {
 			t.Fatalf("err = %v, want %q", err, want)
 		}

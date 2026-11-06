@@ -131,7 +131,6 @@ type flags struct {
 	kubeconfig      string
 	kubeContext     string
 	profilePath     string
-	counts          profile
 	workers         int
 	seed            int64
 	qps             float64
@@ -285,7 +284,7 @@ func parseFlags(args []string) (flags, map[string]int, error) {
 	fs.StringVar(&f.profilePath, "profile", "", "JSON profile holding the counts: nodes, pods, namespaces, services, events")
 	counts := make(map[string]*int, len(countFields))
 	for _, c := range countFields {
-		counts[c.name] = c.field(&f.counts)
+		counts[c.name] = new(int)
 		fs.IntVar(counts[c.name], c.name, 0, c.name+" count; overrides the profile's")
 	}
 	fs.IntVar(&f.workers, "workers", defaultWorkers, "concurrent create requests")
@@ -392,7 +391,7 @@ func seed(ctx context.Context, client kubernetes.Interface, metaClient metadata.
 	}
 	if f.waitRunning && ctx.Err() == nil {
 		want := s.Phases.Pods.Created + s.Phases.Pods.Existed
-		seconds, err := waitRunning(ctx, metaClient, want, f.waitTimeout)
+		seconds, err := waitRunning(ctx, metaClient, names, want, f.waitTimeout)
 		s.PodsRunningAfterSeconds = seconds
 		if err != nil {
 			errs.record(err)
@@ -488,16 +487,10 @@ feed:
 // place: a namespace it failed to create never gets one, and waiting on it
 // would only run the clock out.
 func waitForDefaultServiceAccounts(ctx context.Context, client metadata.Interface, names []string, want int64, timeout time.Duration) error {
-	ours := make(map[string]bool, len(names))
-	for _, name := range names {
-		ours[name] = true
-	}
 	resource := corev1.SchemeGroupVersion.WithResource(serviceAccountsResource)
 	start := time.Now()
 	for {
-		have, err := countPaged(ctx, client, resource, serviceAccountFieldSelector, func(m *metav1.PartialObjectMetadata) bool {
-			return ours[m.Namespace]
-		})
+		have, err := countPaged(ctx, client, resource, serviceAccountFieldSelector, inNamespaces(names))
 		if err != nil {
 			return fmt.Errorf("count default ServiceAccounts: %w", err)
 		}
@@ -517,13 +510,26 @@ func waitForDefaultServiceAccounts(ctx context.Context, client metadata.Interfac
 	}
 }
 
-// waitRunning polls the count of Running Pods until it reaches want or
-// timeout passes, and returns the seconds it took either way.
-func waitRunning(ctx context.Context, client metadata.Interface, want int64, timeout time.Duration) (float64, error) {
+// inNamespaces keeps the objects in one of the namespaces in names. Both
+// waits count through it: the cluster has pods and ServiceAccounts of its
+// own, and a reused one has those of an earlier run under another prefix,
+// and neither may stand in for the objects this run put in place.
+func inNamespaces(names []string) func(*metav1.PartialObjectMetadata) bool {
+	ours := make(map[string]bool, len(names))
+	for _, name := range names {
+		ours[name] = true
+	}
+	return func(m *metav1.PartialObjectMetadata) bool { return ours[m.Namespace] }
+}
+
+// waitRunning polls the count of Running Pods in the namespaces in names
+// until it reaches want or timeout passes, and returns the seconds it took
+// either way.
+func waitRunning(ctx context.Context, client metadata.Interface, names []string, want int64, timeout time.Duration) (float64, error) {
 	resource := corev1.SchemeGroupVersion.WithResource(podsResource)
 	start := time.Now()
 	for {
-		running, err := countPaged(ctx, client, resource, runningFieldSelector, nil)
+		running, err := countPaged(ctx, client, resource, runningFieldSelector, inNamespaces(names))
 		if err != nil {
 			return time.Since(start).Seconds(), fmt.Errorf("count Running pods: %w", err)
 		}
