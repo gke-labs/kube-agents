@@ -83,7 +83,7 @@ INJECT_MARKERS = [
     },
     {
         "name": "a2a.activity",
-        "args": {"taskId": "task-43a7d48b651b04e0"},
+        "args": {"calls": 1, "dropped": 0},
         "result": None,
         "status": "completed",
     },
@@ -305,6 +305,16 @@ def test_another_clusters_agent_doing_the_work_fails_the_worker_entry():
     }
     assert _status(WORKER_ENTRY, [to_b] + _cluster_run(agent=SEEDED_B)) == "fail"
     assert _status(ROUTER_ENTRY, [to_b] + _cluster_run(agent=SEEDED_B)) == "pass"
+    # The card named seeded-a's agent and another cluster's agent did the work:
+    # the router leaf passes, so only the worker leaf can fail the entry here.
+    assert (
+        _status(WORKER_ENTRY, [READABLE_CREATE] + _cluster_run(agent=SEEDED_B))
+        == "fail"
+    )
+    assert (
+        _status(WORKER_ENTRY, [READABLE_CREATE] + _cluster_run(agent="platform"))
+        == "fail"
+    )
 
 
 def test_a_card_filed_to_platform_fails_the_worker_entry_whoever_completes_it():

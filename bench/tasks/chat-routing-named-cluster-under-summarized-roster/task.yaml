@@ -32,7 +32,8 @@
 # shapeOf, a2a/docs/hermes-bridge.md "What goes on the bus"), so no pattern
 # over them can name the assignee, and the workers are not graded there
 # until #2619. The route is therefore graded over the agent API only (a dev
-# install, the today lane); on the nightly a card to `platform` whose
+# install; no CI lane runs this case over that transport today); on the
+# nightly a card to `platform` whose
 # answer named the namespaces passes until #2619 lands, with the worker
 # evidence on the record. And that the answer names the cluster's
 # namespaces, including seeded-debug, which only a read of seeded-a can
