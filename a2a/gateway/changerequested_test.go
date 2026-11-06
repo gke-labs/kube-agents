@@ -355,3 +355,31 @@ func TestInjectConfirmIntent(t *testing.T) {
 		}
 	}
 }
+
+// A confirm frame on .in, which console-mcp can publish, never reaches a
+// submission as a change request: the console adapter drops it, and the
+// typed turn after it is submitted with changeRequested false. Only
+// chat.console.<token>.confirm carries the intent.
+func TestChangeRequested_AConfirmFrameOnTheInSubjectNeverSetsIt(t *testing.T) {
+	console := startConsoleRig(t)
+	params := targetParams("p1", "us-east1", "prod")
+	console.send(t, "tab-cr-in", ConsoleInFrame{MessageID: "m1", Text: "open the pull request", Kind: "confirm", Addressee: "cluster", Parameters: params})
+	console.send(t, "tab-cr-in", ConsoleInFrame{MessageID: "m2", Text: "what's wrong with it", Addressee: "cluster", Parameters: params})
+	waitFor(t, "the typed frame", func() bool { return len(console.inbound()) >= 1 })
+	turns := console.inbound()
+	for _, m := range turns {
+		if m.Intent == IntentConfirm {
+			t.Fatalf("a frame on .in came through with the confirm intent: %+v", m)
+		}
+	}
+	if len(turns) != 1 || turns[0].MessageID != "m2" {
+		t.Fatalf("console turns = %+v, want only m2", turns)
+	}
+
+	r := startProfileRig(t)
+	r.adapter.inbox <- turns[0]
+	env := submissionOn(t, r, "prod-east")
+	if found, got := submittedChange(t, env); got {
+		t.Fatalf("submission changeRequested = %v (part found %v), want false", got, found)
+	}
+}
