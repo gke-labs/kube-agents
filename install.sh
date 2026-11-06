@@ -524,6 +524,10 @@ PARAM_GITHUB_APP_FROM_FLAG="false"
 # when an interactive run must replace the token rather than keep it.
 PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG="false"
 PARAM_GITOPS_TOKEN_MUST_REPLACE="false"
+# The token Secret the recorded forge used, set on a switch between two forges
+# with a token. Its read-token key is the old forge's too, so
+# create_gitlab_read_token_secret removes it when this run writes none.
+PARAM_GITOPS_OLD_TOKEN_SECRET=""
 # The forge and host install.env records, before any flag changes them. A
 # GitHub Enterprise Server host is recorded with GITOPS_FORGE=github, a
 # self-managed GitLab host with GITOPS_FORGE=gitlab, so a host is kept only
@@ -5451,8 +5455,14 @@ validate_gitops_forge_flags() {
     # one forge's token to the other's host. So it is kept only when this run
     # names the new token or the Secret that holds it.
     if gitops_forge_uses_token "$recorded_forge" && gitops_forge_uses_token "$forge" &&
+      [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ]; then
+      PARAM_GITOPS_OLD_TOKEN_SECRET="${PARAM_GITLAB_TOKEN_SECRET:-$(default_gitops_token_secret "$recorded_forge")}"
+    fi
+    if gitops_forge_uses_token "$recorded_forge" && gitops_forge_uses_token "$forge" &&
       [ -z "${PARAM_GITLAB_TOKEN_FILE:-}" ] && [ "${PARAM_GITLAB_TOKEN_SECRET_FROM_FLAG:-false}" != "true" ]; then
-      if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
+      # No terminal is the same as --non-interactive here: the token prompt
+      # after the apply cannot run, and the old token would stay.
+      if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
         print_error "The recorded token Secret '${PARAM_GITLAB_TOKEN_SECRET:-}' holds the ${recorded_label} token, and this run's GitOps forge is ${forge_label}. Give the ${forge_label} token with --gitops-token-file, or name the Secret that holds it with --gitops-token-secret."
         return 1
       fi
@@ -6110,6 +6120,10 @@ create_gitlab_token_secret() {
     exists="false"
   fi
   if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    if [ "${PARAM_GITOPS_TOKEN_MUST_REPLACE:-false}" = "true" ]; then
+      print_error "Secret '${name}' holds the token of the forge this install used before, and this run has no terminal to ask for the ${label} token. Re-run with --gitops-token-file."
+      return 1
+    fi
     if [ "$exists" = "true" ]; then
       print_info "Keeping the existing ${label} token Secret '${name}'."
     else
@@ -6142,6 +6156,11 @@ create_gitlab_token_secret() {
   echo "" >/dev/tty
   token="$(gitlab_token_strip "$token")"
   if [ -z "$token" ]; then
+    if [ "${PARAM_GITOPS_TOKEN_MUST_REPLACE:-false}" = "true" ]; then
+      # A forge switch: an empty answer would leave the old forge's token.
+      print_error "No ${label} token entered. Secret '${name}' still holds the token of the forge this install used before, and the agent would send it to ${label}. Re-run with --gitops-token-file, or enter the token."
+      return 1
+    fi
     print_warning "No token entered; nothing was stored. Create Secret '${name}' later (see the install guide)."
     return 0
   fi
@@ -6163,7 +6182,21 @@ create_gitlab_read_token_secret() {
   local label
   label="$(gitops_forge_label "${GITOPS_FORGE:-gitlab}")"
   local token="" rc=0
-  [ -n "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ] || return 0
+  if [ -z "${PARAM_GITLAB_READ_TOKEN_FILE:-}" ]; then
+    # A forge switch that keeps the old Secret: its read-token key is the old
+    # forge's, and the broker would present it to the new forge's host.
+    if [ -n "${PARAM_GITOPS_OLD_TOKEN_SECRET:-}" ] && [ "$name" = "$PARAM_GITOPS_OLD_TOKEN_SECRET" ] &&
+      [ -n "$(kubectl get secret "$name" -n "$namespace" --context "$context" \
+        -o "jsonpath={.data.${GITLAB_READ_TOKEN_SECRET_KEY}}" 2>/dev/null)" ]; then
+      if ! kubectl patch secret "$name" -n "$namespace" --context "$context" --type json \
+        -p "[{\"op\":\"remove\",\"path\":\"/data/${GITLAB_READ_TOKEN_SECRET_KEY}\"}]" >/dev/null 2>&1; then
+        print_error "Could not remove key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}'. It holds the read token of the forge this install used before. Remove it: kubectl patch secret ${name} -n ${namespace} --type json -p '[{\"op\":\"remove\",\"path\":\"/data/${GITLAB_READ_TOKEN_SECRET_KEY}\"}]'"
+        return 1
+      fi
+      print_info "Removed key ${GITLAB_READ_TOKEN_SECRET_KEY} from Secret '${name}': it held the read token of the forge this install used before. Give the ${label} read token with GITOPS_READ_TOKEN_FILE to read private context repositories."
+    fi
+    return 0
+  fi
   IFS= read -r -d '' token <"$PARAM_GITLAB_READ_TOKEN_FILE" || true
   token="$(gitlab_token_strip "$token")"
   if [ -z "$token" ]; then

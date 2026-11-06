@@ -217,9 +217,11 @@ the examples above.
 **A switch of forge.** When `install.env` records another forge with a token (GitLab, or the other
 Bitbucket product), the recorded token Secret holds that forge's token. The installer does not keep
 it. Give the new token with `--gitops-token-file`, or name the Secret that holds it with
-`--gitops-token-secret`. A non-interactive run without one of them stops before it changes
-anything. An interactive run asks for the new token after the apply and does not offer to keep the
-old one.
+`--gitops-token-secret`. A non-interactive run, or a run with no terminal, stops before it changes
+anything when it has neither. An interactive run asks for the new token after the apply, does not
+offer to keep the old one, and stops if you enter none. When the run keeps the recorded Secret and
+gives no read token, the installer removes the Secret's `read-token` key, which holds the old
+forge's read token, and says so. Give the new read token with `GITOPS_READ_TOKEN_FILE`.
 
 **No token file.** In a non-interactive run without `--gitops-token-file`, the install completes
 and prints the command that creates the Secret. Until the Secret exists, every Bitbucket call

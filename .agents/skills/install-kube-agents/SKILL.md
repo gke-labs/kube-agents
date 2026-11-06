@@ -585,8 +585,10 @@ Rules for the agent:
   prints the command that creates the Secret), or pass the operator's file or password-manager
   command as `--gitops-token-file=<(…)`. `--gitlab-token-file` is the same flag under its old name.
 - When `install.env` records another forge with a token (GitLab, or the other Bitbucket product),
-  the run needs `--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run
-  stops before it changes anything, because the recorded Secret holds the old forge's token.
+  the run needs `--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run,
+  or a run with no terminal, stops before it changes anything, because the recorded Secret holds the
+  old forge's token. When the recorded Secret is kept and no read token is given, the installer
+  removes its `read-token` key; pass the new read token with `GITOPS_READ_TOKEN_FILE`.
 - Only for a Data Center instance behind a private CA, add `--gitops-ca-file` (a regular PEM file).
 - Tell the operator that Bitbucket has no issue tracker: the fleet audits keep their ledger in the
   report store and post to chat, and still open pull requests in the GitOps repository.

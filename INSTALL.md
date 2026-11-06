@@ -349,7 +349,8 @@ Rules for the agent:
 - On an install whose `install.env` records another forge with a token (GitLab, or the other
   Bitbucket product), give the new token with `--gitops-token-file` or name its Secret with
   `--gitops-token-secret`: the installer refuses to keep the recorded Secret, which holds the old
-  forge's token.
+  forge's token. A run with no terminal is refused like a non-interactive one. When the recorded
+  Secret is kept and no read token is given, the installer removes its `read-token` key.
 - Only for a Data Center instance whose certificate a private CA signed, add
   `--gitops-ca-file="$HOME/secure/internal-ca.pem"`. The installer stores it in the Secret
   `bitbucket-forge-ca`. The installer refuses it for Cloud.

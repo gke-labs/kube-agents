@@ -417,8 +417,10 @@ environment are aliases of the `GITLAB_*` variables. The generator writes `gitop
 drops a recorded identity, and a default token Secret name becomes the new forge's default. A
 switch between two forges with a token (GitLab, Bitbucket Cloud, Bitbucket Data Center) does not
 keep the recorded token Secret, which holds the old forge's token: the run must give
-`--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run stops, and an
-interactive run asks for the new token after the apply.
+`--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run or a run with
+no terminal stops, and an interactive run asks for the new token after the apply and stops if none
+is entered. When the run keeps the recorded Secret and gives no read token, the installer removes
+the Secret's `read-token` key, which holds the old forge's read token.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.

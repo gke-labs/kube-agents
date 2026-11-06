@@ -254,16 +254,27 @@ class BitbucketFlagsTest(unittest.TestCase):
         self.assertIn("rc=0 repo=acme/infra host= secret=bb-cloud", proc.stdout, proc.stderr)
 
     def test_an_interactive_forge_switch_asks_for_the_new_token(self):
-        proc = self._validate(self._cloud(
-            PARAM_NON_INTERACTIVE="false", PARAM_GITOPS_RECORDED_FORGE="bitbucket-datacenter",
-            PARAM_GITLAB_TOKEN_SECRET="bitbucket-forge-token"))
-        self.assertIn("rc=0 ", proc.stdout, proc.stderr + proc.stdout)
+        # The run has a terminal: the test stands one in.
         proc = self._run_install_func(
+            "has_controlling_tty() { return 0; }; "
             "PARAM_GITOPS_FORGE=bitbucket PARAM_GITOPS_REPO=acme/infra PARAM_NON_INTERACTIVE=false "
             "PARAM_GITOPS_RECORDED_FORGE=bitbucket-datacenter PARAM_GITLAB_TOKEN_SECRET=bitbucket-forge-token; "
             'validate_gitops_forge_flags >/dev/null 2>&1; echo "replace=${PARAM_GITOPS_TOKEN_MUST_REPLACE:-}"'
         )
         self.assertIn("replace=true", proc.stdout, proc.stderr)
+
+    def test_a_forge_switch_without_a_terminal_is_refused_like_non_interactive(self):
+        """CI runs with no terminal and often without --non-interactive. The
+        token prompt cannot run there, so the switch must stop at the check,
+        before anything changes."""
+        proc = self._run_install_func(
+            "has_controlling_tty() { return 1; }; "
+            "PARAM_GITOPS_FORGE=bitbucket PARAM_GITOPS_REPO=acme/infra PARAM_NON_INTERACTIVE=false "
+            "PARAM_GITOPS_RECORDED_FORGE=bitbucket-datacenter PARAM_GITLAB_TOKEN_SECRET=bitbucket-forge-token; "
+            'validate_gitops_forge_flags && rc=0 || rc=$?; echo "rc=$rc"'
+        )
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+        self.assertIn("--gitops-token-file", proc.stdout + proc.stderr)
 
     def test_parse_args_marks_a_named_secret(self):
         proc = self._run_install_func(
@@ -280,6 +291,85 @@ class BitbucketFlagsTest(unittest.TestCase):
         })
         self.assertIn("rc=0 ", proc.stdout, proc.stderr + proc.stdout)
         self.assertIn("Dropping the recorded Bitbucket Cloud identity", proc.stdout + proc.stderr)
+
+
+_KUBECTL_STUB = r"""#!/usr/bin/env bash
+echo "kubectl $*" >> "$STUB_DIR/kubectl.log"
+case "$*" in
+  *"get secret"*"jsonpath={.data.token}"*) printf 'b2xk' ;;
+  *"get secret"*"jsonpath={.data.read-token}"*) [ "${STUB_HAS_READ_TOKEN:-1}" = 1 ] && printf 'b2xk' ;;
+esac
+case "$1 $2" in
+  "create secret") cat >/dev/null 2>&1; printf 'apiVersion: v1\nkind: Secret\n' ;;
+  "apply"*) cat >/dev/null ;;
+esac
+exit 0
+"""
+
+
+class BitbucketForgeSwitchSecretTest(unittest.TestCase):
+    """After a forge switch, the token Secret must hold nothing of the old
+    forge: not its write token, and not its read token."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp = pathlib.Path(tmp.name)
+        bin_dir = self._tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "kubectl").write_text(_KUBECTL_STUB)
+        (bin_dir / "kubectl").chmod(0o755)
+        self._bin = bin_dir
+        (self._tmp / "install.env").write_text("")
+
+    def _run(self, body, **env):
+        setup = f'source "{_INSTALLER_COMMON}"\nKUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{body}\n'
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._tmp / "install.env"), "STUB_DIR": str(self._tmp),
+                     "PATH": f"{self._bin}:" + __import__("os").environ["PATH"]}
+        overrides.update(env)
+        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides, absent=_TOKEN_SOURCE_VARS))
+
+    def _log(self):
+        f = self._tmp / "kubectl.log"
+        return f.read_text() if f.exists() else ""
+
+    def test_a_switch_removes_the_old_read_token(self):
+        proc = self._run(
+            "GITOPS_FORGE=bitbucket GITLAB_TOKEN_SECRET=bitbucket-forge-token "
+            "PARAM_GITOPS_OLD_TOKEN_SECRET=bitbucket-forge-token PARAM_GITLAB_READ_TOKEN_FILE=; "
+            'create_gitlab_read_token_secret agents ctx1 && rc=0 || rc=$?; echo "rc=$rc"'
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertRegex(self._log(), r"patch secret bitbucket-forge-token .*remove.*/data/read-token")
+        self.assertIn("read-token", proc.stdout + proc.stderr)
+
+    def test_a_secret_this_run_names_keeps_its_read_token(self):
+        self._run(
+            "GITOPS_FORGE=bitbucket GITLAB_TOKEN_SECRET=bb-cloud "
+            "PARAM_GITOPS_OLD_TOKEN_SECRET=bitbucket-forge-token PARAM_GITLAB_READ_TOKEN_FILE=; "
+            "create_gitlab_read_token_secret agents ctx1"
+        )
+        self.assertNotIn("patch secret", self._log())
+
+    def test_no_switch_keeps_the_read_token(self):
+        self._run(
+            "GITOPS_FORGE=bitbucket GITLAB_TOKEN_SECRET=bitbucket-forge-token PARAM_GITLAB_READ_TOKEN_FILE=; "
+            "create_gitlab_read_token_secret agents ctx1"
+        )
+        self.assertNotIn("patch secret", self._log())
+
+    def test_an_empty_answer_on_a_switch_stops_the_run(self):
+        """The prompt offers no "keep"; an empty answer must not leave the old
+        forge's token in place with a success code."""
+        proc = self._run(
+            "has_controlling_tty() { return 0; }; "
+            "GITOPS_FORGE=bitbucket GITLAB_TOKEN_SECRET=bitbucket-forge-token PARAM_NON_INTERACTIVE=false "
+            "PARAM_GITOPS_TOKEN_MUST_REPLACE=true PARAM_GITLAB_TOKEN_FILE=; "
+            "read() { token=''; return 0; }; "
+            'create_gitlab_token_secret agents ctx1 </dev/null && rc=0 || rc=$?; echo "rc=$rc"'
+        )
+        self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
+        self.assertNotIn("No token entered; nothing was stored. Create", proc.stdout + proc.stderr)
 
 
 class BitbucketInstallEnvTest(unittest.TestCase):
