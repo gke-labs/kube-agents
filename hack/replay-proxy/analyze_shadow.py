@@ -23,7 +23,11 @@ answer" and Rollout step 1):
 
   It is an estimate both ways. Where the live model took a different action,
   shadow mode sees a different tool result and counts a miss, while replay
-  would have run the saved action, so it is low there. It judges each request
+  would have run the saved action, so it is low there. It is low too where a
+  live answer named a new ID, IP or CIDR: placeholder numbers run across every
+  message, answers included, and one CIDR anywhere changes how every IP is
+  keyed, so later tool and user hashes shift where replay, serving the saved
+  answer, would not have shifted them. It judges each request
   on its own, so it is high where an earlier request of the same conversation
   would have missed (and gone live), or matched a different recording: real
   replay serves an answer only when the conversation so far, served answers
@@ -127,7 +131,8 @@ NIGHTLY_ONLY_ESTIMATES = (LOW, REPLAYED_LOW)
 # What the replayed rows leave out, printed under the estimate table.
 REPLAYED_CAVEAT = (
     "replayed rows are an estimate: a different live action gave a different tool result here, where replay would"
-    " have run the saved one (so low there); each request is judged alone, though an earlier miss in its"
+    " have run the saved one, and a live answer naming a new ID, IP or CIDR shifted later messages' hashes, where"
+    " the saved answer would not have (so low there); each request is judged alone, though an earlier miss in its"
     " conversation, or answers from two recordings, would end a real replay (so high there)."
 )
 DEFAULT_TOP_MISSES = 20
@@ -387,7 +392,11 @@ class ReplayedPrefixSources(Sources):
         return [record.settings_hash, *record.replayed_chain()]
 
     def first_difference(self, request: Record) -> str:
-        """The role of the first message no allowed source matches, assistant answers ignored."""
+        """The role of the first message no allowed high source matches, assistant words not compared.
+
+        `assistant`: no allowed source has an answer at that position; `none`:
+        a longer allowed recording passes through, but none stopped here.
+        """
         if request.message_hashes is None or self.find(request.settings_hash, request, nightly_only=False) is None:
             return difference_role(request, request.message_hashes, False, 0)
         matched = 0
@@ -742,7 +751,8 @@ def render(report: Dict[str, Any], skipped: Dict[str, int]) -> str:
         )
     lines += [REPLAYED_CAVEAT, "",
               f"miss tokens by first differing message: {report['miss_tokens_by_first_difference']}",
-              "replayed_high miss tokens by first differing message, assistant answers ignored:"
+              "replayed_high miss tokens by role of first differing message (assistant: no recording answered there;"
+              " none: only longer recordings pass through):"
               f" {report['replayed_miss_tokens_by_first_difference']}", "",
               "top misses (prompt tokens, matched/total messages, first difference, closest earlier request):"]
     for m in report["top_misses"]:

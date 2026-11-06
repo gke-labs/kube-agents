@@ -331,6 +331,22 @@ class ReplayedTest(unittest.TestCase):
         # The exact breakdown names the answer that diverged first; the replayed one looks past it.
         self.assertEqual(rep["miss_tokens_by_first_difference"]["assistant"], 600)
 
+    def test_the_breakdown_takes_the_high_sources(self):
+        roles = ["system", "user", "assistant", "tool"]
+        cases = {
+            # An earlier finished build of the same pull request.
+            "earlier build": ([presubmit("a", 1, "10", "b1", "A", ["sys", "task", "ans", "out"], roles=roles)], {}),
+            # Another pull request's last build, once it merged.
+            "merge copy": ([presubmit("a", 1, "11", "b1", "A", ["sys", "task", "ans", "out"], roles=roles)],
+                           {"11": 10.0}),
+        }
+        for name, (sources, merged) in cases.items():
+            with self.subTest(name):
+                request = presubmit("b", 20, "10", "b2", "B", ["sys", "task", "ANS", "OTHER"], roles=roles)
+                rep, _ = report(sources + [request], merged=merged)
+                # The source's own request has nothing earlier: settings.
+                self.assertEqual(rep["replayed_miss_tokens_by_first_difference"], {"tool": 100, "settings": 100})
+
     def test_a_longer_recording_with_no_request_stopping_here_is_none(self):
         source = line("a", 1, "nightly", "n1", "A", ["sys", "task", "ans", "out"],
                       roles=["system", "user", "assistant", "tool"])
@@ -345,7 +361,32 @@ class ReplayedTest(unittest.TestCase):
         text = analyze_shadow.render(rep, skipped)
         self.assertIn("replayed_high", text)
         self.assertIn("replayed rows are an estimate", text)
-        self.assertIn("assistant answers ignored", text)
+        self.assertIn("by role of first differing message", text)
+
+
+class EarliestSourceTest(unittest.TestCase):
+    """Two sources in one earlier build under the same key: the earlier one is used."""
+
+    def test_the_hit_is_served_from_the_earliest_source_of_the_build(self):
+        lines = [
+            presubmit("a1", 1, "10", "b1", "A", ["a"]),
+            presubmit("a2", 2, "10", "b1", "A", ["a"]),
+            presubmit("p", 10, "10", "b2", "A", ["a"]),
+        ]
+        records, _ = analyze_shadow.load([write(lines)])
+        recordings = [h.recording.request_id for r, h in analyze_shadow.iter_hits(records, "high") if h]
+        self.assertEqual(recordings, ["a1"])
+
+    def test_the_closest_request_is_the_earliest_source_of_the_build(self):
+        rep, _ = report([
+            presubmit("a1", 1, "10", "b1", "A", ["s", "u", "t1"]),
+            presubmit("a2", 2, "10", "b1", "B", ["s", "u", "t2"]),
+            presubmit("p", 10, "10", "b2", "C", ["s", "u", "t3"], tokens=500),
+        ])
+        top = rep["top_misses"][0]
+        self.assertEqual(top["request_id"], "p")
+        self.assertEqual(top["closest_request_id"], "a1")
+        self.assertEqual(top["matched_messages"], 2)
 
 
 class MissTest(unittest.TestCase):

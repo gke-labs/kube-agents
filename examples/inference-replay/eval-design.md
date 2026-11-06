@@ -569,9 +569,12 @@ before stage 3 of the rollout (turning replay on):
      request counts when its settings and every message that isn't one of the model's replies
      match an allowed recording, position by position. They're still estimates: shadow mode can't
      hold the next two points fixed, so those still count as misses here, and they judge each
-     request alone, while a real replay stops at the conversation's first miss. For their misses
-     the script names the first message, replies aside, that no recording matched, which is where
-     normalizer work pays;
+     request alone, while a real replay stops at the conversation's first miss. They also read low
+     where a live reply names a new ID, IP or CIDR, which shifts how later messages are keyed. For
+     the high one's misses, the script adds up tokens by the role of the first message no
+     recording matched, replies' words aside, which is where normalizer work pays. Two labels
+     aren't roles: `assistant` means no recording had a reply at that point, and `none` means a
+     longer recording passes through but none stopped there;
    - in a multi-agent run, one agent's answer becomes another agent's input: the card text the
      platform agent writes is what the Cluster Agent reads. Under replay that text would match;
      in shadow mode it's worded differently every run;
