@@ -1857,6 +1857,12 @@ main() {
   # preview reads its engine from a temporary copy, which has no install.env.
   local install_env_file
   install_env_file="$(resolve_install_env_file "$repo_dir" "$install_checkout")"
+  # Absolute now, as install.sh makes it: the chat checklist's re-run command
+  # names this path for a paste from any directory.
+  case "$install_env_file" in
+    /*) ;;
+    *) install_env_file="$(pwd)/${install_env_file}" ;;
+  esac
   # Clear any shell-exported coordinates before sourcing the file: load_install_env
   # only unsets NAMESPACE, so without this an install.env that omits REGION while
   # the caller's shell exports REGION=europe-west1 would make the cross-check
@@ -2429,13 +2435,16 @@ main() {
   # needs. The retag arms reuse the recorded values and change neither.
   # Guarded: an older target's installer_common.sh lacks the helper. The DM
   # link in the Google Chat checklist is the project's number, which
-  # install.env never records.
+  # install.env never records. The topic is the one the generator rendered: a
+  # file that names none renders the default, which the helper must be handed,
+  # since the generator keeps it local.
   if [ "$PARAM_UPGRADE_MODE" = "full" ] && declare -F print_chat_setup_checklists >/dev/null; then
     local project_number=""
     if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
       project_number="$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)" 2>/dev/null || echo "")"
     fi
-    PROJECT_NUMBER="$project_number" INSTALL_ENV_FILE="$install_env_file" \
+    CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}" \
+      PROJECT_NUMBER="$project_number" INSTALL_ENV_FILE="$install_env_file" \
       print_chat_setup_checklists "${PLATFORM_AGENT_MODE_AFTER_APPLY:-${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}}"
   fi
   if declare -F print_next_home_channel_unset_summary >/dev/null; then
