@@ -37,6 +37,12 @@ The address is what used to be wrong. An event-triage turn arrives over the REST
 
 The session id is therefore the thread key, and `session_metadata` records the `platform` alongside the `thread_id`: a thread belongs to exactly one chat platform, and a report addressed to the other is not degraded to the home channel but refused outright.
 
+#### Limiting the open triage pull requests
+
+With `INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true` and `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` above `0` (chart: `platformAgent.deployment.incidentMaxOpenPullRequests`; `0`, negative or not a number is no limit), `_attempt_triage_start` asks `_triage_pull_request_decision` before it builds the query, for an event triage only. `_claim_triage_pull_request` counts the branches that start with `INCIDENT_PR_BRANCH_PREFIX` and have an open proposal on the forge from the managed repository itself (a fork's, whose `sourceRepo` names another repository, does not count) (`proposal-list` on each managed repository, `TRIAGE_PR_LIST_MAX_PAGES` pages of 100 at most, within `TRIAGE_PR_COUNT_TIMEOUT_S`, 10 s), plus the branches in `triage_pr_reservations`. The forge is read before the lock, and the reservations are read and written under it, so triages that start together count each other before any pull request exists. Under the limit, or when the incident's own branch is already counted (its card revises that pull request), the branch is reserved and the query is `_build_agent_query_with_pull_request`. At the limit, `_build_agent_query` gets `open_pull_request=False` and writes the default query, and once the turn starts `TRIAGE_PR_CAP_NOTE` is posted where `_triage_not_started` posts its notice: in the alert's thread, or under the alert's quoted first line when it has no thread. With no chat platform the note is only logged. A count the forge does not answer (an error, the timeout, too many pages) is held the same way with `TRIAGE_PR_UNCOUNTED_NOTE` (`TRIAGE_PR_UNCOUNTED_AT_LIMIT`). No text the model reads changes: the held triage gets the query an install without the opt-in gets.
+
+There is one reservation per triage and branch. It is released when its branch shows an open proposal (it then counts as open), when that triage's `Open GitOps PR for …` card assigned to `platform` is `done` or `archived` and opened no pull request after the forge was read (a later one is not in that read, so the reservation still counts it), when the triage does not start (`_triage_not_started`), and after `TRIAGE_PR_RESERVATION_MAX_S` (24 h). The last covers a card never filed, and a card that is `blocked` or held in `todo` behind a blocked triage card: such a card can still open its pull request, so it keeps counting until it settles or the 24 hours pass. Under the watcher's `--mode=shared`, where every incident shares one session, the first settled card, or one triage that does not start, releases every reservation. A daemon start also releases each reservation whose triage never reached `started` (a process that died between the claim and the start), beside the fold anchors. The count goes by the branch prefix alone: a pull request opened by a reply's `apply` counts when the branch `submit-suggestion` names for it (`platform-agent/<change_type>-<target_id>`) takes the prefix, and not otherwise.
+
 ### Daily Alert Ceiling
 
 Deduplication bounds how often _one_ failure is reported. It does nothing about many _distinct_ failures at once — a node draining or a namespace collapsing produces a hundred unrelated pods, each a legitimately new incident. The ceiling is the backstop for that case.
@@ -615,6 +621,21 @@ The column is named `severity` and three of its four values are one, but the key
 `Warning`. `GET /v1/alert-quota` reports the row as it finds it, so a reader sees four buckets.
 
 Rows age out after `SESSION_KV_CLEANUP_TTL_DAYS`, along with `session_metadata`, `incidents` and `incident_applies`, so roughly two weeks of history is available to answer "what did we drop last week".
+
+#### `triage_pr_reservations`
+
+The branches triages were routed to open a pull request on, which count against `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS` ([above](#limiting-the-open-triage-pull-requests)):
+
+```sql
+CREATE TABLE triage_pr_reservations(
+  branch TEXT NOT NULL,           -- platform-agent/incident-<incident>
+  session_id TEXT NOT NULL,       -- the triage that reserved it
+  reserved_at REAL NOT NULL,      -- epoch seconds
+  PRIMARY KEY (branch, session_id)
+);
+```
+
+Not swept by the TTL: each claim releases the rows that no longer count.
 
 The same database also holds `findings` and `queue_publications`, the findings queue's tables. They are exempt from the TTL sweep — a backlog item disappears when its state says it is finished, not when it gets old. [`docs/designs/inventory-findings-queue.md`](../../../docs/designs/inventory-findings-queue.md) §3.1 is the canonical description of both.
 

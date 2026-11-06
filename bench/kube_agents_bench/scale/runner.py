@@ -56,6 +56,11 @@ WATCHER_POLL_SECONDS = 30
 TRIGGER_DRAIN_SECONDS = 1800
 # The commands that change the test clusters or the install, and so hold the live-test lease.
 MUTATING_COMMANDS = ("run", "apply", "teardown")
+# A plan that measures the broker at limits set by hand names them under this settings key
+# (resource -> quantity, as in a pod spec); `run` and `apply` refuse to start while the live broker
+# pods carry other limits, and `run --dry-run` says whether they match.
+EXPECTED_PROXY_LIMITS_KEY = "expect_proxy_limits"
+LIMIT_FIELDS = {"cpu": "cpu_cores", "memory": "memory_bytes"}
 LEASE_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "live_test_lease.py"
 LEASE_ENVS_VAR = "KUBE_AGENTS_LIVE_TEST_ENVS"
 LEASE_SESSION_VAR = "KUBE_AGENTS_LEASE_SESSION"
@@ -78,6 +83,11 @@ DRAIN_POLL_SECONDS = 60
 # The fits a run leaves out when work other than its own loaded the harness during it.
 RESOURCE_FITS = ("cpu_peak_cores", "cpu_seconds", "memory_peak_bytes", "proxy_command_seconds", "proxy_commands",
                  "proxy_wait_max_seconds", "proxy_wait_p50_seconds")
+# The readings that split a total in RESOURCE_FITS, left out wherever that total is: the per-tool
+# proxy counts with `proxy_commands`; the throttling and the slots-in-use peak, which the same
+# broker's load sets, with `cpu_seconds`.
+PER_TOOL_PREFIXES = ("proxy_commands_", "proxy_command_seconds_")
+BROKER_LOAD_FITS = ("cpu_throttled_seconds", "cpu_throttled_period_share", collect.PROXY_SLOTS_PEAK)
 # A proxy load run that shared the broker also leaves out its throughput and command times.
 PROXY_LOAD_FITS = ("proxy_load_per_second", "proxy_load_p50_seconds", "proxy_load_p95_seconds", "proxy_load_max_seconds")
 # A prompt answered without its operation measures none of the operation's cost.
@@ -118,7 +128,17 @@ TERMINATED_EXIT_CODE = 143
 STOPPED_EXIT_CODE = 2
 PEAK_METRIC = "memory_peak_bytes"
 # What add_peaks reads from Cloud Monitoring; remonitor replaces exactly these.
-MONITORING_METRICS = ("memory_peak_bytes", "cpu_peak_cores", "cpu_seconds")
+MONITORING_METRICS = ("memory_peak_bytes", "cpu_peak_cores", "cpu_seconds", collect.PROXY_SLOTS_PEAK)
+# Recorded when a run that read the broker's slot cap got no slots-in-use series: the cluster runs no
+# Managed Prometheus collection for the gauge. Not a monitoring error, so fits and backfill ignore it.
+SLOTS_UNKNOWN_NOTE = "proxy slots peak unknown: no Managed Prometheus series for the slots gauge"
+# The same unknown peak when the slots query itself failed: the container peaks still stand.
+SLOTS_FAILED_NOTE = "proxy slots peak unknown: the slots query failed"
+# A record stored before `operations.answer_preview` cut at a word can end inside the project ID.
+# scrub_answer, which reclassify runs on stored answers only, redacts a last word that starts the
+# ID when it is at least this long, or when it follows "project" or "the `", where the ID would stand.
+MIN_PROJECT_PREFIX_CHARS = 6
+CUT_WORD = re.compile(r"(?P<lead>\bproject `?|\bthe `)?(?<![A-Za-z0-9-])(?P<word>[A-Za-z0-9-]+)$")
 PROJECT_PLACEHOLDER = "<project>"
 MONITORING_ERROR = "monitoring:"
 REVISION_LENGTH = 12
@@ -416,6 +436,21 @@ class Runner:
         """Replace the target project's ID in recorded text, so the committed data names no project."""
         return text.replace(self.project, PROJECT_PLACEHOLDER)
 
+    def fresh_answers(self, previews: list[str]) -> list[str]:
+        """A new run's answer previews, scrubbed. A preview never ends inside a word
+        (`operations.answer_preview`), so the whole-ID scrub is all it needs: the cut-off scrub
+        would only rewrite a complete last word that happens to start the ID."""
+        return [self.scrub(preview) for preview in previews]
+
+    def scrub_answer(self, text: str) -> str:
+        """scrub an answer preview, and the start of the project ID where the cut fell inside it."""
+        text = self.scrub(text)
+        match = CUT_WORD.search(text)
+        word = match.group("word") if match else ""
+        if word and self.project.startswith(word) and (len(word) >= MIN_PROJECT_PREFIX_CHARS or match.group("lead")):
+            return text[:match.start("word")] + PROJECT_PLACEHOLDER
+        return text
+
     @staticmethod
     def mark_shared(record: records.Record, kind: str) -> None:
         """Leave a short run out of the fits that work other than its own loaded.
@@ -439,6 +474,14 @@ class Runner:
             record.errors.append(note)
         record.excluded_from += [fit for fit in fits if fit not in record.excluded_from]
 
+    @staticmethod
+    def cover_split_fits(record: records.Record) -> None:
+        """Leave out the per-tool, throttle and slots-peak readings of a run whose proxy or CPU totals are left out."""
+        split = [m.name for m in record.metrics
+                 if ("proxy_commands" in record.excluded_from and m.name.startswith(PER_TOOL_PREFIXES))
+                 or ("cpu_seconds" in record.excluded_from and m.name in BROKER_LOAD_FITS)]
+        record.excluded_from += sorted({name for name in split if name not in record.excluded_from})
+
     def reclassify(self) -> int:
         """Apply the current rules to every stored record; returns how many changed.
 
@@ -453,8 +496,9 @@ class Runner:
         for raw in data["records"]:
             record = records.Record.from_dict(raw)
             before = json.dumps(record.to_dict(), sort_keys=True)
+            record.image = self.scrub(record.image)
             record.errors = [self.scrub(e) for e in record.errors]
-            record.answers = [self.scrub(a) for a in record.answers]
+            record.answers = [self.scrub_answer(a) for a in record.answers]
             profiles = next((m.value for m in record.metrics if m.name == PROFILES_METRIC), None)
             clusters = record.totals.get(CLUSTERS_TOTAL)
             if profiles is not None and clusters and profiles > clusters:
@@ -490,6 +534,7 @@ class Runner:
                     record.excluded_from += [f for f in RESOURCE_FITS + TOKEN_FITS if f not in record.excluded_from]
             if operation:
                 self.mark_shared(record, operation.kind)
+            self.cover_split_fits(record)
             if json.dumps(record.to_dict(), sort_keys=True) != before:
                 changed.append(record)
         if unnamed:
@@ -604,12 +649,13 @@ class Runner:
         record = records.Record(
             commit=commit, mode=mode, phase=self.plan.phase, runner=RUNNER_REVISION,
             factor=spec.factor, level=spec.level, operation=op.name, run=spec.run,
-            started=started_iso, ended=ended_iso, image=image, values=values, totals=totals,
+            started=started_iso, ended=ended_iso, image=self.scrub(image), values=values, totals=totals,
             limits=limits, requests=requests, replicas=replicas, metrics=metrics,
-            provider_429s=provider_429s, answers=[self.scrub(a) for a in outcome.previews],
+            provider_429s=provider_429s, answers=self.fresh_answers(outcome.previews),
             excluded_from=list(excluded) + [f for f in carried_fits if f not in excluded], errors=errors,
         )
         self.mark_shared(record, op.kind)
+        self.cover_split_fits(record)
         return record
 
     def pending(self, specs: list[RunSpec]) -> list[RunSpec]:
@@ -694,6 +740,31 @@ class Runner:
             self.flush_peaks(awaiting, wait=True)
         return not stopped
 
+    def limit_mismatches(self) -> list[str]:
+        """How the live broker's limits differ from the plan's ``expect_proxy_limits``; empty when they match or none is named."""
+        expected = self.plan.settings.get(EXPECTED_PROXY_LIMITS_KEY) or {}
+        if not expected:
+            return []
+        live = self.install.limits().get(collect.PROXY_CONTAINER, {})
+        problems = []
+        for resource, quantity in expected.items():
+            if resource not in LIMIT_FIELDS:
+                problems.append(f"{resource}: not a limit this check reads ({', '.join(LIMIT_FIELDS)})")
+                continue
+            have = live.get(LIMIT_FIELDS[resource])
+            if have is None or abs(have - collect.parse_quantity(str(quantity))) > 1e-9:
+                problems.append(f"{resource}: the plan expects {quantity}, the broker has {'none' if have is None else f'{have:g}'}")
+        return problems
+
+    def check_limits(self) -> None:
+        """Refuse to go on while the broker's limits are not the plan's ``expect_proxy_limits``."""
+        problems = self.limit_mismatches()
+        if problems:
+            raise SystemExit(
+                f"the broker's limits are not this plan's {EXPECTED_PROXY_LIMITS_KEY}: {'; '.join(problems)}. "
+                "Set them on the PlatformAgent, wait for the broker to roll, then run again."
+            )
+
     def dry_run(self, specs: list[RunSpec], force: bool, limit: int = 0) -> list[str]:
         """What ``run`` would do, as lines: each level's cluster creates and deletes, and each run.
 
@@ -704,6 +775,9 @@ class Runner:
         todo = pending[:limit] if limit else pending
         current = set(kube.clusters_with_prefix(self.project, self.zone, self.prefix, self.label))
         lines = [f"{len(todo)} runs to do (of {len(specs)}); test clusters now: {len(current)}"]
+        if self.plan.settings.get(EXPECTED_PROXY_LIMITS_KEY):
+            problems = self.limit_mismatches()
+            lines.append(f"{EXPECTED_PROXY_LIMITS_KEY}: {'; '.join(problems) if problems else 'the broker matches'}")
         for (factor, level), group in itertools.groupby(todo, key=lambda s: (s.factor, s.level)):
             values = self.plan.level_values(factor, level)
             wanted = set(self.cluster_names(int(values[CLUSTERS_TOTAL])))
@@ -828,6 +902,18 @@ class Runner:
         for container, values in peaks.items():
             for name, value in values.items():
                 record.metrics.append(records.Metric(name, value, container))
+        self.note_slots(record, getattr(self.install, "slots_query_error", None))
+
+    @staticmethod
+    def note_slots(record: records.Record, failure: str | None = None) -> None:
+        """Say so when a record from a runner that reads the slot cap has no slots-in-use peak,
+        and why: no series stored, or `failure`, the slots query's own error."""
+        names = {m.name for m in record.metrics}
+        record.errors = [
+            e for e in record.errors if e != SLOTS_UNKNOWN_NOTE and not e.startswith(SLOTS_FAILED_NOTE)
+        ]
+        if collect.PROXY_SLOT_CAP_METRIC in names and collect.PROXY_SLOTS_PEAK not in names:
+            record.errors.append(f"{SLOTS_FAILED_NOTE} ({failure})" if failure else SLOTS_UNKNOWN_NOTE)
 
     def remonitor(self) -> int:
         """Read every stored record's Cloud Monitoring metrics again, with the current queries.
@@ -852,6 +938,7 @@ class Runner:
                 for container, values in peaks.items() for name, value in values.items()
             ]
             record.errors = [e for e in record.errors if not e.startswith(MONITORING_ERROR)]
+            self.note_slots(record, getattr(self.install, "slots_query_error", None))
             record.remonitored = RUNNER_REVISION
             changed.append(record)
         records.merge(self.data_file, changed)
@@ -998,6 +1085,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _mutate(runner: Runner, args: argparse.Namespace, specs: list[RunSpec]) -> int:
     """The commands that change the test clusters or the install, run under the lease."""
+    if args.command in ("run", "apply"):
+        runner.check_limits()
     if args.command == "run":
         # Non-zero when the run stopped at a level, so a script does not go on to its next step.
         return 0 if runner.run(specs, args.force, args.limit) else STOPPED_EXIT_CODE
