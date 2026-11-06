@@ -585,7 +585,12 @@ writes that document to `findings_path` and runs `finish --scheduled` on it with
 manifest. The request rule is there because the stored document answers no request: `finish`
 opens a fix only for a `manifest` remediation, so a request on a `manual` finding would otherwise
 wait until the fleet changed; an answered request holds nothing, since the markers are permanent
-and the comment is never edited, and a non-writer's is refused the same on either path. The stored
+and the comment is never edited, and a non-writer's is refused the same on either path. The
+document goes to `finish` with each remediation's note as the worker wrote it
+(`_strip_route_notes`, as after a carry): the route notes and the Config Connector paragraph are
+`finish`'s to write again from this run's manifest, and the note before a cut (`uncut_note`),
+which `validate_findings` drops, would otherwise pass for the worker's own on a finding whose
+excerpt moved and leave the store for good. The stored
 document is the one `finish` left, after the passes that write on it, and the close runs those
 passes again on a workspace `start` has reset, so `stored_document_replay_problem` refuses what
 they could not reproduce, by the rule the carry already applies (`_remediation_may_carry`): a
