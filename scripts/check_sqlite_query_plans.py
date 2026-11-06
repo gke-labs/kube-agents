@@ -14,14 +14,26 @@ own planner instead, offline, and fails a pull request that adds another.
 module: a string literal, a module-level constant, an f-string or `+`
 concatenation of those with `str(...)` of one or `", ".join(...)` over a tuple
 of them allowed (so a partial index's literal and a column list keep their
-values; a list can be appended to after its literal, so it does not count), a constant of another target module named through it
-(`findings_queue.X`), or a name bound exactly once in the enclosing function
-or in a function enclosing that one (the innermost binding wins, as it does
-when the code runs), by a plain assignment (`a = x`, or `a, b = x, y`
-element-wise), to such an expression (a name bound any other way, or in two
-places, resolves to nothing, never to a module constant of the same name).
-Anything else (`.format(...)`, `%`, a join over a comprehension, a name
-assigned in a branch) is listed as `dynamic` and not judged.
+values; a list can be appended to after its literal, so it does not count), a
+constant of another target module named through it (`findings_queue.X`,
+resolved against that module's own names), or a name bound exactly once in
+the enclosing function or in a function enclosing that one (the innermost
+binding wins, as it does when the code runs), by a plain assignment (`a = x`,
+or `a, b = x, y` element-wise), to such an expression. Scope follows Python's
+rule: a binding counts against the function or module whose own body holds
+it, wherever in that body (a module constant rebound inside a top-level `if`
+or `try` is bound twice); a nested function, lambda or class is a scope of
+its own, so its parameters and locals do not count against the function
+around it; and a `nonlocal` (or, for the module, `global`) declaration in any
+scope nested inside counts as a binding of the name it declares, since it
+lets that scope rebind it. A name bound any other way, or in two places,
+resolves to nothing, never to a module constant of the same name. Anything
+else (`.format(...)`, `%`, a join over a comprehension, a name assigned in a
+branch) is listed as `dynamic` and not judged. The check sees a statement
+only at the execute call: a literal handed to a helper that executes its
+parameter (`_ids_where_in(conn, "SELECT ...", ids)` in the server) is not
+read at the call site, and the helper's one execute call is listed `dynamic`,
+so such a statement is neither judged nor listed on its own.
 
 The schema is the real one, not a replay of the DDL: `SCHEMA_SOURCE` names the
 server module, the attribute that holds its database path, the function that
@@ -41,21 +53,29 @@ define (Hermes's `state.db` and `kanban.db` tables); the statement is listed as
 missing column, a syntax error) is a problem that fails the check. A plan line
 that reads a whole table the schema defines is a finding, unless the table is
 in `BOUNDED_TABLES`: tables that hold one row, or a daily-pruned or capped
-handful, by design. Two plan lines read a whole table: `SCAN <table>` without
-`USING INDEX` or `USING COVERING INDEX`, and `SEARCH <table> USING AUTOMATIC
-... INDEX`, the planner's transient index, which it builds by reading every
-row of the table each time the statement runs (a `SEARCH` on a real index is
-not a finding). The planner names an aliased table by its alias, which the
-check maps back from the statement's FROM, JOIN, UPDATE, INTO and comma list
-words; an alias the statement binds to two different tables (an outer query
-and a subquery reusing one letter) is a problem that fails the check, since
-the plan line does not say which was read. A scan of `sqlite_master`, of a
-constant row, of a subquery or of a CTE the statement declares is not a table
-scan; a scan of any other name the statement does not declare is a problem
-that fails the check, so an alias shape the check does not read cannot pass
-as clean. The plan wording this reads (`SCAN <name>`, not `SCAN TABLE
-<name>`) arrived in SQLite 3.36, so an older `sqlite3` library is a problem
-that fails the check before any statement is read.
+handful, by design. Two plan lines read a whole table: every `SCAN <table>`,
+with or without `USING [COVERING] INDEX` (a scan through an index walks the
+whole index, so a count, a projection of indexed columns or an `ORDER BY` an
+index serves still reads every row; a `LIMIT` is not in the plan line), and
+`SEARCH <table> USING AUTOMATIC ... INDEX`, the planner's transient index,
+which it builds by reading every row of the table each time the statement
+runs. A `SEARCH` on a real index is not a finding, and a `SCAN` through a
+partial index (one with a `WHERE`) reads only the rows that index admits,
+the bound the index declares, so it is listed `bounded` rather than flagged.
+The planner names an aliased table by its alias, which the check maps back
+from the statement's FROM, JOIN, UPDATE, INTO and comma list words; an alias
+the statement binds to two different tables (an outer query and a subquery
+reusing one letter) is a problem that fails the check, since the plan line
+does not say which was read. A scan of `sqlite_master`, of a constant row, of
+a subquery or of a CTE the statement declares is not a table scan, whether the
+plan names it by its own name, by the alias the statement gives it, or as
+`(subquery-N)`: the plan's own `CO-ROUTINE <name>` and `MATERIALIZE <name>`
+lines declare the derived tables, and a `WITH` clause declares the CTEs. A
+scan of any other name the statement does not declare is a problem that fails
+the check, so an alias shape the check does not read cannot pass as clean. The
+plan wording this reads (`SCAN <name>`, not `SCAN TABLE <name>`) arrived in
+SQLite 3.36, so an older `sqlite3` library is a problem that fails the check
+before any statement is read.
 
 ``scripts/sqlite_query_plan_baseline.txt``: one line per (file, function,
 table) that carried a full scan when the check arrived,
@@ -175,14 +195,25 @@ BINDINGS_RE = re.compile(r"The current statement uses (\d+)")
 NO_SUCH_TABLE_PREFIX = "no such table: "
 # A plan line that reads a table: `SCAN <name>` or `SEARCH <name>`, the name
 # possibly followed by `AS <alias>`; then whatever the loop uses. A SCAN reads
-# the whole table unless it uses a real index; a SEARCH reads the whole table
-# only when it uses an automatic index, which the planner builds by reading
-# every row (`SEARCH t USING AUTOMATIC COVERING INDEX (col=?)`, or
-# `AUTOMATIC PARTIAL COVERING INDEX`).
+# every row, through an index or not; a SEARCH reads the whole table only when
+# it uses an automatic index, which the planner builds by reading every row
+# (`SEARCH t USING AUTOMATIC COVERING INDEX (col=?)`, or `AUTOMATIC PARTIAL
+# COVERING INDEX`).
 SCAN_RE = re.compile(r"^(?P<verb>SCAN|SEARCH) (?P<name>\S+)(?: AS \S+)?(?P<rest>.*)$")
 SEARCH_VERB = "SEARCH"
-INDEXED_SCAN_MARKERS = (" USING INDEX ", " USING COVERING INDEX ")
 AUTOMATIC_INDEX_MARKER = " USING AUTOMATIC "
+# The index a SCAN walks (`SCAN t USING INDEX i`, `SCAN t USING COVERING
+# INDEX i`); a partial one bounds the rows read to those its WHERE admits.
+SCAN_INDEX_RE = re.compile(r" USING (?:COVERING )?INDEX (?P<index>\S+)")
+# `PRAGMA index_list(<table>)`: the index name and whether it is partial.
+INDEX_LIST_PRAGMA = "PRAGMA index_list({table})"
+INDEX_LIST_NAME_COLUMN = 1
+INDEX_LIST_PARTIAL_COLUMN = 4
+# The plan lines that declare a derived table, a FROM-clause subquery or a
+# CTE the planner runs as a co-routine or materialises, under the name its
+# later `SCAN`/`SEARCH` lines use: the alias when the statement gives one,
+# else the CTE's name or `(subquery-N)`.
+DERIVED_RE = re.compile(r"^(?:CO-ROUTINE|MATERIALIZE) (?P<name>\S+)")
 # The planner names a table by its alias when the statement gives one
 # (`FROM intercepted_events e` plans as `SCAN e`), so the aliases are read
 # from the statement: the word after FROM, JOIN, UPDATE (with an optional
@@ -218,6 +249,11 @@ PLAN_DETAIL_COLUMN = 3
 # statement outside any function.
 QUALIFIED_SEPARATOR = "."
 MODULE_LEVEL = "(module)"
+# The nodes that open a scope of their own: a binding inside one belongs to
+# it, not to the function or module around it. A comprehension is left out on
+# purpose: its targets then count against the enclosing scope, which can only
+# make a name resolve to nothing, never to the wrong value.
+NESTED_SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 # A statement built from constants that point at each other deeper than this is
 # not something the check reads.
 RESOLVE_DEPTH = 8
@@ -329,22 +365,67 @@ class _NullBindings(defaultdict):
 
 
 class _Constants:
-    """The statically resolvable names of one module, and of the other targets it names."""
+    """The statically resolvable names of one module, and of the other targets it names.
+
+    A sibling's constant is resolved against the sibling's own names (its
+    f-string reads its own column tuple, not one of the same name here), so
+    each sibling is held as a `_Constants` of its own, one hop deep: a
+    sibling's constant that names a third module resolves to nothing.
+    """
 
     def __init__(self, module: ast.Module, siblings: dict[str, ast.Module]) -> None:
         self.names = _module_constants(module)
-        self.siblings = {name: _module_constants(tree) for name, tree in siblings.items()}
+        self.siblings: dict[str, _Constants] = {name: _Constants(tree, {}) for name, tree in siblings.items()}
 
 
 def _module_constants(module: ast.Module) -> dict[str, ast.expr]:
-    """Module-level names assigned exactly once, with the expression assigned."""
+    """Module-level names bound exactly once, by a plain assignment, with the expression assigned.
+
+    A binding anywhere in the module's own body counts (inside a top-level
+    `if`, `try`, `for` or `with` too), and so does a `global` declaration in
+    any function or class nested in the module, which lets it rebind the name.
+    """
+    return {name: value for name, value in _bindings(module, ast.Global).items() if value is not None}
+
+
+def _own_nodes(scope: ast.AST) -> Iterable[ast.AST]:
+    """Every node of a scope's own body: the nested scopes are kept as nodes (a `def` binds its name) and not entered."""
+    pending = list(ast.iter_child_nodes(scope))
+    while pending:
+        node = pending.pop()
+        yield node
+        if not isinstance(node, NESTED_SCOPE_NODES):
+            pending.extend(ast.iter_child_nodes(node))
+
+
+def _bindings(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]) -> dict[str, ast.expr | None]:
+    """Every name a scope binds: the expression, when bound exactly once by a plain assignment, else None.
+
+    Every binding in the scope's own body counts against the name: a store to
+    it (an assignment, an unpacking, a loop or `with` target, a walrus, an
+    augmented assignment), a parameter, an `except ... as`, an `import ...
+    as`, a `global` or `nonlocal`, a `match` capture, or a nested `def` or
+    `class`, whose body is a scope of its own and is not entered. A
+    `declaration` (`nonlocal` for a function, `global` for the module) in any
+    scope nested inside, however deep, counts as a binding here too, since it
+    lets that scope rebind the name. A name bound any other way, or twice, is
+    in the map with None, so it resolves to nothing rather than to the module
+    constant of the same name.
+    """
     counts: dict[str, int] = defaultdict(int)
     values: dict[str, ast.expr] = {}
-    for node in module.body:
-        for name, value in _assigned(node):
+    for node in _own_nodes(scope):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            for name, value in _assigned(node):
+                values[name] = value
+        for name in _bound_names(node):
             counts[name] += 1
-            values[name] = value
-    return {name: value for name, value in values.items() if counts[name] == 1}
+        if isinstance(node, NESTED_SCOPE_NODES):
+            for inner in ast.walk(node):
+                if isinstance(inner, declaration):
+                    for name in inner.names:
+                        counts[name] += 1
+    return {name: (values.get(name) if count == 1 else None) for name, count in counts.items()}
 
 
 def _assigned(node: ast.stmt) -> list[tuple[str, ast.expr]]:
@@ -366,24 +447,8 @@ def _assigned(node: ast.stmt) -> list[tuple[str, ast.expr]]:
 
 
 def _local_constants(function: ast.AST) -> dict[str, ast.expr | None]:
-    """Every name the function binds: the expression, when bound exactly once by a plain assignment, else None.
-
-    Every binding counts against the name: a store to it (an assignment, an
-    unpacking, a loop or `with` target, a walrus, an augmented assignment), a
-    parameter, an `except ... as`, an `import ... as`, a `global` or
-    `nonlocal`, a `match` capture, or a nested `def` or `class`. A name bound
-    any other way, or twice, is in the map with None, so it resolves to
-    nothing rather than to the module constant of the same name.
-    """
-    counts: dict[str, int] = defaultdict(int)
-    values: dict[str, ast.expr] = {}
-    for node in ast.walk(function):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            for name, value in _assigned(node):
-                values[name] = value
-        for name in _bound_names(node):
-            counts[name] += 1
-    return {name: (values.get(name) if count == 1 else None) for name, count in counts.items()}
+    """Every name the function binds, as `_bindings` counts them, with `nonlocal` in a nested scope a binding here."""
+    return _bindings(function, ast.Nonlocal)
 
 
 def _bound_names(node: ast.AST) -> list[str]:
@@ -442,8 +507,8 @@ def _resolve(expr: ast.expr, constants: _Constants, scopes: Scopes, depth: int =
         return None if source is None else _resolve(source, constants, [], depth + 1)
     if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
         sibling = constants.siblings.get(expr.value.id)
-        source = None if sibling is None else sibling.get(expr.attr)
-        return None if source is None else _resolve(source, constants, [], depth + 1)
+        source = None if sibling is None else sibling.names.get(expr.attr)
+        return None if source is None or sibling is None else _resolve(source, sibling, [], depth + 1)
     if isinstance(expr, ast.JoinedStr):
         parts: list[str] = []
         for value in expr.values:
@@ -502,8 +567,8 @@ def _sequence_items(expr: ast.expr, constants: _Constants, scopes: Scopes, depth
         return None if source is None else _sequence_items(source, constants, [], depth + 1)
     if isinstance(expr, ast.Attribute) and isinstance(expr.value, ast.Name):
         sibling = constants.siblings.get(expr.value.id)
-        source = None if sibling is None else sibling.get(expr.attr)
-        return None if source is None else _sequence_items(source, constants, [], depth + 1)
+        source = None if sibling is None else sibling.names.get(expr.attr)
+        return None if source is None or sibling is None else _sequence_items(source, sibling, [], depth + 1)
     return None
 
 
@@ -661,9 +726,10 @@ def explain(conn: sqlite3.Connection, sql: str) -> list[str]:
 def scanned_table(plan: str) -> str | None:
     """The table a plan line reads in full, or None.
 
-    A `SCAN` without a real index reads the table; so does a `SEARCH` through
-    an automatic index, whatever its verb, because the planner builds that
-    index by reading every row each time the statement runs.
+    Every `SCAN` reads every row, through an index (the whole index) or not;
+    so does a `SEARCH` through an automatic index, whatever its verb, because
+    the planner builds that index by reading every row each time the
+    statement runs. A `SEARCH` on a real index reads what the index finds.
     """
     match = SCAN_RE.match(plan)
     if match is None:
@@ -671,13 +737,42 @@ def scanned_table(plan: str) -> str | None:
     rest = match.group("rest") + " "
     if AUTOMATIC_INDEX_MARKER in rest:
         return match.group("name")
-    if match.group("verb") == SEARCH_VERB or any(marker in rest for marker in INDEXED_SCAN_MARKERS):
+    if match.group("verb") == SEARCH_VERB:
         return None
     return match.group("name")
 
 
+def scan_index(plan: str) -> str | None:
+    """The index a `SCAN` line walks (`SCAN t USING [COVERING] INDEX i`), or None for a table scan or a `SEARCH`."""
+    match = SCAN_RE.match(plan)
+    if match is None or match.group("verb") == SEARCH_VERB:
+        return None
+    index = SCAN_INDEX_RE.search(match.group("rest"))
+    return None if index is None else index.group("index")
+
+
+def partial_indexes(conn: sqlite3.Connection, tables: Iterable[str]) -> frozenset[str]:
+    """The names of the partial indexes (those with a WHERE) over the given tables; a scan through one is bounded by it."""
+    names: set[str] = set()
+    for table in tables:
+        for row in conn.execute(INDEX_LIST_PRAGMA.format(table=table)).fetchall():
+            if row[INDEX_LIST_PARTIAL_COLUMN]:
+                names.add(row[INDEX_LIST_NAME_COLUMN])
+    return frozenset(names)
+
+
+def derived_names(plans: Iterable[str]) -> frozenset[str]:
+    """The derived tables a plan declares (`CO-ROUTINE <name>`, `MATERIALIZE <name>`), which no later scan line reads as a table."""
+    found: set[str] = set()
+    for plan in plans:
+        match = DERIVED_RE.match(plan)
+        if match is not None:
+            found.add(match.group("name"))
+    return frozenset(found)
+
+
 def table_aliases(sql: str, tables: frozenset[str]) -> dict[str, str | None]:
-    """alias -> table for every aliased reference to a schema table in the statement.
+    """alias -> table for every aliased reference in the statement to one of `tables` (schema tables, CTEs and derived tables).
 
     An alias the statement binds to two different tables (one letter reused
     by an outer query and a subquery) maps to None: the planner prints the
@@ -701,9 +796,9 @@ def cte_names(sql: str) -> frozenset[str]:
     return frozenset(match.group("name") for match in CTE_RE.finditer(sql))
 
 
-def _non_table_scan(name: str, ctes: frozenset[str]) -> bool:
-    """Whether a scan name is a constant row, an unflattened subquery or a CTE rather than a table."""
-    return name in NON_TABLE_SCAN_NAMES or name.isdecimal() or name.startswith(SUBQUERY_SCAN_PREFIXES) or name in ctes
+def _non_table_scan(name: str, derived: frozenset[str]) -> bool:
+    """Whether a scan name is a constant row, an unflattened subquery, a CTE or a derived table the plan declares, not a table."""
+    return name in NON_TABLE_SCAN_NAMES or name.isdecimal() or name.startswith(SUBQUERY_SCAN_PREFIXES) or name in derived
 
 
 def planned_text(sql: str) -> str | None:
@@ -724,6 +819,7 @@ def planned_text(sql: str) -> str | None:
 def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[list[Verdict], list[str]]:
     """Every statement classified, and the statements that do not prepare for a reason other than a foreign table."""
     tables = schema_tables(conn)
+    partial = partial_indexes(conn, tables)
     verdicts: list[Verdict] = []
     problems: list[str] = []
     for statement in statements:
@@ -753,13 +849,18 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
                 )
             continue
         judged = 0
-        aliases = table_aliases(statement.sql, tables)
-        ctes = cte_names(statement.sql)
+        # The CTEs the statement declares and the derived tables the plan
+        # declares are names a scan line may use, directly or through an
+        # alias, and none of them is a table.
+        derived = cte_names(statement.sql) | derived_names(plans)
+        aliases = table_aliases(statement.sql, tables | derived)
         for plan in plans:
             name = scanned_table(plan)
             if name is None or name in SCHEMA_TABLES:
                 continue
             table = name if name in tables else aliases.get(name)
+            if table in derived:
+                continue
             if table is None:
                 if name in aliases:
                     # Bound to two different tables: the plan line does not
@@ -772,7 +873,7 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
                         )
                     )
                     continue
-                if _non_table_scan(name, ctes):
+                if _non_table_scan(name, derived):
                     continue
                 # A name the statement did not declare is a scan the check
                 # cannot place: loud, so an alias form the regex does not
@@ -791,8 +892,10 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
                 )
                 continue
             judged += 1
-            kind = KIND_BOUNDED if table in BOUNDED_TABLES else KIND_FINDING
-            verdicts.append(Verdict(statement, kind, table=table, plan=plan))
+            # A scan through a partial index reads the rows its WHERE admits,
+            # the bound the index declares.
+            bounded = table in BOUNDED_TABLES or scan_index(plan) in partial
+            verdicts.append(Verdict(statement, KIND_BOUNDED if bounded else KIND_FINDING, table=table, plan=plan))
         if judged == 0:
             verdicts.append(Verdict(statement, KIND_OK))
     return verdicts, problems

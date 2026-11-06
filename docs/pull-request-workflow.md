@@ -144,11 +144,12 @@ line, and the check skips the spans on that line. CI runs the same check through
 `session_manager.py`, run `make sqlite-plan-check` (it imports the server, so it needs
 `make test-python-deps`). It prepares every fixed statement under `EXPLAIN QUERY PLAN` against the
 schema the server builds and fails a plan that reads a whole table this repository defines (a
-`SCAN <table>` without an index, or a `SEARCH` through an automatic index, which is built by
-reading the table), because such a read grows with the fleet; statements on tables Hermes owns are
-listed as skipped, and the scans already in the tree are pinned with a reason in
-`scripts/sqlite_query_plan_baseline.txt`, which only shrinks. CI runs the same check through
-`scripts/test_check_sqlite_query_plans.py`.
+`SCAN <table>`, through an index or not, since a scan through an index walks the whole index; or a
+`SEARCH` through an automatic index, which is built by reading the table), because such a read
+grows with the fleet; a scan through a partial index is bounded by that index's `WHERE` and passes.
+Statements on tables Hermes owns are listed as skipped, and the scans already in the tree are
+pinned with a reason in `scripts/sqlite_query_plan_baseline.txt`, which only shrinks. CI runs the
+same check through `scripts/test_check_sqlite_query_plans.py`.
 
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
