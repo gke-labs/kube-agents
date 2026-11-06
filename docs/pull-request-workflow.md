@@ -140,6 +140,29 @@ quotes the shape only to warn against it carries `<!-- cluster-reads-check: warn
 line, and the check skips the spans on that line. CI runs the same check through
 `scripts/test_check_cluster_reads.py`.
 
+**SQL in the session KV server.** If you add or change a SQL statement in
+`agents/platform/scripts/session_kv_server.py`, `findings_queue.py`, `session_retention.py`,
+`session_manager.py`, `chat_notify.py` or `eod_report_generator.py`, run `make sqlite-plan-check` (it imports the server, so it needs
+`make test-python-deps`). It prepares every fixed statement under `EXPLAIN QUERY PLAN` against the
+schema the server builds and fails a plan that reads a whole table this repository defines (a
+`SCAN <table>`, through an index or not, since a scan through an index walks the whole index; or a
+`SEARCH` through an automatic index, which is built by reading the table), because such a read
+grows with the fleet; a scan through a partial index passes as bounded only when the script's
+`BOUNDED_INDEXES` vouches for that index's `WHERE` as a bound (the pending drift backlog today).
+A statement handed to a helper that executes its parameter (`_ids_where_in`) is read at the call
+site, an `IN` list's `",".join("?" * n)` marks as one parameter (a `VALUES` row built that way is
+dynamic, since its count is the statement's shape). Statements on the Hermes tables the script's
+`FOREIGN_TABLES` lists are skipped; a statement on any other table the schema does not build fails
+the check until the table is built in the schema or listed there with its owner; a statement on a
+table any target creates itself fails until that table is built in the schema (a `FOREIGN_TABLES`
+entry for a created table is itself a problem); and a statement that names an owned table beside a
+Hermes one fails rather than skipping, since the owned read cannot be planned here. The scans
+already in the tree, and the statements the check
+cannot read statically (one `(dynamic)` entry per function), are pinned with a reason in
+`scripts/sqlite_query_plan_baseline.txt`: a rise against an entry fails, so a new scan or a new
+dynamic statement needs a baseline hunk the reviewer sees. CI runs the same check through
+`scripts/test_check_sqlite_query_plans.py`.
+
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
 ```bash
