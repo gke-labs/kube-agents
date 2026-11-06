@@ -578,6 +578,7 @@ POLL_PAUSE_SECONDS = 1.0
 # started rather than routing a second message (``injectSubmission`` in
 # a2a/gateway/inject.go).
 RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+RETRY_AFTER_HEADER = "Retry-After"
 
 
 def conversation_key(run_id: str, case_id: str, repetition: str) -> str:
@@ -682,9 +683,14 @@ class InjectUnavailable(RuntimeError):
     abandon path reads the difference (:attr:`InjectTask.unanswered_post`).
     """
 
-    def __init__(self, message: str, *, retryable: bool = True, answered: bool = False) -> None:
+    def __init__(
+        self, message: str, *, retryable: bool = True, answered: bool = False, retry_after: float | None = None
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
+        # The seconds a 503 asked the caller to wait (its Retry-After), as a
+        # gateway standby answers; None when it named none.
+        self.retry_after = retry_after
         self.answered = answered
 
 
@@ -911,8 +917,8 @@ class Fold:
         """The answer this task produced, as a customer would have read it.
 
         Ordinarily that is everything the conversation received for the task
-        that nothing rewrote, reassembled. The window is decided here rather
-        than while folding: whether a post belongs to this task is only
+        that nothing rewrote, reassembled. The window (:attr:`window_posts`)
+        is decided when read rather than while folding: whether a post belongs to this task is only
         answerable once it is known whether this task's marker appeared at
         all, and a fold reading a bounded transcript may never see one. With a
         marker, the posts between it and the next task's; without, every post,
@@ -928,10 +934,15 @@ class Fold:
         """
         if self.stream_result:
             return self.stream_result
+        return "".join(post["text"] for post in self.window_posts if post["messageId"] not in self.edited)
+
+    @property
+    def window_posts(self) -> list[dict[str, Any]]:
+        """The messages this task posted: its window when its marker appeared,
+        every post otherwise. A post a later edit rewrote (the status
+        placeholder) is still a message the thread shows."""
         windowed = [post for post in self.posts if post["inWindow"]]
-        if not windowed:
-            windowed = self.posts
-        return "".join(post["text"] for post in windowed if post["messageId"] not in self.edited)
+        return windowed or self.posts
 
     @property
     def gateway_declared(self) -> bool:
@@ -1298,6 +1309,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
 
 
+def _retry_after(exc: urllib.error.HTTPError) -> float | None:
+    """A response's Retry-After in seconds, when it gives a number of them.
+
+    The HTTP-date form is not read: nothing this transport talks to sends it.
+    """
+    raw = exc.headers.get(RETRY_AFTER_HEADER) if exc.headers is not None else None
+    try:
+        seconds = float(raw) if raw is not None else None
+    except ValueError:
+        return None
+    return seconds if seconds is not None and seconds >= 0 else None
+
+
 def _error_detail(exc: urllib.error.HTTPError) -> str:
     """The body of an error answer, or what stopped it arriving.
 
@@ -1351,6 +1375,7 @@ def _request(
             f"HTTP {exc.code} from {url}: {detail}",
             retryable=exc.code in RETRYABLE_STATUSES,
             answered=True,
+            retry_after=_retry_after(exc),
         ) from exc
     except (OSError, http.client.HTTPException, ValueError) as exc:
         # A ValueError is a body that was not JSON, which the door did

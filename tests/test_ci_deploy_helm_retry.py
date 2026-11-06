@@ -216,6 +216,7 @@ exit 0
                 "GITOPS_REPO": "test-repo",
                 "API_SERVER_KEY": "test-key",
                 "GEMINI_API_KEY": "test-gemini",
+                "AGENT_GEMINI_API_KEY": "test-gemini",
                 "SANDBOX_KEY_DIR": str(sandbox_dir),
                 "MODEL_PROVIDER": "vertex_ai",
                 "MODEL_DEFAULT_NAME": "gemini-2.5-flash",

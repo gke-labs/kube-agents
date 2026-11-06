@@ -65,6 +65,55 @@ _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST",)
 # into, so the mirror must not fill the key the container env lacks.
 _PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
 
+# The origin of a unit of work (docs/designs/proposal-origin.md §2.1): one value
+# per session, written once under ORIGIN_KEY in its metadata, with the chat
+# platform beside it under ORIGIN_PLATFORM_KEY (`platform` is already a key the
+# alert path overwrites). ORIGIN_OTHER is what an unresolved unit reads as.
+ORIGIN_KEY = "origin"
+ORIGIN_PLATFORM_KEY = "origin_platform"
+ORIGINS = ("chat", "console", "api", "event", "drift", "audit", "scheduled", "issue", "other")
+ORIGIN_OTHER = "other"
+ORIGIN_EVENT = "event"
+ORIGIN_DRIFT = "drift"
+# The sessions this server opens for the event watcher (`create_session`); only
+# those take their origin from the first inject.
+WATCHER_SESSION_PREFIX = "k8s-evt-"
+# Bounds on what the origin and ledger routes store.
+ORIGIN_PLATFORM_MAX_CHARS = 64
+ORIGIN_JOB_ID_MAX_CHARS = 256
+PROPOSAL_URL_MAX_CHARS = 2048
+PROPOSAL_OPENED_AT_MAX_CHARS = 64
+# The upward compression walk `_session_origin` takes, as
+# deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
+ORIGIN_COMPRESSION_END_REASON = "compression"
+ORIGIN_COMPRESSION_WALK_MAX = 32
+# The profile the gateway runs as, as the operator sets it for this container
+# (empty for the default profile). On a platform front-door install the gateway's
+# sessions are in that profile's `state.db`, not in this server's own.
+GATEWAY_PROFILE_ENV = "HERMES_GATEWAY_PROFILE"
+ORIGIN_DB_TIMEOUT_SECONDS = 5.0
+# The board's origin stamp (`_stamp_board_task_origin`, the drift backlog's
+# writer), a side table in the kanban database that the first stamp wins.
+KANBAN_TASK_ORIGINS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS kanban_task_origins (
+        task_id TEXT PRIMARY KEY,
+        origin TEXT,
+        origin_platform TEXT,
+        stamped_at TEXT
+    )
+"""
+# One-time stamp tickets (`POST /v1/board/stamp-tickets`): an in-pod writer that
+# knows its card's origin mints one with the pod's key and hands it to its
+# in-process create through a ContextVar; the board's insert-time stamp
+# (deploy/docker/patches/kanban_origin.py) redeems it once. The ticket is an
+# unguessable reference, not an origin. Minting needs this server's key on the agent
+# container's loopback, which the shell-sandbox pod, where the model's commands
+# run, has neither of (docs/credential-isolation-design.md, "The loopback-only
+# exception").
+STAMP_TICKET_BYTES = 16  # os.urandom(16).hex(): 32 hex characters
+STAMP_TICKET_TTL_SECONDS = 300
+STAMP_TICKET_MAX_CHARS = 2 * STAMP_TICKET_BYTES
+
 
 def _load_dotenv_ignoring_operator_switches(path: str) -> None:
     """Load ``path`` with python-dotenv's grammar, minus the operator-only switches.
@@ -242,6 +291,10 @@ FEED_STATUS_FOLDED = "folded"
 # others, because its `notified` is 0 and would otherwise read as suppressed. A
 # carded backlog row (DRIFT_BACKLOG_CARDED) reads as a live drift row does.
 FEED_STATUS_BACKLOG = "backlog"
+# A row an alert-exclude rule held back in the watcher (POST /v1/excluded-events).
+# Checked first: its `notified` is 0, and it was never offered to chat, so it is
+# neither suppressed nor filtered.
+FEED_STATUS_EXCLUDED = "excluded"
 # The alert was admitted and its triage turn never started: the retries ran out,
 # or the start was queued past `TRIAGE_QUEUE_WAIT_LIMIT_S` and its one attempt
 # failed (`triage_state = aborted`).
@@ -915,9 +968,12 @@ _WORKLOAD_FOLD_LOCK = threading.Lock()
 # request a card opened is a `pr_opened` event on that card in kanban.db
 # (agents/platform/plugins/pr_opened). Same pattern as that plugin's
 # PROPOSAL_URL, copied because a plugin is loaded by file path: the repository
-# forge.call takes, then the number.
+# forge.call takes, then the number, for every forge the broker serves (GitHub
+# /pull/, GitLab /-/merge_requests/, Gitea /pulls/, Bitbucket /pull-requests/;
+# http for an in-cluster Gitea; the last marker before the number wins, and the
+# tail after it carries no further marker, `/-/` or `/issues/`).
 PR_OPENED_EVENT_KIND = "pr_opened"
-PROPOSAL_URL_RE = re.compile(r"^(https://[^/\s]+/\S+?)(?:/pull/|/-/merge_requests/)(\d+)(?:[/?#]\S*)?$")
+PROPOSAL_URL_RE = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 PROPOSAL_OPEN_STATE = "open"
 # How many of the workload's most recent incidents are searched for a fix.
 FIX_PR_INCIDENTS_SCANNED = 5
@@ -1000,7 +1056,9 @@ INJECT_KIND_STALL = "controller-stall"
 # event for the watcher's --quiet-after since the last sighting. It arrives on
 # the alert's own session, which is how `_inject_followup` finds the thread.
 INJECT_KIND_FOLLOWUP = "k8s-event-followup"
-INJECT_KINDS_SUPPORTED = ["k8s-event", INJECT_KIND_FOLLOWUP, INJECT_KIND_DRIFT, INJECT_KIND_STALL]
+# The watcher's incident kind, which POST /v1/excluded-events also takes.
+INJECT_KIND_EVENT = "k8s-event"
+INJECT_KINDS_SUPPORTED = [INJECT_KIND_EVENT, INJECT_KIND_FOLLOWUP, INJECT_KIND_DRIFT, INJECT_KIND_STALL]
 # What this daemon does with an event's session beyond posting the alert,
 # advertised twice: on the event path's `injected` answer, which the watcher
 # records per session (injectResponse.Features in injector.go), and under
@@ -1126,6 +1184,21 @@ SLACK_CRASHLOOP_ALERT = "🚨 **{workload} in {cluster} keeps crashing.** Lookin
 ALERT_TITLE = "{workload} crashloop"
 ALERT_TITLE_CLUSTER = " in {cluster}"
 ALERT_TITLE_KEY = "title"
+# A drift alert's thread title, and the mark slack_ux_incident lays its triage out by.
+DRIFT_ALERT_TITLE = "{name} {kind} drift"
+DRIFT_ALERT_TITLE_CLUSTER = " in {cluster}"
+ALERT_KIND_KEY = "alert_kind"
+ALERT_KIND_DRIFT = "drift"
+# The kind a drift title names, by the audit record's resource; any other resource is named as recorded.
+DRIFT_TITLE_KINDS = {
+    "horizontalpodautoscalers": "HPA",
+    "deployments": "Deployment",
+    "statefulsets": "StatefulSet",
+    "daemonsets": "DaemonSet",
+    "services": "Service",
+    "configmaps": "ConfigMap",
+    "networkpolicies": "NetworkPolicy",
+}
 
 # The cluster name a drift card falls back to when the payload names none and
 # GKE_CLUSTER_NAME is unset -- the cluster the agent itself runs on. The event
@@ -1191,7 +1264,23 @@ DRIFT_MAX_RENDERED_PATHS = 12
 # Advertised in `/healthz` `features`, so a detector reading an older daemon
 # keeps sending every record as a card.
 DRIFT_BACKLOG_FEATURE = "drift-backlog"
-DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP]
+# The watcher posts the events its alert-exclude rules hold back to
+# POST /v1/excluded-events, for the daily recap's count, only when it reads this
+# feature: an older daemon has no such route.
+ALERT_EXCLUDED_FEATURE = "alert-excluded"
+DAEMON_FEATURES = [DRIFT_BACKLOG_FEATURE, INJECT_FEATURE_FOLLOWUP, ALERT_EXCLUDED_FEATURE]
+# How far back POST /v1/excluded-events looks for the object's row to add to.
+# An hour, not a day: the daily recap selects rows by `created_at`, so a row
+# that kept collecting for a day after it was created would carry sightings
+# from after one recap that the next recap does not read. An hour bounds that
+# to one hour at the recap's edge, for at most 24 rows per object and reason a
+# day. The watcher sends one record per key per flush interval.
+EXCLUDED_ROW_FOLD_SECONDS = 60 * 60
+# The most sightings one record may carry. The watcher sends at most a flush
+# interval's worth; the bound keeps a bad caller from overflowing the column.
+EXCLUDED_OCCURRENCES_MAX = 1_000_000
+# The event type a record without one is graded as, as the inject route does.
+EXCLUDED_DEFAULT_EVENT_TYPE = "Warning"
 # `intercepted_events.backlog`. Zero for every row that is not backlog, which
 # includes every row written before the column existed. A pending row is owed a
 # digest or a card; the other three are terminal.
@@ -1239,6 +1328,14 @@ DRIFT_BACKLOG_CARD_TITLE = "Drift backlog: {count} {noun} reached drift detectio
 DRIFT_BACKLOG_CARD_KEY_PREFIX = "drift-backlog-"
 DRIFT_BACKLOG_CARD_CREATED_BY = "drift-detector"
 DRIFT_BACKLOG_CARD_STATUS = "blocked"
+# The card's board stamp is `drift` (docs/designs/proposal-origin.md §2.1),
+# written here, in the board, once the create returns the id, through the same
+# `INSERT OR IGNORE` the board's insert-time stamp uses when it redeems a stamp
+# ticket, so the first stamp wins either way. Not a ticket in the subprocess's
+# environment: Hermes reloads `$HERMES_HOME/.env` with override on, so a value
+# planted there would replace it. The subprocess has no turn, so its insert
+# leaves the card unstamped and this stamp lands; a dedupe hit on a card that
+# already carries a stamp keeps it.
 # The CLI timeout is the send timeout, so the lease (sized from it) outlives
 # the call. A timeout counts as no card, unlike the chat send, because the rows
 # must not be marked without a task id; a create that committed before the kill
@@ -1429,6 +1526,9 @@ def init_db() -> None:
                 # live dispatcher, so startup stamps it to created_at below
                 # and NULL never means "old".
                 ("dispatched_at", "dispatched_at TEXT"),
+                # 1 on a row an alert-exclude rule held back in the watcher
+                # (POST /v1/excluded-events); 0 on every other row.
+                ("excluded", "excluded INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column in ledger_columns:
                     continue
@@ -1562,6 +1662,44 @@ def init_db() -> None:
                 )
                 """
             )
+            # The origin each cron job id was created or last changed under,
+            # written from trusted context by the `cronjob` tool's handler
+            # (docs/designs/proposal-origin.md §2.1), and the ledger of
+            # proposals the agent verified it opened, one row per url (§2.2).
+            # Neither is idle-session state: `cleanup_old_records` leaves both.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cron_job_origins (
+                    job_id          TEXT PRIMARY KEY,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    recorded_at     TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS proposals_opened (
+                    url             TEXT PRIMARY KEY,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    opened_at       TEXT
+                )
+                """
+            )
+            # One-time stamp tickets for a card's board origin; spent or
+            # expired rows are removed by `cleanup_old_records`.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kanban_stamp_tickets (
+                    ticket          TEXT PRIMARY KEY,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    issued_at       REAL,
+                    redeemed_at     REAL NULL
+                )
+                """
+            )
             # A fold anchor is written as an intent, before its background task
             # runs, so a process that died in between (OOM, SIGKILL, a crash)
             # leaves a row anchoring its workload with no triage behind it and
@@ -1579,6 +1717,8 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
     # `findings` and `queue_publications` are deliberately absent: a backlog
     # with a TTL is not a backlog, and a `dismissed` row that ages out is one
     # the next sweep re-offers. Their lifecycle is `state`, not age.
+    # `cron_job_origins` and `proposals_opened` are absent too: a job's origin
+    # holds for as long as the job exists, and the ledger is a durable count.
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
@@ -1622,6 +1762,10 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
         # is kept the same 14 days as everything else so an operator asked
         # "what did we drop last week" still has an answer.
         conn.execute("DELETE FROM alert_quota WHERE day < date('now', ?)", (param,))
+        # A ticket past its TTL can no longer be redeemed, spent or not.
+        conn.execute(
+            "DELETE FROM kanban_stamp_tickets WHERE issued_at < ?", (time.time() - STAMP_TICKET_TTL_SECONDS,)
+        )
     except Exception as exc:
         logger.error(f"Failed to clean up old DB records: {exc}")
 
@@ -2137,7 +2281,7 @@ def healthz() -> Dict[str, Any]:
 @app.post("/sessions", status_code=201, dependencies=[Depends(verify_api_key)])
 def create_session() -> Dict[str, str]:
     """Create a new session ID for the incoming incident."""
-    session_id = f"k8s-evt-{uuid.uuid4().hex[:8]}"
+    session_id = f"{WATCHER_SESSION_PREFIX}{uuid.uuid4().hex[:8]}"
     
     # Save the session to the local metadata DB
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -2394,8 +2538,10 @@ def enabled_chat_platforms() -> list[str]:
     ``spec.mode: next`` the
     managed scope says that platform's Hermes consumer is off because the A2A
     gateway holds the backend, and posts to it go through the gateway instead,
-    so it is still a platform this install posts to. The operator renders the
-    variable only then, and it is reserved against every other source.
+    so it is still a platform this install posts to, with a home channel or
+    (when it is the only chat platform) without one, the gateway keeping the
+    refused posts for a digest. The operator renders the variable only then,
+    and it is reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
@@ -2497,7 +2643,9 @@ def _no_chat_route_error() -> str:
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
     backend whether or not a home channel is set, so with one named the cause is
     the missing home channel; without one this cannot tell no chat from a
-    misconfigured one, so it guesses at neither.
+    misconfigured one, so it guesses at neither. A pod the operator has routed
+    never reaches this: its send goes to the gateway, whose refusal says the
+    post is kept.
     """
     platform = chat_notify.gateway_platform()
     setting = HOME_CHANNEL_SETTINGS.get(platform)
@@ -2545,6 +2693,10 @@ def get_active_platform(platforms: Optional[list[str]] = None) -> str:
 #: falling through would post it a second time somewhere else. Deliberately not
 #: a plausible thread id, so a caller that ignores it addresses nothing.
 ALERT_SENT_WITHOUT_THREAD = "\x00alert-sent-without-thread"
+# `_post_initial_alert`'s fourth outcome: the gateway refused the alert for want
+# of a home channel and kept it for the digest it posts once one is set
+# (chat_notify.kept). Nothing posted now; the caller must not re-send.
+ALERT_KEPT_FOR_DIGEST = "\x00alert-kept-for-digest"
 
 
 def _run_alert_send(active_platform: str, alert_msg: str, session_id: str = "") -> subprocess.CompletedProcess:
@@ -2580,9 +2732,11 @@ def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = 
     """Send the initial warning alert and return the thread/message ID.
 
     Posts with `hermes send`, or with `a2a notify` for the platform the A2A
-    gateway holds under next (chat_notify.py). Three outcomes, not two: a thread
-    id, `None` when the send failed, and :data:`ALERT_SENT_WITHOUT_THREAD` when
-    it succeeded (or may have) and the id could not be read. The route's own docstring names that third case as one that has
+    gateway holds under next (chat_notify.py). Four outcomes, not two: a thread
+    id, `None` when the send failed, :data:`ALERT_SENT_WITHOUT_THREAD` when
+    it succeeded (or may have) and the id could not be read, and
+    :data:`ALERT_KEPT_FOR_DIGEST` when the gateway kept it for want of a home
+    channel (the caller records it as kept and does not re-send). The route's own docstring names that third case as one that has
     happened here, and it is the one where a retry does damage rather than good.
     """
     try:
@@ -2603,6 +2757,9 @@ def _post_initial_alert(active_platform: str, alert_msg: str, session_id: str = 
             # alert may well be in the channel, so it must not be sent again.
             logger.error(f"Alert to '{active_platform}' got no answer in time; treating it as sent. Stderr: {exc.stderr}")
             return ALERT_SENT_WITHOUT_THREAD
+        if chat_notify.kept(exc.returncode):
+            logger.warning(f"Alert to '{active_platform}' was refused for want of a home channel and kept by the gateway for its digest")
+            return ALERT_KEPT_FOR_DIGEST
         logger.error(f"Failed to post warning alert. Stdout: {exc.stdout}. Stderr: {exc.stderr}. Exc: {exc}")
     except Exception as exc:
         logger.error(f"Failed to post warning alert or parse message_id response: {exc}")
@@ -2828,8 +2985,10 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
         logger.error(f"Failed to update session metadata with thread_id: {exc}")
 
 
-def _record_alert_title(session_id: str, title: str) -> None:
-    """Add the Slack session title to the alert's routing row, for gateway/slack_ux_incident.py.
+def _record_alert_title(session_id: str, title: Optional[str], kind: str = "") -> None:
+    """Add the Slack session title, and any ``kind`` of alert, to the alert's routing row, for gateway/slack_ux_incident.py.
+
+    Either may be empty: a drift alert whose object has no name gets no title but keeps its kind.
 
     Cosmetic, so a failure is logged and the triage goes on without it.
     """
@@ -2842,7 +3001,10 @@ def _record_alert_title(session_id: str, title: str) -> None:
                 ).fetchone()
                 if row:
                     meta = json.loads(row[0])
-                    meta[ALERT_TITLE_KEY] = title
+                    if title:
+                        meta[ALERT_TITLE_KEY] = title
+                    if kind:
+                        meta[ALERT_KIND_KEY] = kind
                     conn.execute(
                         "UPDATE session_metadata SET metadata = ? WHERE session_id = ?",
                         (json.dumps(meta), session_id),
@@ -4310,12 +4472,13 @@ def trigger_agent_troubleshooter(
     event_row_id: Optional[int] = None,
     slack_alert_msg: Optional[str] = None,
     alert_title: Optional[str] = None,
+    alert_kind: str = "",
 ) -> None:
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background.
 
     ``slack_alert_msg`` replaces ``alert_msg`` when the alert goes to Slack, and
     ``alert_title`` is recorded for a thread on a card platform: Slack, or Google
-    Chat under ``spec.mode: next``.
+    Chat under ``spec.mode: next``, with ``alert_kind`` beside it.
 
     An exception releases the row's fold anchor before it propagates: the
     ledger row was written as admitted before this task was queued, and a task
@@ -4326,7 +4489,8 @@ def trigger_agent_troubleshooter(
     """
     try:
         _trigger_agent_troubleshooter(
-            session_id, alert_msg, payload, event_row_id, slack_alert_msg=slack_alert_msg, alert_title=alert_title
+            session_id, alert_msg, payload, event_row_id, slack_alert_msg=slack_alert_msg, alert_title=alert_title,
+            alert_kind=alert_kind,
         )
     except Exception:
         mark_triage_not_started(event_row_id)
@@ -4340,6 +4504,7 @@ def _trigger_agent_troubleshooter(
     event_row_id: Optional[int] = None,
     slack_alert_msg: Optional[str] = None,
     alert_title: Optional[str] = None,
+    alert_kind: str = "",
 ) -> None:
     """trigger_agent_troubleshooter's work, without the release on an exception."""
     # 1. Post initial warning notification to Google Chat or Slack.
@@ -4374,8 +4539,15 @@ def _trigger_agent_troubleshooter(
     else:
         active_platform = get_active_platform(platforms)
         thread_id = None
+        kept = False
         for candidate in [active_platform] + [p for p in platforms if p != active_platform]:
             thread_id = _post_initial_alert(candidate, _alert_for(candidate, alert_msg, slack_alert_msg), session_id)
+            if thread_id == ALERT_KEPT_FOR_DIGEST:
+                # Refused for want of a home channel and kept by the gateway for
+                # the digest it posts once one is set. Stop: the next platform
+                # is the same install, and the record below says kept, not lost.
+                active_platform, thread_id, kept = candidate, None, True
+                break
             if thread_id == ALERT_SENT_WITHOUT_THREAD:
                 # Delivered, and unthreadable. Stop: the reader has the alert, and
                 # trying the next platform would post it to a second channel to
@@ -4400,10 +4572,10 @@ def _trigger_agent_troubleshooter(
         if thread_id:
             _register_session_routing(session_id, active_platform, thread_id)
             notice = _TriageNotice(active_platform, thread_id, "")
-            if alert_title and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
+            if (alert_title or alert_kind) and active_platform in CARD_PLATFORMS and (active_platform == SLACK_PLATFORM or chat_notify.routes(active_platform)):
                 # The title heads the plan the cards draw: on Slack, and on the
                 # platform the gateway lays the plan out for under spec.mode: next.
-                _record_alert_title(session_id, alert_title)
+                _record_alert_title(session_id, alert_title, alert_kind)
             # Armed here, before the gateway is contacted: an alert whose turn
             # never starts (session creation refused, the turn's POST failing)
             # is the case the watchdog exists for, and the steps below return
@@ -4426,8 +4598,9 @@ def _trigger_agent_troubleshooter(
             # mode is false reassurance.
             mark_delivery_failed(
                 event_row_id,
-                f"no message id from {' or '.join(repr(p) for p in platforms)}; "
-                "see the session server log",
+                f"kept by the gateway for its digest: no home channel on {active_platform!r}"
+                if kept
+                else f"no message id from {' or '.join(repr(p) for p in platforms)}; see the session server log",
             )
             logger.error(
                 f"Alert for session {session_id} was not delivered to any enabled platform "
@@ -4790,6 +4963,9 @@ def _send_to_chat(
             # as a success does; a fresh post has no thread to register.
             logger.warning(f"Relayed report to {target} got no answer in time; treating it as sent")
             return thread_id if threaded else ALERT_SENT_WITHOUT_THREAD
+        if chat_notify.kept(exc.returncode):
+            logger.warning(f"Relayed report to {target} was kept by the gateway for its digest (no home channel)")
+            return None
         logger.error(f"Failed to post relayed report to {target}. Stderr: {exc.stderr}")
         return None
     except Exception as exc:
@@ -4825,6 +5001,13 @@ class AuditPost(NamedTuple):
     """Where :func:`_post_audit_blocks` left the report: its thread."""
 
     thread_id: str
+
+
+# `_post_audit_chat_via_gateway`'s answer when the gateway refused the card for
+# want of a home channel and kept it for its digest (chat_notify.kept): the leg
+# is undelivered, and the text fallback must not follow, or the one report is
+# kept twice.
+AUDIT_POST_KEPT = AuditPost("")
 
 
 class AuditHeadline(NamedTuple):
@@ -5123,7 +5306,8 @@ def _post_audit_chat_via_gateway(
     gateway lays it out, its buttons included. ``text`` is the message's fallback, which the gateway
     posts itself when it does not lay the message out. Same outcomes as the
     relay path: None, to post text instead, after a refusal, a failure to
-    send, or a post that may have landed.
+    send, or a post that may have landed; and :data:`AUDIT_POST_KEPT` when the
+    gateway kept the card for want of a home channel, so no text follows.
     """
     path = ""
     try:
@@ -5150,6 +5334,9 @@ def _post_audit_chat_via_gateway(
             except OSError:
                 pass
     if res.returncode != 0:
+        if chat_notify.kept(res.returncode):
+            logger.warning(f"Relay for {profile}/{job_id}: report card kept by the gateway for its digest (no home channel); no text follows")
+            return AUDIT_POST_KEPT
         if chat_notify.outcome_unknown(res.returncode):
             logger.warning(f"Relay for {profile}/{job_id}: report card may have posted, posting text: {res.stderr.strip()}")
         else:
@@ -5638,8 +5825,10 @@ def relay_cron_report(
     they are skipped rather than missed.
 
     An install with no chat route gets no send at all, where the fallback to
-    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): a
-    `next` install whose gateway holds Slack with no home channel. The error
+    DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): one
+    with neither platform, or a pod rendered before the operator routed its only
+    platform without a home channel (a routed pod sends, and the gateway refuses
+    and keeps the post). The error
     names the platform and the setting that arms it, in the wording
     `chat_delivery_watch` reads the platform from; see
     :func:`_no_chat_route_error`.
@@ -5763,7 +5952,12 @@ def relay_cron_report(
                     posted = _post_failed_audit_via_gateway(
                         platform, profile, job_id, report, leg_chat_id, leg_thread_id, blocks_deadline
                     )
-        if posted is not None:
+        if posted is AUDIT_POST_KEPT:
+            # Kept by the gateway for its digest: undelivered, and no text
+            # follows, or the report is kept twice.
+            new_thread_id = None
+            posted = None
+        elif posted is not None:
             new_thread_id = posted.thread_id or None
         else:
             # A failed audit whose folded card did not post goes out whole: under
@@ -6080,9 +6274,37 @@ def _inject_drift(
             "suppressed_today": str(suppressed_today),
         }
 
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, _drift_alert_message(summary), payload, event_row_id)
+    background_tasks.add_task(
+        trigger_agent_troubleshooter,
+        session_id,
+        _drift_alert_message(summary),
+        payload,
+        event_row_id,
+        alert_title=_drift_session_title(payload),
+        alert_kind=_drift_alert_kind(),
+    )
 
     return {"status": "injected"}
+
+
+def _drift_alert_kind() -> str:
+    """The mark a drift alert's routing row gets with KAGE_SLACK_UX on, else "": only the flag's layout reads it."""
+    return ALERT_KIND_DRIFT if slack_presenter.enabled() else ""
+
+
+def _drift_session_title(payload: Dict[str, Any]) -> str | None:
+    """The session title for a drift alert's thread with KAGE_SLACK_UX on, else None.
+
+    "checkout-gateway HPA drift in seeded-b": the object, its kind, and the cluster it changed on.
+    """
+    resource = _drift_resource(payload)
+    name = _defang_drift_field(resource.get("name"))
+    if not (slack_presenter.enabled() and name):
+        return None
+    recorded = _defang_drift_field(resource.get("resource")) or DRIFT_UNKNOWN_FIELD
+    title = DRIFT_ALERT_TITLE.format(name=name, kind=DRIFT_TITLE_KINDS.get(recorded.lower(), recorded))
+    cluster = _defang_drift_field(payload.get("cluster")) or _drift_fallback_cluster()
+    return title + DRIFT_ALERT_TITLE_CLUSTER.format(cluster=cluster)
 
 
 def _drift_alert_message(summary: str) -> str:
@@ -6152,6 +6374,87 @@ def post_drift_backlog(payload: Dict[str, Any]) -> Dict[str, str]:
         raise HTTPException(status_code=503, detail="the drift backlog record could not be written") from exc
     _arm_drift_backlog_digest()
     return {"status": "backlog"}
+
+
+@app.post("/v1/excluded-events", dependencies=[Depends(verify_api_key)])
+def post_excluded_event(payload: Dict[str, Any]) -> Dict[str, str]:
+    """Count one event that an alert-exclude rule held back in the watcher.
+
+    The watcher posts here, with no session, the events its rules match
+    (ALERT_EXCLUDED_FEATURE), so the daily recap can say how much the rules
+    hold back. Nothing here spends quota, posts to chat or starts a turn. The
+    row is marked `excluded`, which keeps it out of every count of alerts and
+    out of the workload fold (it has no fold_key and `notified` is 0).
+
+    One row per object and reason per EXCLUDED_ROW_FOLD_SECONDS: a later record
+    adds its `occurrences` to that row. The watcher sends a record per key per
+    flush interval, carrying the sightings since its last one, so a chronic
+    failure stays one row an hour however often it repeats.
+    """
+    if payload.get("kind") != INJECT_KIND_EVENT:
+        raise HTTPException(status_code=400, detail=f"an excluded event needs kind {INJECT_KIND_EVENT!r}")
+    occurrences = payload.get("occurrences", 1)
+    if (
+        not isinstance(occurrences, int)
+        or isinstance(occurrences, bool)
+        or not 1 <= occurrences <= EXCLUDED_OCCURRENCES_MAX
+    ):
+        raise HTTPException(
+            status_code=400, detail=f"occurrences must be an integer from 1 to {EXCLUDED_OCCURRENCES_MAX}"
+        )
+    event_reason = payload.get("reason") or TRIAGE_DEFAULT_REASON
+    namespace = payload.get("namespace") or TRIAGE_DEFAULT_NAMESPACE
+    object_kind = payload.get("kind_of_object") or TRIAGE_DEFAULT_KIND
+    object_uid = payload.get("uid") or ""
+    event_cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
+    _, severity_label = get_severity_details(payload.get("type") or EXCLUDED_DEFAULT_EVENT_TYPE, event_reason)
+    clean_name = clean_workload_name(object_kind, payload.get("name") or "")
+    clean_msg = clean_event_message(payload.get("message") or "")
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=INCIDENT_FOLD_DB_TIMEOUT_S)) as conn:
+            with conn:
+                updated = conn.execute(
+                    "UPDATE intercepted_events SET occurrences = occurrences + ? "
+                    "WHERE id = (SELECT id FROM intercepted_events WHERE excluded = 1 AND cluster = ? "
+                    "AND object_uid = ? AND reason = ? AND created_at >= datetime('now', ?) "
+                    # A record with no UID folds only into a row of the same
+                    # workload, so nameless objects of different workloads
+                    # stay apart.
+                    "AND (object_uid != '' OR (namespace = ? AND workload = ?)) "
+                    "ORDER BY id DESC LIMIT 1)",
+                    (occurrences, event_cluster, object_uid, event_reason, f"-{EXCLUDED_ROW_FOLD_SECONDS} seconds",
+                     namespace, clean_name),
+                ).rowcount
+                if not updated:
+                    conn.execute(
+                        "INSERT INTO intercepted_events "
+                        "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, "
+                        "occurrences, notified, session_id, excluded) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', 1)",
+                        (
+                            event_cluster,
+                            namespace,
+                            clean_name,
+                            object_uid,
+                            object_kind,
+                            event_reason,
+                            clean_msg[:LEDGER_MESSAGE_MAX_CHARS],
+                            severity_label,
+                            occurrences,
+                        ),
+                    )
+                # This route writes at the cluster's rate and creates no
+                # session, so it prunes here too: otherwise a quiet install
+                # whose rules mute the noise would never reach the TTL and the
+                # row cap.
+                cleanup_old_records(conn)
+    except sqlite3.Error as exc:
+        # A 5xx, as the drift backlog route answers: the row is all this route
+        # does. The watcher keeps the sightings and sends them with its next
+        # record for the key.
+        logger.error(f"Failed to record excluded event {object_uid or '(no uid)'} {event_reason}: {exc}")
+        raise HTTPException(status_code=503, detail="the excluded event could not be written") from exc
+    return {"status": FEED_STATUS_EXCLUDED}
 
 
 # The digest worker. One daemon thread, started by the first pending row and
@@ -6412,6 +6715,11 @@ def _file_drift_backlog_card(rows: Sequence[Dict[str, Any]]) -> str:
             task_id = ""
     if not task_id:
         logger.error(f"Drift backlog card: no task id in the board's answer: {out.strip()[:LEDGER_MESSAGE_MAX_CHARS]}")
+        return task_id
+    try:
+        _stamp_board_task_origin(task_id, ORIGIN_DRIFT, "")
+    except Exception as exc:  # noqa: BLE001 - the card is filed; the stamp is telemetry
+        logger.warning(f"Drift backlog card: could not stamp {task_id} as {ORIGIN_DRIFT}: {exc}")
     return task_id
 
 
@@ -6485,6 +6793,7 @@ def _card_drift_backlog_minorities(rows: Sequence[Dict[str, Any]]) -> list[Dict[
         threading.Thread(
             target=trigger_agent_troubleshooter,
             args=(session_id, _drift_alert_message(_drift_summary(payload)), payload, row["id"]),
+            kwargs={"alert_title": _drift_session_title(payload), "alert_kind": _drift_alert_kind()},
             name=f"drift-backlog-card-{row['id']}",
             daemon=True,
         ).start()
@@ -6513,6 +6822,12 @@ def _send_drift_backlog_digest(platform: str, message: str) -> bool:
         logger.warning(f"Drift backlog digest to '{platform}' timed out; treating it as sent")
         return True
     except subprocess.CalledProcessError as exc:
+        if chat_notify.kept(exc.returncode):
+            # Refused for want of a home channel and kept by the gateway for the
+            # digest it posts once one is set: handled for this run, so the rows
+            # are digested rather than re-sent every retry into the keep.
+            logger.warning(f"Drift backlog digest to '{platform}' was kept by the gateway for its digest (no home channel)")
+            return True
         if chat_notify.outcome_unknown(exc.returncode):
             logger.warning(f"Drift backlog digest to '{platform}' got no answer in time; treating it as sent")
             return True
@@ -6700,6 +7015,20 @@ def inject_message(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="inner payload must be a JSON object")
 
+    answer = _dispatch_inject(session_id, payload, background_tasks, x_watcher_features)
+    # After the handler accepted the inject: a payload it refused does not
+    # decide the session's origin.
+    _stamp_watcher_session_origin(session_id, payload.get("kind"))
+    return answer
+
+
+def _dispatch_inject(
+    session_id: str,
+    payload: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    x_watcher_features: str,
+) -> Dict[str, Any]:
+    """The kind dispatch and the event path of `inject_message`, on its parsed payload."""
     if payload.get("kind") == INJECT_KIND_DRIFT:
         return _inject_drift(session_id, payload, background_tasks)
     if payload.get("kind") == INJECT_KIND_STALL:
@@ -7235,6 +7564,340 @@ def put_conversation_route(session_id: str, request_data: Dict[str, Any]) -> Dic
     return {"status": "recorded"}
 
 
+# --------------------------------------------------------------------------
+# The origin record, the per-job origin table and the proposals ledger:
+# docs/designs/proposal-origin.md §2.1-§2.2.
+# --------------------------------------------------------------------------
+
+
+def _origin_fields(request_data: Dict[str, Any]) -> tuple[str, str]:
+    """The `(origin, platform)` a request names, or a 400 for a value outside ORIGINS."""
+    origin = request_data.get("origin")
+    if not isinstance(origin, str) or origin not in ORIGINS:
+        raise HTTPException(status_code=400, detail=f"origin must be one of {list(ORIGINS)}")
+    platform = request_data.get("platform") or ""
+    if not isinstance(platform, str) or len(platform) > ORIGIN_PLATFORM_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"platform must be a string of at most {ORIGIN_PLATFORM_MAX_CHARS} characters"
+        )
+    return origin, platform.strip()
+
+
+def _set_session_origin(session_id: str, origin: str, platform: str = "") -> bool:
+    """Write the session's origin record if it has none; False when one exists.
+
+    Read and written in one `BEGIN IMMEDIATE` transaction, keeping every other
+    key on the row, so two first writers cannot both win. A session with no row
+    yet gets one carrying the record alone.
+    """
+    if origin not in ORIGINS:
+        raise ValueError(f"origin {origin!r} is not one of {ORIGINS}")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT metadata FROM session_metadata WHERE session_id = ?", (session_id,)).fetchone()
+            meta: Dict[str, Any] = {}
+            if row:
+                try:
+                    loaded = json.loads(row[0])
+                    meta = loaded if isinstance(loaded, dict) else {}
+                except ValueError:
+                    meta = {}
+            if meta.get(ORIGIN_KEY):
+                conn.execute("ROLLBACK")
+                return False
+            meta[ORIGIN_KEY] = origin
+            meta[ORIGIN_PLATFORM_KEY] = platform
+            conn.execute(
+                "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET metadata = excluded.metadata, updated_at = CURRENT_TIMESTAMP",
+                (session_id, json.dumps(meta)),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return True
+
+
+def _origin_state_dbs() -> list[str]:
+    """The Hermes session stores the compression walk reads, in order.
+
+    `kanban_event_routing.state_db_path` resolves the store from inside the
+    gateway, whose `HERMES_HOME` is its profile's home. This server runs with
+    the root home, so it reads its own store (`_card_stop_state_db`) and then,
+    when `HERMES_GATEWAY_PROFILE` names a profile, that profile's store under
+    the data root, the way the feed readers find a profile's `state.db`
+    (`_profile_state_db`).
+    """
+    stores: list[str] = []
+    own = _card_stop_state_db()
+    if own and os.path.isfile(own):
+        stores.append(own)
+    profile = os.environ.get(GATEWAY_PROFILE_ENV, "").strip()
+    if profile and profile != DEFAULT_PROFILE:
+        try:
+            gateway = _profile_state_db(_feed_data_root(), profile)
+        except Exception as exc:  # noqa: BLE001 - no data root here: the walk fails open
+            logger.warning("origin: the gateway profile's session store is unresolvable: %s", exc)
+            gateway = None
+        if gateway is not None and str(gateway) not in stores:
+            stores.append(str(gateway))
+    return stores
+
+
+def _session_compression_ancestors(session_id: str) -> list[str]:
+    """The sessions `session_id` continues through compression, nearest first.
+
+    The walk `_compression_ancestors` in deploy/docker/patches/kanban_event_routing.py
+    takes over Hermes' `state.db`, replicated here because this server does not
+    load that patch. A session lives in one store, so the first store
+    (`_origin_state_dbs`) that knows a parent answers. Fails open to none.
+    """
+    for state_db in _origin_state_dbs():
+        found = _compression_ancestors_in(session_id, state_db)
+        if found:
+            return found
+    return []
+
+
+def _compression_ancestors_in(session_id: str, state_db: str) -> list[str]:
+    """`_session_compression_ancestors` over one session store."""
+    found: list[str] = []
+    try:
+        with closing(_read_only(state_db)) as conn:
+            current = session_id
+            for _ in range(ORIGIN_COMPRESSION_WALK_MAX):
+                row = conn.execute(
+                    "SELECT s.parent_session_id FROM sessions s JOIN sessions p ON p.id = s.parent_session_id "
+                    "WHERE s.id = ? AND p.end_reason = ?",
+                    (current, ORIGIN_COMPRESSION_END_REASON),
+                ).fetchone()
+                if not row or not row[0] or row[0] in found or row[0] == session_id:
+                    break
+                current = row[0]
+                found.append(current)
+    except sqlite3.Error as exc:
+        logger.warning("origin: the compression lineage of %s is unreadable: %s", session_id, exc)
+    return found
+
+
+def _session_origin(session_id: str) -> tuple[str, str]:
+    """The session's `(origin, platform)`, inherited through compression; `("other", "")` when none."""
+    for candidate in (session_id, *_session_compression_ancestors(session_id)):
+        meta = _session_metadata(candidate)
+        origin = meta.get(ORIGIN_KEY)
+        if isinstance(origin, str) and origin in ORIGINS:
+            platform = meta.get(ORIGIN_PLATFORM_KEY)
+            return origin, platform if isinstance(platform, str) else ""
+    return ORIGIN_OTHER, ""
+
+
+def _stamp_watcher_session_origin(session_id: str, kind: Any) -> None:
+    """Stamp a watcher session this server opened with its first inject's origin.
+
+    `drift` for INJECT_KIND_DRIFT, `event` for every other kind. The create call
+    carries no body, so the first inject is the first moment the producer is
+    known; the write-if-absent makes that one win. A session this server never
+    created (a watcher in shared mode) has no row and gets no record. A failed
+    write does not fail the inject.
+    """
+    if not session_id.startswith(WATCHER_SESSION_PREFIX):
+        return
+    meta = _session_metadata(session_id)
+    if not meta or meta.get(ORIGIN_KEY):
+        return
+    origin = ORIGIN_DRIFT if kind == INJECT_KIND_DRIFT else ORIGIN_EVENT
+    try:
+        _set_session_origin(session_id, origin)
+    except Exception as exc:  # noqa: BLE001 - telemetry, never the inject's failure
+        logger.warning("origin: could not record %s for %s: %s", origin, session_id, exc)
+
+
+@app.put("/v1/sessions/{session_id}/origin", dependencies=[Depends(verify_api_key)])
+def put_session_origin(session_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record a session's origin once; 409 when it already has one."""
+    origin, platform = _origin_fields(request_data)
+    if not _set_session_origin(session_id, origin, platform):
+        raise HTTPException(status_code=409, detail="the session already has an origin record")
+    return {"origin": origin, "platform": platform}
+
+
+@app.get("/v1/sessions/{session_id}/origin", dependencies=[Depends(verify_api_key)])
+def get_session_origin(session_id: str) -> Dict[str, str]:
+    """The session's origin record, inherited through compression; 404 when none.
+
+    A mid-turn compression rotates the session id, and the child's row carries no
+    record, so a reader of the raw metadata row would resolve such a turn
+    `other`. `_session_origin` walks the compression parents. A walk that finds
+    no record answers 404, which the reader (deploy/docker/patches/kanban_origin.py)
+    takes as `other`, as it would a recorded `other`.
+    """
+    origin, platform = _session_origin(session_id)
+    if origin == ORIGIN_OTHER and not platform:
+        raise HTTPException(status_code=404, detail="the session has no origin record")
+    return {"origin": origin, "platform": platform}
+
+
+def _cron_job_origin(job_id: str) -> Optional[tuple[str, str]]:
+    """The `(origin, platform)` recorded for a cron job id, or None."""
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        row = conn.execute(
+            "SELECT origin, origin_platform FROM cron_job_origins WHERE job_id = ?", (job_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return str(row[0] or ORIGIN_OTHER), str(row[1] or "")
+
+
+@app.put("/v1/cron/jobs/{job_id}/origin", dependencies=[Depends(verify_api_key)])
+def put_cron_job_origin(job_id: str, request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Record the origin a cron job was created or last changed under (an upsert)."""
+    if not job_id or len(job_id) > ORIGIN_JOB_ID_MAX_CHARS:
+        raise HTTPException(status_code=400, detail=f"job_id must be 1 to {ORIGIN_JOB_ID_MAX_CHARS} characters")
+    origin, platform = _origin_fields(request_data)
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO cron_job_origins (job_id, origin, origin_platform, recorded_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET origin = excluded.origin, "
+                "origin_platform = excluded.origin_platform, recorded_at = excluded.recorded_at",
+                (job_id, origin, platform, datetime.now(timezone.utc).isoformat()),
+            )
+    return {"origin": origin, "platform": platform}
+
+
+@app.get("/v1/cron/jobs/{job_id}/origin", dependencies=[Depends(verify_api_key)])
+def get_cron_job_origin(job_id: str) -> Dict[str, str]:
+    """The origin recorded for a cron job id; 404 when it has none.
+
+    Read by a tick-started run of a job that no longer matches the image's
+    template (`deploy/docker/patches/cron_job_template.py`).
+    """
+    recorded = _cron_job_origin(job_id)
+    if recorded is None:
+        raise HTTPException(status_code=404, detail="no origin recorded for this cron job")
+    origin, platform = recorded
+    return {"origin": origin, "platform": platform}
+
+
+@app.post("/v1/proposals/opened", dependencies=[Depends(verify_api_key)])
+def post_proposal_opened(request_data: Dict[str, Any]) -> Dict[str, bool]:
+    """Record one verified proposal in the ledger; the first record of a url stands.
+
+    200 either way, so a hook that retries after a lost answer is not told it failed.
+    """
+    url = request_data.get("url")
+    if not isinstance(url, str) or not url.strip() or len(url) > PROPOSAL_URL_MAX_CHARS:
+        raise HTTPException(status_code=400, detail=f"url must be 1 to {PROPOSAL_URL_MAX_CHARS} characters")
+    origin, platform = _origin_fields(request_data)
+    opened_at = request_data.get("opened_at") or datetime.now(timezone.utc).isoformat()
+    if not isinstance(opened_at, str) or len(opened_at) > PROPOSAL_OPENED_AT_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"opened_at must be a string of at most {PROPOSAL_OPENED_AT_MAX_CHARS} characters"
+        )
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO proposals_opened (url, origin, origin_platform, opened_at) VALUES (?, ?, ?, ?)",
+                (url.strip(), origin, platform, opened_at),
+            )
+    return {"recorded": cursor.rowcount > 0}
+
+
+@app.get("/v1/proposals/opened/counts", dependencies=[Depends(verify_api_key)])
+def get_proposals_opened_counts() -> Dict[str, Dict[str, int]]:
+    """`{origin: {platform: n}}` for every origin in ORIGINS, an origin with no row as `{"": 0}`."""
+    counts: Dict[str, Dict[str, int]] = {origin: {} for origin in ORIGINS}
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        rows = conn.execute(
+            "SELECT origin, COALESCE(origin_platform, ''), COUNT(*) FROM proposals_opened GROUP BY 1, 2"
+        ).fetchall()
+    for origin, platform, n in rows:
+        bucket = counts[origin if origin in ORIGINS else ORIGIN_OTHER]
+        bucket[platform] = bucket.get(platform, 0) + n
+    for origin in ORIGINS:
+        if not counts[origin]:
+            counts[origin][""] = 0
+    return counts
+
+
+def _stamp_board_task_origin(task_id: str, origin: str, platform: str) -> bool:
+    """Stamp a card in the board's side table if it has no stamp; True when this call wrote it.
+
+    Raises FileNotFoundError without a board, ImportError without Hermes'
+    kanban module, and sqlite3.Error when the board cannot be written.
+    """
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        raise FileNotFoundError(board)
+    _, connect_tracked = _hermes_kanban()
+    with closing(_card_stop_connect(connect_tracked, board)) as conn:
+        conn.execute(KANBAN_TASK_ORIGINS_SCHEMA)
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO kanban_task_origins (task_id, origin, origin_platform, stamped_at) VALUES (?, ?, ?, ?)",
+            (task_id, origin, platform, datetime.now(timezone.utc).isoformat()),
+        )
+        return cursor.rowcount > 0
+
+
+def _mint_stamp_ticket(origin: str, platform: str = "") -> str:
+    """Issue a one-time stamp ticket for `origin`; returns the ticket."""
+    if origin not in ORIGINS:
+        raise ValueError(f"origin {origin!r} is not one of {ORIGINS}")
+    ticket = os.urandom(STAMP_TICKET_BYTES).hex()
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            conn.execute(
+                "INSERT INTO kanban_stamp_tickets (ticket, origin, origin_platform, issued_at) VALUES (?, ?, ?, ?)",
+                (ticket, origin, platform, time.time()),
+            )
+    return ticket
+
+
+def _redeem_stamp_ticket(ticket: str) -> Optional[tuple[str, str]]:
+    """The `(origin, platform)` a live, unspent ticket carries, spending it; None otherwise."""
+    if not ticket or len(ticket) > STAMP_TICKET_MAX_CHARS:
+        return None
+    now = time.time()
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS, isolation_level=None)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute(
+                "UPDATE kanban_stamp_tickets SET redeemed_at = ? "
+                "WHERE ticket = ? AND redeemed_at IS NULL AND issued_at >= ?",
+                (now, ticket, now - STAMP_TICKET_TTL_SECONDS),
+            )
+            row = None
+            if cursor.rowcount == 1:
+                row = conn.execute(
+                    "SELECT origin, origin_platform FROM kanban_stamp_tickets WHERE ticket = ?", (ticket,)
+                ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    if not row:
+        return None
+    return str(row[0]), str(row[1] or "")
+
+
+@app.post("/v1/board/stamp-tickets", dependencies=[Depends(verify_api_key)])
+def post_stamp_ticket(request_data: Dict[str, Any]) -> Dict[str, str]:
+    """Mint a one-time ticket that stamps one new card with `origin` at insert."""
+    origin, platform = _origin_fields(request_data)
+    return {"ticket": _mint_stamp_ticket(origin, platform)}
+
+
+@app.post("/v1/board/stamp-tickets/{ticket}/redeem", dependencies=[Depends(verify_api_key)])
+def redeem_stamp_ticket(ticket: str) -> Dict[str, str]:
+    """Spend a ticket: its origin once; 404 when unknown, already spent, or past STAMP_TICKET_TTL_SECONDS."""
+    found = _redeem_stamp_ticket(ticket)
+    if not found:
+        raise HTTPException(status_code=404, detail="no live stamp ticket by that value")
+    return {"origin": found[0], "platform": found[1]}
+
+
 @app.get("/v1/sessions/{session_id}/metadata", dependencies=[Depends(verify_api_key)])
 def get_metadata(session_id: str) -> Dict[str, Any]:
     if not session_id:
@@ -7493,6 +8156,7 @@ def _feed_status(
     backlog: int = DRIFT_BACKLOG_NONE,
     duplicate_of: Optional[int] = None,
     triage_state: str = "",
+    excluded: int = 0,
 ) -> str:
     """What became of a ledger row, in the inject route's own words.
 
@@ -7508,8 +8172,11 @@ def _feed_status(
     triage never started is still `notified`, and `injected` would say the triage
     is under way. A row whose delivery failed or is unconfirmed stays
     `undelivered` whatever its triage did: that the alert may not have been seen
-    is the fact a reader needs first.
+    is the fact a reader needs first. A row an alert-exclude rule held back is
+    `excluded`: it was never offered to chat.
     """
+    if excluded:
+        return FEED_STATUS_EXCLUDED
     if backlog and backlog != DRIFT_BACKLOG_CARDED:
         return FEED_STATUS_BACKLOG
     if duplicate_of is not None:
@@ -7541,7 +8208,8 @@ def list_intercepted_events(
     limit = _clamp_limit(limit, FEED_EVENTS_MAX_LIMIT)
     columns = (
         "id, session_id, created_at, cluster, namespace, object_kind, workload, "
-        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request"
+        "reason, severity, notified, delivery_error, message, backlog, duplicate_of, triage_state, pull_request, "
+        "excluded"
     )
     with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
         if since_id is not None:
@@ -7567,7 +8235,7 @@ def list_intercepted_events(
             "severity": row["severity"],
             "status": _feed_status(
                 row["notified"], row["severity"], row["delivery_error"], row["backlog"],
-                row["duplicate_of"], row["triage_state"],
+                row["duplicate_of"], row["triage_state"], row["excluded"],
             ),
             "message": row["message"],
             "duplicate_of": row["duplicate_of"],

@@ -18,6 +18,11 @@ package controller
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -70,7 +75,12 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		{"next slack, blank home", slackHome("next", "  "), []string{"spec.integration.slack.homeChannel"}},
 		{"next slack, home set", slackHome("next", "C0123ABCD"), nil},
 		{"today slack, no home", slackHome("today", ""), nil},
-		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL"}},
+		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "keeps them"}},
+		{"next chat and slack, no chat home", func() string {
+			a := chatAndSlackTestAgent("next")
+			a.Spec.Integration.GoogleChat.HomeChannel = ""
+			return homeChannelUnsetMessage(a, homeChannelRecord{})
+		}, []string{"Google Chat", "Slack Hermes platform meanwhile"}},
 		{"next chat, home set", chatHome("next", "spaces/AAA"), nil},
 		{"today chat, no home", chatHome("", ""), nil},
 		{"next chat and slack, chat home set", bothChatHomeOnly, nil},
@@ -89,8 +99,8 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 					t.Errorf("message does not name %q: %q", want, got)
 				}
 			}
-			if !strings.Contains(got, "dropped") {
-				t.Errorf("message must say the posts are dropped, not just that a field is empty: %q", got)
+			if !strings.Contains(got, "keeps them") && !strings.Contains(got, "Slack Hermes platform") {
+				t.Errorf("message must say where the posts go meanwhile, not just that a field is empty: %q", got)
 			}
 		})
 	}
@@ -293,6 +303,7 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 		{"manual is named before a malformed record", "", "manual", record(map[string]string{homeChannelRecordSlackKey: "D0DM"}), "", "", true, []string{"manual"}, []string{"not a channel id"}},
 		{"recorded channel the gateway refused", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordRefusedKey: "archived"}), "", "", true, []string{"C0LEARNED", "archived", "replaces it"}, nil},
 		{"recorded channel refused as malformed", "", "", record(map[string]string{homeChannelRecordSlackKey: "C0LEARNED", homeChannelRecordRefusedKey: "malformed"}), "", "", true, []string{"C0LEARNED", "not a channel id"}, nil},
+		{"recorded group DM refused as a direct message", "", "", record(map[string]string{homeChannelRecordSlackKey: "G0MPIM", homeChannelRecordRefusedKey: "direct-message"}), "", "", true, []string{"G0MPIM", "direct or group direct message"}, []string{"does not know", "not a channel id"}},
 		{"refused candidate, known reason", "", "", record(map[string]string{homeChannelRecordRefusedKey: "shared"}), "", "", true, []string{"refused", "Slack Connect"}, nil},
 		{"refused candidate, unknown reason is not echoed", "", "", record(map[string]string{homeChannelRecordRefusedKey: strings.Repeat("x", 40000)}), "", "", true, []string{"refused", "does not know"}, nil},
 		{"malformed learned id", "", "", record(map[string]string{homeChannelRecordSlackKey: "D0DM"}), "", "", true, []string{"not a channel id"}, nil},
@@ -315,8 +326,12 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 			if got := env[agentSlackHomeChannelEnvVar].Value; got != tc.wantEnv {
 				t.Errorf("%s = %q, want %q (the learned channel travels as a file, not env)", agentSlackHomeChannelEnvVar, got, tc.wantEnv)
 			}
-			if _, routed := env[a2aNotifyPlatformEnvVar]; routed != (tc.wantEnv != "") {
-				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, routed, tc.wantEnv != "")
+			// Routed with the CR's channel, and with the field empty (Slack is
+			// the only chat platform here, so the gateway keeps what it
+			// refuses); a malformed CR value routes nothing.
+			wantRouted := tc.wantEnv != "" || strings.TrimSpace(tc.crHome) == ""
+			if _, routed := env[a2aNotifyPlatformEnvVar]; routed != wantRouted {
+				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, routed, wantRouted)
 			}
 			msg := homeChannelUnsetMessage(a, rec)
 			if (msg != "") != tc.wantCond {
@@ -600,5 +615,54 @@ func TestPlatformAgentReconciler_Reconcile_HomeChannelRecordDrivesTheProjection(
 	}
 	if c := condition(); c != nil {
 		t.Fatalf("HomeChannelUnset survived the CR field: %+v", c)
+	}
+}
+
+// gatewayHomeChannelSource holds the gateway's refusal vocabulary, the
+// homeRefused* constants it writes into slack.refused. The a2a module cannot be
+// imported here, so the words are read from the source.
+const gatewayHomeChannelSource = "../../../a2a/gateway/slack_home_channel.go"
+
+// homeChannelRefusedReasons is a copy of the gateway's vocabulary: a word the
+// gateway writes and the operator does not map renders as a reason the operator
+// does not know. Every step fails rather than passing on nothing found.
+func TestHomeChannelRefusedReasonsMatchTheGatewaysVocabulary(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), gatewayHomeChannelSource, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v (if the gateway's home-channel file moved, this test's path must move with it; it is what keeps homeChannelRefusedReasons honest)", gatewayHomeChannelSource, err)
+	}
+	var gateway []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		for i, name := range spec.Names {
+			if !strings.HasPrefix(name.Name, "homeRefused") || i >= len(spec.Values) {
+				continue
+			}
+			lit, ok := spec.Values[i].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				t.Fatalf("%s in %s is not a string literal; this test reads the words as literals", name.Name, gatewayHomeChannelSource)
+			}
+			word, err := strconv.Unquote(lit.Value)
+			if err != nil {
+				t.Fatalf("%s in %s: %v", name.Name, gatewayHomeChannelSource, err)
+			}
+			gateway = append(gateway, word)
+		}
+		return true
+	})
+	if len(gateway) == 0 {
+		t.Fatalf("no homeRefused* string constants in %s; they are what homeChannelRefusedReasons mirrors", gatewayHomeChannelSource)
+	}
+	operator := make([]string, 0, len(homeChannelRefusedReasons))
+	for word := range homeChannelRefusedReasons {
+		operator = append(operator, word)
+	}
+	sort.Strings(gateway)
+	sort.Strings(operator)
+	if strings.Join(gateway, ",") != strings.Join(operator, ",") {
+		t.Errorf("the gateway writes refusal words %q, homeChannelRefusedReasons maps %q: a word on one side only renders as %q or is never written", gateway, operator, homeChannelRefusedUnknown)
 	}
 }

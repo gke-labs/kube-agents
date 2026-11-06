@@ -109,6 +109,16 @@ the events where one replica has none until a new pod schedules and starts: a ro
 drain (a graceful handover in a few seconds) and a node or zone loss (the lease's 20s, then the
 relay's 30s).
 
+The election also makes the gateway depend on the API server, which it otherwise needs only for
+side tasks (spawning session pods, the home-channel record). A leader whose renewals fail gives up
+10s after the first failure (about 12s after its last good renewal), stops and exits, and no
+replica can take the lease until the API server answers again. So any control-plane outage longer
+than that stops chat, the console and the relay for its length. A zonal cluster's control-plane
+upgrade is the common case: several minutes with no API server, which an unelected gateway rides
+through. Two replicas don't change this, since both need the API server. This is accepted: an
+install that wants the gateway highly available runs a regional control plane, which keeps the API
+server up through an upgrade.
+
 ### Fencing
 
 A replica that can't renew the lease steps down, and the stop has to fit before a standby can
@@ -337,7 +347,10 @@ AlwaysAllow` as the callout's has, so a node drain takes one replica at a time a
    PDB, the spread, the Lease (with its owner reference and
    an `Owns` watch, recreated one `leaseDuration` after a deletion) and its Role. Its tests pin
    each, including the held-back recreate, the first roll across the election, and a pin to a
-   pre-election image and back.
+   pre-election image and back. It lands in two parts: first the Lease, its Role grant and the
+   gateway's election env, at one replica with `Recreate`, behind an operator flag
+   (`A2A_GATEWAY_ELECTION`) that CI and the live runs turn on; then the replicas, the strategy and
+   their guard, the readiness probe, the PDB and the spread.
 5. **The cards-pending mark on the record** (planned separately).
 6. **Live runs** on a `next` lane: a rollout, a node drain and a force delete of the active pod
    while a task streams, measuring the gap and showing every event rendered once.

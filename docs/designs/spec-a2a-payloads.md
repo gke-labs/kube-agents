@@ -943,13 +943,22 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   message posts the fallback, logged and counted, as for an invalid one, and never clips
   it or sends a card the API will refuse. The same goes for a post the backend's API
   refuses: the renderer retries it once as the fallback.
+- **Wording is linted, not validated.** A headline names no card id (`t_` and eight hex
+  digits), opens with no markdown heading or apology ("Sorry", "I apologize",
+  "Unfortunately") and carries no code fence; a choice's label is no slash command, code
+  span, or command line opening on a CLI's name (`kubectl`, `gcloud`, `git` and the like). Breaking one is an emitter bug, but not one a renderer acts on:
+  dropping the message for its wording would lose the answer. `chatmsg.Lint` and
+  `chat_cases.lint` check them, and the emitters' tests and the shared cases hold the
+  emitters to them. The Slack renderer keeps the buttons to five a row by wrapping.
 
-`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above, the
+`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above but
+the wording one, which `Lint` checks, the
 fallback each carrier pairs with a chat message, and the DataPart encoding. The command
 matchers and the label check it shares with the gateway are in `a2a/lib/chattext`. The shared
 cases in `tests/conformance/chat/` pair inputs from the `today` presenters' tests with the chat
-messages the emitter owes for them; `chatmsg` validates every one, and
+messages the emitter owes for them; `chatmsg` validates and lints every one, and
 `agents/platform/scripts/chat_cases.py` reads them for the Python presenters.
+`tests/conformance/chat-ux/lint.json` holds the lint's own cases, which both lints read.
 
 ## Topics
 
