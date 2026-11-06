@@ -320,9 +320,10 @@ NEW_RESULT_DESCRIPTION = (
     "(the chat message already shows the card title), "
     "`[text](url)` for every artifact you name, backticks "
     "around raw values like ids, paths and timestamps, and a "
-    "pipe table for tabular data — but keep the table to a few "
-    "short columns and never let it be the only place a fact "
-    "lives, because Google Chat drops tables."
+    "one pipe table for tabular data (a row per node, cluster or "
+    "workload is a table row, not a bullet, and is not repeated as "
+    "one), kept to a few short columns, which Google Chat shows as "
+    "a monospace block."
 )
 
 # Upstream's ``_handle_complete`` has raised the check through ``_check`` (a
