@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -325,11 +326,14 @@ func TestHandlerUpgrade(t *testing.T) {
 
 func TestHandlerMaxInFlight(t *testing.T) {
 	const blockedPath = "/api/v1/pods"
-	entered, release := make(chan struct{}), make(chan struct{})
+	entered, gate := make(chan struct{}), make(chan struct{})
+	// release frees the held request on a failed assertion too, so its goroutine does not leak.
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
 	upstream := &fakeUpstream{handler: func(_ string, req *http.Request) (*http.Response, error) {
 		if req.URL.Path == blockedPath {
 			close(entered)
-			<-release
+			<-gate
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -343,7 +347,7 @@ func TestHandlerMaxInFlight(t *testing.T) {
 		return serve(h, httptest.NewRequest(http.MethodGet, "/clusters/"+gkeHost+path, nil))
 	}
 
-	held := make(chan *httptest.ResponseRecorder)
+	held := make(chan *httptest.ResponseRecorder, 1)
 	go func() { held <- get(blockedPath) }()
 	<-entered
 
@@ -373,7 +377,7 @@ func TestHandlerMaxInFlight(t *testing.T) {
 		t.Errorf("refused write over the cap: code = %d, want 403: the policy answers before the cap", rec.Code)
 	}
 
-	close(release)
+	release()
 	if rec := <-held; rec.Code != http.StatusOK {
 		t.Fatalf("held request: code = %d, want 200", rec.Code)
 	}

@@ -27,7 +27,8 @@ const (
 	metricsPortFlag         = "metrics-port"
 	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
 
-	// defaultMaxInFlight keeps a replica under its 512Mi limit: at the 500-object pages
+	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
+	// k8s-operator/internal/controller/kube_proxy_manifests.go): at the 500-object pages
 	// kubectl reads, a forwarded list held about 9.5 MiB in flight and the proxy was
 	// OOMKilled at 43 to 48 in flight.
 	defaultMaxInFlight = 24
