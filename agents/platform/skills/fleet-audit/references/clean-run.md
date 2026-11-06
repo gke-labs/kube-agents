@@ -18,7 +18,10 @@ above the old body. The banner says that the run found none of the findings belo
 issue does not show them as open. The findings below the banner are not rewritten; they stay as the
 record. On a ledger that a coverage gap opened, the banner says that a complete run found no
 findings and no gap. A later run
-with findings opens a new ledger issue; it does not reopen this one.
+with findings opens a new ledger issue; it does not reopen this one. A carried finding whose
+cluster this run lists in neither `scope.clusters` nor `scope.skipped` does not hold the close (the
+fleet listing has no such cluster), but the all-clear names it under "Not confirmed fixed", it is
+left out of `resolved`, and the JSON line lists its id under `retired_unlisted`; report that line.
 
 **Zero findings plus a coverage gap is not a clean run, and a run with a new or changed gap is not
 silent, even on a stream with no ledger.** With gaps, the harness opens one — titled `coverage incomplete (n gaps, 0 findings)`
