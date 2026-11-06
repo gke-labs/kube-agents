@@ -1629,18 +1629,20 @@ The one case it is neither written nor removed is version skew, a `spec.mode` th
 
 | Reason                 | Status  | Meaning                                                                                                                                                                                                   |
 | ---------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `InPlace`              | `True`  | The policy and binding are in place and the dispatcher holds its Jobs Role in the profile namespace.                                                                                                      |
+| `InPlace`              | `True`  | The last pass that settled Job mode found the policy and binding in place and granted the dispatcher its Jobs Role in the profile namespace.                                                              |
 | `PolicyMissing`        | `False` | The policy or its binding is missing, unreadable to the operator (`Forbidden`), or loosened. The message is the `DispatcherJobPolicyMissing` Event's and names which.                                     |
 | `NamespaceNotSelected` | `False` | The profile namespace lacks a label the binding selects it by, so the policy does not hold there. The message is the Event's.                                                                             |
-| `NamespaceNotReady`    | `False` | The profile namespace is absent, lacks the chart's markers, or has no network fence yet.                                                                                                                  |
+| `NamespaceNotReady`    | `False` | The profile namespace is absent or lacks the chart's markers, or the pass did not apply its network fence, which includes a failed fence write or a failed read of the namespace.                         |
 | `ForeignJobTemplate`   | `False` | A `DispatchJobTemplate` under one of the operator's names in the profile namespace lacks this agent's labels. The operator leaves it alone, and Job mode stays off for every profile until it is removed. |
 | `GrantFailed`          | `False` | Granting Job mode failed this pass (copying the CA bundle, writing the templates, applying the Jobs Role, or reading the profile namespace). The message carries the error.                               |
 
-Every `False` reason means the pass revoked the dispatcher's Jobs Role and left the Job templates out of the dispatch config. Jobs already running are left to finish.
+Every `False` reason means the pass left the Job templates out of the dispatch config and revoked the dispatcher's Jobs Role. If the revoke itself fails, the Role can still stand; the operator logs that error, and the condition keeps the reason that triggered the revoke. Jobs already running are left to finish.
 
-**When it changes.** It follows what each pass does to the Jobs Role, written on the way out of the reconcile like `BusCredentialsReady`, so a pass that ends `Degraded` still writes it. A pass that changes nothing about the Role leaves it as it was: a read of the policy that fails for a reason other than `NotFound` or `Forbidden` (a timeout, throttling), or a pass that stops before the dispatcher step.
+**When it changes.** It follows what each pass does to the Jobs Role, written on the way out of the reconcile like `BusCredentialsReady`, so a pass that ends `Degraded` still writes it. A pass that changes nothing about the Role leaves it as it was: a read of the policy that fails for a reason other than `NotFound` or `Forbidden` (a timeout, throttling), or a pass that stops before the dispatcher step. So `True` describes the last pass that settled Job mode, not the cluster now: the operator does not watch the policy or its binding, so a policy removed since then shows on the next pass that reaches the dispatcher.
 
-**When it is removed.** Removed, not set `False`, when the chart's signal is off, the operator runs no dispatcher, or the mode is not `next`.
+**When it is removed.** Removed, not set `False`, only by a pass that tore Job mode down or found nothing of it left. With the chart's signal off, that is once the dispatcher's Jobs, Job templates and Jobs Role are deleted. With no dispatcher image, it is once the dispatcher is removed. With the mode flipped to `today`, it is once the A2A stack is torn down. A pass that stops before that teardown (a refused `spec`, say) or whose teardown fails leaves the condition as it was, because the Jobs Role and the templates are still live.
+
+Version skew, a `spec.mode` this operator does not recognise, neither writes nor removes it, as for `BusCredentialsReady`: the dispatcher a newer CRD rendered is left standing, so the condition describing it is too.
 
 ### What `A2AGateway` reports
 
