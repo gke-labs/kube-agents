@@ -155,8 +155,8 @@ func TestAFinishBetweenHoldersIsSettledNotFailed(t *testing.T) {
 }
 
 // A lease record nobody can read still says the task started, so it is
-// re-adopted, not offered. It names neither a deadline nor a confirm time,
-// so the limit counts from the re-adoption, and the restart grace covers it
+// re-adopted, not offered. It names no deadline, so the limit counts from
+// the entry's write (decodeLease), and the restart grace covers it
 // like any other: a worker still renewing keeps it, and its final renewal
 // settles it with no failure terminal.
 func TestAnUnreadableRecordIsReadoptedWithTheRestartGrace(t *testing.T) {

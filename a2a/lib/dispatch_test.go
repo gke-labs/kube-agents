@@ -347,6 +347,14 @@ func TestTheOperatorsDispatchConfigDecodesAndValidates(t *testing.T) {
 	if cfg.Version == "" || cfg.Namespace == "" || cfg.ProfileNamespace != cfg.Namespace+"-profiles" {
 		t.Errorf("version %q, namespace %q, profile namespace %q", cfg.Version, cfg.Namespace, cfg.ProfileNamespace)
 	}
+	// The operator can't import lib, so this is what holds the submit
+	// stream's max age it renders (the operator's own test ties that to the
+	// stream it provisions) equal to ProfileSubmitRetention, the floor the
+	// dispatcher keeps tombstones for: a change to either is a deliberate
+	// edit of both (#4813). The raised-then-lowered case is #4948.
+	if got := time.Duration(cfg.SubmitRetentionSeconds) * time.Second; got != ProfileSubmitRetention {
+		t.Errorf("the operator renders a submit retention of %v; ProfileSubmitRetention is %v", got, ProfileSubmitRetention)
+	}
 }
 
 // The durable the operator makes and the pool labels it renders (its
