@@ -43,7 +43,10 @@ const (
 )
 
 var (
-	inlineWhitespaceRe   = regexp.MustCompile(`\s+`)
+	// inlineWhitespaceRe also takes control characters and the Unicode
+	// line and paragraph separators: a producer's field rendered on one
+	// line must not start another, such as a forged server task line.
+	inlineWhitespaceRe   = regexp.MustCompile(`[\s\p{Cc}\x{2028}\x{2029}]+`)
 	quotedFlagArgRe      = regexp.MustCompile(`^([A-Za-z0-9_.-]+=)"([^"]*)"$`)
 	thoughtAbbreviations = []string{"e.g.", "i.e.", "etc.", "vs.", "cf."}
 )
@@ -606,13 +609,13 @@ func humanizeStepTitle(d StepDetail) string {
 	s := d.Step
 	title := collapseInlineWhitespace(s.Title)
 	if s.Kind == stepmsg.KindSubtask && s.Subtask != nil {
-		cardID := strings.TrimSpace(s.Subtask.ID)
+		cardID := collapseInlineWhitespace(s.Subtask.ID)
 		cardTitle := collapseInlineWhitespace(s.Subtask.Title)
 		if cardTitle == "" {
 			cardTitle = title
 		}
 		status := strings.ToLower(strings.TrimSpace(s.Subtask.Status))
-		verdict := strings.ToUpper(strings.TrimSpace(s.Subtask.Verdict))
+		verdict := strings.ToUpper(collapseInlineWhitespace(s.Subtask.Verdict))
 		prefix := "Kanban Card"
 		if cardID != "" {
 			prefix = fmt.Sprintf("Kanban Card #%s", cardID)
