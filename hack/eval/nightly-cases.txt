@@ -1220,7 +1220,9 @@
 # (#4705), is a public tree over the ceiling with one manifest on a removed
 # apiVersion; the scan reads it with no credential, so it needs no pool change.
 # Red on main 5a4cdc5e and three greens on #4776's build, on the
-# devops-bench-complex-evals dev install (today mode, agent API).
+# devops-bench-complex-evals dev install (today mode, agent API). On this
+# file's inject lane only the report checks grade (the task header says
+# which), so the api lane is the red's home.
 ./tasks/upgrades-api-deprecation-large-repo/task.yaml
 
 # Catalogue entry 23 through the readiness report's control-plane-upgrade-history

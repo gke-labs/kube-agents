@@ -1025,8 +1025,8 @@ repository has.
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE`,
 `BUNDLE_TOO_LARGE` and `SNAPSHOT_TOO_LARGE` (when the measure listed the tree, the
 refusal carries `ceiling`, the `revision` it measured, and `entries`: each entry one
-level below what was asked, with its `type`, its count of `manifests`, and the `bytes` a
-snapshot of it alone measures),
+level below what was asked, with its `path`, its `type`, its count of `manifests`, and
+the `bytes` a snapshot of it alone measures; past 4096 entries it carries none),
 400 `PATH_NOT_FOUND` (a `snapshot` path that names nothing at the ref; the refusal
 carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,

@@ -25,6 +25,15 @@
 # reads the tree in one snapshot of `clusters/` and every check passes. Not yet
 # run on a next-mode install through the inject door.
 #
+# The red's home is the api lane. The nightly grades through the inject door,
+# which sets aside the-deprecation-scan-ran and
+# the-scan-read-the-repository-itself on every record, and
+# the-request-was-delegated when the door shows no tool-call trace. What stays
+# graded there reads only the report: the PDB, no invented CVE, and
+# the-section-names-its-source. The red on main failed that last check, since
+# its --manifests-dir copy has no "manifests as of" line; a worker on main that
+# writes the phrase itself would pass it, so the inject lane's red is weaker.
+#
 # Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
 # write). The repository is public, so the broker reads it as an unregistered
 # repository with no credential.
