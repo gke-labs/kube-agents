@@ -1262,9 +1262,11 @@ func TestStreamingStepsFollowedTaskTooLargeToReadIsReadOnceAndSettles(t *testing
 // When a streamed delegated turn has aliased step state under root R and
 // followed children C1, C2 while running[token] points to C1, a follow-up
 // send_message's awaitRunningTurn waits for the children once without
-// multiplying readers, stops the aliased step state across all keys, and does
-// not loop again on R.
-func TestAwaitRunningTurnStopsAliasedDelegatedStepState(t *testing.T) {
+// multiplying readers, marks the aliased step state superseded (left for its
+// streaming client, no longer the conversation's running turn), and does not
+// loop again on R. The streaming client's next poll then settles it with the
+// children's answer and removes it across all keys.
+func TestAwaitRunningTurnSupersedesAliasedDelegatedStepState(t *testing.T) {
 	url, js := testBus(t)
 	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
 	if err != nil {
@@ -1368,10 +1370,123 @@ func TestAwaitRunningTurnStopsAliasedDelegatedStepState(t *testing.T) {
 	}
 
 	convs.mu.Lock()
+	first := convs.steps["task-root1"]
+	convs.mu.Unlock()
+	if first == nil || !first.superseded.Load() {
+		t.Fatalf("the first turn's step state after awaitRunningTurn = %v, want it kept and superseded", first)
+	}
+
+	// The first turn's streaming client polls again: it settles with a
+	// child's answer, not the root's empty one, and the state goes.
+	res3 := callTool(t, s, ToolTaskControl, map[string]any{
+		"action":       "get",
+		"task":         fakeAddressee + "/task-root1",
+		"wait_seconds": 5,
+		"stream_steps": true,
+	})
+	if res3.IsError {
+		t.Fatalf("task_control get on the first turn failed: %s", res3.Content[0].Text)
+	}
+	mustContain(t, res3.Content[0].Text, "child b done")
+	mustNotContain(t, res3.Content[0].Text, StreamingStepContinuePrefix)
+	convs.mu.Lock()
 	remainingSteps := len(convs.steps)
 	convs.mu.Unlock()
 	if remainingSteps != 0 {
-		t.Errorf("len(convs.steps) after awaitRunningTurn = %d, want 0", remainingSteps)
+		t.Errorf("len(convs.steps) after the first turn settled = %d, want 0", remainingSteps)
+	}
+}
+
+// A second message on a conversation whose first turn is still being
+// streamed must not take the first turn's step state from under its client:
+// the client's next poll still follows the delegated child (here still
+// running, so it reports the turn running rather than settling on the
+// root's empty answer), and settles with the child's answer once the child ends. The mutant this kills: a
+// second message that deletes and closes the state (the client's next poll
+// starts a bare one that settles on the root at once).
+func TestASecondMessageLeavesTheFirstTurnsStreamToItsClient(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	var turnNum atomic.Int32
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		i := turnNum.Add(1)
+		root := fmt.Sprintf("task-second-root%d", i)
+		publishSubmission(t, js, fakeAddressee, root, conv, f.Text, "")
+		if i == 1 {
+			publishRun(t, js, fakeAddressee, root, "", false)
+			publishArtifact(t, js, fakeAddressee, root, lib.ArtifactDelegate, "cluster-a: inspect")
+			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
+			publishSubmission(t, js, "cluster-a", "task-second-child", conv, "inspect a", root)
+			publishRun(t, js, "cluster-a", "task-second-child", "", false)
+			return
+		}
+		publishRun(t, js, fakeAddressee, root, answerText, true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, w, err := b.SendTurn(t.Context(), convs, token, "first delegated turn", 5*time.Second)
+	if err != nil || res.Task == nil {
+		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+	}
+	convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+	first, err := b.WaitForTurnStep(t.Context(), convs, w, *res.Task, 500*time.Millisecond)
+	if err != nil || !first.StillRunning {
+		t.Fatalf("first poll: StillRunning=%v err=%v, want a running turn", first.StillRunning, err)
+	}
+
+	// The second message waits out the turn's tasks: the child finishes
+	// on the bus while it waits, then the second turn goes.
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		publishResult(t, js, "cluster-a", "task-second-child", wakeAnswer)
+		publishStatus(t, js, "cluster-a", "task-second-child", lib.StateCompleted, true)
+	}()
+	res2, w2, err := b.SendTurn(t.Context(), convs, token, "second turn", 5*time.Second)
+	if err != nil || res2.Task == nil {
+		t.Fatalf("second SendTurn: res=%+v err=%v", res2, err)
+	}
+	w2.close()
+
+	var out TurnStepOutcome
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err = b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 500*time.Millisecond)
+		if err != nil {
+			t.Fatalf("first turn's poll after the second message: %v", err)
+		}
+		if !out.StillRunning {
+			break
+		}
+	}
+	if out.StillRunning {
+		t.Fatal("the first turn never settled after the second message")
+	}
+	_, _, resultText := FormatTurnCustomToolEnvelope(out)
+	mustContain(t, resultText, wakeAnswer)
+	if ref, ok := convs.runningTask(token); !ok || ref != *res2.Task {
+		t.Errorf("running task after the first turn settled = %v (%v), want the second turn's %v", ref, ok, *res2.Task)
 	}
 }
 
@@ -1791,4 +1906,171 @@ func TestIdleReleaseIgnoresAStaleGeneration(t *testing.T) {
 	if !released || f.unsubscribed.Load() != 1 {
 		t.Fatalf("the armed idle release did not close the watches (released=%v, unsubscribed=%d)", released, f.unsubscribed.Load())
 	}
+}
+
+// The gateway's relay mints a delegating turn's child after the root's
+// terminal, and can trail it by minutes (its relayLagGrace). A streamed
+// turn whose child arrives later than the old two-second follow grace is
+// still followed: the polls before it report the turn running, and the
+// child's answer is the turn's. The mutant this kills: a poll that settles
+// on the root's own answer once a short grace passes with no child.
+func TestAChildThatTrailsItsDelegatingRootIsStillStreamed(t *testing.T) {
+	url, js := testBus(t)
+	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+
+	rootID := "task-trailing-root"
+	childID := "task-trailing-child"
+	_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+		token := strings.Split(m.Subject, ".")[2]
+		conv := "console:" + token
+		var f ConsoleInFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		publishSubmission(t, js, fakeAddressee, rootID, conv, f.Text, "")
+		publishRun(t, js, fakeAddressee, rootID, "", false)
+		publishArtifact(t, js, fakeAddressee, rootID, lib.ArtifactDelegate, "cluster-a: inspect")
+		publishStatus(t, js, fakeAddressee, rootID, lib.StateCompleted, true)
+		go func() {
+			time.Sleep(3 * time.Second)
+			publishSubmission(t, js, "cluster-a", childID, conv, "inspect", rootID)
+			publishRun(t, js, "cluster-a", childID, "", false)
+			publishResult(t, js, "cluster-a", childID, wakeAnswer)
+			publishStatus(t, js, "cluster-a", childID, lib.StateCompleted, true)
+		}()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, w, err := b.SendTurn(t.Context(), convs, token, "delegate trailing child", 5*time.Second)
+	if err != nil || res.Task == nil {
+		t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+	}
+	convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+
+	var out TurnStepOutcome
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err = b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, 500*time.Millisecond)
+		if err != nil {
+			t.Fatalf("WaitForTurnStep: %v", err)
+		}
+		if !out.StillRunning {
+			break
+		}
+	}
+	if out.StillRunning {
+		t.Fatal("the delegated turn never settled after its trailing child finished")
+	}
+	_, _, resultText := FormatTurnCustomToolEnvelope(out)
+	mustContain(t, resultText, wakeAnswer)
+}
+
+// A stop is not held up by a streamed poll in flight on the conversation
+// (WaitForTurnStep holds the step state's lock for its whole window): it
+// goes out, and task_control returns, well inside the window. The mutants
+// this kills: a stop that discards the step state before sending, and a
+// discard that waits for the poll's lock rather than cancel the poll.
+func TestAStopDuringAStreamedPollGoesOutPromptly(t *testing.T) {
+	url, js := testBus(t)
+	frames := &frameLog{}
+	runFakeGateway(t, url, js, gatewayScenario{
+		root:   func(int32) (string, bool) { return "task-stop-root", false },
+		frames: frames,
+	})
+	b := dial(t, url)
+	convs := NewConversations().WithEvents(b.Events())
+	s := mustServer(t, SendMessageTool(b, convs), TaskControlTool(b, convs))
+
+	res1 := callTool(t, s, ToolSendMessage, map[string]any{
+		"text":         "a long streamed turn",
+		"wait_seconds": 1,
+		"stream_steps": true,
+	})
+	if res1.IsError {
+		t.Fatalf("send_message failed: %s", res1.Content[0].Text)
+	}
+	mustContain(t, res1.Content[0].Text, StreamingStepContinuePrefix)
+
+	polled := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_, _ = b.WaitForTurnStep(context.Background(), convs, nil, TaskRef{Addressee: fakeAddressee, TaskID: "task-stop-root"}, 0)
+		polled <- time.Since(start)
+	}()
+	time.Sleep(500 * time.Millisecond) // the poll holds the state's lock
+
+	start := time.Now()
+	res := callTool(t, s, ToolTaskControl, map[string]any{"action": "stop"})
+	elapsed := time.Since(start)
+	if res.IsError {
+		t.Fatalf("stop failed: %s", res.Content[0].Text)
+	}
+	mustContain(t, res.Content[0].Text, "Stopped the running task")
+	if elapsed > 2*time.Second {
+		t.Errorf("stop during a streamed poll took %s, want well under the poll window", elapsed)
+	}
+	select {
+	case d := <-polled:
+		if d > 3*time.Second {
+			t.Errorf("the in-flight poll ran %s after the stop, want it cut short", d)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the in-flight poll never returned")
+	}
+	convs.mu.Lock()
+	remaining := len(convs.steps)
+	convs.mu.Unlock()
+	if remaining != 0 {
+		t.Errorf("len(convs.steps) after the stop = %d, want 0", remaining)
+	}
+}
+
+// failingStopBus is a step bus whose stop never goes out.
+type failingStopBus struct{ fakeStepTurnBus }
+
+func (b *failingStopBus) SendStop(context.Context, *Conversations, string) (TurnResult, error) {
+	return TurnResult{}, errors.New("publish failed")
+}
+
+// A stop that fails to go out leaves the conversation's streamed step state
+// as it was: its turn is still running, and a client polling it must not
+// start over and repeat every step. The mutant this kills: discarding the
+// state before the stop is sent.
+func TestAFailedStopKeepsTheStreamedStepState(t *testing.T) {
+	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-failed-stop"}
+	bus := &failingStopBus{fakeStepTurnBus{ref: ref}}
+	convs := NewConversations()
+	token, _, err := convs.ResolveCall("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := convs.initTaskStepState(ref, token, DefaultConversation, false, nil, &turnWatch{stop: make(chan struct{})})
+	s := mustServer(t, TaskControlTool(bus, convs))
+
+	res := callTool(t, s, ToolTaskControl, map[string]any{"action": "stop"})
+	if !res.IsError {
+		t.Fatalf("a failed stop reported success: %s", res.Content[0].Text)
+	}
+	convs.mu.Lock()
+	kept := convs.steps[ref.TaskID] == st
+	convs.mu.Unlock()
+	if !kept || !st.active.Load() {
+		t.Errorf("a failed stop discarded the streamed step state (kept=%v, active=%v)", kept, st.active.Load())
+	}
+	st.closeAll()
 }

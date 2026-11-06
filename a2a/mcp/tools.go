@@ -444,11 +444,13 @@ func TaskControlTool(bus TurnBus, convs *Conversations) Tool {
 				if err != nil {
 					return "", err
 				}
-				convs.stopTaskStepState(token)
 				res, err := bus.SendStop(ctx, convs, token)
 				if err != nil {
 					return "", err
 				}
+				// Only a stop that went out discards the streamed state; it
+				// cancels an in-flight poll rather than wait for it.
+				convs.stopTaskStepState(token)
 				var sb strings.Builder
 				writeConversation(&sb, a.Conversation, token, byToken)
 				sb.WriteString("Sent stop.\n")

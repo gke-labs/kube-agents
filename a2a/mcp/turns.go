@@ -90,7 +90,14 @@ const (
 	stepPollWait          = 200 * time.Millisecond
 	stepPollIdleSleep     = 50 * time.Millisecond
 	delegationSettleGrace = 400 * time.Millisecond
-	delegationFollowGrace = 2 * time.Second
+	// delegationFollowGrace is how long a streamed poll waits for the first
+	// task delegated from a finished, delegating root before it takes the
+	// root's own answer. The gateway's relay mints that task and can trail
+	// the root's terminal by up to its relayLagGrace (10 minutes by
+	// default), and the non-streamed wait (waitForChain) waits its whole
+	// wait for it; each poll inside the grace reports the turn still
+	// running.
+	delegationFollowGrace = 10 * time.Minute
 	reportGatherBudget    = 5 * time.Second
 	stepWatchIdleRelease  = 2 * time.Second
 )
@@ -625,6 +632,32 @@ type taskStepState struct {
 	// so it cannot close the watches that poll just kept.
 	idleTimer *time.Timer
 	idleGen   uint64
+	// superseded is set when a newer turn on the conversation found this
+	// state's tasks finished (awaitRunningTurn). A client may still be
+	// streaming it, so it stays for that client's own settle, but it no
+	// longer counts as the conversation's running turn or records one.
+	superseded atomic.Bool
+	// cancelPoll cancels the in-flight poll (WaitForTurnStep holds mu for
+	// all of it), so a stop need not wait out the poll window for mu.
+	// cancelMu guards it, not mu.
+	cancelMu   sync.Mutex
+	cancelPoll context.CancelFunc
+}
+
+func (s *taskStepState) setCancelPoll(cancel context.CancelFunc) {
+	s.cancelMu.Lock()
+	s.cancelPoll = cancel
+	s.cancelMu.Unlock()
+}
+
+// cancelInFlightPoll cuts short the poll holding mu, if there is one.
+func (s *taskStepState) cancelInFlightPoll() {
+	s.cancelMu.Lock()
+	cancel := s.cancelPoll
+	s.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // armIdleReleaseLocked schedules the task watches' release after
@@ -935,8 +968,39 @@ func (c *Conversations) knownTaskRef(taskID string) (TaskRef, bool) {
 }
 
 func (c *Conversations) stopTaskStepState(token string, refs ...TaskRef) {
-	if c == nil || (token == "" && len(refs) == 0) {
+	matched := c.matchTaskStepStates(token, refs...)
+	if len(matched) == 0 {
 		return
+	}
+	for st := range matched {
+		st.cancelInFlightPoll()
+	}
+	c.mu.Lock()
+	for k, st := range c.steps {
+		if matched[st] {
+			delete(c.steps, k)
+		}
+	}
+	c.mu.Unlock()
+	for st := range matched {
+		st.closeAll()
+	}
+}
+
+// supersedeTaskStepState marks the conversation's step states for refs
+// superseded (see taskStepState.superseded) without closing them: a client
+// still streaming one settles it, with its delegated tasks' answer, itself.
+func (c *Conversations) supersedeTaskStepState(token string, refs ...TaskRef) {
+	for st := range c.matchTaskStepStates(token, refs...) {
+		st.superseded.Store(true)
+	}
+}
+
+// matchTaskStepStates returns token's step states keyed under, rooted at or
+// following one of refs, or all of token's with no refs.
+func (c *Conversations) matchTaskStepStates(token string, refs ...TaskRef) map[*taskStepState]bool {
+	if c == nil || (token == "" && len(refs) == 0) {
+		return nil
 	}
 	wantIDs := make(map[string]bool, len(refs))
 	for _, r := range refs {
@@ -965,19 +1029,7 @@ func (c *Conversations) stopTaskStepState(token string, refs ...TaskRef) {
 			matched[st] = true
 		}
 	}
-	if len(matched) == 0 {
-		return
-	}
-	c.mu.Lock()
-	for k, st := range c.steps {
-		if matched[st] {
-			delete(c.steps, k)
-		}
-	}
-	c.mu.Unlock()
-	for st := range matched {
-		st.closeAll()
-	}
+	return matched
 }
 
 func (c *Conversations) deleteTaskStepState(ref TaskRef, st *taskStepState) {
@@ -1087,7 +1139,7 @@ func (c *Conversations) hasActiveStepState(token string) (TaskRef, bool) {
 	seen := map[*taskStepState]bool{}
 	var candidates []*taskStepState
 	for _, st := range c.steps {
-		if st != nil && !seen[st] && st.token == token {
+		if st != nil && !seen[st] && st.token == token && !st.superseded.Load() {
 			seen[st] = true
 			candidates = append(candidates, st)
 		}
@@ -1453,7 +1505,7 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 				}
 			}
 			convs.clearRunning(token, ref)
-			convs.stopTaskStepState(token, ref)
+			convs.supersedeTaskStepState(token, ref)
 			if _, active := convs.hasActiveStepState(token); active {
 				continue
 			}
@@ -1463,7 +1515,7 @@ func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, to
 			// on either. Holding the conversation for it would refuse every
 			// later message, so let this one go.
 			convs.clearRunning(token, ref)
-			convs.stopTaskStepState(token, ref)
+			convs.supersedeTaskStepState(token, ref)
 			if _, active := convs.hasActiveStepState(token); active {
 				continue
 			}
@@ -1795,7 +1847,12 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	if wait > 0 && wait < window {
 		window = wait
 	}
-	stepCtx, cancel := context.WithTimeout(ctx, window)
+	// A stop cancels pollCtx (cancelInFlightPoll) rather than wait for mu.
+	pollCtx, pollCancel := context.WithCancel(ctx)
+	defer pollCancel()
+	st.setCancelPoll(pollCancel)
+	defer st.setCancelPoll(nil)
+	stepCtx, cancel := context.WithTimeout(pollCtx, window)
 	defer cancel()
 
 	prevSteps := st.lastReportedSteps
@@ -1911,11 +1968,11 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 			if wait > 0 && wait < gatherBudget {
 				gatherBudget = wait
 			}
-			reportCtx, reportCancel := context.WithTimeout(ctx, gatherBudget)
+			reportCtx, reportCancel := context.WithTimeout(pollCtx, gatherBudget)
 			b.gatherStepReports(reportCtx, st.watch, &out, details)
 			reportCancel()
 		}
-		if st.token != "" {
+		if st.token != "" && !st.superseded.Load() {
 			convs.setRunning(st.token, nil)
 		}
 		st.closeAllLocked()
@@ -1924,7 +1981,7 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		if len(st.taskWatches) > 0 {
 			st.armIdleReleaseLocked()
 		}
-		if st.token != "" {
+		if st.token != "" && !st.superseded.Load() {
 			if unf := out.Unfinished(); unf != nil {
 				convs.setRunning(st.token, unf)
 			} else {
