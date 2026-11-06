@@ -3985,8 +3985,9 @@ const defaultA2AMaxSessions = 10
 // a2aQuotaHeadroom is the sum of three parts:
 //
 //   - a2aStandingPods: what this operator keeps running for the agent;
-//   - the chart's pods (the operator, LiteLLM, Hindsight, the GitHub minter and
-//     the web console, plus one surge pod for each that rolls surge-first,
+//   - the chart's pods (its standing workloads in kube-agents.chartWorkloads:
+//     the operator, LiteLLM and its replay proxy, Hindsight, the GitHub minter
+//     and the web console, plus one surge pod for each that rolls surge-first,
 //     since a chart bump rolls several in one upgrade), which only the chart
 //     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation.
 //     The CR is in the namespace those pods run in, and the chart renders it

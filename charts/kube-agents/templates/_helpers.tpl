@@ -2010,9 +2010,8 @@ the standing workloads in kube-agents.chartWorkloads at their replica counts (ev
 the pre-delete cleanup hook, which runs only at uninstall), plus one surge pod for each that
 rolls surge-first and runs at least one replica (every one but Hindsight's PostgreSQL
 StatefulSet). quotaRequirements reads the same list, so a workload added there is counted
-here too. A chart bump
-rolls several of them in one upgrade, since the chart's version label is in their pod
-templates, and each surge pod counts against the quota while it starts.
+here too. A chart bump rolls several of them in one upgrade, since the chart's version label
+is in their pod templates, and each surge pod counts against the quota while it starts.
 platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods,
 and the operator sizes the quota above the session cap from it (#3848): those pods share the
 quota, and only the chart knows which of them it renders. tests/test_quota_preflight.py ties

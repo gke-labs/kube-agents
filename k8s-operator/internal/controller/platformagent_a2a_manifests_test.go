@@ -8518,9 +8518,6 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 	})
 }
 
-// A chart-pods annotation the operator discards is reported, once per spec
-// generation, as a Warning event; an absent one (a CR written without the
-// chart) and a usable one are not.
 // One parse decides both the count and the discard (#4893): a value is used
 // exactly when no reason is given, an absent annotation takes the default
 // without one, and every discarded value takes the default with one.
@@ -8556,6 +8553,9 @@ func TestA2AChartPodsCountAndDiscardReadOneParse(t *testing.T) {
 	}
 }
 
+// A chart-pods annotation the operator discards is reported, once per spec
+// generation, as a Warning event; an absent one (a CR written without the
+// chart) and a usable one are not.
 func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 	warnings := func(rec *record.FakeRecorder) int {
 		n := 0

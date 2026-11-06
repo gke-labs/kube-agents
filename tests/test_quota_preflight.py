@@ -1027,9 +1027,12 @@ class PreflightDecisionTest(unittest.TestCase):
             meta = doc.get("metadata", {})
             if doc.get("kind") == "PlatformAgent":
                 chart_pods = int((meta.get("annotations") or {})["kubeagents.x-k8s.io/a2a-quota-chart-pods"])
-            if doc.get("kind") not in ("Deployment", "StatefulSet"):
-                continue
             if "helm.sh/hook" in (meta.get("annotations") or {}):
+                continue
+            # A pod-running kind neither list models would pass both unseen, so it fails here.
+            self.assertNotIn(doc.get("kind"), ("DaemonSet", "Job", "CronJob", "ReplicaSet", "Pod"),
+                             f"the chart renders a {doc.get('kind')} that kube-agents.chartWorkloads doesn't model")
+            if doc.get("kind") not in ("Deployment", "StatefulSet"):
                 continue
             if meta.get("namespace") not in (None, "", "default"):  # helm template renders into "default"
                 continue
@@ -1076,6 +1079,7 @@ class PreflightDecisionTest(unittest.TestCase):
             with self.subTest(sets=sets):
                 chart_pods, required = self._chart_pods_and_requirements(sets)
                 hook = 0 if "platformAgent.cleanupHook.enabled=false" in sets else 1
+                self.assertGreater(required["chartSurgePods"], 0)
                 self.assertEqual(chart_pods, required["pods"] - operator_pods - hook + required["chartSurgePods"])
 
     def test_a_chart_count_past_the_operators_cap_fails_the_render(self) -> None:
