@@ -411,8 +411,9 @@ including:
   directory, the card workspace or the run directory the cron workdir patch minted, and
   a chat turn, which runs from neither, sends no key; the session id reaches the wrapper
   where the terminal runs in its own pod, the profile and session pods. The broker counts
-  per key: a shell, profile or scope session past `BROKER_SESSION_MAX_TOOL_CALLS`
-  commands is refused with `403 BROKER_SESSION_BUDGET_EXCEEDED`, and any keyed session
+  per key: a shell or profile session past `BROKER_SESSION_MAX_TOOL_CALLS`
+  commands is refused with `403 BROKER_SESSION_BUDGET_EXCEEDED` (the scope publisher is
+  a script whose Job sets no key, so its calls are uncounted), and any keyed session
   is refused the same command, on the same cluster, after it failed or was blocked
   `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times running, with `403 BROKER_LOOP_BREAKER`;
   the site's [troubleshooting entries](site/src/content/docs/reference/credential-isolation.md#troubleshooting)

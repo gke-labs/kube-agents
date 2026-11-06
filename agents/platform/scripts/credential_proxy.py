@@ -2221,12 +2221,15 @@ INTERACTIVE_ROLES = frozenset({CALLER_ROLE_SESSION})
 BACKGROUND_ROLES = frozenset({CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE})
 
 # The roles whose sessions take the per-session tool-call ceiling
-# (SessionToolBudget): the shell's cron runs and kanban workers, the profile
-# workers and the scope publisher, the background runs the ceiling exists for.
+# (SessionToolBudget): the shell's cron runs and kanban workers and the
+# profile workers, the model-driven background runs the ceiling exists for.
 # The shell role carries a person's chat turns too, but those arrive with no
 # key (see ENV_SESSION_MAX_TOOL_CALLS) and are not counted; the session pod's
-# role is a conversation by construction and gets the loop breaker only.
-SESSION_BUDGET_CEILING_ROLES = frozenset({CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE})
+# role is a conversation by construction and gets the loop breaker only. The
+# scope role is the scope publisher, a script with no model in its loop whose
+# Job sets no key (the operator renders none), so it is uncounted and the
+# ceiling is not its: a bound on it would only cut a large fleet's publish.
+SESSION_BUDGET_CEILING_ROLES = frozenset({CALLER_ROLE_SHELL, CALLER_ROLE_PROFILE})
 
 
 def admission_class(role: str) -> str:

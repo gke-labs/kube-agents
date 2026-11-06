@@ -20997,14 +20997,13 @@ class SessionToolBudgetTest(unittest.TestCase):
 
     def test_the_ceiling_roles_are_the_background_running_ones(self):
         self.assertEqual(
-            frozenset({
-                credential_proxy.CALLER_ROLE_SHELL,
-                credential_proxy.CALLER_ROLE_PROFILE,
-                credential_proxy.CALLER_ROLE_SCOPE,
-            }),
+            frozenset({credential_proxy.CALLER_ROLE_SHELL, credential_proxy.CALLER_ROLE_PROFILE}),
             credential_proxy.SESSION_BUDGET_CEILING_ROLES,
         )
+        # A chat session is a conversation, and the scope publisher is a script
+        # whose Job sets no key: neither is the ceiling's.
         self.assertNotIn(credential_proxy.CALLER_ROLE_SESSION, credential_proxy.SESSION_BUDGET_CEILING_ROLES)
+        self.assertNotIn(credential_proxy.CALLER_ROLE_SCOPE, credential_proxy.SESSION_BUDGET_CEILING_ROLES)
 
 
 class SessionToolBudgetRouteTest(unittest.TestCase):
@@ -21162,6 +21161,11 @@ class SessionToolBudgetRouteTest(unittest.TestCase):
         for _ in range(5):
             self.assertEqual(200, self._post(self.LIST, session_id="chat-1", role=credential_proxy.CALLER_ROLE_SESSION)[0])
         self.assertEqual(9, len(self.executor.calls))
+        # Nor is a scope caller that did send a key: whatever the scope policy
+        # then says of the command, the ceiling is not what refuses it.
+        for _ in range(5):
+            status, body = self._post(self.LIST, session_id="scope-1", role=credential_proxy.CALLER_ROLE_SCOPE)
+            self.assertNotEqual("BROKER_SESSION_BUDGET_EXCEEDED", body.get("code"), (status, body))
 
     def test_the_loop_breaker_holds_a_chat_session_too(self):
         self._budget(max_calls=3, max_identical_failures=2)
