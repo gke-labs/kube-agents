@@ -31,8 +31,10 @@ BODY = (
     "Say add the usage summary to attach the install's versions and counters. Shall I file it?\n"
 )
 # A heading, however the agent lays the line out: bold, a bullet, a table
-# row, a plain label, a dash, the label alone above its line, and the form's
-# other word for it.
+# row, a plain label, a dash, the label alone above its line, the form's
+# other word for it, and the label with a qualifier: the form's own name for
+# the field (`One-line summary`, feedback_broker.QUESTION_LABELS["title"]),
+# `Issue title`, and a parenthesis after the label.
 HEADINGS = (
     "**Summary:** Weekly cost report posted twice in one thread\n",
     "- **Summary**: Weekly cost report posted twice in one thread\n",
@@ -42,10 +44,16 @@ HEADINGS = (
     "**Summary**\nWeekly cost report posted twice in one thread\n",
     "Title: Weekly cost report posted twice in one thread\n",
     "1. **Title:** Weekly cost report posted twice in one thread\n",
+    "**One-line summary:** Weekly cost report posted twice in one thread\n",
+    "- **One-line summary**: Weekly cost report posted twice in one thread\n",
+    "| One-line summary | Weekly cost report posted twice in one thread |\n",
+    "Issue title: Weekly cost report posted twice in one thread\n",
+    "**Summary (issue title):** Weekly cost report posted twice in one thread\n",
 )
-# The word "summary" without a heading: the offer as the persona words it
-# (already in BODY), hyphenated, wrapped across a line, paraphrased with the
-# word bare, and inside a sentence that opens no line.
+# The word "summary" or "title" without a heading: the offer as the persona
+# words it (already in BODY), hyphenated, wrapped across a line, paraphrased
+# with the word bare, inside a sentence that opens no line, and a label's
+# words opening a sentence that is not a label.
 NO_HEADING = (
     "",
     "I can also add the usage-summary (no names in it).\n",
@@ -53,6 +61,8 @@ NO_HEADING = (
     "I can attach a summary of the install's usage if you like.\n",
     "Here is the submission - summary and all - for your yes.\n",
     "Summary and title are the same thing on the form.\n",
+    "One-line summary and kind come first on the form.\n",
+    "Issue title is taken from the first line.\n",
 )
 
 
