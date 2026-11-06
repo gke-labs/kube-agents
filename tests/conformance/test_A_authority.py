@@ -1204,6 +1204,22 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
         the callout, so no served config carries its grants."""
         return h.go_function_body(h.text("a2a_dispatcher"), "dispatcherIdentity")
 
+    # The dispatcher's reads of the stop record: its subscription on each
+    # profile's records (the `stops` list) and the direct get it catches up
+    # with after a restart. Reads don't count as writers.
+    DISPATCHER_STOP_READS = ("$JS.API.DIRECT.GET.", "stops = append(stops,")
+
+    @classmethod
+    def _dispatcher_writes(cls) -> str:
+        """`dispatcherIdentity`'s body without its reads of the stop record
+        and without comments, so a spelling left in it is a write."""
+        lines = cls._dispatcher_identity().splitlines()
+        return "\n".join(
+            line
+            for line in lines
+            if not line.lstrip().startswith("//") and not any(read in line for read in cls.DISPATCHER_STOP_READS)
+        )
+
     STOP_PROBE = "a2a.stop.cluster.task-0001"
 
     def test_A3_the_stop_record_has_exactly_one_writer(self) -> None:
@@ -1229,9 +1245,9 @@ class A3TheTaskPlaneSubjectSaysWhoWroteIt(unittest.TestCase):
                 "the callout derives an executor a publish grant on a stop record; "
                 "a worker that can write there can stop other requesters' tasks",
             )
-        dispatcher = self._dispatcher_identity()
+        dispatcher = self._dispatcher_writes()
         for spelling in self.STOP_SPELLINGS:
-            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a grant on the stop record")
+            self.assertNotIn(spelling, dispatcher, "the dispatcher holds a publish grant on the stop record")
 
     NOTIFY_PROBE = "chat.notify.gchat"
     NOTIFY_SLACK_PROBE = "chat.notify.slack"
