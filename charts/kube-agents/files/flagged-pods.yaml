@@ -22,10 +22,10 @@ pods:
     env: A2A_MCP_DOOR
     enabledWhen: "true"
     replicas: 1
-    cpuMillisRequest: 50
+    cpuMillisRequest: 100
     cpuMillisLimit: 500
-    memoryBytesRequest: 67108864
-    memoryBytesLimit: 134217728
+    memoryBytesRequest: 134217728
+    memoryBytesLimit: 268435456
     ephemeralStorageBytesRequest: 0
     ephemeralStorageBytesLimit: 0
   - name: dispatcher

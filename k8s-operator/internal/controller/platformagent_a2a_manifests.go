@@ -7346,12 +7346,13 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	if profileQuotaErr != nil {
 		r.profileNamespaceFailure(ctx, agent, "delete the quota on the flip to today", profileQuotaErr)
 	}
-	// And the dispatcher's pod-read Role and binding there, likewise
-	// unowned, likewise not worth stopping the flip for, and likewise kept
-	// in sight: a failure leaves the fence below as the sentinel.
+	// And the dispatcher's warm pools, their CA bundle copy and its pod-read
+	// Role and binding there, likewise unowned, likewise not worth stopping
+	// the flip for, and likewise kept in sight: a failure leaves the fence
+	// below as the sentinel.
 	dispatcherRBACErr := r.deleteDispatcherPodsRBAC(ctx, agent)
 	if dispatcherRBACErr != nil {
-		r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's pod-read Role on the flip to today", dispatcherRBACErr)
+		r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on the flip to today", dispatcherRBACErr)
 	}
 
 	// 2. The callout's ClusterRoleBinding. Cluster-scoped, so it carries no

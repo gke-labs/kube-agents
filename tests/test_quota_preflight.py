@@ -64,12 +64,12 @@ data:
 # are the same numbers the install prerequisites table quotes, so a change that moves one
 # without updating the other fails here.
 _DEFAULT_PODS = 9
-_DEFAULT_REQUESTS_CPU_MILLIS = 2706
+_DEFAULT_REQUESTS_CPU_MILLIS = 2756
 _DEFAULT_LIMITS_CPU_MILLIS = 13200
 # Memory and ephemeral storage are summed by the same helper as CPU but were asserted
 # nowhere, so a generator that stopped parsing them could be regenerated and committed
 # together with a green `--check` (both sides move at once) and nothing would catch it.
-_DEFAULT_REQUESTS_MEMORY_BYTES = 9408 * 1024**2
+_DEFAULT_REQUESTS_MEMORY_BYTES = 9536 * 1024**2
 _DEFAULT_LIMITS_MEMORY_BYTES = 24448 * 1024**2
 # Ephemeral-storage requests: the footprint's 11Gi (the agent pod's 3Gi and the credential
 # proxy's 8Gi), LiteLLM's 1280Mi per replica (its tmp emptyDir's sizeLimit plus logs) on two
@@ -99,8 +99,13 @@ _HA_REPLICAS = 2
 # The largest pod that rolls with a surge Pod at defaults: LiteLLM, at a 100m CPU request.
 # The agent pod is larger but rolls with Recreate at the default single replica.
 _LARGEST_SURGING_REQUEST_MILLIS = 100
-# The operator's own request: the smallest GKE Autopilot admits unchanged beside 128Mi.
-_OPERATOR_REQUEST_MILLIS = 50
+# The operator's own request, sized to be livable as the limit an Autopilot cluster without
+# bursting clamps to, and inside the band GKE Autopilot admits unchanged beside 256Mi.
+_OPERATOR_REQUEST_MILLIS = 100
+# The web console's request (webConsole.resources), sized to be livable as the limit an
+# Autopilot cluster without bursting clamps to.
+_WEB_CONSOLE_REQUEST_MILLIS = 100
+_WEB_CONSOLE_REQUEST_MEMORY_BYTES = 128 * 1024**2
 # Two operator-rendered claims plus two from the shell StatefulSet's volumeClaimTemplates.
 _OPERATOR_PVC_COUNT = 4
 _OPERATOR_STORAGE_BYTES = 102 * 1024**3
@@ -1476,8 +1481,8 @@ class PreflightDecisionTest(unittest.TestCase):
         base = self._requirements()
         with_console = self._requirements(["webConsole.enabled=true"])
         self.assertEqual(with_console["pods"], base["pods"] + 1)
-        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + 50)
-        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + 32 * 1024**2)
+        self.assertEqual(with_console["requestsCpu"], base["requestsCpu"] + _WEB_CONSOLE_REQUEST_MILLIS)
+        self.assertEqual(with_console["requestsMemory"], base["requestsMemory"] + _WEB_CONSOLE_REQUEST_MEMORY_BYTES)
 
     def test_a_workload_scaled_to_zero_is_not_charged(self) -> None:
         """`replicas | default 1` read a falsy 0 as absent and charged a full replica.
@@ -1773,8 +1778,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small cpu shorthand quota must fail")
         self.assertIn("  - cpu:", res.stderr)
-        # The release's 2706m plus one LiteLLM surge Pod's 100m.
-        self.assertIn('"cpu":"2806m"', res.stderr)
+        # The release's 2756m plus one LiteLLM surge Pod's 100m.
+        self.assertIn('"cpu":"2856m"', res.stderr)
 
     def test_shorthand_memory_spelling_is_enforced(self) -> None:
         """`memory` is the shorthand spelling for `requests.memory` and must be checked."""
@@ -1783,7 +1788,8 @@ class PreflightDecisionTest(unittest.TestCase):
         )
         self.assertNotEqual(res.returncode, 0, "a too-small memory shorthand quota must fail")
         self.assertIn("  - memory:", res.stderr)
-        self.assertIn('"memory":"11456Mi"', res.stderr)
+        # The release's 9536Mi plus one LiteLLM surge Pod's 2Gi.
+        self.assertIn('"memory":"11584Mi"', res.stderr)
 
     def test_shorthand_ephemeral_storage_spelling_is_enforced(self) -> None:
         """`ephemeral-storage` is the shorthand spelling for `requests.ephemeral-storage`."""
