@@ -116,8 +116,8 @@ a `LimitRange` to default it), as the chart README explains. Under `spec.mode: n
 NATS adds a 40 GiB JetStream persistent volume claim (bringing the total to 5 claims
 totalling 142 GiB of `requests.storage`), and the operator renders a namespace-wide
 `ResourceQuota` on `pods` of `maxSessions` plus a headroom it derives: the pods it
-runs for the agent (one more with `A2A_MCP_DOOR=true`, for the MCP server, and one more with `A2A_DISPATCHER_IMAGE` set, for the profile dispatcher), the chart's own pods in the namespace with a rollout surge pod
-for each that rolls with one (the chart stamps them on the `PlatformAgent`; 5
+runs for the agent (one more with `A2A_MCP_DOOR=true`, for the MCP server, and one more with `A2A_DISPATCHER_IMAGE` set, for the profile dispatcher), the chart's own pods in the namespace with the surge pods
+each one's rollout can add, from its `maxSurge` (the chart stamps them on the `PlatformAgent`; 5
 without the chart), and 7 for the operator's rollout surges, the provisioning and
 scope-publishing Jobs and the gateway's count-then-create overshoot (34 pods by
 default, from `spec.harness.tuning.maxSessions: 10`, 40 with Hindsight and the

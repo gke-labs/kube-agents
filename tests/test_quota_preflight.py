@@ -1134,7 +1134,8 @@ class PreflightDecisionTest(unittest.TestCase):
         actually renders in the release namespace, and their surge pods, read from the
         manifests. Every Deployment and StatefulSet the chart renders there counts at its
         replicas; Helm hooks (the uninstall cleanup Job) are not standing. A Deployment that
-        runs a pod and doesn't roll Recreate sizes one surge pod; a StatefulSet sizes none."""
+        runs a pod and doesn't roll Recreate sizes the surge pods its rendered maxSurge
+        allows; a StatefulSet sizes none."""
         res = self._render({"probe": {}}, sets)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
         chart_pods, pods, surges, names = None, 0, 0, []
@@ -1157,8 +1158,12 @@ class PreflightDecisionTest(unittest.TestCase):
             pods += replicas
             names.append(f"{doc['kind']}/{meta['name']}={replicas}")
             if doc["kind"] == "Deployment" and replicas > 0:
-                if (doc["spec"].get("strategy") or {}).get("type") != "Recreate":
-                    surges += 1
+                strategy = doc["spec"].get("strategy") or {}
+                if strategy.get("type") != "Recreate":
+                    # The surge pods the controller can add: maxSurge as rendered (Kubernetes'
+                    # 25% when the template sets none), a percentage rounded up (#4876).
+                    raw = str((strategy.get("rollingUpdate") or {}).get("maxSurge", "25%")).strip()
+                    surges += math.ceil(float(raw[:-1]) * replicas / 100) if raw.endswith("%") else int(raw)
         self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
         return chart_pods, pods + surges, names
 
@@ -1185,10 +1190,30 @@ class PreflightDecisionTest(unittest.TestCase):
              "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
              "litellm.replayShadow.replicaCount=5"],
             ["litellm.replicaCount=0"],
+            # maxSurge from values (#4876): an integer above 1, a percentage that rounds up past
+            # 1, an integer at a workload's single replica, and 0 (LiteLLM rolls by maxUnavailable).
+            ["litellm.replicaCount=4", "litellm.rollingUpdate.maxSurge=2"],
+            ["operator.replicaCount=4", "operator.rollingUpdate.maxSurge=50%"],
+            ["operator.replicaCount=3", "operator.rollingUpdate.maxSurge=34%"],
+            ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=3"],
+            ["litellm.rollingUpdate.maxSurge=0"],
         ):
             with self.subTest(sets=sets):
                 chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
                 self.assertEqual(chart_pods, rendered, names)
+
+    def test_the_preflight_sizes_surge_room_by_the_largest_rollout(self) -> None:
+        """The patch's surge room is one workload's rollout at a time, so it holds that
+        workload's maxSurge pods at once (#4876): LiteLLM at maxSurge 3 needs room for three
+        of its pods, not one."""
+        base = self._requirements(["platformAgent.mode=next", "litellm.replicaCount=4"])
+        three = self._requirements(["platformAgent.mode=next", "litellm.replicaCount=4",
+                                    "litellm.rollingUpdate.maxSurge=3"])
+        mem = str(yaml.safe_load(_VALUES.read_text())["litellm"]["resources"]["requests"]["memory"])
+        units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30}
+        per_pod = int(mem[:-2]) * units[mem[-2:]]
+        self.assertGreaterEqual(three["surgeRequestsMemory"], 3 * per_pod)
+        self.assertEqual(three["chartSurgePods"], base["chartSurgePods"] + 2)
 
     def test_the_preflight_and_the_operator_read_one_workload_list(self) -> None:
         """quotaRequirements counts the same chart workloads as chartQuotaPods, plus the
