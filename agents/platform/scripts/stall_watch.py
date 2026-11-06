@@ -947,18 +947,23 @@ def lost_kinds(record: dict | None, candidates: list[str]) -> set[str]:
     return {r for r in set(known) | set(record.get(DISCOVERY_UNKNOWN_KEY) or []) if resource_group(r) not in served_groups}
 
 
-def discovery_due(record: dict | None, now: str, refreshed: int) -> bool:
+def discovery_due(record: dict | None, now: str, refreshed: int, candidates: list[str] = ()) -> bool:
     """Whether a cluster's wildcard discovery runs this tick: at once with no
     record, after DISCOVERY_RETRY_SECONDS when the record left kinds unknown
-    and after DISCOVERY_REFRESH_SECONDS otherwise, the last two only while
-    fewer than DISCOVERY_REFRESHES_PER_TICK ran this tick."""
+    that a discovery could read now (their group is among the candidates; a
+    lost group's kinds wait for a listing that shows it again, not for a
+    retry that cannot list them), and after DISCOVERY_REFRESH_SECONDS
+    otherwise, the last two only while fewer than DISCOVERY_REFRESHES_PER_TICK
+    ran this tick."""
     if not isinstance(record, dict) or not isinstance(record.get(DISCOVERY_KINDS_KEY), dict):
         return True
     try:
         age = datetime.fromisoformat(now) - datetime.fromisoformat(str(record.get(DISCOVERY_AT_KEY)))
     except (TypeError, ValueError):
         return True
-    wait = DISCOVERY_RETRY_SECONDS if record.get(DISCOVERY_UNKNOWN_KEY) else DISCOVERY_REFRESH_SECONDS
+    served_groups = {resource_group(c) for c in candidates}
+    retry = any(resource_group(u) in served_groups for u in record.get(DISCOVERY_UNKNOWN_KEY) or [])
+    wait = DISCOVERY_RETRY_SECONDS if retry else DISCOVERY_REFRESH_SECONDS
     return not (timedelta(0) <= age < timedelta(seconds=wait)) and refreshed < DISCOVERY_REFRESHES_PER_TICK
 
 
@@ -1133,13 +1138,14 @@ def resource_names_kind(resource: str, kind: str) -> bool:
     """Whether a kubectl resource name (`deployments`, `gateways.gateway...`)
     is the plural of an object's Kind (`Deployment`, `Gateway`)."""
     plural = resource.split(".", 1)[0].lower()
+    singulars = {plural, plural.rstrip("s")}
     if plural.endswith(PLURAL_IES):
-        singular = plural[: -len(PLURAL_IES)] + "y"
-    elif plural.endswith(PLURAL_ES_SUFFIXES):
-        singular = plural[: -len(PLURAL_ES)]
-    else:
-        singular = plural.rstrip("s")
-    return kind.lower() in (singular, plural)
+        singulars.add(plural[: -len(PLURAL_IES)] + "y")
+    if plural.endswith(PLURAL_ES_SUFFIXES):
+        # `addresses` -> `address`; but a CRD may pluralise `cache` as
+        # `caches`, so the bare `-s` cut above stays a candidate too.
+        singulars.add(plural[: -len(PLURAL_ES)])
+    return kind.lower() in singulars
 
 
 def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None) -> tuple[list[dict], set[str]]:
@@ -1601,7 +1607,7 @@ def sweep_fleet(
             extra_kinds, held, cut = {}, set(), {}
             candidates = wildcard_candidates(served, wildcards)
             record = discoveries.get(cid)
-            if candidates and not sweep.out_of_budget(started, cid) and discovery_due(record, now, refreshed):
+            if candidates and not sweep.out_of_budget(started, cid) and discovery_due(record, now, refreshed, candidates):
                 if record is not None:
                     refreshed += 1
                 record = discover_kinds(kubeconfig, candidates, now, record)

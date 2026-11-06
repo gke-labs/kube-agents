@@ -1247,7 +1247,7 @@ class Ledger(Base):
         self.assertEqual(left, ["repeating-warnings"], "the condition row cleared; the warning row waits for a scan that read events")
 
     def test_a_skipped_resource_matches_its_object_kind(self):
-        for resource, kind in (("gateways.gateway.networking.k8s.io", "Gateway"), ("networkpolicies.networking.k8s.io", "NetworkPolicy"), ("ingresses.networking.k8s.io", "Ingress"), ("statefulsets", "StatefulSet"), ("jobs.batch", "Job"), (KCC_SQL, "SQLInstance"), ("computeaddresses.compute.cnrm.cloud.google.com", "ComputeAddress"), ("iampolicies.iam.cnrm.cloud.google.com", "IAMPolicy")):
+        for resource, kind in (("gateways.gateway.networking.k8s.io", "Gateway"), ("networkpolicies.networking.k8s.io", "NetworkPolicy"), ("ingresses.networking.k8s.io", "Ingress"), ("statefulsets", "StatefulSet"), ("jobs.batch", "Job"), (KCC_SQL, "SQLInstance"), ("computeaddresses.compute.cnrm.cloud.google.com", "ComputeAddress"), ("iampolicies.iam.cnrm.cloud.google.com", "IAMPolicy"), ("storageanywherecaches.storage.cnrm.cloud.google.com", "StorageAnywhereCache"), ("computenetworkpeerings.compute.cnrm.cloud.google.com", "ComputeNetworkPeering")):
             self.assertTrue(stall_watch.resource_names_kind(resource, kind), (resource, kind))
         self.assertFalse(stall_watch.resource_names_kind("deployments", "Gateway"))
 
@@ -2067,12 +2067,21 @@ class ConfigConnector(Base):
         self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_BUCKETS]])
         self.assertEqual(lines, [])
         self.assertIn(KCC_SQL, self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")][stall_watch.DISCOVERY_UNKNOWN_KEY])
+        # An hour on with the group still lost: no retry, since a discovery
+        # could not list the kind the retry is for.
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=no_sql, objects=[], now="2026-11-06T09:00:00+00:00")
+        self.assertEqual(fake.discoveries(), [])
+        self.assertEqual(lines, [])
         # The group is back before any discovery is due: still unknown, still held.
         lines, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], now=t[3])
         self.assertEqual(fake.discoveries(), [])
         self.assertNotIn(KCC_SQL, fake.kinds_asked("payments"))
         self.assertEqual(lines, [], "the row waits for a discovery that reads its kind")
         self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["SQLInstance/orders-db"])
+        # Listed again, the unknown kind is retried on the hour and read.
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], now="2026-11-06T10:00:00+00:00")
+        self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_SQL, KCC_BUCKETS]])
+        self.assertEqual(len(self.cleared(lines)), 1)
 
     def test_a_kind_dropped_while_its_group_stays_is_not_asked_and_its_rows_clear(self):
         databases = "sqldatabases.sql.cnrm.cloud.google.com"

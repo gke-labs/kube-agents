@@ -182,6 +182,15 @@ class StaleConditions(unittest.TestCase):
         # A run-wide threshold above the hour applies to it as to every kind.
         pool = obj("ContainerNodePool", "pool-a", status={"conditions": [condition("Ready", "False", 70, "DependencyNotReady")]})
         self.assertEqual(analyze([pool], override=120), [])
+        # Its generation lag waits the same hour, so a spec edit while it
+        # waits on its parent is not a row sooner than the condition.
+        pool = obj("ContainerNodePool", "pool-a", spec={}, status={"observedGeneration": 1, "conditions": [condition("Ready", "False", 40, "DependencyNotReady")]})
+        pool["metadata"]["generation"] = 2
+        pool["metadata"]["managedFields"] = [managed(40)]
+        self.assertEqual(analyze([pool]), [])
+        pool["metadata"]["managedFields"] = [managed(70)]
+        pool["status"]["conditions"] = [condition("Ready", "False", 70, "DependencyNotReady")]
+        self.assertEqual(sorted(r["heuristic"] for r in analyze([pool])), ["generation-lag", "stale-condition"])
 
     def test_unrelated_condition_types_are_ignored(self):
         hpa = obj("HorizontalPodAutoscaler", "web", status={"conditions": [condition("ScalingLimited", "False", 500)]})

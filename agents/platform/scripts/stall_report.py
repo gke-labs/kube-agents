@@ -495,17 +495,33 @@ def finding(obj: dict, heuristic: str, detail: str, stalled: timedelta) -> dict:
     }
 
 
+def ready_reason(obj: dict) -> str:
+    """The reason on the object's own Ready condition while it is not True,
+    else the empty string."""
+    status = obj.get("status")
+    if not isinstance(status, dict):
+        return ""
+    for path, cond in iter_conditions(status):
+        if path == "" and cond.get("type") == READY_CONDITION_TYPE and cond.get("status") != CONDITION_TRUE:
+            return str(cond.get("reason") or "")
+    return ""
+
+
 def ready_in_progress(obj: dict) -> bool:
     """Whether the object's own Ready condition says its controller is still
     applying or deleting it (IN_PROGRESS_READY_REASONS), in which case no
     heuristic calls it stalled."""
-    status = obj.get("status")
-    if not isinstance(status, dict):
-        return False
-    for path, cond in iter_conditions(status):
-        if path == "" and cond.get("type") == READY_CONDITION_TYPE and cond.get("status") != CONDITION_TRUE:
-            return cond.get("reason") in IN_PROGRESS_READY_REASONS
-    return False
+    return ready_reason(obj) in IN_PROGRESS_READY_REASONS
+
+
+def dependency_wait(reason: str, threshold: timedelta) -> timedelta:
+    """The age a Ready=False with this reason must reach: the usual threshold,
+    or DEPENDENCY_STALL_MINUTES at least for DependencyNotReady, by every
+    heuristic alike, so the generation lag of an object waiting on a
+    dependency is not a row sooner than its condition."""
+    if reason == DEPENDENCY_NOT_READY_REASON:
+        return max(threshold, timedelta(minutes=DEPENDENCY_STALL_MINUTES))
+    return threshold
 
 
 def check_generation_lag(obj: dict, now: datetime, threshold: timedelta) -> list[dict]:
@@ -515,6 +531,7 @@ def check_generation_lag(obj: dict, now: datetime, threshold: timedelta) -> list
         return []
     if ready_in_progress(obj):
         return []
+    threshold = dependency_wait(ready_reason(obj), threshold)
     generation = meta.get("generation")
     observed = status.get("observedGeneration")
     if not isinstance(generation, int) or not isinstance(observed, int):
@@ -583,9 +600,7 @@ def check_stale_conditions(obj: dict, now: datetime, threshold: timedelta) -> li
         reason = cond.get("reason") or ""
         if ctype == READY_CONDITION_TYPE and reason in IN_PROGRESS_READY_REASONS:
             continue
-        wait = threshold
-        if ctype == READY_CONDITION_TYPE and reason == DEPENDENCY_NOT_READY_REASON:
-            wait = max(threshold, timedelta(minutes=DEPENDENCY_STALL_MINUTES))
+        wait = dependency_wait(reason, threshold) if ctype == READY_CONDITION_TYPE else threshold
         if age < wait:
             continue
         where = f"{path} " if path else ""
