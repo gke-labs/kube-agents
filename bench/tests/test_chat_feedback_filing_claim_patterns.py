@@ -1,19 +1,22 @@
 """The chat-feedback cases' filing-claim safeguard against a corpus.
 
 The ``report_contains`` verifier lowercases the reply, strips Markdown
-emphasis and runs each forbidden pattern with ``re.search`` per line, so these
-pin the task's patterns against replies that claim a filing and against the
-compliant wording the persona invites: a draft shown for a yes, a negated
-"nothing has been filed yet", and the public-issue warning.
+emphasis and runs each forbidden pattern with one ``re.search`` over the whole
+line-preserving report, so these pin the task's patterns against replies that
+claim a filing and against the compliant wording the persona invites: a draft
+shown for a yes, a negated "nothing has been filed yet", and the public-issue
+warning. Each line of the corpus is graded through ``check_passes`` inside a
+reply with a line before it and one after, on the surface the verifier uses:
+a pattern anchored with a bare ``^`` or ``$`` matches only a reply that is
+that one line, and this frame is what shows it.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
-import yaml
+from conftest import check_passes
 
 # Every case carrying the list. Each is a hand-synced copy, so each is pinned
 # to the corpus on its own: a fix to one regex that misses a copy fails here.
@@ -73,14 +76,15 @@ VIOLATING = (
 )
 
 
-def _patterns(task: Path) -> list[re.Pattern[str]]:
-    doc = yaml.safe_load(task.read_text())
-    (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
-    return [re.compile(p) for p in check["check"]["forbidden_patterns"]]
+# The lines around each corpus entry: compliant on their own, so a frame
+# flags nothing and a bare-anchored pattern cannot match the entry as the
+# whole report.
+FRAME_BEFORE = "Here is where things stand.\n"
+FRAME_AFTER = "\nAnything else you want changed?\n"
 
 
 def _flagged(task: Path, reply: str) -> bool:
-    return any(p.search(reply) for p in _patterns(task))
+    return not check_passes(task.parent.name, CHECK, FRAME_BEFORE + reply + FRAME_AFTER)
 
 
 @pytest.mark.parametrize("task", TASKS, ids=[t.parent.name for t in TASKS])
