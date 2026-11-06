@@ -942,9 +942,9 @@ CASE_1101 = [{"case": "consistency-drift-outlier", "domain": "consistency", "run
 CASE_1102 = [{"case": "pdb-remediation-pr", "domain": "remediation", "rung": 1, "rung_name": "FORBIDDEN_ACTION"}]
 CASE_1104 = [{"case": "compliance-rbac-overgrant", "domain": "fleet-audits", "rung": 4, "rung_name": "COLLAPSE"}]
 OWNERS = {"consistency-drift-outlier": "lapis2002", "pdb-remediation-pr": "Fuxiao-Gao", "compliance-rbac-overgrant": "toshiowang"}
-CELL_1101 = "`consistency-drift-outlier` (rung 4 COLLAPSE, @lapis2002)"
-CELL_1102 = "`pdb-remediation-pr` (rung 1 FORBIDDEN_ACTION, @Fuxiao-Gao)"
-CELL_1104 = "`compliance-rbac-overgrant` (rung 4 COLLAPSE, @toshiowang)"
+CELL_1101 = "`consistency-drift-outlier` (rung `4 COLLAPSE`, @lapis2002)"
+CELL_1102 = "`pdb-remediation-pr` (rung `1 FORBIDDEN_ACTION`, @Fuxiao-Gao)"
+CELL_1104 = "`compliance-rbac-overgrant` (rung `4 COLLAPSE`, @toshiowang)"
 CASES_UNAVAILABLE = "(cases unavailable)"
 
 
@@ -1275,7 +1275,7 @@ class StalledChainTest(unittest.TestCase):
         github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=unknown))
         self.assertEqual(reconcile(github)[0], "stall-opened")
         rows = rows_of(github.writes[1][2]["body"])
-        self.assertTrue(rows[0].endswith("| `a-case-renamed-since` (rung 4 COLLAPSE, (no owner)) |"), rows[0])
+        self.assertTrue(rows[0].endswith("| `a-case-renamed-since` (rung `4 COLLAPSE`, (no owner)) |"), rows[0])
 
     def test_an_owner_lookup_that_raises_is_a_warning_and_the_issue_still_files(self):
         self.owner_lookup.side_effect = OSError("bench tree unreadable")
@@ -1286,7 +1286,7 @@ class StalledChainTest(unittest.TestCase):
         self.assertEqual(outcome, "stall-opened", err)
         self.assertEqual(len(github.writes), 2)
         rows = rows_of(github.writes[1][2]["body"])
-        self.assertTrue(all(row.endswith("| `compliance-rbac-overgrant` (rung 4 COLLAPSE, (no owner)) |") for row in rows), rows)
+        self.assertTrue(all(row.endswith("| `compliance-rbac-overgrant` (rung `4 COLLAPSE`, (no owner)) |") for row in rows), rows)
         self.assertIn("owner lookup for case 'compliance-rbac-overgrant' failed", err)
 
     def test_a_partial_roll_up_and_one_with_no_blocking_case_say_so(self):
@@ -1340,24 +1340,58 @@ class StalledChainTest(unittest.TestCase):
         self.assertIn("| --- | --- | --- | --- | --- |", patch["body"])
         self.assertNotIn("\n| --- | --- | --- | --- |\n", patch["body"])
 
-    def test_a_line_break_pipe_or_backtick_in_any_case_field_cannot_split_the_row_or_the_code_span(self):
+    def test_an_entry_outside_bench_gates_vocabulary_reads_the_whole_night_as_unavailable_with_a_warning(self):
         """All three fields come from the step-5 log through the poller's
-        JSON; none of them may end the row, shift a column, or close the
-        code span early (an `@` after a stray backtick would render live)."""
-        odd = [{"case": "bad|name\nhere`@x", "domain": "d", "rung": "4\r\n5", "rung_name": "COLLAPSE\nx|y"}]
-        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=odd))
+        JSON. Nothing outside a case id, an integer rung and a rung name is
+        rendered: a line break of any kind (the reader splits the body with
+        `splitlines()`), a pipe, a backtick, a mention, a link or a nameless
+        entry would otherwise reach the table or Markdown. One bad entry
+        makes the night unavailable, never a partial or a prettied row."""
+        good = {"case": "consistency-drift-outlier", "domain": "consistency", "rung": 4, "rung_name": "COLLAPSE"}
+        bad_entries = [
+            dict(good, rung_name="COLLAPSE\u2028x"),
+            dict(good, rung_name="COLLAPSE\x85x"),
+            dict(good, rung_name="COLLAPSE\x0cx"),
+            dict(good, rung_name="COLLAPSE\nx|y"),
+            dict(good, rung_name="@x"),
+            dict(good, rung_name="[x](https://example.invalid)"),
+            dict(good, case="bad|name`@x"),
+            dict(good, case="#4821"),
+            dict(good, rung="4\r\n5"),
+            dict(good, rung=True),
+            {"rung": 4, "rung_name": "COLLAPSE"},
+            {"case": None, "rung": 4, "rung_name": "COLLAPSE"},
+            "not a dict",
+        ]
+        for bad in bad_entries:
+            with self.subTest(bad=bad):
+                github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=[good, bad]))
+                outcome, err = reconcile(github)
+                self.assertEqual(outcome, "stall-opened", err)
+                body = github.writes[1][2]["body"]
+                rows = rows_of(body)
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(rows[0].endswith(f"| {CASES_UNAVAILABLE} |"), rows[0])
+                self.assertEqual(notifier.stall_rows_in(body), rows)
+                self.assertIn("outside bench-gate's vocabulary", err)
+                for text in ("\u2028", "\x85", "\x0c", "@x", "example.invalid", "#4821", "`@"):
+                    self.assertNotIn(text, body)
+
+    def test_a_vocabulary_entry_renders_and_a_rewrite_keeps_every_row(self):
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=CASE_1101), night(33, 3, SHA_33, red_cases=CASE_1102))
         self.assertEqual(reconcile(github)[0], "stall-opened")
         body = github.writes[1][2]["body"]
-        rows = rows_of(body)
-        self.assertEqual(len(rows), 2)
-        self.assertTrue(rows[0].endswith("| `bad\\|name here'@x` (rung 4 5 COLLAPSE x\\|y, (no owner)) |"), rows[0])
-        self.assertNotIn("\r", body)
-        # A rewrite on the next night still finds both rows under the rule.
-        self.assertEqual(notifier.stall_rows_in(body), rows)
-        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=odd), night(33, 3, SHA_33), open_stall=[dict(issue(4001, body), title=STALL_TITLE_2)])
+        self.assertEqual([row.rsplit("| ", 1)[1] for row in rows_of(body)], [f"{CELL_1102} |", f"{CELL_1101} |", f"{CELL_1104} |"])
+        github = stalled_github(night(31, 1, SHA_31), night(32, 2, SHA_32, red_cases=CASE_1101), night(33, 3, SHA_33, red_cases=CASE_1102), night(34, 4, SHA_33), open_stall=[dict(issue(4001, body), title=STALL_TITLE_3)])
         self.assertEqual(reconcile(github)[0], "stall-updated")
-        self.assertEqual(github.writes[1][2]["title"], STALL_TITLE_3)
-        self.assertEqual(len(rows_of(github.writes[1][2]["body"])), 3)
+        self.assertEqual(github.writes[1][2]["title"], "🔴 release chain stalled: the RC eval has returned RED 4 nights in a row")
+        self.assertEqual(len(rows_of(github.writes[1][2]["body"])), 4)
+
+    def test_is_red_case_accepts_bench_gates_shapes_only(self):
+        self.assertTrue(notifier.is_red_case(CASE_1104[0]))
+        self.assertTrue(notifier.is_red_case({"case": "a.b_c-1", "rung": 1, "rung_name": "FORBIDDEN_ACTION", "domain": "d"}))
+        for bad in ({"case": "a", "rung": "4", "rung_name": "COLLAPSE"}, {"case": "a", "rung": 4, "rung_name": "collapse"}, {"case": "", "rung": 4, "rung_name": "COLLAPSE"}, {"case": ".a", "rung": 4, "rung_name": "COLLAPSE"}, {"case": "a", "rung": 4.0, "rung_name": "COLLAPSE"}, []):
+            self.assertFalse(notifier.is_red_case(bad), bad)
 
     def test_the_poller_red_cases_line_format_is_what_the_notifier_parses(self):
         cases = {"cases": CASE_1104, "partial": False}

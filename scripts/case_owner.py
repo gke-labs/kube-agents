@@ -47,7 +47,10 @@ _DOMAIN_OWNER = re.compile(r"^\s+owner:\s*([^\s#]+)")
 _TASK_FIELD = r"^{key}:[ \t]*([^\s#]+)"
 _QUOTES = "'\""
 # A case id as the dashboard reads it from a build log: no slash, no leading dot.
-_CASE_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
+# A case id, the shape a `bench/tasks/<id>` directory name takes. Exported for
+# readers that must accept only a case id before they render it.
+CASE_NAME_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
+_CASE_NAME = CASE_NAME_RE
 
 
 def parse_domain_owners(text: str) -> dict[str, str]:

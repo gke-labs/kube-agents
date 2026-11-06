@@ -115,7 +115,7 @@ from eval_dashboard.post_health import SPACE_ENV, TOKEN_ENV, Sender  # noqa: E40
 from github_api import is_refusal, log  # noqa: E402
 from notify_broken_main import FAILING_CONCLUSIONS, decide, newest_reporting_run, reporting_history  # noqa: E402
 from notify_flaky_check import GitHubAPI as FlakyGitHubAPI  # noqa: E402
-from case_owner import effective_owner_of_case  # noqa: E402
+from case_owner import CASE_NAME_RE, effective_owner_of_case  # noqa: E402
 from poll_rc_eval_verdict import (  # noqa: E402
     RED_CASE_NAME_KEY,
     RED_CASE_RUNG_KEY,
@@ -360,12 +360,16 @@ STALL_CELL_SEPARATOR = "|"
 # A row written before the red-cases column existed has this many cells;
 # a rewrite pads it rather than leaving it short under the wider header.
 STALL_ROW_CELLS_WITHOUT_CASES = 4
-# The case, rung and rung name are log-derived text inside a code span in a
-# table cell: a line break would end the row (and the rows below it would be
-# lost on the next rewrite), so each becomes a space; `_inline` then handles
-# the backtick and the pipe as it does for the stage issue's cells.
-_LINE_BREAK_RE = re.compile(r"[\r\n]+")
-LINE_BREAK_REPLACEMENT = " "
+# The case, rung and rung name reach the issue body, the comment and the
+# Chat line from the step-5 log. They are accepted only in bench-gate's own
+# vocabulary, the one producer of the roll-up: a case id (the shape
+# `scripts/case_owner.py` requires of a task directory), an integer rung,
+# and a rung name spelled as `Rung.name` is. Nothing else is rendered: one
+# entry outside it makes the whole line read as unavailable, with a
+# warning, so no line break, pipe, backtick, mention or link can ever
+# reach Markdown from the log, and no sanitiser has to keep up with the
+# reader. Every field still sits inside a code span in the cell.
+_RUNG_NAME_RE = re.compile(r"[A-Z_]+")
 # How much of a line that did not parse the warning quotes.
 CELL_PREVIEW_CHARS = 120
 # The red-cases cell: each blocking case the step-5 log named, with its rung
@@ -374,7 +378,7 @@ CELL_PREVIEW_CHARS = 120
 # the owner is told. A log with no red-cases line, a run before the poller
 # printed one, reads as unavailable; a case the checkout cannot resolve
 # reads as having no owner.
-STALL_CASE = "`{case}` (rung {rung} {rung_name}, {owner})"
+STALL_CASE = "`{case}` (rung `{rung} {rung_name}`, {owner})"
 STALL_CASE_OWNER = "@{owner}"
 STALL_NO_OWNER = "(no owner)"
 STALL_CASES_SEPARATOR = "; "
@@ -800,14 +804,27 @@ def extract_red_cases(log_text: str) -> dict | None:
         if not isinstance(data, dict) or not isinstance(data.get(RED_CASES_CASES_KEY), list):
             warn(f"the step-5 log's red-cases line has no {RED_CASES_CASES_KEY!r} list ({match.group(1)[:CELL_PREVIEW_CHARS]!r}); the night's cases read as unavailable")
             return None
-        return {RED_CASES_CASES_KEY: [case for case in data[RED_CASES_CASES_KEY] if isinstance(case, dict)], RED_CASES_PARTIAL_KEY: data.get(RED_CASES_PARTIAL_KEY) is True}
+        if not all(is_red_case(case) for case in data[RED_CASES_CASES_KEY]):
+            warn(f"the step-5 log's red-cases line carries an entry outside bench-gate's vocabulary ({match.group(1)[:CELL_PREVIEW_CHARS]!r}); the night's cases read as unavailable")
+            return None
+        return {RED_CASES_CASES_KEY: data[RED_CASES_CASES_KEY], RED_CASES_PARTIAL_KEY: data.get(RED_CASES_PARTIAL_KEY) is True}
     return None
 
 
-def cell_text(value) -> str:
-    """One log-derived value for the red-cases cell: no line break, no
-    backtick, no bare pipe survives."""
-    return _inline(_LINE_BREAK_RE.sub(LINE_BREAK_REPLACEMENT, str(value if value is not None else ""))).strip()
+def is_red_case(case) -> bool:
+    """True when the entry is one bench-gate could have written: a case id,
+    an integer rung, a rung name. `bool` is an int in Python and is refused."""
+    if not isinstance(case, dict):
+        return False
+    name, rung, rung_name = case.get(RED_CASE_NAME_KEY), case.get(RED_CASE_RUNG_KEY), case.get(RED_CASE_RUNG_NAME_KEY)
+    return (
+        isinstance(name, str)
+        and CASE_NAME_RE.fullmatch(name) is not None
+        and isinstance(rung, int)
+        and not isinstance(rung, bool)
+        and isinstance(rung_name, str)
+        and _RUNG_NAME_RE.fullmatch(rung_name) is not None
+    )
 
 
 def owner_of_case(case: str) -> str | None:
@@ -829,15 +846,12 @@ def stall_cases_cell(cases: dict | None) -> str:
         return STALL_CASES_UNAVAILABLE
     parts = []
     for case in cases[RED_CASES_CASES_KEY]:
-        name = cell_text(case.get(RED_CASE_NAME_KEY))
-        if not name:
-            continue
-        owner = owner_of_case(name)
+        owner = owner_of_case(case[RED_CASE_NAME_KEY])
         parts.append(
             STALL_CASE.format(
-                case=name,
-                rung=cell_text(case.get(RED_CASE_RUNG_KEY)),
-                rung_name=cell_text(case.get(RED_CASE_RUNG_NAME_KEY)),
+                case=case[RED_CASE_NAME_KEY],
+                rung=case[RED_CASE_RUNG_KEY],
+                rung_name=case[RED_CASE_RUNG_NAME_KEY],
                 owner=STALL_CASE_OWNER.format(owner=owner) if owner else STALL_NO_OWNER,
             )
         )

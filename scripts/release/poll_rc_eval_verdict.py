@@ -743,9 +743,10 @@ def red_cases(verdict_text):
 
     Blocking, not "any rung below GREEN": the roll-up also lists cases on
     the two non-rungs INFRA and NOT_GRADED_ON_TRANSPORT, which never block
-    and are not why the night was RED. `partial` is the EXIT-trap table
-    hack/ci-eval-rc.sh writes when the run stopped before grading every
-    case; the notifier says so beside the names.
+    and are not why the night was RED. `partial` is what bench-gate writes
+    into the roll-up when the run stopped before grading every case
+    (hack/ci-eval-rc.sh reads the same flag); the notifier says so beside
+    the names.
     """
     if not isinstance(verdict_text, str):
         return None
