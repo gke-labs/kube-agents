@@ -251,7 +251,7 @@ def pin_parents(agent_home: Path) -> list[str]:
         try:
             keep_parents(home, timeout=PINS_ONLY_TIMEOUT_SECONDS)
         except Exception as exc:  # noqa: BLE001 - one store's failure must not stop the rest
-            lines.append(f"pinning session parents in {label(home, agent_home)} failed: {type(exc).__name__}")
+            lines.append(f"pinning session parents in {label(home, agent_home)} failed: {type(exc).__name__}: {span_safe(exc)}")
     return lines
 
 

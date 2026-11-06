@@ -239,6 +239,7 @@ class PinsOnlyForTheEntrypoint(RetentionTest):
         self.assertEqual({"root"}, self.pinned(profile))
         written = "".join(c.args[0] for c in stderr.write.call_args_list)
         self.assertIn("profile `broken`", written)
+        self.assertIn("DatabaseError: file is not a database", written)
 
 
 class PinsOnlyIsBrief(RetentionTest):
