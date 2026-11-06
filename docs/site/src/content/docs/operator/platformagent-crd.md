@@ -781,8 +781,11 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   take over within the lease's 20s if it stops. The operator renders more than one only once a
   gateway pod on the image it renders holds the Lease (the `GatewayElected` condition), and one
   with `Recreate` until then. Two or more roll with a surge pod, so the namespace's ResourceQuota
-  needs room for one more gateway pod during a rollout; set 1 where it has none. An install
-  upgrading from one gateway pod goes to two once its new gateway holds the Lease.
+  needs room for one more gateway pod during a rollout; set 1 where it has none. An install upgrading from one gateway pod
+  goes to two once its new gateway holds the Lease.
+
+  The chart's quota check and the operator's own session pod quota both count the standby and
+  the surge pod.
 
   The elected gateway depends on the API server. A leader whose renewals fail stops about 12s
   after its last good renewal, and no replica leads until the API server answers again. Chat, the

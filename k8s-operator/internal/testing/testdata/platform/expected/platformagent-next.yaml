@@ -4639,7 +4639,7 @@ metadata:
       uid: ""
 spec:
   hard:
-    pods: "27"
+    pods: "29"
 status: {}
 ---
 apiVersion: v1
@@ -5507,33 +5507,3 @@ spec:
                   expirationSeconds: 3600
                   path: token
 status: {}
----
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: gateway
-  name: platformagent-a2a-gateway
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
-spec:
-  maxUnavailable: 1
-  selector:
-    matchLabels:
-      app: platformagent-a2a-gateway
-  unhealthyPodEvictionPolicy: AlwaysAllow
-status:
-  currentHealthy: 0
-  desiredHealthy: 0
-  disruptionsAllowed: 0
-  expectedPods: 0

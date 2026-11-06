@@ -1561,22 +1561,24 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 		t.Fatalf("quota does not bound pods: %v", hard)
 	}
 	// Default gateway cap 10 + the fixed headroom for the rest of the
-	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 27 {
-		t.Fatalf("default quota = %d, want 27 (cap 10 + headroom 17)", pods.Value())
+	// namespace (base stack, rollout surge, race overshoot) + the gateway's
+	// standby and its rollout's surge pod (two replicas by default under the
+	// election, a2aGatewayStandbyPods).
+	if pods.Value() != 29 {
+		t.Fatalf("default quota = %d, want 29 (cap 10 + headroom 17 + gateway standby 2)", pods.Value())
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 19 {
-		t.Fatalf("tuned quota = %d, want 19 (cap 2 + headroom 17)", pods.Value())
+	if pods.Value() != 21 {
+		t.Fatalf("tuned quota = %d, want 21 (cap 2 + headroom 17 + gateway standby 2)", pods.Value())
 	}
 
 	// The MCP server is one more standing pod, only while its flag is on (#3869).
 	t.Setenv(a2aMCPDoorEnvVar, "true")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != 20 {
-		t.Fatalf("tuned quota with the MCP server = %d, want 20 (cap 2 + headroom 17 + 1)", pods.Value())
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != 22 {
+		t.Fatalf("tuned quota with the MCP server = %d, want 22 (cap 2 + headroom 17 + gateway standby 2 + 1)", pods.Value())
 	}
 }
 
@@ -2212,6 +2214,12 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatalf("render: %v", err)
+	}
+	// The gateway's budget renders only once it's scaled out, which takes a
+	// pod on its image holding the Lease and a second pass.
+	electGateway(t, ctx, cl, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatalf("render after the election: %v", err)
 	}
 	// Precondition: the profile namespace's half rendered, so its delete
 	// below proves something.

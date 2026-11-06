@@ -4427,7 +4427,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AMaxSessions(agent)+a2aQuotaHeadroom) + a2aMCPStandingPods(agent)
+	limit := int64(resolveA2AMaxSessions(agent)+a2aQuotaHeadroom) + a2aMCPStandingPods(agent) + a2aGatewayStandbyPods(agent)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -5342,12 +5342,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Ports: append(injectPorts, corev1.ContainerPort{
 							Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort,
 						}),
-						// Not ready until the event relay binds: the adapters and
-						// doors start only after it, and it waits for TASKS rather
-						// than exiting. Recreate (above) already stops the old
-						// pod before this one starts, so the probe opens no gap
-						// in a roll; it shows the existing one, with the reason
-						// in the probe's failure message.
+						// The replica holding the Lease is not ready until its
+						// event relay binds: the adapters and doors start only
+						// after it, and it waits for TASKS rather than exiting. A
+						// standby is ready once connected with the Lease read
+						// (gateway.ElectedReadiness), so a rolling update's surge
+						// pod reads Ready before an old pod stops. At one replica,
+						// Recreate stops the old pod first and the probe shows
+						// that gap, with the reason in its failure message.
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{Path: a2aGatewayReadyzPath, Port: intstr.FromString(a2aGatewayMetricsPortName)},
@@ -6176,13 +6178,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 	// Its budget, after the Deployment it selects, so a drain takes one
-	// replica at a time.
-	pdb := buildA2AGatewayPDB(agent)
-	if err := ctrl.SetControllerReference(agent, pdb, r.Scheme); err != nil {
+	// replica at a time; only while it runs more than one. At one replica a
+	// budget protects nothing, and one rendered over a scale-out that hasn't
+	// happened yet would pin the one pod that runs.
+	if err := r.reconcileA2AGatewayPDB(ctx, agent, ptr.Deref(dep.Spec.Replicas, 1) > 1); err != nil {
 		return state, err
-	}
-	if err := r.applyManaged(ctx, agent, pdb); err != nil {
-		return state, fmt.Errorf("failed to apply A2A gateway PodDisruptionBudget: %w", err)
 	}
 
 	// And the removal AFTER it, the other half of the same ordering

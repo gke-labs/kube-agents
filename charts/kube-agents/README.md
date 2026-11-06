@@ -1195,7 +1195,9 @@ in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those valu
 rather than re-implementing it, so it can over-count; it never fails the render on them.
 When `operator.extraEnv` sets `A2A_MCP_DOOR` to `true`, or in a form the chart cannot read (a
 `valueFrom`, a non-string value), the check also counts the MCP server's pod, at the console's
-size, since the operator sizes the two alike. The mode is read from the values, so a mode set
+size, since the operator sizes the two alike. It counts the A2A gateway at two pods, the
+operator's default under its election, with one gateway pod of surge room for a rollout,
+unless `operator.extraEnv` sets `A2A_GATEWAY_ELECTION` to `false`. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own.

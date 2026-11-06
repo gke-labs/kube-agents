@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -48,6 +50,9 @@ const (
 	// pending stack's 30s requeue, so a pass waiting on a roll still comes
 	// back sooner than a settled one.
 	a2aGatewayElectionRecheck = 60 * time.Second
+	// a2aGatewaySurgePods is the extra pod a rolling update of two or more
+	// replicas starts before it stops an old one (maxSurge 1).
+	a2aGatewaySurgePods = int64(1)
 )
 
 // a2aGatewayReplicas is the replica count the CR asks for under next:
@@ -218,6 +223,38 @@ func a2aGatewayTopologySpread(agent *agentv1alpha1.PlatformAgent) []corev1.Topol
 		LabelSelector:     &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aGatewayName(agent)}},
 		MatchLabelKeys:    []string{a2aGatewaySpreadMatchLabelKey},
 	}}
+}
+
+// a2aGatewayStandbyPods is what the gateway adds to the namespace pod quota
+// beyond the one pod a2aQuotaHeadroom counts: its standbys, and a rolling
+// update's surge pod, while the CR asks for more than one replica under the
+// election. No golden renders the scale-out (no pod holds the Lease there), so
+// it's counted apart, as the MCP server is.
+func a2aGatewayStandbyPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	if !a2aStackRendering(agent) || !a2aGatewayElectionEnabled() {
+		return 0
+	}
+	replicas := int64(a2aGatewayReplicas(agent))
+	if replicas <= 1 {
+		return 0
+	}
+	return replicas - 1 + a2aGatewaySurgePods
+}
+
+// reconcileA2AGatewayPDB applies the gateway's budget while it runs more than
+// one replica and removes it otherwise.
+func (r *PlatformAgentReconciler) reconcileA2AGatewayPDB(ctx context.Context, agent *agentv1alpha1.PlatformAgent, scaledOut bool) error {
+	pdb := buildA2AGatewayPDB(agent)
+	if !scaledOut {
+		return r.deleteA2AObjectIfOwned(ctx, agent, pdb, r.Client, nil)
+	}
+	if err := ctrl.SetControllerReference(agent, pdb, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, pdb); err != nil {
+		return fmt.Errorf("failed to apply A2A gateway PodDisruptionBudget: %w", err)
+	}
+	return nil
 }
 
 // buildA2AGatewayPDB lets a drain take one gateway replica at a time.

@@ -445,3 +445,61 @@ func TestACarriedRecordDoesntScaleOutAFreshRender(t *testing.T) {
 		t.Fatalf("a carried record scaled out: %d replicas, %s", *dep.Spec.Replicas, dep.Spec.Strategy.Type)
 	}
 }
+
+// TestTheGatewayStandbysAreInTheQuota: the namespace pod quota counts the
+// gateway's standbys and a rollout's surge pod while the CR asks for more
+// than one replica, and nothing extra at one replica or with the election off.
+func TestTheGatewayStandbysAreInTheQuota(t *testing.T) {
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	base := *buildA2ASessionQuota(withGatewayReplicas(a2aTestAgent(), 1)).Spec.Hard.Pods()
+	two := *buildA2ASessionQuota(a2aTestAgent()).Spec.Hard.Pods()
+	three := *buildA2ASessionQuota(withGatewayReplicas(a2aTestAgent(), 3)).Spec.Hard.Pods()
+	if got := two.Value() - base.Value(); got != 2 {
+		t.Errorf("two replicas add %d to the quota, want 2 (a standby and a surge pod)", got)
+	}
+	if got := three.Value() - base.Value(); got != 3 {
+		t.Errorf("three replicas add %d to the quota, want 3", got)
+	}
+	t.Setenv(a2aGatewayElectionEnvVar, "false")
+	if off := *buildA2ASessionQuota(a2aTestAgent()).Spec.Hard.Pods(); off.Value() != base.Value() {
+		t.Errorf("with the election off the quota is %d, want %d", off.Value(), base.Value())
+	}
+}
+
+// TestNoBudgetPinsAGatewayHeldAtOneReplica: before the scale-out there is no
+// gateway budget, so the one pod that runs can still be drained.
+func TestNoBudgetPinsAGatewayHeldAtOneReplica(t *testing.T) {
+	t.Setenv(a2aGatewayImageEnvVar, "example.com/a2a-gateway:v1")
+	t.Setenv(a2aGatewayElectionEnvVar, "")
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().
+		WithScheme(setupScheme()).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme()}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aGatewayName(agent)}, &policyv1.PodDisruptionBudget{}); err == nil {
+		t.Fatal("a gateway budget over a gateway held at one replica")
+	}
+}
+
+// electGateway puts a pod of the gateway's Deployment on the image the
+// operator renders and hands it the Lease, as an elected gateway does.
+func electGateway(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	holder := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-a2a-gateway-elected", Namespace: agent.Namespace,
+			Labels: map[string]string{"app": a2aGatewayName(agent)}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: a2aGatewayContainerName, Image: a2aGatewayImage()}}},
+	}
+	if err := cl.Create(ctx, holder); err != nil {
+		t.Fatal(err)
+	}
+	takeLease(t, ctx, cl, agent, holder.Name)
+}
