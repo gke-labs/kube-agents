@@ -90,8 +90,8 @@ func provision(t *testing.T, url string) {
 // Not before the gateway's relay has bound its durable on the stream, though.
 // The rig starts Run on a goroutine, and Run binds the relay before it starts
 // the adapter that reads the inbox; a stream deleted ahead of that bind leaves
-// Run retrying "stream not found" for the whole bind window (lib's
-// subscribeBindWindow, 45s), so no turn is ever read and the test times out
+// Run waiting for the stream to exist again (the relay's WaitForStream), so
+// no turn is ever read and the test times out
 // waiting for a failure the gateway never got to have. Under a loaded
 // `go test ./...` the goroutine can lose that race.
 func deleteTasksStream(t *testing.T, url string) {

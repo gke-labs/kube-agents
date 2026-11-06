@@ -8,8 +8,8 @@ deterministic is what lets it block merges with no repetitions and no statistics
 
 ## Status: gating
 
-This directory is in `PYTHON_TEST_DIRS`. `make test-python` runs it, the `test` job
-in `python-tests.yml` runs it, and a red seam test is a red pull request. It spent
+This directory is in `PYTHON_TEST_DIRS`. `make test-python` runs it, the `test-shard` jobs
+in `python-tests.yml` run it (the `test` job joins them), and a red seam test is a red pull request. It spent
 its first weeks on probation in a job of its own so that a flake in a young suite
 could not red an already-gating check; it came through without a failure, and a
 tier nothing gates on is a tier people learn to merge around. The separate

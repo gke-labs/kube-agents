@@ -27,6 +27,17 @@ import chat_platforms  # noqa: E402
 import cluster_agent_profile as cap  # noqa: E402
 import cluster_agent_reconcile as rec  # noqa: E402
 
+
+def _delete_each(names):
+    """The prune's batch, forwarded to delete_profile one name at a time in the
+    batch's order, so these tests' patches of delete_profile see every prune.
+    delete_profiles itself is tested in test_cluster_agent_profile.py, and
+    PruneBatchTest below checks the reconcile hands it the whole prune at once."""
+    return {name: rec.delete_profile(name) or "deleted" for name in sorted(set(names))}
+
+
+rec.delete_profiles = _delete_each
+
 # The ScopeTest timing tests prove "these lookups overlapped" and "the run went on without
 # this one" by synchronising with the stubbed lookups rather than timing them: a stub meets
 # its peers at a Barrier, or blocks on an Event the test releases only after reconcile()
@@ -217,6 +228,27 @@ def _name_for(identity_kwargs, identities):
             return name
     raise KeyError(identity_kwargs)
 
+
+class PruneBatchTest(HomesMixin):
+    """The reconcile hands its whole prune to delete_profiles in one call (#4574)."""
+
+    def test_every_pruned_name_goes_in_one_batch(self):
+        profiles = ["cluster-a", "cluster-b", "cluster-c", "cluster-live"]
+        identities = {n: _identity(cluster=n.split("-", 1)[1]) for n in profiles}
+        existence = {"cluster-a": False, "cluster-b": False, "cluster-c": False, "cluster-live": True}
+        batches = []
+        with mock.patch.object(rec, "delete_profiles", side_effect=lambda names: batches.append(list(names)) or {}):
+            report, deleted = ReconcileTest._run(self, profiles, identities, existence)
+        self.assertEqual(batches, [["cluster-a", "cluster-b", "cluster-c"]])
+        self.assertEqual(deleted, [])  # not one delete_profile per name
+        self.assertEqual(sorted(report["pruned"]), ["cluster-a", "cluster-b", "cluster-c"])
+
+    def test_a_dry_run_deletes_nothing(self):
+        profiles = ["cluster-a"]
+        identities = {"cluster-a": _identity(cluster="a")}
+        with mock.patch.object(rec, "delete_profiles", side_effect=AssertionError("a dry run deleted")):
+            report, _ = ReconcileTest._run(self, profiles, identities, {"cluster-a": False}, dry_run=True)
+        self.assertEqual(report["pruned"], ["cluster-a"])
 
 class CreateDirectionTest(HomesMixin):
     def test_creates_missing_including_the_management_cluster(self):

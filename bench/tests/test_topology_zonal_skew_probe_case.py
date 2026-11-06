@@ -76,7 +76,8 @@ def _fleet_dir(root: Path) -> None:
     """A runner-shaped directory with every catalogue slot reached: the
     objectives' ``fixture_roles`` resolve to slot d's credential."""
     catalog = json.loads(CATALOG.read_text(encoding="utf-8"))
-    roles = catalog["roles"]
+    # The roles on a cluster slot; a project-scoped role has no slot line.
+    roles = {role: spec for role, spec in catalog["roles"].items() if spec["cluster_slot"] is not None}
     (root / "clusters").mkdir(exist_ok=True)
     lines = ["project=kube-agents-evals"] + [f"slot.{role}={spec['cluster_slot']}" for role, spec in roles.items()]
     for slot in sorted({spec["cluster_slot"] for spec in roles.values()}):

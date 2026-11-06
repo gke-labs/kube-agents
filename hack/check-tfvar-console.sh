@@ -13,15 +13,18 @@
 # composition; this is the step that puts the helper in front of it.
 #
 # The sweep is read out of the source rather than listed here: every variable
-# named literally at a tfvar call site in lifecycle.sh, plus every string
-# variable variables.tf declares with `default = null`. The second set is what
-# makes a call that passes the name in a shell variable -- `$(tfvar "$name")`
-# -- safe to leave unread: a string with a non-null default cannot come back
-# as anything but a plain value, so the nullable strings are the only ones that
-# can leak whichever way they are read. A nullable bool or list read through
-# tfvar is the bound: the helper does not normalise those shapes today, and
-# nothing reads one. The variables without a default are given placeholders so
-# their answer is a value rather than `(known after apply)`.
+# named literally at a tfvar call site in lifecycle.sh, plus every string,
+# number or bool variable variables.tf declares with `default = null`. The
+# second set is what makes a call that passes the name in a shell variable --
+# `$(tfvar "$name")`, which is how the node-pool shape guard reads the two
+# nullable disk sizes -- safe to leave unread: a scalar with a non-null default
+# cannot come back as anything but a plain value, so the nullable scalars are
+# the only ones that can leak whichever way they are read, and the three typed
+# nulls they print (`tostring(null)`, `tonumber(null)`, `tobool(null)`) are the
+# shapes the helper folds. A nullable list, map or object read through tfvar
+# is the bound: the helper does not normalise those shapes today, and nothing
+# reads one. The variables without a default are given placeholders so their
+# answer is a value rather than `(known after apply)`.
 #
 # Run via `make tfvar-check`; CI runs it in validate.yml. `--list` prints the
 # variables the sweep would evaluate and exits, without touching terraform.
@@ -36,10 +39,10 @@ readonly TFVAR_CALL_PATTERN='\$\(tfvar [A-Za-z0-9_-]+'
 readonly REPORT_NAME_WIDTH=32
 # Shapes `terraform console` prints for anything that is not a plain value:
 # `tostring(null)`, `tobool(null)`, `tolist(null) /* of string */`,
-# `(known after apply)`, `(sensitive value)`, and for a populated list or map
-# the closing `])` or `}` that tfvar's `tail -1` would keep. Every one of them
-# carries a bracket or the word `null`, and no variable lifecycle.sh reads
-# legitimately does.
+# `null /* object */`, `(known after apply)`, `(sensitive value)`, and for a
+# populated list or map the closing `])` or `}` that tfvar's `tail -1` would
+# keep. Every one of them carries a bracket or the word `null`, and no
+# variable lifecycle.sh reads legitimately does.
 readonly LEAK_PATTERN='null|[][(){}]'
 readonly LIST_FLAG=--list
 readonly PLACEHOLDER_PROJECT=tfvar-check-project
@@ -56,16 +59,16 @@ cd "$COMPOSITION"
 KUBE_AGENTS_SOURCE_ONLY=true source "./$LIFECYCLE"
 
 literal_callers() { grep -oE "$TFVAR_CALL_PATTERN" "$LIFECYCLE" | awk '{print $2}'; }
-nullable_strings() {
+nullable_scalars() {
   awk '
-    /^variable "/ { name = $2; gsub(/"/, "", name); is_string = 0; is_null = 0 }
-    /^[ \t]*type[ \t]*=[ \t]*string[ \t]*$/ { is_string = 1 }
+    /^variable "/ { name = $2; gsub(/"/, "", name); is_scalar = 0; is_null = 0 }
+    /^[ \t]*type[ \t]*=[ \t]*(string|number|bool)[ \t]*$/ { is_scalar = 1 }
     /^[ \t]*default[ \t]*=[ \t]*null[ \t]*$/ { is_null = 1 }
-    /^}/ { if (name != "" && is_string && is_null) print name; name = "" }
+    /^}/ { if (name != "" && is_scalar && is_null) print name; name = "" }
   ' "$VARIABLES_TF"
 }
 variables=()
-while IFS= read -r name; do variables+=("$name"); done < <({ literal_callers; nullable_strings; } | sort -u)
+while IFS= read -r name; do variables+=("$name"); done < <({ literal_callers; nullable_scalars; } | sort -u)
 if [[ $(literal_callers | wc -l) -eq 0 ]]; then
   echo "ERROR: found no tfvar callers in $COMPOSITION/$LIFECYCLE; the pattern is stale." >&2
   exit 1

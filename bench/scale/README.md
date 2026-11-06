@@ -21,6 +21,17 @@ console's Harness limits page reads `harness-limits.json`.
 - `phase3-proxy-raised.yaml`: Phase 3's two windows at 2 and 16 clusters with the credential proxy's
   limits raised, so its CPU peak shows what it needs; set the limits before the runs and remove them
   after.
+- `phase4.yaml`: the Phase 4 plan: an onboarded install's daily work (Stall Watch, one daily audit,
+  fan-out questions) from 40 clusters down. Its test clusters are created before the run, outside
+  the runner, each with its own subnet and small Pod and Service ranges, so the project's default
+  network does not cap their number.
+- [`real-install-test-plan.md`](real-install-test-plan.md) and its plan files: `real-install.yaml`
+  (the fleet point, first-run flow, questions, restart, churn, soak and S-size red test),
+  `real-install-concurrent.yaml` (questions at once), `real-install-failing.yaml` (20 failing Pods),
+  `real-install-stress.yaml` and `real-install-stress-load.yaml` (stress beyond fair use),
+  `real-install-scaling.yaml` (token cost at 80 and 20 clusters). Run each
+  with `--only-factor combined`. [`real-install-results.md`](real-install-results.md) holds the
+  results, and [`real-install-evidence.md`](real-install-evidence.md) the data behind them.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.
@@ -59,6 +70,15 @@ python3 -m kube_agents_bench.scale.runner teardown <plan>             # remove f
 python3 -m kube_agents_bench.scale.runner teardown <plan> --delete-fleet
 ```
 
+`run --dry-run` prints what a run would do and changes nothing: each level's cluster creates and
+deletes, and each run, marked where it makes model calls of its own. `run`, `apply` and `teardown`
+hold the experiment install's live-test lease while they work
+([`docs/designs/live-test-lease.md`](../../docs/designs/live-test-lease.md)), so a second runner or
+an agent's live validation cannot change the install at the same time; a lease another holder has
+refuses the command. The lease lasts `lease_ttl_minutes` (default 60) and the runner renews it
+every third of that while it works. After two failed renewals in a row it stops the run, so it never
+changes the install unleased; a runner that dies frees the lease within the TTL.
+
 An operation's `kind` says what a run does:
 
 - `prompt` sends the operation's `prompt` through the agent API, and at a `concurrent` value of N
@@ -93,6 +113,7 @@ Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, 
 - `test_cluster_machine_type`: the machine type of new test clusters, for a zone short of the
   default one;
 - `cluster_registration_timeout_seconds`: how long to wait for a Cluster Agent profile.
+- `lease_ttl_minutes`: the live-test lease's TTL; the runner renews it every third of that.
 - `trigger_drain_seconds`: how long the run after a `trigger_soak` waits for its jobs to finish.
 
 The agent API is reached through the repository's `kubectl exec` relay
@@ -173,7 +194,7 @@ run saw a provider 429 or an unfinished prompt, or, for a fleet audit or upgrade
 before answers were kept, when its completion cannot be checked. The CPU, memory and proxy metrics
 are left out too when work other than the run's own shared the broker: jobs an earlier `trigger_soak`
 started were still running; a prompt or boot-burst run started inside a Stall Watch read (2 minutes
-plus 30 seconds per cluster after :00 or :30) or held a tick; a proxy load run's broker ran a command its
+plus 50 seconds per cluster after :00 or :30) or held a tick; a proxy load run's broker ran a command its
 workers did not send (its throughput and tokens are left out as well). A prompt answered without its
 operation is left out of those and of the token metrics. `python3 -m kube_agents_bench.scale.runner reclassify <plan>` re-applies these rules to the stored records whose operation the plan names, and warns how many it passed over; with a data file several plans wrote, run it once per plan. `remonitor` reads every stored record's Cloud
 Monitoring metrics again with the current queries, within Monitoring's retention, and writes its own
@@ -201,3 +222,5 @@ Metric names:
   reports them; `run_tokens_input` is the non-cached part of the prompt, so the run's share of the
   window is `run_tokens_input + run_tokens_cached` against `tokens_input`);
 - the fixtures: `churn_achieved_per_minute`.
+- the jobs a triggered window started, read after the drain: `job_seconds` (the slowest completed job's run
+  time) and `jobs_completed`.

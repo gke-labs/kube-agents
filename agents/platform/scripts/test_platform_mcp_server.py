@@ -719,6 +719,19 @@ class TestSendNotification(unittest.TestCase):
     @patch('platform_mcp_server._run_env')
     @patch('platform_mcp_server.subprocess.run')
     @patch.dict(os.environ, {**BLANK_CHAT_ENV})
+    def test_send_notification_kept_by_the_gateway_is_handled_not_resent(self, mock_run, mock_env):
+        """Exit 5: the gateway kept the post for its digest. The tool says so,
+        counts it as handled, and runs the send once."""
+        mock_env.return_value = {}
+        mock_run.side_effect = subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        result = send_notification("hello warning", session_id="")
+        self.assertIn("KEPT: Notification to google_chat was not posted (no home channel)", result)
+        self.assertNotIn("ERROR", result)
+        self.assertEqual(mock_run.call_count, 1)
+
+    @patch('platform_mcp_server._run_env')
+    @patch('platform_mcp_server.subprocess.run')
+    @patch.dict(os.environ, {**BLANK_CHAT_ENV})
     def test_send_notification_no_session(self, mock_run, mock_env):
         mock_env.return_value = {}
         mock_response = MagicMock()
