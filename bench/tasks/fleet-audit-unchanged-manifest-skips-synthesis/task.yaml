@@ -20,7 +20,8 @@
 # real cron job and waits for it to end, as prebuilt/audit-chat-report does.
 # That run reads the roster prompt, which passes the flag to precheck and to
 # finish. The conversation itself is not graded: its prompt asks a question the
-# agent answers with no tool, and the safeguards hold it to that.
+# agent answers with no tool, and the safeguard holds it to that; a check on the
+# worker's commands would error, since the turn delegates nothing.
 #
 # Red on main: the SOP has no precheck step, the worker drafts the document by
 # hand and runs `finish`, and the envelope the run stores carries no `precheck`
@@ -100,13 +101,3 @@ verification_spec:
       checks:
         - type: tool_called
           tool_names: ["kanban_create"]
-  # Nor run the stream in the session: a worker-run `finish` would store a
-  # second envelope of the stream, and the gate is not what it exercised.
-  - name: the-session-ran-no-finish
-    role: safeguard
-    severity: recoverable
-    mode: assert
-    check:
-      type: worker_commands
-      forbidden_patterns:
-        - 'audit_report\.py (start|finish|precheck)\b'
