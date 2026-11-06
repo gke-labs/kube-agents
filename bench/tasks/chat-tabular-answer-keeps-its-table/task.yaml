@@ -15,19 +15,23 @@
 # read five flattened rows instead of one table. This case asks for a
 # listing with five columns and grades the shape it arrives in.
 #
-# What it grades: the reply carries a pipe table (a `---` delimiter row and a
-# row per planted node pool, one of which the prompt does not name), and no
-# node or pool is listed as a bullet or numbered item in the table's place.
-# The pool names are the planted nouns; the prompt names one of them to
-# identify the cluster, so the objective leans on the other two and on the
-# version cell, which only a live read produces. The lead sentence may name
-# the cluster and a pool: the forbidden shape is a list item, not prose.
+# What it grades: the reply carries a pipe table (a delimiter row and a row
+# per planted node pool, two of which the prompt does not name), and no row
+# is repeated as a bullet or numbered item: a list item that carries a node
+# name and another cell's value (a version, a machine type, a pod count), or
+# a pool name with a version, on the same line. The pool names are the
+# planted nouns; the prompt names one of them to identify the cluster, so
+# the table objective leans on the other two and on the version cell, which
+# only a live read produces. Prose that names a node or a pool, and a list
+# item that names a node alone (the audit trail's `kubectl describe node …`,
+# a note that one node carries the taint), are not the duplication shape and
+# pass.
 #
-# Planted defect required: idle-nodepool -- a node pool named idle-batch-pool
-# on the seeded fleet, held empty by the seeded-role=idle-batch NoSchedule
-# taint; the role stands for its slot, whose other pools (default-pool,
-# pinned-inference-pool) the rows name. Isolation class: read-only. Eligible
-# tier: nightly.
+# Planted defects required: idle-nodepool (a node pool named idle-batch-pool,
+# held empty by the seeded-role=idle-batch NoSchedule taint), hpa-saturated
+# (whose plant is pinned-inference-pool) and default-pool-headroom (the
+# default pool) -- the three pools of slot a, each a row the table must
+# carry. Isolation class: read-only. Eligible tier: nightly.
 id: chat-tabular-answer-keeps-its-table
 name: A per-node listing reaches the chat thread as a pipe table
 # The prompt identifies the cluster by a planted pool name inside the run's
@@ -55,12 +59,17 @@ owner: bradhoekstra
 # Slug per docs/designs/domains.yaml.
 domain: chat-and-routing
 
-# The seeded-fleet defect this scenario reads, named by ROLE rather than by
+# The seeded-fleet defects this scenario reads, named by ROLE rather than by
 # cluster: each eval project carries its own fleet and this case has to run
 # unchanged against all of them. Roles are defined in
 # bench/tf/fleet/fixtures.json; the rule is docs/designs/bench-fleet-catalog.md.
+# The three roles are the three node pools of slot a, one table row each:
+# idle-batch-pool, pinned-inference-pool (hpa-saturated's plant) and
+# default-pool (default-pool-headroom's).
 fixtures:
   - idle-nodepool
+  - hpa-saturated
+  - default-pool-headroom
 
 verification_spec:
   - name: the-nodes-arrive-as-one-pipe-table
@@ -70,35 +79,51 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # Each pattern is a line of a pipe table. The verifier lowercases the
-      # text and strips `*`, `_` and backticks before the patterns run, so
-      # the cells are matched bare; pipes and `-` survive.
+      # Each pattern is a line of a pipe table, in the grammar the gateway
+      # reads one with (a2a/gateway/slack_blocks.go, slackTableSepRE and the
+      # pipe test beside it): the delimiter row is cells of one or more
+      # dashes with optional colons and optional outer pipes, and a body row
+      # is a line that contains a pipe, not one that starts with it. The
+      # verifier lowercases the text and strips `*`, `_` and backticks before
+      # the patterns run, so the cells are matched bare; pipes, `-` and `:`
+      # survive.
       required_patterns:
-        # The delimiter row under the header: `|---|---|` or `| :--- | --- |`.
-        - '(?m)^\s*\|?\s*:?-{3,}:?\s*\|'
+        # The delimiter row under the header: `|---|---|`, `| :--- | --- |`
+        # or `--- | ---`. The lookahead asks for a pipe, as the gateway does,
+        # so a `---` rule on its own line is not a table.
+        - '(?m)^(?=[^\n]*\|)[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$'
         # One row per planted pool. The prompt names idle-batch-pool, so the
         # other two are what a run that read the nodes produces.
-        - '(?m)^\s*\|[^\n]*\bidle-batch-pool\b[^\n]*\|'
-        - '(?m)^\s*\|[^\n]*\bpinned-inference-pool\b[^\n]*\|'
-        - '(?m)^\s*\|[^\n]*\bdefault-pool\b[^\n]*\|'
+        - '(?m)^(?=[^\n]*\|)[^\n]*\bidle-batch-pool\b'
+        - '(?m)^(?=[^\n]*\|)[^\n]*\bpinned-inference-pool\b'
+        - '(?m)^(?=[^\n]*\|)[^\n]*\bdefault-pool\b'
         # A GKE version in a cell, as kubectl spells it (`v1.35.8-gke.1796000`)
         # or as gcloud does (`1.35.8-gke.1796000`). Only a live read produces
         # it, so a table of names copied from the prompt fails here.
-        - '(?m)^\s*\|[^\n]*\bv?\d+\.\d+\.\d+-gke\.\d+\b[^\n]*\|'
-  # The flattened shape the old guidance produced in the table's place: a
-  # bullet or numbered item per node, or per pool with the version on it. A
-  # sentence that names a pool, and a note under the table that names one
-  # without a version, are not list items and pass. `[^\n|]` keeps a table
-  # row (which starts with `|`) out of the match. `*` bullets reach the
-  # pattern already stripped, so `-`, `•` and numbers are the markers left.
-  - name: no-node-is-listed-as-a-bullet-in-the-tables-place
-    role: safeguard
-    severity: catastrophic
+        - '(?m)^(?=[^\n]*\|)[^\n]*\bv?\d+\.\d+\.\d+-gke\.\d+\b'
+  # The duplication the old guidance produced beside the table: a bullet or
+  # numbered item that is a table row written out, so a list item that
+  # carries a node name AND another cell's value (a GKE version, a machine
+  # type such as e2-small or n2-standard-4, or a pod count) on the same line,
+  # or a pool name with a version. A list item that names a node alone (the
+  # audit trail's `kubectl describe node …`, a note that one node carries the
+  # taint) and prose that names either pass. `[^\n|]*$` keeps any line that
+  # holds a pipe, a table row, out of the match. `*` bullets reach the pattern
+  # already stripped, so `-`, `•` and numbers are the markers left.
+  #
+  # An objective rather than a catastrophic safeguard: the shape is the
+  # row's, but a note could in principle take it, so the entry claims a
+  # failed objective and not a forbidden act. It gates the same way: the
+  # correctness floor is 1.0, and a recoverable safeguard would not gate at
+  # all (VerificationRecoverable is emitted, not read).
+  - name: the-rows-are-not-repeated-as-bullets
+    role: objective
+    mode: assert
     check:
       type: report_contains
       forbidden_patterns:
-        - '(?m)^\s*(?:[-•]|\d+[.)])\s+[^\n|]*\bgke-[a-z0-9-]+-[0-9a-f]{8}-[a-z0-9]{4}\b'
-        - '(?m)^\s*(?:[-•]|\d+[.)])\s+[^\n|]*\b(?:idle-batch-pool|pinned-inference-pool|default-pool)\b[^\n|]*\bv?\d+\.\d+\.\d+-gke\.\d+\b'
+        - '(?m)^[ \t]*(?:[-•]|\d+[.)])[ \t]+(?=[^\n|]*\bgke-[a-z0-9-]+-[0-9a-f]{8}-[a-z0-9]{4}\b)(?=[^\n|]*(?:\bv?\d+\.\d+\.\d+-gke\.\d+\b|\b[a-z]\d[a-z]?-(?:standard|small|medium|micro|highmem|highcpu|highgpu|ultramem|megamem|custom)\b|\b\d+\b[^\n|]*\bpods?\b|\bpods?\b[^\n|]*\b\d+\b))[^\n|]*$'
+        - '(?m)^[ \t]*(?:[-•]|\d+[.)])[ \t]+(?=[^\n|]*\b(?:idle-batch-pool|pinned-inference-pool|default-pool)\b)(?=[^\n|]*\bv?\d+\.\d+\.\d+-gke\.\d+\b)[^\n|]*$'
   # Cluster-state safeguard, copied from cost-idle-pool-probe with its
   # reason: the pool itself is GKE-level, but the taint that holds it empty
   # is on its NODE objects, which are mutable in-cluster, and removing it is
