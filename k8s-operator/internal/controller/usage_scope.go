@@ -109,38 +109,52 @@ func usageClusterRefsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usage
 }
 
 // scopeNeighbours is every registered cluster in the management project that is
-// not the host: spec.harness's cluster by name, and by location where the series
-// carries one (the directly reached cluster is labelled by name alone, with no
-// project, until its profile is absorbed). The project filter is what makes the
-// attribution true: project-wide adoption produces management-project clusters
-// only, and a profile made by hand for a cluster in another project, which the
-// scope prune keeps, is not this condition's to report. nil when the CR does not
-// name its host, or names its project by number: the watcher labels the series
-// with the project ID, so the host could not be told from a neighbour.
+// not the host, spec.harness's cluster by name and location. The project filter
+// is what makes the attribution true: project-wide adoption produces
+// management-project clusters only, and a profile made by hand for a cluster in
+// another project, which the scope prune keeps, is not this condition's to
+// report. It also skips the directly reached cluster's bare series (name alone,
+// no project, until its profile is absorbed), which can only be the host. nil
+// when the management project's ID is not known (scopeHostProject).
 func scopeNeighbours(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef) []usageClusterRef {
-	if !scopeHostKnown(agent) {
+	management := scopeHostProject(agent, refs)
+	if management == "" {
 		return nil
 	}
 	h := agent.Spec.Harness
 	var out []usageClusterRef
 	for _, ref := range refs {
-		// The bare direct entry is skipped here too: it is the host, under no project.
-		if ref.Project != h.ProjectID {
+		if ref.Project != management {
 			continue
 		}
-		host := ref.Name == h.ClusterName && (ref.Location == "" || ref.Location == h.Location)
-		if !host {
+		if ref.Name != h.ClusterName || ref.Location != h.Location {
 			out = append(out, ref)
 		}
 	}
 	return out
 }
 
-// scopeHostKnown reports whether spec.harness names the host cluster and its
-// project by ID, the two things a series must match to read as the host.
-func scopeHostKnown(agent *agentv1alpha1.PlatformAgent) bool {
+// scopeHostProject is the management project's ID, which every series the
+// reconcile scaffolded under it carries: spec.harness.projectId when that is an
+// ID, else, for a harness that names the project by number (which nothing
+// refuses), the project label of the host's own series, found by the name and
+// location spec.harness gives. Empty when the CR does not name its host, or the
+// number cannot be resolved yet (the host still watched through its bare direct
+// entry), and the operator then says nothing.
+func scopeHostProject(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef) string {
 	h := agent.Spec.Harness
-	return h != nil && h.ClusterName != "" && h.ProjectID != "" && !isProjectNumber(h.ProjectID)
+	if h == nil || h.ClusterName == "" || h.Location == "" || h.ProjectID == "" {
+		return ""
+	}
+	if !isProjectNumber(h.ProjectID) {
+		return h.ProjectID
+	}
+	for _, ref := range refs {
+		if ref.Name == h.ClusterName && ref.Location == h.Location && ref.Project != "" {
+			return ref.Project
+		}
+	}
+	return ""
 }
 
 func scopeUndeclaredLabel(value string) string {
@@ -191,8 +205,8 @@ func scopeUndeclaredRemovalCause(agent *agentv1alpha1.PlatformAgent, refs []usag
 		return "spec.scope declares a membership"
 	case refs == nil:
 		return "the operator has no current reading from the event watcher"
-	case !scopeHostKnown(agent):
-		return "spec.harness does not name the host cluster and its project by ID"
+	case scopeHostProject(agent, refs) == "":
+		return "the management project's ID is not known: spec.harness does not name the host cluster, or names its project by number and the host's own series does not carry the ID yet"
 	default:
 		return "the watcher registers no cluster beyond the host in the management project"
 	}

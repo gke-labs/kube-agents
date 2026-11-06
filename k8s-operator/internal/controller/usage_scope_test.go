@@ -176,14 +176,14 @@ func TestScopeUndeclared_HostOnlyWritesNothing(t *testing.T) {
 	}
 }
 
-// Without the host's name on the CR, or with its project given by number where
-// the watcher labels by ID, the operator cannot tell a neighbour from the host,
-// so it says nothing rather than naming the host as adopted.
+// Without the host's name, location or project on the CR the operator cannot
+// tell a neighbour from the host, so it says nothing rather than naming the
+// host as adopted.
 func TestScopeUndeclared_UnknownHostWritesNothing(t *testing.T) {
 	for name, edit := range map[string]func(h *agentv1alpha1.HarnessSpec){
 		"no cluster name":   func(h *agentv1alpha1.HarnessSpec) { h.ClusterName = "" },
+		"no location":       func(h *agentv1alpha1.HarnessSpec) { h.Location = "" },
 		"no project":        func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "" },
-		"project by number": func(h *agentv1alpha1.HarnessSpec) { h.ProjectID = "123456789012" },
 		"no harness at all": nil,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -221,6 +221,26 @@ func TestScopeUndeclared_IgnoresClustersInOtherProjects(t *testing.T) {
 	}
 }
 
+// A harness that names its project by number, which nothing refuses, is matched
+// through the host's own series, which carries the ID the reconcile resolved;
+// until that series exists (the host still watched through its bare direct
+// entry) the operator says nothing rather than naming the host as adopted.
+func TestScopeUndeclared_ProjectNumberIsResolvedThroughTheHostsSeries(t *testing.T) {
+	agent := usageTestAgent(usageClock(0).Add(-time.Hour))
+	agent.Spec.Harness.ProjectID = "123456789012"
+	h := scopeHarness(t, agent, usageClusterRef{Name: "c"}, scopeTestNeighbourA)
+	h.poll(5)
+	if cond := scopeCondition(t, h); cond != nil {
+		t.Fatalf("condition before the host's series carries a project = %+v, want none", cond)
+	}
+	h.stub.setClusterRefs(gatewayAddr(), scopeTestHost, scopeTestNeighbourA)
+	h.poll(10)
+	cond := scopeCondition(t, h)
+	if cond == nil || !strings.Contains(cond.Message, "1 cluster(s) beyond the host cluster c") || !strings.Contains(cond.Message, "analytics-dev") || strings.Contains(cond.Message, "c (p/l)") {
+		t.Fatalf("condition = %+v, want the neighbour alone, named under the resolved project", cond)
+	}
+}
+
 func TestScopeUndeclaredRemovalCause(t *testing.T) {
 	agent := usageTestAgent(usageClock(0))
 	if got := scopeUndeclaredRemovalCause(agent, nil); !strings.Contains(got, "no current reading") {
@@ -236,8 +256,11 @@ func TestScopeUndeclaredRemovalCause(t *testing.T) {
 	}
 	numeric := usageTestAgent(usageClock(0))
 	numeric.Spec.Harness.ProjectID = "123456789012"
-	if got := scopeUndeclaredRemovalCause(numeric, []usageClusterRef{scopeTestHost}); !strings.Contains(got, "by ID") {
-		t.Errorf("numeric project: %q", got)
+	if got := scopeUndeclaredRemovalCause(numeric, []usageClusterRef{{Name: "c"}}); !strings.Contains(got, "not known") {
+		t.Errorf("numeric project, host unresolved: %q", got)
+	}
+	if got := scopeUndeclaredRemovalCause(numeric, []usageClusterRef{scopeTestHost}); !strings.Contains(got, "no cluster beyond the host") {
+		t.Errorf("numeric project, host resolved: %q", got)
 	}
 }
 
