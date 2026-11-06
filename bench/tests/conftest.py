@@ -67,6 +67,14 @@ def _no_grader_sha_from_the_shell(monkeypatch):
     monkeypatch.delenv("EVAL_GRADER_SHA", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_judge_skip_from_the_shell(monkeypatch):
+    """hack/ci-eval-pr.sh exports KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES on a pull
+    request; a shell that has it would patch two devops-bench evaluators off
+    in the first test that builds a harness, for the rest of the session."""
+    monkeypatch.delenv("KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES", raising=False)
+
+
 FIXTURE_RUNS = Path(__file__).parent / "fixtures" / "runs"
 TASKS = Path(__file__).resolve().parents[1] / "tasks"
 

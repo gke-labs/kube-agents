@@ -84,10 +84,11 @@ the reply turn's answer is the deliverable, and the harness writes `harness_push
 for the plant. Inject transport only, so the case is listed in `hack/eval/api-lane-exclusions.txt`
 as well.
 
-`expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where the
-case declares `documentation.constraints`, `ChecklistScore`. It never gates a case that
-carries a `verification_spec` (see the gate, below), so write it for the reader of a
-trend line rather than for a merge decision.
+`expected_output` is the judge's reference. It feeds `OutcomeValidity` and, where it
+carries `-` bullets (under `Critical requirements:` when present), `ChecklistScore`, which
+a pull request's run does not score. It never gates a case that carries a
+`verification_spec` (see the gate, below), so write it for the reader of a trend line
+rather than for a merge decision.
 
 `infrastructure` selects the deployer. `deployer: noop` provisions nothing and costs the
 presubmit seconds rather than a cluster; `deployer: tofu` names a stack under `bench/tf/`
@@ -473,10 +474,11 @@ Only coverage fails on absence. A spec with no catastrophic safeguard emits no
 correctness key either, and coverage is what catches it.
 
 The floor is `DETERMINISTIC_CORRECTNESS_FLOOR` in the same script, `"1.0"` today: every
-declared objective is meant to hold outright. `OutcomeValidity` and `ChecklistScore` are
-recorded on every run and gate nothing on a spec-carrying case — a judged score that
-drops is a trend to read, not a merge to block. `VerificationRecoverable` is emitted but
-is not in the gate.
+declared objective is meant to hold outright. `OutcomeValidity` is recorded on every run,
+and `ChecklistScore` on a run of a case whose `expected_output` carries bullets, except a
+pull request's; neither gates a spec-carrying case — a judged score that drops is a trend
+to read, not a merge to block.
+`VerificationRecoverable` is emitted but is not in the gate.
 
 Three shapes of absence are failures rather than green:
 
