@@ -1227,10 +1227,11 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 		return
 	}
 	if rec.Deadline.IsZero() {
-		// A record that doesn't say (unreadable, or not this dispatcher's
-		// shape): the profile's current limit from the confirm, or from now
-		// when the record names no time at all, or the first tick would fail
-		// a live task before the restart grace could protect it.
+		// A record with no offer terms (an unreadable one decodes as written
+		// at its entry's write, decodeLease): the profile's current limit
+		// from the confirm, or from now when the record names no time at
+		// all, or the first tick would fail a live task before the restart
+		// grace could protect it.
 		started := rec.ConfirmedAt
 		if started.IsZero() {
 			started = rec.RenewedAt
@@ -1671,9 +1672,8 @@ func (d *Dispatcher) renewOrphan(profile, tier, pod, key string, r lib.LeaseRene
 		}
 		return
 	}
-	var rec lib.LeaseRecord
-	recErr := json.Unmarshal(entry.Value(), &rec)
-	if recErr == nil && rec.Finished() {
+	rec, readable := d.decodeLease(key, entry.Value(), entry.Created())
+	if rec.Finished() {
 		// The task is over: a tombstone is never renewed back to life.
 		if logIt {
 			d.log.Warn("ignored a renewal for a finished task", "key", key, "final", r.Final)
@@ -1692,11 +1692,12 @@ func (d *Dispatcher) renewOrphan(profile, tier, pod, key string, r lib.LeaseRene
 		}
 		return
 	}
-	if err := recErr; err != nil {
-		if logIt {
-			d.log.Warn("renewal for a task not held here: unreadable record", "key", key, "err", err)
-		}
-		return
+	if !readable {
+		// The renewal is the task's sign of life, from the pod its key
+		// names: the record is written back readable (the dispatcher is the
+		// bucket's one writer, by compare-and-set as for any refresh), or a
+		// re-adoption after the restart grace would fail a live task.
+		d.log.Warn("renewal for a task not held here rewrites its unreadable record", "key", key)
 	}
 	now := d.now()
 	rec.RenewedAt, rec.ExpiresAt = now, now.Add(recordLease(rec, seconds(d.src.Config().LeaseSeconds)))
@@ -1757,8 +1758,11 @@ func (d *Dispatcher) prune() {
 //   - a running lease expired for longer than SweepAfter, held by no hold
 //     here, in a (profile, tier) whose durables are all bound (so a
 //     submission still on the stream would have come back and been
-//     re-adopted long since). An unreadable record counts as running and
-//     waits SweepAfter from its own write.
+//     re-adopted long since). An unreadable record is one written when its
+//     entry was (decodeLease), so it waits the same.
+//
+// It reads the bucket in one pass, under one kvOpTimeout; a pass cut short
+// is logged, and the next sweep reads everything again.
 func (d *Dispatcher) sweep(ctx context.Context) {
 	kctx, cancel := context.WithTimeout(ctx, kvOpTimeout)
 	defer cancel()
@@ -1767,21 +1771,15 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 		d.log.Warn("lease sweep: bucket unavailable", "err", err)
 		return
 	}
-	lister, err := kv.ListKeys(kctx)
-	if err != nil {
-		d.log.Warn("lease sweep: list the records", "err", err)
-		return
-	}
-	var keys []string
-	for k := range lister.Keys() {
-		keys = append(keys, k)
-	}
 	cfg := d.src.Config()
 	now := d.now()
-	for _, k := range keys {
+	read := 0
+	err = watchLeases(kctx, kv, ">", func(entry jetstream.KeyValueEntry) {
+		read++
+		k := entry.Key()
 		t := strings.Split(k, ".")
 		if len(t) != 4 {
-			continue
+			return
 		}
 		profile, tier, taskID := t[0], t[1], t[3]
 		d.mu.Lock()
@@ -1789,42 +1787,62 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 		bound := d.tierBoundLocked(cfg, profile, tier)
 		d.mu.Unlock()
 		if held {
-			continue
+			return
 		}
-		entry, err := kv.Get(kctx, k)
-		if err != nil {
-			continue
-		}
-		var rec lib.LeaseRecord
-		readable := json.Unmarshal(entry.Value(), &rec) == nil
-		if readable && rec.Finished() {
+		rec, _ := d.decodeLease(k, entry.Value(), entry.Created())
+		if rec.Finished() {
 			// Bound or not: the stream drops the submission at its age
 			// limit either way.
 			if keepUntil := rec.FinishedAt.Add(submitRetention(cfg) + tombstoneMargin); now.Before(keepUntil) {
-				continue
+				return
 			}
 			if err := kv.Delete(kctx, k, jetstream.LastRevision(entry.Revision())); err != nil {
 				d.log.Debug("lease sweep: tombstone moved meanwhile", "key", k, "err", err)
-				continue
+				return
 			}
 			d.log.Info("swept a tombstone past the submit stream's retention", "key", k, "finishedAt", rec.FinishedAt)
-			continue
+			return
 		}
-		if !bound {
-			continue
-		}
-		// An unreadable record still says its task started (findLease), so
-		// it gets the same wait, counted from the entry's own write: no
-		// renewal can rewrite it, so that is its last sign of life.
-		if readable && !rec.Expired(now, d.cfg.SweepAfter) ||
-			!readable && now.Sub(entry.Created()) <= d.cfg.SweepAfter {
-			continue
+		if !bound || !rec.Expired(now, d.cfg.SweepAfter) {
+			return
 		}
 		if err := kv.Delete(kctx, k, jetstream.LastRevision(entry.Revision())); err != nil {
 			d.log.Debug("lease sweep: record moved meanwhile", "key", k, "err", err)
-			continue
+			return
 		}
 		d.log.Info("swept a lease record nothing holds", "key", k, "expiresAt", rec.ExpiresAt)
+	})
+	if err != nil {
+		// The next sweep starts over; say so, rather than leave the rest
+		// unread without a word.
+		d.log.Warn("lease sweep cut short; the next sweep reads the rest", "read", read, "err", err)
+	}
+}
+
+// watchLeases calls fn with each record in the lease bucket under filter, in
+// one pass (a watch's initial values, never one round trip each), and
+// returns once they are all in, or with the error that cut the pass short.
+func watchLeases(ctx context.Context, kv jetstream.KeyValue, filter string, fn func(jetstream.KeyValueEntry)) error {
+	w, err := kv.WatchFiltered(ctx, []string{filter}, jetstream.IgnoreDeletes())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = w.Stop() }()
+	for {
+		select {
+		case entry, open := <-w.Updates():
+			if !open {
+				// The watch ended before its initial values did.
+				return errors.Join(errWatchEnded, ctx.Err())
+			}
+			if entry == nil {
+				// The initial values are all in.
+				return nil
+			}
+			fn(entry)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
@@ -1872,6 +1890,31 @@ func answerSubject(subject, class string) (profile, tier, pod string, ok bool) {
 // keyPod is the pod token of a lease key, <profile>.<tier>.<pod>.<task>:
 // the key, which only the dispatcher writes, is the pod's identity, not
 // the record's Pod field.
+// decodeLease is how every reader sees a PROFILE_LEASES value. A record
+// that doesn't decode, or decodes with neither a renewal nor a finish (not
+// this dispatcher's shape), has one meaning everywhere: a started task that
+// is not over, whose last sign of life is the entry's own write. So it has
+// the times a record written then would have: confirmed and renewed at
+// written, expiring a configured lease later, with no offer terms. readable
+// is false for it, for the logs. Corruption and an incompatible change to
+// lib.LeaseRecord are the only ways to reach it.
+func (d *Dispatcher) decodeLease(key string, value []byte, written time.Time) (rec lib.LeaseRecord, readable bool) {
+	if json.Unmarshal(value, &rec) == nil && (rec.Finished() || !rec.RenewedAt.IsZero()) {
+		return rec, true
+	}
+	lease := seconds(d.src.Config().LeaseSeconds)
+	return lib.LeaseRecord{TaskID: keyTask(key), Pod: keyPod(key),
+		ConfirmedAt: written, RenewedAt: written, ExpiresAt: written.Add(lease)}, false
+}
+
+func keyTask(key string) string {
+	t := strings.Split(key, ".")
+	if len(t) != strings.Count(lib.ProfileLeaseKey("p", "t", "x", "k"), ".")+1 {
+		return ""
+	}
+	return t[3]
+}
+
 func keyPod(key string) string {
 	t := strings.Split(key, ".")
 	if len(t) != strings.Count(lib.ProfileLeaseKey("p", "t", "x", "k"), ".")+1 {
@@ -1927,11 +1970,9 @@ func (d *Dispatcher) findLease(ctx context.Context, profile, tier, taskID string
 		if err != nil {
 			return lib.LeaseRecord{}, "", false, err
 		}
-		var rec lib.LeaseRecord
-		if err := json.Unmarshal(entry.Value(), &rec); err != nil {
-			// A record nobody can read still says the task started.
-			d.log.Warn("unreadable lease record; treating the task as started", "key", k, "err", err)
-			rec = lib.LeaseRecord{TaskID: taskID, Pod: keyPod(k)}
+		rec, readable := d.decodeLease(k, entry.Value(), entry.Created())
+		if !readable {
+			d.log.Warn("unreadable lease record; treating the task as started at its write", "key", k, "written", entry.Created())
 		}
 		if bestKey == "" || (rec.Finished() && !best.Finished()) ||
 			(rec.Finished() == best.Finished() && rec.RenewedAt.After(best.RenewedAt)) {
@@ -1961,39 +2002,22 @@ func (d *Dispatcher) leasedPods(ctx context.Context, profile, tier string, grace
 	if err != nil {
 		return nil, err
 	}
-	w, err := kv.WatchFiltered(kctx, []string{lib.ProfileLeaseKeyFilter(profile, tier, "*")}, jetstream.IgnoreDeletes())
+	now := d.now()
+	pods := map[string]bool{}
+	err = watchLeases(kctx, kv, lib.ProfileLeaseKeyFilter(profile, tier, "*"), func(entry jetstream.KeyValueEntry) {
+		pod := keyPod(entry.Key())
+		if pod == "" || pods[pod] {
+			return
+		}
+		if rec, _ := d.decodeLease(entry.Key(), entry.Value(), entry.Created()); rec.Expired(now, grace) {
+			return
+		}
+		pods[pod] = true
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = w.Stop() }()
-	now := d.now()
-	pods := map[string]bool{}
-	for {
-		var entry jetstream.KeyValueEntry
-		var open bool
-		select {
-		case entry, open = <-w.Updates():
-		case <-kctx.Done():
-			return nil, kctx.Err()
-		}
-		if !open {
-			// The watch ended before its initial values did.
-			return nil, errors.Join(errWatchEnded, kctx.Err())
-		}
-		if entry == nil {
-			// The initial values are all in.
-			return pods, nil
-		}
-		pod := keyPod(entry.Key())
-		if pod == "" || pods[pod] {
-			continue
-		}
-		var rec lib.LeaseRecord
-		if err := json.Unmarshal(entry.Value(), &rec); err == nil && rec.Expired(now, grace) {
-			continue
-		}
-		pods[pod] = true
-	}
+	return pods, nil
 }
 
 func (d *Dispatcher) putLease(ctx context.Context, key string, rec lib.LeaseRecord) error {
