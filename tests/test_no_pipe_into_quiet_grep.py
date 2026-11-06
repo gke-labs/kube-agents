@@ -54,9 +54,10 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SHELL_PATHSPECS = ("*.sh", ":!third_party/google-skills/*")
 
 #: Scripts this guard does not read, each with the test module that owns the
-#: rule for it. The fix for #4357 converts hack/ci-eval-pr.sh's pipelines and
-#: guards that whole script from scripts/test_ci_eval_nightly.py; reading it
-#: here as well would hold one file to two grammars.
+#: rule for it. #4372 converts hack/ci-eval-pr.sh's pipelines (#4357, #5022)
+#: and adds a guard over that whole script to scripts/test_ci_eval_nightly.py.
+#: Reading the script here as well would fail on main until #4372 merges, and
+#: would hold one file to two grammars after.
 SKIPPED_SCRIPTS = {
     "hack/ci-eval-pr.sh": "scripts/test_ci_eval_nightly.py",
 }
