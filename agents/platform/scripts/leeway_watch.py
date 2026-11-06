@@ -45,13 +45,16 @@ Threshold filtering and environment knobs. Before ledger gating,
 pigeonhole floor (`observedSkew - minAchievableSkew < 1`, e.g. `[0, 1, 1]` or
 `[1, 1, 2]` across three zones) by default while keeping attributed findings,
 `selector_confined` single-zone pool confinement, `leeway.domain_unavailable`,
-and stackable skews above the floor (`[4, 0]`). `LEEWAY_WATCH_MIN_SEVERITY`,
+and stackable skews above the floor (`[4, 0]`). Findings still present in the
+unfiltered `leeway` report but suppressed by active thresholds remain silently
+in `ledger.json` rather than retiring as resolved. `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE` (topology
 findings), `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and
 `LEEWAY_WATCH_REFRESH_DAYS` — together with `LEEWAY_WATCH_CLUSTERS`,
 `LEEWAY_WATCH_PROJECTS`, and `LEEWAY_WATCH_HOME` — are optional overrides for
-runs started by hand in the pod; the operator's `spec.deployment.env` allowlist
-does not carry them.
+runs started by hand in the pod (pass `--dry-run` when probing narrower or wider
+thresholds so `ledger.json` and `reports/latest.*` are not mutated); the
+operator's `spec.deployment.env` allowlist does not carry them.
 
 State ledger, blackboard topic, and 7-day reminder gate. Under
 `<profile home>/leeway/`:
@@ -672,7 +675,7 @@ def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[st
     f_kind = str(finding.get("kind") or DEFAULT_FINDING_KIND_DRIFT)
     key = CLUSTER_KEY_SEPARATOR.join([cluster, ns, s_kind, s_name, topo_key, f_kind])
 
-    score = finding.get("score") if isinstance(finding.get("score"), dict) else {}
+    score = finding.get(SCORE_FIELD) if isinstance(finding.get(SCORE_FIELD), dict) else {}
     domains = finding.get("domains") if isinstance(finding.get("domains"), list) else []
     max_actual = 0
     total_actual = 0
@@ -1394,8 +1397,9 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
 
     lines: list[str] = []
 
+    raw_findings, ok_clusters, cluster_errors = extract_findings(report, already_filtered=True)
     report = filter_report_findings(report)
-    active_findings, ok_clusters, cluster_errors = extract_findings(report, already_filtered=True)
+    active_findings, _, _ = extract_findings(report, already_filtered=True)
     all_errors: dict[str, str] = {**scan_errors, **cluster_errors}
     all_error_kinds: dict[str, str] = {
         **error_kinds,
@@ -1467,10 +1471,15 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             LAST_REPORT_KEY: last_report_at,
         }
 
-    # 2. Check prior findings not seen in this tick: retire if their cluster
-    #    was cleanly scanned, or retain if the cluster/project scan failed.
+    # 2. Check prior findings not seen in active_findings: retain silently if
+    #    still emitted by leeway (suppressed only by active thresholds), retire
+    #    if absent from the unfiltered report on a cleanly scanned cluster, or
+    #    retain if the cluster/project scan failed.
     for key, prior in sorted(prior_findings.items()):
         if key in active_findings or not isinstance(prior, dict):
+            continue
+        if key in raw_findings:
+            next_findings[key] = prior
             continue
         if can_retire_finding(
             key, prior, ok_clusters, cluster_errors, scanned_projects, scan_errors, requested_clusters

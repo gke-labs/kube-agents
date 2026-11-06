@@ -353,6 +353,7 @@ class GateAndReportingTests(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("dry run: would report 1 finding(s) (1 new finding)", out)
+        self.assertIn("Deployment/shop/checkout-api [constraint_ignored, 100%]", out)
         self.assertFalse((self.home / watch.LEDGER_FILE_NAME).exists())
         self.assertFalse((self.home / watch.REPORTS_DIR_NAME).exists())
 
@@ -1011,6 +1012,170 @@ class GateAndReportingTests(unittest.TestCase):
             self.assertIn("publishing to blackboard topic topology-skew succeeded again", out2)
             ledger2 = watch.load_ledger(self.home)
             self.assertNotIn(watch.ANNOUNCED_KEY, ledger2)
+
+    def test_threshold_filtered_findings_stay_in_ledger_without_false_retirement_or_repage(self) -> None:
+        floor_equal = make_topology_finding(
+            name="metrics-server",
+            namespace="kube-system",
+            replicas=2,
+            tier="C",
+            severity="info",
+            cause="unknown",
+        )
+        floor_equal["score"] = {
+            "drift": 0.1667,
+            "observedSkew": 1,
+            "minAchievableSkew": 1,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 0.5,
+        }
+        warn_skew = make_topology_finding(name="checkout-api", severity="warning", cause="constraint_ignored")
+        rep_both = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [floor_equal, warn_skew]}],
+            T0,
+        )
+
+        # Day 0 (pre-upgrade / explicit excess floor 0): both findings enter ledger.json.
+        with mock.patch.dict(os.environ, {watch.MIN_EXCESS_OVER_FLOOR_ENV: "0"}, clear=False):
+            code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep_both), now=T0)
+        self.assertEqual(code0, 0)
+        self.assertIn("2 finding(s) due", out0)
+
+        # Day 1 (upgrade to default floor filter): floor_equal is suppressed by thresholds while still
+        # emitted by leeway -> must NOT print a false "resolved" line and stays silently in ledger.json.
+        t1 = T0 + timedelta(days=1)
+        code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep_both), now=t1)
+        self.assertEqual(code1, 0)
+        self.assertEqual(out1, "")
+        ledger1 = watch.load_ledger(self.home)
+        self.assertEqual(len(ledger1[watch.FINDINGS_KEY]), 2)
+
+        # Day 2 (operator runs manual tick with LEEWAY_WATCH_MIN_SEVERITY=critical without --dry-run):
+        # warn_skew is threshold-filtered, so it must NOT retire or lose first_seen/last_report_at.
+        t2 = T0 + timedelta(days=2)
+        with mock.patch.dict(os.environ, {watch.MIN_SEVERITY_ENV: "critical"}, clear=False):
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep_both), now=t2)
+        self.assertEqual(code2, 0)
+        self.assertEqual(out2, "")
+
+        # Day 3 (normal cron tick at default thresholds): warn_skew is still within its 7-day window
+        # and was preserved in ledger.json, so it does NOT re-page as a new finding.
+        t3 = T0 + timedelta(days=3)
+        code3, out3 = self.run_tick(lambda *a, **kw: completed_json(rep_both), now=t3)
+        self.assertEqual(code3, 0)
+        self.assertEqual(out3, "")
+        warn_key = next(k for k in watch.load_ledger(self.home)[watch.FINDINGS_KEY] if "checkout-api" in k)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY][warn_key][watch.FIRST_SEEN_KEY], watch.iso(T0))
+
+        # Day 4: leeway stops emitting both findings on a clean scan -> now both genuinely retire.
+        t4 = T0 + timedelta(days=4)
+        rep_empty = make_report([{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": []}], t4)
+        code4, out4 = self.run_tick(lambda *a, **kw: completed_json(rep_empty), now=t4)
+        self.assertEqual(code4, 0)
+        self.assertIn("2 finding(s) resolved", out4)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY], {})
+
+    def test_due_finding_clears_deferred_report_refresh_marker(self) -> None:
+        rep_day0 = make_report(
+            [
+                {
+                    "cluster": "p1/us-central1/alpha",
+                    "status": "ok",
+                    "topology_findings": [make_topology_finding(name="svc-old")],
+                },
+                {"cluster": "p1/us-east1/beta", "status": "ok", "topology_findings": []},
+            ],
+            T0,
+        )
+        t1 = T0 + timedelta(days=1)
+        rep_day1_partial = make_report(
+            [
+                {"cluster": "p1/us-central1/alpha", "status": "ok", "topology_findings": []},
+                {"cluster": "p1/us-east1/beta", "status": "error", "error": "dial tcp timeout"},
+            ],
+            t1,
+        )
+        t2 = T0 + timedelta(days=2)
+        rep_day2_due = make_report(
+            [
+                {"cluster": "p1/us-central1/alpha", "status": "ok", "topology_findings": []},
+                {
+                    "cluster": "p1/us-east1/beta",
+                    "status": "ok",
+                    "topology_findings": [make_topology_finding(name="svc-new")],
+                },
+            ],
+            t2,
+        )
+        t3 = T0 + timedelta(days=3)
+        rep_day3_quiet = make_report(rep_day2_due["clusters"], t3)
+        a2a_calls: list[list[str]] = []
+
+        def fake_a2a(argv, **kw):
+            a2a_calls.append(list(argv))
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                watch.CLUSTERS_ENV: "p1/us-central1/alpha,p1/us-east1/beta",
+                watch.PROJECTS_ENV: "",
+                watch.NATS_URL_ENV: "nats://nats:4222",
+            },
+            clear=False,
+        ), mock.patch.object(watch.shutil, "which", return_value="/usr/local/bin/a2a"), mock.patch.object(
+            watch.subprocess, "run", side_effect=fake_a2a
+        ):
+            self.run_tick(lambda *a, **kw: completed_json(rep_day0), now=T0)
+            self.assertEqual(len(a2a_calls), 1)
+
+            # Day 1: partial-scan retirement sets announced.deferred_report_refresh.
+            self.run_tick(lambda *a, **kw: completed_json(rep_day1_partial), now=t1)
+            self.assertEqual(
+                watch.load_ledger(self.home)[watch.ANNOUNCED_KEY].get(watch.ANNOUNCED_DEFERRED_REFRESH_KEY),
+                watch.REASON_ALL_RESOLVED,
+            )
+            self.assertEqual(len(a2a_calls), 1)
+
+            # Day 2: new due finding writes fresh report, publishes topic, and clears deferred_report_refresh.
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep_day2_due), now=t2)
+            self.assertEqual(code2, 0)
+            self.assertIn("svc-new", out2)
+            self.assertEqual(len(a2a_calls), 2)
+            self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
+
+            # Day 3: quiet clean scan makes zero redundant report refreshes or a2a calls.
+            code3, out3 = self.run_tick(lambda *a, **kw: completed_json(rep_day3_quiet), now=t3)
+            self.assertEqual(code3, 0)
+            self.assertEqual(out3, "")
+            self.assertEqual(len(a2a_calls), 2)
+
+    def test_blackboard_topic_publish_timeout_surfaces_exception_and_recovers(self) -> None:
+        rep = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [make_topology_finding()]}],
+            T0,
+        )
+        attempts = 0
+
+        def fake_a2a(argv, **kw):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=watch.A2A_PUBLISH_TIMEOUT_SECONDS)
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
+            watch.shutil, "which", return_value="/usr/local/bin/a2a"
+        ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
+            code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+            self.assertEqual(code0, 0)
+            self.assertIn("publishing to blackboard topic topology-skew failed (TimeoutExpired:", out0)
+
+            t1 = T0 + timedelta(days=1)
+            code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t1)
+            self.assertEqual(code1, 0)
+            self.assertEqual(out1.strip(), "leeway watch: publishing to blackboard topic topology-skew succeeded again")
 
 
 class DiscoveryTests(unittest.TestCase):

@@ -439,12 +439,13 @@ Agent profile's identity names; a project with no Cluster Agent profiles is
 enumerated with `gcloud container clusters list` first, since the sandbox
 relays that and not the GKE API route leeway's own `--clusters-from <project>`
 would take) and gates notifications through `<profile home>/leeway/ledger.json`.
-`unknown`-cause topology findings whose observed skew equals their pigeonhole
-floor (`excessSkew <= 0`) are dropped before gating so balanced odd-replica
-workloads do not page; `LEEWAY_WATCH_MIN_SEVERITY`, `LEEWAY_WATCH_MIN_DRIFT`,
-`LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`, `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and
-`LEEWAY_WATCH_REFRESH_DAYS` are for runs started by hand in the pod (the
-operator's `spec.deployment.env` allowlist does not carry them). The report's
+`unknown`-cause topology findings at their pigeonhole floor
+(`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
+balanced odd-replica workloads do not page; `LEEWAY_WATCH_MIN_SEVERITY`,
+`LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`,
+`LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` are for
+runs started by hand in the pod with `--dry-run` (the operator's
+`spec.deployment.env` allowlist does not carry them). The report's
 topology findings (`leeway.contract_violated`, `leeway.placement_drift`,
 `leeway.domain_unavailable`) are keyed by cluster, namespace, subject, topology
 key and kind; its ComputeClass rank findings (`leeway.rank_wedged`,
