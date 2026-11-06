@@ -470,7 +470,13 @@ func TestADelegateIsIgnoredAndLogged(t *testing.T) {
 			} else if err := exec.PublishArtifact(context.Background(), art); err != nil {
 				t.Fatal(err)
 			}
-			waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+tc.rule, origin.TaskID, "backend=discord", "requester=hmac:"))
+			if tc.from != "" {
+				// Another addressee's subject: the relay drops the event before
+				// the delegate path sees it.
+				waitFor(t, "relay drop line", loggedContaining(r, "event dropped; it came on another addressee's subject", origin.TaskID, "subjectAddressee="+tc.from))
+			} else {
+				waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+tc.rule, origin.TaskID, "backend=discord", "requester=hmac:"))
+			}
 			if n := platformSubmissions(t, r); n != 0 {
 				t.Fatalf("an ignored request minted %d children", n)
 			}
@@ -698,7 +704,9 @@ func TestTheSessionCannotDelegateForItsChild(t *testing.T) {
 	if err := r.bus.Publish(ctx, lib.TaskEventsSubject(session, child.TaskID), env); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+ruleDelegationStale, child.TaskID))
+	// The child's events come only on platform's subjects; the session's
+	// subject carrying the child's id is dropped by the relay.
+	waitFor(t, "relay drop line", loggedContaining(r, "event dropped; it came on another addressee's subject", child.TaskID, "subjectAddressee="+session))
 	if n := platformSubmissions(t, r); n != 1 {
 		t.Fatalf("platform received %d submissions, want 1", n)
 	}

@@ -223,6 +223,37 @@ def test_the_caps_count_characters_and_sentences():
     assert "5 sentences, over 4" in _run(bullets).reason
 
 
+def test_the_step_lines_that_end_a_result_are_not_measured():
+    """``[next: ...]`` lines are drawn as a button, never shown as text, so they cost nothing."""
+    answer = GOOD + "\n\nVerified against 2 commands on the card.\n\n[next: show the 2 verified commands behind t_1]"
+    assert _run(answer, max_sentences=4).success
+    assert _run(answer, max_chars=len(GOOD) + 45).success
+    assert not _run(answer, max_sentences=3).success
+    # A step line inside the text is text, as the presenters leave it.
+    inside = GOOD + "\n\n[next: drain node-b]\n\nOne more sentence."
+    assert not _run(inside, max_sentences=4).success
+
+
+def test_the_step_line_grammar_is_the_presenters():
+    """``_STEP_LINE`` reads a step line as ``slack_moments.NEXT_STEP_LINE`` does."""
+    import importlib
+    import sys
+    from pathlib import Path
+
+    from kube_agents_bench import verifiers
+
+    scripts = Path(__file__).resolve().parents[2] / "agents" / "platform" / "scripts"
+    sys.path.insert(0, str(scripts))
+    try:
+        slack_moments = importlib.import_module("slack_moments")
+    finally:
+        sys.path.remove(str(scripts))
+    for case in ["[next: drain node-b]", "[NEXT: drain]", "[next:]", "[next: a]b", "next: a", "[next: a\nb]", "- [next: a]"]:
+        assert (verifiers._STEP_LINE.fullmatch(case) is None) == (slack_moments.NEXT_STEP_LINE.fullmatch(case) is None), case
+    answer = "**Done.**\n[next: drain node-b]\n\n  [Next: cordon node-b]  \n"
+    assert verifiers._visible(answer) == slack_moments.visible_text(answer)
+
+
 def test_a_recap_in_the_lead_itself_is_not_a_restatement():
     outcome = _run("**The cluster is healthy.** All pods run.", recap_patterns=[r"cluster is healthy"])
     assert outcome.success, outcome.reason

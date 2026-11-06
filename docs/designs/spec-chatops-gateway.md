@@ -1551,8 +1551,9 @@ time may still post, so `a2a notify` exits with its own status then, and the ale
 treats that as sent rather than sending again. `wait_ms` is how long the requester waits:
 a request that fails or is refused after it has nobody to tell and is already recorded as
 possibly posted, so the gateway logs it as lost, at error, with its first line. When the
-route is not there (no gateway subscribed, or the bus unreachable) `a2a notify` exits with
-a third status, nothing posted; the alert path, which has one shot, waits through about
+route is not there (no gateway subscribed, or the bus unreachable), or the gateway refuses
+with `retry` (it is stopping, or couldn't read the conversation's record in time), `a2a notify`
+exits with a third status, nothing posted; the alert path, which has one shot, waits through about
 half a minute of those before giving up. A home post the gateway refused and kept answers
 with `kept` beside the error, and `a2a notify` exits with a fourth status for it: the
 senders that re-send on failure (the drift-backlog digest, the data-volume warning) take
@@ -1605,7 +1606,9 @@ The bound is the set of live records rather than a secret: the agent principal, 
 can read every live conversation's context id (its Hermes sessions are named for them), so the
 check refuses a conversation with no record, a made-up key and a stale route, not a post into
 another conversation the agent holds a session for. No record, another
-context, or a record that cannot be read gets one refusal whatever the reason; a malformed request (a key on another backend, a thread and a conversation
+context, or a record that doesn't decode gets one refusal whatever the reason. A record that
+couldn't be read in time (the bucket unreachable, the lookup's 5s) is refused with `retry`, which
+the CLI reports as the route not there, so a card's subscription isn't charged for it; a malformed request (a key on another backend, a thread and a conversation
 together, a conversation with no context id) is refused by name. Nothing is posted in either
 case. The subjects and grants are the same as for a home post; a route the
 bridge cannot record is said at the end of the turn's answer, since the card's report will not
@@ -1808,7 +1811,7 @@ rewrite that fails posts the line in the conversation instead. The questions and
 are held in the process: after a restart a question keeps its buttons until clicked, the click
 is still a turn, and the rewrite reads the message the event carries, its text, its link
 buttons and the clicked button's label. A click on a button the adapter did not draw is
-logged and acked.
+logged and acked. A click on a rating button or the note card is never a turn ([Answer feedback](#answer-feedback-added-1016)).
 
 ## The Slack adapter (added 9/4)
 
@@ -2331,7 +2334,7 @@ one `feedback_buttons` element (hover text "Good answer" and "Bad answer"), the 
 block, inside its side bar when it has one (an attachment draws after every top-level block, and
 Slack draws the block there too, seen live). The block's id carries the task id
 (`kage.feedback.<task>`). A text chunk carrying the mark is posted as sections (more than one when
-escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. Every other backend ignores the mark. A tap is never a turn,
+escaping takes it past a section's cap) and the block; a chunk Slack refuses posts as text. The Google Chat adapter draws it too (below); Discord and the console ignore it. A tap is never a turn,
 and a tap from a sender the gateway would not take a turn from (`resolvePrincipal`), or from
 another workspace's member, changes nothing.
 
@@ -2361,7 +2364,7 @@ No new scope: `chat:write` covers the ephemeral line, and `views.open` takes onl
 
 A kept rating is a JSON record in the `feedback` KV bucket, one key per answer and rater
 (`<task>.<rater>`, so re-rating replaces it): the rating, the note, the platform, the rater's Slack
-member id, the conversation and rated message, the task and context ids, the ask and the answer.
+member id or Google Chat email, the conversation and rated message, the task and context ids, the ask and the answer.
 It is user content and may hold cluster data, which the bucket's posture answers: the provision Job
 creates it with a 30-day max age (`--ttl=720h`), so NATS drops a record 30 days after the rating;
 the gateway turns feedback on only when the bucket exists and has a max age, and leaves answers
@@ -2394,11 +2397,83 @@ the last seven days (`FeedbackRecorder.Tally`, every current record read over on
 reused for five minutes (one minute after a failed read) and left out when feedback is off or the
 tally cannot be read; a new rating shows once the count is read again.
 
+The Google Chat adapter (added 11/4, [`gchat-answer-feedback.md`](gchat-answer-feedback.md)) draws
+the mark as two buttons at the end of the message's one
+button list, after its choice and link buttons: `👍` (alt text "Good answer") and `👎` ("Bad
+answer"), each calling `kage.feedback` with the parameters `task` (the root task id) and `rating`
+(`up` or `down`). A text answer carries them as accessory widgets on the chunk the mark is on, its
+last. They are drawn only once the gateway has handed the adapter its recorder, and only on a post
+in a conversation: a home post (`PostNotifyMessage`) never carries them. A post Chat refuses with
+them (a `400`) is posted once more without them, a laid-out one as its layout and a text one as
+text. The adapter remembers in the process the buttons each rated message carries (`rated`).
+
+A tap on Google Chat is never a turn and claims no question, so a choice click on the same message
+is still one. The adapter logs and drops a tap when feedback is off, when it has no `task`, a
+rating other than `up` or `down`, no clicker email, or no space or message name, when it is a
+redelivery (the message name and event time, under its own dedupe prefix), and when the recorder
+does not admit the sender (`Admits`). Otherwise it records the rating off the pull loop
+(`platform: googlechat`, the rater's address, the conversation a choice click there binds to, the
+message name, and the message's text as the event carries it as the answer), then patches the
+answer with the tapped button `type: FILLED` and the other plain. The patch takes its text and
+its other buttons from the adapter's record when it has one (`ratedLayout`): a question not yet
+answered keeps its own layout; an answered one keeps the layout its answered rewrite put on it,
+the `✓` line included (`shown`, held without the rating buttons), and, while that rewrite has not
+landed, takes the event's text and link buttons only. Any other message, one from before a
+restart, takes the event's text and its choice and link buttons. A tap therefore never restores
+the choices an answer removed. A failed write logs and patches nothing; a failed patch logs and
+keeps the rating. Taps on one message are ordered by event time. The adapter records each
+rater's newest tap on a message when it takes the tap. It records the rating and patches the
+message under the message's rewrite lock, and asks for the note after it releases the lock. A tap
+older than one the same rater has already made is superseded: it is dropped before it is
+recorded, with no patch and no note card. An older tap whose write was already running when the
+newer tap came in is recorded and patched, and the newer tap repaints after it. That older 👎
+asks for no note while the newer tap stands. A failed write leaves the rater's newest tap
+time as it is, so a late older tap stays dropped and the rater's next tap, newer, proceeds. When
+the newer tap's write fails, the older 👎 stays recorded and drawn, with no note card; a tap
+after that opens a new card. An older tap from
+another rater is kept, and leaves the buttons as the newest tap drew them. A tap with no event
+time is never superseded.
+
+A kept 👎 then posts the note card, the adapter's one `cardsV2` message (card id
+`kage.feedback-note`), in the answer's thread: "What went wrong?", a single-line text input
+named `note` labelled "Anything else?" with a 500-character limit, the kept line the Slack box
+shows, and Send and Cancel, both calling `kage.feedback-note` with `task` and `rating=down`, and
+Cancel adding `cancel=1`. In a one-to-one DM the card posts plainly, since the DM has one reader.
+Anywhere else it is private to the clicker (`privateMessageViewer`), and it is not posted when
+the event names the clicker by no `users/` name, since it would then be public. A private thread
+reply Chat refuses is posted once more at the space's top level, still private; a second refusal
+logs and leaves the 👎 kept without a note. A repeat 👎 by the same rater posts another note
+card, as Slack opens its box again. Send and Cancel are never turns either: they are
+dropped on the tap's checks (a `rating` other than `down` included) and handled off the pull
+loop. Cancel collapses the card (a `cards_v2` patch) to the thanks line and the form link. Send
+reads the note from `formInputs`, telling a click with no `formInputs` object from one whose value
+is empty. An empty value is an empty note, kept and thanked as on Slack. No object keeps no note,
+logs a warning, and collapses the card to "The note did not reach me; your rating stands as it
+was." A kept note, trimmed and cut to 500 code points, collapses the card to the thanks line and
+the form link; `errFeedbackNotKept` (a 👍 replaced the 👎) collapses it to "This answer's rating
+changed, so the note was not kept."; any other failed write leaves the card for another Send.
+When Chat refuses the collapse patch, the adapter posts the line as a new card to the same viewer
+in the same thread.
+
+The Google Chat rewrites keep the rating buttons. The answered rewrite a choice click or typed
+reply makes (`gchatAnsweredLayout`) and a later edit that lays out no choices (`answeredLayout`)
+put them back after the link buttons, filled as last rated, from the adapter's record. For a
+message from before a restart the click's rewrite reads them from the event's copy
+(`gchatMessageButtons`, which reads the `task` parameter and the `FILLED` button) and remembers
+them, so a later edit draws the same. Buttons are told
+apart by function (`kage.choice`, `kage.feedback`, `kage.feedback-note`) or link
+(`classifyGchatButton`), never by position. Google Chat has no Home tab, so the weekly count
+above is Slack's only; it shows nothing more after a 👍, as Slack does not.
+
 An install turns it off with `spec.integration.slack.answerFeedback: false` (default `true`). The
 operator renders `A2A_SLACK_ANSWER_FEEDBACK=false` on the gateway only for an explicit `false`, so an
 install that never set the field keeps its gateway pod unchanged; the gateway then never looks for
 the bucket, marks no answer and hands the adapter no recorder, so a tap on a button already posted
-is acked and changes nothing (Slack still fills the tapped icon; no box opens).
+is acked and changes nothing (Slack still fills the tapped icon; no box opens). A Google Chat install
+turns it off with `spec.integration.googleChat.answerFeedback: false` (default `true`), which the
+operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. The gateway holds one
+chat backend, so either name turns off the one global flag (`AnswerFeedbackOff`); a tap or note
+click on a Google Chat message already posted is logged and acked and changes nothing.
 
 ## The console adapter (added 9/23)
 
@@ -2419,9 +2494,17 @@ and `messageId` `r-<taskId>-<state>`, so a repeated end (a redelivery, a heal) r
 a different end of the same task (a never-started heal, then its late completion) is a new frame. An
 end the gateway declared itself (the bus unreachable, a task released for producing nothing) is
 worded as the page's notice is. A completed
-task that handed work to kanban cards (the bridge's `handoff` artifact) carries `"cardsPending":
-true`, so a client waits for the cards' notify frames; without it, no handoff was seen and the
-client need not wait. Its text is the deliverable for a completed task and the gateway's notice
+task that handed work to kanban cards and left them unsettled at turn end (the bridge's `handoff`
+artifact; emitted on routed chat origins such as Slack, Discord, and Google Chat where
+`waitKanbanInTurn` is false and the turn returns immediately so the client receives card completion
+via `chat.notify.*`, or when a turn ends with cards still unsettled) carries `"cardsPending":
+true`, so a client waits for the cards' notify frames; on console and MCP origins
+(`!run.routeRecorded.Load() || isConsoleOrigin(run.origin)`), the bridge's `api` executor instead
+holds the turn open in `waitForKanbanCards`, streams specialist card progress and synthesis steps in
+turn, folds settled card results directly into the task's `result` artifact, and clears `cardsFiled`
+so no `handoff` or `"cardsPending": true` is emitted once the cards settle in turn. Without
+`"cardsPending": true`, no unsettled handoff remains and the client need not wait. Its text is the
+deliverable for a completed task and the gateway's notice
 otherwise. A chain that ends at a child with no wake (the session could not take one) ends failed,
 carrying the notice; a console client reads the child's answer from TASKS. A kanban card's report into the conversation is a frame too, with `"kind": "notify"` and the
 turn it answers as `replyTo` ("Proactive posts: the chat.notify route", the console's route). A

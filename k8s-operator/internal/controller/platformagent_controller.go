@@ -261,6 +261,21 @@ const (
 		"(SLACK_* or GOOGLE_CHAT_* in install.env) to deliver them in chat."
 	noChatPlatformWithRepo = "stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests)"
 	noChatPlatformNoRepo   = "stay in the report store on the data volume alone, since no GitOps repository is registered"
+	// The condition reporting that spec.harness.experimental.shellSandbox.image
+	// pins an image other than the one this operator runs
+	// (operatorShellSandboxImage). The pin survives every upgrade of the
+	// operator and the agent, and a sandbox older than the agent fails each
+	// kubectl call at the credential proxy with a refusal that names neither
+	// the pin nor the image (#4966). Informational, like NoChatPlatform: a
+	// deliberate pin to a mirror or a test build is allowed, so it leaves Ready
+	// alone and is written only in that state.
+	shellSandboxImagePinnedConditionType = "ShellSandboxPinned"
+	shellSandboxImagePinnedReason        = "ImageDiffersFromOperator"
+	// shellSandboxImagePinnedMessageFormat takes the pinned image and the
+	// operator's own.
+	shellSandboxImagePinnedMessageFormat = "spec.harness.experimental.shellSandbox.image pins %s, but this operator runs %s. " +
+		"A sandbox older than the agent fails its kubectl calls at the credential proxy with a policy refusal. " +
+		"Clear the field to run the operator's image, or set it to the matching build."
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
 	// install.env key, what the field holds, and where the posts go
 	// meanwhile (one of the two sentences below).
@@ -480,7 +495,8 @@ type PlatformAgentReconciler struct {
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
 	// the proposal readings as one (usageNewerFieldReadings), the two people
-	// readings as one (usageNewerFieldPeople), lastHumanActiveTime, and each
+	// readings as one (usageNewerFieldPeople), the nine origin readings as one
+	// (usageNewerFieldOrigins), lastHumanActiveTime, and each
 	// counter after the first schema by its name -- the last poll in which the usage counters poller wrote the field
 	// and it came back absent: a served CRD at a previous schema, which has
 	// the first-schema counters and not every later field. A record per field
@@ -611,7 +627,9 @@ type PlatformAgentReconciler struct {
 	// credential proxy's default requests (resolveCredentialProxyResourcesFor).
 	// The cluster type cannot change under a running operator, so only an
 	// authoritative probe sets autopilotResolved; a failed one is retried, and
-	// renders the Standard requests meanwhile.
+	// meanwhile the proxy keeps the cluster type it was rendered for, from its
+	// cluster-type annotation or, without one, its requests; else Standard
+	// (liveCredentialProxyAutopilot).
 	autopilotMu       sync.Mutex
 	autopilotResolved bool
 	autopilot         bool
@@ -1426,14 +1444,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// quota on deletion, and what a refused delete should do to the
 		// finalizer, is #3827.
 		//
-		// The dispatcher's pod-read binding there is removed, for the
-		// ClusterRoleBinding's reason above: left behind, anyone who later
-		// creates a ServiceAccount of the dispatcher's name inherits pod read
-		// in that namespace. A failure is logged and never holds the
-		// finalizer, under the profile-namespace rule (#3827 settles what a
-		// refused delete should do).
+		// The dispatcher's warm pools there go, with their CA bundle copy
+		// (their pods hold bus and broker tokens), and so does its pod-read
+		// binding, for the ClusterRoleBinding's reason above: left behind,
+		// anyone who later creates a ServiceAccount of the dispatcher's name
+		// inherits pod read in that namespace. A failure is logged and never
+		// holds the finalizer, under the profile-namespace rule (#3827
+		// settles what a refused delete should do).
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
-			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's pod-read Role on deletion", err)
+			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
 		}
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
@@ -3258,7 +3277,21 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, r.clusterAutopilot())
+	autopilot, determined := r.clusterAutopilot()
+	recorded := true
+	if !determined {
+		if autopilot, recorded, err = r.liveCredentialProxyAutopilot(ctx, agent, rendered); err != nil {
+			return err
+		}
+	}
+	proxy := buildCredentialProxyDeploymentForPlugins(rendered, policyHash, agentPlugins, owned, profiles, autopilot)
+	// The annotation records a cluster type, so only a definite answer, or the
+	// annotation it carries forward, writes one; a guess from the requests is
+	// rendered but not recorded, or the next failed check would read it back
+	// as fact.
+	if !recorded {
+		delete(proxy.Annotations, credentialProxyClusterTypeAnnotation)
+	}
 	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
 		return err
 	}
@@ -4327,10 +4360,13 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
 	homeMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
 	noChatMsg := noChatPlatformMsg(agent)
+	// So does the sandbox pin: an old sandbox is a likely cause of the park.
+	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		noChatPlatformConditionCurrent(agent, noChatMsg) &&
+		shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) {
@@ -4341,6 +4377,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
 			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
+			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition)
@@ -4353,6 +4390,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setNoChatPlatformCondition(agent, noChatMsg, now)
+	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
@@ -4674,6 +4712,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Its counterpart for the install with no chat platform, same shape.
 	noChatPlatformMsgNow := noChatPlatformMsg(agent)
 	noChatPlatformUnchanged := noChatPlatformConditionCurrent(agent, noChatPlatformMsgNow)
+	// The sandbox image pin, the same class: from the spec and the operator's
+	// own image, compared on its message.
+	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
+	sandboxPinnedUnchanged := shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg)
 
 	// The A2AGateway condition, same class as EventWatcher and for the same
 	// reason it needs its own term: on an upgraded install, the way back
@@ -4759,6 +4801,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
 		noChatPlatformUnchanged &&
+		sandboxPinnedUnchanged &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
@@ -4837,6 +4880,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
 	setNoChatPlatformCondition(agent, noChatPlatformMsgNow, now)
+	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 
@@ -5025,6 +5069,50 @@ func setNoChatPlatformCondition(agent *agentv1alpha1.PlatformAgent, msg string, 
 		Type:               noChatPlatformConditionType,
 		Status:             metav1.ConditionTrue,
 		Reason:             noChatPlatformReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+// shellSandboxImagePinnedMsg is the ShellSandboxPinned condition's message,
+// or "" when the condition is to be absent: the CR pins no sandbox image, or
+// pins the one the operator runs anyway.
+func shellSandboxImagePinnedMsg(agent *agentv1alpha1.PlatformAgent) string {
+	spec := shellSandboxSpec(agent)
+	if spec == nil || spec.Image == "" {
+		return ""
+	}
+	own := operatorShellSandboxImage()
+	if spec.Image == own {
+		return ""
+	}
+	return fmt.Sprintf(shellSandboxImagePinnedMessageFormat, spec.Image, own)
+}
+
+// shellSandboxImagePinnedConditionCurrent reports whether the
+// ShellSandboxPinned condition already says msg, where "" means the
+// condition is to be absent.
+func shellSandboxImagePinnedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, shellSandboxImagePinnedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == shellSandboxImagePinnedReason && existing.Message == msg
+}
+
+// setShellSandboxImagePinnedCondition writes the ShellSandboxPinned
+// condition, or removes it when msg is "". The caller does the API write.
+func setShellSandboxImagePinnedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, shellSandboxImagePinnedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               shellSandboxImagePinnedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             shellSandboxImagePinnedReason,
 		Message:            msg,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
@@ -6308,24 +6396,66 @@ func (r *PlatformAgentReconciler) imageVolumeSupported(agent *agentv1alpha1.Plat
 
 // clusterAutopilot reports whether the cluster is GKE Autopilot, from
 // discovery (isGKEAutopilot), and reuses an authoritative answer. An answer
-// discovery could not give is false, the Standard requests, and is asked again
-// on the next reconcile: a smaller request than Autopilot wants delays the
-// broker's CPU, where a larger one than a Standard node can fit leaves it
-// Pending.
-func (r *PlatformAgentReconciler) clusterAutopilot() bool {
+// discovery could not give is (false, false) and is asked again on the next
+// reconcile; the caller decides what to render meanwhile
+// (liveCredentialProxyAutopilot).
+func (r *PlatformAgentReconciler) clusterAutopilot() (autopilot bool, determined bool) {
 	r.autopilotMu.Lock()
 	defer r.autopilotMu.Unlock()
 	if r.autopilotResolved {
-		return r.autopilot
+		return r.autopilot, true
 	}
-	autopilot, determined := isGKEAutopilot(r.DiscoveryClient)
+	autopilot, determined = isGKEAutopilot(r.DiscoveryClient)
 	if !determined {
-		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy at the Standard requests until discovery answers.")
-		return false
+		logf.Log.WithName("platformagent-controller").Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; rendering the credential proxy for the cluster type it was last rendered for, else Standard, until discovery answers.")
+		return false, false
 	}
 	r.autopilot = autopilot
 	r.autopilotResolved = true
-	return autopilot
+	return autopilot, true
+}
+
+// liveCredentialProxyAutopilot picks the cluster type to render the proxy at
+// while discovery cannot say: the one the running proxy was last rendered for.
+// Rendering the Standard requests over a proxy running at the Autopilot ones
+// would restart it (its Deployment is Recreate), and again once discovery
+// answers. The type is read from credentialProxyClusterTypeAnnotation, which
+// holds across a CR edit and an operator upgrade that moves the defaults. A
+// Deployment an older operator wrote has no annotation, so the type is then
+// the one whose requests, for this CR, the proxy already carries. The requests
+// are still computed from the current CR, so an edit made meanwhile is
+// applied. With no proxy yet, or one matching neither render, it is Standard:
+// a smaller request than Autopilot wants delays the broker's CPU, where a
+// larger one than a Standard node can fit leaves it Pending.
+func (r *PlatformAgentReconciler) liveCredentialProxyAutopilot(ctx context.Context, agent, rendered *agentv1alpha1.PlatformAgent) (autopilot bool, recorded bool, err error) {
+	live := &appsv1.Deployment{}
+	if err := r.Get(ctx, client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}, live); err != nil {
+		if errors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("failed to read the credential proxy Deployment: %w", err)
+	}
+	switch live.Annotations[credentialProxyClusterTypeAnnotation] {
+	case credentialProxyClusterTypeAutopilot:
+		return true, true, nil
+	case credentialProxyClusterTypeStandard:
+		return false, true, nil
+	}
+	for _, c := range live.Spec.Template.Spec.Containers {
+		if c.Name != credentialProxyContainerName {
+			continue
+		}
+		want := resolveCredentialProxyResourcesFor(rendered.Spec.Deployment, true, renderedSizingTier(rendered)).Requests
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			have, ok := c.Resources.Requests[name]
+			wantQ := want[name]
+			if !ok || have.Cmp(wantQ) != 0 {
+				return false, false, nil
+			}
+		}
+		return true, false, nil
+	}
+	return false, false, nil
 }
 
 type pluginFailure struct {

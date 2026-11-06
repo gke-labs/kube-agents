@@ -4669,12 +4669,6 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	// listener reachable from outside its Pod with CREDENTIAL_PROXY_AUTH_MODE
 	// unset, so a broker rendered without these would crash-loop at boot rather
 	// than serve credentials to whoever reached the port.
-	//
-	// CREDENTIAL_PROXY_CONTENT_WORKSPACE has no field to turn it off. The Pods
-	// share no volume, so a working-tree clone in a directory the agent named is
-	// not something the broker can do at all — the fallback the flag guards
-	// elsewhere does not exist here, and an install that could switch it off
-	// would only be choosing to have the GitHub-writing skills fail.
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
@@ -4718,7 +4712,6 @@ func buildCredentialProxyEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agent
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
 	if harness := agent.Spec.Harness; harnessOnKind(harness) {
 		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --

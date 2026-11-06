@@ -182,11 +182,10 @@ MAX_INVARIANT_ITEMS = 20
 MAX_REPORT_CHARS = 8500
 # The other findings' header, under the stuck tasks when both are present.
 REPORT_HEADER = "kanban board health: attention required"
-# A full data volume, in the Session KV server's words: from its warn line, every
-# board write is at risk, and at 100% each one fails with a bare "disk I/O
-# error". The line and the text are session_kv_server.py's DATA_VOLUME_WARN_PERCENT
-# and DATA_VOLUME_WARNING (a test holds them equal); that module is not imported,
-# because it brings FastAPI in.
+# A full data volume: from the warn line, every board write is at risk, and at
+# 100% each one fails with a bare "disk I/O error". session_kv_server.py imports
+# these for its home-channel warning, so the two say the same line at the same
+# figure.
 DATA_VOLUME_WARN_PERCENT = 90
 DATA_VOLUME_WARNING = (
     "The agent's data volume is {percent}% full ({used:.1f} of {total:.1f} GiB). "
@@ -890,19 +889,26 @@ def data_volume_usage(home: Path) -> tuple[int, int] | None:
     return total, st.f_bavail * st.f_frsize
 
 
+def data_volume_percent(total: int, free: int) -> int:
+    """The share of the volume in use, in whole percent, rounded down."""
+    return (total - free) * PERCENT // total
+
+
+def data_volume_text(template: str, total: int, free: int) -> str:
+    """`template` (DATA_VOLUME_WARNING, or another text with its `percent`,
+    `used` and `total` fields) for a volume of `total` bytes with `free` left."""
+    return template.format(
+        percent=data_volume_percent(total, free), used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
+    )
+
+
 def data_volume_line(home: Path) -> str | None:
     """The full-volume line when the volume holding the board is at or above
     DATA_VOLUME_WARN_PERCENT used, else None (also when it cannot be read)."""
     usage = data_volume_usage(home)
-    if usage is None:
+    if usage is None or data_volume_percent(*usage) < DATA_VOLUME_WARN_PERCENT:
         return None
-    total, free = usage
-    percent = (total - free) * PERCENT // total
-    if percent < DATA_VOLUME_WARN_PERCENT:
-        return None
-    return DATA_VOLUME_WARNING.format(
-        percent=percent, used=(total - free) / BYTES_PER_GIB, total=total / BYTES_PER_GIB
-    )
+    return data_volume_text(DATA_VOLUME_WARNING, *usage)
 
 
 def is_disk_full_error(exc: BaseException, home: Path) -> bool:
@@ -1006,6 +1012,9 @@ def main(argv=None, *, env=None, now=None) -> int:
             print("\n".join([REPORT_HEADER, BOARD_DISK_FULL.format(error=exc), volume]))
             return 0
         print(f"kanban board health: cannot read {board_path(home)}: {exc}")
+        if volume:
+            # Not said as the cause, which may be a failing disk, but true.
+            print(volume)
         return 0
     out = []
     said = []

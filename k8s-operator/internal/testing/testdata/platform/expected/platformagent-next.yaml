@@ -1419,8 +1419,6 @@ spec:
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/token
-            - name: CREDENTIAL_PROXY_CONTENT_WORKSPACE
-              value: "1"
             - name: GKE_PROJECT_ID
               value: example-project
             - name: GKE_CLUSTER_NAME
@@ -2094,6 +2092,8 @@ spec:
                 resourceFieldRef:
                   divisor: "0"
                   resource: limits.memory
+            - name: BRIDGE_DEBUG_ERROR_TEXT
+              value: "false"
             - name: A2A_CAPABILITY_REQUIRED
               value: "true"
           image: ghcr.io/gke-labs/kube-agents/hermes-bridge:latest
@@ -4818,7 +4818,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-8573af72
+  name: platformagent-a2a-provision-da9e6400
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5130,19 +5130,37 @@ spec:
               >&2\n  echo \"  Provisioning does not edit an existing stream; to append
               the subject to its current subjects:\" >&2\n  echo \"    nats stream edit
               TOPICS-STATE --subjects=\\\"${topics_state_subjects},a2a.topics.agent.platform.topology-skew\\\"\"
-              >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only where the kubelet
-              has mounted the file: outside a pod there is\n# nothing to write to, and
-              a copy of a report is not a reason to fail a fully\n# provisioned bus. Nor
-              is a write that fails (a full or faulting disk under\n# the kubelet's file):
-              under set -e that would exit 1 on a bus this script\n# just finished provisioning,
-              and exit 1 matches no podFailurePolicy rule, so\n# the Job would burn its
-              backoff into BackoffLimitExceeded. A pod that has no\n# file, or whose write
-              failed, leaves no message, and the reconcile logs that\n# rather than reading
-              it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n  printf '%s' \"${report}\"
-              > \"/dev/termination-log\" \\\n    || echo \"WARNING: could not write the
-              provision report to the termination log; the log above is this run's only
-              record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf '%s'
-              \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
+              >&2\nfi\n#\n# PROFILE_SUBMITS older than this render: read its live max
+              age back. The\n# dispatcher keeps a finished task's tombstone for the max
+              age the operator\n# renders, and a submission still on the stream past its
+              tombstone would be\n# run again; provisioning never edits the stream (lowering
+              a max age evicts\n# queued submissions), so a stream an older operator created
+              longer than this\n# render's 259200s is reported, and the operator\n# renders
+              the longer one (#4948). 0 is no age limit. Same stance as the\n# extractors
+              above: an answer with no readable max_age FAILS.\nsubmits_json=\"$($NATS
+              stream info PROFILE_SUBMITS --json | tr -d ' \\t\\r\\n')\"\nlive_submit_max_age_ns=\"$(printf
+              '%s' \"${submits_json}\" \\\n  | grep -o '\"max_age\":[0-9]\\{1,\\}' | head
+              -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_submit_max_age_ns}\" ]; then\n
+              \ echo \"could not read max_age off the PROFILE_SUBMITS stream; refusing
+              to report this install as provisioned\" >&2\n  exit 1\nfi\nlive_submit_max_age=$((live_submit_max_age_ns
+              / 1000000000))\nif [ \"${live_submit_max_age_ns}\" = \"0\" ] || [ \"${live_submit_max_age}\"
+              -gt 259200 ]; then\n  report_findings=\"${report_findings}${report_findings:+,}\\\"submit_max_age\\\":{\\\"live\\\":${live_submit_max_age}}\"\n
+              \ echo \"NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s
+              (0 is no limit); this render creates it at 259200s.\" >&2\n  echo \"  The
+              dispatcher is told the longer one, so a finished task's tombstone outlives
+              its submission.\" >&2\nfi\nreport=\"{${report_findings}}\"\n# Written only
+              where the kubelet has mounted the file: outside a pod there is\n# nothing
+              to write to, and a copy of a report is not a reason to fail a fully\n# provisioned
+              bus. Nor is a write that fails (a full or faulting disk under\n# the kubelet's
+              file): under set -e that would exit 1 on a bus this script\n# just finished
+              provisioning, and exit 1 matches no podFailurePolicy rule, so\n# the Job
+              would burn its backoff into BackoffLimitExceeded. A pod that has no\n# file,
+              or whose write failed, leaves no message, and the reconcile logs that\n#
+              rather than reading it as clean.\nif [ -w \"/dev/termination-log\" ]; then\n
+              \ printf '%s' \"${report}\" > \"/dev/termination-log\" \\\n    || echo \"WARNING:
+              could not write the provision report to the termination log; the log above
+              is this run's only record\" >&2\nfi\n\nrequired_consumers=110\nlive_consumers=\"$(printf
+              '%s' \"${tasks_json}\" \\\n  | grep -o '\"max_consumers\":-\\{0,1\\}[0-9]\\{1,\\}'
               | head -n1 | cut -d: -f2 || true)\"\nif [ -z \"${live_consumers}\" ]; then\n
               \ echo \"could not read max_consumers off the TASKS stream; refusing to
               report this install as provisioned\" >&2\n  exit 1\nfi\nif [ \"${live_consumers}\"

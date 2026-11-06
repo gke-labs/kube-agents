@@ -1382,8 +1382,8 @@ type CredentialProxySpec struct {
 	// per GiB of the memory request. The broker sizes how many commands it
 	// admits at once from the memory limit, so raising the limit, or picking
 	// a spec.deployment.sizingProfile row that raises it, is the knob for an
-	// install whose fleet outgrows the default; the ephemeral-storage limit bounds the content
-	// workspace the broker clones into; the proxy's state emptyDir (sizeLimit
+	// install whose fleet outgrows the default; the ephemeral-storage limit bounds the vcs
+	// scratch trees the broker clones into; the proxy's state emptyDir (sizeLimit
 	// 5Gi) grows by whatever the limit is raised above the 8Gi default, and
 	// its /tmp emptyDir keeps its 2Gi, so the kubelet does not evict the pod
 	// at the smaller figure.
@@ -2630,6 +2630,19 @@ type AgentStatus struct {
 	// what is there; the key is absent while the served CRD predates it.
 	// +optional
 	Inference *InferenceStatus `json:"inference,omitempty"`
+
+	// ProfileSubmitMaxAgeSeconds is the live PROFILE_SUBMITS stream's max age,
+	// in seconds, when the A2A provision Job last found it longer than this
+	// operator creates the stream with (0 when the stream has no age limit).
+	// It is absent when the stream is no longer than that, or before a report.
+	// Provisioning never edits an existing stream, so one an older operator
+	// created longer, or one edited by hand, can keep submissions longer than
+	// this operator would, and the dispatcher is told the longer of the two
+	// (up to a year): a finished task's tombstone has to outlive its
+	// submission. It is read once per provision Job run, so a hand edit is
+	// picked up within a day.
+	// +optional
+	ProfileSubmitMaxAgeSeconds *int64 `json:"profileSubmitMaxAgeSeconds,omitempty"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static
@@ -2647,7 +2660,10 @@ type AgentStatus struct {
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
 // ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, and
 // the two people readings (PeopleSeen7d and PeopleSeen30d) from the A2A
-// gateway's, all of which it reads every five minutes on the leader; the
+// gateway's, TopTools, the broker's top five tool and subcommand pairs,
+// and the nine origin readings (ProposalsFromChat to ProposalsFromOther)
+// from the chat plugin's, all of which it reads every five minutes on the
+// leader; the
 // agent's own ServiceAccount holds no write verb on this status.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative count of sessions the agent opened: the
@@ -2906,6 +2922,81 @@ type AgentUsageStatus struct {
 	// +optional
 	PeopleSeen30d *int64 `json:"peopleSeen30d,omitempty"`
 
+	// ProposalsFromChat is the agent pod's count now of the pull requests it
+	// opened for work a person asked for on a chat platform, from its durable
+	// proposals ledger: kubeagents_proposals_opened under origin chat, summed
+	// over the platform label, on the chat plugin's listener. A count is taken
+	// only for a proposal the agent verified with the forge and claimed, so
+	// the nine origin fields usually sum to at most RemediationsProposedTotal.
+	// A reading, not an accumulation: the ledger survives a restart and the
+	// plugin reads it whole; a read that fails after the plugin's first success
+	// keeps serving the last counts, so a stale count reads as current until
+	// the plugin restarts. A 0 is a reading. Absent until the first
+	// reading, after two polls in a row without one, and while the served CRD
+	// predates the field. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	ProposalsFromChat *int64 `json:"proposalsFromChat,omitempty"`
+
+	// ProposalsFromConsole is ProposalsFromChat for work started from the web
+	// console, the admin console's chat page, the A2A gateway's console
+	// backend or the dashboard: kubeagents_proposals_opened under origin
+	// console. A 0 is a reading. Absent on the same terms as
+	// ProposalsFromChat. Moves neither LastActiveTime nor LastHumanActiveTime.
+	// +optional
+	ProposalsFromConsole *int64 `json:"proposalsFromConsole,omitempty"`
+
+	// ProposalsFromApi is ProposalsFromChat for work a caller on an A2A door
+	// started: kubeagents_proposals_opened under origin api. Conversation
+	// turns on the gateway's own agent API port count under ProposalsFromOther
+	// until that door writes a record. A 0 is a reading. Absent on the same
+	// terms as ProposalsFromChat. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	ProposalsFromApi *int64 `json:"proposalsFromApi,omitempty"`
+
+	// ProposalsFromEvent is ProposalsFromChat for the event watcher's triage
+	// of a cluster event: kubeagents_proposals_opened under origin event. A 0
+	// is a reading. Absent on the same terms as ProposalsFromChat. Moves
+	// neither LastActiveTime nor LastHumanActiveTime.
+	// +optional
+	ProposalsFromEvent *int64 `json:"proposalsFromEvent,omitempty"`
+
+	// ProposalsFromDrift is ProposalsFromChat for the drift detector's work:
+	// kubeagents_proposals_opened under origin drift. A 0 is a reading. Absent
+	// on the same terms as ProposalsFromChat. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	ProposalsFromDrift *int64 `json:"proposalsFromDrift,omitempty"`
+
+	// ProposalsFromAudit is ProposalsFromChat for a scheduled fleet audit:
+	// kubeagents_proposals_opened under origin audit. A 0 is a reading. Absent
+	// on the same terms as ProposalsFromChat. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	ProposalsFromAudit *int64 `json:"proposalsFromAudit,omitempty"`
+
+	// ProposalsFromScheduled is ProposalsFromChat for any other scheduled job
+	// the image ships: kubeagents_proposals_opened under origin scheduled. A 0
+	// is a reading. Absent on the same terms as ProposalsFromChat. Moves
+	// neither LastActiveTime nor LastHumanActiveTime.
+	// +optional
+	ProposalsFromScheduled *int64 `json:"proposalsFromScheduled,omitempty"`
+
+	// ProposalsFromIssue is ProposalsFromChat for a claimed GitHub issue:
+	// kubeagents_proposals_opened under origin issue. A 0 is a reading. Absent
+	// on the same terms as ProposalsFromChat. Moves neither LastActiveTime nor
+	// LastHumanActiveTime.
+	// +optional
+	ProposalsFromIssue *int64 `json:"proposalsFromIssue,omitempty"`
+
+	// ProposalsFromOther is ProposalsFromChat for work whose origin none of
+	// the other eight resolves: kubeagents_proposals_opened under origin
+	// other. A 0 is a reading. Absent on the same terms as ProposalsFromChat.
+	// Moves neither LastActiveTime nor LastHumanActiveTime.
+	// +optional
+	ProposalsFromOther *int64 `json:"proposalsFromOther,omitempty"`
+
 	// ClustersRegistered is the number of clusters the event watcher has
 	// built a client for: the management cluster and the Cluster Agent
 	// profiles the GKE API would describe, the management cluster counted
@@ -2977,6 +3068,65 @@ type AgentUsageStatus struct {
 	// five minutes.
 	// +optional
 	LastHumanActiveTime *metav1.Time `json:"lastHumanActiveTime,omitempty"`
+
+	// TopTools is the credential broker's five most-invoked tool and
+	// subcommand pairs since its pod last started, as its
+	// kubeagents_tool_invocations_total stands now: a reading, not an
+	// accumulation, summed across the running broker pods and projected as
+	// the latest poll's, so a broker restart starts it over. Sorted by total
+	// descending, then tool and subcommand ascending; at most five rows.
+	// Every word is from a closed vocabulary mirrored from the broker's own
+	// (an unlisted subcommand reads other; an unlisted tool or status is not
+	// counted), so the field stays static enums and integers. Read every five
+	// minutes; one poll that cannot read the broker leaves the rows where they
+	// were, and a second in a row clears them to absent, as the proposal
+	// readings are cleared. Absent while the served CRD predates it. Moves
+	// neither LastActiveTime nor LastHumanActiveTime. scripts/feedback-summary.sh
+	// and the chat gateway's "/feedback summary" print it as the
+	// "tools (top 5, since broker start)" block.
+	// +kubebuilder:validation:MaxItems=5
+	// +listType=atomic
+	// +optional
+	TopTools []ToolUsageSummary `json:"topTools,omitempty"`
+}
+
+// ToolUsageSummary is one row of AgentUsageStatus.TopTools: a tool and
+// subcommand pair the credential broker ran, with its invocations by outcome.
+// Static enums and integers only.
+type ToolUsageSummary struct {
+	// Tool is the executable the broker ran, from its closed vocabulary; other
+	// is an executable it refused to run.
+	// +kubebuilder:validation:Enum=kubectl;gcloud;git;gh;feedback;other
+	Tool string `json:"tool"`
+	// Subcommand is the tool's first bare word, from the broker's closed
+	// vocabulary for the tool; none for a bare tool, other for a word outside
+	// the vocabulary.
+	Subcommand string `json:"subcommand"`
+	// Total is every invocation of the pair: the five outcomes summed.
+	// +kubebuilder:validation:Minimum=0
+	Total int64 `json:"total"`
+	// Success is the commands that ran and exited 0.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Success int64 `json:"success,omitempty"`
+	// Error is the commands that ran and failed, or that the broker rejected
+	// or failed on before running.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Error int64 `json:"error,omitempty"`
+	// Blocked is the commands the broker's policy refused.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Blocked int64 `json:"blocked,omitempty"`
+	// Busy is the commands the broker had no slot or memory budget for.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Busy int64 `json:"busy,omitempty"`
+	// Abandoned is the commands whose caller hung up while they were queued
+	// or running.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Abandoned int64 `json:"abandoned,omitempty"`
 }
 
 const (

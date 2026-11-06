@@ -32,9 +32,15 @@ half of the first:
   applied manifest among them, but no spec or status of its own). The four
   controller kinds are already readable whole by name under
   `WATCHER_NAMED_READS`; pods are not, so the first-sorted pod's metadata is
-  reach this rule adds. No other list, no watch of anything else (the
-  deprecated `watch/<resource>` paths included), no subresource, never a
-  Secret.
+  reach this rule adds. One more GET reads one named Pod's metadata, under a
+  JSON `PartialObjectMetadata` Accept on every range, for the event watcher's
+  owner lookup; the broker relays only its projection (`project_pod_metadata`:
+  the controller ownerReference's kind and name when it is one of
+  `POD_METADATA_OWNER_KINDS`, a ReplicaSet only with its `pod-template-hash`
+  label, which is relayed with it), never the Pod's name or UID, an
+  annotation, another label, another owner or managedFields. No other list, no
+  watch of anything else (the deprecated `watch/<resource>` paths included), no
+  subresource, never a Secret.
 
 Standard library only, like `api_policy`. `Decision` is reused from
 `command_policy`. No refusal message repeats caller text.
@@ -83,6 +89,7 @@ RULE_K8S_ACCEPT = "kubernetes.watcher.accept"
 RULE_K8S_EVENTS = "kubernetes.watcher.events"
 RULE_K8S_NAMED_GET = "kubernetes.watcher.named-get"
 RULE_K8S_COUNT_LIST = "kubernetes.watcher.count-list"
+RULE_K8S_POD_METADATA = "kubernetes.watcher.pod-metadata"
 
 # Google's project id grammar, and GKE's location and cluster name grammars:
 # lower-case, digits and hyphens, so no segment can smuggle a slash or a dot.
@@ -239,6 +246,37 @@ COUNT_LIST_QUERY = {"limit": ["1"]}
 # the server and return the printer columns, which are spec and status. A
 # spelling the server might also take (quoted, cased) is refused, not guessed at.
 COUNT_LIST_ACCEPT_PARAMS = {"as": "PartialObjectMetadataList", "g": "meta.k8s.io", "v": "v1"}
+# A named Pod GET is admitted only under this Accept, parsed the same way, and
+# only as JSON, so the broker can project the answer: the server answers with
+# the one Pod's whole ObjectMeta, every annotation (a client-side apply's
+# last-applied-configuration, which holds the manifest and its env values,
+# among them) and managedFields included, and the broker relays only the few
+# fields POD_METADATA_KIND's comment names (project_pod_metadata). The event watcher reads a
+# Pod's controller from that (cmd/k8s-event-watcher/owner.go), so its incident
+# folds with the other Pods of the same workload. Pods stay out of
+# WATCHER_NAMED_READS: a full Pod read is still refused.
+POD_METADATA_ACCEPT_PARAMS = {"as": "PartialObjectMetadata", "g": "meta.k8s.io", "v": "v1"}
+POD_METADATA_MEDIA_TYPE = "application/json"
+POD_RESOURCE = "pods"
+# What a projected Pod answer keeps, and nothing else, each because the event
+# watcher's owner lookup (cmd/k8s-event-watcher/owner.go) reads it:
+# - the controller ownerReference's kind and name, only when it is one of
+#   POD_METADATA_OWNER_KINDS: the workload the Pod's incident folds on;
+# - its controller flag, true: the lookup reads only a controller entry;
+# - the pod-template-hash label, only when that controller is a ReplicaSet: the
+#   Deployment is the ReplicaSet's name less "-<hash>". A ReplicaSet without
+#   the label, or whose name does not end in it, is not a Deployment's, and
+#   the lookup reads it as none, so it is not relayed either.
+# The Pod's name, namespace and UID are not relayed: the watcher has them from
+# the event it is looking up. Any other controller (a static Pod's Node, a
+# custom controller), every other owner, label and annotation, and
+# managedFields, are dropped.
+POD_METADATA_KIND = "PartialObjectMetadata"
+POD_METADATA_HASH_LABEL = "pod-template-hash"
+POD_METADATA_HASH_OWNER_KIND = "ReplicaSet"
+# The controller kinds the lookup folds on (foldableControllerKinds in owner.go;
+# tests/test_watcher_pod_metadata_parity.py holds the two equal).
+POD_METADATA_OWNER_KINDS = frozenset({POD_METADATA_HASH_OWNER_KIND, "StatefulSet", "DaemonSet", "Job"})
 
 
 def _validate_named_reads(table: frozenset[tuple[str, str]]) -> None:
@@ -266,6 +304,45 @@ CLUSTER_FIELDS = frozenset(
     {"name", "location", "status", "endpoint", "controlPlaneEndpointsConfig", "autopilot", "currentNodeCount"}
 )
 CLUSTER_MASTER_AUTH_FIELDS = frozenset({"clusterCaCertificate"})
+
+
+def project_pod_metadata(body: bytes) -> bytes | None:
+    """The relayed form of a named Pod's PartialObjectMetadata, or None if it is not one.
+
+    `{"metadata": {"ownerReferences": [{"kind", "name", "controller": true}],
+    "labels": {"pod-template-hash"}}}` with the first controller entry only,
+    and the label only when that controller is a ReplicaSet. `{"metadata": {}}`
+    for a Pod with no controller, a controller of another kind, or a ReplicaSet
+    without the label or whose name does not end in it. See POD_METADATA_KIND's comment for why each field is
+    there.
+    """
+    try:
+        obj = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("kind") != POD_METADATA_KIND:
+        return None
+    meta = obj.get("metadata")
+    if not isinstance(meta, dict):
+        return None
+    projected: dict[str, object] = {}
+    owners = meta.get("ownerReferences")
+    for ref in owners if isinstance(owners, list) else []:
+        if not isinstance(ref, dict) or ref.get("controller") is not True:
+            continue
+        kind, name = ref.get("kind"), ref.get("name")
+        if not (isinstance(kind, str) and kind and isinstance(name, str) and name):
+            continue
+        labels = meta.get("labels")
+        hash_value = labels.get(POD_METADATA_HASH_LABEL) if isinstance(labels, dict) else None
+        # The lookup reads a ReplicaSet only when its name ends in the hash.
+        has_hash = isinstance(hash_value, str) and bool(hash_value) and name.endswith("-" + hash_value)
+        if kind in POD_METADATA_OWNER_KINDS and (kind != POD_METADATA_HASH_OWNER_KIND or has_hash):
+            projected["ownerReferences"] = [{"kind": kind, "name": name, "controller": True}]
+            if kind == POD_METADATA_HASH_OWNER_KIND:
+                projected["labels"] = {POD_METADATA_HASH_LABEL: hash_value}
+        break
+    return json.dumps({"metadata": projected}, separators=(",", ":")).encode()
 
 
 def project_cluster(body: bytes) -> bytes | None:
@@ -408,18 +485,24 @@ def split_k8s_target(rest: str) -> tuple[dict[str, str], str] | None:
     return match.groupdict(), parts[3]
 
 
-def accepts_metadata_only(accept: str) -> bool:
-    """True when every media range in `accept` asks for a PartialObjectMetadataList.
+def accepts_metadata_only(
+    accept: str, expected: dict[str, str] = COUNT_LIST_ACCEPT_PARAMS, media_type: str = ""
+) -> bool:
+    """True when every media range in `accept` asks for metadata only.
 
     Each range's parameters are parsed into a name-value table the way the
-    API server parses them, and the table has to equal
-    `COUNT_LIST_ACCEPT_PARAMS`: no parameter missing, none extra, none
-    repeated. An empty or blank `Accept` offers no range and is False.
+    API server parses them, and the table has to equal `expected`
+    (`COUNT_LIST_ACCEPT_PARAMS` for a count list, `POD_METADATA_ACCEPT_PARAMS`
+    for a named Pod): no parameter missing, none extra, none repeated. When
+    `media_type` is set, every range's type has to be it too. An empty or
+    blank `Accept` offers no range and is False.
     """
     ranges = [media_range.strip() for media_range in accept.split(",")]
     if not all(ranges):
         return False
     for media_range in ranges:
+        if media_type and media_range.split(";", 1)[0].strip().lower() != media_type:
+            return False
         params: dict[str, str] = {}
         for param in media_range.split(";")[1:]:
             name, separator, value = param.partition("=")
@@ -427,7 +510,7 @@ def accepts_metadata_only(accept: str) -> bool:
             if not separator or name in params:
                 return False
             params[name] = value
-        if params != COUNT_LIST_ACCEPT_PARAMS:
+        if params != expected:
             return False
     return True
 
@@ -437,7 +520,7 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]], accept: st
 
     `rest` is the path after the prefix; `accept` is the `Accept` header the
     broker will forward, or empty when it forwards none. Only the count-list
-    rule reads it.
+    and named Pod rules read it.
     """
     if method != METHOD_GET:
         return _refuse(RULE_K8S_METHOD, "The watcher's Kubernetes route is read-only: GET only.")
@@ -469,6 +552,16 @@ def evaluate_k8s(method: str, rest: str, query: dict[str, list[str]], accept: st
         )
     if match.group("resource") in REFUSED_RESOURCES:
         return _refuse(RULE_K8S_SECRETS, "The watcher's Kubernetes route never reads a Secret.")
+    if match.re is _NAMED_CORE and match.group("ns") and match.group("resource") == POD_RESOURCE:
+        # No query key at all: the watcher's lookup sends none, and a
+        # resourceVersion would only let a caller read a cached version.
+        if query:
+            return _refuse(RULE_K8S_QUERY, "A named Pod read carries no query key.")
+        if not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):
+            return _refuse(
+                RULE_K8S_ACCEPT, "A named Pod read asks for a JSON PartialObjectMetadata on every Accept range."
+            )
+        return Decision(allowed=True, rule_id=RULE_K8S_POD_METADATA, message="")
     group = match.groupdict().get("group") or ""
     if (group, match.group("resource")) not in WATCHER_NAMED_READS:
         return _refuse(

@@ -499,7 +499,10 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 				// The bus answered, so the grant is there: the durable
 				// just isn't yet, or its stored config is refused (the
 				// server's record, which no reconnect changes). The bind
-				// retries pick it up, with backoff, as bind's would.
+				// retries pick it up, with backoff, as bind's would. A
+				// bind BindAttemptTimeout cut short mid-look-up still
+				// lands here when an earlier attempt in the window was
+				// answered: the lib returns that answer with the deadline.
 				d.noteBindFailure(name, err)
 			default:
 				refused = append(refused, name)
@@ -1829,11 +1832,14 @@ func (d *Dispatcher) sweep(ctx context.Context) {
 }
 
 // submitRetention is how long the submit stream keeps a submission, which
-// a tombstone must outlive. The install config will carry the stream's
-// max age (DispatchConfig.SubmitRetentionSeconds, a follow-up); until then
-// it is the operator's fixed value.
-func submitRetention(lib.DispatchConfig) time.Duration {
-	return lib.ProfileSubmitRetention
+// a tombstone must outlive: the max age the operator renders in the install
+// config, the longer of the constant it creates the stream with and the
+// live stream's own when its provision Job reports a longer one (#4948). It
+// is never less than lib.ProfileSubmitRetention, so a config can't take a
+// tombstone below the compiled 72h. A config with no value (an older
+// operator) gets the fixed value.
+func submitRetention(cfg lib.DispatchConfig) time.Duration {
+	return max(time.Duration(cfg.SubmitRetentionSeconds)*time.Second, lib.ProfileSubmitRetention)
 }
 
 // tierBoundLocked reports whether every durable of a (profile, tier) the
