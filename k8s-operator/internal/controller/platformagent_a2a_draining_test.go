@@ -26,6 +26,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -46,6 +47,10 @@ func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 		{Name: "draining", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 600, Durables: []a2aDispatchDurable{}, DrainingUntil: until},
 		{Name: "kept", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 600,
 			Durables: []a2aDispatchDurable{{Tier: "read", Kind: "top", Name: profileDurableName("kept", "read", "top")}}},
+		// Not what the render produces: a ConfigMap edit, which must grant nothing.
+		{Name: "*", Concurrency: 1, Tiers: []string{"read"}},
+		{Name: "bad-tier", Concurrency: 1, Tiers: []string{"read", "a.b"}},
+		{Name: "no-tier", Concurrency: 1},
 	}}
 	live := map[string]bool{"kept": true}
 
@@ -58,8 +63,13 @@ func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 		t.Fatalf("draining %v, want gone and draining only", got)
 	}
 	gone := names["gone"]
-	if want := now.Add(1800*time.Second + a2aDrainingMargin); !gone.DrainingUntil.Equal(want) || len(gone.Durables) != 0 || gone.Concurrency != 2 {
+	// The window is the longest deadline any task can carry, not the
+	// profile's current one: a task keeps the deadline it was confirmed with.
+	if want := now.Add(a2aDrainingWindow); !gone.DrainingUntil.Equal(want) || len(gone.Durables) != 0 || gone.Concurrency != 2 {
 		t.Errorf("a newly dropped profile drains as %+v, want until %v with no durables and its limits kept", gone, want)
+	}
+	if a2aDrainingWindow < time.Duration(agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds)*time.Second {
+		t.Errorf("the drain window %v is shorter than the longest task deadline", a2aDrainingWindow)
 	}
 	if d := names["draining"]; !d.DrainingUntil.Equal(until) {
 		t.Errorf("an already draining profile's time moved: %v, want %v", d.DrainingUntil, until)
@@ -112,14 +122,19 @@ func TestADrainingProfileKeepsItsTerminalGrantAndNoDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var publish []string
+	var publish, subscribe []string
 	for _, id := range doc.Identities {
 		if id.User == a2aDispatcherUser {
-			publish = id.Grants.Publish
+			publish, subscribe = id.Grants.Publish, id.Grants.Subscribe
 		}
 	}
-	if !slices.Contains(publish, "a2a.tasks.gone.*.supervisor") {
-		t.Errorf("the dispatcher lost the draining profile's .supervisor grant: %v", publish)
+	for _, want := range []string{"a2a.tasks.gone.*.supervisor", "$JS.API.DIRECT.GET." + a2aDispatchStopStream + "." + a2aDispatchStopPrefix + "gone.*"} {
+		if !slices.Contains(publish, want) {
+			t.Errorf("the dispatcher lost the draining profile's grant %q: %v", want, publish)
+		}
+	}
+	if !slices.Contains(subscribe, a2aDispatchStopPrefix+"gone.*") {
+		t.Errorf("the dispatcher lost the draining profile's stop subscription: %v", subscribe)
 	}
 	for _, g := range publish {
 		if strings.Contains(g, "profile-gone-") {
@@ -162,5 +177,48 @@ func TestTheReconcileDrainsWhatTheAppliedConfigListed(t *testing.T) {
 	}
 	if got := r.dispatchDraining(ctx, agent, nil); got != nil {
 		t.Errorf("an unreadable applied config drained %v", got)
+	}
+}
+
+// Through the reconcile: an applied dispatch config that lists a profile the
+// install no longer has makes both renders keep it draining, the dispatch
+// config with no durables and the identity map with its .supervisor grant,
+// from the one set read for the pass.
+func TestTheReconcileRendersADroppedProfileDrainingInBothPlaces(t *testing.T) {
+	withDispatcher(t)
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	applied := a2aDispatchConfig{Profiles: []a2aDispatchProfile{{Name: "gone", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 600,
+		Durables: []a2aDispatchDurable{{Tier: "read", Kind: "top", Name: profileDurableName("gone", "read", "top")}}}}}
+	body, _ := json.Marshal(applied)
+	if err := cl.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatchConfigName(agent), Namespace: agent.Namespace},
+		Data: map[string]string{a2aDispatchConfigKey: string(body)}}); err != nil {
+		t.Fatal(err)
+	}
+	reconcileTwice(t, ctx, r, req)
+
+	cm := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
+		t.Fatal(err)
+	}
+	var rendered a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &rendered); err != nil {
+		t.Fatal(err)
+	}
+	if i := slices.IndexFunc(rendered.Profiles, func(p a2aDispatchProfile) bool { return p.Name == "gone" }); i < 0 ||
+		rendered.Profiles[i].DrainingUntil.IsZero() || len(rendered.Profiles[i].Durables) != 0 {
+		t.Fatalf("the reconciled dispatch config does not keep gone draining: %+v", rendered.Profiles)
+	}
+	shard := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aAuthMapShardName(agent, 0)}, shard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(shard.Data[a2aAuthMapKey], `"a2a.tasks.gone.*.supervisor"`) {
+		t.Errorf("the reconciled identity map dropped gone's .supervisor grant")
+	}
+	if strings.Contains(shard.Data[a2aAuthMapKey], "profile-gone-") {
+		t.Errorf("the reconciled identity map keeps a durable grant of gone")
 	}
 }

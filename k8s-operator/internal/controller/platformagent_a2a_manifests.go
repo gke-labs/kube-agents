@@ -5793,7 +5793,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, r.dispatchDraining(ctx, agent, profiles))
+	// The profiles still draining (#5074), read once from the applied
+	// dispatch config for both renders: the identity map keeps their
+	// .supervisor grant exactly as long as the dispatch config lists them.
+	draining := r.dispatchDraining(ctx, agent, profiles)
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
@@ -5973,7 +5977,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
 	// has an image for it. Its pod-read Role lives in the profile namespace,
 	// and a failure there follows the same rule as the quota's.
-	if dispatcherProfileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, profileFenced); err != nil {
+	if dispatcherProfileErr, err := r.reconcileA2ADispatcherDraining(ctx, agent, profiles, profileFenced, draining); err != nil {
 		return state, err
 	} else if dispatcherProfileErr != nil {
 		*profileErr = goerrors.Join(*profileErr, dispatcherProfileErr)

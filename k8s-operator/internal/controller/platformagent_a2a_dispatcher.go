@@ -614,33 +614,57 @@ func desiredDispatchConfigDraining(agent *agentv1alpha1.PlatformAgent, profiles 
 	return cfg, nil
 }
 
-// a2aDrainingMargin is how long past its active deadline a profile that has
-// left the install stays draining: the dispatcher fails a task still held at
-// its deadline and retries that terminal, which needs the grant (#5074).
+// a2aDrainingMargin is how long past the longest task deadline a profile that
+// has left the install stays draining: the dispatcher fails a task still held
+// at its deadline and retries that terminal, which needs the grant (#5074).
 const a2aDrainingMargin = 15 * time.Minute
+
+// a2aDrainingWindow is how long a profile that has left the install drains:
+// the longest deadline any of its tasks can carry, plus a2aDrainingMargin. A
+// task keeps the deadline it was confirmed with, which the profile's or the
+// install's later, lower limit doesn't shorten, so the window is the hard
+// ceiling on every task deadline (spec.harness.tuning.profiles.
+// maxTaskDeadlineSeconds may only be lowered from its default), not the
+// profile's current one.
+const a2aDrainingWindow = time.Duration(agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds)*time.Second + a2aDrainingMargin
 
 // drainingDispatchProfiles is the profiles the applied dispatch config lists
 // that the render no longer does (live names it), still draining at now: a
-// profile listed live there drains from now for its active deadline plus
-// a2aDrainingMargin; one already draining keeps its DrainingUntil, so the
-// render is stable, until that passes. A draining profile has no durables.
-// The applied config is the state: with none, nothing drains.
+// profile listed live there drains from now for a2aDrainingWindow; one
+// already draining keeps its DrainingUntil, so the render is stable, until
+// that passes. A draining profile has no durables. The applied config is the
+// state: with none, nothing drains.
+//
+// The applied config is a ConfigMap, and a draining profile's name becomes a
+// grant on the dispatcher's identity (dispatcherGrantNames), so only what the
+// render would itself produce is carried forward: a name and tiers that are
+// subject tokens, and the limits; nothing else of the entry. An entry that
+// isn't is dropped, and grants nothing.
 func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time) []a2aDispatchProfile {
 	if applied == nil {
 		return nil
 	}
 	var out []a2aDispatchProfile
-	for _, p := range applied.Profiles {
-		if live[p.Name] {
+	for _, a := range applied.Profiles {
+		if live[a.Name] || !isDNS1123LabelToken(a.Name) || len(a.Tiers) == 0 ||
+			slices.ContainsFunc(a.Tiers, func(t string) bool { return !isDNS1123LabelToken(t) }) {
 			continue
 		}
-		if p.DrainingUntil.IsZero() {
-			p.DrainingUntil = now.Add(time.Duration(p.ActiveDeadlineSeconds)*time.Second + a2aDrainingMargin).Truncate(time.Second).UTC()
-		} else if !now.Before(p.DrainingUntil) {
+		until := a.DrainingUntil
+		if until.IsZero() {
+			until = now.Add(a2aDrainingWindow).Truncate(time.Second).UTC()
+		} else if !now.Before(until) {
 			continue
 		}
-		p.Durables = []a2aDispatchDurable{}
-		out = append(out, p)
+		out = append(out, a2aDispatchProfile{
+			Name:                  a.Name,
+			Tiers:                 slices.Clone(a.Tiers),
+			Concurrency:           max(a.Concurrency, 1),
+			QueueTimeoutSeconds:   a.QueueTimeoutSeconds,
+			ActiveDeadlineSeconds: a.ActiveDeadlineSeconds,
+			Durables:              []a2aDispatchDurable{},
+			DrainingUntil:         until,
+		})
 	}
 	return out
 }
@@ -692,10 +716,17 @@ func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []ag
 // follow the profile-namespace rule: a failure there is returned for the
 // caller to log, and the rest still lands.
 func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool) (profileErr error, err error) {
+	return r.reconcileA2ADispatcherDraining(ctx, agent, profiles, profileNamespaceReady, r.dispatchDraining(ctx, agent, profiles))
+}
+
+// reconcileA2ADispatcherDraining is reconcileA2ADispatcher with the draining
+// profiles given: reconcileA2AStack reads them once a pass and hands the same
+// set to the identity map, so the two never disagree on a profile's grant.
+func (r *PlatformAgentReconciler) reconcileA2ADispatcherDraining(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile) (profileErr error, err error) {
 	if !a2aDispatcherEnabled() {
 		return r.removeA2ADispatcher(ctx, agent)
 	}
-	cm, err := buildA2ADispatchConfigMap(agent, profiles, r.dispatchDraining(ctx, agent, profiles))
+	cm, err := buildA2ADispatchConfigMap(agent, profiles, draining)
 	if err != nil {
 		return nil, fmt.Errorf("failed to render the dispatch config: %w", err)
 	}

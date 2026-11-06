@@ -8,9 +8,12 @@ import (
 )
 
 // A profile that leaves the install drains (#5074): the config lists it
-// with no durables until DrainingUntil. A task it holds runs on and settles
-// as any other, and nothing new is dispatched for it: a submission that
-// reaches its stream afterwards is never offered.
+// with no durables until DrainingUntil. The dispatcher takes such a config,
+// a task it holds runs on and settles as any other, and nothing new is
+// dispatched for it: a submission that reaches its stream afterwards isn't
+// offered within several retry delays. The harness has no auth callout, so
+// grants aren't enforced here; that the draining profile keeps its
+// .supervisor grant is the operator's identity-map test.
 func TestADrainingProfileFinishesWhatItHoldsAndTakesNothingNew(t *testing.T) {
 	b := newBus(t, "tse-0")
 	b.ensure("tse", 2, 0, "read")
