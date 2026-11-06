@@ -221,7 +221,7 @@ tofu fmt <workspace>/clusters/<cluster>/provisioning/<file>.tf
 
 Submit through **submit-suggestion** `submit` with the branch from Step 1.
 Use this shape for the `--body-file` document, after the skill's standard
-header:
+header, and pass the `--evidence-file` its Step 3 requires:
 
 ```
 ### Terraform change

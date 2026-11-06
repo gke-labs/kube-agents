@@ -225,7 +225,8 @@ unless the siblings use another convention. A new `ContainerCluster` goes
 where the repository already keeps `ContainerCluster` manifests; if it keeps
 none, ask which path, rather than inventing one. Then submit it through
 **submit-suggestion** with branch `platform-agent/kcc-<kind>-<name>`. Use
-this shape for the `--body-file` document, after the skill's standard header:
+this shape for the `--body-file` document, after the skill's standard header,
+and pass the `--evidence-file` its Step 3 requires:
 
 ```
 ### Config Connector change

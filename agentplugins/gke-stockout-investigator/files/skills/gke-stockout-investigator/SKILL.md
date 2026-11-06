@@ -330,12 +330,30 @@ gcloud beta compute advice capacity-history --provisioning-model=SPOT --machine-
 - **Remediation**: <description of the changes made to ComputeClass/workload manifests>.
 EOF
 
+EVIDENCE=$(mktemp -p /opt/data/scratch pr_evidence.XXXXXX.json)
+cat > "$EVIDENCE" <<'EOF'
+{
+  "finding": "<the scale-up failure and the capacity constraint behind it>",
+  "checks": [
+    {"command": "kubectl get configmap cluster-autoscaler-status -n kube-system -o yaml", "output": "<the lines naming the failed scale-up>"},
+    {"command": "gcloud beta compute advice capacity ...", "output": "<the lines showing the constraint>"}
+  ],
+  "change": "<what the ComputeClass/workload change does>",
+  "verify": [
+    {"command": "kubectl get pods -n <namespace> -l <selector>", "expect": "<pods Running on the new machine family>"}
+  ]
+}
+EOF
+
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --repo "<owner>/<repo>" \
   --branch "platform-agent/remediate-stockout-<workload_name>" \
   --title "fix(capacity): remediate GKE capacity constraint for <workload_name>" \
-  --body-file "$BODY"
+  --body-file "$BODY" \
+  --evidence-file "$EVIDENCE"
 ````
+
+The evidence file follows **submit-suggestion** Step 3: commands you ran, each with the output lines that show the constraint, as JSON.
 
 The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc expands the same constructs the argument would have.
 

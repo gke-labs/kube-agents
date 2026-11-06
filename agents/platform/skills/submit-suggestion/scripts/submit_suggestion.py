@@ -52,6 +52,7 @@ sys.path.append("/opt/data/scripts")
 # The same directory in a source checkout, where nothing is staged into /opt.
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
+import credential_shapes
 import gitops_workspace
 import vcs_client
 from github_token_refresh import log
@@ -585,6 +586,16 @@ def handle_submit(args) -> int:
             "--title and one of --body / --body-file are required unless "
             "--keep-description is given."
         )
+    if args.keep_description and args.evidence_file:
+        raise ValueError(
+            "--evidence-file was given with --keep-description, which leaves "
+            "the open proposal's body as it is, so the evidence would never "
+            "reach it. Drop one of the two."
+        )
+    if not args.keep_description:
+        # Before anything is published: a refusal after the publish leaves the
+        # revisions on the forge and the proposal without a body.
+        body = body.rstrip("\n") + "\n\n" + render_evidence(load_evidence(args.evidence_file))
     branch = check_branch(args.branch)
 
     # Keyed on the branch: one repository can be cloned twice here, once per
@@ -894,18 +905,158 @@ def _submit_body(args) -> str:
     """
     if not args.body_file:
         return args.body or ""
+    return _read_scratch_file("--body-file", args.body_file)
+
+
+def _read_scratch_file(flag: str, path: str) -> str:
+    """The text of a model-named file, confined to SCRATCH_DIR (see `_submit_body`)."""
     # Resolved before the prefix test, so a symlink planted inside scratch
     # cannot reach out of it.
     scratch = os.path.realpath(SCRATCH_DIR)
-    real = os.path.realpath(args.body_file)
+    real = os.path.realpath(path)
     if not real.startswith(scratch + os.sep):
-        raise ValueError(f"--body-file {args.body_file} resolves outside {scratch}.")
+        raise ValueError(f"{flag} {path} resolves outside {scratch}.")
     if not os.path.isfile(real):
-        raise ValueError(f"--body-file {args.body_file} does not exist.")
-    body = Path(real).read_text(encoding="utf-8")
-    if not body.strip():
-        raise ValueError(f"--body-file {args.body_file} is empty.")
-    return body
+        raise ValueError(f"{flag} {path} does not exist.")
+    text = Path(real).read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError(f"{flag} {path} is empty.")
+    return text
+
+
+# The evidence a remediation pull request carries (#4966). A reviewer of a
+# one-line body has to redo the investigation to judge the fix, so the body is
+# not accepted without what was found, the read-only reads that showed it, what
+# the change does, and how to check it after merge. Taken as JSON and rendered
+# here, the way fleet-audit renders its own, so every proposal carries the same
+# section and a grader can find it by its heading.
+EVIDENCE_HEADING = "## Evidence"
+EVIDENCE_SHAPE = (
+    '{"finding": "<what is wrong, or what was requested>", '
+    '"checks": [{"command": "<read-only command you ran>", "output": "<excerpt of what it printed>"}], '
+    '"change": "<what merging this changes>", '
+    '"verify": [{"command": "<read-only command to run after merge>", "expect": "<what it should show>"}]}'
+)
+MAX_EVIDENCE_ITEMS = 5
+MAX_EVIDENCE_COMMAND_CHARS = 500
+MAX_EVIDENCE_OUTPUT_LINES = 40
+MAX_EVIDENCE_OUTPUT_CHARS = 3000
+MAX_EVIDENCE_TEXT_CHARS = 1500
+# `kind: Secret` as YAML or JSON prints it, alone on its line.
+SECRET_MANIFEST = re.compile(r'^[ \t]*"?kind"?[ \t]*:[ \t]*"?Secret"?[ \t]*,?[ \t]*$', re.MULTILINE)
+KEY_MATERIAL = re.compile(r"client-key-data|-----BEGIN [A-Z ]*PRIVATE KEY-----")
+
+
+def _evidence_refusal(problem: str) -> ValueError:
+    return ValueError(
+        f"{problem}. Every proposal body carries evidence: write a JSON file "
+        f"under {SCRATCH_DIR} shaped {EVIDENCE_SHAPE} and pass it as "
+        "--evidence-file. `checks` holds at least one read-only command you ran "
+        "with an excerpt of its output; `expect` is optional. For a requested "
+        "change with no defect, the finding is the request and the check is "
+        "the read that shows the current state."
+    )
+
+
+def load_evidence(path: str | None) -> dict:
+    """The evidence file, validated; a refusal names what is missing."""
+    if not path:
+        raise _evidence_refusal("no --evidence-file was given")
+    text = _read_scratch_file("--evidence-file", path)
+    try:
+        evidence = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise _evidence_refusal(f"--evidence-file {path} is not JSON ({exc})") from exc
+    if not isinstance(evidence, dict):
+        raise _evidence_refusal(f"--evidence-file {path} is not a JSON object")
+
+    def text_field(value, where: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise _evidence_refusal(f"evidence `{where}` is missing or empty")
+        # Output keeps its first line's indentation: an excerpt from the
+        # middle of a YAML dump is misaligned without it.
+        return value.strip("\n").rstrip() if where.endswith(".output") else value.strip()
+
+    def items(key: str, required: tuple, optional: tuple = ()) -> list:
+        listed = evidence.get(key)
+        if not isinstance(listed, list) or not listed:
+            raise _evidence_refusal(f"evidence `{key}` must be a non-empty list")
+        if len(listed) > MAX_EVIDENCE_ITEMS:
+            raise _evidence_refusal(
+                f"evidence `{key}` has {len(listed)} entries; keep the "
+                f"{MAX_EVIDENCE_ITEMS} that show it best"
+            )
+        out = []
+        for i, item in enumerate(listed):
+            if not isinstance(item, dict):
+                raise _evidence_refusal(f"evidence `{key}[{i}]` is not an object")
+            entry = {name: text_field(item.get(name), f"{key}[{i}].{name}") for name in required}
+            for name in optional:
+                if item.get(name) is not None:
+                    entry[name] = text_field(item.get(name), f"{key}[{i}].{name}")
+            out.append(entry)
+        return out
+
+    loaded = {
+        "finding": text_field(evidence.get("finding"), "finding"),
+        "checks": items("checks", ("command", "output")),
+        "change": text_field(evidence.get("change"), "change"),
+        "verify": items("verify", ("command",), ("expect",)),
+    }
+    for i, check in enumerate(loaded["checks"]):
+        # Redaction knows token shapes, not a Secret's base64 `data:` or a
+        # kubeconfig's key, and a read-only `kubectl get secret -o yaml` prints
+        # both. The body is published, so these are refused, not passed on.
+        if SECRET_MANIFEST.search(check["output"]) or KEY_MATERIAL.search(check["output"]):
+            raise ValueError(
+                f"evidence `checks[{i}].output` holds a Secret manifest or key "
+                "material, and the proposal body is published. Quote the "
+                "object's name, type and the key names only, never the "
+                "values, and pass --evidence-file again."
+            )
+    return loaded
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _clip_output(text: str) -> str:
+    lines = text.splitlines()
+    kept = lines[:MAX_EVIDENCE_OUTPUT_LINES]
+    clipped = _clip("\n".join(kept), MAX_EVIDENCE_OUTPUT_CHARS)
+    if len(lines) > len(kept):
+        clipped += f"\n… ({len(lines) - len(kept)} more lines)"
+    return clipped
+
+
+def _code_block(text: str, lang: str) -> list:
+    # A fence longer than any backtick run inside, so command output that
+    # carries a fence of its own cannot close this one early.
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return [f"{fence}{lang}", text, fence]
+
+
+def render_evidence(evidence: dict) -> str:
+    """The evidence section, redacted of credential shapes, as Markdown."""
+    def clean(text: str, limit: int) -> str:
+        return _clip(credential_shapes.redact(text), limit)
+
+    out = [EVIDENCE_HEADING, "", f"**Finding:** {clean(evidence['finding'], MAX_EVIDENCE_TEXT_CHARS)}", ""]
+    out.append("**Reproduce with** (read-only):")
+    for check in evidence["checks"]:
+        out.append("")
+        out += _code_block(clean(check["command"], MAX_EVIDENCE_COMMAND_CHARS), "bash")
+        out += _code_block(_clip_output(credential_shapes.redact(check["output"])), "text")
+    out += ["", f"**What this change does:** {clean(evidence['change'], MAX_EVIDENCE_TEXT_CHARS)}", ""]
+    out.append("**Verify after merge:**")
+    for step in evidence["verify"]:
+        out.append("")
+        out += _code_block(clean(step["command"], MAX_EVIDENCE_COMMAND_CHARS), "bash")
+        if step.get("expect"):
+            out.append(f"Expect: {clean(step['expect'], MAX_EVIDENCE_TEXT_CHARS)}")
+    return "\n".join(out) + "\n"
 
 
 COMMANDS = ("prepare", "submit")
@@ -998,6 +1149,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-description",
         action="store_true",
         help="Leave the open proposal's title and body as its author wrote them",
+    )
+    submit.add_argument(
+        "--evidence-file",
+        default=None,
+        help=f"JSON file under {SCRATCH_DIR} holding the evidence the body "
+             "carries; required with --body / --body-file",
     )
     submit.add_argument("--repo", default=None, help="Target repository as owner/name")
     submit.add_argument(

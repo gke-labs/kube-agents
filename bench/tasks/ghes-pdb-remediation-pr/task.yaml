@@ -200,7 +200,9 @@ verification_spec:
     check:
       # Under BENCH_GITHUB_HOST only a URL on that host is a candidate; the
       # rest is pdb-remediation-pr's check (resolved, written in this run,
-      # head commit in the window, at least one file).
+      # head commit in the window, at least one file), without its
+      # `body_contains`: this case grades the forge plumbing, and its unit
+      # fixtures carry no body.
       # No owner pin: any repository on BENCH_GITHUB_HOST (see the header).
       type: pull_request_opened
   - name: the-fix-names-the-workload-and-the-budget

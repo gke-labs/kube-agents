@@ -160,6 +160,12 @@ verification_spec:
       # gke-agentic/<project>-infra on every pool project, so the org half is a
       # fair exact match and breaks loudly if the org moves.
       owner: gke-agentic
+      # The description carries its evidence: #4966's live run opened one
+      # whose whole body was one sentence. submit_suggestion.py refuses a body
+      # without evidence and renders it under these headings. On this leaf,
+      # not a second one: each pull_request_opened leaf raises the lane's
+      # requested_pull_requests allowance by one (bench/kube_agents_bench/lane.py).
+      body_contains: ["## Evidence", "**Verify after merge:**"]
   - name: the-fix-names-the-workload-and-the-budget
     role: objective
     # assert, not the converge default: the transcript is immutable once the
