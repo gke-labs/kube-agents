@@ -64,9 +64,9 @@ const (
 var scopeUndeclaredNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 // scopeDeclared reports whether spec.scope names a project, folder, organisation
-// or selector. Exclusions are not a declaration: a block with only
-// exclude.projects, which every installer-made install carries, still adopts the
-// management project's other clusters.
+// or selector. Exclusions are not a declaration: a block whose membership lists
+// are all empty, the installer's own render without SCOPE_* values, still
+// adopts the management project's other clusters.
 func scopeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 	s := agent.Spec.Scope
 	if s == nil {
@@ -108,26 +108,39 @@ func usageClusterRefsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usage
 	return refs, true
 }
 
-// scopeNeighbours is every registered cluster that is not the host:
-// spec.harness's cluster by name, and by project and location where the series
-// carries them (the directly reached cluster is labelled by name alone until its
-// profile is absorbed). nil when the CR does not name its host, since then no
-// cluster can be told from it.
+// scopeNeighbours is every registered cluster in the management project that is
+// not the host: spec.harness's cluster by name, and by location where the series
+// carries one (the directly reached cluster is labelled by name alone, with no
+// project, until its profile is absorbed). The project filter is what makes the
+// attribution true: project-wide adoption produces management-project clusters
+// only, and a profile made by hand for a cluster in another project, which the
+// scope prune keeps, is not this condition's to report. nil when the CR does not
+// name its host, or names its project by number: the watcher labels the series
+// with the project ID, so the host could not be told from a neighbour.
 func scopeNeighbours(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef) []usageClusterRef {
-	h := agent.Spec.Harness
-	if h == nil || h.ClusterName == "" {
+	if !scopeHostKnown(agent) {
 		return nil
 	}
+	h := agent.Spec.Harness
 	var out []usageClusterRef
 	for _, ref := range refs {
-		host := ref.Name == h.ClusterName &&
-			(ref.Project == "" || ref.Project == h.ProjectID) &&
-			(ref.Location == "" || ref.Location == h.Location)
+		// The bare direct entry is skipped here too: it is the host, under no project.
+		if ref.Project != h.ProjectID {
+			continue
+		}
+		host := ref.Name == h.ClusterName && (ref.Location == "" || ref.Location == h.Location)
 		if !host {
 			out = append(out, ref)
 		}
 	}
 	return out
+}
+
+// scopeHostKnown reports whether spec.harness names the host cluster and its
+// project by ID, the two things a series must match to read as the host.
+func scopeHostKnown(agent *agentv1alpha1.PlatformAgent) bool {
+	h := agent.Spec.Harness
+	return h != nil && h.ClusterName != "" && h.ProjectID != "" && !isProjectNumber(h.ProjectID)
 }
 
 func scopeUndeclaredLabel(value string) string {
@@ -154,15 +167,11 @@ func scopeUndeclaredMessage(agent *agentv1alpha1.PlatformAgent, neighbours []usa
 		h.ProjectID, len(neighbours), h.ClusterName, listed, scopeUndeclaredHint)
 }
 
-// scopeUndeclaredConditionFor is the condition a reading calls for. nil means
-// remove it: a declared scope, a host-only reading, an install whose host the
-// CR does not name, or no reading at all.
-func scopeUndeclaredConditionFor(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef) *metav1.Condition {
-	if scopeDeclared(agent) {
-		return nil
-	}
-	neighbours := scopeNeighbours(agent, refs)
-	if len(neighbours) == 0 {
+// scopeUndeclaredConditionFor is the condition the neighbours call for. nil means
+// remove it: a declared scope, or no neighbour (a host-only reading, an install
+// whose host the CR cannot tell apart, or no reading at all).
+func scopeUndeclaredConditionFor(agent *agentv1alpha1.PlatformAgent, neighbours []usageClusterRef) *metav1.Condition {
+	if scopeDeclared(agent) || len(neighbours) == 0 {
 		return nil
 	}
 	return &metav1.Condition{
@@ -171,6 +180,21 @@ func scopeUndeclaredConditionFor(agent *agentv1alpha1.PlatformAgent, refs []usag
 		Reason:             scopeUndeclaredReason,
 		ObservedGeneration: agent.Generation,
 		Message:            scopeUndeclaredMessage(agent, neighbours),
+	}
+}
+
+// scopeUndeclaredRemovalCause says why a condition the CR carries no longer
+// applies, for the log line that records its removal.
+func scopeUndeclaredRemovalCause(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef) string {
+	switch {
+	case scopeDeclared(agent):
+		return "spec.scope declares a membership"
+	case refs == nil:
+		return "the operator has no current reading from the event watcher"
+	case !scopeHostKnown(agent):
+		return "spec.harness does not name the host cluster and its project by ID"
+	default:
+		return "the watcher registers no cluster beyond the host in the management project"
 	}
 }
 
@@ -187,17 +211,17 @@ func (p *UsageCounterPoller) projectScope(ctx context.Context, agent *agentv1alp
 	}
 	log := logf.FromContext(ctx).WithName(usagePollerLogName).WithValues("platformagent", client.ObjectKeyFromObject(agent).String())
 	base := agent.DeepCopy()
-	want := scopeUndeclaredConditionFor(agent, refs)
+	neighbours := scopeNeighbours(agent, refs)
+	want := scopeUndeclaredConditionFor(agent, neighbours)
 	existing := meta.FindStatusCondition(agent.Status.Conditions, scopeUndeclaredCondition)
 	switch {
 	case want == nil:
 		if !meta.RemoveStatusCondition(&agent.Status.Conditions, scopeUndeclaredCondition) {
 			return nil
 		}
-		log.Info("the watcher registers no cluster beyond the host without a declared scope; the ScopeUndeclared condition is removed")
+		log.Info("the ScopeUndeclared condition is removed", "cause", scopeUndeclaredRemovalCause(agent, refs))
 	case existing == nil || existing.Status != want.Status || existing.Reason != want.Reason || existing.Message != want.Message:
 		meta.SetStatusCondition(&agent.Status.Conditions, *want)
-		neighbours := scopeNeighbours(agent, refs)
 		named := make([]string, 0, len(neighbours))
 		for _, ref := range neighbours {
 			named = append(named, scopeUndeclaredLabel(ref.Project)+"/"+scopeUndeclaredLabel(ref.Location)+"/"+scopeUndeclaredLabel(ref.Name))

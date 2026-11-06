@@ -945,8 +945,8 @@ block already marked `retiring` is still pruned on a clean run); an empty `proje
 present block drops the projects an earlier block declared, over two clean runs.
 
 That default reaches every cluster in the management project, the ones nobody deployed the agent
-for included. A scope with no membership list is the block absent, or present with only
-`exclude` and `maxProjects`, which is what the installer renders without `SCOPE_*` values. While
+for included. A scope with no membership list is the block absent, or present with every
+membership list empty, which is what the installer renders without `SCOPE_*` values. While
 that holds and the event watcher registers a cluster other than `spec.harness`'s, the operator
 writes the `ScopeUndeclared` condition with the count and names of the adopted clusters
 ([Status](#status)). To keep them and clear it, name the management project in `projects`; to
