@@ -12,7 +12,9 @@ Inputs:
 
 - LOG paths: JSONL files (read whatever their suffix), or directories
   searched for `*.jsonl` and `*.jsonl.open` log segments and
-  `job-<ms>.json` run manifests;
+  `job-<ms>.json` run manifests. Each file's job kind is its nearest
+  enclosing `nightly`, `nightly-untrusted` or `presubmit` folder (or
+  `--kind`), never its lines' own tags; a line whose tag disagrees is dropped;
 - `--eval-data data.json` (repeatable): the dashboard's runs, joined to the
   lines on the Prow build id (`job.build` == `runs[].build_id`);
 - `--prices`: the dated price table (default: model-prices.json beside this
@@ -25,8 +27,8 @@ Every metric is defined once, in METRICS and CASE_METRICS below; the README's
 table of them is generated from those (`make docs-generate`).
 
 Usage:
-  python3 baseline_report.py LOG [LOG ...] [--eval-data data.json] [--price-as model-default=MODEL]
-      [--since DATE] [--until DATE] [--json]
+  python3 baseline_report.py LOG [LOG ...] [--kind KIND] [--eval-data data.json]
+      [--price-as model-default=MODEL] [--since DATE] [--until DATE] [--json]
   python3 baseline_report.py LOG [LOG ...] ... --compare BASELINE.json [--json]
   python3 baseline_report.py --report CURRENT.json --compare BASELINE.json [--json]
 """
@@ -42,7 +44,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple
 
 import analyze_shadow
 import replay_proxy
@@ -153,6 +155,8 @@ SKIP_UNTAGGED = analyze_shadow.SKIP_UNTAGGED
 SKIP_BAD_TS = "bad_ts"
 SKIP_DUPLICATE = "duplicate_request_id"
 SKIP_OUTSIDE_WINDOW = "outside_window"
+# The line's job.kind tag names a kind other than the folder it was filed under.
+SKIP_KIND_MISMATCH = "kind_mismatch"
 
 # Report keys read back by render() and compare().
 REPORT_SCHEMA = "report_schema"
@@ -390,6 +394,7 @@ class Quality:
     files: int = 0
     manifests: int = 0
     bad_manifests: int = 0
+    manifest_kind_mismatches: int = 0
     skipped: Dict[str, int] = field(default_factory=dict)
     # A field present with a value of the wrong type or sign, by field name.
     bad_values: Dict[str, int] = field(default_factory=dict)
@@ -536,10 +541,14 @@ def expand_paths(paths: Iterable[str]) -> Tuple[List[str], List[str]]:
     return logs, manifests
 
 
-def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
+def parse_line(entry: Dict[str, Any], quality: Quality, kind: str) -> Optional[Line]:
+    """`kind` is the folder's (or --kind); a line whose own tag disagrees is dropped and counted."""
     job = entry.get(F.JOB)
     if not isinstance(job, dict) or job.get(F.JOB_KIND) not in JOB_KINDS:
         quality.skip(SKIP_UNTAGGED)
+        return None
+    if job[F.JOB_KIND] != kind:
+        quality.skip(SKIP_KIND_MISMATCH)
         return None
     ts = _as_seconds(entry.get(F.TS), MAX_EPOCH_SECONDS)
     if ts is None:
@@ -563,7 +572,7 @@ def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
     if cost is not None and litellm_cost_usd is None:
         quality.bad(F.LITELLM_COST_USD)
     return Line(
-        kind=job[F.JOB_KIND],
+        kind=kind,
         build=str(job.get(F.JOB_BUILD) or ""),
         project=str(job.get(F.JOB_PROJECT) or ""),
         pr=str(job.get(F.JOB_PR) or ""),
@@ -587,14 +596,66 @@ def parse_line(entry: Dict[str, Any], quality: Quality) -> Optional[Line]:
     )
 
 
-def load_lines(paths: Iterable[str], quality: Quality) -> Tuple[List[Line], List[Manifest]]:
-    """The request lines in time order, and each readable manifest."""
+def folder_kind(path: str) -> Optional[str]:
+    """The job kind a file was filed under: its nearest enclosing directory named for one.
+
+    Mirrors analyze_shadow.folder_kind (kube-agents#4982) with this report's
+    JOB_KINDS; replace it with that import once both are on main.
+    """
+    for part in reversed(os.path.normpath(os.path.abspath(os.path.dirname(path))).split(os.sep)):
+        if part in JOB_KINDS:
+            return part
+    return None
+
+
+def kind_of(path: str, kind: Optional[str]) -> str:
+    """A file's job kind: `kind` when given, else its folder's; never its lines' own tags, which the proxy
+    built from the commit under test writes."""
+    found = kind or folder_kind(path)
+    if found is None:
+        raise ValueError(f"{path} is under no {', '.join(JOB_KINDS)} folder; copy the bucket's"
+                         " replay-shadow/<kind>/ folders as they are, or pass --kind")
+    return found
+
+
+def load_lines(
+    paths: Iterable[str], quality: Quality, kind: Optional[str] = None
+) -> Tuple[List[Line], List[Manifest]]:
+    """The request lines in time order, and each readable manifest, each of the kind kind_of() gives."""
     logs, manifest_paths = expand_paths(paths)
     quality.files = len(logs)
     quality.manifests = len(manifest_paths)
+    log_kinds = [(path, kind_of(path, kind)) for path in logs]
+    manifest_kinds = [(path, kind_of(path, kind)) for path in manifest_paths]
     lines: List[Line] = []
     seen: set = set()
-    for entry in analyze_shadow.iter_request_lines(logs, quality.skipped):
+    for path, file_kind in log_kinds:
+        for line in _file_lines(path, file_kind, quality, seen):
+            lines.append(line)
+    lines.sort(key=lambda l: l.ts)
+    manifests: List[Manifest] = []
+    for path, file_kind in manifest_kinds:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                doc = json.load(handle)
+        except (OSError, ValueError):
+            quality.bad_manifests += 1
+            continue
+        if not isinstance(doc, dict) or doc.get(F.JOB_KIND) not in JOB_KINDS:
+            quality.bad_manifests += 1
+            continue
+        if doc[F.JOB_KIND] != file_kind:
+            quality.manifest_kind_mismatches += 1
+            continue
+        name = MANIFEST_NAME.match(os.path.basename(path))
+        started = int(name.group(1)) / MS_PER_SECOND if name else None
+        manifests.append(Manifest(file_kind, str(doc.get(F.JOB_BUILD) or ""), started))
+    return lines, manifests
+
+
+def _file_lines(path: str, kind: str, quality: Quality, seen: Set[str]) -> Iterator[Line]:
+    """One log file's request lines, deduplicated by request_id across files."""
+    for entry in analyze_shadow.iter_request_lines([path], quality.skipped):
         request_id = entry.get(F.REQUEST_ID)
         if isinstance(request_id, str) and request_id:
             # The bucket holds each segment once (the collector uploads an open
@@ -605,25 +666,9 @@ def load_lines(paths: Iterable[str], quality: Quality) -> Tuple[List[Line], List
                 quality.skip(SKIP_DUPLICATE)
                 continue
             seen.add(request_id)
-        line = parse_line(entry, quality)
+        line = parse_line(entry, quality, kind)
         if line is not None:
-            lines.append(line)
-    lines.sort(key=lambda l: l.ts)
-    manifests: List[Manifest] = []
-    for path in manifest_paths:
-        try:
-            with open(path, encoding="utf-8") as handle:
-                doc = json.load(handle)
-        except (OSError, ValueError):
-            quality.bad_manifests += 1
-            continue
-        if not isinstance(doc, dict) or doc.get(F.JOB_KIND) not in JOB_KINDS:
-            quality.bad_manifests += 1
-            continue
-        name = MANIFEST_NAME.match(os.path.basename(path))
-        started = int(name.group(1)) / MS_PER_SECOND if name else None
-        manifests.append(Manifest(doc[F.JOB_KIND], str(doc.get(F.JOB_BUILD) or ""), started))
-    return lines, manifests
+            yield line
 
 
 def parse_time(value: str, end_of_day: bool = False) -> float:
@@ -947,6 +992,7 @@ def build_report(
             "log_files": quality.files,
             "manifests": quality.manifests,
             "bad_manifests": quality.bad_manifests,
+            "manifest_kind_mismatches": quality.manifest_kind_mismatches,
             "manifest_builds_without_lines": sorted(
                 f"{kind}/{build}" for kind, build in {(m.kind, m.build) for m in manifests} - logged
             ),
@@ -1135,6 +1181,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--prices", default=DEFAULT_PRICES_PATH, help="the price table (JSON)")
     parser.add_argument("--price-as", action="append", default=[], metavar="GROUP=MODEL",
                         help="price a logged model group or model as a model in the price table")
+    parser.add_argument("--kind", choices=JOB_KINDS,
+                        help="the job kind of every input, instead of the replay-shadow/<kind>/ folder each is under")
     parser.add_argument("--since", help="first build start to include: epoch seconds, YYYY-MM-DD or ISO datetime")
     parser.add_argument("--until", help="builds starting at or after this are left out (a date means its end)")
     parser.add_argument("--compare", metavar="BASELINE.json", help="print headline deltas against this report")
@@ -1154,7 +1202,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             quality = Quality()
             since = parse_time(args.since) if args.since else None
             until = parse_time(args.until, end_of_day=True) if args.until else None
-            lines, manifests = load_lines(args.logs, quality)
+            lines, manifests = load_lines(args.logs, quality, args.kind)
             lines, excluded = in_window(lines, since, until, quality)
             manifests = manifests_in_window(manifests, lines, excluded, since, until)
             runs = load_eval(args.eval_data, quality)

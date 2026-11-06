@@ -74,8 +74,16 @@ def tearDownModule():
     shutil.rmtree(TEMP_DIR, ignore_errors=True)
 
 
+def kind_dir(kind="nightly", root=None):
+    """A `<kind>/` folder, as the bucket files a job kind's logs."""
+    path = os.path.join(root or tempfile.mkdtemp(dir=TEMP_DIR), kind)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def write(lines, suffix=".jsonl", directory=None):
-    handle = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, dir=directory or TEMP_DIR)
+    """Lines into one file, under a `nightly/` folder unless `directory` says otherwise."""
+    handle = tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, dir=directory or kind_dir())
     with handle:
         for entry in lines:
             handle.write((entry if isinstance(entry, str) else json.dumps(entry)) + "\n")
@@ -94,9 +102,23 @@ def write_json(doc, name=None, directory=None):
     return path
 
 
+def write_by_kind(lines):
+    """Each line under the `<kind>/` folder its own tag names (`nightly/` when it names none), as the
+    collector files them; returns the root."""
+    root = tempfile.mkdtemp(dir=TEMP_DIR)
+    by_kind = {}
+    for entry in lines:
+        job = entry.get("job") if isinstance(entry, dict) else None
+        kind = job.get("kind") if isinstance(job, dict) else None
+        by_kind.setdefault(kind if kind in br.JOB_KINDS else "nightly", []).append(entry)
+    for kind, entries in by_kind.items():
+        write(entries, directory=kind_dir(kind, root))
+    return root
+
+
 def report(lines, runs=None, price_as=None, since=None, until=None):
     quality = br.Quality()
-    loaded, manifests = br.load_lines([write(lines)], quality)
+    loaded, manifests = br.load_lines([write_by_kind(lines)], quality)
     loaded, _ = br.in_window(loaded, since, until, quality)
     eval_runs = br.load_eval([write_json({"runs": runs})], quality) if runs is not None else {}
     return br.build_report(loaded, manifests, eval_runs, prices(price_as), quality, since, until)
@@ -574,7 +596,7 @@ class SecondReview(unittest.TestCase):
     EPOCH = 1_700_000_000
 
     def window_dir(self):
-        root = tempfile.mkdtemp(dir=TEMP_DIR)
+        root = kind_dir()
         write([line("a", self.EPOCH + 100, build="old"), line("b", self.EPOCH + 200, build="new")], directory=root)
         for build, seconds in (("old", 100), ("new", 200), ("quiet-old", 50), ("quiet-new", 210)):
             # quiet-*: builds that logged nothing, started outside and inside the window.
@@ -708,6 +730,58 @@ class NightlyUntrusted(unittest.TestCase):
         self.assertEqual(br.SCOPES, ("total",) + br.JOB_KINDS)
 
 
+class KindFromFolder(unittest.TestCase):
+    def test_a_lines_kind_is_its_folders_and_a_disagreeing_tag_is_dropped(self):
+        root = tempfile.mkdtemp(dir=TEMP_DIR)
+        # A presubmit's proxy tags its lines nightly; the bucket filed them under presubmit/.
+        write([line("a", 1, kind="nightly", build="p1"), line("b", 2, kind="presubmit", build="p1", pr="3")],
+              directory=kind_dir("presubmit", root))
+        write([line("c", 3, kind="nightly", build="n1")], directory=os.path.join(kind_dir("nightly", root)))
+        quality = br.Quality()
+        lines, _ = br.load_lines([root], quality)
+        self.assertEqual([(l.kind, l.build) for l in lines], [("presubmit", "p1"), ("nightly", "n1")])
+        self.assertEqual(quality.skipped.get("kind_mismatch"), 1)
+
+    def test_the_nearest_kind_folder_wins(self):
+        outer = kind_dir("presubmit")
+        inner = kind_dir("nightly-untrusted", os.path.join(outer, "2026-11-05"))
+        self.assertEqual(br.folder_kind(os.path.join(inner, "b1", "logs", "x.jsonl")), "nightly-untrusted")
+        self.assertEqual(br.folder_kind(os.path.join(outer, "x.jsonl")), "presubmit")
+        self.assertIsNone(br.folder_kind(os.path.join(TEMP_DIR, "x.jsonl")))
+        self.assertIsNone(br.folder_kind(os.path.join(TEMP_DIR, "nightlyish", "x.jsonl")))
+
+    def test_an_input_under_no_kind_folder_needs_kind(self):
+        loose = tempfile.mkdtemp(dir=TEMP_DIR)
+        path = write([line("a", 1_700_000_000, kind="presubmit", pr="3")], directory=loose)
+        code, _, err = run_main([path])
+        self.assertEqual(code, 2)
+        self.assertIn("is under no nightly, nightly-untrusted, presubmit folder", err)
+        code, out, err = run_main([path, "--kind", "presubmit", "--json"])
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(out)["scopes"]["presubmit"]["requests"], 1)
+        code, out, _ = run_main([path, "--kind", "nightly", "--json"])
+        self.assertEqual(json.loads(out)["data_quality"]["skipped_lines"], {"kind_mismatch": 1})
+
+    def test_kind_overrides_the_folder(self):
+        path = write([line("a", 1, kind="nightly")], directory=kind_dir("presubmit"))
+        quality = br.Quality()
+        lines, _ = br.load_lines([path], quality, kind="nightly")
+        self.assertEqual([l.kind for l in lines], ["nightly"])
+
+    def test_a_manifest_takes_its_folders_kind_too(self):
+        root = tempfile.mkdtemp(dir=TEMP_DIR)
+        write_json({"kind": "nightly", "build": "p9"}, name="job-1.json", directory=kind_dir("presubmit", root))
+        write_json({"kind": "presubmit", "build": "p8"}, name="job-2.json", directory=kind_dir("presubmit", root))
+        quality = br.Quality()
+        _, manifests = br.load_lines([root], quality)
+        self.assertEqual([(m.kind, m.build) for m in manifests], [("presubmit", "p8")])
+        self.assertEqual(quality.manifest_kind_mismatches, 1)
+        loose = tempfile.mkdtemp(dir=TEMP_DIR)
+        write_json({"kind": "nightly", "build": "n1"}, name="job-3.json", directory=loose)
+        with self.assertRaises(ValueError):
+            br.load_lines([loose], br.Quality())
+
+
 class MalformedInput(unittest.TestCase):
     def test_skips_and_bad_values_are_counted_not_fatal(self):
         r = report([
@@ -742,8 +816,10 @@ class MalformedInput(unittest.TestCase):
         write([line("b", 2)], suffix=".jsonl.open", directory=os.path.join(build, "logs"))
         write_json({"role": "user"}, name="0" * 64 + ".json", directory=os.path.join(build, "store", "blobs"))
         write_json({"kind": "nightly", "project": "p1", "build": "b1", "pr": ""}, name="job-1.json", directory=build)
+        presubmit_build = os.path.join(root, "presubmit", "2026-11-05", "b9")
+        os.makedirs(presubmit_build)
         write_json({"kind": "presubmit", "project": "p1", "build": "b9", "pr": "4"}, name="job-2.json",
-                   directory=build)
+                   directory=presubmit_build)
         write_json({"kind": "weekly"}, name="job-3.json", directory=build)
         with open(os.path.join(build, "job-4.json"), "w", encoding="utf-8") as handle:
             handle.write("{")
