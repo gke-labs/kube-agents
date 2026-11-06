@@ -1,0 +1,201 @@
+{
+  "about": "Peak resident memory (MiB) of each kubectl list command, keyed `get <kinds> <cluster|namespace|object> <json|table>`, per sizing tier. Written by scripts/dev/profile_kubectl_costs.py, which runs each command alone against the tier reference cluster; nothing is computed at run time. A command a tier does not list is charged that tier `other` figure. Procedure: .agents/skills/update-kubectl-cost-table/SKILL.md.",
+  "tiers": {
+    "default": {
+      "reference": "scale-host: about 80 Pods, 4 nodes, 16 namespaces (a small fleet); the higher of two native runs",
+      "measured": "2026-11-05",
+      "kubectl": "v1.35.10 linux/x86_64",
+      "commands": {
+        "get clusterrolebindings,clusterroles,rolebindings,roles cluster json": {
+          "peak_mib": 59,
+          "example": "kubectl get clusterroles,roles,clusterrolebindings,rolebindings -A -o json"
+        },
+        "get configmaps cluster json": {
+          "peak_mib": 56,
+          "example": "kubectl get cm -A -o json"
+        },
+        "get cronjobs cluster json": {
+          "peak_mib": 48,
+          "example": "kubectl get cronjobs -A -o json"
+        },
+        "get cronjobs,daemonsets,deployments,pods,statefulsets cluster json": {
+          "peak_mib": 95,
+          "example": "kubectl get deploy,sts,ds,cronjob,pod -A -o json"
+        },
+        "get daemonsets cluster json": {
+          "peak_mib": 64,
+          "example": "kubectl get ds -A -o json"
+        },
+        "get deployments cluster json": {
+          "peak_mib": 54,
+          "example": "kubectl get deploy -A -o json"
+        },
+        "get endpoints cluster json": {
+          "peak_mib": 49,
+          "example": "kubectl get ep -A -o json"
+        },
+        "get events cluster json": {
+          "peak_mib": 47,
+          "example": "kubectl get events -A -o json"
+        },
+        "get events cluster table": {
+          "peak_mib": 48,
+          "example": "kubectl get events -A"
+        },
+        "get jobs cluster json": {
+          "peak_mib": 47,
+          "example": "kubectl get jobs -A -o json"
+        },
+        "get namespaces cluster json": {
+          "peak_mib": 47,
+          "example": "kubectl get ns -o json"
+        },
+        "get namespaces,networkpolicies cluster json": {
+          "peak_mib": 49,
+          "example": "kubectl get netpol,ns -A -o json"
+        },
+        "get nodes cluster json": {
+          "peak_mib": 48,
+          "example": "kubectl get nodes -o json"
+        },
+        "get nodes cluster table": {
+          "peak_mib": 47,
+          "example": "kubectl get nodes"
+        },
+        "get persistentvolumeclaims cluster json": {
+          "peak_mib": 48,
+          "example": "kubectl get pvc -A -o json"
+        },
+        "get persistentvolumes cluster json": {
+          "peak_mib": 48,
+          "example": "kubectl get pv -o json"
+        },
+        "get pods cluster json": {
+          "peak_mib": 67,
+          "example": "kubectl get pods -A -o json"
+        },
+        "get pods cluster table": {
+          "peak_mib": 53,
+          "example": "kubectl get pods -A"
+        },
+        "get replicasets cluster json": {
+          "peak_mib": 74,
+          "example": "kubectl get rs -A -o json"
+        },
+        "get serviceaccounts cluster json": {
+          "peak_mib": 49,
+          "example": "kubectl get sa -A -o json"
+        },
+        "get services cluster json": {
+          "peak_mib": 48,
+          "example": "kubectl get svc -A -o json"
+        },
+        "get statefulsets cluster json": {
+          "peak_mib": 47,
+          "example": "kubectl get sts -A -o json"
+        }
+      },
+      "other": {
+        "peak_mib": 256
+      }
+    },
+    "fleet": {
+      "reference": "kwok-01: 104,944 KWOK Pods, 2,895 nodes, 311 namespaces; the higher of two native runs",
+      "measured": "2026-11-05",
+      "kubectl": "v1.35.10 linux/x86_64",
+      "commands": {
+        "get clusterrolebindings,clusterroles,rolebindings,roles cluster json": {
+          "peak_mib": 57,
+          "example": "kubectl get clusterroles,roles,clusterrolebindings,rolebindings -A -o json"
+        },
+        "get configmaps cluster json": {
+          "peak_mib": 60,
+          "example": "kubectl get cm -A -o json"
+        },
+        "get cronjobs cluster json": {
+          "peak_mib": 47,
+          "example": "kubectl get cronjobs -A -o json"
+        },
+        "get cronjobs,daemonsets,deployments,pods,statefulsets cluster json": {
+          "peak_mib": 15309,
+          "example": "kubectl get deploy,sts,ds,cronjob,pod -A -o json"
+        },
+        "get daemonsets cluster json": {
+          "peak_mib": 58,
+          "example": "kubectl get ds -A -o json"
+        },
+        "get deployments cluster json": {
+          "peak_mib": 222,
+          "example": "kubectl get deploy -A -o json"
+        },
+        "get endpoints cluster json": {
+          "peak_mib": 521,
+          "example": "kubectl get ep -A -o json"
+        },
+        "get events cluster json": {
+          "peak_mib": 47,
+          "example": "kubectl get events -A -o json"
+        },
+        "get events cluster table": {
+          "peak_mib": 47,
+          "example": "kubectl get events -A"
+        },
+        "get jobs cluster json": {
+          "peak_mib": 49,
+          "example": "kubectl get jobs -A -o json"
+        },
+        "get namespaces cluster json": {
+          "peak_mib": 53,
+          "example": "kubectl get ns -o json"
+        },
+        "get namespaces,networkpolicies cluster json": {
+          "peak_mib": 53,
+          "example": "kubectl get netpol,ns -A -o json"
+        },
+        "get nodes cluster json": {
+          "peak_mib": 255,
+          "example": "kubectl get nodes -o json"
+        },
+        "get nodes cluster table": {
+          "peak_mib": 146,
+          "example": "kubectl get nodes"
+        },
+        "get persistentvolumeclaims cluster json": {
+          "peak_mib": 47,
+          "example": "kubectl get pvc -A -o json"
+        },
+        "get persistentvolumes cluster json": {
+          "peak_mib": 47,
+          "example": "kubectl get pv -o json"
+        },
+        "get pods cluster json": {
+          "peak_mib": 14307,
+          "example": "kubectl get pods -A -o json"
+        },
+        "get pods cluster table": {
+          "peak_mib": 4417,
+          "example": "kubectl get pods -A"
+        },
+        "get replicasets cluster json": {
+          "peak_mib": 205,
+          "example": "kubectl get rs -A -o json"
+        },
+        "get serviceaccounts cluster json": {
+          "peak_mib": 51,
+          "example": "kubectl get sa -A -o json"
+        },
+        "get services cluster json": {
+          "peak_mib": 105,
+          "example": "kubectl get svc -A -o json"
+        },
+        "get statefulsets cluster json": {
+          "peak_mib": 48,
+          "example": "kubectl get sts -A -o json"
+        }
+      },
+      "other": {
+        "peak_mib": 256
+      }
+    }
+  }
+}

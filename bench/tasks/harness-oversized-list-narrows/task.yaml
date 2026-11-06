@@ -1,0 +1,76 @@
+# Domain: harness at fleet scale. Journey: a question whose obvious read does not
+# fit the sandbox shell's memory. The shell's kubectl admission refuses a list
+# whose profiled cost (deploy/sandbox/kubectl-costs.json, the install's tier)
+# exceeds what one read may take, with a `capacity:` reason that names narrower
+# reads; the memory guard stops what slips past. The agent must answer from a
+# narrower read (one namespace at a time, a selector, the count the API server
+# reports) instead of retrying the same list or giving up.
+#
+# Red on an install without the admission: the agent's first `kubectl get pods
+# -A` for each large cluster holds about 4.3 GiB, and the 2 GiB shell is
+# OOMKilled with every session in it.
+#
+# Fixture: two clusters of more than 100,000 Pods each (about 3,000 KWOK nodes
+# and 300 namespaces on a small GKE cluster). No pool project carries one, so the case is parked as FIXTURE_NOT_READY
+# with the issue that plants it. The counts below are that fleet's; a planted
+# fleet of another size changes them in the same pull request.
+# Install: KUBEAGENTS_KUBECTL_COST_TIER=fleet in spec.deployment.env.
+# The prompt counts every phase: "Pods run" read as phase Running sent one run
+# to a field selector, for which the API server gives no remainingItemCount, and
+# to a partial per-namespace sum.
+# Isolation class: read-only.
+id: harness-oversized-list-narrows
+name: A fleet-wide list too large for the shell is narrowed, not retried
+prompt: >-
+  How many Pods are there, across all namespaces and in every phase, on each
+  cluster in my fleet that has more than 100,000 Pods? Give the exact number for
+  each cluster and name it.
+expected_output: >-
+  The answer names the two large clusters and gives each one's Pod count, read
+  from the live clusters, and the shell sandbox is not OOMKilled along the way. Where a read was refused for capacity, the agent
+  switched to a narrower read (per namespace, a selector, or the API server's
+  count) rather than repeating the refused list, and did not report a crashed or
+  unreachable shell as the answer.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: harness-scale
+
+# The large clusters, named by role. The role does not exist on the pool yet;
+# FIXTURE_NOT_READY exempts the parked case from the catalogue check.
+fixtures:
+  - oversized-pod-cluster
+
+verification_spec:
+  # The shell sandbox was not OOMKilled (or restarted at all) during the run.
+  # Read at the end of the run from the install's own cluster: a shell
+  # container that terminated has a lastState.terminated. It holds on a fresh
+  # install and after any rollout of the shell, as the presubmit's and a dev
+  # loop's runs are. On an install without the admission, the first
+  # fleet-wide `kubectl get pods -A` OOMKilled the 2 GiB shell five times in
+  # one run.
+  - name: the-shell-was-not-oomkilled
+    role: objective
+    mode: assert
+    check:
+      type: resource_property
+      kind: pod
+      resource_name: platform-agent-shell-0
+      namespace: kubeagents-system
+      path: 'status.containerStatuses[?(@.name=="shell")].lastState.terminated'
+      op: absent
+  # Two different counts above 100,000 (the prompt's threshold itself does not
+  # count; a sentence may end on a number), one per large cluster: an answer from a read
+  # the shell could hold. Exact figures are left to the judge, since whether the
+  # agent counts system namespaces is a reading of the question, not of the
+  # change.
+  - name: the-answer-gives-two-counts-above-100000
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        [
+          '(?s)(?<![\d,.])(?!100,?000(?!,?\d))(1\d\d,?\d{3})(?!,\d|\.\d|\d).*?(?<![\d,.])(?!\1(?!,\d|\.\d|\d))(?!100,?000(?!,?\d))1\d\d,?\d{3}(?!,\d|\.\d|\d)',
+        ]

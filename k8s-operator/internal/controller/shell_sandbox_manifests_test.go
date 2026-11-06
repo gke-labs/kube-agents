@@ -2207,3 +2207,43 @@ func TestHostClusterContextNameAgreesOnKindAndGKE(t *testing.T) {
 		t.Errorf("kube-proxy still renders KUBE_PROXY_DEFAULT_CLUSTER=%q; it routes nothing now", v)
 	}
 }
+
+// The kubectl cost tier reaches the shell container only as a plain lowercase
+// literal from spec.deployment.env: the entrypoint writes it to a file the
+// admission opens by tier name.
+func TestShellSandboxKubectlCostTierEnv(t *testing.T) {
+	read := func(agent *agentv1alpha1.PlatformAgent) (string, bool) {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+		for _, env := range sts.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == envKubectlCostTier {
+				return env.Value, true
+			}
+		}
+		return "", false
+	}
+	if _, ok := read(shellSandboxTestAgent()); ok {
+		t.Errorf("%s is set with no spec.deployment.env entry; unset means the default tier", envKubectlCostTier)
+	}
+	for value, want := range map[string]string{"fleet": "fleet", " Fleet ": "fleet", "large-2": "large-2"} {
+		agent := shellSandboxTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envKubectlCostTier, Value: value}}}
+		if got, ok := read(agent); !ok || got != want {
+			t.Errorf("%s = %q, %v for the CR value %q; want %q", envKubectlCostTier, got, ok, value, want)
+		}
+	}
+	for _, value := range []string{"", "../etc", "fleet tier", "\"fleet\"", "9fleet"} {
+		agent := shellSandboxTestAgent()
+		agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{Name: envKubectlCostTier, Value: value}}}
+		if got, ok := read(agent); ok {
+			t.Errorf("%s = %q reached the sandbox for the CR value %q; only a plain tier name may", envKubectlCostTier, got, value)
+		}
+	}
+	fromSecret := shellSandboxTestAgent()
+	fromSecret.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{{
+		Name:      envKubectlCostTier,
+		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}},
+	}}}
+	if _, ok := read(fromSecret); ok {
+		t.Errorf("%s with a valueFrom reached the sandbox container: only a literal value may", envKubectlCostTier)
+	}
+}

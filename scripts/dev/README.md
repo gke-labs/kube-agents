@@ -9,6 +9,8 @@ live in the sibling [`../installer/`](../installer/README.md).
 | Script                                     | What it does                                                                            |
 | ------------------------------------------ | --------------------------------------------------------------------------------------- |
 | `dev_rebuild_agent.sh`                     | Rebuilds one agent image and redeploys it; what `make dev-rebuild-agent` runs           |
+| `profile_kubectl_costs.py`                 | Profiles each fleet-wide `kubectl get` and writes `deploy/sandbox/kubectl-costs.json`   |
+| `profile_kubectl_costs_job.sh`             | Runs that profiler as a Job on a tier's reference cluster                               |
 | `setup-gcp-github-wif.sh`                  | Workload Identity Federation for CI, documented below                                   |
 | `teardown_dev_01_gcp_artifact_registry.sh` | Deletes the throwaway dev Artifact Registry this tooling created                        |
 | `update_cluster_name.sh`                   | Patches the target GKE cluster name into the deployed `PlatformAgent` spec; run by hand |
