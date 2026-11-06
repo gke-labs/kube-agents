@@ -509,6 +509,43 @@ def timed(t, agent_s, turn1_s=None):
     return t
 
 
+def shaped(t, opens_on_verdict=True, answer_words=60):
+    """``t`` with every rep carrying a reply shape."""
+    for rep in t["reps"]:
+        rep["shape"] = {"opens_on_verdict": opens_on_verdict, "apology": False, "bot_messages": 2,
+                        "words_before_answer": 0, "answer_words": answer_words}
+    return t
+
+
+class ToneBlockTest(Harness):
+    """The reply-shape line (nightly_tone.py) as the section carries it."""
+
+    def shaped_nights(self, last_verdict=True, timed_too=False):
+        def tasks(verdict):
+            ts = [shaped(green("case-green")), shaped(green("case-red"), opens_on_verdict=verdict)]
+            return [timed(t, 100.0, 10.0) for t in ts] if timed_too else ts
+
+        nights = [night(day, tasks(True)) for day in range(13, 20)]
+        nights.append(night(20, tasks(last_verdict)))
+        return data(*nights)
+
+    def test_a_quiet_day_carries_the_line_without_a_latency_block(self):
+        section = self.build(self.shaped_nights())
+        self.assertTrue(section.quiet)
+        self.assertEqual(len(section.lines), 2)
+        self.assertTrue(section.lines[1].startswith("🗣 *Reply shape*: 100% of "), section.lines[1])
+
+    def test_it_follows_the_latency_block_and_marks_a_regression(self):
+        lines = self.build(self.shaped_nights(last_verdict=False, timed_too=True)).lines
+        latency = next(i for i, line in enumerate(lines) if line.startswith("⏱ *Latency*"))
+        self.assertTrue(lines[latency + 1].startswith("🗣 *Reply shape*: 50% of "), lines[latency + 1])
+        self.assertIn("open on the answer ⚠ (typical 100%)", lines[latency + 1])
+
+    def test_no_line_when_no_reply_was_measured(self):
+        nights = [night(day, [green("case-green")]) for day in range(13, 21)]
+        self.assertFalse([line for line in self.build(data(*nights)).lines if line.startswith("🗣")])
+
+
 class LatencyBlockTest(Harness):
     """The latency block (nightly_latency.py) as the section and the
     one-line fallback carry it."""

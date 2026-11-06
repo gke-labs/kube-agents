@@ -5,12 +5,16 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -178,6 +182,9 @@ class ProxyTestCase(unittest.TestCase):
     redactor_path = REDACTOR
     upstream_timeout = replay_proxy.DEFAULT_UPSTREAM_TIMEOUT_SECONDS
     store_is_file = False
+    # Set to a subdirectory name to write segment files there (REPLAY_LOG_DIR).
+    log_subdir = None
+    data_max_bytes = replay_proxy.DEFAULT_DATA_MAX_BYTES
 
     def setUp(self):
         FakeLiteLLM.calls = []
@@ -195,12 +202,14 @@ class ProxyTestCase(unittest.TestCase):
             with open(self.store, "w"):
                 pass
         self.out = io.StringIO()
+        self.log_dir = os.path.join(temp, self.log_subdir) if self.log_subdir else replay_proxy.UNSET
         config = replay_proxy.Config(
             listen_port=0, upstream_host="127.0.0.1", upstream_port=self.upstream.server_address[1],
             store_dir=self.store, redactor_path=self.redactor_path, transcript_rules_path=RULES,
             upstream_timeout_seconds=self.upstream_timeout,
-            litellm_config_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
+            model_behaviour_checksum="abc123", litellm_image="ghcr.io/berriai/litellm:v1",
             job_kind="presubmit", job_project="pool-1", job_build="42", job_pr="4700",
+            log_dir=self.log_dir, data_max_bytes=self.data_max_bytes,
         )
         self.server = replay_proxy.make_server(config, host="127.0.0.1", out=self.out)
         self.proxy = self.server.proxy
@@ -526,6 +535,76 @@ class StoreWriteFailureTest(ProxyTestCase):
         self.assertTrue(line["message_hashes"])
 
 
+class SegmentLogTest(ProxyTestCase):
+    log_subdir = "logs"
+
+    def segment_lines(self):
+        out = []
+        for name in sorted(os.listdir(self.log_dir)):
+            with open(os.path.join(self.log_dir, name), encoding="utf-8") as handle:
+                out += [json.loads(l) for l in handle if l.strip()]
+        return out
+
+    def test_every_stdout_line_is_also_in_the_segments(self):
+        self.proxy.log(self.proxy.startup_line())
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.lines(2)
+        self.proxy.drain()
+        stdout = [json.loads(l) for l in self.out.getvalue().splitlines() if l]
+        self.assertEqual(self.segment_lines(), stdout)
+        self.assertTrue(stdout[0]["log_file"])
+        self.assertIsNone(stdout[0]["log_file_error"])
+        self.assertEqual(stdout[0]["log_segments_recovered"], 0)
+
+    def test_close_leaves_only_closed_segments(self):
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.lines(1)
+        self.proxy.close()
+        names = os.listdir(self.log_dir)
+        self.assertTrue(names)
+        self.assertTrue(all(n.endswith(".jsonl") for n in names), names)
+
+
+class SegmentLogUnavailableTest(ProxyTestCase):
+    # A directory cannot be made under a file.
+    log_subdir = "a-file/logs"
+
+    def setUp(self):
+        temp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, temp, ignore_errors=True)
+        with open(os.path.join(temp, "a-file"), "w"):
+            pass
+        with unittest.mock.patch.object(tempfile, "mkdtemp", return_value=temp):
+            super().setUp()
+
+    def test_stdout_carries_on_and_the_start_line_says_why(self):
+        start = json.loads(json.dumps(self.proxy.startup_line()))
+        self.assertFalse(start["log_file"])
+        self.assertTrue(start["log_file_error"])
+        status, _, _ = self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.assertEqual(status, 200)
+        self.assertTrue(self.lines(1)[0]["fingerprint"])
+
+
+class DataBudgetSpentTest(ProxyTestCase):
+    log_subdir = "logs"
+    data_max_bytes = 1
+
+    def test_store_and_segments_stop_and_stdout_keeps_every_line(self):
+        self.assertEqual(self.proxy.startup_line()["data_max_bytes"], 1)
+        self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
+        self.request("POST", "/v1/chat/completions", chat("t_22222222", stream=False))
+        first, second = self.lines(2)[:2]
+        # The volume was empty, so the first request is stored; that spends
+        # the budget, and from then on nothing more is written to the volume.
+        self.assertTrue(first["stored"])
+        self.assertFalse(second["stored"])
+        self.assertEqual(second["store_skipped"], "budget_spent")
+        self.proxy.drain()
+        self.assertEqual(os.listdir(self.log_dir), [])
+        self.assertIn("replay_shadow_log_file_dropped_total 2", self.proxy.metrics.render())
+
+
 class DiagnosisHashTest(ProxyTestCase):
     def test_line_carries_diagnosis_hashes_beside_unchanged_message_hashes(self):
         import normalizer
@@ -657,7 +736,7 @@ class LogLineTest(ProxyTestCase):
         self.assertEqual(line["roles"], ["system", "user"])
         self.assertEqual(line["litellm_model_group"], "model-default")
         self.assertEqual(line["litellm_attempted_fallbacks"], "0")
-        self.assertEqual(line["litellm_config_checksum"], "abc123")
+        self.assertEqual(line["model_behaviour_checksum"], "abc123")
         self.assertEqual(line["litellm_image"], "ghcr.io/berriai/litellm:v1")
         self.assertIsInstance(line["latency_ms"], int)
         self.assertTrue(line["answer_hash"])
@@ -704,6 +783,23 @@ class LogLineTest(ProxyTestCase):
         self.assertEqual([len(a["message_hashes"]), len(b["message_hashes"])], [2, 3])
         self.assertEqual(a["message_hashes"][:1], b["message_hashes"][:1])
 
+    def test_an_answer_naming_the_prompt_date_is_unstorable_as_a_date(self):
+        # The system prompt's date is counted in days, so the key matches the
+        # next day; an answer carrying the date must not be saved.
+        body = {"model": "model-default", "messages": [
+            {"role": "system", "content": "Conversation started: Wednesday, November 04, 2026 (UTC, UTC+00:00)"},
+            {"role": "user", "content": "write today's notes"}]}
+        mapping = replay_proxy.normalizer.normalize_request(body, time.time()).mapping
+        scrubber = replay_proxy.request_store.Scrubber(REDACTOR, RULES)
+        headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
+        dated = {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": '{"path": "memory/2026-11-04.md"}'}}]}
+        reasons = replay_proxy.unstorable_reasons(body, 200, dated, headers, mapping, scrubber)
+        self.assertIn("repeats_swapped_date", reasons)
+        self.assertNotIn("repeats_swapped_number", reasons)
+        plain = {"role": "assistant", "content": "notes written"}
+        self.assertNotIn("repeats_swapped_date", replay_proxy.unstorable_reasons(body, 200, plain, headers, mapping, scrubber))
+
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
@@ -742,14 +838,103 @@ class FailClosedProxyTest(ProxyTestCase):
 class ConfigTest(unittest.TestCase):
     def test_from_env(self):
         config = replay_proxy.Config.from_env({
-            "REPLAY_UPSTREAM_HOST": "up", "REPLAY_UPSTREAM_PORT": "4000", "REPLAY_LITELLM_CONFIG_CHECKSUM": "c",
+            "REPLAY_UPSTREAM_HOST": "up", "REPLAY_UPSTREAM_PORT": "4000", "REPLAY_MODEL_BEHAVIOUR_CHECKSUM": "c",
             "REPLAY_LITELLM_IMAGE": "img", "REPLAY_STORE_DIR": "/s", "REPLAY_JOB_KIND": "nightly",
         })
         self.assertEqual((config.upstream_host, config.upstream_port), ("up", 4000))
-        self.assertEqual((config.litellm_config_checksum, config.litellm_image, config.store_dir), ("c", "img", "/s"))
+        self.assertEqual((config.model_behaviour_checksum, config.litellm_image, config.store_dir), ("c", "img", "/s"))
         self.assertEqual(config.job_kind, "nightly")
         self.assertGreaterEqual(replay_proxy.Config.from_env({}).upstream_timeout_seconds, 600)
 
+
+
+class ShutdownTest(unittest.TestCase):
+    """replay_proxy.py as the pod runs it: TERM closes the open segment before exit."""
+
+    PROCESS_WAIT_SECONDS = 30
+
+    def setUp(self):
+        FakeLiteLLM.calls = []
+        FakeLiteLLM.mode = "normal"
+        FakeLiteLLM.custom_body = None
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeLiteLLM)
+        threading.Thread(target=self.upstream.serve_forever, args=(POLL_SECONDS,), daemon=True).start()
+        self.addCleanup(self.upstream.server_close)
+        self.addCleanup(self.upstream.shutdown)
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.logs = os.path.join(self.tmp, "logs")
+        with socket.socket() as probe:  # a free port for the proxy
+            probe.bind(("127.0.0.1", 0))
+            self.port = probe.getsockname()[1]
+        env = dict(os.environ, REPLAY_LISTEN_PORT=str(self.port), REPLAY_UPSTREAM_HOST="127.0.0.1",
+                   REPLAY_UPSTREAM_PORT=str(self.upstream.server_address[1]),
+                   REPLAY_STORE_DIR=os.path.join(self.tmp, "store"), REPLAY_LOG_DIR=self.logs,
+                   REPLAY_REDACTOR_PATH=REDACTOR, REPLAY_TRANSCRIPT_RULES_PATH=RULES,
+                   REPLAY_JOB_KIND="nightly")
+        self.proc = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(__file__), "replay_proxy.py")],
+                                     env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self._reap)
+
+    def _reap(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.communicate()
+
+    def _read_line(self, event):
+        deadline = time.monotonic() + self.PROCESS_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            line = self.proc.stdout.readline()
+            if not line:
+                self.fail(f"the proxy exited: {self.proc.stderr.read()}")
+            if json.loads(line).get("event") == event:
+                return json.loads(line)
+        self.fail(f"no {event} line")
+
+    def test_term_closes_the_open_segment_with_the_request_line_in_it(self):
+        self._read_line("replay_shadow_start")
+        deadline = time.monotonic() + self.PROCESS_WAIT_SECONDS
+        while True:
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=LOG_WAIT_SECONDS)
+                conn.request("POST", "/v1/chat/completions", body=json.dumps(chat("t_11111111", stream=False)),
+                             headers={"Content-Type": "application/json"})
+                self.assertEqual(conn.getresponse().status, 200)
+                conn.close()
+                break
+            except ConnectionRefusedError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(POLL_SECONDS)
+        request = self._read_line("replay_shadow_request")
+        # Still open: the segment age is 60 s.
+        self.assertTrue(any(n.endswith(".jsonl.open") for n in os.listdir(self.logs)), os.listdir(self.logs))
+        started = time.monotonic()
+        self.proc.send_signal(signal.SIGTERM)
+        self.proc.wait(timeout=self.PROCESS_WAIT_SECONDS)
+        self.assertLess(time.monotonic() - started, replay_proxy.SHUTDOWN_CLOSE_SECONDS + 5)
+        self.assertEqual(self.proc.returncode, 0)
+        names = os.listdir(self.logs)
+        self.assertTrue(names)
+        self.assertFalse([n for n in names if n.endswith(".open")], names)
+        with open(os.path.join(self.logs, sorted(names)[-1]), encoding="utf-8") as handle:
+            ids = [json.loads(l).get("request_id") for l in handle if l.strip()]
+        self.assertIn(request["request_id"], ids)
+
+    def test_close_with_a_deadline_returns_while_the_worker_is_busy(self):
+        self._reap()
+        proxy = replay_proxy.ShadowProxy(replay_proxy.Config(store_dir=os.path.join(self.tmp, "s2"),
+                                                             log_dir=os.path.join(self.tmp, "l2")),
+                                         out=io.StringIO())
+        release = threading.Event()
+        with unittest.mock.patch.object(proxy, "analyze", side_effect=lambda *a, **k: release.wait(30) or {}):
+            proxy.submit({"messages": []}, time.time(), {"status": 200}, 0)
+            started = time.monotonic()
+            proxy.close(timeout=0.5)
+            self.assertLess(time.monotonic() - started, 3)
+            proxy.log({"event": "late"})  # after close: stdout only, no new segment
+            release.set()
+        self.assertFalse([n for n in os.listdir(os.path.join(self.tmp, "l2")) if n.endswith(".open")])
 
 if __name__ == "__main__":
     unittest.main()

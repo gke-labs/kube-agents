@@ -22,9 +22,10 @@ import (
 // busy is the dispatcher's business (its holdings and the lease bucket),
 // not the pool's.
 type PodPool struct {
-	store cache.Store
-	run   func(stop <-chan struct{})
-	ready func() bool
+	namespace string
+	store     cache.Store
+	run       func(stop <-chan struct{})
+	ready     func() bool
 }
 
 // NewPodPool builds the watch on namespace. Run starts it.
@@ -51,7 +52,7 @@ func NewPodPool(ctx context.Context, client kubernetes.Interface, namespace stri
 			},
 		},
 	})
-	return &PodPool{store: store, run: informer.Run, ready: informer.HasSynced}
+	return &PodPool{namespace: namespace, store: store, run: informer.Run, ready: informer.HasSynced}
 }
 
 // Run watches until ctx ends.
@@ -74,6 +75,22 @@ func (p *PodPool) Pods(profile, tier string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// PodUID implements Pool: the UID of the watched pod of that name, if it is
+// one of the (profile, tier)'s pods and isn't being deleted. A pod deleted
+// and re-created under the same name has a new UID, which is the point: a
+// task credential names the UID the pod had when it was offered the task.
+func (p *PodPool) PodUID(profile, tier, pod string) string {
+	obj, ok, err := p.store.GetByKey(p.namespace + "/" + pod)
+	if err != nil || !ok {
+		return ""
+	}
+	po, ok := obj.(*corev1.Pod)
+	if !ok || po.Labels[lib.ProfileNameLabel] != profile || po.Labels[lib.ProfileTierLabel] != tier || po.DeletionTimestamp != nil {
+		return ""
+	}
+	return string(po.UID)
 }
 
 func podReady(p *corev1.Pod) bool {

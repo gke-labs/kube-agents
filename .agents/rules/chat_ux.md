@@ -153,10 +153,11 @@ Stop button; a typed `stop`, and Stop on other backends, are not gated.
 
 Every word in a structured message comes from the message. A renderer lays out, escapes and
 validates; it never invents a field, reads the text to fill one, or rewords. What it adds is its
-backend's own, such as step markers, a side bar's colour, which emoji a mark shows, the "✓ name:
-choice" receipt of an answered question and the labels on the board row buttons; the spec's "The
-emitter composes, the renderer lays out" paragraph is the full list. An invalid message posts its text fallback whole rather than a clipped or
-repaired layout.
+backend's own: the spec's "The emitter composes, the renderer lays out" paragraph (the "✓ name:
+choice" receipt of an answered question, a "waiting on you" context line, which emoji a mark shows)
+and each renderer's header comment (step markers, a plan item's glyph, a row's bullet, the side
+bar's colour, the board row buttons' labels) are the sources. An invalid message posts its text
+fallback whole rather than a clipped or repaired layout.
 
 Why: the emitter is the one place a word is decided, so a renderer that composes makes Slack and
 Google Chat disagree and hides emitter bugs.

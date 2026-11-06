@@ -61,6 +61,12 @@ CONCEPTS = {"proposal": "proposal", "issue": "issue", "label": "label"}
 SHAPES: dict[str, frozenset[str]] = {
     # `sourceRepo` and `sourceRevision` sit beside `source` because a branch
     # name alone answers neither "whose branch is this" nor "what is on it now".
+    # `mergeCommit` is null unless merged; then it is the merge or squash
+    # commit, or after a rebase or fast-forward merge the target's tip, which
+    # may not hold the whole change -- a revert must check. GitLab answers null
+    # for a fast-forward merge. Bitbucket Cloud answers a 12-character
+    # abbreviation, so compare it with git's full id as a prefix; Bitbucket Data
+    # Center may answer null for a merged pull request.
     "proposal": frozenset(
         {
             "number",
@@ -77,6 +83,7 @@ SHAPES: dict[str, frozenset[str]] = {
             "created",
             "updated",
             "closed",
+            "mergeCommit",
             "body",
         }
     ),
@@ -135,6 +142,11 @@ FORGES_WITHOUT_A_COUNT = frozenset({"bitbucket-datacenter"})
 # Forges whose author filter cannot find the install's account, so the forge
 # reads the repository's proposals and keeps the author's itself.
 FORGES_THAT_FILTER_THE_AUTHOR_HERE = frozenset({"bitbucket-datacenter"})
+# How a merged proposal's `mergeCommit` reads, per forge, where it is not the
+# full 40-character sha: Bitbucket Cloud abbreviates it to 12. Data Center may
+# leave it out -- the recorded listings do -- so None is allowed there too.
+MERGE_COMMIT_PATTERN = {"bitbucket": r"^[0-9a-f]{12}$"}
+FORGES_THAT_MAY_OMIT_THE_MERGE_COMMIT = frozenset({"bitbucket-datacenter"})
 RECORDED_TALLY = {"open": 2, "merged": 5, "closed": 1}
 RECORDED_CLOSER = {"actor": "example-maintainer", "bot": False}
 # The address the broker stamps the install's proxied commits with. No forge
@@ -365,6 +377,40 @@ class ContractTest(unittest.TestCase):
                     items = answer.get("proposals") or [answer["proposal"]]
                     for item in items:
                         self.assertIn(item["state"], PROPOSAL_STATES)
+
+    def test_only_a_merged_proposal_names_its_merge_commit(self):
+        # GitHub answers `merge_commit_sha` on an open pull request too, with a
+        # test merge nobody can revert; a caller that read it would act on a
+        # commit that is on no branch. The listings carry a merged proposal
+        # on every forge, so each one is checked in both directions.
+        for name, forge, directory in self.instances():
+            if "proposal-list" not in forge.verbs:
+                continue
+            fixture = self.load(directory, "proposal-list")
+            with self.subTest(forge=name):
+                answer, _ = self.invoke(forge, "proposal-list", fixture)
+                states = {item["state"] for item in answer["proposals"]}
+                self.assertIn("merged", states)
+                for item in answer["proposals"]:
+                    if item["state"] != "merged":
+                        self.assertIsNone(item["mergeCommit"])
+                    elif item["mergeCommit"] is None and name in FORGES_THAT_MAY_OMIT_THE_MERGE_COMMIT:
+                        continue
+                    else:
+                        pattern = MERGE_COMMIT_PATTERN.get(name, r"^[0-9a-f]{40}$")
+                        self.assertRegex(item["mergeCommit"], pattern)
+
+    def test_an_unmerged_proposal_view_names_no_merge_commit(self):
+        # The recorded open pull request carries GitHub's test-merge sha; the
+        # Bitbucket recordings view a declined one.
+        for name, forge, directory in self.instances():
+            if "proposal-view" not in forge.verbs:
+                continue
+            fixture = self.load(directory, "proposal-view")
+            with self.subTest(forge=name):
+                answer, _ = self.invoke(forge, "proposal-view", fixture)
+                self.assertNotEqual(answer["proposal"]["state"], "merged")
+                self.assertIsNone(answer["proposal"]["mergeCommit"])
 
     def test_a_listing_declares_itself_truncated_against_the_limit(self):
         for name, forge, directory in self.instances():

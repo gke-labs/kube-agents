@@ -66,10 +66,10 @@ const (
 	credentialProxyTaskSigningKeysEnvVar = a2aCalloutTaskSigningKeysEnvVar
 
 	// credentialProxyTaskCredentialMaxLifetimeEnvVar is the lifetime ceiling
-	// the callout and the broker share. Not rendered yet: #4121 adds the
-	// PlatformAgent field it comes from (the install's maxTaskDeadlineSeconds)
-	// and renders it for both. Until then both default to 6h. Reserved now,
-	// so a CR can't set a ceiling the operator didn't choose.
+	// the callout, the broker and the dispatcher share, rendered from the
+	// install's maxTaskDeadlineSeconds for all three
+	// (a2aTaskCredentialMaxLifetimeEnv). Reserved, so a CR can't set a
+	// ceiling the operator didn't choose.
 	credentialProxyTaskCredentialMaxLifetimeEnvVar = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- Environment variable name, not hardcoded credentials
 )
 
@@ -87,6 +87,10 @@ type credentialProxyProfileIdentity struct {
 type credentialProxyProfileConfig struct {
 	// TaskSigningPublic is the task-signing public key (C...).
 	TaskSigningPublic string
+	// MaxLifetime is the task credential lifetime ceiling
+	// (a2aTaskCredentialMaxLifetimeEnv), the same value the callout and the
+	// dispatcher get.
+	MaxLifetime corev1.EnvVar
 	// Identities are the profile worker ServiceAccounts, in map order.
 	Identities []credentialProxyProfileIdentity
 }
@@ -158,7 +162,9 @@ func credentialProxyProfileEnv(c credentialProxyProfileConfig) []corev1.EnvVar {
 	if c.TaskSigningPublic != "" {
 		env = append(env, corev1.EnvVar{Name: credentialProxyTaskSigningKeysEnvVar, Value: c.TaskSigningPublic})
 	}
-	// credentialProxyTaskCredentialMaxLifetimeEnvVar: see its declaration.
+	if c.MaxLifetime.Name != "" {
+		env = append(env, c.MaxLifetime)
+	}
 	return env
 }
 
@@ -215,5 +221,5 @@ func (r *PlatformAgentReconciler) credentialProxyProfileConfigFor(ctx context.Co
 	if err != nil {
 		return credentialProxyProfileConfig{}, fmt.Errorf("failed to ensure the A2A task-signing key for the credential proxy: %w", err)
 	}
-	return credentialProxyProfileConfig{TaskSigningPublic: key.Public, Identities: identities}, nil
+	return credentialProxyProfileConfig{TaskSigningPublic: key.Public, Identities: identities, MaxLifetime: a2aTaskCredentialMaxLifetimeEnv(agent)}, nil
 }

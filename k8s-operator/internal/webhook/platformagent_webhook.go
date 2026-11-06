@@ -283,17 +283,19 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		// 2f. The credential-proxy container's requests and limits, checked as
 		// the operator will render them rather than as written: the override is
 		// merged over the defaults per key, so a CR that raises only
-		// requests.memory collides with a limit it never wrote. The reconciler
-		// runs the same function before it writes the proxy Deployment, so this
+		// requests.memory collides with a limit it never wrote. The row it
+		// merges over is the one the CR renders, the latched tier under auto,
+		// read off the status this object carries. The reconciler runs the
+		// same function before it writes the proxy Deployment, so this
 		// refuses at apply what the operator refuses at reconcile anyway.
-		proxyErrs, proxyWarnings := controller.ValidateCredentialProxyResources(platformAgent.Spec.Deployment, depPath.Child("credentialProxy", "resources"))
+		proxyErrs, proxyWarnings := controller.ValidateCredentialProxyResources(platformAgent, depPath.Child("credentialProxy", "resources"))
 		allErrs = append(allErrs, proxyErrs...)
 		warnings = append(warnings, proxyWarnings...)
 
 		// 2g. The agent-api-auth sidecar's requests and limits, checked the same
 		// way: merged over the defaults per key, so the reconciler refuses at
 		// reconcile what this refuses at apply.
-		apiAuthErrs, apiAuthWarnings := controller.ValidateAgentAPIAuthResources(platformAgent.Spec.Deployment, depPath.Child("agentAPIAuth", "resources"))
+		apiAuthErrs, apiAuthWarnings := controller.ValidateAgentAPIAuthResources(platformAgent, depPath.Child("agentAPIAuth", "resources"))
 		allErrs = append(allErrs, apiAuthErrs...)
 		warnings = append(warnings, apiAuthWarnings...)
 
