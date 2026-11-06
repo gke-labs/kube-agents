@@ -862,6 +862,20 @@ class ReplayTest(ProxyTestCase):
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=False), port=port)
         self.assertEqual(self.lines(1, out)[0]["miss"]["role"], "no_saved_request")
 
+    def test_a_cache_seeded_after_start_rebuilds_the_miss_index_once_marked(self):
+        # The replay lane seeds the cache into a running proxy (collect_shadow.py).
+        _, port, out = self.replay()
+        extra = ({"role": "user", "content": "first turn"},)
+        self.record(chat("t_11111111", stream=False, extra_messages=extra))
+        changed = ({"role": "user", "content": "first turn, but the pod restarted 3 times"},)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        self.assertEqual(self.lines(1, out)[0]["miss"]["role"], "no_saved_request", "not marked yet")
+        Path(self.cache_dir, replay_cache.SEED_MARKER).write_text("1")
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        miss = self.lines(2, out)[1]["miss"]
+        self.assertEqual(miss["closest_fingerprint"], self.lines(1, self.record_out)[0]["fingerprint"])
+        self.assertEqual((miss["index"], miss["role"]), (1, "user"))
+
     def test_an_unbound_placeholder_is_a_miss(self):
         self.record(chat("t_11111111", stream=False))
         fingerprint = self.lines(1, self.record_out)[0]["fingerprint"]

@@ -533,9 +533,11 @@ class ShadowProxy:
             )
         self.config = config
         self.cache = replay_cache.AnswerCache(config.cache_dir) if config.mode != F.MODE_SHADOW else None
-        # Replay reads a cache another job recorded; its index is built once, at start.
+        # Replay reads a cache another job recorded; its index is built at start,
+        # and again whenever the seed marker changes (refresh_index).
         self.index = replay_cache.PrefixIndex(self.cache.entries()) if config.mode == F.MODE_REPLAY else None
         self.index_empty = not (self.index and self.index.by_prefix)
+        self._index_stamp: Optional[int] = self._seed_stamp() if config.mode == F.MODE_REPLAY else None
         self.key_context = normalizer.KeyContext(config.model_behaviour_checksum, config.litellm_image)
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
         self.budget: Optional[spool.DataBudget] = None
@@ -841,12 +843,35 @@ class ShadowProxy:
             block[F.MISS_REFUSED] = refused
         return block
 
+    def _seed_stamp(self) -> Optional[int]:
+        try:
+            return os.stat(os.path.join(self.config.cache_dir, replay_cache.SEED_MARKER)).st_mtime_ns
+        except OSError:
+            return None
+
+    def refresh_index(self) -> None:
+        """Rebuild the miss index when the cache was seeded since it was built.
+
+        The replay lane seeds the cache after the proxy has started (and again
+        into a pod that replaced one), so an index built only at start would
+        report every miss as `no_saved_request`. Serving never needs this:
+        every lookup reads the cache as it is. Runs on the analysis thread.
+        """
+        stamp = self._seed_stamp()
+        if stamp is None or stamp == self._index_stamp:
+            return
+        self._index_stamp = stamp
+        index = replay_cache.PrefixIndex(self.cache.entries())
+        self.index, self.index_empty = index, not index.by_prefix
+
     def _closest(self, entry: Dict[str, Any], raw_messages: List[Any], diag_walked: List[Any]) -> Dict[str, Any]:
         """The closest saved request and where this one first differs from it."""
-        if self.index_empty:
+        self.refresh_index()
+        index = self.index
+        if self.index_empty or index is None:
             return {F.MISS_ROLE: F.MISS_ROLE_NO_CACHE}
         hashes = entry[F.DIAG_MESSAGE_HASHES]
-        candidates, matched = self.index.candidates(entry[F.DIAG_SETTINGS_HASH], hashes)
+        candidates, matched = index.candidates(entry[F.DIAG_SETTINGS_HASH], hashes)
         if not candidates:
             return {F.MISS_ROLE: F.MISS_ROLE_SETTINGS, F.MISS_MATCHED_MESSAGES: 0}
         current = None

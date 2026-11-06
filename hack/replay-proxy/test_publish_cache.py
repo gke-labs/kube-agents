@@ -1,0 +1,203 @@
+"""Publishing a nightly's recorded answers: only from runs that passed, each name written once."""
+
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+import publish_cache as P
+from test_run_attribution import World, created, front, worker
+
+VERSION = "f246cb61aa625224"
+BUCKET = "replay-cache-bucket"
+POD = "inference-replay-shadow-abc12-xyz34"
+
+
+def fp(n):
+    return f"{n:064x}"
+
+
+class FakeBucket:
+    """`gcloud storage cp --no-clobber` into a directory: an existing object is never replaced."""
+
+    def __init__(self, root):
+        self.root = root
+        self.fail = False
+        self.calls = []
+
+    def path(self, url):
+        assert url.startswith("gs://"), url
+        return os.path.join(self.root, url[len("gs://"):])
+
+    def __call__(self, kind, cmd, timeout, input=None, env=None):
+        self.calls.append((kind, list(cmd)))
+        assert cmd[:3] == ["gcloud", "storage", "cp"] and "--no-clobber" in cmd, cmd
+        if self.fail:
+            return None
+        if "-I" in cmd:
+            dest = self.path(cmd[-1])
+            os.makedirs(dest, exist_ok=True)
+            for src in filter(None, input.decode().split("\n")):
+                target = os.path.join(dest, os.path.basename(src))
+                if not os.path.exists(target):
+                    shutil.copyfile(src, target)
+        else:
+            target = self.path(cmd[-1])
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            if not os.path.exists(target):
+                shutil.copyfile(cmd[-2], target)
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    def objects(self):
+        out = {}
+        for dirpath, _, names in os.walk(self.root):
+            for name in names:
+                full = os.path.join(dirpath, name)
+                with open(full) as handle:
+                    out[os.path.relpath(full, os.path.join(self.root, BUCKET))] = handle.read()
+        return out
+
+
+class PublishTest(unittest.TestCase):
+    def setUp(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.world = World(root)
+        self.keep = root
+        self.pod_dir = os.path.join(root, "pods", POD)
+        os.makedirs(os.path.join(self.pod_dir, "logs"))
+        self.bucket = FakeBucket(os.path.join(root, "bucket"))
+        self.publisher = P.Publisher(keep_dir=self.keep, verdicts_dir=self.world.verdicts, bucket=BUCKET,
+                                     build="1790000000000000000", run=self.bucket, clock=self.clock)
+        self.now = 1_800_000_000.0
+
+    def clock(self):
+        self.now += 1
+        return self.now
+
+    def cache_file(self, rel, content):
+        path = os.path.join(self.pod_dir, "cache", rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(content)
+
+    def answer(self, n, version=VERSION):
+        self.cache_file(f"answers/{fp(n)}.json", json.dumps(
+            {"fingerprint": fp(n), "answer": {"content": f"answer {n}"}, "normalizer_version": version}))
+
+    def write_logs(self):
+        lines = [{"event": "replay_shadow_start", "normalizer_version": VERSION}] + self.world.lines
+        with open(os.path.join(self.pod_dir, "logs", "seg-1.jsonl"), "w") as handle:
+            handle.write("\n".join(json.dumps(l) for l in lines) + "\n")
+
+    def test_only_answers_from_runs_that_passed_go_up(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.run("case-a", 2, "fail", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.world.request(worker("t_22222222"), fp(2), recorded=True)
+        self.answer(1)
+        self.answer(2)
+        self.answer(3)  # saved, but no line of this pod recorded it
+        self.write_logs()
+        report = self.publisher.publish(final=True)
+        objects = self.bucket.objects()
+        self.assertIn(f"replay-cache/{VERSION}/answers/{fp(1)}.json", objects)
+        self.assertNotIn(f"replay-cache/{VERSION}/answers/{fp(2)}.json", objects)
+        self.assertNotIn(f"replay-cache/{VERSION}/answers/{fp(3)}.json", objects)
+        self.assertEqual(report["decisions"], {"pass": 1, "fail": 1, "no_recording_line": 1})
+
+    def test_a_slot_goes_up_only_with_its_answer_and_variants_go_up_flat(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.run("case-a", 2, "fail", ["t_22222222"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.world.request(worker("t_22222222"), fp(2), recorded=True)
+        self.answer(1)
+        self.answer(2)
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(1)))
+        self.cache_file(f"slots/{fp(11)}.json", json.dumps(fp(2)))
+        self.cache_file(f"variants/{fp(20)}/{'a' * 16}.json", "")
+        self.cache_file(f"messages/{'b' * 16}.json", json.dumps("text"))
+        self.write_logs()
+        self.publisher.publish(final=True)
+        objects = self.bucket.objects()
+        prefix = f"replay-cache/{VERSION}"
+        self.assertIn(f"{prefix}/slots/{fp(10)}.json", objects)
+        self.assertNotIn(f"{prefix}/slots/{fp(11)}.json", objects, "its answer came from a failing run")
+        self.assertIn(f"{prefix}/variants/{fp(20)}-{'a' * 16}.json", objects)
+        self.assertIn(f"{prefix}/messages/{'b' * 16}.json", objects)
+
+    def test_the_first_night_to_record_a_key_keeps_it(self):
+        earlier = self.bucket.path(f"gs://{BUCKET}/replay-cache/{VERSION}/answers/{fp(1)}.json")
+        os.makedirs(os.path.dirname(earlier))
+        with open(earlier, "w") as handle:
+            handle.write("an earlier night's answer")
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1)
+        self.write_logs()
+        self.publisher.publish(final=True)
+        with open(earlier) as handle:
+            self.assertEqual(handle.read(), "an earlier night's answer")
+        record = self._records()[-1]
+        self.assertEqual(record["objects"], {VERSION: [f"answers/{fp(1)}.json"]},
+                         "the record still names it, so the lane fetches the earlier night's copy")
+
+    def test_an_answer_waits_until_its_case_is_graded_and_goes_up_once(self):
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1)
+        self.write_logs()
+        self.assertEqual(self.publisher.publish()["decisions"], {"pending": 1})
+        self.assertEqual(self.bucket.objects(), {})
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
+        self.assertEqual(self.publisher.publish()["uploaded"], {}, "never uploaded twice")
+
+    def test_an_opening_is_decided_only_by_the_last_call(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.world.request(front(), fp(1), recorded=True)
+        self.world.request(front(*created("t_00000001")), fp(2), recorded=True)
+        self.answer(1)
+        self.answer(2)
+        self.write_logs()
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
+        self.assertEqual(self.publisher.publish(final=True)["uploaded"], {"answers": 1})
+
+    def test_an_answer_from_another_normalizer_version_is_dropped(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1, version="0000000000000000")
+        self.write_logs()
+        self.assertEqual(self.publisher.publish(final=True)["decisions"], {"version_mismatch": 1})
+
+    def test_a_failed_upload_is_retried_and_its_names_recorded_then(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1)
+        self.write_logs()
+        self.bucket.fail = True
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 0})
+        self.bucket.fail = False
+        self.publisher.publish(final=True)
+        self.assertIn(f"answers/{fp(1)}.json", self._records()[-1]["objects"][VERSION])
+        runs = self._records()[-1]["runs"]
+        self.assertEqual(runs, [{"case": "case-a", "rep": 1, "outcome": "pass"}])
+
+    def test_object_names_refuse_anything_outside_the_layout(self):
+        self.assertEqual(P.object_name("variants", f"{fp(1)}/{'a' * 16}.json"), f"variants/{fp(1)}-{'a' * 16}.json")
+        for sub, rel in (("answers", "../x.json"), ("answers", f"{fp(1)}.tmp"), ("slots", f"a/{fp(1)}.json"),
+                         ("variants", f"{fp(1)}.json"), ("other", f"{fp(1)}.json"), ("answers", "ABC.json")):
+            with self.subTest(sub=sub, rel=rel):
+                self.assertIsNone(P.object_name(sub, rel))
+
+    def _records(self):
+        out = []
+        for name, content in sorted(self.bucket.objects().items()):
+            if name.startswith("replay-cache/builds/1790000000000000000/publish-"):
+                out.append(json.loads(content))
+        return out
+
+
+if __name__ == "__main__":
+    unittest.main()

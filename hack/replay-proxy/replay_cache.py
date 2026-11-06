@@ -30,6 +30,10 @@ SLOTS_DIR = "slots"
 VARIANTS_DIR = "variants"
 JSON_SUFFIX = ".json"
 TMP_SUFFIX = ".tmp"
+# Written last by whatever seeds a replay cache from outside the pod
+# (hack/replay-proxy/collect_shadow.py, in the replay lane): a replay proxy
+# rebuilds the index its miss report searches whenever this file changes.
+SEED_MARKER = ".seeded"
 TEXT_ENCODING = "utf-8"
 TOOL_CALLS_KEY = "tool_calls"
 # The model's reasoning text in an answer, never stored (stored_answer).

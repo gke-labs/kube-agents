@@ -70,9 +70,12 @@ class FakeCluster:
                     out[os.path.relpath(full, self.bucket)] = handle.read()
         return out
 
-    def __call__(self, cmd, input=None, remaining=None, env=None):
+    def __call__(self, cmd, input=None, remaining=None, env=None, stdin_path=None):
         cmd = list(cmd)
         self.calls.append(cmd)
+        if stdin_path is not None:
+            with open(stdin_path, "rb") as handle:
+                input = handle.read()
         if cmd[0] == "kubectl":
             return self.kubectl(cmd, input)
         if cmd[0] == "gcloud":
@@ -463,6 +466,9 @@ FAKE_KUBECTL = """\
 import json, os, subprocess, sys
 args = sys.argv[1:]
 pod_dir = os.environ["FAKE_POD_DIR"]
+if "get" in args and os.environ.get("FAKE_NO_PODS"):
+    print(json.dumps({{"items": []}}))
+    sys.exit(0)
 if "get" in args:
     print(json.dumps({{"items": [{{"metadata": {{"name": "proxy-a"}}, "status": {{"phase": "Running",
         "containerStatuses": [{{"name": "{container}", "state": {{"running": {{}}}}}}]}}}}]}}))
@@ -494,6 +500,155 @@ else:
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     shutil.copyfile(args[-2], dst)
 """
+
+
+POD_NAME = "proxy-a"
+CACHE = C.DEFAULT_CACHE_SUBDIR
+
+
+def fp(n):
+    return f"{n:064x}"
+
+
+class RecordModeTest(CollectorTestCase):
+    """Record mode copies saved answers to the kept copy, empties them in the pod, never uploads them."""
+
+    def setUp(self):
+        super().setUp()
+        self.keep = os.path.join(self.root, "keep")
+        self.publishes = []
+        self.collector.mode = C.MODE_RECORD
+        self.collector.keep_dir = self.keep
+        self.collector.publisher = self
+        self.collector.publish_interval = 300
+
+    def publish(self, final=False):
+        self.publishes.append((self.now, final))
+
+    def cache(self, rel, data):
+        path = os.path.join(self.pod, CACHE, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(data)
+        return path
+
+    def kept(self, rel):
+        return os.path.join(self.keep, "pods", POD_NAME, "cache", rel)
+
+    def test_answers_are_kept_on_this_machine_and_emptied_in_the_pod(self):
+        answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
+        variant = self.cache(f"variants/{fp(2)}/{'a' * 16}.json", b"")
+        self.collector.collect_pass()
+        with open(self.kept(f"answers/{fp(1)}.json"), "rb") as handle:
+            self.assertEqual(handle.read(), b'{"answer": 1}')
+        self.assertTrue(os.path.isfile(self.kept(f"variants/{fp(2)}/{'a' * 16}.json")), "an empty variant is kept")
+        self.assertEqual(os.path.getsize(answer), 0, "emptied, so its name still says the key was written")
+        self.assertTrue(os.path.exists(variant))
+        self.assertFalse(any(CACHE in name or "answers" in name for name in self.cluster.objects()),
+                         "the cache never goes to the shadow bucket")
+        fetches = sum(1 for c in self.cluster.calls if "exec" in c and C.TAR_SCRIPT in c)
+        self.collector.collect_pass()
+        self.assertEqual(sum(1 for c in self.cluster.calls if "exec" in c and C.TAR_SCRIPT in c), fetches,
+                         "a kept file is not fetched again")
+
+    def test_lines_and_stored_requests_are_kept_beside_their_upload(self):
+        self.put("logs/seg-1.jsonl", b'{"line": 1}\n')
+        self.put(f"store/requests/{HEX}.json", b"{}")
+        self.collector.collect_pass()
+        self.assertTrue(os.path.isfile(os.path.join(self.keep, "pods", POD_NAME, "logs", "seg-1.jsonl")))
+        self.assertTrue(os.path.isfile(os.path.join(self.keep, "store", "requests", f"{HEX}.json")))
+        self.assertIn(self.key("logs/seg-1.jsonl"), self.cluster.objects())
+
+    def test_a_name_outside_the_cache_layout_is_neither_copied_nor_emptied(self):
+        odd = self.cache("answers/not-a-key.json", b"x")
+        self.collector.collect_pass()
+        self.assertEqual(os.path.getsize(odd), 1)
+        self.assertFalse(os.path.exists(os.path.join(self.keep, "pods", POD_NAME, "cache", "answers", "not-a-key.json")))
+
+    def test_publishes_on_its_interval_and_always_in_the_last_pass(self):
+        self.collector.collect_pass()
+        self.now = 100.0
+        self.collector.collect_pass()
+        self.now = 301.0
+        self.collector.collect_pass()
+        self.now = 302.0
+        self.collector.deadline = 1000.0
+        self.collector.collect_pass(final=True)
+        self.assertEqual(self.publishes, [(0.0, False), (301.0, False), (302.0, True)])
+
+    def test_shadow_mode_copies_no_answers(self):
+        self.collector.mode = C.MODE_SHADOW
+        answer = self.cache(f"answers/{fp(1)}.json", b"{}")
+        self.collector.collect_pass()
+        self.assertEqual(os.path.getsize(answer), 2)
+        self.assertFalse(os.path.exists(self.keep + "/pods"))
+
+
+class ReplayModeTest(CollectorTestCase):
+    """Replay mode seeds every pod that has not got the cache, and the last pass writes the lane's report."""
+
+    def setUp(self):
+        super().setUp()
+        self.seed_dir = os.path.join(self.root, "seed")
+        for rel, data in ((f"answers/{fp(1)}.json", b'{"a": 1}'), (f"variants/{fp(2)}/{'b' * 16}.json", b""),
+                          ("answers/stray.txt", b"no")):
+            path = os.path.join(self.seed_dir, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(data)
+        self.collector.mode = C.MODE_REPLAY
+        self.collector.keep_dir = os.path.join(self.root, "keep")
+        self.collector.seed_dir = self.seed_dir
+
+    def seeds(self):
+        return sum(1 for c in self.cluster.calls if "exec" in c and C.SEED_SCRIPT in c)
+
+    def test_an_unseeded_pod_is_seeded_once_with_only_the_cache_layout(self):
+        self.collector.collect_pass()
+        base = os.path.join(self.pod, CACHE)
+        with open(os.path.join(base, "answers", f"{fp(1)}.json"), "rb") as handle:
+            self.assertEqual(handle.read(), b'{"a": 1}')
+        self.assertTrue(os.path.isfile(os.path.join(base, "variants", fp(2), f"{'b' * 16}.json")))
+        self.assertFalse(os.path.exists(os.path.join(base, "answers", "stray.txt")))
+        with open(os.path.join(base, C.CACHE_SEED_MARKER)) as handle:
+            self.assertEqual(handle.read(), "2")
+        self.collector.collect_pass()
+        self.assertEqual(self.seeds(), 1, "a seeded pod is not seeded again")
+
+    def test_a_pod_that_replaced_one_is_seeded_too(self):
+        self.collector.collect_pass()
+        other = self.cluster.add_pod("proxy-b")
+        self.collector.collect_pass()
+        self.assertTrue(os.path.isfile(os.path.join(other, CACHE, C.CACHE_SEED_MARKER)))
+        self.assertEqual(self.seeds(), 2)
+
+    def test_seed_script_writes_no_member_outside_the_layout(self):
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w") as tar:
+            for name in ("../escape.json", f"answers/{fp(1)}.json", f"answers/../../{fp(1)}.json"):
+                info = tarfile.TarInfo(name)
+                info.size = 1
+                tar.addfile(info, io.BytesIO(b"x"))
+        proc = subprocess.run([sys.executable, "-c", C.SEED_SCRIPT, self.pod, CACHE, C.CACHE_SEED_MARKER,
+                               C.CACHE_REL_RE.pattern], input=stream.getvalue(), capture_output=True)
+        self.assertEqual(proc.stdout.strip(), b"1")
+        self.assertFalse(os.path.exists(os.path.join(self.root, "escape.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "pods", f"{fp(1)}.json")))
+
+    def test_seed_all_reports_how_many_pods_took_it(self):
+        self.cluster.add_pod("proxy-b")
+        self.assertEqual(self.collector.seed_all(), (2, 2))
+
+    def test_the_last_pass_uploads_the_lane_report_under_report(self):
+        def report(out_dir):
+            with open(os.path.join(out_dir, "verdicts.json"), "w") as handle:
+                handle.write("{}")
+            return "case-a: lane 3/3"
+
+        self.collector.lane_report = report
+        C.run_loop(self.collector, 0, 10, 0, stop=lambda: True, sleep=lambda s: None)
+        self.assertIn(self.key("report/verdicts.json"), self.cluster.objects())
+        self.assertIn("case-a: lane 3/3", self.out.getvalue())
 
 
 class ProcessTest(unittest.TestCase):
@@ -574,6 +729,19 @@ class ProcessTest(unittest.TestCase):
         parent.wait()
         out, err = proc.communicate(timeout=PROCESS_WAIT_SECONDS)
         self.assertEqual(proc.returncode, 0, err)
+
+    def test_seed_once_fails_on_bad_arguments_and_without_pods(self):
+        bad = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--seed-once"],
+                             env=self.env, capture_output=True, timeout=PROCESS_WAIT_SECONDS)
+        self.assertEqual(bad.returncode, 1)
+        seed = os.path.join(self.root, "seed")
+        os.makedirs(seed)
+        none = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--namespace", NAMESPACE,
+                               "--selector", SELECTOR, "--container", CONTAINER, "--bucket", BUCKET, "--kind",
+                               "replay-lane", "--build", "123", "--mode", "replay", "--keep-dir", self.root,
+                               "--seed-dir", seed, "--seed-once"],
+                              env=dict(self.env, FAKE_NO_PODS="1"), capture_output=True, timeout=PROCESS_WAIT_SECONDS)
+        self.assertEqual(none.returncode, 1, none.stdout)
 
     def test_bad_arguments_still_exit_0(self):
         proc = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--kind", "weekly"],
