@@ -2766,7 +2766,11 @@ class TestWorkloadIncidentFold(unittest.TestCase):
                     forge.call.reset_mock()
                     self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
                     forge.call.assert_called_once_with(
-                        "proposal-view", {"number": number}, repository, retry_transient=True
+                        "proposal-view",
+                        {"number": number},
+                        repository,
+                        retry_transient=True,
+                        timeout_s=session_kv_server.FIX_PR_LOOKUP_TIMEOUT_S,
                     )
 
     def test_the_repository_read_from_each_forges_url_is_one_the_broker_resolves_to_that_forge(self):
