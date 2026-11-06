@@ -72,8 +72,9 @@ const (
 	usageSummarySpendLabel        = "  spend (since install): "
 	usageSummaryLatencyNote       = "  latency: in scripts/feedback-summary.sh's block"
 	usageSummarySpendCurrency     = "USD"
-	//: status.usage's three inference totals, the script's PERFORMANCE_TOTAL_FIELDS
-	//: verbatim; the spend is in micro-dollars (usageSummaryMicrosPerUSD).
+	//: status.usage's three inference totals, read in the order the script's
+	//: PERFORMANCE_TOTAL_FIELDS names them, which its GatewayCopyTest holds to
+	//: the render below; the spend is in micro-dollars (usageSummaryMicrosPerUSD).
 	usageSummaryInputTokensField  = "inputTokensTotal"
 	usageSummaryOutputTokensField = "outputTokensTotal"
 	usageSummarySpendMicrosField  = "spendMicrosUSDTotal"
@@ -228,11 +229,6 @@ var usageSummaryFixedLinePrefixes = []string{usageSummaryModelLinePrefix, usageS
 // : The environment lines, in the order the block prints them: the script's
 // : ENVIRONMENT_KEYS verbatim.
 var usageSummaryEnvironmentKeys = []string{"version", "mode", "model", "kubernetes", "installed", "interfaces"}
-
-// : The status.usage fields the performance block prints, in the order the
-// : script's PERFORMANCE_TOTAL_FIELDS names them; the script's GatewayCopyTest
-// : holds the two lists together.
-var usageSummaryTotalFields = []string{usageSummaryInputTokensField, usageSummaryOutputTokensField, usageSummarySpendMicrosField}
 
 // : Spec subtrees whose string leaves name the install and must not reach the
 // : block: the script's list verbatim, so the two audits read the same (chat

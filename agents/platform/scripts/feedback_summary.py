@@ -104,8 +104,8 @@ SPEND_CURRENCY = "USD"
 #: ``status.usage``'s three inference totals, the operator's running sums of
 #: LiteLLM's token and spend counters since the install (they survive a LiteLLM
 #: restart, where the live ``tokens:`` and ``spend:`` lines below start again at
-#: zero); the gateway's usageSummaryTotalFields verbatim. The spend is kept in
-#: micro-dollars so the field stays an integer.
+#: zero); the three fields the gateway's render reads, in the order it reads
+#: them. The spend is kept in micro-dollars so the field stays an integer.
 PERFORMANCE_TOTAL_FIELDS: Tuple[str, str, str] = ("inputTokensTotal", "outputTokensTotal", "spendMicrosUSDTotal")
 MICROS_PER_USD = 1_000_000
 TOKENS_SINCE_INSTALL_LABEL = "tokens (since install)"

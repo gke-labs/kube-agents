@@ -575,6 +575,16 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	// first read later is the under-count that rule already accepts, taken
 	// over a set kept per pod.
 	folded := map[string]bool{}
+	// refusedInference is the pods whose body put one of the three inference
+	// totals past its ceiling this poll, on either adding branch. The three
+	// are one reading of one process, so they refuse together: a LiteLLM pod
+	// whose history is past the token ceiling when it is first read (an
+	// operator upgrade onto a pod that has run for weeks) would otherwise
+	// keep its spend and lose its tokens, or the reverse, and the status
+	// would carry a spend with no tokens behind it. Their candidates are
+	// dropped below, baselines advanced, and the three start together from
+	// the next poll's deltas.
+	refusedInference := map[string]bool{}
 	for _, s := range ordered {
 		key := usagePodEntryKey(s.UID, s.Counter)
 		entry, known := doc.Pods[key]
@@ -630,7 +640,11 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// replica from the first poll, so none reaches here that way.
 			youngProcess := usageAggregationFor(s.Counter) == usageAggregateSum && s.StartTime != nil && *s.StartTime > float64(doc.FirstRecorded.Unix())
 			fresh := !usageBodyRead(readPods[s.UID], s.Counter) && (s.Created.After(doc.FirstRecorded.Time) || youngProcess)
-			if (fresh || unfolded) && s.Sample <= usageDeltaCeilingFor(s.Counter) {
+			wholeSample := fresh || unfolded
+			if wholeSample && s.Sample > usageDeltaCeilingFor(s.Counter) && slices.Contains(usageLiteLLMCounters, s.Counter) {
+				refusedInference[s.UID] = true
+			}
+			if wholeSample && s.Sample <= usageDeltaCeilingFor(s.Counter) {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue
@@ -665,6 +679,9 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 
 		delta, adds := usageBranch(entry, s)
 		if !adds || delta > usageDeltaCeilingFor(s.Counter) {
+			if adds && slices.Contains(usageLiteLLMCounters, s.Counter) {
+				refusedInference[s.UID] = true
+			}
 			// Refused, and because the body parsed the baseline advances to
 			// it: a refusal that kept the baseline would be repeated on every
 			// poll until the pod restarted.
@@ -680,6 +697,28 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		doc.Unfolded = slices.DeleteFunc(doc.Unfolded, func(counter string) bool { return folded[counter] })
 		if len(doc.Unfolded) == 0 {
 			doc.Unfolded = nil
+		}
+	}
+	for _, counter := range usageLiteLLMCounters {
+		if len(refusedInference) == 0 {
+			break
+		}
+		kept := candidates[counter][:0]
+		for _, c := range candidates[counter] {
+			if !refusedInference[c.entry.PodUID] {
+				kept = append(kept, c)
+				continue
+			}
+			// A sibling of a refused total: dropped as the refused one was,
+			// its baseline advanced to the body it would have added.
+			if advanceUsageBaseline(c.entry, c.sample, c.startTime) {
+				changed = true
+			}
+		}
+		if len(kept) == 0 {
+			delete(candidates, counter)
+		} else {
+			candidates[counter] = kept
 		}
 	}
 
