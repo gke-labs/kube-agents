@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -134,9 +135,10 @@ func TestTheDispatchSubmitRetentionIsTheLongerOfTheRenderAndTheLiveStream(t *tes
 	}{
 		"no report yet":                 {nil, render},
 		"a stream older and longer":     {&week, int(week)},
-		"a stream with no age limit":    {ptrTo(int64(0)), year},
-		"a stream longer than the cap":  {ptrTo(int64(10 * year)), year},
-		"a shorter value (not written)": {ptrTo(int64(60)), render},
+		"a stream with no age limit":    {ptr.To(int64(0)), year},
+		"a stream longer than the cap":  {ptr.To(int64(10 * year)), year},
+		"a value no Duration can hold":  {ptr.To(int64(1) << 62), year},
+		"a shorter value (not written)": {ptr.To(int64(60)), render},
 	} {
 		agent := a2aTestAgent()
 		agent.Status.ProfileSubmitMaxAgeSeconds = tc.live
@@ -197,8 +199,6 @@ func TestTheProvisionReportKeepsTheLiveSubmitMaxAgeOnTheStatus(t *testing.T) {
 		})
 	}
 }
-
-func ptrTo[T any](v T) *T { return &v }
 
 func deref(p *int64) any {
 	if p == nil {

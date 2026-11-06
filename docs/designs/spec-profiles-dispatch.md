@@ -385,9 +385,11 @@ leave open:
   config's `submitRetentionSeconds`, never less than `lib.ProfileSubmitRetention` (72h). The
   operator renders the longer of the constant it creates the stream with and the live stream's
   max age, which the provision Job reads back and reports when it is longer
-  (`status.profileSubmitMaxAgeSeconds`; no age limit renders a year). The operator never edits
-  an existing stream, so a stream an older release created longer is covered this way, not by
-  editing it (#4948).
+  (`status.profileSubmitMaxAgeSeconds`). The operator never edits an existing stream, so a
+  stream an older release created longer, or one edited by hand, is covered this way, once the
+  Job's next run (at most a day) has read it. The retention is capped at a year
+  (`lib.MaxSubmitRetention`): a stream with no age limit, or a longer one, keeps tombstones that
+  long (#4948).
 - **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.

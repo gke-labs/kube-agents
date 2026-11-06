@@ -548,18 +548,22 @@ const a2aMaxSubmitRetention = 365 * 24 * time.Hour
 // dispatchSubmitRetentionSeconds is the submit retention the dispatch config
 // carries: the longer of this operator's a2aProfileSubmitMaxAge and the live
 // stream's, as the provision Job last reported it (#4948), capped at
-// a2aMaxSubmitRetention. A stream with no age limit gets the cap. With no
-// report yet it is the constant, as before.
+// a2aMaxSubmitRetention. A stream with no age limit, or one longer than the
+// cap, gets the cap, and its tombstones are kept that long, not as long as
+// the stream (the dispatcher refuses a longer retention). With no report yet
+// it is the constant, as before. The comparison is in seconds, so a value
+// no Duration can hold still lands on the cap.
 func dispatchSubmitRetentionSeconds(agent *agentv1alpha1.PlatformAgent) int {
-	retention := a2aProfileSubmitMaxAge
+	render, ceiling := int64(a2aProfileSubmitMaxAge/time.Second), int64(a2aMaxSubmitRetention/time.Second)
+	retention := render
 	if live := agent.Status.ProfileSubmitMaxAgeSeconds; live != nil {
-		if *live == 0 {
-			retention = a2aMaxSubmitRetention
+		if *live == 0 || *live > ceiling {
+			retention = ceiling
 		} else {
-			retention = max(retention, time.Duration(*live)*time.Second)
+			retention = max(retention, *live)
 		}
 	}
-	return int(min(retention, a2aMaxSubmitRetention) / time.Second)
+	return int(retention)
 }
 
 // desiredDispatchConfig is what the dispatcher reads for this agent: every

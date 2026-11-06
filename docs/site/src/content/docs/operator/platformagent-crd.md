@@ -1459,13 +1459,16 @@ writers carry the field through as they read it, so a pass that ends `Degraded` 
 
 `profileSubmitMaxAgeSeconds` is the live `PROFILE_SUBMITS` stream's max age, as the A2A
 provision Job last read it, when it is longer than this release creates the stream with (`0` is no
-age limit). Provisioning never edits an existing stream, so a stream an older release created
-keeps its own max age. The dispatch config's submit retention is the longer of the two, so a
-finished task's tombstone outlives its submission; no age limit renders a year.
+age limit). Provisioning never edits an existing stream, so a stream created by an older release
+with a longer max age, or edited by hand, keeps its own. The dispatch config's submit retention is
+the longer of the two, so a finished task's tombstone outlives its submission, up to a year: a
+stream with no age limit, or one longer than a year, gets a year.
 
-The field is absent when the stream is no longer than this release's, and before the first report.
-Only a report the operator can read changes it. Under a served CRD that predates the field the write is dropped and
-the retention stays this release's own until the CRD is applied.
+The value is read once per provision Job run, and the Job runs again a day after it finishes, so
+a stream edited by hand is picked up within a day. A Job that fails records nothing. The field is
+absent when the stream is no longer than this release's, and before the first report. Only a report
+the operator can read changes it. Under a served CRD that predates the field the write is dropped
+and the retention stays this release's own until the CRD is applied.
 
 The counters and the two times land through the poller above, which consults the same five-minute
 record. Under a served CRD that predates `status.usage` they accumulate in the
