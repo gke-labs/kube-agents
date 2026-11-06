@@ -105,8 +105,8 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         its producer; the workstation summary reads the same families live, and the two
         readers must agree on the suffixed name and its bare sibling, in that order."""
         for go_total, go_bare, key, mapping in (
-            ("litellmInputTokensSeries", "litellmInputTokensBareSeries", "in", "TOKEN_FAMILIES"),
-            ("litellmOutputTokensSeries", "litellmOutputTokensBareSeries", "out", "TOKEN_FAMILIES"),
+            ("litellmInputSeries", "litellmInputBareSeries", "in", "TOKEN_FAMILIES"),
+            ("litellmOutputSeries", "litellmOutputBareSeries", "out", "TOKEN_FAMILIES"),
             ("litellmSpendSeries", "litellmSpendBareSeries", None, "SPEND_FAMILIES"),
         ):
             with self.subTest(family=go_total):
