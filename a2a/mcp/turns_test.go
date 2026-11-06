@@ -1808,6 +1808,94 @@ func TestAStreamedDelegationSettlesOnTheWakeTasksAnswer(t *testing.T) {
 	}
 }
 
+// A poll whose caller is cut off mid-poll leaves the step state as it was:
+// mid-turn its steps stay unseen, and on the settling poll the state is not
+// torn down, so the caller's retry reads the same steps on the same turn.
+func TestACutOffStreamedPollLeavesItsStepsForTheRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		finish bool
+		cutOff time.Duration
+	}{
+		// Inside minStepBatchWait, before the poll would return the step.
+		{"mid-turn", false, 300 * time.Millisecond},
+		// While the settling poll gathers the cards' reports.
+		{"settling", true, 1500 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The settling poll gathers the handed-off cards' reports
+			// until its caller is cut off.
+			setReportQuiet(t, 30*time.Second)
+			url, js := testBus(t)
+			nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(nc.Close)
+			rootID := "task-cutoff-root"
+			stepPart := mustStepPart(t, stepmsg.Step{Kind: stepmsg.KindSynthesis, Title: "Summarising the nodes"})
+			_, err = nc.Subscribe("chat.console.*.in", func(m *nats.Msg) {
+				conv := "console:" + strings.Split(m.Subject, ".")[2]
+				var f ConsoleInFrame
+				if json.Unmarshal(m.Data, &f) != nil {
+					return
+				}
+				publishSubmission(t, js, fakeAddressee, rootID, conv, f.Text, "")
+				publishRun(t, js, fakeAddressee, rootID, "", false)
+				publishParts(t, js, fakeAddressee, rootID, stepmsg.ArtifactName, stepPart)
+				if tc.finish {
+					publishArtifact(t, js, fakeAddressee, rootID, lib.ArtifactHandoff, "cards")
+					publishResult(t, js, fakeAddressee, rootID, answerText)
+					publishStatus(t, js, fakeAddressee, rootID, lib.StateCompleted, true)
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := nc.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			b := dial(t, url)
+			convs := NewConversations().WithEvents(b.Events())
+			token, _, err := convs.ResolveCall("", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, w, err := b.SendTurn(t.Context(), convs, token, "check the nodes", 5*time.Second)
+			if err != nil || res.Task == nil {
+				t.Fatalf("SendTurn: res=%+v err=%v", res, err)
+			}
+			st := convs.initTaskStepState(*res.Task, token, DefaultConversation, false, res.Notices, w)
+
+			cut, cancel := context.WithTimeout(t.Context(), tc.cutOff)
+			defer cancel()
+			if _, err := b.WaitForTurnStep(cut, convs, nil, *res.Task, 10*time.Second); err == nil {
+				t.Errorf("a cut-off poll returned no error")
+			}
+			convs.mu.Lock()
+			kept := convs.steps[rootID] == st
+			convs.mu.Unlock()
+			if !kept {
+				t.Errorf("the cut-off poll removed the turn's step state")
+			}
+
+			retry, err := b.WaitForTurnStep(t.Context(), convs, nil, *res.Task, time.Second)
+			if err != nil {
+				t.Fatalf("retry WaitForTurnStep: %v", err)
+			}
+			if len(retry.NewStepDetails) != 1 {
+				t.Errorf("retry new steps = %+v; want the step the cut-off poll read", retry.NewStepDetails)
+			}
+			if retry.Token != token {
+				t.Errorf("retry token = %q; want the turn's %q", retry.Token, token)
+			}
+			if retry.StillRunning == tc.finish {
+				t.Errorf("retry still running = %v; want %v", retry.StillRunning, !tc.finish)
+			}
+		})
+	}
+}
+
 func TestWaitForTurnStepReusesTaskWatchAcrossPollsWithReapDelay(t *testing.T) {
 	url, js := testBus(t)
 	nc, err := nats.Connect(url, nats.UserInfo("admin", "admin"))

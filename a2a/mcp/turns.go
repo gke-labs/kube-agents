@@ -1943,6 +1943,25 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 		}
 	}
 
+	if chainSettled && st.watch != nil {
+		gatherBudget := reportGatherBudget
+		if wait > 0 && wait < gatherBudget {
+			gatherBudget = wait
+		}
+		reportCtx, reportCancel := context.WithTimeout(pollCtx, gatherBudget)
+		b.gatherStepReports(reportCtx, st.watch, &out, details)
+		reportCancel()
+	}
+	// A caller cut off mid-poll never sees this outcome: leave the state
+	// as it was, its steps unseen and a settled turn not torn down, so the
+	// caller's retry reads the same steps and answer.
+	if ctx.Err() != nil {
+		if len(st.taskWatches) > 0 {
+			st.armIdleReleaseLocked()
+		}
+		return TurnStepOutcome{}, ctx.Err()
+	}
+
 	newDetails := unseenStepDetails(details, st.seenStepKeys)
 	if newDetails == nil {
 		newDetails = []StepDetail{}
@@ -1991,15 +2010,6 @@ func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *
 	st.lastReportedActs = nextActs
 
 	if !stillRunning {
-		if st.watch != nil {
-			gatherBudget := reportGatherBudget
-			if wait > 0 && wait < gatherBudget {
-				gatherBudget = wait
-			}
-			reportCtx, reportCancel := context.WithTimeout(pollCtx, gatherBudget)
-			b.gatherStepReports(reportCtx, st.watch, &out, details)
-			reportCancel()
-		}
 		if st.token != "" && !st.superseded.Load() {
 			convs.setRunning(st.token, nil)
 		}
