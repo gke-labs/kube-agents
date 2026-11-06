@@ -23,12 +23,17 @@ COMPOSITION = REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
 POOL_BY_STRING = re.compile(r'"serviceAccount:\$\{[^}]+\}\.svc\.id\.goog\[')
 MODULE_BLOCK = re.compile(r'^module "(?P<name>[^"]+)" \{\n(?P<body>.*?)^\}', re.MULTILINE | re.DOTALL)
 SOURCE = re.compile(r'^\s*source\s*=\s*"\.\./\.\./modules/(?P<module>[^"]+)"', re.MULTILINE)
-DEPENDS_ON = re.compile(r"^\s*depends_on\s*=\s*\[(?P<items>.*?)\]", re.MULTILINE | re.DOTALL)
+# The list ends at the `]` that closes the line, so an item such as `module.x[0]` does not cut it short.
+DEPENDS_ON = re.compile(r"^\s*depends_on\s*=\s*\[(?P<items>.*?)\]\s*$", re.MULTILINE | re.DOTALL)
 CLUSTER_MODULE = "module.gke_cluster"
 
 
 def modules_naming_the_pool_by_string() -> set[str]:
-    return {path.parent.name for path in MODULES.glob("*/main.tf") if POOL_BY_STRING.search(path.read_text())}
+    return {path.parent.name for path in MODULES.glob("*/*.tf") if POOL_BY_STRING.search(path.read_text())}
+
+
+def depends_on_items(items: str) -> set[str]:
+    return {item.strip() for item in items.split(",") if item.strip()}
 
 
 class WorkloadIdentityWaitsForClusterTest(unittest.TestCase):
@@ -47,7 +52,7 @@ class WorkloadIdentityWaitsForClusterTest(unittest.TestCase):
             with self.subTest(module=block["name"]):
                 depends = DEPENDS_ON.search(block["body"])
                 self.assertIsNotNone(depends, f'module "{block["name"]}" has no depends_on')
-                self.assertIn(CLUSTER_MODULE, depends["items"],
+                self.assertIn(CLUSTER_MODULE, depends_on_items(depends["items"]),
                               f'module "{block["name"]}" binds a Workload Identity member by string '
                               f"and does not wait for {CLUSTER_MODULE}")
         self.assertGreaterEqual(checked, 3)
