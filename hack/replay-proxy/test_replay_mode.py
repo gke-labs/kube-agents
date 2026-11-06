@@ -596,6 +596,25 @@ class RecordTest(ProxyTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
 
 
+class RecordBudgetTest(ProxyTestCase):
+    """The cache counts against the data budget in record mode: spent, nothing is saved and forwarding goes on."""
+
+    mode = "record"
+    data_max_bytes = 1
+
+    def test_a_spent_budget_saves_nothing_and_still_answers(self):
+        self.proxy.budget._used = 10  # past the one-byte budget, as a full volume would be
+        status, _, _ = self.request("POST", COMPLETIONS, chat("t_11111111", stream=False))
+        self.assertEqual(status, 200)
+        line = self.lines(1)[0]
+        self.assertEqual((line["recorded"], line["record_error"]), (False, "budget_spent"))
+        self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
+        self.assertEqual(self.proxy.metrics.get("record_budget_spent"), 1)
+
+    def test_the_cache_directory_is_one_of_the_budgets_roots(self):
+        self.assertIn(self.cache_dir, self.proxy.budget.roots)
+
+
 class SecretReadTest(ProxyTestCase):
     """A tool result whose call printed a secret reaches neither the saved messages nor a miss line."""
 

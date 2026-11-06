@@ -247,6 +247,7 @@ class Metrics:
         "analysis_dropped": "replay_shadow_analysis_dropped_total",
         "served": "replay_shadow_served_total",
         "recorded": "replay_shadow_recorded_total",
+        "record_budget_spent": "replay_shadow_record_budget_spent_total",
         "log_file_errors": "replay_shadow_log_file_errors_total",
         "log_file_dropped": "replay_shadow_log_file_dropped_total",
     }
@@ -540,9 +541,13 @@ class ShadowProxy:
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
         self.budget: Optional[spool.DataBudget] = None
         if config.data_max_bytes > 0:
-            self.budget = spool.DataBudget(
-                [config.store_dir, config.log_dir], config.data_max_bytes, DATA_BUDGET_INTERVAL_SECONDS
-            )
+            # Record mode's cache is emptied by the collector as it copies it,
+            # like the store and the segments, so it counts against the same
+            # budget; replay's is a seeded, bounded copy that must stay whole.
+            roots = [config.store_dir, config.log_dir]
+            if config.mode == F.MODE_RECORD:
+                roots.append(config.cache_dir)
+            self.budget = spool.DataBudget(roots, config.data_max_bytes, DATA_BUDGET_INTERVAL_SECONDS)
         self.store = request_store.RequestStore(config.store_dir, self.scrubber, self.budget)
         self.metrics = Metrics(self.scrubber.available)
         self.segments: Optional[spool.SegmentLog] = None
@@ -783,6 +788,12 @@ class ShadowProxy:
         (`record_error`), as RequestStore.write reports its own failures.
         """
         if entry[F.UNSTORABLE]:
+            return False
+        if self.budget is not None and not self.budget.allows():
+            # The cache counts against the data budget in record mode, so a
+            # cache the collector can't empty stops growing before the volume fills.
+            entry[F.RECORD_ERROR] = F.RECORD_ERROR_BUDGET
+            self.metrics.add("record_budget_spent")
             return False
         try:
             return self._record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
