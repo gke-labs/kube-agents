@@ -33,6 +33,10 @@ import (
 
 const dispatchConfigDrainingFixturePath = "../../../a2a/lib/testdata/rendered-dispatch-config-draining.json"
 
+// dispatcherMapDrainingFixturePath is the identity map with a draining
+// profile, which the callout suite runs a real server against.
+const dispatcherMapDrainingFixturePath = "../../../a2a/authcallout/testdata/rendered-identity-map-dispatcher-draining.json"
+
 // A profile the applied dispatch config lists and the render no longer does
 // drains (#5074): from now for its active deadline plus the margin, with no
 // durables. One already draining keeps its time until that passes, and a
@@ -118,6 +122,11 @@ func TestADrainingProfileKeepsItsTerminalGrantAndNoDurable(t *testing.T) {
 		t.Errorf("drainingUntil is not rendered in RFC 3339:\n%s", cm.Data[a2aDispatchConfigKey])
 	}
 
+	shards, _, err := buildA2AAuthMapConfigMaps(agent, []agentv1alpha1.AgentProfile{tse}, draining)
+	if err != nil || len(shards) != 1 {
+		t.Fatalf("the identity map with a draining profile: %d shards, %v", len(shards), err)
+	}
+	checkFixture(t, dispatcherMapDrainingFixturePath, shards[0].Data[a2aAuthMapKey])
 	doc, err := renderA2AAuthMapDraining(agent, []agentv1alpha1.AgentProfile{tse}, draining)
 	if err != nil {
 		t.Fatal(err)
