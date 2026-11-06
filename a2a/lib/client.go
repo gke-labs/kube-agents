@@ -167,6 +167,10 @@ var (
 	// startWithRetry checking that it landed on the current connection, so a
 	// test can replace the connection in that window. Nil outside tests.
 	afterBind func()
+	// beforeBindAttempt, when set, runs before each first-bind attempt with
+	// its number, so a test can end the caller's context on a chosen attempt.
+	// Nil outside tests.
+	beforeBindAttempt func(attempt int)
 )
 
 // fullJitterBackoff returns a delay drawn uniformly from [0, min(cap,
@@ -767,12 +771,28 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // connection a rebuild has just replaced is tried again on the new one;
 // otherwise the durable would read bound, be skipped, and consume from a
 // dead connection.
+//
+// When the loop stops because ctx ended, the error names the last verdict
+// the server gave as well, if the attempt it ended on got none: a caller
+// whose deadline fires during a look-up, after an earlier attempt was
+// answered with ErrConsumerNotFound, gets an error errors.Is finds both the
+// deadline and the missing durable in, rather than the bare deadline, which
+// reads as if the bus never answered (the dispatcher's regrant tells a
+// missing durable from a missing grant by exactly that). An attempt that
+// ended on the server's own verdict returns it as before, and a bind that
+// was never answered returns the context's error alone.
 func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream) error {
 	deadline := time.Now().Add(subscribeBindWindow)
 	var waitStart, lastLog time.Time
 	var lastWaitingFor string
 	warned := 0
+	// lastAnswer is the most recent error the server answered an attempt
+	// with: neither the context's own nor a lost connection.
+	var lastAnswer error
 	for attempt := 1; ; attempt++ {
+		if beforeBindAttempt != nil {
+			beforeBindAttempt(attempt)
+		}
 		err := s.start(ctx, js)
 		if err == nil {
 			if afterBind != nil {
@@ -795,6 +815,9 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 		}
 		if errors.Is(err, ErrHeldBindRefused) {
 			return err
+		}
+		if serverAnswered(err) {
+			lastAnswer = err
 		}
 		// What a WaitForStream bind is waiting for, if anything: the stream,
 		// or the connection. Whether the stream exists is unknown while the
@@ -843,24 +866,45 @@ func (s *durableSub) startWithRetry(ctx context.Context, js jetstream.JetStream)
 			lastWaitingFor = waitingFor
 			select {
 			case <-ctx.Done():
-				return err
+				return bindEndedWith(err, lastAnswer)
 			case <-time.After(bindBackoff(attempt)):
 			}
 			js = s.c.currentJS()
 			continue
 		}
-		if ctx.Err() != nil || s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
+		if ctx.Err() != nil {
+			return bindEndedWith(err, lastAnswer)
+		}
+		if s.c.closing.Load() || s.stopped.Load() || time.Now().After(deadline) {
 			return err
 		}
 		s.c.log.Warn("durable bind failed; retrying",
 			"durable", s.cfg.Durable, "attempt", attempt, "err", err)
 		select {
 		case <-ctx.Done():
-			return err
+			return bindEndedWith(err, lastAnswer)
 		case <-time.After(bindBackoff(attempt)):
 		}
 		js = s.c.currentJS()
 	}
+}
+
+// serverAnswered is whether err is a verdict a server gave on a bind
+// attempt, rather than the caller's context ending or the attempt never
+// reaching a server that could answer (connectionLost).
+func serverAnswered(err error) bool {
+	return err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !connectionLost(err)
+}
+
+// bindEndedWith is the error a first bind returns when the caller's context
+// ended on attempt err: err itself when the server answered that attempt or
+// no attempt was ever answered, otherwise err wrapped with lastAnswer so
+// errors.Is finds both the context's error and the server's last verdict.
+func bindEndedWith(err, lastAnswer error) error {
+	if lastAnswer == nil || serverAnswered(err) {
+		return err
+	}
+	return fmt.Errorf("%w (the last attempt the server answered: %w)", err, lastAnswer)
 }
 
 // Connected is whether the client's current connection is connected, rather
