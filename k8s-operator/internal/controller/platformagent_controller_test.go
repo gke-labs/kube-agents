@@ -1023,7 +1023,7 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	}
 	// The operator's defaults, read from the merge with no override, so a
 	// change to them does not need a second copy here.
-	wantResources := resolveCredentialProxyResources(nil)
+	wantResources := resolveCredentialProxyResources(nil, sizingTierSmall)
 	if !equality.Semantic.DeepEqual(proxy.Resources, wantResources) {
 		t.Errorf("the proxy container's resources = %v, want the operator's defaults %v; a refused override is ignored", proxy.Resources, wantResources)
 	}

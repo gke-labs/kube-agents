@@ -903,7 +903,11 @@ significant digits is refused at render as well: the chart compares quantities a
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
-decimal one can compare equal to it; the operator decides that pair. The quota
+decimal one can compare equal to it; the operator decides that pair. A request
+set without its limit is checked against the sizing profile row's limit, and
+under `auto` against the fleet row's, the highest the operator's latch reaches:
+the chart cannot read the latch, so it refuses only a request no row admits and
+leaves the row the install runs to the webhook. The quota
 preflight sums the
 override merged over the operator's defaults. On an existing install, apply the
 chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
@@ -923,6 +927,20 @@ crossed-pair and zero-limit refusals to the operator; the quota preflight counts
 the override, at the defaults when the operator would refuse it (it then renders
 the shell at them), and the same CRD guard fails the upgrade when the installed CRD
 predates the field.
+
+`platformAgent.deployment.sizingProfile` picks the preset the credential proxy,
+the `agent-api-auth` sidecar and the shell container start from, forwarded to the
+CR's `spec.deployment.sizingProfile` when set: `small` (the operator's defaults,
+and what an unset value means), `medium`, `fleet`, or `auto`, which steps the
+tier up with the cluster count the operator polls, holding a step the
+namespace's ResourceQuota has no room for, and steps it back one tier when
+admission refuses the pod a step recreated; a count that falls never lowers it. The
+[`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
+has each row's figures and the auto rules. The three per-key overrides (the two
+above and `platformAgent.deployment.agentAPIAuth.resources`, the sidecar's) are
+applied over the preset, so an explicit key wins. The quota preflight counts
+`medium` and `fleet` at their rows and `auto` at the small row it starts from. The
+same CRD guard fails the upgrade when the installed CRD predates the field.
 
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
 `critical`, `warning`, `info` and `drift`, and each key that is set becomes an
@@ -1182,11 +1200,17 @@ held to at most one CPU per GiB of the memory request. A cpu or memory limit set
 request lowers the counted request to that limit, as the operator does. An override setting only
 `limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
-the API server defaults it to the limit. The shell sandbox is counted the same way with
+the API server defaults it to the limit. A proxy override the operator refuses against the row
+the preflight counts (a zero limit, a request above that row's limit) is counted at the row; under
+`auto` that is a request set alone between the small row's limit and the fleet row's, which the
+CR template admits and the small latch refuses. The shell sandbox is counted the same way with
 `platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
 ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
 override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
-the operator renders in its place, because the chart does not fail the render on those. A
+the operator renders in its place, because the chart does not fail the render on those. Under
+`platformAgent.deployment.sizingProfile` `medium` or `fleet` the proxy, the sidecar and the shell
+are counted at that row, with each override merged over it; `auto` is counted at the small row it
+starts from, and the operator checks the quota itself before each later promotion. A
 `PlatformAgent` edited by hand after the install is outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
