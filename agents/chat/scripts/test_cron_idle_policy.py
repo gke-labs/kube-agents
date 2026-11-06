@@ -353,6 +353,25 @@ class HibernateTest(PolicyCase):
         # The first multiple of the period past now, counted from the last run.
         self.assertEqual(self.next_run("two-hourly"), iso(last + timedelta(hours=4)))
 
+    def test_a_hibernating_interval_job_is_held_again_each_day(self):
+        # Its hold sits a day on, off its period: the policy's own timestamp,
+        # not a hand-marked run, so day two holds it again instead of firing it.
+        last = NOW - timedelta(hours=2)
+        self.write(interval_job("two-hourly", 120, NOW, last))
+        reader = Reader(days_ago(15))
+        self.run_policy(reader)
+        day_two = NOW + timedelta(days=1)
+        lines = self.run_policy(reader, now=day_two)
+        self.assertEqual(lines, [f"platform: held two-hourly until {iso(day_two + timedelta(days=1))} (hibernate)"])
+        self.assertEqual(self.next_run("two-hourly"), iso(day_two + timedelta(days=1)))
+        self.assertEqual(self.state()["held"]["two-hourly"]["next_run_at"], iso(day_two + timedelta(days=1)))
+        # A hand-marked run on the same job is still a request.
+        jobs = json.loads(self.store.read_text())
+        jobs["jobs"][0]["next_run_at"] = iso(day_two + timedelta(hours=1))
+        self.store.write_text(json.dumps(jobs))
+        self.assertEqual(self.run_policy(reader, now=day_two + timedelta(hours=1)), [])
+        self.assertEqual(self.next_run("two-hourly"), iso(day_two + timedelta(hours=1)))
+
     def test_an_overdue_job_after_a_restart_is_held_a_day_from_now(self):
         self.write(prompt_job("compliance-audit", "20 6 * * *", days_ago(3), days_ago(4)))
         late = NOW + timedelta(hours=5)

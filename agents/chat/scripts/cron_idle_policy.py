@@ -522,7 +522,10 @@ def _apply_locked(
             continue
         if stage == STAGE_ACTIVE or not _due(job, now):
             continue
-        if marked_by_hand(job, parse_timestamp(job.get("next_run_at")), zone):
+        # A due timestamp the policy wrote itself is never a hand mark: an
+        # interval job's hibernate hold sits a day on, off its period.
+        own_hold = record is not None and job.get("next_run_at") == record.get("next_run_at")
+        if not own_hold and marked_by_hand(job, parse_timestamp(job.get("next_run_at")), zone):
             continue  # `hermes cron run`: somebody asked for this one
         target = _hold_target(job, stage, now, throttle_days, zone)
         if target is None or target <= now:
