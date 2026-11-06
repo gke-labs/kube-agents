@@ -45,9 +45,9 @@ const (
 	kubeProxyCAMountPath                 = "/var/run/secrets/kubeagents/kube-proxy-ca"
 	kubeProxyCACertFile                  = kubeProxyCAMountPath + "/ca.crt"
 	kubeProxyCPURequest                  = "100m"
-	kubeProxyMemoryRequest               = "256Mi"
+	kubeProxyMemoryRequest               = "512Mi"
 	kubeProxyCPULimit                    = "1"
-	kubeProxyMemoryLimit                 = "512Mi"
+	kubeProxyMemoryLimit                 = "1Gi"
 	kubeProxyTLSHashAnnotation           = "kubeagents.x-k8s.io/tls-cert-hash"
 	kubeProxyTLSClockSkew                = 5 * time.Minute
 	kubeProxyTLSValidity                 = 10 * 365 * 24 * time.Hour
