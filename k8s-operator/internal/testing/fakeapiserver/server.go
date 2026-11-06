@@ -340,11 +340,13 @@ func Start(opts Options) *Server {
 // golang/go#81404, in Go 1.27.0 and 1.27.1 and fixed in Go 1.27.2. go.mod's
 // toolchain line selects a Go with the fix, but GOTOOLCHAIN=local ignores
 // that line, so the Transport stays for a test binary built that way by
-// Go 1.27.0 or 1.27.1. A connection per request leaves nothing to reuse, at
-// one dial per request, which the paged soaks absorb. It fixes the fake's
-// clients only. The watcher's broker route reaches profile clusters over
-// pooled plain HTTP/1.1 (clusterprofiles.Broker.ClientConfig) and had the
-// same exposure; its watches now open on a non-pooled twin
+// Go 1.27.0 or 1.27.1. It can go once go.mod's go line is 1.27.2 or later,
+// since an older Go then refuses to build the module. A connection per
+// request leaves nothing to reuse, at one dial per request, which the paged
+// soaks absorb. It fixes the fake's clients only. The watcher's broker route
+// reaches profile clusters over pooled plain HTTP/1.1
+// (clusterprofiles.Broker.ClientConfig) and had the same exposure; its
+// watches now open on a non-pooled twin
 // (cmd/k8s-event-watcher/watchtransport.go). A test that sets a CA, a client
 // certificate, a certificate callback or Insecure on this config fails at
 // client construction, since client-go refuses those next to a Transport.
