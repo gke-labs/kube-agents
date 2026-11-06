@@ -16,12 +16,13 @@
 # (cluster_slot null), which the runner probes with gcloud. No check reads it
 # by `fixture_role:`, because the role has no kubeconfig.
 #
-# Eval-driven development (.agents/rules/eval_driven_development.md): red on
-# main, whose markers (`startup-script exit status 1`, `Finished running
-# startup scripts with error`) are the older guest agent's; the current agent
-# prints `Script "startup-script" failed with error: exit status 1` and a plain
-# `Finished running startup scripts`, so no finding can be filed. Green once
-# the collector recognises the current line.
+# Eval-driven development (.agents/rules/eval_driven_development.md): the
+# case was red before the collector fix. The collector knew only the markers
+# of the older guest agent (`startup-script exit status 1`, `Finished running
+# startup scripts with error`). The current agent prints `Script
+# "startup-script" failed with error: exit status 1` and a plain `Finished
+# running startup scripts`, so no finding was filed. The collector now
+# recognises the current line too, and the case is green.
 #
 # Isolation class: read-only on the project; writes the ledger issue to the
 # eval GitOps repo, as every fleet-audit stream does.

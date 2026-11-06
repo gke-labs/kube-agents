@@ -8,8 +8,8 @@
 # checks the scheduled GCE compute audit runs, answered in chat with no
 # ledger run. Main already does this: on main 8aabdadb all three runs loaded
 # gce-compute-fleet-audit, ran compute_fleet_audit.py, answered in chat and
-# opened no ledger (run_20261014_195809_279763, _202919_114569, _204137_182782), so the
-# audit-stream table in agents/platform/SOUL.md has no row for this stream.
+# opened no ledger (run_20261014_195809_279763, _202919_114569,
+# _204137_182782), so the audit-stream table in agents/platform/SOUL.md has no row for this stream.
 # This case guards that behaviour: a change that sends the question to a
 # ledger run, or to improvised `gcloud compute` reads, fails it.
 #
@@ -27,9 +27,10 @@
 # it with no age gate. The role is project-scoped, with no cluster slot.
 # CI: every pool project has the VM (#2483), and the fixture-state scan reads
 # the role healthy on every pool project. Dev: a targeted apply of
-# bench/tf/fleet plants it in the dev project. The dev install declares a scope, so the chat command passes
-# the fleet_scope tool's collector_args and the collector sweeps only the
-# declared projects; the VM has to be in one of them. Every candidate this
+# bench/tf/fleet plants it in the dev project. The dev install declares a
+# scope, so the chat command passes the fleet_scope tool's collector_args and
+# the collector sweeps only the declared projects; the VM has to be in one of
+# them. Every candidate this
 # check emits carries needs_triage gke-managed-node, and the reply must not
 # drop the VM on that flag.
 #
