@@ -13,10 +13,12 @@ Three callers need a Secret verb on the manager role:
   (`k8s-operator/internal/controller/platformagent_secret_hash.go`). Which
   Secrets it reads is decided by the rendered pod spec, so a CR- or
   plugin-supplied `SecretKeyRef` is covered. Every read is by name and uncached.
-- The `mode: next` A2A render needs `create`/`update`/`patch`/`delete`. The
-  operator generates the NATS credential Secret once and repairs a missing key,
-  renders the config Secret, and deletes the config Secret on the way back to
-  `today`; all of them are owner-referenced to the `PlatformAgent`.
+- The kube-proxy render needs `create` and `update` on every install: the
+  operator mints the proxy's TLS Secret and renews it. The `mode: next` A2A
+  render needs `create`/`update`/`patch`/`delete`. The operator generates the
+  NATS credential Secret once and repairs a missing key, renders the config
+  Secret, and deletes the config Secret on the way back to `today`; all of
+  them are owner-referenced to the `PlatformAgent`.
 
 Every one of those reads or writes a Secret in the namespace of the
 PlatformAgent being reconciled, so the grant is a namespaced `Role`: the

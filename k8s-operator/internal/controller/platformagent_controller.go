@@ -778,9 +778,10 @@ type PlatformAgentReconciler struct {
 // checkShellSandboxKeys asks whether the sandbox's authorized-keys Secret exists so the status
 // can say so, and never reads a value out of one; stampSecretEnvHash reads the values of the
 // Secret keys a pod consumes as environment and digests them onto the pod template, so
-// rotating one rolls the pod (platformagent_secret_hash.go); the mode-next A2A stack creates,
+// rotating one rolls the pod (platformagent_secret_hash.go); ensureKubeProxyTLSSecret creates
+// and renews the kube-proxy TLS Secret on every install; the mode-next A2A stack creates,
 // repairs, patches and deletes the NATS credentials, config, TLS, callout-key, inject-token,
-// door-token and MCP-access Secrets it generates, and the kube-proxy TLS Secret. All by name,
+// door-token and MCP-access Secrets it generates. All by name,
 // all through r.APIReader (a2aReader): a cached Get of a type the manager does not watch would
 // start a cluster-wide Secret informer, hold every Secret in the cluster in memory and, with no
 // `list` granted, block WaitForCacheSync forever behind a forbidden LIST. No list or watch, so

@@ -2,8 +2,10 @@
 # Syncs the Helm chart's copies of operator-owned manifests from their source
 # of truth under k8s-operator/config/:
 #   - charts/kube-agents/crds/*.yaml are verbatim copies of config/crd/bases/.
-#   - The ClusterRole rules in templates/operator-rbac.yaml are spliced from
-#     config/rbac/role.yaml between the GENERATED RULES markers.
+#   - The RBAC rules in templates/operator-rbac.yaml are spliced from
+#     config/rbac/role.yaml: the ClusterRole document between the GENERATED RULES
+#     markers, the namespaced Role document between the GENERATED NAMESPACED RULES
+#     markers.
 #   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
 #     wrapped in the chart's values gate. The chart is the only thing that installs those
 #     policies, so a drifted copy is a backstop nobody applies.
