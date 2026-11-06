@@ -42,10 +42,12 @@ const dispatchConfigDrainingFixturePath = "../../../a2a/lib/testdata/rendered-di
 const dispatcherMapDrainingFixturePath = "../../../a2a/authcallout/testdata/rendered-identity-map-dispatcher-draining.json"
 
 // A profile the applied dispatch config lists and the render no longer does
-// drains (#5074): from now for its active deadline plus the margin, with no
-// durables. One already draining keeps its time until that passes, and a
-// profile the render has is never draining. With no applied config nothing
-// drains.
+// drains (#5074): from now for a2aDrainingWindow (the longest task deadline
+// plus the margin), with no durables. One already draining keeps its time
+// until that passes, and a profile the render has is never draining. Only
+// what the render could itself produce is carried: entries it couldn't are
+// dropped, and a time or a limit past its range is clamped. With no applied
+// config nothing drains.
 func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	until := now.Add(time.Hour)
@@ -61,7 +63,9 @@ func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 		{Name: "no-tier", Concurrency: 1},
 		// Listed twice, and with a time no drain this operator writes has.
 		{Name: "gone", Concurrency: 9, Tiers: []string{"read"}},
-		{Name: "far", Concurrency: 1, Tiers: []string{"read"}, Durables: []a2aDispatchDurable{}, DrainingUntil: now.AddDate(10, 0, 0)},
+		{Name: "far", Concurrency: 1, Tiers: []string{"read"}, Durables: []a2aDispatchDurable{}, DrainingUntil: now.AddDate(10, 0, 0),
+			// Limits no render produces, which the dispatcher's Validate refuses.
+			ActiveDeadlineSeconds: 3000000000, QueueTimeoutSeconds: -5},
 	}}
 	live := map[string]bool{"kept": true}
 
@@ -73,8 +77,13 @@ func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 	if _, ok := names["kept"]; ok || len(got) != 3 {
 		t.Fatalf("draining %v, want gone, draining and far only", got)
 	}
-	if far := names["far"]; !far.DrainingUntil.Equal(now.Add(a2aDrainingWindow)) {
+	far := names["far"]
+	if !far.DrainingUntil.Equal(now.Add(a2aDrainingWindow)) {
 		t.Errorf("a time ten years out was kept as %v, want clamped to %v", far.DrainingUntil, now.Add(a2aDrainingWindow))
+	}
+	if far.ActiveDeadlineSeconds != agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds || far.QueueTimeoutSeconds != 0 {
+		t.Errorf("limits carried as deadline %d, queue timeout %d; want clamped to %d and 0",
+			far.ActiveDeadlineSeconds, far.QueueTimeoutSeconds, agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds)
 	}
 	gone := names["gone"]
 	// The window is the longest deadline any task can carry, not the

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -638,8 +639,9 @@ const a2aDrainingWindow = time.Duration(agentv1alpha1.DefaultProfileMaxTaskDeadl
 // The applied config is a ConfigMap, and a draining profile's name becomes a
 // grant on the dispatcher's identity (dispatcherGrantNames), so only what the
 // render would itself produce is carried forward: a name and tiers that are
-// subject tokens, once each, the limits, and a time no later than the
-// window from now; nothing else of the entry. An entry that isn't is
+// subject tokens, once each, the limits within the render's range (the
+// deadline under its 6h ceiling), and a time no later than the window from
+// now; nothing else of the entry. An entry that isn't is
 // dropped, and grants nothing.
 func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time) []a2aDispatchProfile {
 	if applied == nil {
@@ -662,11 +664,13 @@ func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, 
 			continue
 		}
 		out = append(out, a2aDispatchProfile{
-			Name:                  a.Name,
-			Tiers:                 slices.Clone(a.Tiers),
-			Concurrency:           max(a.Concurrency, 1),
-			QueueTimeoutSeconds:   a.QueueTimeoutSeconds,
-			ActiveDeadlineSeconds: a.ActiveDeadlineSeconds,
+			Name:        a.Name,
+			Tiers:       slices.Clone(a.Tiers),
+			Concurrency: max(a.Concurrency, 1),
+			// The limits within the render's own range, so the dispatcher's
+			// Validate takes the entry whatever was written into it.
+			QueueTimeoutSeconds:   min(max(a.QueueTimeoutSeconds, 0), math.MaxInt32),
+			ActiveDeadlineSeconds: min(max(a.ActiveDeadlineSeconds, 0), agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds),
 			Durables:              []a2aDispatchDurable{},
 			DrainingUntil:         until,
 		})

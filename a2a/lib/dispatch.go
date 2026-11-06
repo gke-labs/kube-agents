@@ -368,7 +368,8 @@ type DispatchConfig struct {
 	// the field; the dispatcher then uses ProfileSubmitRetention.
 	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
-	// identity. A profile absent here has no durables to read.
+	// identity, and those draining after they left it (DrainingUntil). A
+	// profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
 }
 
