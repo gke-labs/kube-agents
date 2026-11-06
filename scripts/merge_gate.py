@@ -89,7 +89,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
-from github_api import PER_PAGE, GitHubAPI, log  # noqa: E402
+from github_api import PER_PAGE, GitHubAPI, has_marker_comment, log  # noqa: E402
 
 #: The queue is `main`'s alone; a release line still merges through Tide.
 BASE = "main"
@@ -609,8 +609,7 @@ def comment_left_out(api, pull, line, dry_run=False):
     path = f"/repos/{api.repo}/issues/{pull['number']}/comments"
     try:
         # The marker comment is newer than the removal, so only comments since then can hold it.
-        since = f"{path}?since={removed}" if removed else path
-        if any((comment.get("body") or "").startswith(marker) for comment in api.get_all(since)):
+        if has_marker_comment(api, pull["number"], marker, since=removed):
             return f"#{pull['number']}: left-out comment already posted"
         if not dry_run:
             body = left_out_comment(pull, marker, line)

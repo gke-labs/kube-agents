@@ -1870,6 +1870,16 @@ SHARED_ACCOUNT_SHIELD_NOTE = (
 )
 # How many declared workloads the note names before counting the rest.
 SHARED_ACCOUNT_SHIELD_NAMES = 3
+# How a remediation note that carries the shield starts: the note up to its
+# first clause. A finding listed on one line keeps the shield on the line under
+# it (`render_listed_finding`), since its full block, where the note is, is not
+# on the ledger.
+SHARED_ACCOUNT_SHIELD_PREFIX = SHARED_ACCOUNT_SHIELD_NOTE[: SHARED_ACCOUNT_SHIELD_NOTE.index(";")]
+# Where the shield note ends inside a remediation note it opens: the
+# template's closing `.)_` at the end of the note or before the worker's own
+# text. The declared names in between come from the repository, so a bare `)_`
+# in a path or object is not the end.
+SHARED_ACCOUNT_SHIELD_END_RE = re.compile(r"\.\)_(?=\s|$)")
 # The kinds a 2.7 declaration may name: collect.py's COMPLIANCE_WORKLOAD_KINDS,
 # the set `check_default_sa_automount` walks, folded as `_object_kind_segment`
 # folds them. An item naming anything else covers no workload's token.
@@ -1950,6 +1960,14 @@ PDB_NAME_SLOT = "{name}"
 # questions, all within the first question that needs it, so a refusal that a
 # retry clears (a 403 during a credential refresh) costs no question its answer.
 PROBE_OPEN_ATTEMPTS = 2
+# How many narrow snapshots one `finish` asks for once the whole tree is over
+# the broker's snapshot ceiling, refused ones included. Each one is a broker
+# clone of the revision of a repository that is large by definition, so past
+# this a check is skipped as unchecked rather than cloning without bound.
+PROBE_NARROW_SNAPSHOT_CAP = 16
+# The broker's setting for its snapshot ceiling, which a too-large warning
+# names as the one an operator can raise.
+BROKER_SNAPSHOT_CEILING_ENV = "CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
 # Where a read unpacks its snapshot: a directory under the vcs client's copies
 # root, named with this prefix, so a run killed mid-read leaves a directory
 # `remove_stale_snapshots` can find. The snapshot itself goes one level down.
@@ -2003,9 +2021,14 @@ GENERATED_FIX_NOTE = (
 )
 # A decline naming the pull request that carries the fix: the one a
 # PodDisruptionBudget `finish` would write still takes.
-# A proposal's URL on either forge: GitHub's `/pull/<n>`, GitLab's
-# `/-/merge_requests/<n>`.
-PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_requests)/\d+")
+# A proposal's URL on every forge the broker serves: GitHub's `/pull/<n>`,
+# GitLab's `/-/merge_requests/<n>` (the `-/` is optional), Gitea's `/pulls/<n>`,
+# and Bitbucket Cloud's and Data Center's `/pull-requests/<n>`. The tail after
+# the number carries no further marker, `/-/` or `/issues/`, so an issue under a
+# GitLab subgroup named like a marker is not a pull request.
+PULL_REQUEST_URL_PATTERN = re.compile(
+    r"https?://\S+/(?:pull|pulls|pull-requests|(?:-/)?merge_requests)/\d+(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?(?![/?#\w])"
+)
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
@@ -2486,6 +2509,38 @@ def auto_promotion_enabled() -> bool:
         value = os.environ.get(AUTO_PROMOTE_ENV, "")
     return value.strip().lower() != AUTO_PROMOTE_OFF
 
+
+# The run's own waiver of the sweep: `finish --no-promote`. A card that carries
+# the Planning Agent's propose-only line ("do not open a pull request") still
+# publishes its ledger, which is the report, and the worker passes this flag
+# so the automatic sweep opens nothing on that run. The install's switch above
+# is untouched; a `/remediate` still opens what it names.
+NO_PROMOTE_FLAG = "--no-promote"
+SWEEP_WAIVED_REASON = (
+    "the automatic sweep was withheld on this run: the request asked for no pull "
+    f"request (`finish {NO_PROMOTE_FLAG}`)"
+)
+SWEEP_OFF_ON_INSTALL_REASON = (
+    f"the automatic sweep is off on this install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`)"
+)
+_SWEEP_WAIVED = False
+
+
+def set_sweep_waived(waived: bool) -> None:
+    """Record whether this `finish` carries the per-run waiver; set once per command."""
+    global _SWEEP_WAIVED
+    _SWEEP_WAIVED = bool(waived)
+
+
+def sweep_enabled_for_run() -> bool:
+    """The install's switch, less this run's waiver."""
+    return auto_promotion_enabled() and not _SWEEP_WAIVED
+
+
+def sweep_off_reason() -> str:
+    """Why no automatic pull request opened, in the ledger's words: the waiver names the run, else the install."""
+    return SWEEP_WAIVED_REASON if _SWEEP_WAIVED else SWEEP_OFF_ON_INSTALL_REASON
+
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
 # `finish` reads it when `--manifest-file` names one; every constant below is
 # unused on a run without it.
@@ -2736,6 +2791,10 @@ class NoGitOpsRepo(RuntimeError):
     def __init__(self, message: str) -> None:
         super().__init__(f"{message} {NO_REPOSITORY_CHOSEN_AGENT_NOTE}")
         self.message = message
+
+
+class _NarrowTooLarge(Exception):
+    """A narrow snapshot of a directory is over the ceiling; the file alone is tried next."""
 
 
 class BrokerUnavailable(ValidationError):
@@ -11794,6 +11853,11 @@ def render_listed_finding(
     A state other than open, and its pull request, follow the id: the state
     index covers full rows only, so a listed row is the one place a reader
     finds them.
+
+    A finding the shared-account shield made manual keeps the shield on an
+    indented line under the bullet: it is the instruction not to apply the
+    namespace-wide fix, and without it the row reads like any other 2.7
+    finding. `LISTED_LINE_RE` reads the bullet line alone.
     """
     fid = str(finding.get("id", ""))
     suffix = ""
@@ -11802,11 +11866,32 @@ def render_listed_finding(
     namespace = _ident(str(finding.get("namespace", "")))
     where = f"`{_ident(str(finding.get('cluster', '')))}`"
     where += f" / `{namespace}`" if namespace else " / _cluster-scoped_"
-    return (
+    line = (
         f"- **{_cell(str(finding.get('severity', '')))}** — "
         f"{_cell(str(finding.get('title', '')))} — {where} — "
         f"`{_ident(str(finding.get('object', '')))}` (`{fid}`){suffix}"
     )
+    shield = _shared_account_shield(finding)
+    return line + (f"\n  {shield}" if shield else "")
+
+
+def _shared_account_shield(finding: dict) -> str:
+    """The shield note at the head of a 2.7 finding's remediation note, or "".
+
+    Through `clip_text` like every other note bound for the body, and on one
+    line: the note's text is the harness's, but the names in it come from the
+    repository, and a newline or comment opener in them must not reach the
+    listed section's brackets.
+    """
+    if str(finding.get("check", "")) != SHARED_ACCOUNT_CHECK:
+        return ""
+    note = str((finding.get("remediation") or {}).get("note", ""))
+    if not note.startswith(SHARED_ACCOUNT_SHIELD_PREFIX):
+        return ""
+    end = SHARED_ACCOUNT_SHIELD_END_RE.search(note)
+    if end is None:
+        return ""
+    return " ".join(clip_text(note[: end.end()], MAX_NOTE_CHARS).split())
 
 
 def _listed_header(count: int) -> list[str]:
@@ -12778,8 +12863,8 @@ def _render_withheld(
     if off:
         out += [
             "",
-            f"{len(off)} finding(s) qualify for an automatic remediation {noun}, and the automatic "
-            f"sweep is off on this install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), so none was "
+            f"{len(off)} finding(s) qualify for an automatic remediation {noun}, and "
+            f"{sweep_off_reason()}, so none was "
             "opened without a request. Comment `/remediate <finding-id>` to open any of them.",
             "",
             *rows(off),
@@ -13869,8 +13954,7 @@ def render_stale_close_comment(
         "",
         resolution
         or (
-            f"If the finding comes back: the automatic remediation sweep is off on this "
-            f"install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`), so nothing is re-proposed "
+            f"If the finding comes back: {sweep_off_reason()}, so nothing is re-proposed "
             "without a request; `/remediate <finding-id>` re-opens it on this same branch."
             if sweep_off
             else f"If the finding comes back: a finding graded `{UNVOUCHED_PROMOTION_FLOOR}`, "
@@ -17180,7 +17264,9 @@ class _RepositoryProbe:
     """What the repository already holds, for the fixes `finish` writes.
 
     Directory mode reads the clone. Content mode takes one snapshot of the
-    repository's base for the whole run and reads it locally. An answer it
+    repository's base for the whole run and reads it locally; when the whole
+    tree is over the broker's snapshot ceiling, each question takes a
+    snapshot of only the part it asks about (narrow mode). An answer it
     cannot give -- no snapshot, an unreadable file -- is a yes, so `finish`
     never writes a file it could not check.
     """
@@ -17207,17 +17293,31 @@ class _RepositoryProbe:
         # Directory mode's answers to `committed`, filled by `ask_committed`.
         self._committed: dict[str, tuple[bool, str]] = {}
         self._unreadable = False
+        # Narrow mode: the whole tree was over the snapshot ceiling, so each
+        # question takes a snapshot of only the path it asks about. Each path's
+        # snapshot, None for a path the revision does not hold.
+        self.narrow = False
+        self._narrow: dict[str, RepositorySnapshot | None] = {}
+        # Paths whose narrow snapshot was refused as too large, a directory's or
+        # a file's, so neither is asked of the broker again this run.
+        self._narrow_refused: set[str] = set()
+        # The revision the first narrow answer was read at, a refusal's included.
+        self._narrow_revision = ""
 
     @property
     def base_sha(self) -> str:
         """The commit SHA of the snapshot already taken, or empty."""
-        return self._snapshot.revision if self._snapshot is not None else ""
+        if self._snapshot is not None:
+            return self._snapshot.revision
+        return self._narrow_revision
 
     def known_absent(self, path: str) -> bool:
         """Whether an earlier `has_path` call already found `path` absent."""
         return path in self._paths and not self._paths[path][0]
 
     def broker(self) -> RepositorySnapshot | None:
+        import vcs_client
+
         # Every attempt is made inside the first call that needs the snapshot,
         # so the question that asked is answered from a retry that worked.
         while self._snapshot is None and self._attempts < PROBE_OPEN_ATTEMPTS:
@@ -17228,6 +17328,16 @@ class _RepositoryProbe:
                 # A retry that worked answers for the failed one before it.
                 self.outage = None
             except Exception as exc:  # noqa: BLE001 -- no snapshot: every question is a yes
+                if getattr(exc, "code", None) == vcs_client.SNAPSHOT_TOO_LARGE:
+                    # Not a failure to retry: the tree is over the ceiling, so
+                    # each question narrows its own snapshot (`_narrow_snapshot_for`).
+                    self.narrow = True
+                    self._attempts = PROBE_OPEN_ATTEMPTS
+                    log(
+                        f"WARNING: {self.repo} is too large for one snapshot ({exc}); "
+                        "each repository check takes a snapshot of only the path it asks about"
+                    )
+                    return None
                 self.unavailable = f"{type(exc).__name__}: {exc}"
                 self.note_outage(exc)
                 log(f"WARNING: could not take a snapshot of {self.repo} through the broker ({self.unavailable})")
@@ -17271,15 +17381,118 @@ class _RepositoryProbe:
             return answer
         self.unanswered = ""
         answer = self._broker_has_path(path)
-        if self._snapshot is not None:
+        if (self._snapshot is not None or self.narrow) and not self.unanswered:
             self._paths[path] = (answer, self.unanswered)
         return answer
 
     def _broker_has_path(self, path: str) -> bool:
         snap = self.broker()
+        if snap is None and self.narrow:
+            try:
+                narrowed = self._narrow_snapshot_for(path)
+            except Exception as exc:  # noqa: BLE001 -- an unanswered check cannot rule the path out
+                self.unanswered = f"a snapshot of {path}: {type(exc).__name__}: {exc}"
+                self.note_outage(exc)
+                return True
+            return narrowed is not None and narrowed.has_file(path)
         if snap is None:
             return True
         return snap.has_file(path)
+
+    def narrow_unreadable(self, tree: str) -> str:
+        """In narrow mode, why the name search under `tree` cannot run; "" when it can.
+
+        "" outside narrow mode. The planner asks this before its other checks
+        of a generated fix, so a fix whose name search would fail anyway is
+        declined at once, without the per-file snapshots of the checks before it.
+        """
+        if not content_mode():
+            return ""
+        if self._snapshot is None and self._attempts == 0:
+            # The first question of the run: this is what finds narrow mode.
+            self.broker()
+        if not self.narrow:
+            return ""
+        if not tree:
+            return f"{self.repo} is too large to search whole for a name"
+        try:
+            self._narrow_snapshot_for(tree.rstrip("/"))
+        except Exception as exc:  # noqa: BLE001 -- the reason the fix is declined
+            return f"{type(exc).__name__}: {exc}"
+        return ""
+
+    @staticmethod
+    def _narrow_key(path: str) -> str:
+        """What narrow mode snapshots to answer a question about `path`.
+
+        The directory two levels down that holds it -- a `clusters/<name>`
+        tree in the GitOps layout -- so one snapshot answers every fix,
+        kustomization marker and name search in that tree. Nearer the top a
+        directory holds most of the repository, so the file alone is taken.
+        """
+        parts = PurePosixPath(path).parent.parts
+        return str(PurePosixPath(*parts[:CLUSTER_TREE_DEPTH])) if len(parts) >= CLUSTER_TREE_DEPTH else path
+
+    def _narrow_snapshot_for(self, path: str) -> "RepositorySnapshot | None":
+        """The narrow snapshot that answers for `path`; None when the revision does not hold it.
+
+        A snapshot already held of `path` or of a directory above it answers
+        first, so a run pays one snapshot per tree. Otherwise `_narrow_key`'s
+        directory is taken, and when that is over the ceiling, the file alone.
+        """
+        for key, held in self._narrow.items():
+            if path == key or path.startswith(f"{key}/"):
+                return held
+        key = self._narrow_key(path)
+        if key != path:
+            try:
+                return self._take_narrow(key, last=False)
+            except _NarrowTooLarge:
+                pass
+        return self._take_narrow(path, last=True)
+
+    def _take_narrow(self, key: str, *, last: bool) -> "RepositorySnapshot | None":
+        """A snapshot of only `key`, kept for the run; None when the revision does not hold it.
+
+        Past `PROBE_NARROW_SNAPSHOT_CAP` it takes none and raises, and a
+        snapshot over the ceiling with nothing narrower to try raises too; the
+        question reads either as unanswered, so the check is skipped and the
+        fix declined with that reason, as when no snapshot could be taken at
+        all. The run goes on and the report publishes.
+        """
+        import vcs_client
+
+        if len(self._narrow) + len(self._narrow_refused) >= PROBE_NARROW_SNAPSHOT_CAP:
+            raise RuntimeError(
+                f"this run already took {PROBE_NARROW_SNAPSHOT_CAP} narrow snapshots of "
+                f"{self.repo} (PROBE_NARROW_SNAPSHOT_CAP), so {key} was not checked"
+            )
+        too_large = (
+            f"{key} in {self.repo} is too large for one snapshot; an operator can raise "
+            f"the broker's {BROKER_SNAPSHOT_CEILING_ENV}"
+        )
+        if key in self._narrow_refused:
+            # Refused earlier this run: the broker's answer does not change.
+            if not last:
+                raise _NarrowTooLarge(key)
+            raise RuntimeError(too_large)
+        try:
+            snap: RepositorySnapshot | None = RepositorySnapshot(self.repo, paths=[key])
+        except vcs_client.VcsError as exc:
+            if exc.code == SNAPSHOT_PATH_NOT_FOUND:
+                snap = None
+                self._narrow_revision = self._narrow_revision or (exc.revision or "")
+            elif exc.code == vcs_client.SNAPSHOT_TOO_LARGE:
+                self._narrow_refused.add(key)
+                if not last:
+                    raise _NarrowTooLarge(key) from exc
+                raise RuntimeError(f"{too_large} ({exc})") from exc
+            else:
+                raise
+        if snap is not None:
+            self._narrow_revision = self._narrow_revision or snap.revision
+        self._narrow[key] = snap
+        return snap
 
     def committed(self, path: str) -> bool:
         """Whether `path` is a file at the audited commit, not only in the tree.
@@ -17345,10 +17558,15 @@ class _RepositoryProbe:
                 return None
             return shown.stdout or ""
         snap = self.broker()
-        if snap is None:
-            self.unanswered = self.unavailable or "the snapshot could not be taken"
-            return None
         try:
+            if snap is None and self.narrow:
+                snap = self._narrow_snapshot_for(path)
+                if snap is None or not snap.has_file(path):
+                    self.unanswered = f"{path} is not in the repository"
+                    return None
+            if snap is None:
+                self.unanswered = self.unavailable or "the snapshot could not be taken"
+                return None
             return snap.read_bytes(path).decode("utf-8")
         except Exception as exc:  # noqa: BLE001 -- an unread file cannot show the entry
             self.unanswered = f"reading {path}: {type(exc).__name__}: {exc}"
@@ -17384,10 +17602,18 @@ class _RepositoryProbe:
                 if path.startswith(prefix) and path not in self.ignored
             )
         snap = self.broker()
-        if snap is None:
-            return True
+        tree = prefix.rstrip("/")
         try:
-            found = snap.grep(expression, prefix=prefix.rstrip("/") or None, regex=True)
+            if snap is None and self.narrow:
+                if not tree:
+                    self.unanswered = f"{self.repo} is too large to search whole for {name}"
+                    return True
+                snap = self._narrow_snapshot_for(tree)
+                if snap is None:
+                    return False
+            if snap is None:
+                return True
+            found = snap.grep(expression, prefix=tree or None, regex=True)
         except Exception as exc:  # noqa: BLE001 -- an unanswered search cannot rule it out
             self.unanswered = f"searching for {name}: {type(exc).__name__}: {exc}"
             return True
@@ -17395,8 +17621,10 @@ class _RepositoryProbe:
 
     def close(self) -> None:
         snap, self._snapshot = self._snapshot, None
-        if snap is not None:
-            snap.close()
+        narrowed, self._narrow = self._narrow, {}
+        for held in (snap, *narrowed.values()):
+            if held is not None:
+                held.close()
 
 
 class _WorkingTreeProbe(_RepositoryProbe):
@@ -17533,6 +17761,10 @@ def plan_generated_fixes(
             reason = f"the namespace already has a PodDisruptionBudget named {name}"
         elif not ours and target.exists():
             reason = f"{path} already exists"
+        elif not ours and (unreadable := probe.narrow_unreadable(scope)):
+            # Narrow mode: the name search below would fail, so the per-file
+            # checks before it would be spent for nothing.
+            reason = f"the repository could not be checked ({unreadable})"
         elif not ours and probe.has_path(path):
             reason = unchecked(f"{path} already exists")
         elif any(probe.has_path(str(parent / marker)) for parent in (directory, *directory.parents) for marker in KUSTOMIZATION_FILE_NAMES):
@@ -21094,9 +21326,9 @@ def _handle_finish_dry_run(
 
     states = {str(f.get("id", "")): STATE_OPEN for f in findings}
     triage_reasons = triage_markers(findings, manifest)
-    sweep_on = auto_promotion_enabled()
+    sweep_on = sweep_enabled_for_run()
     if not sweep_on:
-        log(f"{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF} on this install: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
+        log(f"{sweep_off_reason()}: the automatic sweep opens nothing; only `/remediate` requests open a {noun}.")
     plan = promotion_candidates(
         findings,
         {},
@@ -22436,7 +22668,9 @@ def _plan_remediation_files(
         listing_refusal = str(exc)
         log(f"WARNING: {listing_refusal}; this run opens, syncs and closes no proposal.")
         remediation_prs = []
-    sweep_on = auto_promotion_enabled() and listing_refusal is None
+    sweep_on = sweep_enabled_for_run() and listing_refusal is None
+    if not sweep_on and listing_refusal is None:
+        log(f"{sweep_off_reason()}: the automatic sweep opens nothing; only `/remediate` requests open a proposal.")
     # The last point before anything is published. A fix the sweep would open
     # and the worker did not write is refused until it is written or declined
     # by name with a reason: refused once, a worker re-ran `finish` unchanged
@@ -23146,7 +23380,14 @@ def kcc_paragraph_index(
     if probe is None or not content_mode():
         return kcc_declaration_index(roots)
     scanned = _kcc_paragraph_scan(repo, probe)
-    if scanned is None:
+    if scanned is None and probe.narrow:
+        # The whole tree is over the ceiling, so no snapshot is held, and the
+        # paragraph reads every declaration, which no narrow snapshot holds.
+        log(
+            f"WARNING: the Config Connector paragraph names no declaration file: {repo} is too "
+            f"large for one snapshot; an operator can raise the broker's {BROKER_SNAPSHOT_CEILING_ENV}"
+        )
+    elif scanned is None:
         log(
             f"WARNING: the Config Connector paragraph could not take a snapshot of {repo} "
             f"({probe.unavailable}); a paragraph can name no declaration file that the repository has."
@@ -23172,6 +23413,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # `--scheduled`; an on-demand run does not, so its `silent_ok` is always
     # False and the person who asked gets an answer.
     scheduled = bool(getattr(args, "scheduled", False))
+    set_sweep_waived(getattr(args, "no_promote", False))
     data = load_findings(args.findings_file, audit_id, command="finish")
     stale_since = findings_predate_run(args.findings_file, audit_id)
     if stale_since:
@@ -23385,8 +23627,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # has none and reads a snapshot, and only when a finding could match, so
     # a run with no such fix costs no round trip.
     kcc_prebuilt: dict[KccKey, KccDeclaration] = {}
-    # One snapshot for the run's repository questions; deleted after the
-    # generated fixes are planned below.
+    # The run's repository questions share one snapshot, or in narrow mode a
+    # few kept for the run; deleted after the generated fixes are planned below.
     probe = _RepositoryProbe(repo, root)
     # The worker's budget is still in those files; it names nothing the
     # repository holds, so the name search reads past it.
@@ -23402,7 +23644,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     if content_mode() and gcloud_check_wanted:
         # The probe's snapshot is the scan's; `broker` makes its retry itself.
         snap = probe.broker()
-        if snap is None:
+        if snap is None and probe.narrow:
+            # The scan reads every declaration in the tree, which no narrow
+            # snapshot holds.
+            log(
+                f"WARNING: the Config Connector scan was skipped: {repo} is too large for one "
+                "snapshot; gcloud fixes publish as written"
+            )
+        elif snap is None:
             log(
                 f"WARNING: the Config Connector scan could not take a snapshot of "
                 f"{repo} through the broker ({probe.unavailable}); gcloud fixes "
@@ -25067,6 +25316,17 @@ def build_parser() -> argparse.ArgumentParser:
             "The run is a scheduled run: the cron prompt passes this flag. Only a "
             "scheduled run can get silent_ok true. Do not pass it on a run a person "
             "asked for."
+        ),
+    )
+    finish_parser.add_argument(
+        NO_PROMOTE_FLAG,
+        dest="no_promote",
+        action="store_true",
+        help=(
+            "Publish the ledger and open no automatic remediation pull request on this "
+            "run. Pass it when the card says not to open a pull request (the Planning "
+            "Agent's propose-only line); the ledger says the fixes await `/remediate`. "
+            "The install's switch is not changed."
         ),
     )
     finish_parser.add_argument(

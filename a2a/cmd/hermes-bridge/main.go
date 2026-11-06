@@ -41,6 +41,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
 	hermesbridge "github.com/gke-labs/kube-agents/a2a/hermes-bridge"
+	"github.com/gke-labs/kube-agents/a2a/lib/memlimit"
 )
 
 const (
@@ -82,6 +83,20 @@ const (
 	// executor when the key is present and the subprocess executor when it
 	// is not (bridgeExecutor).
 	executorEnv = "BRIDGE_EXECUTOR"
+	// memoryLimitEnv carries this container's memory limit in bytes, which
+	// the operator writes from the container's own limits.memory through the
+	// Downward API (a2aBridgeMemoryLimitEnvVar in
+	// k8s-operator/internal/controller/platformagent_a2a_bridge.go), so the
+	// soft limit follows whatever limit the cluster admitted, an Autopilot
+	// clamp included. Unset, the runtime default stands, which is how the
+	// bridge ran before it; an explicit GOMEMLIMIT wins (lib/memlimit).
+	memoryLimitEnv = "BRIDGE_MEMORY_LIMIT_BYTES"
+	// memoryLimitFraction is the share of the container limit the bridge
+	// takes as its soft limit. It is alone in its container, so the tenth
+	// left over is headroom for what the cgroup counts and the heap does
+	// not: goroutine stacks, the runtime's own structures, and the kernel's
+	// accounting.
+	memoryLimitFraction = 0.9
 
 	// saNamespaceFile is the kubelet's projection of the pod's own
 	// namespace, and it is capabilityScope's LAST rung rather than its
@@ -152,6 +167,7 @@ func managedScopeDir() string {
 // logged where it is found and then returned; a missing NATS_URL returns
 // errUsage before anything is dialed.
 func realMain(ctx context.Context, log *slog.Logger) error {
+	applyMemoryLimit(log)
 	cfg, err := configFromEnv(log)
 	if err != nil {
 		return err
@@ -168,6 +184,23 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	}
 	log.Info("bridge shut down cleanly")
 	return nil
+}
+
+// applyMemoryLimit sets the Go soft memory limit from the container's
+// admitted memory limit, before anything allocates in earnest, and logs one
+// line either way. Under GOGC's default pacing the heap may double between
+// collections whatever the cgroup says; a soft limit a tenth under the
+// container's makes the collector work before the kernel does. It does not
+// cap live heap: a cli bridge whose children's output outgrows the container
+// is still OOM-killed, later, which is what the stdout cap in
+// hermes-bridge/bridge.go is for.
+func applyMemoryLimit(log *slog.Logger) {
+	if limitBytes, applied, reason := memlimit.Apply(memoryLimitEnv, memoryLimitFraction); applied {
+		log.Info("Go soft memory limit set from the container's memory limit",
+			"bytes", limitBytes, "source", memoryLimitEnv, "fraction", memoryLimitFraction)
+	} else {
+		log.Info("Go soft memory limit not derived; the runtime default applies", "reason", reason)
+	}
 }
 
 // maxDurationSeconds is the largest count of seconds a time.Duration holds;

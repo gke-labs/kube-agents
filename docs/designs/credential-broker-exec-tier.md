@@ -220,12 +220,12 @@ base and makes a wrong route fail loudly.
 
 | Caller                                          | Today                                                                                          | Proposed                                                                                           |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Sandbox shim, `execute()`                       | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set, else `CREDENTIAL_PROXY_URL`                                  |
+| Sandbox shim, `execute()`                       | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set and well-formed, else `CREDENTIAL_PROXY_URL`                  |
 | Sandbox shim, `Workspace`, vcs, forge           | `CREDENTIAL_PROXY_URL`                                                                         | Unchanged                                                                                          |
 | Session pods (under the cluster-view flag only) | `CREDENTIAL_PROXY_URL`, from the gateway's `A2A_CREDENTIAL_PROXY_URL` (`a2a/gateway/spawn.go`) | Also get `CREDENTIAL_PROXY_EXEC_URL`, through a new `A2A_CREDENTIAL_PROXY_EXEC_URL` on the gateway |
 | Fleet audits (agent cron jobs)                  | The model's shell, then the shim                                                               | Same path; background by default once the turn token exists (§4.1); until then, interactive (§12)  |
 | Watches, reconcile                              | Through `sandbox_exec` and the shim                                                            | Same path; background by default once the turn token exists (§4.1); until then, interactive (§12)  |
-| Cloud API relay callers (`ApiSession`)          | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set, else `CREDENTIAL_PROXY_URL`                                  |
+| Cloud API relay callers (`ApiSession`)          | `CREDENTIAL_PROXY_URL`                                                                         | `CREDENTIAL_PROXY_EXEC_URL` when set and well-formed, else `CREDENTIAL_PROXY_URL`                  |
 | Gateway relays, watchers                        | Their own URL variables                                                                        | Unchanged                                                                                          |
 
 The fallback means an exec tier that is off, or a new shim against an old operator, behaves as
@@ -238,7 +238,11 @@ check: exec-role commands on `stateful` while replicas > 0 mean the exec path is
 API relay client (`ApiSession`) also falls back on a connection error that comes after the request
 was sent, because every relay call is a GET and sending it again is safe; it then stays on the
 stateful broker for the rest of the session, and it retries the broker's own busy reply on §4.3's
-schedule. The command path never resends after a send, because a command may have run. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
+schedule. The command path never resends after a send, because a command may have run. A
+malformed `CREDENTIAL_PROXY_EXEC_URL` (not a valid `http://` URL, no host, or a port that is not a number
+from 0 to 65535, or a query or fragment) is ignored when `CREDENTIAL_PROXY_URL` is set: both callers
+use the stateful broker, and the shim writes one stderr line per process. A shape the check does not
+know still falls back in `execute()` when it fails before a byte is sent. The sandbox forwards only the variable names in `SANDBOX_FORWARDED_ENV_NAMES`
 (`deploy/sandbox/entrypoint.sh`), so `CREDENTIAL_PROXY_EXEC_URL` is added there. Without that, the
 shim always takes the fallback and nothing reports it.
 
@@ -254,8 +258,9 @@ shim always takes the fallback and nothing reports it.
 - Own selector and labels. The exec pods do not reuse `credentialProxySelector`
   (`credential_proxy_manifests.go`), so today's Service does not send chat and workspace calls
   to them, where they would get a 404. They do not carry `kubeagents.x-k8s.io/has-credential-proxy`,
-  which opens the github-token-minter to a pod. The exec builder mounts no forge credentials and no
-  Slack tokens, so scaling out makes no copies of secrets that exec never uses.
+  which opens the github-token-minter to a pod. The exec builder mounts no forge credentials, no
+  Slack tokens and not the broker's ServiceAccount token for the minter, so scaling out makes no
+  copies of secrets that exec never uses.
 - Every chart or operator object that selects today's broker labels (`app: <agent>-credential-proxy`
   or `kubeagents.x-k8s.io/component: credential-proxy`) gets an exec-tier counterpart. The builder
   finds them by a search for both labels. On `main` they are:
@@ -461,8 +466,8 @@ drop the split and scale one broker, once both are gone:
 
 - **The content workspace is removed.** Its callers on `main` today: the fleet audit's
   remediation push and its reads (`audit_report.py`, `_land_group_via_broker` and
-  `detect_content_mode`), the collectors' repository mirror (`collect.py`), the deprecation scan
-  (`api_deprecation_scan.py`) and `inspect-repository`. The snapshot verb (`POST /v1/vcs/snapshot`)
+  `detect_content_mode`), the deprecation scan (`api_deprecation_scan.py`) and
+  `inspect-repository`. The snapshot verb (`POST /v1/vcs/snapshot`)
   covers the reads that the other `/v1/vcs` verbs do not: repositories the install does not
   manage, context repositories, and a shallow read. The read-only callers, such as
   `inspect-repository`'s `clone` and `api_deprecation_scan.py`, can move to it.
@@ -994,6 +999,6 @@ copies, and `test_exec_tier_contract.py` checks that they match this section.
 | Replica count in pods | The ConfigMap's key `replicas`, mounted at `/etc/credential-proxy-exec-tier/replicas`; `CREDENTIAL_PROXY_EXEC_REPLICAS_FILE` names that path. A scale change rewrites the ConfigMap and does not restart the pods. The admission route reads the file on each request and, for a positive count, adds `replicas`, `tier_admitted` and `tier_interactive_cap` to its report (§3.5).                                                                                                                                                                                                                                                        |
 | Busy reply            | HTTP 503 `{"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "bound": "<bound>", "error": "…"}`. The bounds are `slot`, `budget`, `refresh-lock`, `session`, `profile`, `scope`, `background`, `draining` and `other`; `background` is the background cap `B` (§4.2) after the 60 s wait; `draining` is a replica that is stopping (§9 step 0). `scope` is the scope publisher role's refusal, not a capacity bound, so the shim does not retry it.                                                                                                                                                                                      |
 | Shim retry            | Up to 4 times (5 attempts) and inside 170 s of the first send (or the shorter deadline a caller names in `CREDENTIAL_PROXY_RETRY_DEADLINE_SECONDS`), each on a new connection after a jittered wait (a numeric Retry-After held between 2 s and 30 s, else 2·2^k capped at 16 s; §4.3), for the bounds `slot`, `budget`, `background`, `draining` and `profile`, and for a reply with no bound; never for the others, and never after a dropped connection. The relay client (ApiSession) applies the same loop to a reply whose top-level code is the broker's busy or resource-pressure code and passes an upstream 429 or 503 through. |
-| Connect fallback      | When a connection to `CREDENTIAL_PROXY_EXEC_URL` cannot be made, the shim sends the request to `CREDENTIAL_PROXY_URL` and writes one stderr line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Connect fallback      | When a connection to `CREDENTIAL_PROXY_EXEC_URL` cannot be made, or the request fails before a byte is sent, the shim sends the request to `CREDENTIAL_PROXY_URL` and writes one stderr line.                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | Classes               | `interactive` and `background`; the metric label is `class`, on the admission wait, the refusals and the command duration. The profile and `scope` roles are background. Every other slot-taking role is interactive: the session role, the MCP role, and the shell role (its vcs and forge routes too) until the turn token exists (§4.1). Interactive work is held at `admitted − 1`, so one admission stays free for background work. Background children run at nice 10, set on their process group right after they start. The reserve `R = 2` and the caps are constants.                                                           |
 | Audit fields          | `broker_tier` (`exec` or `stateful`), `class` and `broker_pod` on each tool-execution record. §5's `requestId` and caller name are fields of their own, outside `principal`.                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

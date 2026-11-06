@@ -608,5 +608,31 @@ class CRDFieldBlocksTest(unittest.TestCase):
                 self.assertEqual(generate_docs.main(["--check", "example"], blocks), 0)
 
 
+class SkillCatalogTest(unittest.TestCase):
+    """Platform and Cluster Agent skills that share a name keep their own descriptions."""
+
+    def test_shared_skill_names_render_each_trees_own_description(self):
+        platform_skills = generate_docs._read_skills(generate_docs.SKILLS_DIR)
+        cluster_skills = generate_docs._read_skills(generate_docs.CLUSTER_SKILLS_DIR)
+        shared = sorted(set(platform_skills) & set(cluster_skills))
+        self.assertTrue(shared, "expected at least one shared skill name across trees")
+
+        catalog = generate_docs.gen_skill_catalog()
+        platform_part, cluster_part = catalog.split(
+            f"### {generate_docs.CLUSTER_SKILL_GROUP}\n", 1
+        )
+        for name in shared:
+            platform_link = f"{generate_docs.GITHUB_BLOB}/agents/platform/skills/{name}/SKILL.md"
+            cluster_link = f"{generate_docs.GITHUB_BLOB}/agents/cluster/skills/{name}/SKILL.md"
+            self.assertIn(
+                f"| [`{name}`]({platform_link}) | {generate_docs.md_escape(platform_skills[name])} |",
+                platform_part,
+            )
+            self.assertIn(
+                f"| [`{name}`]({cluster_link}) | {generate_docs.md_escape(cluster_skills[name])} |",
+                cluster_part,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

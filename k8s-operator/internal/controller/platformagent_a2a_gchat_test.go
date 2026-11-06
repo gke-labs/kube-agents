@@ -491,11 +491,12 @@ func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 
 // TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
 // container is told to send proactive posts through chat.notify exactly when
-// the next stack holds Google Chat and the home channel is a space name, and
-// the kanban notifier to send a card's report back to its conversation
-// whenever the gateway arms the route (home channel unset or a space name).
-// Telling either with no route behind it sends posts to a subject nobody
-// answers.
+// the next stack holds Google Chat and the home channel is a space name, or
+// is unset with no Slack to fall back to (the gateway then keeps the refused
+// posts for the digest); and the kanban notifier to send a card's report
+// back to its conversation whenever the gateway arms the route (home channel
+// unset or a space name). Telling either with no route behind it sends posts
+// to a subject nobody answers.
 func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
 	for _, tc := range []struct {
 		name               string
@@ -505,7 +506,8 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 		{"today with chat", gchatTestAgent("", true), false, false},
 		{"skew with chat", gchatTestAgent("later", true), false, false},
 		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true},
-		{"next with chat, no home channel", gchatTestAgent("next", true), false, true},
+		{"next with chat, no home channel", gchatTestAgent("next", true), true, true},
+		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), false, true},
 		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false},
 		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false},
 		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false},

@@ -32,7 +32,7 @@ KUBE_PROXY_IMAGE_ARGS := $(foreach v,$(KUBE_PROXY_IMAGE_VARS),$(if $($(v)),--bui
 KUBE_AGENTS_VERSION ?= dev
 VERSION_ARG := --build-arg KUBE_AGENTS_VERSION=$(KUBE_AGENTS_VERSION)
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template chart-sync chart-check iac-parity-check cluster-reads-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-build-kube-proxy docker-build-sandbox docker-smoke-sandbox dev-rebuild-agent mirror-images images-check prettier-check prettier-write shellcheck lint-python test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests test-e2e-deps validate prompt-check skills-sync skills-continue skills-import skills-refresh skills-generate skills-check skills-status skills-verify-upstream docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-audience docs-check-prose docs-check-context-budget docs-check-pr-template chart-sync chart-check iac-parity-check cluster-reads-check concurrency-check tfvar-check terraform-test tf-apply tf-destroy fleet-audit-view coverage coverage-merge coverage-check test-integration conformance
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -189,8 +189,8 @@ lint-python: ## Run ruff's error rules over every Python file (the set tests/tes
 # flake in a young seam test could not red an already-gating job; it finished
 # that period without a single failure, and a tier nothing gates on is a tier
 # people learn to merge around. It is deterministic by construction -- real
-# components, no model calls -- so it belongs in the sweep the `test` job runs
-# rather than beside it. The one thing that costs: the injector seam shells out
+# components, no model calls -- so it belongs in the sweep the `test-shard` jobs
+# run rather than beside it. The one thing that costs: the injector seam shells out
 # to `go test`, so every job that expands this list needs a Go toolchain on
 # PATH or those tests skip themselves and the sweep reports green without them.
 PYTHON_TEST_FILES := $(sort \
@@ -437,7 +437,7 @@ endef
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
 # as `dotenv` and pyyaml as `yaml`.
-PYTHON_TEST_IMPORTS := fastapi httpx markdown_it mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
+PYTHON_TEST_IMPORTS := croniter fastapi httpx markdown_it mcp dotenv plotly pydantic streamlit uvicorn websockets yaml
 
 test-python-deps: ## Install the third-party imports `make test-python` needs.
 	@python3 -m pip install -r requirements-test.txt
@@ -690,7 +690,7 @@ coverage-merge: ## Join the coverage the sharded `make coverage` runs left in CO
 	fi
 
 # 55 is a deliberately loose placeholder: the real floor gets committed from the
-# first green CI run of the `test` job's coverage sweep, not from a laptop
+# first green CI run of the coverage the `test` job joins from the shards, not from a laptop
 # measurement, because CI's Python and dependency set produce a different number.
 COVERAGE_FLOOR ?= 55
 
@@ -763,6 +763,18 @@ test-bench-deps: ## Install what `make test-bench` needs: bench/ editable plus p
 test-bench: ## Run the bench harness tests under pytest.
 	@python3 -m pytest bench/tests/
 
+# The harness-scale measurement (docs/designs/agent-harness-bottlenecks.md). SCALE_CONFIG is a plan
+# file; the target project and clusters come from it and from SCALE_* in the environment
+# (SCALE_PROJECT_ID is required for scale-run). The data file is the plan's target.data_file.
+SCALE_CONFIG ?= bench/scale/phase1.yaml
+
+.PHONY: scale-plan scale-run
+scale-plan: ## Print the harness-scale measurement matrix for SCALE_CONFIG (default bench/scale/phase1.yaml).
+	@cd bench && python3 -m kube_agents_bench.scale.runner plan $(abspath $(SCALE_CONFIG))
+
+scale-run: ## Run the harness-scale measurement in SCALE_CONFIG against the target in SCALE_*, resuming from its data file.
+	@cd bench && python3 -m kube_agents_bench.scale.runner run $(abspath $(SCALE_CONFIG))
+
 # A broken bench case otherwise costs a full presubmit to discover: provision,
 # deploy, run the agent, score, read the log. Most of the ways a task.yaml is
 # broken are static -- an unknown domain slug, a fixture role the seeded fleet
@@ -779,7 +791,7 @@ bench-case-check: ## Validate every bench task.yaml against the case-format cont
 # The integration tier: real components wired together with the agent replaced
 # by a fake -- no model calls, deterministic by construction (strategy 4.1b).
 # The tier now gates: tests/integration is in PYTHON_TEST_DIRS, so `make
-# test-python` and the CI `test` job both run it, and a red seam test is a red
+# test-python` and the CI `test-shard` jobs both run it, and a red seam test is a red
 # pull request. This target is a convenience for running that one tier while
 # you work on a seam -- seconds instead of the whole sweep -- and is not what
 # CI invokes, so do not reach for it as the definition of what must pass.
@@ -881,6 +893,9 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 
 cluster-reads-check: ## Fail when a file under agents/ adds a whole-cluster kubectl read, several kinds or one unpaged kind across every namespace as full objects (pinned backlog: scripts/cluster_reads_allowlist.txt; CI runs this via scripts/test_check_cluster_reads.py).
 	@python3 scripts/check_cluster_reads.py
+
+concurrency-check: ## Fail when a request handler in the broker, the KV server or the auth callout can start an unbounded thread or goroutine (CI runs this via scripts/test_check_bounded_concurrency.py).
+	@python3 scripts/check_bounded_concurrency.py
 
 # The unit tests stub `terraform`, so only this puts lifecycle.sh's tfvar()
 # in front of the real binary (#1309 shipped against a stub that answered `null`

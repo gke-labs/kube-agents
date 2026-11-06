@@ -273,6 +273,19 @@ func scopeTestJob(created time.Time, hash string, finished bool) batchv1.Job {
 	return job
 }
 
+// scopeTestDeadlineJob is a Job its deadline killed, as Kubernetes 1.30
+// reports it: Failed (DeadlineExceeded) at failedAt, with no pod counted as
+// active or terminating although the killed pod may still be shutting down.
+func scopeTestDeadlineJob(created, failedAt time.Time, hash string) batchv1.Job {
+	job := scopeTestJob(created, hash, false)
+	job.Status.Conditions = []batchv1.JobCondition{{
+		Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+		Reason: batchv1.JobReasonDeadlineExceeded, LastTransitionTime: metav1.NewTime(failedAt),
+	}}
+	job.Status.Terminating = ptr.To(int32(0))
+	return job
+}
+
 func TestTheScopePublishSchedule(t *testing.T) {
 	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
 	const hash = "sha256:current"
@@ -298,6 +311,22 @@ func TestTheScopePublishSchedule(t *testing.T) {
 		{"the newest Job decides, not an older one for another hash",
 			[]batchv1.Job{scopeTestJob(now.Add(-20*time.Minute), "sha256:old", true), scopeTestJob(now.Add(-2*time.Minute), hash, true)},
 			false, 13 * time.Minute},
+		{"a Job its deadline failed within the grace period blocks a new one, even for another hash",
+			[]batchv1.Job{scopeTestDeadlineJob(now.Add(-20*time.Minute), now.Add(-10*time.Second), "sha256:old")}, false, scopeActiveJobRecheck},
+		{"a Job its deadline failed a grace period ago starts the next",
+			[]batchv1.Job{scopeTestDeadlineJob(now.Add(-20*time.Minute), now.Add(-30*time.Second), hash)}, true, 15 * time.Minute},
+		{"a Job that failed for another reason does not wait out the grace period",
+			[]batchv1.Job{func() batchv1.Job {
+				job := scopeTestDeadlineJob(now.Add(-20*time.Minute), now.Add(-10*time.Second), hash)
+				job.Status.Conditions[0].Reason = batchv1.JobReasonBackoffLimitExceeded
+				return job
+			}()}, true, 15 * time.Minute},
+		{"a longer grace period on the pod template is the one waited out",
+			[]batchv1.Job{func() batchv1.Job {
+				job := scopeTestDeadlineJob(now.Add(-20*time.Minute), now.Add(-time.Minute), hash)
+				job.Spec.Template.Spec.TerminationGracePeriodSeconds = ptr.To(int64(120))
+				return job
+			}()}, false, scopeActiveJobRecheck},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
