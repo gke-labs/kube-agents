@@ -1049,6 +1049,9 @@ spec:
       {{- with $integ.googleChat.homeChannel }}
       homeChannel: {{ . | quote }}
       {{- end }}
+      {{- if eq (toString $integ.googleChat.answerFeedback) "false" }}
+      answerFeedback: false
+      {{- end }}
       mode: {{ $integ.googleChat.mode | default "default" | quote }}
     {{- end }}
     {{- if $integ.slack.enabled }}

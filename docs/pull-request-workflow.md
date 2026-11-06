@@ -119,10 +119,11 @@ that failure is why this step has previously been skipped rather than run.
 **Shell scripts.** If you change a `.sh` file, run `make shellcheck`. The `validate` job runs the
 same target on every pull request, and it is a required check, so a warning-severity finding in
 any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
-shellcheck step in `.github/workflows/validate.yml`) from
-<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
-package on the GitHub-hosted runner image is whatever release that image's Ubuntu ships, not the
-one the job pins and asserts, and a different release reports a different set of findings than CI.
+shellcheck step in `.github/workflows/validate.yml`): a different release reports a different set
+of findings than CI. A distribution package is whatever release that distribution ships, so check
+`shellcheck --version` against the pin and install from
+<https://github.com/koalaman/shellcheck/releases> when it differs; the job does the same with the
+runner image's package.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
 place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in

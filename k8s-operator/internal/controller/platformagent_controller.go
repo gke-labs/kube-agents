@@ -267,6 +267,21 @@ const (
 		"(SLACK_* or GOOGLE_CHAT_* in install.env) to deliver them in chat."
 	noChatPlatformWithRepo = "stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests)"
 	noChatPlatformNoRepo   = "stay in the report store on the data volume alone, since no GitOps repository is registered"
+	// The condition reporting that spec.harness.experimental.shellSandbox.image
+	// pins an image other than the one this operator runs
+	// (operatorShellSandboxImage). The pin survives every upgrade of the
+	// operator and the agent, and a sandbox older than the agent fails each
+	// kubectl call at the credential proxy with a refusal that names neither
+	// the pin nor the image (#4966). Informational, like NoChatPlatform: a
+	// deliberate pin to a mirror or a test build is allowed, so it leaves Ready
+	// alone and is written only in that state.
+	shellSandboxImagePinnedConditionType = "ShellSandboxPinned"
+	shellSandboxImagePinnedReason        = "ImageDiffersFromOperator"
+	// shellSandboxImagePinnedMessageFormat takes the pinned image and the
+	// operator's own.
+	shellSandboxImagePinnedMessageFormat = "spec.harness.experimental.shellSandbox.image pins %s, but this operator runs %s. " +
+		"A sandbox older than the agent fails its kubectl calls at the credential proxy with a policy refusal. " +
+		"Clear the field to run the operator's image, or set it to the matching build."
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
 	// install.env key, what the field holds, and where the posts go
 	// meanwhile (one of the two sentences below).
@@ -1453,14 +1468,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// quota on deletion, and what a refused delete should do to the
 		// finalizer, is #3827.
 		//
-		// The dispatcher's pod-read binding there is removed, for the
-		// ClusterRoleBinding's reason above: left behind, anyone who later
-		// creates a ServiceAccount of the dispatcher's name inherits pod read
-		// in that namespace. A failure is logged and never holds the
-		// finalizer, under the profile-namespace rule (#3827 settles what a
-		// refused delete should do).
+		// The dispatcher's warm pools there go, with their CA bundle copy
+		// (their pods hold bus and broker tokens), and so does its pod-read
+		// binding, for the ClusterRoleBinding's reason above: left behind,
+		// anyone who later creates a ServiceAccount of the dispatcher's name
+		// inherits pod read in that namespace. A failure is logged and never
+		// holds the finalizer, under the profile-namespace rule (#3827
+		// settles what a refused delete should do).
 		if err := r.deleteDispatcherPodsRBAC(ctx, agent); err != nil {
-			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's pod-read Role on deletion", err)
+			r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on deletion", err)
 		}
 
 		// Delete managed litellm-policy during finalizer teardown only if Deployment/litellm
@@ -4364,10 +4380,13 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	homeMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
 	conversionMsg := a2aBusConversionRefusedMessage(agent)
 	noChatMsg := noChatPlatformMsg(agent)
+	// So does the sandbox pin: an old sandbox is a likely cause of the park.
+	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
 	if a2aGatewayConditionCurrent(agent, gatewayMsg) && busProvisionedConditionCurrent(agent, want) &&
 		a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown) &&
 		homeChannelUnsetConditionCurrent(agent, homeMsg) &&
 		noChatPlatformConditionCurrent(agent, noChatMsg) &&
+		shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
@@ -4380,6 +4399,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		return a2aGatewayConditionCurrent(live, gatewayMsg) && busProvisionedConditionCurrent(live, wantLive) &&
 			homeChannelUnsetConditionCurrent(live, homeChannelUnsetMessage(live, a2a.homeRecord)) &&
 			noChatPlatformConditionCurrent(live, noChatPlatformMsg(live)) &&
+			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
@@ -4394,6 +4414,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setHomeChannelUnsetCondition(agent, homeMsg, now)
 	setNoChatPlatformCondition(agent, noChatMsg, now)
+	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
@@ -4761,6 +4782,10 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Its counterpart for the install with no chat platform, same shape.
 	noChatPlatformMsgNow := noChatPlatformMsg(agent)
 	noChatPlatformUnchanged := noChatPlatformConditionCurrent(agent, noChatPlatformMsgNow)
+	// The sandbox image pin, the same class: from the spec and the operator's
+	// own image, compared on its message.
+	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
+	sandboxPinnedUnchanged := shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg)
 
 	// The refused conversion, from the spec and the count this pass resolved:
 	// advisory, so Ready stands on the bus that runs.
@@ -4852,6 +4877,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		homeChannelUnsetUnchanged &&
 		conversionRefusedUnchanged &&
 		noChatPlatformUnchanged &&
+		sandboxPinnedUnchanged &&
 		hostPathDroppedUnchanged &&
 		replicasLimitedUnchanged &&
 		a2aGatewayUnchanged &&
@@ -4932,6 +4958,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
 	setA2ABusConversionRefusedCondition(agent, conversionRefusedMsg, now)
 	setNoChatPlatformCondition(agent, noChatPlatformMsgNow, now)
+	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 	setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 
@@ -5123,6 +5150,50 @@ func setNoChatPlatformCondition(agent *agentv1alpha1.PlatformAgent, msg string, 
 		Type:               noChatPlatformConditionType,
 		Status:             metav1.ConditionTrue,
 		Reason:             noChatPlatformReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+// shellSandboxImagePinnedMsg is the ShellSandboxPinned condition's message,
+// or "" when the condition is to be absent: the CR pins no sandbox image, or
+// pins the one the operator runs anyway.
+func shellSandboxImagePinnedMsg(agent *agentv1alpha1.PlatformAgent) string {
+	spec := shellSandboxSpec(agent)
+	if spec == nil || spec.Image == "" {
+		return ""
+	}
+	own := operatorShellSandboxImage()
+	if spec.Image == own {
+		return ""
+	}
+	return fmt.Sprintf(shellSandboxImagePinnedMessageFormat, spec.Image, own)
+}
+
+// shellSandboxImagePinnedConditionCurrent reports whether the
+// ShellSandboxPinned condition already says msg, where "" means the
+// condition is to be absent.
+func shellSandboxImagePinnedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, shellSandboxImagePinnedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == shellSandboxImagePinnedReason && existing.Message == msg
+}
+
+// setShellSandboxImagePinnedCondition writes the ShellSandboxPinned
+// condition, or removes it when msg is "". The caller does the API write.
+func setShellSandboxImagePinnedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, shellSandboxImagePinnedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               shellSandboxImagePinnedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             shellSandboxImagePinnedReason,
 		Message:            msg,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,

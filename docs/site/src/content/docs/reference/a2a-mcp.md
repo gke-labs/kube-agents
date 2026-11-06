@@ -43,6 +43,8 @@ The bridge's token belongs to the deployment's saved target, not its name. A con
 
 The bridge relays `notifications/progress` frames from an NDJSON reply as live progress, but this server sends none yet: each call gets one JSON answer, so the bridge shows a turn's result when it ends, with no progress before it.
 
+The bridge offers `poll_events` too and forwards it to this server, so card reports that arrive after a `send_message` answer can be read with the `conversation_token` and `since` the answer gives.
+
 To rotate the token, write a new value into the Secret. The server reads the mounted file on every request, so the new token is accepted and the old one refused as soon as the kubelet updates the mount, usually within a minute. A blank value, or one holding a byte no request header could carry, is replaced: the operator mints a new token over it.
 
 ## The tools
