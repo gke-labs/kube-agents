@@ -306,8 +306,11 @@ check went unevaluated), `periodic-refresh` (seven days since the last full synt
 scheduled run the record names, with a findings document `finish` can run again (no remediation
 that names a file or carries a note `finish` wrote, no withheld postures, every `declared[]` entry
 filed again by this run's `start`, and this run's own search covering every repository the step
-names), and the ledger carries no pending `/remediate` request, it writes that document to
-`findings_path` and runs `finish --scheduled` on it with this run's manifest, so the cross-check,
+names), and the ledger carries no `/remediate` request still owed an answer (a writer's, `all`
+included, with no acked or refused marker; a conversation that cannot be read whole counts as
+one, and a lost broker is the `BROKER UNAVAILABLE` exit 2 as from any command), it writes that
+document to `findings_path`, with each remediation's note as the worker wrote it before the route
+notes, and runs `finish --scheduled` on it with this run's manifest, so the cross-check,
 the ledger comparison and `silent_ok` are `finish`'s own: the line is then `finish`'s, plus
 `precheck: unchanged`, and the run is over. In every other case the line says `closed: false` and
 why, the findings file is as it was, and the SOP continues; a close that dies puts the file back

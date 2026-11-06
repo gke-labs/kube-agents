@@ -36193,6 +36193,122 @@ class TestPrecheckOnTheForgePath(HarnessTestCase):
         self.assertEqual(pending, [])
         self.assertIn("the forge timed out", unread)
 
+    def day_one(self):
+        """A scheduled day-1 `finish` of one finding on the forge path.
+
+        The candidate it was drafted from, the id the ledger published it
+        under, and the envelope text the store holds after it.
+        """
+        a = make_finding(fid="a", severity="major", remediation=dict(REPLAYABLE_REMEDIATION))
+        body = published_body(make_doc(findings=[a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        candidate = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a", "severity": "major", "excerpt": "e"}
+        self.assertEqual(self.run_finish(make_doc(findings=[a]), ["--manifest-file", self.manifest_file("day1", [candidate])]), 0, self.err)
+        requested = audit_report.parse_delta_block(body)[0]
+        return candidate, requested, (self.store_dir() / "latest.json").read_text(encoding="utf-8")
+
+    def day_two_precheck(self, candidate, comments, truncated=False):
+        """The next day's `precheck --scheduled` over the same fleet, with `comments` on the ledger."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "*-view comments": comments_view({"comments": comments}, truncated=truncated),
+        }
+        self.searched_this_run()
+        return self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
+
+    def test_an_answered_remediate_request_does_not_hold_the_close(self):
+        """The markers are permanent and the comment is never edited, so an acked request is not pending."""
+        candidate, requested, _ = self.day_one()
+        answered = [
+            comment(f"/remediate {requested}", node_id="IC_1"),
+            harness_comment(f"opened a pull request\n{audit_report.acked_marker('IC_1')}\n", node_id="IC_9"),
+        ]
+        rc = self.day_two_precheck(candidate, answered)
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertTrue(out["silent_ok"])
+
+    def test_a_refused_remediate_request_does_not_hold_the_close(self):
+        candidate, requested, _ = self.day_one()
+        answered = [
+            comment(f"/remediate {requested}", node_id="IC_1"),
+            harness_comment(f"a manual finding\n{audit_report.refused_marker('IC_1')}\n", node_id="IC_9"),
+        ]
+        rc = self.day_two_precheck(candidate, answered)
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()[audit_report.PRECHECK_KEY], "unchanged")
+
+    def test_a_remediate_all_request_keeps_the_run_a_full_one(self):
+        """A full run is where the worker writes the files `all` asks for; the stored document has none."""
+        candidate, _, stored = self.day_one()
+        rc = self.day_two_precheck(candidate, [comment("/remediate all")])
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn("a /remediate request is pending on the ledger for all", out["reason"])
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), stored)
+
+    def test_a_non_writers_request_does_not_hold_the_close(self):
+        """A request the run would refuse for want of standing is refused the same on either path."""
+        candidate, requested, _ = self.day_one()
+        rc = self.day_two_precheck(candidate, [comment(f"/remediate {requested}", association="NONE", login="passer-by")])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()[audit_report.PRECHECK_KEY], "unchanged")
+
+    def test_a_conversation_that_cannot_be_read_whole_means_a_full_run(self):
+        """`read_comments` answers None for a truncated thread; that is unread, not empty."""
+        candidate, requested, stored = self.day_one()
+        rc = self.day_two_precheck(candidate, [comment(f"/remediate {requested}")], truncated=True)
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn(audit_report.PRECHECK_CONVERSATION_UNREAD, out["reason"])
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), stored)
+
+    def test_a_requester_whose_standing_the_forge_cannot_answer_means_a_full_run(self):
+        candidate, requested, stored = self.day_one()
+        self.harness.failures = {"identity login=dev": 1}
+        rc = self.day_two_precheck(candidate, [comment(f"/remediate {requested}")])
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn(audit_report.PRECHECK_CONVERSATION_UNREAD, out["reason"])
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), stored)
+
+    def test_a_lost_broker_at_the_ledger_check_is_said_and_exits_2(self):
+        """The outage is the SOP's wait-and-run-again case, not a reason to draft in full."""
+        candidate, _, stored = self.day_one()
+        draft = Path(audit_report.findings_path_for(AUDIT))
+        draft.write_text("{}", encoding="utf-8")
+        with patch.object(audit_report, "refresh_credentials", side_effect=audit_report.BrokerUnavailable("the broker at x did not answer")):
+            rc = self.day_two_precheck(candidate, [])
+        self.assertEqual(rc, 2)
+        self.assertIn("BROKER UNAVAILABLE", self.err)
+        self.assertEqual(self.out, "")
+        self.assertEqual(draft.read_text(encoding="utf-8"), "{}")
+        self.assertEqual((self.store_dir() / "latest.json").read_text(encoding="utf-8"), stored)
+
+    def test_a_broker_lost_raw_at_the_ledger_check_is_said_as_an_outage(self):
+        import urllib.error
+
+        candidate, _, _ = self.day_one()
+        lost = urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+        with patch.object(audit_report, "find_existing_issue", side_effect=lost):
+            rc = self.day_two_precheck(candidate, [])
+        self.assertEqual(rc, 2)
+        self.assertIn("BROKER UNAVAILABLE", self.err)
+
 
 if __name__ == "__main__":
     unittest.main()

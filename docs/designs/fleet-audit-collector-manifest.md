@@ -577,11 +577,15 @@ a fleet that changed. A scheduled `finish` that waived the manifest removes it t
 `unchanged` with the flag, when the newest stored envelope of the ledger this run publishes to
 (`stored_scheduled_document`: not diverted, `scheduled: true`, this id scheme, the run the record's
 `envelope_finished_at` names, a `document` with a findings list) is there, and the open ledger issue
-carries no pending `/remediate` request (`pending_ledger_requests`, read as `start` reads them; a
-ledger that cannot be read counts as pending), `precheck` writes that document to `findings_path`
-and runs `finish --scheduled` on it with this run's manifest. The request rule is there because
-the stored document answers no request: `finish` opens a fix only for a `manifest` remediation,
-so a request on a `manual` finding would otherwise wait until the fleet changed. The stored
+carries no `/remediate` request still owed an answer (`pending_ledger_requests`: a writer's
+request, `all` included, that no acked or refused marker has answered, read with
+`unanswered_remediate_comments`; a conversation `read_comments` could not read whole, or any other
+lookup failure, counts as pending, and a lost broker is raised as from any command), `precheck`
+writes that document to `findings_path` and runs `finish --scheduled` on it with this run's
+manifest. The request rule is there because the stored document answers no request: `finish`
+opens a fix only for a `manifest` remediation, so a request on a `manual` finding would otherwise
+wait until the fleet changed; an answered request holds nothing, since the markers are permanent
+and the comment is never edited, and a non-writer's is refused the same on either path. The stored
 document is the one `finish` left, after the passes that write on it, and the close runs those
 passes again on a workspace `start` has reset, so `stored_document_replay_problem` refuses what
 they could not reproduce, by the rule the carry already applies (`_remediation_may_carry`): a
