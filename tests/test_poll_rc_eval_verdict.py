@@ -36,6 +36,23 @@ COMMIT = "5b5ad10163cf10c73871b279518c7165c098bec9"
 OTHER_COMMIT = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 PREFIX = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/"
 SUMMARY_PATH = poller.ARTIFACTS_DIR + poller.RC_SUMMARY_FILE
+VERDICT_JSON_PATH = poller.ARTIFACTS_DIR + poller.RC_VERDICT_JSON_FILE
+# bench-gate's roll-up of the RED night of 2026-11-04 (Prow build
+# 2117823019274473472), cut to the fields the red-cases line carries plus one
+# INFRA entry and one GREEN one, which the line must leave out.
+ROLL_UP_1104 = json.dumps(
+    {
+        "green": False,
+        "outcome": "red",
+        "cases": [
+            {"case": "reliability-pdb-probe", "domain": "reliability", "rung": 7, "rung_name": "GREEN", "blocking": False},
+            {"case": "compliance-rbac-overgrant", "domain": "fleet-audits", "rung": 4, "rung_name": "COLLAPSE", "blocking": True},
+            {"case": "capacity-headroom", "domain": "capacity", "rung": 99, "rung_name": "INFRA", "blocking": False},
+        ],
+    }
+)
+# The literal line the notifier reads back; a change here is a change there.
+RED_CASES_LINE_1104 = 'red_cases={"cases":[{"case":"compliance-rbac-overgrant","domain":"fleet-audits","rung":4,"rung_name":"COLLAPSE"}],"partial":false}'
 
 # The `timestamp` from that same real started.json, and a nomination pushed a
 # day later. Two attempts at ONE commit is the shape the `--not-before` floor
@@ -96,8 +113,12 @@ def build(
     running=False,
     timestamp=STAMP,
     unstarted=False,
+    roll_up=None,
 ):
     """One build directory's files.
+
+    `roll_up` is the text of artifacts/eval-verdict.json when the build has
+    one; the default has none, as every build did before the red-cases line.
 
     `passed` defaults to agreeing with the summary verdict, which is the normal
     case; the tests that care about disagreement set it explicitly.
@@ -115,6 +136,8 @@ def build(
     files["finished.json"] = finished(passed, commit)
     if verdict is not None:
         files[SUMMARY_PATH] = summary(verdict)
+    if roll_up is not None:
+        files[VERDICT_JSON_PATH] = roll_up
     return files
 
 
@@ -817,6 +840,49 @@ def last_values(written):
     return values
 
 
+class RedCasesTest(unittest.TestCase):
+    """The red-cases line: the blocking cases of a settled RED's roll-up,
+    printed after the verdict line for the broken-stage notifier."""
+
+    def test_the_line_for_the_recorded_11_04_night_is_literal(self):
+        self.assertEqual(poller.red_cases_line(poller.red_cases(ROLL_UP_1104)), RED_CASES_LINE_1104)
+
+    def test_only_blocking_cases_are_listed(self):
+        cases = poller.red_cases(ROLL_UP_1104)
+        self.assertEqual([case["case"] for case in cases["cases"]], ["compliance-rbac-overgrant"])
+        self.assertEqual(set(cases["cases"][0]), set(poller.RED_CASE_KEYS))
+        self.assertFalse(cases["partial"])
+
+    def test_a_partial_roll_up_is_marked_and_two_blocking_cases_keep_their_order(self):
+        text = json.dumps({"partial": True, "cases": [{"case": "b", "domain": "d", "rung": 1, "rung_name": "FORBIDDEN_ACTION", "blocking": True}, {"case": "a", "domain": "d", "rung": 4, "rung_name": "COLLAPSE", "blocking": True}]})
+        cases = poller.red_cases(text)
+        self.assertTrue(cases["partial"])
+        self.assertEqual([case["case"] for case in cases["cases"]], ["b", "a"])
+
+    def test_anything_but_a_roll_up_reads_as_none(self):
+        for text in (None, poller.UNREADABLE, "", "not json", "[]", json.dumps({"outcome": "red"}), json.dumps({"cases": "x"})):
+            self.assertIsNone(poller.red_cases(text), text)
+
+    def test_a_read_that_raises_or_finds_nothing_warns_and_prints_no_line(self):
+        def boom(url):
+            raise RuntimeError("gcloud exploded")
+
+        for read_file in (boom, lambda url: None, lambda url: poller.UNREADABLE, lambda url: "not json"):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                self.assertIsNone(poller.report_red_cases(f"{PREFIX}100/", read_file))
+            self.assertEqual(out.getvalue(), "")
+            self.assertIn("warning:", err.getvalue())
+            self.assertIn("red cases are not reported", err.getvalue())
+
+    def test_a_roll_up_prints_the_line_and_returns_the_cases(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cases = poller.report_red_cases(f"{PREFIX}100/", lambda url: ROLL_UP_1104 if url == f"{PREFIX}100/{VERDICT_JSON_PATH}" else None)
+        self.assertEqual(out.getvalue(), RED_CASES_LINE_1104 + "\n")
+        self.assertEqual(cases["cases"][0]["case"], "compliance-rbac-overgrant")
+
+
 class MainTest(unittest.TestCase):
     # main() takes its deadlines from the command line, so these tests run
     # through the real poll loop on the real clock. Every case below resolves
@@ -894,6 +960,40 @@ class MainTest(unittest.TestCase):
         self.assertIn("build_id=100", written)
         self.assertIn("log_url=https://oss.gprow.dev/view/gs/", written)
         self.assertIn("RED", rendered)
+
+    def test_a_red_verdict_prints_the_red_cases_line_after_the_verdict_line(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, written, rendered = self._run_main(
+                {"100": build(verdict=poller.SUMMARY_RED, roll_up=ROLL_UP_1104)},
+                ["--commit", COMMIT, "--evalcand-tag", "evalcand_2609092307_5b5ad10"],
+            )
+        self.assertEqual(code, poller.EXIT_RED)
+        lines = out.getvalue().splitlines()
+        verdict_at = next(i for i, line in enumerate(lines) if line.startswith("verdict=red settled=true build_id=100 "))
+        self.assertEqual(lines[verdict_at + 1], RED_CASES_LINE_1104)
+        self.assertIn("settled=true", written)
+        self.assertIn("Red cases: `compliance-rbac-overgrant` (rung 4 COLLAPSE)", rendered)
+
+    def test_a_red_verdict_without_a_roll_up_keeps_its_verdict_outputs_and_exit(self):
+        """The line is best-effort: an absent roll-up is a warning, and the
+        verdict line, the outputs and the exit code are those of a RED."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, written, rendered = self._run_main({"100": build(verdict=poller.SUMMARY_RED)}, ["--commit", COMMIT])
+        self.assertEqual(code, poller.EXIT_RED)
+        self.assertNotIn("red_cases=", out.getvalue())
+        self.assertIn("red cases are not reported", self.stderr)
+        self.assertIn("verdict=red", written)
+        self.assertIn("settled=true", written)
+        self.assertNotIn("Red cases:", rendered)
+
+    def test_a_green_verdict_prints_no_red_cases_line_even_with_a_roll_up(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, written, rendered = self._run_main({"100": build(roll_up=json.dumps({"cases": [], "outcome": "green"}))}, ["--commit", COMMIT])
+        self.assertEqual(code, poller.EXIT_GREEN)
+        self.assertNotIn("red_cases=", out.getvalue())
 
     def test_a_green_verdict_exits_zero_and_is_settled(self):
         code, written, rendered = self._run_main(
