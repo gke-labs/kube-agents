@@ -2,7 +2,7 @@
 
 > **STATUS — proposal; measured; shadow mode built and on by default in CI.** A prototype proxy was run against a dev install on 2026-10-31 to 2026-11-02.
 > [`hack/replay-proxy/`](../../hack/replay-proxy/README.md) has the shadow-mode proxy, its
-> fingerprint log, the scrubbed request store, the hit-rate script and the CI collector; the chart
+> fingerprint log, the scrubbed request store, the hit-rate script, the baseline report and the CI collector; the chart
 > carries the proxy behind `litellm.replayShadow`, and `hack/ci-deploy.sh` and `hack/ci-eval-pr.sh`
 > deploy it on every Prow presubmit and nightly and copy its output to a private bucket in
 > `kube-agents-prow` (`EVAL_REPLAY_SHADOW=false` turns it off). The join with run
@@ -589,6 +589,12 @@ before stage 3 of the rollout (turning replay on):
    results, or a swap hid something that looks like real state, that's a collision. A reviewed
    collision report is a bar for stage 3. This stage needs no shared cache and no new permissions
    inside the cluster.
+
+   The first two weeks of shadow data also freeze the baseline that replay is measured against:
+   tokens, cache hits, estimated cost, model time, 429s and fallbacks, and pass rates, per job kind
+   and per build, from `hack/replay-proxy/baseline_report.py`. Replay is not switched on anywhere
+   until that report is saved, and every report after it comes from the same script with
+   `--compare`, so before and after are measured the same way.
 
 2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
    without changing their results, so it gets its own job: a periodic, non-blocking job that runs a

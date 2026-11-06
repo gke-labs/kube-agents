@@ -134,6 +134,14 @@ class EstimateTest(unittest.TestCase):
             analyze_shadow.load(write(lines))[0], "high", merged={"10": 10.0}) if h]
         self.assertEqual(hit_ids, ["p4"])
 
+    def test_lines_with_the_litellm_accounting_fields_read_as_before(self):
+        extra = {"reasoning_tokens": 5, "cache_write_tokens": 0, "litellm_model_name": "vertex_ai/m",
+                 "litellm_attempted_retries": 1, "litellm_cost_usd": 0.01}
+        lines = [line("n1", 1, "nightly", "b0", "fp", ["m"]),
+                 dict(presubmit("p1", 10, "7", "b1", "fp", ["m"]), **extra)]
+        r, _ = report(lines)
+        self.assertEqual(r["estimates"]["low"]["hits"], 1)
+
     def test_presubmit_lines_without_a_pr_are_counted(self):
         rep, _ = report([presubmit("p1", 1, "", "b1", "A", ["a"]), presubmit("p2", 2, "10", "b2", "A", ["a"]),
                          line("n1", 3, "nightly", "n", "A", ["a"])])

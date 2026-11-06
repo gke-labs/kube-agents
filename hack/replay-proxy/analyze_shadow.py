@@ -612,14 +612,9 @@ def log_files(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Tu
     return found, off_layout
 
 
-def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record], Dict[str, int]]:
-    """Read JSON lines from each path (log_files); returns the records in time order and skip counts."""
-    records: List[Record] = []
-    skipped = {reason: 0 for reason in SKIP_REASONS}
-    files, skipped[SKIP_OFF_LAYOUT] = log_files(paths, kind)
-    for path, file_kind in files:
-        # At the layout (no `kind`), <build>/logs/<segment>: the build's store is beside logs/.
-        store_dir = None if kind else os.path.join(os.path.dirname(os.path.dirname(path)), BUILD_STORE_DIR)
+def iter_request_lines(paths: Iterable[str], skipped: Dict[str, int]) -> Iterator[Dict[str, Any]]:
+    """Each request line in the files, parsed; counts the rest in `skipped` (not JSON, another event)."""
+    for path in paths:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -628,28 +623,40 @@ def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record]
                 try:
                     entry = json.loads(line)
                 except ValueError:
-                    skipped[SKIP_NOT_JSON] += 1
+                    skipped[SKIP_NOT_JSON] = skipped.get(SKIP_NOT_JSON, 0) + 1
                     continue
                 if not isinstance(entry, dict) or entry.get(F.EVENT) != F.REQUEST_EVENT:
-                    skipped[SKIP_OTHER_EVENT] += 1
+                    skipped[SKIP_OTHER_EVENT] = skipped.get(SKIP_OTHER_EVENT, 0) + 1
                     continue
-                if entry.get(F.ERROR) == F.ERROR_ANALYSIS_DROPPED:
-                    skipped[SKIP_ANALYSIS_DROPPED] += 1
-                    continue
-                if entry.get(F.ERROR):
-                    skipped[SKIP_ERROR] += 1
-                    continue
-                if not entry.get(F.FINGERPRINT):
-                    skipped[SKIP_NO_FINGERPRINT] += 1
-                    continue
-                tag = (entry.get(F.JOB) or {}).get(F.JOB_KIND)
-                if tag not in JOB_KINDS:
-                    skipped[SKIP_UNTAGGED] += 1
-                    continue
-                if tag != file_kind:
-                    skipped[SKIP_KIND_MISMATCH] += 1
-                    continue
-                records.append(Record.from_line(entry, file_kind, store_dir))
+                yield entry
+
+
+def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record], Dict[str, int]]:
+    """Read JSON lines from each path (log_files); returns the records in time order and skip counts."""
+    records: List[Record] = []
+    skipped = {reason: 0 for reason in SKIP_REASONS}
+    files, skipped[SKIP_OFF_LAYOUT] = log_files(paths, kind)
+    for path, file_kind in files:
+        # At the layout (no `kind`), <build>/logs/<segment>: the build's store is beside logs/.
+        store_dir = None if kind else os.path.join(os.path.dirname(os.path.dirname(path)), BUILD_STORE_DIR)
+        for entry in iter_request_lines([path], skipped):
+            if entry.get(F.ERROR) == F.ERROR_ANALYSIS_DROPPED:
+                skipped[SKIP_ANALYSIS_DROPPED] += 1
+                continue
+            if entry.get(F.ERROR):
+                skipped[SKIP_ERROR] += 1
+                continue
+            if not entry.get(F.FINGERPRINT):
+                skipped[SKIP_NO_FINGERPRINT] += 1
+                continue
+            tag = (entry.get(F.JOB) or {}).get(F.JOB_KIND)
+            if tag not in JOB_KINDS:
+                skipped[SKIP_UNTAGGED] += 1
+                continue
+            if tag != file_kind:
+                skipped[SKIP_KIND_MISMATCH] += 1
+                continue
+            records.append(Record.from_line(entry, file_kind, store_dir))
     records.sort(key=lambda r: r.ts)
     return records, skipped
 
