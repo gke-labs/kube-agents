@@ -3990,7 +3990,7 @@ spec:
   minReadySeconds: 20
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Retain
-    whenScaled: Delete
+    whenScaled: Retain
   replicas: 3
   selector:
     matchLabels:

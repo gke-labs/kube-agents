@@ -115,8 +115,8 @@ func TestTheBusRendersAClusterByDefaultAndOneServerOnRequest(t *testing.T) {
 				}
 			}
 			if p := sts.Spec.PersistentVolumeClaimRetentionPolicy; p == nil ||
-				p.WhenScaled != appsv1.DeletePersistentVolumeClaimRetentionPolicyType || p.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
-				t.Errorf("claim retention = %+v, want delete on scale-down and retain on StatefulSet deletion", p)
+				p.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType || p.WhenDeleted != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
+				t.Errorf("claim retention = %+v, want retain on scale-down and on StatefulSet deletion (a scale to 0 keeps the store)", p)
 			}
 			if got := sts.Spec.MinReadySeconds > 0; got != tc.wantCluster {
 				t.Errorf("minReadySeconds > 0 = %v, want %v", got, tc.wantCluster)
@@ -126,21 +126,35 @@ func TestTheBusRendersAClusterByDefaultAndOneServerOnRequest(t *testing.T) {
 			}) {
 				t.Error("POD_NAME is not the pod's name; server_name reads it")
 			}
-			if c.Lifecycle == nil || c.Lifecycle.PreStop == nil || c.Lifecycle.PreStop.Exec == nil ||
-				!slices.Equal(c.Lifecycle.PreStop.Exec.Command, []string{"nats-server", "--signal", "ldm=" + a2aNATSPidFile}) {
-				t.Errorf("preStop is not the lame-duck signal: %+v", c.Lifecycle)
-			}
-			if pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds <= a2aNATSLameDuckSeconds {
-				t.Errorf("termination grace %v does not leave room for a %ds lame duck", pod.TerminationGracePeriodSeconds, a2aNATSLameDuckSeconds)
+			// Lame duck only on a cluster: a single server has nowhere to move
+			// its clients, and lame duck there only delays its exit.
+			if tc.wantCluster {
+				if c.Lifecycle == nil || c.Lifecycle.PreStop == nil || c.Lifecycle.PreStop.Exec == nil ||
+					!slices.Equal(c.Lifecycle.PreStop.Exec.Command, []string{"nats-server", "--signal", "ldm=" + a2aNATSPidFile}) {
+					t.Errorf("preStop is not the lame-duck signal: %+v", c.Lifecycle)
+				}
+				if pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds <= a2aNATSLameDuckSeconds {
+					t.Errorf("termination grace %v does not leave room for a %ds lame duck", pod.TerminationGracePeriodSeconds, a2aNATSLameDuckSeconds)
+				}
+			} else {
+				if c.Lifecycle != nil {
+					t.Errorf("a single server has a lifecycle hook: %+v", c.Lifecycle)
+				}
+				if pod.TerminationGracePeriodSeconds != nil {
+					t.Errorf("a single server sets a grace period (%d); the default is enough without lame duck", *pod.TerminationGracePeriodSeconds)
+				}
 			}
 
 			conf := renderA2ANATSConf(agent, func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"})
 			if got := a2aClusterBlockRe.MatchString(conf); got != tc.wantCluster {
 				t.Errorf("cluster block present = %v, want %v", got, tc.wantCluster)
 			}
-			for _, line := range []string{"server_name: $POD_NAME", `pid_file: "` + a2aNATSPidFile + `"`, `lame_duck_duration: "30s"`} {
-				if !strings.Contains(conf, line) {
-					t.Errorf("nats.conf lacks %q", line)
+			if !strings.Contains(conf, "server_name: $POD_NAME") {
+				t.Error("nats.conf lacks server_name: $POD_NAME")
+			}
+			for _, line := range []string{`pid_file: "` + a2aNATSPidFile + `"`, `lame_duck_duration: "30s"`} {
+				if got := strings.Contains(conf, line); got != tc.wantCluster {
+					t.Errorf("nats.conf has %q = %v, want %v", line, got, tc.wantCluster)
 				}
 			}
 
@@ -622,34 +636,47 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 		}
 		return c
 	}
-	sts := func(agent *agentv1alpha1.PlatformAgent, replicas int32) *appsv1.StatefulSet {
-		s := buildA2ANATSStatefulSet(agent, "h")
+	// sts is a StatefulSet rendered for rendered servers and scaled to
+	// replicas: the two differ only after a hand scale.
+	sts := func(agent *agentv1alpha1.PlatformAgent, rendered, replicas int32) *appsv1.StatefulSet {
+		shaped := agent.DeepCopy()
+		shaped.Status.BusReplicas = rendered
+		s := buildA2ANATSStatefulSet(shaped, "h")
 		s.Spec.Replicas = ptr.To(replicas)
 		return s
 	}
 	for _, tc := range []struct {
 		name      string
 		spec      *int
+		recorded  int32
 		objects   func(*agentv1alpha1.PlatformAgent) []client.Object
 		want      int32
 		wantEvent bool
 	}{
-		{"a new bus", nil, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 3, false},
-		{"an existing single-server bus", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, false},
-		{"an existing cluster", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, false},
-		{"a deleted single-server bus's claim", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, true)} }, 1, false},
-		{"a deleted cluster's claims, one missing", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object {
+		{"a new bus", nil, 0, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 3, false},
+		{"an existing single-server bus", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, false},
+		{"an existing cluster", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 3)} }, 3, false},
+		{"a deleted single-server bus's claim", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, true)} }, 1, false},
+		{"a deleted cluster's claims, one missing", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object {
 			return []client.Object{claim(a, 0, true), claim(a, 1, true)}
 		}, 3, false},
-		{"an unlabelled squatter claim", nil, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, false)} }, 3, false},
-		{"set to 3 on a single-server bus converts it", ptr.To(3), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 3, true},
-		{"set to 1 on a cluster converts it", ptr.To(1), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 1, true},
-		{"set to what runs is no conversion", ptr.To(1), func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, false},
+		{"an unlabelled squatter claim", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, false)} }, 3, false},
+		{"set to 3 on a single-server bus converts it", ptr.To(3), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 3, true},
+		{"set to 1 on a cluster converts it", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 3)} }, 1, true},
+		{"set to what runs is no conversion", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, false},
 		// Claims 0 and 1 without 2 read as a cluster, so setting 1 over
 		// them is a conversion and says so.
-		{"set to 1 over a deleted cluster's two claims converts it", ptr.To(1), func(a *agentv1alpha1.PlatformAgent) []client.Object {
+		{"set to 1 over a deleted cluster's two claims converts it", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object {
 			return []client.Object{claim(a, 0, true), claim(a, 1, true)}
 		}, 1, true},
+		// A hand scale between 1 and 3 is not the bus's shape: the record
+		// holds, with or without the field, and nothing converts or warns.
+		{"a single-server bus scaled by hand to 3", nil, 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, false},
+		{"a cluster scaled by hand to 1", nil, 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 1)} }, 3, false},
+		{"a hand scale to 3 with the field at the old count", ptr.To(1), 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, false},
+		// With no record (an operator from before the field), the template
+		// decides, not the live count.
+		{"an unrecorded single-server bus scaled by hand to 3", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
@@ -657,6 +684,7 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
 			}
 			objs := append([]client.Object{agent}, tc.objects(agent)...)
+			agent.Status.BusReplicas = tc.recorded
 			rec := record.NewFakeRecorder(8)
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec, busConversionAllowed: true}
 			converting, err := r.resolveA2ABusReplicas(ctx, agent)
@@ -1264,8 +1292,12 @@ func TestAnExistingBusRefusesAConversion(t *testing.T) {
 			Labels: buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels,
 		}}
 	}
+	// sts is a StatefulSet rendered for, and running, replicas servers: the
+	// count resolveA2ABusReplicas reads from its template.
 	sts := func(agent *agentv1alpha1.PlatformAgent, replicas int32) *appsv1.StatefulSet {
-		s := buildA2ANATSStatefulSet(agent, "h")
+		shaped := agent.DeepCopy()
+		shaped.Status.BusReplicas = replicas
+		s := buildA2ANATSStatefulSet(shaped, "h")
 		s.Spec.Replicas = ptr.To(replicas)
 		return s
 	}
@@ -1393,9 +1425,10 @@ func TestARefusedConversionRendersNothingTowardTheNewCount(t *testing.T) {
 func TestARefusedConversionIsAConditionThatClears(t *testing.T) {
 	ctx := context.Background()
 	agent := a2aTestAgent()
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	// A running cluster: rendered for three servers before the field asks
+	// for one (the count is read from the template, not the live replicas).
 	running := buildA2ANATSStatefulSet(agent, "h")
-	running.Spec.Replicas = ptr.To(int32(3))
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, running).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
 	read := func() *metav1.Condition {

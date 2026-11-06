@@ -9942,8 +9942,9 @@ spec:
                             that outage; it saves two NATS pods and two 40Gi volumes.
 
                             Unset, an install keeps the count its bus already runs, so an install
-                            from before the three-server default stays on one server, and a new bus
-                            gets three (status.busReplicas shows which applies).
+                            whose next-mode bus predates the three-server default stays on one
+                            server, and a new bus gets three, including the one a today install's
+                            first switch to next creates (status.busReplicas shows which applies).
 
                             Set, it decides the count of a bus that does not exist yet. An existing
                             bus keeps the count it runs: NATS cannot carry a single server's streams

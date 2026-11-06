@@ -2259,12 +2259,7 @@ func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) s
 server_name: $POD_NAME
 port: ` + strconv.Itoa(a2aNATSClientPort) + `
 http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
-
-# For the preStop hook's lame-duck signal (buildA2ANATSStatefulSet).
-pid_file: "` + a2aNATSPidFile + `"
-# How long a stopping server spreads its clients' reconnects over.
-lame_duck_duration: "` + strconv.Itoa(a2aNATSLameDuckSeconds) + `s"
-` + renderA2ANATSCluster(agent) + `
+` + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
 
 # TLS on the client listener, required of every connection: the server
 # advertises tls_required, so a client that dials nats:// is told to upgrade
@@ -2771,14 +2766,15 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 			// until it does. Raft quorum keeps it from losing data either way.
 			MinReadySeconds: a2aNATSMinReadySeconds(replicas),
 			Selector:        &metav1.LabelSelector{MatchLabels: selector},
-			// A scale-down deletes the claims of the servers it removes. Kept,
-			// they would hold the old cluster's metadata and streams, and a
-			// later return to three servers would bring that stale state back
-			// rather than start empty as a conversion does. Deleting the
-			// StatefulSet keeps them: a flip to today and back finds the bus
-			// where it left it, and handleDeletion reaps them with the CR.
+			// Claims are kept on a scale-down and on StatefulSet deletion: a
+			// maintenance scale to 0 and back, or a flip to today and back,
+			// finds the bus where it left it, and handleDeletion reaps them
+			// with the CR. Only a conversion, which the gate keeps closed in
+			// this release, would want a scale-down to delete them (a later
+			// return to three servers would otherwise find the old cluster's
+			// state); #4225 changes WhenScaled when it opens that path.
 			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
-				WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 			},
 			Template: corev1.PodTemplateSpec{
@@ -2795,8 +2791,9 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					// Lame duck has to finish inside this, with room for the
-					// preStop signal to land first.
-					TerminationGracePeriodSeconds: ptr.To(int64(a2aNATSTerminationGraceSeconds)),
+					// preStop signal to land first; a single server keeps the
+					// default (a2aNATSTerminationGrace).
+					TerminationGracePeriodSeconds: a2aNATSTerminationGrace(replicas),
 					TopologySpreadConstraints:     a2aNATSTopologySpread(selector, replicas),
 					Containers: []corev1.Container{{
 						Name:    "nats",
@@ -2810,17 +2807,9 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 							ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
 						}},
 						Ports: a2aNATSContainerPorts(replicas),
-						// Lame duck on the way out: the server stops accepting
-						// connections and moves its clients to the other
-						// servers over lame_duck_duration, rather than
-						// dropping them all at once when the kubelet's TERM
-						// arrives. On a single server there is nowhere to move
-						// them, and it still closes them gracefully.
-						Lifecycle: &corev1.Lifecycle{
-							PreStop: &corev1.LifecycleHandler{
-								Exec: &corev1.ExecAction{Command: []string{"nats-server", "--signal", "ldm=" + a2aNATSPidFile}},
-							},
-						},
+						// Lame duck on the way out, on a cluster only
+						// (a2aNATSLifecycle).
+						Lifecycle: a2aNATSLifecycle(replicas),
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
 							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
@@ -4355,9 +4344,12 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 // resolveA2ABusReplicas sets status.busReplicas to the server count this pass
 // renders, before anything renders. An existing bus keeps what it has,
 // because changing the count empties it (the field's doc and
-// spec-nats-deployment.md): the running StatefulSet's replicas when they are
-// 1 or 3; for a StatefulSet scaled by hand to anything else, the count last
-// resolved; failing a StatefulSet, the data claims a bus left behind (a
+// spec-nats-deployment.md): the count last resolved, or with no record the
+// shape the StatefulSet's template was rendered for. The live replica count
+// is never read: a StatefulSet scaled by hand, to any count, is a hand scale
+// the next apply reverts, not a new bus shape, so a scale between 1 and 3
+// cannot convert the bus past the gate. Failing a StatefulSet, the data
+// claims a bus left behind (a
 // StatefulSet deleted by hand keeps its claims, and the next one must come
 // back at their count, or it would convert them). The field decides only for a
 // bus that does not exist yet, and three when it is unset.
@@ -4373,13 +4365,12 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 	recorded := int(agent.Status.BusReplicas)
 	sts := &appsv1.StatefulSet{}
 	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); {
-	case err == nil && sts.Spec.Replicas != nil && (*sts.Spec.Replicas == 1 || *sts.Spec.Replicas == 3):
-		running = int(*sts.Spec.Replicas)
 	case err == nil && (recorded == 1 || recorded == 3):
-		// A StatefulSet scaled by hand outside 1 and 3 still holds the bus
-		// last resolved: its count is the record, not the claims, which a
-		// single server scaled to 2 leaves looking like a cluster short one
-		// and a scale to 0 deletes (WhenScaled: Delete).
+		// A StatefulSet scaled by hand still holds the bus last resolved:
+		// its count is the record, not its live replicas (a scale from 1 to
+		// 3 or back would otherwise read as the bus's shape) and not the
+		// claims, which a single server scaled to 2 leaves looking like a
+		// cluster short one.
 		running = recorded
 	case err == nil:
 		// The same, with no record (an older CRD pruned it, or a first status
@@ -4540,6 +4531,49 @@ const (
 	a2aNATSLameDuckSeconds         = 30
 	a2aNATSTerminationGraceSeconds = 60
 )
+
+// renderA2ANATSLameDuck is the nats.conf lines for lame duck on a cluster: the
+// pid file the preStop hook signals, and how long a stopping server spreads
+// its clients' reconnects over the other servers. A single server renders
+// neither (a2aNATSLifecycle).
+func renderA2ANATSLameDuck(agent *agentv1alpha1.PlatformAgent) string {
+	if a2aNATSReplicas(agent) <= 1 {
+		return ""
+	}
+	return `
+# For the preStop hook's lame-duck signal (buildA2ANATSStatefulSet).
+pid_file: "` + a2aNATSPidFile + `"
+# How long a stopping server spreads its clients' reconnects over.
+lame_duck_duration: "` + strconv.Itoa(a2aNATSLameDuckSeconds) + `s"
+`
+}
+
+// a2aNATSLifecycle is the server's preStop lame-duck signal on a cluster: the
+// server stops accepting connections and moves its clients to the other
+// servers over lame_duck_duration, rather than dropping them all when the
+// kubelet's TERM arrives. A single server has nowhere to move them, and lame
+// duck there only delays its exit (nats-server ignores TERM while in lame
+// duck, and the StatefulSet cannot start the same-named replacement until the
+// pod is gone), so it gets none.
+func a2aNATSLifecycle(replicas int) *corev1.Lifecycle {
+	if replicas <= 1 {
+		return nil
+	}
+	return &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{Command: []string{"nats-server", "--signal", "ldm=" + a2aNATSPidFile}},
+		},
+	}
+}
+
+// a2aNATSTerminationGrace is the pod's grace period: room for lame duck on a
+// cluster, the Kubernetes default on a single server, which runs none.
+func a2aNATSTerminationGrace(replicas int) *int64 {
+	if replicas <= 1 {
+		return nil
+	}
+	return ptr.To(int64(a2aNATSTerminationGraceSeconds))
+}
 
 // a2aNATSMinReadySeconds holds a multi-server bus's rollout between servers
 // (the comment on MinReadySeconds in buildA2ANATSStatefulSet). A single

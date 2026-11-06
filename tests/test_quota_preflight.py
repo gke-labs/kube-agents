@@ -885,6 +885,24 @@ class PreflightDecisionTest(unittest.TestCase):
             delta[out] = sum(w[key] for w in workloads) + bridge[key] * agent_replicas
         return delta
 
+    def test_a_single_server_bus_is_counted_as_one_server(self) -> None:
+        """footprint.yaml counts the bus at three NATS servers; with
+        platformAgent.harness.tuning.busReplicas: 1 the preflight counts one, so a
+        one-server install is not asked for two more pods' and claims' room."""
+        nats = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aNats"]
+        claims = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["storage"]
+        n = int(nats["pods"])
+        self.assertEqual(n, 3)
+        three = self._requirements(["platformAgent.mode=next"])
+        one = self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=1"])
+        self.assertEqual(three["pods"] - one["pods"], n - 1)
+        self.assertEqual(three["persistentVolumeClaims"] - one["persistentVolumeClaims"], int(claims["persistentVolumeClaims"]) - 1)
+        self.assertEqual(three["requestsStorage"] - one["requestsStorage"], int(claims["storageBytesRequest"]) * (n - 1) // n)
+        self.assertEqual(three["requestsCpu"] - one["requestsCpu"], int(nats["cpuMillisRequest"]) * (n - 1) // n)
+        self.assertEqual(three["requestsMemory"] - one["requestsMemory"], int(nats["memoryBytesRequest"]) * (n - 1) // n)
+        # Set to 3, or unset, it counts three.
+        self.assertEqual(self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=3"]), three)
+
     def test_mode_next_adds_the_next_mode_footprint(self) -> None:
         """A next-mode install runs the A2A stack beside the today-mode one (#3753)."""
         base = self._requirements()
