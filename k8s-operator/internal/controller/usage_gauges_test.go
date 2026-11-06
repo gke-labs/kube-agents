@@ -429,6 +429,41 @@ func TestReconcile_PublishesAUsageBlockThatHoldsAnyValue(t *testing.T) {
 	}
 }
 
+// A usage block whose only content is topTools is a poll that landed, not an
+// unpolled or pruned status: the first poll baselines a broker that already
+// ran commands without moving a counter, while it projects that broker's tool
+// table. Its zero counters publish as idle.
+func TestReconcile_PublishesAUsageBlockThatHoldsOnlyTopTools(t *testing.T) {
+	usage := agentv1alpha1.AgentUsageStatus{TopTools: []agentv1alpha1.ToolUsageSummary{{Tool: "kubectl", Subcommand: "get", Total: 6, Blocked: 6}}}
+	if usageBlockEmpty(&usage) {
+		t.Fatal("a block holding only topTools reads as empty")
+	}
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "tools-only", Namespace: "reconcile-tools-only"},
+		Status:     agentv1alpha1.AgentStatus{Phase: readyPhase, Usage: usage},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(agent).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	if _, err := r.Reconcile(context.Background(), req); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if held := r.heldUsageFields(agent); held != nil {
+		t.Errorf("held fields %v, want none for a block holding topTools", held)
+	}
+	// Every int row publishes; the pointer rows are all absent.
+	pointers := 0
+	for _, f := range usageExportFields {
+		if f.pointer {
+			pointers++
+		}
+	}
+	if n := samplesOfAgent(t, usageMetrics.usage, agent.Namespace); n != len(usageExportFields)-pointers {
+		t.Errorf("%d usage samples, want %d: a block with topTools in it is published", n, len(usageExportFields)-pointers)
+	}
+}
+
 // A served CRD at an intermediate schema serves the first-schema fields and
 // prunes the newer ones, which the poller records per field. The publish reads
 // those records and holds back the pruned fields' samples alone, so a block
