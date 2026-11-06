@@ -17,16 +17,17 @@ without a maintainer's call. This script holds the checks.
 Offline (the default, and what `scripts/test_check_quarantine.py` runs on every
 pull request): every quarantine string in the tree cites an issue number and
 sits beside a `KA_RUN_QUARANTINED` check, so whoever fixes the flake can run
-the test without editing it first.
+the test without editing it first. A quarantine under `PROTECTED_PREFIXES`
+(conformance, auth-callout) also needs its own line in `APPROVALS_FILE`, which
+`hack/OWNERS` lets only the security approvers approve: a flaky security test is
+fixed, not skipped, unless they say otherwise, and the pull request adding the
+skip cannot merge without them.
 
 `--github` (the daily `.github/workflows/quarantine-check.yml`) reads each
 cited issue and fails when one is closed (the fix landed and the skip stayed),
 lacks the `ci:quarantined` label, has no assignee to own the fix, or never
 states a suspected cause and that a product race was ruled out. A flake that
-was really a product race is a bug, and skipping its test hides it. A test
-under `PROTECTED_PREFIXES` (conformance, auth-callout) also needs a
-`Quarantine approved` comment from one of `APPROVERS`: a flaky security test is
-fixed, not skipped, unless they say otherwise. The script also reports how many
+was really a product race is a bug, and skipping its test hides it. The script also reports how many
 tests are quarantined and for how long, flags any quarantined longer than
 `STALE_DAYS`, and flags any open `ci:quarantined` issue whose skip is no longer
 in the tree.
@@ -78,11 +79,10 @@ SELF_FILES = frozenset({"scripts/check_quarantine.py", "scripts/test_check_quara
 LABEL = "ci:quarantined"
 LABEL_COLOR = "fbca04"
 LABEL_DESCRIPTION = "A test is skipped in source until this issue is fixed (scripts/check_quarantine.py)"
-#: Tests that are fixed, not skipped: a quarantine under one of these needs an `APPROVERS` comment
-#: on its issue carrying `APPROVAL_RE`.
+#: Tests that are fixed, not skipped: a quarantine under one of these needs a `<path> <issue>` line
+#: in `APPROVALS_FILE`, whose changes only the security approvers can approve (`hack/OWNERS`).
 PROTECTED_PREFIXES = ("tests/conformance/", "a2a/authcallout/")
-APPROVERS = frozenset({"bnaylor"})
-APPROVAL_RE = re.compile(r"^\s*quarantine approved\b", re.IGNORECASE | re.MULTILINE)
+APPROVALS_FILE = "hack/quarantine-approved.txt"
 #: Opens each comment the daily run posts; one per issue per kind, so a standing problem is told once.
 COMMENT_MARKER = "<!-- quarantine-check:{kind} -->"
 #: The login a workflow's GITHUB_TOKEN posts as.
@@ -171,7 +171,32 @@ def scan_tree(root: Path = REPO_ROOT, report: Report | None = None) -> Report:
         except (OSError, UnicodeDecodeError):
             continue
         scan_text(path, text, report)
+    check_protected(report, read_approvals(root))
     return report
+
+
+def read_approvals(root: Path = REPO_ROOT) -> set[tuple[str, int]]:
+    """The `<path> <issue>` pairs `APPROVALS_FILE` approves; blank lines and `#` comments skipped."""
+    try:
+        text = (root / APPROVALS_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    pairs = set()
+    for line in text.splitlines():
+        fields = line.split("#", 1)[0].split()
+        if len(fields) == 2 and fields[1].isdigit():
+            pairs.add((fields[0], int(fields[1])))
+    return pairs
+
+
+def check_protected(report: Report, approvals: set[tuple[str, int]]) -> None:
+    """Fail each protected quarantine `APPROVALS_FILE` does not list with its issue."""
+    for q in report.quarantines:
+        if q.path.startswith(PROTECTED_PREFIXES) and (q.path, q.issue) not in approvals:
+            report.failures.append(
+                f"{q.path}:{q.line}: a security or conformance test quarantined for #{q.issue} needs the line "
+                f"`{q.path} {q.issue}` in {APPROVALS_FILE}, which only the security approvers can approve"
+            )
 
 
 def parse_time(value: str) -> datetime:
@@ -215,19 +240,6 @@ def check_issue(api, number: int, sites: list[Quarantine], report: Report, now: 
             number,
             KIND_INCOMPLETE,
             f"#{number} never states `Product race ruled out: yes`; until it is, the test stays live",
-        )
-    protected = [q for q in sites if q.path.startswith(PROTECTED_PREFIXES)]
-    approved = any(
-        (c.get("user") or {}).get("login") in APPROVERS and APPROVAL_RE.search(c.get("body") or "")
-        for c in comments
-    )
-    if protected and not approved:
-        report.fail(
-            number,
-            KIND_INCOMPLETE,
-            f"#{number} quarantines a security or conformance test "
-            f"({', '.join(f'{q.path}:{q.line}' for q in protected)}) without a `Quarantine approved` "
-            f"comment from {', '.join(sorted(APPROVERS))}",
         )
     since = labeled_at(api, number) if LABEL in labels else None
     if since is not None:

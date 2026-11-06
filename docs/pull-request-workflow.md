@@ -852,9 +852,10 @@ the bug. Quarantine a test only when all of these hold:
   area's primary owner in [`ownership.md`](ownership.md) when one is known. Reuse the `ci:flaky`
   issue when one exists.
 - The test is not a conformance test, an auth-callout account-boundary or grant test, or any other
-  security or isolation test. Those are fixed, not skipped, unless one of `APPROVERS` in the check
-  script comments `Quarantine approved` on the issue; the daily check requires that comment for
-  anything under `PROTECTED_PREFIXES`.
+  security or isolation test. Those are fixed, not skipped, unless a security approver agrees: a
+  skip under `PROTECTED_PREFIXES` needs its `<path> <issue>` line in
+  [`hack/quarantine-approved.txt`](../hack/quarantine-approved.txt), which only the
+  `security-approvers` alias can approve ([`hack/OWNERS`](../hack/OWNERS)).
 
 The skip names the issue in a fixed form and checks `KA_RUN_QUARANTINED`, so whoever fixes it can
 run the test without editing it:
@@ -874,10 +875,10 @@ Under pytest (`bench/tests/`) the same pair goes through
 pull request removes the skip and closes the issue.
 
 [`scripts/check_quarantine.py`](../scripts/check_quarantine.py) checks both halves. Its offline
-check runs with the Python unit tests and fails a quarantine string that is malformed or does not
-read `KA_RUN_QUARANTINED`. [`quarantine-check.yml`](../.github/workflows/quarantine-check.yml) runs
+check runs with the Python unit tests and fails a quarantine string that is malformed, does not
+read `KA_RUN_QUARANTINED`, or skips a protected test the approvals file does not list. [`quarantine-check.yml`](../.github/workflows/quarantine-check.yml) runs
 it daily with `--github --notify`. That run fails when a cited issue is closed, unlabelled,
-unassigned, missing either line above, or missing a needed approval, and comments once on that
+unassigned, or missing either line above, and comments once on that
 issue naming its assignees. Its summary lists every quarantine with its age. A quarantine older
 than `STALE_DAYS` (14) gets one comment too. The summary also flags an open `ci:quarantined` issue
 that no test cites any more.

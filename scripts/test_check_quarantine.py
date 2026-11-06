@@ -126,6 +126,56 @@ class ScanTest(unittest.TestCase):
         self.assertEqual(1, len(scanned(("a_test.go", text)).failures))
 
 
+class ProtectedTest(unittest.TestCase):
+    PROTECTED = ("a2a/authcallout/grant_test.go", GO_GATED)
+
+    def test_a_protected_quarantine_needs_its_line_in_the_approvals_file(self):
+        cases = (
+            (set(), 1),
+            ({("a2a/authcallout/grant_test.go", 999)}, 1),
+            ({("a2a/authcallout/other_test.go", 4357)}, 1),
+            ({("a2a/authcallout/grant_test.go", 4357)}, 0),
+        )
+        for approvals, failures in cases:
+            with self.subTest(approvals=approvals):
+                report = scanned(self.PROTECTED)
+                cq.check_protected(report, approvals)
+                self.assertEqual(failures, len(report.failures), report.failures)
+
+    def test_an_unprotected_quarantine_needs_no_line(self):
+        report = scanned(("a2a/lib/x_test.go", GO_GATED))
+        cq.check_protected(report, set())
+        self.assertEqual([], report.failures)
+
+    def test_the_tree_scan_applies_the_approvals_file(self):
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "a2a" / "authcallout" / "grant_test.go"
+            target.parent.mkdir(parents=True)
+            target.write_text(GO_GATED)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            self.assertEqual(1, len(cq.scan_tree(root).failures))
+            (root / "hack").mkdir()
+            (root / cq.APPROVALS_FILE).write_text("a2a/authcallout/grant_test.go 4357\n")
+            self.assertEqual([], cq.scan_tree(root).failures)
+
+    def test_the_approvals_file_skips_comments_and_malformed_lines(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "hack").mkdir()
+            (root / cq.APPROVALS_FILE).write_text(
+                "# header\n\ntests/conformance/a_test.py 12  # why\nbad line here\nx notanumber\n"
+            )
+            self.assertEqual({("tests/conformance/a_test.py", 12)}, cq.read_approvals(root))
+            self.assertEqual(set(), cq.read_approvals(root / "missing"))
+
+
 class TheTreeTest(unittest.TestCase):
     def test_every_quarantine_in_the_tree_is_well_formed_and_gated(self):
         report = cq.scan_tree()
@@ -223,17 +273,6 @@ class GitHubTest(unittest.TestCase):
         self.assertEqual([], report.failures)
         self.assertEqual(2, len(report.quarantines))
         self.assertEqual([f"/repos/{cq.REPO}/issues/4357"], api.got)
-
-    def test_a_protected_test_needs_an_approvers_comment(self):
-        approval = {"user": {"login": min(cq.APPROVERS)}, "body": "Quarantine approved, flake is in the fake."}
-        stranger = {"user": {"login": "someone-else"}, "body": "Quarantine approved"}
-        go = ("a2a/authcallout/grant_test.go", GO_GATED)
-        cases = (([], 1), ([stranger], 1), ([approval], 0))
-        for comments, failures in cases:
-            with self.subTest(comments=comments):
-                api = FakeAPI({4357: issue(4357)}, comments={4357: comments})
-                report = self.run_check(api, files=(go,))
-                self.assertEqual(failures, len(report.failures), report.failures)
 
 
 class NotifyTest(unittest.TestCase):
