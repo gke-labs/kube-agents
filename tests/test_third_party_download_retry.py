@@ -1217,6 +1217,29 @@ class ShippedGitHubReleaseRetryTest(unittest.TestCase):
                     "on 2026-11-05; `--retry 8` gives 255" % (source, short, GITHUB_RELEASE_RETRY_FLOOR_SECONDS),
                 )
 
+    def test_the_floor_reads_every_github_release_download(self):
+        """Every release URL is on a curl line the walk reads or in the tirith RUN.
+
+        A wget loop, an ADD or a piped curl anywhere else would pass both checks
+        unseen.
+        """
+        for source in IMAGE_BUILDS:
+            with self.subTest(source=source.name):
+                unread = []
+                for command, marks in _joined_commands(source.read_text()):
+                    tirith = command.startswith(DOCKERFILE_RUN) and TIRITH_DOWNLOAD in command
+                    curl = [own_text for _, own_text, piped in network_fetches(command) if not piped]
+                    read = int(tirith) + sum(len(GITHUB_RELEASE_DOWNLOAD.findall(own_text)) for own_text in curl)
+                    if len(GITHUB_RELEASE_DOWNLOAD.findall(command)) > read:
+                        unread.append(marks[0][1])
+                self.assertEqual(
+                    unread,
+                    [],
+                    "%s fetches a GitHub release asset in the instruction at line(s) %s in a way the "
+                    "floor cannot read, such as wget, ADD or a piped curl: fetch it to a file with curl, "
+                    "or run it against stubs as TirithDownloadRetryTest runs tirith" % (source, unread),
+                )
+
     def test_the_walk_actually_reaches_the_github_release_downloads(self):
         """A floor, so a walk that matches nothing cannot report success."""
         found = [

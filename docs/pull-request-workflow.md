@@ -175,7 +175,8 @@ been fed the bytes of the failed one. A GitHub release download in either Docker
 retrying for at least four minutes, which is `--retry 8`: GitHub's release-asset CDN can fail one
 runner for minutes while it serves others, and curl's doubling backoff waits 255 seconds over eight
 retries but 31 over five. The test reads that wait from the flags, where `--retry-max-time` can only
-shorten it, and runs the tirith download, a wget loop, against stubs.
+shorten it, and runs the tirith download, a wget loop, against stubs; a release URL fetched any other
+way, such as another wget loop, an `ADD` or a piped curl, fails it.
 
 `docker-build.yml` also retries whole steps: the buildx setup and each image build that fetches
 from the network run once more, after a pause, when the first attempt fails. The in-image gate
