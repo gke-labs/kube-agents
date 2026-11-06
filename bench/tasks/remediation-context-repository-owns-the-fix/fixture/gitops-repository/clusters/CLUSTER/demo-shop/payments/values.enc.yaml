@@ -1,5 +1,5 @@
 # SOPS-encrypted. Edit with `sops values.enc.yaml` on a workstation that holds
-# the environment's PGP key; never by hand, and never from an agent.
+# the environment's PGP key, never by hand.
 apiVersion: v1
 kind: Secret
 metadata:

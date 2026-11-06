@@ -1,6 +1,4 @@
-# The chart repository. Flux reads it on the cluster; the agent reads it
-# through inspect-repository, because the install registers it as a context
-# repository (role: context) and the agent's write credential never reaches it.
+# The platform charts repository.
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: GitRepository
 metadata:
