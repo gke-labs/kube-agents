@@ -87,13 +87,17 @@ not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, a
 the A2A gateway and the agent's bridge fail behind it.
 
 Upgrade forward to the release you came from. That renders the right configuration, but the
-StatefulSet does not replace a pod that never became Ready. Wait until the StatefulSet's update
-revision changes, which can take up to ten minutes while the auth callouts roll, then delete the
-pod (the default agent name is `platform-agent`):
+StatefulSet does not replace a pod that never became Ready. Wait until the StatefulSet's
+`status.updateRevision` no longer matches the pod's `controller-revision-hash` label, then delete
+the pod (the default agent name is `platform-agent`). The operator can hold the bus on its earlier
+template for up to ten minutes, the auth callouts' rollout deadline, and a pod deleted before then
+comes back on that template:
 
 ```bash
 kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system \
-  -o jsonpath='{.status.currentRevision} {.status.updateRevision}{"\n"}'
+  -o jsonpath='{.status.updateRevision}{"\n"}'
+kubectl get pod platform-agent-a2a-nats-0 -n kubeagents-system \
+  -o jsonpath='{.metadata.labels.controller-revision-hash}{"\n"}'
 kubectl delete pod platform-agent-a2a-nats-0 -n kubeagents-system
 ```
 
