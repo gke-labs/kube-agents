@@ -369,6 +369,16 @@ class ClosestByTextTest(unittest.TestCase):
         miss = report(self.LINES, texts=texts)[0]["top_misses"][0]
         self.assertEqual((miss["closest_request_id"], miss["matched_messages"]), ("n2", 2))
 
+    def test_a_nightly_untrusted_request_is_never_closest(self):
+        # n1 is a real source for the prefix, so the search reaches the text ranking,
+        # where the untrusted n2 has the most alike next message. Its tags are the
+        # proxy's, so it can claim to be an earlier build of p1's pull request.
+        texts = analyze_shadow.StoredText(write_store(self.TEXTS))
+        lines = [dict(l) for l in self.LINES]
+        lines[1] = dict(lines[1], job={"kind": "nightly-untrusted", "project": "p1", "build": "b0", "pr": "10"})
+        miss = report(lines, texts=texts)[0]["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
+
     def test_a_request_replay_could_not_have_used_is_never_closest(self):
         # n2 finished after p1 started, so it was not available to p1.
         lines = [dict(l) for l in self.LINES]

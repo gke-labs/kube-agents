@@ -31,7 +31,8 @@ instead names the kind of every input and skips the layout check, for logs
 from outside the bucket. A line whose tag names another kind than its file is
 dropped and counted. A `nightly-untrusted` line (a scheduled run that uploaded
 as an account presubmits can also run as, hack/ci-env.sh) is counted and never
-a source: pull-request code could have written it.
+a source, nor a miss's closest request: pull-request code could have written
+it.
 
 A sighting is available from when its answer finished (`ts + latency_ms`),
 and counts only when replay would have saved it (the line's `unstorable` list
@@ -427,13 +428,17 @@ class PrefixSources(Sources):
 
     def add(self, key: str, record: Record) -> None:
         super().add(key, record)
-        if self.members is not None:
+        # Only what Sources.add takes as a source: a nightly-untrusted line could
+        # have been written by pull-request code.
+        if self.members is not None and record.kind in (NIGHTLY, PRESUBMIT):
             self.members.setdefault(key, []).append(record)
 
     def usable(self, record: Record, request: Record) -> bool:
         """Whether `find` could return `record` for `request`, under the same rules."""
         if record.kind == NIGHTLY:
             return record.available_at <= request.ts
+        if record.kind != PRESUBMIT:
+            return False
         merged_at = self.merged.get(record.pr)
         if (merged_at is not None and self.merge_build.get(record.pr) == record.build_key
                 and merged_at <= request.ts and record.pr != request.pr):
