@@ -2630,6 +2630,17 @@ type AgentStatus struct {
 	// what is there; the key is absent while the served CRD predates it.
 	// +optional
 	Inference *InferenceStatus `json:"inference,omitempty"`
+
+	// ProfileSubmitMaxAgeSeconds is the live PROFILE_SUBMITS stream's max age,
+	// in seconds, when the A2A provision Job last found it longer than this
+	// operator creates the stream with (0 when the stream has no age limit).
+	// It is absent when the stream is no longer than that, or before a report.
+	// Provisioning never edits an existing stream, so a stream an older
+	// operator created can keep submissions longer than this one would, and
+	// the dispatcher is told the longer of the two: a finished task's
+	// tombstone has to outlive its submission.
+	// +optional
+	ProfileSubmitMaxAgeSeconds *int64 `json:"profileSubmitMaxAgeSeconds,omitempty"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static

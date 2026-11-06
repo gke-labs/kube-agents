@@ -540,6 +540,28 @@ func profileDurableName(profile, tier, kind string) string {
 	return fmt.Sprintf("profile-%s-%s-%s", profile, tier, kind)
 }
 
+// a2aMaxSubmitRetention is lib.MaxSubmitRetention, the longest retention a
+// dispatch config may carry (the operator can't import lib; the dispatcher's
+// Validate refuses a longer one and keeps its last good config).
+const a2aMaxSubmitRetention = 365 * 24 * time.Hour
+
+// dispatchSubmitRetentionSeconds is the submit retention the dispatch config
+// carries: the longer of this operator's a2aProfileSubmitMaxAge and the live
+// stream's, as the provision Job last reported it (#4948), capped at
+// a2aMaxSubmitRetention. A stream with no age limit gets the cap. With no
+// report yet it is the constant, as before.
+func dispatchSubmitRetentionSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	retention := a2aProfileSubmitMaxAge
+	if live := agent.Status.ProfileSubmitMaxAgeSeconds; live != nil {
+		if *live == 0 {
+			retention = a2aMaxSubmitRetention
+		} else {
+			retention = max(retention, time.Duration(*live)*time.Second)
+		}
+	}
+	return int(min(retention, a2aMaxSubmitRetention) / time.Second)
+}
+
 // desiredDispatchConfig is what the dispatcher reads for this agent: every
 // value resolved, and the profiles that have a rendered identity, each with
 // the durables the operator creates for it, one per (tier, kind).
@@ -556,7 +578,7 @@ func desiredDispatchConfig(agent *agentv1alpha1.PlatformAgent, profiles []agentv
 		RenewSeconds:           resolveProfileRenewSeconds(agent),
 		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
 		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
-		SubmitRetentionSeconds: int(a2aProfileSubmitMaxAge / time.Second),
+		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
 		Profiles:               []a2aDispatchProfile{},
 	}
 	resolved := resolveAgentProfileIdentities(agent, profiles)
