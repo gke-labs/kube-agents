@@ -2805,6 +2805,12 @@ BUSY_SLOT = {
     "bound": "slot",
     "error": "the credential proxy is at its limit of 8 concurrent commands",
 }
+BUSY_DRAINING = {
+    "status": "busy",
+    "code": "CREDENTIAL_PROXY_BUSY",
+    "bound": "draining",
+    "error": "the credential proxy is stopping",
+}
 BUSY_SESSION = {
     "status": "busy",
     "code": "CREDENTIAL_PROXY_BUSY",
@@ -3219,6 +3225,31 @@ class ApiSessionRetriesTheBrokerOnlyTest(unittest.TestCase):
         self.assertGreaterEqual(self.sleeps[0], 2.0)
         self.assertLessEqual(self.sleeps[0], 4.0)
         self.assertEqual(2, len(err.getvalue().strip().splitlines()))
+
+    def test_a_draining_refusal_drops_the_pooled_connections_before_the_retry(self):
+        # A draining exec pod answers on the caller's keep-alive connection to
+        # its Envoy; only a new connection reaches another replica.
+        class ClosingHttp(self.ScriptedHttp):
+            def __init__(self, responses):
+                super().__init__(responses)
+                self.events = []
+
+            def get(self, url, **kwargs):
+                self.events.append("get")
+                return super().get(url, **kwargs)
+
+            def close(self):
+                self.events.append("close")
+
+        ok = self.Response(200, {"timeSeries": []})
+        draining = ClosingHttp([self.Response(503, BUSY_DRAINING), ok])
+        slot = ClosingHttp([self.Response(503, BUSY_SLOT), ok])
+        for http_ in (draining, slot):
+            session = credential_proxy_client.ApiSession(http=http_, sleep_fn=self.sleeps.append, rng=random.Random(3))
+            with patch("sys.stderr", new=io.StringIO()):
+                self.assertIs(ok, session.get(self.URL))
+        self.assertEqual(["get", "close", "get"], draining.events)
+        self.assertEqual(["get", "get"], slot.events)
 
     def test_a_broker_that_stays_busy_hands_back_its_last_answer(self):
         busy = self.Response(503, BUSY_SLOT)
