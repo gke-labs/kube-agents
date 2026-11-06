@@ -677,9 +677,17 @@ def summarise_status_tools(rows: Sequence[Any]) -> List[Tuple[str, int, Mapping[
             continue
         tool = str(row.get(TOP_TOOLS_TOOL_FIELD) or "")
         sub = str(row.get(TOP_TOOLS_SUBCOMMAND_FIELD) or "")
-        counts = {status: int(row.get(status) or 0) for status in TOOL_STATUS_ORDER if int(row.get(status) or 0) > 0}
-        out.append((_tool_pair(tool, sub), int(row.get(TOP_TOOLS_TOTAL_FIELD) or 0), counts))
+        counts = {status: _count(row.get(status)) for status in TOOL_STATUS_ORDER if _count(row.get(status)) > 0}
+        out.append((_tool_pair(tool, sub), _count(row.get(TOP_TOOLS_TOTAL_FIELD)), counts))
     return out
+
+
+def _count(value: Any) -> int:
+    """A status row's count as an integer; anything that is not one reads 0, as the gateway's asInt reads it."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _tools_lines(top_tools: Sequence[Tuple[str, int, Mapping[str, int]]]) -> List[str]:
