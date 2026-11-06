@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -102,12 +103,11 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 	}
 
 	h, err := NewHandler(Config{
-		Authenticator:    tokenAuthenticator{expected: "valid-token"},
-		Upstream:         upstream,
-		DefaultClusterID: "in-cluster",
-		Policy:           Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
-		Logger:           slog.New(slog.DiscardHandler),
-		Metrics:          metrics,
+		Authenticator: tokenAuthenticator{expected: "valid-token"},
+		Upstream:      upstream,
+		Policy:        Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Logger:        slog.New(slog.DiscardHandler),
+		Metrics:       metrics,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
@@ -125,7 +125,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	// 2. Allowed GET pods.
 	{
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+		req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/pods", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -136,7 +136,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	// 3. Allowed dry-run POST configmaps.
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/configmaps?dryRun=All", strings.NewReader(`{}`))
+		req := httptest.NewRequest(http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/configmaps?dryRun=All", strings.NewReader(`{}`))
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -147,7 +147,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	// 4. Allowed GET secret (triggers Accept header rewrite + payload scrub).
 	{
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/secrets/my-secret", nil)
+		req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/secrets/my-secret", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -158,7 +158,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	// 5. Rejected unauthenticated request.
 	{
-		req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/default/pods", nil)
+		req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/api/v1/namespaces/default/pods", nil)
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != http.StatusUnauthorized {
@@ -168,7 +168,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	// 6. Rejected POST without dryRun=All.
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/configmaps", strings.NewReader(`{}`))
+		req := httptest.NewRequest(http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/configmaps", strings.NewReader(`{}`))
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -179,7 +179,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	// 7. Rejected DELETE pod.
 	{
-		req := httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/p1", nil)
+		req := httptest.NewRequest(http.MethodDelete, "/clusters/in-cluster/api/v1/namespaces/default/pods/p1", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -190,7 +190,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	// 8. Rejected pod exec with Upgrade header records resource="pods" and subresource="exec".
 	{
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/namespaces/default/pods/p1/exec?command=whoami", nil)
+		req := httptest.NewRequest(http.MethodPost, "/clusters/in-cluster/api/v1/namespaces/default/pods/p1/exec?command=whoami", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		req.Header.Set("Connection", "Upgrade")
 		req.Header.Set("Upgrade", "SPDY/3.1")
@@ -203,7 +203,7 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 
 	// 9. Arbitrary custom resource name to verify cardinality bounding.
 	{
-		req := httptest.NewRequest(http.MethodGet, "/apis/example.com/v1/namespaces/default/CallerSuppliedUnboundedResource42", nil)
+		req := httptest.NewRequest(http.MethodGet, "/clusters/in-cluster/apis/example.com/v1/namespaces/default/CallerSuppliedUnboundedResource42", nil)
 		req.Header.Set("Authorization", "Bearer valid-token")
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
@@ -241,6 +241,90 @@ func TestPrometheusMetricsAndCardinalitySafety(t *testing.T) {
 	}
 }
 
+// TestMetricsOutcomesThatAreNotTheUpstreams checks the 5xx answers the upstream did not cause:
+// each keeps its own outcome rather than counting as upstream_error, and a Secret response
+// replaced with a 502 is not counted as scrubbed.
+func TestMetricsOutcomesThatAreNotTheUpstreams(t *testing.T) {
+	podList := func(_ string, _ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"apiVersion":"v1","kind":"PodList","items":[]}`)),
+		}, nil
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name     string
+		authn    CallerAuthenticator
+		upstream func(string, *http.Request) (*http.Response, error)
+		ctx      context.Context
+		target   string
+		wantCode int
+		want     string
+		notWant  string
+	}{
+		{
+			name:     "authentication unavailable",
+			authn:    staticAuthenticator{err: fmt.Errorf("%w: %w", errAuthenticationUnavailable, errors.New("connection refused"))},
+			upstream: podList,
+			target:   "/clusters/in-cluster/api/v1/namespaces/default/pods",
+			wantCode: http.StatusServiceUnavailable,
+			want:     `outcome="auth_unavailable",resource="unknown",status_code="503"`,
+		},
+		{
+			name:  "caller gone",
+			authn: staticAuthenticator{caller: &CallerIdentity{Username: "shell"}},
+			upstream: func(_ string, req *http.Request) (*http.Response, error) {
+				return nil, req.Context().Err()
+			},
+			ctx:      canceled,
+			target:   "/clusters/in-cluster/api/v1/namespaces/default/pods",
+			wantCode: http.StatusBadGateway,
+			want:     `outcome="canceled",resource="pods",status_code="502"`,
+		},
+		{
+			name:     "unredactable secret",
+			authn:    staticAuthenticator{caller: &CallerIdentity{Username: "shell"}},
+			upstream: podList,
+			target:   "/clusters/in-cluster/api/v1/namespaces/default/secrets/db",
+			wantCode: http.StatusBadGateway,
+			want:     `outcome="upstream_error",resource="secrets",status_code="502"`,
+			notWant:  `kubeagents_kube_proxy_secrets_redacted_total{action="payload_scrubbed"} 1`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics := NewMetrics()
+			h, err := NewHandler(Config{
+				Authenticator: tc.authn,
+				Upstream:      &fakeUpstream{handler: tc.upstream},
+				Policy:        Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+				Logger:        slog.New(slog.DiscardHandler),
+				Metrics:       metrics,
+			})
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			if tc.ctx != nil {
+				req = req.WithContext(tc.ctx)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantCode)
+			}
+			exposition := scrapeMetricsText(t, metrics)
+			if !strings.Contains(exposition, tc.want) {
+				t.Errorf("metrics exposition lacks %q\n%s", tc.want, exposition)
+			}
+			if tc.notWant != "" && strings.Contains(exposition, tc.notWant) {
+				t.Errorf("metrics exposition has %q\n%s", tc.notWant, exposition)
+			}
+		})
+	}
+}
+
 func TestOpenTelemetryTracing(t *testing.T) {
 	exporter := &recordingSpanExporter{}
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
@@ -257,12 +341,11 @@ func TestOpenTelemetryTracing(t *testing.T) {
 	}
 
 	h, err := NewHandler(Config{
-		Authenticator:    tokenAuthenticator{expected: "valid-token"},
-		Upstream:         upstream,
-		DefaultClusterID: "in-cluster",
-		Policy:           Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
-		Logger:           slog.New(slog.DiscardHandler),
-		TracerProvider:   tp,
+		Authenticator:  tokenAuthenticator{expected: "valid-token"},
+		Upstream:       upstream,
+		Policy:         Policy{Mode: ModeReadOnlyWithDryRun, RedactSecrets: true},
+		Logger:         slog.New(slog.DiscardHandler),
+		TracerProvider: tp,
 	})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
@@ -278,7 +361,7 @@ func TestOpenTelemetryTracing(t *testing.T) {
 	}
 
 	// 2. Rejected request produces error server span with rejection_reason.
-	delReq := httptest.NewRequest(http.MethodDelete, "/api/v1/namespaces/default/pods/victim", nil)
+	delReq := httptest.NewRequest(http.MethodDelete, "/clusters/in-cluster/api/v1/namespaces/default/pods/victim", nil)
 	delReq.Header.Set("Authorization", "Bearer valid-token")
 	delRec := httptest.NewRecorder()
 	h.ServeHTTP(delRec, delReq)

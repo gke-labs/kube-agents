@@ -147,8 +147,9 @@ a different constant rather than a different path.
 The Go event watcher marshals an `InjectPayload`, wraps it as `{"message": "<escaped JSON>"}`, and
 `POST`s it to `/sessions/{id}/inject` (`k8s-operator/cmd/k8s-event-watcher/injector.go`). The watcher
 sends **no prompt** — it sends facts. Noise control lives here too: namespace allow/deny rules, a
-flapping guard, a two-minute settle period for the crash-loop family (a back-off that clears sooner
-is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
+flapping guard, a two-minute settle period for the crash-loop family and kubelet's `host IP unknown`
+config error (a back-off that clears sooner, or a DaemonSet pod's `host IP unknown` as its node is
+deleted, is not forwarded), and a 24h dedup window keyed on `EventKey{UID, Reason}`, so a crashlooping pod
 is one incident rather than forty. Once an alerted object has been quiet for fifteen minutes the
 watcher sends a `k8s-event-followup` on the same session, which lands in the alert's thread and on its triage card (the card alone on an install without chat).
 
@@ -331,8 +332,10 @@ written to the live cluster directly.
   architecture, and it is stated in the prompt.
 
 A domain also registers a **skill** ([Plugging in a new domain](#plugging-in-a-new-domain) says where), which supplies the
-diagnostic procedure — e.g. `gke-workload-troubleshooting` walks pod status → namespace events →
-container logs → service and NetworkPolicy checks → propose a GitOps correction. The persona that runs
+diagnostic procedure — e.g. for workload faults, `gke-workload-troubleshooting` routes an unknown-symptom workload to the
+focused skill for its symptom (`pod-crashloop-oom`, `pod-pending-scheduling`, `pod-container-creating` or
+`service-connectivity`), while `workload-triage-scan` handles cluster-wide health scans, each ending in a proposed GitOps
+correction. The persona that runs
 the triage requires the agent to query the catalog and load the matching domain skill before diagnosing
 (Cluster Agent `SOUL.md` §3) and to pass a pre-report self-audit demanding quoted command output,
 resource names, and only the timestamps a command printed (§4). The communication policy on the result — the three-part layout

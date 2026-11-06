@@ -25,14 +25,19 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
+// AccountControl and AccountApp are the two NATS accounts the callout will
+// issue a user into: control-plane writers in TRUSTED and runtime workloads in
+// APP. Narrowed identities (session and profile workers) may only be minted
+// into AccountApp.
+const (
+	AccountControl = "TRUSTED"
+	AccountApp     = "APP"
+)
+
 // mintableAccounts is every NATS account the callout will issue a user into.
 //
-// The deployment renders exactly one application account, and the callout's own
-// account holds nothing but the callout. Anything else - $SYS above all - is
-// either a mistake or an attempt, and both are worth refusing at the point the
-// map is parsed rather than at the point a connection lands somewhere it should
-// not be.
-var mintableAccounts = []string{"APP"}
+// Anything outside this list - $SYS above all - is refused at parse time.
+var mintableAccounts = []string{AccountControl, AccountApp}
 
 const (
 	// ServiceAccountPrefix is how the Kubernetes TokenReview API spells a
@@ -237,6 +242,10 @@ func (id Identity) validate() error {
 	if !slices.Contains(mintableAccounts, id.Account) {
 		return fmt.Errorf("user %q names account %q, which this callout will not mint into (allowed: %v)",
 			id.User, id.Account, mintableAccounts)
+	}
+	if id.Narrowing != "" && id.Account != AccountApp {
+		return fmt.Errorf("user %q narrows on %q and must land in account %q, not %q",
+			id.User, id.Narrowing, AccountApp, id.Account)
 	}
 	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 	// The profile fields mean something only under NarrowingProfile. On any

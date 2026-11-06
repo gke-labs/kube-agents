@@ -88,14 +88,24 @@ _KUBECTL_SUBCOMMANDS: dict[str, frozenset[str]] = {
 from credential_proxy_client import (  # noqa: F401  (re-export)
     ADMISSION_BOUND_BACKGROUND,
     ADMISSION_BOUND_DRAINING,
+    ADMISSION_REPLICAS_KEY,
+    ADMISSION_TIER_ADMITTED_KEY,
+    ADMISSION_TIER_INTERACTIVE_CAP_KEY,
     API_RELAY_PREFIX,
+    AUDIT_BROKER_POD,
+    AUDIT_BROKER_TIER,
+    AUDIT_CLASS,
     BACKGROUND_NICE,
+    BROKER_TIER_EXEC,
+    BROKER_TIER_STATEFUL,
     BUSY_BOUND_KEY,
     CLASS_BACKGROUND,
     CLASS_INTERACTIVE,
     CLASS_LABEL,
     CONTEXT_FLAG,
     END_OF_FLAGS,
+    EXEC_REPLICAS_FILE,
+    EXEC_REPLICAS_FILE_ENV,
     EXEC_ROLE,
     KUBECONFIG_FLAG,
     ClusterTarget,
@@ -790,10 +800,15 @@ HEALTHZ_PATH = "/healthz"
 # worker pools by (`broker_admission.sweep_width`). Read-only: the slot cap, the
 # count the child memory budget fits at this container's effective limit, the
 # smaller of the two, the interactive cap inside it, and the session role's own
-# cap. Only the broker knows the
-# effective limit: on GKE Autopilot without bursting it is the memory request,
-# rewritten after the operator rendered the pod.
+# cap; on an exec pod, also the tier's totals (`exec_tier_replicas`). Only the
+# broker knows the effective limit: on GKE Autopilot without bursting it is the
+# memory request, rewritten after the operator rendered the pod.
 ADMISSION_PATH = "/v1/exec/admission"
+# The largest exec-tier replica count the report multiplies by: the CR field's
+# bound (credential-broker-exec-tier.md §12). A larger count in the replicas
+# file is held to it.
+EXEC_REPLICAS_MAX = 32
+EXEC_REPLICAS_RE = re.compile(r"[0-9]+")
 # Requests that keep serving while the broker drains (SHUTDOWN_DRAIN_SECONDS),
 # by method and path: the health probe; a relay's settle routes, so the
 # gateway's acks for pulls already answered land; and the event pulls. Slack's
@@ -843,22 +858,159 @@ METRICS_SERVER_HEADER = "credential-proxy-metrics"
 METRICS_MAX_CONNECTIONS = 16
 METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # How many connections the kernel queues for the credentialed listener between
-# accepts. The handler speaks HTTP/1.0 and closes after every response, so Envoy
-# opens a fresh upstream connection for every request: each brokered command,
-# each event-pull iteration and each readiness probe is one connect() on the
-# Unix socket. On that socket a connect() past the queue is refused with EAGAIN
-# at once, and Envoy answers the caller with a 503 before any handler thread
-# exists; a probe caught in a burst that way reads as not ready. (The TCP
-# listeners share the constant; there a full queue drops the SYN and the
-# client stalls until it retries.) The stdlib's 5 is smaller than one sweep's
-# command slots. Envoy's per-cluster connection ceiling for the credentialed
-# route (max_connections in deploy/shared/envoy-credential-proxy.yaml) is the
-# most it can hold open to the broker at once, so a queue of that size leaves
-# Envoy's own breaker, never this queue, as what refuses first; the test holds
-# this constant at or above that number. listen() clamps it to net.core.somaxconn: 4096
-# on a recent Linux kernel, 1024 inside a gVisor sandbox, so the queue is at
-# most this size and never less.
+# accepts. Envoy reuses an upstream connection across requests (the handler
+# speaks HTTP/1.1 and keeps the connection open, below), so the queue sees a
+# connect() only when Envoy's pool grows: a burst of brokered commands, event
+# pulls and probes past the connections it already holds open. On the Unix
+# socket a connect() past the queue is refused with EAGAIN at once, and Envoy
+# answers the caller with a 503 before any handler thread exists; a probe
+# caught in a burst that way reads as not ready. (The TCP listeners share the
+# constant; there a full queue drops the SYN and the client stalls until it
+# retries.) The stdlib's 5 is smaller than one sweep's command slots. Envoy's
+# per-cluster connection ceiling for the credentialed route (max_connections
+# in deploy/shared/envoy-credential-proxy.yaml) is the most it can hold open
+# to the broker at once, so a queue of that size leaves Envoy's own breaker,
+# never this queue, as what refuses first; the test holds this constant at or
+# above that number. listen() clamps it to net.core.somaxconn: 4096 on a
+# recent Linux kernel, 1024 inside a gVisor sandbox, so the queue is at most
+# this size and never less.
 LISTEN_BACKLOG = 4096
+# How long the credentialed handler and the agent API door hold an idle
+# keep-alive connection open for its next request before closing it, and so
+# the longest a connection that sends nothing holds a thread under the cap
+# below. Also the window a request has to arrive in full once its first
+# byte is in, request line, headers and body together, rather than a
+# timeout on each read (_RequestReadDeadline): a peer that sends a byte
+# inside every per-read timeout would otherwise hold its thread, and its
+# slot, for as long as it kept dripping. Envoy, the credentialed listener's
+# only client, closes an idle upstream connection at the shorter timeout in
+# deploy/shared/envoy-credential-proxy.yaml, so the side that sends on a
+# connection is never the side that just closed it; this is the backstop for
+# a peer that does not, and the door's peers are under no such discipline.
+KEEPALIVE_IDLE_SECONDS = 60
+# How the stdlib's handle_one_request reports every socket timeout on the
+# connection to log_error ("Request timed out: %r"). _log_socket_timeout
+# reads the TimeoutError it passes rather than this text, which the tests
+# pin as never reaching the log.
+IDLE_CLOSE_LOG_PREFIX = "Request timed out"
+# The most connections a credentialed listener (the Unix socket or TCP port
+# behind Envoy, and the agent API door) holds a thread for at once. The
+# stdlib server starts one OS thread per accepted connection with no cap; one
+# past this is answered THREAD_CAP_REFUSAL on a short-lived refusal thread of
+# its own (THREAD_CAP_REFUSAL_SECONDS, below) and closed, with no handler
+# thread spent. MAX_THREADS_ENV names the cap for both listeners. Unset, the
+# listener behind Envoy takes a cap derived from Envoy's config
+# (default_max_threads): the sum, over the static clusters that forward to
+# the broker's socket, of each cluster's circuit-breaker max_connections,
+# Envoy's own default of
+# ENVOY_DEFAULT_MAX_CONNECTIONS for a cluster that sets none. Derived rather
+# than pinned so that Envoy's breaker refuses before the cap does whatever a
+# config raises it to, and so that a second cluster to the socket (a health
+# route's, say) keeps thread slots of its own when the first holds every
+# connection its breaker allows; the cap then backstops the admission the
+# broker already does through its command, session, profile and scope slots
+# rather than refusing ahead of them. The config is read from the copy the
+# credential-proxy image carries beside the broker, or the repository's when
+# running from source; the shipped config declares 4096 on the credentialed
+# route's cluster and 64 on the readiness probe's, so the derived cap is 4160
+# there. With neither readable, the fallback is Envoy's default for one
+# cluster. The agent API door derives nothing: no Envoy fronts it, its peers
+# are the pods of its namespace, and the argument above does not hold there,
+# so unset it takes FALLBACK_MAX_THREADS (door_thread_cap_from_env).
+MAX_THREADS_ENV = "CREDENTIAL_PROXY_MAX_THREADS"
+ENVOY_CONFIG_PATH = Path("/etc/envoy/envoy-credential-proxy.yaml")
+# This file sits three directories under the repository root
+# (agents/platform/scripts), where the image's copy of the config comes from.
+ENVOY_CONFIG_SOURCE_DEPTH = 3
+ENVOY_CONFIG_SOURCE_RELATIVE = Path("deploy") / "shared" / "envoy-credential-proxy.yaml"
+_THIS_FILE_PARENTS = Path(__file__).resolve().parents
+ENVOY_CONFIG_SOURCE_PATH = (
+    _THIS_FILE_PARENTS[ENVOY_CONFIG_SOURCE_DEPTH] / ENVOY_CONFIG_SOURCE_RELATIVE
+    if len(_THIS_FILE_PARENTS) > ENVOY_CONFIG_SOURCE_DEPTH
+    else None
+)
+ENVOY_CONFIG_PATHS: tuple[Path, ...] = tuple(
+    path for path in (ENVOY_CONFIG_PATH, ENVOY_CONFIG_SOURCE_PATH) if path is not None
+)
+# The Unix socket the broker serves behind Envoy, as the config's clusters
+# name it; a cluster to any other address is not a client of the broker.
+ENVOY_BROKER_SOCKET_PATH = "/var/run/credential-proxy/backend.sock"
+# The one leading run normpath keeps: a path that begins with exactly two
+# slashes, which POSIX lets an implementation resolve apart from the root
+# and Linux, so the kernel Envoy's connect() goes through, does not. It is
+# collapsed to one before a pipe path is compared (_normalised_pipe_path).
+ENVOY_PIPE_DOUBLED_ROOT = "//"
+# Envoy's per-cluster connection ceiling when a cluster's circuit_breakers
+# set none.
+ENVOY_DEFAULT_MAX_CONNECTIONS = 1024
+# The largest count a threshold's max_connections can carry: it is a
+# UInt32Value, and proto-JSON refuses a config with one past this, so Envoy
+# does not start on it (_connection_count).
+ENVOY_MAX_CONNECTIONS_LIMIT = 2**32 - 1
+# The routing priority a route runs at unless it names another, and the one
+# a circuit-breaker threshold applies to when it names none. Envoy keeps a
+# breaker per priority; the shipped routes set none, so DEFAULT's is the
+# ceiling in force, whatever a HIGH threshold beside it says. Envoy reads the
+# config through proto-JSON, which takes an enum by its name, its number, or
+# a string carrying its number (a quoted "0" is DEFAULT), so a threshold's
+# priority is one of those spellings or the config is one Envoy would not
+# load (_routing_priority). A threshold the walk cannot read either way is
+# read in the direction that costs nothing: the largest count the cluster
+# declares (envoy_broker_connection_ceiling), since a cap above Envoy's
+# breaker never fires and one below it refuses connections Envoy carries.
+ENVOY_DEFAULT_PRIORITY = "DEFAULT"
+ENVOY_ROUTING_PRIORITIES: Mapping[str, int] = {ENVOY_DEFAULT_PRIORITY: 0, "HIGH": 1}
+# What a WARNING about an Envoy config that could not be read says it was
+# not read for. The thread cap's derivation (default_max_threads) and the
+# listener ports the auxiliary listeners are refused by name
+# (envoy_listener_ports) read the same file.
+ENVOY_READ_FOR_THREAD_CAP = "the thread cap"
+ENVOY_READ_FOR_LISTENER_PORTS = "the listener ports"
+FALLBACK_MAX_THREADS = ENVOY_DEFAULT_MAX_CONNECTIONS
+# The 503 a connection past the thread cap is written before it is closed: a
+# whole HTTP/1.1 response with an empty body, so a client that already sent
+# its request reads an answer that says when to retry rather than a reset.
+THREAD_CAP_RETRY_AFTER_SECONDS = 5
+THREAD_CAP_REFUSAL = (
+    "HTTP/1.1 503 Service Unavailable\r\n"
+    f"Retry-After: {THREAD_CAP_RETRY_AFTER_SECONDS}\r\n"
+    "Content-Length: 0\r\n"
+    "Connection: close\r\n"
+    "\r\n"
+).encode("ascii")
+# The refusal is written and then what the peer sent is read until the peer
+# closes: a socket closed with unread bytes in it resets the peer, and the
+# reset discards the 503 before the peer reads it. That wait is never the
+# accept loop's: each refusal runs on a short-lived thread of its own, at
+# most this long, and at most THREAD_CAP_REFUSAL_THREADS of them at once;
+# a refused connection past that many is closed at once, unanswered, which
+# only a peer that holds its refused connections open brings about. Envoy,
+# the client the cap is for, closes on reading the answer, so its refusal
+# thread lives a millisecond.
+THREAD_CAP_REFUSAL_SECONDS = 0.5
+THREAD_CAP_REFUSAL_THREADS = 16
+THREAD_CAP_DRAIN_CHUNK_BYTES = 64 * 1024
+# How often the cap writes a line while it is being hit: one ALERT when an
+# episode starts, then at most one per interval carrying the count refused
+# since the last line, and one line when a connection closes after an
+# interval with no refusal. Under sustained saturation with ordinary
+# turnover, a line per refusal or per freed slot would be hundreds a second.
+THREAD_CAP_LOG_INTERVAL_SECONDS = 60
+# The health-only listener: GET /healthz and nothing else, on a TCP port of
+# its own beside the metrics listener, so a probe reads the broker's liveness
+# even while every thread the credentialed listener may spend is spent. Bound
+# on the same host as the metrics listener, which is the pod IP in the
+# operator's layout, so a kubelet probe can reach it; /healthz stays on the
+# credentialed listener too. Opt-in, as the metrics port is: unset or 0 opens
+# none. The operator's readiness probe reads /healthz through Envoy, whose
+# config can give that route a cluster of its own to the broker's socket,
+# with thread slots the cap above then keeps for it; a port here is for a
+# probe an operator points at the broker directly.
+HEALTH_PORT_ENV = "CREDENTIAL_PROXY_HEALTH_PORT"
+DEFAULT_HEALTH_PORT = 0
+HEALTH_SERVER_HEADER = "credential-proxy-health"
+# What /healthz answers, on both listeners.
+HEALTHZ_PAYLOAD = {"status": "ok"}
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -972,6 +1124,17 @@ VCS_REQUESTS_METRIC = "kubeagents_vcs_requests_total"
 VCS_VERB_LABEL = "verb"
 VCS_PROVIDER_LABEL = "provider"
 VCS_PROVIDER_NONE = "none"
+# The one-time claim token minted with each `proposal-create` answer, under
+# CLAIM_TOKEN_FIELD, and burned by the first `proposal-claim` that presents it
+# (`ClaimTokens`). It lives CLAIM_TOKEN_TTL_SECONDS, the window
+# `vcs_broker.CLAIM_WINDOW_SECONDS` holds the proposal's creation time to, and
+# is CLAIM_TOKEN_BYTES of os.urandom, spelled in hex.
+PROPOSAL_CREATE_VERB = "proposal-create"
+PROPOSAL_CLAIM_VERB = "proposal-claim"
+CLAIM_TOKEN_FIELD = "claim"
+CLAIM_URL_FIELD = "url"
+CLAIM_TOKEN_TTL_SECONDS = vcs_broker.CLAIM_WINDOW_SECONDS
+CLAIM_TOKEN_BYTES = 32
 # The provider label's closed set: the names of the forge classes this image
 # ships (providers.AVAILABLE), which is also the set the registry admits a
 # configured forge from, so a configured forge's name is always in it.
@@ -997,6 +1160,7 @@ VCS_READINGS_FAILURE_REASONS = frozenset({
     vcs_readings.REASON_DETAIL_TRUNCATED,
     vcs_readings.REASON_RATE_LIMITED,
     vcs_readings.REASON_WARMING,
+    vcs_readings.REASON_QUOTA_FLOOR,
 })
 # The broker's own failures, by kind and, for a timeout, by the tool it ran:
 # work it took on and could not carry out
@@ -1251,14 +1415,546 @@ class HandlerErrorsToLog:
         LOGGER.exception("request handler failed type=%s", type(sys.exc_info()[1]).__name__)
 
 
-class ThreadingUnixHTTPServer(HandlerErrorsToLog, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class ConnectionCap:
+    """A ceiling on the connections a threading server holds a thread for.
+
+    socketserver's ThreadingMixIn starts one thread per accepted connection
+    with no cap. Mixed in ahead of it, this admits ``cap`` connections at a
+    time and hands one past that to ``refuse_connection`` on the accept
+    loop's thread, before any thread is spent on it; a slot comes back when
+    the admitted connection's handler returns.
+    """
+
+    def __init__(self, *args: Any, cap: int, **kwargs: Any) -> None:
+        self.connection_cap = cap
+        self._cap_slots = threading.BoundedSemaphore(cap)
+        super().__init__(*args, **kwargs)
+
+    def refuse_connection(self, request: Any) -> None:
+        """Dispose of a connection past the cap; the default closes it unserved."""
+        self.shutdown_request(request)
+
+    def connection_released(self) -> None:
+        """Called once an admitted connection's handler has returned."""
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._cap_slots.acquire(blocking=False):
+            self.refuse_connection(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._cap_slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._cap_slots.release()
+            self.connection_released()
+
+
+class ThreadCap(ConnectionCap):
+    """ConnectionCap for the credentialed listeners: the refused connection is told.
+
+    A peer past the cap is written THREAD_CAP_REFUSAL, a complete 503 with a
+    Retry-After, and closed; Envoy relays that answer to the caller, where a
+    bare close would be a reset. The write and the drain behind it run on a
+    short-lived thread, one per refusal and at most
+    THREAD_CAP_REFUSAL_THREADS at once, so a peer that holds its refused
+    connection open never holds the accept loop; past
+    THREAD_CAP_REFUSAL_THREADS such peers a refused connection is closed at
+    once, unanswered. The cap is serve()'s to set: MAX_THREADS_ENV or Envoy's
+    config for the listener behind Envoy (thread_cap_from_env), MAX_THREADS_ENV
+    or the fallback for the door (door_thread_cap_from_env); a test passes
+    ``max_threads`` directly. The log carries one
+    ALERT when the cap is first reached, at most one line per
+    THREAD_CAP_LOG_INTERVAL_SECONDS while it keeps being reached, and one
+    when an interval has passed without a refusal, each with the count
+    refused since the last line and how many of those were closed
+    unanswered; never one per refused
+    connection or per freed slot, so a saturated hour cannot fill the log.
+    """
+
+    # The cap a credentialed listener is built with unless told otherwise;
+    # serve() sets it from MAX_THREADS_ENV, or Envoy's config, before building
+    # the listener behind Envoy (thread_cap_from_env), and builds the door
+    # with its own (door_thread_cap_from_env).
+    max_threads: int = FALLBACK_MAX_THREADS
+
+    def __init__(self, *args: Any, max_threads: int | None = None, **kwargs: Any) -> None:
+        # Refusals since the last line, when that line was written (None
+        # outside an episode) and when the last refusal happened; see
+        # THREAD_CAP_LOG_INTERVAL_SECONDS.
+        self._refused = 0
+        self._refused_unanswered = 0
+        self._refused_logged_at: float | None = None
+        self._last_refusal_at = 0.0
+        self._refused_lock = threading.Lock()
+        self._refusal_slots = threading.BoundedSemaphore(THREAD_CAP_REFUSAL_THREADS)
+        cap = self.max_threads if max_threads is None else max_threads
+        super().__init__(*args, cap=cap, **kwargs)
+
+    def refuse_connection(self, request: Any) -> None:
+        # How the refusal ends is settled before it is counted, so the one
+        # line that counts it says how it ended: answered on a refusal
+        # thread of its own, or closed unanswered, because
+        # THREAD_CAP_REFUSAL_THREADS refusals are already waiting on their
+        # peers or because the refusal thread could not be started. Counted
+        # first, a thread start that then failed would leave the refusal
+        # counted as answered on one line and as unanswered on the next.
+        answered = self._refusal_slots.acquire(blocking=False)
+        if not answered:
+            LOGGER.debug(
+                "thread cap refusal closed unanswered: %d refusals already waiting on their peers",
+                THREAD_CAP_REFUSAL_THREADS,
+            )
+            self.shutdown_request(request)
+        else:
+            try:
+                threading.Thread(
+                    target=self._deliver_refusal, args=(request,), daemon=True, name="thread-cap-refusal"
+                ).start()
+            except RuntimeError as exc:
+                # The slot was taken and the answer not written: the refusal
+                # is closed, and counted, as unanswered.
+                self._refusal_slots.release()
+                answered = False
+                LOGGER.debug("thread cap refusal closed unanswered type=%s", type(exc).__name__)
+                self.shutdown_request(request)
+        self._count_refusal(answered)
+
+    def _count_refusal(self, answered: bool) -> None:
+        """Count one refusal that ended as ``answered`` says, and write the ALERT line when one is due."""
+        now = time.monotonic()
+        with self._refused_lock:
+            self._refused += 1
+            if not answered:
+                self._refused_unanswered += 1
+            self._last_refusal_at = now
+            due = (
+                self._refused_logged_at is None
+                or now - self._refused_logged_at >= THREAD_CAP_LOG_INTERVAL_SECONDS
+            )
+            if not due:
+                return
+            refused, unanswered = self._refused, self._refused_unanswered
+            self._refused = self._refused_unanswered = 0
+            self._refused_logged_at = now
+        LOGGER.warning(
+            "ALERT connection refused: %d connections hold a thread (%s); %d refused since "
+            "the last line, %d answered 503 with Retry-After on a refusal thread and %d closed "
+            "unanswered with %d refusals already waiting on their peers or no thread to answer on",
+            self.connection_cap,
+            MAX_THREADS_ENV,
+            refused,
+            refused - unanswered,
+            unanswered,
+            THREAD_CAP_REFUSAL_THREADS,
+        )
+
+    def _deliver_refusal(self, request: Any) -> None:
+        """Write THREAD_CAP_REFUSAL, wait for the peer's close, close; on a thread of its own."""
+        deadline = time.monotonic() + THREAD_CAP_REFUSAL_SECONDS
+        try:
+            request.settimeout(THREAD_CAP_REFUSAL_SECONDS)
+            request.sendall(THREAD_CAP_REFUSAL)
+            request.shutdown(socket.SHUT_WR)
+            # The request the peer sent in the meantime, or the start of it,
+            # read and dropped until the peer closes on the answer, so that
+            # the close below finds nothing unread.
+            while (left := deadline - time.monotonic()) > 0:
+                request.settimeout(left)
+                if not request.recv(THREAD_CAP_DRAIN_CHUNK_BYTES):
+                    break
+        except OSError as exc:
+            LOGGER.debug("thread cap refusal not delivered type=%s", type(exc).__name__)
+        finally:
+            self._refusal_slots.release()
+            self.shutdown_request(request)
+
+    def connection_released(self) -> None:
+        # The episode is over once an interval has passed with no refusal;
+        # a slot freed in the middle of one is taken by the next accept and
+        # says nothing.
+        with self._refused_lock:
+            if self._refused_logged_at is None:
+                return
+            if time.monotonic() - self._last_refusal_at < THREAD_CAP_LOG_INTERVAL_SECONDS:
+                return
+            refused, unanswered = self._refused, self._refused_unanswered
+            self._refused = self._refused_unanswered = 0
+            self._refused_logged_at = None
+        LOGGER.warning(
+            "thread cap released: no connection refused for %ds, %d refused since the last line, "
+            "%d answered 503 with Retry-After and %d closed unanswered",
+            THREAD_CAP_LOG_INTERVAL_SECONDS,
+            refused,
+            refused - unanswered,
+            unanswered,
+        )
+
+
+def thread_cap_from_env() -> int:
+    """MAX_THREADS_ENV as a positive integer, or default_max_threads() with a WARNING.
+
+    The same grammar as every other positive-integer knob the broker reads
+    (session_slot_limit_from_env), so the two cannot drift; the default is
+    derived from Envoy's config rather than pinned beside it, and only when
+    it is the cap: a pinned value reads no config and logs no derivation.
+    """
+    raw = os.getenv(MAX_THREADS_ENV, "").strip()
+    try:
+        pinned = int(raw) if raw else 0
+    except ValueError:
+        pinned = 0
+    if pinned > 0:
+        return pinned
+    return session_slot_limit_from_env(MAX_THREADS_ENV, default_max_threads())
+
+
+def door_thread_cap_from_env() -> int:
+    """The agent API door's cap: MAX_THREADS_ENV as a positive integer, else FALLBACK_MAX_THREADS.
+
+    Nothing is derived for the door. The derivation (default_max_threads)
+    sums Envoy's connection ceilings to the broker's socket so that Envoy's
+    breaker refuses before the cap, and no Envoy fronts the door: its peers
+    are the pods of its namespace, with no breaker between them and it, so a
+    cap read off the broker's config would bound it by a file no proxy in its
+    pod reads. The same grammar as thread_cap_from_env for the environment.
+    """
+    return session_slot_limit_from_env(MAX_THREADS_ENV, FALLBACK_MAX_THREADS)
+
+
+def default_max_threads(paths: Sequence[Path] | None = None) -> int:
+    """The thread cap when MAX_THREADS_ENV is unset.
+
+    Derived from the first Envoy config in ``paths`` (ENVOY_CONFIG_PATHS by
+    default: the image's copy, then the repository's) that is readable and
+    names a cluster to the broker's socket (envoy_broker_connection_ceiling);
+    FALLBACK_MAX_THREADS, with a WARNING, when none is. Nothing a caller sends
+    reaches this: the config is the image's own file.
+    """
+    candidates = tuple(ENVOY_CONFIG_PATHS if paths is None else paths)
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            # Unreadable, or readable and not UTF-8: not this path's to
+            # decide the cap; the next, or the fallback.
+            continue
+        ceiling = _envoy_ceiling_from_text(text, path)
+        if ceiling is not None:
+            LOGGER.info("thread cap default %d derived from %s", ceiling, path)
+            return ceiling
+    LOGGER.warning(
+        "no Envoy config naming a cluster to %s is readable at %s; thread cap default is %d",
+        ENVOY_BROKER_SOCKET_PATH, ", ".join(str(path) for path in candidates) or "(no path)",
+        FALLBACK_MAX_THREADS,
+    )
+    return FALLBACK_MAX_THREADS
+
+
+def _parsed_envoy_config(text: str, path: Path, purpose: str) -> tuple[bool, Any]:
+    """Whether ``text`` parses as YAML, and the document; a WARNING naming ``purpose`` when it does not.
+
+    Fail-safe: nothing the parser raises leaves this function. The readers
+    run at the start of every broker and agent API door, and a config Envoy
+    itself starts on (yaml-cpp has no recursion limit to hit) must not keep
+    the broker from starting; the path is passed over for the next.
+    """
+    try:
+        import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
+    except ImportError:
+        LOGGER.warning("pyyaml is not importable; %s is not read for %s", path, purpose)
+        return False, None
+    try:
+        return True, yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        LOGGER.warning("%s does not parse as YAML (%s); not read for %s", path, exc, purpose)
+        return False, None
+    except Exception as exc:  # a RecursionError on a nested document, or anything else the parser raises
+        LOGGER.warning("%s could not be parsed (%s: %s); not read for %s", path, type(exc).__name__, exc, purpose)
+        return False, None
+
+
+def _envoy_ceiling_from_text(text: str, path: Path) -> int | None:
+    """envoy_broker_connection_ceiling over a config's text; None, with a WARNING, when it cannot be read.
+
+    Fail-safe: nothing the parse or the walk raises leaves this function
+    (_parsed_envoy_config), and a config that reads a count the broker could
+    not is passed over for the next, or the fallback, not a crash loop.
+    """
+    parsed, config = _parsed_envoy_config(text, path, ENVOY_READ_FOR_THREAD_CAP)
+    if not parsed:
+        return None
+    try:
+        ceiling = envoy_broker_connection_ceiling(config)
+    except Exception as exc:  # a shape the walk did not foresee; the fallback, not a crash loop
+        LOGGER.warning(
+            "%s could not be walked (%s: %s); not read for %s",
+            path, type(exc).__name__, exc, ENVOY_READ_FOR_THREAD_CAP,
+        )
+        return None
+    if ceiling is None:
+        LOGGER.warning(
+            "%s names no cluster to %s; not read for the thread cap", path, ENVOY_BROKER_SOCKET_PATH
+        )
+    return ceiling
+
+
+def envoy_broker_connection_ceiling(config: Any) -> int | None:
+    """Envoy's ceiling on connections to the broker, from a parsed Envoy config.
+
+    The sum, over the clusters in ``static_resources.clusters`` whose endpoint
+    is the pipe at ENVOY_BROKER_SOCKET_PATH, of each cluster's
+    max_connections at the ENVOY_DEFAULT_PRIORITY: the first threshold in
+    ``circuit_breakers.thresholds`` that names that priority or none (Envoy
+    reads the first for a priority), and ENVOY_DEFAULT_MAX_CONNECTIONS for a
+    cluster with no such threshold, or a threshold that sets no count, since
+    Envoy applies its default to a priority no threshold names. A threshold
+    at another priority is not read: the shipped routes run at DEFAULT, and
+    a route that named HIGH would draw on a pool this does not count. The
+    priority and the count are read as Envoy's proto-JSON reads them
+    (_routing_priority, _connection_count). A value neither reads, a
+    priority that is not a RoutingPriority or a max_connections that is not
+    a count, is a WARNING naming the cluster, and the cluster is then read
+    in the direction that costs nothing: the largest count declared anywhere
+    in its thresholds, or Envoy's default, whichever is larger. The two
+    errors are not alike: a cap above Envoy's breaker never fires, since
+    Envoy refuses first, while a cap below it refuses with the broker's own
+    503 connections Envoy would have carried. So a spelling this walk did
+    not foresee costs a cap that does nothing rather than one that refuses,
+    and the WARNING says which reading was taken. None when no cluster
+    forwards to the socket, or the sum is zero, so the caller can say so
+    rather than cap at nothing.
+    """
+    clusters = _mapping(_mapping(config).get("static_resources")).get("clusters")
+    total = 0
+    found = False
+    default_priority = ENVOY_ROUTING_PRIORITIES[ENVOY_DEFAULT_PRIORITY]
+    for cluster in clusters if isinstance(clusters, list) else ():
+        cluster = _mapping(cluster)
+        if not _cluster_forwards_to_broker(cluster):
+            continue
+        found = True
+        name = cluster.get("name")
+        thresholds = _mapping(cluster.get("circuit_breakers")).get("thresholds")
+        # The DEFAULT priority's count as Envoy reads it (None until a
+        # threshold at that priority is met), the largest count read
+        # anywhere in the list, and whether a threshold was not read.
+        ceiling: int | None = None
+        largest = ENVOY_DEFAULT_MAX_CONNECTIONS
+        unread = False
+        for threshold in (thresholds if isinstance(thresholds, list) else ()):
+            threshold = _mapping(threshold)
+            declared = threshold.get("max_connections")
+            count = _connection_count(declared)
+            if count is None and declared is not None:
+                LOGGER.warning(
+                    "Envoy cluster %s: max_connections %r is not a count Envoy would read",
+                    name, declared,
+                )
+                unread = True
+            elif count is not None:
+                largest = max(largest, count)
+            priority = _routing_priority(threshold.get("priority"))
+            if priority is None:
+                LOGGER.warning(
+                    "Envoy cluster %s: threshold priority %r is not a RoutingPriority Envoy would read",
+                    name, threshold.get("priority"),
+                )
+                unread = True
+                continue
+            if priority == default_priority and ceiling is None:
+                ceiling = ENVOY_DEFAULT_MAX_CONNECTIONS if count is None else count
+        if ceiling is None:
+            ceiling = ENVOY_DEFAULT_MAX_CONNECTIONS
+        if unread and largest > ceiling:
+            LOGGER.warning(
+                "Envoy cluster %s: a threshold was not read as Envoy reads it, so the largest count "
+                "declared, %d, is read for the thread cap rather than %d: a cap above Envoy's breaker "
+                "never fires, one below it refuses connections Envoy carries",
+                name, largest, ceiling,
+            )
+            ceiling = largest
+        total += ceiling
+    return total if found and total > 0 else None
+
+
+def _normalised_pipe_path(path: str) -> str:
+    """A pipe's path as the kernel resolves it, for comparing with ENVOY_BROKER_SOCKET_PATH.
+
+    normpath collapses a doubled slash and a ``.`` segment anywhere but at
+    the start, where it keeps exactly two slashes (ENVOY_PIPE_DOUBLED_ROOT);
+    Linux reads that run as the root, so it is collapsed here too.
+    """
+    normalised = os.path.normpath(path)
+    if normalised.startswith(ENVOY_PIPE_DOUBLED_ROOT):
+        normalised = normalised[1:]
+    return normalised
+
+
+def _cluster_forwards_to_broker(cluster: Mapping[str, Any]) -> bool:
+    """Whether any endpoint of a parsed Envoy cluster is the broker's socket.
+
+    The pipe's path is compared normalised (_normalised_pipe_path): a
+    doubled slash, leading or not, or a ``.`` segment names the same socket
+    to the kernel, and so to Envoy.
+    """
+    endpoints = _mapping(cluster.get("load_assignment")).get("endpoints")
+    for locality in endpoints if isinstance(endpoints, list) else ():
+        lb_endpoints = _mapping(locality).get("lb_endpoints")
+        for lb_endpoint in lb_endpoints if isinstance(lb_endpoints, list) else ():
+            address = _mapping(_mapping(_mapping(lb_endpoint).get("endpoint")).get("address"))
+            path = _mapping(address.get("pipe")).get("path")
+            if isinstance(path, str) and _normalised_pipe_path(path) == ENVOY_BROKER_SOCKET_PATH:
+                return True
+    return False
+
+
+def _routing_priority(value: Any) -> int | None:
+    """A threshold's priority as Envoy reads it: the RoutingPriority's number, or None for a value it would not load.
+
+    Absent or null is DEFAULT. proto-JSON reads an enum by its name or its
+    number, and a string that is not a name as the number it spells, so
+    ``DEFAULT``, ``0`` and a quoted ``"0"`` are one priority and ``HIGH``,
+    ``1`` and ``"1"`` the other (ENVOY_ROUTING_PRIORITIES); Envoy 1.39 runs
+    the breaker at a threshold spelt ``priority: "0"``. A bool is not a
+    number here (pyyaml reads ``true`` as one), a lower-case name is not the
+    name, a float is neither, and a number past the enum fails Envoy's
+    validation; Envoy loads none of them.
+    """
+    if value is None:
+        return ENVOY_ROUTING_PRIORITIES[ENVOY_DEFAULT_PRIORITY]
+    if isinstance(value, str):
+        if value in ENVOY_ROUTING_PRIORITIES:
+            return ENVOY_ROUTING_PRIORITIES[value]
+        if not value.isdecimal():
+            return None
+        value = int(value)
+    if isinstance(value, int) and not isinstance(value, bool) and value in ENVOY_ROUTING_PRIORITIES.values():
+        return value
+    return None
+
+
+def _connection_count(value: Any) -> int | None:
+    """A threshold's max_connections as Envoy reads it, or None when it is not a count.
+
+    Envoy's proto-JSON reading of a UInt32Value takes a digit string
+    (``"4096"``) and a float with no fractional part (``4096.0``) as the
+    integer, so the breaker runs at either; both are counts here. Decimal
+    digits only for the string: ``str.isdigit`` admits a superscript, which
+    ``int`` refuses. A bool, a negative, a fraction, a word, a value past
+    ENVOY_MAX_CONNECTIONS_LIMIT (proto-JSON refuses it, and Envoy does not
+    start) and an unset value are None. An integer pyyaml read from the
+    file is Envoy's reading of it: both read ``010`` as octal 8 and
+    ``0x10`` as 16 (yaml-cpp converts a scalar with the base left to the
+    number's prefix), so no integer needs re-reading here.
+    """
+    if isinstance(value, str) and value.isdecimal():
+        value = int(value)
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= ENVOY_MAX_CONNECTIONS_LIMIT:
+        return None
+    return value
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    """``value`` when it is a mapping, else an empty one: a parsed config's absent keys read as absent."""
+    return value if isinstance(value, Mapping) else {}
+
+
+def envoy_listener_ports(paths: Sequence[Path] | None = None) -> Mapping[int, str]:
+    """Port to listener name for the TCP listeners of the first readable Envoy config in ``paths``.
+
+    ENVOY_CONFIG_PATHS by default, in default_max_threads's order: the
+    image's copy, then the repository's; the first that reads and parses
+    decides (envoy_listener_ports_in). Empty, with a WARNING, when none
+    does: the refusals by name (_metrics_port_refusal) then know no Envoy
+    port, and a collision with one is left to bind(). The config is the
+    image's own file; nothing a caller sends reaches this. The ports are
+    the file's: start-services.sh re-addresses every listener to the
+    operator's address and leaves the ports alone.
+    """
+    candidates = tuple(ENVOY_CONFIG_PATHS if paths is None else paths)
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        parsed, config = _parsed_envoy_config(text, path, ENVOY_READ_FOR_LISTENER_PORTS)
+        if not parsed:
+            continue
+        try:
+            ports = envoy_listener_ports_in(config)
+        except Exception as exc:  # a shape the walk did not foresee; no port known, not a crash loop
+            LOGGER.warning(
+                "%s could not be walked (%s: %s); not read for %s",
+                path, type(exc).__name__, exc, ENVOY_READ_FOR_LISTENER_PORTS,
+            )
+            continue
+        LOGGER.info(
+            "Envoy listener ports %s read from %s; the metrics and health listeners are refused them by name",
+            ", ".join(f"{port} ({name or 'unnamed'})" for port, name in sorted(ports.items())) or "(none)",
+            path,
+        )
+        return ports
+    LOGGER.warning(
+        "no Envoy config is readable at %s; the metrics and health listeners are refused no Envoy port by name",
+        ", ".join(str(path) for path in candidates) or "(no path)",
+    )
+    return {}
+
+
+def envoy_listener_ports_in(config: Any) -> dict[int, str]:
+    """Port to listener name for every listener in a parsed Envoy config that binds a TCP port.
+
+    ``static_resources.listeners[].address.socket_address.port_value``, read
+    as Envoy's proto-JSON reads the uint32 (_listener_port): an integer, a
+    digit string or a whole float, 1 to 65535. Not in the map: a listener on
+    a pipe, one on port 0 (Envoy takes an ephemeral port, which no hand-set
+    value names) and one whose port_value Envoy would not load. A listener
+    with no name maps its port to ""; two listeners on one port keep the
+    first's name, since both would hold it.
+    """
+    listeners = _mapping(_mapping(config).get("static_resources")).get("listeners")
+    ports: dict[int, str] = {}
+    for listener in listeners if isinstance(listeners, list) else ():
+        listener = _mapping(listener)
+        socket_address = _mapping(_mapping(listener.get("address")).get("socket_address"))
+        port = _listener_port(socket_address.get("port_value"))
+        if port is None or port in ports:
+            continue
+        name = listener.get("name")
+        ports[port] = name if isinstance(name, str) else ""
+    return ports
+
+
+def _listener_port(value: Any) -> int | None:
+    """A socket_address's port_value as Envoy reads it, or None when it is no port in METRICS_PORT_MIN-METRICS_PORT_MAX.
+
+    The uint32 grammar _connection_count reads (a digit string and a whole
+    float are the integer, a bool is not a number), held to the port range:
+    Envoy's validation refuses a value past it, and 0 binds an ephemeral
+    port.
+    """
+    count = _connection_count(value)
+    if count is None or not METRICS_PORT_MIN <= count <= METRICS_PORT_MAX:
+        return None
+    return count
+
+
+class ThreadingUnixHTTPServer(HandlerErrorsToLog, ThreadCap, socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     """HTTP server over a private Unix socket used behind Envoy."""
 
     daemon_threads = True
     request_queue_size = LISTEN_BACKLOG
 
 
-class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadingHTTPServer):
+class ThreadingTCPHTTPServer(HandlerErrorsToLog, ThreadCap, ThreadingHTTPServer):
     """ThreadingHTTPServer for the credentialed and API-relay listeners on TCP."""
 
     request_queue_size = LISTEN_BACKLOG
@@ -1582,6 +2278,15 @@ SESSION_KUBECTL_VALUE_FLAGS: frozenset[str] = frozenset({
     "--output", "--sort-by", "--container", "--tail", "--since", "--since-time",
     "--limit-bytes", "--chunk-size", "--limit", "--for", "--types", "--verbs",
     "--api-group", "--template",
+    # A paged collection read. Its value is judged by command_policy's
+    # `kubernetes.raw-path` rule downstream, the same gate the shell's raw
+    # reads pass: a relative collection path on an allowlisted kind, on `get`.
+    # The rule's exact endpoints (`/metrics`, `KUBECTL_RAW_ENDPOINTS`) are
+    # not a session's: the rule takes no role, so `_session_value_refused`
+    # refuses a `--raw` whose decoded path names one, and the API server's
+    # own metrics stay the shell role's, as they were when `--raw` was
+    # refused here by name.
+    command_policy.KUBECTL_RAW_FLAG,
 })
 # Verbs a session may not run even though they are reads: both wait by
 # default (`rollout status` watches until the rollout completes, `wait` until
@@ -1616,6 +2321,19 @@ def _session_output_permitted(value: str) -> bool:
     return value in SESSION_KUBECTL_OUTPUT_FORMATS or value.startswith(SESSION_KUBECTL_OUTPUT_PREFIXES)
 
 
+def _session_value_refused(name: str, value: str) -> bool:
+    """Whether a value-taking flag on the session allowlist carries a value
+    the allowlist does not admit: an output format that reads a file on the
+    broker, or a `--raw` whose percent-decoded path is one of the raw-path
+    rule's exact endpoints (`/metrics`), decoded as the rule decodes it so an
+    encoded spelling is the same path here."""
+    if name == "--output":
+        return not _session_output_permitted(value)
+    if name == command_policy.KUBECTL_RAW_FLAG:
+        return command_policy.kubectl_raw_endpoint(value) is not None
+    return False
+
+
 def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
     """The first kubectl flag a session caller may not pass, or None.
 
@@ -1634,7 +2352,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
         token = tokens[index]
         index += 1
         if pending is not None:
-            if pending == "--output" and not _session_output_permitted(token):
+            if _session_value_refused(pending, token):
                 return pending
             pending = None
             continue
@@ -1646,7 +2364,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 continue
             if name in SESSION_KUBECTL_VALUE_FLAGS:
                 if separator:
-                    if name == "--output" and not _session_output_permitted(value):
+                    if _session_value_refused(name, value):
                         return name
                 else:
                     pending = name
@@ -1667,7 +2385,7 @@ def session_kubectl_flag_refusal(role: str, argv: list[str]) -> str | None:
                 if attached.startswith("="):
                     attached = attached[1:]
                 if attached:
-                    if long_name == "--output" and not _session_output_permitted(attached):
+                    if _session_value_refused(long_name, attached):
                         return long_name
                 else:
                     pending = long_name
@@ -1709,8 +2427,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # rather than /v1/exec's roles. A sweep run under any other role is refused
     # here and falls back to four (broker_admission.sweep_width).
     (ADMISSION_PATH, (CALLER_ROLE_SHELL,)),
-    # The profile role reaches this route and no other: the Cloud API relay,
-    # the MCP relay, the watcher and Pub/Sub routes all stay closed to it.
+    # The profile role reaches this route and the MCP relay's profile set: the
+    # Cloud API relay, the watcher and Pub/Sub routes all stay closed to it.
     # The scope role reaches it alone too (scope_policy).
     ("/v1/exec", (CALLER_ROLE_SHELL, CALLER_ROLE_SESSION, CALLER_ROLE_PROFILE, CALLER_ROLE_SCOPE)),
     # The feedback form verb: the sandbox's one way to file a report about
@@ -1725,8 +2443,9 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # The remote MCP relay belongs to the gateway, where Hermes runs the
     # mcp-remote children; the sandbox has no MCP client. Session pods are not
     # admitted here yet: that is a new read path for them, argued in the change
-    # that wires them, not by default.
-    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),
+    # that wires them, not by default. Profile workers are, for a task in hand
+    # and only for mcp_policy.PROFILE_SERVER_TOOLS (_handle_mcp_relay, #3658).
+    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),
     # The watchers' Google calls: theirs alone. The Hermes container beside
     # them holds the chat token and cannot present this one.
     (watcher_policy.WATCHER_GCP_PREFIX, (CALLER_ROLE_WATCHER,)),
@@ -1868,6 +2587,28 @@ def exec_pod_serves(method: str, path: str) -> bool:
     if method == "POST":
         return path == "/v1/exec" or path.startswith(API_RELAY_PREFIX)
     return path in (HEALTHZ_PATH, ADMISSION_PATH) or path.startswith(API_RELAY_PREFIX)
+
+
+def exec_tier_replicas() -> int | None:
+    """The exec tier's replica count from the file the operator mounts, or None.
+
+    Read on each call, because a scale change rewrites the ConfigMap and does
+    not restart the pod (§3.5). A file that is absent (as on the stateful pod),
+    cannot be read or holds no positive integer gives None, with a debug line
+    only, because the admission route reads it on each request.
+    """
+    path = os.environ.get(EXEC_REPLICAS_FILE_ENV) or EXEC_REPLICAS_FILE
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read().strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        LOGGER.debug("could not read the exec tier's replica count path=%s: %s", path, type(exc).__name__)
+        return None
+    replicas = int(text) if EXEC_REPLICAS_RE.fullmatch(text) else 0
+    if replicas < 1:
+        LOGGER.debug("the exec tier's replica count is not a positive integer path=%s", path)
+        return None
+    return min(replicas, EXEC_REPLICAS_MAX)
 
 
 # How long a managed-repository allowlist read is reused.
@@ -3415,7 +4156,9 @@ class SessionSlots:
 class InFlight:
     """The requests the broker is serving, for the drain to wait on.
 
-    Counted per request in CredentialProxyHandler.handle_one_request. An open
+    Counted per request in CredentialProxyHandler.parse_request, from the
+    request line's arrival to the answer (handle_one_request's finally), so
+    a kept-open connection idle between requests is not in flight. An open
     route or a long poll (_refused_while_draining) leaves the count as soon as
     its path is known, so the drain does not wait out a pull that would answer
     nothing.
@@ -3564,6 +4307,65 @@ class NullAuthenticator:
 class _CacheEntry:
     expires_at: float
     principal: Principal
+
+
+@dataclass(frozen=True)
+class _ClaimEntry:
+    expires_at: float
+    url: str
+    repository: Any
+    number: int
+
+
+class ClaimTokens:
+    """The claim tokens `proposal-create` answers have minted and no claim has burned.
+
+    Keyed by the token's SHA-256, as the authenticator's cache is, so the
+    process holds no token it could leak. Each keeps the proposal's url and
+    number and the repository the create resolved, for the claim to check in
+    place of anything its caller sends. Expiry is on the monotonic clock;
+    expired entries are pruned on every mint and never served.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = CLAIM_TOKEN_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._entries: dict[str, _ClaimEntry] = {}
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    @staticmethod
+    def _key(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def mint(self, url: str, repository: Any, number: int) -> str:
+        """A new token for the proposal at ``url``, kept for ``ttl_seconds``."""
+        token = os.urandom(CLAIM_TOKEN_BYTES).hex()
+        now = self._clock()
+        with self._lock:
+            self._entries = {
+                key: entry for key, entry in self._entries.items() if entry.expires_at > now
+            }
+            self._entries[self._key(token)] = _ClaimEntry(now + self.ttl_seconds, url, repository, number)
+        return token
+
+    def burn(self, token: Any) -> _ClaimEntry | None:
+        """Spend ``token``: its entry if it was live, None if unknown, burned or expired."""
+        if not isinstance(token, str) or not token:
+            return None
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.pop(self._key(token), None)
+        if entry is None or entry.expires_at <= now:
+            return None
+        return entry
 
 
 class ServiceAccountAuthenticator:
@@ -3801,8 +4603,9 @@ class ServiceAccountAuthenticator:
 
 
 # The profile role's configuration (#3889). All four are reserved against
-# spec.deployment.env (mergeCredentialProxyEnv). The operator renders the first
-# three; it doesn't render the max lifetime yet, so the 6h default holds.
+# spec.deployment.env (mergeCredentialProxyEnv), and the operator renders all
+# four: the max lifetime is the same value the callout and the dispatcher get
+# (a2aTaskCredentialMaxLifetimeEnv). The 6h default holds only without it.
 PROFILE_AUDIENCE_ENV = "CREDENTIAL_PROXY_PROFILE_AUDIENCE"
 # JSON: {"system:serviceaccount:<ns>:<sa>": {"profile": ..., "tier": ...}}.
 PROFILE_IDENTITIES_ENV = "CREDENTIAL_PROXY_PROFILE_IDENTITIES"
@@ -4190,7 +4993,13 @@ def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
     it discards in AGENT_API_DRAIN_CHUNK_BYTES chunks rather than
     materialising the body, and it gives up after
     AGENT_API_DRAIN_TIMEOUT_SECONDS so a client that announces a body and
-    stalls cannot hold the handler thread.
+    stalls, or drips it, cannot hold the handler thread. That bound is the
+    drain's own, armed in place of the request's read deadline
+    (_RequestReadDeadline): a refusal that waited for admission, the vcs
+    route's queue timeout, reaches here after that deadline, counted from
+    the request's first byte, has passed, and the first read that needs the
+    socket would otherwise fail before any byte, leaving the body unread and
+    the answer to the close.
 
     Declining the oversized case has a cost worth stating: a body over
     ``max_bytes`` still loses its refusal to the reset, which is the symptom
@@ -4207,6 +5016,9 @@ def drain_request_body(handler: BaseHTTPRequestHandler, max_bytes: int) -> None:
     if content_length <= 0 or content_length > max_bytes:
         return
     previous_timeout = handler.connection.gettimeout()
+    arm = getattr(handler, "_arm_request_read_deadline", None)
+    if arm is not None:
+        arm(AGENT_API_DRAIN_TIMEOUT_SECONDS)
     try:
         handler.connection.settimeout(AGENT_API_DRAIN_TIMEOUT_SECONDS)
         remaining = content_length
@@ -4262,7 +5074,134 @@ AGENT_API_STATE_DB_BUSY_TIMEOUT_SECONDS = 2.0
 AGENT_API_SESSION_PARENT_WALK_LIMIT = 256
 
 
-class AgentAPIProxyHandler(BaseHTTPRequestHandler):
+class _DeadlineSocketIO(socket.SocketIO):
+    """The raw request stream under a handler's rfile, holding every read to one deadline while one is armed.
+
+    A socket timeout bounds one recv. The stdlib reads a request line and its
+    headers through a buffered reader that recvs as often as it needs to, and
+    a route reads its body the same way, so a peer that sends a byte inside
+    every timeout never trips it. While armed, each recv is given what is
+    left of the deadline (or the socket's own timeout, when a route set a
+    shorter one), and one past the deadline raises TimeoutError before the
+    recv, which the stdlib's handle_one_request reports and closes on as it
+    does any socket timeout; the socket's timeout is put back after each
+    recv, so a write that follows runs under the one its route set. The
+    window is counted from the first byte: a connection may wait idle for
+    one window before its request starts, and the request then has one
+    window to arrive in full. ``received`` counts the bytes read while
+    armed, so the log can tell a request that never began from one that
+    stalled part-way.
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        super().__init__(sock, "r")
+        self.deadline: float | None = None
+        self.window = 0.0
+        self.received = 0
+
+    def arm(self, window: float) -> None:
+        self.window = window
+        self.deadline = time.monotonic() + window
+        self.received = 0
+
+    def disarm(self) -> None:
+        self.deadline = None
+
+    def readinto(self, b: Any) -> int | None:
+        deadline = self.deadline
+        if deadline is None:
+            return super().readinto(b)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the request did not arrive in time")
+        previous = self._sock.gettimeout()
+        self._sock.settimeout(left if previous is None else min(left, previous))
+        try:
+            count = super().readinto(b)
+        finally:
+            with contextlib.suppress(OSError):
+                self._sock.settimeout(previous)
+        if count:
+            if not self.received:
+                self.deadline = time.monotonic() + self.window
+            self.received += count
+        return count
+
+
+class _RequestReadDeadline:
+    """Mixed in ahead of BaseHTTPRequestHandler: one deadline for every read of a request.
+
+    ``_arm_request_read_deadline`` runs before each request line is read and
+    gives the connection KEEPALIVE_IDLE_SECONDS to start a request and the
+    request that long again to arrive in full, request line, headers and
+    the body a route reads; ``_disarm_request_read_deadline`` lifts it, and
+    the handler's handle_one_request does so once the route has returned.
+    A route that bounds a late body read by a deadline of its own
+    (_read_json_body_within, measured from admission) disarms this one
+    first, and a refusal's body drain, which may run after it has passed,
+    arms it again with the drain's own window (drain_request_body). A
+    handler built without a socket (the route tests' stand-ins assign their
+    own rfile) has no stream to arm, and both calls do nothing.
+
+    The same socket timeout bounds a route's direct writes, so a peer that
+    stops reading a response for the window ends it with the same
+    TimeoutError the stdlib reports through log_error. ``_response_started``
+    says which side stalled: False until the handler flushes a response's
+    status line and headers (end_headers), True from then until the next
+    request; the handlers clear it before each request line, with
+    raw_requestline, and _log_socket_timeout reads it.
+    """
+
+    _request_stream: _DeadlineSocketIO | None = None
+    _response_started = False
+
+    def end_headers(self) -> None:
+        # Set before the flush: a flush the peer does not read times out
+        # inside it, and the response is on the wire in part either way.
+        self._response_started = True
+        super().end_headers()
+
+    def handle_expect_100(self) -> bool:
+        # The stdlib's parse_request answers `Expect: 100-continue` with an
+        # interim 100 through end_headers, before the route runs and before
+        # a body byte is read. That is not the response: a body that then
+        # stalls is a request stalled before its response, so the flag the
+        # interim write set is cleared, and only the route's own end_headers
+        # sets it.
+        continued = super().handle_expect_100()
+        self._response_started = False
+        return continued
+
+    def setup(self) -> None:
+        super().setup()
+        # socketserver's rfile is a buffered reader over the socket's own raw
+        # stream; before a byte is read it is swapped for one over the
+        # deadline-keeping stream, buffered the same way (rbufsize is -1,
+        # the default buffer, on both handlers).
+        self.rfile.close()
+        self._request_stream = _DeadlineSocketIO(self.connection)
+        self.rfile = io.BufferedReader(
+            self._request_stream, self.rbufsize if self.rbufsize > 0 else io.DEFAULT_BUFFER_SIZE
+        )
+
+    def _arm_request_read_deadline(self, window: float | None = None) -> None:
+        if self._request_stream is None:
+            return
+        if window is None:
+            window = KEEPALIVE_IDLE_SECONDS
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(window)
+        self._request_stream.arm(window)
+
+    def _disarm_request_read_deadline(self) -> None:
+        if self._request_stream is None:
+            return
+        self._request_stream.disarm()
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(KEEPALIVE_IDLE_SECONDS)
+
+
+class AgentAPIProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     """Authenticate the external PlatformAgent API without sharing its key."""
 
     external_key: str
@@ -4277,12 +5216,37 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
         # The guard the credentialed and metrics handlers carry: a peer that
         # resets while its request line is read, or while a 401 is on its
         # way, is a debug line and a closed connection, not a handler fault
-        # for the server's error hook to log with a traceback.
+        # for the server's error hook to log with a traceback. The request
+        # read deadline is armed before the request line is read, as the
+        # credentialed handler arms it, and lifted once the route returns:
+        # the door's peers are every pod in the namespace, and a connection
+        # that sends nothing, or a byte at a time, would otherwise hold its
+        # thread, and its slot under the thread cap, for as long as the peer
+        # kept it open. The stdlib reports the timeout through log_error and
+        # closes; every served response here says `Connection: close`, so a
+        # kept-open connection is only ever one that has not sent a request.
+        # raw_requestline is emptied first so that log_error can tell that
+        # idle close from a request that stalled, and _response_started so
+        # that it can tell either from a response the peer stopped reading
+        # (_log_socket_timeout).
+        self.raw_requestline = b""
+        self._response_started = False
+        self._arm_request_read_deadline()
         try:
             super().handle_one_request()
         except OSError as exc:
             self.close_connection = True
             LOGGER.debug("api request not answered type=%s", type(exc).__name__)
+        finally:
+            self._disarm_request_read_deadline()
+
+    def log_error(self, message: str, *args: Any) -> None:
+        # The stdlib reports the socket timeout through log_error, which
+        # without this override reaches log_message: an access-log-shaped
+        # INFO line per idle connection closed at KEEPALIVE_IDLE_SECONDS.
+        if _log_socket_timeout(self, message, args):
+            return
+        super().log_error(message, *args)
 
     def do_GET(self) -> None:  # noqa: N802
         self._proxy()
@@ -4388,8 +5352,21 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
             # the end of the body, which holds a streamed turn (SSE) until it
             # finishes. read1 returns what has arrived.
             while chunk := response.read1(64 * 1024):
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (ConnectionError, TimeoutError, OSError) as exc:
+                    # The downstream side: the peer closed, or stopped
+                    # reading for the connection's window
+                    # (KEEPALIVE_IDLE_SECONDS, the socket's timeout). Not
+                    # an upstream failure, and no traceback: the response
+                    # is cut and the connection closes.
+                    LOGGER.warning(
+                        "PlatformAgent API response not read by the peer; cut mid-response type=%s",
+                        type(exc).__name__,
+                    )
+                    self.close_connection = True
+                    break
         except (ConnectionError, TimeoutError, OSError, http.client.HTTPException):
             LOGGER.warning("PlatformAgent API upstream request failed", exc_info=True)
             if not response_started:
@@ -5822,6 +6799,14 @@ class ExecutionResult:
     # The caller's connection closed while the command ran, and the command was
     # killed for it. There is nobody to answer; the handler logs and returns.
     abandoned: bool = False
+    # How much of stdout the caller receives, in UTF-8 bytes, and the per-stream
+    # cap it was held to. Answered with `truncated` so a caller that was cut can
+    # say how much it kept and page the rest, rather than only that it was cut.
+    stdout_bytes: int = 0
+    output_limit: int = 0
+    # Whether the cut fell on stdout. `truncated` covers either stream; the
+    # shim's non-zero exit is for a cut payload, not for cut diagnostics.
+    stdout_truncated: bool = False
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -7552,6 +8537,9 @@ class _CapturedOutput:
     truncated: bool
     timed_out: bool
     abandoned: bool
+    # Whether the cut fell on stdout: the caller's payload, as against its
+    # diagnostics. `truncated` covers either stream.
+    stdout_truncated: bool = False
     # The child's own peak resident set from the rusage its reap returned, in
     # bytes; None when the reap did not go through `_reap` (already reaped).
     peak_rss_bytes: int | None = None
@@ -7768,6 +8756,7 @@ def _capture_output(
     deadline = time.monotonic() + timeout
     outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
     truncated = False
+    stdout_truncated = False
     pending = memoryview(stdin) if stdin else None
     written = 0
     stopped = False
@@ -7792,7 +8781,7 @@ def _capture_output(
 
         Returns (timed_out, abandoned).
         """
-        nonlocal truncated, written
+        nonlocal truncated, stdout_truncated, written
         if not watch_caller and caller is not None:
             with contextlib.suppress(KeyError, ValueError):
                 selector.unregister(caller)
@@ -7850,6 +8839,8 @@ def _capture_output(
                     buffer += data[:room]
                 if len(data) > room:
                     truncated = True
+                    if stream is process.stdout:
+                        stdout_truncated = True
         return False, False
 
     try:
@@ -7901,6 +8892,7 @@ def _capture_output(
         abandoned=abandoned,
         peak_rss_bytes=getattr(process, REAPED_PEAK_RSS_ATTRIBUTE, None),
         stopped=stopped,
+        stdout_truncated=stdout_truncated,
     )
 
 
@@ -10862,6 +11854,11 @@ class CommandExecutor:
             truncated=captured.truncated or stdout_cut or stderr_cut,
             timed_out=captured.timed_out,
             abandoned=captured.abandoned and not drained,
+            # Text that decoded cleanly is the captured bytes, measured once;
+            # only a cut re-decode is re-encoded to be measured.
+            stdout_bytes=len(stdout_text.encode("utf-8")) if stdout_cut else len(captured.stdout),
+            output_limit=self.max_output_bytes,
+            stdout_truncated=captured.stdout_truncated or stdout_cut,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -10993,6 +11990,9 @@ class _SweepTransport:
     def whoami(self) -> str:
         return self._retried(self._inner.whoami)
 
+    def quota(self) -> "providers.QuotaReading | None":
+        return self._inner.quota()
+
     def _retried(self, call: Callable[[], Any]) -> Any:
         try:
             return call()
@@ -11012,7 +12012,8 @@ def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: 
     GraphQL `viewer`. GitLab and Gitea: the forge's own HTTP transport with
     its static token, as every verb reads. Bounded by the numbers
     `build_vcs_broker` hands the broker. `opener` is the broker's
-    `http_opener`, for tests.
+    `http_opener`, for tests. Each keeps the quota the forge's headers report
+    (`quota_from_headers`), which the sweep paces step 2 on (#4615).
     """
     if forge.name == GITHUB_PROVIDER:
         api_url = forge.api_url or GITHUB_COM_API_URL
@@ -11032,6 +12033,7 @@ def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: 
             ca_file=forge.ca_file,
             ca_source=forge.ca_source,
             whoami_graphql=whoami_graphql,
+            quota_from_headers=getattr(forge, "quota_from_headers", None),
         )
         return _SweepTransport(transport, lambda: executor.drop_sweep_credential(forge.name, repo))
     if forge.transport == FORGE_HTTP_TRANSPORT and forge.api_url:
@@ -11048,6 +12050,7 @@ def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: 
             ca_file=forge.ca_file,
             ca_source=forge.ca_source,
             allow_http=(forge.scheme == FORGE_HTTP_SCHEME),
+            quota_from_headers=getattr(forge, "quota_from_headers", None),
         )
     raise providers.ForgeUnsupported(f"{forge.name} has no HTTP transport for the readings sweep")
 
@@ -11277,6 +12280,60 @@ def _sanitized_log_args(args: tuple[Any, ...], max_length: int = 512) -> tuple[A
     )
 
 
+def _log_socket_timeout(handler: BaseHTTPRequestHandler, message: str, args: tuple[Any, ...]) -> bool:
+    """Log the stdlib's report of a socket timeout for what it was; False for any other message.
+
+    The stdlib's handle_one_request catches every TimeoutError raised under
+    it, the wait for a request line and a body read or a direct write inside
+    a route alike, and reports each through log_error with the exception as
+    the one argument; the exception is what is read, since the text
+    (IDLE_CLOSE_LOG_PREFIX) is the stdlib's to reword. Which it was is read
+    off raw_requestline and the request stream's count: the credentialed
+    handler and the agent API door
+    empty raw_requestline before each request line is read and the stdlib
+    assigns it as its first statement, and _DeadlineSocketIO counts the bytes
+    read while the request's deadline is armed. Both still empty, the timeout
+    hit while waiting for a request that never began: the idle close at
+    KEEPALIVE_IDLE_SECONDS, a connection ending as a peer's EOF does, and a
+    debug line rather than an access-log-shaped INFO line per idle
+    connection. With the response's status line and headers already flushed
+    (_response_started, which _RequestReadDeadline sets in end_headers and
+    the handlers clear before each request line), the same timeout bounded
+    a route's direct write of its body, and the peer stopped reading it:
+    the response is cut, and the warning says so and names the request.
+    Otherwise a request, or part of one, arrived and stalled
+    before its response was on the wire; it went unanswered, and is a warning
+    naming it, with the bytes of it that arrived. requestline is the stdlib's
+    copy of the request line, caller text, sanitised as log_message sanitises
+    it, and empty when the stall came inside the line: the credentialed
+    handler clears it before each request line is read, since the stdlib
+    assigns it inside parse_request and never resets it, and the door's
+    kept-open connections have never served a request.
+    """
+    if not args or not isinstance(args[0], TimeoutError):
+        return False
+    kind = type(args[0]).__name__
+    stream = getattr(handler, "_request_stream", None)
+    received = stream.received if stream is not None else 0
+    if getattr(handler, "_response_started", False):
+        LOGGER.warning(
+            "response stalled: the peer stopped reading it, and the connection closes with it cut "
+            "requestline=%s type=%s",
+            *_sanitized_log_args((getattr(handler, "requestline", ""),)),
+            kind,
+        )
+    elif getattr(handler, "raw_requestline", b"") or received:
+        LOGGER.warning(
+            "request stalled before its response requestline=%s received_bytes=%d type=%s",
+            *_sanitized_log_args((getattr(handler, "requestline", ""),)),
+            received,
+            kind,
+        )
+    else:
+        LOGGER.debug("connection closed idle type=%s", kind)
+    return True
+
+
 def read_only_refusal(argv: list[str]) -> tuple[dict[str, str], str | None] | None:
     """The blocked-response body for `argv`, or None if it may run.
 
@@ -11504,6 +12561,18 @@ class JsonLineFormatter(logging.Formatter):
         return json.dumps(payload, default=str, separators=(",", ":"))
 
 
+def broker_tier_of(role: str) -> str:
+    """The `broker_tier` audit field of a broker process in ``role``."""
+    return BROKER_TIER_EXEC if role == EXEC_ROLE else BROKER_TIER_STATEFUL
+
+
+@functools.lru_cache(maxsize=None)
+def _broker_pod() -> str:
+    """This broker's pod name, for the `broker_pod` audit field. Kubernetes
+    sets a pod's hostname to its name. Read once for the life of the process."""
+    return socket.gethostname()
+
+
 def _tool_audit(
     status: str,
     request_id: str,
@@ -11515,12 +12584,15 @@ def _tool_audit(
     duration_ms: int | None = None,
     rule: str | None = None,
     pod: str = "",
+    broker_tier: str,
+    klass: str,
 ) -> dict[str, Any]:
     """The `audit` mapping of one tool-execution record.
 
     Only identifiers and outcomes: the request id, the verified principal, the
     tool and subcommand as the metrics label them (a closed vocabulary, never the
-    argv), the outcome and, where there is one, the exit code, the duration and
+    argv), the outcome, the broker's tier (`broker_tier_of`), the admission class,
+    this broker's pod and, where there is one, the exit code, the duration and
     the policy rule. No argument, path, stdin or output is ever here, so there is
     nothing in the record for a `--token` to leak through.
     """
@@ -11531,6 +12603,9 @@ def _tool_audit(
         "tool": tool,
         "subcommand": subcommand,
         "status": status,
+        AUDIT_BROKER_TIER: broker_tier,
+        AUDIT_CLASS: klass,
+        AUDIT_BROKER_POD: _broker_pod(),
     }
     if pod:
         # The caller's pod, from the TokenReview's pod-name extra: every
@@ -12030,7 +13105,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
         return
 
 
-class MetricsServer(HandlerErrorsToLog, ThreadingHTTPServer):
+class MetricsServer(HandlerErrorsToLog, ConnectionCap, ThreadingHTTPServer):
     """ThreadingHTTPServer with a ceiling on live connections.
 
     The stdlib server starts one thread per accepted connection with no cap,
@@ -12041,47 +13116,70 @@ class MetricsServer(HandlerErrorsToLog, ThreadingHTTPServer):
     to MetricsHandler's deadline.
     """
 
+    listener_label = "metrics"
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._slots = threading.BoundedSemaphore(METRICS_MAX_CONNECTIONS)
+        super().__init__(*args, cap=METRICS_MAX_CONNECTIONS, **kwargs)
 
-    def process_request(self, request: Any, client_address: Any) -> None:
-        if not self._slots.acquire(blocking=False):
-            LOGGER.debug("metrics connection closed unserved: %d already open", METRICS_MAX_CONNECTIONS)
-            self.shutdown_request(request)
+    def refuse_connection(self, request: Any) -> None:
+        LOGGER.debug(
+            "%s connection closed unserved: %d already open", self.listener_label, self.connection_cap
+        )
+        self.shutdown_request(request)
+
+
+class HealthHandler(MetricsHandler):
+    """The health-only listener: GET /healthz, and nothing else.
+
+    MetricsHandler's bounds, deadline and silence, serving the answer the
+    credentialed listener's /healthz gives and nothing the process knows:
+    unauthenticated, like that route, because the probe runs before any
+    token would be available and reveals nothing. A separate port so that a
+    credentialed listener at its thread cap still reads as alive.
+    """
+
+    server_version = HEALTH_SERVER_HEADER
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self.path != HEALTHZ_PATH:
+            self.send_error(HTTPStatus.NOT_FOUND)
             return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self._slots.release()
-            raise
-
-    def process_request_thread(self, request: Any, client_address: Any) -> None:
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._slots.release()
+        body = json.dumps(HEALTHZ_PAYLOAD, separators=(",", ":")).encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
-def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
-    """Open the metrics-only listener on a daemon thread; log, not raise, when it cannot.
+class HealthServer(MetricsServer):
+    """MetricsServer's connection ceiling, for the health-only listener."""
+
+    listener_label = "health"
+
+
+def _start_auxiliary_listener(
+    server_class: type[MetricsServer], handler: type[BaseHTTPRequestHandler], host: str, port: int, serves: str
+) -> MetricsServer | None:
+    """Open one of the two auxiliary listeners on a daemon thread; log, not raise, when it cannot.
 
     Never fatal: a port that cannot be bound, or that is no port at all (bind
-    raises OverflowError, not OSError, past 65535), costs the broker its
-    metrics, not the commands it exists to broker, and the ALERT line is the
+    raises OverflowError, not OSError, past 65535), costs the broker that
+    listener, not the commands it exists to broker, and the ALERT line is the
     signal.
     """
+    label = server_class.listener_label
     try:
-        server = MetricsServer((host, port), MetricsHandler)
+        server = server_class((host, port), handler)
     except (OSError, OverflowError) as exc:
         LOGGER.error(
-            "ALERT metrics listener on %s:%d unavailable type=%s; the broker serves no "
-            "/metrics until it restarts, and commands are unaffected",
-            host, port, type(exc).__name__,
+            "ALERT %s listener on %s:%d unavailable type=%s; the broker serves no "
+            "%s until it restarts, and commands are unaffected",
+            label, host, port, type(exc).__name__, serves,
         )
         return None
-    threading.Thread(target=server.serve_forever, daemon=True, name="metrics").start()
-    LOGGER.info("metrics listening on %s:%d", host, port)
+    threading.Thread(target=server.serve_forever, daemon=True, name=label).start()
+    LOGGER.info("%s listening on %s:%d", label, host, port)
     return server
 
 
@@ -12091,7 +13189,93 @@ def _busy_phrase(exc: CommandSlotUnavailable) -> str:
     return "refused under resource pressure" if isinstance(exc, ResourcePressure) else "queued too long"
 
 
-class CredentialProxyHandler(BaseHTTPRequestHandler):
+def mcp_relay_decision(
+    principal: Principal | None, server_name: str, message: dict[str, Any] | None
+) -> tuple[command_policy.Decision, frozenset[str] | None]:
+    """The MCP relay's decision for one message, and the tools its caller is offered.
+
+    The second value narrows a ``tools/list`` reply: None for the table's own
+    set, or a profile worker's set (empty for a server outside it, so a later
+    change to the decision can't hand a profile worker the table's list).
+
+    A profile worker (#3658) reaches the relay only inside a task: a warm pod
+    between tasks holds no task credential, so it gets no reads. With one, it
+    is held to mcp_policy.PROFILE_SERVER_TOOLS. Everyone else gets the table.
+    """
+    if principal is None or principal.role != CALLER_ROLE_PROFILE:
+        return mcp_policy.evaluate(server_name, message), None
+    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())
+    if principal.task is None:
+        return (
+            command_policy.Decision(
+                allowed=False,
+                rule_id=RULE_TASK_CREDENTIAL,
+                message="Profile workers reach MCP servers only with a task credential.",
+            ),
+            offered,
+        )
+    return mcp_policy.evaluate_for_profile(server_name, message), offered
+
+
+def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
+    """Open the metrics-only listener; see _start_auxiliary_listener."""
+    return _start_auxiliary_listener(MetricsServer, MetricsHandler, host, port, METRICS_PATH)
+
+
+def start_health_listener(host: str, port: int) -> HealthServer | None:
+    """Open the health-only listener; see _start_auxiliary_listener.
+
+    The credentialed listener's /healthz is unaffected by a failure here: a
+    probe pointed at this port reads connection refused, which is the signal.
+    """
+    return _start_auxiliary_listener(HealthServer, HealthHandler, host, port, f"{HEALTHZ_PATH} on it")
+
+
+class _CountingReader:
+    """The handler's request stream, counting the bytes handed out.
+
+    What the keep-alive framing below needs to know is whether a route read
+    the body its request announced: a response written over unread body
+    bytes, on a connection kept open, would leave those bytes to be parsed
+    as the next request line. The count is the only addition; every read
+    goes to the buffered reader socketserver made.
+    """
+
+    __slots__ = ("_raw", "consumed")
+
+    def __init__(self, raw: Any) -> None:
+        self._raw = raw
+        self.consumed = 0
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._raw.read(size)
+        self.consumed += len(data)
+        return data
+
+    def read1(self, size: int = -1) -> bytes:
+        data = self._raw.read1(size)
+        self.consumed += len(data)
+        return data
+
+    def readline(self, size: int = -1) -> bytes:
+        data = self._raw.readline(size)
+        self.consumed += len(data)
+        return data
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+
+class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
+    # HTTP/1.1, so Envoy reuses one upstream connection for request after
+    # request instead of opening one per brokered command, event pull and
+    # probe. Every response is then framed: _json and the relays' direct
+    # writes carry a Content-Length, the one stream of unknown length (the
+    # watcher's Kubernetes relay) says `Connection: close` and closes, and a
+    # response written while the request's body is still unread closes too
+    # (_body_unread), so no body byte is ever read as the next request line.
+    # A connection idle between requests is closed at KEEPALIVE_IDLE_SECONDS.
+    protocol_version = "HTTP/1.1"
     policy: Policy
     executor: CommandExecutor
     # resolve_role()'s answer, set by serve(). On EXEC_ROLE the handler serves
@@ -12167,6 +13351,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # the sandbox reaches a repository at all. It is None on an exec pod, which
     # answers /v1/vcs/* with 404 (exec_pod_serves), and on no other broker.
     vcs: vcs_broker.VcsBroker | None = None
+    # The claim tokens `proposal-create` answers carry and `proposal-claim`
+    # burns. One store per process, shared by every handler thread.
+    claim_tokens: ClaimTokens = ClaimTokens()
     # Set by _repository_is_permitted on a refusal: the status it answered.
     repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
@@ -12349,17 +13536,26 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return False
 
     def _admission_report(self) -> dict[str, int | None]:
-        """The five numbers ADMISSION_PATH answers with, and nothing else of the
-        budget's internals. `interactive_cap` is what interactive work, the
-        shell's sweeps included, may hold at once (`class_cap`), which a sweep
-        sizes itself inside (`broker_admission.width_for`)."""
-        return {
+        """The five per-replica numbers ADMISSION_PATH answers with, and nothing
+        else of the budget's internals. `interactive_cap` is what interactive
+        work, the shell's sweeps included, may hold at once (`class_cap`), which
+        a sweep sizes itself inside (`broker_admission.width_for`). When the exec
+        tier's replicas file holds a count, the report adds it and the tier's
+        admitted count and interactive cap, each the per-replica one times the
+        count; the per-replica numbers stay as they are."""
+        report = {
             "slot_cap": self.executor.max_concurrent_commands,
             "budget_admits": self.executor.requests_the_budget_admits(),
             "admitted": self.executor.admitted_requests(),
             "interactive_cap": self.executor.class_cap(CLASS_INTERACTIVE),
             "session_cap": getattr(self.session_slots, "limit", DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS),
         }
+        replicas = exec_tier_replicas()
+        if replicas is not None:
+            report[ADMISSION_REPLICAS_KEY] = replicas
+            report[ADMISSION_TIER_ADMITTED_KEY] = report["admitted"] * replicas
+            report[ADMISSION_TIER_INTERACTIVE_CAP_KEY] = report["interactive_cap"] * replicas
+        return report
 
     def _refused_while_shutting_down(self, **fields: Any) -> bool:
         """Answer a Chat event pull 503 SHUTDOWN_ERROR while the stop is under way."""
@@ -12428,7 +13624,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.METHOD_NOT_ALLOWED)
             self.send_header("Allow", API_RELAY_POST)
             self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._end_headers()
             return
         if self.path.startswith("/v1/chat/slack/events"):
             if self.slack_relay is None:
@@ -12506,7 +13702,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
-        self._json(HTTPStatus.OK, {"status": "ok"})
+        self._json(HTTPStatus.OK, HEALTHZ_PAYLOAD)
 
     def do_POST(self) -> None:  # noqa: N802
         principal = self._authenticated()
@@ -12637,7 +13833,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
-            return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod, **fields)}
+            return {
+                AUDIT_EXTRA_KEY: _tool_audit(
+                    status, request_id, principal_label, tool_label, subcommand_label, pod=principal.pod,
+                    broker_tier=broker_tier_of(self.broker_role), klass=admission_class(principal.role), **fields,
+                )
+            }
 
         LOGGER.info(
             "exec request_id=%s principal=%s executable=%s",
@@ -12715,8 +13916,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "rule": RULE_CALLER_KUBECTL_FLAG,
                     "message": (
                         f"The {principal.role} caller may pass only kubectl's inspection flags; {refused_flag} "
-                        "is not one of them (file inputs, file-backed output formats and streaming flags are "
-                        "not available to a session)."
+                        "is not one of them (file inputs, file-backed output formats, streaming flags and the "
+                        "API server's own endpoints under --raw are not available to a session)."
                     ),
                 },
             )
@@ -12997,6 +14198,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "stderr": result.stderr,
                     "durationMs": result.duration_ms,
                     "truncated": result.truncated,
+                    # Beside `truncated`: how much of stdout survived the cap,
+                    # and the cap. The shim prints both on a cut, so a caller
+                    # knows how much it holds and that the rest is to be paged.
+                    "bytesWritten": result.stdout_bytes,
+                    "limit": result.output_limit,
+                    "stdoutTruncated": result.stdout_truncated,
                     "timedOut": result.timed_out,
                 }
                 # Only `get-credentials` fills this, and only when the caller
@@ -13367,7 +14574,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if upstream.content_type:
             self.send_header("Content-Type", sanitize_header(upstream.content_type))
         self.send_header("Content-Length", str(len(upstream.body)))
-        self.end_headers()
+        self._end_headers()
         self.wfile.write(upstream.body)
 
     def _handle_mcp_relay(self) -> None:
@@ -13416,7 +14623,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         message = mcp_policy.parse(self.rfile.read(content_length))
-        decision = mcp_policy.evaluate(server_name, message)
+        decision, offered = mcp_relay_decision(principal, server_name, message)
         if not decision.allowed:
             LOGGER.warning("mcp blocked request_id=%s rule=%s", request_id, decision.rule_id)
             reply = mcp_policy.refusal(message, decision) if entry is not None else None
@@ -13501,7 +14708,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             and decision.rule_id == mcp_policy.METHOD_TOOLS_LIST
             and upstream.status < HTTPStatus.MULTIPLE_CHOICES
         ):
-            filtered = mcp_policy.filter_tools_list(server_name, upstream.body)
+            filtered = mcp_policy.filter_tools_list(server_name, upstream.body, offered)
             if filtered is None:
                 refused = ("UPSTREAM_UNREADABLE", "the upstream tools/list reply could not be read")
             else:
@@ -13530,7 +14737,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if reply_body:
             self.send_header("Content-Type", MCP_RELAY_CONTENT_TYPE)
         self.send_header("Content-Length", str(len(reply_body)))
-        self.end_headers()
+        self._end_headers()
         self.wfile.write(reply_body)
 
     def _handle_watcher_gcp(self) -> None:
@@ -13680,7 +14887,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if upstream.content_type:
             self.send_header("Content-Type", sanitize_header(upstream.content_type))
         self.send_header("Content-Length", str(len(relayed)))
-        self.end_headers()
+        self._end_headers()
         self.wfile.write(relayed)
 
     def _watcher_cluster_endpoint(self, target: dict[str, str], request_id: str) -> tuple[str, str] | None:
@@ -13868,9 +15075,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             content_type = response.getheader("Content-Type", "")
             if content_type:
                 self.send_header("Content-Type", sanitize_header(content_type))
+            # No Content-Length: a stream of unknown length ends with the
+            # connection, so the response says it will close and the handler
+            # closes after the body (send_header sets close_connection).
+            self.send_header("Connection", "close")
             self.end_headers()
-            # No Content-Length: the handler speaks HTTP/1.0 and closes after the
-            # body, which is how a stream of unknown length ends.
             sent = 0
             while True:
                 if watching and time.monotonic() - started > WATCHER_WATCH_MAX_S:
@@ -13878,8 +15087,24 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 chunk = response.read1(API_RELAY_READ_CHUNK_BYTES)
                 if not chunk:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (ConnectionError, TimeoutError, OSError) as exc:
+                    # The downstream side: the watcher closed, or stopped
+                    # reading its stream for the connection's window
+                    # (KEEPALIVE_IDLE_SECONDS, the socket's timeout). Not
+                    # the API server's failure, which the catch below would
+                    # name it as: the stream is cut and the connection
+                    # closes, and the cached address stands.
+                    LOGGER.warning(
+                        "watcher k8s response not read by the peer; cut mid-stream request_id=%s type=%s bytes=%d",
+                        request_id,
+                        type(exc).__name__,
+                        sent,
+                    )
+                    self.close_connection = True
+                    break
                 sent += len(chunk)
             LOGGER.info("watcher k8s closed request_id=%s bytes=%d", request_id, sent)
         except (OSError, http.client.HTTPException) as exc:
@@ -14222,8 +15447,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         def audit(status: str) -> dict[str, Any]:
             return {
+                # Interactive: the class of the request slot below.
                 AUDIT_EXTRA_KEY: _tool_audit(
-                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND
+                    status, request_id, principal_label, FEEDBACK_AUDIT_TOOL, FEEDBACK_AUDIT_SUBCOMMAND,
+                    broker_tier=broker_tier_of(self.broker_role), klass=CLASS_INTERACTIVE,
                 )
             }
 
@@ -14296,6 +15523,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.vcs_provider = VCS_PROVIDER_NONE
         status = self._dispatch_vcs_post(verb)
         self.metrics.record_vcs(_vcs_verb_label(verb), status, self.vcs_provider)
+
+    def _mint_claim(self, result: Any, repository: Any) -> None:
+        """Add a one-time claim token to a `proposal-create` answer that names its proposal.
+
+        Kept with the proposal's url and number and the repository the
+        request resolved, for `proposal-claim` to check. An answer with no url
+        or number gets none: there is nothing a claim could be checked against.
+        """
+        proposal = result.get("proposal") if isinstance(result, dict) else None
+        if not isinstance(proposal, dict):
+            return
+        url, number = proposal.get("url"), proposal.get("number")
+        if not isinstance(url, str) or not url or isinstance(number, bool) or not isinstance(number, int):
+            return
+        result[CLAIM_TOKEN_FIELD] = self.claim_tokens.mint(url, repository, number)
 
     def _dispatch_vcs_post(self, verb: str) -> str:
         """Answer one version-control request and return its outcome label.
@@ -14402,6 +15644,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 # verb will read it (`snapshot_bare_name_fallback`): lifted
                 # onto the install's GitHub forge, or, when it is read from a
                 # host outside the table with no credential, not at all.
+                if verb == PROPOSAL_CLAIM_VERB:
+                    # Burned before anything else is asked, so a claim whose
+                    # forge check fails below has spent its token too. What
+                    # the broker checks is what the create kept with the
+                    # token, never the caller's repository or number.
+                    entry = self.claim_tokens.burn(payload.get(CLAIM_TOKEN_FIELD))
+                    if entry is None or entry.url != payload.get(CLAIM_URL_FIELD):
+                        self._json(
+                            HTTPStatus.NOT_FOUND,
+                            {
+                                "error": "no live claim for that proposal: unknown, already claimed, or expired",
+                                "code": "CLAIM_UNKNOWN",
+                            },
+                        )
+                        return TOOL_STATUS_BLOCKED
+                    payload = {"repository": entry.repository, CLAIM_URL_FIELD: entry.url, "number": entry.number}
                 role_selected = verb in vcs_broker.ROLE_SELECTED_VERBS
                 named, outside = payload.get("repository"), None
                 if role_selected:
@@ -14427,6 +15685,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                             return TOOL_STATUS_ERROR
                         return TOOL_STATUS_BLOCKED
                 result = route(payload)
+                if verb == PROPOSAL_CREATE_VERB:
+                    self._mint_claim(result, payload.get("repository"))
                 self._json(HTTPStatus.OK, result)
                 return TOOL_STATUS_SUCCESS
         except CallerHungUp as exc:
@@ -14514,6 +15774,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length <= 0 or content_length > max_bytes:
             raise ValueError("request exceeds configured size limit")
+        # This read's deadline runs from admission, which the request may
+        # have waited for; the connection's own, counted from the request's
+        # first byte, is lifted so it cannot end the read first.
+        self._disarm_request_read_deadline()
         deadline = time.monotonic() + seconds
         chunks: list[bytes] = []
         remaining = content_length
@@ -14666,26 +15930,121 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 body["slack"] = fields
             self._json(HTTPStatus.BAD_GATEWAY, body)
 
-    def handle_one_request(self) -> None:
-        # Counted in flight from here until its answer is written, for the
-        # broker's drain (install_shutdown_handler); _refused_while_draining
-        # lets a long poll or a watch out of the count once its path is known.
+    def setup(self) -> None:
+        super().setup()
+        self.rfile = _CountingReader(self.rfile)
+
+    def parse_request(self) -> bool:
+        # Counted in flight from here, once the request line has arrived,
+        # until the answer is written (handle_one_request's finally), for the
+        # broker's drain (install_shutdown_handler). Not from
+        # handle_one_request's entry: a kept-open connection waits there for
+        # its next request line for up to KEEPALIVE_IDLE_SECONDS, longer than
+        # the drain, and counted from there it would hold every stop for a
+        # request that never came. _refused_while_draining lets a long poll or
+        # a watch out of the count once its path is known.
         self._counted_in_flight = True
         self.in_flight.enter()
+        # Where this request's body starts in the stream, and how long it
+        # said it was: None when it cannot be framed (a Transfer-Encoding,
+        # which no route reads; a length that is not a number, or is
+        # negative; or two Content-Length headers that disagree, of which
+        # the routes read the first), which _body_unread reads as unread, so
+        # the answer closes the connection and whatever follows the headers
+        # is never read as the next request line (RFC 9112 section 6.3).
+        parsed = super().parse_request()
+        if parsed:
+            self._body_start = self.rfile.consumed
+            if self.headers.get("Transfer-Encoding"):
+                self._body_length: int | None = None
+            else:
+                try:
+                    lengths = {int(value) for value in self.headers.get_all("Content-Length") or ["0"]}
+                except ValueError:
+                    lengths = set()
+                length = lengths.pop() if len(lengths) == 1 else -1
+                self._body_length = length if length >= 0 else None
+        return parsed
+
+    def _body_unread(self) -> bool:
+        """Did this request announce body bytes no route has read yet?
+
+        False for a handler built without a socket (the route tests' stand-ins
+        assign their own rfile), whose connection nothing keeps open.
+        """
+        consumed = getattr(self.rfile, "consumed", None)
+        start = getattr(self, "_body_start", None)
+        if consumed is None or start is None:
+            return False
+        if self._body_length is None:
+            return True
+        return consumed - start < self._body_length
+
+    def _end_headers(self) -> None:
+        """end_headers, saying `Connection: close` first when the body is unread.
+
+        Every response that goes through here is framed by a Content-Length,
+        so the peer takes the connection as reusable unless told otherwise. A
+        response written over a body no route read (a 401, 403 or 413 on a
+        POST, a GET carrying a body, a chunked body) closes with the answer,
+        so the unread bytes are never parsed as the next request; and the
+        close is announced in the response rather than found afterwards,
+        because Envoy returns a reusable connection to its pool the moment
+        the response is complete and may dispatch another caller's request
+        onto it before an unannounced close arrives. send_header sets
+        close_connection on seeing the header.
+        """
+        if self._body_unread():
+            self.send_header("Connection", "close")
+        self.end_headers()
+
+    def handle_one_request(self) -> None:
+        # The request is counted in flight by parse_request, once its request
+        # line has arrived, and left in the finally below once its answer is
+        # written, for the broker's drain (install_shutdown_handler).
+        # A peer that resets the connection while its request is being read,
+        # or before an error page is on the wire, is a debug line and a closed
+        # connection, as on the metrics listener; the exception would
+        # otherwise leave the handler and reach the server's error hook. No
+        # audit record is lost: every site logs before its response is
+        # written, and _json guards its own writes. The request read
+        # deadline is armed here, before the request line is read, and
+        # lifted once the route returns, so the same bound holds for the
+        # first request and for every one a kept-open connection carries
+        # after it, and for the whole request rather than each read of it;
+        # a route that changed the socket's timeout has it put back. The
+        # path is cleared here too: the stdlib's
+        # parse_request resets the command and never the path, so on a
+        # kept-open connection a request line it rejects (a 400, a 414, a
+        # 431) would otherwise be counted by log_request under the previous
+        # request's route. requestline, which parse_request assigns and
+        # never resets either, is cleared for the same reason: a request
+        # that stalls inside its line would otherwise be logged under the
+        # previous request's. raw_requestline is emptied for log_error,
+        # which reads it to tell the idle close from a request that stalled,
+        # and _response_started, which tells either from a response the peer
+        # stopped reading (_log_socket_timeout).
+        self.path = ""
+        self.requestline = ""
+        self.raw_requestline = b""
+        self._response_started = False
+        self._arm_request_read_deadline()
         try:
-            # A peer that resets the connection while its request is being read,
-            # or before an error page is on the wire, is a debug line and a closed
-            # connection, as on the metrics listener; the exception would
-            # otherwise leave the handler and reach the server's error hook. No
-            # audit record is lost: every site logs before its response is
-            # written, and _json guards its own writes.
-            try:
-                super().handle_one_request()
-            except OSError as exc:
-                self.close_connection = True
-                LOGGER.debug("request not answered type=%s", type(exc).__name__)
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("request not answered type=%s", type(exc).__name__)
+            return
         finally:
+            self._disarm_request_read_deadline()
             self._leave_in_flight()
+        if not self.close_connection and self._body_unread():
+            # The last resort for a response written over a body no route
+            # read without going through _end_headers, which announces the
+            # close in the response: closing here is unannounced, and a peer
+            # may already have dispatched onto the connection, so every
+            # direct write goes through _end_headers and this should not fire.
+            self.close_connection = True
 
     def _leave_in_flight(self) -> None:
         if getattr(self, "_counted_in_flight", False):
@@ -14788,9 +16147,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # the 401 an unauthenticated caller gets, the relay's direct writes and
         # every _json() alike -- so it is the one place the request counter
         # sees them all. The label is the route family the path falls in,
-        # never the path: the path is caller text. The path is absent when the
-        # request line itself could not be parsed, and that response counts
-        # under LABEL_OTHER like any other unclaimed one.
+        # never the path: the path is caller text. The path is empty when the
+        # request line itself could not be parsed (handle_one_request clears
+        # it before each request), and that response counts under LABEL_OTHER
+        # like any other unclaimed one.
         status_code = str(int(code)) if isinstance(code, int) else str(code)
         family = _endpoint_label(getattr(self, "path", ""))
         self.metrics.record_request(family, status_code)
@@ -14800,6 +16160,17 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if kind is not None and getattr(self, "command", "") in BROKER_FAILURE_COUNTED_METHODS:
             self.metrics.record_failure(kind)
         super().log_request(code, size)
+
+    def log_error(self, message: str, *args: Any) -> None:
+        # The stdlib's handle_one_request catches the socket timeout itself
+        # and reports it here, the idle close at KEEPALIVE_IDLE_SECONDS and a
+        # request that stalled mid-body or mid-write alike;
+        # _log_socket_timeout tells them apart and logs each for what it is.
+        # Everything else log_error carries (send_error's code and message)
+        # goes on to log_message as before.
+        if _log_socket_timeout(self, message, args):
+            return
+        super().log_error(message, *args)
 
     def log_message(self, message: str, *args: Any) -> None:
         # BaseHTTPRequestHandler.log_request passes self.requestline through
@@ -14832,7 +16203,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # The one extra header any route sends is Retry-After, a number.
             for name, value in (headers or {}).items():
                 self.send_header(name, value)
-            self.end_headers()
+            self._end_headers()
             self.wfile.write(body)
         except OSError as exc:
             LOGGER.warning(
@@ -14841,6 +16212,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 len(body),
                 type(exc).__name__,
             )
+            # The response is incomplete on the wire, so nothing further can
+            # be framed on this connection: it closes rather than parking in
+            # the idle wait with a thread, a slot and a truncated response.
+            self.close_connection = True
 
     def _session_slot(self, role: str) -> contextlib.AbstractContextManager:
         """The session, profile or scope role's bounded share, or nothing for every other role."""
@@ -14930,8 +16305,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         )
 
 
-def start_agent_api_proxy() -> ThreadingHTTPServer:
+def start_agent_api_proxy(max_threads: int | None = None) -> ThreadingHTTPServer:
     """Bind the authenticated front door for the agent's own API.
+
+    ``max_threads`` is the door's connection cap (door_thread_cap_from_env;
+    the class attribute when None, as a test sets it).
 
     This runs wherever the agent's API server is reachable on loopback. In the
     sidecar deployment that is this same container; when the broker is split
@@ -14952,8 +16330,12 @@ def start_agent_api_proxy() -> ThreadingHTTPServer:
         or "/opt/data"
     )
     port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
-    server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
-    LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
+    cap = ThreadCap.max_threads if max_threads is None else max_threads
+    server = ThreadingTCPHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler, max_threads=cap)
+    LOGGER.info(
+        "authenticated PlatformAgent API proxy listening on port %d, %d connections at once (%s)",
+        port, cap, MAX_THREADS_ENV,
+    )
     return server
 
 
@@ -15251,10 +16633,19 @@ def install_shutdown_handler(
 
 
 def serve(args: argparse.Namespace) -> None:
+    # Before any listener is built. The thread stack is left at the
+    # platform's: a smaller one (1 MiB was tried) is not enough for the C
+    # recursion the shipped interpreter permits, so a nested JSON body that
+    # raises RecursionError on the default stack overflows the smaller one
+    # and takes the process down with it; the default's size is address
+    # space, not memory.
     role = resolve_role()
     if role == ROLE_API_PROXY:
-        start_agent_api_proxy().serve_forever()
+        # The door alone: its cap is the environment's or the fallback, and
+        # no Envoy config is read, since none fronts it (MAX_THREADS_ENV).
+        start_agent_api_proxy(max_threads=door_thread_cap_from_env()).serve_forever()
         return
+    ThreadCap.max_threads = thread_cap_from_env()
 
     CredentialProxyHandler.broker_role = role
     # Decided before anything credentialed starts, so a misconfigured
@@ -15453,7 +16844,7 @@ def serve(args: argparse.Namespace) -> None:
                 teams_tenant_id or "common",
             )
     if role == ROLE_COMBINED:
-        api_server = start_agent_api_proxy()
+        api_server = start_agent_api_proxy(max_threads=door_thread_cap_from_env())
         threading.Thread(target=api_server.serve_forever, daemon=True).start()
     if args.unix_socket:
         socket_path = Path(args.unix_socket)
@@ -15481,6 +16872,11 @@ def serve(args: argparse.Namespace) -> None:
     # reachable-off-pod refusal above on purpose: that rule guards a listener
     # that hands out credentials, and this one serves counters.
     metrics_port = int(getattr(args, "metrics_port", 0) or 0)
+    health_port = int(getattr(args, "health_port", 0) or 0)
+    # The ports Envoy's listeners bind, for the refusals below: Envoy runs
+    # in this container on the same address, and its listeners are the ones
+    # the broker does not otherwise know about. Read only when a port is set.
+    envoy_ports = envoy_listener_ports() if metrics_port or health_port else {}
     if not metrics_port:
         raw = os.getenv(METRICS_PORT_ENV)
         LOGGER.info(
@@ -15488,7 +16884,7 @@ def serve(args: argparse.Namespace) -> None:
             METRICS_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
         )
     else:
-        refusal = _metrics_port_refusal(metrics_port, args)
+        refusal = _metrics_port_refusal(metrics_port, args, envoy_ports)
         if refusal is not None:
             LOGGER.error(
                 "ALERT %s=%d %s; the broker serves no /metrics until it restarts with "
@@ -15497,6 +16893,24 @@ def serve(args: argparse.Namespace) -> None:
             )
         else:
             start_metrics_listener(args.host, metrics_port)
+    # The health-only listener, on the same terms: after the credentialed
+    # server, never fatal, and on a port no other listener in the Pod holds.
+    if not health_port:
+        raw = os.getenv(HEALTH_PORT_ENV)
+        LOGGER.info(
+            "health listener disabled: --health-port resolved to 0 (%s is %s)",
+            HEALTH_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
+        )
+    else:
+        refusal = _health_port_refusal(health_port, args, metrics_port, envoy_ports)
+        if refusal is not None:
+            LOGGER.error(
+                "ALERT %s=%d %s; the broker serves no %s on a port of its own until it "
+                "restarts with another, and commands are unaffected",
+                HEALTH_PORT_ENV, health_port, refusal, HEALTHZ_PATH,
+            )
+        else:
+            start_health_listener(args.host, health_port)
     install_shutdown_handler(
         server,
         [
@@ -15514,23 +16928,75 @@ def serve(args: argparse.Namespace) -> None:
     LOGGER.info("credential proxy stopped")
 
 
-def _metrics_port_refusal(metrics_port: int, args: argparse.Namespace) -> str | None:
+def _metrics_port_refusal(
+    metrics_port: int, args: argparse.Namespace, envoy_ports: Mapping[int, str]
+) -> str | None:
     """Why the metrics listener must not open on this port, or None if it may.
 
-    Both are hand-edit cases the operator's managed env never produces, refused
+    All are hand-edit cases the operator's managed env never produces, refused
     by name so the ALERT says what to fix rather than what bind() thought of
     it. args.port is the operator's credentialProxyPort, set in the broker's
-    managed env, and Envoy's listener carries the same number, held to that
-    constant by OperatorContractTest; so the comparison is against the port
-    that is bound, by this process on the TCP branch or by Envoy in front of
-    the Unix socket. Which of two processes wins a port depends on start
-    order, and the loser must never be the one holding the credentials.
+    managed env, and Envoy's credentialed listener carries the same number,
+    held to that constant by OperatorContractTest; so the comparison is
+    against the port that is bound, by this process on the TCP branch or by
+    Envoy in front of the Unix socket. ``envoy_ports`` is every port a
+    listener in Envoy's config binds (envoy_listener_ports): that one again,
+    and the health listener the operator's readiness probe reads. Envoy runs
+    in the broker's container (start-services.sh), after the broker, on the
+    same address, so a port of its the broker took first is one Envoy's bind
+    fails on, which ends the container, credentialed path and all; and a
+    port both bind, where the two sockets' options allow it, splits the
+    kubelet's probe between them with no line saying so. Which of two
+    processes wins a port depends on start order, and the loser must never
+    be the one holding the credentials.
     """
     if not METRICS_PORT_MIN <= metrics_port <= METRICS_PORT_MAX:
         return f"is not a port in {METRICS_PORT_MIN}-{METRICS_PORT_MAX}"
     if metrics_port == args.port:
         return f"is the credentialed listener's port {args.port}"
+    if metrics_port in envoy_ports:
+        name = envoy_ports[metrics_port]
+        if name:
+            return f"is Envoy's {name} listener's port {metrics_port}"
+        return f"is an Envoy listener's port {metrics_port}"
     return None
+
+
+def _health_port_refusal(
+    health_port: int, args: argparse.Namespace, metrics_port: int, envoy_ports: Mapping[int, str]
+) -> str | None:
+    """Why the health listener must not open on this port, or None if it may.
+
+    _metrics_port_refusal's cases, and the metrics port itself: every
+    listener in the Pod has a port of its own, and which of two processes
+    wins a port depends on start order.
+    """
+    refusal = _metrics_port_refusal(health_port, args, envoy_ports)
+    if refusal is not None:
+        return refusal
+    if health_port == metrics_port:
+        return f"is the metrics listener's port {metrics_port}"
+    return None
+
+
+def _health_port_default() -> int:
+    """HEALTH_PORT_ENV as an integer, DEFAULT_HEALTH_PORT (none) when unset, or 0 with an ALERT.
+
+    As the metrics port: unset opens no listener, a port opens one, and a
+    value that is no integer costs the listener alone.
+    """
+    raw = os.getenv(HEALTH_PORT_ENV, "").strip()
+    if not raw:
+        return DEFAULT_HEALTH_PORT
+    try:
+        return int(raw)
+    except ValueError:
+        LOGGER.error(
+            "ALERT %s=%r is not an integer; the broker serves no %s on a port of its own "
+            "until it restarts with a port, and commands are unaffected",
+            HEALTH_PORT_ENV, raw, HEALTHZ_PATH,
+        )
+        return 0
 
 
 def _metrics_port_default() -> int:
@@ -15574,6 +17040,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=_metrics_port_default(),
         help="Port of the metrics-only listener (GET /metrics); 0 or unset opens none",
+    )
+    parser.add_argument(
+        "--health-port",
+        type=int,
+        default=_health_port_default(),
+        help=f"Port of the health-only listener (GET {HEALTHZ_PATH}); 0 or unset opens none",
     )
     parser.add_argument(
         "--timeout-seconds",

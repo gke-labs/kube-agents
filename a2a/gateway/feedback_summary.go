@@ -35,7 +35,7 @@ const (
 	//: The block's line cap. The script's SUMMARY_MAX_LINES differs because each cap
 	//: matches its own block's shape (the script adds the performance figures and
 	//: task rows this block does not carry); nothing holds the two in step, by design.
-	usageSummaryMaxLines = 41
+	usageSummaryMaxLines = 47
 	hoursPerDay          = 24
 	//: The task roll-up's window, as the script's; the gateway clamps it to
 	//: SessionTTL, past which idle records (and their tasks) are deleted.
@@ -90,12 +90,13 @@ const (
 	//: The model line's start: the audit runs over the block without this one line.
 	usageSummaryModelLinePrefix = "  model: "
 	//: status.inference, the operator's reading of the install's default model.
-	inferenceStatusKey     = "inference"
-	inferenceProviderField = "provider"
-	inferenceModelField    = "model"
-	inferenceSeparator     = "/"
-	usageNoReading         = "no reading"
-	usageReadingSuffix     = " (as the forge reports)"
+	inferenceStatusKey        = "inference"
+	inferenceProviderField    = "provider"
+	inferenceModelField       = "model"
+	inferenceSeparator        = "/"
+	usageNoReading            = "no reading"
+	usageForgeReadingSuffix   = " (as the forge reports)"
+	usageGatewayReadingSuffix = " (as the gateway reports)"
 )
 
 // : status.usage fields, in the order the block prints them; a missing counter
@@ -103,16 +104,26 @@ const (
 // : The script's USAGE_COUNTERS verbatim.
 var usageSummaryCounters = []string{
 	"clustersRegistered", "clustersMonitored", "chatMessagesInboundTotal", "sessionsTotal",
-	"chatSessionsTotal", "toolExecutionsTotal", "eventsIngestedTotal", "remediationsProposedTotal",
-	"remediationsMergedTotal", "proposalsAuthored", "remediationsOpen", "remediationsClosedUnmergedTotal",
-	"proposalHumanTouches", "proposalsMergedUntouched",
+	"chatSessionsTotal", "toolExecutionsTotal", "toolExecutionsBlockedTotal", "brokerFailuresTotal",
+	"eventsIngestedTotal", "chatTurnsErroredTotal", "backgroundTasksGaveUpTotal", "negativeFeedbackTotal",
+	"remediationsProposedTotal", "remediationsMergedTotal", "proposalsAuthored", "remediationsOpen",
+	"remediationsClosedUnmergedTotal", "proposalHumanTouches", "proposalsMergedUntouched",
+	"peopleSeen7d", "peopleSeen30d",
 }
 
-// : The fields the broker reads off the forge rather than counts: absent means
-// : it has no reading yet, which is not 0. The script's USAGE_READINGS.
-var usageSummaryReadings = map[string]bool{
-	"remediationsMergedTotal": true, "proposalsAuthored": true, "remediationsOpen": true,
-	"remediationsClosedUnmergedTotal": true, "proposalHumanTouches": true, "proposalsMergedUntouched": true,
+// : The fields read off a source rather than counted, each to the suffix naming
+// : that source: absent means no reading yet, which is not 0. The broker reads
+// : the six off the forge; the operator reads the two people readings off this
+// : gateway. The script's USAGE_READINGS.
+var usageSummaryReadings = map[string]string{
+	"remediationsMergedTotal":         usageForgeReadingSuffix,
+	"proposalsAuthored":               usageForgeReadingSuffix,
+	"remediationsOpen":                usageForgeReadingSuffix,
+	"remediationsClosedUnmergedTotal": usageForgeReadingSuffix,
+	"proposalHumanTouches":            usageForgeReadingSuffix,
+	"proposalsMergedUntouched":        usageForgeReadingSuffix,
+	"peopleSeen7d":                    usageGatewayReadingSuffix,
+	"peopleSeen30d":                   usageGatewayReadingSuffix,
 }
 
 // : The environment lines, in the order the block prints them: the script's
@@ -398,7 +409,8 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	lines = append(lines, "usage:")
 	for _, counter := range usageSummaryCounters {
 		value, present := usage[counter]
-		if !usageSummaryReadings[counter] {
+		suffix, isReading := usageSummaryReadings[counter]
+		if !isReading {
 			lines = append(lines, fmt.Sprintf("  %s: %d", counter, asInt(value)))
 			continue
 		}
@@ -406,13 +418,17 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 		if present && value != nil {
 			shown = strconv.FormatInt(asInt(value), 10)
 		}
-		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, usageReadingSuffix))
+		lines = append(lines, fmt.Sprintf("  %s: %s%s", counter, shown, suffix))
 	}
 	last := asString(usage["lastActiveTime"])
 	if last == "" {
 		last = usageSummaryNever
 	}
-	lines = append(lines, "  lastActive: "+last)
+	lastHuman := asString(usage["lastHumanActiveTime"])
+	if lastHuman == "" {
+		lastHuman = usageSummaryNever
+	}
+	lines = append(lines, "  lastActive: "+last, "  lastHumanActive: "+lastHuman)
 	lines = append(lines, "performance: "+usageSummaryPerformanceNote)
 	days := windowDays(window)
 	if !haveTasks {

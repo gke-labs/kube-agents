@@ -207,6 +207,27 @@ func TestAttacker_ForgedSupervisorTerminalOnTheExecutorsOwnSubject(t *testing.T)
 			t.Errorf("the real supervisor terminal disagreed with its own subject: %v", err)
 		}
 	})
+
+	t.Run("another_named_supervisor_agrees_and_nobody_else_does", func(t *testing.T) {
+		// The profile dispatcher writes its terminals on `…supervisor` as
+		// itself; a consumer that names it reads them, and still refuses
+		// every writer it names nowhere.
+		sup := TaskSupervisorSubject(addressee, taskID)
+		p := AgreementPolicy{Supervisor: agreementSupervisor, OtherSupervisors: []string{DispatcherSession}}
+		asDispatcher := supervisorTerminal(t, taskID, StateFailed, true)
+		asDispatcher.From = Party{Session: DispatcherSession, AgentType: "a2a-dispatcher"}
+		if err := CheckSubjectAgreement(sup, asDispatcher, p); err != nil {
+			t.Errorf("the dispatcher's terminal disagreed with a policy naming it: %v", err)
+		}
+		if err := CheckSubjectAgreement(sup, asDispatcher, AgreementPolicy{Supervisor: agreementSupervisor}); err == nil {
+			t.Error("the dispatcher's terminal passed a policy that names only the gateway")
+		}
+		stranger := supervisorTerminal(t, taskID, StateFailed, true)
+		stranger.From = Party{Session: "someone-else"}
+		if err := CheckSubjectAgreement(sup, stranger, p); err == nil || IsAdvisoryDisagreement(err) {
+			t.Errorf("a writer named nowhere passed (%v)", err)
+		}
+	})
 }
 
 // Condition 2, per class, closed-world on kind. Every row is an envelope

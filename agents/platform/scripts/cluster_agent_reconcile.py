@@ -73,6 +73,7 @@ from cluster_agent_profile import (
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
     create_profile,
     delete_profile,
+    delete_profiles,
     profile_name,
     kubeconfig_landed,
     list_profiles,
@@ -155,7 +156,8 @@ ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
 # The two fields the resolver reads, projected so a container of thousands of clusters
 # stays far below the credential proxy's output cap; full-fidelity JSON is ~1 KB a row.
 ASSET_SEARCH_FORMAT = "json(name,location)"
-# The credential proxy's stderr note when it cut a stream at its output cap.
+# The credential proxy's stderr note when it cut a stream at its output cap; the
+# shim exits 74 with it, so the note is read before the exit code.
 _PROXY_TRUNCATED_MARKER = "truncated"
 # Regional clusters render as .../locations/<L>/clusters/<C>, zonal ones as
 # .../zones/<Z>/clusters/<C>; a parser written to one shape drops the other (design §4).
@@ -947,6 +949,12 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
         if not isinstance(assets, list):
             raise ValueError("asset search did not return a list")
     except subprocess.CalledProcessError as e:
+        if _PROXY_TRUNCATED_MARKER in (e.stderr or ""):
+            # The shim's exit 74 on a cut reply: the cap, not a failed call.
+            log(f"resolving {container} errored ({OUTCOME_UNREACHABLE}; its previous members are carried "
+                f"forward): the credential proxy cut the search output at its cap; the container "
+                f"holds more clusters than one search can return through it")
+            return None, OUTCOME_UNREACHABLE
         outcome = _classify_list_failure(e.stderr or "")
         log(f"resolving {container} through Cloud Asset Inventory failed ({outcome}; its previous "
             f"members are carried forward, no CREATE under them): {(e.stderr or '').strip()}")
@@ -1563,9 +1571,10 @@ def _previous_management(previous: dict | None) -> str | None:
 def remaining_profiles(project: str, identities: dict, pruned: list[str]) -> int:
     """Profiles of a project still on the volume after this run's deletes.
 
-    A pruned name still counts while its home is on disk: `delete_profile` swallows
-    its own errors, and a project whose delete failed must stay `retiring` so the
-    next run tries again instead of reading the survivor as never in scope.
+    A pruned name still counts while its home is on disk: `delete_profiles` swallows
+    its own errors and skips a name whose lock is held, and a project whose delete
+    failed or was skipped must stay `retiring` so the next run tries again instead
+    of reading the survivor as never in scope.
     """
     pruned_set = set(pruned)
     return sum(
@@ -1667,10 +1676,11 @@ def _exclusive_run():
     apart. Overlapping runs would call `create_profile` and `delete_profile` against
     the same profile home: interleaved read-modify-writes of `config.yaml` and
     `.env`, or an rmtree under a scaffold in progress. The lock lives here rather
-    than in either caller because it has to cover both. create_profile and
-    delete_profile also hold a per-profile lock of their own, which is what keeps a
+    than in either caller because it has to cover both. create_profile and the
+    deletes also hold a per-profile lock of their own, which is what keeps a
     `create` run outside the reconcile (by hand in the agent pod, or bench seeding)
-    apart from this run's PRUNE of the same name (#4389).
+    apart from this run's PRUNE of the same name (#4389). PRUNE's batch
+    (delete_profiles) takes those locks without blocking and skips a held one (#4574).
     """
     path = _hermes_home() / RECONCILE_LOCK
     try:
@@ -2188,6 +2198,9 @@ def reconcile(dry_run: bool = False) -> dict:
             consequence="inconclusive; the profile is kept",
         ))
     described.update({name: (True, "") for name in listed_alive})
+    # Pruned names, deleted together once the loop has judged every profile: their
+    # sandbox homes go in one mirror call rather than one each (#4574).
+    prune_queue: list[str] = []
     for name in profiles:
         identity = identities[name]
         if identity is None:
@@ -2214,7 +2227,7 @@ def reconcile(dry_run: bool = False) -> dict:
                 log(f"{name}: {identity['cluster']} is in {why} — WOULD prune (dry-run).")
             else:
                 log(f"{name}: {identity['cluster']} is in {why} — pruning.")
-                delete_profile(name)
+                prune_queue.append(name)
             report["pruned"].append(name)
             continue
 
@@ -2227,7 +2240,7 @@ def reconcile(dry_run: bool = False) -> dict:
                     log(f"{name}: project {project} left the scope — WOULD prune (dry-run).")
                 else:
                     log(f"{name}: project {project} left the scope — pruning.")
-                    delete_profile(name)
+                    prune_queue.append(name)
                 report["pruned"].append(name)
                 continue
             if management_changed and management_listed and project == previous_management:
@@ -2290,8 +2303,17 @@ def reconcile(dry_run: bool = False) -> dict:
         else:
             log(f"{name}: cluster {identity['cluster']} ({identity['project']}/{identity['location']}) "
                 f"is gone — pruning.")
-            delete_profile(name)
+            prune_queue.append(name)
         report["pruned"].append(name)
+
+    # Before anything below reads which homes are left. A name the batch skipped
+    # (its lock held) or could not delete stays in "pruned"; remaining_profiles
+    # counts it while its home is on disk, so its project stays retiring.
+    if prune_queue:
+        outcomes = delete_profiles(prune_queue)
+        undone = {name: outcome for name, outcome in outcomes.items() if outcome != "deleted"}
+        log(f"pruned {len(prune_queue) - len(undone)} of {len(prune_queue)} profile(s) here and in the sandbox"
+            + (f"; not fully: {', '.join(f'{n} ({o})' for n, o in sorted(undone.items()))}" if undone else ""))
 
     # A project absent from the resolved set whose only profiles were unreadable this run
     # was judged by nothing above; it is judged here by attribution, the same way a
@@ -2501,6 +2523,9 @@ def _notify(message: str) -> None:
         except subprocess.CalledProcessError as e:
             if chat_notify.outcome_unknown(e.returncode):
                 log(f"Reconcile notification to {platform} got no answer in time; it may have posted")
+                continue
+            if chat_notify.kept(e.returncode):
+                log(f"Reconcile notification to {platform} kept by the gateway for the home-channel digest")
                 continue
             log(f"Failed to post reconcile notification to {platform}: {e}")
         except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run

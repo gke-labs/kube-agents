@@ -77,6 +77,7 @@ _PAGE_TABLE_HEADING = "## What each pod needs"
 _PAGE_ROW_PROXY = "Credential proxy"
 _PAGE_ROW_GATEWAY = "Gateway pod"
 _PAGE_ROW_SANDBOX = "Shell sandbox"
+_PAGE_ROW_KUBE_PROXY = "Kubernetes API proxy"
 _PAGE_ROW_OPERATOR = "Operator"
 _PAGE_ROW_LITELLM = "LiteLLM"
 _PAGE_ROW_MINTER = "GitHub token minter"
@@ -332,10 +333,14 @@ class DeclaredColumnTest(unittest.TestCase):
         dashboard = _footprint_block(agent["dashboard"])
         gateway = tuple(b + d for b, d in zip(base, dashboard))
         data_claim_gi = self.footprint["storage"]["dataClaimBytesRequest"] / (1024 ** 3)
+        # The footprint sums the kube-proxy's replicas; the row reads per replica, "each".
+        kube_proxy = self.footprint["kubeProxy"]
+        kube_proxy_each = tuple(part / kube_proxy["pods"] for part in _footprint_block(kube_proxy))
         return {
             _PAGE_ROW_PROXY: (_footprint_block(self.footprint["credentialProxy"]), 1, 0),
             _PAGE_ROW_GATEWAY: (gateway, 1, data_claim_gi + 1),
             _PAGE_ROW_SANDBOX: (_footprint_block(self.footprint["shellSandbox"]), 1, data_claim_gi + 1),
+            _PAGE_ROW_KUBE_PROXY: (kube_proxy_each, kube_proxy["pods"], 0),
             _PAGE_ROW_OPERATOR: (_values_block(self.values["operator"]["resources"]), self.values["operator"]["replicaCount"], 0),
             _PAGE_ROW_LITELLM: (_values_block(self.values["litellm"]["resources"]), self.values["litellm"]["replicaCount"], 0),
             _PAGE_ROW_MINTER: (_values_block(self.values["githubMinter"]["resources"]), self.values["githubMinter"]["replicaCount"], 0),
@@ -356,7 +361,7 @@ class DeclaredColumnTest(unittest.TestCase):
         self.assertTrue(self._row(_PAGE_ROW_PROXY)[5].startswith(f"{_gib(proxy)} GiB"))
         self.assertTrue(self._row(_PAGE_ROW_GATEWAY)[5].startswith(f"{_gib(gateway)} GiB"))
         self.assertEqual(self._row(_PAGE_ROW_LITELLM)[5], f"{_gib(litellm)} GiB each")
-        for label in (_PAGE_ROW_SANDBOX, _PAGE_ROW_OPERATOR, _PAGE_ROW_MINTER):
+        for label in (_PAGE_ROW_SANDBOX, _PAGE_ROW_KUBE_PROXY, _PAGE_ROW_OPERATOR, _PAGE_ROW_MINTER):
             with self.subTest(row=label):
                 self.assertEqual(declared[label][0][4], 0)
                 self.assertEqual(self._row(label)[5], "none declared")

@@ -120,6 +120,10 @@ type metrics struct {
 	// CAs), so watching only one of them leaves half the surface dark.
 	clusterDiscoveryErrors *prometheus.CounterVec
 	clusterUp              *prometheus.GaugeVec
+	// relists counts the backlog re-reads a cluster's reflector made after its
+	// initial delivery, paged lists and watch-list streams alike; before it
+	// nothing distinguished a relist loop from a quiet cluster.
+	relists *prometheus.CounterVec
 	// processStart is processStartTimeMetric, set once in newMetrics, which
 	// runs at process start, and constant for the life of the process by
 	// construction.
@@ -196,7 +200,7 @@ func newMetrics() *metrics {
 		}, []string{"cluster", "project", "location", "reason", "namespace"}),
 		settleOutcomes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_settle_outcomes_total",
-			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
+			Help: "Settle-family keys a gate stopped (the settle gate or a count gate), by what became of them: forwarded once a later sighting in the family was accepted, or self_resolved once the key went unsighted for the settle period plus the slack. Settle-held sightings themselves are events_filtered_total{gate=\"settle\"}.",
 		}, []string{"cluster", "project", "location", "reason", "outcome"}),
 		followups: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "k8s_event_watcher_followups_total",
@@ -257,6 +261,10 @@ func newMetrics() *metrics {
 			Name: "k8s_event_watcher_cluster_up",
 			Help: "1 once this cluster's informer has completed its initial list and is delivering events; 0 while it has not synced (including a stuck informer retrying an unreachable API server), while the API server refuses its events list or watch with 403 Forbidden and the informer is held between attempts, or once it has stopped.",
 		}, []string{"cluster", "project", "location"}),
+		relists: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "k8s_event_watcher_relists_total",
+			Help: "Full re-reads of a cluster's Event backlog after its initial sync, as a paged list or a new watch-list stream: the watch could not be resumed or the stream failed.",
+		}, []string{"cluster", "project", "location"}),
 		processStart: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: processStartTimeMetric,
 			Help: "Start time of the process since unix epoch in seconds, captured once at start.",
@@ -309,6 +317,7 @@ func newMetrics() *metrics {
 		m.activeIncidents,
 		m.clusterDiscoveryErrors,
 		m.clusterUp,
+		m.relists,
 		m.processStart,
 		m.fleetNodes,
 		m.fleetMaxClusterNodes,

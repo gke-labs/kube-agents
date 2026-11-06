@@ -385,6 +385,101 @@
         "traceLogPath": {
           "type": "string",
           "pattern": "^/tmp/([^\\x00/]*[^\\x00/.][^\\x00/]*/)*[^\\x00/]*[^\\x00/.][^\\x00/]*$"
+        },
+        "replayShadow": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": "string"
+                },
+                "pullPolicy": {
+                  "type": "string",
+                  "enum": ["Always", "IfNotPresent", "Never"]
+                }
+              }
+            },
+            "replicaCount": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "rollingUpdate": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "properties": {
+                "maxSurge": {
+                  "type": ["integer", "string", "null"]
+                },
+                "maxUnavailable": {
+                  "type": ["integer", "string", "null"]
+                }
+              }
+            },
+            "job": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": ["", "nightly", "presubmit"]
+                },
+                "project": {
+                  "type": "string"
+                },
+                "build": {
+                  "type": "string"
+                },
+                "pr": {
+                  "type": "string"
+                }
+              }
+            },
+            "resources": {
+              "type": "object"
+            }
+          },
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": ["enabled"]
+          },
+          "then": {
+            "required": ["image", "job"],
+            "properties": {
+              "image": {
+                "required": ["repository", "tag"],
+                "properties": {
+                  "repository": {
+                    "minLength": 1
+                  },
+                  "tag": {
+                    "minLength": 1
+                  }
+                }
+              },
+              "job": {
+                "required": ["kind"],
+                "properties": {
+                  "kind": {
+                    "enum": ["nightly", "presubmit"]
+                  }
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -824,6 +919,74 @@
                 }
               }
             },
+            "eventWatcher": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "alertExclude": {
+                  "type": ["array", "null"],
+                  "maxItems": 64,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "cluster": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["clusterName"],
+                        "properties": {
+                          "projectId": {
+                            "type": "string",
+                            "maxLength": 128,
+                            "pattern": "^([a-z0-9.-]+:)?[a-z]([-a-z0-9]*[a-z0-9])?$"
+                          },
+                          "location": {
+                            "type": "string",
+                            "maxLength": 63,
+                            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                          },
+                          "clusterName": {
+                            "type": "string",
+                            "maxLength": 63,
+                            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                          }
+                        }
+                      },
+                      "namespace": {
+                        "type": "string",
+                        "maxLength": 63,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                      },
+                      "reason": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "pattern": "^[A-Za-z][-_.A-Za-z0-9]*$"
+                      },
+                      "kind": {
+                        "type": "string",
+                        "maxLength": 63,
+                        "pattern": "^[A-Za-z][A-Za-z0-9]*$"
+                      },
+                      "name": {
+                        "type": "string",
+                        "maxLength": 253,
+                        "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*|[a-z0-9][-.a-z0-9]*\\*)$"
+                      }
+                    },
+                    "anyOf": [
+                      { "required": ["cluster"] },
+                      { "required": ["namespace"] },
+                      { "required": ["reason"] },
+                      { "required": ["kind"] },
+                      {
+                        "required": ["name"],
+                        "properties": { "name": { "not": { "const": "*" } } }
+                      }
+                    ]
+                  }
+                }
+              }
+            },
             "stallWatch": {
               "type": "object",
               "additionalProperties": false,
@@ -1027,6 +1190,103 @@
                   "type": ["integer", "null"],
                   "minimum": 0,
                   "maximum": 2147483647
+                }
+              }
+            },
+            "eventWatcher": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "dedupWindow": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$",
+                      "not": {
+                        "pattern": "^(0|(0{1,18}(\\.0{1,3})?(ns|us|ms|s|m|h)|0{1,18}\\.[0-9]{1,3}ns){1,16})$"
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "backoffMinCount": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "maximum": 2147483647
+                },
+                "imagePullTransientMinCount": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "maximum": 2147483647
+                },
+                "failedSchedulingMinCount": {
+                  "type": ["integer", "null"],
+                  "minimum": 1,
+                  "maximum": 2147483647
+                },
+                "failedSchedulingMinSpan": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$"
+                    },
+                    {
+                      "type": "integer",
+                      "const": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "scaleUpHold": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$",
+                      "not": {
+                        "pattern": "^(0|(0{1,18}(\\.0{1,3})?(ns|us|ms|s|m|h)|0{1,18}\\.[0-9]{1,3}ns){1,16})$"
+                      }
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "settle": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$"
+                    },
+                    {
+                      "type": "integer",
+                      "const": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "quietAfter": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^(0|([0-9]{1,18}(\\.[0-9]{1,3})?(ns|us|ms|s|m|h)){1,16})$"
+                    },
+                    {
+                      "type": "integer",
+                      "const": 0
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "autopilotScaleToZeroHold": {
+                  "type": ["boolean", "null"]
                 }
               }
             },

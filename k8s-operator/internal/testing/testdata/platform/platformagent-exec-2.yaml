@@ -42,11 +42,10 @@ spec:
   # decoupling the compute payload from the agent's application logic.
   # +optional
   deployment:
-    # Golden fixture: identical to examples/platformagent.yaml except that the
-    # image embeds a tag, and the tag field carries the "latest" the CRD
-    # default / mutating webhook persists on a real cluster. The embedded tag
-    # must win for the agent container AND the derived credential-proxy
-    # sidecar (no version skew).
+    # As in platformagent-tagged.yaml: the image embeds a tag, and the tag
+    # field carries the "latest" the CRD default / mutating webhook persists on
+    # a real cluster. The embedded tag must win for the agent container AND the
+    # derived credential-proxy sidecar (no version skew).
     image: "ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9"
     tag: "latest"
 

@@ -386,9 +386,10 @@ type usageScrapedPod struct {
 	// Clusters is the watcher's cluster gauges, nil for any pod but a gateway's.
 	// Not folded: the poll projects the largest reading as it stands.
 	Clusters *usageClusterGauges
-	// Readings and ReadingsPresent are the broker's proposal readings, nil
-	// for any pod but a broker's. Not folded either: the poll projects the
-	// largest of each field across the brokers read (usageReadingsForPoll).
+	// Readings and ReadingsPresent are the readings the pod's target asked
+	// for: the broker's proposal readings or the A2A gateway's people reading,
+	// nil for any other pod. Not folded either: the poll projects the largest
+	// of each field across the pods read (usageReadingsForPoll).
 	Readings        map[string]int64
 	ReadingsPresent map[usageReadingKind]bool
 	// DataVolume is the watcher's data volume reading, nil for any pod but a

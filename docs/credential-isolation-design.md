@@ -119,8 +119,9 @@ OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, the `ALERT_DAILY_LIMIT_*` aler
 (`FINDINGS_DAILY_CRITICALS`, `FINDINGS_FIRST_REPORT_CRITICALS`,
 `FINDINGS_NONCRITICAL_AFTER_HOUR`, `FINDINGS_NONCRITICAL_MAX`), the `INCIDENT_WORKLOAD_DEDUP_SECONDS`
 window, the `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` switch, the `BOOTSTRAP_MAX_CREATES_PER_TICK`
-cap on the profiles one Cluster Agent reconcile run creates, and the `KAGE_SLACK_UX` flag —
-but only as literal values; all `valueFrom` sources are rejected. One name goes to the shell Pod
+cap on the profiles one Cluster Agent reconcile run creates, the `KUBEAGENTS_ROSTER_SUMMARY_THRESHOLD`
+roster count, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
+are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
 operator normalises to `true` or `false` before it reaches that Pod. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
@@ -217,9 +218,17 @@ credential-proxy Pod
 
 Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
-caller can bypass Envoy by reaching the runtime directly. The runtime's one TCP
-listener is the metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
-set by the operator): it serves Prometheus series whose label values are
+caller can bypass Envoy by reaching the runtime directly. The runtime opens up
+to two TCP listeners of its own. The health-only one, closed unless
+`CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers
+`GET /healthz` and nothing else, unauthenticated like `/healthz` on 8765, with
+a fixed `{"status":"ok"}` body, under the same sixteen-connection cap and
+ten-second deadline as the metrics listener, so that a probe an operator
+points at the broker directly reads it as alive while the credentialed
+listener is at its thread cap; the operator's readiness probe reads `/healthz`
+through Envoy's health listener on 8768 instead (below), and the broker's
+NetworkPolicy opens the port to no pod, so only a kubelet probe reaches it. The metrics-only one on port 8766 (`CREDENTIAL_PROXY_METRICS_PORT`,
+set by the operator) serves Prometheus series whose label values are
 static enums and closed vocabularies, holds no route, credential or policy,
 answers at most sixteen connections at a time and cuts each off ten seconds
 after it opened whatever the peer sends (the credentialed handler shares the
@@ -258,7 +267,8 @@ three refusals remove the Pod from the Service. That ceiling is declared rather 
 inherited: `circuit_breakers.thresholds` on both priorities, 4096 connections, 1024 pending
 requests and 4096 requests, where Envoy's default is 1024 of each; the broker's listen
 backlog (`LISTEN_BACKLOG`) is sized to the same 4096 so that the breaker, never the queue,
-refuses first. The health listener routes `/healthz` alone to a `credential_health` cluster
+refuses first, and the runtime's thread cap is derived from the same thresholds at startup
+(`CREDENTIAL_PROXY_MAX_THREADS`, below), so the breaker refuses before the cap too. The health listener routes `/healthz` alone to a `credential_health` cluster
 on the same Unix socket, behind a breaker of 64, so ready still means the broker answers and
 no watch can mark the Pod unready; any other path on it is a 404. The Service and the
 NetworkPolicy do not open the port, the kubelet probes it on the Pod IP, and
@@ -335,7 +345,8 @@ to a per-process random salt with one warning.
 
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted at
-`/var/run/secrets/kubeagents/serviceaccount/token` in the credential runtime. A token
+`/var/run/secrets/kubeagents/serviceaccount/token` in the stateful broker's credential
+runtime (the exec tier does not mount it). A token
 for the gateway's own broker audience, `kubeagents-credential-proxy-chat`, is mounted
 read-only in the `platform-agent` container, because that is how the agent
 authenticates to a broker that is not on loopback and how the broker knows it is the
@@ -717,8 +728,14 @@ per-invocation timeout. A shallow clone plus the ceiling would bound both and is
 the right follow-up; neither alone does.
 
 Separately, the content routes raise the request-body cap to twice the
-total-payload limit, and the listener is threaded with no connection cap, so
-peak heap on those routes is roughly concurrency times that figure: the bodies
+total-payload limit, and the listener is threaded with one connection per
+thread up to `CREDENTIAL_PROXY_MAX_THREADS` (by default the sum of Envoy's
+connection ceilings to the broker's socket, read from the Envoy config shipped
+beside the broker: 4160 as shipped, the credentialed route's 4096 and the
+probe's 64, and 1024 for a cluster that sets none; a connection past it is
+answered `503` with `Retry-After` and closed), a bound on connections that
+is no bound on heap in practice, so peak heap on those routes is roughly
+concurrency times that figure: the bodies
 are read before any command runs, so the broker's command cap does not bound
 them, and the git these verbs run is serialised by the store's lock rather than
 counted against that cap. None of this is reachable from outside the Pod, but
@@ -887,7 +904,17 @@ Consequences:
   deploys it); the rest is drained and dropped, so what a command prints past
   the cap costs the broker nothing. The same bound applies to the decoded
   text's UTF-8 size, so output that is not UTF-8, whose every byte becomes a
-  three-byte replacement character, cannot cost more than text does. At most
+  three-byte replacement character, cannot cost more than text does. The reply
+  says when it was cut: `truncated` is true when either stream was cut,
+  `stdoutTruncated` when the cut fell on stdout, `bytesWritten` is the stdout
+  the caller receives in UTF-8 bytes, and `limit` is the cap (all four are
+  present on every completed reply). When stdout was cut the shim exits
+  `EXIT_OUTPUT_TRUNCATED` (74, `EX_IOERR`) whatever the command exited, and
+  prints the counts after its `credential proxy output truncated` stderr
+  marker, so a cut `-o json` dump reads as a failure to the model's own
+  `kubectl` and to a script alike, never as an exit 0 with a partial payload; a
+  cut on stderr alone keeps the command's exit code, and the marker says stdout
+  is complete. At most
   `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
   flight at once (8; the operator sets it, as it sets the output cap, and
   reserves the name). A slot is held from admission until the response is on
