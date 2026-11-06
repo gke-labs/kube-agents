@@ -33,11 +33,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
-	"github.com/gke-labs/kube-agents/k8s-operator/internal/profilepod"
 )
 
 // Job mode for the unattended tier (#3655 PR 6). The dispatcher runs each
@@ -65,82 +63,24 @@ const (
 	// dispatchJobLabel marks a Job the dispatcher created (lib.DispatchJobLabel),
 	// so a teardown can find them.
 	dispatchJobLabel = "kubeagents.x-k8s.io/dispatch-job"
-	// The worker's scratch workspace and its tmpfs for the proxy task token
-	// (contract addendum 8).
-	workerScratchVolume    = "scratch"
-	workerScratchSizeLimit = "2Gi"
-	workerTokenVolume      = "task-token"
-	workerTokenSizeLimit   = "1Mi"
-	workerContainerName    = "worker"
 )
 
-// profileWorkerPodSpecForJob is the worker pod a profile's Job runs. It is a
-// stand-in until the warm worker (#3655 PR 5) lands buildProfileWorkerPodSpec,
-// which then replaces it here, in the shape PR 5's pod contract on #3655
-// gives; the Job wraps whatever it returns.
-var profileWorkerPodSpecForJob = stubProfileWorkerPodSpec
-
-// stubProfileWorkerPodSpec is the worker pod in PR 5's posted shape: the
-// harness container under the profile's tier ServiceAccount, the persona and
-// tools mounted (image volumes, or staged into emptyDirs), a scratch
-// emptyDir, a tmpfs for the proxy task token, the bus and broker tokens, and
-// the bus CA. Pod Security restricted, and nothing scheduling-specific.
-func stubProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, tier string, imageVolumes bool) corev1.PodSpec {
-	persona := profilepod.RenderPersonaAndTools(p, imageVolumes)
-	volumes := []corev1.Volume{
-		{Name: workerScratchVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(workerScratchSizeLimit))}}},
-		{Name: workerTokenVolume, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse(workerTokenSizeLimit))}}},
-		a2aBusTokenVolumeSource(),
-		{Name: "broker-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
-			ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: credentialProxyProfileAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token"},
-		}}}}},
-		a2aNATSCABundleVolume(agent),
-	}
-	volumes = append(volumes, persona.Volumes...)
-	mounts := []corev1.VolumeMount{
-		{Name: workerScratchVolume, MountPath: "/workspace"},
-		{Name: workerTokenVolume, MountPath: "/run/task-token"},
-		a2aNATSCABundleMount(),
-	}
-	mounts = append(mounts, persona.Mounts...)
-	return corev1.PodSpec{
-		ServiceAccountName:           agentProfileServiceAccountName(p, tier),
-		AutomountServiceAccountToken: ptr.To(false),
-		RestartPolicy:                corev1.RestartPolicyNever,
-		SecurityContext: &corev1.PodSecurityContext{
-			RunAsNonRoot:   ptr.To(true),
-			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
-		},
-		InitContainers: persona.InitContainers,
-		Containers: []corev1.Container{{
-			Name:  workerContainerName,
-			Image: resolveAgentImage(agent.Spec.Deployment, defaultPlatformAgentImage()),
-			Env: []corev1.EnvVar{
-				{Name: "PROFILE_WORKER_ONE_SHOT", Value: "1"},
-				{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
-				{Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
-			},
-			SecurityContext: &corev1.SecurityContext{
-				// Writes go to the mounted emptyDirs (the workspace, the
-				// task token), never the image's root.
-				ReadOnlyRootFilesystem:   ptr.To(true),
-				AllowPrivilegeEscalation: ptr.To(false),
-				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-			},
-			VolumeMounts: mounts,
-		}},
-		Volumes: volumes,
-	}
+// profileWorkerPodSpecForJob is the worker pod a profile's Job runs: the warm
+// pool's pod (buildProfileWorkerPodSpec) in one-shot mode, which serves one
+// task and exits (PROFILE_WORKER_ONE_SHOT, restartPolicy Never), under the
+// (profile, tier)'s ServiceAccount.
+func profileWorkerPodSpecForJob(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, tier string, imageVolumes bool) corev1.PodSpec {
+	return buildProfileWorkerPodSpec(agent, p, tier, agentProfileServiceAccountName(p, tier), profileWorkerOneShot, imageVolumes)
 }
 
 // buildProfileJobTemplate is the pod template a profile's unattended Jobs
-// run: the worker pod, restartPolicy Never (a Job's pod must not restart, and
-// a PodTemplate defaults it to Always, which would break the policy's exact
-// comparison), with the worker labels for the profile's unattended tier.
+// run: the one-shot worker pod, whose restartPolicy is Never (a Job's pod
+// must not restart, and a PodTemplate defaults it to Always, which would
+// break the policy's exact comparison), with the worker labels for the
+// profile's unattended tier.
 func buildProfileJobTemplate(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, imageVolumes bool) *corev1.PodTemplateSpec {
 	tier := agentv1alpha1.AgentProfileTierUnattended
 	spec := profileWorkerPodSpecForJob(agent, p, tier, imageVolumes)
-	spec.RestartPolicy = corev1.RestartPolicyNever
 	settleForPlatformMutation(&spec, p)
 	return &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
@@ -171,9 +111,11 @@ var jobArchToleration = corev1.Toleration{Key: "kubernetes.io/arch", Operator: c
 // the two, so the comparison holds. Found live on GKE Autopilot, whose
 // webhook defaults a container's unset cpu, memory and ephemeral-storage and
 // adds jobArchToleration: every container gets a request and a limit for all
-// three (the worker's cpu and memory from the profile, anything else unset
-// from jobDefaultResources, a limit from its request), and the toleration is
-// added. Autopilot also raises a request that breaks its cpu-to-memory ratio;
+// three, and the toleration is added. The worker builder sets the worker's
+// three itself (cpu and memory from the profile, ephemeral-storage from its
+// emptyDirs, buildProfileWorkerPodSpec), and those stand; what a container
+// leaves unset is filled (the worker's from the profile as a fallback,
+// anything else from jobDefaultResources, a limit from its request). Autopilot also raises a request that breaks its cpu-to-memory ratio;
 // that it can't be told apart from a forged Job, so such a profile's Jobs are
 // refused there (fail closed).
 func settleForPlatformMutation(spec *corev1.PodSpec, p *agentv1alpha1.AgentProfile) {
@@ -202,9 +144,10 @@ func settleForPlatformMutation(spec *corev1.PodSpec, p *agentv1alpha1.AgentProfi
 		}
 	}
 	profile := p.Spec.Resources
-	// The pod's ephemeral-storage ceiling is its containers' limits, and its
-	// disk-backed emptyDirs count against it: the worker's share covers
-	// their size limits, on top of the default for its own writes.
+	// The fallback for a worker with no ephemeral-storage: the pod's ceiling
+	// is its containers' limits, and its disk-backed emptyDirs count against
+	// it, so the worker's share covers their size limits, on top of the
+	// default for its own writes.
 	ephemeral := jobDefaultResources[corev1.ResourceEphemeralStorage].DeepCopy()
 	for _, v := range spec.Volumes {
 		if v.EmptyDir != nil && v.EmptyDir.Medium != corev1.StorageMediumMemory && v.EmptyDir.SizeLimit != nil {

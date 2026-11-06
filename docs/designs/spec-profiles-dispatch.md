@@ -430,9 +430,11 @@ leave open:
 - **Job mode (#3655 PR 6b).** With a Job runner, an unattended task runs on a Job of its own:
   the dispatcher launches it, waits up to `jobStartSeconds` (default 300) for its pod to be
   Ready, and offers that pod the task once, with the same offer, accept and confirm as a warm
-  worker. A Job that never comes up, fails or doesn't take the task is deleted, and the task
-  fails `no-worker`. Jobs count against the same caps. The Job is deleted when the task's
-  outcome is settled, never when the dispatcher stops, so a restart re-adopts the task.
+  worker. The Job's pod is the warm worker's pod in one-shot mode (`PROFILE_WORKER_ONE_SHOT`):
+  it serves that one task and exits. A Job that never comes up, fails or doesn't take the task
+  is deleted, and the task fails `no-worker`. Jobs count against the same caps. The Job is
+  deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
+  re-adopts the task.
   Without a Job runner, unattended tasks go to the warm pool.
 
 ### Execution

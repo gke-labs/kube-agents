@@ -174,6 +174,11 @@ func TestTheJobTemplateInTheConfigIsThePolicysParam(t *testing.T) {
 	if held.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		t.Errorf("restartPolicy %q: a PodTemplate defaults it to Always, which a Job pod refuses", held.Spec.RestartPolicy)
 	}
+	// The Job's worker serves its one task and exits, rather than wait for
+	// a next one that never comes until the task deadline.
+	if got := envOf(held.Spec.Containers[0])["PROFILE_WORKER_ONE_SHOT"]; got != "1" {
+		t.Errorf("the Job's worker has PROFILE_WORKER_ONE_SHOT %q, want 1: a pool worker would outlive its task", got)
+	}
 	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + "reader"}, &agentv1alpha1.DispatchJobTemplate{}); !apierrors.IsNotFound(err) {
 		t.Errorf("a read-only profile has a Job template param: %v", err)
 	}
@@ -696,19 +701,16 @@ func TestTheJobTemplateSettlesWhatAutopilotFillsIn(t *testing.T) {
 	if n != 1 || len(tmpl.Spec.Tolerations) != 1 {
 		t.Errorf("tolerations %+v, want the architecture's alone, once", tmpl.Spec.Tolerations)
 	}
-	// The worker's ephemeral-storage covers the pod's disk-backed emptyDirs
-	// (they count against the pod's ceiling), plus its own writes.
-	need := jobDefaultResources[corev1.ResourceEphemeralStorage].DeepCopy()
-	for _, v := range tmpl.Spec.Volumes {
-		if v.EmptyDir != nil && v.EmptyDir.Medium != corev1.StorageMediumMemory && v.EmptyDir.SizeLimit != nil {
-			need.Add(*v.EmptyDir.SizeLimit)
+	// The worker's ephemeral-storage is the builder's, as a warm pool's pod
+	// has it: the pod's disk-backed emptyDirs (they count against the pod's
+	// ceiling), plus its log allowance. The settling leaves it be.
+	need := profileWorkerEphemeralStorage(tmpl.Spec.Volumes)
+	for _, got := range []resource.Quantity{tmpl.Spec.Containers[0].Resources.Requests[corev1.ResourceEphemeralStorage], tmpl.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage]} {
+		if !got.Equal(need) {
+			t.Errorf("the worker's ephemeral-storage %s isn't its emptyDirs plus its log allowance, %s", got.String(), need.String())
 		}
 	}
-	if got := tmpl.Spec.Containers[0].Resources.Limits[corev1.ResourceEphemeralStorage]; got.Cmp(need) < 0 {
-		t.Errorf("the worker's ephemeral-storage limit %s is under its emptyDirs plus its own writes, %s", got.String(), need.String())
-	}
-	// An init container a builder leaves bare (the stub's declare theirs) is
-	// settled too, from the defaults.
+	// A container a builder leaves bare is settled too, from the defaults.
 	bare := corev1.PodSpec{Containers: []corev1.Container{{Name: "worker"}}, InitContainers: []corev1.Container{{Name: "stage"}}}
 	settleForPlatformMutation(&bare, &p)
 	if got := bare.InitContainers[0].Resources.Requests[corev1.ResourceEphemeralStorage]; got.String() != "1Gi" {
