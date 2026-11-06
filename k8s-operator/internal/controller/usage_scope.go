@@ -139,8 +139,9 @@ func scopeNeighbours(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef)
 // ID, else, for a harness that names the project by number (which nothing
 // refuses), the project label of the host's own series, found by the name and
 // location spec.harness gives. Empty when the CR does not name its host, or the
-// number cannot be resolved yet (the host still watched through its bare direct
-// entry), and the operator then says nothing.
+// number cannot be tied to one project: the host still watched through its bare
+// direct entry, or two projects carrying a series of the host's name and
+// location; the operator then says nothing.
 func scopeHostProject(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef) string {
 	h := agent.Spec.Harness
 	if h == nil || h.ClusterName == "" || h.Location == "" || h.ProjectID == "" {
@@ -152,9 +153,11 @@ func scopeHostProject(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef
 	// Two clusters may share a name and location in different projects, and a
 	// hand-made profile for the other one would sort first: with more than one
 	// candidate the number cannot be tied to either, and the operator says nothing.
+	// A label that is not shaped like a project ID is the peer's text and is no
+	// candidate: the message would otherwise tell the reader to declare it.
 	found := ""
 	for _, ref := range refs {
-		if ref.Name != h.ClusterName || ref.Location != h.Location || ref.Project == "" {
+		if ref.Name != h.ClusterName || ref.Location != h.Location || !scopeUndeclaredNamePattern.MatchString(ref.Project) {
 			continue
 		}
 		if found != "" && found != ref.Project {
@@ -188,7 +191,7 @@ func scopeUndeclaredMessage(agent *agentv1alpha1.PlatformAgent, management strin
 	}
 	return fmt.Sprintf("spec.scope names no project, folder, organization or selector, so the Cluster Agent reconcile adopts every GKE cluster in the management project %s. "+
 		"%d cluster(s) beyond the host cluster %s have a Cluster Agent profile and are watched: %s. %s",
-		management, len(neighbours), h.ClusterName, listed, scopeUndeclaredHint)
+		scopeUndeclaredLabel(management), len(neighbours), h.ClusterName, listed, scopeUndeclaredHint)
 }
 
 // scopeUndeclaredConditionFor is the condition the neighbours call for. nil means
@@ -216,7 +219,7 @@ func scopeUndeclaredRemovalCause(agent *agentv1alpha1.PlatformAgent, refs []usag
 	case refs == nil:
 		return "the operator has no current reading from the event watcher"
 	case scopeHostProject(agent, refs) == "":
-		return "the management project's ID is not known: spec.harness does not name the host cluster's name, location and project, or names the project by number and the host's own series does not carry one ID yet"
+		return "the management project's ID is not known: spec.harness does not name the host cluster's name, location and project, or names the project by number and no single project carries a series of the host's name and location"
 	default:
 		return "the watcher registers no cluster beyond the host in the management project"
 	}

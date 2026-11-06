@@ -248,11 +248,22 @@ func TestScopeUndeclared_ProjectNumberIsResolvedThroughTheHostsSeries(t *testing
 	// Two clusters named like the host in two projects (the watcher watches both
 	// through their profiles): the number cannot be tied to either, so nothing is
 	// written, whichever sorts first.
+	// The twin's project has a cluster of its own, so a first-match rule would
+	// name alpha-team as the management project and list that cluster as adopted.
 	twin := usageClusterRef{Name: "c", Project: "alpha-team", Location: "l"}
-	h.stub.setClusterRefs(gatewayAddr(), twin, scopeTestHost, scopeTestNeighbourA)
+	twinsNeighbour := usageClusterRef{Name: "other", Project: "alpha-team", Location: "l"}
+	h.stub.setClusterRefs(gatewayAddr(), twin, twinsNeighbour, scopeTestHost, scopeTestNeighbourA)
 	h.poll(15)
 	if again := scopeCondition(t, h); again != nil {
 		t.Fatalf("condition with two host-named series = %+v, want it removed", again)
+	}
+
+	// A host series whose project label is not shaped like a project ID is the
+	// listener's text, never the project the message tells the reader to declare.
+	h.stub.setClusterRefs(gatewayAddr(), usageClusterRef{Name: "c", Project: "P R", Location: "l"}, usageClusterRef{Name: "n", Project: "P R", Location: "l"})
+	h.poll(20)
+	if again := scopeCondition(t, h); again != nil {
+		t.Fatalf("condition under a malformed project label = %+v, want none", again)
 	}
 }
 

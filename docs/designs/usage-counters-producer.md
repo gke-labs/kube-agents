@@ -172,7 +172,8 @@ folder, organisation or selector; removed otherwise, and on the data volume read
 there is no reading. A series in another project is a profile somebody made by hand, or one a
 dropped declaration still carries, so it is not counted; a harness that names its project by
 number is matched through the host's own series, whose label carries the ID the reconcile
-resolved, and the operator says nothing until that series exists. The
+resolved, and the operator says nothing until that series exists and exactly one project carries
+one of the host's name and location (two clusters may share both). The
 union across replicas, each triple once, sorted, so an unchanged fleet rewrites nothing. A third
 status patch, on the same terms as the second. The reconcile that adopted the clusters cannot
 write the CR, which is why the operator surfaces it from the watcher's reading
