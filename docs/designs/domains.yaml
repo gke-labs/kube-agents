@@ -85,6 +85,12 @@ domains:
     backup: stalhaali
     meaning: Checks whether node pools can take more load, and names what blocks them.
     journey: A targeted probe asks whether the pinned pool can absorb load and names the cap that stops it
+  - slug: harness-scale
+    name: Harness at fleet scale
+    owner: haoxuw
+    backup: stalhaali
+    meaning: Checks that the agent answers a question whose obvious read does not fit the sandbox shell, without crashing it.
+    journey: A question whose fleet-wide list exceeds the shell's memory is answered from a narrower read
   - slug: cost
     name: Cost (fleet-wide-cost-analysis)
     owner: Fuxiao-Gao
@@ -225,3 +231,10 @@ allowlist:
   # roster line on 2026-10-23, and consistency from its probe's demotion on
   # 2026-10-21 (#3598) until consistency-drift-outlier took its roster line on
   # 2026-10-26.
+  # harness-scale was added on 2026-11-05 with one case, parked because its
+  # fixture (two clusters of more than 100,000 Pods) is on no pool project.
+  - slug: harness-scale
+    since: 2026-11-05
+    issue: 4896
+    owner: haoxuw
+    expires: 2026-11-19

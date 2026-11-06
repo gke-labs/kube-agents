@@ -290,6 +290,13 @@ KNOWN_UNREGISTERED = {
 # (merging plants nothing; the reconcile's postsubmit does) and goes in the
 # later pull request that moves the case to the nightly file.
 FIXTURE_NOT_READY = {
+    # Needs two clusters of more than 100,000 Pods each (KWOK nodes on a small GKE
+    # cluster, as the OOM reproduction harness builds them) and an install on the
+    # kubectl cost table's fleet tier. No pool project carries one.
+    "harness-oversized-list-narrows": (
+        "#4896: needs two clusters of more than 100,000 Pods (KWOK) on the pool; "
+        "no pool project carries one"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no

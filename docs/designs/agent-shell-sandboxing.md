@@ -991,6 +991,106 @@ which is the property this design exists to hold.
 Anything beyond this one token — a Role, a Secret, a second audience — is the boundary
 moving again, and should be argued for here the way this one is.
 
+#### A memory guard beside sshd
+
+A memory limit alone does not keep the container up: every session's commands share it, and one
+`kubectl get … -A -o json` of a cluster of 100,000 Pods holds about 10 GiB. That one read OOMKilled
+the shell, ended every session in it, and the agents sent it again after the restart. The entrypoint
+starts [`shell-memory-guard`](../../deploy/sandbox/shell-memory-guard.py) as root before `sshd`, in
+a loop that restarts it every 5 s if it exits. Every 100 ms the guard reads what the kernel cannot
+reclaim before an OOMKill: on cgroup v2, `memory.current` less the page cache (shared memory
+excepted) and the reclaimable slab; on cgroup v1, `memory.usage_in_bytes` less `total_cache` (shared
+memory excepted); nothing subtracted when `memory.stat` is absent. At the limit less the larger of
+256 MiB and an eighth of the limit, at most a quarter of it, the guard sends SIGKILL to processes of
+a non-root user that hold at least 64 MiB of the memory a kill frees (`RssAnon` plus `RssShmem`),
+largest first, in one batch large enough to bring usage 64 MiB under the watermark. Memory of a
+process it signalled in the last second counts as leaving, so one burst is not paid for twice.
+`sshd`, the entrypoint and the guard run as root, and a session's shell is far below the floor, so
+none of them is chosen. The commands fail as killed processes do, and the container and the other
+sessions stay up. Commands each under the floor are not stopped: the guard logs `no-candidate` once
+when small ones fill the container, and the kubectl admission's slots bound how many run at once. A
+process that does not exit after SIGKILL is not chosen again.
+
+Before each kill the guard checks that a kill can help. When the memory held outside processes
+(usage less the summed sizes of every process) is so large that stopping even a 64 MiB
+command would leave the container at its limit, that memory is in tmpfs or a mapping no kill frees.
+The guard then holds off rather than empty the container of sessions, and kills again as soon as a
+kill can keep the container under its limit, or once usage falls below the watermark. Sizes count copy-on-write and shared pages in every process that maps them, so the outside figure errs
+towards killing.
+
+It defends against the OOMKill at the limit, not against the kubelet's eviction of a pod above its
+request under node pressure. The limit comes from `SANDBOX_MEMORY_LIMIT_BYTES`, which the operator
+sets from the container's `limits.memory`, because under gVisor the cgroup v1 limit can be the
+sandbox's virtual memory (on the gateway pod it read 10.25 GiB). Without the variable the guard
+reads cgroup v2 `memory.max`, then cgroup v1's `memory.limit_in_bytes` when it is below the
+machine's `MemTotal` (on gVisor that file is the container's limit on the shell and the sandbox's
+whole memory elsewhere); with none, it stops nothing and logs that it is disabled. Under
+gVisor the shell has cgroup v1 with no `memory.stat`, so nothing is subtracted, and no `RssAnon`, so processes are sized by `VmRSS`; the guard stopped a process growing at 100 MiB/s at 1,834 MiB of a 2
+GiB limit, as on runc. Under gVisor the sentry also holds host memory per guest process that the
+guest's figures do not show: in a fan-out of about 180 processes the host OOM-killed the sentry while
+the guest read 1,795 MiB of 2 GiB, at least 1.4 MiB a process. The guard detects gVisor from the
+kernel release and lowers its watermark by 3 MiB, about twice that, per running process. Each kill, hold, release and `no-candidate` is a JSON line on the container's log. A kill names the command by its program and the plain words before its first flag, so a token a session put on its command line never reaches the log. The guard does not make an oversized read succeed: the read fails
+every time until it is narrowed.
+
+#### A cost check in front of kubectl
+
+The guard keeps the container up; it does not make an oversized read succeed, and it acts after the
+read has run for tens of seconds. The kubectl admission refuses such a read before it starts.
+`/usr/local/bin/kubectl` execs [`kubectl-admit`](../../deploy/sandbox/kubectl-admit.py), which
+charges a `get` across the cluster (`-A`, or a cluster-scoped kind) the peak memory that
+[`kubectl-costs.json`](../../deploy/sandbox/kubectl-costs.json) lists for it. The table's key is
+`get <kinds> cluster <json|table>`; every output that decodes full objects, `-o name` included, is
+`json`, and only the table the API server builds is `table`. A command whose key is not listed is
+charged the sum of its kinds' entries (`get all`, `get po,svc`, `deployments.apps`), and the tier's
+`other` figure only when none of its kinds is listed. One namespace, named objects, other verbs,
+watches and `--raw` reads run unchanged: their cost does not grow with the fleet, and the guard
+bounds them.
+
+Nothing is estimated at run time. The table is measured ahead of time by
+[`scripts/dev/profile_kubectl_costs.py`](../../scripts/dev/profile_kubectl_costs.py), which runs
+each command alone, with the Linux `kubectl` the image pins, against a reference cluster and records
+its peak. One read costs very different amounts on different fleets: `get pods -A -o json` peaks at
+67 MiB on a cluster of about 80 Pods and at 14,307 MiB on one of 104,944. So the table has one
+column per sizing tier, and the install picks one with `KUBEAGENTS_KUBECTL_COST_TIER` in
+`spec.deployment.env` (`default` when unset). The charge comes from the tier, not from the cluster
+read: on the `fleet` tier a small cluster's `get pods -A` is charged the reference cluster's figure
+and refused. The operator passes the tier only as a lowercase word, and the entrypoint writes it to
+a root-owned file. A command charged `other` is recorded in the admission's event log, which is how
+the table learns new commands. The procedure is the
+[`update-kubectl-cost-table`](../../.agents/skills/update-kubectl-cost-table/SKILL.md) skill.
+
+The charge is booked as a reservation: a file named by the wrapper's pid, in a directory every
+session user shares, written atomically under an exclusive lock. Two large reads therefore cannot
+both see free memory and both start. The free budget is the guard's watermark, less the memory in
+use outside admitted reads, less every reservation at full size. A read that fits runs as a child
+under its reservation. One that does not fit now waits up to 30 s and then fails with exit 75. One
+larger than a single read may take (the watermark less 256 MiB) fails at once with exit 3. Both
+refusals print a `capacity:` reason with the alternatives: a count from one item (`kubectl get --raw
+'<collection>?limit=1'` and its `metadata.remainingItemCount`), one namespace at a time, a selector
+when it matches few objects, or a batch of at most 10 clusters. A read with a selector narrows by an
+amount no table knows, so it is never refused; it books what is free, up to its charge. A read the
+guard stops prints the same reason.
+
+Every kubectl command also takes a slot, a pid-named file beside the reservations, for as long as it
+runs: the charged reads, and the reads of one namespace or one object that pass through. A command
+that passes through keeps its pid across the exec, so its slot lasts exactly as long as kubectl.
+Only verbs that decode objects take one (`get`, `describe`, `events`, `top`, `logs`, `diff`,
+`apply`, `delete`, `api-resources`); a watch, `logs -f`, `exec`, `rollout status` or `wait` stays
+open as long as the session likes and takes none. The shell runs at most one read's capacity in
+96 MiB slots at once: 16 at the default limit, fewer under gVisor, whose reserve lowers the
+watermark.
+A command past that waits up to 30 s and then fails with exit 75 and a `capacity:` reason. The slots
+answer the shape the guard cannot: 60 concurrent per-namespace reads, each under the 64 MiB floor,
+grew together by about 1 GiB in a second, faster than kills could follow.
+
+The admission is advisory. A session can run `/usr/local/libexec/kubectl` directly, and the shared
+directory is writable by every session user, so the guard is the boundary that holds either way. The
+admission reads the guard's memory figure and watermark from the guard's own module, so the two
+agree. When it cannot read them, or fails in any other way, it runs the command unchanged. A command
+that cannot take the lock waits in the kernel, 5 s at a time, inside the same 30 s, and is then
+refused: in a fan-out of 60 commands on two CPUs, the commands that ran unslotted after a lock
+timeout outgrew the shell.
+
 ### Running the sandbox under gVisor
 
 `harness.experimental.shellSandbox.runtimeClassName` puts the sandbox pod on a sandboxed

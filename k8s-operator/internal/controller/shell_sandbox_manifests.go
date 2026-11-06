@@ -44,6 +44,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -118,6 +119,11 @@ const (
 	// pod, not the agent's, and deploy/sandbox/entrypoint.sh writes it to a
 	// root-owned file the script reads before the session's variable (#3439).
 	envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+	// The sizing tier whose column of deploy/sandbox/kubectl-costs.json the shell's
+	// kubectl admission charges ("default" when unset). An operator sets it in
+	// spec.deployment.env; deploy/sandbox/entrypoint.sh writes it to a root-owned
+	// file the admission reads, so a session cannot pick a lighter tier.
+	envKubectlCostTier = "KUBEAGENTS_KUBECTL_COST_TIER"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -234,6 +240,9 @@ const (
 	shellSandboxMemoryRequest = "512Mi"
 	shellSandboxCPULimit      = "2"
 	shellSandboxMemoryLimit   = "2Gi"
+	// The variable that carries the shell container's memory limit, in bytes,
+	// to the memory guard the entrypoint starts.
+	shellSandboxMemoryLimitEnvVar = "SANDBOX_MEMORY_LIMIT_BYTES"
 
 	// The shell container's name, which the sizing step-up check reads the
 	// StatefulSet's template by (sizing_profile.go) and the eval harness execs
@@ -255,6 +264,10 @@ const (
 	// from one place, and so the chart can render the sandbox's Secret from it.
 	shellSandboxPrivateKeySecretKey = "SANDBOX_SSH_PRIVATE_KEY" // #nosec G101 -- Secret key name, not a credential
 )
+
+// kubectlCostTierPattern is a tier name the entrypoint will write: a short
+// lowercase word, as the cost table's tier keys are.
+var kubectlCostTierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 
 var (
 	// The /opt/defaults trees deploy/sandbox/Dockerfile ships and the
@@ -579,6 +592,16 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			if v.Name == envAuditAutoPromote && v.ValueFrom == nil {
 				off := strings.EqualFold(strings.TrimSpace(v.Value), "false")
 				env = append(env, corev1.EnvVar{Name: envAuditAutoPromote, Value: strconv.FormatBool(!off)})
+				break
+			}
+		}
+		// The tier the same way: a literal only, and only a plain lowercase name,
+		// since the entrypoint writes it to a file the admission opens by name.
+		for _, v := range agent.Spec.Deployment.Env {
+			if v.Name == envKubectlCostTier && v.ValueFrom == nil {
+				if tier := strings.ToLower(strings.TrimSpace(v.Value)); kubectlCostTierPattern.MatchString(tier) {
+					env = append(env, corev1.EnvVar{Name: envKubectlCostTier, Value: tier})
+				}
 				break
 			}
 		}
@@ -960,6 +983,16 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 	env = append(slices.Clone(env),
 		corev1.EnvVar{Name: shellSandboxImageTreesEnvVar, Value: shellSandboxImageTreesMode},
 		corev1.EnvVar{Name: shellSandboxHomeRootsEnvVar, Value: shellSandboxHomeRoots()},
+		// The memory guard's limit (deploy/sandbox/shell-memory-guard.py). Under
+		// gVisor the container's cgroup v1 limit is the sandbox's virtual memory,
+		// not this container's limit, so the guard reads the figure from here.
+		corev1.EnvVar{Name: shellSandboxMemoryLimitEnvVar, ValueFrom: &corev1.EnvVarSource{
+			ResourceFieldRef: &corev1.ResourceFieldSelector{
+				ContainerName: shellSandboxContainerName,
+				Resource:      containerMemoryLimitResource,
+				Divisor:       resource.MustParse("1"),
+			},
+		}},
 	)
 	container := corev1.Container{
 		Name:  shellSandboxContainerName,
