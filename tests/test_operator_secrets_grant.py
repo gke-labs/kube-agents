@@ -88,6 +88,14 @@ def _of_kind(kind: str) -> list[dict]:
     return [doc for doc in _documents() if doc.get("kind") == kind]
 
 
+def _namespaced_role(test: unittest.TestCase) -> dict:
+    # Asserted, not indexed: against a role.yaml with no Role document the
+    # failure should read as the missing grant, not as an IndexError.
+    roles = _of_kind(ROLE_KIND)
+    test.assertEqual(len(roles), 1, f"expected one namespaced Role in {ROLE_PATH}, found {len(roles)}")
+    return roles[0]
+
+
 def _secret_rules(doc: dict) -> list[dict]:
     return [
         rule
@@ -112,13 +120,12 @@ class OperatorSecretsGrantTest(unittest.TestCase):
         )
 
     def test_secrets_are_granted_in_exactly_one_namespaced_rule(self):
-        roles = _of_kind(ROLE_KIND)
-        self.assertEqual(len(roles), 1, f"expected one namespaced Role in {ROLE_PATH}")
+        role = _namespaced_role(self)
         self.assertTrue(
-            roles[0].get("metadata", {}).get("namespace"),
+            role.get("metadata", {}).get("namespace"),
             "the Role document carries no namespace; controller-gen writes one from the marker",
         )
-        rules = _secret_rules(roles[0])
+        rules = _secret_rules(role)
         self.assertEqual(
             len(rules),
             1,
@@ -126,7 +133,7 @@ class OperatorSecretsGrantTest(unittest.TestCase):
         )
 
     def test_the_secret_verbs_are_exactly_the_set_three_callers_need(self):
-        rule = _secret_rules(_of_kind(ROLE_KIND)[0])[0]
+        rule = _secret_rules(_namespaced_role(self))[0]
         self.assertEqual(set(rule.get("verbs") or []), PERMITTED_SECRET_VERBS)
         self.assertEqual(rule.get("apiGroups"), [CORE_API_GROUP])
 
@@ -135,7 +142,7 @@ class OperatorSecretsGrantTest(unittest.TestCase):
         # property, not a consequence of today's list: `list`/`watch` turn a
         # by-name grant into enumeration, which is a different power from
         # get/create/update/patch/delete by name.
-        verbs = set(_secret_rules(_of_kind(ROLE_KIND)[0])[0].get("verbs") or [])
+        verbs = set(_secret_rules(_namespaced_role(self))[0].get("verbs") or [])
         self.assertEqual(
             set(),
             verbs & REFUSED_SECRET_VERBS,
@@ -148,7 +155,7 @@ class OperatorSecretsGrantTest(unittest.TestCase):
         # Folding `secrets` into a rule that also names, say, `configmaps` would
         # keep the verbs at `get` and still widen what a later verb addition
         # reaches.
-        rule = _secret_rules(_of_kind(ROLE_KIND)[0])[0]
+        rule = _secret_rules(_namespaced_role(self))[0]
         self.assertEqual(rule.get("resources"), [SECRETS_RESOURCE])
 
     def test_the_trivy_exemption_stays_scoped_to_the_rbac_directory(self):

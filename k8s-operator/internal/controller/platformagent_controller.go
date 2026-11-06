@@ -696,9 +696,9 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
 // Render: the agent, broker, gateway and bus workloads; escalation prevention for the reads.
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
-// Escalation prevention. apps/daemonsets is also read by resolveNetpolProfile to discover the
-// gke-metadata-server DaemonSet port (issue #747 B4) — a second consumer of a grant that
-// already existed for buildMinimalPlatformRole's requirement.
+// Escalation prevention, with two operator reads on the same grant: resolveNetpolProfile
+// reads the gke-metadata-server DaemonSet to discover its port (issue #747 B4), and
+// a2aCalloutHasOlderPods lists ReplicaSets to tell an old callout pod from a new one.
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
 // Render: the agent's ServiceAccounts, data claims, config, Services and (mode next) session
 // pods; escalation prevention for the reads.
