@@ -1,8 +1,9 @@
 {{- /*
 The Hindsight memory store, mirroring k8s-operator/config/integrations/hindsight:
 the API Deployment the agents call for long-term memory, the Postgres/pgvector
-StatefulSet behind it, the NetworkPolicy that stands in for the database's
-missing password, and the PodMonitoring that watches recall latency.
+StatefulSet behind it, the NetworkPolicies that isolate the API pod and stand
+in for the database's missing password, and the PodMonitoring that watches
+recall latency.
 
 Renders when kube-agents.hindsightEnabled says so: hindsight.enabled = true or
 false is an answer, and null (the default) follows
@@ -350,6 +351,112 @@ spec:
           requests:
             storage: {{ .Values.hindsight.postgresql.storage }}
 {{- if .Values.hindsight.networkPolicy }}
+---
+# Confines hindsight-api's ingress to pods in the release namespace (the agent
+# gateway and its workers) and the GKE Managed Prometheus collector namespace
+# on TCP 8888, and its egress to cluster DNS, hindsight-postgresql on TCP 5432,
+# and the in-cluster inference gateway (LiteLLM or standalone-replay) on TCP
+# 80, 4000, and 8080. Models are baked into the image (HF_HUB_OFFLINE=1,
+# TRANSFORMERS_OFFLINE=1) and the pod holds no cloud identity, so neither
+# external HTTPS nor the metadata server's credential ports are permitted.
+# The egress half is gated on litellm.enabled so a bring-your-own gateway
+# install (litellm.enabled=false) still gets the ingress confinement and the
+# hindsight-postgresql guard below without having its custom inference-gateway
+# egress dropped (#4946).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hindsight-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: hindsight
+    app.kubernetes.io/component: api
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hindsight
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+    {{- if .Values.litellm.enabled }}
+    - Egress
+    {{- end }}
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8888
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8888
+          protocol: TCP
+  {{- if .Values.litellm.enabled }}
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        # Cluster DNS answers on the kube-dns Service ClusterIP, which a static
+        # manifest cannot know: it is 10.96.0.10 on some GKE clusters and
+        # 34.118.224.10 on others. NetworkPolicy matches that VIP, not the pods
+        # behind it, so the selectors above never fire for it. The two peers
+        # below cover both shapes: the literal handles the classic service
+        # range, and the excepted block handles any VIP outside private space
+        # (34.118.224.0/20 today, whatever GKE allocates next).
+        - ipBlock:
+            cidr: 10.96.0.10/32
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    - ports:
+        - port: 5432
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: hindsight
+              app.kubernetes.io/component: postgresql
+    - ports:
+        - port: 80
+          protocol: TCP
+        - port: 4000
+          protocol: TCP
+        - port: 8080
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+        - podSelector:
+            matchLabels:
+              app: standalone-replay
+  {{- end }}
 ---
 # The database takes no password, so this is what keeps it private: only the
 # Hindsight API pod may open a connection to it. Ingress only — Postgres makes

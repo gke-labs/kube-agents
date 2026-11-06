@@ -491,7 +491,15 @@ prune skips pinned rows, the prunes it runs at process start included. The job
 sets the flag on the one row (Hermes' own pin command pins the whole lineage and
 unhides it), and keeps the ids it pinned in the store's `state_meta`, so a pin
 set by hand is never cleared. A chain unwinds one parent a day once its newest
-session is pruned. A store whose pins cannot be set is not pruned that day.
+session is pruned. A store whose pins cannot be set is not pruned by the job that
+day.
+
+The entrypoint runs the same pinning (`session_retention.py --pins-only`) before
+the gateway starts, because Hermes prunes at gateway start and, on the first start
+after an upgrade, that prune would otherwise come before the job's first tick. It
+is best-effort and gives each store a few seconds. A store it cannot pin is
+named in a `WARN`, and the gateway's prune at that start can still delete an aged
+parent there.
 
 A blocked kanban card needs no exemption: its worker starts a
 fresh session on every run and reads its context from the card. A chat thread
