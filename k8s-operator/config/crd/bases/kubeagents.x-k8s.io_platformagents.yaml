@@ -9251,6 +9251,10 @@ spec:
                         both admit (the running one when they admit none) and sets the
                         SizingCappedByQuota condition for the step refused, naming the quota
                         or the LimitRange, rather than rolling out pods admission would refuse.
+                        A pod the namespace admits between that check and the recreated
+                        broker's admission can take the room the check found; a step whose
+                        pod a quota then refuses is stepped back one tier, the condition
+                        naming the quota and admission's message.
                         The check reads namespaced admission, not node capacity: on GKE
                         Standard the medium and fleet rows' broker requests (1 and 4 CPU) have
                         to fit on one node before the recreated broker can start, so a Standard
