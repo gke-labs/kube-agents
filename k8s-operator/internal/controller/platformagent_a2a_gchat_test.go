@@ -538,3 +538,33 @@ func withHome(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.Pl
 	agent.Spec.Integration.GoogleChat.HomeChannel = home
 	return agent
 }
+
+// TestGchatAnswerFeedbackOffIsTheOnlyRenderedState: googleChat.answerFeedback
+// reaches the gateway only as its off switch, and only when Chat is the
+// gateway's backend; unset or true renders nothing.
+func TestGchatAnswerFeedbackOffIsTheOnlyRenderedState(t *testing.T) {
+	t.Setenv(a2aInjectBackendEnvVar, "")
+	off, on := false, true
+	for _, tc := range []struct {
+		name    string
+		agent   *agentv1alpha1.PlatformAgent
+		setting *bool
+		want    string
+		present bool
+	}{
+		{"unset", gchatTestAgent("next", true), nil, "", false},
+		{"true", gchatTestAgent("next", true), &on, "", false},
+		{"false", gchatTestAgent("next", true), &off, "false", true},
+		{"false under today", gchatTestAgent("", true), &off, "", false},
+		{"false with chat disabled", gchatTestAgent("next", false), &off, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.agent.Spec.Integration.GoogleChat.AnswerFeedback = tc.setting
+			env := envMapOf(buildA2AGatewayDeployment(tc.agent).Spec.Template.Spec.Containers[0].Env)
+			got, ok := env[a2aGchatAnswerFeedbackEnvVar]
+			if ok != tc.present || got.Value != tc.want {
+				t.Errorf("%s = %q (rendered %v), want %q (rendered %v)", a2aGchatAnswerFeedbackEnvVar, got.Value, ok, tc.want, tc.present)
+			}
+		})
+	}
+}

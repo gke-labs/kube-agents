@@ -589,9 +589,9 @@ SHUTDOWN_NACK_TIMEOUT_SECONDS = 2
 SHUTDOWN_ERROR = "credential proxy shutting down"
 # The drain thread's name, for a reader of a thread dump mid-stop.
 SHUTDOWN_THREAD_NAME = "shutdown"
-# In the broker role the stop is a drain (install_shutdown_handler): new
-# requests are refused with the `draining` bound, and the requests already in
-# flight get this long to finish before the commands still running are ended.
+# In the broker and exec roles the stop is a drain (install_shutdown_handler):
+# new requests are refused with the `draining` bound, and the requests already
+# in flight get this long to finish before the commands still running are ended.
 # The pod's terminationGracePeriodSeconds (45 s, the operator's
 # credentialProxyTerminationGraceSeconds) holds this, SHUTDOWN_END_WAIT_SECONDS,
 # the hand-back and the entrypoint's kill of Envoy after it; the entrypoint
@@ -726,6 +726,11 @@ WATCHER_WATCH_MAX_S = 3600
 # Forwarded from the caller when it has this shape: client-go negotiates JSON or
 # protobuf with it.
 WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
+# The most of a named Pod's metadata the broker reads before projecting it
+# (watcher_policy.project_pod_metadata). An ObjectMeta is a few KiB; one with a
+# large last-applied annotation can be more, and anything past this is refused
+# rather than relayed in part.
+WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
@@ -1325,6 +1330,17 @@ AUDIT_STATUS_BUSY = "busy"
 # so the two cannot drift apart.
 RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
 RULE_CALLER_EXECUTABLE = "caller.executable-role"
+# Appended to the executable refusal (this rule, or executable.allowlist once
+# kubectl leaves the exec route) when the shell sends kubectl. The current sandbox
+# image runs stock kubectl against kube-proxy and never sends it here, so the
+# usual sender is a sandbox image older than the agent, typically one pinned by
+# spec.harness.experimental.shellSandbox.image through an upgrade (#4966).
+SHELL_KUBECTL_REFUSAL_HINT = (
+    " The shell sandbox runs kubectl against kube-proxy, so a sandbox sending kubectl here is "
+    "likely running an image older than the agent's: check spec.harness.experimental.shellSandbox.image "
+    "on the PlatformAgent (its ShellSandboxPinned condition, when present, names the operator's image) "
+    "and the operator's AGENT_SANDBOX_IMAGE."
+)
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
@@ -2178,6 +2194,19 @@ def executable_permitted(role: str, executable: str) -> bool:
     """Whether ``role`` may run ``executable`` through /v1/exec."""
     narrowed = ROLE_EXECUTABLES.get(role)
     return narrowed is None or executable in narrowed
+
+
+def shell_kubectl_hint(role: str, executable: str) -> str:
+    """SHELL_KUBECTL_REFUSAL_HINT when the shell sent kubectl, else ""."""
+    return SHELL_KUBECTL_REFUSAL_HINT if role == CALLER_ROLE_SHELL and executable == "kubectl" else ""
+
+
+def executable_refusal_message(role: str, executable: str) -> str:
+    """The message refusing ``role`` the ``executable`` it may not run."""
+    return (
+        f"The {role} caller may run only "
+        f"{', '.join(sorted(ROLE_EXECUTABLES[role]))} through the credential proxy."
+    ) + shell_kubectl_hint(role, executable)
 
 
 # Which `POST /v1/vcs/<verb>` verbs a role may reach, checked on the verb after
@@ -13305,16 +13334,17 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
     teams_relay: TeamsRelay | None = None
-    # Set by the SIGTERM handler (install_shutdown_handler). While set, the
-    # two Chat event-pull routes answer 503 SHUTDOWN_ERROR, and the settle
-    # routes and the Slack pull serve until the server stops, so the gateway's
-    # acks for pulls already answered still land. In the sidecar roles every
-    # other route serves too; in the broker role `draining` below refuses them.
+    # Set by the SIGTERM handler (install_shutdown_handler). While set, the two
+    # Chat event-pull routes answer 503 SHUTDOWN_ERROR, and the settle routes
+    # and the Slack pull serve until the server stops, so the gateway's acks for
+    # pulls already answered still land. In the sidecar roles every other route
+    # serves too; in the broker and exec roles `draining` below refuses them.
     shutting_down = threading.Event()
-    # Set by the SIGTERM handler in the broker role, where the stop is a drain
-    # (install_shutdown_handler): a request outside DRAIN_OPEN_ROUTES is refused
-    # with the `draining` bound before its route runs, so no command is refused
-    # half-way and a retry never runs one twice; the drain waits on in_flight.
+    # Set by the SIGTERM handler in the broker and exec roles, where the stop is
+    # a drain (install_shutdown_handler): a request outside DRAIN_OPEN_ROUTES is
+    # refused with the `draining` bound before its route runs, so no command is
+    # refused half-way and a retry never runs one twice; the drain waits on
+    # in_flight.
     draining = threading.Event()
     in_flight = InFlight()
     # The read-only Cloud API relay's credential and transport. Armed by
@@ -13871,7 +13901,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_EXECUTABLE_ALLOWLIST,
-                    "message": "Executable is not supported by the credential proxy.",
+                    "message": "Executable is not supported by the credential proxy."
+                    + shell_kubectl_hint(principal.role, argv[0]),
                 },
             )
             return
@@ -13890,10 +13921,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_CALLER_EXECUTABLE,
-                    "message": (
-                        f"The {principal.role} caller may run only "
-                        f"{', '.join(sorted(ROLE_EXECUTABLES[principal.role]))} through the credential proxy."
-                    ),
+                    "message": executable_refusal_message(principal.role, argv[0]),
                 },
             )
             return
@@ -14966,11 +14994,13 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
     def _handle_watcher_k8s(self) -> None:
         """`GET /v1/k8s/<project>/<location>/<cluster>/<path>`: a fleet API server read.
 
-        The event watcher's list and watch of events and its one-item
-        metadata-only count lists, and the drift detector's read of one named
-        object, on the broker's credential. `watcher_policy.evaluate_k8s` is
-        the table. A watch is streamed through as the API server sends it;
-        everything else is streamed too, with the Cloud API relay's deadline
+        The event watcher's list and watch of events, its one-item
+        metadata-only count lists and its read of one named Pod's metadata,
+        and the drift detector's read of one named object, on the broker's
+        credential. `watcher_policy.evaluate_k8s` is the table. A watch is
+        streamed through as the API server sends it. A Pod's metadata is read
+        whole and relayed as its projection (`project_pod_metadata`).
+        Everything else is streamed too, with the Cloud API relay's deadline
         on each read.
         """
         request_id = str(uuid.uuid4())
@@ -15062,6 +15092,46 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     HTTPStatus.BAD_GATEWAY,
                     {"error": "the API server answered with a redirect", "code": "UPSTREAM_REDIRECTED"},
                 )
+                return
+            if decision.rule_id == watcher_policy.RULE_K8S_POD_METADATA:
+                # Read whole and projected: the Pod's ObjectMeta carries every
+                # annotation and managedFields, and only the owner lookup's
+                # fields leave the broker. A non-200 answer is the API server's
+                # Status, which carries no Pod data, and is relayed as it is.
+                body = response.read(WATCHER_POD_METADATA_MAX_BYTES + 1)
+                if len(body) > WATCHER_POD_METADATA_MAX_BYTES:
+                    LOGGER.warning("watcher k8s pod metadata too large request_id=%s", request_id)
+                    self._json(
+                        HTTPStatus.BAD_GATEWAY,
+                        {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                    )
+                    return
+                if response.status == HTTPStatus.OK:
+                    projected = watcher_policy.project_pod_metadata(body)
+                    if projected is None:
+                        LOGGER.warning("watcher k8s unparseable pod metadata request_id=%s", request_id)
+                        self._json(
+                            HTTPStatus.BAD_GATEWAY,
+                            {"error": "the upstream answer could not be relayed", "code": "UPSTREAM_UNRELAYABLE"},
+                        )
+                        return
+                    body = projected
+                LOGGER.info(
+                    "watcher k8s forwarded request_id=%s rule=%s status=%d bytes=%d",
+                    request_id,
+                    decision.rule_id,
+                    response.status,
+                    len(body),
+                )
+                self.send_response(response.status)
+                answered = True
+                self.send_header("Content-Type", watcher_policy.POD_METADATA_MEDIA_TYPE)
+                # Framed by its length, so the connection stays reusable, and
+                # closed with the answer when the request's body went unread.
+                self.send_header("Content-Length", str(len(body)))
+                self._end_headers()
+                self.wfile.write(body)
+                self.wfile.flush()
                 return
             LOGGER.info(
                 "watcher k8s forwarded request_id=%s rule=%s status=%d watch=%s",
@@ -16557,11 +16627,11 @@ def install_shutdown_handler(
     gateway on a next install reads Slack itself. A second SIGTERM changes
     nothing; the stop already under way finishes.
 
-    With drain_seconds (the broker role, SHUTDOWN_DRAIN_SECONDS), the stop is
-    a drain as well: every new request outside DRAIN_OPEN_ROUTES is refused
-    503 with the `draining` bound, the Slack relay stops taking events from
-    Slack, and the requests already in flight get up to drain_seconds from the
-    signal to finish. The commands still running then are ended through
+    With drain_seconds (the broker and exec roles, SHUTDOWN_DRAIN_SECONDS), the
+    stop is a drain as well: every new request outside DRAIN_OPEN_ROUTES is
+    refused 503 with the `draining` bound, the Slack relay stops taking events
+    from Slack, and the requests already in flight get up to drain_seconds from
+    the signal to finish. The commands still running then are ended through
     executor.end_commands and answer DRAINED_COMMAND_EXIT_CODE; their requests
     get end_wait_seconds to write it. Only then are the Chat receipts handed
     back and the server stopped. The other roles keep the short stop: their
@@ -16919,10 +16989,12 @@ def serve(args: argparse.Namespace) -> None:
             if relay is not None
         ],
         executor=executor,
-        # Only the standalone broker pod drains: the operator gives it the grace
-        # period for one (credentialProxyTerminationGraceSeconds), and the
-        # sidecar roles' pods keep the short stop.
-        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role == ROLE_BROKER else 0,
+        # The standalone broker pod and the exec tier's pods drain: the operator
+        # gives each the grace period for one
+        # (credentialProxyTerminationGraceSeconds), and an exec pod that stops
+        # mid-rollout must finish the commands it
+        # admitted. The sidecar roles' pods keep the short stop.
+        drain_seconds=SHUTDOWN_DRAIN_SECONDS if role in (ROLE_BROKER, EXEC_ROLE) else 0,
     )
     server.serve_forever()
     LOGGER.info("credential proxy stopped")

@@ -142,13 +142,144 @@ class K8sTest(unittest.TestCase):
     def test_an_unlisted_kind_is_refused_by_the_kind_rule(self):
         for path in (
             "api/v1/nodes/node-1",
-            "api/v1/namespaces/default/pods/web-0",
             "apis/coordination.k8s.io/v1/namespaces/kube-system/leases/kube-scheduler",
             "apis/cert-manager.io/v1/namespaces/default/certificates/tls",
             "apis/networking.gke.io/v1/namespaces/default/managedcertificates/c",
         ):
             with self.subTest(path=path):
                 self.assertEqual(self.evaluate(path).rule_id, w.RULE_K8S_KIND)
+
+    POD_META_ACCEPT = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1"
+
+    def pod(self, path, accept=POD_META_ACCEPT, query=None):
+        return w.evaluate_k8s("GET", TARGET + path, query or {}, accept)
+
+    def test_a_named_pod_is_read_only_as_metadata(self):
+        # The event watcher's owner lookup: one Pod's ObjectMeta as JSON, which the broker projects.
+        for accept in (
+            self.POD_META_ACCEPT,
+            "application/json; as=PartialObjectMetadata; g=meta.k8s.io; v=v1",
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,"
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+        ):
+            with self.subTest(accept=accept):
+                self.assertEqual(
+                    self.pod("api/v1/namespaces/default/pods/web-0", accept=accept).rule_id, w.RULE_K8S_POD_METADATA
+                )
+        self.assertNotIn(("", "pods"), w.WATCHER_NAMED_READS, "a full Pod read must stay refused")
+
+    def test_a_named_pod_read_that_could_return_more_than_metadata_is_refused(self):
+        for accept in (
+            "",
+            "application/json",
+            "application/vnd.kubernetes.protobuf",
+            # A list's metadata shape is not the object's.
+            "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1",
+            # One range that asks for the whole Pod is enough to get it.
+            self.POD_META_ACCEPT + ",application/json",
+            "application/json;as=Table;g=meta.k8s.io;v=v1",
+            "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1;as=Table",
+            # Only JSON can be projected; the broker never relays protobuf here.
+            "application/vnd.kubernetes.protobuf;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+            "*/*;as=PartialObjectMetadata;g=meta.k8s.io;v=v1",
+        ):
+            with self.subTest(accept=accept):
+                self.assertEqual(self.pod("api/v1/namespaces/default/pods/web-0", accept=accept).rule_id, w.RULE_K8S_ACCEPT)
+        for query in ({"fieldSelector": ["x"]}, {"resourceVersion": ["0"]}, {"watch": ["true"]}):
+            with self.subTest(query=query):
+                self.assertEqual(self.pod("api/v1/namespaces/default/pods/web-0", query=query).rule_id, w.RULE_K8S_QUERY)
+
+    @staticmethod
+    def _key_paths(value, prefix=""):
+        """Every key path in a JSON value, lists entered without an index."""
+        paths = set()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                path = f"{prefix}.{key}" if prefix else key
+                paths.add(path)
+                paths |= K8sTest._key_paths(child, path)
+        elif isinstance(value, list):
+            for child in value:
+                paths |= K8sTest._key_paths(child, prefix + "[]")
+        return paths
+
+    FULL_POD_METADATA = {
+        "kind": "PartialObjectMetadata",
+        "apiVersion": "meta.k8s.io/v1",
+        "metadata": {
+            "name": "checkout-6cfdb6b98b-zwv24", "namespace": "default", "uid": "u-1",
+            "labels": {"app": "checkout", "pod-template-hash": "6cfdb6b98b", "team": "payments"},
+            "annotations": {"kubectl.kubernetes.io/last-applied-configuration": '{"env":"hunter2"}'},
+            "managedFields": [{"manager": "kubectl"}],
+            "resourceVersion": "7", "creationTimestamp": "2026-11-04T00:00:00Z", "finalizers": ["x"],
+            "ownerReferences": [
+                {"kind": "ConfigMap", "name": "c"},
+                {"kind": "ReplicaSet", "name": "checkout-6cfdb6b98b", "controller": True, "uid": "u-2",
+                 "apiVersion": "apps/v1", "blockOwnerDeletion": True},
+            ],
+        },
+    }
+
+    def test_a_projected_pod_has_exactly_the_owner_lookups_key_paths(self):
+        # Pinned so that no later change widens what the watcher token reads of
+        # a Pod without this test changing too.
+        projected = json.loads(w.project_pod_metadata(json.dumps(self.FULL_POD_METADATA).encode()))
+        self.assertEqual(
+            self._key_paths(projected),
+            {
+                "metadata",
+                "metadata.ownerReferences",
+                "metadata.ownerReferences[].kind",
+                "metadata.ownerReferences[].name",
+                "metadata.ownerReferences[].controller",
+                "metadata.labels",
+                "metadata.labels.pod-template-hash",
+            },
+        )
+        self.assertEqual(projected, {"metadata": {
+            "ownerReferences": [{"kind": "ReplicaSet", "name": "checkout-6cfdb6b98b", "controller": True}],
+            "labels": {"pod-template-hash": "6cfdb6b98b"},
+        }})
+
+    def test_a_projected_pod_keeps_the_hash_only_for_a_replicaset_and_only_the_controller(self):
+        for owners, want in (
+            # Not a ReplicaSet: the hash label is not needed, so not relayed.
+            ([{"kind": "StatefulSet", "name": "web", "controller": True}],
+             {"ownerReferences": [{"kind": "StatefulSet", "name": "web", "controller": True}]}),
+            # No controller at all: nothing.
+            ([{"kind": "ConfigMap", "name": "c"}, {"kind": "Job", "name": "j", "controller": False}], {}),
+            ([], {}),
+            # Only the first well-formed controller entry.
+            ([{"kind": 7, "name": "x", "controller": True}, {"kind": "Job", "name": "j", "controller": True},
+              {"kind": "DaemonSet", "name": "d", "controller": True}],
+             {"ownerReferences": [{"kind": "Job", "name": "j", "controller": True}]}),
+            ("not-a-list", {}),
+            # A controller the lookup does not fold on (a static Pod's Node, a
+            # custom controller) is not relayed, and the first controller decides.
+            ([{"kind": "Node", "name": "node-a", "controller": True}], {}),
+            ([{"kind": "Rollout", "name": "r", "controller": True}, {"kind": "Job", "name": "j", "controller": True}], {}),
+        ):
+            with self.subTest(owners=owners):
+                body = {"kind": "PartialObjectMetadata", "metadata": {"labels": {"pod-template-hash": "h"}, "ownerReferences": owners}}
+                self.assertEqual(json.loads(w.project_pod_metadata(json.dumps(body).encode())), {"metadata": want})
+        # A ReplicaSet without the hash label, or whose name does not end in
+        # it, is not a Deployment's: not relayed.
+        for labels in ({}, {"rollouts-pod-template-hash": "h"}, {"pod-template-hash": ""}, "not-a-map",
+                       {"pod-template-hash": "other"}):
+            with self.subTest(labels=labels):
+                body = {"kind": "PartialObjectMetadata", "metadata": {
+                    "labels": labels, "ownerReferences": [{"kind": "ReplicaSet", "name": "c-h", "controller": True}]}}
+                self.assertEqual(json.loads(w.project_pod_metadata(json.dumps(body).encode())), {"metadata": {}})
+        for body in (b"not json", b"[]", b'{"kind":"Pod","metadata":{}}', b'{"kind":"PartialObjectMetadata"}'):
+            with self.subTest(body=body):
+                self.assertIsNone(w.project_pod_metadata(body))
+
+    def test_the_pod_rule_reaches_no_list_subresource_or_cluster_scoped_path(self):
+        self.assertEqual(self.pod("api/v1/pods/web-0").rule_id, w.RULE_K8S_KIND)
+        for path in ("api/v1/namespaces/default/pods/web-0/log", "api/v1/namespaces/default/pods/web-0/exec"):
+            with self.subTest(path=path):
+                self.assertFalse(self.pod(path).allowed)
+        self.assertEqual(self.pod("api/v1/namespaces/default/pods", query={"limit": ["1"]}).rule_id, w.RULE_K8S_PATH)
 
     def test_a_listed_plural_under_another_group_is_refused(self):
         # The group used to be captured and never checked.
