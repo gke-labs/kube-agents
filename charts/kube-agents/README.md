@@ -1269,7 +1269,8 @@ pods with a surge pod for each that rolls with one (which the chart stamps on th
 and a margin of 7. Every release also renders the same count in a ConfigMap,
 `a2a-quota-chart-pods`, in the release namespace. With `platformAgent.enabled=false` the
 chart renders no `PlatformAgent`, and the operator reads that ConfigMap for a next-mode one
-written by hand there. An annotation on the CR still wins. Either source past the cap of 64,
+written by hand there. The operator reads it from its own namespace only, so a hand-written
+CR elsewhere needs the annotation itself. An annotation on the CR still wins. Either source past the cap of 64,
 or unreadable, counts 5 instead and records an `A2AQuotaChartPodsDiscarded` Warning naming it.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check

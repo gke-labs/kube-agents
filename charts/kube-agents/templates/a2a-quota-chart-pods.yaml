@@ -4,11 +4,11 @@ The chart's pods in the release namespace, with their rollout surge pods
 also stamps this count on the PlatformAgent it renders, as the
 kubeagents.x-k8s.io/a2a-quota-chart-pods annotation, and the annotation wins. This copy is
 for a PlatformAgent written by hand in a release with platformAgent.enabled=false, which
-still runs the operator, LiteLLM, Hindsight and the minter here: the operator reads it from
-the agent's namespace when the CR carries no annotation, rather than counting its default.
-A fixed name, since the operator looks it up by name. Anyone who can write ConfigMaps here
-can change it, so the operator holds it to the same cap as the annotation and reports a
-value it discards.
+still runs the operator, LiteLLM, Hindsight and the minter here: when the CR carries no
+annotation, the operator reads this from its own namespace, rather than counting its
+default. It doesn't read it from any other namespace. A fixed name, since the operator
+looks it up by name; it holds the value to the annotation's cap and reports one it
+discards.
 */}}
 apiVersion: v1
 kind: ConfigMap

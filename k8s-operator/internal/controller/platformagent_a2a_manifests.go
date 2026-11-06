@@ -4012,9 +4012,9 @@ const (
 	// release, the operator and two LiteLLM replicas, and a surge pod for each
 	// of the two Deployments. It errs high for a CR in a namespace with no
 	// chart pods, which only loosens the bound. A hand-written CR beside a
-	// chart release (platformAgent.enabled=false) gets the release's count
-	// from the ConfigMap (#4883). tests/test_quota_preflight.py ties it to a
-	// default chart render.
+	// chart release that runs the operator (platformAgent.enabled=false) gets
+	// the release's count from the ConfigMap in the operator's namespace
+	// (#4883). tests/test_quota_preflight.py ties it to a default chart render.
 	a2aDefaultChartPods = 5
 	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
 	// enforcement half of the session bound, and anyone who can annotate the
@@ -4083,13 +4083,18 @@ func a2aParseChartPods(raw string, present bool, source string) (int64, string) 
 }
 
 // a2aQuotaAgent is the agent the session quota is sized for: agent itself
-// when it carries the chart-pods annotation, or when its namespace has no
-// chart ConfigMap; otherwise a copy carrying the ConfigMap's count as the
-// annotation, so every sizing function reads one figure (#4883). The second
-// result is why that count was discarded, "" when it was used, naming the
-// source it came from. The ConfigMap is read uncached (a2aReader), like the
-// rest of this path's bookkeeping; anyone who can write ConfigMaps in the
-// namespace can set it, so it gets the annotation's cap and Warning.
+// when it carries the chart-pods annotation, or when no chart ConfigMap can
+// be used; otherwise a copy carrying the ConfigMap's count as the annotation,
+// so every sizing function reads one figure (#4883). The second result is
+// why a count was not used, "" when it was, naming its source.
+//
+// The operator reads the chart's ConfigMap from its own namespace only
+// (r.OperatorNamespace, from POD_NAMESPACE through the downward API): the
+// release that runs the operator and its chart pods there, with a
+// PlatformAgent written by hand beside them. A chart ConfigMap in any other
+// namespace is not read, and the quota counts the default. It is read
+// uncached (a2aReader), like the rest of this path's bookkeeping, and goes
+// through the annotation's parse, cap and Warning.
 func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*agentv1alpha1.PlatformAgent, string, error) {
 	if _, ok := agent.GetAnnotations()[a2aChartPodsAnnotation]; ok {
 		_, why := a2aChartPodsCount(agent)
@@ -4102,6 +4107,9 @@ func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agen
 	}
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read the chart's pod count from ConfigMap %s: %w", a2aChartPodsConfigMapName, err)
+	}
+	if r.OperatorNamespace == "" || agent.Namespace != r.OperatorNamespace {
+		return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator reads the chart's pod count only from its own namespace (%q), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, r.OperatorNamespace, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
 	}
 	raw, present := cm.Data[a2aChartPodsConfigMapKey]
 	_, why := a2aParseChartPods(raw, present, fmt.Sprintf("ConfigMap %s key %s (the PlatformAgent carries no %s annotation)", a2aChartPodsConfigMapName, a2aChartPodsConfigMapKey, a2aChartPodsAnnotation))

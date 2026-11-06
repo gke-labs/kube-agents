@@ -8569,14 +8569,18 @@ func TestA2AQuotaAgentReadsTheChartConfigMap(t *testing.T) {
 		name       string
 		annotation *string
 		configMap  *corev1.ConfigMap
+		operatorNS string
 		want       int64
 		why        string
 	}{
-		{"the ConfigMap, without an annotation", nil, cm("11"), 11, ""},
-		{"the annotation wins over the ConfigMap", ptr.To("7"), cm("11"), 7, ""},
-		{"neither: the default", nil, nil, a2aDefaultChartPods, ""},
-		{"a ConfigMap past the cap: the default, named", nil, cm("70"), a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
-		{"an unreadable ConfigMap: the default, named", nil, cm("seven"), a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		{"the ConfigMap, without an annotation", nil, cm("11"), "test-ns", 11, ""},
+		{"the annotation wins over the ConfigMap", ptr.To("7"), cm("11"), "test-ns", 7, ""},
+		{"neither: the default", nil, nil, "test-ns", a2aDefaultChartPods, ""},
+		{"a ConfigMap past the cap: the default, named", nil, cm("70"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		{"an unreadable ConfigMap: the default, named", nil, cm("seven"), "test-ns", a2aDefaultChartPods, "ConfigMap " + a2aChartPodsConfigMapName},
+		// The operator reads the ConfigMap from its own namespace only.
+		{"a ConfigMap outside the operator's namespace: the default, said", nil, cm("11"), "kubeagents-system", a2aDefaultChartPods, "only from its own namespace"},
+		{"an operator with no namespace: the default, said", nil, cm("11"), "", a2aDefaultChartPods, "only from its own namespace"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
@@ -8588,7 +8592,7 @@ func TestA2AQuotaAgentReadsTheChartConfigMap(t *testing.T) {
 				objs = append(objs, tc.configMap)
 			}
 			cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build()
-			r := &PlatformAgentReconciler{Client: cl}
+			r := &PlatformAgentReconciler{Client: cl, OperatorNamespace: tc.operatorNS}
 			sized, why, err := r.a2aQuotaAgent(context.Background(), agent)
 			if err != nil {
 				t.Fatal(err)
@@ -8607,15 +8611,21 @@ func TestA2AQuotaAgentReadsTheChartConfigMap(t *testing.T) {
 }
 
 // The reconcile sizes the applied session quota from the ConfigMap's count
-// when the CR has no annotation, and warns, naming the ConfigMap, when it
-// discards one (#4883).
+// when the CR has no annotation and the ConfigMap is in the operator's own
+// namespace, and warns, naming the ConfigMap, when it discards one or does
+// not read one from another namespace (#4883).
 func TestA2ASessionQuotaFollowsTheChartConfigMap(t *testing.T) {
 	for _, tc := range []struct {
-		value string
-		pods  int64
-		warns bool
-	}{{"11", 11, false}, {"70", a2aDefaultChartPods, true}} {
-		t.Run(tc.value, func(t *testing.T) {
+		value      string
+		operatorNS string
+		pods       int64
+		warns      bool
+	}{
+		{"11", "test-ns", 11, false},
+		{"70", "test-ns", a2aDefaultChartPods, true},
+		{"11", "kubeagents-system", a2aDefaultChartPods, true},
+	} {
+		t.Run(tc.value+"/"+tc.operatorNS, func(t *testing.T) {
 			agent := a2aTestAgent()
 			cm := &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{Name: a2aChartPodsConfigMapName, Namespace: agent.Namespace},
@@ -8626,7 +8636,7 @@ func TestA2ASessionQuotaFollowsTheChartConfigMap(t *testing.T) {
 				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
 			rec := record.NewFakeRecorder(256)
-			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec}
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec, OperatorNamespace: tc.operatorNS}
 			if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
 				t.Fatal(err)
 			}
