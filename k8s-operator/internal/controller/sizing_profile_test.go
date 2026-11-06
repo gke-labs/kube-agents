@@ -33,8 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -2563,6 +2565,61 @@ func TestSizingStepBackRequeueFollowsTheHold(t *testing.T) {
 	r.steppedBackAt.Store(key, time.Now().Add(-sizingStepBackHoldInterval))
 	if got := r.sizingStepBackRequeue(agent); got != secretEnvReprobeInterval {
 		t.Errorf("requeue after the hold = %s, want the caller's ceiling %s", got, secretEnvReprobeInterval)
+	}
+}
+
+// The min at Reconcile's tail is what turns the hold's end into a pass: a
+// held step back has to shorten the steady-state requeue to what is left of
+// the hold, and a hold that has passed has to leave the caller's ceiling
+// alone. Read off Reconcile itself, as the usage record's cap is, because the
+// helper passing on its own says nothing about whether the tail still
+// consults it.
+func TestReconcileRequeuesForTheHoldsEndWhileAStepBackIsHeld(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		// The sandbox keys Secret keeps the agent out of Degraded, whose 30s
+		// requeue would mask the interval under test.
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	// The finalizer, then the workload and the status, then a settled pass.
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", pass, err)
+		}
+	}
+	settled, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("settled Reconcile: %v", err)
+	}
+	if settled.RequeueAfter != secretEnvReprobeInterval {
+		t.Fatalf("settled RequeueAfter = %v, want the ceiling %v before any step back is held", settled.RequeueAfter, secretEnvReprobeInterval)
+	}
+
+	elapsed := 3 * time.Minute
+	r.steppedBackAt.Store(client.ObjectKeyFromObject(agent), time.Now().Add(-elapsed))
+	held, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile with a step back held: %v", err)
+	}
+	if remaining := sizingStepBackHoldInterval - elapsed; held.RequeueAfter <= 0 || held.RequeueAfter > remaining || held.RequeueAfter < remaining-time.Minute {
+		t.Errorf("RequeueAfter = %v %v into the hold, want about the %v left of it: nothing else schedules the pass that measures the step again", held.RequeueAfter, elapsed, remaining)
+	}
+
+	r.steppedBackAt.Store(client.ObjectKeyFromObject(agent), time.Now().Add(-sizingStepBackHoldInterval))
+	released, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile with the hold passed: %v", err)
+	}
+	if released.RequeueAfter != secretEnvReprobeInterval {
+		t.Errorf("RequeueAfter = %v after the hold, want the ceiling %v", released.RequeueAfter, secretEnvReprobeInterval)
 	}
 }
 
