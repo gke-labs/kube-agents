@@ -38,14 +38,16 @@ const peopleKeyHexLen = 32
 // nobody has seen since; the desk follows the bucket in memory (seen) so the
 // distinct people of the last peopleWindowShort and peopleWindowLong can be
 // counted without a read per key.
+// peopleRetryInterval is how often the gateway looks again for a people
+// bucket it did not find at start, and peopleRetries how many times, as for
+// the feedback bucket (feedbackRetryInterval, feedbackRetries). The off
+// switch's purge (purgePeople) retries a failed attempt on the same schedule.
+// Each Gateway carries its own copy (peopleRetry), which a test shortens on
+// its own gateway.
+const peopleRetryInterval = time.Minute
+
 const (
-	// peopleRetryInterval is how often the gateway looks again for a people
-	// bucket it did not find at start, and peopleRetries how many times, as
-	// for the feedback bucket (feedbackRetryInterval, feedbackRetries). The
-	// off switch's purge (purgePeople) retries a failed attempt on the same
-	// schedule.
-	peopleRetryInterval = time.Minute
-	peopleRetries       = 30
+	peopleRetries = 30
 	// peopleWatchRetryInterval is how long the desk waits before it watches
 	// the bucket again after a watch ended or failed.
 	peopleWatchRetryInterval = time.Minute
@@ -140,21 +142,27 @@ func (k *peopleKeyer) Key(principal string) string {
 	return peopleKeyPrefix + hex.EncodeToString(mac.Sum(nil))[:peopleKeyHexLen]
 }
 
-// startPeople purges the people bucket when the count is turned off, and
-// otherwise turns it on (tryPeople), or, when it cannot yet, tries again
-// every peopleRetryInterval until it can, ctx ends or peopleRetries tries
-// have failed.
-func (g *Gateway) startPeople(ctx context.Context) {
+// startPeople makes the first try to turn the people count on (tryPeople),
+// and reports whether that settled it: on, or turned off on this install
+// (which purges the bucket). Run calls it before the relay binds, and calls
+// retryPeople after the bind when it did not.
+func (g *Gateway) startPeople(ctx context.Context) bool {
 	if g.cfg.PeopleSeenOff {
 		g.log.Info(peopleOffSwitchLog)
 		go g.purgePeople(ctx)
-		return
+		return true
 	}
-	if g.tryPeople(ctx, false) {
-		return
-	}
+	return g.tryPeople(ctx, false)
+}
+
+// retryPeople tries again every g.peopleRetry until the count is on,
+// ctx ends or peopleRetries tries have failed. Run starts it once the relay
+// has bound rather than before: the provision Job creates the bucket with
+// TASKS, and a relay that waited for TASKS longer than the retries last
+// would otherwise come up with the count given up on for good.
+func (g *Gateway) retryPeople(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(peopleRetryInterval)
+		ticker := time.NewTicker(g.peopleRetry)
 		defer ticker.Stop()
 		for range peopleRetries {
 			select {
