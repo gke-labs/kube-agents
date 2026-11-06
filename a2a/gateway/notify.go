@@ -94,7 +94,8 @@ const (
 	notifyNoConversations = "this route does not post into conversations"
 	// notifyConversationRefused is the one refusal for a conversation the
 	// request may not post into, whatever the reason: no session record, a
-	// context id that does not match, or a record that cannot be read.
+	// context id that does not match, or a record that doesn't decode. A
+	// record that couldn't be read in time gets notifyRecordUnreadable.
 	notifyConversationRefused = "not a live conversation with that context"
 	// notifyUpdateKeysMax is the spec's cap on a conversation's, or a home
 	// thread's, live update keys (spec-a2a-payloads.md, "Card work after
