@@ -82,7 +82,10 @@ verification_spec:
         - "(?i)public issue"
         # The offer, in the words the skill's summary card answers to.
         - "(?i)usage summary"
-        - '\?'
+        # The ask for a yes, as a question or as the imperative the offer
+        # line invites ("say add the usage summary, or just yes to file it"):
+        # the first green on the branch asked without a question mark.
+        - '(?i)(?:\?|\byes\b)'
   # Nothing filed, nothing claimed filed: the patterns the earlier case uses,
   # verbatim; bench/tests/test_chat_feedback_filing_claim_patterns.py holds
   # both corpora.
