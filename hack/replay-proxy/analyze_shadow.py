@@ -32,7 +32,10 @@ from outside the bucket. A line whose tag names another kind than its file is
 dropped and counted. A `nightly-untrusted` line (a scheduled run that uploaded
 as an account presubmits can also run as, hack/ci-env.sh) is counted and never
 a source, nor a miss's closest request: pull-request code could have written
-it.
+it. A `nightly` line is one no account pull-request code runs as uploaded; it
+is not proof that the night was free of pull-request influence, since a
+presubmit with cluster access in the same pool project could have tampered
+with that night's proxy (hack/replay-proxy/README.md, Limitations).
 
 A sighting is available from when its answer finished (`ts + latency_ms`),
 and counts only when replay would have saved it (the line's `unstorable` list

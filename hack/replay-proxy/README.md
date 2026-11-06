@@ -79,6 +79,7 @@ Keep the bucket's layout: `analyze_shadow.py` takes a line's kind from the top-l
 Limitations:
 
 - each kind writes under its own top-level prefix, and IAM conditions on the object name confine each runner to its own (create and view, never delete): `prowjob-default-sa` to `presubmit/` and `nightly-untrusted/`, `eval-baseline-recorder` to `nightly/` and `nightly-untrusted/`. Below its prefix an uploader names every path, so within `presubmit/` and `nightly-untrusted/` one run could still write under another's build, and any file off the collector's layout is only skipped and counted;
+- `nightly/` guarantees who uploaded, not that the night is free of pull-request influence: no account pull-request code runs as can create objects there, but the Prow runner holds `roles/container.admin` in every pool project ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)), so a presubmit leased into the same project as a running nightly could exec into or patch that night's `inference-replay-shadow` pods, and the nightly runner's collector would upload what they then hold under `nightly/`. The design names the same gap for the cache's nightly writer ([Who can write to the cache](../../examples/inference-replay/eval-design.md#who-can-write-to-the-cache));
 - the image is built from the commit under test, not from `PULL_BASE_SHA` as the design's replay stage requires ("The proxy can't come from the pull request"). Shadow mode changes no verdict, but a pull request can change what its own run records.
 
 ## Tests
