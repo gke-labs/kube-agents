@@ -528,7 +528,11 @@ ENV_PROFILE_SLOTS = "CREDENTIAL_PROXY_PROFILE_SLOTS"
 # a loop-guard key, never an authorization input, since the body is the
 # model's to compose. A request with no key in its environment -- a collector
 # an operator runs by hand, a bare curl -- is uncounted; a collector a card or
-# a run launches inherits the key and counts against it. The ceiling applies
+# a run launches inherits the key and counts against it. A key's counts last
+# as long as the budget remembers it (SESSION_TOOL_BUDGET_MAX_SESSIONS keys,
+# or the process): a cron run's key names one execution, so its counts end
+# with the run, while a card's key is the card id, so its ceiling and its
+# streak span every dispatch of the card on this replica. The ceiling applies
 # to the background-running roles only (SESSION_BUDGET_CEILING_ROLES), and a
 # chat turn in the shell sandbox runs from no card or run directory and so
 # sends no key, which together keep a conversation out of it; the loop

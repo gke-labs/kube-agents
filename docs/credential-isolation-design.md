@@ -417,7 +417,9 @@ including:
   is refused the same command, on the same cluster, after it failed or was blocked
   `BROKER_SESSION_MAX_IDENTICAL_FAILURES` times running, with `403 BROKER_LOOP_BREAKER`;
   the site's [troubleshooting entries](site/src/content/docs/reference/credential-isolation.md#troubleshooting)
-  carry the defaults and the operator's knobs. The key is a loop guard, never an
+  carry the defaults and the operator's knobs. A key's counts last as long as the broker remembers it: a
+  scheduled run's key names one execution, a card's names the card, so a card's ceiling
+  and streak span its dispatches on a replica. The key is a loop guard, never an
   identity: it comes from the body, which the model composes, so no policy decision
   reads it, a request with no key is uncounted, and the authenticated principal stays
   the only input to who may do what. Each broker process counts alone, in a bounded
