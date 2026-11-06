@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1018,5 +1019,61 @@ func TestAnUnattendedOnlyProfileGetsTheCABundleForItsJobs(t *testing.T) {
 	}
 	if err := c.Get(ctx, bundleKey, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the CA bundle outlived Job mode with no pool to mount it: %v", err)
+	}
+}
+
+// Past the tool limit with image volumes off, a profile's Job pods would never
+// schedule on Autopilot, as its pool's wouldn't: it gets no Job template, the
+// reconcile names it as a profile-namespace error, and the other profiles keep
+// theirs. With image volumes on, it gets its template.
+func TestAProfilePastTheToolLimitGetsNoJobTemplateWithoutImageVolumes(t *testing.T) {
+	agent := a2aTestAgent()
+	r, c := jobTemplateTestReconciler(t, agent)
+	ctx := context.Background()
+	pns := profileNamespaceName(agent)
+	big := unattendedProfile(agent, "big")
+	big.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierUnattended}
+	for i := 0; i <= profileWorkerAutopilotToolLimit; i++ {
+		big.Spec.Tools = append(big.Spec.Tools, agentv1alpha1.AgentProfileTool{Name: "tool" + strconv.Itoa(i), Image: "registry.example/tool" + strconv.Itoa(i) + ":1"})
+	}
+	profiles := []agentv1alpha1.AgentProfile{big, unattendedProfile(agent, "small")}
+	param := func(name string) error {
+		return c.Get(ctx, types.NamespacedName{Namespace: pns, Name: dispatchJobTemplatePrefix + name}, &agentv1alpha1.DispatchJobTemplate{})
+	}
+
+	agent.Annotations = map[string]string{"kubeagents.x-k8s.io/enable-image-volumes": "false"}
+	profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true)
+	if err != nil || profileErr == nil {
+		t.Fatalf("a profile past the tool limit should surface as a profile-namespace error: %v / %v", err, profileErr)
+	}
+	if want := "AgentProfile big has " + strconv.Itoa(profileWorkerAutopilotToolLimit+1) + " tools"; !strings.Contains(profileErr.Error(), want) || !strings.Contains(profileErr.Error(), "Job template") {
+		t.Errorf("the error %q doesn't name the profile's Job template and its tools (%q)", profileErr, want)
+	}
+	if err := param("big"); !apierrors.IsNotFound(err) {
+		t.Errorf("a profile past the tool limit got a Job template without image volumes: %v", err)
+	}
+	var cm corev1.ConfigMap
+	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	var cfg a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range cfg.Profiles {
+		if p.Name == "big" && p.JobTemplate != nil {
+			t.Error("the dispatch config names a Job template for a profile past the tool limit")
+		}
+	}
+	if err := param("small"); err != nil {
+		t.Errorf("a profile past the tool limit held up another profile's Job template: %v", err)
+	}
+
+	agent.Annotations["kubeagents.x-k8s.io/enable-image-volumes"] = "true"
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("with image volumes: %v / %v", err, profileErr)
+	}
+	if err := param("big"); err != nil {
+		t.Errorf("with image volumes the profile got no Job template: %v", err)
 	}
 }

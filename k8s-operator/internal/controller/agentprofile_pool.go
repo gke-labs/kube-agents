@@ -283,6 +283,17 @@ func profileWorkerResetPaths(mounts []corev1.VolumeMount, volumes []corev1.Volum
 	return paths
 }
 
+// profileWorkerToolsProblem says why a profile's worker pod, a pool's or a
+// Job's, would never schedule, or "": past profileWorkerAutopilotToolLimit
+// tools with image volumes off, its ephemeral request passes Autopilot's 10Gi.
+func profileWorkerToolsProblem(p *agentv1alpha1.AgentProfile, imageVolumes bool) string {
+	if n := len(p.Spec.Tools); !imageVolumes && n > profileWorkerAutopilotToolLimit {
+		return fmt.Sprintf("AgentProfile %s has %d tools; without image volumes a worker fits Autopilot's 10Gi of ephemeral storage with at most %d",
+			p.Name, n, profileWorkerAutopilotToolLimit)
+	}
+	return ""
+}
+
 // profilePoolName is the warm pool Deployment for one (profile, tier).
 func profilePoolName(profile, tier string) string {
 	return "agentprofile-" + profile + "-" + tier
@@ -378,9 +389,8 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 			// never schedule. The pool isn't applied, and the error names the
 			// profile, like a pool the API server refuses (which stays
 			// wanted too, so an earlier pool isn't swept).
-			if n := len(profiles[i].Spec.Tools); !imageVolumes && n > profileWorkerAutopilotToolLimit {
-				errs = append(errs, fmt.Errorf("the warm pool %s: AgentProfile %s has %d tools; without image volumes a worker fits Autopilot's 10Gi of ephemeral storage with at most %d",
-					pool.Name, profiles[i].Name, n, profileWorkerAutopilotToolLimit))
+			if problem := profileWorkerToolsProblem(&profiles[i], imageVolumes); problem != "" {
+				errs = append(errs, fmt.Errorf("the warm pool %s: %s", pool.Name, problem))
 				continue
 			}
 			pools = append(pools, pool)

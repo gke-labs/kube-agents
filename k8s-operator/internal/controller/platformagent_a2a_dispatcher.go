@@ -647,7 +647,8 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 	// One rendering of each unattended profile's Job template, into the
 	// dispatch config and into the admission policy's params, so the two
 	// never differ.
-	jobTemplates := dispatchJobTemplates(agent, profiles, r.imageVolumeSupported(agent))
+	imageVolumes := r.imageVolumeSupported(agent)
+	jobTemplates := dispatchJobTemplates(agent, profiles, imageVolumes)
 	// Wanted: the chart's signal, and the policy in the cluster as
 	// rendered. A read that answers neither way changes nothing.
 	signal := dispatcherJobPolicyRendered()
@@ -715,6 +716,9 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			}
 		}
 	}
+	// A profile whose Job pods would never schedule got no template; the
+	// error names it, as the pool path's does.
+	jobErr = goerrors.Join(dispatchJobToolsProblems(agent, profiles, imageVolumes), jobErr)
 	for i := range profiles {
 		if jobTemplates[profiles[i].Name] == nil {
 			continue

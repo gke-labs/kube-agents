@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"slices"
@@ -221,7 +222,9 @@ func dispatcherJobPolicyRendered() bool {
 }
 
 // dispatchJobTemplates is the Job template of each profile the dispatch
-// config admits that allows the unattended tier, by profile name.
+// config admits that allows the unattended tier, by profile name. A profile
+// whose worker would never schedule (profileWorkerToolsProblem) gets none,
+// as it gets no pool; dispatchJobToolsProblems says why.
 func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool) map[string]*corev1.PodTemplateSpec {
 	if !dispatcherJobPolicyRendered() {
 		return nil
@@ -230,12 +233,34 @@ func dispatchJobTemplates(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
-		if resolved[p.Name].refused != nil || !slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
+		if resolved[p.Name].refused != nil || !slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) ||
+			profileWorkerToolsProblem(p, imageVolumes) != "" {
 			continue
 		}
 		out[p.Name] = buildProfileJobTemplate(agent, p, imageVolumes)
 	}
 	return out
+}
+
+// dispatchJobToolsProblems names each profile dispatchJobTemplates leaves
+// without a Job template because its worker would never schedule, as the
+// pool path names one it leaves without a pool.
+func dispatchJobToolsProblems(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, imageVolumes bool) error {
+	if !dispatcherJobPolicyRendered() {
+		return nil
+	}
+	var errs []error
+	resolved := resolveAgentProfileIdentities(agent, profiles)
+	for i := range profiles {
+		p := &profiles[i]
+		if resolved[p.Name].refused != nil || !slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended) {
+			continue
+		}
+		if problem := profileWorkerToolsProblem(p, imageVolumes); problem != "" {
+			errs = append(errs, fmt.Errorf("the Job template of profile %s: %s", p.Name, problem))
+		}
+	}
+	return goerrors.Join(errs...)
 }
 
 // dispatchJobLabels are the labels on every Job the dispatcher creates.
