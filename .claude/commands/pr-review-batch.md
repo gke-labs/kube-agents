@@ -41,9 +41,9 @@ The repo is named literally in both: Phase −1 runs before Phase 0 defines `$RE
 ```bash
 # Signal 1, in one call: the head SHA, the bot's reviews with the commit each one
 # actually read, the commit graph, the open threads, and the contested ones: a
-# resolved thread whose last reply starts `declined:` or `deferred to`. The filter
-# reports the commits *after* the review's commit, which is what the currency
-# test needs.
+# resolved thread whose last reply starts with `declined` or `deferred`, in any
+# case and with or without a colon. The filter reports the commits *after* the
+# review's commit, which is what the currency test needs.
 gh api graphql -f query='
 query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(number:$pr){
   headRefOid isDraft state author{login}
@@ -54,7 +54,7 @@ query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(numb
 | ([$p.reviews.nodes[] | select(.author.login == "kube-agents-bot")] | last) as $r
 | ($p.commits.nodes | map(.commit)) as $cs
 | ($cs | map(.oid) | index($r.commit.oid // "")) as $i
-| "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length) contested=\([$p.reviewThreads.nodes[]|select(.isResolved and ((.last.nodes[0].body // "") | (startswith("declined:") or startswith("deferred to"))))]|length)",
+| "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length) contested=\([$p.reviewThreads.nodes[]|select(.isResolved and ((.last.nodes[0].body // "") | ascii_downcase | test("^(declined|deferred)\\b")))]|length)",
   (if $r == null then "lastbot: NONE"
    else "lastbot at=\($r.submittedAt) commit=\($r.commit.oid)",
         ($r.body | split("\n") | [.[0], (.[] | select(startswith("### Findings outside") or startswith("#### ") or startswith("_This was a")))] | join("\n")),
@@ -72,10 +72,10 @@ Use GraphQL for the reviews rather than `gh api repos/$REPO/pulls/<N>/reviews`: 
 has been observed returning an empty body against this repo while `/pulls/<N>/comments` worked.
 (REST does carry the review's `commit_id`, so that is not the reason — availability is.)
 
-Keep the filter's `.[0]` / `startswith` shape if you edit it. `gh --jq` is gojq, but the same
-program gets piped through real `jq` often enough that it has to run in both, and jq rejects a field
-access applied straight to a function call — `capture("…").s` compiles under gojq and is a syntax
-error under jq 1.6.
+Keep the filter's `.[0]` / `startswith` / `test` shape if you edit it. `gh --jq` is gojq, but the
+same program gets piped through real `jq` often enough that it has to run in both, and jq rejects a
+field access applied straight to a function call — `capture("…").s` compiles under gojq and is a
+syntax error under jq 1.6.
 
 All three page sizes are caps rather than promises:
 
@@ -417,9 +417,9 @@ Otherwise proceed. If a prior review exists but new commits landed, review the c
 and note in your report which findings from the prior review the new commits resolved. Read the
 existing PR conversation carefully either way — a finding the author has already answered in a
 thread is either resolved (drop it) or contested (address their argument directly rather than
-restating the claim). A resolved thread whose last reply starts `declined:` or `deferred to` is
-contested, not settled: the author resolves a declined bot finding after the reply, so read it and
-rule on the decline.
+restating the claim). A resolved thread whose last reply starts with `declined` or `deferred`, in
+any case and with or without a colon, is contested, not settled: the author resolves a declined bot
+finding after the reply, so read it and rule on the decline.
 
 ### Phase 2b — Establish intent
 
