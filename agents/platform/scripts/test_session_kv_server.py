@@ -13392,6 +13392,37 @@ class TestDataVolumeWarning(unittest.TestCase):
         self.assertEqual(self.post.call_count, 3)
         self.assertFalse(session_kv_server._data_volume_warned())
 
+    def test_a_refill_after_a_refused_all_clear_is_a_new_crossing(self):
+        self._check_at(95)
+        self.post.return_value = None
+        with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            self._check_at(80)
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_CLEAR_PENDING)
+        # Between the lines the pending all-clear neither retries nor warns.
+        self._check_at(87)
+        self.assertEqual(self.post.call_count, 2)
+        self.post.return_value = "thread-2"
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._check_at(95)
+        self.assertEqual(self.post.call_count, 3)
+        self.assertTrue(self.post.call_args.args[1].startswith("The agent's data volume is 95% full"))
+        self.assertTrue(any("data volume is 95% full" in line for line in logs.output))
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_WARNED)
+        self._check_at(96)
+        self.assertEqual(self.post.call_count, 3)
+
+    def test_a_refused_refill_warning_is_tried_again_and_the_all_clear_still_follows(self):
+        self._check_at(95)
+        self.post.return_value = None
+        with self.assertLogs(session_kv_server.logger, level="WARNING"):
+            self._check_at(80)
+            self._check_at(95)
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_CLEAR_PENDING)
+        self.post.return_value = "thread-2"
+        self._check_at(80)
+        self.assertEqual(self.post.call_args.args[1], "The agent's data volume is back to 80% full (8.0 of 10.0 GiB).")
+        self.assertEqual(session_kv_server._data_volume_state(), session_kv_server.DATA_VOLUME_ARMED)
+
     def test_no_chat_platform_logs_the_all_clear_and_rearms(self):
         self._check_at(95)
         with patch.object(session_kv_server, "enabled_chat_platforms", return_value=[session_kv_server.DEFAULT_CHAT_PLATFORM]), \

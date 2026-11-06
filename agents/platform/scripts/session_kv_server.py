@@ -172,6 +172,13 @@ DATA_VOLUME_PATH = os.getenv("PLATFORM_AGENT_HOME") or "/opt/data"
 DATA_VOLUME_CHECK_INTERVAL_SECONDS = 300
 DATA_VOLUME_REARM_PERCENT = 85
 DATA_VOLUME_CLEARED = "The agent's data volume is back to {percent}% full ({used:.1f} of {total:.1f} GiB)."
+# The states the data_volume_warning row holds: armed for the next crossing; the
+# warning delivered and standing; or back below the lower line with the
+# all-clear not delivered yet, which a refill past the warn line drops, so the
+# refill is a new crossing rather than a silence.
+DATA_VOLUME_ARMED = 0
+DATA_VOLUME_WARNED = 1
+DATA_VOLUME_CLEAR_PENDING = 2
 
 # Bounds on the index `/v1/incidents/recent` returns. Both axes matter because
 # its caller prepends the result to messages that carry no report of their own,
@@ -1759,8 +1766,8 @@ def init_db() -> None:
                 )
                 """
             )
-            # One row: whether the data volume warning has been posted for the
-            # current crossing, kept until the all-clear is. On this database rather than in memory so that a
+            # One row: where the current crossing stands (DATA_VOLUME_ARMED,
+            # _WARNED or _CLEAR_PENDING). On this database rather than in memory so that a
             # restart while the volume is still full does not post it again, and
             # on this database rather than the data volume, which is the one that
             # is full.
@@ -3152,18 +3159,22 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
         return True, 0
 
 
-def _data_volume_warned() -> bool:
+def _data_volume_state() -> int:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
         row = conn.execute("SELECT warned FROM data_volume_warning WHERE id = 1").fetchone()
-    return bool(row and row[0])
+    return row[0] if row else DATA_VOLUME_ARMED
 
 
-def _set_data_volume_warned(warned: bool) -> None:
-    """Set the flag to `warned`."""
+def _data_volume_warned() -> bool:
+    """Whether a warning was posted and its all-clear is not yet delivered."""
+    return _data_volume_state() != DATA_VOLUME_ARMED
+
+
+def _set_data_volume_state(state: int) -> None:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
         with conn:
             conn.execute("INSERT OR IGNORE INTO data_volume_warning (id, warned) VALUES (1, 0)")
-            conn.execute("UPDATE data_volume_warning SET warned = ? WHERE id = 1", (int(warned),))
+            conn.execute("UPDATE data_volume_warning SET warned = ? WHERE id = 1", (state,))
 
 
 def _post_data_volume_warning(message: str, what: str = "warning") -> bool:
@@ -3193,24 +3204,25 @@ def check_data_volume() -> None:
         return
     total, free = usage
     percent = kanban_board_health.data_volume_percent(total, free)
-    warned = _data_volume_warned()
-    if warned:
-        if percent < DATA_VOLUME_REARM_PERCENT:
-            message = kanban_board_health.data_volume_text(DATA_VOLUME_CLEARED, total, free)
-            logger.info(message)
-            # Re-armed only after the all-clear is delivered, for the reason
-            # the warning's flag is set only after it is.
-            if _post_data_volume_warning(message, "all-clear"):
-                _set_data_volume_warned(False)
+    state = _data_volume_state()
+    if state != DATA_VOLUME_ARMED and percent < DATA_VOLUME_REARM_PERCENT:
+        message = kanban_board_health.data_volume_text(DATA_VOLUME_CLEARED, total, free)
+        logger.info(message)
+        # Re-armed only after the all-clear is delivered, for the reason the
+        # warning's state is set only after it is.
+        delivered = _post_data_volume_warning(message, "all-clear")
+        _set_data_volume_state(DATA_VOLUME_ARMED if delivered else DATA_VOLUME_CLEAR_PENDING)
         return
-    if percent < kanban_board_health.DATA_VOLUME_WARN_PERCENT:
+    if state == DATA_VOLUME_WARNED or percent < kanban_board_health.DATA_VOLUME_WARN_PERCENT:
         return
+    # Armed, or an undelivered all-clear that the refill has made untrue: a new
+    # crossing either way.
     message = kanban_board_health.data_volume_text(kanban_board_health.DATA_VOLUME_WARNING, total, free)
     logger.warning(message)
     # Set only after the post is delivered. A process killed during the send
     # (a pod roll) then posts at the next check instead of never.
     if _post_data_volume_warning(message):
-        _set_data_volume_warned(True)
+        _set_data_volume_state(DATA_VOLUME_WARNED)
 
 
 def _data_volume_monitor() -> None:
