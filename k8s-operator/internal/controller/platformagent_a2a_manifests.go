@@ -5609,6 +5609,14 @@ type a2aProvisionState struct {
 	leaseRequeue time.Duration
 }
 
+// wantsRequeue reports whether a pass should come back at a2aPendingRequeue
+// rather than wait for an event: the stack is still converging, the gateway
+// or the bus is held, or the callouts haven't settled on the map (a map
+// taken changes nothing the operator watches).
+func (s a2aProvisionState) wantsRequeue() bool {
+	return !s.done || s.gatewayHeld || s.gatewayWaking || s.busHeld || s.calloutMap.unsettled()
+}
+
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
 // fence's DNS rule. Ungated through the shared helper: spec.networkPolicy
 // .enabled withholds the agent's own gateway policy and nothing else, so a

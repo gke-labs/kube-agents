@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -60,6 +61,9 @@ const (
 	// a2aCalloutRefusalMaxChars caps the refusal quoted in the condition.
 	a2aCalloutRefusalMaxChars = 512
 )
+
+// a2aIdentityMapRemoved is the state on a pass with the A2A stack off.
+var a2aIdentityMapRemoved = calloutMapState{}
 
 // calloutStatusAnswer is the part of the callout's /status the operator
 // reads (authcallout.Status).
@@ -109,7 +113,8 @@ func (h *httpCalloutStatus) Read(ctx context.Context, addr string) (calloutStatu
 }
 
 // calloutMapState is what the callout pods said about the map this pass:
-// the condition's status, reason and message.
+// the condition's status, reason and message. a2aIdentityMapRemoved, the
+// zero value, says the A2A stack is off and the condition goes.
 type calloutMapState struct {
 	status  metav1.ConditionStatus
 	reason  string
@@ -117,13 +122,15 @@ type calloutMapState struct {
 }
 
 // readCalloutMapState reads every Ready callout pod's /status and compares
-// it with rendered, the identity map version this pass rendered. A pod with
-// a refusal standing makes it Refused, whatever the others say; else a pod
-// on another version, or mid-way through shards, makes it Pending; else, with
-// at least one pod read, Serving. Ready pods none of which answers is
-// StatusUnreadable, which hides a refusal (a NetworkPolicy in the way, say)
-// and is a Warning; no Ready pod at all is NoReadyCallout, which the
-// callout's readiness and A2ACalloutRolloutStalled already report.
+// it with rendered, the identity map version this pass rendered. The reads
+// run side by side under one deadline, so a hung callout costs a pass
+// a2aCalloutStatusTimeout, not that per pod. A pod with a refusal standing
+// makes it Refused, whatever the others say. Else a Ready pod that didn't
+// answer makes it StatusUnreadable, since that pod may be the one holding a
+// refusal, which is a Warning; else a pod on another version, or mid-way
+// through shards, makes it Pending; else Serving. No Ready pod at all is
+// NoReadyCallout, which the callout's readiness and A2ACalloutRolloutStalled
+// already report.
 func (r *PlatformAgentReconciler) readCalloutMapState(ctx context.Context, agent *agentv1alpha1.PlatformAgent, rendered string) calloutMapState {
 	reader := r.calloutStatus
 	if reader == nil {
@@ -131,52 +138,76 @@ func (r *PlatformAgentReconciler) readCalloutMapState(ctx context.Context, agent
 	}
 	unreadable := func(why string) calloutMapState {
 		return calloutMapState{status: metav1.ConditionUnknown, reason: a2aIdentityMapStatusUnreadable,
-			message: "no auth callout pod's status could be read (" + why + "), so whether identity map " + rendered +
+			message: "an auth callout pod's status could not be read (" + why + "), so whether identity map " + rendered +
 				" was taken or refused is unknown; the callout keeps serving its previous map when it refuses one"}
 	}
 	pods := &corev1.PodList{}
 	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels(a2aCalloutPodSelector(agent))); err != nil {
 		return unreadable("listing the callout pods: " + err.Error())
 	}
-	slices.SortFunc(pods.Items, func(a, b corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
-	var pending, readErr string
-	read := 0
+	var ready []*corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if pod.Status.PodIP == "" || !podIsReady(pod) || pod.DeletionTimestamp != nil {
-			continue
+		if pod.Status.PodIP != "" && podIsReady(pod) && pod.DeletionTimestamp == nil {
+			ready = append(ready, pod)
 		}
-		answer, err := reader.Read(ctx, net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(a2aCalloutStatusPort)))
-		if err != nil {
+	}
+	if len(ready) == 0 {
+		return calloutMapState{status: metav1.ConditionUnknown, reason: a2aIdentityMapNoReadyCallout,
+			message: "no auth callout pod is Ready, so none can say whether identity map " + rendered + " was taken"}
+	}
+	slices.SortFunc(ready, func(a, b *corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
+	type result struct {
+		answer calloutStatusAnswer
+		err    error
+	}
+	results := make([]result, len(ready))
+	rctx, cancel := context.WithTimeout(ctx, a2aCalloutStatusTimeout)
+	defer cancel()
+	var wg sync.WaitGroup
+	for i, pod := range ready {
+		wg.Add(1)
+		go func(i int, addr string) {
+			defer wg.Done()
+			a, err := reader.Read(rctx, addr)
+			results[i] = result{a, err}
+		}(i, net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(a2aCalloutStatusPort)))
+	}
+	wg.Wait()
+	var pending, readErr string
+	for i, pod := range ready {
+		res := results[i]
+		switch {
+		case res.err != nil:
 			if readErr == "" {
-				readErr = pod.Name + ": " + err.Error()
+				readErr = pod.Name + ": " + res.err.Error()
 			}
-			continue
-		}
-		read++
-		if answer.LastError != "" {
+		case res.answer.LastError != "":
 			return calloutMapState{status: metav1.ConditionFalse, reason: a2aIdentityMapRefused,
 				message: fmt.Sprintf("auth callout pod %s refused identity map %s and serves version %q in its place: %s",
-					pod.Name, rendered, answer.Version, truncateForCondition(answer.LastError, a2aCalloutRefusalMaxChars))}
-		}
-		if pending == "" && (answer.Version != rendered || answer.Pending != "") {
-			pending = fmt.Sprintf("auth callout pod %s serves identity map %q, not yet %s", pod.Name, answer.Version, rendered)
-			if answer.Pending != "" {
-				pending += " (" + truncateForCondition(answer.Pending, a2aCalloutRefusalMaxChars) + ")"
+					pod.Name, rendered, res.answer.Version, truncateForCondition(res.answer.LastError, a2aCalloutRefusalMaxChars))}
+		case pending == "" && (res.answer.Version != rendered || res.answer.Pending != ""):
+			pending = fmt.Sprintf("auth callout pod %s serves identity map %q, not yet %s", pod.Name, res.answer.Version, rendered)
+			if res.answer.Pending != "" {
+				pending += " (" + truncateForCondition(res.answer.Pending, a2aCalloutRefusalMaxChars) + ")"
 			}
 		}
 	}
 	switch {
-	case read == 0 && readErr != "":
+	case readErr != "":
 		return unreadable(readErr)
-	case read == 0:
-		return calloutMapState{status: metav1.ConditionUnknown, reason: a2aIdentityMapNoReadyCallout,
-			message: "no auth callout pod is Ready, so none can say whether identity map " + rendered + " was taken"}
 	case pending != "":
 		return calloutMapState{status: metav1.ConditionFalse, reason: a2aIdentityMapPending, message: pending}
 	}
 	return calloutMapState{status: metav1.ConditionTrue, reason: a2aIdentityMapServing,
 		message: fmt.Sprintf("every Ready auth callout pod serves identity map %s", rendered)}
+}
+
+// unsettled reports whether the state is one the next pass should look at
+// again soon: a map still loading, or pods that didn't answer. Nothing the
+// operator watches changes when a callout takes a map.
+func (s *calloutMapState) unsettled() bool {
+	return s != nil && (s.reason == a2aIdentityMapPending || s.reason == a2aIdentityMapStatusUnreadable)
 }
 
 // truncateForCondition caps s at n bytes, on a rune boundary, marking a cut.
@@ -202,10 +233,15 @@ func podIsReady(pod *corev1.Pod) bool {
 	return false
 }
 
-// setA2AIdentityMapAppliedCondition writes state onto the agent; a nil state
-// (no map rendered this pass) leaves the condition as it is.
+// setA2AIdentityMapAppliedCondition writes state onto the agent. A nil state
+// (no map rendered this pass) leaves the condition as it is; an empty one
+// (the A2A stack is off, a2aIdentityMapRemoved) removes it.
 func setA2AIdentityMapAppliedCondition(agent *agentv1alpha1.PlatformAgent, state *calloutMapState, now metav1.Time) {
 	if state == nil {
+		return
+	}
+	if state.reason == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aIdentityMapAppliedConditionType)
 		return
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
@@ -225,6 +261,9 @@ func a2aIdentityMapAppliedConditionCurrent(agent *agentv1alpha1.PlatformAgent, s
 		return true
 	}
 	c := meta.FindStatusCondition(agent.Status.Conditions, a2aIdentityMapAppliedConditionType)
+	if state.reason == "" {
+		return c == nil
+	}
 	return c != nil && c.Status == state.status && c.Reason == state.reason && c.Message == state.message &&
 		c.ObservedGeneration == agent.Generation
 }
