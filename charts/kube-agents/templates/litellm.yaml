@@ -716,6 +716,23 @@ spec:
 {{- $replayShadowDataSize := "2Gi" }}
 {{- $replayShadowDataMaxBytes := 1610612736 }}
 {{- /*
+  The mode (values.yaml, replayShadow.mode). Record and replay keep saved
+  answers in the same volume (cacheDir): record's are emptied as the collector
+  copies them out, replay's are the seeded cache, which the replay lane holds
+  to 512 MiB (hack/replay-proxy/fetch_cache.py). Either way the logs and store
+  get a 1 GiB budget instead, so all three stay under the volume. Replay
+  serves answers, so it renders only with allowServe as well; the schema
+  refuses either alone, and this refuses it again.
+*/}}
+{{- $replayShadowMode := $replayShadow.mode | default "shadow" }}
+{{- $replayShadowAllowServe := default false $replayShadow.allowServe }}
+{{- if or (and (eq $replayShadowMode "replay") (not $replayShadowAllowServe)) (and $replayShadowAllowServe (ne $replayShadowMode "replay")) }}
+{{- fail "litellm.replayShadow: mode replay and allowServe true go together; set both or neither" }}
+{{- end }}
+{{- if ne $replayShadowMode "shadow" }}
+{{- $replayShadowDataMaxBytes = 1073741824 }}
+{{- end }}
+{{- /*
   The proxy closes a log segment this long after its first line, and a pod
   being replaced keeps running this long after it leaves the Service
   (preStop). While it drains, its segments close 5 s after their first line
@@ -838,6 +855,17 @@ spec:
               value: {{ $replayShadowJob.build | default "" | quote }}
             - name: REPLAY_JOB_PR
               value: {{ $replayShadowJob.pr | default "" | quote }}
+            {{- if ne $replayShadowMode "shadow" }}
+            - name: REPLAY_MODE
+              value: {{ $replayShadowMode | quote }}
+            - name: REPLAY_CACHE_DIR
+              value: {{ $replayShadow.cacheDir | default "/data/replay-cache" | quote }}
+            {{- end }}
+            {{- if and (eq $replayShadowMode "replay") $replayShadowAllowServe }}
+            # Replay mode refuses to start without it (hack/replay-proxy/README.md, "Modes").
+            - name: REPLAY_ALLOW_SERVE
+              value: "yes"
+            {{- end }}
           ports:
             - containerPort: 8080
           # Forwarded through the proxy to LiteLLM's own readiness endpoint, so

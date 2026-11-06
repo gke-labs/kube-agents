@@ -687,9 +687,21 @@ litellm:
     rollingUpdate:
       maxSurge: 1
       maxUnavailable: 0
-    # Stamped on every log line (REPLAY_JOB_*). kind is nightly or presubmit,
-    # and is required when the proxy is on: an untagged line counts in no
-    # estimate.
+    # What the proxy does with answers (hack/replay-proxy/README.md, "Modes").
+    # shadow, the default, saves and serves nothing. record also saves each
+    # answer under cacheDir, for a trusted nightly (job.kind nightly) to
+    # publish. replay serves saved answers instead of calling the model, for
+    # the replay lane (job.kind replay-lane) only, and needs allowServe: true
+    # as well; the schema refuses either of those two without the other, so
+    # one value set by mistake can't serve an answer. hack/ci-env.sh decides
+    # the mode (resolve_replay_shadow). cacheDir is one directory in the data
+    # volume, beside the proxy's logs/ and store/.
+    mode: shadow
+    cacheDir: /data/replay-cache
+    allowServe: false
+    # Stamped on every log line (REPLAY_JOB_*). kind is nightly, presubmit or
+    # replay-lane, and is required when the proxy is on: an untagged line
+    # counts in no estimate.
     job:
       kind: ""
       project: ""
