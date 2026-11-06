@@ -98,8 +98,7 @@ LOGGER = logging.getLogger("credential-proxy.vcs")
 #: The key in a forge's credentials Secret that holds its read-only token.
 FORGE_READ_TOKEN_KEY = "read-token"
 
-# The same shape of ceiling `content_workspace` applies, for the same reason:
-# the broker's scratch volume is an emptyDir sized for manifests, and a
+# A ceiling on one clone: the broker's scratch volume is an emptyDir sized for manifests, and a
 # repository that does not fit should say so rather than fill the disk out from
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
@@ -515,7 +514,7 @@ def _tree_bytes(root: Path, stop_past: int) -> int:
 def _snapshot_paths(raw: Any) -> list[str]:
     """`paths` of a snapshot request: literal repository-relative names, or none.
 
-    Each is checked as the content routes check a name (`validate_path`):
+    Each is checked with `validate_path`:
     no absolute path, no `.` or `..` segment, no `.git` segment, no control
     character.
     """

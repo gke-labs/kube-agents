@@ -224,7 +224,7 @@ const (
 	credentialProxyAutopilotCPUStepMilli int64 = 250
 	// The limits. CPU is the ceiling a mint or a listing may burst to on
 	// Standard; memory is what the comment above sizes; ephemeral storage
-	// bounds the content workspace (the broker's own clone of a repository
+	// bounds the vcs scratch trees (the broker's own clones of a repository
 	// under its state emptyDir) together with /tmp, so a runaway clone fills
 	// the container's allowance rather than the node's disk. A CR override
 	// that sets only limits.memory keeps all three of the others.
@@ -258,7 +258,7 @@ const (
 	// The sizing test holds the limit to the caps plus this.
 	credentialProxyEphemeralStorageHeadroom = "1Gi"
 	// The emptyDir sizeLimits of the broker's /tmp and of its state volume (the
-	// content workspace and vcs scratch). The kubelet evicts the pod when either
+	// vcs scratch). The kubelet evicts the pod when either
 	// fills, whatever the container's ephemeral-storage limit, and the default
 	// render keeps these figures, each under the container's limit so that a
 	// runaway in one volume cannot take the other's share. A CR override that
@@ -363,7 +363,7 @@ func credentialProxyMinimumMemoryLimitBytes(outputCapBytes int64) int64 {
 // one setting an install reaches for is the memory limit (#2324), and a
 // wholesale replacement would make "raise the limit to 2Gi" silently drop the
 // CPU request Autopilot sizes the pod by and the ephemeral-storage limit that
-// bounds the content workspace. Each key the override carries wins; each it
+// bounds the vcs scratch. Each key the override carries wins; each it
 // omits keeps the operator's value. Claims, the fourth map on
 // ResourceRequirements, are not carried: the proxy pod names no ResourceClaim.
 func resolveCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, tier sizingTier) corev1.ResourceRequirements {
@@ -519,10 +519,9 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 // deadline is delivered again and its turn runs twice. A few seconds of
 // unavailability is the cheaper failure: the gateway retries its long poll.
 //
-// One replica, by design. The Chat relay's ack ids, the Slack relay's
-// event queue and receipts, and the content workspace live in this process or its
-// emptyDir, so a second pod behind the Service breaks them; only the exec route
-// scales as it is. docs/designs/credential-proxy-single-pod.md records the
+// One replica, by design. The Chat relay's ack ids and the Slack relay's
+// event queue and receipts live in this process or its emptyDir, so a second
+// pod behind the Service breaks them; only the exec route scales as it is. docs/designs/credential-proxy-single-pod.md records the
 // decision, the load it was sized against, and the split exec tier to build if
 // it reopens. What one pod costs on an eviction or a rollout, and how the pod
 // leaves, is buildCredentialProxyPDB's and the proxy's SIGTERM handler's.
@@ -931,7 +930,7 @@ var (
 	// Volumes the agent container must never mount, whatever the CR says.
 	// `credential-proxy-state` is the sharp one: it holds $HOME/.gitconfig, the
 	// regenerated kubeconfigs the agent is specifically not supposed to hold,
-	// and the content workspaces. Three separate controls in credential_proxy.py
+	// and the vcs scratch trees. Three separate controls in credential_proxy.py
 	// rest on the agent not seeing that directory, and each of their comments
 	// says the protection is deployment geometry rather than a check — this is
 	// the check. The CR is authored by an operator rather than by the agent, so

@@ -89,13 +89,12 @@ const (
 
 // credentialProxyExecTierEnvDropped names the broker env the exec tier does
 // not carry: the routes that read it are refused on an exec pod (§12), and
-// the relays and the content workspace are not started there.
+// the relays are not started there.
 var credentialProxyExecTierEnvDropped = map[string]bool{
-	"TOKEN_BROKER_URL":                   true,
-	execTierDroppedMinterEnv:             true,
-	"GOOGLE_CHAT_PROJECT_ID":             true,
-	"GOOGLE_CHAT_SUBSCRIPTION_NAME":      true,
-	"CREDENTIAL_PROXY_CONTENT_WORKSPACE": true,
+	"TOKEN_BROKER_URL":              true,
+	execTierDroppedMinterEnv:        true,
+	"GOOGLE_CHAT_PROJECT_ID":        true,
+	"GOOGLE_CHAT_SUBSCRIPTION_NAME": true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

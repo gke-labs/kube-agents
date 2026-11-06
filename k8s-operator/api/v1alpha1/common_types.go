@@ -1382,8 +1382,8 @@ type CredentialProxySpec struct {
 	// per GiB of the memory request. The broker sizes how many commands it
 	// admits at once from the memory limit, so raising the limit, or picking
 	// a spec.deployment.sizingProfile row that raises it, is the knob for an
-	// install whose fleet outgrows the default; the ephemeral-storage limit bounds the content
-	// workspace the broker clones into; the proxy's state emptyDir (sizeLimit
+	// install whose fleet outgrows the default; the ephemeral-storage limit bounds the vcs
+	// scratch trees the broker clones into; the proxy's state emptyDir (sizeLimit
 	// 5Gi) grows by whatever the limit is raised above the 8Gi default, and
 	// its /tmp emptyDir keeps its 2Gi, so the kubelet does not evict the pod
 	// at the smaller figure.

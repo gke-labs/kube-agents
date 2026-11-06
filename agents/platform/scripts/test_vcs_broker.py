@@ -1,9 +1,8 @@
 """Tests for the broker-side version-control routes.
 
-`clone` and `publish` run against a real `git` and real local repositories, for
-the reason `test_content_workspace.py` gives: the properties being asserted are
-properties of what git does with a bundle, and a mock would assert what this file
-believes git does. The forge is the seam that makes that possible — a test forge
+`clone` and `publish` run against a real `git` and real local repositories: the
+properties being asserted are properties of what git does with a bundle, and a
+mock would assert what this file believes git does. The forge is the seam that makes that possible — a test forge
 registered in the host allowlist points `clone_url` at a directory, so the same
 code path that would reach github.com reaches a bare repository on disk.
 

@@ -93,7 +93,7 @@ func TestCredentialProxyResourcesDefaultToTheOperatorsValues(t *testing.T) {
 // TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults is the case the
 // field exists for (#2324): a CR raises limits.memory and nothing else, and the
 // CPU request Autopilot sizes the pod by, the CPU limit and the
-// ephemeral-storage limit that bounds the content workspace all survive.
+// ephemeral-storage limit that bounds the vcs scratch all survive.
 func TestCredentialProxyMemoryLimitOverrideKeepsTheOtherDefaults(t *testing.T) {
 	container := buildCredentialProxyContainer(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
