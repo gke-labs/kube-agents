@@ -4188,6 +4188,22 @@ class SessionRoleExecutableTest(unittest.TestCase):
             with self.subTest(role=role, executable=executable):
                 self.assertEqual(want, credential_proxy.executable_permitted(role, executable))
 
+    def test_the_shell_refused_kubectl_is_pointed_at_its_sandbox_image(self):
+        # Only a sandbox image older than the agent sends kubectl here (#4966),
+        # so that refusal names the CR field that pins it; every other
+        # refusal keeps the bare policy message.
+        shell_kubectl = credential_proxy.executable_refusal_message(credential_proxy.CALLER_ROLE_SHELL, "kubectl")
+        self.assertIn("may run only gcloud", shell_kubectl)
+        self.assertIn("spec.harness.experimental.shellSandbox.image", shell_kubectl)
+        self.assertIn("ShellSandboxPinned", shell_kubectl)
+        for role, executable in (
+            (credential_proxy.CALLER_ROLE_SHELL, "gh"),
+            (credential_proxy.CALLER_ROLE_SCOPE, "kubectl"),
+            (credential_proxy.CALLER_ROLE_SESSION, "git"),
+        ):
+            with self.subTest(role=role, executable=executable):
+                self.assertNotIn("shellSandbox", credential_proxy.executable_refusal_message(role, executable))
+
     def test_git_from_a_session_is_refused_by_the_route_before_the_role(self):
         # /v1/exec admits only EXEC_ROUTE_EXECUTABLES for every role, so a
         # session asking for git meets the route's own refusal first; the role
@@ -4218,6 +4234,7 @@ class SessionRoleExecutableTest(unittest.TestCase):
             self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
             self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
             self.assertIn("shell", body["message"])
+            self.assertIn("shellSandbox.image", body["message"])
             status, body = self.post_as("", {"argv": ["git", "status"]})
             self.assertEqual(200, status, body)
 
