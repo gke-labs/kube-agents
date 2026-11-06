@@ -55,7 +55,7 @@
 # An exemption first removes one grep, egrep or fgrep invocation with its
 # options and its pattern argument (quoted or bare). A bare word or a
 # double-quoted pattern has no `$(` or backquote, and a bare word also has no
-# <, >, ( or ). It does this only on a row that is that grep and nothing
+# <, >, (, ), ;, & or |. It does this only on a row that is that grep and nothing
 # else: after the pattern, the row has no |, ;, &, backquote, (, ), <, > or
 # newline, except a `2>/dev/null` or `> /dev/null` trailer, and it is not a
 # collapsed chain (a row ending ` + N command(s)`). The file operands, and any text that the rendering
@@ -193,7 +193,7 @@ verification_spec:
       # that grep and nothing else; the case header states the limits.
       exempt_patterns:
         - >-
-          ^(?!.*\s\+\s\d+\scommands?\s*$)\s*(?:grep|egrep|fgrep)(?:\s+(?:-e\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^\s"'`$<>()](?:[^\s`$<>()]|\$(?!\())*)|-[ABCm]\s+\d+|-(?:[^\s`$<>()]|\$(?!\())+))*(?:\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^-\s"'`$<>()](?:[^\s`$<>()]|\$(?!\())*))?(?=[^;&|`()<>\n]*(?:\s*[12]?>\s*/dev/null)*\s*$)
+          ^(?!.*\s\+\s\d+\scommands?\s*$)\s*(?:grep|egrep|fgrep)(?:\s+(?:-e\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^\s"'`$<>();&|](?:[^\s`$<>();&|]|\$(?!\())*)|-[ABCm]\s+\d+|-(?:[^\s`$<>();&|]|\$(?!\())+))*(?:\s+(?:"(?:[^"`$]|\$(?!\())*"|'[^']*'|[^-\s"'`$<>();&|](?:[^\s`$<>();&|]|\$(?!\())*))?(?=[^;&|`()<>\n]*(?:\s*[12]?>\s*/dev/null)*\s*$)
       # Any row that names the workspace route, or the script with a verb
       # as the next word.
       forbidden_patterns:
