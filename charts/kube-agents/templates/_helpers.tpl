@@ -2068,21 +2068,33 @@ needs headroom for it, but it is not standing, so the session quota leaves it ou
 */}}
 {{/*
 The surge pods a rollout of one workload can add, from its maxSurge and its replicas
-(#4876): an integer as written, a percentage of the replicas rounded up, as the Deployment
-controller rounds it, and none for a workload scaled to zero. Takes a dict with
-"maxSurge" and "replicas".
+(#4876): an integer as written, or a percentage of the replicas rounded up, as the
+Deployment controller rounds it, and never more than the replicas, since the controller
+never scales the new ReplicaSet past the desired count. None for a workload scaled to zero.
+A maxSurge that is neither a whole number nor a whole percentage fails the render, which
+the API server would refuse at apply time anyway. Takes a dict with "maxSurge" and
+"replicas".
 */}}
 {{- define "kube-agents.surgePods" -}}
 {{- $replicas := .replicas | int64 -}}
-{{- $raw := trim (toString .maxSurge) -}}
-{{- if le $replicas (int64 0) -}}
-0
-{{- else if hasSuffix "%" $raw -}}
-{{- $pct := trimSuffix "%" $raw | float64 -}}
-{{- ceil (divf (mulf $pct (float64 $replicas)) 100.0) | int64 -}}
+{{- $v := .maxSurge -}}
+{{- $raw := "" -}}
+{{- if or (kindIs "float64" $v) (kindIs "int64" $v) (kindIs "int" $v) -}}
+  {{- $raw = toString ($v | int64) -}}
+  {{- if ne (float64 ($v | int64)) (float64 $v) -}}{{- $raw = toString $v -}}{{- end -}}
 {{- else -}}
-{{- $raw | int64 -}}
+  {{- $raw = trim (toString $v) -}}
 {{- end -}}
+{{- if not (regexMatch "^[0-9]+%?$" $raw) -}}
+  {{- fail (printf "quota preflight: maxSurge %q is not a whole number or a whole percentage" $raw) -}}
+{{- end -}}
+{{- $n := 0 -}}
+{{- if hasSuffix "%" $raw -}}
+  {{- $n = ceil (divf (mulf (trimSuffix "%" $raw | float64) (float64 $replicas)) 100.0) | int64 -}}
+{{- else -}}
+  {{- $n = $raw | int64 -}}
+{{- end -}}
+{{- if le $replicas (int64 0) -}}0{{- else -}}{{- min $n $replicas -}}{{- end -}}
 {{- end }}
 
 {{- define "kube-agents.chartWorkloads" -}}
@@ -2825,14 +2837,17 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $surgePods = include "kube-agents.surgePods" (dict "maxSurge" $workload.maxSurge "replicas" $replicas) | int64 -}}
   {{- end -}}
   {{- if gt $surgePods (int64 0) -}}
-    {{- /* The patch's surge room is one workload's rollout at a time: its surge pods. */ -}}
+    {{- /* chartSurgePods totals every rollout's surge pods, the figure chartQuotaPods stamps
+           for the operator's session quota. The patch's surge room stays one pod of the
+           largest surging workload: enough for a rollout to make progress, since the
+           ReplicaSet controller creates the next surge pod as quota frees up. */ -}}
     {{- $chartSurgePods = add $chartSurgePods $surgePods -}}
-    {{- $surgeCpuReq = max $surgeCpuReq (mul $res.cpuRequest $surgePods) -}}
-    {{- $surgeCpuLim = max $surgeCpuLim (mul $res.cpuLimit $surgePods) -}}
-    {{- $surgeMemReq = max $surgeMemReq (mul $res.memoryRequest $surgePods) -}}
-    {{- $surgeMemLim = max $surgeMemLim (mul $res.memoryLimit $surgePods) -}}
-    {{- $surgeEphReq = max $surgeEphReq (mul $res.ephemeralRequest $surgePods) -}}
-    {{- $surgeEphLim = max $surgeEphLim (mul $res.ephemeralLimit $surgePods) -}}
+    {{- $surgeCpuReq = max $surgeCpuReq $res.cpuRequest -}}
+    {{- $surgeCpuLim = max $surgeCpuLim $res.cpuLimit -}}
+    {{- $surgeMemReq = max $surgeMemReq $res.memoryRequest -}}
+    {{- $surgeMemLim = max $surgeMemLim $res.memoryLimit -}}
+    {{- $surgeEphReq = max $surgeEphReq $res.ephemeralRequest -}}
+    {{- $surgeEphLim = max $surgeEphLim $res.ephemeralLimit -}}
   {{- end -}}
 {{- end -}}
 

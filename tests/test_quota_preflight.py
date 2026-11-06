@@ -1163,7 +1163,9 @@ class PreflightDecisionTest(unittest.TestCase):
                     # The surge pods the controller can add: maxSurge as rendered (Kubernetes'
                     # 25% when the template sets none), a percentage rounded up (#4876).
                     raw = str((strategy.get("rollingUpdate") or {}).get("maxSurge", "25%")).strip()
-                    surges += math.ceil(float(raw[:-1]) * replicas / 100) if raw.endswith("%") else int(raw)
+                    n = math.ceil(float(raw[:-1]) * replicas / 100) if raw.endswith("%") else int(raw)
+                    # The controller never scales the new ReplicaSet past the desired count.
+                    surges += min(n, replicas)
         self.assertIsNotNone(chart_pods, "the PlatformAgent carries no a2a-quota-chart-pods annotation")
         return chart_pods, pods + surges, names
 
@@ -1197,27 +1199,40 @@ class PreflightDecisionTest(unittest.TestCase):
             ["operator.replicaCount=3", "operator.rollingUpdate.maxSurge=34%"],
             ["hindsight.enabled=true", "hindsight.api.rollingUpdate.maxSurge=3"],
             ["litellm.rollingUpdate.maxSurge=0"],
+            # Past the replicas: a rollout still adds at most the replicas.
+            ["operator.rollingUpdate.maxSurge=100"],
+            # An empty maxSurge takes the template's default, and the replay proxy reads its
+            # own key, not LiteLLM's (each list entry repeats its template's fencepost call).
+            ["litellm.rollingUpdate.maxSurge="],
+            ["litellm.replayShadow.enabled=true", "litellm.replayShadow.image.repository=r",
+             "litellm.replayShadow.image.tag=t", "litellm.replayShadow.job.kind=nightly",
+             "litellm.replayShadow.rollingUpdate.maxSurge=2"],
         ):
             with self.subTest(sets=sets):
                 chart_pods, rendered, names = self._rendered_chart_pods(["platformAgent.mode=next", *sets])
                 self.assertEqual(chart_pods, rendered, names)
 
-    def test_the_preflight_sizes_surge_room_by_the_largest_rollout(self) -> None:
-        """The patch's surge room is one workload's rollout at a time, so it holds that
-        workload's maxSurge pods at once (#4876): LiteLLM at maxSurge 3 needs room for three
-        of its pods, not one."""
+    def test_the_session_quota_counts_every_surge_pod_and_the_patch_room_stays_one(self) -> None:
+        """chartSurgePods totals each rollout's surge pods (#4876), and the patch's surge room
+        stays one pod of the largest surging workload, enough for a rollout to progress."""
         base = self._requirements(["platformAgent.mode=next", "litellm.replicaCount=4"])
         three = self._requirements(["platformAgent.mode=next", "litellm.replicaCount=4",
                                     "litellm.rollingUpdate.maxSurge=3"])
-        mem = str(yaml.safe_load(_VALUES.read_text())["litellm"]["resources"]["requests"]["memory"])
-        units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30}
-        per_pod = int(mem[:-2]) * units[mem[-2:]]
-        self.assertGreaterEqual(three["surgeRequestsMemory"], 3 * per_pod)
         self.assertEqual(three["chartSurgePods"], base["chartSurgePods"] + 2)
+        for key in ("surgeRequestsCpu", "surgeRequestsMemory", "surgeLimitsCpu", "surgeLimitsMemory"):
+            self.assertEqual(three[key], base[key], key)
+
+    def test_a_max_surge_that_is_not_a_whole_number_or_percentage_fails_the_render(self) -> None:
+        for bad in ("abc", "1.5", "50 %", "-1", "%"):
+            with self.subTest(bad=bad):
+                res = self._render({"probe": {"emitRequirements": True}},
+                                   ["platformAgent.mode=next", f"operator.rollingUpdate.maxSurge={bad}"])
+                self.assertNotEqual(res.returncode, 0, f"maxSurge={bad} rendered")
+                self.assertIn("is not a whole number or a whole percentage", res.stderr)
 
     def test_the_preflight_and_the_operator_read_one_workload_list(self) -> None:
         """quotaRequirements counts the same chart workloads as chartQuotaPods, plus the
-        uninstall-only cleanup hook, and a surge pod for each that surges (#4893)."""
+        uninstall-only cleanup hook, and the surge pods each rollout can add (#4893, #4876)."""
         op = yaml.safe_load(_FOOTPRINT.read_text())["operatorRendered"]
         operator_pods = (
             op["agentPod"]["base"]["pods"] + op["shellSandbox"]["pods"] + op["credentialProxy"]["pods"]

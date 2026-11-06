@@ -16,7 +16,7 @@ metadata:
     wins because it drives the rest of the release too: litellm.networkPolicy is
     the static render gate, telemetry.collectorNamespace the static policy's
     egress namespace, litellm.openaiCompatible the static policy's rule to
-    the model server, and the chart's pods (standing plus one surge pod per surging workload) the session quota's count. A platformAgent.annotations entry that disagrees with the
+    the model server, and the chart's pods (standing plus each workload's rollout surge pods) the session quota's count. A platformAgent.annotations entry that disagrees with the
     value it duplicates fails the render rather than being overwritten in silence.
   */}}
   {{- $litellmPolicyKey := "kubeagents.x-k8s.io/enable-litellm-network-policy" }}
@@ -74,7 +74,7 @@ metadata:
          the values, and the operator's A2AQuotaChartPodsDiscarded Warning
          covers a mode set on the PlatformAgent by hand. */}}
   {{- if and (eq (toString .Values.platformAgent.mode) "next") (gt (int $chartPods) 64) }}
-  {{- fail (printf "the chart would run %s pods at once in this namespace, counting each workload's rollout surge pods, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts, or run some of these components in another namespace." $chartPods) }}
+  {{- fail (printf "the chart would run %s pods at once in this namespace, counting each workload's rollout surge pods, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts or a workload's rollingUpdate.maxSurge, or run some of these components in another namespace." $chartPods) }}
   {{- end }}
   {{- with get $annotations $chartPodsKey }}
   {{- if ne (toString . | trim) $chartPods }}
