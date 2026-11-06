@@ -1502,13 +1502,25 @@ func (r *PlatformAgentReconciler) sizingRefusedStep(ctx context.Context, agent *
 // container at that row's render). The last term tells a refusal of the row
 // above, lingering on the Deployment after a step back from it, from the
 // latched row's own: the one asks for the row above's figure or more, the
-// other for less. At the top row nothing lingers from above.
+// other for less. It is read only where the row above moves the key on this
+// pod: an override pins a request across the rows it fits, and the proxy's
+// 4Gi memory request is the bare row at small and 4Gi at medium and fleet,
+// so at a medium latch the row above asks the same figure the medium pod
+// does and a refusal naming it is the medium pod's own; where the two rows
+// coincide nothing lingers from above that the recorded message in
+// sizingRefusedStep does not already answer. At the top row nothing lingers
+// from above.
 func sizingRefusalIsTheSteps(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, template corev1.PodTemplateSpec, name string, tier sizingTier, requested corev1.ResourceList) bool {
 	if tier == sizingTierSmall || len(requested) == 0 {
 		return false
 	}
 	step := sizedContainerStepBetween(agent, autopilot, clamped, name, tier-1, tier)
-	var aboveRequests, aboveLimits corev1.ResourceList
+	var atRequests, atLimits, aboveRequests, aboveLimits corev1.ResourceList
+	for _, rendered := range renderedSizedContainersAt(agent, autopilot, tier) {
+		if rendered.container == name {
+			atRequests, atLimits = sizingPodFigures(template, name, rendered.resources, clamped)
+		}
+	}
 	if tier < sizingTierFleet {
 		for _, rendered := range renderedSizedContainersAt(agent, autopilot, tier+1) {
 			if rendered.container == name {
@@ -1521,15 +1533,17 @@ func sizingRefusalIsTheSteps(agent *agentv1alpha1.PlatformAgent, autopilot bool,
 		if !named {
 			continue
 		}
-		side, above := step.requests, aboveRequests
+		side, at, above := step.requests, atRequests, aboveRequests
 		if dim.limits {
-			side, above = step.limits, aboveLimits
+			side, at, above = step.limits, atLimits, aboveLimits
 		}
 		if moved, ok := side[dim.resource]; !ok || moved.Sign() <= 0 {
 			continue
 		}
 		if bound, ok := above[dim.resource]; ok && asked.Cmp(bound) >= 0 {
-			continue
+			if own, has := at[dim.resource]; !has || bound.Cmp(own) > 0 {
+				continue
+			}
 		}
 		return true
 	}

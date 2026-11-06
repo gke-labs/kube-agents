@@ -2331,6 +2331,35 @@ func TestResolveSizingTierStepsBackFromARefusedRecreate(t *testing.T) {
 			}
 		}
 	})
+	t.Run("the latched row's own refusal is read when an override pins the row above's figure to it", func(t *testing.T) {
+		t.Parallel()
+		// A 4Gi requests.memory override on the proxy: the small row's 2Gi
+		// limit refuses it, so the small render is the bare row at 1Gi, and
+		// the medium and fleet rows both admit it, so the pod asks 4Gi at
+		// either. The step small to medium moves the key by 3Gi, but the
+		// row above asks the same 4Gi the medium pod does: a refusal naming
+		// 4Gi is the medium pod's own, there being no fleet figure above it
+		// to linger, and the latch steps back to small.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		}}
+		workloads := sizedWorkloadsAt(agent, sizingTierMedium)
+		refusedByQuota(workloads[0].(*appsv1.Deployment), credentialProxyName(agent)+"-7d9f8b6c4", "platform-baseline-quota", "4Gi")
+		stored, _ := resolve(t, agent, workloads, sizingQuota("platform-baseline-quota", "10Gi", "7Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small: the medium pod's refusal was read as the fleet row's", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != sizingCappedByQuotaReason {
+			t.Fatalf("SizingCappedByQuota = %+v, want True with reason %s", cond, sizingCappedByQuotaReason)
+		}
+		for _, want := range []string{"recreates at the medium tier", "ResourceQuota platform-baseline-quota", "the small tier stays"} {
+			if !strings.Contains(cond.Message, want) {
+				t.Errorf("message lacks %q: %s", want, cond.Message)
+			}
+		}
+	})
 	t.Run("the next step up is measured only once the hold interval after a step back has passed", func(t *testing.T) {
 		t.Parallel()
 		// The proxy's fleet pod is refused with 13Gi free: the room came
