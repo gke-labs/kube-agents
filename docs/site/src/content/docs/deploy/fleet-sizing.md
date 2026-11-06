@@ -72,12 +72,29 @@ leaves it alone, because Helm patches only the fields its render changes. The
 
 The shell sandbox's 2 vCPU and 2 GiB limits are the operator's defaults.
 [`shellSandbox.resources`](/kube-agents/operator/platformagent-crd/#shellsandbox) raises them one
-key at a time; the example leaves them, so a fleet audit that needs more memory in the sandbox is
-bounded by `maxInProgress`, which the example lowers to 3. The sandbox runs on the node's default
-runtime unless
+key at a time. The sandbox runs on the node's default runtime unless
 [`spec.harness.experimental.shellSandbox.runtimeClassName`](/kube-agents/operator/platformagent-crd/#shellsandbox)
 names `gvisor`; the gateway pod's class is the separate `availability.runtimeClassName`, which
 the installer sets.
+
+`maxInProgress` counts kanban workers, not the memory of one command. A single
+`kubectl get … -A -o json` of a cluster of 100,000 Pods holds about 10 GiB.
+
+The sandbox's memory guard acts at its limit less the larger of 256 MiB and an eighth of the limit
+(at most a quarter). It stops the largest commands of at least 64 MiB, as many as bring it back
+under that mark. Those commands fail, and the sandbox and its other sessions stay up. Each stop is a
+JSON line with the program and its size in the sandbox's log
+(`kubectl -n kubeagents-system logs <name>-shell-0`). A read that large fails at any limit below its
+size; narrow it to a namespace or a batch of clusters.
+
+Many small commands are bounded by the kubectl admission instead: the sandbox runs at most 16
+kubectl reads at once at the default limit (fewer under gVisor), and the next one waits, then fails with a
+`capacity:` reason.
+
+The shell's kubectl admission refuses such a read before it starts, with a reason that names a
+narrower read, when its measured cost does not fit. Costs are measured per fleet size: on a fleet
+whose clusters hold tens of thousands of Pods, set `KUBEAGENTS_KUBECTL_COST_TIER=fleet` in
+[`spec.deployment.env`](/kube-agents/operator/platformagent-crd/#specdeployment). The tier applies to every cluster the install reads, so on a fleet that mixes large and small clusters a small cluster's fleet-wide read is charged the large figure and refused. Unset, the `default` tier charges the small-fleet figures and lets the memory guard stop what does not fit.
 
 Two optional stacks add to the total:
 
@@ -181,9 +198,9 @@ caveat beside it:
   `platformAgent.deployment.incidentWorkloadDedupSeconds`, the key that turns it off.
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
-its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
-run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
-containers. The name in the example reaches the container that reads it. Process tunables such
+its allowlist. It forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` and `KUBEAGENTS_KUBECTL_COST_TIER` to
+the shell sandbox, where the audits run, and passes every name it does not reserve to the
+credential proxy and `agent-api-auth` containers. Both names in the example reach the container that reads them. Process tunables such
 as `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
 allowlist: a values file that sets them renders a proxy pod that carries them, where `gcloud` and
 `kubectl` run, and an agent container that does not. The example leaves them out. The
