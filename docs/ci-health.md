@@ -17,8 +17,10 @@ repetition's final report under its grading line (`rep N report:`), the
 collector keeps it as `reps[].excerpt`, and the Brief and the run page show
 it beside the grader's reason (builds graded before 2026-09-15 carry none).
 In the same way, a `rep N timing:` line under each grading line carries the
-repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show
-([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
+repetition's `agent_s` and `turn1_s`, which the Cases, Nightly and Trend pages show,
+and a `rep N shape:` line the shape of the reply it delivered, from which the Nightly
+page shows how many repetitions opened on the answer, the apologies and the answer's
+median length ([SCHEMA.md](../scripts/eval_dashboard/SCHEMA.md) defines them).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 11 AM Toronto time,
 which also carries the slow-gate and close-to-the-deadline notes
@@ -519,12 +521,16 @@ Three Prow jobs keep the pool in shape from outside any run, and until this
 rule existed they reported nowhere but TestGrid: `ci-kube-agents-pull-sweep`
 (the GitOps stale-pull-request sweep, hourly) and the seeded-fleet
 reconcile, as a postsubmit on every merge that changes the stack and as a
-daily pass over every project. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
+not a pool job but the certification lane's weekly slice, watched here because
+its record is its logs bucket and nothing else reads a failed build of it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
-`gs://kube-agents-periodic-logs`, the bucket these jobs log to (their own
-identities cannot write the Prow archive),
+`gs://kube-agents-periodic-logs`, the bucket the pool jobs log to (their own
+identities cannot write the Prow archive), or from the nightlies' bucket
+`gs://kube-agents-evals-nightly-logs` for the certification slice, which is
+decorated like the nightlies (each `WATCHED` entry names its root),
 walks back to a build with a `finished.json` (the newest is often still
 running), keeps the job's report when the build wrote one (the reconcile's
 `fleet-reconcile.json`, the sweep's `pull-sweep.json`, and beside it the
@@ -556,7 +562,7 @@ notes any failed build rather than hide one already told. A
 recovery needs a build that passed: a failed check under the threshold writes
 no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
-daily reconcile; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
+daily reconcile, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
 pool note is. The note carries the build, when it finished, `since` (kept for
 the job across ticks through the previous `health.json`, ticks with no reading
@@ -1003,6 +1009,18 @@ Nightly report's.
   or with a part missing or still running, carries the block too, labelled as
   covering only the cases or parts on record. It is advisory and moves no
   state, verdict or gate. `scripts/eval_dashboard/nightly_latency.py` holds the rules.
+- **🗣 Reply shape:** how last night's answers read, over every repetition that
+  delivered one and was not lost to infra: the share opening on the answer rather than a lead-in or a heading,
+  the answer's median length, the median messages posted for the ask, and the share
+  that apologized, each against its typical, worked out as the latency line's are. A
+  number gets a ⚠ mark when the share opening on the answer drops 5 points or more,
+  the share apologizing rises as much, or the answer or the message count reaches
+  1.5× its typical. A second line gives the two shares for the chat-and-routing
+  cases alone, whose replies are what they grade, marked at 10 points: a drop
+  confined to them barely moves the whole suite's share. A night cut off at the deadline, or with a part missing or still
+  running, carries the line too, labelled as the latency block is. It is advisory and
+  moves no state, verdict or gate. `scripts/eval_dashboard/nightly_tone.py`
+  holds the rules, and `bench/kube_agents_bench/chat_shape.py` measures each reply.
 - A footer asking owners to reply in the thread.
 
 Each list shows at most 5 lines; the rest are one line linking to the Nightly
@@ -1010,9 +1028,9 @@ report. A night with no new bug, no case owed a bug for the first time, no
 case red for the first night (a tracked case red again after a green night
 counts), no recovery, no infra item and no part cut off, missing or still running is
 one summary line instead: the date, the pass count and how many were not graded, "no
-new reds, nothing recovered", and how many are still red, followed by the latency block. A night whose main part was cut
+new reds, nothing recovered", and how many are still red, followed by the latency block and the reply-shape line. A night whose main part was cut
 off at the deadline, or a run-level event, is labelled so, none of its cases are
-counted, and only the infra list and the latency block follow; a writers part cut off, missing or still running is named in
+counted, and only the infra list, the latency block and the reply-shape line follow; a writers part cut off, missing or still running is named in
 the header; a cut-off part's cases stay in the pass count, as on the Nightly page, but its reds are not listed.
 
 Domain names, owners and backups come from

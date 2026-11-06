@@ -1803,8 +1803,6 @@ spec:
               value: "8766"
             - name: KUBECONFIG
               value: /var/run/event-watcher/watcher.config
-            - name: KSA_TOKEN_FILE
-              value: /var/run/secrets/kubeagents/serviceaccount/token
             - name: GITOPS_STATE_CONFIGMAP
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
@@ -1899,9 +1897,6 @@ spec:
               name: credential-proxy-runtime
             - mountPath: /var/run/event-watcher
               name: event-watcher-kubeconfig
-            - mountPath: /var/run/secrets/kubeagents/serviceaccount
-              name: credential-proxy-ksa-token
-              readOnly: true
             - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               name: event-watcher-ksa-token
               readOnly: true
@@ -1937,14 +1932,6 @@ spec:
             medium: Memory
             sizeLimit: 1Mi
           name: event-watcher-kubeconfig
-        - name: credential-proxy-ksa-token
-          projected:
-            defaultMode: 256
-            sources:
-              - serviceAccountToken:
-                  audience: kubeagents-credential-proxy
-                  expirationSeconds: 3600
-                  path: token
         - name: event-watcher-ksa-token
           projected:
             defaultMode: 256
@@ -2065,6 +2052,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:

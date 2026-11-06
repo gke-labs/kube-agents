@@ -262,6 +262,9 @@ opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
 failure.
 
+`litellm.replayShadow` is an eval-only fixture, off by default: CI turns it on to put the
+inference-replay shadow proxy in front of LiteLLM ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md)).
+
 `litellm.rollingUpdate.maxUnavailable` defaults to `1` so that a rollout can
 replace a Pod in place. Set it to `0` for a zero-downtime rollout, but only
 where the namespace has quota headroom for one more LiteLLM Pod: at `0` the
@@ -562,8 +565,14 @@ itself. With `webConsole.environment.enabled` (the default) the chart also
 renders the console's ServiceAccount, a ClusterRole that lists nodes,
 namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
 gets/patches the `PlatformAgent` resource (for repository topology, preferred
-model annotations, and applied PR annotations). `values.yaml` describes
-each toggle. The
+model annotations, and applied PR annotations). `webConsole.resources` is
+sized to run under its requests, which is what GKE Autopilot without Pod
+bursting clamps the limits to; the console reads the memory limit the cluster
+admitted through the Downward API and sets its Go soft memory limit to nine
+tenths of it. For a busier console raise `webConsole.resources.requests.memory`
+under that clamp, where the request is the ceiling, and `limits.memory` where
+bursting is on and the limit is. `values.yaml`
+describes each toggle. The
 [Web console page](https://gke-labs.github.io/kube-agents/deploy/web-console/)
 is canonical for what it does and how it is reached.
 
@@ -845,12 +854,13 @@ is canonical for the behaviour.
 The defaults fit a fleet of under 10 clusters. `examples/values-fleet.yaml` sets what the chart
 exposes for 25 clusters or more: `operator.resources` at 1Gi, `platformAgent.storage.size` at
 100Gi, `platformAgent.harness.tuning.maxInProgress` at 3, the credential-proxy and
-`agent-api-auth` resource blocks, and two `platformAgent.deployment.env` entries
-(`INCIDENT_WORKLOAD_DEDUP_SECONDS`, `KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its
-reason and what GKE Autopilot without bursting runs it at. It does not size the agent container
-itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
+`agent-api-auth` resource blocks, and one `platformAgent.deployment.env` entry
+(`KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its reason and what GKE Autopilot without
+bursting runs it at. The fold window is not in it: `incidentWorkloadDedupSeconds` already renders
+the hour, and an `env` entry for the name would override that key. It does not size the agent
+container itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
 sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
-operator's 2 CPU and 2Gi defaults. The two env names reach the containers that read them;
+operator's 2 CPU and 2Gi defaults. The env name reaches the container that reads it;
 `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
 allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
 out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
@@ -900,7 +910,11 @@ significant digits is refused at render as well: the chart compares quantities a
 float64, scaled in decimal arithmetic, so `1005m` equals `1.005` and the
 comparison matches the operator's for every decimal value within the cap. A
 binary-suffixed value within float64 rounding (about one part in 10^16) of a
-decimal one can compare equal to it; the operator decides that pair. The quota
+decimal one can compare equal to it; the operator decides that pair. A request
+set without its limit is checked against the sizing profile row's limit, and
+under `auto` against the fleet row's, the highest the operator's latch reaches:
+the chart cannot read the latch, so it refuses only a request no row admits and
+leaves the row the install runs to the webhook. The quota
 preflight sums the
 override merged over the operator's defaults. On an existing install, apply the
 chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
@@ -921,6 +935,20 @@ the override, at the defaults when the operator would refuse it (it then renders
 the shell at them), and the same CRD guard fails the upgrade when the installed CRD
 predates the field.
 
+`platformAgent.deployment.sizingProfile` picks the preset the credential proxy,
+the `agent-api-auth` sidecar and the shell container start from, forwarded to the
+CR's `spec.deployment.sizingProfile` when set: `small` (the operator's defaults,
+and what an unset value means), `medium`, `fleet`, or `auto`, which steps the
+tier up with the cluster count the operator polls, holding a step the
+namespace's ResourceQuota has no room for, and steps it back one tier when
+admission refuses the pod a step recreated; a count that falls never lowers it. The
+[`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
+has each row's figures and the auto rules. The three per-key overrides (the two
+above and `platformAgent.deployment.agentAPIAuth.resources`, the sidecar's) are
+applied over the preset, so an explicit key wins. The quota preflight counts
+`medium` and `fleet` at their rows and `auto` at the small row it starts from. The
+same CRD guard fails the upgrade when the installed CRD predates the field.
+
 `platformAgent.deployment.alertDailyLimits` sets the daily alert ceilings. Its keys are
 `critical`, `warning`, `info` and `drift`, and each key that is set becomes an
 `ALERT_DAILY_LIMIT_<KEY>` entry in the CR's `spec.deployment.env`. A key that is not set keeps the
@@ -932,6 +960,15 @@ lost. Move them to `platformAgent.deployment.env` first. A re-tag to a chart wit
 `upgrade.sh --drop-undeclared-values`. The
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives
 the buckets, the defaults and a sizing method.
+
+`platformAgent.deployment.incidentMaxOpenPullRequests` limits how many triage pull requests are open
+or being opened at once when `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` is `"true"` in
+`platformAgent.deployment.env`. Above `0` it becomes an `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS`
+entry in the CR's `spec.deployment.env`; `0`, the default, is no limit and renders no entry. The same
+rules as `alertDailyLimits` apply: an entry with the same name in `platformAgent.deployment.env`
+wins, and a `valueFrom` entry for it fails the render while the key is above `0`. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#limiting-the-open-triage-pull-requests)
+says what is counted and what a held triage does.
 
 `platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
 `backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,
@@ -945,6 +982,17 @@ An entry with the same name in `platformAgent.deployment.env` wins over the key,
 entry included. A change rolls the agent pod and the credential-proxy pod. The
 [watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
 gives each setting's meaning and default.
+
+`platformAgent.deployment.incidentWorkloadDedupSeconds` is the window in which a broken workload's
+later events fold into its open incident, rendered as the `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry
+in `spec.deployment.env`. It defaults to `3600`, so a default render carries that entry; `0` turns
+folding off, the most is `86400`, and `null` renders no entry and leaves the default the operator
+renders into the agent container, the same hour. The same precedence rules as the ceilings apply:
+an entry of that name in `platformAgent.deployment.env` wins, and a `valueFrom` entry for it fails
+the render while the key is set. A re-tag to a chart that does not declare the key, after it was
+set, needs `upgrade.sh --drop-undeclared-values`. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#one-incident-per-workload)
+has the fold rules.
 
 #### PlatformAgent annotations
 
@@ -1117,7 +1165,7 @@ Exactly one owner creates the broker's KSA, depending on
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`admissionPolicy.enabled` (default `true`) installs four cluster-scoped
 `ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
@@ -1134,6 +1182,13 @@ access, Pod Security "restricted", and exactly the session labels. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
+
+The fourth, `kube-agents-web-console-cr`, is generated from
+`k8s-operator/config/admission/web-console-cr-policy.yaml` and renders where the
+web console and its environment page are on. It holds the console's
+ServiceAccount to its own annotations and `spec.integration.forges`,
+`repositories` and `github` on the PlatformAgent, and refuses any other change it
+makes.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
@@ -1172,11 +1227,17 @@ held to at most one CPU per GiB of the memory request. A cpu or memory limit set
 request lowers the counted request to that limit, as the operator does. An override setting only
 `limits.ephemeral-storage` is counted
 as a request of that size too, because the operator renders no ephemeral-storage request and
-the API server defaults it to the limit. The shell sandbox is counted the same way with
+the API server defaults it to the limit. A proxy override the operator refuses against the row
+the preflight counts (a zero limit, a request above that row's limit) is counted at the row; under
+`auto` that is a request set alone between the small row's limit and the fleet row's, which the
+CR template admits and the small latch refuses. The shell sandbox is counted the same way with
 `platformAgent.harness.experimental.shellSandbox.resources` merged over its footprint entry, the
 ephemeral-storage rule included, since the shell declares no ephemeral-storage of its own; an
 override the operator refuses (a zero limit, a request above its limit) is counted at the defaults
-the operator renders in its place, because the chart does not fail the render on those. A
+the operator renders in its place, because the chart does not fail the render on those. Under
+`platformAgent.deployment.sizingProfile` `medium` or `fleet` the proxy, the sidecar and the shell
+are counted at that row, with each override merged over it; `auto` is counted at the small row it
+starts from, and the operator checks the quota itself before each later promotion. A
 `PlatformAgent` edited by hand after the install is outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
@@ -1195,9 +1256,11 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-When `operator.extraEnv` sets `A2A_MCP_DOOR` to `true`, or in a form the chart cannot read (a
-`valueFrom`, a non-string value), the check also counts the MCP server's pod, at the console's
-size, since the operator sizes the two alike. The mode is read from the values, so a mode set
+It also counts the standing pods the operator renders only behind an `operator.extraEnv` flag,
+listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
+is `true`, and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but
+blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
@@ -1330,9 +1393,11 @@ old defaults. An explicit limit under 512Mi, in a values file or `extra_helm_val
 every path: raise it to 512Mi or more, or drop the key. The operator reads whatever limit is
 rendered through the Downward API and sets its Go soft memory limit to nine tenths of it, so a
 larger cluster raises this one value. On GKE Autopilot the floor still applies. A cluster without
-bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets the limits equal to
-the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
-rendered manifest. A cluster with bursting admits the manifest as rendered.
+bursting sets the limits equal to the requests, so the manager runs under its memory request, 256Mi
+by default, and `operator.resources.requests.memory` is the value to raise there; where Autopilot
+also raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, the manager runs under 512Mi
+and the admitted pod differs from the rendered manifest. Either way the manager reads the admitted
+limit. A cluster with bursting admits the manifest as rendered.
 
 ### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 
@@ -1468,6 +1533,10 @@ helm uninstall kube-agents -n kubeagents-system
   `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
+- `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
+  `operator.extraEnv` flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
+  (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
+  differ, so edit both together.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
   (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and

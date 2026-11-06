@@ -74,6 +74,8 @@ The operator runs the gateway as one replica whatever `spec.deployment.availabil
 
 To run the agent unsandboxed: `ENABLE_GVISOR=false` at install time, or in `install.env` before a full `upgrade.sh`, which re-renders the runtime class from it — read [`scripts/installer/README.md`](../scripts/installer/README.md) on what else that apply rewrites before you run it on an install you care about. CI reaches the same place by overriding the chart value directly, which a throwaway cluster can afford: `hack/ci-deploy.sh` pins `runtimeClassName` empty before `hack/ci-eval-pr.sh` runs, and says why.
 
+The fold window is the other value `hack/ci-deploy.sh` pins for the eval install. `INCIDENT_WORKLOAD_DEDUP_SECONDS` defaults to an hour, and on a dev install that keeps the default, a case that re-plants one workload and waits for that repetition's own card (`autoops-warning-event-triage`, `autoops-crashloop-config-triage`, `autoops-warning-event-no-action-triage`) folds its second and third repetition into the first's incident, so no card comes and the plant times out. Before running one of those three times back to back, set the window to 150 s as CI does, with the chart key `platformAgent.deployment.incidentWorkloadDedupSeconds: 150` (an `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry in `platformAgent.deployment.env` wins over it); `hack/ci-deploy.sh` says how the number was chosen.
+
 ## Running evals
 
 ```bash
@@ -143,7 +145,7 @@ Delegation on the inject path is a seam, not a feature, and it is deliberately n
 
 ## The gate
 
-devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused a verdict the pull request holds: its own prior green, or an admin `/override` at this head): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`. It also reads `timing.json`, which the shell copies from the harness's `KUBE_AGENTS_TIMING_FILE`, for the opening chat turn's seconds; these are reported, not scored. Before handing a run over, the shell asks the judge once more for a missing `OutcomeValidity` devops-bench left out (`kube_agents_bench/rejudge.py`), marks the record with `rejudged` or `judge_errors`, and recomputes `OutcomeScore`.
+devops-bench scores a run; it does not decide whether a pull request may merge. That decision is `bench-gate`, and `hack/ci-eval-pr.sh` is what drives it (when step 0, `hack/ci-revalidate.sh`, has not already reused a verdict the pull request holds: its own prior green, or an admin `/override` at this head): the shell runs each task `EVAL_REPETITIONS` times (default 3) and hands the resulting run **directories** to the scorer, which reads `results.json` for the scores, `manifest.json` for `setupId`, and `rows.json` for `scoringVersion`. It also reads `timing.json`, which the shell copies from the harness's `KUBE_AGENTS_TIMING_FILE`, for the opening chat turn's seconds, and `shape.json`, copied the same way from `KUBE_AGENTS_SHAPE_FILE`, for the shape of the reply the run delivered (`kube_agents_bench/chat_shape.py`: whether it opens on its answer, an apology, the messages the thread received, and word counts); both are reported, not scored, and `bench-gate case` prints them as each repetition's `rep N timing:` and `rep N shape:` lines. Before handing a run over, the shell asks the judge once more for a missing `OutcomeValidity` devops-bench left out (`kube_agents_bench/rejudge.py`), marks the record with `rejudged` or `judge_errors`, and recomputes `OutcomeScore`.
 
 ```bash
 uv run bench-gate case --task ./tasks/<id>/task.yaml \
@@ -169,7 +171,7 @@ Thresholds are named environment variables, all with the documented default: `EV
 The certification suite is the set of cases behind the certified-capabilities page. It has its
 own lane and nothing else: `hack/eval/certification-cases.txt` is its roster, `EVAL_TIER=certification` in
 `hack/ci-eval-pr.sh` runs that file alone (one `# part N` section of it under
-`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, rerun from Deck and never on a cron),
+`EVAL_CERTIFICATION_PART=N`, one Prow periodic per section, weekly on a Saturday cron and on Rerun from Deck),
 and no pull request and no nightly runs a case named there. A certification case is an ordinary
 case under `bench/tasks/<id>/` whose `task.yaml` carries `suite: certification`;
 `scripts/validate_bench_cases.py` refuses a rostered case without the line and a case with the line
@@ -184,7 +186,7 @@ block. The lane's record is its logs bucket, read by the page per case and model
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 
-Three rules hold for every fixture a certification case plants, enforced in review until a
+Four rules hold for every fixture a certification case plants, enforced in review until a
 validator check lands with the first stack that needs it:
 
 1. A fail-closed admission webhook matches one bench-owned API group only, carries a
@@ -198,6 +200,9 @@ validator check lands with the first stack that needs it:
 3. Fixture credentials are inert literals, never a token that was once valid, and a service account
    a fixture creates is destroyed in the same stack. The expected-fail marker hides a fixture that
    failed to plant, so the `resource_property` safeguard stays on every case.
+4. A declared-gap fixture plants a signal the agent's read role reaches (a webhook configuration's
+   CA bundle, an object's condition, an event), never a Secret: agents hold no Secret access, so a
+   gap recorded on one could never close.
 
 ## Portal CUJ evaluations
 

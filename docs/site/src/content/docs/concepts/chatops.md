@@ -471,7 +471,7 @@ The line is labelled `chat turns`, not `tasks`, because the script's `tasks` lin
 
 It names no cluster, project, namespace, task or person. The gateway audits the block outside its `model:` line, which carries only the provider and model name from the status. It refuses to post a block whose audited lines contain the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings), and says so instead. The block's own words, such as a bucket or interface name, are not refused.
 
-The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
+The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the cluster scale counts, the top five credential broker tools, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
 
 ### The Slack Home tab
 
@@ -635,6 +635,8 @@ The daily recap has the line "N alerts from M workloads withheld by the daily ce
 
 Drift refusals never appear in the recap. The `GitOpsDrift` row of `/v1/alert-quota` and the session server log show them. The drift detector does not offer a refused record again, so that alert is lost from chat.
 
+The recap line "N events from M workloads were silenced by alert-exclude rules" counts the events that the [alert-exclude rules](/kube-agents/operator/platformagent-crd/#specharnesseventwatcher) held back, and names the five workloads that sent the most. These events never reached the ceiling, and `GET /v1/intercepted-events` lists them with the status `excluded`.
+
 The recap line "N alerts failed to post to chat" is a different problem. It means that chat refused the post, or did not confirm it. Some of these alerts can be in the channel. A higher ceiling does not change this count. Look in the session server log for the cause.
 
 #### Sizing a bucket
@@ -648,25 +650,27 @@ The counter is fleet-wide, so the demand on it increases with the number of clus
 
 ### One incident per workload
 
-By default, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. Set `INCIDENT_WORKLOAD_DEDUP_SECONDS` to fold them into one. Within that many seconds of an alert, a later Warning event for the same workload, or a later Critical one after a Critical alert, posts nothing, starts no triage turn and spends no budget.
+Without folding, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. `INCIDENT_WORKLOAD_DEDUP_SECONDS` folds them into one, and is on by default at `3600`, an hour. Within that many seconds of an alert, a later Warning event for the same workload, or a later Critical one after a Critical alert, posts nothing, starts no triage turn and spends no budget.
 
 The same workload means the same cluster, namespace and kind, and either the same Deployment (a pod named with its ReplicaSet hash, such as `checkout-6cfdb6b98b-zwv24`) or the same name for an object that is not a Pod. About 1 in 400 Deployments has a hash shorter than 8 characters, and its pods do not fold. Other pods do not fold: the pods of a StatefulSet, a DaemonSet, a Job or a CronJob each still alert, so a Job's failure is never folded into a same-named Deployment's alert.
 
-A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again, unless its fix is waiting for review (below). The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0`, the default, turns folding off, a larger value than `86400` counts as `86400`, and a value that is negative or not a number counts as `0`.
+A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again, unless its fix is waiting for review (below). The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0` turns folding off, a larger value than `86400` counts as `86400`, a negative value counts as `0`, and a value that is not a number counts as the default.
 
-Set it as an entry in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages:
+Change it with the chart value `platformAgent.deployment.incidentWorkloadDedupSeconds`, which renders the entry into the CR's `spec.deployment.env`, or set that entry yourself on an install that no chart manages. On an install made with `install.sh`, put the value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={deployment={incidentWorkloadDedupSeconds=0}}}'`. `0` turns folding off:
 
 ```yaml
 platformAgent:
   deployment:
-    env:
-      - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
-        value: "900"
+    incidentWorkloadDedupSeconds: 0
 ```
 
-With the setting on, a workload that breaks again after the window, while the pull request the agent opened automatically to fix one of its recent incidents (`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`) is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand, or one opened for anything else asked in the incident's thread, does not count.
+An entry named `INCIDENT_WORKLOAD_DEDUP_SECONDS` in `platformAgent.deployment.env` wins over the key. A change to the window restarts the agent pod and the credential-proxy pod, and the first apply that renders the entry replaces entries added to the CR's `spec.deployment.env` by hand, as the ceilings paragraph above describes.
+
+With folding on, a workload that breaks again after the window, while the pull request the agent opened automatically to fix one of its recent incidents (`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`) is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand, or one opened for anything else asked in the incident's thread, does not count.
 
 A fix opened by replying `apply` or clicking an option button in the incident's own thread holds a recurrence the same way. The hold counts the first card for the Platform Agent filed from that thread within 30 minutes of the reply. A later card in the thread does not count, and neither does an `apply` typed in the main space or the first reply in a Google Chat direct message, which is answered at top level. Under `spec.mode: next`, an `apply` on the platform the A2A gateway holds is not recorded and does not hold.
+
+With folding on by default, an install that opens fix pull requests runs this lookup for every new incident. The search is bounded, and a forge that does not answer in time announces the event as a new incident.
 
 The hold covers the same fault only: the event's reason must be one the incident showed, its own or one folded into it, so a workload waiting on a fix for `BackOff` that starts failing `Unhealthy` gets a new incident. For the same fault, the incident's chat thread gets one short reminder per window instead, naming the pull request: the fault is already diagnosed and its fix is waiting on a person. Once that pull request is merged or closed, the next new failure is a new incident again. The feed `GET /v1/intercepted-events` lists such an event as `folded`, with the pull request in its `pull_request` field.
 
@@ -678,7 +682,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it the same way as `INCIDENT_WORKLOAD_DEDUP_SECONDS`, as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
 
 ```yaml
 platformAgent:
@@ -693,6 +697,20 @@ A human still reviews and merges the pull request, and nothing is written to the
 StatefulSet, DaemonSet, Job and CronJob pods, and bare pods, each get a branch of their own, because the pod name alone cannot prove they belong to one workload. With the fold on, a Deployment's repeat events inside the window start no triage, so they file no pull-request card either. The second card's result, the pull request URL, is posted in the same thread as the report.
 
 The setting has limits. Drift and controller-stall reports are not covered; they still wait for a reply. On Slack with `KAGE_SLACK_UX` on, the report's button for the recommended or single fix is left off when the report says that fix's pull request `is being opened automatically`; buttons for the other options stay. A typed `apply Option B` still works and opens its own pull request. Changing the value rolls the agent pod. The agent ignores the variable in its own `.env` file, so only the install can turn it on. It is an environment variable for now and can move to a `PlatformAgent` field once it has proven itself.
+
+### Limiting the open triage pull requests
+
+A failure that breaks many workloads at once, such as a node or storage fault, starts many triages, and with `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` on each one opens a pull request. Set `platformAgent.deployment.incidentMaxOpenPullRequests` to limit how many are open or being opened at once. The chart renders it as `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS`. `0`, the default, is no limit.
+
+```yaml
+platformAgent:
+  deployment:
+    incidentMaxOpenPullRequests: 5
+```
+
+A triage whose pull request would pass the limit still runs, but its report asks for a reply, as without the setting, and a note in the alert's thread says that the limit held its pull request back. An incident whose branch already has a pull request is not held: its card revises that pull request. If the open pull requests cannot be counted, because the forge fails or does not answer in time, the triage is held the same way, with a note that says so. As with the switch, the agent ignores the variable in its own `.env` file.
+
+The limit counts triage pull requests only: the open pull requests whose branch starts with `platform-agent/incident-`, plus each triage routed to open one whose pull request does not exist yet. The count goes by that branch prefix alone, so a pull request opened by a reply counts only when its branch takes the prefix. A routed triage stops counting when its pull request opens (it then counts as open), when its pull-request card is `done` or `archived`, or after 24 hours. A card that is `blocked`, or waits behind a blocked triage card, keeps counting until then, because it can still open its pull request.
 
 ## First-run onboarding
 
