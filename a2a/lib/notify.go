@@ -111,4 +111,8 @@ type NotifyReply struct {
 	// Nothing was posted, and the same request may land later, so a sender
 	// waits rather than counting it against the destination.
 	Retry bool `json:"retry,omitempty"`
+	// Kept says the refusal in Error is a home post the gateway kept for the
+	// digest it posts once a home channel is set: nothing was posted now, and
+	// a sender that would retry or re-send should treat the post as handled.
+	Kept bool `json:"kept,omitempty"`
 }

@@ -25,10 +25,14 @@ type fakeNotifyPoster struct {
 	posts   []notifyPost
 	failAt  int // 1-based post index to fail; 0 never
 	landsIn string
-	noName  bool // answer with an empty message name
+	noName  bool              // answer with an empty message name
+	before  func(text string) // runs before each post lands, outside the lock
 }
 
 func (f *fakeNotifyPoster) PostNotify(space, thread, text string) (string, string, error) {
+	if f.before != nil {
+		f.before(text)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.posts = append(f.posts, notifyPost{space, thread, text})
@@ -78,6 +82,12 @@ func serveBytes(t *testing.T, n *Notifier, body []byte) lib.NotifyReply {
 	t.Helper()
 	req, home, refusal := n.validate(body)
 	if refusal != nil {
+		if refusal.Kept {
+			// As handle does: the keeper answers once the store has the post.
+			done := make(chan lib.NotifyReply, 1)
+			n.keepRefused(req, func(r lib.NotifyReply) { done <- r })
+			return <-done
+		}
 		return *refusal
 	}
 	var answers []lib.NotifyReply
@@ -719,7 +729,7 @@ func TestNotifyWithNoHomeServesConversationsOnly(t *testing.T) {
 	}
 	conv := &fakeConversations{contexts: map[string]string{testConversation: testContext}}
 	n.SetConversations(conv)
-	if got := serveJSON(t, n, lib.NotifyRequest{Text: "alert"}); got.Error != notifyNoHome {
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: "alert"}); got.Error != notifyNoHome || got.Kept {
 		t.Fatalf("home post reply = %+v, want refused", got)
 	}
 	if got := serveJSON(t, n, lib.NotifyRequest{Text: "3 nodes", Conversation: testConversation, ContextID: testContext}); got.Error != "" {

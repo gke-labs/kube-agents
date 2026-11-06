@@ -59,6 +59,15 @@ const notifyExitRouteUnavailable = 4
 // notifyExitRouteUnavailable.
 var errNotifyRouteUnavailable = errors.New("route unavailable")
 
+// notifyExitKept is the exit status for a home post the gateway refused for
+// want of a home channel and kept for the digest it posts once one is set
+// (NotifyReply.Kept). Nothing was posted now, and nothing is lost: a sender
+// that re-sends on failure treats the post as handled.
+const notifyExitKept = 5
+
+// errNotifyKept marks the failure main reports with notifyExitKept.
+var errNotifyKept = errors.New("kept for the digest")
+
 // notifyUpdateMax bounds an --update key. The gateway keeps at most 16 per
 // conversation or home thread (spec-a2a-payloads, "Card work after the task ends"); the
 // senders pick short ones (plan-<card>-<serial>, question-<card>-<serial>,
@@ -82,9 +91,11 @@ on; the console passes it on so its client can join the post to that turn.
 Reads the text from stdin when it is omitted, or "-" with no "--" before it.
 Prints the gateway's answer as JSON (message_id, the field hermes send --json
 prints, and thread_id). Exits 1 when nothing was posted, 3 when the gateway
-did not answer in time (the post may still land), and 4 when the route is not
+did not answer in time (the post may still land), 4 when the route is not
 there right now (nothing answering, the bus unreachable, or a refusal the
-gateway marks retry; nothing posted).
+gateway marks retry; nothing posted), and 5 when the gateway refused a home
+post for want of a home channel and kept it for the digest it posts once one
+is set (nothing posted now).
 `
 
 func runNotify(args []string) error {
@@ -228,6 +239,9 @@ func runNotify(args []string) error {
 		return fmt.Errorf("notify: unreadable answer: %w", err)
 	}
 	fmt.Println(string(msg.Data))
+	if answer.Kept {
+		return fmt.Errorf("notify: the gateway posted nothing: %s: %w", answer.Error, errNotifyKept)
+	}
 	if answer.Error != "" && answer.MessageID == "" && answer.Retry {
 		// Nothing was posted and the same request may land later: the same
 		// exit as no route, which a sender waits out.

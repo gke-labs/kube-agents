@@ -12,11 +12,11 @@ metadata:
   {{- $annotations = deepCopy . }}
   {{- end }}
   {{- /*
-    Three keys the operator reads are also derived from chart values, and the value
+    Four keys the operator reads are also derived from chart values, and the value
     wins because it drives the rest of the release too: litellm.networkPolicy is
     the static render gate, telemetry.collectorNamespace the static policy's
-    egress namespace, and litellm.openaiCompatible the static policy's rule to
-    the model server. A platformAgent.annotations entry that disagrees with the
+    egress namespace, litellm.openaiCompatible the static policy's rule to
+    the model server, and the chart's pods (standing plus one surge pod per surging workload) the session quota's count. A platformAgent.annotations entry that disagrees with the
     value it duplicates fails the render rather than being overwritten in silence.
   */}}
   {{- $litellmPolicyKey := "kubeagents.x-k8s.io/enable-litellm-network-policy" }}
@@ -55,6 +55,33 @@ metadata:
   {{- $_ := set $annotations $upstreamEgressKey $upstreamEgress }}
   {{- end }}
   {{- end }}
+  {{- /*
+    The chart's pods in this namespace, with a surge pod for each that rolls
+    with one (kube-agents.chartQuotaPods), which share the next-mode
+    namespace pod quota with the session pods; the operator sizes that quota's
+    headroom from it (#3848). Stamped on the CR rather than the operator, because
+    the CR is in the namespace those pods run in and the chart renders it even
+    when an operator installed elsewhere reconciles it. Chart-derived like the
+    keys above, so an entry in platformAgent.annotations that disagrees fails.
+  */}}
+  {{- $chartPodsKey := "kubeagents.x-k8s.io/a2a-quota-chart-pods" }}
+  {{- $chartPods := include "kube-agents.chartQuotaPods" $ }}
+  {{- /* The operator discards a count past its cap (a2aMaxChartPods) for its
+         default (a2aDefaultChartPods), which would size the session quota
+         below what the namespace runs; refuse to stamp one rather than let it
+         be dropped. The quota renders only in next mode, so only a next-mode
+         render is refused; as for the quota preflight, the mode is read from
+         the values, and the operator's A2AQuotaChartPodsDiscarded Warning
+         covers a mode set on the PlatformAgent by hand. */}}
+  {{- if and (eq (toString .Values.platformAgent.mode) "next") (gt (int $chartPods) 64) }}
+  {{- fail (printf "the chart would run %s pods at once in this namespace, counting a surge pod for each workload that rolls with one, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts, or run some of these components in another namespace." $chartPods) }}
+  {{- end }}
+  {{- with get $annotations $chartPodsKey }}
+  {{- if ne (toString . | trim) $chartPods }}
+  {{- fail (printf "platformAgent.annotations[%q]=%q contradicts the chart's own pods, %s. Drop the annotation; the chart stamps it." $chartPodsKey (toString .) $chartPods) }}
+  {{- end }}
+  {{- end }}
+  {{- $_ := set $annotations $chartPodsKey $chartPods }}
   {{- with $annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
@@ -321,6 +348,17 @@ spec:
     {{- with (include "kube-agents.imagePullSecrets" .) }}
     {{- . | nindent 4 }}
     {{- end }}
+    {{- /*
+      The sizing preset, forwarded as spec.deployment.sizingProfile when set.
+      The schema holds the value to the CRD's enum, so the only shape fault
+      left to guard is the one the API server would prune silently: a profile
+      set against an installed CRD that predates the field, through the same
+      guard the three resources overrides use.
+    */}}
+    {{- with .Values.platformAgent.deployment.sizingProfile }}
+    {{- include "kube-agents.crdFieldGuard" (dict "value" "platformAgent.deployment.sizingProfile" "path" (list "deployment") "field" "sizingProfile") }}
+    sizingProfile: {{ . | quote }}
+    {{- end }}
     {{- $availability := .Values.platformAgent.deployment.availability | default dict }}
     {{- with include "kube-agents.compactFields" (dict
           "replicas" $availability.replicas
@@ -347,6 +385,11 @@ spec:
       key. The value goes through int64 because Helm reads a number from a
       values file as float64, and toString writes a large float64 in exponent
       form, which the daemon cannot read.
+
+      deployment.incidentMaxOpenPullRequests follows them as
+      INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS, by the same rules, but only when
+      it is above 0: 0 is no limit, the same as no entry, so a default render
+      still has no env.
     */}}
     {{- $userEnv := .Values.platformAgent.deployment.env | default list }}
     {{- $userEnvNames := dict }}
@@ -367,6 +410,16 @@ spec:
     {{- end }}
     {{- if and (not (kindIs "invalid" $limit)) (not (hasKey $userEnvNames $name)) }}
     {{- $env = append $env (dict "name" $name "value" ($limit | int64 | toString)) }}
+    {{- end }}
+    {{- end }}
+    {{- $prLimitName := "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS" }}
+    {{- $prLimit := .Values.platformAgent.deployment.incidentMaxOpenPullRequests }}
+    {{- if and (not (kindIs "invalid" $prLimit)) (gt ($prLimit | int64) 0) }}
+    {{- if hasKey $userValueFromNames $prLimitName }}
+    {{- fail (printf "platformAgent.deployment.incidentMaxOpenPullRequests is set, and platformAgent.deployment.env gives %s through valueFrom. The operator forwards only literal values, so it drops that entry and the agent has no limit. Remove the valueFrom entry or set the key to 0." $prLimitName) }}
+    {{- end }}
+    {{- if not (hasKey $userEnvNames $prLimitName) }}
+    {{- $env = append $env (dict "name" $prLimitName "value" ($prLimit | int64 | toString)) }}
     {{- end }}
     {{- end }}
     {{- /*
@@ -491,7 +544,18 @@ spec:
       shared with the agentAPIAuth and shellSandbox blocks.
     */}}
     {{- $proxyQuantities := include "kube-agents.resourcesOverrideQuantities" $proxyResources | fromJson }}
-    {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
+    {{- /* The row the override merges over is the sizing profile's
+           (kube-agents.credentialProxyRow): the defaults under small, unset and
+           auto, so a pair valid on the chosen row is not refused against the
+           small one, as the operator admits it. A request set without its limit
+           is checked against the ceiling row's limit
+           (kube-agents.credentialProxyCeilingRow): the same row, and under auto
+           the fleet row, since the operator renders the latched tier, which the
+           chart cannot read, and a request under the fleet row's limit is one
+           the webhook admits at a latch that has reached it. */}}
+    {{- $proxyDefaults := include "kube-agents.credentialProxyRow" . | fromJson }}
+    {{- $proxyCeiling := include "kube-agents.credentialProxyCeilingRow" . | fromJson }}
+    {{- $proxyAuto := eq (((.Values.platformAgent.deployment | default dict).sizingProfile) | default "") "auto" }}
     {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
     {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
     {{- range $side := list "requests" "limits" }}
@@ -545,17 +609,22 @@ spec:
     {{- range $name, $rawRequest := $proxyMerged.requests }}
       {{- if hasKey $proxyMerged.limits $name }}
       {{- $isCpu := eq $name "cpu" }}
-      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
-      {{- $limit := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
-      {{- if gt $request $limit }}
       {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
       {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
-      {{- $req := index $proxyMerged.requests $name }}
       {{- $lim := index $proxyMerged.limits $name }}
+      {{- if not $setLimit }}
+      {{- $lim = index $proxyCeiling.limits $name }}
+      {{- end }}
+      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
+      {{- $limit := include "kube-agents.quantityExact" (dict "raw" $lim "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
+      {{- if gt $request $limit }}
+      {{- $req := index $proxyMerged.requests $name }}
       {{- if and $setRequest $setLimit }}
       {{- fail (printf "%s.requests.%s (%s) exceeds limits.%s (%s); a request above its limit is refused by the API server, and by the operator" $proxyPrefix $name $req $name $lim) }}
+      {{- else if $proxyAuto }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the fleet row's limits.%s (%s), the highest row auto reaches, which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- else }}
-      {{- fail (printf "%s.requests.%s (%s) exceeds the operator's default limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the sizing profile row's limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- end }}
       {{- end }}
       {{- end }}

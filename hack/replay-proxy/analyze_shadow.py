@@ -1,7 +1,7 @@
 """Estimate what replay would have saved, from the shadow proxy's JSON lines.
 
-Reads the lines replay_proxy.py writes (one per chat request, collected from
-each job with `kubectl logs -f`) and asks of every presubmit request whether
+Reads the lines replay_proxy.py writes (one per chat request; in CI,
+collect_shadow.py copies them from each job to a bucket) and asks of every presubmit request whether
 replay would have had an answer for it, from the sources the design allows
 (examples/inference-replay/eval-design.md, "How a pull request run finds an
 answer" and Rollout step 1):

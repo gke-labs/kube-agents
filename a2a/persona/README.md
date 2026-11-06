@@ -82,8 +82,10 @@ frontmatter, puts a short note on using the skill in a session after the title,
 marks every code block that writes as a proposal, every one that runs a program
 the session can't run as unavailable, and every piped read as one command per
 call, replaces the cluster agent's kanban reporting steps with "give it in your
-answer", and rewrites references to its scripts, example files and settings as
-not in this session. Only `SKILL.md` ships. The Dockerfile copies the result
+answer", rewrites cross-skill `SKILL.md` links to backticked skill names for
+shipped skills, and rewrites references to its scripts, reference files,
+example files, settings and unshipped skill files as not in this session. Only
+`SKILL.md` ships. The Dockerfile copies the result
 into `CLAUDE_CONFIG_DIR` (`/home/node/.claude`), owned by root.
 
 Editing a skill in `sessionSkills` now also feeds the worker image: its build
