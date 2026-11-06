@@ -139,9 +139,12 @@ example leaves the new proxy pod `Pending` with the old one gone. Every brokered
 
 The same holds under `spec.deployment.sizingProfile: auto`, which applies the `medium` row at 10
 clusters and the `fleet` row at 25 with no human in the loop. Before a step up the operator checks
-the namespace's `ResourceQuota`, not node allocatable capacity. A Standard pool therefore needs
-nodes that fit the `fleet` row's 4 vCPU proxy request (`e2-standard-8` or larger) before the count
-reaches 25. The `medium` row's 1 vCPU request fits an `e2-standard-4`.
+the namespace's `ResourceQuota` alone, neither node allocatable capacity nor a `LimitRange`. A
+Standard pool therefore needs nodes that fit the `fleet` row's 4 vCPU proxy request
+(`e2-standard-8` or larger) before the count reaches 25. The `medium` row's 1 vCPU request fits an
+`e2-standard-4`. A `LimitRange` in the namespace whose per-container `max` is below a row's figure
+refuses the recreated pod the same way. Under `auto` its `max` has to admit the `fleet` row (8 CPU
+and 8Gi per container), or name the tier.
 
 | Pool             | Shape (modeled)                                                                            | Carries                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |

@@ -1333,11 +1333,14 @@ type DeploymentSpec struct {
 	// tier the quotas have room for (the running one when they have room for
 	// none) and sets the SizingCappedByQuota condition for the step refused,
 	// rather than rolling out pods the quota would refuse. The check reads
-	// ResourceQuota, not node capacity: on GKE Standard the medium and fleet
-	// rows' broker requests (1 and 4 CPU) have to fit on one node before the
-	// recreated broker can start, so a Standard pool needs nodes that fit the
-	// fleet row's 4 CPU request (e2-standard-8 or larger) before the count
-	// reaches 25 under auto. An
+	// ResourceQuota alone, neither node capacity nor a LimitRange: on GKE
+	// Standard the medium and fleet rows' broker requests (1 and 4 CPU) have
+	// to fit on one node before the recreated broker can start, so a Standard
+	// pool needs nodes that fit the fleet row's 4 CPU request (e2-standard-8
+	// or larger) before the count reaches 25 under auto; and a LimitRange in
+	// the namespace whose per-container max is below a row's figure refuses
+	// the pod a step up recreates, so under auto its max has to admit the
+	// fleet row (8 CPU and 8Gi per container), or the tier is named. An
 	// explicit tier is applied as written, without the quota check. The agent
 	// container's own resources are not part of a profile. A change of tier
 	// recreates the proxy pod once and rolls the gateway and the shell pod.
