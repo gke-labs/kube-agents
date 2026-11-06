@@ -299,6 +299,33 @@ class ThrottleTest(PolicyCase):
         self.run_policy(Reader(days_ago(15)))
         self.assertEqual(self.next_run("two-hourly"), iso(NOW - timedelta(minutes=1)))
 
+    def test_a_period_no_timedelta_can_hold_costs_no_other_job_its_hold(self):
+        # A `minutes` the JSON grammar admits but a timedelta cannot hold
+        # (`1e400` reads as inf; an integer wider than a float; a finite value
+        # past the timedelta range) is no period: the entry is left to Hermes
+        # and the rest of the store is still held on the same tick.
+        audit = prompt_job("compliance-audit", "20 6 * * *", due("20 6 * * *"), days_ago(2))
+        store = json.dumps({"jobs": [interval_job("wide", 0, NOW - timedelta(minutes=1), days_ago(2)), audit]})
+        for minutes in ("1e400", str(10**400), "2e12"):
+            self.write(raw=store.replace('"minutes": 0', f'"minutes": {minutes}'))
+            lines = self.run_policy(Reader(days_ago(8)))
+            self.assertIn("held compliance-audit", "\n".join(lines), minutes)
+            self.assertEqual(self.next_run("wide"), iso(NOW - timedelta(minutes=1)), minutes)
+            self.assertNotIn("wide", self.state()["held"], minutes)
+
+    def test_a_period_past_the_calendars_end_releases_without_a_next_slot(self):
+        # The release adds the period to the last run; a period that lands past
+        # year 9999 has no next slot, so the job keeps the hold's timestamp and
+        # the release of every other job goes through.
+        self.write(interval_job("aeon", 1e10, NOW), interval_job("two-hourly", 120, NOW, NOW - timedelta(hours=2)))
+        self.run_policy(Reader(days_ago(15)))
+        self.assertEqual(self.next_run("aeon"), iso(NOW + timedelta(days=1)))
+        later = NOW + timedelta(minutes=50)
+        lines = self.run_policy(Reader(later), now=later)
+        self.assertIn("released two-hourly", "\n".join(lines))
+        self.assertEqual(self.next_run("aeon"), iso(NOW + timedelta(days=1)))
+        self.assertEqual(self.state()["held"], {})
+
     def test_disabled_job_is_not_held(self):
         self.write(prompt_job("compliance-audit", "20 6 * * *", NOW, days_ago(2), enabled=False))
         self.run_policy(Reader(days_ago(8)))

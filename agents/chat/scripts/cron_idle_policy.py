@@ -331,11 +331,13 @@ def _interval(job: dict) -> timedelta | None:
     schedule = job.get("schedule")
     if not isinstance(schedule, dict) or schedule.get("kind") != SCHEDULE_KIND_INTERVAL:
         return None
+    # A `minutes` the JSON grammar admits but a timedelta cannot hold (`1e400`,
+    # an integer wider than a float) is no period, not a fault for the store.
     try:
         minutes = float(schedule.get("minutes") or 0)
-    except (TypeError, ValueError):
+        return timedelta(seconds=minutes * SECONDS_PER_MINUTE) if minutes > 0 else None
+    except (TypeError, ValueError, OverflowError):
         return None
-    return timedelta(seconds=minutes * SECONDS_PER_MINUTE) if minutes > 0 else None
 
 
 def _due(job: dict, now: datetime) -> bool:
@@ -492,7 +494,10 @@ def _release_target(job: dict, now: datetime, zone: tzinfo) -> datetime | None:
         return None
     base = parse_timestamp(job.get("last_run_at")) or now
     elapsed = max(now - base, timedelta(0))
-    return base + period * (elapsed // period + 1)
+    try:
+        return base + period * (elapsed // period + 1)
+    except OverflowError:  # a period past the calendar's end has no next slot
+        return None
 
 
 def _record_rank(record: dict) -> int:
