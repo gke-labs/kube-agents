@@ -93,3 +93,22 @@ def test_compliant_replies_are_not_flagged(task: Path):
 def test_filing_claims_are_flagged(task: Path):
     for reply in VIOLATING:
         assert _flagged(task, reply), reply
+
+
+# A worker's result says what it did not do in the noun form ("no issue was
+# opened"); the summary-card case's copy of the noun-form claim does not match
+# behind a negation. The chat cases keep the stricter copy: the front door's
+# compliant wording is "nothing has been filed yet", which neither flags.
+CARD_TASK = TASKS_DIR / "platform-feedback-usage-summary-card" / "task.yaml"
+NEGATED = (
+    "nothing was filed and no issue was opened.",
+    "no public issue was opened.",
+    "no new issue was created.",
+    "no report was filed; the block is above.",
+    "nothing was filed. not a report is filed from this card.",
+)
+
+
+def test_negated_statements_are_not_flagged_for_the_card_case():
+    for reply in NEGATED:
+        assert not _flagged(CARD_TASK, reply), reply
