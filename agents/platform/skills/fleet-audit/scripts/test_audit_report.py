@@ -89,6 +89,23 @@ STAMP_TOLERANCE_SECONDS = 300
 # Which SOP owns each stream's check roster. Spelled out rather than derived
 # from the audit id so that renaming a file breaks this mapping loudly instead
 # of silently skipping the roster-drift check for that stream.
+# The streams whose SOP runs `audit_report.py precheck` after its collector and
+# whose cron prompt passes `--scheduled` to it: the nine daily and weekly
+# governance audits. `upgrade-retrospective` runs a collector too, but grades
+# recorded weeks that move every run, so it keeps the plain `finish` sentence.
+PRECHECK_STREAMS = frozenset(
+    {
+        "ai-security-audit",
+        "compliance-audit",
+        "fleet-consistency-drift",
+        "fleet-wide-cost-analysis",
+        "gce-compute-fleet-audit",
+        "gcp-networking-fabric-audit",
+        "obtainability-audit",
+        "security-patch-orchestrator",
+        "stockout-prevention",
+    }
+)
 SOP_FILENAMES = {
     "compliance-audit": "compliance_audit_sop.md",
     "security-patch-orchestrator": "security_patch_orchestrator_sop.md",
@@ -3204,8 +3221,13 @@ class TestAuditCatalogue(unittest.TestCase):
         for audit_id, spec in sorted(audit_report.AUDITS.items()):
             with self.subTest(audit=audit_id):
                 self.assertIn(audit_id, jobs, f"{audit_id} has no cron job")
+                phrase = (
+                    "pass --scheduled to precheck and finish"
+                    if audit_id in PRECHECK_STREAMS
+                    else "pass --scheduled to finish"
+                )
                 self.assertIn(
-                    "pass --scheduled to finish",
+                    phrase,
                     jobs[audit_id]["prompt"],
                     f"the {audit_id} prompt does not make its run scheduled",
                 )
@@ -3213,6 +3235,34 @@ class TestAuditCatalogue(unittest.TestCase):
                     "--scheduled",
                     (sop_dir / spec.sop).read_text(encoding="utf-8"),
                     f"{spec.sop} passes --scheduled, so an on-demand run passes it too",
+                )
+
+    def test_every_collector_sop_runs_precheck_after_its_collector(self):
+        """The gate is a step of every SOP that runs a collector, and of no other.
+
+        The step names the stream's own manifest path, so `precheck` reads the
+        file the collector command above it wrote; a stream without a
+        collector has no manifest to digest and no step.
+        """
+        self.cron_jobs()
+        sop_dir = self.sop_dir()
+        streams = self.collector_streams()
+        self.assertTrue(PRECHECK_STREAMS <= set(streams), "a precheck stream has no collector")
+        for audit_id, spec in sorted(audit_report.AUDITS.items()):
+            text = (sop_dir / spec.sop).read_text(encoding="utf-8")
+            step = (
+                f"audit_report.py precheck --audit {audit_id} "
+                f"--manifest-file /opt/data/scratch/manifest_{audit_id}.json"
+            )
+            with self.subTest(audit=audit_id):
+                if audit_id not in PRECHECK_STREAMS:
+                    self.assertNotIn("audit_report.py precheck", text, f"{spec.sop} runs precheck outside the gated streams")
+                    continue
+                self.assertIn(step, text, f"{spec.sop} does not run precheck on its manifest")
+                collector = text.index("Run the collector")
+                self.assertGreater(text.index(step), collector, f"{spec.sop} runs precheck before its collector")
+                self.assertLess(
+                    text.index(step), text.index("audit_report.py finish"), f"{spec.sop} runs precheck after finish"
                 )
 
     def test_cron_prompts_name_the_real_collector_invocation(self):
@@ -35527,6 +35577,339 @@ class TestStoreLedger(HarnessTestCase):
         self.assertTrue(self.latest()["ledger_held_open"])
         self.assertNotIn(pr6["url"], out["prs_closed"])
         self.assertEqual(out["prs_closed"], [pr9["url"]])
+
+
+class TestPrecheck(BaseTestCase):
+    """`precheck`: the delta gate between the collector and the drafting by hand.
+
+    With no forge, so that every `finish` here is the real one with no
+    recorder to stub; the forge path is `TestPrecheckOnTheForgePath`.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.patch_attr("GITOPS_WORKSPACE", str(self.tmp_path / "gitops"))
+        self.recorder = Recorder()
+        self.patch_attr("run_cmd", self.recorder)
+        no_remote = type(sys)("github_token_refresh")
+        no_remote.get_current_git_repo = lambda cwd=None: None
+        for patcher in (
+            patch("gitops_workspace.get_managed_repos", return_value=[]),
+            patch("gitops_workspace._read_state_text", lambda key: ""),
+            patch("gitops_workspace.get_context_github_repo_entries", return_value=[]),
+            patch.dict(sys.modules, {"github_token_refresh": no_remote}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.manifest_dir = self.tmp_path / "manifests"
+        self.manifest_dir.mkdir()
+
+    def store(self):
+        return self.reports_dir / AUDIT / "no_forge" / "local"
+
+    def latest(self):
+        return json.loads((self.store() / "latest.json").read_text(encoding="utf-8"))
+
+    def manifest_file(self, name="day1", candidates=(), **extra):
+        manifest = {
+            **_full_manifest(candidates=candidates),
+            "audit": AUDIT,
+            "checks_revision": "rev-a",
+            # After any `start` these tests take, so `load_manifest` reads
+            # the manifest as this run's; the `stale` test overrides it.
+            "started_at": "2099-01-01T06:20:00Z",
+            "finished_at": "2099-01-01T06:23:00Z",
+            **extra,
+        }
+        for index, cluster in enumerate(manifest["clusters"]):
+            for command in cluster["commands"]:
+                command["duration_s"] = float(len(name) + index)
+                command["output_sha256"] = f"{name}-{index}"
+        path = self.manifest_dir / f"{name}.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def start(self):
+        self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0, self.err)
+
+    def finish(self, doc, manifest, scheduled=True, extra=()):
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(doc), encoding="utf-8")
+        argv = ["finish", "--audit", AUDIT, "--findings-file", path, "--manifest-file", manifest, *extra]
+        if scheduled:
+            argv.append("--scheduled")
+        self.assertEqual(self.run_main(argv), 0, self.err)
+        return self.stdout_json()
+
+    def precheck(self, manifest, scheduled=True, start=True):
+        if start:
+            self.start()
+        argv = ["precheck", "--audit", AUDIT, "--manifest-file", manifest]
+        if scheduled:
+            argv.append("--scheduled")
+        return self.run_main(argv)
+
+    def digest_record(self):
+        delta = audit_report._manifest_delta()
+        return delta.read_record(AUDIT, audit_report.SCRATCH_DIR)
+
+    def test_the_parser_has_the_subcommand_and_scheduled_defaults_to_false(self):
+        args = audit_report.build_parser().parse_args(["precheck", "--audit", AUDIT, "--manifest-file", "m.json"])
+        self.assertEqual((args.subcommand, args.scheduled, args.repo), ("precheck", False, None))
+        args = audit_report.build_parser().parse_args(
+            ["precheck", "--audit", AUDIT, "--manifest-file", "m.json", "--scheduled", "--repo", "acme/fleet"]
+        )
+        self.assertTrue(args.scheduled)
+        self.assertEqual(args.repo, "acme/fleet")
+
+    def test_a_first_run_prints_the_verdict_and_closes_nothing(self):
+        rc = self.precheck(self.manifest_file())
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out, {"verdict": "first-run", "closed": False, "reason": audit_report.PRECHECK_REASON_FIRST_RUN})
+        self.assertFalse(self.store().exists())
+        self.assertIn("PRECHECK: first-run", self.err)
+
+    def test_a_scheduled_finish_with_a_manifest_records_the_digest(self):
+        out = self.finish(make_doc(findings=[]), self.manifest_file())
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertNotIn(audit_report.PRECHECK_KEY, out)
+        record = self.digest_record()
+        self.assertIsNotNone(record)
+        self.assertEqual(record["checks_revision"], "rev-a")
+        self.assertIn("recorded this scheduled run's manifest digest", self.err)
+        self.assertNotIn(audit_report.PRECHECK_KEY, self.latest())
+
+    def test_an_on_demand_finish_records_nothing(self):
+        self.finish(make_doc(findings=[]), self.manifest_file(), scheduled=False)
+        self.assertIsNone(self.digest_record())
+
+    def test_a_scheduled_finish_that_waived_the_manifest_removes_the_record(self):
+        self.finish(make_doc(findings=[]), self.manifest_file())
+        self.assertIsNotNone(self.digest_record())
+        self.start()
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=[])), encoding="utf-8")
+        rc = self.run_main(
+            ["finish", "--audit", AUDIT, "--findings-file", path, "--no-collector-manifest", "the collector died", "--scheduled"]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertIsNone(self.digest_record())
+
+    def test_an_unchanged_scheduled_run_is_closed_from_the_stored_document(self):
+        first = self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        self.assertNotIn(audit_report.PRECHECK_KEY, first)
+        before = self.digest_record()
+        stale_draft = Path(audit_report.findings_path_for(AUDIT))
+        stale_draft.write_text("{}", encoding="utf-8")
+
+        rc = self.precheck(self.manifest_file("day2"))
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertEqual(out["status"], audit_report.NO_FORGE_STATUS)
+        self.assertTrue(out["silent_ok"])
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        self.assertIn("PRECHECK: unchanged: closing the run from the document of the scheduled run", self.err)
+        latest = self.latest()
+        self.assertEqual(latest[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertTrue(latest[audit_report.RUN_SCHEDULED_KEY])
+        self.assertEqual(latest["document"]["findings"], [])
+        # The findings file is the stored document now, written after `start`.
+        self.assertEqual(json.loads(stale_draft.read_text(encoding="utf-8"))["findings"], [])
+        # The record moved, and the last full synthesis did not.
+        after = self.digest_record()
+        self.assertEqual(after["last_full_run_at"], before["last_full_run_at"])
+        self.assertGreaterEqual(after["recorded_at"], before["recorded_at"])
+
+    def test_a_finding_the_fleet_still_carries_is_republished_unchanged(self):
+        candidate = {
+            "check": "netpol-missing",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Namespace/no-network-policy",
+            "severity": "critical",
+            "excerpt": "zero NetworkPolicies in payments",
+        }
+        finding = make_finding(remediation={"kind": "manual", "note": "Write a default-deny policy."})
+        first = self.finish(make_doc(findings=[finding]), self.manifest_file("day1", candidates=[candidate]))
+        self.assertEqual(first["new"], 1)
+        rc = self.precheck(self.manifest_file("day2", candidates=[candidate]))
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertTrue(out["silent_ok"])
+        self.assertEqual((out["new"], out["resolved"], out["findings"]), (0, 0, 1))
+        ids = [f["id"] for f in self.latest()["document"]["findings"]]
+        self.assertEqual(ids, [f["id"] for f in json.loads(json.dumps(self.latest()["document"]))["findings"]])
+        self.assertEqual(len(ids), 1)
+
+    def test_without_the_flag_an_unchanged_run_is_not_closed(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        stored = self.latest()
+        rc = self.precheck(self.manifest_file("day2"), scheduled=False)
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["verdict"], "unchanged")
+        self.assertFalse(out["closed"])
+        self.assertEqual(out["reason"], audit_report.PRECHECK_NOT_SCHEDULED_REASON)
+        self.assertEqual(self.latest(), stored)
+
+    def test_a_changed_fleet_runs_in_full(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        stored = self.latest()
+        candidate = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "x", "object": "Namespace/x", "severity": "major", "excerpt": "e"}
+        rc = self.precheck(self.manifest_file("day2", candidates=[candidate]))
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out, {"verdict": "findings-changed", "closed": False, "reason": audit_report.PRECHECK_REASON_FINDINGS_CHANGED})
+        self.assertEqual(self.latest(), stored)
+
+    def test_a_week_without_a_full_synthesis_runs_in_full(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        delta = audit_report._manifest_delta()
+        path = delta.digest_path_for(AUDIT, audit_report.SCRATCH_DIR)
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["last_full_run_at"] = "2020-01-01T00:00:00+00:00"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        rc = self.precheck(self.manifest_file("day2"))
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["verdict"], "periodic-refresh")
+        self.assertFalse(self.stdout_json()["closed"])
+
+    def test_a_newer_on_demand_run_means_a_full_run(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        self.finish(make_doc(findings=[]), self.manifest_file("day1-afternoon"), scheduled=False)
+        rc = self.precheck(self.manifest_file("day2"))
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out["verdict"], "unchanged")
+        self.assertFalse(out["closed"])
+        self.assertIn("was not a scheduled run", out["reason"])
+        self.assertIn(audit_report.PRECHECK_CONTINUES_SUFFIX, out["reason"])
+
+    def test_an_unusable_stored_document_means_a_full_run(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        latest = self.store() / "latest.json"
+        envelope = json.loads(latest.read_text(encoding="utf-8"))
+        envelope["document"] = {"scope": {}}
+        latest.write_text(json.dumps(envelope), encoding="utf-8")
+        rc = self.precheck(self.manifest_file("day2"))
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn("no usable findings document", out["reason"])
+
+    def test_a_document_finish_rejects_means_a_full_run_and_the_draft_is_put_back(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        stored = self.latest()
+        draft = Path(audit_report.findings_path_for(AUDIT))
+        self.start()
+        draft.write_text('{"the": "draft"}', encoding="utf-8")
+        with patch.object(audit_report, "_finish", side_effect=audit_report.ValidationError("scope.clusters: dr-west is missing")):
+            rc = self.precheck(self.manifest_file("day2"), start=False)
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual((out["verdict"], out["closed"]), ("unchanged", False))
+        self.assertIn("finish did not take the stored document (scope.clusters: dr-west is missing)", out["reason"])
+        self.assertEqual(draft.read_text(encoding="utf-8"), '{"the": "draft"}')
+        self.assertEqual(self.latest(), stored)
+        self.assertIsNone(audit_report._PRECHECK_VERDICT)
+
+    def test_a_rejected_close_with_no_draft_leaves_no_findings_file(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        draft = Path(audit_report.findings_path_for(AUDIT))
+        self.start()
+        draft.unlink(missing_ok=True)
+        with patch.object(audit_report, "_finish", side_effect=audit_report.ValidationError("no")):
+            self.assertEqual(self.precheck(self.manifest_file("day2"), start=False), 0, self.err)
+        self.assertFalse(draft.exists())
+
+    def test_a_lost_broker_during_the_close_is_said_and_exits_2(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        with patch.object(audit_report, "_finish", side_effect=audit_report.BrokerUnavailable("the broker at x did not answer")):
+            rc = self.precheck(self.manifest_file("day2"))
+        self.assertEqual(rc, 2)
+        self.assertIn("BROKER UNAVAILABLE", self.err)
+        self.assertEqual(self.out, "")
+        self.assertIsNone(audit_report._PRECHECK_VERDICT)
+
+    def test_a_manifest_that_predates_the_run_is_refused(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        self.start()
+        rc = self.precheck(self.manifest_file("stale", finished_at="2020-01-01T00:00:00Z"), start=False)
+        self.assertEqual(rc, 2)
+        self.assertIn("FINDINGS REJECTED", self.err)
+        self.assertIn("before this run started", self.err)
+
+    def test_a_partial_manifest_is_never_closed_from_the_store(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        manifest = json.loads(Path(self.manifest_file("day2")).read_text(encoding="utf-8"))
+        manifest["clusters"][1]["checks_unevaluated"] = [{"check": "netpol-missing", "reason": "read failed"}]
+        path = self.manifest_dir / "partial.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(self.precheck(str(path)), 0, self.err)
+        self.assertEqual(self.stdout_json()["verdict"], "findings-changed")
+
+    def test_a_blank_manifest_path_is_refused(self):
+        rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", " ", "--scheduled"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--manifest-file", self.err)
+
+    def test_the_precheck_close_then_a_full_run_moves_the_last_full_synthesis(self):
+        self.finish(make_doc(findings=[]), self.manifest_file("day1"))
+        first = self.digest_record()["last_full_run_at"]
+        self.assertEqual(self.precheck(self.manifest_file("day2")), 0, self.err)
+        self.assertEqual(self.digest_record()["last_full_run_at"], first)
+        self.finish(make_doc(findings=[]), self.manifest_file("day3"))
+        self.assertGreaterEqual(self.digest_record()["last_full_run_at"], first)
+        self.assertNotIn(audit_report.PRECHECK_KEY, self.latest())
+
+
+class TestPrecheckOnTheForgePath(HarnessTestCase):
+    """The close `precheck` runs is the forge path's own `finish`."""
+
+    def manifest_file(self, name, candidates=()):
+        manifest = {**_full_manifest(candidates=candidates), "audit": AUDIT, "finished_at": "2099-01-01T06:23:00Z"}
+        path = self.tmp_path / f"{name}.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return str(path)
+
+    def test_an_unchanged_scheduled_run_closes_with_the_ledger_untouched(self):
+        a = make_finding(fid="a", severity="major")
+        body = published_body(make_doc(findings=[a]), generated_at=NOW)
+        self.seed_report(
+            body,
+            coverage_gaps=[],
+            status="UPDATED",
+            **{
+                audit_report.RUN_SCHEDULED_KEY: True,
+                audit_report.SCHEDULED_COVERAGE_GAPS_KEY: [],
+                audit_report.SCHEDULED_PUBLISHED_IDS_KEY: audit_report.parse_delta_block(body),
+            },
+        )
+        self.harness.replies = {"issue-list": self.issue_list()}
+        candidate = {"check": "netpol-missing", "cluster": "prod-us-east", "namespace": "payments", "object": "Namespace/a", "severity": "major", "excerpt": "e"}
+        rc = self.run_finish(make_doc(findings=[a]), ["--manifest-file", self.manifest_file("day1", [candidate])])
+        self.assertEqual(rc, 0, self.err)
+        first = self.stdout_json()
+        self.assertTrue(first["silent_ok"])
+        self.assertNotIn(audit_report.PRECHECK_KEY, first)
+
+        rc = self.run_main(["precheck", "--audit", AUDIT, "--manifest-file", self.manifest_file("day2", [candidate]), "--scheduled"])
+
+        self.assertEqual(rc, 0, self.err)
+        out = self.stdout_json()
+        self.assertEqual(out[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertEqual(out["status"], "UPDATED")
+        self.assertTrue(out["silent_ok"])
+        self.assertEqual((out["new"], out["resolved"]), (0, 0))
+        latest = json.loads((self.store_dir() / "latest.json").read_text(encoding="utf-8"))
+        self.assertEqual(latest[audit_report.PRECHECK_KEY], "unchanged")
+        self.assertEqual(latest["issue_number"], 42)
+        self.assertEqual([f["id"] for f in latest["document"]["findings"]], audit_report.parse_delta_block(body))
 
 
 if __name__ == "__main__":

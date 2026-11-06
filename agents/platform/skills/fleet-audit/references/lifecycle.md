@@ -287,3 +287,20 @@ findings document from the collector's manifest: `scope.clusters` with each coll
 one finding per candidate carrying its evidence, impact and severity. It leaves each finding's
 `recommendation` empty and its `remediation` `manual`, because those are the judgement the collector
 cannot make: write them, and `finish` has nothing else to reject.
+
+`audit_report.py precheck --audit <audit-id> --manifest-file <manifest> [--repo "<owner>/<repo>"] [--scheduled]`
+runs between the collector and `draft`, where the SOP puts it. It digests what the manifest says
+about the fleet (every cluster's outcome, its checks and their exit codes, its candidates, its
+limitations, `checks_not_applicable`, `checks_unevaluated` and the collector's `checks_revision`;
+not its timestamps, durations, output hashes or command strings) and compares the digest with the
+one the last scheduled `finish` of the stream recorded at
+`/opt/data/scratch/last_scheduled_digest_<audit-id>.json`. Its one JSON line gives the `verdict`:
+`first-run` (no record), `findings-changed` (the digest differs, a target was not collected, or a
+check went unevaluated), `periodic-refresh` (seven days since the last full synthesis) or
+`unchanged`. With `--scheduled` and `unchanged`, when the newest stored run of the ledger is a
+scheduled run with a findings document, it writes that document to `findings_path` and runs
+`finish --scheduled` on it with this run's manifest, so the cross-check, the ledger comparison and
+`silent_ok` are `finish`'s own: the line is then `finish`'s, plus `precheck: unchanged`, and the run
+is over. In every other case the line says `closed: false` and why, the findings file is as it
+was, and the SOP continues. Without the flag it never closes a run: an on-demand run is answered
+by the person who asked for it, in full.
