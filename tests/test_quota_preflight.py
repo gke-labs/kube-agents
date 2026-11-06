@@ -487,6 +487,29 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(admitted["limitsMemory"], fleet["limitsMemory"])
         self.assertEqual(self._requirements([f"{_SIZING_VALUE}=fleet", f"{_SHELL_VALUE}.requests.memory=5Gi"]), fleet)
 
+    def test_sizing_profile_auto_counts_a_proxy_request_alone_above_the_small_limit_at_the_row(self) -> None:
+        """Under auto the CR template admits a proxy request set alone up to the fleet
+        row's limit, while the preflight counts auto at the small row, where the operator
+        refuses that request and renders the row: a 6Gi memory request alone (above
+        small's 2Gi limit, under fleet's 8Gi) is counted at the small row rather than as a
+        6Gi request against a 2Gi limit, a pod the operator never writes. The same request
+        under fleet is admitted and counted as written, as is one set together with a
+        limit that admits it under auto, and a limit set alone below the row's request
+        lowers the request rather than reading as crossed."""
+        base = self._requirements()
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=auto", f"{_PROXY_VALUE}.requests.memory=6Gi"]), base)
+        self.assertEqual(self._requirements([f"{_SIZING_VALUE}=auto", f"{_PROXY_VALUE}.requests.cpu=3"]), base)
+        fleet = self._requirements([f"{_SIZING_VALUE}=fleet"])
+        admitted = self._requirements([f"{_SIZING_VALUE}=fleet", f"{_PROXY_VALUE}.requests.memory=6Gi"])
+        self.assertEqual(admitted["requestsMemory"] - fleet["requestsMemory"], (6 - 8) * 1024**3)
+        self.assertEqual(admitted["limitsMemory"], fleet["limitsMemory"])
+        paired = self._requirements([f"{_SIZING_VALUE}=auto", f"{_PROXY_VALUE}.requests.memory=6Gi", f"{_PROXY_VALUE}.limits.memory=8Gi"])
+        self.assertEqual(paired["requestsMemory"] - base["requestsMemory"], 5 * 1024**3)
+        self.assertEqual(paired["limitsMemory"] - base["limitsMemory"], 6 * 1024**3)
+        lowered = self._requirements([f"{_SIZING_VALUE}=auto", f"{_PROXY_VALUE}.limits.memory=768Mi"])
+        self.assertEqual(lowered["requestsMemory"] - base["requestsMemory"], 768 * 1024**2 - 1024**3)
+        self.assertEqual(lowered["limitsMemory"] - base["limitsMemory"], 768 * 1024**2 - 2 * 1024**3)
+
     def test_sizing_profile_on_autopilot_counts_the_rows_autopilot_requests(self) -> None:
         """On GKE Autopilot the proxy's requests are the row's Autopilot pair, not the
         small one: medium requests 2 CPU and 4Gi (the Standard medium row requests 1 CPU),
