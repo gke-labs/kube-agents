@@ -90,6 +90,13 @@ def poll_step_seconds() -> int:
     return int(lifted_line(CONSTANT_LINES[5]).split("=", 1)[1])
 
 
+def release_loop() -> str:
+    """The release loop in run_one_unit, as shipped."""
+    match = re.search(r"^  local note_stream\n  for note_stream in .*?\n  done\n", lifted("run_one_unit"), re.DOTALL | re.MULTILINE)
+    assert match, "run_one_unit no longer releases the in-flight note in a note_stream loop"
+    return match.group(0)
+
+
 def pod_snippet() -> str:
     """The script the pod's shell runs, as shipped."""
     match = re.search(r"sh -c '(.*?)' sh \"\$\{note\}\"", lifted("release_inflight_note"), re.DOTALL)
@@ -358,10 +365,49 @@ class NamesTest(unittest.TestCase):
         # not push the waiter past it, so the grace is in the deadline.
         self.assertIn('lock_deadline="$(stream_lock_deadline "${name}" "${audit_id}" "${streams}")"', lifted("run_one_unit"))
         self.assertIn(
-            "($(unit_delegation_timeout \"$1\") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS + run_wait)",
+            "($(unit_delegation_timeout \"$1\") + UNIT_LOCK_ALLOWANCE_SECONDS + EVAL_INFLIGHT_GRACE_SECONDS * notes + run_wait)",
             lifted("stream_lock_deadline"),
         )
         self.assertEqual(grace_seconds(), 300)
+
+    def deadline(self, audit_id: str, streams: str, matrix: tuple[str, ...]) -> int:
+        # The deadline with every other term pinned, so the grace is what
+        # moves; `matrix` is TASK_STREAMS, each entry one unit's declared streams.
+        body = "\n".join(
+            [
+                "stream_case_count() { echo 1; }",
+                "unit_delegation_timeout() { echo 1000; }",
+                "stream_stack_wait() { echo 0; }",
+                "UNIT_LOCK_ALLOWANCE_SECONDS=0; EVAL_INFLIGHT_GRACE_SECONDS=300; EVAL_PLATFORM_RUN_WAIT_SECONDS=0",
+                "TASK_STREAMS=(" + " ".join(shlex.quote(entry) for entry in matrix) + ")",
+                lifted("stream_note_count"),
+                lifted("stream_lock_deadline"),
+                f"stream_lock_deadline t {shlex.quote(audit_id)} {shlex.quote(streams)}",
+            ]
+        )
+        result = run_bash(body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return int(result.stdout.strip())
+
+    def test_the_lock_deadline_grants_one_grace_per_note_the_holder_may_release(self):
+        # A ledger case alone on its stream: one grace, as before.
+        self.assertEqual(self.deadline("compliance-audit", "compliance-audit", ("compliance-audit", "")), 1300)
+        # A case with no ledger: one grace per stream it declares.
+        self.assertEqual(self.deadline("", "compliance-audit", ("compliance-audit",)), 1300)
+        two = "compliance-audit security-patch-orchestrator"
+        self.assertEqual(self.deadline("", two, (two,)), 1600)
+        # A waiter on a stream a five-stream ledgerless unit also holds
+        # outlasts that unit's five graces: the stream lock passes the stream
+        # itself, the task lock of a ledger case its ledger id.
+        five = "ai-security-audit compliance-audit fleet-consistency-drift obtainability-audit security-patch-orchestrator"
+        self.assertEqual(self.deadline("compliance-audit", "compliance-audit", ("compliance-audit", five)), 2500)
+        # The task lock of a case with no ledger passes an empty id and keeps
+        # the single-unit figure, as stream_case_count does for it.
+        self.assertEqual(self.deadline("", "compliance-audit", ("compliance-audit", five)), 1300)
+        # Another stream's holders do not count, and a unit on no stream
+        # keeps the single grace.
+        self.assertEqual(self.deadline("compliance-audit", "compliance-audit", ("compliance-audit", "a b c")), 1300)
+        self.assertEqual(self.deadline("", "", ("compliance-audit", five)), 1300)
 
 
 class CallSiteTest(unittest.TestCase):
@@ -376,22 +422,53 @@ class CallSiteTest(unittest.TestCase):
         unit = lifted("run_one_unit")
         stream_lock = unit.index('lock_acquire "${STATE_DIR}/lock-stream-${s}"')
         reset = unit.index('reset_audit_ledgers "${name} rep ${rep}" "${audit_id}"')
-        release = unit.index('release_inflight_note "${name} rep ${rep}" "${audit_id}"')
+        release = unit.index('release_inflight_note "${name} rep ${rep}" "${note_stream}"')
         launch = unit.index("uv run devops-bench")
         stream_release = unit.index('release_streams "${streams}"', launch)
         self.assertLess(stream_lock, release)
         self.assertLess(release, reset)
         self.assertLess(reset, launch)
         self.assertLess(launch, stream_release)
-        # Both inside the one block gated on the case writing a ledger.
+        # The reset alone is gated on the case writing a ledger; the release
+        # runs for every unit, over its ledger stream or its declared ones.
         block = re.search(r'  if \[ -n "\$\{audit_id\}" \]; then\n(.*?)\n  fi\n', unit, re.DOTALL).group(1)
         self.assertIn("reset_audit_ledgers", block)
-        self.assertIn("release_inflight_note", block)
+        self.assertNotIn("release_inflight_note", block)
+        self.assertIn('for note_stream in ${audit_id:-${streams}}; do', release_loop())
+
+    def released(self, audit_id: str, streams: str) -> list[str]:
+        # The loop as shipped, with the release stubbed to name its stream.
+        body = "\n".join(
+            [
+                'release_inflight_note() { echo "RELEASE $2"; }',
+                f"name=case; rep=1; audit_id={shlex.quote(audit_id)}; streams={shlex.quote(streams)}",
+                release_loop(),
+            ]
+        )
+        result = run_bash(body)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line.split(" ", 1)[1] for line in result.stdout.splitlines()]
+
+    def test_a_unit_without_a_ledger_releases_each_declared_streams_note(self):
+        # A ledger case releases its ledger stream's note, as before (#4268:
+        # the reset is per stream, and that is the stream the case writes).
+        self.assertEqual(self.released("compliance-audit", "compliance-audit"), ["compliance-audit"])
+        # A report-store case (audit_report_stored, audit_streams:, no ledger
+        # check) releases each stream it declares; before this it released
+        # none, and the install's own cron run's note, left when a scope
+        # patch rolled the gateway, refused every repetition inside two hours.
+        self.assertEqual(self.released("", "compliance-audit"), ["compliance-audit"])
+        self.assertEqual(
+            self.released("", "ai-security-audit compliance-audit"),
+            ["ai-security-audit", "compliance-audit"],
+        )
+        # A unit on no stream releases nothing.
+        self.assertEqual(self.released("", ""), [])
 
     def test_the_release_runs_per_unit_and_nowhere_else(self):
         src = SCRIPT.read_text(encoding="utf-8")
         calls = re.findall(r"^\s*release_inflight_note .*$", src, re.MULTILINE)
-        self.assertEqual(calls, ['    release_inflight_note "${name} rep ${rep}" "${audit_id}"'])
+        self.assertEqual(calls, ['    release_inflight_note "${name} rep ${rep}" "${note_stream}"'])
         # Defined after the ledger reset it sits beside, before the matrix;
         # its constants with the script's other readonly ones, above both.
         self.assertLess(src.index("reset_audit_ledgers() {"), src.index("release_inflight_note() {"))
