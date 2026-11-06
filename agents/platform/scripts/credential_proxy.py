@@ -3903,7 +3903,9 @@ def session_slot_limit_from_env(
     ``minimum=0``, where 0 is a value and means off. Anything that is not an
     integer of at least ``minimum`` falls back to the default with a warning,
     so a typo narrows rather than opens: the default is the small number, and
-    an unset or broken knob is never "unlimited".
+    an unset or broken knob is never "unlimited". The warning says "not a
+    positive integer" under the default minimum (the phrase the thread-cap and
+    slot-limit tests read) and names the minimum otherwise.
     """
     raw = os.getenv(env_name, "").strip()
     if not raw:
@@ -3913,10 +3915,8 @@ def session_slot_limit_from_env(
     except ValueError:
         value = minimum - 1
     if value < minimum:
-        LOGGER.warning(
-            "%s=%r is not an integer of at least %d; using the default of %d",
-            env_name, raw, minimum, default,
-        )
+        bound = "a positive integer" if minimum == 1 else "an integer of at least %d" % minimum
+        LOGGER.warning("%s=%r is not %s; using the default of %d", env_name, raw, bound, default)
         return default
     return value
 

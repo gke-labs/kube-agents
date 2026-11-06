@@ -21015,9 +21015,11 @@ class SessionToolBudgetTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {name: raw}), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 self.assertEqual(1500, read(name, 1500, minimum=0))
             self.assertIn("at least 0", logs.output[0])
-        # And the slot limits still refuse 0.
-        with mock.patch.dict(os.environ, {name: "0"}), self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+        # And the slot limits still refuse 0, in the phrase the thread-cap tests read.
+        with mock.patch.dict(os.environ, {name: "0"}), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
             self.assertEqual(2, read(name, 2))
+        self.assertIn("not a positive integer", logs.output[0])
+        self.assertNotIn("at least", logs.output[0])
         self.assertEqual("BROKER_SESSION_MAX_TOOL_CALLS", name)
         self.assertEqual("BROKER_SESSION_MAX_IDENTICAL_FAILURES", credential_proxy.ENV_SESSION_MAX_IDENTICAL_FAILURES)
 
