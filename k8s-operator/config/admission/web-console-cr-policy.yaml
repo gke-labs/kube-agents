@@ -31,7 +31,11 @@
 #   4. A forge that already existed (matched by name) keeps its host, port, scheme, provider,
 #      credentialsRef and caBundleRef, and its namespace when it has a credentialsRef.
 #   5. A forge the console adds carries no credentialsRef and no caBundleRef.
-#   6. The install's GitHub host (the first GitHub forge's host, github.com by default) is unchanged.
+#   6. The install's GitHub host (the first GitHub forge's host, github.com by default) is unchanged,
+#      and a GitHub forge the console adds sits at a host a GitHub forge already uses (github.com
+#      when there is none). The second part covers the operator's fallback to the first usable
+#      GitHub forge when the first one is refused for its host. Removing the install's only GitHub
+#      Enterprise forge moves the host back to github.com, so the console cannot do that either.
 #
 # Adding a repository on a forge with a credentialsRef still widens that forge's served
 # namespaces, and with them the token's allowed paths: adding repositories is the console's job, so
@@ -116,6 +120,16 @@ spec:
         size(variables.newGitHubForges) == 0 || !has(variables.newGitHubForges[0].host) ||
           variables.newGitHubForges[0].host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com'] ?
           'github.com' : variables.newGitHubForges[0].host.trim().lowerAscii()
+    # Every GitHub forge's host, read the same way, before the update. A GitHub forge the console
+    # adds must sit at one of them (github.com when there are none): GitHubHost falls back to the
+    # first usable GitHub forge when the first one is refused for its host, so holding the first
+    # forge alone would let a new one take the host over.
+    - name: oldGitHubHosts
+      expression: >-
+        size(variables.oldGitHubForges) == 0 ? ['github.com'] :
+          variables.oldGitHubForges.map(o, !has(o.host) ||
+            o.host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com'] ?
+            'github.com' : o.host.trim().lowerAscii())
     - name: oldAnnotations
       expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
     - name: newAnnotations
@@ -156,6 +170,12 @@ spec:
         variables.newForges.all(f, variables.oldForges.exists(o, o.name == f.name) ||
           (!has(f.credentialsRef) && !has(f.caBundleRef)))
       message: "a forge the web console adds may not carry a credentialsRef or a caBundleRef"
+      reason: Forbidden
+    - expression: >-
+        variables.newGitHubForges.all(f, variables.oldForges.exists(o, o.name == f.name) ||
+          (!has(f.host) || f.host.trim().lowerAscii() in ['', 'github.com', 'www.github.com', 'ssh.github.com'] ?
+            'github.com' : f.host.trim().lowerAscii()) in variables.oldGitHubHosts)
+      message: "a GitHub forge the web console adds must sit at a host a GitHub forge already uses"
       reason: Forbidden
     - expression: "variables.newGitHubHost == variables.oldGitHubHost"
       messageExpression: >-

@@ -1145,7 +1145,8 @@ web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
 makes. Inside `forges`, the console may not move an existing forge's credential to
-another host, add a forge with a credential, or change the install's GitHub host.
+another host, add a forge with a credential, add a GitHub forge at a new host, or
+change the install's GitHub host.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it

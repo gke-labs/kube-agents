@@ -37,7 +37,7 @@ const (
 	webConsoleForgePolicyNamespace = "web-console-forge-policy"
 	// The forges the CR declares before each case, as JSON list items.
 	forgeGitHub = `{"name":"github","namespace":"gke-labs"}`
-	forgeGitLab = `{"name":"gl","provider":"gitlab","host":"gitlab.example.com","namespace":"acme","credentialsRef":{"name":"gl-token"}}`
+	forgeGitLab = `{"name":"gl","provider":"gitlab","host":"gitlab.example.com","namespace":"acme","credentialsRef":{"name":"gl-token"},"caBundleRef":{"name":"gl-ca"}}`
 	// Port and scheme are fields of a Gitea forge only, so that is where they are tried.
 	forgeGitea     = `{"name":"gt","provider":"gitea","host":"gitea.gitea.svc.cluster.local","namespace":"acme","credentialsRef":{"name":"gt-token"}}`
 	reposBothForge = `[{"forge":"github","repository":"gke-labs/kube-agents","role":"gitops"},` +
@@ -151,6 +151,7 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 		destinationRule = "may not change where an existing forge's credential goes"
 		newForgeRule    = "a forge the web console adds may not carry a credentialsRef or a caBundleRef"
 		gitHubHostRule  = "may not change the install's GitHub host"
+		newGitHubRule   = "a GitHub forge the web console adds must sit at a host a GitHub forge already uses"
 	)
 	gitLabWith := func(old, new string) string {
 		return integration(forgeGitHub+","+strings.Replace(forgeGitLab, old, new, 1)+","+forgeGitea, reposBothForge)
@@ -161,7 +162,12 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 	for _, tc := range []struct{ name, body, rule string }{
 		{"a credentialed forge's host", hostMoved, destinationRule},
 		{"a credentialed forge's credentialsRef", gitLabWith(`"gl-token"`, `"platform-agent-secrets"`), destinationRule},
-		{"a credentialed forge's caBundleRef", gitLabWith(`"credentialsRef"`, `"caBundleRef":{"name":"evil-ca"},"credentialsRef"`), destinationRule},
+		{"a credentialed forge's caBundleRef", gitLabWith(`"gl-ca"`, `"evil-ca"`), destinationRule},
+		{"a credentialed forge's provider", gitLabWith(`"provider":"gitlab"`, `"provider":"gitea"`), destinationRule},
+		{"a credentialsRef added to a forge with none", integration(
+			`{"name":"github","namespace":"gke-labs","credentialsRef":{"name":"gl-token"}},`+forgeGitLab+","+forgeGitea, reposBothForge), destinationRule},
+		{"a forge added with only a CA bundle", integration(forgeGitHub+","+forgeGitLab+","+forgeGitea+
+			`,{"name":"gh-ca","provider":"github","host":"ghe.attacker.example","caBundleRef":{"name":"evil-ca"}}`, reposBothForge), newForgeRule},
 		{"a credentialed forge's namespace", gitLabWith(`"namespace":"acme"`, `"namespace":"other-group"`), destinationRule},
 		{"a credentialed forge's port", giteaWith(`"namespace":"acme"`, `"namespace":"acme","port":3000`), destinationRule},
 		{"a credentialed forge's scheme", giteaWith(`"namespace":"acme"`, `"namespace":"acme","scheme":"http"`), destinationRule},
@@ -174,7 +180,7 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 		{"the GitHub forge replaced by one at another host", integration(
 			`{"name":"gh-ghes","provider":"github","host":"github.attacker.example","namespace":"gke-labs"},`+forgeGitLab+","+forgeGitea,
 			`[{"forge":"gh-ghes","repository":"gke-labs/kube-agents","role":"gitops"},{"forge":"gl","repository":"acme/infra","role":"context"}]`),
-			gitHubHostRule},
+			newGitHubRule},
 	} {
 		reset()
 		err := patch(console, tc.body)
@@ -185,6 +191,45 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 		if !strings.Contains(err.Error(), tc.rule) {
 			t.Errorf("%s: refused with %q, want the rule %q", tc.name, err, tc.rule)
 		}
+	}
+
+	// Cases that start from their own declaration, set by the admin.
+	for _, tc := range []struct{ name, setup, body, rule string }{
+		{
+			// The operator refuses a GitHub forge at a reserved domain and falls
+			// back to the first usable one, so a new forge must not become it.
+			name:  "a GitHub forge added after a refused first one",
+			setup: integration(`{"name":"gh-res","provider":"github","host":"acme.ghe.com","namespace":"gke-labs"}`, `[]`),
+			body: integration(`{"name":"gh-res","provider":"github","host":"acme.ghe.com","namespace":"gke-labs"},`+
+				`{"name":"x","provider":"github","host":"github.attacker.example","namespace":"org1"}`,
+				`[{"forge":"x","repository":"org1/infra","role":"gitops"}]`),
+			rule: newGitHubRule,
+		},
+		{
+			name:  "the only GitHub Enterprise forge removed",
+			setup: integration(`{"name":"ghe","provider":"github","host":"ghe.corp.example","namespace":"acme"},`+forgeGitLab, `[]`),
+			body:  integration(forgeGitLab, `[]`),
+			rule:  gitHubHostRule,
+		},
+	} {
+		if err := patch(admin, tc.setup); err != nil {
+			t.Fatalf("%s: setting the declaration: %v", tc.name, err)
+		}
+		err := patch(console, tc.body)
+		if !apierrors.IsForbidden(err) && !apierrors.IsInvalid(err) {
+			t.Errorf("%s: %v, want refused", tc.name, err)
+		} else if !strings.Contains(err.Error(), tc.rule) {
+			t.Errorf("%s: refused with %q, want the rule %q", tc.name, err, tc.rule)
+		}
+	}
+	// The deprecated alias moved to forges, with github.com spelled another
+	// way: the GitHub host does not change, so the console may write it.
+	if err := patch(admin, `{"spec":{"integration":{"forges":null,"repositories":null,"github":{"org":"gke-labs","gitRepo":"kube-agents"}}}}`); err != nil {
+		t.Fatalf("setting the alias: %v", err)
+	}
+	if err := patch(console, `{"spec":{"integration":{"forges":[{"name":"github","host":"GitHub.com","namespace":"gke-labs"}],`+
+		`"repositories":[{"forge":"github","repository":"gke-labs/kube-agents","role":"gitops"}],"github":null}}}`); err != nil {
+		t.Errorf("the alias moved to forges at GitHub.com: refused, want admitted: %v", err)
 	}
 
 	// Another identity holding the same Role is not selected.
