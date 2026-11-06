@@ -295,6 +295,22 @@ class SummaryTest(unittest.TestCase):
         self.assertIn("  tokens: unavailable", lines)
         self.assertIn("tasks (14 days): unavailable", lines)
         self.assertNotIn("ops-alerts-prod", out)
+        # The rating form is for a person pasting the block by hand; an
+        # attached block ends on its last data line, then the fence.
+        self.assertNotIn("feedback:", lines)
+        self.assertFalse(any("Rating" in line for line in lines))
+        self.assertEqual("tasks (14 days): unavailable", lines[-2])
+
+    def test_the_rating_form_is_cut_only_where_render_puts_it(self) -> None:
+        rendered = file_feedback.feedback_summary.render(file_feedback.feedback_summary.Snapshot(
+            generated_at=file_feedback.feedback_summary.TEMPLATE_EPOCH, cr=RESOURCE, server_version=None,
+            litellm_config=None, tasks=None, litellm_metrics=None, sources={}))
+        form = list(file_feedback.feedback_summary.FEEDBACK_TEMPLATE)
+        self.assertEqual(form, rendered.split("\n")[-1 - len(form):-1], "render moved the form; the cut must follow")
+        cut = file_feedback._without_rating_form(rendered)
+        self.assertEqual(rendered.split("\n")[: -1 - len(form)] + ["```"], cut.split("\n"))
+        # A block without the form at its end is passed through untouched.
+        self.assertEqual(cut, file_feedback._without_rating_form(cut))
 
     def test_an_identifier_in_the_block_is_blocked_with_a_count_only(self) -> None:
         leaking = json.loads(json.dumps(RESOURCE))

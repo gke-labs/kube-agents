@@ -68,8 +68,10 @@ verification_spec:
       fold_decoration: true
       required_patterns:
         # The one-line heading: the form calls it the summary and says it
-        # becomes the issue title, and the agent labels it either way.
-        - '(?i)\b(?:summary|title)\b'
+        # becomes the issue title, and the agent labels it either way. The
+        # offer's own "usage summary" is excluded, or the heading could never
+        # be missing from a reply that makes the offer.
+        - '(?i)\b(?<!usage )(?:summary|title)\b'
         - '(?i)\bbug\b'
         - "(?i)what happened"
         - "(?i)twice a day"
