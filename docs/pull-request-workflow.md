@@ -461,8 +461,8 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   the loop or without. An open thread makes the pull request the author's on the reviewers'
   dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)), so the summoned
   reviewer would never see a pull request that kept one open. The reply stays on the resolved
-  thread. A reviewer who disagrees reopens it, or replies in it, which does not reopen it: then you
-  unresolve it, and it is your move again (**who counts**, next;
+  thread. A reviewer who disagrees reopens it or replies in it; a reply does not reopen it, so on one
+  that asks for the fix, unresolve it, and it is your move again (**who counts**, next;
   [resolving conversations](#resolving-conversations)).
 - **Who counts, and how a reply is read.** A human is _on_ a pull request when a reviewer is requested,
   or a non-robot human other than the author has filed `CHANGES_REQUESTED`, or an `APPROVED` that
