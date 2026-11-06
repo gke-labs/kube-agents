@@ -5,8 +5,10 @@ Three parts, planted once per install. No pool install carries them yet, so the 
 that holds all three.
 
 1. **The context repository** (`context-repository/`). A public Git repository, or a private
-   one the install's GitHub App is installed on, whose tree is this directory's content at a
-   pinned ref. Register it in the install's `context_repos` with that ref:
+   one in the same GitHub organization as the GitOps repository with the install's GitHub App
+   installed on it (the operator renders the read-only token policy for same-organization
+   entries only), whose tree is this directory's content at a pinned ref. Register it in the
+   install's `context_repos` with that ref:
 
    ```json
    [
