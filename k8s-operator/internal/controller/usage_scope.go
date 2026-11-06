@@ -114,24 +114,24 @@ func usageClusterRefsForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usage
 // management-project clusters only, and a profile made by hand for a cluster in
 // another project, which the scope prune keeps, is not this condition's to
 // report. It also skips the directly reached cluster's bare series (name alone,
-// no project, until its profile is absorbed), which can only be the host. nil
-// when the management project's ID is not known (scopeHostProject).
-func scopeNeighbours(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef) []usageClusterRef {
-	management := scopeHostProject(agent, refs)
+// no project, until its profile is absorbed), which can only be the host. The
+// management project's ID comes back with the list, for the message; both are
+// empty when the ID is not known (scopeHostProject).
+func scopeNeighbours(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef) (management string, neighbours []usageClusterRef) {
+	management = scopeHostProject(agent, refs)
 	if management == "" {
-		return nil
+		return "", nil
 	}
 	h := agent.Spec.Harness
-	var out []usageClusterRef
 	for _, ref := range refs {
 		if ref.Project != management {
 			continue
 		}
 		if ref.Name != h.ClusterName || ref.Location != h.Location {
-			out = append(out, ref)
+			neighbours = append(neighbours, ref)
 		}
 	}
-	return out
+	return management, neighbours
 }
 
 // scopeHostProject is the management project's ID, which every series the
@@ -149,12 +149,20 @@ func scopeHostProject(agent *agentv1alpha1.PlatformAgent, refs []usageClusterRef
 	if !isProjectNumber(h.ProjectID) {
 		return h.ProjectID
 	}
+	// Two clusters may share a name and location in different projects, and a
+	// hand-made profile for the other one would sort first: with more than one
+	// candidate the number cannot be tied to either, and the operator says nothing.
+	found := ""
 	for _, ref := range refs {
-		if ref.Name == h.ClusterName && ref.Location == h.Location && ref.Project != "" {
-			return ref.Project
+		if ref.Name != h.ClusterName || ref.Location != h.Location || ref.Project == "" {
+			continue
 		}
+		if found != "" && found != ref.Project {
+			return ""
+		}
+		found = ref.Project
 	}
-	return ""
+	return found
 }
 
 func scopeUndeclaredLabel(value string) string {
@@ -166,7 +174,9 @@ func scopeUndeclaredLabel(value string) string {
 
 // scopeUndeclaredMessage names the adopted clusters, the first
 // scopeUndeclaredNamesShown by name and the rest by count, and says what to do.
-func scopeUndeclaredMessage(agent *agentv1alpha1.PlatformAgent, neighbours []usageClusterRef) string {
+// The management project is named by the ID (scopeHostProject), the form
+// spec.scope.projects accepts, whatever spec.harness carries.
+func scopeUndeclaredMessage(agent *agentv1alpha1.PlatformAgent, management string, neighbours []usageClusterRef) string {
 	h := agent.Spec.Harness
 	names := make([]string, 0, min(len(neighbours), scopeUndeclaredNamesShown))
 	for _, ref := range neighbours[:min(len(neighbours), scopeUndeclaredNamesShown)] {
@@ -178,13 +188,13 @@ func scopeUndeclaredMessage(agent *agentv1alpha1.PlatformAgent, neighbours []usa
 	}
 	return fmt.Sprintf("spec.scope names no project, folder, organization or selector, so the Cluster Agent reconcile adopts every GKE cluster in the management project %s. "+
 		"%d cluster(s) beyond the host cluster %s have a Cluster Agent profile and are watched: %s. %s",
-		h.ProjectID, len(neighbours), h.ClusterName, listed, scopeUndeclaredHint)
+		management, len(neighbours), h.ClusterName, listed, scopeUndeclaredHint)
 }
 
 // scopeUndeclaredConditionFor is the condition the neighbours call for. nil means
 // remove it: a declared scope, or no neighbour (a host-only reading, an install
 // whose host the CR cannot tell apart, or no reading at all).
-func scopeUndeclaredConditionFor(agent *agentv1alpha1.PlatformAgent, neighbours []usageClusterRef) *metav1.Condition {
+func scopeUndeclaredConditionFor(agent *agentv1alpha1.PlatformAgent, management string, neighbours []usageClusterRef) *metav1.Condition {
 	if scopeDeclared(agent) || len(neighbours) == 0 {
 		return nil
 	}
@@ -193,7 +203,7 @@ func scopeUndeclaredConditionFor(agent *agentv1alpha1.PlatformAgent, neighbours 
 		Status:             metav1.ConditionTrue,
 		Reason:             scopeUndeclaredReason,
 		ObservedGeneration: agent.Generation,
-		Message:            scopeUndeclaredMessage(agent, neighbours),
+		Message:            scopeUndeclaredMessage(agent, management, neighbours),
 	}
 }
 
@@ -206,7 +216,7 @@ func scopeUndeclaredRemovalCause(agent *agentv1alpha1.PlatformAgent, refs []usag
 	case refs == nil:
 		return "the operator has no current reading from the event watcher"
 	case scopeHostProject(agent, refs) == "":
-		return "the management project's ID is not known: spec.harness does not name the host cluster, or names its project by number and the host's own series does not carry the ID yet"
+		return "the management project's ID is not known: spec.harness does not name the host cluster's name, location and project, or names the project by number and the host's own series does not carry one ID yet"
 	default:
 		return "the watcher registers no cluster beyond the host in the management project"
 	}
@@ -225,8 +235,8 @@ func (p *UsageCounterPoller) projectScope(ctx context.Context, agent *agentv1alp
 	}
 	log := logf.FromContext(ctx).WithName(usagePollerLogName).WithValues("platformagent", client.ObjectKeyFromObject(agent).String())
 	base := agent.DeepCopy()
-	neighbours := scopeNeighbours(agent, refs)
-	want := scopeUndeclaredConditionFor(agent, neighbours)
+	management, neighbours := scopeNeighbours(agent, refs)
+	want := scopeUndeclaredConditionFor(agent, management, neighbours)
 	existing := meta.FindStatusCondition(agent.Status.Conditions, scopeUndeclaredCondition)
 	switch {
 	case want == nil:
