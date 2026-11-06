@@ -19479,12 +19479,31 @@ class TeamsRelayTest(unittest.TestCase):
         self.assertEqual(caught.exception.fields["code"], "BotNotInConversationRoster")
         self.assertIn("BotNotInConversationRoster", str(caught.exception))
 
+    def test_teams_relay_identity_rejection_carries_entras_error_and_description(self):
+        """Entra answers a bad secret with ``error`` / ``error_description`` strings,
+        not Bot Framework's ``error`` object; both shapes reach the 502's fields."""
+        import io
+        relay = TeamsRelay(app_id="app-id-123", app_password="wrong-password")
+        body = json.dumps({"error": "invalid_client", "error_description": "AADSTS7000215: Invalid client secret provided."}).encode()
+        err = urllib.error.HTTPError("https://login.microsoftonline.com/t/oauth2/v2.0/token", 401, "Unauthorized", {}, io.BytesIO(body))
+        with mock.patch.object(credential_proxy._TEAMS_OPENER, "open", side_effect=err):
+            with self.assertRaises(credential_proxy.TeamsUpstreamError) as caught:
+                relay._get_access_token()
+        self.assertEqual(caught.exception.fields["status"], 401)
+        self.assertEqual(caught.exception.fields["code"], "invalid_client")
+        self.assertIn("AADSTS7000215", caught.exception.fields["message"])
+        self.assertEqual(str(caught.exception), "HTTP 401: invalid_client AADSTS7000215: Invalid client secret provided.")
+
     def test_teams_relay_identity_faults_are_upstream_errors(self):
         """A non-JSON identity body or a non-numeric expires_in is an upstream
         fault (502 with its reason logged), not a ValueError the route answers
         400 and logs nothing for."""
         relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
-        for raw in (b"<html>captive portal</html>", json.dumps({"access_token": "t", "expires_in": "soon"}).encode()):
+        for raw in (
+            b"<html>captive portal</html>",
+            b"[1, 2]",
+            json.dumps({"access_token": "t", "expires_in": "soon"}).encode(),
+        ):
             resp = mock.MagicMock()
             resp.read.return_value = raw
             resp.__enter__.return_value = resp
