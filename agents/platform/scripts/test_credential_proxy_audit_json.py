@@ -40,7 +40,9 @@ from credential_proxy import (
 
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 _ENVELOPE = ("severity", "timestamp", "logger", "message")
-_TOOL_AUDIT = ("event_type", "request_id", "principal", "tool", "subcommand", "status")
+_TOOL_AUDIT = (
+    "event_type", "request_id", "principal", "tool", "subcommand", "status", "broker_tier", "class", "broker_pod",
+)
 _SECRET = "SECRETVALUE0123456789"
 
 
@@ -245,6 +247,69 @@ class ToolExecutionAuditTest(_BrokerWithJsonLog):
         # log; the structured fields do not, so a series or a filter on `tool`
         # cannot be grown by what a caller names.
         self.assertIn("bash", audits[1]["message"])
+
+
+class BrokerFieldsTest(_BrokerWithJsonLog):
+    """Each record names the broker's tier, the class admission admits the caller
+    under, and the broker's own pod: §5 of docs/designs/credential-broker-exec-tier.md."""
+
+    HOSTNAME = "credential-proxy-exec-7c9d4-x2k8p"
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(
+            self._restore,
+            "broker_role",
+            "broker_role" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("broker_role"),
+        )
+        credential_proxy._broker_pod.cache_clear()
+        self.addCleanup(credential_proxy._broker_pod.cache_clear)
+        patcher = mock.patch.object(socket, "gethostname", return_value=self.HOSTNAME)
+        self.gethostname = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def post_as(self, role, request_id):
+        authenticator = mock.Mock()
+        authenticator.authenticate.return_value = credential_proxy.Principal(
+            workload="system:serviceaccount:ns:caller", role=role
+        )
+        CredentialProxyHandler.authenticator = authenticator
+        self.post(["kubectl", "get", "pods"], request_id=request_id)
+        records = [a for a in self.audits() if a["request_id"] == request_id]
+        self.assertTrue(records, f"no audit record for {request_id}: {self.lines()}")
+        return records
+
+    def test_a_stateful_broker_names_the_stateful_tier(self):
+        for role in (credential_proxy.ROLE_COMBINED, credential_proxy.ROLE_BROKER):
+            with self.subTest(role=role):
+                CredentialProxyHandler.broker_role = role
+                records = self.post_as("", f"req-{role}")
+                self.assertEqual({r["broker_tier"] for r in records}, {"stateful"})
+
+    def test_an_exec_broker_names_the_exec_tier(self):
+        CredentialProxyHandler.broker_role = credential_proxy.EXEC_ROLE
+        records = self.post_as("", "req-exec")
+        self.assertEqual([r["status"] for r in records], ["started", "completed"])
+        self.assertEqual({r["broker_tier"] for r in records}, {"exec"})
+
+    def test_the_class_is_the_callers_admission_class(self):
+        for role, klass in (
+            (credential_proxy.CALLER_ROLE_SHELL, "interactive"),
+            (credential_proxy.CALLER_ROLE_SESSION, "interactive"),
+            (credential_proxy.CALLER_ROLE_PROFILE, "background"),
+            (credential_proxy.CALLER_ROLE_SCOPE, "background"),
+        ):
+            with self.subTest(role=role):
+                records = self.post_as(role, f"req-{role}")
+                self.assertEqual({r["class"] for r in records}, {klass})
+
+    def test_the_broker_pod_is_the_hostname_read_once(self):
+        records = self.post_as("", "req-p1")
+        records += self.post_as("", "req-p2")
+        self.assertEqual(len(records), 4)
+        self.assertEqual({r["broker_pod"] for r in records}, {self.HOSTNAME})
+        self.gethostname.assert_called_once_with()
 
 
 class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):

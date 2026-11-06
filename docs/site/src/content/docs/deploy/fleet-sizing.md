@@ -50,10 +50,11 @@ declared column from the two files and fails when the page falls behind them.
 | Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 2 / 2                  | 4 / 8 then 8 / 8                               | 8 GiB, request and limit | none                                                     |
 | Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
 | Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
+| Kubernetes API proxy                                         | 2    | standard                                                               | 0.1 / 0.25 then 1 / 0.5, each       | unchanged                                      | none declared            | none                                                     |
 | Operator                                                     | 1    | standard                                                               | 0.05 / 0.125 then 0.5 / 0.5         | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
 | LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
 | GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
-| **Total**                                                    | 8    |                                                                        | **2.556 / 8.75 then 12 / 23.25**    | **6.6 / 22.25 then 18 / 35.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| **Total**                                                    | 10   |                                                                        | **2.756 / 9.25 then 14 / 24.25**    | **6.8 / 22.75 then 20 / 36.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
 
 On GKE Autopilot the operator renders the credential proxy's requests at 2 vCPU and 2 GiB
 instead of 0.5 and 1, because Autopilot without bursting clamps a container's limits to its
@@ -115,11 +116,22 @@ including the cluster fee; modeled, so check the pricing calculator against your
 ### Option B: GKE Standard
 
 The composition creates a default pool of `e2-standard-4` nodes, one per zone, and with gVisor
-on a `gvisor-pool` of `e2-standard-4`, one per zone, carrying GKE's sandbox taint. Neither
-machine type is an installer setting, and a machine type changed on a managed pool outside
-Terraform shows as drift on the next plan, so add pools beside them for a fleet.
+on a `gvisor-pool` of `e2-standard-4`, one per zone autoscaling to two, carrying GKE's sandbox
+taint. The module's
+[sizing inputs](https://github.com/gke-labs/kube-agents/blob/main/terraform/modules/gke-cluster/README.md#sizing-the-node-pools)
+resize both: `sizing_profile = "fleet"` renders the table's machine types and boot disks, and
+an explicit input such as `gvisor_machine_type = "n2-standard-8"` wins over the profile. The
+default pool keeps `standard_node_count` nodes per zone and does not autoscale.
 
-Add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
+The installer writes none of these inputs, so set them as `TF_VAR_` lines in `install.env` and
+keep the lines there for every later run. A lost profile line resolves the small profile, and a
+lost explicit line the profile's shape. The composition's `lifecycle.sh` refuses an apply that
+would resize a pool unless a sizing input asks for it: the pool's own input, or a changed profile
+for an attribute the profile decided at the last apply. A changed profile asks nothing about an
+attribute an explicit line set, so that line stays beside it. A machine type changed outside Terraform shows as drift on the next plan, so change it
+through the inputs, or add pools beside the managed ones.
+
+Resize or add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
 the system DaemonSets take theirs, so the example's 4 vCPU proxy request fits on none of them.
 The proxy Deployment recreates its pod rather than rolling it: applied on the default pools, the
 example leaves the new proxy pod `Pending` with the old one gone. Every brokered `gcloud` and

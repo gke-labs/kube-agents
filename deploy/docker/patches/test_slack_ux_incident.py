@@ -65,6 +65,22 @@ SINGLE = (
     "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with this fix.\n"
 )
 
+DRIFT = (
+    "## What's wrong\n\n"
+    "checkout-gateway's autoscaler on seeded-b was changed outside Git.\n\n"
+    "maxReplicas went from 10 to 3 at 13:38 (ops-oncall@). Nothing is failing yet, but it can't scale past 3 "
+    "under load.\n\n"
+    "## Why\n\n"
+    "- The live HPA has `maxReplicas: 3`; the GitOps manager last set 10.\n\n"
+    "## What to do\n\n"
+    "- **Option A (Put Git's version back):** Re-sync the HPA to the manifest in Git.\n"
+    "- **Option B (Keep it · update Git):** Change maxReplicas to 3 in the manifest.\n"
+    "- ✅ **Recommended: Option A** — 3 replicas cannot absorb peak load.\n"
+    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, "
+    "or name one directly with **'apply Option A'** / **'apply Option B'**.\n"
+)
+DRIFT_DETAIL = "maxReplicas went from 10 to 3 at 13:38 (ops-oncall@). Nothing is failing yet, but it can't scale past 3 under load."
+
 NOTIFIER = '''\
 """Fixture standing in for gateway/kanban_watchers_notifier.py after apply_kanban_progress_lines."""
 calls = []
@@ -926,6 +942,89 @@ class RuntimeTest(unittest.TestCase):
             conn.execute("INSERT INTO session_metadata VALUES (?, ?)", ("cron-daily-audit", json.dumps(meta)))
             conn.commit()
         self.assertEqual(runtime.alert_title(CHANNEL, "1700000000.000777", self.db), "")
+
+    def mark_drift(self, session_id="k8s-evt-0000abcd"):
+        meta = {"platform": "slack", "chat_id": CHANNEL, "thread_id": ALERT_TS,
+                "title": "checkout-gateway HPA drift in seeded-b", "alert_kind": "drift"}
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("INSERT OR REPLACE INTO session_metadata VALUES (?, ?)", (session_id, json.dumps(meta)))
+            conn.commit()
+
+    def test_only_an_alert_marked_drift_is_one(self):
+        self.assertFalse(runtime.is_drift_alert(CHANNEL, ALERT_TS, self.db))
+        self.mark_drift()
+        self.assertTrue(runtime.is_drift_alert(CHANNEL, ALERT_TS, self.db))
+        self.assertFalse(runtime.is_drift_alert(CHANNEL, "1700000000.000777", self.db))
+
+    def test_a_drift_triage_says_what_changed_under_the_headline_and_suffixes_no_button(self):
+        triage = runtime.drift_triage(runtime.parse_triage(DRIFT), DRIFT)
+        self.assertEqual(triage["headline"], "checkout-gateway's autoscaler on seeded-b was changed outside Git.")
+        self.assertEqual(triage["detail"], DRIFT_DETAIL)
+        self.assertEqual(triage["choices"], [
+            ("Put Git's version back", "apply Option A: Put Git's version back", True),
+            ("Keep it · update Git", "apply Option B: Keep it · update Git", False),
+        ])
+
+    def test_a_detail_stops_at_a_list_or_fence_under_the_sentence(self):
+        report = DRIFT.replace("under load.\n\n", "under load.\n- first bullet\n```\nraw\n```\n\n")
+        triage = runtime.drift_triage(runtime.parse_triage(report), report)
+        self.assertEqual(triage["detail"], DRIFT_DETAIL)
+
+    def test_a_long_recommended_title_keeps_the_room_its_suffix_had(self):
+        title = "Put Git's version back and roll the checkout gateway autoscaler to ten"
+        report = DRIFT.replace("Put Git's version back", title)
+        parsed = runtime.parse_triage(report)
+        self.assertTrue(parsed["choices"][0][0].endswith("…" + runtime.RECOMMENDED_SUFFIX))
+        self.assertEqual(runtime.drift_triage(parsed, report)["choices"][0][0], title)
+
+    def test_the_fallback_puts_the_detail_under_the_headline_unbolded(self):
+        text = runtime.fallback_text(runtime.drift_triage(runtime.parse_triage(DRIFT), DRIFT))
+        head, detail = text.split("\n")[:2]
+        self.assertEqual(head, "*checkout-gateway's autoscaler on seeded-b was changed outside Git.*")
+        self.assertIn("maxReplicas went from 10 to 3", detail)
+        self.assertFalse(detail.startswith("*"))
+
+    def test_a_one_sentence_whats_wrong_gives_no_detail(self):
+        report = REPORT.replace(" Nothing else changed.", "")
+        triage = runtime.drift_triage(runtime.parse_triage(report), report)
+        self.assertEqual(triage["detail"], "")
+
+    def test_a_drift_alert_is_edited_into_one_message_with_its_detail(self):
+        self.mark_drift()
+        adapter = _Adapter()
+        self.deliver(adapter, result=DRIFT)
+        (kind, update), = adapter.log
+        self.assertEqual(kind, "chat_update")
+        head, actions = update["blocks"][0], update["blocks"][1]
+        self.assertEqual([_texts({"elements": [s]}) for s in head["elements"]],
+                         ["checkout-gateway's autoscaler on seeded-b was changed outside Git.", DRIFT_DETAIL])
+        buttons = actions["elements"]
+        self.assertEqual([b["text"]["text"] for b in buttons], ["Put Git's version back", "Keep it · update Git"])
+        self.assertEqual([b.get("style") for b in buttons], ["primary", None])
+        self.assertIn(DRIFT_DETAIL, update["text"])
+
+    def test_an_event_alert_keeps_its_layout(self):
+        adapter = _Adapter()
+        self.deliver(adapter, result=DRIFT)
+        head, actions = adapter.log[0][1]["blocks"][:2]
+        self.assertEqual(len(head["elements"]), 1)
+        self.assertEqual(actions["elements"][0]["text"]["text"], "Put Git's version back (recommended)")
+
+    def test_under_next_a_drift_alert_is_edited_with_its_detail(self):
+        class StandIn(_Adapter):
+            async def send_chat(self, chat_id, content, chat, update="", metadata=None):
+                self.log.append(("send_chat", chat_id, content, chat, update))
+                return SimpleNamespace(success=True, error=None)
+
+        self.mark_drift()
+        adapter = StandIn()
+        self.deliver(adapter, result=DRIFT)
+        (_kind, _chat_id, text, chat, update), = adapter.log
+        self.assertEqual(update, "alert-k8s-evt-0000abcd")
+        self.assertEqual(chat["detail"], DRIFT_DETAIL)
+        self.assertEqual([(c["text"], c.get("primary", False)) for c in chat["choices"]],
+                         [("Put Git's version back", True), ("Keep it · update Git", False)])
+        self.assertIn(DRIFT_DETAIL, text)
 
 
 class ApplierTest(unittest.TestCase):

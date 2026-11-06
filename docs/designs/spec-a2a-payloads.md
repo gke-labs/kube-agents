@@ -493,7 +493,7 @@ tool-call trace and the turn's model requests, structure only
 **An envelope's publisher is the principal implied by the subject it arrived on** - the
 stored subject, on replay - and that implication is decision-grade exactly where two
 conditions hold. No signed claim, no signing key on the hot path, no key registry at
-replay: every check is a field-to-token comparison, plus the one supervisor name a
+replay: every check is a field-to-token comparison, plus the supervisor names a
 consumer is configured with. The alternatives this beat - a signed claim per envelope,
 a server-stamped header, a key registry consulted at replay - were taken through
 successive hostile review rounds before it was ratified; this section is the contract, and the
@@ -515,7 +515,7 @@ source, and replay skips and counts it.
 | Subject class                        | Admissible kinds                   | `taskId` | Writer the subject implies, and the check                                                                                                                                                                                                                                                        |
 | ------------------------------------ | ---------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `…events`                            | `status-update`, `artifact-update` | = token  | The addressee: `from.session` for a chat session, `from.profile` for a profile-addressed executor; at least one MUST equal the addressee token. Advisory as shipped; hard only once an operator sets `A2A_STRICT_EVENTS_WRITER=true`.                                                            |
-| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it; one that does not checks the negative form, `from` is not the addressee.                                              |
+| `…supervisor`                        | `status-update`, `final: true`     | = token  | The supervisor the render assigns that addressee - a lookup against the render, not a token. A consumer that knows its supervisor's name checks `from.session` against it (the gateway's names the dispatcher too); one that does not checks the negative form, `from` is not the addressee.     |
 | `…in`                                | `message`, `cancel`                | = token  | A requester. Not computable from the tokens, so the check is the negative form - `from` is not the addressee. `to` is conventionally present here and checked when it is, but is not required; see the note below.                                                                               |
 | `…submit` (10/22)                    | `message`                          | = token  | The submitter, the gateway. A consumer that names it (`Submitter`, as a dispatcher does) checks `from.session` against it; one that names none uses the negative form, `from` is not the profile (neither `from.session` nor `from.profile`). `to`, where present, MUST equal the profile token. |
 | `a2a.agents.{profile}`               | `agent-card`, `agent-closed`       | absent   | The profile's owner; `from.profile` MUST equal the subject token (the profile binding, mandated 9/9 before any card publisher exists). A card MUST NOT be refused for lacking a `taskId`.                                                                                                        |
@@ -936,13 +936,22 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   message posts the fallback, logged and counted, as for an invalid one, and never clips
   it or sends a card the API will refuse. The same goes for a post the backend's API
   refuses: the renderer retries it once as the fallback.
+- **Wording is linted, not validated.** A headline names no card id (`t_` and eight hex
+  digits), opens with no markdown heading or apology ("Sorry", "I apologize",
+  "Unfortunately") and carries no code fence; a choice's label is no slash command, code
+  span, or command line opening on a CLI's name (`kubectl`, `gcloud`, `git` and the like). Breaking one is an emitter bug, but not one a renderer acts on:
+  dropping the message for its wording would lose the answer. `chatmsg.Lint` and
+  `chat_cases.lint` check them, and the emitters' tests and the shared cases hold the
+  emitters to them. The Slack renderer keeps the buttons to five a row by wrapping.
 
-`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above, the
+`a2a/lib/chatmsg` implements this section: the types, `Validate` for every rule above but
+the wording one, which `Lint` checks, the
 fallback each carrier pairs with a chat message, and the DataPart encoding. The command
 matchers and the label check it shares with the gateway are in `a2a/lib/chattext`. The shared
 cases in `tests/conformance/chat/` pair inputs from the `today` presenters' tests with the chat
-messages the emitter owes for them; `chatmsg` validates every one, and
+messages the emitter owes for them; `chatmsg` validates and lints every one, and
 `agents/platform/scripts/chat_cases.py` reads them for the Python presenters.
+`tests/conformance/chat-ux/lint.json` holds the lint's own cases, which both lints read.
 
 ## Topics
 

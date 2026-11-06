@@ -49,7 +49,7 @@ const profileMap = `{
     {
       "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-gateway",
       "user": "gateway",
-      "account": "APP",
+      "account": "TRUSTED",
       "grants": {
         "publish": ["a2a.tasks.>", "$JS.API.>", "_INBOX.gateway.>"],
         "subscribe": ["a2a.tasks.>", "_INBOX.gateway.>"]

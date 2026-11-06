@@ -412,8 +412,15 @@ mkdir -p /var/ghes/tls
 [ -s /var/ghes/ca.crt ] || md ca-crt > /var/ghes/ca.crt
 chmod 600 /var/ghes/tls/tls.key; chown -R 65532:65532 /var/ghes/tls  # the image runs as the distroless nonroot user
 mark script-start
-docker-credential-gcr configure-docker --registries "${IMAGE%%/*}" >/dev/null 2>&1
-docker pull "$IMAGE" >/dev/null 2>&1 && mark image-pulled || { echo "FORGE failed pull ${IMAGE}"; exit 1; }
+# Container-Optimized OS mounts /root read-only, so the helper cannot write
+# ~/.docker and docker would pull unauthenticated; keep its config on /var.
+export DOCKER_CONFIG=/var/ghes/docker
+# A failure prints its cause to the serial console, before the `FORGE failed`
+# line `up` stops reading at.
+docker-credential-gcr configure-docker --registries "${IMAGE%%/*}" >/var/ghes/login.log 2>&1 \
+  || { rc=$?; echo "FORGE registry-login rc=${rc}: $(tail -n 1 /var/ghes/login.log)"; }
+docker pull "$IMAGE" >/var/ghes/pull.log 2>&1 && mark image-pulled \
+  || { tail -n 3 /var/ghes/pull.log | sed 's/^/FORGE pull: /'; echo "FORGE failed pull ${IMAGE}"; exit 1; }
 if docker inspect ghes-proxy >/dev/null 2>&1; then
   docker start ghes-proxy >/dev/null && mark container-restarted
 else
