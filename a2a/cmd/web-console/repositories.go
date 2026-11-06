@@ -382,6 +382,16 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 	categories := make(map[string]string)
 	validatedRepos := make([]repositoryInfo, 0, len(req.Repositories))
 	forgesNeeded := make(map[string]forgeInfo)
+	// forgeOrder holds each name in the order it first went into forgesNeeded:
+	// the cluster's forges first, as declared, then new ones. The first GitHub
+	// forge sets the install's GitHub host, so the save must not reorder them.
+	var forgeOrder []string
+	needForge := func(f forgeInfo) {
+		if _, seen := forgesNeeded[f.Name]; !seen {
+			forgeOrder = append(forgeOrder, f.Name)
+		}
+		forgesNeeded[f.Name] = f
+	}
 
 	s.reposMu.RLock()
 	cachedForges := make([]forgeInfo, len(s.cachedForges))
@@ -390,7 +400,7 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 
 	for _, cf := range cachedForges {
 		if cf.Name != "" {
-			forgesNeeded[cf.Name] = cf
+			needForge(cf)
 		}
 	}
 
@@ -411,7 +421,7 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid_provider", fmt.Sprintf("Provider %q is invalid; must be github, gitlab, or gitea.", f.Provider))
 			return
 		}
-		forgesNeeded[f.Name] = f
+		needForge(f)
 	}
 
 	usedForgeNames := make(map[string]bool)
@@ -489,10 +499,10 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 				r.Host = existingForge.Host
 			}
 		} else {
-			forgesNeeded[r.Forge] = forgeInfo{
+			needForge(forgeInfo{
 				Name:     r.Forge,
 				Provider: r.Provider,
-			}
+			})
 		}
 		usedForgeNames[r.Forge] = true
 
@@ -516,9 +526,9 @@ func (s *server) handleRepositoriesSet(w http.ResponseWriter, r *http.Request) {
 			usedForgeNames[fName] = true
 		}
 	}
-	for name, f := range forgesNeeded {
+	for _, name := range forgeOrder {
 		if usedForgeNames[name] {
-			forgesList = append(forgesList, f)
+			forgesList = append(forgesList, forgesNeeded[name])
 		}
 	}
 	if len(forgesList) == 0 {
@@ -548,6 +558,7 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 	if s.kube != nil {
 		path := fmt.Sprintf(platformAgentsAPIPath, s.cfg.PodNamespace, s.cfg.PlatformAgentName)
 		existingForges := map[string]map[string]any{}
+		var clusterForgeOrder []string
 		existingRepos := map[string]map[string]any{}
 		hasGitHubAlias := false
 		var rawCR map[string]any
@@ -564,6 +575,7 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 						if fm, ok := item.(map[string]any); ok {
 							if name, _ := fm["name"].(string); name != "" {
 								existingForges[name] = fm
+								clusterForgeOrder = append(clusterForgeOrder, name)
 							}
 						}
 					}
@@ -585,6 +597,27 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 			}
 		}
 
+		// The forges the cluster declares keep its order, as read just now, and
+		// new ones follow in the order given: the first GitHub forge sets the
+		// install's GitHub host, and the console's cache can be older.
+		pending := make(map[string]forgeInfo, len(forgesList))
+		for _, f := range forgesList {
+			pending[f.Name] = f
+		}
+		ordered := make([]forgeInfo, 0, len(forgesList))
+		for _, name := range clusterForgeOrder {
+			if f, ok := pending[name]; ok {
+				ordered = append(ordered, f)
+				delete(pending, name)
+			}
+		}
+		for _, f := range forgesList {
+			if _, ok := pending[f.Name]; ok {
+				ordered = append(ordered, f)
+			}
+		}
+		forgesList = ordered
+
 		mergedForges := make([]map[string]any, 0, len(forgesList))
 		for _, f := range forgesList {
 			fm := map[string]any{}
@@ -594,7 +627,11 @@ func (s *server) saveRepositoriesToCluster(ctx context.Context, topology string,
 				}
 			}
 			fm["name"] = f.Name
-			fm["provider"] = f.Provider
+			// A forge cached from the cluster with no provider has none to
+			// write; the CRD refuses "", and an absent provider reads as github.
+			if f.Provider != "" {
+				fm["provider"] = f.Provider
+			}
 			if f.Host != "" {
 				fm["host"] = f.Host
 			}
