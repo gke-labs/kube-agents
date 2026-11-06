@@ -91,7 +91,8 @@ COST_SOURCE_LITELLM, COST_SOURCE_TABLE, COST_SOURCE_MIXED = "litellm", "price ta
 # LiteLLM names a deployment's model `<provider>/<model>`.
 PROVIDER_SEPARATOR = "/"
 
-SEGMENT_SUFFIXES = (".jsonl", ".jsonl.open")
+SEGMENT_SUFFIX = ".jsonl"
+SEGMENT_SUFFIXES = (SEGMENT_SUFFIX, ".jsonl.open")
 MANIFEST_NAME = re.compile(r"^job-(\d+)\.json$")
 # Where collect_shadow.py files under the bucket's BUCKET_ROOT: a segment at
 # <kind>/<YYYY-MM-DD>/<build>/logs/<segment>.jsonl and the job manifest at
@@ -651,37 +652,50 @@ def filed_inputs(
     """(log files, job manifests), each with its job kind: `kind` when given, else filed_kind's, never the
     lines' own tags, which the proxy built from the commit under test writes.
 
-    A file found under a directory but off the layout is skipped and counted
-    in off_layout_files. Raises ValueError for a path that does not exist, a
-    file named outright that is off the layout, or a directory whose log files
-    and manifests are all off it: each a mistake in the arguments rather than a
-    planted file.
+    A file found under a directory but off the layout is skipped and counted in
+    off_layout_files, as is a directory with nothing at the layout (with a note
+    on stderr): an object a presubmit planted under its own prefix must not stop
+    the report on the rest. Raises ValueError for the operator's own argument
+    mistakes: a path that does not exist, a file named outright that is not a
+    segment or a manifest or is off the layout, or a run where files were found
+    and none is at the layout. A run with no files at all reads nothing.
+    Mirrors analyze_shadow.log_files (kube-agents#4982), with manifests too.
     """
     logs: List[Tuple[str, str]] = []
     manifests: List[Tuple[str, str]] = []
+    off_layout = 0
     for path in paths:
         if not os.path.exists(path):
             raise ValueError(f"{path} does not exist")
         if not os.path.isdir(path):
+            is_manifest = bool(MANIFEST_NAME.match(os.path.basename(path)))
+            if not is_manifest and not path.endswith(SEGMENT_SUFFIX):
+                raise ValueError(f"{path} is neither a log segment (*{SEGMENT_SUFFIX}) nor a job manifest"
+                                 " (job-<ms>.json); the store is not read")
             file_kind = kind or filed_kind(path)
             if file_kind is None:
                 raise ValueError(f"{path} is not at the bucket's layout ({LAYOUT}, with no other directory in its"
                                  " path named for a kind); pass --kind to name its kind")
-            (manifests if MANIFEST_NAME.match(os.path.basename(path)) else logs).append((path, file_kind))
+            (manifests if is_manifest else logs).append((path, file_kind))
             continue
         found_logs, found_manifests = expand_paths([path])
-        found = 0
+        kept = 0
         for names, out in ((found_logs, logs), (found_manifests, manifests)):
             for name in names:
                 file_kind = kind or filed_kind(name)
                 if file_kind is None:
-                    quality.off_layout_files += 1
+                    off_layout += 1
                     continue
                 out.append((name, file_kind))
-                found += 1
-        if (found_logs or found_manifests) and not found:
-            raise ValueError(f"{path} holds no log file or manifest at the bucket's layout ({LAYOUT}, with no other"
-                             " directory in its path named for a kind); pass a kind folder or its parent, or --kind")
+                kept += 1
+        found = len(found_logs) + len(found_manifests)
+        if found and not kept:
+            print(f"note: {path} holds no log segment or manifest at the bucket's layout; its {found} are counted"
+                  " as off_layout_files and skipped", file=sys.stderr)
+    quality.off_layout_files += off_layout
+    if off_layout and not logs and not manifests:
+        raise ValueError(f"no log segment or manifest is at the bucket's layout ({LAYOUT}, with no other directory"
+                         " in its path named for a kind); pass the kind folders or their parent, or --kind")
     return logs, manifests
 
 

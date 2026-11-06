@@ -812,12 +812,54 @@ class KindFromFolder(unittest.TestCase):
         self.assertIn("is not at the bucket's layout", err)
         code, _, err = run_main([loose])
         self.assertEqual(code, 2)
-        self.assertIn("holds no log file or manifest at the bucket's layout", err)
+        self.assertIn("no log segment or manifest is at the bucket's layout", err)
         code, out, err = run_main([path, "--kind", "presubmit", "--json"])
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(json.loads(out)["scopes"]["presubmit"]["requests"], 1)
         code, out, _ = run_main([path, "--kind", "nightly", "--json"])
         self.assertEqual(json.loads(out)["data_quality"]["skipped_lines"], {"kind_mismatch": 1})
+
+    def test_a_planted_off_layout_folder_does_not_stop_the_report(self):
+        root = tempfile.mkdtemp(dir=TEMP_DIR)
+        write([line("a", 1_700_000_000)], directory=kind_dir("nightly", root))
+        # What a presubmit could plant under nightly-untrusted/: nothing at the layout.
+        planted = os.path.join(root, "nightly-untrusted", "junk")
+        os.makedirs(planted)
+        write([line("b", 1_700_000_001, kind="nightly-untrusted")], directory=planted)
+        code, out, err = run_main([os.path.join(root, "nightly"), os.path.join(root, "nightly-untrusted"), "--json"])
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertEqual(doc["scopes"]["total"]["requests"], 1)
+        self.assertEqual(doc["data_quality"]["off_layout_files"], 1)
+        self.assertIn("holds no log segment or manifest at the bucket's layout", err)
+
+    def test_no_files_at_all_is_an_empty_report(self):
+        empty = tempfile.mkdtemp(dir=TEMP_DIR)
+        code, out, err = run_main([empty, "--json"])
+        self.assertEqual((code, err), (0, ""))
+        doc = json.loads(out)
+        self.assertEqual((doc["scopes"]["total"]["requests"], doc["data_quality"]["off_layout_files"]), (0, 0))
+
+    def test_a_missing_path_is_an_error_even_with_kind(self):
+        missing = os.path.join(TEMP_DIR, "no-such-file.jsonl")
+        code, _, err = run_main([missing, "--kind", "nightly"])
+        self.assertEqual(code, 2)
+        self.assertIn(f"{missing} does not exist", err)
+
+    def test_a_named_file_must_be_a_segment_or_a_manifest(self):
+        logs = kind_dir("nightly")
+        for name in ("notes.json", "seg.jsonl.open", "0" * 64 + ".json"):
+            path = os.path.join(logs, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(line("a", 1_700_000_000)) + "\n")
+            for extra in ([], ["--kind", "nightly"]):
+                code, _, err = run_main([path] + extra)
+                self.assertEqual(code, 2, (name, extra))
+                self.assertIn("is neither a log segment (*.jsonl) nor a job manifest", err)
+        manifest = write_json({"kind": "nightly", "build": "n9"}, name="job-5.json", directory=build_dir())
+        quality = br.Quality()
+        _, manifests = br.load_lines([manifest], quality)
+        self.assertEqual([(m.kind, m.build) for m in manifests], [("nightly", "n9")])
 
     def test_kind_reads_every_file_under_a_folder_as_that_kind(self):
         loose = tempfile.mkdtemp(dir=TEMP_DIR)
