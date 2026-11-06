@@ -92,7 +92,7 @@ layout and are collected from the moment they start running.
   in no case history and no gate number. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
-  red comment's "runs from other PRs" count (`gate_comment.py`), the
+  red comment's gate-versus-this-PR call (`gate_comment.py`), the
   Brief's runs list, the Grid's columns, the Cases page's strips and
   presubmit rates — reads presubmit runs only. A nightly run appears where
   the nightly is meant to: `cases[].nightly`, the Cases page's nightly rate
