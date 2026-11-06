@@ -143,9 +143,9 @@
           "firstSeenAt": "2026-10-19T12:00:00Z",
           "remediation": {
             "kind": "manifest_patch",
-            "summary": "Remove the conflicting nodeAffinity/nodeSelector on topology.kubernetes.io/zone from Deployment/shop/checkout-api so its topologySpreadConstraint can spread replicas across eligible domains.",
+            "summary": "Remove, or widen to more than one domain, the conflicting nodeAffinity/nodeSelector on topology.kubernetes.io/zone from Deployment/shop/checkout-api so its topologySpreadConstraint can spread replicas across eligible domains; the yaml only restates the spread constraint and does not remove the affinity, so applying it alone changes nothing.",
             "command": "kubectl -n shop rollout restart deployment/checkout-api",
-            "yaml": "spec:\n  template:\n    spec:\n      topologySpreadConstraints:\n      - maxSkew: 1\n        topologyKey: topology.kubernetes.io/zone\n        whenUnsatisfiable: ScheduleAnyway\n        labelSelector:\n          matchLabels:\n            app: checkout-api\n        matchLabelKeys:\n        - pod-template-hash"
+            "yaml": "# Step 2 of 2. This patch only restates the topologySpreadConstraint on topology.kubernetes.io/zone.\n# Step 1, which it cannot express, is to remove (or widen to more than one\n# domain) the nodeAffinity/nodeSelector on topology.kubernetes.io/zone in this pod template;\n# applying this patch on its own changes nothing.\nspec:\n  template:\n    spec:\n      topologySpreadConstraints:\n      - maxSkew: 1\n        topologyKey: topology.kubernetes.io/zone\n        whenUnsatisfiable: ScheduleAnyway\n        labelSelector:\n          matchLabels:\n            app: checkout-api\n        matchLabelKeys:\n        - pod-template-hash"
           }
         },
         {
@@ -226,6 +226,55 @@
         }
       },
       "topology_findings": [
+        {
+          "kind": "leeway.placement_drift",
+          "subject": {
+            "kind": "Deployment",
+            "namespace": "finance",
+            "name": "ledger-sync"
+          },
+          "topologyKey": "topology.kubernetes.io/zone",
+          "tier": "C",
+          "severity": "info",
+          "score": {
+            "drift": 0,
+            "observedSkew": 0,
+            "minAchievableSkew": 0,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 1
+          },
+          "intent": {
+            "source": "cluster-default-assumed",
+            "confidence": "assumed",
+            "weighting": "Equal",
+            "maxSkew": 5,
+            "evidence": [
+              "ASSUMED cluster default (kube-scheduler PodTopologySpread defaultingType=System; not readable from a managed control plane, see spike S4) — declare --topology-cluster-defaults to replace this guess[1]: topologyKey=topology.kubernetes.io/zone maxSkew=5 whenUnsatisfiable=ScheduleAnyway; applies because the pod declares no topologySpreadConstraints of its own",
+              "nodeSelector cloud.google.com/gke-nodepool=finance-pool confines placement to 1 of 2 usable domains on topology.kubernetes.io/zone"
+            ]
+          },
+          "domains": [
+            {
+              "domain": "us-east1-b",
+              "actual": 6,
+              "expected": 6,
+              "delta": 0,
+              "readyNodes": 1
+            }
+          ],
+          "suspectedCause": "selector_confined",
+          "contributingFactors": [
+            "nodeSelector cloud.google.com/gke-nodepool=finance-pool confines placement to 1 of 2 usable domains on topology.kubernetes.io/zone",
+            "0 pods pinned by zonal volumes",
+            "whenUnsatisfiable: ScheduleAnyway with maxSkew 5 and observed skew 0"
+          ],
+          "firstSeenAt": "2026-10-19T12:00:00Z",
+          "remediation": {
+            "kind": "cluster_nodes",
+            "summary": "Placement of Deployment/finance/ledger-sync is confined to a single topology.kubernetes.io/zone domain by nodeSelector or required nodeAffinity; expand the target node pool across multiple domains or move Deployment/finance/ledger-sync to a multi-domain pool rather than adding DoNotSchedule spread constraints or widening affinity onto domains without matching nodes."
+          }
+        },
         {
           "kind": "leeway.placement_drift",
           "subject": {
@@ -364,16 +413,17 @@
     "clusters_total": 4,
     "clusters_succeeded": 3,
     "clusters_failed": 1,
-    "topology_findings": 5,
+    "topology_findings": 6,
     "rank_findings": 0,
     "by_severity": {
       "critical": 1,
+      "info": 1,
       "warning": 4
     },
     "by_tier": {
       "A": 1,
       "B": 3,
-      "C": 1
+      "C": 2
     }
   }
 }

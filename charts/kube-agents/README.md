@@ -482,7 +482,7 @@ Old agent pods continue routing through `Service/litellm` until the operator upd
 kubectl delete svc litellm -n <namespace>
 ```
 
-**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on.
+**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on. When Hindsight is enabled alongside `litellm.enabled=false`, `hindsight-api`'s `NetworkPolicy` renders as `Ingress`-only (omitting the `Egress` rules that pin `app: litellm` / `app: standalone-replay` pods in the release namespace) while still confining `hindsight-api` ingress on port 8888 and rendering `hindsight-postgresql`; apply an egress `NetworkPolicy` of your own for `hindsight-api` if you want to restrict its outbound traffic to your custom gateway.
 
 #### Upgrade notes: static to dynamic NetworkPolicy
 
@@ -507,8 +507,9 @@ Helm adopts the object and rewrites its spec to the static copy in the same upgr
 ### Hindsight memory store
 
 `hindsight.*` renders the agents' long-term memory store — the Hindsight API
-Deployment, the Postgres/pgvector StatefulSet behind it, an ingress-only
-NetworkPolicy standing in for the database's deliberate lack of a password,
+Deployment, the Postgres/pgvector StatefulSet behind it, NetworkPolicies
+isolating the API pod (`hindsight-api`) and standing in for the database's
+deliberate lack of a password (`hindsight-postgresql`),
 and a PodMonitoring. `hindsight.enabled` is a tri-state: `null` (the default)
 follows `platformAgent.harness.memory.provider`, so selecting a
 Hindsight-backed provider (`kube_agents_memory`, `hindsight`) brings the store
@@ -565,8 +566,14 @@ itself. With `webConsole.environment.enabled` (the default) the chart also
 renders the console's ServiceAccount, a ClusterRole that lists nodes,
 namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
 gets/patches the `PlatformAgent` resource (for repository topology, preferred
-model annotations, and applied PR annotations). `values.yaml` describes
-each toggle. The
+model annotations, and applied PR annotations). `webConsole.resources` is
+sized to run under its requests, which is what GKE Autopilot without Pod
+bursting clamps the limits to; the console reads the memory limit the cluster
+admitted through the Downward API and sets its Go soft memory limit to nine
+tenths of it. For a busier console raise `webConsole.resources.requests.memory`
+under that clamp, where the request is the ceiling, and `limits.memory` where
+bursting is on and the limit is. `values.yaml`
+describes each toggle. The
 [Web console page](https://gke-labs.github.io/kube-agents/deploy/web-console/)
 is canonical for what it does and how it is reached.
 
@@ -826,6 +833,16 @@ release is a mode switch rather than a setting: the operator rolls the agent
 and renders or retires the A2A stack. `platformAgent.harness.tuning.maxSessions`
 caps the A2A session pods a `next` install runs at once and renders only when set.
 
+### MCP server (`operator.mcpServer.enabled`)
+
+`operator.mcpServer.enabled: true` sets `A2A_MCP_DOOR=true` on the controller manager, which
+then renders the MCP server (`<agent>-a2a-mcp`) beside every `next`-mode `PlatformAgent` it
+manages. It defaults to `false`, and under `today` the operator renders nothing for it. An
+`A2A_MCP_DOOR` entry in `operator.extraEnv`, the way to turn it on before this value existed,
+still works and wins over the value. The
+[MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
+what it renders and how a client connects.
+
 ### Data volume size (`platformAgent.storage.size`)
 
 `platformAgent.storage.size` is the CR's `spec.storage.size`: the request of the agent's
@@ -848,12 +865,13 @@ is canonical for the behaviour.
 The defaults fit a fleet of under 10 clusters. `examples/values-fleet.yaml` sets what the chart
 exposes for 25 clusters or more: `operator.resources` at 1Gi, `platformAgent.storage.size` at
 100Gi, `platformAgent.harness.tuning.maxInProgress` at 3, the credential-proxy and
-`agent-api-auth` resource blocks, and two `platformAgent.deployment.env` entries
-(`INCIDENT_WORKLOAD_DEDUP_SECONDS`, `KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its
-reason and what GKE Autopilot without bursting runs it at. It does not size the agent container
-itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
+`agent-api-auth` resource blocks, and one `platformAgent.deployment.env` entry
+(`KUBEAGENTS_AUDIT_AUTO_PROMOTE`), each commented with its reason and what GKE Autopilot without
+bursting runs it at. The fold window is not in it: `incidentWorkloadDedupSeconds` already renders
+the hour, and an `env` entry for the name would override that key. It does not size the agent
+container itself, which is the CR's `spec.deployment.resources` and has no chart value, nor the shell
 sandbox, whose `platformAgent.harness.experimental.shellSandbox.resources` it leaves at the
-operator's 2 CPU and 2Gi defaults. The two env names reach the containers that read them;
+operator's 2 CPU and 2Gi defaults. The env name reaches the container that reads it;
 `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
 allowlist, would reach only the credential-proxy and `agent-api-auth` containers, and are left
 out. Pass it beside your own values with `-f charts/kube-agents/examples/values-fleet.yaml`,
@@ -975,6 +993,17 @@ An entry with the same name in `platformAgent.deployment.env` wins over the key,
 entry included. A change rolls the agent pod and the credential-proxy pod. The
 [watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
 gives each setting's meaning and default.
+
+`platformAgent.deployment.incidentWorkloadDedupSeconds` is the window in which a broken workload's
+later events fold into its open incident, rendered as the `INCIDENT_WORKLOAD_DEDUP_SECONDS` entry
+in `spec.deployment.env`. It defaults to `3600`, so a default render carries that entry; `0` turns
+folding off, the most is `86400`, and `null` renders no entry and leaves the default the operator
+renders into the agent container, the same hour. The same precedence rules as the ceilings apply:
+an entry of that name in `platformAgent.deployment.env` wins, and a `valueFrom` entry for it fails
+the render while the key is set. A re-tag to a chart that does not declare the key, after it was
+set, needs `upgrade.sh --drop-undeclared-values`. The
+[chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#one-incident-per-workload)
+has the fold rules.
 
 #### PlatformAgent annotations
 
@@ -1147,8 +1176,9 @@ Exactly one owner creates the broker's KSA, depending on
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs four cluster-scoped
-`ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
+`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, and a fourth where the web
+console and its environment page are on. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
 namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
@@ -1170,7 +1200,9 @@ The fourth, `kube-agents-web-console-cr`, is generated from
 web console and its environment page are on. It holds the console's
 ServiceAccount to its own annotations and `spec.integration.forges`,
 `repositories` and `github` on the PlatformAgent, and refuses any other change it
-makes.
+makes. Inside `forges`, the console may not move an existing forge's credential to
+another host, add a forge with a credential, add a GitHub forge at a new host, or
+change the install's GitHub host.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
@@ -1238,10 +1270,10 @@ sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less tha
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
 rather than re-implementing it, so it can over-count; it never fails the render on them.
-It also counts the standing pods the operator renders only behind an `operator.extraEnv` flag,
+It also counts the standing pods the operator renders only behind an operator flag,
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true`, and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but
-blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
+and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
 as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
@@ -1375,9 +1407,11 @@ old defaults. An explicit limit under 512Mi, in a values file or `extra_helm_val
 every path: raise it to 512Mi or more, or drop the key. The operator reads whatever limit is
 rendered through the Downward API and sets its Go soft memory limit to nine tenths of it, so a
 larger cluster raises this one value. On GKE Autopilot the floor still applies. A cluster without
-bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets the limits equal to
-the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
-rendered manifest. A cluster with bursting admits the manifest as rendered.
+bursting sets the limits equal to the requests, so the manager runs under its memory request, 256Mi
+by default, and `operator.resources.requests.memory` is the value to raise there; where Autopilot
+also raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, the manager runs under 512Mi
+and the admitted pod differs from the rendered manifest. Either way the manager reads the admitted
+limit. A cluster with bursting admits the manifest as rendered.
 
 ### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 
@@ -1514,7 +1548,7 @@ helm uninstall kube-agents -n kubeagents-system
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 - `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
-  `operator.extraEnv` flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
+  operator flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
   (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
   differ, so edit both together.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from

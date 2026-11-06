@@ -365,6 +365,13 @@ func resolveShellSandboxImage(agent *agentv1alpha1.PlatformAgent) string {
 	if spec := shellSandboxSpec(agent); spec != nil && spec.Image != "" {
 		return spec.Image
 	}
+	return operatorShellSandboxImage()
+}
+
+// operatorShellSandboxImage is the sandbox image this operator runs when the CR
+// pins none: every rung of resolveShellSandboxImage below the CR's own. The
+// ShellSandboxPinned condition compares a pin against it.
+func operatorShellSandboxImage() string {
 	if override := os.Getenv(shellSandboxImageEnvVar); override != "" {
 		return override
 	}

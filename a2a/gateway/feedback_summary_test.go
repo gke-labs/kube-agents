@@ -2,10 +2,13 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +45,9 @@ func summaryCR() map[string]any {
 				"proposalsAuthored": int64(6), "remediationsOpen": int64(2),
 				"remediationsClosedUnmergedTotal": int64(3), "proposalHumanTouches": int64(5),
 				"peopleSeen7d": int64(3), "peopleSeen30d": int64(11),
+				"proposalsFromChat": int64(3), "proposalsFromConsole": int64(0), "proposalsFromApi": int64(0),
+				"proposalsFromEvent": int64(0), "proposalsFromDrift": int64(1), "proposalsFromAudit": int64(0),
+				"proposalsFromScheduled": int64(0), "proposalsFromIssue": int64(0), "proposalsFromOther": int64(0),
 				"lastActiveTime":      "2026-10-21T11:34:06Z",
 				"lastHumanActiveTime": "2026-10-20T09:15:00Z",
 				"activeInterfaces":    []any{"slack", "googlechat"},
@@ -133,6 +139,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 	}
 	for _, want := range []string{
 		"kube-agents usage & feedback summary (2026-10-21)",
+		"  peopleSeen30d: 11 (as the gateway reports)\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n",
 		"  version: 0.14.0", "  mode: next", "\n  model: vertex_ai/claude-opus-5\n", "  kubernetes: v1.33.4-gke.1234000",
 		"  installed: 19 days; ready: true", "  interfaces: googlechat, slack",
 		"  toolExecutionsTotal: 19127\n  toolExecutionsBlockedTotal: 142\n  brokerFailuresTotal: 3\n",
@@ -194,6 +201,74 @@ func TestRenderUsageSummaryPrintsNoReadingForAnAbsentReading(t *testing.T) {
 	}
 }
 
+// summaryOriginCR is the fixture with every origin reading set to the given
+// values (zero for any field not named), or with none of them when origins is nil.
+func summaryOriginCR(origins map[string]int64) map[string]any {
+	cr := summaryCR()
+	usage := cr["status"].(map[string]any)["usage"].(map[string]any)
+	for _, field := range usageSummaryOriginFields {
+		delete(usage, field)
+		if origins != nil {
+			usage[field] = origins[field]
+		}
+	}
+	return cr
+}
+
+func TestRenderUsageSummaryOriginLineListsNonZeroOriginsInTheTableOrder(t *testing.T) {
+	cr := summaryOriginCR(map[string]int64{"proposalsFromOther": 4, "proposalsFromChat": 3, "proposalsFromEvent": 1, "proposalsFromAudit": 2})
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if want := "\n  proposals by origin: chat 3, event 1, audit 2, other 4 (as the agent reports)\n"; !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+	if n := strings.Count(text, usageSummaryOriginLinePrefix); n != 1 {
+		t.Fatalf("block has %d origin lines, want 1", n)
+	}
+}
+
+func TestRenderUsageSummaryOriginLinePrintsNoneWhenEveryOriginReadsZero(t *testing.T) {
+	text := renderUsageSummary(summaryNow, summaryOriginCR(map[string]int64{}), "", usageSummaryWindow, taskRollup{}, false)
+	if want := "\n  proposals by origin: none (as the agent reports)\n"; !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+}
+
+func TestRenderUsageSummaryOriginLinePrintsNoReadingWhenTheOriginsAreAbsent(t *testing.T) {
+	want := "\n  proposals by origin: no reading (as the agent reports)\n"
+	for name, cr := range map[string]map[string]any{"absent": summaryOriginCR(nil), "empty resource": {}} {
+		if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, want) {
+			t.Errorf("%s: block lacks %q:\n%s", name, want, text)
+		}
+	}
+}
+
+// TestRenderUsageSummaryOriginLineListsThePresentNonZeroOriginsOfAPartialStatus:
+// a status with some of the nine prints the present non-zero ones; the script
+// asserts the same lines.
+func TestRenderUsageSummaryOriginLineListsThePresentNonZeroOriginsOfAPartialStatus(t *testing.T) {
+	cr := summaryOriginCR(nil)
+	usage := cr["status"].(map[string]any)["usage"].(map[string]any)
+	usage["proposalsFromChat"] = int64(2)
+	usage["proposalsFromDrift"] = int64(0)
+	if want, text := "\n  proposals by origin: chat 2 (as the agent reports)\n", renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+	delete(usage, "proposalsFromChat")
+	if want, text := "\n  proposals by origin: none (as the agent reports)\n", renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, want) {
+		t.Fatalf("block lacks %q:\n%s", want, text)
+	}
+}
+
+func TestUsageSummaryOriginFieldsAreTheNineStatusFieldsInTheTableOrder(t *testing.T) {
+	var want []string
+	for _, origin := range []string{"Chat", "Console", "Api", "Event", "Drift", "Audit", "Scheduled", "Issue", "Other"} {
+		want = append(want, "proposalsFrom"+origin)
+	}
+	if strings.Join(usageSummaryOriginFields, ",") != strings.Join(want, ",") {
+		t.Fatalf("usageSummaryOriginFields = %v, want %v", usageSummaryOriginFields, want)
+	}
+}
+
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
 	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
 	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "chat turns (7 days): unavailable"} {
@@ -251,19 +326,63 @@ func TestRenderUsageSummaryEnvironmentLinesFollowTheSharedKeys(t *testing.T) {
 	}
 }
 
-// TestUsageSummaryWithoutModelLineDropsExactlyThatLine: the audit's input is
-// the block less the one model line; every other line stays audited.
-func TestUsageSummaryWithoutModelLineDropsExactlyThatLine(t *testing.T) {
+// TestUsageSummaryWithoutFixedLinesDropsTheModelLine: the audit's input is
+// the block less the model line; every other line stays audited.
+func TestUsageSummaryWithoutFixedLinesDropsTheModelLine(t *testing.T) {
 	text := "```\n  mode: today\n  model: x/prod-eu-1\n  kubernetes: prod-eu-1\n```"
-	got := usageSummaryWithoutModelLine(text)
+	got := usageSummaryWithoutFixedLines(text)
 	if strings.Contains(got, "model:") || !strings.Contains(got, "  kubernetes: prod-eu-1") {
-		t.Fatalf("usageSummaryWithoutModelLine = %q", got)
+		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
 	}
 	if want := len(strings.Split(text, "\n")) - 1; len(strings.Split(got, "\n")) != want {
 		t.Fatalf("dropped more than one line: %q", got)
 	}
 	if leaked := auditUsageSummary(got, []string{"prod-eu-1"}); len(leaked) != 1 {
 		t.Fatalf("the rest of the block must stay audited, got %v", leaked)
+	}
+}
+
+// TestUsageSummaryWithoutFixedLinesDropsTheOriginLine: the origin line goes
+// with the model line, and exactly those two.
+func TestUsageSummaryWithoutFixedLinesDropsTheOriginLine(t *testing.T) {
+	text := "```\n  model: x/y\n  proposals by origin: chat 3 (as the agent reports)\n  kubernetes: prod-eu-1\n```"
+	got := usageSummaryWithoutFixedLines(text)
+	if strings.Contains(got, "model:") || strings.Contains(got, usageSummaryOriginLinePrefix) {
+		t.Fatalf("usageSummaryWithoutFixedLines = %q", got)
+	}
+	if want := len(strings.Split(text, "\n")) - 2; len(strings.Split(got, "\n")) != want {
+		t.Fatalf("dropped other than the two fixed lines: %q", got)
+	}
+	if leaked := auditUsageSummary(got, []string{"prod-eu-1"}); len(leaked) != 1 {
+		t.Fatalf("the rest of the block must stay audited, got %v", leaked)
+	}
+}
+
+// TestAuditDoesNotRefuseAClusterNamedForAnOriginOnTheOriginLine: the origin
+// line prints origin words a cluster may be named; the line is removed before
+// the audit, and the same name anywhere else is still refused. "chat" is
+// already this block's vocabulary (the "chat turns" line), so it is never
+// refused here; "drift" shows the removal.
+func TestAuditDoesNotRefuseAClusterNamedForAnOriginOnTheOriginLine(t *testing.T) {
+	cr := summaryCR()
+	cr["spec"].(map[string]any)["scope"].(map[string]any)["clusters"] = []any{"chat", "drift"}
+	ids := usageIdentifiers(cr)
+	if !contains(ids, "chat") || !contains(ids, "drift") {
+		t.Fatalf("fixture: identifiers lack chat or drift: %v", ids)
+	}
+	text := renderUsageSummary(summaryNow, cr, "v1", usageSummaryWindow, taskRollup{}, false)
+	if !strings.Contains(text, "\n  proposals by origin: chat 3, drift 1 (as the agent reports)\n") {
+		t.Fatalf("fixture: the origin line does not name chat and drift:\n%s", text)
+	}
+	if leaked := auditUsageSummary(text, ids); len(leaked) != 1 || leaked[0] != "drift" {
+		t.Fatalf("fixture: the unstripped block should name drift alone, audit = %v", leaked)
+	}
+	if leaked := auditUsageSummary(usageSummaryWithoutFixedLines(text), ids); len(leaked) != 0 {
+		t.Fatalf("the origin line was the reason for a refusal: %v", leaked)
+	}
+	elsewhere := strings.Replace(text, "  lastActive:", "  cluster: drift\n  lastActive:", 1)
+	if leaked := auditUsageSummary(usageSummaryWithoutFixedLines(elsewhere), ids); len(leaked) != 1 || leaked[0] != "drift" {
+		t.Fatalf("drift outside the origin line must be refused, audit = %v", leaked)
 	}
 }
 
@@ -462,5 +581,96 @@ func TestFeedbackSummaryUnavailableWhenTheResourceCannotBeRead(t *testing.T) {
 	}
 	if n := len(inSubjectEnvelopes(t, r.url, "platform")); n != 0 {
 		t.Fatalf("submitted %d envelope(s); it must submit none", n)
+	}
+}
+
+// topToolsFixture is the shared render fixture: status.usage.topTools as the
+// operator writes it and the lines both renderers must print for it; the
+// script's test_feedback_summary.py renders the same file through its status
+// fallback against the same lines.
+func topToolsFixture(t *testing.T) (rows []any, lines []string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "agents", "platform", "scripts", "testdata", "feedback_summary_top_tools.json"))
+	if err != nil {
+		t.Fatalf("reading the fixture: %v", err)
+	}
+	var fixture struct {
+		TopTools []any    `json:"topTools"`
+		Lines    []string `json:"lines"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatalf("parsing the fixture: %v", err)
+	}
+	return fixture.TopTools, fixture.Lines
+}
+
+// The tools block is the script's, byte for byte, from the status: the shared
+// fixture's rows render to its lines, between lastHumanActive and performance,
+// and the block stays under its cap with the five rows and every reading.
+func TestRenderUsageSummaryPrintsTheTopToolsFromTheStatus(t *testing.T) {
+	rows, want := topToolsFixture(t)
+	cr := summaryCR()
+	cr["status"].(map[string]any)["usage"].(map[string]any)["topTools"] = rows
+	text := renderUsageSummary(summaryNow, cr, "v1.33.4-gke.1234000", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
+	block := "  lastHumanActive: 2026-10-20T09:15:00Z\n" + strings.Join(want, "\n") + "\nperformance: "
+	if !strings.Contains(text, block) {
+		t.Fatalf("block lacks the fixture's tools lines in place:\n%s", text)
+	}
+	if n := len(strings.Split(text, "\n")); n > usageSummaryMaxLines {
+		t.Fatalf("block is %d lines with five rows, cap %d", n, usageSummaryMaxLines)
+	}
+	if leaked := auditUsageSummary(text, usageIdentifiers(cr)); len(leaked) != 0 {
+		t.Errorf("audit of a clean block reported %v", leaked)
+	}
+}
+
+// An absent field prints unavailable, the script's word for a broker it could
+// not read; an empty list prints none; a list past five rows is cut to five,
+// and a row that is not an object is skipped.
+func TestRenderUsageSummaryTopToolsDegrade(t *testing.T) {
+	cr := summaryCR()
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if want := "\ntools (top 5, since broker start): unavailable\nperformance: "; !strings.Contains(text, want) {
+		t.Errorf("block lacks %q:\n%s", want, text)
+	}
+	usage := cr["status"].(map[string]any)["usage"].(map[string]any)
+	usage["topTools"] = []any{}
+	if text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false); !strings.Contains(text, "\ntools (top 5, since broker start): none\n") {
+		t.Errorf("an empty list did not print none:\n%s", text)
+	}
+	var many []any
+	for i := 0; i < 7; i++ {
+		many = append(many, map[string]any{"tool": "git", "subcommand": "fetch", "total": int64(7 - i), "success": int64(7 - i)})
+	}
+	usage["topTools"] = append([]any{"not a row"}, many...)
+	text = renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if got := strings.Count(text, "  git/fetch: "); got != 5 {
+		t.Errorf("%d rows printed from a list of seven, want five:\n%s", got, text)
+	}
+	if strings.Contains(text, "not a row") {
+		t.Errorf("a row that is not an object reached the block:\n%s", text)
+	}
+}
+
+// A cluster named after a word the tools block can print, a gcloud group or
+// a kubectl verb, is not refused for a row that names it: the broker's
+// vocabulary is the block's own, as the script's TEMPLATE_EXTRA_TOKENS is.
+func TestAuditSkipsTheBrokersVocabulary(t *testing.T) {
+	cr := summaryCR()
+	cr["spec"].(map[string]any)["harness"].(map[string]any)["clusterName"] = "compute"
+	cr["spec"].(map[string]any)["scope"].(map[string]any)["projects"] = []any{"describe", "feedback"}
+	cr["status"].(map[string]any)["usage"].(map[string]any)["topTools"] = []any{
+		map[string]any{"tool": "gcloud", "subcommand": "compute", "total": int64(3), "success": int64(3)},
+		map[string]any{"tool": "kubectl", "subcommand": "describe", "total": int64(2), "error": int64(2)},
+		map[string]any{"tool": "feedback", "subcommand": "none", "total": int64(1), "success": int64(1)},
+	}
+	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
+	if leaked := auditUsageSummary(usageSummaryWithoutFixedLines(text), usageIdentifiers(cr)); len(leaked) != 0 {
+		t.Fatalf("the audit refused the block's own vocabulary: %v", leaked)
+	}
+	for _, tool := range []string{"kubectl", "gcloud", "git", "gh", "feedback"} {
+		if _, ok := usageSummaryBrokerSubcommands[tool]; !ok {
+			t.Errorf("the gateway's vocabulary lacks %s", tool)
+		}
 	}
 }

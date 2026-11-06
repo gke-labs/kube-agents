@@ -4188,6 +4188,36 @@ class SessionRoleExecutableTest(unittest.TestCase):
             with self.subTest(role=role, executable=executable):
                 self.assertEqual(want, credential_proxy.executable_permitted(role, executable))
 
+    def test_the_shell_refused_kubectl_is_pointed_at_its_sandbox_image(self):
+        # Only a sandbox image older than the agent sends kubectl here (#4966),
+        # so that refusal names the CR field that pins it; every other
+        # refusal keeps the bare policy message.
+        shell_kubectl = credential_proxy.executable_refusal_message(credential_proxy.CALLER_ROLE_SHELL, "kubectl")
+        self.assertIn("may run only gcloud", shell_kubectl)
+        self.assertIn("spec.harness.experimental.shellSandbox.image", shell_kubectl)
+        self.assertIn("ShellSandboxPinned", shell_kubectl)
+        for role, executable in (
+            (credential_proxy.CALLER_ROLE_SHELL, "gh"),
+            (credential_proxy.CALLER_ROLE_SCOPE, "kubectl"),
+            (credential_proxy.CALLER_ROLE_SESSION, "git"),
+        ):
+            with self.subTest(role=role, executable=executable):
+                self.assertNotIn("shellSandbox", credential_proxy.executable_refusal_message(role, executable))
+
+    def test_the_hint_survives_kubectl_leaving_the_exec_route(self):
+        # Once kubectl is off the exec route the allowlist refuses it before
+        # the role check; the old sandbox must still be pointed at its image.
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", ("gcloud",)):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "pods"]})
+            self.assertEqual(403, status)
+            self.assertEqual(credential_proxy.RULE_EXECUTABLE_ALLOWLIST, body["rule"])
+            self.assertIn("shellSandbox.image", body["message"])
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
+            self.assertEqual(credential_proxy.RULE_EXECUTABLE_ALLOWLIST, body["rule"])
+            self.assertNotIn("shellSandbox", body["message"])
+
     def test_git_from_a_session_is_refused_by_the_route_before_the_role(self):
         # /v1/exec admits only EXEC_ROUTE_EXECUTABLES for every role, so a
         # session asking for git meets the route's own refusal first; the role
@@ -4218,6 +4248,7 @@ class SessionRoleExecutableTest(unittest.TestCase):
             self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
             self.assertEqual(credential_proxy.RULE_CALLER_EXECUTABLE, body["rule"])
             self.assertIn("shell", body["message"])
+            self.assertIn("shellSandbox.image", body["message"])
             status, body = self.post_as("", {"argv": ["git", "status"]})
             self.assertEqual(200, status, body)
 
@@ -11119,10 +11150,14 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         self.assertIsInstance(server, credential_proxy.ThreadingUnixHTTPServer)
         self.assertEqual([], relays)
 
-    def test_serve_drains_on_sigterm_only_in_the_broker_role(self):
-        # The broker pod's grace period holds the drain; the sidecar roles'
-        # pods keep the short stop.
-        for role, drain_seconds in (("broker", credential_proxy.SHUTDOWN_DRAIN_SECONDS), ("combined", 0)):
+    def test_serve_drains_on_sigterm_in_the_broker_and_exec_roles(self):
+        # The broker pod's and the exec pods' grace periods hold the drain; the
+        # sidecar roles' pods keep the short stop.
+        for role, drain_seconds in (
+            ("broker", credential_proxy.SHUTDOWN_DRAIN_SECONDS),
+            (credential_proxy_client.EXEC_ROLE, credential_proxy.SHUTDOWN_DRAIN_SECONDS),
+            ("combined", 0),
+        ):
             with self.subTest(role=role):
                 self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
                 self.assertEqual(drain_seconds, self.installed_shutdown.kwargs["drain_seconds"])

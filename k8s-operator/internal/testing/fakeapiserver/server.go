@@ -21,9 +21,10 @@
 // is 410 Gone, and injects the faults a reflector has to live through: 429s
 // with Retry-After on the first requests, and the expiry of every open watch.
 //
-// The event watcher reads Events only; Nodes and Pods are served, at the
-// sizes the issue of fleet scale names, for the collectors that page through
-// them, which have no Go consumer here yet.
+// The event watcher reads Events, and one named Pod's metadata for its owner
+// lookup, which this fake answers 404 (the Pod reads as having no owner);
+// Nodes and Pods are served, at the sizes the issue of fleet scale names, for
+// the collectors that page through them, which have no Go consumer here yet.
 //
 // What it does not do: selectors beyond `reason=<value>` on Events (every other request sees every object), namespaced
 // paths (the three resources are served at the cluster scope only), writes
@@ -339,9 +340,10 @@ func Start(opts Options) *Server {
 // older than Go 1.27.1, where it was traced; this Transport can go once
 // net/http hands the signal to the reader of the response it belongs to.
 // A connection per request leaves nothing to reuse, at one dial per request,
-// which the paged soaks absorb. It fixes the fake's clients only: the
+// which the paged soaks absorb. It fixes the fake's clients only. The
 // watcher's broker route reaches profile clusters over pooled plain HTTP/1.1
-// (clusterprofiles.Broker.ClientConfig) and is open to the same stall. A
+// (clusterprofiles.Broker.ClientConfig) and had the same exposure; its watches
+// now open on a non-pooled twin (cmd/k8s-event-watcher/watchtransport.go). A
 // test that sets a CA, a client certificate, a certificate callback or
 // Insecure on this config fails at client construction, since client-go
 // refuses those next to a Transport.

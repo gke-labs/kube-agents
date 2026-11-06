@@ -8,6 +8,7 @@ answer is never mistaken for a whole one. `get_object_pages()` pages the
 Actions list endpoints that wrap their page in an object (`workflows()` is
 one caller), and `is_refusal()` is the 4xx test
 the scheduled sweeps share for "ours to fix" against "wait for the next one".
+`has_marker_comment()` is the sweeps' check for a comment they already posted.
 """
 
 from __future__ import annotations
@@ -194,3 +195,17 @@ class GitHubAPI:
         if errors:
             raise RuntimeError(f"GraphQL: {errors}")
         return result["data"]
+
+
+def has_marker_comment(api: GitHubAPI, number: int, marker: str, since: str | None = None) -> bool:
+    """Whether a comment on issue or pull request ``number`` starts with ``marker``.
+
+    The sweeps open their own comments with a hidden marker, so a later run
+    can tell it already posted one. ``since`` (an ISO 8601 time) reads only
+    the comments updated from then on. A failed read is raised, not taken for
+    "none": each caller decides what a failed read costs it.
+    """
+    path = f"/repos/{api.repo}/issues/{number}/comments"
+    if since:
+        path = f"{path}?since={since}"
+    return any((comment.get("body") or "").startswith(marker) for comment in api.get_all(path))

@@ -174,6 +174,25 @@ true
 {{- end }}
 
 {{/*
+The operator flags the chart sets from first-class values, as a YAML env list (empty when
+none is on). operator-deployment.yaml renders it ahead of operator.extraEnv, and the quota
+preflight reads it ahead of extraEnv, so the two agree on which flagged pods run. A flag
+operator.extraEnv already names is left out: extraEnv wins either way, and leaving it out
+keeps the container's env free of a duplicate name. `| default dict` because
+`helm upgrade --reuse-values` renders against a release that predates operator.mcpServer.
+*/}}
+{{- define "kube-agents.operatorFlagEnv" -}}
+{{- $named := dict -}}
+{{- range $e := (.Values.operator.extraEnv | default list) -}}
+{{- $_ := set $named (toString (index ($e | default dict) "name")) true -}}
+{{- end -}}
+{{- if and (.Values.operator.mcpServer | default dict).enabled (not (hasKey $named "A2A_MCP_DOOR")) -}}
+- name: A2A_MCP_DOOR
+  value: "true"
+{{- end -}}
+{{- end }}
+
+{{/*
 Whether the web console's PlatformAgent policy renders: the admissionPolicy values
 gate, on Kubernetes >= 1.30, where the console's ServiceAccount and its Role on the
 CR render (webConsole.enabled and webConsole.environment.enabled).
@@ -1024,6 +1043,102 @@ router_settings:
         index: -1
   {{- end }}
 {{- end }}
+{{- end }}
+
+{{/*
+Every LiteLLM callback entry the chart can register, named once and sorted by
+whether the shadow replay proxy's key covers it
+(kube-agents.replayModelBehaviourChecksum). replayKeyed: the hooks that change
+what the model is sent or what comes back (thinking replay, cache-marker strip,
+redaction). replayUnkeyed: telemetry (otel, prometheus, the trace logger), the
+OAuth2 credential hook, and session affinity, which only picks a Vertex
+serving replica. templates/litellm.yaml registers callbacks only through these
+names, and tests/test_chart_replay_shadow.py fails on a rendered entry that is
+in neither set, so a new hook has to be put in one.
+
+Takes the root context; returns JSON.
+*/}}
+{{- define "kube-agents.litellmCallbacks" -}}
+{{- toJson (dict
+  "replayKeyed" (dict
+    "thinkingReplay" "litellm_thinking_replay_callback.proxy_handler_instance"
+    "cacheControlStrip" "litellm_cache_control_strip_callback.proxy_handler_instance"
+    "redaction" "litellm_redaction_callback.proxy_handler_instance")
+  "replayUnkeyed" (dict
+    "otel" "otel"
+    "prometheus" "prometheus"
+    "oauth2" "litellm_oauth2_callback.proxy_handler_instance"
+    "sessionAffinity" "litellm_session_affinity_callback.proxy_handler_instance"
+    "traceLog" "llm_trace_logger.proxy_handler_instance")) -}}
+{{- end }}
+
+{{/*
+The shadow replay proxy's checksum of what decides the model's answer
+(REPLAY_MODEL_BEHAVIOUR_CHECKSUM in litellm.yaml). The pods' checksum/config
+covers the whole config; this one treats the two LiteLLM routes to Google's
+Gemini models, gemini/ (the Gemini Developer API) and vertex_ai/ (Vertex AI),
+as one, so a nightly and a presubmit serving the same model with the same
+settings get the same replay key. Without that, the eval nightlies (Gemini
+Developer API) record answers no presubmit (Vertex AI) can ever look up.
+
+TODO(#4988): temporary. Once the nightlies and presubmits call the model
+through one API, key replay on the full checksum/config again and delete this.
+
+From the parsed rendered config it changes, and keeps everything else:
+  - a model's gemini/ or vertex_ai/ prefix becomes one shared token
+    ($sharedGoogleRoute); every other provider prefix stays as rendered, so
+    openai_compatible against gemini, or two servers behind two api_base
+    values, keep apart (the chart renders api_base for openai_compatible
+    only, so it stays in);
+  - the Vertex route keys ($vertexRouteParams) are dropped defensively: the
+    chart renders none of them into the config today (the project and
+    location reach the pod as env vars);
+  - the router's timeout and retry settings, which decide when a call is
+    retried, not what the answer says ($deliverySettings), are dropped;
+  - callbacks become .callbacks, the replayKeyed entries of
+    kube-agents.litellmCallbacks in registration order.
+Each keyed hook's source, and the redaction rule file when redaction is on,
+arrive in .sources and are hashed with the config, so an edit to one changes
+the key the way it rolls the pods.
+
+Takes a dict of config (the rendered gateway config), callbacks (the kept
+callback entries, in order) and sources (a list of strings).
+*/}}
+{{- define "kube-agents.replayModelBehaviourChecksum" -}}
+{{- $vertexRouteParams := list "vertex_project" "vertex_location" "vertex_credentials" -}}
+{{- $deliverySettings := list "timeout" "num_retries" "retry_after" -}}
+{{- $googleRoutePattern := "^(gemini|vertex_ai)/" -}}
+{{- $sharedGoogleRoute := "gemini-or-vertex_ai/" -}}
+{{- $parsed := .config | fromYaml -}}
+{{- if hasKey $parsed "Error" -}}
+{{- fail (printf "the rendered LiteLLM config does not parse as YAML, so the replay checksum cannot be computed: %s" (get $parsed "Error")) -}}
+{{- end -}}
+{{- $behaviour := deepCopy $parsed -}}
+{{- $models := list -}}
+{{- range $parsed.model_list -}}
+{{- $params := deepCopy .litellm_params -}}
+{{- range $vertexRouteParams -}}
+{{- $_ := unset $params . -}}
+{{- end -}}
+{{- $_ := set $params "model" (regexReplaceAll $googleRoutePattern $params.model $sharedGoogleRoute) -}}
+{{- $models = append $models (set (deepCopy .) "litellm_params" $params) -}}
+{{- end -}}
+{{- $_ := set $behaviour "model_list" $models -}}
+{{- $settings := deepCopy ($parsed.litellm_settings | default dict) -}}
+{{- $_ := set $settings "callbacks" .callbacks -}}
+{{- $_ := set $behaviour "litellm_settings" $settings -}}
+{{- if $parsed.router_settings -}}
+{{- $router := deepCopy $parsed.router_settings -}}
+{{- range $deliverySettings -}}
+{{- $_ := unset $router . -}}
+{{- end -}}
+{{- if $router -}}
+{{- $_ := set $behaviour "router_settings" $router -}}
+{{- else -}}
+{{- $_ := unset $behaviour "router_settings" -}}
+{{- end -}}
+{{- end -}}
+{{- printf "%s%s" (toJson $behaviour) (join "" .sources) | sha256sum -}}
 {{- end }}
 
 {{/*
@@ -1959,45 +2074,74 @@ and the chart's own replicaCount keys take one too. Only an absent value default
 {{- end }}
 
 {{/*
+The chart's own workloads in the release namespace, as a JSON list of (name, resources
+subtree, pod count, rolls-with-a-surge-pod, standing). Two readers, so a workload is added
+once (#4893): kube-agents.quotaRequirements sums them for the quota preflight, and
+kube-agents.chartQuotaPods counts the standing ones and their surge pods for the operator's
+session quota. One list rather than a block per workload: the blocks it replaced were
+identical but for the values path, which is how the dashboard came to be read from the
+wrong key and how the replay proxy came to be left out of the operator's count.
+`hindsight.postgresql` is a StatefulSet, so it rolls without a surge pod. The pre-delete
+cleanup hook is a Job that runs at uninstall while the release still stands: the preflight
+needs headroom for it, but it is not standing, so the session quota leaves it out.
+*/}}
+{{- define "kube-agents.chartWorkloads" -}}
+{{- $w := list -}}
+{{- if .Values.operator.enabled -}}
+  {{- $w = append $w (dict "name" "operator" "standing" true "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.litellm.enabled -}}
+  {{- $w = append $w (dict "name" "litellm" "standing" true "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
+       beside LiteLLM and only with it. */ -}}
+{{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
+{{- if and .Values.litellm.enabled $replayShadow.enabled -}}
+  {{- $w = append $w (dict "name" "litellm-replay-shadow" "standing" true "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if include "kube-agents.hindsightEnabled" . -}}
+  {{- $w = append $w (dict "name" "hindsight-api" "standing" true "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
+  {{- $w = append $w (dict "name" "hindsight-postgresql" "standing" true "values" .Values.hindsight.postgresql "pods" 1 "surges" false) -}}
+{{- end -}}
+{{- if .Values.githubMinter.enabled -}}
+  {{- $w = append $w (dict "name" "github-minter" "standing" true "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
+  {{- $w = append $w (dict "name" "web-console" "standing" true "values" .Values.webConsole "pods" 1 "surges" true) -}}
+{{- end -}}
+{{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
+  {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
+         while every release pod still exists, so quota admission needs headroom for it. */ -}}
+  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
+  {{- $w = append $w (dict "name" "cleanup-hook" "standing" false "values" $cleanupRes "pods" 1 "surges" false) -}}
+{{- end -}}
+{{- toJson $w -}}
+{{- end }}
+
+{{/*
 The pods the chart may run at once in the release namespace, for the next-mode session quota:
-its standing pods (the operator, LiteLLM, Hindsight's two, the GitHub minter and the web
-console, at their replica counts, as kube-agents.quotaRequirements sums them, less the
-pre-delete cleanup hook, which runs only at uninstall), plus one surge pod for each of those
-that rolls surge-first and runs at least one replica (the same `surges` entries in
-quotaRequirements' list: everything but Hindsight's PostgreSQL StatefulSet). A chart bump
-rolls several of them in one upgrade, since the chart's version label is in their pod
-templates, and each surge pod counts against the quota while it starts.
+the standing workloads in kube-agents.chartWorkloads at their replica counts (every one but
+the pre-delete cleanup hook, which runs only at uninstall), plus one surge pod for each that
+rolls surge-first and runs at least one replica (every one but Hindsight's PostgreSQL
+StatefulSet). quotaRequirements reads the same list, so a workload added there is counted
+here too. A chart bump rolls several of them in one upgrade, since the chart's version label
+is in their pod templates, and each surge pod counts against the quota while it starts.
 platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods,
 and the operator sizes the quota above the session cap from it (#3848): those pods share the
 quota, and only the chart knows which of them it renders. tests/test_quota_preflight.py ties
-it to quotaRequirements' pods and chartSurgePods.
+it to the Deployments and StatefulSets a render actually puts in the release namespace.
 */}}
 {{- define "kube-agents.chartQuotaPods" -}}
 {{- $pods := 0 -}}
 {{- $surges := 0 -}}
-{{- if .Values.operator.enabled -}}
-  {{- $n := include "kube-agents.replicaCount" .Values.operator.replicaCount | int64 -}}
-  {{- $pods = add $pods $n -}}
-  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
-{{- end -}}
-{{- if .Values.litellm.enabled -}}
-  {{- $n := include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64 -}}
-  {{- $pods = add $pods $n -}}
-  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
-{{- end -}}
-{{- if include "kube-agents.hindsightEnabled" . -}}
-  {{- /* The API surges; the PostgreSQL StatefulSet does not. */ -}}
-  {{- $pods = add $pods 2 -}}
-  {{- $surges = add $surges 1 -}}
-{{- end -}}
-{{- if .Values.githubMinter.enabled -}}
-  {{- $n := include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64 -}}
-  {{- $pods = add $pods $n -}}
-  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
-{{- end -}}
-{{- if .Values.webConsole.enabled -}}
-  {{- $pods = add $pods 1 -}}
-  {{- $surges = add $surges 1 -}}
+{{- range $w := include "kube-agents.chartWorkloads" . | fromJsonArray -}}
+  {{- if $w.standing -}}
+    {{- $n := $w.pods | int64 -}}
+    {{- $pods = add $pods $n -}}
+    {{- /* A workload scaled to zero has no pod to surge from. */ -}}
+    {{- if and $w.surges (gt $n (int64 0)) -}}{{- $surges = add $surges 1 -}}{{- end -}}
+  {{- end -}}
 {{- end -}}
 {{- add $pods $surges -}}
 {{- end }}
@@ -2659,44 +2803,9 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- $surgeEphReq := 0 -}}
 {{- $surgeEphLim := 0 -}}
 
-{{- /* The chart's own workloads, as (resources subtree, pod count, rolls-with-a-surge-Pod).
-       One list and one loop rather than a block each: the four blocks this replaced were
-       identical but for the values path, which is how the dashboard came to be read from
-       the wrong key and how a new workload comes to be missed. `hindsight.postgresql` is a
-       StatefulSet, so it contributes no surge Pod. The pre-delete cleanup hook is a batch
-       Job that runs at uninstall while the release still stands, so it needs headroom but
-       no surge. */ -}}
-{{- $chartWorkloads := list -}}
-{{- if .Values.operator.enabled -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true) -}}
-{{- end -}}
-{{- if .Values.litellm.enabled -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
-{{- end -}}
-{{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
-       beside LiteLLM and only with it. */ -}}
-{{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
-{{- if and .Values.litellm.enabled $replayShadow.enabled -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
-{{- end -}}
-{{- if include "kube-agents.hindsightEnabled" . -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.postgresql "pods" 1 "surges" false) -}}
-{{- end -}}
-{{- if .Values.githubMinter.enabled -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
-{{- end -}}
-{{- if .Values.webConsole.enabled -}}
-  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.webConsole "pods" 1 "surges" true) -}}
-{{- end -}}
-{{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
-  {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
-         while every release pod still exists, so quota admission needs headroom for it. */ -}}
-  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" $cleanupRes "pods" 1 "surges" false) -}}
-{{- end -}}
-
+{{- /* The chart's own workloads (kube-agents.chartWorkloads), the same list chartQuotaPods
+       reads for the operator's session quota. */ -}}
+{{- $chartWorkloads := include "kube-agents.chartWorkloads" . | fromJsonArray -}}
 {{- range $workload := $chartWorkloads -}}
   {{- $res := include "kube-agents.workloadResources" $workload.values | fromJson -}}
   {{- $replicas := $workload.pods | int64 -}}
@@ -3073,8 +3182,8 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
   {{- end -}}
   {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
          #3869; the profile dispatcher, #4808). The operator renders each only while
-         operator.extraEnv sets its flag, so no golden renders it and footprint.yaml has no
-         entry for it. An entry's flag is read as the operator reads it, the last setting
+         its flag is set (operator.mcpServer.enabled or operator.extraEnv), so no golden
+         renders it and footprint.yaml has no entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.
          A setting the chart cannot read -- a valueFrom, a non-string value, a string holding
          a $(VAR) reference the kubelet expands -- counts as on; none, null or another literal
@@ -3093,9 +3202,16 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
       {{- fail "quota preflight: flagged-pods.yaml is missing or unreadable in the chart, so the pods the operator renders behind a flag cannot be sized. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
     {{- $flagged := index $flaggedFile "pods" -}}
+    {{- /* The flags first-class values set (operator.mcpServer.enabled), then extraEnv: the
+           order operator-deployment.yaml renders them in, so the last setting wins here too. */ -}}
+    {{- $flagEnv := list -}}
+    {{- with (include "kube-agents.operatorFlagEnv" .) -}}
+      {{- $flagEnv = fromYamlArray . -}}
+    {{- end -}}
+    {{- $operatorEnv := concat $flagEnv (.Values.operator.extraEnv | default list) -}}
     {{- range $w := $flagged -}}
       {{- $on := false -}}
-      {{- range $e := ($.Values.operator.extraEnv | default list) -}}
+      {{- range $e := $operatorEnv -}}
         {{- if eq (toString (index ($e | default dict) "name")) $w.env -}}
           {{- $v := index $e "value" -}}
           {{- $literal := ternary (eq (toString $v) "true") (ne (trim (toString $v)) "") (eq (toString $w.enabledWhen) "true") -}}

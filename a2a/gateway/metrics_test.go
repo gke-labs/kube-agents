@@ -828,3 +828,19 @@ func TestTheGaugeServesNoSampleUntilTheMapLoads(t *testing.T) {
 		t.Fatalf("a sample after the map was unloaded:\n%s", body)
 	}
 }
+
+// TestAnswerFeedbackZeroSeriesCoverBothRatingBackends: both backends that
+// draw rating controls start with a zero series per rating, so a scrape
+// before the first rating reads 0 rather than no data.
+func TestAnswerFeedbackZeroSeriesCoverBothRatingBackends(t *testing.T) {
+	m := NewMetrics()
+	series := make(chan prometheus.Metric, 16)
+	m.answerFeedback.Collect(series)
+	close(series)
+	if got := len(series); got != 4 {
+		t.Errorf("answer_feedback_total series = %d, want 4", got)
+	}
+	if got := counterValue(t, m.answerFeedback.WithLabelValues(platformGoogleChat, FeedbackUp)); got != 0 {
+		t.Errorf("answer_feedback_total{googlechat,up} = %v, want 0", got)
+	}
+}
