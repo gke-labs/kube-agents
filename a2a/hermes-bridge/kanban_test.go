@@ -931,6 +931,109 @@ func TestCardAnswerTextKeepsErrorTextBehindTheDebugSwitch(t *testing.T) {
 	if got := cardAnswerText(failed); !strings.Contains(got, "psql: FATAL") {
 		t.Errorf("failed card answer with the debug switch on = %q, want its error text", got)
 	}
+	// Under the switch, as on an activity entry: the error's first line,
+	// scrubbed and capped, ahead of the worker's run summary.
+	loud := kanbanCardRow{ID: "t_8", Title: "x", Status: "failed", Result: "worker summary " + errSecret,
+		Err: "psql: FATAL password=hunter2loud " + strings.Repeat("y", 2*debugErrorTextCap) + "\nsecond line"}
+	got = cardAnswerText(loud)
+	if strings.Contains(got, "hunter2loud") || strings.Contains(got, "second line") || strings.Contains(got, errSecret) ||
+		len(got) > debugErrorTextCap || !strings.Contains(got, "psql: FATAL") {
+		t.Errorf("failed card answer with the debug switch on = %q (%d bytes), want the error's first line, scrubbed, within %d bytes", got, len(got), debugErrorTextCap)
+	}
+}
+
+// A settled card's step names its own end, and the progress line counts
+// settled cards, not completed ones.
+func TestACardStepNamesItsEnd(t *testing.T) {
+	for status, want := range map[string]string{"done": "completed", "blocked": "blocked", "failed": "failed", "gave_up": "failed", "canceled": "canceled"} {
+		st := cardStep(kanbanCardRow{ID: "t_1", Title: "Check prod-a", Status: status}, 1, 2, "")
+		if want := "Specialist check " + want + ": Check prod-a."; st.Title != want {
+			t.Errorf("%s card step title = %q, want %q", status, st.Title, want)
+		}
+	}
+}
+
+// The failed read's error carries the script's reason, not just its exit.
+func TestAFailedBoardReadNamesItsCause(t *testing.T) {
+	pythonBin := resolvePythonBin()
+	if _, err := exec.LookPath(pythonBin); err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	db := filepath.Join(t.TempDir(), "kanban.db")
+	if err := os.WriteFile(db, []byte("not a sqlite database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := querySessionKanbanCards(context.Background(), pythonBin, db, "a2a-ctx-1", 0, nil)
+	if err == nil || !strings.Contains(err.Error(), "not a database") {
+		t.Fatalf("err = %v, want the script's reason (file is not a database)", err)
+	}
+}
+
+// waitOnRunningCard starts waitForKanbanCards on a session with a card that
+// keeps running, and returns its result channel.
+func waitOnRunningCard(t *testing.T, b *Bridge, taskCtx context.Context, since int64, taskID string) (*taskRun, <-chan [2]any) {
+	t.Helper()
+	sessionID := "a2a-ctx-1"
+	// answerHeld as apiTurn leaves it on a response.
+	run := &taskRun{origin: &lib.Envelope{TaskID: taskID, ContextID: "ctx-1", CorrelationID: "corr-" + taskID}, state: stateRunning, answerHeld: true}
+	act := newSessionActivityState(sessionID, false)
+	act.cardsFiled.Store(true)
+	close(act.done)
+	run.act.Store(act)
+	out := make(chan [2]any, 1)
+	go func() {
+		got, ok := b.waitForKanbanCards(run, taskCtx, act, sessionID, since, 1, "The coordinator's finished answer.")
+		out <- [2]any{got, ok}
+	}()
+	return run, out
+}
+
+// The task's deadline ends a wait on cards with the turn's finished answer,
+// not a failure: the coordinator's work is done.
+func TestTheDeadlineEndsACardWaitWithTheTurnsAnswer(t *testing.T) {
+	since := time.Now().Unix() - 60
+	t.Setenv(hermesKanbanDBEnv, kanbanFixtureDB(t, since))
+	_, url := startServer(t)
+	b := startAPIBridge(t, url, newAPIStub(t, nil), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, out := waitOnRunningCard(t, b, ctx, since, "task-deadline-wait")
+	select {
+	case r := <-out:
+		if r[0] != "The coordinator's finished answer." || r[1] != true {
+			t.Fatalf("waitForKanbanCards = (%q, %v), want the turn's answer", r[0], r[1])
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the wait did not end at the deadline")
+	}
+}
+
+// A shutdown ends a wait on cards with the turn's finished answer: the
+// answer stays held, so shutdownTasks leaves the run to its worker.
+func TestAShutdownEndsACardWaitWithTheTurnsAnswer(t *testing.T) {
+	since := time.Now().Unix() - 60
+	t.Setenv(hermesKanbanDBEnv, kanbanFixtureDB(t, since))
+	_, url := startServer(t)
+	b := startAPIBridge(t, url, newAPIStub(t, nil), nil)
+	run, out := waitOnRunningCard(t, b, context.Background(), since, "task-shutdown-wait")
+	waitFor(t, 5*time.Second, "the wait to start", func() bool { return b.hasActiveKanbanWait("a2a-ctx-1") })
+	time.Sleep(1500 * time.Millisecond)
+	run.mu.Lock()
+	held := run.answerHeld
+	run.mu.Unlock()
+	if !held {
+		t.Fatal("the wait released the held answer, so a shutdown would fail the task")
+	}
+	b.closing.Store(true)
+	defer b.closing.Store(false)
+	select {
+	case r := <-out:
+		if r[0] != "The coordinator's finished answer." || r[1] != true {
+			t.Fatalf("waitForKanbanCards = (%q, %v), want the turn's answer", r[0], r[1])
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the wait did not end on the shutdown")
+	}
 }
 
 // End to end through the in-turn wait: a turn's one card fails with an error
