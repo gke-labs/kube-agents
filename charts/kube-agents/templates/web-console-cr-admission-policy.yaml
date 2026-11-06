@@ -46,6 +46,12 @@
 # namespaces, and with them the token's allowed paths: adding repositories is the console's job, so
 # this policy does not refuse it.
 #
+# A second limit: the policy reads the install's GitHub host as the first GitHub forge's host. It
+# does not repeat the operator's rules for a forge whose host it refuses (a reserved domain, a
+# single-label host, a host a forge of another provider holds, or a stored forge with no provider).
+# When the declaration already has such a forge, the console can still move the host by removing,
+# reordering or changing a forge, but only to a host the declaration names or to github.com.
+#
 # resourceVersion, generation and managedFields are not compared: the API server sets the first
 # two and rewrites managedFields on every write, and none of them grants anything. The status
 # subresource is a separate resource, which the console's Role does not grant and this policy does
