@@ -97,33 +97,57 @@ const (
 	shellSandboxFleetMemoryLimit              = "4Gi"
 
 	// The condition reporting that the auto profile earned a higher tier
-	// than the namespace's ResourceQuota has room for. Written only in that
-	// state, on the ReplicasLimited pattern, by resolveSizingTier alone; the
-	// Ready and Degraded writers carry it through as they read it. The
-	// message names the quota and the dimension, because the person reading
-	// `kubectl describe` decides between raising the quota and naming a tier.
-	// It carries no quantities: the status write and the Warning event are
-	// gated on the message, and the quota's free figure moves with every pod
-	// the namespace admits, so a figure in the message would write status and
+	// than the namespace's admission has room for: a ResourceQuota short of
+	// the step (sizingCappedByQuotaReason), or a LimitRange whose
+	// per-container bound the earned row crosses
+	// (sizingCappedByLimitRangeReason). Written only in that state, on the
+	// ReplicasLimited pattern, by resolveSizingTier alone; the Ready and
+	// Degraded writers carry it through as they read it. The message names
+	// the quota and the dimension, or the LimitRange, the bound and the
+	// container, because the person reading `kubectl describe` decides
+	// between raising the object and naming a tier. It carries no
+	// quantities: the status write and the Warning event are gated on the
+	// message, and the quota's free figure moves with every pod the
+	// namespace admits, so a figure in the message would write status and
 	// record a Warning on every session pod a busy install runs. The figures
 	// go in the event and the log line, recorded when the message changes.
 	sizingCappedByQuotaConditionType = "SizingCappedByQuota"
 	sizingCappedByQuotaReason        = "ResourceQuotaShort"
+	sizingCappedByLimitRangeReason   = "LimitRangeShort"
 	// sizingCappedByQuotaMessageFormat takes the tier earned, the quota's
 	// name, the quota key, the running tier, and the running tier again.
 	sizingCappedByQuotaMessageFormat = "spec.deployment.sizingProfile is auto and the cluster count earns the %s tier, " +
 		"but ResourceQuota %s has no room on %s for the step up from %s; the %s tier stays until the quota is raised " +
 		"or sizingProfile names the tier, which the operator applies without this check"
+	// sizingCappedByLimitRangeMessageFormat takes the tier earned, the
+	// LimitRange's name, the bound (sizingLimitRangeMax or Min), the resource
+	// name, the sized container, the running tier, and the running tier
+	// again.
+	sizingCappedByLimitRangeMessageFormat = "spec.deployment.sizingProfile is auto and the cluster count earns the %s tier, " +
+		"but LimitRange %s sets a per-container %s on %s that the %s container crosses at the step up from %s; " +
+		"the %s tier stays until the LimitRange admits the row or sizingProfile names the tier, " +
+		"which the operator applies without this check"
 	// sizingCappedByQuotaEventFormat is the Warning event's text: the
 	// condition message, then the figures as they stood when it was written.
 	// It takes the message, the cluster count, the free quantity, the quota
 	// key and the quantity the step adds.
 	sizingCappedByQuotaEventFormat = "%s (at %d clusters: %s of %s free, the step adds %s)"
+	// sizingCappedByLimitRangeEventFormat is the LimitRange cap's Warning
+	// event: the message, the cluster count, the bound, its quantity and the
+	// container's figure at the refused row.
+	sizingCappedByLimitRangeEventFormat = "%s (at %d clusters: the %s is %s, the row's figure %s)"
+	// sizingLimitRangeMax and sizingLimitRangeMin name the two bounds of a
+	// Container-type LimitRange item the step-up check reads, as the
+	// LimitRange spec spells them.
+	sizingLimitRangeMax = "max"
+	sizingLimitRangeMin = "min"
 	// sizingTierChangedReason is the Normal event a tier change records, and
-	// sizingCappedByQuotaEventReason the Warning the first capped pass records.
-	sizingTierChangedReason        = "SizingTierChanged"
-	sizingCappedByQuotaEventReason = "SizingCappedByQuota"
-	sizingTierChangedMessageFormat = "sizing tier %s -> %s (spec.deployment.sizingProfile %s)"
+	// sizingCappedByQuotaEventReason and sizingCappedByLimitRangeEventReason
+	// the Warning the first capped pass records.
+	sizingTierChangedReason             = "SizingTierChanged"
+	sizingCappedByQuotaEventReason      = "SizingCappedByQuota"
+	sizingCappedByLimitRangeEventReason = "SizingCappedByLimitRange"
+	sizingTierChangedMessageFormat      = "sizing tier %s -> %s (spec.deployment.sizingProfile %s)"
 
 	// The three sized workloads the step-up check reads back: the gateway
 	// workload (a Deployment, or a StatefulSet under useStatefulSet) named
@@ -192,6 +216,36 @@ type sizingShortfall struct {
 	key   corev1.ResourceName
 	free  resource.Quantity
 	need  resource.Quantity
+}
+
+// sizingBound is one Container-type LimitRange bound a candidate tier's
+// render crosses: the LimitRange, the bound (sizingLimitRangeMax or Min), the
+// resource name, the sized container, the bound's quantity and the figure
+// the container's render carries against it. As with sizingShortfall, the
+// condition message is built from the names alone; the quantities reach the
+// event and the log.
+type sizingBound struct {
+	limitRange string
+	bound      string
+	key        corev1.ResourceName
+	container  string
+	quantity   resource.Quantity
+	figure     resource.Quantity
+}
+
+// sizingCap is the SizingCappedByQuota condition's content: the reason
+// (sizingCappedByQuotaReason or sizingCappedByLimitRangeReason) and the
+// message. The zero value is the condition absent.
+type sizingCap struct {
+	reason  string
+	message string
+}
+
+// sizedRender is one of the three sized containers with its resources as the
+// reconciler renders them at a tier (renderedSizedContainersAt).
+type sizedRender struct {
+	container string
+	resources corev1.ResourceRequirements
 }
 
 // sizingQuotaDimensions are the ResourceQuota hard keys the step-up check
@@ -465,24 +519,27 @@ func renderedShellSandboxResourcesAt(agent *agentv1alpha1.PlatformAgent, tier si
 // each side as the reconciler renders that tier, the limits side read through
 // clamped (sizingRunningLimitsClamped).
 func sizingStepBetween(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, from, to sizingTier) sizingStep {
-	deployment := agent.Spec.Deployment
-	pairs := []struct {
-		container string
-		from, to  corev1.ResourceRequirements
-	}{
-		{credentialProxyContainerName, renderedCredentialProxyResourcesAt(deployment, autopilot, from), renderedCredentialProxyResourcesAt(deployment, autopilot, to)},
-		{agentAPIAuthContainerName, renderedAgentAPIAuthResourcesAt(deployment, from), renderedAgentAPIAuthResourcesAt(deployment, to)},
-		{shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, from), renderedShellSandboxResourcesAt(agent, to)},
-	}
+	before, after := renderedSizedContainersAt(agent, autopilot, from), renderedSizedContainersAt(agent, autopilot, to)
 	step := sizingStep{requests: corev1.ResourceList{}, limits: corev1.ResourceList{}}
-	for _, pair := range pairs {
-		fromRequests, toRequests := effectiveRequests(pair.from), effectiveRequests(pair.to)
+	for i := range before {
+		fromRequests, toRequests := effectiveRequests(before[i].resources), effectiveRequests(after[i].resources)
 		addResourceDelta(step.requests, fromRequests, toRequests)
 		addResourceDelta(step.limits,
-			clampedLimits(pair.from.Limits, fromRequests, clamped),
-			clampedLimits(pair.to.Limits, toRequests, clamped))
+			clampedLimits(before[i].resources.Limits, fromRequests, clamped),
+			clampedLimits(after[i].resources.Limits, toRequests, clamped))
 	}
 	return step
+}
+
+// renderedSizedContainersAt is the three sized containers as the reconciler
+// renders them at tier, in one order: the broker, the sidecar, the shell.
+func renderedSizedContainersAt(agent *agentv1alpha1.PlatformAgent, autopilot bool, tier sizingTier) []sizedRender {
+	deployment := agent.Spec.Deployment
+	return []sizedRender{
+		{credentialProxyContainerName, renderedCredentialProxyResourcesAt(deployment, autopilot, tier)},
+		{agentAPIAuthContainerName, renderedAgentAPIAuthResourcesAt(deployment, tier)},
+		{shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, tier)},
+	}
 }
 
 // clampedLimits is limits with every name replaced by its figure in requests
@@ -1061,43 +1118,115 @@ func sizingQuotaShortfall(agent *agentv1alpha1.PlatformAgent, autopilot bool, cl
 	return nil
 }
 
+// sizingLimitRanges lists the LimitRanges in the agent's namespace in name
+// order, so the condition message is stable across passes. LimitRange is not
+// a watched kind, so the list goes through the API reader, as sizingQuotas
+// does.
+func (r *PlatformAgentReconciler) sizingLimitRanges(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]corev1.LimitRange, error) {
+	ranges := &corev1.LimitRangeList{}
+	if err := r.a2aReader().List(ctx, ranges, client.InNamespace(agent.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing LimitRanges for the sizing step: %w", err)
+	}
+	slices.SortFunc(ranges.Items, func(a, b corev1.LimitRange) int { return strings.Compare(a.Name, b.Name) })
+	return ranges.Items, nil
+}
+
+// sizingLimitRangeBound is nil when every Container-type item of every
+// LimitRange in ranges (the namespace's, in name order) admits the three
+// sized containers as tier to renders them, or the first bound one of them
+// crosses: ranges, items, containers (renderedSizedContainersAt's order) and
+// resource names each in a fixed order, so the condition message is stable
+// across passes. It reads the two checks the LimitRanger admission plugin
+// makes of a container against a Container-type item, after the pod's own
+// defaulting has copied a limit set alone into the request
+// (effectiveRequests): a limit or a request above max, and a request or a
+// limit under min. A name the container does not set is not read: the
+// plugin fills it from the item's default, which the API server sets to max
+// where none is given, so it admits, and a min with no default refuses the
+// running pods' recreation the same whatever the tier. The limits side is
+// read through clamped (sizingRunningLimitsClamped), since the plugin's
+// validation runs after Autopilot's rewrite and sees the clamped limit. A
+// Pod-type item, which sums the pod's containers, and an item's
+// maxLimitRequestRatio are not read; only the three sized containers move
+// with the tier, so the rest of each pod admits at the candidate as it does
+// at the running tier.
+func sizingLimitRangeBound(agent *agentv1alpha1.PlatformAgent, autopilot bool, clamped bool, ranges []corev1.LimitRange, to sizingTier) *sizingBound {
+	if len(ranges) == 0 {
+		return nil
+	}
+	containers := renderedSizedContainersAt(agent, autopilot, to)
+	for i := range ranges {
+		for _, item := range ranges[i].Spec.Limits {
+			if item.Type != corev1.LimitTypeContainer {
+				continue
+			}
+			for _, rendered := range containers {
+				requests := effectiveRequests(rendered.resources)
+				limits := clampedLimits(rendered.resources.Limits, requests, clamped)
+				crossed := func(bound string, key corev1.ResourceName, quantity, figure resource.Quantity) *sizingBound {
+					return &sizingBound{limitRange: ranges[i].Name, bound: bound, key: key, container: rendered.container, quantity: quantity, figure: figure}
+				}
+				for _, key := range sortedResourceNames(item.Max) {
+					if limit, set := limits[key]; set && limit.Cmp(item.Max[key]) > 0 {
+						return crossed(sizingLimitRangeMax, key, item.Max[key], limit)
+					}
+					if request, set := requests[key]; set && request.Cmp(item.Max[key]) > 0 {
+						return crossed(sizingLimitRangeMax, key, item.Max[key], request)
+					}
+				}
+				for _, key := range sortedResourceNames(item.Min) {
+					if request, set := requests[key]; set && request.Cmp(item.Min[key]) < 0 {
+						return crossed(sizingLimitRangeMin, key, item.Min[key], request)
+					}
+					if limit, set := limits[key]; set && limit.Cmp(item.Min[key]) < 0 {
+						return crossed(sizingLimitRangeMin, key, item.Min[key], limit)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // sizingCappedConditionCurrent reports whether the SizingCappedByQuota
-// condition on the CR already says msg, where "" means absent.
-func sizingCappedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+// condition on the CR already says capped, where the zero value means
+// absent.
+func sizingCappedConditionCurrent(agent *agentv1alpha1.PlatformAgent, capped sizingCap) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
-	if msg == "" {
+	if capped.message == "" {
 		return existing == nil
 	}
 	return existing != nil && existing.Status == metav1.ConditionTrue &&
-		existing.Reason == sizingCappedByQuotaReason && existing.Message == msg
+		existing.Reason == capped.reason && existing.Message == capped.message
 }
 
-// setSizingCappedByQuotaCondition writes the SizingCappedByQuota condition,
-// or removes it when msg is "". The caller does the API write.
-func setSizingCappedByQuotaCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
-	if msg == "" {
+// setSizingCappedCondition writes the SizingCappedByQuota condition, or
+// removes it when capped is the zero value. The caller does the API write.
+func setSizingCappedCondition(agent *agentv1alpha1.PlatformAgent, capped sizingCap, now metav1.Time) {
+	if capped.message == "" {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, sizingCappedByQuotaConditionType)
 		return
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
 		Type:               sizingCappedByQuotaConditionType,
 		Status:             metav1.ConditionTrue,
-		Reason:             sizingCappedByQuotaReason,
-		Message:            msg,
+		Reason:             capped.reason,
+		Message:            capped.message,
 		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	})
 }
 
-// sizingCappedConditionMessage is the message the SizingCappedByQuota
-// condition on the CR carries, "" when it is absent or not the condition this
-// operator writes.
-func sizingCappedConditionMessage(agent *agentv1alpha1.PlatformAgent) string {
+// sizingCappedCondition is the reason and message the SizingCappedByQuota
+// condition on the CR carries, the zero value when it is absent or not a
+// condition this operator writes.
+func sizingCappedCondition(agent *agentv1alpha1.PlatformAgent) sizingCap {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, sizingCappedByQuotaConditionType)
-	if existing == nil || existing.Status != metav1.ConditionTrue || existing.Reason != sizingCappedByQuotaReason {
-		return ""
+	if existing == nil || existing.Status != metav1.ConditionTrue ||
+		(existing.Reason != sizingCappedByQuotaReason && existing.Reason != sizingCappedByLimitRangeReason) {
+		return sizingCap{}
 	}
-	return existing.Message
+	return sizingCap{reason: existing.Reason, message: existing.Message}
 }
 
 // resolveSizingTier decides the tier this pass renders and writes it to
@@ -1110,7 +1239,12 @@ func sizingCappedConditionMessage(agent *agentv1alpha1.PlatformAgent) string {
 // the highest tier, at or under what the cluster count earns, whose step from
 // the running tier every ResourceQuota that counts the pods has room for; a
 // quota short on every step keeps the running tier, and any refused step sets
-// the condition. With a quota in the namespace, a step is measured only once
+// the condition. A step is also refused when a Container-type LimitRange in
+// the namespace bounds a figure the candidate's render crosses
+// (sizingLimitRangeBound), since that admission plugin refuses the recreated
+// pod the way a short quota does; the LimitRange is read before the quota,
+// the order admission evaluates them in, so the condition names the LimitRange
+// when both refuse. With a quota in the namespace, a step is measured only once
 // the running tier's workloads have settled (sizingTierSettled), since the
 // used totals it is measured against do not charge a step whose pods
 // admission has not yet created; until then the latch and the condition stay
@@ -1133,8 +1267,9 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 	profile := sizingProfileOf(agent.Spec.Deployment)
 	latched, _ := parseSizingTier(agent.Status.EffectiveSizingTier)
 	tier := specSizingTier(agent.Spec.Deployment)
-	capped := ""
+	capped := sizingCap{}
 	var short *sizingShortfall
+	var bound *sizingBound
 	var count int64
 	if profile == sizingProfileAuto {
 		tier = latched
@@ -1142,6 +1277,10 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 			count = observed
 			if earned := sizingTierForClusterCount(count); earned > tier {
 				quotas, err := r.sizingQuotas(ctx, agent)
+				if err != nil {
+					return err
+				}
+				ranges, err := r.sizingLimitRanges(ctx, agent)
 				if err != nil {
 					return err
 				}
@@ -1167,7 +1306,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					// every pass it takes, so a wait that never ends (a
 					// workload that cannot settle at the tier's render) is
 					// told apart from a quiet pass.
-					capped = sizingCappedConditionMessage(agent)
+					capped = sizingCappedCondition(agent)
 					logf.FromContext(ctx).Info("sizing step held until the running tier's workloads settle",
 						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
 						"waitingOn", waitingOn, "clusters", count)
@@ -1181,7 +1320,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					// answering measures. Reading the scoped quotas as
 					// binding instead would cap the tier on a quota that may
 					// not count these pods and tell the reader to raise it.
-					capped = sizingCappedConditionMessage(agent)
+					capped = sizingCappedCondition(agent)
 					logf.FromContext(ctx).Info("sizing step held until admission answers the sizing pods' priority class",
 						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
 						"clusters", count)
@@ -1191,22 +1330,32 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					// The earned tier first, then each tier between it and
 					// the running one, every step measured from the running
 					// tier against the same used totals: the highest step the
-					// quotas admit is taken, so a count that earns fleet with
-					// room for medium alone reaches medium rather than
-					// waiting at small for the whole fleet step. The cap
-					// reports the lowest step refused, the one raising the
-					// quota by the least relieves.
+					// LimitRanges and the quotas admit is taken, so a count
+					// that earns fleet with room for medium alone reaches
+					// medium rather than waiting at small for the whole fleet
+					// step. The cap reports the lowest step refused, the one
+					// raising the quota or the bound by the least relieves,
+					// and the check that refused it.
 					running := tier
 					for candidate := earned; candidate > running; candidate-- {
-						shortfall := sizingQuotaShortfall(agent, autopilot, clamped, quotas, classes, running, candidate)
-						if shortfall == nil {
-							tier = candidate
-							break
+						if crossed := sizingLimitRangeBound(agent, autopilot, clamped, ranges, candidate); crossed != nil {
+							bound, short = crossed, nil
+							continue
 						}
-						short = shortfall
+						if shortfall := sizingQuotaShortfall(agent, autopilot, clamped, quotas, classes, running, candidate); shortfall != nil {
+							short, bound = shortfall, nil
+							continue
+						}
+						tier = candidate
+						break
 					}
-					if short != nil {
-						capped = fmt.Sprintf(sizingCappedByQuotaMessageFormat, earned, short.quota, short.key, tier, tier)
+					switch {
+					case bound != nil:
+						capped = sizingCap{reason: sizingCappedByLimitRangeReason, message: fmt.Sprintf(sizingCappedByLimitRangeMessageFormat,
+							earned, bound.limitRange, bound.bound, bound.key, bound.container, tier, tier)}
+					case short != nil:
+						capped = sizingCap{reason: sizingCappedByQuotaReason, message: fmt.Sprintf(sizingCappedByQuotaMessageFormat,
+							earned, short.quota, short.key, tier, tier)}
 					}
 				}
 			}
@@ -1218,7 +1367,7 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 			// being raised; auto cannot promote without a reading, so there
 			// is nothing to cap, and the first reading after the watcher is
 			// switched back on checks the quota again.
-			capped = sizingCappedConditionMessage(agent)
+			capped = sizingCappedCondition(agent)
 		}
 	}
 	tierSettled := agent.Status.EffectiveSizingTier == tier.String() ||
@@ -1239,10 +1388,17 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 		log.Info("sizing tier capped by ResourceQuota", "name", agent.Name, "namespace", agent.Namespace,
 			"quota", short.quota, "key", short.key, "free", short.free.String(), "adds", short.need.String(), "clusters", count)
 		r.recordEvent(agent, corev1.EventTypeWarning, sizingCappedByQuotaEventReason,
-			fmt.Sprintf(sizingCappedByQuotaEventFormat, capped, count, short.free.String(), short.key, short.need.String()))
+			fmt.Sprintf(sizingCappedByQuotaEventFormat, capped.message, count, short.free.String(), short.key, short.need.String()))
+	}
+	if bound != nil && !sizingCappedConditionCurrent(agent, capped) {
+		log.Info("sizing tier capped by LimitRange", "name", agent.Name, "namespace", agent.Namespace,
+			"limitRange", bound.limitRange, "bound", bound.bound, "key", bound.key, "container", bound.container,
+			"quantity", bound.quantity.String(), "figure", bound.figure.String(), "clusters", count)
+		r.recordEvent(agent, corev1.EventTypeWarning, sizingCappedByLimitRangeEventReason,
+			fmt.Sprintf(sizingCappedByLimitRangeEventFormat, capped.message, count, bound.bound, bound.quantity.String(), bound.figure.String()))
 	}
 	agent.Status.EffectiveSizingTier = tier.String()
-	setSizingCappedByQuotaCondition(agent, capped, metav1.Now())
+	setSizingCappedCondition(agent, capped, metav1.Now())
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
 	}

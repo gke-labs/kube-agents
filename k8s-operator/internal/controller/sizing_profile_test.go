@@ -473,7 +473,7 @@ func TestResolveSizingTierQuotaGate(t *testing.T) {
 	t.Run("a quota with headroom lets the promotion through and clears the condition", func(t *testing.T) {
 		t.Parallel()
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
-		setSizingCappedByQuotaCondition(agent, "left over from an earlier pass", metav1.Now())
+		setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByQuotaReason, message: "left over from an earlier pass"}, metav1.Now())
 		stored, _ := resolveSizing(t, agent, sizingQuota("platform-baseline-quota", "10Gi", "1Gi"))
 		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
 			t.Fatalf("status.effectiveSizingTier = %q, want medium", stored.Status.EffectiveSizingTier)
@@ -1198,7 +1198,7 @@ func TestResolveSizingTierAsksAdmissionForThePriorityClass(t *testing.T) {
 		refused := apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("exceeded quota: pod-count"))
 		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](12), nil)
 		standing := fmt.Sprintf(sizingCappedByQuotaMessageFormat, sizingTierMedium, inDefault.Name, corev1.ResourceRequestsMemory, sizingTierSmall, sizingTierSmall)
-		setSizingCappedByQuotaCondition(agent, standing, metav1.Now())
+		setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByQuotaReason, message: standing}, metav1.Now())
 		objs := append([]client.Object{agent, inDefault}, sizedWorkloadsAt(agent, sizingTierSmall)...)
 		var seen []*corev1.Pod
 		scheme := setupScheme()
@@ -1816,6 +1816,154 @@ func TestSizingTierSettled(t *testing.T) {
 		}
 		if !r.sizingTierSettled(context.Background(), agent, sizingTierSmall) {
 			t.Fatal("sizingTierSettled = false for the tier the template carries")
+		}
+	})
+}
+
+// sizingLimitRange is a LimitRange with one Container-type item bounding
+// key at quantity on the side bound names (sizingLimitRangeMax or Min).
+func sizingLimitRange(name, bound string, key corev1.ResourceName, quantity string) *corev1.LimitRange {
+	item := corev1.LimitRangeItem{Type: corev1.LimitTypeContainer}
+	if bound == sizingLimitRangeMax {
+		item.Max = corev1.ResourceList{key: resource.MustParse(quantity)}
+	} else {
+		item.Min = corev1.ResourceList{key: resource.MustParse(quantity)}
+	}
+	return &corev1.LimitRange{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "kubeagents-system"},
+		Spec:       corev1.LimitRangeSpec{Limits: []corev1.LimitRangeItem{item}},
+	}
+}
+
+func TestResolveSizingTierLimitRangeGate(t *testing.T) {
+	t.Parallel()
+	// Latched small at 25 clusters, no ResourceQuota. The fleet row's broker
+	// and sidecar carry an 8Gi memory limit, the medium row's a 4Gi one, so
+	// a per-container max of 4Gi admits medium and refuses fleet.
+	t.Run("a max under the earned row takes the tier the LimitRange admits and names the bound", func(t *testing.T) {
+		t.Parallel()
+		stored, recorder := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil),
+			sizingLimitRange("tenant-bounds", sizingLimitRangeMax, corev1.ResourceMemory, "4Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Fatalf("status.effectiveSizingTier = %q, want medium: the gate promoted past a LimitRange max the fleet row crosses", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != sizingCappedByLimitRangeReason || cond.ObservedGeneration != 3 {
+			t.Fatalf("SizingCappedByQuota = %+v, want True with reason %s", cond, sizingCappedByLimitRangeReason)
+		}
+		for _, want := range []string{"earns the fleet tier", "LimitRange tenant-bounds sets a per-container max on memory that the " + credentialProxyContainerName + " container crosses", "step up from medium", "the medium tier stays"} {
+			if !strings.Contains(cond.Message, want) {
+				t.Errorf("message lacks %q: %s", want, cond.Message)
+			}
+		}
+		if strings.Contains(cond.Message, "Gi") {
+			t.Errorf("the message carries a quantity: %s", cond.Message)
+		}
+		// The tier change's Normal event, then the cap's Warning with the
+		// figures.
+		var events []string
+		for len(recorder.Events) > 0 {
+			events = append(events, <-recorder.Events)
+		}
+		if len(events) != 2 || !strings.Contains(events[0], sizingTierChangedReason) {
+			t.Fatalf("events = %q, want the tier change then the cap", events)
+		}
+		for _, want := range []string{sizingCappedByLimitRangeEventReason, "at 25 clusters", "the max is 4Gi", "the row's figure 8Gi"} {
+			if !strings.Contains(events[1], want) {
+				t.Errorf("event lacks %q: %s", want, events[1])
+			}
+		}
+	})
+	t.Run("a bound every row admits lets the promotion through and clears a standing cap", func(t *testing.T) {
+		t.Parallel()
+		agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+		setSizingCappedCondition(agent, sizingCap{reason: sizingCappedByLimitRangeReason, message: "left over from a tighter LimitRange"}, metav1.Now())
+		stored, _ := resolveSizing(t, agent, sizingLimitRange("tenant-bounds", sizingLimitRangeMax, corev1.ResourceMemory, "16Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet", stored.Status.EffectiveSizingTier)
+		}
+		if cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType); cond != nil {
+			t.Fatalf("SizingCappedByQuota still set after the LimitRange was raised: %+v", cond)
+		}
+	})
+	t.Run("a min a row's request falls under refuses every step and names the container", func(t *testing.T) {
+		t.Parallel()
+		// The sidecar requests 384Mi at every tier; a 2Gi per-container min
+		// refuses its recreation at medium and at fleet alike. The broker's
+		// medium request (4Gi) clears it, so the first container that falls
+		// under the min is the sidecar.
+		stored, _ := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil),
+			sizingLimitRange("tenant-bounds", sizingLimitRangeMin, corev1.ResourceMemory, "2Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || cond.Reason != sizingCappedByLimitRangeReason {
+			t.Fatalf("SizingCappedByQuota = %+v, want the LimitRange reason", cond)
+		}
+		for _, want := range []string{"earns the fleet tier", "sets a per-container min on memory that the agent-api-auth container crosses", "step up from small", "the small tier stays"} {
+			if !strings.Contains(cond.Message, want) {
+				t.Errorf("message lacks %q: %s", want, cond.Message)
+			}
+		}
+	})
+	t.Run("a Pod-type item is not read", func(t *testing.T) {
+		t.Parallel()
+		// A Pod-type max sums the pod's containers, which the gate does not
+		// render; the three sized containers are the only figures a tier
+		// moves, and the check reads Container-type items alone.
+		podBound := sizingLimitRange("pod-bounds", sizingLimitRangeMax, corev1.ResourceMemory, "4Gi")
+		podBound.Spec.Limits[0].Type = corev1.LimitTypePod
+		stored, _ := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil), podBound)
+		if stored.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Fatalf("status.effectiveSizingTier = %q, want fleet: a Pod-type item capped the tier", stored.Status.EffectiveSizingTier)
+		}
+	})
+	t.Run("the cap names the check that refused the lowest step", func(t *testing.T) {
+		t.Parallel()
+		// The LimitRange refuses fleet (8Gi over a 4Gi max) and a quota with
+		// 2Gi of requests.memory free refuses medium (the step adds 3Gi):
+		// the tier stays small and the condition names the quota, the check
+		// that refused the step raising the least relieves.
+		stored, _ := resolveSizing(t, sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil),
+			sizingLimitRange("tenant-bounds", sizingLimitRangeMax, corev1.ResourceMemory, "4Gi"),
+			sizingQuota("platform-baseline-quota", "10Gi", "8Gi"))
+		if stored.Status.EffectiveSizingTier != sizingProfileSmall {
+			t.Fatalf("status.effectiveSizingTier = %q, want small", stored.Status.EffectiveSizingTier)
+		}
+		cond := meta.FindStatusCondition(stored.Status.Conditions, sizingCappedByQuotaConditionType)
+		if cond == nil || cond.Reason != sizingCappedByQuotaReason || !strings.Contains(cond.Message, "ResourceQuota platform-baseline-quota has no room on requests.memory") {
+			t.Fatalf("SizingCappedByQuota = %+v, want the quota named for the medium step", cond)
+		}
+	})
+	t.Run("a limit is compared through the Autopilot clamp", func(t *testing.T) {
+		t.Parallel()
+		// A 4 CPU per-container max. The fleet row's broker limit is 8 CPU
+		// as written, which crosses it on Standard and under bursting; on
+		// Autopilot without bursting admission lowers the limit to the 4 CPU
+		// request, which the LimitRanger's validation, running after that
+		// rewrite, admits.
+		bound := func() *corev1.LimitRange {
+			return sizingLimitRange("tenant-bounds", sizingLimitRangeMax, corev1.ResourceCPU, "4")
+		}
+		run := func(t *testing.T, autopilot bool, workloads []client.Object) *agentv1alpha1.PlatformAgent {
+			t.Helper()
+			agent := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent, bound()}, workloads...)...).WithStatusSubresource(agent).Build()
+			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(8), autopilot: autopilot, autopilotResolved: true}
+			if err := r.resolveSizingTier(context.Background(), agent); err != nil {
+				t.Fatalf("resolveSizingTier: %v", err)
+			}
+			return agent
+		}
+		standard := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+		if agent := run(t, false, sizedWorkloadsAt(standard, sizingTierSmall)); agent.Status.EffectiveSizingTier != sizingProfileMedium {
+			t.Errorf("Standard: status.effectiveSizingTier = %q, want medium with fleet refused on the broker's 8 CPU limit", agent.Status.EffectiveSizingTier)
+		}
+		clamped := sizingAgent(sizingProfileAuto, sizingProfileSmall, ptr.To[int64](25), nil)
+		if agent := run(t, true, autopilotClamped(sizedWorkloadsOn(clamped, sizingTierSmall, true))); agent.Status.EffectiveSizingTier != sizingProfileFleet {
+			t.Errorf("Autopilot clamped: status.effectiveSizingTier = %q, want fleet: the broker's limit is its 4 CPU request there", agent.Status.EffectiveSizingTier)
 		}
 	})
 }
