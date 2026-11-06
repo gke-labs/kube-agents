@@ -101,6 +101,15 @@
             }
           }
         },
+        "mcpServer": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -1631,6 +1640,9 @@
                 },
                 "mode": {
                   "type": "string"
+                },
+                "answerFeedback": {
+                  "type": "boolean"
                 }
               }
             },

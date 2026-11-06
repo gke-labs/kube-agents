@@ -183,7 +183,7 @@ func TestChatChunksLongSpanNotMovedWhenExceedingBudget(t *testing.T) {
 	// (1893 bytes + "\n```" = 1897 bytes) and chunk 2 carries the remainder (1615 bytes),
 	// requiring only 2 chunks total.
 	intro := strings.Repeat("intro line\n", 90) + strings.Repeat("x", 10) // 1000 bytes
-	block := "```\n" + strings.Repeat("xxxxxxxxx\n", 250) + "```\n"        // 2505 bytes
+	block := "```\n" + strings.Repeat("xxxxxxxxx\n", 250) + "```\n"       // 2505 bytes
 	text := intro + block
 	chunks := chatChunks(text, discordChunk)
 	if len(chunks) != 2 {
@@ -250,7 +250,7 @@ func TestChatChunksSpanFollowedByLongUnbrokenLineNotMoved(t *testing.T) {
 	// Moving the cut back to 1000 would produce 3 chunks because the next iteration's
 	// cut would land inside the 1591-byte span at byte 1585. Not moving the cut keeps
 	// it at 2 chunks.
-	intro := strings.Repeat("012345678\n", 100)                    // 1000 bytes
+	intro := strings.Repeat("012345678\n", 100)                   // 1000 bytes
 	span := "``" + strings.Repeat("filler line\n", 132) + "end``" // 1591 bytes
 	trailing := strings.Repeat("a", 400) + "\n"                   // 401 bytes
 	text := intro + span + trailing

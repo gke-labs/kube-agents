@@ -251,3 +251,97 @@ func (s *Server) upstreamArgs(ctx context.Context, toolName string, rawArgs json
 	}
 	return rawArgs, nil
 }
+
+// maxPollWaitSeconds is the in-cluster server's ceiling on poll_events' wait (a2a/mcp
+// maxPollSeconds); the server refuses a longer one.
+const maxPollWaitSeconds = 60
+
+// serverPollEventsArgs translates the bridge's poll_events arguments to the in-cluster server's
+// (a2a/mcp pollEventsArgs). serverToken, the server's own token as a send_message answer reports
+// it, goes as conversation_token and conversation is dropped; otherwise conversation is the alias
+// the bridge resolved (the name the bridge's send_message sent the turn under). The bridge's own
+// console tokens are not the server's, so the caller never passes one as serverToken. since is a
+// non-negative whole number (a numeric string is read as its number); wait_seconds is read as
+// send_message's wait is (parseWaitSeconds) and clamped to 0..maxPollWaitSeconds. Any other
+// argument is dropped.
+func serverPollEventsArgs(raw json.RawMessage, conversation, serverToken string) (json.RawMessage, error) {
+	args := map[string]any{}
+	if len(raw) > 0 {
+		dec := json.NewDecoder(strings.NewReader(string(raw)))
+		dec.UseNumber()
+		_ = dec.Decode(&args)
+	}
+	if args == nil {
+		args = map[string]any{}
+	}
+	fwd := map[string]any{}
+	if token := strings.TrimSpace(serverToken); token != "" {
+		fwd["conversation_token"] = token
+	} else if conversation = strings.TrimSpace(conversation); conversation != "" {
+		fwd["conversation"] = conversation
+	}
+	if v, ok := args["since"]; ok && v != nil {
+		var s string
+		switch v := v.(type) {
+		case json.Number:
+			s = v.String()
+		case string:
+			s = strings.TrimSpace(v)
+		default:
+			return nil, fmt.Errorf("invalid since %v: want the cursor an earlier answer reported", v)
+		}
+		since, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid since %q: want the cursor an earlier answer reported", s)
+		}
+		fwd["since"] = since
+	}
+	if v, ok := args["wait_seconds"]; ok && v != nil {
+		if n, isNum := v.(json.Number); isNum {
+			v = n.String()
+		}
+		wait, err := parseWaitSeconds(v)
+		if err != nil {
+			return nil, fmt.Errorf("invalid wait_seconds %v: want a number of seconds, 0 to %d", v, maxPollWaitSeconds)
+		}
+		switch {
+		case wait < 0:
+			wait = 0
+		case wait > maxPollWaitSeconds:
+			wait = maxPollWaitSeconds
+		}
+		fwd["wait_seconds"] = int(wait)
+	}
+	return json.Marshal(fwd)
+}
+
+// pollEventsConversationArgs reads poll_events' conversation and conversation_token. Either, when
+// present and not null, must be a string: a value of another type is refused rather than read as
+// absent, which would poll the active conversation instead of the one the caller named.
+func pollEventsConversationArgs(raw json.RawMessage) (conversation, token string, err error) {
+	if len(raw) == 0 {
+		return "", "", nil
+	}
+	var args map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &args); err != nil {
+		return "", "", fmt.Errorf("invalid poll_events arguments: %v", err)
+	}
+	read := func(key string) (string, error) {
+		v, ok := args[key]
+		if !ok || string(v) == "null" {
+			return "", nil
+		}
+		var s string
+		if err := json.Unmarshal(v, &s); err != nil {
+			return "", fmt.Errorf("invalid %s %s: want the conversation's name or token as a string", key, v)
+		}
+		return strings.TrimSpace(s), nil
+	}
+	if conversation, err = read("conversation"); err != nil {
+		return "", "", err
+	}
+	if token, err = read("conversation_token"); err != nil {
+		return "", "", err
+	}
+	return conversation, token, nil
+}

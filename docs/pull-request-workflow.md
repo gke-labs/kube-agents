@@ -119,10 +119,11 @@ that failure is why this step has previously been skipped rather than run.
 **Shell scripts.** If you change a `.sh` file, run `make shellcheck`. The `validate` job runs the
 same target on every pull request, and it is a required check, so a warning-severity finding in
 any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
-shellcheck step in `.github/workflows/validate.yml`) from
-<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
-package on the GitHub-hosted runner image is whatever release that image's Ubuntu ships, not the
-one the job pins and asserts, and a different release reports a different set of findings than CI.
+shellcheck step in `.github/workflows/validate.yml`): a different release reports a different set
+of findings than CI. A distribution package is whatever release that distribution ships, so check
+`shellcheck --version` against the pin and install from
+<https://github.com/koalaman/shellcheck/releases> when it differs; the job does the same with the
+runner image's package.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
 place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
@@ -180,8 +181,9 @@ check runs once, because its failure is a test verdict. A new `docker/setup-buil
 shape.
 
 `tests/test_third_party_download_retry.py` gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
-the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
-nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
+the `go install` retry behind setup-envtest, controller-gen and kustomize, `a2a-test.yml`'s
+nats CLI install step and `python-tests.yml`'s operator module download steps against stubs, and
+reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
 cache step fails it too. Run it with `python3 -m unittest tests.test_third_party_download_retry`.
 `make test-bench-deps` retries its pip install the same way, because the devops-bench pin is a git

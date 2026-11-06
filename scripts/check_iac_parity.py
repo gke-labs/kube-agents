@@ -4,10 +4,12 @@
 Several static files hand-maintain the same DNS egress rule (port 53):
 * charts/kube-agents/templates/litellm.yaml
 * charts/kube-agents/templates/github-minter.yaml
+* charts/kube-agents/templates/hindsight.yaml
 * examples/litellm-chatgpt-subscription/networkpolicy.yaml
 * examples/litellm-gemini/networkpolicy.yaml
 * examples/vllm-gemma/networkpolicy.yaml
 * k8s-operator/config/integrations/github/deployment.yaml.template
+* k8s-operator/config/integrations/hindsight/networkpolicy.yaml
 * k8s-operator/config/integrations/litellm/base/networkpolicy.yaml
 
 Context (#747 B5, D1; #687):
@@ -112,10 +114,12 @@ DISCOVERY_FILE_PATTERNS: tuple[str, ...] = (
 STATIC_NETWORK_POLICIES: tuple[str, ...] = (
     "charts/kube-agents/templates/litellm.yaml",
     "charts/kube-agents/templates/github-minter.yaml",
+    "charts/kube-agents/templates/hindsight.yaml",
     "examples/litellm-chatgpt-subscription/networkpolicy.yaml",
     "examples/litellm-gemini/networkpolicy.yaml",
     "examples/vllm-gemma/networkpolicy.yaml",
     "k8s-operator/config/integrations/github/deployment.yaml.template",
+    "k8s-operator/config/integrations/hindsight/networkpolicy.yaml",
     "k8s-operator/config/integrations/litellm/base/networkpolicy.yaml",
     "hack/slack-live-check/manifests/setup.yaml.template",
 )
