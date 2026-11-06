@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -32,6 +33,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -71,15 +73,20 @@ func sizingQuota(name, hard, used string) *corev1.ResourceQuota {
 // them once its rollout has settled: each template's sized container at the
 // tier's Standard render (the sidecar as the native init container it is),
 // the controller's status at the current generation with the one replica
-// updated and available.
+// updated and available. sizedWorkloadsOn is the same at either cluster
+// type's render.
 func sizedWorkloadsAt(agent *agentv1alpha1.PlatformAgent, tier sizingTier) []client.Object {
+	return sizedWorkloadsOn(agent, tier, false)
+}
+
+func sizedWorkloadsOn(agent *agentv1alpha1.PlatformAgent, tier sizingTier, autopilot bool) []client.Object {
 	meta := func(name string) metav1.ObjectMeta {
 		return metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Generation: 1}
 	}
 	proxy := &appsv1.Deployment{
 		ObjectMeta: meta(credentialProxyName(agent)),
 		Spec: appsv1.DeploymentSpec{Replicas: ptr.To[int32](1), Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
-			{Name: credentialProxyContainerName, Resources: renderedCredentialProxyResourcesAt(agent.Spec.Deployment, false, tier)},
+			{Name: credentialProxyContainerName, Resources: renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier)},
 		}}}},
 		Status: appsv1.DeploymentStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, AvailableReplicas: 1},
 	}
@@ -99,6 +106,39 @@ func sizedWorkloadsAt(agent *agentv1alpha1.PlatformAgent, tier sizingTier) []cli
 		Status: appsv1.StatefulSetStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1},
 	}
 	return []client.Object{proxy, gateway, shell}
+}
+
+// clampedToRequests rewrites the sized workloads' templates the way GKE
+// Autopilot without Pod bursting admits them: every container's cpu and
+// memory limit set equal to its request, and the ephemeral-storage limit
+// copied into the request where a limit alone was set.
+func clampedToRequests(objs []client.Object) []client.Object {
+	clamp := func(containers []corev1.Container) {
+		for i := range containers {
+			rr := &containers[i].Resources
+			if rr.Requests == nil {
+				continue
+			}
+			for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+				if request, ok := rr.Requests[name]; ok {
+					rr.Limits[name] = request.DeepCopy()
+				}
+			}
+			if limit, ok := rr.Limits[corev1.ResourceEphemeralStorage]; ok {
+				rr.Requests[corev1.ResourceEphemeralStorage] = limit.DeepCopy()
+			}
+		}
+	}
+	for _, obj := range objs {
+		switch workload := obj.(type) {
+		case *appsv1.Deployment:
+			clamp(workload.Spec.Template.Spec.Containers)
+			clamp(workload.Spec.Template.Spec.InitContainers)
+		case *appsv1.StatefulSet:
+			clamp(workload.Spec.Template.Spec.Containers)
+		}
+	}
+	return objs
 }
 
 // sizedPodsWithClass is one live pod this operator created, carrying its
@@ -650,6 +690,37 @@ func TestSizingTierRows(t *testing.T) {
 	assertQuantity(t, shell.Limits, corev1.ResourceMemory, "4Gi")
 }
 
+func TestSizingRowsKeepTheClampReadable(t *testing.T) {
+	t.Parallel()
+	// sizedContainerCarries reads a limit equal to its request as Autopilot's
+	// clamp on a name the row requests, and lets the requests side stand for
+	// it. That reading is sound under bursting, where limits survive, only
+	// while no row sets a limit equal to its request on a name the next row
+	// raises the limit of alone: such a lower template would read as the
+	// higher tier with its limit short. Each container's three rows, on
+	// both cluster types, keep that shape.
+	rows := map[string]func(tier sizingTier) corev1.ResourceRequirements{
+		"proxy on Standard":  func(tier sizingTier) corev1.ResourceRequirements { return credentialProxyTierResources(tier, false) },
+		"proxy on Autopilot": func(tier sizingTier) corev1.ResourceRequirements { return credentialProxyTierResources(tier, true) },
+		"sidecar":            agentAPIAuthTierResources,
+		"shell":              shellSandboxTierResources,
+	}
+	for container, row := range rows {
+		for lower := sizingTierSmall; lower < sizingTierFleet; lower++ {
+			from, to := row(lower), row(lower+1)
+			for _, name := range sizingSettledLimits {
+				fromLimit, fromRequest := from.Limits[name], from.Requests[name]
+				toLimit, toRequest := to.Limits[name], to.Requests[name]
+				raisesLimitAlone := toLimit.Cmp(fromLimit) > 0 && toRequest.Cmp(fromRequest) == 0
+				if raisesLimitAlone && fromLimit.Cmp(fromRequest) == 0 {
+					t.Errorf("%s %s -> %s raises the %s limit alone (%s -> %s) off a row whose limit equals its request: a clamped read cannot tell the two apart",
+						container, lower, lower+1, name, fromLimit.String(), toLimit.String())
+				}
+			}
+		}
+	}
+}
+
 func TestSizingExplicitKeysWinOverThePreset(t *testing.T) {
 	t.Parallel()
 	proxy := resolveCredentialProxyResources(&agentv1alpha1.DeploymentSpec{
@@ -1018,12 +1089,24 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 		}).Build()
 	recorder := record.NewFakeRecorder(8)
 	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: recorder}
-	ctx := context.Background()
+	var logged strings.Builder
+	ctx := logf.IntoContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
 	pass := func(what string) {
 		t.Helper()
 		if err := r.resolveSizingTier(ctx, agent); err != nil {
 			t.Fatalf("%s: %v", what, err)
 		}
+	}
+	// held counts the passes so far that logged the hold naming workload,
+	// the one line a pass that measures nothing leaves.
+	held := func(workload string) int {
+		n := 0
+		for _, line := range strings.Split(logged.String(), "\n") {
+			if strings.Contains(line, "sizing step held until the running tier's workloads settle") && strings.Contains(line, `"waitingOn"="`+workload+`"`) {
+				n++
+			}
+		}
+		return n
 	}
 	capped := func(what string) {
 		t.Helper()
@@ -1037,6 +1120,9 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 	if writes != 1 {
 		t.Fatalf("%d status writes after the first pass, want 1", writes)
 	}
+	if strings.Contains(logged.String(), "sizing step held") {
+		t.Fatalf("the first pass, with the small workloads settled, logged a hold:\n%s", logged.String())
+	}
 
 	// The status write's echo lands before the pass has re-rendered any
 	// workload: the three still carry the small render, rolled out.
@@ -1044,6 +1130,9 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 	capped("before the renders")
 	if writes != 1 || len(recorder.Events) != 2 {
 		t.Fatalf("before the renders: %d status writes and %d events, want the first pass's 1 and 2: the pass measured a step from the latch", writes, len(recorder.Events))
+	}
+	if held("Deployment/"+credentialProxyName(agent)) != 1 {
+		t.Fatalf("the pass that measured nothing did not log the hold naming the proxy Deployment:\n%s", logged.String())
 	}
 
 	// Step 11 of the same pass re-rendered the proxy at medium and the
@@ -1114,6 +1203,9 @@ func TestResolveSizingTierMeasuresNoStepUntilTheLatchedTierSettles(t *testing.T)
 	if writes != 1 {
 		t.Fatalf("%d status writes after the medium workloads settled, want 1: the cap stood as written", writes)
 	}
+	if held("Deployment/"+credentialProxyName(agent)) != 3 {
+		t.Fatalf("the three passes in the proxy's rollout logged the hold %d times, want 3, and the settled pass none:\n%s", held("Deployment/"+credentialProxyName(agent)), logged.String())
+	}
 
 	// The quota is raised by the fleet step: the pass takes it.
 	quota.Spec.Hard[corev1.ResourceRequestsMemory] = resource.MustParse("12Gi")
@@ -1139,73 +1231,113 @@ func TestSizingTierSettled(t *testing.T) {
 	type mutate func(proxy, gateway *appsv1.Deployment, shell *appsv1.StatefulSet) []client.Object
 	all := func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, g, s} }
 	cases := []struct {
-		name string
-		tier sizingTier
-		mut  mutate
-		want bool
+		name      string
+		tier      sizingTier
+		autopilot bool
+		mut       mutate
+		want      bool
 	}{
-		{"all three settled at small", sizingTierSmall, all, true},
-		{"all three settled at medium", sizingTierMedium, all, true},
-		{"at small the proxy Deployment is not there yet", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{g, s} }, true},
-		{"at small none of the three is there yet", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return nil }, true},
-		{"at medium the proxy Deployment is not there", sizingTierMedium, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{g, s} }, false},
-		{"at medium the shell StatefulSet is not there", sizingTierMedium, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, g} }, false},
-		{"at medium the gateway is not there", sizingTierMedium, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, s} }, false},
-		{"the proxy's controller has not observed the generation", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"all three settled at small", sizingTierSmall, false, all, true},
+		{"all three settled at medium", sizingTierMedium, false, all, true},
+		{"at small the proxy Deployment is not there yet", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{g, s} }, true},
+		{"at small none of the three is there yet", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return nil }, true},
+		{"at medium the proxy Deployment is not there", sizingTierMedium, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{g, s} }, false},
+		{"at medium the shell StatefulSet is not there", sizingTierMedium, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, g} }, false},
+		{"at medium the gateway is not there", sizingTierMedium, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object { return []client.Object{p, s} }, false},
+		{"the proxy's controller has not observed the generation", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			p.Generation = 2
 			return all(p, g, s)
 		}, false},
-		{"the proxy's Recreate window: the old pod gone, the new one not created", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the proxy's Recreate window: the old pod gone, the new one not created", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			p.Status.UpdatedReplicas, p.Status.Replicas, p.Status.AvailableReplicas = 0, 0, 0
 			return all(p, g, s)
 		}, false},
-		{"the proxy's new pod is created and not yet available", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the proxy's new pod is created and not yet available", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			p.Status.AvailableReplicas = 0
 			return all(p, g, s)
 		}, false},
-		{"the gateway's old pod is still draining", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the gateway's old pod is still draining", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			g.Status.Replicas = 2
 			return all(p, g, s)
 		}, false},
-		{"the shell's new pod is not created yet", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the shell's new pod is not created yet", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			s.Status.UpdatedReplicas, s.Status.ReadyReplicas = 0, 0
 			return all(p, g, s)
 		}, false},
-		{"the shell's new pod is not ready", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the shell's new pod is not ready", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			s.Status.ReadyReplicas = 0
 			return all(p, g, s)
 		}, false},
-		{"the proxy scaled to zero has nothing to settle", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the proxy scaled to zero has nothing to settle", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			p.Spec.Replicas = ptr.To[int32](0)
 			p.Status.UpdatedReplicas, p.Status.Replicas, p.Status.AvailableReplicas = 0, 0, 0
 			return all(p, g, s)
 		}, true},
-		{"the gateway without the sidecar is not compared", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the gateway without the sidecar is not compared", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			g.Spec.Template.Spec.InitContainers = nil
 			return all(p, g, s)
 		}, true},
-		{"the template Autopilot rewrote upward", sizingTierSmall, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+		{"the template Autopilot rewrote upward", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
 			rr := &p.Spec.Template.Spec.Containers[0].Resources
 			rr.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse("2Gi")
 			rr.Requests[corev1.ResourceCPU] = resource.MustParse("2")
 			rr.Requests[corev1.ResourceMemory] = resource.MustParse("2Gi")
 			return all(p, g, s)
 		}, true},
+		{"the template Autopilot clamped to its requests settles small", sizingTierSmall, true, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			return clampedToRequests(all(p, g, s))
+		}, true},
+		{"the template Autopilot clamped to its requests settles medium", sizingTierMedium, true, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			return clampedToRequests(all(p, g, s))
+		}, true},
+		{"on Standard a limit equal to its request is the row's limit short", sizingTierSmall, false, func(p, g *appsv1.Deployment, s *appsv1.StatefulSet) []client.Object {
+			return clampedToRequests(all(p, g, s))
+		}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			agent := sizingAgent(sizingProfileAuto, tc.tier.String(), ptr.To[int64](12), nil)
-			workloads := sizedWorkloadsAt(agent, tc.tier)
+			workloads := sizedWorkloadsOn(agent, tc.tier, tc.autopilot)
 			objs := tc.mut(workloads[0].(*appsv1.Deployment), workloads[1].(*appsv1.Deployment), workloads[2].(*appsv1.StatefulSet))
 			scheme := setupScheme()
 			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, objs...)...).Build()
-			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
+			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, autopilot: tc.autopilot, autopilotResolved: true}
 			if got := r.sizingTierSettled(context.Background(), agent, tc.tier); got != tc.want {
 				t.Fatalf("sizingTierSettled = %v, want %v", got, tc.want)
 			}
 		})
 	}
+	t.Run("a small template Autopilot clamped has not settled medium", func(t *testing.T) {
+		t.Parallel()
+		// The broker's memory request moves with the step (2Gi to 4Gi on
+		// Autopilot), and the clamp leaves the requests alone, so the
+		// requests side still tells the small template from the medium one.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent}, clampedToRequests(sizedWorkloadsOn(agent, sizingTierSmall, true))...)...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, autopilot: true, autopilotResolved: true}
+		if got := r.sizingTierUnsettledWorkload(context.Background(), agent, sizingTierMedium); got != "Deployment/"+credentialProxyName(agent) {
+			t.Fatalf("sizingTierUnsettledWorkload = %q for a small template clamped at the medium latch, want the proxy Deployment", got)
+		}
+	})
+	t.Run("rows that differ in a limit alone clamp to one template", func(t *testing.T) {
+		t.Parallel()
+		// The sidecar's small and medium rows differ in the memory limit
+		// alone, and the shell has no medium row: clamped, the gateway and
+		// the shell at the small render are what medium runs there, and
+		// the proxy at the medium render settles the tier with them.
+		agent := sizingAgent(sizingProfileAuto, sizingProfileMedium, ptr.To[int64](12), nil)
+		medium := clampedToRequests(sizedWorkloadsOn(agent, sizingTierMedium, true))
+		small := clampedToRequests(sizedWorkloadsOn(agent, sizingTierSmall, true))
+		objs := []client.Object{agent, medium[0], small[1], small[2]}
+		scheme := setupScheme()
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+		r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, autopilot: true, autopilotResolved: true}
+		if got := r.sizingTierUnsettledWorkload(context.Background(), agent, sizingTierMedium); got != "" {
+			t.Fatalf("sizingTierUnsettledWorkload = %q, want settled: the clamped small sidecar and shell are the medium ones", got)
+		}
+	})
 	t.Run("a template at the lower tier has not settled the higher one", func(t *testing.T) {
 		t.Parallel()
 		// The latch moved to medium and the pass parked before the proxy was

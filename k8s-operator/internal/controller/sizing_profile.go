@@ -132,6 +132,11 @@ const (
 	// StatefulSet (shellSandboxName) the shell container
 	// (shellSandboxContainerName).
 	gatewayWorkloadNameSuffix = "-gateway"
+
+	// How the hold names the workload it waits on, in the log line the pass
+	// that measures no step writes (sizingTierUnsettledWorkload).
+	sizingUnsettledDeploymentFormat  = "Deployment/%s"
+	sizingUnsettledStatefulSetFormat = "StatefulSet/%s"
 )
 
 // sizingSettledRequests and sizingSettledLimits are the resource names the
@@ -601,16 +606,16 @@ func (r *PlatformAgentReconciler) namespacePodPriorityClasses(ctx context.Contex
 // container (sizedContainerCarries). The available term is what reads the
 // proxy's Recreate window, where the old pod is gone and the new one not yet
 // created: the generation is observed, no replica is old, and none is there.
-func sizingDeploymentSettled(dep *appsv1.Deployment, container string, rendered corev1.ResourceRequirements) bool {
+func sizingDeploymentSettled(dep *appsv1.Deployment, container string, rendered corev1.ResourceRequirements, autopilot bool) bool {
 	return !bool(deploymentRollIncomplete(dep)) &&
 		dep.Status.AvailableReplicas >= ptr.Deref(dep.Spec.Replicas, 1) &&
-		sizedContainerCarries(dep.Spec.Template, container, rendered)
+		sizedContainerCarries(dep.Spec.Template, container, rendered, autopilot)
 }
 
-func sizingStatefulSetSettled(sts *appsv1.StatefulSet, container string, rendered corev1.ResourceRequirements) bool {
+func sizingStatefulSetSettled(sts *appsv1.StatefulSet, container string, rendered corev1.ResourceRequirements, autopilot bool) bool {
 	return !bool(statefulSetRollIncomplete(sts)) &&
 		sts.Status.ReadyReplicas >= ptr.Deref(sts.Spec.Replicas, 1) &&
-		sizedContainerCarries(sts.Spec.Template, container, rendered)
+		sizedContainerCarries(sts.Spec.Template, container, rendered, autopilot)
 }
 
 // sizedContainerCarries reports whether the container named name in a pod
@@ -619,12 +624,35 @@ func sizingStatefulSetSettled(sts *appsv1.StatefulSet, container string, rendere
 // sizingSettledLimits list, or is not in the template at all, in which case
 // nothing of it is charged. At least rather than equal, because GKE
 // Autopilot's admission rewrites a workload's template (an ephemeral-storage
-// request added, a request raised to a minimum) and only ever upward, so an
-// equal test would never settle there. A template rendered at a lower tier
-// falls short on a figure the step raises; one whose override has since been
-// lowered reads as settled with the quota charged more than the step assumes,
-// the safe side.
-func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendered corev1.ResourceRequirements) bool {
+// request added, a request raised to a minimum), and on the requests side
+// only ever upward, so an equal test would never settle there.
+//
+// The limits side is different on Autopilot: without Pod bursting its
+// admission sets every container's limit equal to its request, so a limit a
+// row sets above its request (the broker's 2 CPU over 1 on Standard, the
+// sidecar's 2Gi over 384Mi) never reaches the template, and a check that
+// wanted the row's limit there would hold the tier for good. So with autopilot
+// true, a limit equal to its own request on a name the row also requests is
+// read as that clamp, and the requests side, already compared, stands for it:
+// the quota is charged the one figure on both sides there, a template whose
+// requests carry the tier's runs what the tier runs, and a lower tier's
+// template, whose requests fall short on a figure the step raises, still does
+// not settle. Two rows that differ in a limit alone (the sidecar's small and
+// medium) clamp to one template and charge the same, so the lower one settles
+// the higher tier, which is what the quota's used total holds. The rows keep
+// this reading sound under bursting too, where limits survive: no row sets a
+// limit equal to its request on a name the next row raises the limit of
+// alone (TestSizingRowsKeepTheClampReadable), so an equal pair is a clamp or
+// a row the requests side tells apart. A name the row sets a limit for alone
+// (the proxy's ephemeral-storage) has no request to stand for it and is
+// compared as written; Autopilot copies such a limit into the request and
+// leaves the limit where it was. On a Standard cluster nothing rewrites a
+// limit and the row's limit is wanted as written.
+//
+// A template rendered at a lower tier falls short on a figure the step raises;
+// one whose override has since been lowered reads as settled with the quota
+// charged more than the step assumes, the safe side.
+func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendered corev1.ResourceRequirements, autopilot bool) bool {
 	var found *corev1.Container
 	for _, list := range [][]corev1.Container{template.Spec.Containers, template.Spec.InitContainers} {
 		for i := range list {
@@ -636,74 +664,110 @@ func sizedContainerCarries(template corev1.PodTemplateSpec, name string, rendere
 	if found == nil {
 		return true
 	}
-	carries := func(have, want corev1.ResourceList, names []corev1.ResourceName) bool {
-		for _, resourceName := range names {
-			wanted, moved := want[resourceName]
-			if !moved {
+	for _, resourceName := range sizingSettledRequests {
+		wanted, moved := rendered.Requests[resourceName]
+		if !moved {
+			continue
+		}
+		if got, set := found.Resources.Requests[resourceName]; !set || got.Cmp(wanted) < 0 {
+			return false
+		}
+	}
+	for _, resourceName := range sizingSettledLimits {
+		wanted, moved := rendered.Limits[resourceName]
+		if !moved {
+			continue
+		}
+		got, set := found.Resources.Limits[resourceName]
+		if !set {
+			return false
+		}
+		if autopilot {
+			request, requested := found.Resources.Requests[resourceName]
+			_, rowRequests := rendered.Requests[resourceName]
+			if requested && rowRequests && got.Cmp(request) == 0 {
 				continue
 			}
-			got, set := have[resourceName]
-			if !set || got.Cmp(wanted) < 0 {
-				return false
-			}
 		}
-		return true
+		if got.Cmp(wanted) < 0 {
+			return false
+		}
 	}
-	return carries(found.Resources.Requests, rendered.Requests, sizingSettledRequests) &&
-		carries(found.Resources.Limits, rendered.Limits, sizingSettledLimits)
+	return true
 }
 
-// sizingTierSettled reports whether the three sized workloads have settled at
-// tier: each carries tier's render, its roll is complete and every replica is
-// available, so that every ResourceQuota's used total includes the pods the
-// tier runs and nothing older. The step-up check measures each candidate step
-// from the running tier against those totals, and the latch runs ahead of the
-// pods: resolveSizingTier writes status.effectiveSizingTier before the
-// workloads are re-rendered, the write re-enqueues the CR at once, and the
-// proxy's Recreate rollout admits its new pod only after the old one has
-// gone. A pass in that window that measured the next step from the latch
-// would count the admitted step as already charged and could promote past
-// the quota; it measures nothing until the pods have settled instead, and the
-// workloads' status updates re-enqueue the CR when they have. The reads are
-// cache hits (both kinds are Owns()'d). A workload that cannot be read has
-// not settled; one that is not there yet has nothing charged, which at small
-// is the tier settled (the first pass of a fresh install, before the steps
-// after this one create the workloads) and above small is a latch the
-// workloads have not caught up with (a pass that failed between the status
-// write and the renders, or a controller restarted between them).
-func (r *PlatformAgentReconciler) sizingTierSettled(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) bool {
+// sizingTierUnsettledWorkload is "" when the three sized workloads have
+// settled at tier, or names the first that has not (its kind and name, for the
+// log line the hold writes): settled means each carries tier's render, its
+// roll is complete and every replica is available, so that every
+// ResourceQuota's used total includes the pods the tier runs and nothing
+// older. The step-up check measures each candidate step from the running tier
+// against those totals, and the latch runs ahead of the pods:
+// resolveSizingTier writes status.effectiveSizingTier before the workloads are
+// re-rendered, the write re-enqueues the CR at once, and the proxy's Recreate
+// rollout admits its new pod only after the old one has gone. A pass in that
+// window that measured the next step from the latch would count the admitted
+// step as already charged and could promote past the quota; it measures
+// nothing until the pods have settled instead, and the workloads' status
+// updates re-enqueue the CR when they have. The reads are cache hits (both
+// kinds are Owns()'d). A workload that cannot be read has not settled; one
+// that is not there yet has nothing charged, which at small is the tier
+// settled (the first pass of a fresh install, before the steps after this one
+// create the workloads) and above small is a latch the workloads have not
+// caught up with (a pass that failed between the status write and the
+// renders, or a controller restarted between them).
+func (r *PlatformAgentReconciler) sizingTierUnsettledWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) string {
 	autopilot := r.clusterAutopilot()
 	absent := func(err error) bool { return apierrors.IsNotFound(err) && tier == sizingTierSmall }
 	proxy := &appsv1.Deployment{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}, proxy); err != nil {
+	proxyKey := client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyName(agent)}
+	if err := r.Get(ctx, proxyKey, proxy); err != nil {
 		if !absent(err) {
-			return false
+			return fmt.Sprintf(sizingUnsettledDeploymentFormat, proxyKey.Name)
 		}
-	} else if !sizingDeploymentSettled(proxy, credentialProxyContainerName, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier)) {
-		return false
+	} else if !sizingDeploymentSettled(proxy, credentialProxyContainerName, renderedCredentialProxyResourcesAt(agent.Spec.Deployment, autopilot, tier), autopilot) {
+		return fmt.Sprintf(sizingUnsettledDeploymentFormat, proxyKey.Name)
 	}
 	shell := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: shellSandboxName(agent)}, shell); err != nil {
+	shellKey := client.ObjectKey{Namespace: agent.Namespace, Name: shellSandboxName(agent)}
+	if err := r.Get(ctx, shellKey, shell); err != nil {
 		if !absent(err) {
-			return false
+			return fmt.Sprintf(sizingUnsettledStatefulSetFormat, shellKey.Name)
 		}
-	} else if !sizingStatefulSetSettled(shell, shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, tier)) {
-		return false
+	} else if !sizingStatefulSetSettled(shell, shellSandboxContainerName, renderedShellSandboxResourcesAt(agent, tier), autopilot) {
+		return fmt.Sprintf(sizingUnsettledStatefulSetFormat, shellKey.Name)
 	}
 	gatewayKey := client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayWorkloadNameSuffix}
 	sidecar := renderedAgentAPIAuthResourcesAt(agent.Spec.Deployment, tier)
 	if useStatefulSet(agent) {
 		gateway := &appsv1.StatefulSet{}
 		if err := r.Get(ctx, gatewayKey, gateway); err != nil {
-			return absent(err)
+			if absent(err) {
+				return ""
+			}
+			return fmt.Sprintf(sizingUnsettledStatefulSetFormat, gatewayKey.Name)
 		}
-		return sizingStatefulSetSettled(gateway, agentAPIAuthContainerName, sidecar)
+		if !sizingStatefulSetSettled(gateway, agentAPIAuthContainerName, sidecar, autopilot) {
+			return fmt.Sprintf(sizingUnsettledStatefulSetFormat, gatewayKey.Name)
+		}
+		return ""
 	}
 	gateway := &appsv1.Deployment{}
 	if err := r.Get(ctx, gatewayKey, gateway); err != nil {
-		return absent(err)
+		if absent(err) {
+			return ""
+		}
+		return fmt.Sprintf(sizingUnsettledDeploymentFormat, gatewayKey.Name)
 	}
-	return sizingDeploymentSettled(gateway, agentAPIAuthContainerName, sidecar)
+	if !sizingDeploymentSettled(gateway, agentAPIAuthContainerName, sidecar, autopilot) {
+		return fmt.Sprintf(sizingUnsettledDeploymentFormat, gatewayKey.Name)
+	}
+	return ""
+}
+
+// sizingTierSettled is sizingTierUnsettledWorkload with no workload to name.
+func (r *PlatformAgentReconciler) sizingTierSettled(ctx context.Context, agent *agentv1alpha1.PlatformAgent, tier sizingTier) bool {
+	return r.sizingTierUnsettledWorkload(ctx, agent, tier) == ""
 }
 
 // sizingQuotas lists the ResourceQuotas in the agent's namespace in name
@@ -860,7 +924,11 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 				if err != nil {
 					return err
 				}
-				if len(quotas) > 0 && !r.sizingTierSettled(ctx, agent, tier) {
+				waitingOn := ""
+				if len(quotas) > 0 {
+					waitingOn = r.sizingTierUnsettledWorkload(ctx, agent, tier)
+				}
+				if waitingOn != "" {
 					// The running tier's pods have not all been admitted yet
 					// (the pass after a promotion, while the proxy recreates),
 					// so the quotas' used totals do not yet charge the step
@@ -869,8 +937,14 @@ func (r *PlatformAgentReconciler) resolveSizingTier(ctx context.Context, agent *
 					// as written, and the workloads' status updates
 					// re-enqueue the CR when the pods have settled. With no
 					// quota there is nothing to measure against, and the
-					// earned tier is taken as before.
+					// earned tier is taken as before. The hold is logged on
+					// every pass it takes, so a wait that never ends (a
+					// workload that cannot settle at the tier's render) is
+					// told apart from a quiet pass.
 					capped = sizingCappedConditionMessage(agent)
+					logf.FromContext(ctx).Info("sizing step held until the running tier's workloads settle",
+						"name", agent.Name, "namespace", agent.Namespace, "tier", tier.String(), "earned", earned.String(),
+						"waitingOn", waitingOn, "clusters", count)
 				} else {
 					classes, err := r.sizingQuotaPriorityClasses(ctx, agent, quotas)
 					if err != nil {
