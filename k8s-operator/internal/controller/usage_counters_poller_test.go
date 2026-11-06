@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -4562,4 +4563,55 @@ func TestUsagePoller_TheOriginReadingsHaveTheirOwnPruningRecord(t *testing.T) {
 	if held[usageExportRemediationsMerged] || held[usageExportPeopleSeen7d] {
 		t.Fatalf("held fields %v, want remediationsMergedTotal and peopleSeen7d published", held)
 	}
+}
+
+// usageBodySource folds a held text body for addr through the real parser and
+// hands every other address to the stub, so a poller test can drive one
+// listener with an exposition.
+type usageBodySource struct {
+	stub   *stubUsageSource
+	addr   string
+	mu     sync.Mutex
+	body   string
+	served bool
+}
+
+func (s *usageBodySource) serve(body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.body, s.served = body, true
+}
+
+func (s *usageBodySource) Scrape(ctx context.Context, addr string, counters []string, kinds []usageReadingKind) (usageReading, error) {
+	s.mu.Lock()
+	body, served := s.body, s.served
+	s.mu.Unlock()
+	if addr != s.addr || !served {
+		return s.stub.Scrape(ctx, addr, counters, kinds)
+	}
+	return foldUsageBody(strings.NewReader(body), counters, kinds)
+}
+
+// A ledger whose read age passes proposalsReadAgeLimit is a miss, though the
+// plugin still serves its last counts: one such poll holds the nine fields,
+// the second clears them, and a fresh read brings them back.
+func TestUsagePoller_StaleOriginReadingsClearAfterTwoPolls(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, nil)
+	source := &usageBodySource{stub: h.stub, addr: chatAddr()}
+	h.p.source = source
+	stale := strconv.FormatFloat(proposalsReadAgeLimit.Seconds()+1, 'f', 3, 64)
+	source.serve(usageOriginsBody(usageOriginsFresh(usageOriginsRows...)...))
+	h.poll(5)
+	usageCheckOrigins(t, h.status(), usageTestOrigins(7), "a fresh read")
+	source.serve(usageOriginsBody(append(slices.Clone(usageOriginsRows), usageOriginsAge(stale)...)...))
+	h.poll(10)
+	usageCheckOrigins(t, h.status(), usageTestOrigins(7), "one poll past the age limit")
+	h.poll(15)
+	usageCheckOrigins(t, h.status(), nil, "two polls past the age limit")
+	source.serve(usageOriginsBody(usageOriginsFresh(usageOriginsRows...)...))
+	h.poll(20)
+	usageCheckOrigins(t, h.status(), usageTestOrigins(7), "a fresh read again")
 }
