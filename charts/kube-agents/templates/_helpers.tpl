@@ -1959,45 +1959,75 @@ and the chart's own replicaCount keys take one too. Only an absent value default
 {{- end }}
 
 {{/*
+The chart's own workloads in the release namespace, as a JSON list of (name, resources
+subtree, pod count, rolls-with-a-surge-pod, standing). Two readers, so a workload is added
+once (#4893): kube-agents.quotaRequirements sums them for the quota preflight, and
+kube-agents.chartQuotaPods counts the standing ones and their surge pods for the operator's
+session quota. One list rather than a block per workload: the blocks it replaced were
+identical but for the values path, which is how the dashboard came to be read from the
+wrong key and how the replay proxy came to be left out of the operator's count.
+`hindsight.postgresql` is a StatefulSet, so it rolls without a surge pod. The pre-delete
+cleanup hook is a Job that runs at uninstall while the release still stands: the preflight
+needs headroom for it, but it is not standing, so the session quota leaves it out.
+*/}}
+{{- define "kube-agents.chartWorkloads" -}}
+{{- $w := list -}}
+{{- if .Values.operator.enabled -}}
+  {{- $w = append $w (dict "name" "operator" "standing" true "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.litellm.enabled -}}
+  {{- $w = append $w (dict "name" "litellm" "standing" true "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
+       beside LiteLLM and only with it. */ -}}
+{{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
+{{- if and .Values.litellm.enabled $replayShadow.enabled -}}
+  {{- $w = append $w (dict "name" "litellm-replay-shadow" "standing" true "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if include "kube-agents.hindsightEnabled" . -}}
+  {{- $w = append $w (dict "name" "hindsight-api" "standing" true "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
+  {{- $w = append $w (dict "name" "hindsight-postgresql" "standing" true "values" .Values.hindsight.postgresql "pods" 1 "surges" false) -}}
+{{- end -}}
+{{- if .Values.githubMinter.enabled -}}
+  {{- $w = append $w (dict "name" "github-minter" "standing" true "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
+{{- end -}}
+{{- if .Values.webConsole.enabled -}}
+  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
+  {{- $w = append $w (dict "name" "web-console" "standing" true "values" .Values.webConsole "pods" 1 "surges" true) -}}
+{{- end -}}
+{{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
+  {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
+         while every release pod still exists, so quota admission needs headroom for it. */ -}}
+  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
+  {{- $w = append $w (dict "name" "cleanup-hook" "standing" false "values" $cleanupRes "pods" 1 "surges" false) -}}
+{{- end -}}
+{{- toJson $w -}}
+{{- end }}
+
+{{/*
 The pods the chart may run at once in the release namespace, for the next-mode session quota:
-its standing pods (the operator, LiteLLM, Hindsight's two, the GitHub minter and the web
-console, at their replica counts, as kube-agents.quotaRequirements sums them, less the
-pre-delete cleanup hook, which runs only at uninstall), plus one surge pod for each of those
-that rolls surge-first and runs at least one replica (the same `surges` entries in
-quotaRequirements' list: everything but Hindsight's PostgreSQL StatefulSet). A chart bump
+the standing workloads in kube-agents.chartWorkloads at their replica counts (every one but
+the pre-delete cleanup hook, which runs only at uninstall), plus one surge pod for each that
+rolls surge-first and runs at least one replica (every one but Hindsight's PostgreSQL
+StatefulSet). quotaRequirements reads the same list, so a workload added there is counted
+here too. A chart bump
 rolls several of them in one upgrade, since the chart's version label is in their pod
 templates, and each surge pod counts against the quota while it starts.
 platform-agent-cr.yaml stamps it on the PlatformAgent as kubeagents.x-k8s.io/a2a-quota-chart-pods,
 and the operator sizes the quota above the session cap from it (#3848): those pods share the
 quota, and only the chart knows which of them it renders. tests/test_quota_preflight.py ties
-it to quotaRequirements' pods and chartSurgePods.
+it to the Deployments and StatefulSets a render actually puts in the release namespace.
 */}}
 {{- define "kube-agents.chartQuotaPods" -}}
 {{- $pods := 0 -}}
 {{- $surges := 0 -}}
-{{- if .Values.operator.enabled -}}
-  {{- $n := include "kube-agents.replicaCount" .Values.operator.replicaCount | int64 -}}
-  {{- $pods = add $pods $n -}}
-  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
-{{- end -}}
-{{- if .Values.litellm.enabled -}}
-  {{- $n := include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64 -}}
-  {{- $pods = add $pods $n -}}
-  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
-{{- end -}}
-{{- if include "kube-agents.hindsightEnabled" . -}}
-  {{- /* The API surges; the PostgreSQL StatefulSet does not. */ -}}
-  {{- $pods = add $pods 2 -}}
-  {{- $surges = add $surges 1 -}}
-{{- end -}}
-{{- if .Values.githubMinter.enabled -}}
-  {{- $n := include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64 -}}
-  {{- $pods = add $pods $n -}}
-  {{- if gt $n (int64 0) -}}{{- $surges = add $surges 1 -}}{{- end -}}
-{{- end -}}
-{{- if .Values.webConsole.enabled -}}
-  {{- $pods = add $pods 1 -}}
-  {{- $surges = add $surges 1 -}}
+{{- range $w := include "kube-agents.chartWorkloads" . | fromJsonArray -}}
+  {{- if $w.standing -}}
+    {{- $n := $w.pods | int64 -}}
+    {{- $pods = add $pods $n -}}
+    {{- /* A workload scaled to zero has no pod to surge from. */ -}}
+    {{- if and $w.surges (gt $n (int64 0)) -}}{{- $surges = add $surges 1 -}}{{- end -}}
+  {{- end -}}
 {{- end -}}
 {{- add $pods $surges -}}
 {{- end }}
@@ -2501,44 +2531,9 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- $surgeEphReq := 0 -}}
 {{- $surgeEphLim := 0 -}}
 
-{{- /* The chart's own workloads, as (resources subtree, pod count, rolls-with-a-surge-Pod).
-       One list and one loop rather than a block each: the four blocks this replaced were
-       identical but for the values path, which is how the dashboard came to be read from
-       the wrong key and how a new workload comes to be missed. `hindsight.postgresql` is a
-       StatefulSet, so it contributes no surge Pod. The pre-delete cleanup hook is a batch
-       Job that runs at uninstall while the release still stands, so it needs headroom but
-       no surge. */ -}}
-{{- $chartWorkloads := list -}}
-{{- if .Values.operator.enabled -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.operator "pods" (include "kube-agents.replicaCount" .Values.operator.replicaCount | int64) "surges" true) -}}
-{{- end -}}
-{{- if .Values.litellm.enabled -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.litellm "pods" (include "kube-agents.replicaCount" .Values.litellm.replicaCount | int64) "surges" true) -}}
-{{- end -}}
-{{- /* The shadow-mode replay proxy (litellm.replayShadow), rendered in templates/litellm.yaml
-       beside LiteLLM and only with it. */ -}}
-{{- $replayShadow := .Values.litellm.replayShadow | default dict -}}
-{{- if and .Values.litellm.enabled $replayShadow.enabled -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" $replayShadow "pods" (include "kube-agents.replicaCount" $replayShadow.replicaCount | int64) "surges" true) -}}
-{{- end -}}
-{{- if include "kube-agents.hindsightEnabled" . -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.api "pods" 1 "surges" true) -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.hindsight.postgresql "pods" 1 "surges" false) -}}
-{{- end -}}
-{{- if .Values.githubMinter.enabled -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.githubMinter "pods" (include "kube-agents.replicaCount" .Values.githubMinter.replicaCount | int64) "surges" true) -}}
-{{- end -}}
-{{- if .Values.webConsole.enabled -}}
-  {{- /* templates/web-console.yaml renders exactly one replica; see the note there. */ -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" .Values.webConsole "pods" 1 "surges" true) -}}
-{{- end -}}
-{{- if and .Values.platformAgent.enabled .Values.platformAgent.cleanupHook.enabled -}}
-  {{- /* Pre-delete hook Job in templates/platform-agent-cr-cleanup.yaml: runs at helm uninstall
-         while every release pod still exists, so quota admission needs headroom for it. */ -}}
-  {{- $cleanupRes := dict "resources" (dict "requests" (dict "cpu" "50m" "memory" "64Mi" "ephemeral-storage" "1088Mi") "limits" (dict "cpu" "200m" "memory" "128Mi" "ephemeral-storage" "1088Mi")) -}}
-  {{- $chartWorkloads = append $chartWorkloads (dict "values" $cleanupRes "pods" 1 "surges" false) -}}
-{{- end -}}
-
+{{- /* The chart's own workloads (kube-agents.chartWorkloads), the same list chartQuotaPods
+       reads for the operator's session quota. */ -}}
+{{- $chartWorkloads := include "kube-agents.chartWorkloads" . | fromJsonArray -}}
 {{- range $workload := $chartWorkloads -}}
   {{- $res := include "kube-agents.workloadResources" $workload.values | fromJson -}}
   {{- $replicas := $workload.pods | int64 -}}
