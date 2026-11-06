@@ -1370,8 +1370,8 @@ The operator writes observed state to the `status` subresource; [PlatformAgent f
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`,
-`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. Every five
-minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
+`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. So are the three inference totals, `usage.inputTokensTotal`, `usage.outputTokensTotal` and `usage.spendMicrosUSDTotal`. Every five
+minutes it reads the credential broker's, the event watcher's, the chat plugin's, LiteLLM's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
 restarts, and patches the status only when it is behind.
