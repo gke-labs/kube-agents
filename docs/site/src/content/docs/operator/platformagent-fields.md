@@ -220,7 +220,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 
 | Field | Type | Required | Default | Constraints | Description |
 | ----- | ---- | -------- | ------- | ----------- | ----------- |
-| `phase` | `string` | no |  |  | Phase is the overall state (Pending, Provisioning, Ready, Degraded, Failed). |
+| `phase` | `string` | no |  |  | Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed). Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the Ready condition then reads False with reason ScaledToZero. |
 | `observedGeneration` | `integer` | no |  |  | ObservedGeneration is the .metadata.generation the status was last computed from. |
 | `address` | `string` | no |  |  | Address is the fully qualified domain name (FQDN) of the agent service. |
 | `lastReconcileTime` | `metav1.Time` | no |  |  | LastReconcileTime is the timestamp when the operator last updated this status. |

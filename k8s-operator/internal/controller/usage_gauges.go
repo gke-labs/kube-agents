@@ -77,10 +77,11 @@ const (
 )
 
 // usagePhases is the closed vocabulary of status.phase the gauge carries: the
-// API's four phases and the controller's Degraded. A phase outside it leaves
-// every sample at 0; TestUsageGauges_PhasesAreConstantsTheVocabularyCarries
-// keeps the writers on these constants.
-var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, degradedPhase, failedPhase}
+// API's four phases, the controller's Degraded and its Paused. A phase outside
+// it leaves every sample at 0;
+// TestUsageGauges_PhasesAreConstantsTheVocabularyCarries keeps the writers on
+// these constants.
+var usagePhases = []string{pendingPhase, provisioningPhase, readyPhase, pausedPhase, degradedPhase, failedPhase}
 
 type usageExportField struct {
 	name string

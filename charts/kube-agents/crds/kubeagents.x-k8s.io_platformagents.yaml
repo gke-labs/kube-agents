@@ -12136,9 +12136,10 @@ spec:
                   format: int64
                   type: integer
                 phase:
-                  description:
-                    Phase is the overall state (Pending, Provisioning, Ready,
-                    Degraded, Failed).
+                  description: |-
+                    Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).
+                    Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the
+                    Ready condition then reads False with reason ScaledToZero.
                   type: string
                 profileSubmitMaxAgeSeconds:
                   description: |-
