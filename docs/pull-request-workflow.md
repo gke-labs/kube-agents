@@ -149,9 +149,12 @@ schema the server builds and fails a plan that reads a whole table this reposito
 `SEARCH` through an automatic index, which is built by reading the table), because such a read
 grows with the fleet; a scan through a partial index passes as bounded only when the script's
 `BOUNDED_INDEXES` vouches for that index's `WHERE` as a bound (the pending drift backlog today).
-Statements on tables Hermes owns are listed as skipped, and the scans already in the tree are
-pinned with a reason in `scripts/sqlite_query_plan_baseline.txt`, which only shrinks. CI runs the
-same check through `scripts/test_check_sqlite_query_plans.py`.
+A statement handed to a helper that executes its parameter (`_ids_where_in`) is read at the call
+site, its `{marks}` list as one parameter. Statements on the Hermes tables the script's
+`FOREIGN_TABLES` lists are skipped; a statement on any other table the schema does not build fails
+the check until the table is built or listed there with its owner. The scans already in the tree
+are pinned with a reason in `scripts/sqlite_query_plan_baseline.txt`, which only shrinks. CI runs
+the same check through `scripts/test_check_sqlite_query_plans.py`.
 
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 

@@ -33,11 +33,26 @@ binding of the name it declares, since it lets that scope rebind it. A name
 bound any other way, or in two places, resolves to nothing, never to a module
 constant of the same name. Anything
 else (`.format(...)`, `%`, a join over a comprehension, a name assigned in a
-branch) is listed as `dynamic` and not judged. The check sees a statement
-only at the execute call: a literal handed to a helper that executes its
-parameter (`_ids_where_in(conn, "SELECT ...", ids)` in the server) is not
-read at the call site, and the helper's one execute call is listed `dynamic`,
-so such a statement is neither judged nor listed on its own.
+branch) is listed as `dynamic` and not judged. A statement handed to a helper
+is read at the call site, one hop deep in the same module: a function (at
+any depth; `_ids_where_in` and the nested `newest` in the server) whose own
+body executes one of its parameters, bare or through
+`parameter.format(name=value, ...)`, is an executing helper, and the
+argument a call passes in that parameter's place, by position or by keyword,
+is a statement of the calling function, resolved where the call is written
+by the rules above (a name resolves to the helper visible where the call
+is written, innermost scope first, the same way a value does; a helper bound
+more than once, called through an attribute, or reached from another
+module is not read). The helper's own execute call stays `dynamic`, since
+its parameter has no value of its own. When the helper formats its
+parameter, each `{name}` field of the statement is filled with the static
+value of the keyword the helper passes under that name, or, for one with no
+static value, with a single `?` parameter: `IN ({marks})` over a list the
+helper builds at run time plans as `IN (?)`, and the planner's choice of
+index does not depend on how many values the list carries. A field the
+helper does not fill, or one with a conversion or a format spec, leaves the
+statement `dynamic`; a field that stood for a name rather than a value does
+not prepare, or plans as the scan it would be, and either is loud.
 
 The schema is the real one, not a replay of the DDL: `SCHEMA_SOURCE` names the
 server module, the attribute that holds its database path, the function that
@@ -51,9 +66,15 @@ and never prepared (some of those take effect at prepare time), except a
 query): that query is planned on its own, from the `SELECT` or `WITH` on.
 
 Every other statement is prepared under `EXPLAIN QUERY PLAN` with a NULL bound
-to each parameter. `no such table` means a table this repository does not
-define (Hermes's `state.db` and `kanban.db` tables); the statement is listed as
-`skipped` with the table named, and not judged. Any other prepare error (a
+to each parameter. `no such table` naming a table in `FOREIGN_TABLES`, the
+tables another process owns and this repository's schema never builds
+(Hermes's `state.db` and `kanban.db` tables), lists the statement as
+`skipped` with the table named, and not judged; `no such table` naming any
+other table is a problem that fails the check, so a table `init_db()` does
+not build (a side table a function creates lazily, a misspelt owned name)
+earns its exemption in `FOREIGN_TABLES` with its owner beside it, or is
+built, rather than passing by being absent. An entry in `FOREIGN_TABLES`
+that the schema does build is a problem too. Any other prepare error (a
 missing column, a syntax error) is a problem that fails the check. A plan line
 that reads a whole table the schema defines is a finding, unless the table is
 in `BOUNDED_TABLES`: tables that hold one row, or a daily-pruned or capped
@@ -109,6 +130,7 @@ import importlib.util
 import os
 import re
 import sqlite3
+import string
 import sys
 import tempfile
 from collections import defaultdict
@@ -166,6 +188,29 @@ BOUNDED_TABLES = frozenset({"alert_quota", "data_volume_warning", "drift_backlog
 # a triage fails), so they are not here, and a scan through one is a finding.
 # Each entry must exist as a partial index in the schema, or the check fails.
 BOUNDED_INDEXES = frozenset({"idx_intercepted_events_backlog_pending"})
+# Tables the targets read that another process owns and `init_db()` never
+# builds, so a statement on one cannot be planned here and is listed
+# `skipped`: Hermes's `state.db` (`sessions`, `messages`, `state_meta`,
+# `executions`) and `kanban.db` (`tasks`, `task_events`, `task_comments`,
+# `task_links`, `kanban_notify_subs`, `kanban_worker_children`). A `no such
+# table` on any other name is a problem, so a side table a function creates
+# lazily, or a misspelt owned table, earns its entry here with its owner, or
+# is built, rather than passing by being absent; an entry the schema does
+# build is a problem too.
+FOREIGN_TABLES = frozenset(
+    {
+        "sessions",
+        "messages",
+        "state_meta",
+        "executions",
+        "tasks",
+        "task_events",
+        "task_comments",
+        "task_links",
+        "kanban_notify_subs",
+        "kanban_worker_children",
+    }
+)
 # SQLite's own schema table, under both of its names; a scan of it is a catalog
 # read, not a ledger read.
 SCHEMA_TABLES = frozenset({"sqlite_master", "sqlite_schema"})
@@ -262,6 +307,13 @@ SUBQUERY_SCAN_PREFIXES = ("(", "SUBQUERY")
 # concatenation, and `", ".join(COLUMNS)` over a tuple of constants.
 STR_CALL = "str"
 JOIN_METHOD = "join"
+# How an executing helper may transform its parameter before executing it:
+# `query.format(marks=marks)`, keywords only. Each `{name}` field of the
+# caller's statement takes the keyword's static value, or this one `?`
+# parameter when the keyword has none (an `IN` list built at run time), which
+# plans the way any length of the list does.
+FORMAT_METHOD = "format"
+FORMAT_FIELD_PARAMETER = "?"
 # The detail column of an EXPLAIN QUERY PLAN row.
 PLAN_DETAIL_COLUMN = 3
 # How a function is named: `Class.method`, `outer.inner`, `outer.<lambda>`
@@ -311,6 +363,11 @@ BOUNDED_INDEX_ERROR = (
     "{script}: BOUNDED_INDEXES names {index!r}, which the schema does not build as a partial index; "
     "drop the entry or build the index"
 )
+FOREIGN_TABLE_ERROR = (
+    "{file}:{line}: {function}: `{statement}` names {table!r}, a table the schema does not build and FOREIGN_TABLES "
+    "does not list; build it in the schema, fix the name, or add it to FOREIGN_TABLES in {script} with its owner"
+)
+FOREIGN_TABLE_BUILT_ERROR = "{script}: FOREIGN_TABLES names {table!r}, which the schema builds; drop the entry"
 BASELINE_MALFORMED_ERROR = "{baseline}:{line}: expected `<file> <function> <table> <count>` with a count above zero, got {text!r}"
 BASELINE_DUPLICATE_ERROR = "{baseline}:{line}: {file} {function} {table} already has an entry at line {first}"
 BASELINE_UNSCANNED_ERROR = "{baseline}:{line}: {file} is not a file this check reads; remove the entry"
@@ -401,6 +458,9 @@ class _Constants:
     def __init__(self, module: ast.Module, siblings: dict[str, ast.Module]) -> None:
         self.names = _module_constants(module)
         self.siblings: dict[str, _Constants] = {name: _Constants(tree, {}) for name, tree in siblings.items()}
+        # The module-level functions that execute a parameter; a sibling's are
+        # not read (one hop, same module).
+        self.helpers: dict[str, _Helper] = _helpers(module, ast.Global, [])
 
 
 def _module_constants(module: ast.Module) -> dict[str, ast.expr]:
@@ -437,6 +497,14 @@ def _bindings(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]
     in the map with None, so it resolves to nothing rather than to the module
     constant of the same name.
     """
+    counts, values = _binding_counts(scope, declaration)
+    return {name: (values.get(name) if count == 1 else None) for name, count in counts.items()}
+
+
+def _binding_counts(
+    scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]
+) -> tuple[dict[str, int], dict[str, ast.expr]]:
+    """How many times a scope binds each name, as `_bindings` counts, and the expression of each plain assignment."""
     counts: dict[str, int] = defaultdict(int)
     values: dict[str, ast.expr] = {}
     for node in _own_nodes(scope):
@@ -450,7 +518,7 @@ def _bindings(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]
                 if isinstance(inner, declaration):
                     for name in inner.names:
                         counts[name] += 1
-    return {name: (values.get(name) if count == 1 else None) for name, count in counts.items()}
+    return counts, values
 
 
 def _assigned(node: ast.stmt) -> list[tuple[str, ast.expr]]:
@@ -521,6 +589,132 @@ def _lookup(name: str, scopes: Scopes) -> tuple[ast.expr | None, Scopes] | None:
         if name in scopes[index]:
             return scopes[index][name], scopes[: index + 1]
     return None
+
+
+@dataclass(frozen=True)
+class _Helper:
+    """A function whose own body executes one of its parameters, so a call's argument there is a statement."""
+
+    # The executed parameter, and its position among the positional
+    # parameters (None for a keyword-only one).
+    parameter: str
+    position: int | None
+    # The keywords of the `parameter.format(...)` the helper executes, or
+    # None when it executes the parameter bare.
+    format_keywords: tuple[ast.keyword, ...] | None
+    # The scopes the helper's body reads, outermost first, its own last: where
+    # the format keywords' values are resolved.
+    scopes: Scopes
+
+
+@dataclass
+class _Scope:
+    """One scope the collector is inside: its bindings, whether it is a class body, and the helpers it defines."""
+
+    names: dict[str, ast.expr | None]
+    is_class: bool
+    helpers: dict[str, _Helper]
+
+
+def _own_defs(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    """The functions a scope's own body defines under a name the scope binds exactly once."""
+    counts, _ = _binding_counts(scope, declaration)
+    return {
+        node.name: node
+        for node in _own_nodes(scope)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and counts.get(node.name) == 1
+    }
+
+
+def _executed_parameter(function: ast.FunctionDef | ast.AsyncFunctionDef, scopes: Scopes) -> _Helper | None:
+    """The helper a function is when its own body executes one of its parameters, bare or through `.format(name=...)`.
+
+    The parameter must be bound once (the parameter itself) so that what the
+    helper executes is what the caller passed; a `.format` with positional
+    arguments or `**kwargs` is not read, and the function is then no helper.
+    """
+    positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
+    keyword_only = [arg.arg for arg in function.args.kwonlyargs]
+    counts, _ = _binding_counts(function, ast.Nonlocal)
+    for node in _own_nodes(function):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in EXECUTE_METHODS
+            and node.args
+        ):
+            continue
+        executed = node.args[0]
+        keywords: tuple[ast.keyword, ...] | None = None
+        if (
+            isinstance(executed, ast.Call)
+            and isinstance(executed.func, ast.Attribute)
+            and executed.func.attr == FORMAT_METHOD
+            and not executed.args
+            and all(keyword.arg is not None for keyword in executed.keywords)
+        ):
+            keywords = tuple(executed.keywords)
+            executed = executed.func.value
+        if not isinstance(executed, ast.Name) or counts.get(executed.id) != 1:
+            continue
+        if executed.id in positional:
+            return _Helper(executed.id, positional.index(executed.id), keywords, scopes)
+        if executed.id in keyword_only:
+            return _Helper(executed.id, None, keywords, scopes)
+    return None
+
+
+def _helpers(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal], scopes: Scopes) -> dict[str, _Helper]:
+    """name -> helper, for every function the scope's own body defines that executes a parameter.
+
+    `scopes` are the maps visible where the scope's body is written; each
+    helper's own locals go innermost, since its format keywords are its own.
+    """
+    found: dict[str, _Helper] = {}
+    for name, function in _own_defs(scope, declaration).items():
+        helper = _executed_parameter(function, [*scopes, _local_constants(function)])
+        if helper is not None:
+            found[name] = helper
+    return found
+
+
+def _passed(call: ast.Call, helper: _Helper) -> ast.expr | None:
+    """The argument a call passes in the helper's executed parameter's place, by keyword or by position, or None."""
+    for keyword in call.keywords:
+        if keyword.arg == helper.parameter:
+            return keyword.value
+    if helper.position is None or helper.position >= len(call.args):
+        return None
+    if any(isinstance(arg, ast.Starred) for arg in call.args[: helper.position + 1]):
+        return None
+    return call.args[helper.position]
+
+
+def _formatted(sql: str, helper: _Helper, constants: _Constants) -> str | None:
+    """The caller's statement with each `{name}` field filled as the helper's `.format(...)` fills it, or None.
+
+    A keyword with a static value fills its field with that value; one with
+    none fills it with a single `?` parameter, so an `IN` list the helper
+    builds at run time plans as `IN (?)`. A field the helper does not fill,
+    or one with a conversion or a format spec, is not read: None, dynamic.
+    """
+    if helper.format_keywords is None:
+        return sql
+    values = {str(keyword.arg): _resolve(keyword.value, constants, helper.scopes) for keyword in helper.format_keywords}
+    try:
+        fields = list(string.Formatter().parse(sql))
+    except ValueError:
+        return None
+    parts: list[str] = []
+    for literal, field, spec, conversion in fields:
+        parts.append(literal)
+        if field is None:
+            continue
+        if spec or conversion is not None or field not in values:
+            return None
+        value = values[field]
+        parts.append(FORMAT_FIELD_PARAMETER if value is None else str(value))
+    return "".join(parts)
 
 
 def _resolve(expr: ast.expr, constants: _Constants, scopes: Scopes, depth: int = 0) -> str | int | float | None:
@@ -610,25 +804,39 @@ class _Collector(ast.NodeVisitor):
         self.shown = shown
         self.constants = constants
         self.stack: list[str] = []
-        # The enclosing scopes' maps, outermost first, each with whether it
-        # is a class body. A function or lambda reads every enclosing
-        # function's names; a class body's names are read by the statements
+        # The enclosing scopes, outermost first, each with whether it is a
+        # class body. A function or lambda reads every enclosing function's
+        # names and helpers; a class body's are read by the statements
         # written in that body and by nothing nested in it, since a method or
         # a lambda inside a class does not see what its class body binds.
-        self.scopes: list[tuple[dict[str, ast.expr | None], bool]] = []
+        self.scopes: list[_Scope] = []
         self.statements: list[Statement] = []
+
+    def _visible(self) -> list[_Scope]:
+        """The scopes a statement written here reads: the enclosing functions, and the class body when it is innermost."""
+        visible = [scope for scope in self.scopes[:-1] if not scope.is_class]
+        if self.scopes:
+            visible.append(self.scopes[-1])
+        return visible
 
     @property
     def locals(self) -> Scopes:
-        """The maps a statement written here reads: the enclosing functions', and the class body's when it is innermost."""
-        visible = [local for local, is_class in self.scopes[:-1] if not is_class]
-        if self.scopes:
-            visible.append(self.scopes[-1][0])
-        return visible
+        return [scope.names for scope in self._visible()]
+
+    def _helper(self, name: str) -> _Helper | None:
+        """The executing helper a bare name means where the call is written: the innermost scope defining it, else the module's."""
+        for scope in reversed(self._visible()):
+            if name in scope.helpers:
+                return scope.helpers[name]
+        return self.constants.helpers.get(name)
 
     def _scoped(self, node: ast.AST, name: str, is_class: bool = False) -> None:
         self.stack.append(name)
-        self.scopes.append((_local_constants(node), is_class))
+        scope = _Scope(_local_constants(node), is_class, {})
+        self.scopes.append(scope)
+        # A helper defined here reads this scope's names and the enclosing
+        # ones, so its map is built with this scope already on the stack.
+        scope.helpers = _helpers(node, ast.Nonlocal, self.locals)
         self.generic_visit(node)
         self.scopes.pop()
         self.stack.pop()
@@ -646,11 +854,22 @@ class _Collector(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Attribute) and node.func.attr in EXECUTE_METHODS and node.args:
-            value = _resolve(node.args[0], self.constants, self.locals)
-            sql = value if isinstance(value, str) else None
-            function = QUALIFIED_SEPARATOR.join(self.stack) or MODULE_LEVEL
-            self.statements.append(Statement(self.shown, node.lineno, function, sql))
+            self._record(node, node.args[0], None)
+        elif isinstance(node.func, ast.Name):
+            helper = self._helper(node.func.id)
+            argument = None if helper is None else _passed(node, helper)
+            if helper is not None and argument is not None:
+                self._record(node, argument, helper)
         self.generic_visit(node)
+
+    def _record(self, node: ast.Call, argument: ast.expr, helper: _Helper | None) -> None:
+        """One statement: an execute call's first argument, or the argument a call hands an executing helper."""
+        value = _resolve(argument, self.constants, self.locals)
+        sql = value if isinstance(value, str) else None
+        if sql is not None and helper is not None:
+            sql = _formatted(sql, helper, self.constants)
+        function = QUALIFIED_SEPARATOR.join(self.stack) or MODULE_LEVEL
+        self.statements.append(Statement(self.shown, node.lineno, function, sql))
 
 
 def scan_statements(path: Path, root: Path, trees: dict[str, ast.Module]) -> list[Statement]:
@@ -874,6 +1093,9 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
     problems: list[str] = [
         BOUNDED_INDEX_ERROR.format(script=SCRIPT_NAME, index=index) for index in sorted(BOUNDED_INDEXES - partial)
     ]
+    # A foreign table the schema builds is an owned table hidden from the
+    # check under the wrong list.
+    problems.extend(FOREIGN_TABLE_BUILT_ERROR.format(script=SCRIPT_NAME, table=table) for table in sorted(FOREIGN_TABLES & tables))
     for statement in statements:
         if statement.sql is None:
             verdicts.append(Verdict(statement, KIND_DYNAMIC))
@@ -887,7 +1109,24 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
         except sqlite3.Error as exc:
             message = str(exc)
             if message.startswith(NO_SUCH_TABLE_PREFIX):
-                verdicts.append(Verdict(statement, KIND_SKIPPED, table=message[len(NO_SUCH_TABLE_PREFIX) :]))
+                table = message[len(NO_SUCH_TABLE_PREFIX) :]
+                if table in FOREIGN_TABLES:
+                    verdicts.append(Verdict(statement, KIND_SKIPPED, table=table))
+                    continue
+                # A table neither built nor listed as foreign: a lazily
+                # created side table or a misspelt owned name, not a Hermes
+                # table, so it is reported rather than skipped.
+                verdicts.append(Verdict(statement, KIND_ERROR, table=table, plan=message))
+                problems.append(
+                    FOREIGN_TABLE_ERROR.format(
+                        file=statement.file,
+                        line=statement.line,
+                        function=statement.function,
+                        statement=statement.preview,
+                        table=table,
+                        script=SCRIPT_NAME,
+                    )
+                )
             else:
                 verdicts.append(Verdict(statement, KIND_ERROR, plan=message))
                 problems.append(

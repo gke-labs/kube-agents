@@ -326,6 +326,55 @@ FIXTURE_SERVER = textwrap.dedent(
         return conn.execute("SELECT id FROM events WHERE id IN ({})".format(marks), ids).fetchall()
 
 
+    def run_sql(conn, query, params=()):
+        return conn.execute(query, params).fetchall()
+
+
+    def run_in(conn, query, ids):
+        marks = ",".join("?" * len(ids))
+        return conn.execute(query.format(marks=marks, table="events"), ids).fetchall()
+
+
+    def run_rebound(conn, query):
+        query = query.strip()
+        return conn.execute(query).fetchall()
+
+
+    def through_helper(conn, cluster):
+        return run_sql(conn, "SELECT id FROM events WHERE cluster = ?", (cluster,))
+
+
+    def through_helper_keyword(conn):
+        return run_sql(conn, params=("x",), query=RECENT_SQL)
+
+
+    def through_helper_dynamic(conn, sql):
+        return run_sql(conn, sql)
+
+
+    def through_format_helper(conn, ids):
+        return run_in(conn, "SELECT id FROM {table} WHERE cluster IN ({marks})", ids)
+
+
+    def through_format_helper_indexed(conn, ids):
+        return run_in(conn, "SELECT id FROM events WHERE id IN ({marks})", ids)
+
+
+    def through_format_helper_unfilled(conn, ids):
+        return run_in(conn, "SELECT id FROM events WHERE {column} IN ({marks})", ids)
+
+
+    def through_rebound_helper(conn):
+        return run_rebound(conn, " SELECT id FROM events WHERE cluster = 'x' ")
+
+
+    def through_nested_helper(conn, cluster):
+        def newest(query, ceiling):
+            return conn.execute(query, (cluster, ceiling))
+
+        return newest("SELECT id FROM events WHERE cluster = ? LIMIT ?", 5)
+
+
     def bounded(conn):
         return conn.execute("SELECT body FROM data_volume_warning").fetchall()
 
@@ -398,6 +447,8 @@ FIXTURE_SCHEMA = SchemaSource(
 FIXTURE_TARGETS = ("fixture_server.py", "fixture_helper.py")
 # The fixture's one partial index whose WHERE is a bound by design; `idx_events_drift` is partial too and is not here.
 FIXTURE_BOUNDED_INDEXES = frozenset({"idx_events_backlog_pending"})
+# The one table the fixture reads that its schema never builds.
+FIXTURE_FOREIGN_TABLES = frozenset({"sessions"})
 # What the fixture's findings pin to, exactly.
 FIXTURE_BASELINE = textwrap.dedent(
     """
@@ -422,6 +473,9 @@ FIXTURE_BASELINE = textwrap.dedent(
     fixture_server.py Store.method notes 1
     fixture_server.py Store.outer.inner notes 1
     fixture_server.py many notes 1
+    fixture_server.py through_helper events 1
+    fixture_server.py through_format_helper events 1
+    fixture_server.py through_nested_helper events 1
     """
 )
 
@@ -440,12 +494,16 @@ def _run(
     baseline: Path,
     list_statements: bool = False,
     bounded_indexes: frozenset[str] = FIXTURE_BOUNDED_INDEXES,
+    foreign_tables: frozenset[str] = FIXTURE_FOREIGN_TABLES,
     **overrides,
 ) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     kwargs = dict(targets=FIXTURE_TARGETS, schema=FIXTURE_SCHEMA, baseline=baseline, list_statements=list_statements)
     kwargs.update(overrides)
-    with mock.patch.object(plan_check, "BOUNDED_INDEXES", bounded_indexes):
+    with (
+        mock.patch.object(plan_check, "BOUNDED_INDEXES", bounded_indexes),
+        mock.patch.object(plan_check, "FOREIGN_TABLES", foreign_tables),
+    ):
         code = check(root, out=out, err=err, **kwargs)
     return code, out.getvalue(), err.getvalue()
 
@@ -556,6 +614,26 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(kinds[server + "named_parameters"], [KIND_OK])
         self.assertEqual(kinds[server + "hermes"], [KIND_SKIPPED])
         self.assertEqual(kinds[server + "dynamic"], [KIND_DYNAMIC])
+        # A helper that executes its parameter keeps its own execute call dynamic; the literal a caller hands it is
+        # the caller's statement, by position or by keyword, and a name with no static value is dynamic there too.
+        self.assertEqual(kinds[server + "run_sql"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "run_in"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "through_helper"], [KIND_FINDING])
+        self.assertIn("through_helper finding table=events plan=SCAN events statement=SELECT id FROM events WHERE cluster = ?", out)
+        self.assertEqual(kinds[server + "through_helper_keyword"], [KIND_OK])
+        self.assertEqual(kinds[server + "through_helper_dynamic"], [KIND_DYNAMIC])
+        # A helper that formats its parameter fills each field: a static keyword with its value, a run-time one
+        # (the `IN` list) with one `?`; a field the helper never fills leaves the statement dynamic.
+        self.assertEqual(kinds[server + "through_format_helper"], [KIND_FINDING])
+        self.assertIn("through_format_helper finding table=events plan=SCAN events statement=SELECT id FROM events WHERE cluster IN (?)", out)
+        self.assertEqual(kinds[server + "through_format_helper_indexed"], [KIND_OK])
+        self.assertEqual(kinds[server + "through_format_helper_unfilled"], [KIND_DYNAMIC])
+        # A function that rebinds the parameter before executing it is no helper: nothing is read at its call site.
+        self.assertEqual(kinds[server + "run_rebound"], [KIND_DYNAMIC])
+        self.assertNotIn(server + "through_rebound_helper", kinds)
+        # A nested helper is read by the calls in the function that defines it.
+        self.assertEqual(kinds[server + "through_nested_helper"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "through_nested_helper.newest"], [KIND_DYNAMIC])
         self.assertEqual(kinds[server + "bounded"], [KIND_BOUNDED])
         self.assertEqual(kinds[server + "catalog"], [KIND_OK])
         self.assertEqual(kinds[server + "constant_row"], [KIND_OK])
@@ -706,7 +784,8 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("automatic_index scans notes: `SEARCH n USING AUTOMATIC COVERING INDEX (author=?)`", err)
         self.assertIn("index_walk scans events: `SCAN events USING COVERING INDEX idx_events_created_at`", err)
         self.assertIn("lambda_closure.<lambda> scans events: `SCAN events`", err)
-        self.assertIn("14 finding(s) not pinned and 7 problem(s)", err)
+        self.assertIn("through_format_helper scans events: `SCAN events` for `SELECT id FROM events WHERE cluster IN (?)`", err)
+        self.assertIn("17 finding(s) not pinned and 7 problem(s)", err)
 
     def test_bounded_index_the_schema_does_not_build_is_a_problem(self) -> None:
         baseline = _write_fixture(self.root)
@@ -719,6 +798,28 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("bounded_index_walk scans events: `SCAN events USING ", err)
         self.assertIn("INDEX idx_events_backlog_pending` for `SELECT id FROM events WHERE backlog = 1`", err)
         self.assertIn("1 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_table_outside_foreign_tables_is_a_problem_not_a_skip(self) -> None:
+        baseline = _write_fixture(self.root)
+        # With `sessions` off the list, the Hermes read is a table the schema does not build and nothing vouches
+        # for: a problem naming the table, where a lazily created side table or a misspelt owned name would land.
+        code, out, err = _run(self.root, baseline, list_statements=True, foreign_tables=frozenset())
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("fixture_server.py:", err)
+        self.assertIn(
+            "hermes: `SELECT id FROM sessions WHERE parent_session_id = ?` names 'sessions', a table the schema does not "
+            "build and FOREIGN_TABLES does not list; build it in the schema, fix the name, or add it to FOREIGN_TABLES",
+            err,
+        )
+        self.assertIn("hermes error table=sessions plan=no such table: sessions", out)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+
+    def test_foreign_table_the_schema_builds_is_a_problem(self) -> None:
+        baseline = _write_fixture(self.root)
+        code, _, err = _run(self.root, baseline, foreign_tables=frozenset({"sessions", "events"}))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("FOREIGN_TABLES names 'events', which the schema builds; drop the entry", err)
+        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
 
     def test_missing_target_fails(self) -> None:
         baseline = _write_fixture(self.root)
@@ -836,6 +937,13 @@ class CheckoutTests(unittest.TestCase):
         listing = out.getvalue()
         self.assertIn("agents/platform/scripts/session_kv_server.py:", listing)
         self.assertIn(" skipped table=sessions ", listing)
+        # The server's `_ids_where_in` executes its parameter: the literal a caller hands it is read at the call
+        # site, its `{marks}` list as one parameter.
+        self.assertIn(
+            " _collect_card_tree skipped table=task_links plan=- "
+            "statement=SELECT parent_id, child_id FROM task_links WHERE parent_id IN (?)",
+            listing,
+        )
 
 
 if __name__ == "__main__":
