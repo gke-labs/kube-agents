@@ -143,7 +143,7 @@ names, and a record with neither takes no claim. The verb does the forge check i
 with the credential it holds and accepts each token once, so the hook no longer makes its own
 forge reads. The claim is one broker call through the sandbox hop per record line, made in line
 before the command returns, so the hook keeps today's cap of five record lines per output: the
-first five are claimed, or burned, before the model reads them, and the hook strips the token
+first five are claimed, or burned, before the model reads them, none starts after the hook's 20 s claim budget, and each claim's hop is bounded so the hook answers inside Hermes' 30 s callback timeout. The hook strips the token
 from every record line in the output it did not claim, those past the cap and those whose claim
 failed, in every process, so no live token reaches what the model reads. A proposal whose line
 went unclaimed counts as missed. A line without a valid token is left as text
@@ -172,7 +172,7 @@ origin). Under the experimental platform-profile front door a chat turn does run
 terminal; its session record then resolves it, `chat` with its platform. A Prometheus reader can split chat by platform; the status does not. The hook is enabled on every profile that has the terminal.
 
 What the count misses, stated so the numbers are read right: a pull request opened by a
-background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
+background process (the hook reads foreground output only); one whose record line the model kept from the hook, or whose token the model burned; one past the five record lines the hook claims per command output, or past its claim budget; one whose claim failed the forge check or arrived after the fifteen-minute window; and one opened by a request the model wrote itself
 instead of `vcs_client.call`. Three windows in the mechanism lose a count too. A claim that
 succeeds and a ledger write that then fails loses that proposal's count, since the token is
 spent. A broker restart between the mint and the claim loses the claims in flight, since the

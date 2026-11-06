@@ -115,6 +115,9 @@ def _total(headers: Mapping[str, str]) -> int | None:
 
 class GiteaForge(Forge):
     name = PROVIDER
+    # `quota_from_headers` stays the default, unknown: no quota headers for
+    # this forge are documented here, and none are guessed, so the readings
+    # sweep paces it on its hourly budget alone (#4615).
     proposal_noun = "pull request"
     verbs = COLLABORATION_VERBS
     transport = "http"

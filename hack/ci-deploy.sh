@@ -699,6 +699,10 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
 source "${SCRIPT_DIR}/../tags.env"
+# EVAL_REPLAY_SHADOW and its bucket and job tags (resolve_replay_shadow in
+# ci-env.sh), checked before anything is built, the way the session-affinity
+# settings are above.
+resolve_replay_shadow || exit 1
 # The failure dump first, because it reads the exit status; then the lease
 # heartbeat started below is stopped (a no-op until it starts).
 DEPLOY_HEARTBEAT_PID=""
@@ -784,6 +788,19 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     --set-string "platformAgent.deployment.env[4].value=false"
     --set "profiles.tse.enabled=true"
   )
+fi
+
+# The shadow-mode replay proxy (on by default; resolved above): the
+# image step 4 builds (cloudbuild-ci.yaml's replay-shadow-proxy step) and the
+# chart values step 5 installs it with. Both empty when it is off, so the build
+# and the release are byte-for-byte what they were. resolve_replay_shadow
+# refuses it on the release-candidate path, which builds nothing.
+REPLAY_SHADOW_PROXY_URI=""
+REPLAY_SHADOW_HELM_ARGS=()
+if [ "${REPLAY_SHADOW_ACTIVE:-false}" = "true" ]; then
+  REPLAY_SHADOW_PROXY_URI="${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}:${TAG}"
+  replay_shadow_helm_args "${AR_REPO}/${REPLAY_SHADOW_IMAGE_NAME}" "${TAG}"
+  echo "Shadow replay proxy: goes in front of LiteLLM (${REPLAY_SHADOW_KIND}, build ${REPLAY_SHADOW_BUILD}); EVAL_REPLAY_SHADOW=false turns it off"
 fi
 
 # ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
@@ -1773,6 +1790,11 @@ else
   # 2a, and skipped this section above), so they are always built here.
   PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
   A2A_BUILD_SUBSTITUTIONS=""
+  REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
+  if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
+    REPLAY_SHADOW_BUILD_SUBSTITUTIONS=",_REPLAY_SHADOW_PROXY_URI=${REPLAY_SHADOW_PROXY_URI}"
+    echo "Shadow replay proxy: also building its image"
+  fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
@@ -1796,7 +1818,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -2065,6 +2087,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "plugins.stockoutInvestigator.applyTuning=false" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
+    ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"} \
     --wait --timeout 15m 2>&1 | tee "${HELM_INSTALL_OUT}"
   HELM_EXIT="${PIPESTATUS[0]}"
   set -e

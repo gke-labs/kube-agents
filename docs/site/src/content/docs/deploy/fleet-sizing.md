@@ -137,6 +137,14 @@ The proxy Deployment recreates its pod rather than rolling it: applied on the de
 example leaves the new proxy pod `Pending` with the old one gone. Every brokered `gcloud` and
 `kubectl` command, and the Google Chat relay, is then down until a node fits.
 
+The same holds under `spec.deployment.sizingProfile: auto`, which applies the `medium` row at 10
+clusters and the `fleet` row at 25 with no human in the loop. Before a step up the operator checks
+the namespace's `ResourceQuota` and the bounds of its `LimitRange` objects, not node
+allocatable capacity. A Standard pool therefore needs nodes that fit the `fleet` row's 4 vCPU proxy
+request (`e2-standard-8` or larger) before the count reaches 25. The `medium` row's 1 vCPU request
+fits an `e2-standard-4`. A `LimitRange` whose `max`, per container or per pod, is below a row's figure holds
+the tier at the row it admits, and the CR's `SizingCappedByQuota` condition names it.
+
 | Pool             | Shape (modeled)                                                                            | Carries                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
 | Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4 | proxy, operator, LiteLLM, minter, the `next` stack                    |
