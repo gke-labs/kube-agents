@@ -3165,11 +3165,6 @@ def _data_volume_state() -> int:
     return row[0] if row else DATA_VOLUME_ARMED
 
 
-def _data_volume_warned() -> bool:
-    """Whether a warning was posted and its all-clear is not yet delivered."""
-    return _data_volume_state() != DATA_VOLUME_ARMED
-
-
 def _set_data_volume_state(state: int) -> None:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)) as conn:
         with conn:
