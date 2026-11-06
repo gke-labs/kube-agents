@@ -12752,6 +12752,10 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         repos = patch.object(session_kv_server.gitops_workspace, "get_managed_repos", return_value=["acme/gitops"])
         repos.start()
         self.addCleanup(repos.stop)
+        # A count an earlier test abandoned may still be running; each test starts with none.
+        count_thread = patch.object(session_kv_server, "_TRIAGE_PR_COUNT_THREAD", None)
+        count_thread.start()
+        self.addCleanup(count_thread.stop)
         self.board = os.path.join(tempfile.mkdtemp(), "kanban.db")
         with sqlite3.connect(self.board) as conn:
             conn.execute("CREATE TABLE tasks (id TEXT, session_id TEXT, assignee TEXT, title TEXT, status TEXT)")
@@ -12957,6 +12961,25 @@ class TestIncidentTriagePullRequestLimit(unittest.TestCase):
         sys.modules["forge"].call = slow
         with patch.object(session_kv_server, "TRIAGE_PR_COUNT_TIMEOUT_S", 0.05):
             self.assertEqual(self.decide("k8s-evt-1", "api-0")[0], False)
+
+    def test_a_count_still_waiting_on_the_forge_holds_the_next_one_uncounted(self):
+        """One count thread at a time: the next claim does not start a second."""
+        release = threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        def slow(*_args, **_kwargs):
+            calls.append(1)
+            release.wait(5)
+            return {"proposals": [], "truncated": False}
+
+        sys.modules["forge"].call = slow
+        with patch.object(session_kv_server, "TRIAGE_PR_COUNT_TIMEOUT_S", 0.05):
+            first = self.decide("k8s-evt-1", "api-0")
+            second = self.decide("k8s-evt-2", "web-2")
+        self.assertEqual(first, (False, session_kv_server.TRIAGE_PR_UNCOUNTED_NOTE.format(limit=2)))
+        self.assertEqual(second, (False, session_kv_server.TRIAGE_PR_UNCOUNTED_NOTE.format(limit=2)))
+        self.assertEqual(len(calls), 1)
 
     def test_the_query_follows_the_decision(self):
         payload = self.payload("api-0")

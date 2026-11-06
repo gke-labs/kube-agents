@@ -3394,16 +3394,23 @@ def _incident_triage_pull_request_limit() -> int:
 # Held from the count to the reservation, so triages that start together
 # (TRIAGE_START_WORKERS) count each other.
 _TRIAGE_PR_CLAIM_LOCK = threading.Lock()
+# The forge count's thread, at most one at a time: a count abandoned at its
+# deadline keeps its thread until the forge answers, and a count that finds one
+# still running is uncounted rather than starting another.
+_TRIAGE_PR_COUNT_THREAD: Optional[threading.Thread] = None
+_TRIAGE_PR_COUNT_THREAD_LOCK = threading.Lock()
 
 
 def _open_triage_pull_request_branches(timeout: float) -> Optional[Set[str]]:
     """The source branches of the open triage pull requests in the managed repositories, or None when unknown.
 
-    Unknown is any forge error, no answer within ``timeout``, or a repository
-    with more than TRIAGE_PR_LIST_MAX_PAGES pages of open proposals. Read on a
-    daemon thread, as _proposal_state reads, so a forge call past the timeout
-    is abandoned rather than waited on.
+    Unknown is any forge error, no answer within ``timeout``, a repository
+    with more than TRIAGE_PR_LIST_MAX_PAGES pages of open proposals, or an
+    earlier count still waiting on the forge. Read on a daemon thread, so a
+    forge call past the timeout is abandoned rather than waited on, and only
+    one such thread runs at a time (_TRIAGE_PR_COUNT_THREAD).
     """
+    global _TRIAGE_PR_COUNT_THREAD
     answer: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
 
     def _list() -> None:
@@ -3439,7 +3446,12 @@ def _open_triage_pull_request_branches(timeout: float) -> Optional[Set[str]]:
         except Exception as exc:
             answer.put((False, exc))
 
-    threading.Thread(target=_list, name="triage-pr-count", daemon=True).start()
+    with _TRIAGE_PR_COUNT_THREAD_LOCK:
+        if _TRIAGE_PR_COUNT_THREAD is not None and _TRIAGE_PR_COUNT_THREAD.is_alive():
+            logger.warning("Could not count the open triage pull requests: an earlier count is still waiting on the forge")
+            return None
+        _TRIAGE_PR_COUNT_THREAD = threading.Thread(target=_list, name="triage-pr-count", daemon=True)
+        _TRIAGE_PR_COUNT_THREAD.start()
     try:
         ok, result = answer.get(timeout=timeout)
     except queue.Empty:
