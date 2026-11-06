@@ -304,14 +304,14 @@ person did not see word for word, and the filing script appends nothing after th
 The front door writes the draft and runs no script, and the gateway's block never enters its
 session, so the block is fetched by a card. The person says `add the usage summary` to the
 draft; the Planning Agent files one `platform` card that asks for the summary and nothing
-else, acks, and ends the turn. The worker runs `file_feedback.py summary`, which imports
+else, acks with a line saying the block will post into the thread and that their next message, a yes included, brings the draft back with it, and ends the turn. The worker runs `file_feedback.py summary`, which imports
 `feedback_summary.py` (staged on the sandbox image's script allowlist for it) and runs
 `collect` with the in-pod sources off: the sandbox's `kubectl` is the broker's shim, a
 context-less read of the host cluster, and the agent's local Role grants `get` on the
 `PlatformAgent`, while `exec` is a write verb to the broker's command policy. The block therefore carries the environment
 and usage sections and prints `unavailable` for tokens, spend, latency and the task roll-up;
-those stay with `scripts/feedback-summary.sh`. The block less its model line is audited as
-the script audits its own; a clean block is the card's `result`, verbatim, and a hit is a
+those stay with `scripts/feedback-summary.sh`. The block less its model and origin lines is audited as
+the script audits its own; a clean block, less the rating form the pasted block ends with (an empty form in an issue reads as a rating nobody gave), is the card's `result`, verbatim, and a hit is a
 `BLOCKED` line that says how many identifiers were found and never which. The worker files
 nothing on this card.
 
@@ -331,18 +331,24 @@ but handing it to the agent beside a typed report departs from the line above th
 gateway passes the text through as typed, and is a Go change in a component that holds no
 part of the filing today.
 
-The case `bench/tasks/chat-feedback-offers-usage-summary/task.yaml` grades the first reply:
-the composed submission as the earlier case does, plus the offer of the usage summary, under
-the same no-card and nothing-filed safeguards. The opt-in turn and the re-shown draft are not
-in a case: a run that reads a card's result is a second turn, and the filing turn stays out
-for the reason §5 gives. Registered in `hack/eval/nightly-cases.txt`.
+Two cases, both registered in `hack/eval/nightly-cases.txt`.
+`bench/tasks/chat-feedback-offers-usage-summary/task.yaml` grades the first reply: the composed
+submission as the earlier case does, plus the offer of the usage summary, under the same no-card
+and nothing-filed safeguards. `bench/tasks/platform-feedback-usage-summary-card/task.yaml`
+grades the summary card: a plain ask for the block reaches the worker as a card, and its result
+carries the script's block (the title, a counter, the `unavailable` line only the resource-only
+render prints) with no rating form and no filing. The opt-in turn and the re-shown draft are not
+in a case: a run that reads a card's result is a second turn, and the filing turn stays out for
+the reason §5 gives.
 
 ## Calls made in the build
 
 - `/feedback summary` is answered by the gateway rather than by a platform card: a block a
   customer pastes must be a function of the sources alone, which a model-composed answer
-  cannot promise, and the gateway is the one component that both sees the resource and
-  posts into the conversation.
+  cannot promise, and, when the command was built, the gateway was the one component that
+  both saw the resource and posted into the conversation. §8 (2026-11-05) adds a card path
+  for the block a report attaches: a script renders it and the model copies it verbatim, and
+  the yes is to the text shown, the contract the typed text already has.
 - The bare-`/feedback` branch is the first case of the gateway's dispatch switch, ahead of
   `/session`, status, stop and steer, gated on a message with no programmatic intent.
 - The sandbox client keeps one marker per payload hash in the task workspace. A broker that

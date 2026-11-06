@@ -3,9 +3,11 @@ name: kube-agents-feedback
 description:
   File a bug report, feature request, or question about kube-agents itself on
   the user's behalf, through the project's public feedback form, exactly once,
-  after the user has confirmed the exact text in chat. A submission becomes a
-  public GitHub issue on gke-labs/kube-agents. Not for telling a user where to
-  report — the persona bullet owns that answer without a skill.
+  after the user has confirmed the exact text in chat, and render the install's
+  audited usage summary for a card that asks only for that, filing nothing. A
+  submission becomes a public GitHub issue on gke-labs/kube-agents. Not for
+  telling a user where to report — the persona bullet owns that answer without
+  a skill.
 ---
 
 # Skill: kube-agents-feedback

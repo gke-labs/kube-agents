@@ -133,8 +133,9 @@ REASON_SUMMARY_LEAK = (
     "the usage summary names {count} identifier(s) read from the resource, so "
     "it is not shown; nothing is attached"
 )
-SUMMARY_STDERR_PREFIX = "feedback-summary: "
 SUMMARY_COMMAND = "summary"
+#: The block's closing fence, which the rating form sits directly above.
+SUMMARY_FENCE = "```"
 
 
 class BrokerAnswerLost(Exception):
@@ -321,25 +322,40 @@ def submit(payload_path: Path, state_dir: Path) -> int:
     return _blocked(REASON_BROKER_ANSWER.format(code=code))
 
 
+def _without_rating_form(text: str) -> str:
+    """The block less the rating form ``render`` ends it with.
+
+    The form (``feedback:``, a rating line, two prompts) is for a person to
+    fill in before pasting the block into an email. An attached block goes
+    into a public issue's environment field as it stands, where an empty form
+    reads as a rating nobody gave, so it is cut here, after the audit ran over
+    the whole block: what is printed is a subset of what was checked.
+    """
+    lines = text.split("\n")
+    form = list(feedback_summary.FEEDBACK_TEMPLATE)
+    if lines[-1] == SUMMARY_FENCE and lines[-1 - len(form):-1] == form:
+        del lines[-1 - len(form):-1]
+    return "\n".join(lines)
+
+
 def summary(namespace: str, name: str) -> int:
     """Print the install's audited usage summary, or a BLOCKED line and no block.
 
     Resource only: ``in_pod`` is off because ``exec`` is a write verb to the
     broker's command policy, and no context or kubeconfig is passed because
-    the shim's context-less read is the host cluster. The audit is the module's own, run
-    over the block less its model line as its ``main`` runs it.
+    the shim's context-less read is the host cluster. The audit is the one
+    ``feedback_summary.main`` runs, through the same helper.
     """
     options = feedback_summary.Options(namespace=namespace, name=name, in_pod=False)
     try:
         snapshot = feedback_summary.collect(options)
     except feedback_summary.CollectError as error:
-        print(f"{SUMMARY_STDERR_PREFIX}{error}", file=sys.stderr)
+        print(f"{feedback_summary.LOG_PREFIX}{error}", file=sys.stderr)
         return _blocked(REASON_SUMMARY_UNREADABLE.format(name=name, namespace=namespace))
-    text = feedback_summary.render(snapshot)
-    leaked = feedback_summary.audit(feedback_summary._without_model_line(text), snapshot.identifiers)
+    text, leaked = feedback_summary.audited_block(snapshot)
     if leaked:
         return _blocked(REASON_SUMMARY_LEAK.format(count=len(leaked)))
-    print(text)
+    print(_without_rating_form(text))
     return 0
 
 
