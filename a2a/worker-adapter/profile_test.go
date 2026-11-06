@@ -114,7 +114,9 @@ func (d *fakeDispatcher) nextAccept(within time.Duration) lib.DispatchAccept {
 // declines as busy, as the dispatcher does with a pod still putting away
 // its last task (the after-task reset runs past the final renewal). Any
 // other decline, an answer for another task, or the bound running out fails
-// the test with the last answer.
+// the test with the last answer. The bound covers the re-offers; each
+// answer gets its own wait of the same length, so a pod that goes silent
+// fails the test in about twice the bound.
 func (d *fakeDispatcher) offerAccepted(task string, env *lib.Envelope, acceptSeconds int) {
 	d.t.Helper()
 	deadline := time.Now().Add(reofferBound)
