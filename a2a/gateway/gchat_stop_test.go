@@ -114,8 +114,8 @@ func TestGchatStopButtonRefusedFallsBackToTheLine(t *testing.T) {
 	f := newFakeChatRelay(t)
 	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/S1/messages/M1"}
 	f.responses["spaces.messages/patch"] = map[string]any{"name": "spaces/S1/messages/M1"}
-	f.respondOnce("spaces.messages/create", fakeChatAPIError{status: 400, reason: "accessory widgets"})
-	f.respondOnce("spaces.messages/patch", fakeChatAPIError{status: 400, reason: "accessory widgets"})
+	f.queue["spaces.messages/create"] = append(f.queue["spaces.messages/create"], fakeChatAPIError{status: 400, reason: "accessory widgets"})
+	f.queue["spaces.messages/patch"] = append(f.queue["spaces.messages/patch"], fakeChatAPIError{status: 400, reason: "accessory widgets"})
 	a := newTestGchatAdapterWithRelay(t, f)
 	conv := "gchat:spaces/S1/threads/T1"
 
@@ -144,14 +144,14 @@ func TestGchatStopButtonRefusedFallsBackToTheLine(t *testing.T) {
 		t.Errorf("fallback patch = %v %+v", labels, f.call(3))
 	}
 
-	f.respondOnce("spaces.messages/create", fakeChatAPIError{status: 500, reason: "backend"})
+	f.queue["spaces.messages/create"] = append(f.queue["spaces.messages/create"], fakeChatAPIError{status: 500, reason: "backend"})
 	if _, err := a.PostMessage(conv, OutMessage{Text: "⏳ submitted…", Stop: "task-1"}); err == nil || len(f.calls) != 5 {
 		t.Errorf("a failed create: err=%v calls=%d", err, len(f.calls))
 	}
 
 	// A laid-out line refused is the layout's refusal: one patch, the
 	// refusal returned, no retry without the button.
-	f.respondOnce("spaces.messages/patch", fakeChatAPIError{status: 400, reason: "bad link"})
+	f.queue["spaces.messages/patch"] = append(f.queue["spaces.messages/patch"], fakeChatAPIError{status: 400, reason: "bad link"})
 	plan := &chatmsg.Message{Schema: chatmsg.Schema, Headline: "Upgrade readiness", Links: []chatmsg.Link{{Text: "board", URL: "https://x.example/b"}}}
 	if err := a.EditMessage(conv, id, OutMessage{Text: "⚙️ working", Chat: plan, Stop: "task-1"}); !errors.Is(err, ErrLayoutRefused) || len(f.calls) != 6 {
 		t.Errorf("a refused laid-out line: err=%v calls=%d", err, len(f.calls))

@@ -468,12 +468,28 @@ func preferProtobuf(cfg *rest.Config) {
 // newClusterClient builds the clientset every watched cluster is read with,
 // from a config preferring protobuf (see preferProtobuf).
 func newClusterClient(cfg *rest.Config) (kubernetes.Interface, error) {
+	client, _, err := newClusterClients(cfg)
+	return client, err
+}
+
+// newClusterClients is newClusterClient plus the client the Events watch is
+// opened with, whose connections are never reused (see watchConfig). Where cfg
+// doesn't qualify for that, the second is the first.
+func newClusterClients(cfg *rest.Config) (client, watchClient kubernetes.Interface, err error) {
 	preferProtobuf(cfg)
-	client, err := kubernetes.NewForConfig(cfg)
+	client, err = kubernetes.NewForConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("kubernetes client: %w", err)
+		return nil, nil, fmt.Errorf("kubernetes client: %w", err)
 	}
-	return client, nil
+	watchCfg, separate := watchConfig(cfg)
+	if !separate {
+		return client, client, nil
+	}
+	watchClient, err = kubernetes.NewForConfig(watchCfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("kubernetes watch client: %w", err)
+	}
+	return client, watchClient, nil
 }
 
 // targetCluster is one cluster the watcher should monitor, discovered from a
@@ -498,6 +514,11 @@ type targetCluster struct {
 	// order, which boot need not have chosen (a refused describe skips it).
 	Source string
 	Client kubernetes.Interface
+	// WatchClient is the client the Events watch is opened with: Client's
+	// twin with no pooled connections where Client shares the process's
+	// default transport (see watchConfig), else Client itself. Nil means
+	// Client, which is what a test's fake and the direct cluster leave.
+	WatchClient kubernetes.Interface
 	// Autopilot says this is a GKE Autopilot cluster, read off the describe
 	// call discovery already makes (clusterprofiles.Cluster.Autopilot). The
 	// FailedScheduling gate is the only reader: an Autopilot cluster with no
@@ -587,17 +608,18 @@ func discoverClusterProfilesWanting(ctx context.Context, dir string, m *metrics,
 		if c.Profile == directProfile {
 			return targetCluster{}, fmt.Errorf("the profile directory name %q is reserved for the directly reached cluster; rename the profile", directProfile)
 		}
-		client, err := newClusterClient(c.Config)
+		client, watchClient, err := newClusterClients(c.Config)
 		if err != nil {
 			return targetCluster{}, err
 		}
 		return targetCluster{
-			Name:      c.Identity.Cluster,
-			ProjectID: c.Identity.Project,
-			Location:  c.Identity.Location,
-			Profile:   c.Profile,
-			Client:    client,
-			Autopilot: c.Autopilot,
+			Name:        c.Identity.Cluster,
+			ProjectID:   c.Identity.Project,
+			Location:    c.Identity.Location,
+			Profile:     c.Profile,
+			Client:      client,
+			WatchClient: watchClient,
+			Autopilot:   c.Autopilot,
 		}, nil
 	})
 	if err != nil {
@@ -673,6 +695,10 @@ type dispatcher struct {
 	// noFollowupLogged keeps the "daemon serves no follow-ups" line to one
 	// per change of answer.
 	noFollowupLogged atomic.Bool
+
+	// excluded sends the events alert-exclude rules hold back to the daemon,
+	// for the daily recap's count; nil in a dry run.
+	excluded *excludedRecorder
 }
 
 func (d *dispatcher) clock() time.Time {
@@ -692,7 +718,12 @@ func (d *dispatcher) clock() time.Time {
 // filter's config rather than the flag so the default applies when the flag
 // was left at zero.
 func newDispatcher(f *flags, filter *filter, dedup *dedupCache, inj *injector, m *metrics) *dispatcher {
+	var excluded *excludedRecorder
+	if inj != nil && !f.dryRun {
+		excluded = newExcludedRecorder((&excludedPoster{inj: inj}).Post)
+	}
 	return &dispatcher{
+		excluded:    excluded,
 		filter:      filter,
 		dedup:       dedup,
 		pullClasses: newPullClassMemo(defaultPullClassTTL, defaultPullClassEntries),
@@ -917,6 +948,9 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			log.Printf("ignored %s pod=%s/%s reported by %q, not %s; no verdict recorded, not forwarded",
 				ev.Key.Reason, ev.Namespace, ev.Name, ev.Reporter, scaleUpReporter)
 		}
+		if gate == gateAlertExcluded && d.excluded != nil {
+			d.excluded.Note(ev)
+		}
 		// A sighting a gate stopped is still a sighting: an alerted object
 		// the scale-up hold keeps from Observe is not quiet.
 		d.dedup.Sighted(ev.Key, ev.Message, ev.LastSeen)
@@ -1095,6 +1129,12 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 // it survives a restart with the entry; an inject that fails is retried on
 // the next sweep. Dry-run prints the payload as Dispatch does.
 func (d *dispatcher) Sweep(ctx context.Context) {
+	// Last, after the settle expiry and the follow-ups, whichever way the
+	// rest returns: they are what a reader sees, and the excluded records
+	// only feed the daily recap.
+	if d.excluded != nil {
+		defer d.excluded.Sweep(ctx)
+	}
 	now := d.clock()
 	quiet := d.filter.cfg.settle + settleQuietSlack
 	for _, h := range d.settles.Expire(now, quiet) {

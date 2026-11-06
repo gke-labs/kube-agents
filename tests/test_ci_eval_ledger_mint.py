@@ -565,6 +565,7 @@ class UnitNotRunTest(unittest.TestCase):
                 _lift_line(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=.*$", "EVAL_INFLIGHT_GRACE_SECONDS"),
                 _lift_line(r"^readonly EVAL_INJECT_LOCAL_PORT_BASE=.*$", "EVAL_INJECT_LOCAL_PORT_BASE"),
                 _lift_line(r"^readonly EVAL_TIMING_FILE=.*$", "EVAL_TIMING_FILE"),
+                _lift_line(r"^readonly EVAL_SHAPE_FILE=.*$", "EVAL_SHAPE_FILE"),
                 _lift_line(r"^readonly EVAL_GATEWAY_GONE_RC=.*$", "EVAL_GATEWAY_GONE_RC"),
                 _lift_line(r"^readonly EVAL_INSTALL_GONE_MARKER=.*$", "EVAL_INSTALL_GONE_MARKER"),
                 # run_one_unit writes the rep log here; a private one per run.

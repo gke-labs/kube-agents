@@ -1690,6 +1690,83 @@ def test_a_timing_file_that_will_not_write_leaves_the_run_alone(
     assert not target.is_file()
 
 
+# --- the delivered reply's shape file -----------------------------------------
+#
+# hack/ci-eval-pr.sh sets KUBE_AGENTS_SHAPE_FILE per repetition and copies the
+# file beside results.json, where load_run reads it for the dashboard.
+
+
+def test_a_run_writes_its_replys_shape(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "opens_on_verdict": True,
+        "apology": False,
+        "bot_messages": 1,
+        "words_before_answer": 0,
+        "answer_words": len(_FINAL_TEXT.split()),
+    }
+    assert [p.name for p in tmp_path.iterdir()] == ["shape.json"]
+
+
+def test_no_shape_file_without_the_variable(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", "")
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0")
+    monkeypatch.chdir(tmp_path)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_no_shape_file_for_a_silence_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gateway posts nothing for the marker, so there is no reply to measure."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+
+    harness._write_chat_shape(AgentResult(output="[SILENT]", trajectory=[], metadata={"final_message": "[SILENT]"}))
+
+    assert not target.exists()
+
+
+def test_no_shape_file_for_an_answer_adopted_from_the_stream(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The relay posted nothing; the thread shows only the placeholder."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    metadata = {"final_message": "**Two pods are OOMKilled.**", "outcome": harness.inject.OUTCOME_STREAM_TERMINAL, "window_posts": 1}
+
+    harness._write_chat_shape(AgentResult(output="", trajectory=[], metadata=metadata))
+
+    assert not target.exists()
+
+
+def test_no_shape_file_when_nothing_was_delivered(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    stub_agent.fail_with = 400
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert not target.exists()
+
+
 # --- the ci-eval-pr.sh contract ----------------------------------------------
 
 
@@ -6325,3 +6402,46 @@ def test_the_sorted_marker_is_this_processs_alone(tmp_path: Path) -> None:
     mine = harness._purge_sorted_marker(["t_1"])
     assert len(others) == 2 and mine not in others
     assert all(m.endswith("-t_1") for m in {*others, mine})
+
+
+def _report_only_judge_context() -> Any:
+    """A record both report-only evaluators apply to: MCP on, a bulleted checklist."""
+    from devops_bench.metrics.pipeline import _build_context
+
+    record = {"input": "prompt", "output": "answer", "expected_output": "Critical requirements:\n- names the node pool"}
+    return _build_context(record, judge_model=None, use_mcp=True)
+
+
+@pytest.fixture
+def report_only_judges(monkeypatch: pytest.MonkeyPatch) -> tuple[type, type]:
+    """The two evaluator classes, with ``applies`` restored after the test, as the switch patches the class."""
+    from devops_bench.metrics.checklist import ChecklistMetric
+    from devops_bench.metrics.tool_invocation import ToolInvocationMetric
+
+    for evaluator in (ToolInvocationMetric, ChecklistMetric):
+        monkeypatch.setattr(evaluator, "applies", evaluator.applies)
+    return ToolInvocationMetric, ChecklistMetric
+
+
+def test_report_only_judges_run_when_the_switch_is_unset(
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type]
+) -> None:
+    monkeypatch.delenv(harness.SKIP_REPORT_ONLY_JUDGES_ENV, raising=False)
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert all(evaluator().applies(ctx) for evaluator in report_only_judges)
+
+
+def test_a_pull_request_run_skips_the_report_only_judges(
+    monkeypatch: pytest.MonkeyPatch, report_only_judges: tuple[type, type], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """hack/ci-eval-pr.sh sets the switch on a pull request; OutcomeValidity, which rung 6 reads, still runs."""
+    from devops_bench.metrics.base import METRICS
+
+    monkeypatch.setenv(harness.SKIP_REPORT_ONLY_JUDGES_ENV, "1")
+    KubeAgentsHarness()
+    ctx = _report_only_judge_context()
+    assert not any(evaluator().applies(ctx) for evaluator in report_only_judges)
+    assert METRICS["outcome_validity"]().applies(ctx)
+    assert {"tool_invocation", "checklist"} <= set(METRICS)
+    assert "judge scores are off for this run" in capsys.readouterr().err

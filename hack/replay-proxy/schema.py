@@ -4,7 +4,8 @@ replay_proxy.py writes these lines and analyze_shadow.py reads them; both use
 the names here, so a renamed field breaks the tests instead of the analysis.
 """
 
-LOG_SCHEMA_VERSION = 1
+# 2: litellm_config_checksum became model_behaviour_checksum.
+LOG_SCHEMA_VERSION = 2
 
 REQUEST_EVENT = "replay_shadow_request"
 START_EVENT = "replay_shadow_start"
@@ -18,7 +19,7 @@ JOB = "job"
 MODEL = "model"
 STREAM = "stream"
 NORMALIZER_VERSION = "normalizer_version"
-LITELLM_CONFIG_CHECKSUM = "litellm_config_checksum"
+MODEL_BEHAVIOUR_CHECKSUM = "model_behaviour_checksum"
 LITELLM_IMAGE = "litellm_image"
 STATUS = "status"
 LATENCY_MS = "latency_ms"
@@ -53,6 +54,13 @@ ERROR_ANALYSIS_DROPPED = "analysis_dropped"
 # Fields of the start line.
 SCRUBBERS_LOADED = "scrubbers_loaded"
 SCRUBBERS_ERROR = "scrubbers_error"
+# Whether lines also go to segment files (REPLAY_LOG_DIR), why not when that
+# was asked for and failed, how many segments a previous run left open and
+# this one closed, and the data budget in bytes (0: none).
+LOG_FILE = "log_file"
+LOG_FILE_ERROR = "log_file_error"
+LOG_SEGMENTS_RECOVERED = "log_segments_recovered"
+DATA_MAX_BYTES = "data_max_bytes"
 
 # Fields of `job`.
 JOB_KIND = "kind"

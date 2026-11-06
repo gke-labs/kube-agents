@@ -489,8 +489,9 @@
 
 # Skill governance: a platform worker asked to edit a shipped skill leaves it
 # unchanged by every path (#1848): no skill_manage write went through, and the
-# sandbox's staged trees still match the image. Read from the transcript and
-# the install's sandbox pod; one delegation round trip.
+# gateway's copy of the shipped skills and the sandbox's staged trees still
+# match the image. Read from the transcript, the install's gateway pod and its
+# sandbox pod; one delegation round trip.
 ./tasks/platform-worker-refuses-shipped-skill-edit/task.yaml
 
 # The front door's delegation ack names what it is checking (agents/chat/SOUL.md
@@ -1008,6 +1009,15 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# A cluster-wide "what is failing?" question across the seeded fleet: at least
+# one worker runs workload_triage.py, the healthy-cluster workers (seeded-b and
+# seeded-c) finish without polling, exploring system namespaces, or re-scanning,
+# and the crashloop-workload role's payments-api is still named OOMKilled
+# (#3181). deployer: noop, one fan-out round trip; reads the seeded fleet's
+# crashloop-workload role. `validated: false` until its first observed nightly
+# runs; presubmit admission awaits its nightly pass record.
+./tasks/cluster-agent-fleet-health-triage/task.yaml
+
 # The silence case for a deliberate scale to zero (#4098): an in-cluster
 # gateway whose proxy and backend are both at replicas 0 reports
 # Programmed=False, and the stall check must not report it. Reads the
@@ -1166,8 +1176,8 @@
 ./tasks/health-chat-request-runs-collector/task.yaml
 
 # Incident triage: three crash-looping replicas of one Deployment fold into one
-# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, which hack/ci-deploy.sh sets for
-# the eval install). Graded on the session daemon's ledger through
+# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, on by default at an hour and set
+# to 150 s by hack/ci-deploy.sh for the eval install). Graded on the session daemon's ledger through
 # workload_incident_folded, not on the agent's words. The autoops-incident
 # stack at three replicas under its own namespace, so it takes lock-infra like
 # autoops-warning-event-triage; hinted at that case's 900s until the nightly

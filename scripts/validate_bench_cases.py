@@ -66,7 +66,12 @@ YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # runs, what the nightly adds. A case is registered by being in one of them.
 PRESUBMIT_CASES_FILE = eval_rosters.PRESUBMIT_CASES_FILE
 NIGHTLY_CASES_FILE = eval_rosters.NIGHTLY_CASES_FILE
-ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE)
+# The certification suite's file: a case there is registered too, on a lane
+# of its own, and its task file must say so with `suite: certification`.
+CERTIFICATION_CASES_FILE = eval_rosters.CERTIFICATION_CASES_FILE
+ROSTER_FILES = (PRESUBMIT_CASES_FILE, NIGHTLY_CASES_FILE, CERTIFICATION_CASES_FILE)
+SUITE_KEY = "suite"
+CERTIFICATION_SUITE = eval_rosters.CERTIFICATION_SUITE
 # The synthetic result key validate_all() reports a broken roster parse under,
 # so a tree whose roster files cannot be read fails loudly instead of calling
 # every case an orphan.
@@ -462,9 +467,11 @@ FIXTURE_NOT_READY = {
         "both paths, so no CI tier can run it; run it by hand against such an install"
     ),
     "incident-triage-open-pr-reminder": (
-        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true and "
-        "INCIDENT_WORKLOAD_DEDUP_SECONDS above 0 in spec.deployment.env and a GitOps repository "
-        "declaring eval-pr-reminder-workload; every CI eval install leaves "
+        "#2513: needs an install with INCIDENT_TRIAGE_OPEN_PULL_REQUEST=true in spec.deployment.env, "
+        "INCIDENT_WORKLOAD_DEDUP_SECONDS set shorter than the fix pull request takes to open (150, "
+        "as hack/ci-deploy.sh sets it; on the hour default the stack's recurrence lands inside the "
+        "window and folds with no pull request on its row, which the objective check fails) and a "
+        "GitOps repository declaring eval-pr-reminder-workload; every CI eval install leaves "
         "INCIDENT_TRIAGE_OPEN_PULL_REQUEST off and no pool *-infra repository declares it, so no CI "
         "tier can run it; run it by hand against such an install"
     ),
@@ -604,9 +611,10 @@ CHECK_ASSERTIONS: dict[str, tuple[str, ...]] = {
     # This repository, sandbox-reading: the paragraphs the onboarding report
     # opens with, and the verdicts it must not write.
     "bootstrap_report_posture": ("posture",),
-    # This repository, sandbox-reading. No field, like pull_request_opened:
-    # the diff against the image is the assertion. It reads the agent's own
-    # shell sandbox pod, not a seeded-fleet fixture, so it is not in
+    # This repository, sandbox- or agent-pod-reading. No field, like
+    # pull_request_opened: the diff against the image is the assertion, and
+    # `target` only picks which pod's copy is read. It reads the agent's own
+    # install, not a seeded-fleet fixture, so it is not in
     # CLUSTER_READING_TYPES below.
     "sandbox_tree_matches_image": (),
     # This repository, agent-disk-reading. No field: whether every first-run audit has a run
@@ -658,6 +666,12 @@ COMPOUND_TYPES = frozenset({"sequence", "parallel", "all", "any", "none"})
 #: The property checks whose `value` the upstream verifier compares raw, so
 #: a quoted boolean never equals the API's boolean.
 RESOURCE_PROPERTY_TYPES = frozenset({"resource_property", "fleet_resource_property"})
+# `ledger_issue_contains` under `scope: finding` reads the findings of the
+# check(s) `finding_check` names; the verifier's model refuses one without the
+# other, which in the lane is after the cluster lease.
+LEDGER_CHECK_TYPE = "ledger_issue_contains"
+LEDGER_FINDING_SCOPE = "finding"
+LEDGER_FINDING_CHECK_FIELD = "finding_check"
 EQUALITY_OPS = frozenset({"eq", "ne"})
 QUOTED_BOOLEANS = frozenset({"true", "false"})
 #: The (parent segment, field) pairs the Kubernetes and GKE APIs serve as
@@ -981,11 +995,12 @@ def fixture_catalog_disagreements() -> list[str]:
 
 
 def registered_cases() -> set[str] | None:
-    """Case names the eval runs: hack/eval/presubmit-cases.txt and nightly-cases.txt.
+    """Case names the eval runs: the presubmit, nightly and certification files.
 
-    An entry in either file is registered; the presubmit one runs on every
+    An entry in any of them is registered; the presubmit one runs on every
     pull request, the nightly one every night (EVAL_TIER=nightly in
-    hack/ci-eval-pr.sh). A commented-out path counts for nothing -- that
+    hack/ci-eval-pr.sh), the certification one on its own lane
+    (EVAL_TIER=certification). A commented-out path counts for nothing -- that
     parking state is retired; a case whose fixture does not exist waits in
     FIXTURE_NOT_READY instead, and commented_out_registrations() reports the
     comment as a finding.
@@ -1002,6 +1017,14 @@ def registered_cases() -> set[str] | None:
         except (OSError, ValueError):
             return None
     return names
+
+
+def certification_cases() -> set[str] | None:
+    """Case names in hack/eval/certification-cases.txt; None when it cannot be read."""
+    try:
+        return set(eval_rosters.certification_cases())
+    except (OSError, ValueError):
+        return None
 
 
 def commented_out_registrations() -> dict[str, str]:
@@ -1090,6 +1113,28 @@ def _check_assertions(node: Any, where: str, problems: list[str]) -> None:
             f"{where}: check '{node_type}' populates none of "
             f"{list(fields)}, so it can only pass"
         )
+
+    # The same two rules the verifier's model applies after the cluster lease:
+    # the scope needs its check, a name or a list of names; the field is
+    # refused, blank or not, under any other scope.
+    if node_type == LEDGER_CHECK_TYPE:
+        scoped = node.get("scope") == LEDGER_FINDING_SCOPE
+        check_names = node.get(LEDGER_FINDING_CHECK_FIELD)
+        names = check_names if isinstance(check_names, list) else [check_names]
+        named = check_names is not None and all(isinstance(n, str) for n in names) and any(
+            n.strip() for n in names if isinstance(n, str)
+        )
+        if scoped and not named:
+            problems.append(
+                f"{where}: check '{node_type}' under scope '{LEDGER_FINDING_SCOPE}' "
+                f"names no '{LEDGER_FINDING_CHECK_FIELD}' (a check name, or a list of them), "
+                "the check whose findings it reads"
+            )
+        elif check_names is not None and not scoped:
+            problems.append(
+                f"{where}: check '{node_type}' sets '{LEDGER_FINDING_CHECK_FIELD}', "
+                f"which is read only under scope '{LEDGER_FINDING_SCOPE}'"
+            )
 
     # A quoted boolean against a boolean field never compares equal: the
     # verifier compares the value raw and the API holds a bool, so the check
@@ -1224,12 +1269,40 @@ def _entry_vocabulary(entry: dict[str, Any], where: str, problems: list[str]) ->
         problems.append(f"{where}: weight {weight!r} must be a number greater than 0")
 
 
-def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None) -> list[str]:
+def validate_case(
+    name: str, path: pathlib.Path, *, registered: set[str] | None, certification: set[str] | None = None
+) -> list[str]:
     """Every problem with one case file, as reader-facing sentences."""
     problems: list[str] = []
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
+
+    # The suite. A certification case says so in its file and sits in the
+    # certification roster; one without the other is a case on the wrong lane.
+    suite = spec.get(SUITE_KEY)
+    if suite is not None and suite != CERTIFICATION_SUITE:
+        problems.append(f"declares '{SUITE_KEY}: {suite}'; the only suite is '{CERTIFICATION_SUITE}'")
+    if certification is not None:
+        if name in certification and suite != CERTIFICATION_SUITE:
+            problems.append(
+                f"is in {_display(CERTIFICATION_CASES_FILE)} but declares no "
+                f"'{SUITE_KEY}: {CERTIFICATION_SUITE}'; add the line, or take the case off the roster"
+            )
+        # A parked case (FIXTURE_NOT_READY, KNOWN_UNREGISTERED) may carry its
+        # suite line before its roster line lands; the registration check
+        # below leaves a suite case to this finding, so the two never ask for
+        # a nightly line and a certification line at once.
+        if (
+            name not in certification
+            and suite == CERTIFICATION_SUITE
+            and name not in KNOWN_UNREGISTERED
+            and name not in FIXTURE_NOT_READY
+        ):
+            problems.append(
+                f"declares '{SUITE_KEY}: {CERTIFICATION_SUITE}' but is not in "
+                f"{_display(CERTIFICATION_CASES_FILE)}; a certification case runs on that lane only"
+            )
 
     # The id key. devops-bench accepts task_id as an alias for id
     # (tasks/schema.py, from_dict) and prefers id when both are present, so a
@@ -1540,12 +1613,16 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
 
     # Registration. hack/ci-eval-pr.sh runs the cases in
     # hack/eval/presubmit-cases.txt and, on the nightly tier,
-    # hack/eval/nightly-cases.txt -- and only those.
+    # hack/eval/nightly-cases.txt, and on the certification tier those in
+    # hack/eval/certification-cases.txt -- and only those. A `suite:
+    # certification` case is reported by the suite check above instead,
+    # which names the right file.
     if (
         registered is not None
         and name not in registered
         and name not in KNOWN_UNREGISTERED
         and name not in FIXTURE_NOT_READY
+        and suite != CERTIFICATION_SUITE
     ):
         problems.append(
             "is registered nowhere and never runs. Add it to "
@@ -1604,12 +1681,15 @@ def validate_paths(paths: list[pathlib.Path]) -> dict[str, list[str]]:
     findings that matter.
     """
     registered = registered_cases()
+    certification = certification_cases()
     out: dict[str, list[str]] = {}
     for path in paths:
         resolved = path.resolve()
         in_tree = resolved.parent.parent == TASKS_DIR
         name = resolved.parent.name if resolved.name == "task.yaml" else resolved.stem
-        out[name] = validate_case(name, resolved, registered=registered if in_tree else None)
+        out[name] = validate_case(
+            name, resolved, registered=registered if in_tree else None, certification=certification if in_tree else None
+        )
     return out
 
 
@@ -1619,25 +1699,27 @@ def validate_all() -> dict[str, list[str]]:
     if registered is None:
         return {
             ROSTER_PARSE_KEY: [
-                "could not read hack/eval/presubmit-cases.txt and "
-                "hack/eval/nightly-cases.txt as case lists -- a file is missing "
-                "or holds a line that is not a ./tasks/<id>/task.yaml path"
+                "could not read hack/eval/presubmit-cases.txt, "
+                "hack/eval/nightly-cases.txt and hack/eval/certification-cases.txt "
+                "as case lists -- a file is missing or holds a line that is not a "
+                "./tasks/<id>/task.yaml path"
             ]
         }
     if not registered:
         return {
             ROSTER_PARSE_KEY: [
-                "hack/eval/presubmit-cases.txt and hack/eval/nightly-cases.txt "
-                "parsed to no cases -- either both are empty or this parse has "
-                "drifted"
+                "hack/eval/presubmit-cases.txt, hack/eval/nightly-cases.txt and "
+                "hack/eval/certification-cases.txt parsed to no cases -- either "
+                "all three are empty or this parse has drifted"
             ]
         }
     results: dict[str, list[str]] = {}
     cases = bench_cases()
+    certification = certification_cases()
     for name, path in cases.items():
         # One unreadable file must not hide every other case's findings.
         try:
-            results[name] = validate_case(name, path, registered=registered)
+            results[name] = validate_case(name, path, registered=registered, certification=certification)
         except CaseError as exc:
             results[name] = [str(exc)]
     for name, problems in greet_phrase_collisions(cases).items():

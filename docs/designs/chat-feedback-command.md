@@ -256,10 +256,14 @@ chat message's button may not carry it either. The dispatch case sits beside the
 ahead of `/session`, status, stop and steer, and changes nothing about the record's task
 state. `a2a/gateway/feedback_summary.go` renders the install's usage and feedback summary
 deterministically, with the environment, usage and feedback sections `scripts/feedback-summary.sh`
-prints from a workstation (epic #3426's share surface; the script adds the performance figures
-and recent task rows): environment (tag, mode, model from `status.inference` or `unavailable`, Kubernetes version, install age,
-readiness, active interfaces), the `status.usage` counters, a roll-up of the gateway's own
-task records, and the feedback template. That roll-up is labelled `chat turns`, not `tasks`:
+prints from a workstation (epic #3426's share surface; the script alone adds the cluster scale
+counts, the performance figures and recent task rows): environment (tag, mode, model from
+`status.inference` or `unavailable`, Kubernetes version, install age, readiness, active
+interfaces), the `status.usage` counters, the credential broker's top five tool and subcommand
+pairs from `status.usage.topTools` (the operator's reading of the broker's counter,
+[`usage-counters-producer.md`](usage-counters-producer.md); the script reads the broker's
+metrics directly when it can and falls back to the same status list), a roll-up of the
+gateway's own task records, and the feedback template. That roll-up is labelled `chat turns`, not `tasks`:
 the script's `tasks` line counts kanban cards, and two pastes from one install must not
 disagree under one label. The roll-up splits by what a `TaskRef` holds: the
 record's `ActiveTask` names the running task, `Canceled` marks a published cancel, and the

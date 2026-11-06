@@ -21919,6 +21919,38 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
         self.assertTrue(audit_report.decline_names_a_pull_request(
             "carried by https://gitlab.com/acme/platform/fleet/merge_requests/12"
         ))
+        # Gitea's and both Bitbucket editions' proposal URLs count too; their
+        # issue URLs do not.
+        for carried in (
+            "https://gitea.example.com/acme/fleet/pulls/12",
+            "https://bitbucket.org/acme/fleet/pull-requests/12",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/12/overview",
+        ):
+            with self.subTest(url=carried):
+                self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {carried}"))
+        for issue in (
+            "https://gitea.example.com/acme/fleet/issues/12",
+            "https://bitbucket.org/acme/fleet/issues/12",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=issue):
+                self.assertFalse(audit_report.decline_names_a_pull_request(f"see {issue}"))
+
+    def test_the_decline_check_knows_a_pull_request_url_on_every_forge_the_broker_serves(self):
+        # One proposal url per forge in providers.AVAILABLE, as its translate.py
+        # emits it. A forge that joins the broker without a row here fails this.
+        shapes = {
+            "github": "https://github.com/acme/fleet/pull/12",
+            "gitlab": "https://gitlab.example.com/group/sub/fleet/-/merge_requests/12",
+            "gitea": "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet/pulls/12",
+            "bitbucket": "https://bitbucket.org/acme/fleet/pull-requests/12/_/diff#comment-42",
+            "bitbucket-datacenter": "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/12/overview",
+        }
+        self.assertEqual(set(shapes), {cls.name for cls in providers.AVAILABLE}, "a forge the broker serves has no url shape here")
+        for provider, url in shapes.items():
+            with self.subTest(provider=provider):
+                self.assertTrue(audit_report.decline_names_a_pull_request(f"carried by {url}"))
 
     def test_the_name_search_reads_past_a_demoted_fixs_own_file(self):
         """The worker's budget is still in the declaration's file; it names
@@ -24781,6 +24813,33 @@ class TestStalledKccInFinish(HarnessTestCase):
         self.assertEqual(rc, 0, self.err)
         self.assertIn("gcloud remediation changes a field a Config Connector declaration holds", self.err)
         self.assertEqual(reads, [False])
+
+    def test_a_repository_over_the_ceiling_says_why_the_paragraph_names_no_file(self):
+        """Narrow mode takes no whole-tree snapshot, so no attempt failed and
+        there is no reason to quote: the paragraph says the tree is over the
+        ceiling, and what an operator can raise, not an empty `()`."""
+        self.patch_attr("content_mode", lambda: True)
+        use_large_repository(self, {KCC_CLUSTER_FILE: KCC_CLUSTER_DECLARATION})
+        finding = make_finding(obj="Cluster/prod-usc1", remediation={"kind": "manual", "note": "Set the release channel."})
+        rc = self.run_finish(make_doc(findings=[finding]), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn(
+            "WARNING: the Config Connector paragraph names no declaration file: acme/fleet is too large for one "
+            "snapshot; an operator can raise the broker's CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES",
+            self.err,
+        )
+        self.assertNotIn("the Config Connector paragraph could not take a snapshot", self.err)
+        self.assertNotIn("acme/fleet ()", self.err)
+
+    def test_a_broker_error_still_names_its_reason_in_the_paragraphs_warning(self):
+        self.patch_attr("content_mode", lambda: True)
+        use_snapshot(self, error=RuntimeError("the broker did not answer"))
+        finding = make_finding(obj="Cluster/prod-usc1", remediation={"kind": "manual", "note": "Set the release channel."})
+        rc = self.run_finish(make_doc(findings=[finding]), ["--manifest-file", self.manifest_file(self.stalled_manifest())])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("WARNING: the Config Connector paragraph could not take a snapshot of acme/fleet (", self.err)
+        self.assertIn("the broker did not answer", self.err)
+        self.assertNotIn("names no declaration file", self.err)
 
     def test_a_merged_fix_that_still_reproduces_says_config_connector_is_not_applying_it(self):
         doc = self.doc_and_file()

@@ -387,7 +387,8 @@ INFRASTRUCTURE_REASONS = frozenset(
 # The persona's reasons, graded: the hermes turn exited non-zero, or ran past
 # the bridge's own deadline; under the api executor, the API server answered
 # with a 5xx or a failed 200, an unparseable completion, a body that broke
-# off mid-read, or a body over the bridge's read cap -- the turn's own failure, as a non-zero exit is for the subprocess. On
+# off mid-read, or a body over the bridge's read cap -- the turn's own failure, as a non-zero exit is for the subprocess, and
+# under the cli executor a child's stdout over the same cap. On
 # either executor, an answer the bridge withheld because it was the model's own
 # reasoning under a `thought` or `thought:` line (#3206): the turn ran and produced no
 # answer. Listed for the record and the tests; an unknown token lands in the
@@ -398,6 +399,7 @@ REASON_HERMES_API_FAILED = "hermes-api-failed"
 REASON_HERMES_API_UNREADABLE = "hermes-api-unreadable"
 REASON_HERMES_API_READ_FAILED = "hermes-api-read-failed"
 REASON_HERMES_API_OVERSIZE = "hermes-api-oversize"
+REASON_HERMES_CLI_OVERSIZE = "hermes-cli-oversize"
 REASON_HERMES_UNSTRUCTURED_REASONING = "hermes-unstructured-reasoning"
 PERSONA_REASONS = frozenset(
     {
@@ -407,6 +409,7 @@ PERSONA_REASONS = frozenset(
         REASON_HERMES_API_UNREADABLE,
         REASON_HERMES_API_READ_FAILED,
         REASON_HERMES_API_OVERSIZE,
+        REASON_HERMES_CLI_OVERSIZE,
         REASON_HERMES_UNSTRUCTURED_REASONING,
     }
 )
@@ -917,8 +920,8 @@ class Fold:
         """The answer this task produced, as a customer would have read it.
 
         Ordinarily that is everything the conversation received for the task
-        that nothing rewrote, reassembled. The window is decided here rather
-        than while folding: whether a post belongs to this task is only
+        that nothing rewrote, reassembled. The window (:attr:`window_posts`)
+        is decided when read rather than while folding: whether a post belongs to this task is only
         answerable once it is known whether this task's marker appeared at
         all, and a fold reading a bounded transcript may never see one. With a
         marker, the posts between it and the next task's; without, every post,
@@ -934,10 +937,15 @@ class Fold:
         """
         if self.stream_result:
             return self.stream_result
+        return "".join(post["text"] for post in self.window_posts if post["messageId"] not in self.edited)
+
+    @property
+    def window_posts(self) -> list[dict[str, Any]]:
+        """The messages this task posted: its window when its marker appeared,
+        every post otherwise. A post a later edit rewrote (the status
+        placeholder) is still a message the thread shows."""
         windowed = [post for post in self.posts if post["inWindow"]]
-        if not windowed:
-            windowed = self.posts
-        return "".join(post["text"] for post in windowed if post["messageId"] not in self.edited)
+        return windowed or self.posts
 
     @property
     def gateway_declared(self) -> bool:

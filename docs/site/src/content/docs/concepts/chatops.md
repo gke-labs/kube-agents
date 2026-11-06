@@ -49,7 +49,9 @@ Unlike Slack's, this one is not covered by `/sethome`. That command writes the *
 
 When no home channel is set and the install's first chat message, on either platform, comes from Google Chat, it makes its space the Planning Agent's home channel, the same write `/sethome` makes. Scheduled `deliver: chat` reports reach that space from then on. That is often a one-person DM: send the first message from the space the team watches, or run `/sethome` there later. The specialists above still read only the pod environment. Like `/sethome`, the write also goes to the profile's `.env`, which outranks a `homeChannel` set on the CR afterwards. After the first message, a CR value still reaches the specialists, but the Planning Agent's home channel moves only with `/sethome`.
 
-Under `spec.mode: next` only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
+Under `spec.mode: next` only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies,.
+
+The gateway keeps the posts it refused, up to fifty for thirty days, then posts one digest once a home channel is set. With Slack enabled too, they go to the Slack Hermes platform instead, which delivers them only if Slack has its own home channel.
 
 ### What it looks like end to end
 
@@ -95,25 +97,6 @@ Slack shows Working… on the thread from your message until the work, the agent
 
 These need the app to hold `reactions:write`, `users:read` and `assistant:write`, to subscribe `assistant_thread_started` (and `app_home_opened` for agent view), and to have interactivity on; the manifest `hermes slack manifest` prints has all of them unless it was generated with `--no-assistant`. On an app built with only the scopes the gateway needs to read and answer messages, add them and reinstall the app. Otherwise the reactions, the answered line, Working… and the prompts silently do not appear, while the answers still arrive. A button on a message posted before a gateway restart still answers when clicked, but a reply typed under it leaves its buttons in place.
 
-### Answer feedback
-
-Under `next`, the final answer to each ask ends with Slack's 👍 and 👎 buttons. That is the agent's own answer or, when it hands the work to a card, the card's report rather than its acknowledgement, once per ask however many cards it fanned out to. An ask whose cards were still running when the agent restarted gets none. The exception is a card that posts progress after the restart while the thread's latest question was also handed to cards: its report is rated under that question. Plan rows, progress, questions waiting on you and notices have none. A tap from someone the gateway would not answer changes nothing.
-
-Each rating is counted. The gateway keeps your question and the answer with it, and nothing else from the thread, so an operator can turn the exchange into an evaluation case: a 👎 as a case to fix, a 👍 as a good answer to keep. A 👍 shows nothing more. A 👎 opens a box asking what was wrong (optional, one line), kept with it. The box says how long your question and the answer are kept, or only the answer when the question is no longer on record. Cancel keeps the 👎 without a note.
-
-Send thanks you with a line only you see. It also links the project's [feedback form](https://gke-labs.github.io/kube-agents/feedback) if you want to tell the kube-agents maintainers. Nothing is filled in for you, and the form opens a public issue, so leave your install's details out. You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces it, note and all, and the reverse. Under `next`, the Slack Home tab ends with the last seven days' count, such as "This week: 4 👍, 1 👎", refreshed every five minutes. No scope beyond the ones above is needed.
-
-What a rating keeps can include cluster names and whatever else the question and answer held. It is stored in the `feedback` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which name the task and the Slack member who rated it. The bucket drops each record 30 days after it was given. Nothing is sent anywhere else. An install whose NATS server has no such bucket draws no buttons; the gateway checks for one again every minute for half an hour after it starts.
-
-The counts are on the gateway's metrics ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
-
-```bash
-kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
-    /gateway feedback export --since 7d > feedback.tar
-```
-
-To turn it off, set `spec.integration.slack.answerFeedback: false` in the `PlatformAgent` CR, or the chart's `platformAgent.integration.slack.answerFeedback`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={integration={slack={answerFeedback=false}}}}'`. Answers then carry no buttons and nothing is kept. Tapping a button already in Slack still highlights it, but nothing is counted or kept and no box opens. Ratings kept before you turned it off stay until the bucket drops them.
-
 ### Allowed users
 
 Slack ingress is gated by `SLACK_ALLOWED_USERS`, a comma-separated list of Slack member IDs such as `U0123ABCD`, matched exactly: an email or display name matches nobody. [Slack app setup](/kube-agents/install/slack-app/#allowed-users) says how to find a member ID. Under `spec.mode: today` a message from a member not on the list is ignored with no reply; under `next` the A2A gateway answers once with a notice naming the member's ID, so an admin can add it. Leaving the list empty allows every member of the workspace (the operator sets `SLACK_ALLOW_ALL_USERS=true` in that case), which in a shared workspace lets anyone there drive the agent.
@@ -147,6 +130,8 @@ Paste the output into your app's **App Manifest** page in the Slack App Console 
 It is optional at install time. Leave the prompt empty and, if the install's first chat message on either platform comes from Slack, it makes its channel or DM the home channel. Otherwise Slack has none until you run `/sethome` (or `/hermes sethome`) in the channel you want, which is also how you move it. That writes the value into the **Planning Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 Under `spec.mode: next` the home channel is `spec.integration.slack.homeChannel` on the PlatformAgent, or, with the field empty, the channel the gateway learns from the first mention (below). The operator hands it to the A2A gateway, which posts the agent's proactive messages (alerts, scheduled reports, and the fleet audit's report card) into that channel and nowhere else, as new threads or as replies in them. `/sethome` does not reach it: an allowed member moves it from the app's Home tab (below). The field must be a channel ID (`C...`, or `G...` for a private channel), not a name; with it set to something else the agent posts nothing to Slack unprompted.
+
+Until a home channel exists, the gateway keeps the posts it refused, up to fifty for thirty days, and posts one digest into the channel once one is set.
 
 With it unset and `spec.integration.slack.homeChannelPolicy` `auto` (the default), the first top-level mention of the agent in a channel makes that channel the home channel. The gateway checks the channel first: not a direct message, not archived, not shared through Slack Connect, and the app a member. It then records the channel in the `<agent>-home-channel` ConfigMap beside the gateway and posts one line in the mention's thread. The operator projects the recorded channel into a file it mounts in the agent pod and the gateway pod; both read it within about a minute, and no pod restarts. Until the learn the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
 
@@ -361,7 +346,7 @@ Each turn that becomes a task posts a status line, `⏳ submitted…`, which the
 
 The answer posts as a message of its own, and the status line then reads `✅ **completed**`. A task that fails posts `❌ failed: <reason>`; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task: <reason>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer. On Google Chat, the gateway rewrites the markdown Chat's text format has no syntax for. A heading becomes a bold line, a rule is dropped, and a bulleted list's marker becomes the one Chat draws a bullet from. A pipe table becomes a monospace block with its columns lined up.
 
-On Google Chat, the agent's answer posts as one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. A card's progress draws one plan message edited in place, and a card's report, the needs-you question, the pull-request message, the fleet-audit card and the first-run report lay out the same way as on Slack. Google Chat draws no reactions on your message, since the app's credential cannot add one.
+On Google Chat, the agent's answer posts as one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. The final answer to each ask ends with 👍 and 👎 buttons after any others ([Answer feedback](#answer-feedback)). A card's progress draws one plan message edited in place, and a card's report, the needs-you question, the pull-request message, the fleet-audit card and the first-run report lay out the same way as on Slack. Google Chat draws no reactions on your message, since the app's credential cannot add one.
 
 A link button opens its link. A choice button is your reply: clicking it sends the button's answer as your message in the conversation, checked against the allowed-users list like a typed one. A click from someone the gateway would not answer changes nothing. The question then loses its choice buttons and shows `✓ <your name>: <the button>`, by your Chat display name (or "Someone" when Chat gives none), never an @-mention.
 
@@ -436,6 +421,33 @@ On Slack, start the message with the bot's mention, `@bot /session`, because Sla
 
 If a task is already running on the `platform` route when you send `/session`, that task finishes there, and the message after it opens the first session pod; `/session <text>` sent then is not run, and the gateway says so. A message that starts with `delegate`, such as `delegate check the node pools`, sends that one task to a fresh session pod and leaves the conversation on the `platform` route.
 
+### Answer feedback
+
+On Slack and Google Chat, the final answer to each ask ends with 👍 and 👎 buttons. That is the agent's own answer or, when it hands the work to a card, the card's report rather than its acknowledgement, once per ask however many cards it fanned out to. An ask whose cards were still running when the agent restarted gets none. The exception is a card that posts progress after the restart while the thread's latest question was also handed to cards: its report is rated under that question. Plan rows, progress, questions waiting on you, notices and home-channel posts have none. A tap from someone the gateway would not answer changes nothing.
+
+Each rating is counted, and the button you tapped fills in. The gateway keeps your question and the answer with it, and nothing else from the thread, so an operator can turn the exchange into an evaluation case: a 👎 as a case to fix, a 👍 as a good answer to keep. A 👍 shows nothing more. A 👎 opens a box asking what was wrong (optional, one line), kept with it. The box says how long your question and the answer are kept, or only the answer when the question is no longer on record. Cancel keeps the 👎 without a note.
+
+On Slack, Send thanks you with a line only you see. It also links the project's [feedback form](https://gke-labs.github.io/kube-agents/feedback) if you want to tell the kube-agents maintainers. Nothing is filled in for you, and the form opens a public issue, so leave your install's details out.
+
+On Google Chat, the box is a card in the answer's thread that only you see. In a group chat or a space without threads, or when Chat will not take it in the thread, the card posts at the top level of the space, still only to you. In a direct message with the app, it is a card in the direct message itself, which only you read.
+
+On Google Chat, Send or Cancel collapses the card to the same thanks line and the form link. If your note did not arrive with Send, the card collapses to "The note did not reach me; your rating stands as it was." If your 👎 was already replaced by a 👍, the card says the rating changed and keeps no note; if the write fails, the card stays for another Send.
+
+In a Google Chat space, the filled button shows the latest tap by anyone, while each person's rating is kept separately.
+
+You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces it, note and all, and the reverse. The last seven days' count, such as "This week: 4 👍, 1 👎", is on the Slack Home tab only, refreshed every five minutes; Google Chat has no Home tab. On Slack, no scope beyond the ones [Slack](#slack) lists is needed.
+
+What a rating keeps can include cluster names and whatever else the question and answer held. It is stored in the `feedback` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which hold the task and a string derived from the rater's Slack member ID or Google Chat address. The bucket drops each record 30 days after it was given. Nothing is sent anywhere else. An install whose NATS server has no such bucket draws no buttons; the gateway checks for one again every minute for half an hour after it starts.
+
+The counts are on the gateway's metrics ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
+
+```bash
+kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
+    /gateway feedback export --since 7d > feedback.tar
+```
+
+To turn it off, set `spec.integration.slack.answerFeedback: false` or `spec.integration.googleChat.answerFeedback: false` in the `PlatformAgent` CR, for the platform the install uses, or the chart's `platformAgent.integration.<slack|googleChat>.answerFeedback`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={integration={googleChat={answerFeedback=false}}}}'`. Answers then carry no buttons and nothing is kept. Tapping a button already posted counts nothing, keeps nothing and opens no box; Slack still highlights the tapped button. Ratings kept before you turned it off stay until the bucket drops them.
+
 ### `/feedback`
 
 `/feedback` is the gateway's other command: how to report a problem with kube-agents itself (the harness, the agent, the operator, the docs) rather than with your cluster. Sent on its own, the gateway answers in place, starts no task, and whatever the conversation is doing carries on:
@@ -462,6 +474,7 @@ On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/s
 - the image tag, the mode, the Kubernetes version, and the install's age and readiness;
 - the model as `provider/name` from the resource's `status.inference` (`unavailable` while the operator has not written it);
 - the `status.usage` counters;
+- the credential broker's top five `tool/subcommand` pairs since its pod started, from `status.usage.topTools` (`unavailable` while the status holds no list);
 - a roll-up of the chat turns the gateway's own records still hold (ended, cancelled, active);
 - a short feedback template.
 
@@ -469,7 +482,7 @@ The line is labelled `chat turns`, not `tasks`, because the script's `tasks` lin
 
 It names no cluster, project, namespace, task or person. The gateway audits the block outside its `model:` line, which carries only the provider and model name from the status. It refuses to post a block whose audited lines contain the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings), and says so instead. The block's own words, such as a bucket or interface name, are not refused.
 
-The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
+The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the cluster scale counts, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
 
 ### The Slack Home tab
 
@@ -633,6 +646,8 @@ The daily recap has the line "N alerts from M workloads withheld by the daily ce
 
 Drift refusals never appear in the recap. The `GitOpsDrift` row of `/v1/alert-quota` and the session server log show them. The drift detector does not offer a refused record again, so that alert is lost from chat.
 
+The recap line "N events from M workloads were silenced by alert-exclude rules" counts the events that the [alert-exclude rules](/kube-agents/operator/platformagent-crd/#specharnesseventwatcher) held back, and names the five workloads that sent the most. These events never reached the ceiling, and `GET /v1/intercepted-events` lists them with the status `excluded`.
+
 The recap line "N alerts failed to post to chat" is a different problem. It means that chat refused the post, or did not confirm it. Some of these alerts can be in the channel. A higher ceiling does not change this count. Look in the session server log for the cause.
 
 #### Sizing a bucket
@@ -646,25 +661,27 @@ The counter is fleet-wide, so the demand on it increases with the number of clus
 
 ### One incident per workload
 
-By default, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. Set `INCIDENT_WORKLOAD_DEDUP_SECONDS` to fold them into one. Within that many seconds of an alert, a later Warning event for the same workload, or a later Critical one after a Critical alert, posts nothing, starts no triage turn and spends no budget.
+Without folding, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. `INCIDENT_WORKLOAD_DEDUP_SECONDS` folds them into one, and is on by default at `3600`, an hour. Within that many seconds of an alert, a later Warning event for the same workload, or a later Critical one after a Critical alert, posts nothing, starts no triage turn and spends no budget.
 
 The same workload means the same cluster, namespace and kind, and either the same Deployment (a pod named with its ReplicaSet hash, such as `checkout-6cfdb6b98b-zwv24`) or the same name for an object that is not a Pod. About 1 in 400 Deployments has a hash shorter than 8 characters, and its pods do not fold. Other pods do not fold: the pods of a StatefulSet, a DaemonSet, a Job or a CronJob each still alert, so a Job's failure is never folded into a same-named Deployment's alert.
 
-A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again, unless its fix is waiting for review (below). The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0`, the default, turns folding off, a larger value than `86400` counts as `86400`, and a value that is negative or not a number counts as `0`.
+A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again, unless its fix is waiting for review (below). The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0` turns folding off, a larger value than `86400` counts as `86400`, a negative value counts as `0`, and a value that is not a number counts as the default.
 
-Set it as an entry in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages:
+Change it with the chart value `platformAgent.deployment.incidentWorkloadDedupSeconds`, which renders the entry into the CR's `spec.deployment.env`, or set that entry yourself on an install that no chart manages. On an install made with `install.sh`, put the value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={deployment={incidentWorkloadDedupSeconds=0}}}'`. `0` turns folding off:
 
 ```yaml
 platformAgent:
   deployment:
-    env:
-      - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
-        value: "900"
+    incidentWorkloadDedupSeconds: 0
 ```
 
-With the setting on, a workload that breaks again after the window, while the pull request the agent opened automatically to fix one of its recent incidents (`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`) is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand, or one opened for anything else asked in the incident's thread, does not count.
+An entry named `INCIDENT_WORKLOAD_DEDUP_SECONDS` in `platformAgent.deployment.env` wins over the key. A change to the window restarts the agent pod and the credential-proxy pod, and the first apply that renders the entry replaces entries added to the CR's `spec.deployment.env` by hand, as the ceilings paragraph above describes.
+
+With folding on, a workload that breaks again after the window, while the pull request the agent opened automatically to fix one of its recent incidents (`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`) is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand, or one opened for anything else asked in the incident's thread, does not count.
 
 A fix opened by replying `apply` or clicking an option button in the incident's own thread holds a recurrence the same way. The hold counts the first card for the Platform Agent filed from that thread within 30 minutes of the reply. A later card in the thread does not count, and neither does an `apply` typed in the main space or the first reply in a Google Chat direct message, which is answered at top level. Under `spec.mode: next`, an `apply` on the platform the A2A gateway holds is not recorded and does not hold.
+
+With folding on by default, an install that opens fix pull requests runs this lookup for every new incident. The search is bounded, and a forge that does not answer in time announces the event as a new incident.
 
 The hold covers the same fault only: the event's reason must be one the incident showed, its own or one folded into it, so a workload waiting on a fix for `BackOff` that starts failing `Unhealthy` gets a new incident. For the same fault, the incident's chat thread gets one short reminder per window instead, naming the pull request: the fault is already diagnosed and its fix is waiting on a person. Once that pull request is merged or closed, the next new failure is a new incident again. The feed `GET /v1/intercepted-events` lists such an event as `folded`, with the pull request in its `pull_request` field.
 
@@ -676,7 +693,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it the same way as `INCIDENT_WORKLOAD_DEDUP_SECONDS`, as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
 
 ```yaml
 platformAgent:
@@ -691,6 +708,20 @@ A human still reviews and merges the pull request, and nothing is written to the
 StatefulSet, DaemonSet, Job and CronJob pods, and bare pods, each get a branch of their own, because the pod name alone cannot prove they belong to one workload. With the fold on, a Deployment's repeat events inside the window start no triage, so they file no pull-request card either. The second card's result, the pull request URL, is posted in the same thread as the report.
 
 The setting has limits. Drift and controller-stall reports are not covered; they still wait for a reply. On Slack with `KAGE_SLACK_UX` on, the report's button for the recommended or single fix is left off when the report says that fix's pull request `is being opened automatically`; buttons for the other options stay. A typed `apply Option B` still works and opens its own pull request. Changing the value rolls the agent pod. The agent ignores the variable in its own `.env` file, so only the install can turn it on. It is an environment variable for now and can move to a `PlatformAgent` field once it has proven itself.
+
+### Limiting the open triage pull requests
+
+A failure that breaks many workloads at once, such as a node or storage fault, starts many triages, and with `INCIDENT_TRIAGE_OPEN_PULL_REQUEST` on each one opens a pull request. Set `platformAgent.deployment.incidentMaxOpenPullRequests` to limit how many are open or being opened at once. The chart renders it as `INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS`. `0`, the default, is no limit.
+
+```yaml
+platformAgent:
+  deployment:
+    incidentMaxOpenPullRequests: 5
+```
+
+A triage whose pull request would pass the limit still runs, but its report asks for a reply, as without the setting, and a note in the alert's thread says that the limit held its pull request back. An incident whose branch already has a pull request is not held: its card revises that pull request. If the open pull requests cannot be counted, because the forge fails or does not answer in time, the triage is held the same way, with a note that says so. As with the switch, the agent ignores the variable in its own `.env` file.
+
+The limit counts triage pull requests only: the open pull requests whose branch starts with `platform-agent/incident-`, plus each triage routed to open one whose pull request does not exist yet. The count goes by that branch prefix alone, so a pull request opened by a reply counts only when its branch takes the prefix. A routed triage stops counting when its pull request opens (it then counts as open), when its pull-request card is `done` or `archived`, or after 24 hours. A card that is `blocked`, or waits behind a blocked triage card, keeps counting until then, because it can still open its pull request.
 
 ## First-run onboarding
 

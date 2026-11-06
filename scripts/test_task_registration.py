@@ -98,6 +98,7 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         homes = {
             "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
             "nightly-cases.txt": set(eval_rosters.nightly_cases()),
+            "certification-cases.txt": set(eval_rosters.certification_cases()),
             "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
             "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
         }
@@ -436,6 +437,31 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_finding_scope_without_its_check_is_rejected(self):
+        """The verifier's model refuses the pair after the cluster lease; this
+        rule refuses it here."""
+        for node, phrase in (
+            ({"scope": "finding", "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [" "], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": 123, "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [123], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"finding_check": "no-pdb", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"finding_check": "", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"scope": "finding_ids", "finding_check": [], "any_of_phrases": ["x"]}, "read only under scope 'finding'"),
+        ):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn(phrase, problems[0])
+        for node in (
+            {"scope": "finding", "finding_check": "no-pdb", "required_phrases": ["x"]},
+            {"scope": "finding", "finding_check": ["a", "b"], "required_phrases": ["x"]},
+            {"scope": "finding_ids", "any_of_phrases": ["x"]},
+        ):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)
+            self.assertEqual(problems, [])
+
     def test_a_quoted_boolean_against_a_boolean_field_is_rejected(self):
         """The verifier compares `value` raw and the API holds a bool, so a
         quoted boolean never compares equal and the check asserts nothing; the
@@ -604,13 +630,15 @@ class TestTheRulesReject(unittest.TestCase):
         ],
     }
 
-    def _validate(self, *, registered=frozenset({"made-up-case"}), text=None, **overrides):
+    def _validate(self, *, registered=frozenset({"made-up-case"}), certification=None, text=None, **overrides):
         spec = {k: v for k, v in {**self.VALID, **overrides}.items() if v is not DELETE}
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
             path.write_text(text if text is not None else yaml.safe_dump(spec))
-            return validator.validate_case("made-up-case", path, registered=set(registered))
+            return validator.validate_case(
+                "made-up-case", path, registered=set(registered), certification=None if certification is None else set(certification)
+            )
 
     def _only(self, needle, **kwargs):
         """The one problem this mutation causes, and nothing else."""
@@ -625,6 +653,27 @@ class TestTheRulesReject(unittest.TestCase):
 
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
+
+    # -- the certification suite: the roster and the suite line agree --
+
+    def test_a_certification_case_with_its_line_in_the_roster_passes(self):
+        self.assertEqual(self._validate(suite="certification", certification={"made-up-case"}), [])
+
+    def test_a_rostered_certification_case_without_the_line_is_reported(self):
+        self._only("is in hack/eval/certification-cases.txt but declares no 'suite: certification'", certification={"made-up-case"})
+
+    def test_a_suite_line_outside_the_roster_is_reported_once(self):
+        # Registered nowhere at all: the suite finding names the right file,
+        # and the general registration finding (which would say
+        # nightly-cases.txt) stays quiet.
+        self._only("is not in hack/eval/certification-cases.txt", suite="certification", certification=set(), registered=set())
+
+    def test_a_parked_certification_case_may_carry_its_suite_line(self):
+        with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
+            self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
+
+    def test_an_unknown_suite_is_reported(self):
+        self._only("the only suite is 'certification'", suite="nightly")
 
     # -- the first-install-hello stack's phrase --
 

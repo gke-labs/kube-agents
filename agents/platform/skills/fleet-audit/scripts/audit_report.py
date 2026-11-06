@@ -1965,6 +1965,9 @@ PROBE_OPEN_ATTEMPTS = 2
 # clone of the revision of a repository that is large by definition, so past
 # this a check is skipped as unchecked rather than cloning without bound.
 PROBE_NARROW_SNAPSHOT_CAP = 16
+# The broker's setting for its snapshot ceiling, which a too-large warning
+# names as the one an operator can raise.
+BROKER_SNAPSHOT_CEILING_ENV = "CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
 # Where a read unpacks its snapshot: a directory under the vcs client's copies
 # root, named with this prefix, so a run killed mid-read leaves a directory
 # `remove_stale_snapshots` can find. The snapshot itself goes one level down.
@@ -2018,9 +2021,14 @@ GENERATED_FIX_NOTE = (
 )
 # A decline naming the pull request that carries the fix: the one a
 # PodDisruptionBudget `finish` would write still takes.
-# A proposal's URL on either forge: GitHub's `/pull/<n>`, GitLab's
-# `/-/merge_requests/<n>`.
-PULL_REQUEST_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|(?:-/)?merge_requests)/\d+")
+# A proposal's URL on every forge the broker serves: GitHub's `/pull/<n>`,
+# GitLab's `/-/merge_requests/<n>` (the `-/` is optional), Gitea's `/pulls/<n>`,
+# and Bitbucket Cloud's and Data Center's `/pull-requests/<n>`. The tail after
+# the number carries no further marker, `/-/` or `/issues/`, so an issue under a
+# GitLab subgroup named like a marker is not a pull request.
+PULL_REQUEST_URL_PATTERN = re.compile(
+    r"https?://\S+/(?:pull|pulls|pull-requests|(?:-/)?merge_requests)/\d+(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?(?![/?#\w])"
+)
 # What a finding's ledger row says when the worker declined the fix the sweep
 # would have opened (`finish --decline-fix`); the worker's reason follows.
 DECLINED_FIX_NOTE = "_(The audit declined the automatic fix: {reason})_"
@@ -17461,7 +17469,7 @@ class _RepositoryProbe:
             )
         too_large = (
             f"{key} in {self.repo} is too large for one snapshot; an operator can raise "
-            "the broker's CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES"
+            f"the broker's {BROKER_SNAPSHOT_CEILING_ENV}"
         )
         if key in self._narrow_refused:
             # Refused earlier this run: the broker's answer does not change.
@@ -23372,7 +23380,14 @@ def kcc_paragraph_index(
     if probe is None or not content_mode():
         return kcc_declaration_index(roots)
     scanned = _kcc_paragraph_scan(repo, probe)
-    if scanned is None:
+    if scanned is None and probe.narrow:
+        # The whole tree is over the ceiling, so no snapshot is held, and the
+        # paragraph reads every declaration, which no narrow snapshot holds.
+        log(
+            f"WARNING: the Config Connector paragraph names no declaration file: {repo} is too "
+            f"large for one snapshot; an operator can raise the broker's {BROKER_SNAPSHOT_CEILING_ENV}"
+        )
+    elif scanned is None:
         log(
             f"WARNING: the Config Connector paragraph could not take a snapshot of {repo} "
             f"({probe.unavailable}); a paragraph can name no declaration file that the repository has."

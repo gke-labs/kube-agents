@@ -699,6 +699,11 @@ fi
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
 echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
 
+# ─── Step 1.6: The eval nightlies' Gemini Developer API key ───────────────────
+echo -e "\n==> [Step 1.6] Minting the project's Gemini Developer API key..."
+# Per project so each leased project gets its own quota window; the same script repairs an already-registered project, which must not be re-provisioned.
+"${SCRIPT_DIR}/provision_ci_pool_gemini_key.sh" "${PROJECT_ID}"
+
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform
 # bucket-level access are not optional: this bucket holds the only record of
