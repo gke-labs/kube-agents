@@ -1031,7 +1031,7 @@
 # in #3448); 22 were real misses: the agent read seeded-c's leftover
 # masterAuthorizedNetworksConfig {gcpPublicCidrsAccessEnabled: true} (no
 # `enabled`) as configured or open and said seeded-c matches its peers, or
-# named the wrong facet, or (once) a tool error. The Claude nightlies pass
+# named the wrong facet, or (once) a tool error. The nightlies on the 2026-10-19 agent model pass
 # it. The fix landed in #3609 (2026-10-23); #3448 closed unmerged. Measured
 # 19/19 on #3975's two lanes, then 10/10 on the inject lane with the route
 # reverted (#4116), so a presubmit seat could not fail when the fix is undone:

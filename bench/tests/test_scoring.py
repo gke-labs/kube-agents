@@ -608,7 +608,7 @@ def no_tool_spec() -> CaseSpec:
 
 
 def test_the_no_tool_cases_declare_it():
-    """The cases the Claude nightly red on rung 3 answer without a tool call
+    """The cases the 2026-10-19-model nightly red on rung 3 answer without a tool call
     (#2691; the refusal on ci-kube-agents-eval-nightly-claude
     2108437444511666176 rep 3); each must carry the key."""
     for case in (
@@ -623,7 +623,7 @@ def test_the_no_tool_cases_declare_it():
 def test_rung_3_accepts_a_reply_with_no_tool_calls_when_the_case_declares_it(
     no_tool_spec, make_run
 ):
-    """The 2026-10-08 Claude nightly record: status success, tokens billed,
+    """The 2026-10-08 nightly record: status success, tokens billed,
     latency recorded, the greeting as the reply, and an empty trajectory
     because a greeting needs no tool. That is a run (#2691)."""
 

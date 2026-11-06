@@ -4162,8 +4162,8 @@ unit_cost_hint() {
     # 2026-09-15 unmeasured; same SOP-faithful audit shape, same band.
     obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
     upgrade-readiness-lagging-cluster) echo 900 ;;
-    # On the blocking roster since 2026-10-26. Measured on the claude-opus-5-5
-    # main nightlies 2026-10-20 to 10-26: median 198s, 165-397s over 14
+    # On the blocking roster since 2026-10-26. Measured on the main nightlies
+    # 2026-10-20 to 10-26: median 198s, 165-397s over 14
     # repetitions. Priced at 600s, the floor scripts/test_ci_eval_nightly.py's
     # audit-band test allows, rather than 900: the hint still launches it
     # early, and the presubmit wall estimate in
