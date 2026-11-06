@@ -25,6 +25,13 @@ const (
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
 	metricsPortFlag         = "metrics-port"
+	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
+
+	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
+	// k8s-operator/internal/controller/kube_proxy_manifests.go): at the 500-object pages
+	// kubectl reads, a forwarded list held about 9.5 MiB in flight and the proxy was
+	// OOMKilled at 43 to 48 in flight.
+	defaultMaxInFlight = 24
 
 	// otelShutdownTimeout bounds the flush of buffered spans on exit.
 	otelShutdownTimeout = 5 * time.Second
@@ -122,6 +129,7 @@ func main() {
 		kubeTokenFile            = flag.String("kube-token-file", envOrDefault("CREDENTIAL_PROXY_KUBE_TOKEN_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/token"), "Host cluster ServiceAccount token file")
 		audience                 = flag.String("audience", envOrDefault("CREDENTIAL_PROXY_AUDIENCE", "kubeagents-credential-proxy"), "Required TokenReview JWT audience")
 		allowedCallers           = flag.String("allowed-callers", envOrDefault("CREDENTIAL_PROXY_ALLOWED_CALLERS", ""), "Comma-separated allowlist of caller ServiceAccount usernames")
+		maxInFlight              = flag.Int("max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
 	)
 	flag.Parse()
 
@@ -203,6 +211,7 @@ func main() {
 		Logger:         logger,
 		Metrics:        metrics,
 		TracerProvider: tp,
+		MaxInFlight:    *maxInFlight,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize k8s-api-proxy handler: %v", err)
