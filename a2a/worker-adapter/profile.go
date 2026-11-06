@@ -292,9 +292,9 @@ type held struct {
 	renewDone chan struct{}
 	// abandon reaches the running task's supervise loop.
 	abandon chan string
-	// creds are the confirm's task credentials, when the dispatcher holds a
-	// task-signing key (addendum 8).
-	creds confirmCredentials
+	// taskCredential and proxyToken are the confirm's task credentials, when
+	// the dispatcher holds a task-signing key (addendum 8).
+	taskCredential, proxyToken string
 	// done carries the task's outcome once execute returns.
 	done chan turnOutcome
 }
@@ -420,7 +420,7 @@ func (w *profileWorker) loop(ctx context.Context) error {
 					continue
 				}
 				cur.running, acceptTimer = true, nil
-				_ = json.Unmarshal(msg.Data, &cur.creds)
+				cur.taskCredential, cur.proxyToken = m.TaskCredential, m.ProxyToken
 				taskDone = w.start(ctx, cur)
 
 			case lib.DispatchAbandon:
@@ -530,14 +530,6 @@ func (w *profileWorker) publish(subject string, v any) error {
 	return w.b.nc.Publish(subject, data)
 }
 
-// confirmCredentials are the two credentials a confirm carries (contract
-// addendum 8). They're decoded by name here until lib.DispatchMessage has
-// the fields, which the dispatcher's mint adds.
-type confirmCredentials struct {
-	TaskCredential string `json:"taskCredential,omitempty"`
-	ProxyToken     string `json:"proxyToken,omitempty"`
-}
-
 // start runs the confirmed task through execute and returns where its
 // outcome arrives. With a task credential, the task's events and input go
 // on a task connection that reaches only that task; without one (a
@@ -549,9 +541,9 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 	cfg.HarnessEnv = append([]string(nil), w.cfg.HarnessEnv...)
 	h.done = make(chan turnOutcome, 1)
 	bus, closeTaskBus := w.b, func() {}
-	if h.creds.TaskCredential != "" {
+	if h.taskCredential != "" {
 		cfg.TaskStem = lib.TaskConsumerStem(cfg.PodName, cfg.TaskID)
-		tb, closeTB, err := dialTaskBus(ctx, cfg, h.creds.TaskCredential)
+		tb, closeTB, err := dialTaskBus(ctx, cfg, h.taskCredential)
 		if err != nil {
 			// Fail closed: nothing runs on the pod connection's wider
 			// grants, renewals stop when the loop releases the task, and
@@ -581,7 +573,7 @@ func (w *profileWorker) start(ctx context.Context, h *held) <-chan turnOutcome {
 			cfg.HarnessEnv = append(cfg.HarnessEnv, "CLAUDE_CONFIG_DIR="+dir)
 		}
 	}
-	removeToken := w.writeTaskToken(h.creds.ProxyToken)
+	removeToken := w.writeTaskToken(h.proxyToken)
 	// The worker stops short of the dispatcher's deadline, so its own
 	// terminal and final renewal land first.
 	cfg.TaskDeadline = time.Until(h.offer.Deadline) - w.pw.deadlineMargin

@@ -609,6 +609,9 @@ const (
 	// slack.answerFeedback=false, carried to the gateway (a2a/gateway's
 	// envSlackAnswerFeedback): no rating buttons, nothing kept.
 	a2aSlackAnswerFeedbackEnvVar = "A2A_SLACK_ANSWER_FEEDBACK"
+	// googleChat.answerFeedback=false, carried to the gateway (a2a/gateway's
+	// envGchatAnswerFeedback): no rating buttons, nothing kept.
+	a2aGchatAnswerFeedbackEnvVar = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
 	// telemetry.peopleSeen=false, carried to the gateway (a2a/gateway's
 	// envPeopleSeen): no per-person key, the people bucket purged at start.
 	a2aPeopleSeenEnvVar = "A2A_PEOPLE_SEEN"
@@ -3987,7 +3990,7 @@ const defaultA2AMaxSessions = 10
 //   - a2aStandingPods: what this operator keeps running for the agent;
 //   - the chart's pods (its standing workloads in kube-agents.chartWorkloads:
 //     the operator, LiteLLM and its replay proxy, Hindsight, the GitHub minter
-//     and the web console, plus one surge pod for each that rolls surge-first,
+//     and the web console, plus the surge pods each one's rollout can add,
 //     since a chart bump rolls several in one upgrade), which only the chart
 //     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation.
 //     The CR is in the namespace those pods run in, and the chart renders it
@@ -5301,6 +5304,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// channel.
 		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
+		}
+		// Answer feedback is on unless the install turns it off; only the
+		// off is rendered, as on Slack, so the pod is unchanged by default.
+		if gchat.AnswerFeedback != nil && !*gchat.AnswerFeedback {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
 		chatMounts = []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
 		chatVolumes = []corev1.Volume{{
