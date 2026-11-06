@@ -257,6 +257,9 @@ func TestCancelActiveKanbanWait_MarksSessionCanceledBeforeWaitEnds(t *testing.T)
 	}
 	act := newSessionActivityState(sessionID, false)
 	act.cardsFiled.Store(true)
+	// No publisher goroutine runs for a hand-built run: mark it joined, so
+	// finalize's waitActivity does not sit out activityPublishTimeout.
+	close(act.done)
 	run.act.Store(act)
 
 	waitDone := make(chan struct{})
