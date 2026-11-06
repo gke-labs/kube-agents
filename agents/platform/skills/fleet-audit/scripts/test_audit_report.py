@@ -24024,6 +24024,36 @@ metadata:
         self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
         self.assertIn("the fix says so", err.getvalue())
 
+    def test_a_shortened_kustomize_block_keeps_the_location_note(self):
+        """The copied file fills the cap beside a declared-file note and the
+        reconciler note. The shorter block makes room for the paragraph's
+        core and for both route notes: the location note is not pushed out."""
+        reason = ("did not open a pull request for this fix. `clusters/a/provisioning/pool.yaml` is a new file in the "
+                  "Kustomize root `clusters/a`, and `clusters/a/kustomization.yaml` does not list it. "
+                  f"{audit_report.KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line `- provisioning/pool.yaml` "
+                  "under `resources:` in `clusters/a/kustomization.yaml`")
+        prefix = f"_(The audit {reason}.)_"
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/a/provisioning/pool.yaml")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        routes = "\n\n" + declared + "\n\n" + reconciled
+        lines = ["apiVersion: container.cnrm.cloud.google.com/v1beta1", "kind: ContainerNodePool", "metadata:",
+                 "  name: pinned-inference-pool", "spec:", "  location: us-central1"] + [
+            f"  # a long explanatory comment line in the worker file, number {i:02d}, kept as is" for i in range(40)]
+        block = audit_report._sized_manifest_block(
+            lines, True, lambda b: len(audit_report.publishable_text(prefix + b + routes)) <= audit_report.MAX_NOTE_CHARS
+        )
+        finding = self.harness_finding(prefix + block + " Raise the cap." + routes)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={})
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith(prefix), note[:200])
+        self.assertIn(declared, note)
+        self.assertIn(reconciled, note)
+        self.assertEqual(note.count("```") % 2, 0)
+        self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_OBJECT_MARK), note[-300:])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
+        self.assertIn("the fix says so", err.getvalue())
+
     def test_the_paragraph_never_cuts_the_degraded_fix_text(self):
         worker = ("Raise the pool's max node count and add a second zone. " * 24).strip()
         degraded = (f"{audit_report.DEGRADED_REMEDIATION_LEDE}did not find the file `clusters/a/provisioning/x.yaml` that "
