@@ -102,11 +102,16 @@ and, under `spec.mode: next` with an `AgentProfile` bound, `kubeagents-credentia
 for each profile tier's ServiceAccount, as [spec-subagent-profiles.md](designs/spec-subagent-profiles.md) describes)
 as a bearer header, and the broker verifies
 it with a `TokenReview` before serving any path on that listener but `/healthz`;
-`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. Two other TCP
-listeners are in the pod. Envoy's health listener on 8768 serves the Pod's readiness probe,
-routes `/healthz` alone to the runtime through a cluster with its own small circuit breaker,
-and is opened to no peer by the Service or the NetworkPolicy. The runtime's metrics-only one
-on 8766 is unauthenticated like `/healthz`: it serves Prometheus counters whose label values are static enums and closed
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. Up to two other
+TCP listeners in the pod are the runtime's own, both unauthenticated like `/healthz`, and Envoy
+opens a third: its health listener on 8768 serves the Pod's readiness probe, routes `/healthz`
+alone to the runtime through a cluster with its own small circuit breaker, and is opened to no
+peer by the Service or the NetworkPolicy. The runtime's
+health-only one, closed unless `CREDENTIAL_PROXY_HEALTH_PORT` names a port, answers `GET /healthz`
+and nothing else with a fixed `{"status":"ok"}` body, holds no route, credential or policy,
+shares the metrics listener's connection cap and deadline, and is opened by the broker's
+NetworkPolicy to no pod, so only a kubelet probe reaches it. The metrics-only one on 8766
+serves Prometheus counters whose label values are static enums and closed
 vocabularies, holds no route, credential or policy, answers at most sixteen connections at a
 time with a ten-second deadline on each, and is the one port the broker's
 NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus

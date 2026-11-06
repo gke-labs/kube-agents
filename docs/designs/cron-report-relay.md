@@ -645,13 +645,18 @@ profile's — then per-platform environment signals for an install neither file
 describes.
 
 An install with no chat route gets no send at all: when the managed scope turns
-every platform off and nothing routes one through the gateway — a `next` install
-whose only chat platform is held by the gateway with no home channel, or an
-install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
-platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
-channel (`composed but not delivered to slack (no home channel: set
-spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
-exists when no platform can be named.
+every platform off and nothing routes one through the gateway — an install with
+neither Google Chat nor Slack, or one whose home channel is malformed, which routes
+nothing — the relay answers 502 without posting, and the detail says that no route
+exists. A `next` install whose only chat platform is held by the gateway with no home
+channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it, the relay
+sends, and the gateway refuses the post and keeps it for the digest it posts once a
+home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
+the relay's `composed but not delivered to <platform>`; the gateway's refusal, which
+says the post is kept, is in the gateway's and the session server's logs. A pod
+rendered before the operator routed it still answers the platform-naming detail
+(`composed but not delivered to slack (no home channel: set
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`).
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the

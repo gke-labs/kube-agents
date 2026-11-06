@@ -2524,6 +2524,9 @@ def _notify(message: str) -> None:
             if chat_notify.outcome_unknown(e.returncode):
                 log(f"Reconcile notification to {platform} got no answer in time; it may have posted")
                 continue
+            if chat_notify.kept(e.returncode):
+                log(f"Reconcile notification to {platform} kept by the gateway for the home-channel digest")
+                continue
             log(f"Failed to post reconcile notification to {platform}: {e}")
         except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
             log(f"Failed to post reconcile notification to {platform}: {e}")

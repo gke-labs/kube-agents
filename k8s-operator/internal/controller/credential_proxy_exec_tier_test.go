@@ -434,8 +434,32 @@ func TestTheExecTierDropsEverySecretBackedVolume(t *testing.T) {
 	if kept["future-secret"] || kept["future-projected"] {
 		t.Errorf("exec pod kept a Secret-backed volume: %v", kept)
 	}
-	if !kept["credential-proxy-ksa-token"] || !kept["credential-proxy-policy"] {
+	if !kept["credential-proxy-policy"] {
 		t.Error("exec pod lost a volume that holds no Secret")
+	}
+	// The minter's token is projected, not a Secret, and the exec role has no
+	// use for it; the broker keeps it.
+	if kept["credential-proxy-ksa-token"] {
+		t.Error("exec pod keeps the github-token-minter token volume")
+	}
+	for _, ctr := range dep.Spec.Template.Spec.Containers {
+		for _, m := range ctr.VolumeMounts {
+			if m.MountPath == "/var/run/secrets/kubeagents/serviceaccount" {
+				t.Errorf("container %s mounts the minter token at %s", ctr.Name, m.MountPath)
+			}
+		}
+		for _, e := range ctr.Env {
+			if e.Name == "KSA_TOKEN_FILE" {
+				t.Errorf("container %s carries KSA_TOKEN_FILE", ctr.Name)
+			}
+		}
+	}
+	brokerKeeps := false
+	for _, v := range broker.Spec.Template.Spec.Volumes {
+		brokerKeeps = brokerKeeps || v.Name == "credential-proxy-ksa-token"
+	}
+	if !brokerKeeps {
+		t.Error("deriving the exec tier took the minter token from the broker")
 	}
 }
 

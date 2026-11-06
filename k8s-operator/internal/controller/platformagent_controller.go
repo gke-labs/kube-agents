@@ -262,10 +262,20 @@ const (
 	noChatPlatformWithRepo = "stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests)"
 	noChatPlatformNoRepo   = "stay in the report store on the data volume alone, since no GitOps repository is registered"
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
-	// install.env key and what the field holds.
+	// install.env key, what the field holds, and where the posts go
+	// meanwhile (one of the two sentences below).
 	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s (spec.mode next) and %[2]s is empty, so the agent's " +
-		"proactive posts -- alerts, drift reports, scheduled reports -- have nowhere to go and are dropped; " +
+		"proactive posts -- alerts, drift reports, scheduled reports -- %[5]s; " +
 		"replies in a conversation still arrive. Set %[2]s (%[3]s in install.env) to %[4]s to deliver them."
+	// homeChannelUnsetKept is the meanwhile when the gateway's backend is the
+	// install's only chat platform: the agent still sends, the gateway
+	// refuses and keeps (a2a/gateway/notify_refused.go).
+	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
+	// homeChannelUnsetToSlack is the meanwhile on a Chat-and-Slack install:
+	// the agent is not routed to Chat (a2aGchatHomeRouted), so the posts go
+	// to the Slack Hermes platform, which delivers them only where Slack's
+	// own home channel is set; the operator cannot see one set from chat.
+	homeChannelUnsetToSlack = "go to the Slack Hermes platform meanwhile, which delivers them only if Slack has a home channel"
 
 	// The condition reporting that the render left a hostPath volume out of
 	// the agent Pod. Written only while the spec carries one, on the
@@ -514,6 +524,12 @@ type PlatformAgentReconciler struct {
 	// when the CR is deleted. Its own gate, as the two above: the overrides
 	// change independently.
 	shellSandboxWarningsLogged sync.Map
+
+	// a2aChartPodsWarned records, per CR, the spec generation and discarded
+	// chart-pods annotation value last reported (a2aChartPodsDiscard), so each
+	// generation and value warns once. Keyed by ObjectKey, value
+	// a2aChartPodsWarning; cleared when the CR is deleted.
+	a2aChartPodsWarned sync.Map
 
 	// replicasLimitedLogged records, per CR, the spec generation whose replica
 	// cap reconcileWorkload last logged, so each generation logs it once
@@ -1447,6 +1463,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.shellSandboxWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
 		r.replicasLimitedLogged.Delete(client.ObjectKeyFromObject(agent))
 		r.forgetDataVolumeExpansion(agent)
 		r.forgetA2AGatewayLease(agent)
@@ -4928,14 +4945,18 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	switch {
 	case a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "":
+		meanwhile := homeChannelUnsetKept
+		if slackEnabled(agent) {
+			meanwhile = homeChannelUnsetToSlack
+		}
 		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
-			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)")
+			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", meanwhile)
 	case a2aSlackArmed(agent) && strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "":
 		if rec.channel != "" {
 			return ""
 		}
 		msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
-			"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)")
+			"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)", homeChannelUnsetKept)
 		switch {
 		case slackHomeChannelPolicy(agent) == slackHomeChannelPolicyManual:
 			return msg + homeChannelUnsetManualSuffix

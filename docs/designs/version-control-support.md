@@ -2606,6 +2606,7 @@ side of each.
 | `url`               | `web_url`                         |                                                                                        |
 | `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                                          |
 | `closed` (proposal) | `merged_at`, else `closed_at`     | GitLab leaves `closed_at` empty on a merge; `""` while open                            |
+| `mergeCommit`       | `merge_commit_sha`                | else `squash_commit_sha`; `null` unless merged, and for a fast-forward merge           |
 | `body`              | `description`                     | GitLab's name for it                                                                   |
 | `labels`            | `labels`                          | plain strings, not GitHub's `{name: …}` dicts                                          |
 

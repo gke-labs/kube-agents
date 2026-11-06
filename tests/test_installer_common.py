@@ -5888,8 +5888,8 @@ class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
 class NextHomeChannelUnsetWarningTest(unittest.TestCase):
     """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
     gateway makes the proactive posts and arms them only on a home channel,
-    so a chat backend the gateway holds with none drops every alert while
-    conversations keep working. The front doors warn, never refuse, and the
+    so a chat backend the gateway holds with none refuses and keeps every
+    alert for a digest while conversations keep working. The front doors warn, never refuse, and the
     closing summary says it again. The backend follows the operator's
     a2aChatArmed / a2aSlackArmed: Chat holds the gateway when enabled."""
 
@@ -5910,7 +5910,7 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         proc = self._run()
         self.assertIn("rc=0 key=SLACK_HOME_CHANNEL", proc.stdout, proc.stderr)
         self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", proc.stdout)
-        self.assertIn("drop every one of them", proc.stdout)
+        self.assertIn("keeps them for one digest", proc.stdout)
         self.assertIn("HomeChannelUnset", proc.stdout)
         self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", proc.stdout)
         self.assertIn("slack-app/#home-channel", proc.stdout)
@@ -5957,7 +5957,7 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
     def test_the_summary_repeats_it_last(self):
         proc = self._run(summary=True)
         lines = [l for l in proc.stdout.splitlines() if l]
-        self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are dropped."), proc.stdout)
+        self.assertTrue(lines[-2].startswith("WARN: No home channel: proactive posts are not delivered there yet."), proc.stdout)
         self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), proc.stdout)
         self.assertEqual(self._run(slack_home="C0123ABCD", summary=True).stdout, "rc=0 key=\n")
 
