@@ -87,7 +87,7 @@ class Reader:
         self.error = error
         self.calls = 0
 
-    def __call__(self):
+    def __call__(self, environ=None):
         self.calls += 1
         if self.error is not None:
             raise self.error
@@ -755,7 +755,7 @@ class ReadSignalTest(unittest.TestCase):
     def test_last_human_active_time_wins(self):
         calls = self.stub(self.listing({"usage": {"lastHumanActiveTime": "2026-08-01T12:00:00Z"}}))
         self.assertEqual(
-            cip.read_signal(),
+            cip.read_signal({}),
             (datetime(2026, 8, 1, 12, tzinfo=timezone.utc), HUMAN),
         )
         argv, kwargs = calls[0]
@@ -764,11 +764,11 @@ class ReadSignalTest(unittest.TestCase):
 
     def test_absent_field_falls_back_to_creation_time(self):
         self.stub(self.listing({"usage": {"lastActiveTime": "2026-08-06T06:00:00Z"}}))
-        self.assertEqual(cip.read_signal(), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
+        self.assertEqual(cip.read_signal({}), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
         self.stub(self.listing())
-        self.assertEqual(cip.read_signal(), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
+        self.assertEqual(cip.read_signal({}), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
         self.stub(self.listing({"usage": {"chatMessagesInboundTotal": 0}}))
-        self.assertEqual(cip.read_signal(), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
+        self.assertEqual(cip.read_signal({}), (datetime(2026, 7, 1, tzinfo=timezone.utc), CREATED))
 
     def test_absent_field_with_counted_messages_is_unknown(self):
         # An operator upgraded, or rolled back and returned, since the last
@@ -776,36 +776,47 @@ class ReadSignalTest(unittest.TestCase):
         # fallback and nothing held until the next message.
         self.stub(self.listing({"usage": {"chatMessagesInboundTotal": 14, "lastActiveTime": "2026-08-06T06:00:00Z"}}))
         with self.assertRaisesRegex(RuntimeError, "lastHumanActiveTime is absent while chatMessagesInboundTotal counts 14"):
-            cip.read_signal()
+            cip.read_signal({})
 
-    def test_namespace_comes_from_the_environment(self):
-        import os
-
+    def test_namespace_comes_from_the_environment_it_is_given(self):
+        # The reader reads the environment it is handed, not the process's, so
+        # the test holds in a shell or a pod that exports the name itself.
         calls = self.stub(self.listing())
-        os.environ[cip.NAMESPACE_ENV] = "agents"
-        self.addCleanup(os.environ.pop, cip.NAMESPACE_ENV, None)
-        cip.read_signal()
+        cip.read_signal({cip.NAMESPACE_ENV: "agents"})
+        self.assertEqual(calls[0][0][4], "agents")
+        cip.read_signal({cip.NAMESPACE_ENV: "  "})
+        self.assertEqual(calls[1][0][4], cip.DEFAULT_NAMESPACE)
+
+    def test_apply_hands_the_reader_its_environment(self):
+        calls = self.stub(self.listing())
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "profiles" / "platform" / "cron").mkdir(parents=True)
+            (home / "profiles" / "platform" / "cron" / "jobs.json").write_text(
+                json.dumps({"jobs": [prompt_job("audit", "20 6 * * *", NOW, days_ago(1))]})
+            )
+            cip.apply(home, NOW, {cip.NAMESPACE_ENV: "agents"})
         self.assertEqual(calls[0][0][4], "agents")
 
     def test_missing_cr_raises(self):
         self.stub(json.dumps({"items": []}))
         with self.assertRaisesRegex(RuntimeError, "no PlatformAgent"):
-            cip.read_signal()
+            cip.read_signal({})
 
     def test_failed_kubectl_raises_with_its_stderr(self):
         self.stub(returncode=1, stderr="Error from server (Forbidden): platformagents is forbidden")
         with self.assertRaisesRegex(RuntimeError, "exited 1: Error from server"):
-            cip.read_signal()
+            cip.read_signal({})
 
     def test_unreachable_sandbox_propagates(self):
         self.stub(raises=subprocess.TimeoutExpired(["kubectl"], 30))
         with self.assertRaises(subprocess.TimeoutExpired):
-            cip.read_signal()
+            cip.read_signal({})
 
     def test_neither_field_raises(self):
         self.stub(json.dumps({"items": [{"metadata": {"name": "x"}}]}))
         with self.assertRaisesRegex(RuntimeError, "neither"):
-            cip.read_signal()
+            cip.read_signal({})
 
 
 if __name__ == "__main__":

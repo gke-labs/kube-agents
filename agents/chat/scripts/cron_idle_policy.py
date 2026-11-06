@@ -225,16 +225,19 @@ def _excerpt(text: str) -> str:
     return " ".join(text.split())[:ERROR_EXCERPT_CHARS]
 
 
-def read_signal() -> tuple[datetime, str]:
+def read_signal(environ: dict | None = None) -> tuple[datetime, str]:
     """When a person last wrote to the install, and which field said so.
 
     ``status.usage.lastHumanActiveTime`` when the CR carries it, else the CR's
     creation time while the install counts no chat message. Raises when the CR
     cannot be read, carries neither, or counts messages the field has yet to
     reflect: the signal is then unknown rather than "idle since creation".
+    The namespace is ``environ``'s (the process environment by default), the
+    same name the operator sets on every agent container.
     """
+    env = os.environ if environ is None else environ
     sandbox_exec = _platform_module(SANDBOX_MODULE)
-    namespace = os.environ.get(NAMESPACE_ENV, "").strip() or DEFAULT_NAMESPACE
+    namespace = str(env.get(NAMESPACE_ENV, "") or "").strip() or DEFAULT_NAMESPACE
     argv = ["kubectl", "get", PLATFORM_AGENT_RESOURCE, "-n", namespace, "-o", "json"]
     completed = sandbox_exec.run(argv, timeout=KUBECTL_TIMEOUT_SECONDS, check=False)
     if completed.returncode != 0:
@@ -705,7 +708,7 @@ def apply(home: Path, now: datetime, environ: dict | None = None) -> list[str]:
     if not base.is_dir():
         return []
     lines: list[str] = []
-    reader = _shared_reader(read_signal)
+    reader = _shared_reader(lambda: read_signal(environ))
     for profile in sorted(p for p in base.iterdir() if p.is_dir()):
         try:
             lines.extend(apply_profile(profile, now, environ, reader))

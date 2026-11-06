@@ -200,7 +200,7 @@ class DispatchTest(unittest.TestCase):
         # The idle policy runs first in main() and would otherwise read the
         # PlatformAgent through whatever kubeconfig this machine has. An
         # active install, read from a stub, keeps these tests about dispatch.
-        self._patch(cip, "read_signal", lambda: (datetime.now(timezone.utc), cip.SIGNAL_SOURCE_HUMAN))
+        self._patch(cip, "read_signal", lambda environ=None: (datetime.now(timezone.utc), cip.SIGNAL_SOURCE_HUMAN))
 
     def _patch(self, obj, attr, value):
         original = getattr(obj, attr)
@@ -904,7 +904,7 @@ class IdlePolicyThroughMainTest(unittest.TestCase):
             os.environ[key] = value
 
     def set_signal(self, when, source=cip.SIGNAL_SOURCE_HUMAN):
-        self._patch(cip, "read_signal", lambda: (when, source))
+        self._patch(cip, "read_signal", lambda environ=None: (when, source))
 
     def prompt(self, job_id, expr, next_run_at, last_run_at=None):
         entry = job(job_id, next_run_at.isoformat(), schedule={"kind": "cron", "expr": expr}, max_turns=250)
