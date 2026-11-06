@@ -374,8 +374,8 @@ func resolveCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, t
 // the cluster type discovery reported: the tier's Autopilot requests when
 // autopilot is true, and on Autopilot a CPU request held inside the CPU:memory
 // band the CR's memory sets (see credentialProxyAutopilotCPURequest). The
-// tier is the row the override merges over: renderedSizingTier for a render,
-// specSizingTier at admission.
+// tier is the row the override merges over, renderedSizingTier at a render
+// and at admission alike.
 func resolveCredentialProxyResourcesFor(deployment *agentv1alpha1.DeploymentSpec, autopilot bool, tier sizingTier) corev1.ResourceRequirements {
 	resolved := credentialProxyTierResources(tier, autopilot)
 	if deployment == nil || deployment.CredentialProxy == nil || deployment.CredentialProxy.Resources == nil {

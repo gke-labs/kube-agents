@@ -141,12 +141,12 @@ func TestCredentialProxyLimitSetAloneBelowTheDefaultRequestLowersTheRequest(t *t
 	if errs, _ := ValidateCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
 		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
-	}).Spec.Deployment, credentialProxyResourcesPath); len(errs) == 0 {
+	}), credentialProxyResourcesPath); len(errs) == 0 {
 		t.Error("an explicit cpu request above its limit was admitted; want refused")
 	}
 	if errs, _ := ValidateCredentialProxyResources(proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1536Mi")},
-	}).Spec.Deployment, credentialProxyResourcesPath); len(errs) != 0 {
+	}), credentialProxyResourcesPath); len(errs) != 0 {
 		t.Errorf("a memory limit set alone under the default request was refused: %v", errs)
 	}
 }
@@ -185,9 +185,10 @@ func TestCredentialProxyAutopilotCPURequestStaysInTheBand(t *testing.T) {
 	// step below it, so the pair stays in the band and draws no band warning.
 	// 672Mi gives 656m before the step, which Autopilot would round up to
 	// 750m and then raise the memory to 768Mi, over the CR's limit.
-	justUnder := proxyAgentWithResources(&corev1.ResourceRequirements{
+	justUnderAgent := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2147483647")},
-	}).Spec.Deployment
+	})
+	justUnder := justUnderAgent.Spec.Deployment
 	assertQuantity(t, resolveCredentialProxyResourcesFor(justUnder, true, sizingTierSmall).Requests, corev1.ResourceCPU, "1750m")
 	atFloor := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("672Mi")},
@@ -198,7 +199,7 @@ func TestCredentialProxyAutopilotCPURequestStaysInTheBand(t *testing.T) {
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")},
 	}).Spec.Deployment
 	assertQuantity(t, resolveCredentialProxyResourcesFor(tiny, true, sizingTierSmall).Requests, corev1.ResourceCPU, "250m")
-	_, warnings := ValidateCredentialProxyResources(justUnder, field.NewPath("spec"))
+	_, warnings := ValidateCredentialProxyResources(justUnderAgent, field.NewPath("spec"))
 	for _, w := range warnings {
 		if strings.Contains(w, "GiB per vCPU") {
 			t.Errorf("a band-held pair drew the band warning: %q", w)

@@ -61,12 +61,13 @@ var shellSandboxResourcesPath = field.NewPath("spec", "harness", "experimental",
 // request is accepted. The webhook calls it at apply and the reconciler before
 // writing the StatefulSet, so an install without the webhook refuses the same
 // override rather than rendering it. The row the override merges over is the
-// one the spec alone fixes (specSizingTier), as for the credential proxy and
-// the agent-api-auth sidecar: small under auto, so the three overrides are
-// admitted by one rule, and the reconciler's reading against the rendered tier
-// (validateShellSandboxResourcesAt) never refuses what admission admitted.
+// one the CR renders (renderedSizingTier), as for the credential proxy and
+// the agent-api-auth sidecar: the latched tier under auto, so the three
+// overrides are admitted by one rule, the reconciler's reading
+// (shellSandboxResourcesRefusal) is against the same row, and an explicit
+// fleet switched to auto keeps the override the fleet row admitted.
 func ValidateShellSandboxResources(agent *agentv1alpha1.PlatformAgent, path *field.Path) (field.ErrorList, admission.Warnings) {
-	return validateShellSandboxResourcesAt(agent, specSizingTier(agent.Spec.Deployment), path)
+	return validateShellSandboxResourcesAt(agent, renderedSizingTier(agent), path)
 }
 
 // validateShellSandboxResourcesAt is ValidateShellSandboxResources against

@@ -323,14 +323,20 @@ var credentialProxyMessages = containerResourceMessages{
 // Autopilot runs. The refusals come out the same either way: the limits do not
 // differ, and a limit set alone lowers its request on both cluster types.
 //
-// The row the override merges over is the one the spec alone fixes
-// (specSizingTier): the explicit profile's, or small under auto, whose latched
-// tier admission cannot read. The reconciler validates against the rendered
-// tier through validateCredentialProxyResourcesAt, and a higher row never
-// refuses what a lower one admitted, so the two agree on every refusal
-// admission makes.
-func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, path *field.Path) (field.ErrorList, admission.Warnings) {
-	return validateCredentialProxyResourcesAt(deployment, specSizingTier(deployment), path)
+// The row the override merges over is the one the CR renders
+// (renderedSizingTier): the explicit profile's, or under auto the latched
+// status.effectiveSizingTier, small before the first pass wrote one. The
+// object admission reads carries the status, so the webhook and the
+// reconciler (credentialProxyResourcesRefusal) read the same row within a
+// pass: an override the latched row admits is admitted, an explicit fleet
+// switched to auto included, since the latch keeps the row that admitted it.
+// A higher row never refuses what a lower one admitted; the one way the
+// render can refuse an admitted override is a step back (resolveSizingTier)
+// to a row under the one that admitted it, which the reconciler then
+// reports as Degraded and renders at the row until the override is
+// corrected, as it does for an override that was never valid.
+func ValidateCredentialProxyResources(agent *agentv1alpha1.PlatformAgent, path *field.Path) (field.ErrorList, admission.Warnings) {
+	return validateCredentialProxyResourcesAt(agent.Spec.Deployment, renderedSizingTier(agent), path)
 }
 
 // validateCredentialProxyResourcesAt is ValidateCredentialProxyResources

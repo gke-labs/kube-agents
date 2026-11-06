@@ -895,35 +895,75 @@ func sizedContainerNamed(t *testing.T, containers []corev1.Container, name strin
 
 func TestSizingValidationFollowsTheRenderedTier(t *testing.T) {
 	t.Parallel()
-	// A 3 CPU request crosses the small row's 2 CPU limit and sits under the
-	// fleet row's 8. Admission under auto checks the small row, so it refuses;
-	// the reconciler checks the latched fleet row, so it renders.
-	agent := sizingAgent(sizingProfileAuto, sizingProfileFleet, nil, nil)
-	agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
-	}}
-	if errs, _ := ValidateCredentialProxyResources(agent.Spec.Deployment, credentialProxyResourcesPath); len(errs) == 0 {
-		t.Error("admission under auto admitted a 3 CPU request against the small row")
+	// Admission and the reconciler validate an override against the same
+	// row, the one the CR renders: the explicit profile's, or under auto
+	// the latched tier, small before the first pass wrote one. A 3 CPU
+	// request crosses the small row's 2 CPU limit and sits under the fleet
+	// row's 8: admitted at a fleet latch, refused with none.
+	proxyOverride := func(profile, latched string) *agentv1alpha1.PlatformAgent {
+		agent := sizingAgent(profile, latched, nil, nil)
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("3")},
+		}}
+		return agent
 	}
-	if refusal, _ := credentialProxyResourcesRefusal(agent); refusal != "" {
+	latched := proxyOverride(sizingProfileAuto, sizingProfileFleet)
+	if errs, _ := ValidateCredentialProxyResources(latched, credentialProxyResourcesPath); len(errs) != 0 {
+		t.Errorf("admission under auto latched at fleet refused a 3 CPU request the fleet row admits: %v", errs)
+	}
+	if refusal, _ := credentialProxyResourcesRefusal(latched); refusal != "" {
 		t.Errorf("the reconciler refused against the fleet latch: %s", refusal)
 	}
-	agent.Spec.Deployment.SizingProfile = sizingProfileFleet
-	if errs, _ := ValidateCredentialProxyResources(agent.Spec.Deployment, credentialProxyResourcesPath); len(errs) != 0 {
-		t.Errorf("admission under an explicit fleet refused: %v", errs)
+	unlatched := proxyOverride(sizingProfileAuto, "")
+	if errs, _ := ValidateCredentialProxyResources(unlatched, credentialProxyResourcesPath); len(errs) == 0 {
+		t.Error("admission under auto with no latch admitted a 3 CPU request against the small row")
+	}
+	if refusal, _ := credentialProxyResourcesRefusal(unlatched); refusal == "" {
+		t.Error("the reconciler under auto with no latch rendered a 3 CPU request over the small row")
+	}
+	if errs, _ := ValidateCredentialProxyResources(proxyOverride(sizingProfileFleet, sizingProfileSmall), credentialProxyResourcesPath); len(errs) != 0 {
+		t.Errorf("admission under an explicit fleet with a stale small latch refused: %v", errs)
+	}
+	if errs, _ := ValidateCredentialProxyResources(proxyOverride(sizingProfileSmall, sizingProfileFleet), credentialProxyResourcesPath); len(errs) == 0 {
+		t.Error("admission under an explicit small with a stale fleet latch admitted a 3 CPU request against the small row")
 	}
 
-	// The shell follows the same rule: a 3Gi memory request alone crosses
-	// the small row's 2Gi limit and sits under the fleet row's 4Gi.
-	shell := sizingAgent(sizingProfileAuto, sizingProfileFleet, nil, nil)
+	// The sidecar follows the same rule: a 3Gi memory request alone crosses
+	// the small row's 2Gi limit and sits under the medium row's 4Gi.
+	sidecar := sizingAgent(sizingProfileAuto, sizingProfileMedium, nil, nil)
+	sidecar.Spec.Deployment.AgentAPIAuth = &agentv1alpha1.AgentAPIAuthSpec{Resources: &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
+	}}
+	if errs, _ := ValidateAgentAPIAuthResources(sidecar, agentAPIAuthResourcesPath); len(errs) != 0 {
+		t.Errorf("admission under auto latched at medium refused a 3Gi sidecar request the medium row admits: %v", errs)
+	}
+	sidecar.Status.EffectiveSizingTier = ""
+	if errs, _ := ValidateAgentAPIAuthResources(sidecar, agentAPIAuthResourcesPath); len(errs) == 0 {
+		t.Error("admission under auto with no latch admitted a 3Gi sidecar request against the small row")
+	}
+
+	// The shell too, on the day an explicit fleet is switched to auto: the
+	// 3Gi request the fleet row admitted runs on the shell pod and the
+	// latch stays at fleet, so the one-field edit to auto is admitted
+	// against the row the CR keeps rendering rather than refused against
+	// the small row it never renders.
+	shell := sizingAgent(sizingProfileFleet, sizingProfileFleet, nil, nil)
 	shell.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Resources: &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("3Gi")},
 	}}}
-	if errs, _ := ValidateShellSandboxResources(shell, shellSandboxResourcesPath); len(errs) == 0 {
-		t.Error("admission under auto admitted a 3Gi shell request against the small row")
+	if errs, _ := ValidateShellSandboxResources(shell, shellSandboxResourcesPath); len(errs) != 0 {
+		t.Errorf("admission under an explicit fleet refused a 3Gi shell request: %v", errs)
+	}
+	shell.Spec.Deployment.SizingProfile = sizingProfileAuto
+	if errs, _ := ValidateShellSandboxResources(shell, shellSandboxResourcesPath); len(errs) != 0 {
+		t.Errorf("admission refused the switch from fleet to auto for a 3Gi shell request the latched fleet row admits: %v", errs)
 	}
 	if refusal, _ := shellSandboxResourcesRefusal(shell); refusal != "" {
 		t.Errorf("the reconciler refused the shell override against the fleet latch: %s", refusal)
+	}
+	shell.Status.EffectiveSizingTier = ""
+	if errs, _ := ValidateShellSandboxResources(shell, shellSandboxResourcesPath); len(errs) == 0 {
+		t.Error("admission under auto with no latch admitted a 3Gi shell request against the small row")
 	}
 }
 

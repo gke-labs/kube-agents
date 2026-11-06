@@ -166,7 +166,7 @@ func TestValidateAgentAPIAuthResources(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			errs, warnings := ValidateAgentAPIAuthResources(apiAuthAgentWithResources(tc.override).Spec.Deployment, path)
+			errs, warnings := ValidateAgentAPIAuthResources(apiAuthAgentWithResources(tc.override), path)
 			if tc.wantErr != (len(errs) > 0) {
 				t.Errorf("errs = %v; want error: %v", errs, tc.wantErr)
 			}
@@ -185,7 +185,7 @@ func TestAgentAPIAuthHasNoChildBudgetFloor(t *testing.T) {
 	errs, _ := ValidateAgentAPIAuthResources(apiAuthAgentWithResources(&corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("256Mi")},
 		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("400Mi")},
-	}).Spec.Deployment, path)
+	}), path)
 	if len(errs) != 0 {
 		t.Errorf("a 400Mi limit was refused (%v); the watcher has no child-budget floor", errs)
 	}

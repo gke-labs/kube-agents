@@ -61,10 +61,10 @@ var agentAPIAuthResourcesPath = field.NewPath("spec", "deployment", "agentAPIAut
 // the request is accepted. The webhook calls it at apply and the reconciler
 // before writing the sidecar, so an install without the webhook refuses the same
 // override rather than rendering it.
-// The row the override merges over is the one the spec alone fixes
-// (specSizingTier), as ValidateCredentialProxyResources explains.
-func ValidateAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, path *field.Path) (field.ErrorList, admission.Warnings) {
-	return validateAgentAPIAuthResourcesAt(deployment, specSizingTier(deployment), path)
+// The row the override merges over is the one the CR renders
+// (renderedSizingTier), as ValidateCredentialProxyResources explains.
+func ValidateAgentAPIAuthResources(agent *agentv1alpha1.PlatformAgent, path *field.Path) (field.ErrorList, admission.Warnings) {
+	return validateAgentAPIAuthResourcesAt(agent.Spec.Deployment, renderedSizingTier(agent), path)
 }
 
 // validateAgentAPIAuthResourcesAt is ValidateAgentAPIAuthResources against

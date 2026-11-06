@@ -387,12 +387,9 @@ func sizingProfileOf(deployment *agentv1alpha1.DeploymentSpec) string {
 
 // specSizingTier is the tier the spec alone fixes: an explicit profile's
 // tier, and small under auto, where the tier is whatever the latch has
-// reached. Admission validates an override against it, so under auto the
-// webhook checks the small row; the reconciler validates against the rendered
-// tier, and a higher row never refuses an override a lower one admitted (its
-// limits are at or above the lower row's and its requests are either the same
-// or lowered to a limit set alone), so the webhook is never looser than the
-// reconciler.
+// reached (renderedSizingTier). resolveSizingTier starts from it; an
+// override is validated, at admission and at render, against the rendered
+// tier, since the webhook reads the status the latch is kept in.
 func specSizingTier(deployment *agentv1alpha1.DeploymentSpec) sizingTier {
 	tier, _ := parseSizingTier(sizingProfileOf(deployment))
 	return tier
