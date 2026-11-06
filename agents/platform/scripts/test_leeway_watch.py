@@ -1170,12 +1170,162 @@ class GateAndReportingTests(unittest.TestCase):
         ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
             code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
             self.assertEqual(code0, 0)
-            self.assertIn("publishing to blackboard topic topology-skew failed (TimeoutExpired:", out0)
+            self.assertIn(
+                "publishing to blackboard topic topology-skew failed "
+                "(TimeoutExpired: a2a topics write topology-skew timed out after 30s)",
+                out0,
+            )
+            warn_line = [ln for ln in out0.splitlines() if "publishing to blackboard topic" in ln][0]
+            self.assertNotIn("--text", warn_line)
+            self.assertNotIn("--data", warn_line)
+            self.assertNotIn("finding(s) due", warn_line)
 
             t1 = T0 + timedelta(days=1)
             code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep), now=t1)
             self.assertEqual(code1, 0)
             self.assertEqual(out1.strip(), "leeway watch: publishing to blackboard topic topology-skew succeeded again")
+
+        with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
+            watch.shutil, "which", return_value="/usr/local/bin/a2a"
+        ), mock.patch.object(
+            watch.subprocess,
+            "run",
+            side_effect=OSError("bad `socket`\n" + ("x" * 400)),
+        ):
+            ok, detail = watch.publish_blackboard_topic("summary", self.home / "r.json")
+            self.assertFalse(ok)
+            assert detail is not None
+            self.assertTrue(detail.startswith("OSError: bad 'socket' "))
+            self.assertNotIn("\n", detail)
+            self.assertNotIn("`", detail)
+            self.assertLessEqual(len(detail), len("OSError: ") + watch.STDERR_EXCERPT_CHARS)
+
+    def test_unknown_cause_without_score_and_unrecognized_severity_pass_default_thresholds(self) -> None:
+        no_score_concentrated = {
+            "kind": "leeway.placement_drift",
+            "subject": {"kind": "Deployment", "namespace": "shop", "name": "legacy-api", "replicas": 4},
+            "topologyKey": "topology.kubernetes.io/zone",
+            "tier": "C",
+            "severity": "urgent",
+            "suspectedCause": "unknown",
+            "domains": [
+                {"domain": "us-central1-a", "actual": 4},
+                {"domain": "us-central1-b", "actual": 0},
+            ],
+        }
+        novel_rank = make_rank_finding(compute_class="novel-class", severity="high", rule="last-rank")
+        rep = make_report(
+            [
+                {
+                    "cluster": "p1/us-central1/seeded-d",
+                    "status": "ok",
+                    "topology_findings": [no_score_concentrated],
+                    "rank_findings": [novel_rank],
+                }
+            ],
+            T0,
+        )
+        code, out = self.run_tick(lambda *a, **kw: completed_json(rep), now=T0)
+        self.assertEqual(code, 0)
+        self.assertIn("2 finding(s) due", out)
+        self.assertIn("Deployment/shop/legacy-api [unknown, 100%]", out)
+        self.assertIn("ComputeClass/novel-class [last-rank, 75%]", out)
+
+    def test_rebalancing_skew_down_to_pigeonhole_floor_retires_and_realerts_on_restack(self) -> None:
+        stacked = make_topology_finding(name="kube-dns", namespace="kube-system", cause="unknown", severity="warning")
+        stacked["subject"]["replicas"] = 2
+        stacked["domains"] = [
+            {"domain": "us-central1-a", "actual": 2, "expected": 1},
+            {"domain": "us-central1-b", "actual": 0, "expected": 1},
+            {"domain": "us-central1-f", "actual": 0, "expected": 0},
+        ]
+        stacked["score"] = {
+            "drift": 0.5,
+            "observedSkew": 2,
+            "minAchievableSkew": 1,
+            "excessSkew": 1,
+            "relocationDistance": 1,
+            "maxDomainShare": 1.0,
+        }
+        rebalanced = json.loads(json.dumps(stacked))
+        rebalanced["domains"] = [
+            {"domain": "us-central1-a", "actual": 1, "expected": 1},
+            {"domain": "us-central1-b", "actual": 1, "expected": 1},
+            {"domain": "us-central1-f", "actual": 0, "expected": 0},
+        ]
+        rebalanced["score"] = {
+            "drift": 0.0,
+            "observedSkew": 1,
+            "minAchievableSkew": 1,
+            "excessSkew": 0,
+            "relocationDistance": 0,
+            "maxDomainShare": 0.5,
+        }
+
+        rep0 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [stacked]}], T0)
+        code0, out0 = self.run_tick(lambda *a, **kw: completed_json(rep0), now=T0)
+        self.assertEqual(code0, 0)
+        self.assertIn("Deployment/kube-system/kube-dns [unknown, 100%]", out0)
+
+        t1 = T0 + timedelta(days=1)
+        rep1 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [rebalanced]}], t1)
+        code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep1), now=t1)
+        self.assertEqual(code1, 0)
+        self.assertIn("1 finding(s) resolved (ap-mcp:kube-system/kube-dns)", out1)
+        self.assertEqual(watch.load_ledger(self.home)[watch.FINDINGS_KEY], {})
+        latest1 = json.loads((self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME).read_text())
+        self.assertEqual(latest1["summary"]["topology_findings"], 0)
+
+        t2 = T0 + timedelta(days=2)
+        rep2 = make_report([{"cluster": "p1/us-central1/ap-mcp", "status": "ok", "topology_findings": [stacked]}], t2)
+        code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep2), now=t2)
+        self.assertEqual(code2, 0)
+        self.assertIn("1 finding(s) due (1 new finding)", out2)
+        self.assertIn("Deployment/kube-system/kube-dns [unknown, 100%]", out2)
+
+    def test_non_dry_run_threshold_override_report_refreshes_on_next_default_tick(self) -> None:
+        warn_skew = make_topology_finding(name="checkout-api", severity="warning", cause="constraint_ignored")
+        crit_skew = make_topology_finding(name="payments-db", severity="critical", cause="volume_pinned")
+        rep_day0 = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [warn_skew]}],
+            T0,
+        )
+        t1 = T0 + timedelta(days=1)
+        rep_day1 = make_report(
+            [{"cluster": "p1/us-central1/seeded-d", "status": "ok", "topology_findings": [warn_skew, crit_skew]}],
+            t1,
+        )
+        t2 = T0 + timedelta(days=2)
+        rep_day2 = make_report(rep_day1["clusters"], t2)
+        a2a_calls: list[list[str]] = []
+
+        def fake_a2a(argv, **kw):
+            a2a_calls.append(list(argv))
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {watch.NATS_URL_ENV: "nats://nats:4222"}, clear=False), mock.patch.object(
+            watch.shutil, "which", return_value="/usr/local/bin/a2a"
+        ), mock.patch.object(watch.subprocess, "run", side_effect=fake_a2a):
+            self.run_tick(lambda *a, **kw: completed_json(rep_day0), now=T0)
+            self.assertEqual(len(a2a_calls), 1)
+
+            # Day 1: operator omits --dry-run with MIN_SEVERITY=critical when crit_skew is due.
+            with mock.patch.dict(os.environ, {watch.MIN_SEVERITY_ENV: "critical"}, clear=False):
+                code1, out1 = self.run_tick(lambda *a, **kw: completed_json(rep_day1), now=t1)
+            self.assertEqual(code1, 0)
+            self.assertIn("payments-db", out1)
+            latest_override = json.loads((self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME).read_text())
+            self.assertEqual(latest_override["summary"]["topology_findings"], 1)
+            self.assertEqual(len(a2a_calls), 2)
+
+            # Day 2: default cron tick has no due/retired findings, yet refreshes latest.json and topic to full set.
+            code2, out2 = self.run_tick(lambda *a, **kw: completed_json(rep_day2), now=t2)
+            self.assertEqual(code2, 0)
+            self.assertEqual(out2, "")
+            latest_restored = json.loads((self.home / watch.REPORTS_DIR_NAME / watch.LATEST_JSON_LINK_NAME).read_text())
+            self.assertEqual(latest_restored["summary"]["topology_findings"], 2)
+            self.assertEqual(len(a2a_calls), 3)
+            self.assertNotIn(watch.ANNOUNCED_KEY, watch.load_ledger(self.home))
 
 
 class DiscoveryTests(unittest.TestCase):

@@ -441,7 +441,9 @@ relays that and not the GKE API route leeway's own `--clusters-from <project>`
 would take) and gates notifications through `<profile home>/leeway/ledger.json`.
 `unknown`-cause topology findings at their pigeonhole floor
 (`observedSkew - minAchievableSkew < 1`) are suppressed before gating so
-balanced odd-replica workloads do not page; `LEEWAY_WATCH_MIN_SEVERITY`,
+balanced odd-replica workloads do not page, while `selector_confined` (`info`)
+findings bypass the drift floor so single-zone node-pool confinement still
+alerts once per refresh window; `LEEWAY_WATCH_MIN_SEVERITY`,
 `LEEWAY_WATCH_MIN_DRIFT`, `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE`,
 `LEEWAY_WATCH_MIN_EXCESS_OVER_FLOOR`, and `LEEWAY_WATCH_REFRESH_DAYS` are for
 runs started by hand in the pod with `--dry-run` (the operator's

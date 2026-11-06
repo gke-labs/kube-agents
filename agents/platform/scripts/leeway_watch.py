@@ -94,7 +94,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_scope_targets  # noqa: E402
@@ -232,8 +232,10 @@ CLUSTERS_FAILED_FIELD = "clusters_failed"
 BY_SEVERITY_FIELD = "by_severity"
 BY_TIER_FIELD = "by_tier"
 SCORE_FIELD = "score"
+OBSERVED_SKEW_RAW_FIELD = "observedSkew"
 MIN_ACHIEVABLE_SKEW_FIELD = "minAchievableSkew"
 DRIFT_FIELD = "drift"
+MAX_DOMAIN_SHARE_RAW_FIELD = "maxDomainShare"
 KEY_FIELD = "key"
 CLUSTER_FIELD = "cluster"
 KIND_FIELD = "kind"
@@ -245,8 +247,11 @@ TIER_FIELD = "tier"
 SUSPECTED_CAUSE_FIELD = "suspected_cause"
 OBSERVED_SKEW_FIELD = "observed_skew"
 MIN_ACHIEVABLE_SKEW_KEY = "min_achievable_skew"
+EXCESS_OVER_FLOOR_KEY = "excess_over_floor"
 DRIFT_KEY = "drift"
+HAS_DRIFT_KEY = "has_drift"
 MAX_DOMAIN_SHARE_KEY = "max_domain_share"
+HAS_MAX_DOMAIN_SHARE_KEY = "has_max_domain_share"
 
 # A2A blackboard topic (`a2a.topics.agent.platform.topology-skew`).
 NATS_URL_ENV = "NATS_URL"
@@ -260,6 +265,8 @@ A2A_TOPIC_NAME = "topology-skew"
 A2A_TOPIC_SUBJECT = "a2a.topics.agent.platform.topology-skew"
 A2A_PUBLISH_TIMEOUT_SECONDS = 30
 A2A_PUBLISH_FAILED_DETAIL = "a2a topics write {topic} exited {code}: {error}"
+A2A_PUBLISH_TIMED_OUT_DETAIL = "TimeoutExpired: a2a topics write {topic} timed out after {seconds}s"
+A2A_PUBLISH_EXCEPTION_DETAIL = "{error_type}: {error}"
 A2A_RETRY_SUMMARY = "{prefix}: topology-skew blackboard report refreshed"
 ERROR_KIND_TOPIC_PUBLISH = "topic_publish_failed"
 SPACE_CHAR = " "
@@ -290,6 +297,7 @@ ANNOUNCED_KEY = "announced"
 ANNOUNCED_PARTIAL_KEY = "partial"
 ANNOUNCED_TOPIC_PUBLISH_KEY = "topic_publish"
 ANNOUNCED_DEFERRED_REFRESH_KEY = "deferred_report_refresh"
+ANNOUNCED_OVERRIDE_THRESHOLDS_KEY = "override_report_thresholds"
 FAILURE_MARKER_FILE_NAME = "last-failure.txt"
 
 # Output lines (stdout is `deliver: "chat"`).
@@ -639,7 +647,15 @@ def merge_reports(reports: list[dict[str, Any]], now: datetime) -> dict[str, Any
 # --- findings extraction & gate ----------------------------------------------
 
 
-def _int(value: object, default: int = 0) -> int:
+@overload
+def _int(value: object, default: int = 0) -> int: ...
+
+
+@overload
+def _int(value: object, default: None) -> int | None: ...
+
+
+def _int(value: object, default: int | None = 0) -> int | None:
     if value is None or isinstance(value, bool):
         return default
     try:
@@ -648,7 +664,15 @@ def _int(value: object, default: int = 0) -> int:
         return default
 
 
-def _float(value: object, default: float = 0.0) -> float:
+@overload
+def _float(value: object, default: float = 0.0) -> float: ...
+
+
+@overload
+def _float(value: object, default: None) -> float | None: ...
+
+
+def _float(value: object, default: float | None = 0.0) -> float | None:
     if value is None or isinstance(value, bool):
         return default
     try:
@@ -690,12 +714,16 @@ def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[st
         total_actual += actual
         domain_parts.append(f"{d_name}: {actual}")
     denom = replicas if replicas > 0 else total_actual
-    raw_share = score.get("maxDomainShare")
+    raw_share_opt = _float(score.get(MAX_DOMAIN_SHARE_RAW_FIELD), None)
     fallback_share = max_actual / denom if denom > 0 else 0.0
-    max_share = _float(raw_share, fallback_share) if raw_share is not None else fallback_share
+    max_share = raw_share_opt if raw_share_opt is not None else fallback_share
+    has_max_share = raw_share_opt is not None or denom > 0
     blast_pct = round(max_share * 100)
     blast_radius = f"{max_actual}/{denom} ({blast_pct}%)" if denom > 0 else DEFAULT_DISPLAY_NA
 
+    raw_observed_skew = _int(score.get(OBSERVED_SKEW_RAW_FIELD), None)
+    raw_min_skew = _int(score.get(MIN_ACHIEVABLE_SKEW_FIELD), None)
+    raw_drift = _float(score.get(DRIFT_FIELD), None)
     remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
     return {
         "key": key,
@@ -709,10 +737,17 @@ def normalize_topology_finding(cluster: str, finding: dict[str, Any]) -> dict[st
         "severity": str(finding.get("severity") or DEFAULT_SEVERITY),
         "suspected_cause": str(finding.get("suspectedCause") or DEFAULT_UNKNOWN),
         "contributing_factors": _str_list(finding.get("contributingFactors")),
-        "observed_skew": _int(score.get("observedSkew"), 0),
-        MIN_ACHIEVABLE_SKEW_KEY: _int(score.get(MIN_ACHIEVABLE_SKEW_FIELD), 0),
-        DRIFT_KEY: round(_float(score.get(DRIFT_FIELD), ZERO_FLOAT), SCORE_ROUND_DECIMALS),
+        "observed_skew": _int(raw_observed_skew, 0),
+        MIN_ACHIEVABLE_SKEW_KEY: _int(raw_min_skew, 0),
+        EXCESS_OVER_FLOOR_KEY: (
+            raw_observed_skew - raw_min_skew
+            if raw_observed_skew is not None and raw_min_skew is not None
+            else None
+        ),
+        DRIFT_KEY: round(raw_drift if raw_drift is not None else ZERO_FLOAT, SCORE_ROUND_DECIMALS),
+        HAS_DRIFT_KEY: raw_drift is not None,
         MAX_DOMAIN_SHARE_KEY: round(max_share, SCORE_ROUND_DECIMALS),
+        HAS_MAX_DOMAIN_SHARE_KEY: has_max_share,
         "distribution_display": ", ".join(domain_parts) if domain_parts else DEFAULT_DISPLAY_NA,
         "blast_radius_display": blast_radius,
         "remediation": {
@@ -790,21 +825,29 @@ def passes_topology_thresholds(
 ) -> bool:
     """Return True when a normalized topology finding passes configured alert thresholds."""
     sev_floor = min_severity_rank() if min_sev_rank is None else min_sev_rank
-    if SEVERITY_RANKS.get(norm[SEVERITY_FIELD], 0) < sev_floor:
+    if SEVERITY_RANKS.get(norm[SEVERITY_FIELD], SEVERITY_RANKS[DEFAULT_SEVERITY]) < sev_floor:
         return False
     if norm[KIND_FIELD] == FINDING_KIND_DOMAIN_UNAVAILABLE:
         return True
     excess_floor = min_excess_over_floor() if min_excess is None else min_excess
+    excess = norm.get(EXCESS_OVER_FLOOR_KEY)
     if (
         norm[SUSPECTED_CAUSE_FIELD] == DEFAULT_UNKNOWN
-        and norm[OBSERVED_SKEW_FIELD] - norm[MIN_ACHIEVABLE_SKEW_KEY] < excess_floor
+        and excess is not None
+        and excess < excess_floor
     ):
         return False
     drift_floor = min_drift() if min_d is None else min_d
-    if norm[SUSPECTED_CAUSE_FIELD] != CAUSE_SELECTOR_CONFINED and norm[DRIFT_KEY] < drift_floor:
+    if (
+        norm[SUSPECTED_CAUSE_FIELD] != CAUSE_SELECTOR_CONFINED
+        and norm[HAS_DRIFT_KEY]
+        and norm[DRIFT_KEY] < drift_floor
+    ):
         return False
     share_floor = min_max_domain_share() if min_share is None else min_share
-    return norm[MAX_DOMAIN_SHARE_KEY] >= share_floor
+    if norm[HAS_MAX_DOMAIN_SHARE_KEY] and norm[MAX_DOMAIN_SHARE_KEY] < share_floor:
+        return False
+    return True
 
 
 def passes_rank_thresholds(norm: dict[str, Any], *, min_sev_rank: int | None = None) -> bool:
@@ -815,7 +858,7 @@ def passes_rank_thresholds(norm: dict[str, Any], *, min_sev_rank: int | None = N
     `LEEWAY_WATCH_MIN_MAX_DOMAIN_SHARE` applies to topology findings only.
     """
     sev_floor = min_severity_rank() if min_sev_rank is None else min_sev_rank
-    return SEVERITY_RANKS.get(norm[SEVERITY_FIELD], 0) >= sev_floor
+    return SEVERITY_RANKS.get(norm[SEVERITY_FIELD], SEVERITY_RANKS[DEFAULT_SEVERITY]) >= sev_floor
 
 
 def filter_report_findings(report: dict[str, Any]) -> dict[str, Any]:
@@ -1192,8 +1235,18 @@ def publish_blackboard_topic(summary_text: str, json_path: Path) -> tuple[bool, 
             timeout=A2A_PUBLISH_TIMEOUT_SECONDS,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        return False, A2A_PUBLISH_TIMED_OUT_DETAIL.format(
+            topic=A2A_TOPIC_NAME,
+            seconds=A2A_PUBLISH_TIMEOUT_SECONDS,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+        exc_raw = SPACE_CHAR.join(str(exc).split()).replace(BACKTICK_CHAR, SINGLE_QUOTE_CHAR)
+        exc_excerpt = exc_raw[:STDERR_EXCERPT_CHARS] if exc_raw else DEFAULT_NO_OUTPUT
+        return False, A2A_PUBLISH_EXCEPTION_DETAIL.format(
+            error_type=type(exc).__name__,
+            error=exc_excerpt,
+        )
     if completed.returncode == 0:
         return True, None
     err_raw = SPACE_CHAR.join((completed.stderr or completed.stdout or "").split()).replace(
@@ -1455,7 +1508,7 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             if reason is not None or not prior
             else str(prior.get("suspected_cause") or item["suspected_cause"])
         )
-        next_findings[key] = {
+        entry: dict[str, Any] = {
             "cluster": item["cluster"],
             "kind": item["kind"],
             "namespace": item["namespace"],
@@ -1470,17 +1523,36 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             FIRST_SEEN_KEY: first_seen,
             LAST_REPORT_KEY: last_report_at,
         }
+        if item.get(EXCESS_OVER_FLOOR_KEY) is not None:
+            entry[EXCESS_OVER_FLOOR_KEY] = item[EXCESS_OVER_FLOOR_KEY]
+        next_findings[key] = entry
 
     # 2. Check prior findings not seen in active_findings: retain silently if
-    #    still emitted by leeway (suppressed only by active thresholds), retire
-    #    if absent from the unfiltered report on a cleanly scanned cluster, or
-    #    retain if the cluster/project scan failed.
+    #    still emitted by leeway and suppressed only by active thresholds (unless
+    #    an above-floor skew genuinely rebalanced down to the pigeonhole floor),
+    #    retire if absent/rebalanced on a cleanly scanned cluster, or retain if
+    #    the cluster/project scan failed.
     for key, prior in sorted(prior_findings.items()):
         if key in active_findings or not isinstance(prior, dict):
             continue
-        if key in raw_findings:
-            next_findings[key] = prior
-            continue
+        raw_item = raw_findings.get(key)
+        if raw_item is not None:
+            raw_excess = raw_item.get(EXCESS_OVER_FLOOR_KEY)
+            at_default_floor = (
+                raw_item.get(SUSPECTED_CAUSE_FIELD) == DEFAULT_UNKNOWN
+                and raw_excess is not None
+                and raw_excess < MIN_EXCESS_OVER_FLOOR_DEFAULT
+            )
+            prior_cause = str(prior.get(SUSPECTED_CAUSE_FIELD) or DEFAULT_UNKNOWN)
+            prior_excess = _int(prior.get(EXCESS_OVER_FLOOR_KEY), None)
+            was_above_floor = prior_cause != DEFAULT_UNKNOWN or (
+                prior_excess >= MIN_EXCESS_OVER_FLOOR_DEFAULT
+                if prior_excess is not None
+                else _int(prior.get(OBSERVED_SKEW_FIELD), 0) > raw_item[OBSERVED_SKEW_FIELD]
+            )
+            if not (at_default_floor and was_above_floor):
+                next_findings[key] = prior
+                continue
         if can_retire_finding(
             key, prior, ok_clusters, cluster_errors, scanned_projects, scan_errors, requested_clusters
         ):
@@ -1518,6 +1590,23 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             print(DRY_RUN_NOTHING_DUE.format(count=len(active_findings)))
         return 0
 
+    current_thresholds: list[int | float] = [
+        min_severity_rank(),
+        min_drift(),
+        min_max_domain_share(),
+        min_excess_over_floor(),
+    ]
+    thresholds_overridden = current_thresholds != [
+        SEVERITY_RANKS[MIN_SEVERITY_DEFAULT],
+        MIN_DRIFT_DEFAULT,
+        MIN_MAX_DOMAIN_SHARE_DEFAULT,
+        MIN_EXCESS_OVER_FLOOR_DEFAULT,
+    ]
+    override_stale = (
+        ANNOUNCED_OVERRIDE_THRESHOLDS_KEY in announced
+        and announced.get(ANNOUNCED_OVERRIDE_THRESHOLDS_KEY) != current_thresholds
+    )
+
     try:
         if retired_labels:
             retired_line = RETIRED_LINE.format(
@@ -1528,6 +1617,10 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             lines.append(retired_line)
         if due_reasons:
             announced.pop(ANNOUNCED_DEFERRED_REFRESH_KEY, None)
+            if thresholds_overridden:
+                announced[ANNOUNCED_OVERRIDE_THRESHOLDS_KEY] = current_thresholds
+            else:
+                announced.pop(ANNOUNCED_OVERRIDE_THRESHOLDS_KEY, None)
             markdown = render_markdown_report(report, active_findings, due_reasons, all_errors, moment, days)
             md_path = write_report_files(home, report, markdown, moment)
             due_items = [active_findings[k] for k in sorted(due_reasons)]
@@ -1557,8 +1650,12 @@ def tick(*, dry_run: bool = False, now: datetime | None = None) -> int:
             # A finding retired on a readable cluster during a partial scan makes
             # `latest.json` stale; defer refreshing and re-publishing until the scan is clean.
             announced[ANNOUNCED_DEFERRED_REFRESH_KEY] = REASON_ALL_RESOLVED
-        elif (retired_labels or ANNOUNCED_DEFERRED_REFRESH_KEY in announced) and not all_errors:
+        elif (retired_labels or ANNOUNCED_DEFERRED_REFRESH_KEY in announced or override_stale) and not all_errors:
             announced.pop(ANNOUNCED_DEFERRED_REFRESH_KEY, None)
+            if thresholds_overridden:
+                announced[ANNOUNCED_OVERRIDE_THRESHOLDS_KEY] = current_thresholds
+            else:
+                announced.pop(ANNOUNCED_OVERRIDE_THRESHOLDS_KEY, None)
             markdown = render_markdown_report(report, active_findings, due_reasons, all_errors, moment, days)
             md_path = write_report_files(home, report, markdown, moment)
             summary_line = retired_line if retired_labels else A2A_RETRY_SUMMARY.format(prefix=LINE_PREFIX)
