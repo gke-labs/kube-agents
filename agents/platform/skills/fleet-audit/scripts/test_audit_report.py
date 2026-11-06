@@ -36095,6 +36095,17 @@ REPLAYABLE_REMEDIATION = {"kind": "manual", "note": "Write a default-deny policy
 class TestPrecheckOnTheForgePath(HarnessTestCase):
     """The close `precheck` runs is the forge path's own `finish`."""
 
+    def setUp(self):
+        super().setUp()
+        # `resolve_repo_or_no_forge` keeps the patched `resolve_repo` answer
+        # only while the install registers a repository, which it reads from
+        # the mounted state file or the ConfigMap through kubectl: pinned, so
+        # the path these tests take does not depend on what the machine
+        # running them can reach.
+        registered = patch.object(gitops_workspace, "managed_repos_registered", lambda: True)
+        registered.start()
+        self.addCleanup(registered.stop)
+
     def manifest_file(self, name, candidates=()):
         manifest = {**_full_manifest(candidates=candidates), "audit": AUDIT, "finished_at": "2099-01-01T06:23:00Z"}
         path = self.tmp_path / f"{name}.json"
