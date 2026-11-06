@@ -337,8 +337,8 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
   counted in the title, but the check is `success` under `Found N issues, none holding`, and the
   review body carries a _Second look_ sentence beside the bar it applied. A Medium here needs no
   further round: fix it only if you would have unasked, saying so in the thread, or answer it there
-  for the reviewer the green summons ([green is settled](#green-is-settled)) — the thread still has
-  to be resolved before the merge, per the section below, but the check is not waiting on it.
+  and resolve it, per the section below ([green is settled](#green-is-settled)); the check is not
+  waiting on it.
 - **Back on the first review's bar:** a diff that has more than doubled in lines since the commit
   the bot last reviewed — the softer bar is earned by a review of roughly this change, not by a
   commit count — and, silently, a pull request whose earlier round the bot could not read back (a
@@ -461,8 +461,9 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   the loop or without. An open thread makes the pull request the author's on the reviewers'
   dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)), so the summoned
   reviewer would never see a pull request that kept one open. The reply stays on the resolved
-  thread, and a reviewer who disagrees reopens it or replies in it, which hands it back to you
-  (**who counts**, next; [resolving conversations](#resolving-conversations)).
+  thread. A reviewer who disagrees reopens it, or replies in it, which does not reopen it: then you
+  unresolve it, and it is your move again (**who counts**, next;
+  [resolving conversations](#resolving-conversations)).
 - **Who counts, and how a reply is read.** A human is _on_ a pull request when a reviewer is requested,
   or a non-robot human other than the author has filed `CHANGES_REQUESTED`, or an `APPROVED` that
   `scripts/request_reviewers.py` counts (an `OWNERS` approver's, or an `OWNERS` reviewer's on a change
@@ -473,7 +474,8 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   human's answer to a resolved bot thread is read for its content, not for the event GitHub files: a
   reply that accepts the decline needs nothing more; a `CHANGES_REQUESTED` review, or a reply or
   comment that asks for the fix, is a disagreement and owes the fix (or the design-question reply of
-  the mechanism rule), with the thread reopened until that lands. A `COMMENTED` review on its own is
+  the mechanism rule): unresolve the thread if the reply left it resolved, and keep it open until
+  the fix lands. A `COMMENTED` review on its own is
   a reply, not a request for the fix — GitHub files one for every thread reply. When the human on it has replied without a
   verdict, their review request is cleared: answer them and re-request the same reviewer
   (`gh pr edit <n> --add-reviewer <login>`, the hand-back under
@@ -492,15 +494,16 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
-`kube-agents-bot` finding you decline or defer, the reason and the follow-up issue, which
+`kube-agents-bot` finding you decline or defer, the reason and the follow-up issue, if any, which
 **Self-Review** gives too. Then resolve what a commit fixed, what you showed wrong, and the bot
 findings you declined or deferred; the description thread waits for the body edit described below,
 or for your reply declining an ask the bot repeated. An open thread makes the pull request its
 author's on the reviewers' dashboard ([who owns an open pull request](#who-owns-an-open-pull-request)),
 so a declined bot thread left open hides the pull request from the reviewer who has to rule on it.
-A reviewer who disagrees reopens the thread or replies in it; a reply that asks for the fix owes the
-fix, with the thread open until it lands ([green is settled](#green-is-settled), _who counts_). A
-human reviewer's own thread stays open until they are satisfied: resolving it does not end a
+A reviewer who disagrees reopens the thread or replies in it. A reply does not reopen a resolved
+thread, so on a reply that asks for the fix, unresolve it (`unresolveReviewThread`, below): it owes
+the fix and stays open until the fix lands ([green is settled](#green-is-settled), _who counts_). A
+disagreement with a human reviewer stays open until they are satisfied: resolving it does not end a
 disagreement with a person. A pull request carrying
 both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
 applied by a workflow so that the enqueue sweep keeps it out of the merge queue until then;
@@ -547,7 +550,7 @@ Five ways that goes wrong quietly:
   because a mutation that fails after the reply is posted leaves a half-answered thread that looks
   handled.
 - `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
-  something you resolved.
+  something you resolved, or a reviewer replies in a resolved thread to ask for the fix.
 - No unresolved threads does not mean the bot is answered. Its finding about the pull request
   description opens one thread, whose first comment starts `<!-- kube-agents-bot:description -->`,
   and only editing the body answers it. After that, every review that still finds the body owing an
@@ -561,7 +564,7 @@ Five ways that goes wrong quietly:
   poll command in [Waiting for it](#waiting-for-it), before reporting the pull request clear. An ask
   that newer review repeats after your reply is a dispute for the human reviewer, not another edit:
   reply `declined: <reason>`, record it in **Self-Review**, and resolve the thread like any other
-  declined bot thread; a reviewer who disagrees reopens it
+  declined bot thread; a reviewer who disagrees reopens it, or replies and you unresolve it
   ([green is settled](#green-is-settled), _who counts_).
 
 ## How a change merges

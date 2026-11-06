@@ -49,12 +49,12 @@ cycle.
    flag, dependency or regex alternative; otherwise reply
    `declined: <reason about this change>` or `deferred to #N`, record it in
    **Self-Review**, and resolve the thread: an open thread hides the PR from
-   its reviewer. A reviewer who disagrees reopens it or replies, and a reply
-   that asks for the fix owes the fix, thread open. A correct 🔴 High is a fix on any round, unless its fix would add a
+   its reviewer. A reviewer who disagrees reopens it or replies; on a reply
+   that asks for the fix, unresolve the thread and owe the fix. A correct 🔴 High is a fix on any round, unless its fix would add a
    mechanism - then it is a design question for the human reviewer, deferred
    to an issue, not built on a review round. Resolve only a thread a commit
-   fixed, you showed factually wrong, or a human ruled on as above, per the
-   bar in the root `AGENTS.md`.
+   fixed, you showed factually wrong, or a bot finding you declined or
+   deferred as above, per the bar in the root `AGENTS.md`.
    Bring the body current in the same push as the fix, before any re-read.
    You get at most two re-reads of your own before green: after a push that
    fixed something, comment `/review` for a narrow re-check of the diff, or
@@ -185,8 +185,8 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
    requires all conversations resolved before it can merge. Resolve a thread
    only once genuinely resolved, per the root `AGENTS.md`; a declined or
    deferred bot finding is resolved once its reply gives the reason and
-   **Self-Review** names it, and a reviewer who disagrees reopens it - a
-   reply that asks for the fix owes it, thread open.
+   **Self-Review** names it; if a reviewer replies asking for the fix,
+   unresolve it and owe the fix.
 2. Reach a human reviewer: a green bot pass - clean on the first review, or
    nothing above Medium and the description answered (the body edited, not
    just its thread resolved) on a later one, per
