@@ -638,20 +638,25 @@ const a2aDrainingWindow = time.Duration(agentv1alpha1.DefaultProfileMaxTaskDeadl
 // The applied config is a ConfigMap, and a draining profile's name becomes a
 // grant on the dispatcher's identity (dispatcherGrantNames), so only what the
 // render would itself produce is carried forward: a name and tiers that are
-// subject tokens, and the limits; nothing else of the entry. An entry that
-// isn't is dropped, and grants nothing.
+// subject tokens, once each, the limits, and a time no later than the
+// window from now; nothing else of the entry. An entry that isn't is
+// dropped, and grants nothing.
 func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time) []a2aDispatchProfile {
 	if applied == nil {
 		return nil
 	}
 	var out []a2aDispatchProfile
+	seen := map[string]bool{}
 	for _, a := range applied.Profiles {
-		if live[a.Name] || !isDNS1123LabelToken(a.Name) || len(a.Tiers) == 0 ||
+		if live[a.Name] || seen[a.Name] || !isDNS1123LabelToken(a.Name) || len(a.Tiers) == 0 ||
 			slices.ContainsFunc(a.Tiers, func(t string) bool { return !isDNS1123LabelToken(t) }) {
 			continue
 		}
+		seen[a.Name] = true
+		// A time past the window is not one this operator wrote: it is
+		// clamped, so no entry keeps a grant longer than a drain can need.
 		until := a.DrainingUntil
-		if until.IsZero() {
+		if until.IsZero() || until.After(now.Add(a2aDrainingWindow)) {
 			until = now.Add(a2aDrainingWindow).Truncate(time.Second).UTC()
 		} else if !now.Before(until) {
 			continue
@@ -670,28 +675,41 @@ func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, 
 }
 
 // dispatchDraining reads the applied dispatch config and returns the
-// profiles of it still draining against this render. An applied config the
-// operator can't read drains nothing: the render is then what it was before
-// draining existed, and the next pass tries again.
-func (r *PlatformAgentReconciler) dispatchDraining(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) []a2aDispatchProfile {
+// profiles of it still draining against this render. None applied (NotFound)
+// drains nothing. A read that fails otherwise is an error for the pass, which
+// then applies neither render: rendering without the set would drop every
+// drain, and the next pass would have nothing left to carry forward. An
+// applied body that doesn't decode can't be read on any pass, so it is a
+// Warning and drains nothing, rather than stop the stack for good; it takes
+// an edit of an object only the operator writes.
+func (r *PlatformAgentReconciler) dispatchDraining(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) ([]a2aDispatchProfile, error) {
 	cm := &corev1.ConfigMap{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, cm); err != nil {
-		return nil
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading the applied dispatch config for the draining profiles: %w", err)
 	}
 	var applied a2aDispatchConfig
 	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &applied); err != nil {
-		return nil
+		r.recordEvent(agent, corev1.EventTypeWarning, reasonDispatchConfigUnreadable,
+			fmt.Sprintf("the applied dispatch config %s does not decode (%v); no profile that has left the install is kept draining", cm.Name, err))
+		return nil, nil
 	}
 	cfg, err := desiredDispatchConfig(agent, profiles)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	live := map[string]bool{}
 	for _, p := range cfg.Profiles {
 		live[p.Name] = true
 	}
-	return drainingDispatchProfiles(&applied, live, time.Now())
+	return drainingDispatchProfiles(&applied, live, time.Now()), nil
 }
+
+// reasonDispatchConfigUnreadable is the Warning when the applied dispatch
+// config doesn't decode, so no draining profile can be carried forward.
+const reasonDispatchConfigUnreadable = "DispatchConfigUnreadable"
 
 func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (*corev1.ConfigMap, error) {
 	cfg, err := desiredDispatchConfigDraining(agent, profiles, draining)
@@ -716,7 +734,11 @@ func buildA2ADispatchConfigMap(agent *agentv1alpha1.PlatformAgent, profiles []ag
 // follow the profile-namespace rule: a failure there is returned for the
 // caller to log, and the rest still lands.
 func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool) (profileErr error, err error) {
-	return r.reconcileA2ADispatcherDraining(ctx, agent, profiles, profileNamespaceReady, r.dispatchDraining(ctx, agent, profiles))
+	draining, err := r.dispatchDraining(ctx, agent, profiles)
+	if err != nil {
+		return nil, err
+	}
+	return r.reconcileA2ADispatcherDraining(ctx, agent, profiles, profileNamespaceReady, draining)
 }
 
 // reconcileA2ADispatcherDraining is reconcileA2ADispatcher with the draining

@@ -651,6 +651,15 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		d.adopt(ctx, log, del, snap, prof, hk, rec, key)
 		return
 	}
+	if prof.Draining() {
+		// Draining (#5074): listed so its held tasks' terminals still land,
+		// but nothing new is dispatched for it. Its durable goes at the next
+		// refresh; until then a new delivery, or a redelivered one from its
+		// backlog, stays queued as an unknown profile's does.
+		log.Info("the profile is draining; the submission stays queued")
+		_ = del.Nak(d.cfg.RetryDelay)
+		return
+	}
 
 	now := d.now()
 	cluster, ref, err := d.admit(ctx, del, snap, prof, hk, now)

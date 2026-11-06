@@ -5796,7 +5796,10 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The profiles still draining (#5074), read once from the applied
 	// dispatch config for both renders: the identity map keeps their
 	// .supervisor grant exactly as long as the dispatch config lists them.
-	draining := r.dispatchDraining(ctx, agent, profiles)
+	draining, err := r.dispatchDraining(ctx, agent, profiles)
+	if err != nil {
+		return state, err
+	}
 	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)

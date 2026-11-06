@@ -41,3 +41,32 @@ func TestADrainingProfileFinishesWhatItHoldsAndTakesNothingNew(t *testing.T) {
 		t.Errorf("the draining profile's worker was offered %d tasks, want only task-1", n)
 	}
 }
+
+// In the window before the dispatcher's next refresh drops a draining
+// profile's durable, a delivery for it (a new submission, or one of its
+// backlog redelivered) stays queued: the profile is listed so its held
+// tasks' terminals land, not to take new work.
+func TestADrainingProfilesDurableTakesNothingBeforeItIsDropped(t *testing.T) {
+	b := newBus(t, "tse-0")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-0", answerAccept, time.Second)
+	ti := oneProfile("tse", 2, "tse-0")
+	cfg := testConfig()
+	cfg.RefreshInterval = time.Hour // the durable stays bound for the whole test
+	b.runDispatcher(cfg, ti, &fakeVerifier{})
+
+	// Bound and taking work while live.
+	b.submit("tse", "read", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 offered while live", func() bool { return w.offerCount() == 1 })
+
+	ti.update(func(c *lib.DispatchConfig) {
+		p := c.Profiles[0]
+		p.Durables, p.DrainingUntil = nil, time.Now().Add(time.Hour)
+		c.Profiles[0] = p
+	})
+	b.submit("tse", "read", lib.SubmitKindTop, "task-2")
+	time.Sleep(2 * time.Second) // several retry delays, no refresh
+	if n := w.offerCount(); n != 1 {
+		t.Errorf("a draining profile's still-bound durable was offered %d tasks, want only task-1", n)
+	}
+}

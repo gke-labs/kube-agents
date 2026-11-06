@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -27,6 +28,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -55,6 +59,9 @@ func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 		{Name: "*", Concurrency: 1, Tiers: []string{"read"}},
 		{Name: "bad-tier", Concurrency: 1, Tiers: []string{"read", "a.b"}},
 		{Name: "no-tier", Concurrency: 1},
+		// Listed twice, and with a time no drain this operator writes has.
+		{Name: "gone", Concurrency: 9, Tiers: []string{"read"}},
+		{Name: "far", Concurrency: 1, Tiers: []string{"read"}, Durables: []a2aDispatchDurable{}, DrainingUntil: now.AddDate(10, 0, 0)},
 	}}
 	live := map[string]bool{"kept": true}
 
@@ -63,8 +70,11 @@ func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 	for _, p := range got {
 		names[p.Name] = p
 	}
-	if _, ok := names["kept"]; ok || len(got) != 2 {
-		t.Fatalf("draining %v, want gone and draining only", got)
+	if _, ok := names["kept"]; ok || len(got) != 3 {
+		t.Fatalf("draining %v, want gone, draining and far only", got)
+	}
+	if far := names["far"]; !far.DrainingUntil.Equal(now.Add(a2aDrainingWindow)) {
+		t.Errorf("a time ten years out was kept as %v, want clamped to %v", far.DrainingUntil, now.Add(a2aDrainingWindow))
 	}
 	gone := names["gone"]
 	// The window is the longest deadline any task can carry, not the
@@ -162,9 +172,11 @@ func TestTheReconcileDrainsWhatTheAppliedConfigListed(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()
 	r, cl, _ := a2aGateTestReconciler(t, agent)
+	rec := record.NewFakeRecorder(8)
+	r.Recorder = rec
 	ctx := context.Background()
-	if got := r.dispatchDraining(ctx, agent, nil); got != nil {
-		t.Fatalf("with no applied config, draining %v", got)
+	if got, err := r.dispatchDraining(ctx, agent, nil); got != nil || err != nil {
+		t.Fatalf("with no applied config, draining %v, %v", got, err)
 	}
 
 	applied := a2aDispatchConfig{Profiles: []a2aDispatchProfile{{Name: "gone", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 600,
@@ -175,17 +187,37 @@ func TestTheReconcileDrainsWhatTheAppliedConfigListed(t *testing.T) {
 	if err := cl.Create(ctx, cm); err != nil {
 		t.Fatal(err)
 	}
-	got := r.dispatchDraining(ctx, agent, nil)
-	if len(got) != 1 || got[0].Name != "gone" || got[0].DrainingUntil.IsZero() || len(got[0].Durables) != 0 {
-		t.Errorf("draining %+v, want gone, draining with no durables", got)
+	got, err := r.dispatchDraining(ctx, agent, nil)
+	if err != nil || len(got) != 1 || got[0].Name != "gone" || got[0].DrainingUntil.IsZero() || len(got[0].Durables) != 0 {
+		t.Errorf("draining %+v, %v; want gone, draining with no durables", got, err)
 	}
 
+	// A read that fails, other than NotFound, fails the pass: rendering
+	// without the set would end every drain for good.
+	failing := &PlatformAgentReconciler{Scheme: r.Scheme, Recorder: rec}
+	failing.Client = interceptor.NewClient(cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Name == a2aDispatchConfigName(agent) {
+				return errors.New("the API server is unavailable")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	if got, err := failing.dispatchDraining(ctx, agent, nil); err == nil {
+		t.Errorf("a failed read drained %v with no error; want the pass to fail", got)
+	}
+
+	// A body that doesn't decode can't be read on any pass: a Warning, and
+	// nothing drains, rather than stop the stack for good.
 	cm.Data[a2aDispatchConfigKey] = "{not json"
 	if err := cl.Update(ctx, cm); err != nil {
 		t.Fatal(err)
 	}
-	if got := r.dispatchDraining(ctx, agent, nil); got != nil {
-		t.Errorf("an unreadable applied config drained %v", got)
+	if got, err := r.dispatchDraining(ctx, agent, nil); got != nil || err != nil {
+		t.Errorf("an undecodable applied config: draining %v, %v", got, err)
+	}
+	if events := drainEvents(rec); len(events) != 1 || !strings.Contains(events[0], reasonDispatchConfigUnreadable) {
+		t.Errorf("events %q, want one %s warning", events, reasonDispatchConfigUnreadable)
 	}
 }
 
