@@ -955,9 +955,13 @@ def resource_for(kind: str, api_version: str, batch: list[str]) -> str:
     return f"{kind.lower()}.{group}"
 
 
-def discover_kinds(kubeconfig: str, candidates: list[str], now: str) -> dict:
+def discover_kinds(kubeconfig: str, candidates: list[str], now: str, previous: dict | None = None) -> dict:
     """Which of `candidates` have objects on the cluster, and in which
     namespaces, from DISCOVERY_BATCH_KINDS kinds per `kubectl get`. A kind
+    the `previous` record names whose group is not among the candidates is
+    not listed and goes to the new record's unknown kinds: the api-resources
+    listing lost the group, and a listing gap must not clear a card, on a
+    refresh tick any more than on another. A kind
     that printed an object is read wherever it printed one. Every kind in a
     batch that exited 0 and was not cut is known: empty where it printed
     nothing. Every kind in any other batch is unknown as well, the ones that
@@ -1002,6 +1006,10 @@ def discover_kinds(kubeconfig: str, candidates: list[str], now: str) -> dict:
                 kinds.setdefault(resource, [])
             else:
                 unknown.append(resource)
+    served_groups = {resource_group(c) for c in candidates}
+    if isinstance(previous, dict):
+        before = set((previous.get(DISCOVERY_KINDS_KEY) or {}) if isinstance(previous.get(DISCOVERY_KINDS_KEY), dict) else []) | set(previous.get(DISCOVERY_UNKNOWN_KEY) or [])
+        unknown += [r for r in before if resource_group(r) not in served_groups and r not in kinds and r not in unknown]
     return {DISCOVERY_AT_KEY: now, DISCOVERY_KINDS_KEY: kinds, DISCOVERY_UNKNOWN_KEY: sorted(unknown)}
 
 
@@ -1558,7 +1566,7 @@ def sweep_fleet(
             if candidates and not sweep.out_of_budget(started, cid) and discovery_due(record, now, refreshed):
                 if record is not None:
                     refreshed += 1
-                record = discover_kinds(kubeconfig, candidates, now)
+                record = discover_kinds(kubeconfig, candidates, now, record)
                 discoveries[cid] = record
             if wildcards and (candidates or record is not None):
                 extra_kinds, held, cut = wildcard_kinds_for(record, candidates, wildcards, cluster_label(cid))

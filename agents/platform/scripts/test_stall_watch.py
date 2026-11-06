@@ -2015,6 +2015,42 @@ class ConfigConnector(Base):
                 self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["SQLInstance/orders-db"])
         self.assertEqual(next(iter(self.board.cards.values()))["status"], "ready")
 
+    def test_a_listing_that_loses_one_group_on_a_refresh_tick_still_holds_its_rows(self):
+        self.run_tick({"c": {"payments": [KCC_ROW]}}, served=KCC_SERVED, objects=KCC_OBJECTS, now="2026-11-06T00:00:00+00:00")
+        self.assertEqual(len(self.last_alerts), 1)
+        no_sql = [k for k in KCC_SERVED if k != KCC_SQL]
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=no_sql, objects=KCC_OBJECTS, now="2026-11-06T07:00:00+00:00")
+        self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_BUCKETS]], "the refresh lists the groups the listing still shows")
+        self.assertNotIn(KCC_SQL, fake.kinds_asked("payments"))
+        self.assertEqual(lines, [], "the lost group's row is held across the refresh")
+        self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["SQLInstance/orders-db"])
+        record = self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")]
+        self.assertEqual(record[stall_watch.DISCOVERY_UNKNOWN_KEY], [KCC_SQL], "carried as unknown, so the hourly retry re-checks it")
+        # The group comes back an hour later: read again, and the row clears
+        # when the object is gone.
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], now="2026-11-06T08:00:00+00:00")
+        self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_SQL, KCC_BUCKETS]])
+        self.assertEqual(len(self.cleared(lines)), 1)
+
+    def test_a_tick_out_of_budget_before_discovery_runs_none(self):
+        exhausted = {"now": False}
+        real_served, real_out_of_budget = stall_watch.served_kinds, stall_watch.Sweep.out_of_budget
+
+        def served_then_exhaust(kubeconfig):
+            served = real_served(kubeconfig)
+            exhausted["now"] = True
+            return served
+
+        def out_of_budget(self, started, cid, namespace=None):
+            # Past the budget from the first check after the listing.
+            return real_out_of_budget(self, started - (stall_watch.TICK_BUDGET_SECONDS + 1) if exhausted["now"] else started, cid, namespace)
+
+        with patch.object(stall_watch, "served_kinds", served_then_exhaust), patch.object(stall_watch.Sweep, "out_of_budget", out_of_budget):
+            _, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(fake.discoveries(), [], "no six-command discovery after the budget is spent")
+        self.assertEqual(fake.scanned(), [])
+        self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+
     def test_a_wildcard_never_expands_to_a_refused_kind(self):
         served = SERVED_DEFAULT + ["leases.coordination.k8s.io", "endpointslices.discovery.k8s.io", "ingresses.networking.k8s.io"]
         objects = [("payments", "Lease", "coordination.k8s.io/v1"), ("payments", "EndpointSlice", "discovery.k8s.io/v1"), ("payments", "Ingress", "networking.k8s.io/v1")]
