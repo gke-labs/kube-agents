@@ -789,13 +789,21 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
+	// Gated off: what an earlier pass rendered goes, before the pools, so
+	// the CA bundle (which the Job pods mount too) goes after the Jobs.
+	var sweepErr error
+	if !signal {
+		sweepErr = r.deleteDispatcherJobResources(ctx, agent)
+	}
 	// The warm pools the dispatcher hands interactive tasks to
 	// (agentprofile_pool.go). A failure there is the profile namespace's,
-	// like the quota's.
-	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved, len(jobTemplates) > 0)
-	// Gated off: what an earlier pass rendered goes.
+	// like the quota's. With no pool the CA bundle stays while Job mode is
+	// signalled: a revoke or a transient failure above leaves templates out
+	// but running Jobs in place, and their pods mount it. Only the gate-off
+	// sweep, once it has deleted the Jobs, lets it go.
+	poolErr := r.reconcileProfilePools(ctx, agent, profiles, resolved, signal || sweepErr != nil)
 	if !signal {
-		return goerrors.Join(poolErr, r.deleteDispatcherJobResources(ctx, agent)), nil
+		return goerrors.Join(poolErr, sweepErr), nil
 	}
 	return goerrors.Join(jobErr, poolErr), nil
 }

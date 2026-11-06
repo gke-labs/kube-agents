@@ -1022,6 +1022,50 @@ func TestAnUnattendedOnlyProfileGetsTheCABundleForItsJobs(t *testing.T) {
 	}
 }
 
+// With no warm pool, Job mode revoked (here the profile namespace losing the
+// label the policy's binding selects it by) leaves the dispatcher's running
+// Jobs to finish, so the CA bundle their pods mount stays with them.
+func TestARevokedJobModeKeepsTheCABundleForItsRunningJobs(t *testing.T) {
+	agent := a2aTestAgent()
+	r, c := jobTemplateTestReconciler(t, agent)
+	ctx := context.Background()
+	p := unattendedProfile(agent, "nightly")
+	p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierUnattended}
+	profiles := []agentv1alpha1.AgentProfile{p}
+	pns := profileNamespaceName(agent)
+	bundleKey := types.NamespacedName{Namespace: pns, Name: a2aNATSCABundleName(agent)}
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("render: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, bundleKey, &corev1.ConfigMap{}); err != nil {
+		t.Fatalf("precondition: no CA bundle in the profile namespace: %v", err)
+	}
+	running := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "dispatch-running", Namespace: pns, Labels: dispatchJobLabels(agent)}}
+	if err := c.Create(ctx, running); err != nil {
+		t.Fatal(err)
+	}
+	var ns corev1.Namespace
+	if err := c.Get(ctx, types.NamespacedName{Name: pns}, &ns); err != nil {
+		t.Fatal(err)
+	}
+	delete(ns.Labels, labelPartOf)
+	if err := c.Update(ctx, &ns); err != nil {
+		t.Fatal(err)
+	}
+	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, profiles, true); err != nil || profileErr != nil {
+		t.Fatalf("revoked: %v / %v", err, profileErr)
+	}
+	if err := c.Get(ctx, types.NamespacedName{Namespace: pns, Name: a2aDispatcherJobsRoleName(agent)}, &rbacv1.RoleBinding{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("precondition: Job mode wasn't revoked: %v", err)
+	}
+	if err := c.Get(ctx, client.ObjectKeyFromObject(running), &batchv1.Job{}); err != nil {
+		t.Fatalf("precondition: the running Job went with the revoke: %v", err)
+	}
+	if err := c.Get(ctx, bundleKey, &corev1.ConfigMap{}); err != nil {
+		t.Errorf("the CA bundle went with the revoke, under a running Job: %v", err)
+	}
+}
+
 // Past the tool limit with image volumes off, a profile's Job pods would never
 // schedule on Autopilot, as its pool's wouldn't: it gets no Job template, the
 // reconcile names it as a profile-namespace error, and the other profiles keep

@@ -365,10 +365,11 @@ func buildProfileCABundle(agent *agentv1alpha1.PlatformAgent, data map[string]st
 // reconcileProfilePools renders a warm pool for every admitted profile's
 // interactive tiers, with the CA bundle they mount, and removes this agent's
 // pools that no longer have a profile or tier. Only with the dispatcher, which
-// is the pools' only source of work. jobs says the dispatch config names a Job
-// template, whose pods mount the bundle too: it is then kept (reconcileA2ADispatcher
-// copied it before publishing the templates) even with no pool.
-func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution, jobs bool) error {
+// is the pools' only source of work. keepBundle says dispatcher Jobs may still
+// mount the bundle (Job mode signalled, even if revoked, since a revoke leaves
+// running Jobs to finish; or a gate-off sweep that didn't finish): it is then
+// kept even with no pool.
+func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, resolved map[string]agentProfileResolution, keepBundle bool) error {
 	imageVolumes := r.imageVolumeSupported(agent)
 	var pools []*appsv1.Deployment
 	var errs []error
@@ -397,7 +398,7 @@ func (r *PlatformAgentReconciler) reconcileProfilePools(ctx context.Context, age
 		}
 	}
 	if len(want) == 0 {
-		if jobs {
+		if keepBundle {
 			return r.deleteProfilePoolsExcept(ctx, agent, nil)
 		}
 		// Nothing left to mount the bundle copy either.
