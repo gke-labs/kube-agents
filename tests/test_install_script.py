@@ -1457,15 +1457,22 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
     def test_both_installers_name_the_restore_before_their_import_advice(self):
         """install.sh and upgrade.sh refuse a minter key with no ENABLED version; the
         restore advice comes first, and their own import advice only when it returns 1."""
-        for script, advice in (
-            (_INSTALL_SH, 'print_info "Fix the App key import'),
-            (_REPO_ROOT / "upgrade.sh", 'print_info "Import the App key with install.sh'),
+        for script, refusal, advice in (
+            (_INSTALL_SH, "but its KMS signing key still has no ENABLED version", 'print_info "Fix the App key import'),
+            (_REPO_ROOT / "upgrade.sh", "but its KMS signing key has no ENABLED version", 'print_info "Import the App key with install.sh'),
         ):
             with self.subTest(script=script.name):
                 text = script.read_text()
-                call = text.index("print_minter_restore_advice ")
-                self.assertLess(call, text.index(advice))
-                self.assertIn(" ||\n", text[call : text.index(advice)])
+                # Anchor on the final refusal's own print_error, not the first
+                # restore-advice call in the file: the helper runs three times
+                # since #4570, and anchoring on the first left the final refusal
+                # free to drop its advice with the test still green.
+                start = text.index(refusal)
+                window = text[start : text.index(advice, start)]
+                # The opening quote matches the call, not upgrade.sh's
+                # `declare -F print_minter_restore_advice` guard line.
+                self.assertIn('print_minter_restore_advice "', window)
+                self.assertIn(" ||\n", window)
         # upgrade.sh sources the target tree's helpers, which may predate this one.
         self.assertIn("declare -F print_minter_restore_advice", (_REPO_ROOT / "upgrade.sh").read_text())
 
@@ -4915,6 +4922,7 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
         legacy_np="False",
         status="RUNNING",
         accept="",
+        env_overrides=None,
     ):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -4947,7 +4955,10 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
                 ["bash", "-c", body],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env)}, bin_dir=str(bin_dir)),
+                env=get_isolated_test_env(
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty_env), **(env_overrides or {})},
+                    bin_dir=str(bin_dir),
+                ),
                 cwd=str(_REPO_ROOT),
             )
 
@@ -4979,6 +4990,20 @@ class SummarizeExistingClusterMutationsTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("Node Pool Metadata Migration: Refused", proc.stdout)
         self.assertIn("install will abort", proc.stdout)
+
+    def test_the_gvisor_line_names_the_sizing_inputs_not_a_fixed_shape(self):
+        """The pool's shape is decided by the module's sizing inputs, which reach
+        the apply as TF_VAR_ lines in install.env that this summary cannot see;
+        a line that names a machine type misstates the pool for an install.env
+        that sizes it."""
+        for env_overrides in ({}, {"TF_VAR_sizing_profile": "fleet"}, {"TF_VAR_gvisor_machine_type": "n2-standard-4"}):
+            with self.subTest(env_overrides=env_overrides):
+                proc = self._run(env_overrides=env_overrides)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("gVisor Sandbox Node Pool: Will create 'gvisor-pool'", proc.stdout)
+                self.assertIn("sizing_profile", proc.stdout)
+                self.assertIn("install.env", proc.stdout)
+                self.assertNotRegex(proc.stdout, r"[a-z][0-9]+[a-z]*-(standard|highmem|highcpu)-[0-9]+")
 
     def test_summary_reflects_unreadable_network_policy(self):
         proc = self._run(status="")
@@ -8060,7 +8085,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("went on ASKED=7", proc.stdout, out)
         self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
         self.assertIn("SLACK_HOME_CHANNEL is empty", out)
-        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
         proc = self._interview("--mode=next", "", lead + ["", "y", "#ops"])
         out = proc.stdout + proc.stderr
         self.assertIn("went on ASKED=6", proc.stdout, out)
@@ -8077,12 +8102,12 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 lead = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD"]
                 proc = self._interview("--mode=next", "", lead + ["\u00a0", "n", "C0123ABCD", "#ops"], locale=locale)
                 out = proc.stdout + proc.stderr
-                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
                 self.assertIn("HOME=[C0123ABCD]", proc.stdout, out)
             with self.subTest(locale=locale, platform="google_chat"):
                 proc = self._interview("--mode=next", "", ["", "", "", "\u3000\u202f", "y"], choice="1", locale=locale)
                 out = proc.stdout + proc.stderr
-                self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+                self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
                 self.assertIn("went on ASKED=5", proc.stdout, out)
 
     def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
@@ -8094,7 +8119,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("went on ASKED=6", proc.stdout, out)
         self.assertIn("PROMPT: Google Chat Home Channel / Space ID (e.g. spaces/AAAA...; alerts and reports post there)", out)
         self.assertIn("GOOGLE_CHAT_HOME_CHANNEL is empty", out)
-        self.assertIn("PROMPT: Continue without a home channel, so alerts and reports are dropped? (y/N)", out)
+        self.assertIn("PROMPT: Continue without a home channel for now? (y/N)", out)
         proc = self._interview("--mode=next", "", lead + ["", "y"], choice="1")
         self.assertIn("went on ASKED=5", proc.stdout, proc.stdout + proc.stderr)
         # Under today the prompt stays optional and nothing is confirmed.

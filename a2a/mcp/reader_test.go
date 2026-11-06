@@ -279,6 +279,12 @@ func TestADrainStopsAtAMessageOverThePullCap(t *testing.T) {
 // A task watch sizes each pull from what is pending then, not when the watch
 // began: a watch opened on a task with no events yet reads a burst of later
 // ones in a few pulls, not one pull per event.
+//
+// The server counts a consumer's pending messages apart from the publish
+// that stores them, so a read that starts right after the publishes can see
+// a count that has not caught up, and size its pulls from it. Under load that
+// count lagged the stored events, and the watch sent up to 15 pulls. The test
+// waits for the consumer to count all n before it reads.
 func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 	url, js := bigBus(t)
 	var pulls atomic.Int64
@@ -287,6 +293,10 @@ func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = sub.Unsubscribe() }()
+	// The server has the counting subscription before any pull goes.
+	if err := js.Conn().Flush(); err != nil {
+		t.Fatal(err)
+	}
 	ref := TaskRef{Addressee: fakeAddressee, TaskID: "task-later"}
 	w, err := dial(t, url).watchTask(context.Background(), ref)
 	if err != nil {
@@ -297,6 +307,7 @@ func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 	publishN(t, js, lib.TaskEventsSubject(ref.Addressee, ref.TaskID), []byte("{}"), n)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	waitConsumerPending(t, ctx, js, n)
 	for w.seen < n && ctx.Err() == nil {
 		if err := w.next(ctx); err != nil {
 			t.Fatal(err)
@@ -307,6 +318,68 @@ func TestATaskWatchSizesEachPullFromWhatIsPending(t *testing.T) {
 	}
 	if got := pulls.Load(); got > 5 {
 		t.Errorf("sent %d pulls for %d events; want each pull sized from what is pending", got, n)
+	}
+}
+
+// waitConsumerPending waits until the TASKS stream's one consumer counts n
+// messages pending, and fails the test if it does not.
+func waitConsumerPending(t *testing.T, ctx context.Context, js jetstream.JetStream, n uint64) {
+	t.Helper()
+	if err := consumerPending(ctx, js, n); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// consumerPending is waitConsumerPending's wait. A watch's consumer with no
+// pull outstanding is reaped after taskConsumerIdle, and from then on no count
+// can arrive, so a listing with no consumer, or one that fails, ends the wait
+// with that cause rather than running out the context.
+func consumerPending(ctx context.Context, js jetstream.JetStream, n uint64) error {
+	s, err := js.Stream(ctx, lib.TasksStream)
+	if err != nil {
+		return err
+	}
+	for {
+		names := s.ConsumerNames(ctx)
+		found := 0
+		for name := range names.Name() {
+			found++
+			c, err := s.Consumer(ctx, name)
+			if err != nil {
+				continue
+			}
+			info, err := c.Info(ctx)
+			if err == nil && info.NumPending == n {
+				return nil
+			}
+		}
+		if err := names.Err(); err != nil {
+			return fmt.Errorf("listing the %s consumers: %w", lib.TasksStream, err)
+		}
+		if found == 0 {
+			return fmt.Errorf("the watch's consumer on %s is gone, reaped after %s with no pull outstanding, before it counted %d messages pending",
+				lib.TasksStream, taskConsumerIdle, n)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("the consumer never counted %d messages pending: %w", n, ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// A consumer reaped before it counts names the reap, not a count that never
+// came.
+func TestConsumerPendingNamesAReapedConsumer(t *testing.T) {
+	_, js := testBus(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := consumerPending(ctx, js, 1)
+	if err == nil || !strings.Contains(err.Error(), "reaped after") {
+		t.Fatalf("err = %v, want the reap named", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the wait ran out its context instead of ending on the empty listing")
 	}
 }
 

@@ -777,9 +777,28 @@ class LogLineTest(ProxyTestCase):
         self.request("POST", "/v1/chat/completions", chat("t_11111111", stream=False))
         extra = ({"role": "user", "content": "earlier turn t_99999999"},)
         self.request("POST", "/v1/chat/completions", chat("t_22222222", stream=False, extra_messages=extra))
-        a, b = self.lines(2)
+        # The two lines can land in either order (#4827): tell them apart by
+        # their message count.
+        a, b = sorted(self.lines(2), key=lambda line: len(line["message_hashes"]))
+        self.assertEqual([len(a["message_hashes"]), len(b["message_hashes"])], [2, 3])
         self.assertEqual(a["message_hashes"][:1], b["message_hashes"][:1])
-        self.assertEqual(len(b["message_hashes"]), 3)
+
+    def test_an_answer_naming_the_prompt_date_is_unstorable_as_a_date(self):
+        # The system prompt's date is counted in days, so the key matches the
+        # next day; an answer carrying the date must not be saved.
+        body = {"model": "model-default", "messages": [
+            {"role": "system", "content": "Conversation started: Wednesday, November 04, 2026 (UTC, UTC+00:00)"},
+            {"role": "user", "content": "write today's notes"}]}
+        mapping = replay_proxy.normalizer.normalize_request(body, time.time()).mapping
+        scrubber = replay_proxy.request_store.Scrubber(REDACTOR, RULES)
+        headers = {"x-litellm-model-group": "model-default", "x-litellm-attempted-fallbacks": "0"}
+        dated = {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "write_file", "arguments": '{"path": "memory/2026-11-04.md"}'}}]}
+        reasons = replay_proxy.unstorable_reasons(body, 200, dated, headers, mapping, scrubber)
+        self.assertIn("repeats_swapped_date", reasons)
+        self.assertNotIn("repeats_swapped_number", reasons)
+        plain = {"role": "assistant", "content": "notes written"}
+        self.assertNotIn("repeats_swapped_date", replay_proxy.unstorable_reasons(body, 200, plain, headers, mapping, scrubber))
 
     def test_fallback_answer_is_marked_unstorable(self):
         FakeLiteLLM.fallbacks = "1"

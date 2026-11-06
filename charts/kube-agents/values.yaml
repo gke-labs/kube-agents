@@ -17,6 +17,11 @@
 # holds the pods the A2A gateway creates to the session pod shape, and sets
 # A2A_GATEWAY_POD_POLICY=true on the operator; turning it off removes both.
 #
+# It also installs templates/web-console-cr-admission-policy.yaml where the web
+# console and its environment page are on: the console's ServiceAccount may
+# change only its own annotations and spec.integration.forges, repositories and
+# github on the PlatformAgent.
+#
 # What the policies do and do not enforce is in the header of
 # templates/agent-rbac-admission-policy.yaml. Read it before relying on them:
 # on a default install with no GitOps overlay, the content policy matches
@@ -912,14 +917,17 @@ platformAgent:
     size: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
-  # "PlatformAgent annotations"). Three of them the chart also derives from
+  # "PlatformAgent annotations"). Four of them the chart also derives from
   # values: litellm.networkPolicy=false stamps
   # kubeagents.x-k8s.io/enable-litellm-network-policy: "false",
   # telemetry.collectorNamespace stamps
   # kubeagents.x-k8s.io/otlp-collector-namespace, and
   # litellm.modelProvider=openai_compatible stamps
   # kubeagents.x-k8s.io/litellm-upstream-egress from litellm.openaiCompatible
-  # (unless the endpoint is public on port 443). When the chart stamps a key,
+  # (unless the endpoint is public on port 443), and every render stamps
+  # kubeagents.x-k8s.io/a2a-quota-chart-pods with the chart's pods and their
+  # rollout surges.
+  # When the chart stamps a key,
   # an entry here that disagrees with it fails the render; otherwise the entry
   # passes through, except that with litellm.otel=true an otlp-collector-namespace
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
@@ -1053,6 +1061,26 @@ platformAgent:
       # but never marks a change as one a controller may already have
       # reverted.
       gitopsManagers: ""
+    # The k8s event watcher. alertExclude lists events that open no incident:
+    # no alert, no triage card, no share of the daily alert ceiling. Their
+    # clusters stay in scope, so the agent still reads them when asked. A rule
+    # sets one or more of cluster ({projectId, location, clusterName}, only
+    # clusterName required), namespace, reason, kind and name (a trailing *
+    # is a prefix), and matches when every part it sets matches; an event is
+    # excluded when any rule matches. At most 64 rules. Empty omits the block.
+    # A change rolls the gateway pod. See spec.harness.eventWatcher in the
+    # PlatformAgent CRD reference. Removing the last rule through helm upgrade
+    # removes the CR's whole eventWatcher block, so an enabled: false set there
+    # with kubectl patch is lost too; set it again afterwards. The watcher's
+    # tuning settings are under platformAgent.deployment.eventWatcher.
+    eventWatcher:
+      alertExclude: []
+        # - namespace: payments
+        # - reason: FailedScheduling
+        #   cluster: { clusterName: batch }
+        # - namespace: shop
+        #   kind: Pod
+        #   name: inventory-api-*
     # The controller stall watch, the stall-watch cron job that alerts on
     # controllers that stopped making progress. Empty omits the block and
     # keeps the watch's defaults. A change rolls the agent pod. The
@@ -1284,6 +1312,7 @@ platformAgent:
     # each setting does. A duration that the watcher cannot read keeps its
     # default, and the container log names it. A change rolls the agent pod
     # and the credential-proxy pod, which also gets spec.deployment.env.
+    # Alert excludes are under platformAgent.harness.eventWatcher.alertExclude.
     eventWatcher: {}
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key

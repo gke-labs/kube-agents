@@ -24,7 +24,8 @@ With the flag on, :func:`register` adds three listeners:
   read the message is told what the click is about. Part of a line is not
   enough: it can say the opposite of the line it came from. The answered line still shows the label.
   An incident option button is the other exception: it shows the option's
-  title (`` (recommended)`` after the recommended one's) and its value is the
+  title (`` (recommended)`` after the recommended one's, except on a drift
+  alert, where the primary style alone marks it) and its value is the
   reply the report's call to action asks for, ``apply Option B: <that
   title>``, which is the turn when its title is the one shown, whole or as
   the clip shows it. The shown title, without the suffix, is what the

@@ -130,7 +130,15 @@ The rules that keep this safe:
   they are ("minutes ago", "days ago", "in the future", and so on), and an expired certificate never
   matches a valid one. Anything in the last hour is one token and anything in the next hour
   another, so run-to-run timing jitter (a card read 50 or 70 seconds after it was claimed) doesn't change the
-  key. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
+  key. A spelled-out date with no time of day, like the "Conversation started: Thursday, November
+  05, 2026" line Hermes puts in the system prompt, becomes how many calendar days it is from the
+  request's own day instead ("today", "yesterday", "days ago", ...), counted in the time zone
+  written after it, so a nightly recorded on Wednesday still matches a presubmit on Thursday. A
+  date-only `2026-11-05` and an `ls -l` date with a year are counted the same way. An answer that
+  names one of these dates isn't saved, since replayed the next day it would carry the wrong date.
+  The answer is read for dates in any common shape (`memory/2026-11-04.md`, `20261104`,
+  `11/04/2026`, "4 November", "nov-04"), and today's date also counts without the year or by its
+  weekday ("findings for November 04"). In the dev-install trials that was 1 of 153 saved answers. Epoch seconds count only under a key that names a time (`created_at`, `ts`,
   `timestamp`); any other 10-digit number, like `memory: 1717986918`, isn't read as a time. IP
   addresses stay as they are whenever the request mentions a network range (like `10.0.0.0/16`),
   because then which range an IP falls in can matter.
@@ -166,9 +174,9 @@ Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task 
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
 `resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages. Epoch seconds
 become an unnumbered how-far-from-now time token rather than a numbered placeholder, because two
-events in one second would otherwise shift every later number. Known gaps from the measurements:
-`ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`). The
-rules above change two of these classes: timestamps get a how-far-from-now token, and IPs stay as
+events in one second would otherwise shift every later number. The measurements found two gaps,
+`ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`); the
+normalizer handles both now. The rules above change two of these classes: timestamps get a how-far-from-now token, and IPs stay as
 they are when a network range is in the request.
 
 ## Measurements
@@ -190,7 +198,7 @@ recording. That happened in three ways:
 
 - the GCP capacity advisor returned a different score and zone (real data that changes);
 - a `sleep 60` in a polling loop timed out in one run and finished normally in another;
-- `ls -l` printed different file timestamps (a normalizer gap, listed above).
+- `ls -l` printed different file timestamps (a normalizer gap then, handled now).
 
 The provisioning case's verdict flipped because of the third one. Every replay of it reached the
 same `ls -la`, ran live from there, and so finished as an ordinary live run, and that case passes
