@@ -1323,6 +1323,17 @@ platformAgent:
     # and the credential-proxy pod, which also gets spec.deployment.env.
     # Alert excludes are under platformAgent.harness.eventWatcher.alertExclude.
     eventWatcher: {}
+    # Seconds an alert holds its workload's incident open: within the window a
+    # later Warning event for the same workload (a Deployment's other replicas,
+    # a replacement pod, another reason in the cascade), or a later Critical
+    # after a Critical alert, posts nothing, starts no triage turn and spends
+    # no alert budget. Rendered as INCIDENT_WORKLOAD_DEDUP_SECONDS in
+    # spec.deployment.env. 0 turns folding off; the most is 86400, a day. null
+    # renders no entry and leaves the default the operator renders into the
+    # agent container, the same hour. An entry with the same name in env above wins, and a valueFrom
+    # entry for it fails the render while this key is set. The site's chatops
+    # page, "One incident per workload", has the rules.
+    incidentWorkloadDedupSeconds: 3600
     # The credential-proxy container's requests and limits, forwarded to the CR as
     # spec.deployment.credentialProxy.resources when any key is set. Each key
     # merges over the operator's defaults (500m CPU and 1Gi requests, or 2 CPU

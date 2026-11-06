@@ -174,15 +174,16 @@ caveat beside it:
   admits nothing more in parallel.
 - `platformAgent.deployment.agentAPIAuth.resources`: 0.5 vCPU and 2 GiB requests, a 4 GiB
   memory limit, `limits.cpu` left at its default because the watcher's `GOMAXPROCS` follows it.
-- `platformAgent.deployment.env`: `INCIDENT_WORKLOAD_DEDUP_SECONDS=3600`, which folds an
-  admitted workload's later events into one incident for an hour, and
-  `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, which keeps the fleet audits from opening remediation
-  pull requests on their own.
+- `platformAgent.deployment.env`: `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, which keeps the fleet
+  audits from opening remediation pull requests on their own. The window that folds a workload's
+  later events into [one incident](/kube-agents/concepts/chatops/#one-incident-per-workload) is
+  an hour on every install and is not in the file: an `env` entry for it would override
+  `platformAgent.deployment.incidentWorkloadDedupSeconds`, the key that turns it off.
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
 run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
-containers. Both names in the example reach the container that reads them. Process tunables such
+containers. The name in the example reaches the container that reads it. Process tunables such
 as `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
 allowlist: a values file that sets them renders a proxy pod that carries them, where `gcloud` and
 `kubectl` run, and an agent container that does not. The example leaves them out. The
@@ -214,7 +215,7 @@ that already has one rather than pasting over it:
 
 ```bash
 PLATFORM_AGENT_STORAGE_SIZE=100Gi
-TF_VAR_extra_helm_values='{operator={resources={requests={cpu="250m",memory="1Gi"},limits={cpu="500m",memory="1Gi"}}},platformAgent={harness={tuning={maxInProgress=3}},deployment={env=[{name="INCIDENT_WORKLOAD_DEDUP_SECONDS",value="3600"},{name="KUBEAGENTS_AUDIT_AUTO_PROMOTE",value="false"}],credentialProxy={resources={requests={cpu="4",memory="8Gi"},limits={cpu="8",memory="8Gi"}}},agentAPIAuth={resources={requests={cpu="500m",memory="2Gi"},limits={memory="4Gi"}}}}}}'
+TF_VAR_extra_helm_values='{operator={resources={requests={cpu="250m",memory="1Gi"},limits={cpu="500m",memory="1Gi"}}},platformAgent={harness={tuning={maxInProgress=3}},deployment={env=[{name="KUBEAGENTS_AUDIT_AUTO_PROMOTE",value="false"}],credentialProxy={resources={requests={cpu="4",memory="8Gi"},limits={cpu="8",memory="8Gi"}}},agentAPIAuth={resources={requests={cpu="500m",memory="2Gi"},limits={memory="4Gi"}}}}}}'
 ```
 
 Read the result on the CR and the pods:

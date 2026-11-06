@@ -30,6 +30,9 @@ _REQUIRED = [
     "--set", "platformAgent.harness.clusterName=ci-cluster",
     "--set", "platformAgent.harness.location=us-central1",
     "--set", "platformAgent.harness.projectId=ci-project",
+    # The fold window defaults to an entry of its own; nulled so these renders
+    # show the limit alone.
+    "--set", "platformAgent.deployment.incidentWorkloadDedupSeconds=null",
 ]
 _NAME = "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS"
 _VALUE_FROM = {"configMapKeyRef": {"name": "limits", "key": "pull-requests"}}
