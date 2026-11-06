@@ -18,7 +18,7 @@ It binds loopback rather than `0.0.0.0` because every one of its callers shares 
 2. **Dynamic Thread Resolution:** Captures the Chat API message ID returned from the first alert, saving it as the persistent thread key.
 3. **Incident Triage Context Preservation:** Persists completed triage reports inside the local SQLite database.
 4. **Gateway Message Rewriting Hook:** Integrates the `incident_context` plugin to intercept user replies on active incident threads and automatically prepend the triage report, allowing the fixer agent session to run with full context. An `apply` among them is also recorded for the recurrence hold ([below](#holding-a-recurrence-while-its-fix-waits-for-review)).
-5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap.
+5. **Severity Gate & Event Ledger:** Records every forwarded event in `intercepted_events`, then alerts on the warning ones only. The drift detector and the stall watch write to the same table under `reason`s of their own; see [the second producer](#the-second-producer-gitops-drift) and [the third](#the-third-producer-controller-stall). Informational events are held back from chat and reported as a count by the daily recap. Events an alert-exclude rule held back in the watcher arrive on `POST /v1/excluded-events` with no session, as rows marked `excluded = 1` (one per object and reason per hour, with later records added to its `occurrences`), and the recap counts them on a line of their own that names the five noisiest workloads. `GET /v1/intercepted-events` lists them with the status `excluded`. They count toward `LEDGER_MAX_ROWS` like every other row.
 6. **Daily Alert Ceiling:** Caps how many alerts of each severity reach chat in one UTC day, bounding the volume that survives deduplication.
 7. **Scheduled-Report Relay:** Accepts a finished report from a specialist's cron job on `POST /v1/cron-reports`, posts it as written (for the scheduled delivery of a fleet-audit job the image ships, it posts the report `finish` rendered for each repository, with a line naming any it did not finish, or a notice that the run did not finish, and on Slack a one-repository report is replaced by a headline linking its ledger issue), and stores the full report against the thread it lands in, so a reply there reaches the Chat Agent with the report attached. Its caller is the scheduler, not the model: `deliver: "chat"` resolves to a delivery-only platform plugin whose sender POSTs here, and `report_to_chat` remains for a job that needs to report mid-run. Deliberately not a mode of `/sessions/{id}/inject`: a scheduled report has no severity and must not spend the alert ceiling above. See [the design](../../../docs/designs/cron-report-relay.md).
 8. **Triage Routing:** Instructs the front door to hand the diagnosis to the Cluster Agent of the cluster the event came from, and records the chat route that carries the report back.
@@ -489,7 +489,8 @@ CREATE TABLE intercepted_events(
   duplicate_of INTEGER,                    -- the admitted row this event was folded into; NULL otherwise
   fold_key    TEXT NOT NULL DEFAULT '',    -- what the row folds on: the workload of a pod named like a Deployment's, or a non-Pod object's name; '' when it cannot fold or anchor, was released, or predates the last server start
   workload_key TEXT NOT NULL DEFAULT '',   -- the workload an incident's fix belongs to (_incident_branch_workload); never cleared
-  pull_request TEXT NOT NULL DEFAULT ''    -- the open fix pull request a recurrence was held for; '' otherwise
+  pull_request TEXT NOT NULL DEFAULT '',   -- the open fix pull request a recurrence was held for; '' otherwise
+  excluded    INTEGER NOT NULL DEFAULT 0   -- 1 on a row an alert-exclude rule held back in the watcher (POST /v1/excluded-events); 0 otherwise
 );
 CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id
   ON intercepted_events (session_id);
@@ -553,9 +554,9 @@ time and bounds nothing on disk; 512 keeps more than it shows, which leaves room
 ##### Which columns are migrated, and which are not
 
 `init_db` runs `ALTER TABLE intercepted_events ADD COLUMN ...` for `session_id`, `backlog`,
-`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key` and `pull_request` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request` and `excluded` (which arrived after the table first shipped in 0.2.0, so released 0.2.0+
 databases carry `cluster`, `object_uid` and `delivery_error` and gain `session_id`, `backlog`,
-`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request` and `idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
+`principal`, `payload`, `triage_state`, `duplicate_of`, `fold_key`, `dispatched_at`, `workload_key`, `pull_request`, `excluded` and `idx_intercepted_events_session_id` in place on startup), and runs `CREATE TABLE IF NOT EXISTS` for everything else: there is no `ALTER TABLE` for
 `cluster`, `object_uid` or `delivery_error` anywhere in the tree. Those three columns landed
 before the table ever shipped in a release, so the only databases carrying an earlier shape
 without them are pre-0.2.0 dev installs that ran an intermediate commit of the change that

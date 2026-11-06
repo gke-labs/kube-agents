@@ -24,3 +24,9 @@
 # pull request.
 
 # part 1
+# Capability row: security, Workload Identity, RBAC and CVEs; the compliance
+# audit on an admission webhook whose CA bundle certificate has expired (the
+# planted ValidatingWebhookConfiguration bench-expiring-webhook-ca, failurePolicy
+# Ignore on an inert group). A declared gap, expected_fail: no compliance check
+# reads a CA bundle's notAfter; the gap is #4960.
+./tasks/security-expiring-node-bootstrap-and-webhook-certs/task.yaml

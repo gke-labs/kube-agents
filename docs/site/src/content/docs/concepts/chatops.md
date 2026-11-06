@@ -471,7 +471,7 @@ The line is labelled `chat turns`, not `tasks`, because the script's `tasks` lin
 
 It names no cluster, project, namespace, task or person. The gateway audits the block outside its `model:` line, which carries only the provider and model name from the status. It refuses to post a block whose audited lines contain the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings), and says so instead. The block's own words, such as a bucket or interface name, are not refused.
 
-The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
+The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the cluster scale counts, the top five credential broker tools, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
 
 ### The Slack Home tab
 
@@ -634,6 +634,8 @@ Add `?day=YYYY-MM-DD` to the URL for an earlier day. The reply gives `limit`, `s
 The daily recap has the line "N alerts from M workloads withheld by the daily ceiling and never reached chat". N counts each pod and reason one time, so it can be lower than `suppressed`. M counts the workloads that sent those alerts. The pods of one Deployment are one workload. N is one count for the `Critical` and `Warning` buckets together. The recap runs at 21:00 UTC on weekdays, and each recap covers the time since the previous recap. Thus the recap period is not the UTC day of `/v1/alert-quota`, and the Monday recap covers the weekend.
 
 Drift refusals never appear in the recap. The `GitOpsDrift` row of `/v1/alert-quota` and the session server log show them. The drift detector does not offer a refused record again, so that alert is lost from chat.
+
+The recap line "N events from M workloads were silenced by alert-exclude rules" counts the events that the [alert-exclude rules](/kube-agents/operator/platformagent-crd/#specharnesseventwatcher) held back, and names the five workloads that sent the most. These events never reached the ceiling, and `GET /v1/intercepted-events` lists them with the status `excluded`.
 
 The recap line "N alerts failed to post to chat" is a different problem. It means that chat refused the post, or did not confirm it. Some of these alerts can be in the channel. A higher ceiling does not change this count. Look in the session server log for the cause.
 
