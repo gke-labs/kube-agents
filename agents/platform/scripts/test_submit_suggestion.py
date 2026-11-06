@@ -1992,16 +1992,23 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             submit_suggestion.load_evidence(self.evidence_file({**EVIDENCE, "verify": [{"command": "x", "expect": 3}]}))
         self.assertIn("`verify[0].expect`", str(caught.exception))
 
+    # The headings pdb-remediation-pr's `body_contains` grades. The case adds
+    # them only once main's grader accepts the field: the smoke job grades a
+    # pull request's cases with main's bench/, so one change cannot add the
+    # field and use it.
+    BENCH_EVIDENCE_HEADINGS = ("## Evidence", "**Verify after merge:**")
+
     def test_the_bench_case_grades_the_headings_this_renders(self):
-        """pdb-remediation-pr's `body_contains` names strings render_evidence writes;
-        renaming one here without the case reds a presubmit roster case."""
+        """render_evidence writes every heading the bench case grades; renaming
+        one here without the case reds a presubmit roster case."""
+        section = submit_suggestion.render_evidence(EVIDENCE)
+        for phrase in self.BENCH_EVIDENCE_HEADINGS:
+            self.assertIn(phrase, section)
         task = HERE.parents[2] / "bench" / "tasks" / "pdb-remediation-pr" / "task.yaml"
         lines = [line for line in task.read_text().splitlines() if line.strip().startswith("body_contains:")]
-        self.assertEqual(len(lines), 1)
-        phrases = json.loads(lines[0].split(":", 1)[1])
-        section = submit_suggestion.render_evidence(EVIDENCE)
-        for phrase in phrases:
-            self.assertIn(phrase, section)
+        self.assertLessEqual(len(lines), 1)
+        if lines:
+            self.assertEqual(tuple(json.loads(lines[0].split(":", 1)[1])), self.BENCH_EVIDENCE_HEADINGS)
 
     def test_evidence_with_keep_description_is_refused(self):
         with self.assertRaises(ValueError) as caught:

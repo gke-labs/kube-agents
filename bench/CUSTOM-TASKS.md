@@ -616,7 +616,7 @@ what the case grades is that the fix went out. `owner: gke-agentic` pins the org
 match across every pool project that breaks loudly if the organisation ever moves.
 
 `body_contains` lists substrings the pull request's description must carry verbatim (on GitLab,
-the merge request's description). A remediation case lists the headings of the evidence section
+the merge request's description). A remediation case can list the headings of the evidence section
 `submit_suggestion.py` renders into every body (`## Evidence`, `**Verify after merge:**`), because
 a one-line description passes every other clause.
 
