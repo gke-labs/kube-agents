@@ -83,13 +83,14 @@ requirement.
 - **Zonal and topology balance.** The acute case in this document — the operator's motivating
   outage began as undetected skew — so it does not wait for a weekly report: the daily
   `leeway-watch` job (`agents/platform/scripts/leeway_watch.py`) sweeps pod and node distribution
-  per zone per cluster with `leeway report` and relays each finding with leeway's own cause
-  (`constraint_ignored` for a spread constraint the scheduler could not honour,
+  per zone per cluster with `leeway report --topology-tier-c-signals` and relays each finding with
+  leeway's own cause (`constraint_ignored` for a spread constraint the scheduler could not honour,
   `volume_pinning` for zone-pinned PersistentVolumes, `domain_capacity_shortfall` for a zone out of
-  capacity, `taint_exclusion` or `domain_outage` for a cordoned or NotReady zone) and the
-  single-zone share of running replicas. What the sweep cannot see — a single-zone node pool, which
-  leeway reads as intent and reports nothing for — the on-demand `topology-drift` skill checks by
-  hand. Still to come: the re-evaluation on the event trigger the
+  capacity, `taint_exclusion` or `domain_outage` for a cordoned or NotReady zone, and
+  `selector_confined` at `info` severity when a `nodeSelector` or required `nodeAffinity` confines a
+  workload onto a single-zone node pool) and the single-zone share of running replicas; the
+  on-demand `topology-drift` skill confirms which node pool or constraint produced each row before
+  recommending a fix. Still to come: the re-evaluation on the event trigger the
   [capability delivery vehicle](capability-delivery-vehicle.md) defines when an autoscaler
   out-of-resources event arrives, cross-zone traffic cost estimation, zonal autoscaler headroom
   (autoscaler maximum against current size per zone), and load-balancer backend distribution per

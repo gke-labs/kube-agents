@@ -1716,6 +1716,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -1996,6 +1998,8 @@ spec:
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
               value: /etc/gitops/managed_repos
+            - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
+              value: "3600"
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -2085,6 +2089,11 @@ spec:
                   optional: true
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: BRIDGE_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  divisor: "0"
+                  resource: limits.memory
             - name: BRIDGE_DEBUG_ERROR_TEXT
               value: "false"
             - name: A2A_CAPABILITY_REQUIRED
@@ -2095,10 +2104,10 @@ spec:
           resources:
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
             requests:
-              cpu: 100m
-              memory: 256Mi
+              cpu: 250m
+              memory: 512Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -4517,6 +4526,11 @@ spec:
               value: localhost:8080,127.0.0.1:8080
             - name: NATS_CA_FILE
               value: /etc/a2a-nats-ca/ca.crt
+            - name: WEB_CONSOLE_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  divisor: "0"
+                  resource: limits.memory
           image: ghcr.io/gke-labs/kube-agents/a2a-console:latest
           livenessProbe:
             failureThreshold: 6
@@ -4537,10 +4551,10 @@ spec:
           resources:
             limits:
               cpu: 500m
-              memory: 128Mi
+              memory: 256Mi
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 100m
+              memory: 128Mi
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:

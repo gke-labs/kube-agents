@@ -13,6 +13,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -236,8 +237,23 @@ def _prompt_worker(prompt: str, env: dict[str, str]) -> dict[str, Any]:
         "tokens": dict(result.tokens or {}),
         "errors": list(result.errors or []),
         "output_chars": len(result.output or ""),
-        "preview": (result.output or "")[:ANSWER_PREVIEW_CHARS],
+        "preview": answer_preview(result.output or ""),
     }
+
+
+def answer_preview(output: str) -> str:
+    """The start of an answer, cut before a word that the bound would split.
+
+    The runner scrubs the project ID from what is stored, and it can only find
+    a whole ID: a cut inside one would store its first characters. An answer
+    whose first `ANSWER_PREVIEW_CHARS` hold no space (a long URL, compact JSON)
+    has no word to cut before, and keeps the hard cut rather than an empty
+    preview that reads as a failed prompt.
+    """
+    cut = output[:ANSWER_PREVIEW_CHARS]
+    if len(output) <= ANSWER_PREVIEW_CHARS or output[ANSWER_PREVIEW_CHARS].isspace():
+        return cut
+    return re.sub(r"\S*\Z", "", cut) or cut
 
 
 def unfinished_reason(preview: str, errors: list[str]) -> str:

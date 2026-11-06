@@ -896,6 +896,8 @@ func TestCardStepScrubsTheTitle(t *testing.T) {
 // completed card's report, a blocked card's question, and for a failed card a
 // line naming it and its status, its error text only with the debug switch.
 func TestCardAnswerTextKeepsErrorTextBehindTheDebugSwitch(t *testing.T) {
+	// The off half holds the default, whatever the shell running it exports.
+	t.Setenv(debugErrorTextEnv, "")
 	const errSecret = "tok_card_error_text_canary"
 	done := kanbanCardRow{ID: "t_1", Title: "Check prod-a", Status: "done", Result: "prod-a is healthy"}
 	failed := kanbanCardRow{ID: "t_2", Title: "Check prod-b", Status: "failed", Err: "psql: FATAL " + errSecret}
@@ -1040,6 +1042,7 @@ func TestAShutdownEndsACardWaitWithTheTurnsAnswer(t *testing.T) {
 // that repeats a value, and the task's answer names the card and how it
 // ended, without the error text (that is the debugging switch's to add).
 func TestWaitForKanbanCards_AFailedCardsAnswerOmitsItsErrorText(t *testing.T) {
+	t.Setenv(debugErrorTextEnv, "")
 	if _, err := exec.LookPath("python3"); err != nil {
 		t.Skip("python3 not on PATH; the kanban fixture needs it")
 	}
@@ -1200,5 +1203,73 @@ func TestASynthesisIsAnnouncedOnlyWhenOneRuns(t *testing.T) {
 	}
 	if cardSynthesisRuns(nil, 1, strings.Repeat("a full answer of the turn's own. ", 20), two) {
 		t.Error("a substantive answer of the turn's own stands in: no synthesis runs")
+	}
+}
+
+// staleCardDB holds one card on the session, created and last updated long
+// before the task began and never settled: a worker that died mid-run.
+func staleCardDB(t *testing.T, sessionID string, since int64) string {
+	t.Helper()
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not on PATH; the kanban fixture needs it")
+	}
+	db := filepath.Join(t.TempDir(), "kanban.db")
+	initScript := `
+import sqlite3, sys
+db, sess, since = sys.argv[1], sys.argv[2], int(sys.argv[3])
+c = sqlite3.connect(db)
+c.executescript("""
+CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT, status TEXT, assignee TEXT, creator_session_id TEXT,
+  result TEXT, last_failure_error TEXT, created_at REAL, updated_at REAL, parent_id TEXT);
+CREATE TABLE task_runs (id INTEGER PRIMARY KEY, task_id TEXT, summary TEXT, error TEXT, session_id TEXT, verdict TEXT, metadata TEXT);
+CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT, payload TEXT);
+""")
+c.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?)",
+  ("t_stale1", "A check whose worker died", "running", "cluster-diagnostics", sess, "", "", since - 86400, since - 86000, None))
+c.commit()
+`
+	if out, err := exec.Command("python3", "-c", initScript, db, sessionID, strconv.FormatInt(since, 10)).CombinedOutput(); err != nil {
+		t.Fatalf("init db: %v\n%s", err, out)
+	}
+	return db
+}
+
+// A session's poll reads the cards its task filed or tracks: an older card
+// that never settled is not one of them.
+func TestASessionPollSkipsAnOldUnsettledCard(t *testing.T) {
+	since := time.Now().Unix() - 10
+	db := staleCardDB(t, "a2a-ctx-stale", since)
+	rows, err := querySessionKanbanCards(context.Background(), resolvePythonBin(), db, "a2a-ctx-stale", since, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("rows = %+v, want none: the card predates the task and is not tracked", rows)
+	}
+	// A tracked card is still read, whatever its age.
+	rows, err = querySessionKanbanCards(context.Background(), resolvePythonBin(), db, "a2a-ctx-stale", since, []string{"t_stale1"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("tracked: rows = %+v, err = %v; want the tracked card", rows, err)
+	}
+}
+
+// A turn on a session with an old card that never settled ends with its own
+// answer instead of waiting on that card to the deadline.
+func TestAnOldUnsettledCardDoesNotHoldALaterTurn(t *testing.T) {
+	since := time.Now().Unix() - 10
+	sessionID := "a2a-ctx-stale"
+	t.Setenv(hermesKanbanDBEnv, staleCardDB(t, sessionID, since))
+	_, url := startServer(t)
+	b := startAPIBridge(t, url, newAPIStub(t, nil), nil)
+	run := &taskRun{origin: &lib.Envelope{TaskID: "task-stale", ContextID: "ctx-stale", CorrelationID: "corr-stale"}, state: stateRunning, answerHeld: true}
+	act := newSessionActivityState(sessionID, false)
+	close(act.done)
+	run.act.Store(act)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	start := time.Now()
+	got, ok := b.waitForKanbanCards(run, ctx, act, sessionID, since, 1, "Here is the answer.")
+	if !ok || got != "Here is the answer." || time.Since(start) > 5*time.Second {
+		t.Fatalf("waitForKanbanCards = (%q, %v) after %s, want the turn's own answer at once", got, ok, time.Since(start))
 	}
 }

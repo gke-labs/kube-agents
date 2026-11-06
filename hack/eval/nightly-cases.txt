@@ -1176,8 +1176,8 @@
 ./tasks/health-chat-request-runs-collector/task.yaml
 
 # Incident triage: three crash-looping replicas of one Deployment fold into one
-# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, which hack/ci-deploy.sh sets for
-# the eval install). Graded on the session daemon's ledger through
+# incident (INCIDENT_WORKLOAD_DEDUP_SECONDS, on by default at an hour and set
+# to 150 s by hack/ci-deploy.sh for the eval install). Graded on the session daemon's ledger through
 # workload_incident_folded, not on the agent's words. The autoops-incident
 # stack at three replicas under its own namespace, so it takes lock-infra like
 # autoops-warning-event-triage; hinted at that case's 900s until the nightly
@@ -1217,7 +1217,8 @@
 # root-cause attribution across the three planted zonal-skew roles on slot d
 # (zonal-skew-scheduling, zonal-skew-volume, zonal-skew-capacity in namespace
 # seeded-topology) plus the capacity role's sponge, the single-zone node-pool
-# case leeway reports nothing for, and that `leeway report` ran. deployer:
+# case (`selector_confined` under `--topology-tier-c-signals`, silent without
+# it), and that `leeway report` ran. deployer:
 # noop, read-only, off the infra lock.
 ./tasks/topology-zonal-skew-probe/task.yaml
 

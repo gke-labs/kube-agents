@@ -193,8 +193,54 @@ func (s *Server) toolDefinitions() []ToolDefinition {
 	}
 	if s.host != nil {
 		defs = s.host.AugmentToolSchemas(defs)
+	} else {
+		// With no host integration, poll_events goes to the in-cluster server (handlePollEvents).
+		for i := range defs {
+			if defs[i].Name == ToolSendMessage {
+				defs[i].Description += " " + sendMessagePollHint
+			}
+		}
+		defs = append(defs, pollEventsDefinition())
 	}
 	return defs
+}
+
+// sendMessagePollHint points send_message's caller at poll_events for the card reports that
+// arrive after the answer; it is advertised only when the bridge forwards poll_events.
+const sendMessagePollHint = "Card reports that arrive after the answer can be read with poll_events, passing the conversation_token and since cursor the answer gives."
+
+// pollEventsDefinition is poll_events' schema in the stock bridge, which forwards the call to the
+// in-cluster server. conversation_token is the server's own name for its argument, so the hint a
+// send_message answer gives ("poll_events (conversation_token ..., since N)") can be followed
+// as written.
+func pollEventsDefinition() ToolDefinition {
+	return ToolDefinition{
+		Name: ToolPollEvents,
+		Description: "Read the card reports posted to a kube-agents conversation after a send_message answer returned, newer than a cursor. " +
+			"Pass the conversation_token and since that the send_message answer (or the previous poll_events answer) gives; the answer returns the new cursor for the next call. " +
+			"The in-cluster server keeps reports live only: reports posted before it first heard of the conversation, or before it restarted, are gone.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"conversation_token": map[string]any{
+					"type":        "string",
+					"description": "The server's token for the conversation, as a send_message answer reports it (\"later reports can be read with poll_events (conversation_token ...)\"). Takes precedence over conversation. A console:conv-… token from manage_session list belongs in conversation, though the bridge maps it here too.",
+				},
+				"conversation": map[string]any{
+					"type":        "string",
+					"description": "Optional conversation alias or console token as manage_session lists it, when no conversation_token is given (defaults to the active conversation). The conversation must have had a turn sent on it.",
+				},
+				"since": map[string]any{
+					"type":        "integer",
+					"description": "Return reports newer than this cursor, as the send_message answer or the previous poll_events answer gave it (default 0: everything the server kept).",
+				},
+				"wait_seconds": map[string]any{
+					"type":        "integer",
+					"description": fmt.Sprintf("When nothing is newer than since, wait up to this many seconds for a report (default 0, at most %d; larger values are clamped to %d).", maxPollWaitSeconds, maxPollWaitSeconds),
+				},
+			},
+		},
+	}
 }
 
 // debugProperty is send_message's and task_control's debug argument, advertised only once
