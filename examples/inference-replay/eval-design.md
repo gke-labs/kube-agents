@@ -620,11 +620,13 @@ and the merge copy takes only the merged pull request's last passing presubmit.
 **Telling the runs in a build apart.** One presubmit build isn't one run. It's about 45 runs (around
 15 cases, three times each) going at the same time on the same install, and a build can pass while
 some of those runs fail. Requests don't say which run they belong to, but we can work it out after
-the run with data we already have. Every request names the kanban card it's working on (a worker's
-first message is "work kanban task t\_…"), or the A2A task ID for the front door. Each run's
-`results.json` already lists the cards and task IDs that run used, and whether it passed. So the
-copy job can match each saved answer to its card, the card to its run, and the run to pass or fail,
-and copy only the passing ones.
+the run with data we already have. A worker's request names the card it's working on (its first
+message is "work kanban task t\_…"), and a front door's request names the cards it created (what
+its `kanban_create` calls returned). Each run's `results.json` lists the cards its workers worked,
+and whether it passed. So the copy job can match each saved answer to its card, the card to its
+run, and the run to pass or fail, and copy only the passing ones. A front door's first request
+names no card at all, only the case's prompt. It is matched through the request that came after
+it: an answer is copied when a passing run's next request went on from exactly that answer.
 
 Each case runs three times. Ideally each of the three would replay its own recording, so we still
 get three different samples instead of one sample three times. That needs the proxy to know the run
@@ -765,16 +767,21 @@ before stage 3 of the rollout (turning replay on):
    Run it on a dev install first, with a few cases recorded and replayed several times, to check the
    mechanics; then as the periodic job for the measurement week.
 
-   **Built:** the dev-install runs ("Replay lane trials") and the CI wiring
-   ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)).
-   A nightly running as `eval-baseline-recorder` records, and uploads the answers whose runs passed
-   to a bucket only that account can write. It works out which run each answer came from after the
-   fact, from the cards each request and each run's results name ("Telling the runs in a build
-   apart"). A periodic on `main` replays the last night's selection, gating nothing. It reports
-   what was served before each first miss, the miss causes, and each case's verdicts beside the
-   nightly's. **Not built:** the bucket and its grants
-   ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)) and the periodic's Prow job,
-   both outside this repository; the merge copy job and a pull request's own saved answers. The estimate the decision rests on
+   **Built:** the dev-install runs ("Replay lane trials"), the CI wiring
+   ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md#record-and-replay-the-replay-lane))
+   and the bucket ([`docs/ci-pool-projects.md`](../../docs/ci-pool-projects.md)). A nightly running
+   as `eval-baseline-recorder` records, and uploads the answers whose runs passed to a bucket only
+   that account can write. It works out which run each answer came from after the fact, from the
+   cards each request and each run's results name ("Telling the runs in a build apart"). A
+   periodic on `main` replays the last night's selection, gating nothing. It reports what was
+   served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
+   The bucket's grants say who uploaded, not that nothing touched the night. A presubmit leased
+   into the same pool project as a running nightly can reach the nightly's proxy, or the LiteLLM
+   behind it, with the Prow runner's `roles/container.admin`, and the nightly then publishes what
+   they hold ("Who can write to the cache" names this). That doesn't matter while the lane only
+   measures. It must be closed before replay gates anything (stage 3), for example by recording
+   only on projects no presubmit can lease. **Not built:** the periodic's Prow job, in
+   `oss-test-infra`; the merge copy job and a pull request's own saved answers. The estimate the decision rests on
    combines both: what replay saves per conversation (this lane) times how often pull request
    conversations start on a saved recording (shadow mode).
 
