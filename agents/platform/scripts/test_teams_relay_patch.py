@@ -540,6 +540,12 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(res.success)
             self.assertEqual(res.message_id, "msg-1")
             self.assertEqual(res.raw_response, {"response": {"id": "msg-1"}})
+            # The post waits out the broker's token leg plus its Bot Framework leg.
+            self.assertEqual(
+                mock_urlopen.call_args.kwargs["timeout"],
+                teams_relay_patch.TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS,
+            )
+            self.assertGreater(teams_relay_patch.TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS, 20 + 30)
 
             await adapter.send_typing(
                 "conv-123", metadata={"serviceUrl": "https://smba.trafficmanager.net/teams/"}
