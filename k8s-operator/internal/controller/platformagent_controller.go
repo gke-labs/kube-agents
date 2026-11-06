@@ -274,7 +274,7 @@ const (
 	// shellSandboxImagePinnedMessageFormat takes the pinned image and the
 	// operator's own.
 	shellSandboxImagePinnedMessageFormat = "spec.harness.experimental.shellSandbox.image pins %s, but this operator runs %s. " +
-		"A sandbox older than the agent fails its kubectl calls at the credential proxy (caller.executable-role). " +
+		"A sandbox older than the agent fails its kubectl calls at the credential proxy with a policy refusal. " +
 		"Clear the field to run the operator's image, or set it to the matching build."
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
 	// install.env key, what the field holds, and where the posts go

@@ -130,6 +130,9 @@ func TestPlatformAgentReconciler_Reconcile_ShellSandboxImagePinned(t *testing.T)
 				if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
 					t.Fatalf("get: %v", err)
 				}
+				if tc.wantPhase == "" && string(got.Status.Phase) == "Degraded" {
+					t.Fatalf("the ready-writer fixture parked Degraded (conditions %+v); it no longer covers updateStatusReady", got.Status.Conditions)
+				}
 				if tc.wantPhase != "" && string(got.Status.Phase) != tc.wantPhase {
 					t.Fatalf("phase = %q, want %q (conditions %+v)", got.Status.Phase, tc.wantPhase, got.Status.Conditions)
 				}

@@ -1325,7 +1325,8 @@ AUDIT_STATUS_BUSY = "busy"
 # so the two cannot drift apart.
 RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
 RULE_CALLER_EXECUTABLE = "caller.executable-role"
-# Appended to that refusal when the shell sends kubectl. The current sandbox
+# Appended to the executable refusal (this rule, or executable.allowlist once
+# kubectl leaves the exec route) when the shell sends kubectl. The current sandbox
 # image runs stock kubectl against kube-proxy and never sends it here, so the
 # usual sender is a sandbox image older than the agent, typically one pinned by
 # spec.harness.experimental.shellSandbox.image through an upgrade (#4966).
@@ -2190,15 +2191,17 @@ def executable_permitted(role: str, executable: str) -> bool:
     return narrowed is None or executable in narrowed
 
 
+def shell_kubectl_hint(role: str, executable: str) -> str:
+    """SHELL_KUBECTL_REFUSAL_HINT when the shell sent kubectl, else ""."""
+    return SHELL_KUBECTL_REFUSAL_HINT if role == CALLER_ROLE_SHELL and executable == "kubectl" else ""
+
+
 def executable_refusal_message(role: str, executable: str) -> str:
     """The message refusing ``role`` the ``executable`` it may not run."""
-    message = (
+    return (
         f"The {role} caller may run only "
         f"{', '.join(sorted(ROLE_EXECUTABLES[role]))} through the credential proxy."
-    )
-    if role == CALLER_ROLE_SHELL and executable == "kubectl":
-        message += SHELL_KUBECTL_REFUSAL_HINT
-    return message
+    ) + shell_kubectl_hint(role, executable)
 
 
 # Which `POST /v1/vcs/<verb>` verbs a role may reach, checked on the verb after
@@ -13892,7 +13895,8 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_EXECUTABLE_ALLOWLIST,
-                    "message": "Executable is not supported by the credential proxy.",
+                    "message": "Executable is not supported by the credential proxy."
+                    + shell_kubectl_hint(principal.role, argv[0]),
                 },
             )
             return

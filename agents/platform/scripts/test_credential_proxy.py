@@ -4204,6 +4204,20 @@ class SessionRoleExecutableTest(unittest.TestCase):
             with self.subTest(role=role, executable=executable):
                 self.assertNotIn("shellSandbox", credential_proxy.executable_refusal_message(role, executable))
 
+    def test_the_hint_survives_kubectl_leaving_the_exec_route(self):
+        # Once kubectl is off the exec route the allowlist refuses it before
+        # the role check; the old sandbox must still be pointed at its image.
+        with mock.patch.object(credential_proxy, "EXEC_ROUTE_EXECUTABLES", ("gcloud",)):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SHELL, {"argv": ["kubectl", "get", "pods"]})
+            self.assertEqual(403, status)
+            self.assertEqual(credential_proxy.RULE_EXECUTABLE_ALLOWLIST, body["rule"])
+            self.assertIn("shellSandbox.image", body["message"])
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+                status, body = self.post_as(credential_proxy.CALLER_ROLE_SESSION, {"argv": ["kubectl", "get", "pods"]})
+            self.assertEqual(credential_proxy.RULE_EXECUTABLE_ALLOWLIST, body["rule"])
+            self.assertNotIn("shellSandbox", body["message"])
+
     def test_git_from_a_session_is_refused_by_the_route_before_the_role(self):
         # /v1/exec admits only EXEC_ROUTE_EXECUTABLES for every role, so a
         # session asking for git meets the route's own refusal first; the role
