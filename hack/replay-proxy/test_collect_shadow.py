@@ -601,6 +601,30 @@ class RecordModeTest(CollectorTestCase):
         self.collector.collect_pass(final=True)
         self.assertEqual(order, [("publish", False), ("publish", True)])
 
+    def test_a_publish_still_running_at_the_deadline_skips_the_last_one_and_never_hangs(self):
+        import threading
+        release, started, order = threading.Event(), threading.Event(), []
+        self.addCleanup(release.set)
+
+        class Stuck:
+            def publish(inner, final=False):
+                order.append(final)
+                if not final:
+                    started.set()
+                    release.wait(30)
+
+        self.collector.publisher = Stuck()
+        self.collector.publish_in_background = True
+        self.collector.collect_pass()
+        self.assertTrue(started.wait(5))
+        self.collector.deadline = self.now + 0.3
+        began = time.monotonic()
+        self.collector.collect_pass(final=True)
+        self.assertLess(time.monotonic() - began, 10, "the last pass waits no longer than the deadline")
+        self.assertEqual(order, [False], "no last publish beside one still running")
+        self.assertEqual(self.collector.totals.errors.get("publish_overran"), 1)
+        self.assertIn("publish_overran", self.out.getvalue())
+
     def test_keep_writes_never_leave_a_partial_file_under_its_name(self):
         answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
         self.put("logs/seg-1.jsonl", b'{"line": 1}\n')

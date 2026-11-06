@@ -64,14 +64,14 @@ VARIANTS = replay_cache.VARIANTS_DIR
 MESSAGES = replay_cache.MESSAGES_DIR
 # Upload order: an answer before the slot pointing at it.
 UPLOAD_ORDER = (ANSWERS, VARIANTS, SLOTS, MESSAGES)
-JSON_SUFFIX = ".json"
+JSON_SUFFIX = replay_cache.JSON_SUFFIX
 VARIANT_SEPARATOR = "-"
 SEGMENT_SUFFIX = ".jsonl"
 HEX = replay_cache.CACHE_HEX
 SAFE_HEX = re.compile(rf"^{HEX}$")
 # A cache object's name under the version prefix: replay_cache.CACHE_REL_RE's
 # layout with each variant flattened to one name, `variants/<context>-<answer>.json`.
-OBJECT_NAME_RE = re.compile(rf"^(?:(?:answers|slots|messages)/{HEX}\.json|variants/{HEX}{VARIANT_SEPARATOR}{HEX}\.json)$")
+OBJECT_NAME_RE = re.compile(replay_cache.CACHE_LAYOUT_PATTERN.replace(replay_cache.VARIANT_JOINER, re.escape(VARIANT_SEPARATOR)))
 NORMALIZER_VERSION_RE = re.compile(r"^[0-9a-f]{16}$")
 POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
 # A build id as a path segment: hack/ci-env.sh's REPLAY_SHADOW_BUILD_RE, which

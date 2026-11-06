@@ -233,6 +233,22 @@ class PublishTest(unittest.TestCase):
                          [f"answers/{fp(1)}.json", f"answers/{fp(2)}.json"],
                          "the earlier call's names ride in the next record, or no lane would ever fetch them")
 
+    def test_every_cache_layout_shape_maps_to_a_name_the_lane_accepts(self):
+        import fetch_cache
+        import replay_cache
+        shapes = [(sub, f"{fp(1)}.json") for sub in ("answers", "slots", "messages")]
+        shapes.append(("variants", f"{fp(2)}/{'a' * 16}.json"))
+        fetcher = fetch_cache.Fetcher(bucket=BUCKET, version=VERSION, run=self.bucket)
+        for sub, rel in shapes:
+            with self.subTest(sub=sub):
+                self.assertTrue(replay_cache.CACHE_REL_RE.match(f"{sub}/{rel}"))
+                name = P.object_name(sub, rel)
+                self.assertTrue(P.OBJECT_NAME_RE.match(name), name)
+                item = {"name": name, "bytes": 1}
+                if sub == "slots":
+                    item["target"] = fp(1)
+                self.assertEqual(fetcher._confirmed({"objects": {VERSION: [item]}})[0][0], name)
+
     def test_object_names_refuse_anything_outside_the_layout(self):
         self.assertEqual(P.object_name("variants", f"{fp(1)}/{'a' * 16}.json"), f"variants/{fp(1)}-{'a' * 16}.json")
         for sub, rel in (("answers", "../x.json"), ("answers", f"{fp(1)}.tmp"), ("slots", f"a/{fp(1)}.json"),

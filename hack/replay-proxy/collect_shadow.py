@@ -125,6 +125,11 @@ KEEP_LOGS_DIR = "logs"
 KEEP_CACHE_DIR = "cache"
 POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
 DEFAULT_PUBLISH_INTERVAL_SECONDS = 300.0
+PUBLISH_THREAD_NAME = "replay-cache-publish"
+# A file being written: the store's, and the collector's own kept copies.
+TMP_SUFFIX = ".tmp"
+# Stands for TMP_SUFFIX in the in-pod scripts' text, filled in where they are defined.
+TMP_SUFFIX_PLACEHOLDER = "__TMP_SUFFIX__"
 SEED_TAR_NAME = "seed.tar"
 REPORT_DIR = "report"
 
@@ -236,7 +241,7 @@ entries = [e for e in sys.stdin.buffer.read().decode().split("\0") if e]
 emptied = 0
 for entry in entries:
     size, _, rel = entry.partition("\t")
-    if not rel or rel.endswith(".open") or rel.endswith(".tmp"):
+    if not rel or rel.endswith(".open") or rel.endswith("__TMP_SUFFIX__"):
         continue
     full = os.path.realpath(os.path.join(root, rel))
     if not full.startswith(root + os.sep):
@@ -249,7 +254,7 @@ for entry in entries:
     except (OSError, ValueError):
         pass
 print(emptied)
-"""
+""".replace(TMP_SUFFIX_PLACEHOLDER, TMP_SUFFIX)
 
 
 # `python3 -c <script> <data dir> <cache subdir> <rel regex>`: prints
@@ -317,7 +322,7 @@ print(written)
 
 def _copy_atomically(src: str, target: str) -> None:
     """Copy so a reader (the publisher's thread) never sees half a file: a temporary name, then a rename."""
-    tmp = f"{target}.{os.getpid()}.{threading.get_ident()}.tmp"
+    tmp = f"{target}.{os.getpid()}.{threading.get_ident()}{TMP_SUFFIX}"
     try:
         shutil.copyfile(src, tmp)
         os.replace(tmp, target)
@@ -767,7 +772,7 @@ class Collector:
         if not self.publish_in_background:
             self._publish(final=False)
             return
-        self.publish_thread = threading.Thread(target=self._publish, args=(False,), name="replay-cache-publish",
+        self.publish_thread = threading.Thread(target=self._publish, args=(False,), name=PUBLISH_THREAD_NAME,
                                                daemon=True)
         self.publish_thread.start()
 
