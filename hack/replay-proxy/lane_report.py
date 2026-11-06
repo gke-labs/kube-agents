@@ -59,12 +59,12 @@ def case_of(run_key: str) -> str:
 
 
 def nightly_outcomes(nightly_runs: Dict[str, List[Dict[str, Any]]], build: str, case: str) -> Optional[Dict[str, Any]]:
-    runs = [r for r in nightly_runs.get(build, []) if r.get("case") == case]
+    runs = [r for r in nightly_runs.get(build, []) if r.get(P.RUN_CASE) == case]
     if not runs:
         return None
-    scored = [r for r in runs if r.get("outcome") in (RA.REP_OUTCOME_PASS, RA.REP_OUTCOME_FAIL)]
-    return {"passes": sum(1 for r in scored if r.get("outcome") == RA.REP_OUTCOME_PASS), "scored": len(scored),
-            "outcomes": [str(r.get("outcome")) for r in sorted(runs, key=lambda r: r.get("rep", 0))]}
+    scored = [r for r in runs if r.get(P.RUN_OUTCOME) in (RA.REP_OUTCOME_PASS, RA.REP_OUTCOME_FAIL)]
+    return {"passes": sum(1 for r in scored if r.get(P.RUN_OUTCOME) == RA.REP_OUTCOME_PASS), "scored": len(scored),
+            "outcomes": [str(r.get(P.RUN_OUTCOME)) for r in sorted(runs, key=lambda r: r.get(P.RUN_REP, 0))]}
 
 
 def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
@@ -73,13 +73,22 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
     segments = lane_segments(keep_dir)
     logs = RA.load_logs(segments)
     attribution = RA.Attribution(logs, RA.Store(keep_dir), runs, final=True)
-    run_of: Dict[str, Optional[str]] = {}
+    # A line's run: the one its own cards name, or else the one its conversation's
+    # lines name (a front door's opening names no card; its continuation does).
+    # These are counts for the report, never a decision to publish anything.
+    own = {line.request_id: attribution.run_of(line) for line in logs.lines}
+    lines = analyze_replay.load(segments)
+    convs = analyze_replay.conversations([l for l in lines if not l.lost])
+    run_of: Dict[str, Optional[str]] = dict(own)
+    for conv in convs:
+        keys = {own.get(l.request_id) for l in conv.lines} - {None}
+        if len(keys) == 1:
+            for l in conv.lines:
+                run_of[l.request_id] = run_of.get(l.request_id) or next(iter(keys))
     per_run: Dict[str, Dict[str, Any]] = {}
     unattributed_tokens = 0
     for line in logs.lines:
-        decided = attribution.decide(line)
-        key = decided.runs[0] if len(decided.runs) == 1 else None
-        run_of[line.request_id] = key
+        key = run_of.get(line.request_id)
         if key is None:
             unattributed_tokens += line.prompt_tokens
             continue
@@ -112,8 +121,7 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
     # Per served conversation: the lane run's verdict against the recording's.
     conversation_counts = {MATCH: 0, MISMATCH: 0, UNKNOWN: 0}
     mismatched: List[Dict[str, Any]] = []
-    lines = analyze_replay.load(segments)
-    for conv in analyze_replay.conversations([l for l in lines if not l.lost]):
+    for conv in convs:
         if not any(l.served for l in conv.lines):
             continue
         keys = {run_of.get(l.request_id) for l in conv.lines} - {None}

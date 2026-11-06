@@ -17,6 +17,7 @@ import difflib
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -24,6 +25,12 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import normalizer
 
 ANSWERS_DIR = "answers"
+# Every name the cache writes, relative to its directory: one key per file, a
+# variant one directory deeper. The one definition the collector, the
+# publisher and the lane's download check names against.
+CACHE_HEX = r"[0-9a-f]{16,64}"
+CACHE_REL_RE = re.compile(
+    rf"^(?:(?:answers|slots|messages)/{CACHE_HEX}\.json|variants/{CACHE_HEX}/{CACHE_HEX}\.json)$")
 MESSAGES_DIR = "messages"
 # Saved answers by answer-slot key, and the answers recorded for each slot context.
 SLOTS_DIR = "slots"

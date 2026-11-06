@@ -521,6 +521,7 @@ class RecordModeTest(CollectorTestCase):
         self.collector.keep_dir = self.keep
         self.collector.publisher = self
         self.collector.publish_interval = 300
+        self.collector.publish_in_background = False
 
     def publish(self, final=False):
         self.publishes.append((self.now, final))
@@ -575,6 +576,44 @@ class RecordModeTest(CollectorTestCase):
         self.collector.deadline = 1000.0
         self.collector.collect_pass(final=True)
         self.assertEqual(self.publishes, [(0.0, False), (301.0, False), (302.0, True)])
+
+    def test_an_ordinary_publish_runs_beside_collection_and_the_last_waits_for_it(self):
+        import threading
+        release, started, finished, order = threading.Event(), threading.Event(), threading.Event(), []
+
+        class Slow:
+            def publish(inner, final=False):
+                order.append(("publish", final))
+                if not final:
+                    started.set()
+                    release.wait(10)
+                    finished.set()
+
+        self.collector.publisher = Slow()
+        self.collector.publish_in_background = True
+        answer = self.cache(f"answers/{fp(1)}.json", b"{}")
+        self.collector.collect_pass()
+        self.assertFalse(finished.is_set(), "the pass returned while the publish still ran")
+        self.assertTrue(started.wait(5))
+        self.assertEqual(os.path.getsize(answer), 0, "the pod was emptied while the publish still ran")
+        self.collector.deadline = 1000.0
+        threading.Timer(0.2, release.set).start()
+        self.collector.collect_pass(final=True)
+        self.assertEqual(order, [("publish", False), ("publish", True)])
+
+    def test_keep_writes_never_leave_a_partial_file_under_its_name(self):
+        answer = self.cache(f"answers/{fp(1)}.json", b'{"answer": 1}')
+        self.put("logs/seg-1.jsonl", b'{"line": 1}\n')
+        written = []
+        original = C.shutil.copyfile
+        C.shutil.copyfile = lambda src, dst, *a, **k: written.append(dst) or original(src, dst, *a, **k)
+        self.addCleanup(setattr, C.shutil, "copyfile", original)
+        self.collector.collect_pass()
+        kept = [d for d in written if d.startswith(self.keep)]
+        self.assertTrue(kept)
+        self.assertTrue(all(d.endswith(".tmp") for d in kept), "a reader never sees a kept file half written")
+        cache = os.path.join(self.keep, "pods", POD_NAME, "cache", "answers")
+        self.assertEqual(os.listdir(cache), [f"{fp(1)}.json"], "no temporary file left beside it")
 
     def test_shadow_mode_copies_no_answers(self):
         self.collector.mode = C.MODE_SHADOW

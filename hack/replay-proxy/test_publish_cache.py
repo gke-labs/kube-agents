@@ -141,7 +141,7 @@ class PublishTest(unittest.TestCase):
         with open(earlier) as handle:
             self.assertEqual(handle.read(), "an earlier night's answer")
         record = self._records()[-1]
-        self.assertEqual(record["objects"], {VERSION: [f"answers/{fp(1)}.json"]},
+        self.assertEqual([o["name"] for o in record["objects"][VERSION]], [f"answers/{fp(1)}.json"],
                          "the record still names it, so the lane fetches the earlier night's copy")
 
     def test_an_answer_waits_until_its_case_is_graded_and_goes_up_once(self):
@@ -154,15 +154,43 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
         self.assertEqual(self.publisher.publish()["uploaded"], {}, "never uploaded twice")
 
-    def test_an_opening_is_decided_only_by_the_last_call(self):
+    def test_an_opening_goes_up_once_a_passing_run_went_on_from_its_answer(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
-        self.world.request(front(), fp(1), recorded=True)
-        self.world.request(front(*created("t_00000001")), fp(2), recorded=True)
+        self.world.request(front(), fp(1), recorded=True, answer="A")
         self.answer(1)
+        self.write_logs()
+        self.assertEqual(self.publisher.publish()["decisions"], {"pending": 1})
+        self.world.request(front({"role": "assistant", "content": "A"}, *created("t_00000001")), fp(2),
+                           recorded=True, prior=(f"ctx-{fp(1)}", "A"))
         self.answer(2)
         self.write_logs()
-        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 1})
-        self.assertEqual(self.publisher.publish(final=True)["uploaded"], {"answers": 1})
+        self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 2})
+
+    def test_records_give_each_objects_size_and_each_slots_target(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1)
+        self.cache_file(f"slots/{fp(10)}.json", json.dumps(fp(1)))
+        self.write_logs()
+        self.publisher.publish(final=True)
+        objects = {o["name"]: o for o in self._records()[-1]["objects"][VERSION]}
+        self.assertEqual(objects[f"slots/{fp(10)}.json"]["target"], fp(1))
+        self.assertEqual(objects[f"answers/{fp(1)}.json"]["bytes"],
+                         os.path.getsize(os.path.join(self.pod_dir, "cache", "answers", f"{fp(1)}.json")))
+
+    def test_a_kept_segment_is_read_again_only_once_it_changes(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        self.world.request(worker("t_11111111"), fp(1), recorded=True)
+        self.answer(1)
+        self.write_logs()
+        reads = []
+        original = P.RA.read_lines
+        P.RA.read_lines = lambda paths: reads.append(list(paths)) or original(paths)
+        self.addCleanup(setattr, P.RA, "read_lines", original)
+        self.publisher.publish()
+        first = len(reads)
+        self.publisher.publish()
+        self.assertEqual(len(reads), first, "nothing changed, nothing is parsed again")
 
     def test_an_answer_from_another_normalizer_version_is_dropped(self):
         self.world.run("case-a", 1, "pass", ["t_11111111"])
@@ -180,7 +208,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(self.publisher.publish()["uploaded"], {"answers": 0})
         self.bucket.fail = False
         self.publisher.publish(final=True)
-        self.assertIn(f"answers/{fp(1)}.json", self._records()[-1]["objects"][VERSION])
+        self.assertIn(f"answers/{fp(1)}.json", [o["name"] for o in self._records()[-1]["objects"][VERSION]])
         runs = self._records()[-1]["runs"]
         self.assertEqual(runs, [{"case": "case-a", "rep": 1, "outcome": "pass"}])
 

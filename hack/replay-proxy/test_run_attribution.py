@@ -39,7 +39,7 @@ class World:
                 json.dump(message, handle)
         return self.blobs[key]
 
-    def request(self, messages, fingerprint, stored=True, recorded=False):
+    def request(self, messages, fingerprint, stored=True, recorded=False, answer=None, prior=None):
         request_id = f"{len(self.lines) + 1:032x}"
         if stored:
             with open(os.path.join(self.root, "store", "requests", request_id + ".json"), "w") as handle:
@@ -48,6 +48,10 @@ class World:
         entry = {"event": "replay_shadow_request", "request_id": request_id, "fingerprint": fingerprint,
                  "job": {"build": BUILD}, "diag_settings_hash": SETTINGS, "diag_message_hashes": hashes,
                  "recorded": recorded, "prompt_tokens": 100}
+        if answer:
+            entry["answer_variant"] = ["ctx-" + fingerprint, answer]
+        if prior:
+            entry["prior_answer"] = list(prior)
         self.lines.append(entry)
         return entry
 
@@ -106,13 +110,13 @@ class CardsTest(unittest.TestCase):
                          listing, later)
         self.assertEqual(RA.owned_cards(messages), set(), "a system prompt, a listing, a later user turn")
 
-    def test_a_run_owns_its_trajectory_tasks_and_inject_task(self):
+    def test_a_run_owns_its_worker_trajectory_tasks_only(self):
         record = [{"trajectory": [
             {"name": "inject.task", "args": {"taskId": "task-0770b8e639ccae1a"}},
             {"name": "kanban_show", "args": {"task_id": "t_99999999"}, "result": "t_88888888", "task": "t_11111111"},
             {"name": "terminal", "task": "not-a-card"},
         ]}]
-        self.assertEqual(RA.run_cards(record), {"task-0770b8e639ccae1a", "t_11111111"})
+        self.assertEqual(RA.run_cards(record), {"t_11111111"})
 
 
 class DecisionTest(unittest.TestCase):
@@ -152,43 +156,77 @@ class DecisionTest(unittest.TestCase):
         entry = self.world.request(worker("t_11111111"), "f1")
         self.assertEqual(self.world.decide(entry).decision, "unattributed")
 
-    def _openings(self, outcomes, continue_all=True):
-        """Each run's front door opens with the same request, then creates its own card."""
-        openings = []
-        for rep, outcome in enumerate(outcomes, start=1):
-            card = f"t_{rep:08x}"
-            self.world.run("case-a", rep, outcome, [card])
-            openings.append(self.world.request(front(), "opening"))
-            if continue_all or rep == 1:
-                self.world.request(front(*created(card)), f"next-{rep}")
-        return openings
+    def _rep(self, rep, outcome, answer, continued=True, opening_logged=True, recorded=False):
+        """One repetition's front door: the shared opening, answered `answer`, then its own card."""
+        card = f"t_{rep:08x}"
+        self.world.run("case-a", rep, outcome, [card])
+        opening = None
+        if opening_logged:
+            opening = self.world.request(front(), "opening", recorded=recorded, answer=answer)
+        if continued:
+            self.world.request(front({"role": "assistant", "content": answer}, *created(card)), f"next-{rep}",
+                               prior=("ctx-opening", answer))
+        return opening
 
-    def test_an_opening_with_no_card_is_decided_by_the_runs_that_continued_it(self):
-        openings = self._openings(["pass", "pass", "pass"])
-        self.assertEqual(self.world.decide(openings[0]).__dict__,
-                         {"decision": "pass", "runs": ("case-a#1", "case-a#2", "case-a#3")})
+    def test_an_opening_is_published_when_a_passing_run_went_on_from_its_answer(self):
+        opening = self._rep(1, "pass", "A", recorded=True)
+        self._rep(2, "fail", "B")
+        self.assertEqual(self.world.decide(opening).__dict__, {"decision": "pass", "runs": ("case-a#1",)})
+        self.assertEqual(self.world.decide(opening, final=False).decision, "pass", "positive evidence holds early")
 
-    def test_an_opening_one_failing_run_continued_is_a_fail(self):
-        openings = self._openings(["pass", "fail", "pass"])
-        self.assertEqual(self.world.decide(openings[0]).decision, "fail")
+    def test_a_failing_runs_opening_is_not_published_when_the_passing_runs_line_was_lost(self):
+        # The review's case: the failing repetition recorded the opening; the
+        # passing one's opening line never reached a segment. Its continuation
+        # went on from another answer, so it is no evidence for this one.
+        opening = self._rep(1, "fail", "A", recorded=True)
+        self._rep(2, "pass", "B", opening_logged=False)
+        self.assertEqual(self.world.decide(opening).decision, "fail")
+        self.assertEqual(self.world.decide(opening, final=False).decision, "pending")
 
-    def test_an_opening_issued_more_often_than_runs_continued_it_is_ambiguous(self):
-        # Run 2 and 3 issued the opening and never continued it (their front
-        # door answered and stopped): either could have written the saved answer.
-        openings = self._openings(["pass", "fail", "fail"], continue_all=False)
-        self.assertEqual(self.world.decide(openings[0]).decision, "ambiguous")
+    def test_the_same_answer_given_to_a_passing_run_publishes_it(self):
+        opening = self._rep(1, "fail", "A", recorded=True)
+        self._rep(2, "pass", "A")
+        self.assertEqual(self.world.decide(opening).__dict__, {"decision": "pass", "runs": ("case-a#2",)})
 
-    def test_an_opening_waits_for_every_case_and_a_lost_line_refuses_it(self):
-        openings = self._openings(["pass", "pass"])
-        self.assertEqual(self.world.decide(openings[0], final=False).decision, "pending")
-        self.assertEqual(self.world.decide(openings[0], lost=1).decision, "ambiguous")
+    def test_an_opening_with_no_continuation_logged_is_never_published(self):
+        # Lost lines of every kind -- a spent budget, a replaced pod, a cut last
+        # pass -- leave the opening without evidence, never with false evidence.
+        opening = self._rep(1, "pass", "A", recorded=True, continued=False)
+        self._rep(2, "pass", "B", opening_logged=False, continued=False)
+        self.assertEqual(self.world.decide(opening, final=False).decision, "pending")
+        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
+        self.assertEqual(self.world.decide(opening, lost=5).decision, "ambiguous")
 
-    def test_a_continuation_naming_two_runs_counts_for_neither(self):
+    def test_a_line_without_an_answer_variant_is_never_published(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        opening = self.world.request(front(), "opening", recorded=True)
+        self.world.request(front(*created("t_00000001")), "next", prior=("ctx-opening", "A"))
+        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
+
+    def test_a_continuation_naming_two_runs_is_no_evidence(self):
         self.world.run("case-a", 1, "pass", ["t_00000001"])
         self.world.run("case-a", 2, "pass", ["t_00000002"])
-        opening = self.world.request(front(), "opening")
-        self.world.request(front(*created("t_00000001", "c1"), *created("t_00000002", "c2")), "both")
+        opening = self.world.request(front(), "opening", recorded=True, answer="A")
+        self.world.request(front(*created("t_00000001", "c1"), *created("t_00000002", "c2")), "both",
+                           prior=("ctx-opening", "A"))
         self.assertEqual(self.world.decide(opening).decision, "ambiguous")
+
+    def test_the_same_answer_after_another_request_is_no_evidence(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        opening = self.world.request(front(), "opening", recorded=True, answer="A")
+        other = [system(), {"role": "user", "content": "another prompt"}, *created("t_00000001")]
+        self.world.request(other, "elsewhere", prior=("ctx-opening", "A"))
+        self.assertEqual(self.world.decide(opening).decision, "ambiguous")
+
+    def test_load_runs_reads_no_relative_run_directory(self):
+        self.world.run("case-a", 1, "pass", ["t_11111111"])
+        path = os.path.join(self.world.verdicts, "case-case-a.json")
+        with open(path) as handle:
+            case = json.load(handle)
+        case["reps"][0]["run_dir"] = os.path.relpath(case["reps"][0]["run_dir"])
+        with open(path, "w") as handle:
+            json.dump(case, handle)
+        self.assertEqual(RA.load_runs(self.world.verdicts)[0].ids, frozenset())
 
     def test_load_runs_skips_a_case_file_still_being_written(self):
         with open(os.path.join(self.world.verdicts, "case-half.json"), "w") as handle:

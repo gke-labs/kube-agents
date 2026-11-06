@@ -24,8 +24,9 @@ What goes up, under gs://<bucket>/replay-cache/<normalizer version>/:
   snippets are drawn from.
 And gs://<bucket>/replay-cache/builds/<build>/publish-<ms>.json, one per call
 that changed anything: the graded runs and their outcomes, what was decided,
-and the names this call confirmed are in the bucket (uploaded now, or there
-already from an earlier night). The replay lane reads these to fetch exactly
+and the objects this call confirmed are in the bucket (uploaded now, or there
+already from an earlier night), each with its size in this night's copy and,
+for a slot, the fingerprint of the answer it points at. The replay lane reads these to fetch exactly
 the answers recent nightlies selected (fetch_cache.py) and to compare verdicts
 (lane_report.py).
 
@@ -64,13 +65,34 @@ MESSAGES = replay_cache.MESSAGES_DIR
 # Upload order: an answer before the slot pointing at it.
 UPLOAD_ORDER = (ANSWERS, VARIANTS, SLOTS, MESSAGES)
 JSON_SUFFIX = ".json"
-SEGMENT_SUFFIX = ".jsonl"
 VARIANT_SEPARATOR = "-"
-HEX = r"[0-9a-f]{16,64}"
+SEGMENT_SUFFIX = ".jsonl"
+HEX = replay_cache.CACHE_HEX
 SAFE_HEX = re.compile(rf"^{HEX}$")
+# A cache object's name under the version prefix: replay_cache.CACHE_REL_RE's
+# layout with each variant flattened to one name, `variants/<context>-<answer>.json`.
+OBJECT_NAME_RE = re.compile(rf"^(?:(?:answers|slots|messages)/{HEX}\.json|variants/{HEX}{VARIANT_SEPARATOR}{HEX}\.json)$")
 NORMALIZER_VERSION_RE = re.compile(r"^[0-9a-f]{16}$")
 POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
-BUILD_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# A build id as a path segment: hack/ci-env.sh's REPLAY_SHADOW_BUILD_RE, which
+# tests/test_ci_replay_shadow.py holds equal to this.
+BUILD_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+BUILD_RE = re.compile(rf"^{BUILD_PATTERN}$")
+# A publish record's fields, read by fetch_cache.py and lane_report.py.
+RECORD_BUILD = "build"
+RECORD_FINAL = "final"
+RECORD_RUNS = "runs"
+RECORD_DECISIONS = "decisions"
+RECORD_LOST_LINES = "lost_lines"
+RECORD_OBJECTS = "objects"
+RUN_CASE = "case"
+RUN_REP = "rep"
+RUN_OUTCOME = "outcome"
+# Each object a record confirms: its name, its size in the recorder's copy, and
+# for a slot the fingerprint of the answer it points at.
+OBJECT_NAME = "name"
+OBJECT_BYTES = "bytes"
+OBJECT_TARGET = "target"
 MS_PER_SECOND = 1000
 GCLOUD_TIMEOUT_SECONDS = 300.0
 TEXT_ENCODING = "utf-8"
@@ -92,16 +114,12 @@ def cache_prefix(bucket: str, version: str) -> str:
 
 def object_name(sub: str, rel: str) -> Optional[str]:
     """The object name (under the version prefix) for a pod cache file `<sub>/<rel>`; None if it isn't one."""
-    parts = rel.split("/")
-    if sub == VARIANTS:
-        if len(parts) == 2 and SAFE_HEX.match(parts[0]) and parts[1].endswith(JSON_SUFFIX) \
-                and SAFE_HEX.match(parts[1][: -len(JSON_SUFFIX)]):
-            return f"{VARIANTS}/{parts[0]}{VARIANT_SEPARATOR}{parts[1]}"
+    if not replay_cache.CACHE_REL_RE.match(f"{sub}/{rel}"):
         return None
-    if sub in (ANSWERS, SLOTS, MESSAGES) and len(parts) == 1 and parts[0].endswith(JSON_SUFFIX) \
-            and SAFE_HEX.match(parts[0][: -len(JSON_SUFFIX)]):
-        return f"{sub}/{parts[0]}"
-    return None
+    if sub == VARIANTS:
+        context, answer = rel.split("/")
+        return f"{VARIANTS}/{context}{VARIANT_SEPARATOR}{answer}"
+    return f"{sub}/{rel}"
 
 
 def read_json(path: str):
@@ -126,9 +144,14 @@ def segment_paths(pod_dir: str) -> List[str]:
         return []
 
 
-def pod_version(segments: Sequence[str]) -> str:
-    """The normalizer version the pod's proxy started with (its start line), or empty."""
+def pod_version(segments: Sequence[str], known: Optional[Dict[str, str]] = None) -> str:
+    """The normalizer version the pod's proxy started with (its start line), or empty.
+
+    `known`, kept between calls, maps a segment already read to the version it gave.
+    """
     for path in segments:
+        if known is not None and path in known:
+            return known[path]
         try:
             with open(path, encoding=TEXT_ENCODING) as handle:
                 for raw in handle:
@@ -139,6 +162,8 @@ def pod_version(segments: Sequence[str]) -> str:
                     if isinstance(entry, dict) and entry.get(F.EVENT) == F.START_EVENT:
                         version = str(entry.get(F.NORMALIZER_VERSION) or "")
                         if NORMALIZER_VERSION_RE.match(version):
+                            if known is not None:
+                                known[path] = version
                             return version
         except OSError:
             continue
@@ -178,25 +203,39 @@ class Selection:
         self.decisions[decision] = self.decisions.get(decision, 0) + 1
 
 
-def select(keep_dir: str, verdicts_dir: str, final: bool, store: Optional[RA.Store] = None) -> Selection:
-    """Decide which kept cache files may go up, against the cases graded so far.
+@dataclass
+class State:
+    """What a Publisher keeps between calls, so each call reads only what is new."""
 
-    `store`, kept between calls, reads each stored message once per process.
-    """
-    selection = Selection(runs=RA.load_runs(verdicts_dir))
+    store: Optional[RA.Store] = None
+    reader: RA.LogReader = field(default_factory=RA.LogReader)
+    results: Dict[Tuple[str, int, int], Set[str]] = field(default_factory=dict)
+    versions: Dict[str, str] = field(default_factory=dict)
+    # (version, object name) already in the bucket: not read or decided again.
+    done: Set[Tuple[str, str]] = field(default_factory=set)
+
+
+def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State] = None) -> Selection:
+    """Decide which kept cache files may go up, against the cases graded so far."""
+    state = state or State()
+    if state.store is None:
+        state.store = RA.Store(keep_dir)
+    selection = Selection(runs=RA.load_runs(verdicts_dir, state.results))
     pods = [(name, path, segment_paths(path)) for name, path in pod_dirs(keep_dir)]
-    logs = RA.load_logs(p for _, _, segments in pods for p in segments)
+    logs = state.reader.load(p for _, _, segments in pods for p in segments)
     selection.lost_lines = logs.lost
-    attribution = RA.Attribution(logs, store or RA.Store(keep_dir), selection.runs, final)
+    attribution = RA.Attribution(logs, state.store, selection.runs, final)
     for _, pod_dir, segments in pods:
-        version = pod_version(segments)
+        version = pod_version(segments, state.versions)
         if not version:
             continue
         recorded: Dict[str, RA.Line] = {}
-        for line in RA.load_logs(segments).lines:
+        for line in state.reader.load(segments).lines:
             if line.recorded:
                 recorded.setdefault(line.fingerprint, line)
         for name, path in pod_files(pod_dir, ANSWERS):
+            if (version, name) in state.done:
+                continue
             fingerprint = name[len(ANSWERS) + 1: -len(JSON_SUFFIX)]
             line = recorded.get(fingerprint)
             if line is None:
@@ -215,8 +254,11 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, store: Optional[RA.Sto
                 selection.add(version, ANSWERS, name, path)
         for sub in (VARIANTS, MESSAGES):
             for name, path in pod_files(pod_dir, sub):
-                selection.add(version, sub, name, path)
+                if (version, name) not in state.done:
+                    selection.add(version, sub, name, path)
         for name, path in pod_files(pod_dir, SLOTS):
+            if (version, name) in state.done:
+                continue
             target = read_json(path)
             if isinstance(target, str) and SAFE_HEX.match(target):
                 selection.add(version, SLOTS, name, path)
@@ -238,11 +280,11 @@ class Publisher:
         self.env = env
         self.emit = emit
         self.clock = clock
-        self.uploaded: Set[Tuple[str, str]] = set()  # (version, object name)
+        self.state = State(store=RA.Store(keep_dir))
+        self.uploaded = self.state.done  # (version, object name) in the bucket
         self.recorded_runs: Optional[Tuple[Tuple[str, str], ...]] = None
         # Names confirmed in the bucket whose record did not upload yet.
-        self.unrecorded: Dict[str, Set[str]] = {}
-        self.store = RA.Store(keep_dir)
+        self.unrecorded: Dict[str, Dict[str, Dict[str, object]]] = {}
         self.totals: Dict[str, int] = {}
 
     def _upload(self, version: str, sub: str, items: Dict[str, str]) -> List[str]:
@@ -264,7 +306,7 @@ class Publisher:
         finally:
             shutil.rmtree(stage, ignore_errors=True)
 
-    def _record(self, selection: Selection, final: bool, confirmed: Dict[str, List[str]]) -> None:
+    def _record(self, selection: Selection, final: bool, confirmed: Dict[str, Dict[str, Dict[str, object]]]) -> None:
         """Upload this call's record: the graded runs, the decisions and the names confirmed in the bucket."""
         runs = tuple(sorted((run.key, run.outcome) for run in selection.runs))
         if not final and not confirmed and (not runs or runs == self.recorded_runs):
@@ -275,10 +317,11 @@ class Publisher:
             path = os.path.join(stage, name)
             with open(path, "w", encoding=TEXT_ENCODING) as handle:
                 json.dump({
-                    "build": self.build, "final": final,
-                    "runs": [{"case": r.case, "rep": r.rep, "outcome": r.outcome} for r in selection.runs],
-                    "decisions": selection.decisions, "lost_lines": selection.lost_lines,
-                    "objects": {version: sorted(names) for version, names in confirmed.items()},
+                    RECORD_BUILD: self.build, RECORD_FINAL: final,
+                    RECORD_RUNS: [{RUN_CASE: r.case, RUN_REP: r.rep, RUN_OUTCOME: r.outcome} for r in selection.runs],
+                    RECORD_DECISIONS: selection.decisions, RECORD_LOST_LINES: selection.lost_lines,
+                    RECORD_OBJECTS: {version: [objects[n] for n in sorted(objects)]
+                                     for version, objects in confirmed.items()},
                 }, handle, sort_keys=True)
             dest = f"gs://{self.bucket}/{CACHE_ROOT}/{BUILDS_DIR}/{self.build}/{name}"
             if self.run("publish_record", ["gcloud", "storage", "cp", "--no-clobber", path, dest],
@@ -286,15 +329,15 @@ class Publisher:
                 self.recorded_runs = runs
             else:
                 # Retried on the next call, which records these names again.
-                for version, names in confirmed.items():
-                    self.unrecorded.setdefault(version, set()).update(names)
+                for version, objects in confirmed.items():
+                    self.unrecorded.setdefault(version, {}).update(objects)
         finally:
             shutil.rmtree(stage, ignore_errors=True)
 
     def publish(self, final: bool = False) -> Dict[str, object]:
-        selection = select(self.keep_dir, self.verdicts_dir, final, self.store)
+        selection = select(self.keep_dir, self.verdicts_dir, final, self.state)
         uploaded_now: Dict[str, int] = {}
-        confirmed: Dict[str, List[str]] = {v: sorted(n) for v, n in self.unrecorded.items()}
+        confirmed: Dict[str, Dict[str, Dict[str, object]]] = {v: dict(o) for v, o in self.unrecorded.items()}
         self.unrecorded = {}
         for version, subs in sorted(selection.objects.items()):
             for sub in UPLOAD_ORDER:
@@ -307,9 +350,13 @@ class Publisher:
                 if not items:
                     continue
                 done = self._upload(version, sub, items)
+                targets = selection.slot_targets.get(version, {})
                 for name in done:
                     self.uploaded.add((version, name))
-                confirmed.setdefault(version, []).extend(done)
+                    described: Dict[str, object] = {OBJECT_NAME: name, OBJECT_BYTES: _size(items[name])}
+                    if sub == SLOTS:
+                        described[OBJECT_TARGET] = targets.get(name, "")
+                    confirmed.setdefault(version, {})[name] = described
                 uploaded_now[sub] = uploaded_now.get(sub, 0) + len(done)
                 self.totals[sub] = self.totals.get(sub, 0) + len(done)
         self._record(selection, final, confirmed)
@@ -320,6 +367,13 @@ class Publisher:
         }
         self.emit(report)
         return report
+
+
+def _size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
 
 
 def valid_bucket(bucket: str) -> bool:

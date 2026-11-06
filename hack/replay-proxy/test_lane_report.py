@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 import lane_report
-from test_run_attribution import World, worker
+from test_run_attribution import World, created, front, worker
 
 NIGHT = "1790000000000000001"
 POD = "inference-replay-shadow-abc12-xyz34"
@@ -67,6 +67,19 @@ class LaneReportTest(unittest.TestCase):
         self.conversation("t_00000001", (True, True), recorded_from="1790000000000000999")
         report, _ = self.report({NIGHT: []})
         self.assertEqual(report["served_conversations"], {"match": 0, "mismatch": 0, "unknown": 1})
+
+    def test_a_front_doors_opening_counts_for_the_run_its_conversation_names(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        for messages, served in ((front(), True), (front({"role": "assistant", "content": "A"}, *created("t_00000001")), False)):
+            entry = self.world.request(messages, f"fp-{len(messages)}")
+            self.ts += 1
+            entry.update(mode="replay", ts=self.ts, served=served, roles=[m["role"] for m in messages])
+            if served:
+                entry["served_from"] = {"build": NIGHT}
+        report, _ = self.report({NIGHT: [{"case": "case-a", "rep": 1, "outcome": "pass"}]})
+        run = report["cases"]["case-a"]["lane"]["runs"][0]
+        self.assertEqual((run["requests"], run["served_requests"]), (2, 1))
+        self.assertEqual(report["unattributed_prompt_tokens"], 0)
 
     def test_a_conversation_served_nothing_is_not_compared(self):
         self.world.run("case-a", 1, "fail", ["t_00000001"])

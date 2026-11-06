@@ -13,25 +13,31 @@ t_...`) and the cards the conversation created (the `task_id` a `kanban_create`
 call returned). Card ids anywhere else are not evidence: system prompts quote
 old cards, board listings show every run's cards, and Hermes' recent-work digest
 lists the assignee's runs on other cards. A run's cards are the `task` its
-worker trajectory entries carry and the A2A task its `inject.task` entry names.
+worker trajectory entries carry. (A front door's request names no A2A task id,
+so a run's A2A task is no evidence and is not read.)
 
 A request that names no card of its own (a front door's opening, which is only
-the case's prompt) is attributed through the requests that continue it: each
-continuation holds it as a prefix, so its run issued it. That proves which runs
-issued it, not which of them got the answer that was saved, so it decides only
-when the count closes: when as many distinct runs continued past the request as
-there are logged requests with its fingerprint, every one of those requests
-belongs to one of those runs. That is decided only once every case is graded,
-since a run still going could issue the request again, and never in a build
-that lost any request's analysis (`analysis_dropped`), which can undercount.
+the case's prompt) is decided by evidence instead: a later request whose
+conversation went on from exactly the answer that was saved. Record mode logs
+each line's answer (`answer_variant`) and the answer the request's last
+assistant message is (`prior_answer`), both as normalizer.answer_variant
+identifies an answer in a history. A continuation attributed to one run, holding
+the request as its prefix and that answer next, proves that run got that answer
+to that request; the answer is published when any such run passed, which is the
+design's "at least one passing run produced that same fingerprint", here for
+the same answer as well. Only positive evidence decides, so a line lost before
+it reached a segment (a spent budget, a pod replaced before its last segment
+was copied, a last pass cut short, a pod that came and went between passes) can
+only leave an answer unpublished, never publish one.
 
 Decisions, per logged request:
 - `pass`: every run it belongs to was graded and passed;
 - `fail`: it belongs to a run that was graded and did not pass;
 - `pending`: its text is not all stored yet, or it names a card no graded run
-  has yet (its case is still running), or it names none and cases are running;
+  has yet (its case is still running), or it names none and no passing run has
+  been seen going on from its answer while cases are still running;
 - `unattributed`: once every case is graded, no stored text or a card no run worked;
-- `ambiguous`: no card of its own, and its continuations do not close the count.
+- `ambiguous`: no card of its own, and no graded run went on from its answer.
 """
 
 from __future__ import annotations
@@ -46,16 +52,13 @@ import replay_cache
 import schema as F
 
 CARD_RE = re.compile(r"^t_[0-9a-f]{8}$")
-A2A_TASK_RE = re.compile(r"^task-[0-9a-f]{16}$")
 # Hermes' first message to a worker (bench/kube_agents_bench/worker_trajectory.py reads the same).
 WORKER_OPENING_RE = re.compile(r"\Awork kanban task (t_[0-9a-f]{8})\b")
 CREATE_TOOL = "kanban_create"
 CREATED_ID_KEY = "task_id"
-# A results.json trajectory entry: the worker card it ran under, and the inject door's task.
+# A results.json trajectory entry: the worker card it ran under.
 TRAJECTORY_KEY = "trajectory"
 TRAJECTORY_TASK_KEY = "task"
-INJECT_TASK_TOOL = "inject.task"
-INJECT_TASK_ARG = "taskId"
 ROLE_KEY = "role"
 USER_ROLE = "user"
 ASSISTANT_ROLE = "assistant"
@@ -67,7 +70,6 @@ TOOL_CALL_ID_KEY = "tool_call_id"
 FUNCTION_KEY = "function"
 NAME_KEY = "name"
 ID_KEY = "id"
-ARGS_KEY = "args"
 
 PASS = "pass"
 FAIL = "fail"
@@ -76,6 +78,16 @@ UNATTRIBUTED = "unattributed"
 AMBIGUOUS = "ambiguous"
 DECISIONS = (PASS, FAIL, PENDING, UNATTRIBUTED, AMBIGUOUS)
 
+# bench-gate's case-<name>.json (bench/kube_agents_bench/scoring.py, CaseVerdict.to_dict):
+# the case, its repetitions, and each one's index, outcome and run directory.
+# The run directory is absolute: devops-bench resolves the run directory it
+# prints (evalharness/reporter.py, new_run_dir), and hack/ci-eval-pr.sh hands
+# that path to bench-gate as given.
+CASE_FIELD = "case"
+REPS_FIELD = "reps"
+REP_INDEX_FIELD = "index"
+REP_OUTCOME_FIELD = "outcome"
+REP_RUN_DIR_FIELD = "run_dir"
 # bench-gate's per-repetition outcome for a pass (bench/kube_agents_bench/scoring.py).
 REP_OUTCOME_PASS = "pass"
 REP_OUTCOME_FAIL = "fail"
@@ -88,6 +100,8 @@ STORE_BLOBS_DIR = os.path.join("store", "blobs")
 MESSAGES_KEY = "messages"
 # The names the store writes: a request id (uuid4 hex) and a blob (sha256 hex).
 SAFE_STORE_NAME = re.compile(r"^[0-9a-f]{16,64}$")
+# An answer's identity in a history: [context, answer] (normalizer.answer_variant).
+ANSWER_PAIR_LENGTH = 2
 TEXT_ENCODING = "utf-8"
 
 
@@ -159,7 +173,7 @@ def owned_cards(messages: List[Any]) -> Set[str]:
 
 
 def run_cards(record: Any) -> Set[str]:
-    """The cards (and A2A task) one repetition's results.json says its run worked."""
+    """The cards one repetition's results.json says its workers worked (each trajectory entry's `task`)."""
     if isinstance(record, list):
         record = record[0] if record else None
     found: Set[str] = set()
@@ -171,11 +185,6 @@ def run_cards(record: Any) -> Set[str]:
         task = entry.get(TRAJECTORY_TASK_KEY)
         if isinstance(task, str) and CARD_RE.match(task):
             found.add(task)
-        args = entry.get(ARGS_KEY)
-        if entry.get(NAME_KEY) == INJECT_TASK_TOOL and isinstance(args, dict):
-            a2a = args.get(INJECT_TASK_ARG)
-            if isinstance(a2a, str) and A2A_TASK_RE.match(a2a):
-                found.add(a2a)
     return found
 
 
@@ -205,12 +214,14 @@ class Run:
         return self.outcome == REP_OUTCOME_PASS
 
 
-def load_runs(verdicts_dir: str) -> List[Run]:
+def load_runs(verdicts_dir: str, results_cache: Optional[Dict[Tuple[str, int, int], Set[str]]] = None) -> List[Run]:
     """Every repetition of every graded case under `verdicts_dir` (bench-gate's case-<name>.json).
 
     A case file still being written does not parse and is skipped until it does;
-    a repetition with no run directory or no readable results.json is a run that
-    names no ID, so no request is attributed to it.
+    a repetition with no run directory, a relative one, or no readable
+    results.json names no card, so no request is attributed to it.
+    `results_cache`, kept between calls, reads each results.json once while it
+    is unchanged.
     """
     runs: List[Run] = []
     try:
@@ -221,18 +232,32 @@ def load_runs(verdicts_dir: str) -> List[Run]:
         if not (name.startswith(CASE_JSON_PREFIX) and name.endswith(JSON_SUFFIX)):
             continue
         case = read_json(os.path.join(verdicts_dir, name))
-        if not isinstance(case, dict) or not isinstance(case.get("reps"), list):
+        if not isinstance(case, dict) or not isinstance(case.get(REPS_FIELD), list):
             continue
-        case_id = str(case.get("case") or name[len(CASE_JSON_PREFIX):-len(JSON_SUFFIX)])
-        for rep in case["reps"]:
-            if not isinstance(rep, dict) or not isinstance(rep.get("index"), int):
+        case_id = str(case.get(CASE_FIELD) or name[len(CASE_JSON_PREFIX):-len(JSON_SUFFIX)])
+        for rep in case[REPS_FIELD]:
+            if not isinstance(rep, dict) or not isinstance(rep.get(REP_INDEX_FIELD), int):
                 continue
             ids: Set[str] = set()
-            run_dir = rep.get("run_dir")
-            if isinstance(run_dir, str) and run_dir:
-                ids = run_cards(read_json(os.path.join(run_dir, RESULTS_FILE)))
-            runs.append(Run(case_id, rep["index"], str(rep.get("outcome") or ""), frozenset(ids)))
+            run_dir = rep.get(REP_RUN_DIR_FIELD)
+            if isinstance(run_dir, str) and os.path.isabs(run_dir):
+                ids = _results_cards(os.path.join(run_dir, RESULTS_FILE), results_cache)
+            runs.append(Run(case_id, rep[REP_INDEX_FIELD], str(rep.get(REP_OUTCOME_FIELD) or ""), frozenset(ids)))
     return runs
+
+
+def _results_cards(path: str, cache: Optional[Dict[Tuple[str, int, int], Set[str]]]) -> Set[str]:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return set()
+    key = (path, st.st_size, st.st_mtime_ns)
+    if cache is not None and key in cache:
+        return cache[key]
+    cards = run_cards(read_json(path))
+    if cache is not None:
+        cache[key] = cards
+    return cards
 
 
 @dataclass
@@ -247,6 +272,8 @@ class Line:
     served: bool = False
     served_from_build: str = ""
     prompt_tokens: int = 0
+    answer_variant: Optional[Tuple[str, ...]] = None
+    prior_answer: Optional[Tuple[str, ...]] = None
 
     @classmethod
     def from_entry(cls, entry: Dict[str, Any]) -> "Line":
@@ -262,7 +289,15 @@ class Line:
             served=entry.get(F.SERVED) is True,
             served_from_build=str(served_from.get(F.JOB_BUILD) or "") if isinstance(served_from, dict) else "",
             prompt_tokens=int(entry.get(F.PROMPT_TOKENS) or 0),
+            answer_variant=_pair(entry.get(F.ANSWER_VARIANT)),
+            prior_answer=_pair(entry.get(F.PRIOR_ANSWER)),
         )
+
+
+def _pair(value: Any) -> Optional[Tuple[str, ...]]:
+    if isinstance(value, list) and len(value) == ANSWER_PAIR_LENGTH and all(isinstance(v, str) and v for v in value):
+        return tuple(value)
+    return None
 
 
 @dataclass
@@ -290,13 +325,45 @@ def read_lines(paths: Iterable[str]) -> Iterator[Dict[str, Any]]:
 
 
 def load_logs(paths: Iterable[str]) -> LogSet:
-    logs = LogSet()
-    for entry in read_lines(paths):
-        if entry.get(F.FINGERPRINT) and entry.get(F.REQUEST_ID):
-            logs.lines.append(Line.from_entry(entry))
-        else:
-            logs.lost += 1
-    return logs
+    return LogReader().load(paths)
+
+
+class LogReader:
+    """Reads segments into lines, each file once while its size and time are unchanged.
+
+    The collector rewrites a kept segment only to add to it (an open segment
+    taken again once closed), so the size and modification time say when to read again.
+    """
+
+    def __init__(self):
+        self._files: Dict[str, Tuple[Tuple[int, int], List[Line], int]] = {}
+
+    def _file(self, path: str) -> Tuple[List[Line], int]:
+        try:
+            st = os.stat(path)
+        except OSError:
+            return [], 0
+        stamp = (st.st_size, st.st_mtime_ns)
+        cached = self._files.get(path)
+        if cached is not None and cached[0] == stamp:
+            return cached[1], cached[2]
+        lines: List[Line] = []
+        lost = 0
+        for entry in read_lines([path]):
+            if entry.get(F.FINGERPRINT) and entry.get(F.REQUEST_ID):
+                lines.append(Line.from_entry(entry))
+            else:
+                lost += 1
+        self._files[path] = (stamp, lines, lost)
+        return lines, lost
+
+    def load(self, paths: Iterable[str]) -> LogSet:
+        logs = LogSet()
+        for path in paths:
+            lines, lost = self._file(path)
+            logs.lines.extend(lines)
+            logs.lost += lost
+        return logs
 
 
 class Store:
@@ -355,20 +422,15 @@ class Attribution:
         for run in runs:
             for run_id in run.ids:
                 self.by_id.setdefault(run_id, set()).add(run.key)
-        self.count_by_fingerprint: Dict[Tuple[str, str], int] = {}
+        # Continuations by the answer they went on from: (build, answer pair) ->
+        # [(the continuation's prefix keys, its one run)].
+        self.went_on: Dict[Tuple[str, Tuple[str, ...]], List[Tuple[List[str], str]]] = {}
         for line in logs.lines:
-            key = (line.build, line.fingerprint)
-            self.count_by_fingerprint[key] = self.count_by_fingerprint.get(key, 0) + 1
-        # Runs known to have issued a request: each request its own IDs tie to
-        # exactly one run registers that run at every strict prefix of its
-        # messages. One naming two runs proves neither issued the prefix.
-        self.continued: Dict[Tuple[str, str], Set[str]] = {}
-        for line in logs.lines:
-            run = self.run_of(line)
-            if run is None:
+            if line.prior_answer is None:
                 continue
-            for prefix in line.chain[1:-1]:
-                self.continued.setdefault((line.build, prefix), set()).add(run)
+            run = self.run_of(line)
+            if run is not None:
+                self.went_on.setdefault((line.build, line.prior_answer), []).append((line.chain, run))
 
     def _own(self, line: Line) -> Optional[Tuple[Set[str], bool]]:
         """(runs its own IDs name, whether any ID names no graded run); None without stored text.
@@ -403,18 +465,21 @@ class Attribution:
             return Decision(UNATTRIBUTED if self.final else PENDING, tuple(sorted(runs)))
         if runs:
             return self._of_runs(runs)
-        # No ID of its own: the runs that continued past it, if they close the
-        # count. Only once every run is in: a run still going could issue the
-        # same request again and reopen a count that looked closed.
+        # No card of its own: the runs seen going on from exactly its answer.
+        evidence = set()
+        if line.answer_variant is not None:
+            depth = len(line.chain)
+            for chain, run in self.went_on.get((line.build, line.answer_variant), []):
+                if len(chain) > depth and chain[depth - 1] == line.chain[-1]:
+                    evidence.add(run)
+        passed = {run for run in evidence if self.runs[run].passed}
+        if passed:
+            return Decision(PASS, tuple(sorted(passed)))
         if not self.final:
             return Decision(PENDING)
-        if self.logs.lost:
-            return Decision(AMBIGUOUS)
-        continued = self.continued.get((line.build, line.chain[-1]), set())
-        issued = self.count_by_fingerprint.get((line.build, line.fingerprint), 0)
-        if not continued or issued > len(continued):
-            return Decision(AMBIGUOUS)
-        return self._of_runs(continued)
+        if evidence:
+            return Decision(FAIL, tuple(sorted(evidence)))
+        return Decision(AMBIGUOUS)
 
     def run_of(self, line: Line) -> Optional[str]:
         """The one run a request names by its own IDs, for the lane's per-run counts; None otherwise."""

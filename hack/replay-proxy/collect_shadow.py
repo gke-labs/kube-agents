@@ -76,9 +76,12 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+import replay_cache
 
 BUCKET_ROOT = "replay-shadow"
 JOB_KINDS = ("nightly", "presubmit", "replay-lane")
@@ -92,6 +95,7 @@ JSON_SUFFIX = ".json"
 SEGMENT_SUFFIX = ".jsonl"
 OPEN_SUFFIX = ".open"
 LOGS_DIR = "logs"
+STORE_DIR = "store"
 STORE_REQUESTS_DIR = "store/requests"
 STORE_BLOBS_DIR = "store/blobs"
 # What a pod's data volume may hold that is ours to copy, by directory, and the
@@ -112,8 +116,7 @@ SAFE_NAME = re.compile(
 # deeper, so a name is checked like the others before it becomes a path.
 DEFAULT_CACHE_SUBDIR = "replay-cache"
 CACHE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-CACHE_REL_RE = re.compile(
-    r"^(?:(?:answers|slots|messages)/[0-9a-f]{16,64}\.json|variants/[0-9a-f]{16,64}/[0-9a-f]{16,64}\.json)$")
+CACHE_REL_RE = replay_cache.CACHE_REL_RE
 CACHE_SEED_MARKER = ".seeded"
 # The kept copy on this machine: one directory per pod (its lines and its
 # saved answers), and the store, whose names are unique across pods.
@@ -312,6 +315,17 @@ print(written)
 """
 
 
+def _copy_atomically(src: str, target: str) -> None:
+    """Copy so a reader (the publisher's thread) never sees half a file: a temporary name, then a rename."""
+    tmp = f"{target}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def mask(text: str) -> str:
     return HEX_RUN.sub(HEX_MASK, text)
 
@@ -442,6 +456,10 @@ class Collector:
         self.publisher = publisher
         self.publish_interval = publish_interval
         self.last_publish: Optional[float] = None
+        # Ordinary publishes run beside collection, so emptying the pods never
+        # waits on one; the last pass waits for any still running, then publishes.
+        self.publish_in_background = True
+        self.publish_thread: Optional[threading.Thread] = None
         # Writes the lane's report into a directory and returns its summary.
         self.lane_report = lane_report
 
@@ -619,7 +637,7 @@ class Collector:
                 target = os.path.join(self.keep_dir, name)
             try:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
-                shutil.copyfile(os.path.join(root, name), target)
+                _copy_atomically(os.path.join(root, name), target)
             except OSError:
                 self.fail("keep_write")
 
@@ -665,7 +683,7 @@ class Collector:
                                           rel[len(self.cache_subdir) + 1:])
                     try:
                         os.makedirs(os.path.dirname(target), exist_ok=True)
-                        shutil.copyfile(os.path.join(root, rel), target)
+                        _copy_atomically(os.path.join(root, rel), target)
                     except OSError:
                         self.fail("keep_write")
                         continue
@@ -722,18 +740,36 @@ class Collector:
         pods = self.pods()
         return len(pods), sum(1 for pod in pods if self.seed(pod))
 
-    def maybe_publish(self, final: bool) -> None:
-        """Record mode: publish every publish_interval seconds, and always in the last pass."""
-        if self.publisher is None:
-            return
-        now = self.clock()
-        if not final and self.last_publish is not None and now - self.last_publish < self.publish_interval:
-            return
-        self.last_publish = now
+    def _publish(self, final: bool) -> None:
         try:
-            self.publisher.publish(final=final)
+            self.publisher.publish(final=final)  # type: ignore[union-attr]
         except Exception as exc:  # a failed publish is retried by the next one
             self.fail("publish_crashed", reason=type(exc).__name__)
+
+    def maybe_publish(self, final: bool) -> None:
+        """Record mode: publish every publish_interval seconds, beside collection, and always in the last pass."""
+        if self.publisher is None:
+            return
+        running = self.publish_thread is not None and self.publish_thread.is_alive()
+        if final:
+            if running:
+                self.publish_thread.join(max(0.0, self.deadline - self.clock()) if self.deadline else None)  # type: ignore[union-attr]
+                if self.publish_thread.is_alive():  # type: ignore[union-attr]
+                    self.fail("publish_overran")
+                    return
+            self.last_publish = self.clock()
+            self._publish(final=True)
+            return
+        now = self.clock()
+        if running or (self.last_publish is not None and now - self.last_publish < self.publish_interval):
+            return
+        self.last_publish = now
+        if not self.publish_in_background:
+            self._publish(final=False)
+            return
+        self.publish_thread = threading.Thread(target=self._publish, args=(False,), name="replay-cache-publish",
+                                               daemon=True)
+        self.publish_thread.start()
 
     def write_lane_report(self) -> None:
         """Replay mode's last step: the lane's report, into the job's prefix under report/."""
@@ -895,7 +931,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--seed-once", action="store_true", help="replay: seed every pod, then exit")
     parser.add_argument("--nightly-runs", default="", help="replay: fetch_cache.py's runs per recording build")
     args = parser.parse_args(argv)
-    if not CACHE_SUBDIR_RE.match(args.cache_subdir) or args.cache_subdir in (LOGS_DIR, "store"):
+    if not CACHE_SUBDIR_RE.match(args.cache_subdir) or args.cache_subdir in (LOGS_DIR, STORE_DIR):
         parser.error("--cache-subdir must be one plain directory name other than logs and store")
     if args.mode != MODE_SHADOW and not args.keep_dir:
         parser.error(f"--mode {args.mode} needs --keep-dir")

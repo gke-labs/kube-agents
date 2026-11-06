@@ -66,6 +66,8 @@ class FetchTest(unittest.TestCase):
         self.bucket = FakeBucket(os.path.join(root, "bucket"))
         self.dest = os.path.join(root, "cache")
         self.runs_out = os.path.join(root, "runs.json")
+        self.sizes = {}
+        self.targets = {}
 
     def fetcher(self, **overrides):
         settings = dict(bucket=BUCKET, version=VERSION, run=self.bucket, clock=lambda: NOW)
@@ -73,16 +75,32 @@ class FetchTest(unittest.TestCase):
         return FC.Fetcher(**settings)
 
     def record(self, build, ms, objects, runs=(), created=NOW):
+        """A publish record; `objects` maps a version to names, or to (name, bytes, target) entries."""
+        described = {}
+        for version, names in objects.items():
+            described[version] = []
+            for item in names:
+                name, size, target = (item, self.sizes.get(item, 1), self.targets.get(item, "")) \
+                    if isinstance(item, str) else item
+                entry = {"name": name, "bytes": size}
+                if name.startswith("slots/"):
+                    entry["target"] = target
+                described[version].append(entry)
         self.bucket.put(f"replay-cache/builds/{build}/publish-{ms}.json",
-                        json.dumps({"build": build, "objects": objects, "runs": list(runs)}), created)
+                        json.dumps({"build": build, "objects": described, "runs": list(runs)}), created)
 
-    def objects(self, version, *names):
+    def objects(self, version, *names, content=None):
         for name in names:
-            self.bucket.put(f"replay-cache/{version}/{name}", json.dumps(name))
+            body = content if content is not None else json.dumps(name)
+            if name.startswith("slots/"):
+                body = json.dumps(self.targets.get(name, fp(1)))
+            self.bucket.put(f"replay-cache/{version}/{name}", body)
+            self.sizes[name] = len(body)
 
     def test_fetches_what_recent_records_confirmed_at_this_version(self):
         names = [f"answers/{fp(1)}.json", f"slots/{fp(2)}.json", f"variants/{fp(3)}-{'a' * 16}.json",
                  f"messages/{'b' * 16}.json"]
+        self.targets[names[1]] = fp(1)
         self.objects(VERSION, *names, f"answers/{fp(9)}.json")
         self.objects(OTHER_VERSION, f"answers/{fp(1)}.json")
         self.record("101", 1, {VERSION: names[:2], OTHER_VERSION: [f"answers/{fp(1)}.json"]},
@@ -128,21 +146,83 @@ class FetchTest(unittest.TestCase):
         for name in ("answers/../../etc.json", f"answers/{fp(1)}.tmp", f"variants/{fp(1)}/{'a' * 16}.json",
                      "store/requests/x.json"):
             with self.subTest(name=name):
-                self.record("101", 1, {VERSION: [name]})
+                self.record("101", 1, {VERSION: [(name, 1, "")]})
                 with self.assertRaises(FC.Refused):
                     self.fetcher().fetch(self.dest)
 
-    def test_the_byte_bound_refuses_a_cache_too_large_for_the_pod(self):
-        self.objects(VERSION, f"answers/{fp(1)}.json", f"answers/{fp(2)}.json")
-        self.record("101", 1, {VERSION: [f"answers/{fp(1)}.json", f"answers/{fp(2)}.json"]})
-        with self.assertRaises(FC.Refused):
-            self.fetcher(max_bytes=80).fetch(self.dest)
+    def test_a_slot_without_a_named_answer_or_an_object_without_a_size_refuses(self):
+        for item in ((f"slots/{fp(1)}.json", 1, ""), (f"answers/{fp(1)}.json", -1, ""),
+                     (f"answers/{fp(1)}.json", True, "")):
+            with self.subTest(item=item):
+                self.record("101", 1, {VERSION: [item]})
+                with self.assertRaises(FC.Refused):
+                    self.fetcher().fetch(self.dest)
+
+    def test_the_bound_leaves_out_by_priority_and_never_refuses(self):
+        answers = [f"answers/{fp(n)}.json" for n in (1, 2)]
+        slot = f"slots/{fp(10)}.json"
+        self.targets[slot] = fp(1)
+        message = f"messages/{'b' * 16}.json"
+        self.objects(VERSION, *answers, slot, message)
+        self.record("101", 1, {VERSION: [answers[0], slot, message]})
+        self.record("101", 2, {VERSION: [answers[1]]})
+        # Room for two files: both answers; the slot and the message are left out.
+        result = self.fetcher(max_bytes=2 * FC.disk_cost(100)).fetch(self.dest)
+        self.assertEqual(result.by_kind, {"answers": 2})
+        self.assertEqual(result.left_out, {"slots": 1, "messages": 1})
+
+    def test_the_newest_records_answers_come_first(self):
+        old, new = f"answers/{fp(1)}.json", f"answers/{fp(2)}.json"
+        self.objects(VERSION, old, new)
+        self.record("100", 1, {VERSION: [old]}, created=NOW - 10)
+        self.record("101", 1, {VERSION: [new]})
+        result = self.fetcher(max_bytes=FC.disk_cost(100)).fetch(self.dest)
+        self.assertEqual(os.listdir(os.path.join(self.dest, "answers")), [f"{fp(2)}.json"])
+        self.assertEqual(result.left_out, {"answers": 1})
+
+    def test_a_slot_whose_answer_was_left_out_is_left_out(self):
+        slot = f"slots/{fp(10)}.json"
+        self.targets[slot] = fp(1)
+        self.objects(VERSION, f"answers/{fp(1)}.json", slot)
+        self.record("101", 1, {VERSION: [(f"answers/{fp(1)}.json", 10 ** 9, ""), slot]})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(result.left_out, {"answers": 1, "slots": 1})
+        self.assertFalse(os.path.exists(os.path.join(self.dest, "slots")))
+
+    def test_a_slot_whose_answer_did_not_arrive_is_removed(self):
+        slot = f"slots/{fp(10)}.json"
+        self.targets[slot] = fp(1)
+        self.objects(VERSION, f"answers/{fp(2)}.json", slot)
+        # The record names the slot's answer, but the object has expired.
+        self.record("101", 1, {VERSION: [(f"answers/{fp(1)}.json", 10, ""), f"answers/{fp(2)}.json", slot]})
+        result = self.fetcher().fetch(self.dest)
+        self.assertEqual(result.removed, {"slots": 1})
+        self.assertFalse(os.path.exists(os.path.join(self.dest, "slots", f"{fp(10)}.json")))
+
+    def test_a_copy_larger_than_its_record_is_costed_at_its_real_size(self):
+        big = "x" * (3 * FC.DISK_BLOCK_BYTES)
+        self.objects(VERSION, f"answers/{fp(1)}.json", content=big)
+        self.objects(VERSION, f"answers/{fp(2)}.json")
+        self.record("101", 1, {VERSION: [(f"answers/{fp(1)}.json", 10, ""), (f"answers/{fp(2)}.json", 10, "")]})
+        result = self.fetcher(max_bytes=2 * FC.disk_cost(10)).fetch(self.dest)
+        self.assertEqual(result.removed, {"answers": 1})
+        self.assertEqual(result.downloaded, 1)
+
+    def test_disk_cost_rounds_to_blocks_and_counts_the_entry(self):
+        self.assertEqual(FC.disk_cost(0), FC.FILE_OVERHEAD_BYTES)
+        self.assertEqual(FC.disk_cost(1), FC.DISK_BLOCK_BYTES + FC.FILE_OVERHEAD_BYTES)
+        self.assertEqual(FC.disk_cost(FC.DISK_BLOCK_BYTES + 1), 2 * FC.DISK_BLOCK_BYTES + FC.FILE_OVERHEAD_BYTES)
 
     def test_an_object_expired_since_its_record_is_skipped(self):
         self.objects(VERSION, f"answers/{fp(1)}.json")
-        self.record("101", 1, {VERSION: [f"answers/{fp(1)}.json", f"answers/{fp(2)}.json"]})
+        self.record("101", 1, {VERSION: [f"answers/{fp(1)}.json", (f"answers/{fp(2)}.json", 10, "")]})
         result = self.fetcher().fetch(self.dest)
         self.assertEqual((result.objects, result.downloaded), (2, 1))
+
+    def test_a_build_with_a_dot_is_a_record_like_any_other(self):
+        self.objects(VERSION, f"answers/{fp(1)}.json")
+        self.record("101.2", 1, {VERSION: [f"answers/{fp(1)}.json"]})
+        self.assertEqual(self.fetcher().fetch(self.dest).builds, ["101.2"])
 
 
 if __name__ == "__main__":

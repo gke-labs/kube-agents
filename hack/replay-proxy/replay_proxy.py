@@ -247,6 +247,7 @@ class Metrics:
         "analysis_dropped": "replay_shadow_analysis_dropped_total",
         "served": "replay_shadow_served_total",
         "recorded": "replay_shadow_recorded_total",
+        "record_budget_spent": "replay_shadow_record_budget_spent_total",
         "log_file_errors": "replay_shadow_log_file_errors_total",
         "log_file_dropped": "replay_shadow_log_file_dropped_total",
     }
@@ -542,9 +543,13 @@ class ShadowProxy:
         self.scrubber = request_store.Scrubber(config.redactor_path, config.transcript_rules_path)
         self.budget: Optional[spool.DataBudget] = None
         if config.data_max_bytes > 0:
-            self.budget = spool.DataBudget(
-                [config.store_dir, config.log_dir], config.data_max_bytes, DATA_BUDGET_INTERVAL_SECONDS
-            )
+            # Record mode's cache is emptied by the collector as it copies it,
+            # like the store and the segments, so it counts against the same
+            # budget; replay's is a seeded, bounded copy that must stay whole.
+            roots = [config.store_dir, config.log_dir]
+            if config.mode == F.MODE_RECORD:
+                roots.append(config.cache_dir)
+            self.budget = spool.DataBudget(roots, config.data_max_bytes, DATA_BUDGET_INTERVAL_SECONDS)
         self.store = request_store.RequestStore(config.store_dir, self.scrubber, self.budget)
         self.metrics = Metrics(self.scrubber.available)
         self.segments: Optional[spool.SegmentLog] = None
@@ -635,10 +640,27 @@ class ShadowProxy:
         process, on when the prefix arrived), so it is kept by their digests:
         each turn normalizes only its new answer's prefix, not every earlier one.
         """
+        for variant in self.history_variants(body, messages, digests, first_seen, received):
+            if not self.cache.has_variant(*variant):
+                return False
+        return True
+
+    def history_variants(
+        self, body: Dict[str, Any], messages: List[Any], digests: List[str], first_seen: List[float], received: float,
+        last_only: bool = False,
+    ):
+        """(context, answer) of each assistant message, as record mode noted the answer to the request before it.
+
+        Memoized by the digests of the prefix, so each answer is normalized once
+        per process. With `last_only`, only the last assistant message's.
+        """
         settings = {k: v for k, v in body.items() if k not in normalizer.KEY_DROP_FIELDS and k != normalizer.MESSAGES_FIELD}
         chain = normalizer.stable_hash(settings)
+        indices = [i for i, m in enumerate(messages)
+                   if isinstance(m, dict) and m.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE]
+        wanted = set(indices[-1:] if last_only else indices)
         for index, message in enumerate(messages):
-            if isinstance(message, dict) and message.get(ROLE_KEY) == normalizer.ASSISTANT_ROLE:
+            if index in wanted:
                 memo_key = normalizer.stable_hash([chain, digests[index]])
                 with self._variant_lock:
                     variant = self._variants.get(memo_key)
@@ -651,10 +673,8 @@ class ShadowProxy:
                         self._variants[memo_key] = variant
                         while len(self._variants) > VARIANT_MEMO_CAPACITY:
                             self._variants.popitem(last=False)
-                if not self.cache.has_variant(*variant):
-                    return False
+                yield variant
             chain = normalizer.stable_hash([chain, digests[index]])
-        return True
 
     def submit(
         self, body: Dict[str, Any], received: float, upstream: Dict[str, Any], request_bytes: int,
@@ -786,6 +806,12 @@ class ShadowProxy:
         """
         if entry[F.UNSTORABLE]:
             return False
+        if self.budget is not None and not self.budget.allows():
+            # The cache counts against the data budget in record mode, so a
+            # cache the collector can't empty stops growing before the volume fills.
+            entry[F.RECORD_ERROR] = F.RECORD_ERROR_BUDGET
+            self.metrics.add("record_budget_spent")
+            return False
         try:
             return self._record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
         except OSError as exc:
@@ -816,7 +842,8 @@ class ShadowProxy:
         # fallback's answer or any other unstorable one. Each recording notes its
         # own, so two that answered differently both count, even where the first
         # write of the saved answer won.
-        self.cache.add_variant(*normalizer.answer_variant(normalized, upstream["message"], self.key_context))
+        variant = entry.get(F.ANSWER_VARIANT) or normalizer.answer_variant(normalized, upstream["message"], self.key_context)
+        self.cache.add_variant(*variant)
         slot_key, slots = normalizer.answer_slots(normalized, self.key_context)
         if slots:
             self.cache.save_slot(slot_key, entry[F.FINGERPRINT])
@@ -1002,6 +1029,12 @@ class ShadowProxy:
         entry[F.DIAG_MESSAGE_HASHES] = diag_hashes
         entry[F.DIAG_SETTINGS_HASH] = self.diagnosis.settings_hash(body, self.key_context.as_dict(), received)
         if self.config.mode == F.MODE_RECORD:
+            if upstream["message"]:
+                entry[F.ANSWER_VARIANT] = list(normalizer.answer_variant(normalized, upstream["message"], self.key_context))
+            digests, first_seen = self.diagnosis.first_seen_with_digests(raw_messages, received)
+            prior = list(self.history_variants(body, raw_messages, digests, first_seen, received, last_only=True))
+            if prior:
+                entry[F.PRIOR_ANSWER] = list(prior[0])
             entry[F.RECORDED] = self.record(entry, upstream, normalized, stored, raw_messages, diag_walked, received)
         if self.config.mode == F.MODE_REPLAY and served is None:
             entry[F.MISS] = self.miss_block(entry, raw_messages, diag_walked, upstream.get("refused"))
