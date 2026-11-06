@@ -115,6 +115,8 @@ _NEXT_LANE_JOB_NAMES = (
     "ci-kube-agents-certification-1",
     # The release-candidate eval: a postsubmit, so no PULL_NUMBER.
     "post-kube-agents-eval-rc",
+    # The replay lane: a periodic replaying the next-mode nightlies' recordings.
+    "ci-kube-agents-eval-replay-lane",
 )
 _RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 _RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"

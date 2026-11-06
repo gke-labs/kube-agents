@@ -35,7 +35,10 @@ a source, nor a miss's closest request: pull-request code could have written
 it. A `nightly` line is one no account pull-request code runs as uploaded; it
 is not proof that the night was free of pull-request influence, since a
 presubmit with cluster access in the same pool project could have tampered
-with that night's proxy (hack/replay-proxy/README.md, Limitations).
+with that night's proxy (hack/replay-proxy/README.md, Limitations). A
+`replay-lane` line is the replay lane's: counted, never a source and never a
+request estimated for, since a replayed run says nothing about what a
+presubmit would have hit.
 
 A sighting is available from when its answer finished (`ts + latency_ms`),
 and counts only when replay would have saved it (the line's `unstorable` list
@@ -103,7 +106,11 @@ import schema as F
 NIGHTLY = "nightly"
 NIGHTLY_UNTRUSTED = "nightly-untrusted"
 PRESUBMIT = "presubmit"
-JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT)
+# The replay lane's lines (hack/replay-proxy/README.md, "Record and replay"):
+# a replayed run, never a source or a request this analysis estimates for;
+# lane_report.py reads them. Counted, like an untrusted night's.
+REPLAY_LANE = "replay-lane"
+JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT, REPLAY_LANE)
 # The proxy's segment files (spool.py); a directory argument is searched for these.
 LOG_SUFFIX = ".jsonl"
 # Where collect_shadow.py files under the bucket's BUCKET_ROOT: a segment at
@@ -168,8 +175,11 @@ SKIP_KIND_MISMATCH = "kind_mismatch"
 # Files, not lines: a log file found under a directory argument but not at the
 # collector's layout (FILED_DEPTH), so its kind is not the folder IAM governs.
 SKIP_OFF_LAYOUT = "off_layout_files"
+# A replay-mode line served from the cache: the model was not called, so it is
+# neither a sighting a later request could reuse nor an answer to judge.
+SKIP_SERVED = "served"
 SKIP_REASONS = (SKIP_NOT_JSON, SKIP_OTHER_EVENT, SKIP_UNTAGGED, SKIP_ERROR, SKIP_ANALYSIS_DROPPED, SKIP_NO_FINGERPRINT,
-                SKIP_KIND_MISMATCH, SKIP_OFF_LAYOUT)
+                SKIP_KIND_MISMATCH, SKIP_OFF_LAYOUT, SKIP_SERVED)
 # Labels in Miss.first_difference_role besides a message role.
 DIFF_UNHASHED = "unhashed"
 DIFF_SETTINGS = "settings"
@@ -642,6 +652,9 @@ def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record]
                 if not entry.get(F.FINGERPRINT):
                     skipped[SKIP_NO_FINGERPRINT] += 1
                     continue
+                if entry.get(F.SERVED):
+                    skipped[SKIP_SERVED] += 1
+                    continue
                 tag = (entry.get(F.JOB) or {}).get(F.JOB_KIND)
                 if tag not in JOB_KINDS:
                     skipped[SKIP_UNTAGGED] += 1
@@ -737,6 +750,7 @@ def summarize(
         "presubmit_requests": len(presubmit),
         "nightly_requests": sum(1 for r in records if r.kind == NIGHTLY),
         "nightly_untrusted_requests": sum(1 for r in records if r.kind == NIGHTLY_UNTRUSTED),
+        "replay_lane_requests": sum(1 for r in records if r.kind == REPLAY_LANE),
         "presubmit_prompt_tokens": total_tokens,
         "merge_times_given": len(merged or {}),
         "health": health(records, skipped),

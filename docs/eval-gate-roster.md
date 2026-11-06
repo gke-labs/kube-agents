@@ -15,7 +15,7 @@ them, since the merge-blocking presubmit runs on that lane (below).
 `hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
 recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
 Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
-`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt`, `hack/eval/replay-lane-cases.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -992,6 +992,15 @@ the evidence store and publishes no dashboard; its record is its logs bucket. A 
 earns a seat here; a capability the presubmit must guard gets a case of its own in the catalogue.
 The file needs the normal approvers, like `nightly-cases.txt`. The rules a certification fixture
 meets are in [`bench/README.md`](../bench/README.md#certification-suite).
+
+## The replay lane
+
+`hack/eval/replay-lane-cases.txt` is what the replay lane replays (`EVAL_REPLAY_LANE=true`; the
+[inference-replay design](../examples/inference-replay/eval-design.md), Rollout step 2). Every entry
+is a registered case the inject lane runs, so the nightly has recorded it. The roster above never
+reaches it: the script arms no roster case there, and the lane appends nothing to the evidence
+store and publishes no dashboard. Its record is its report in the shadow bucket
+([`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)).
 
 ## Demoting a flaky case
 
