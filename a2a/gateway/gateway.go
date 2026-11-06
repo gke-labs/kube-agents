@@ -20,6 +20,7 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -89,6 +90,10 @@ const (
 const (
 	termWaitRetry    = 2 * time.Second
 	termWaitLogEvery = 30 * time.Second
+	// jetstreamTemporarilyUnavailable is the JetStream API's error code for
+	// "JetStream system temporarily unavailable", while its meta leader is
+	// being elected.
+	jetstreamTemporarilyUnavailable = jetstream.ErrorCode(10008)
 )
 
 // noticeBusUnreachable says a task's publish failed: on its rolling line, or
@@ -843,9 +848,20 @@ func (g *Gateway) BeginTerm(ctx context.Context) (uint64, error) {
 }
 
 // termCanWait reports whether a term start's error is one that clears on its
-// own: the bucket not created yet, or the bus unreachable.
+// own: the bucket not created yet, the bus unreachable, or JetStream not
+// answering while the connection is up (no responders, an API timeout, or
+// the cluster's meta leader moving, as when a drain takes a NATS server with
+// the gateway's leader). The relay's bind waits on the same class.
 func (g *Gateway) termCanWait(err error) bool {
-	return errors.Is(err, jetstream.ErrBucketNotFound) || (g.client != nil && !g.client.Connected())
+	if errors.Is(err, jetstream.ErrBucketNotFound) || (g.client != nil && !g.client.Connected()) {
+		return true
+	}
+	if errors.Is(err, nats.ErrNoResponders) || errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, jetstream.ErrJetStreamNotEnabled) {
+		return true
+	}
+	var apiErr *jetstream.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode == jetstreamTemporarilyUnavailable
 }
 
 // OnFenced sets what runs when a registry write is refused because a newer

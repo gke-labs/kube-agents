@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -258,5 +261,32 @@ func TestATermStartWaitsForTheSessionStateBucket(t *testing.T) {
 	}
 	if _, why := r.g.Readiness(); strings.Contains(why, "waiting for bucket") {
 		t.Fatalf("Readiness still names the term wait: %q", why)
+	}
+}
+
+// TestATermStartWaitsOutAJetStreamOutage: with the connection up but
+// JetStream not answering (no responders, an API timeout, the meta leader
+// moving), a term start waits; any other error still ends it.
+func TestATermStartWaitsOutAJetStreamOutage(t *testing.T) {
+	g := &Gateway{}
+	for name, err := range map[string]error{
+		"no responders":           fmt.Errorf("stream info: %w", nats.ErrNoResponders),
+		"an api timeout":          fmt.Errorf("stream info: %w", context.DeadlineExceeded),
+		"a request timeout":       nats.ErrTimeout,
+		"meta leader moving":      &jetstream.APIError{Code: 503, ErrorCode: jetstreamTemporarilyUnavailable, Description: "JetStream system temporarily unavailable"},
+		"the bucket not there":    jetstream.ErrBucketNotFound,
+		"jetstream not available": jetstream.ErrJetStreamNotEnabled,
+	} {
+		if !g.termCanWait(err) {
+			t.Errorf("%s: a term start gave up on %v", name, err)
+		}
+	}
+	for name, err := range map[string]error{
+		"a wrong-type marker": errors.New("term marker: not a number"),
+		"another api error":   &jetstream.APIError{Code: 400, ErrorCode: 10052, Description: "invalid request"},
+	} {
+		if g.termCanWait(err) {
+			t.Errorf("%s: a term start waited on %v", name, err)
+		}
 	}
 }
