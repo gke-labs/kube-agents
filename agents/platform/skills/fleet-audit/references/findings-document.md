@@ -339,7 +339,8 @@ Two slugs name both a posture and a fault, and the join moves only the posture: 
 or an allow-all `NetworkPolicy/<name>` is reported on stderr and not applied. An item whose `expires`
 has passed moves nothing: the finding it covered stays under `findings` with a _Declared intent
 expired_ line in its ledger block naming the note and the date, unless a standing item covers it; a
-hand-written entry's `declaration.expires` is held to the format and rejected once past.
+hand-written entry's `declaration.expires` is held to the format, and refused by `finish` when it had
+lapsed on the day the run started; a later reopening holds the format only.
 The worker's half is the `provisioning/` pins HCL and YAML make in the GitOps clone, which have no
 machine-readable form yet; a match there is moved here by the worker with the lines that pin the
 property as `excerpt`. A posture a `declares:` note covers is written to `findings` like any other

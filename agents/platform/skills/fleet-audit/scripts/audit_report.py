@@ -5484,14 +5484,21 @@ def _scope_spelling_hint(
     return f" Did you mean {' or '.join(map(repr, entries))}?" if entries else ""
 
 
-def validate_findings(data: object, audit_id: str) -> dict:
+def validate_findings(data: object, audit_id: str, expiry_day: date | None = None) -> dict:
     """Validate a findings document. Raises one ValidationError naming every
     missing or empty string field by index, up to MAX_REPORTED_FINDINGS_ERRORS,
-    plus the first other problem it met; a single problem reads as before."""
+    plus the first other problem it met; a single problem reads as before.
+
+    `expiry_day` is the day a hand-written `declared[].declaration.expires`
+    is held against: `finish` passes the day its run started, so a note the
+    worker read that had already lapsed is refused on the day, and a `finish`
+    retried after midnight reads the same document the same way. Without it
+    the date is held to its format only, which is how `remediate` reopens a
+    document on a later day without the calendar turning it bad."""
     errors: list[str] = []
     token = _FIELD_ERRORS.set(errors)
     try:
-        result = _validate_findings_document(data, audit_id)
+        result = _validate_findings_document(data, audit_id, expiry_day=expiry_day)
     except ValidationError as exc:
         # A check that read a field already recorded as wrong repeats that
         # field ("'None' is not a check"); the recorded error is the real one.
@@ -5535,7 +5542,7 @@ def _repeats_a_recorded_field(message: str, recorded: list[str]) -> bool:
     )
 
 
-def _validate_findings_document(data: object, audit_id: str) -> dict:
+def _validate_findings_document(data: object, audit_id: str, expiry_day: date | None = None) -> dict:
     validate_audit_id(audit_id)
 
     if not isinstance(data, dict):
@@ -6232,9 +6239,14 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
                 allow_empty=False,
             )
             if DECLARATION_EXPIRES_FIELD in declaration:
-                # Optional, one format, and not in the past: a note whose
-                # date has lapsed justifies nothing, and the posture it
-                # covered is a finding until the owner renews or remediates.
+                # Optional, one format, and — on the day the run started,
+                # when the caller names it — not in the past: a note whose
+                # date had lapsed when the worker read it justifies nothing,
+                # and the posture it covered is a finding until the owner
+                # renews or remediates. Held against the run's day rather
+                # than the clock, so a `finish` retried after midnight, or a
+                # `remediate` that reopens the document later (no day given),
+                # does not refuse a document that was right when written.
                 raw_expires = declaration[DECLARATION_EXPIRES_FIELD]
                 expires = parse_declaration_expiry(raw_expires)
                 if expires is None:
@@ -6243,11 +6255,12 @@ def _validate_findings_document(data: object, audit_id: str) -> dict:
                         f"{DECLARATION_EXPIRES_FORMAT_HINT} (UTC) when present, got {raw_expires!r}"
                     )
                 declaration[DECLARATION_EXPIRES_FIELD] = expires
-                if declaration_expired(declaration):
+                if expiry_day is not None and declaration_expired(declaration, expiry_day):
                     raise ValidationError(
                         f"{where}.declaration.{DECLARATION_EXPIRES_FIELD}: the declaration expired "
-                        f"on {expires}, so it justifies nothing now — write the posture under "
-                        "`findings`; the owner renews the date in the note, or remediates"
+                        f"on {expires}, before this run started on {expiry_day.strftime(DECLARATION_EXPIRES_FORMAT)}, "
+                        "so it justifies nothing — write the posture under `findings`; the owner "
+                        "renews the date in the note, or remediates"
                     )
             # Identity, on the same four fields as a finding, so that one
             # posture cannot be both. A worker that writes the finding *and*
@@ -18164,7 +18177,22 @@ def join_harness_declarations(
     return [str(finding.get("id", "")) for finding in moved] + from_manifest, shielded, shield_filed_namespaces(standing)
 
 
-def load_findings(path: str, audit_id: str, command: str | None = None) -> dict:
+def run_start_day(audit_id: str) -> date:
+    """The UTC day this stream's run started, from `start`'s record; today when there is none.
+
+    What `finish` holds a hand-written `declared[].declaration.expires`
+    against (`validate_findings`): the worker read the note on the run's
+    day, so that is the day a lapsed date is judged on, whatever day the
+    document is reopened.
+    """
+    record = read_run_record(audit_id)
+    started = parse_gh_timestamp(record.get(RUN_RECORD_STARTED_KEY)) if isinstance(record, dict) else None
+    return started.date() if started is not None else _today_utc()
+
+
+def load_findings(
+    path: str, audit_id: str, command: str | None = None, expiry_day: date | None = None
+) -> dict:
     findings_file = Path(path)
     if not findings_file.is_file():
         if command == "finish" and audit_id in COLLECTOR_AUDITS:
@@ -18190,7 +18218,7 @@ def load_findings(path: str, audit_id: str, command: str | None = None) -> dict:
             f"--manifest-file {path} --out <findings file>`, fill each recommendation, then give "
             "that file as --findings-file and the manifest as --manifest-file."
         )
-    return validate_findings(data, audit_id)
+    return validate_findings(data, audit_id, expiry_day=expiry_day)
 
 
 def remediation_file_problem(
@@ -23596,7 +23624,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     # False and the person who asked gets an answer.
     scheduled = bool(getattr(args, "scheduled", False))
     set_sweep_waived(getattr(args, "no_promote", False))
-    data = load_findings(args.findings_file, audit_id, command="finish")
+    data = load_findings(args.findings_file, audit_id, command="finish", expiry_day=run_start_day(audit_id))
     stale_since = findings_predate_run(args.findings_file, audit_id)
     if stale_since:
         raise ValidationError(

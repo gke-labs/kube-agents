@@ -30,7 +30,7 @@ import threading
 import time
 import unittest
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from unittest import mock
@@ -6696,25 +6696,39 @@ class TestDeclaredIntent(BaseTestCase):
         doc["declared"] = [make_declared(excerpt="   ")]
         self.rejects(doc, "declared[0].declaration.excerpt", "non-empty")
 
-    def test_an_expires_date_is_optional_one_format_and_not_in_the_past(self):
-        # A hand-written entry may carry the note's `expires:`; it is then
-        # held to the one format and to the calendar, because an expired
-        # declaration justifies nothing and the posture is a finding.
-        today = datetime.now(timezone.utc).date()
+    def test_an_expires_date_is_optional_one_format_and_not_past_on_the_runs_day(self):
+        # A hand-written entry may carry the note's `expires:`. The format is
+        # always held; the calendar only against the day the caller names —
+        # `finish` passes its run's start day — so a note that had lapsed
+        # when the worker read it is refused, and a document reopened on a
+        # later day (`remediate`, a retried `finish`) is read as it was
+        # written. The clock is pinned: the test must not race midnight.
+        today = date(2026, 11, 6)
         fmt = audit_report.DECLARATION_EXPIRES_FORMAT
         doc = declaring_doc()
         entry = make_declared()
-        entry["declaration"]["expires"] = (today + timedelta(days=1)).strftime(fmt)
         doc["declared"] = [entry]
-        self.assertEqual(self.validate(doc)["declared"][0]["declaration"]["expires"], entry["declaration"]["expires"])
-        entry["declaration"]["expires"] = today.strftime(fmt)
-        self.validate(doc)
-        for bad in ("2027-1-5", "soon", 20270131, None, ""):
-            with self.subTest(expires=bad):
-                entry["declaration"]["expires"] = bad
-                self.rejects(doc, "declared[0].declaration.expires", audit_report.DECLARATION_EXPIRES_FORMAT_HINT)
-        entry["declaration"]["expires"] = (today - timedelta(days=1)).strftime(fmt)
-        self.rejects(doc, "declared[0].declaration.expires", "expired", "findings")
+        with patch.object(audit_report, "_today_utc", return_value=today):
+            entry["declaration"]["expires"] = (today + timedelta(days=1)).strftime(fmt)
+            self.assertEqual(self.validate(doc)["declared"][0]["declaration"]["expires"], entry["declaration"]["expires"])
+            for bad in ("2027-1-5", "soon", 20270131, None, ""):
+                with self.subTest(expires=bad):
+                    entry["declaration"]["expires"] = bad
+                    self.rejects(doc, "declared[0].declaration.expires", audit_report.DECLARATION_EXPIRES_FORMAT_HINT)
+            # On the run's day: the day it names still stands, the day before has lapsed.
+            entry["declaration"]["expires"] = today.strftime(fmt)
+            audit_report.validate_findings(copy.deepcopy(doc), DECLARING_AUDIT, expiry_day=today)
+            entry["declaration"]["expires"] = (today - timedelta(days=1)).strftime(fmt)
+            with self.assertRaises(audit_report.ValidationError) as caught:
+                audit_report.validate_findings(copy.deepcopy(doc), DECLARING_AUDIT, expiry_day=today)
+            self.assertIn("declared[0].declaration.expires", str(caught.exception))
+            self.assertIn("expired", str(caught.exception))
+            self.assertIn("findings", str(caught.exception))
+            # The same lapsed entry, with no day named: format only, as
+            # `remediate` reads it, and as `finish` reads it when its run
+            # started on the day the note still stood.
+            self.validate(doc)
+            audit_report.validate_findings(copy.deepcopy(doc), DECLARING_AUDIT, expiry_day=today - timedelta(days=1))
 
     def test_a_title_is_required(self):
         doc = declaring_doc()
@@ -9578,14 +9592,56 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.finish(self.doc())
         self.assertIn("`acme/fleet:knowledge/prod.md`", self.ledger_body())
 
-    @staticmethod
-    def day(offset):
-        """Today in UTC plus `offset` days, in the `expires:` format."""
-        return (datetime.now(timezone.utc).date() + timedelta(days=offset)).strftime(
-            audit_report.DECLARATION_EXPIRES_FORMAT
-        )
+    # The day every expiry test runs on. Pinned, so no test here reads the
+    # clock twice and races midnight against `finish`'s own calendar read.
+    TODAY = date(2026, 11, 6)
+
+    def pin_today(self):
+        self.patch_attr("_today_utc", lambda: self.TODAY)
+        self.patch_attr("run_start_day", lambda audit_id: self.TODAY)
+
+    def day(self, offset):
+        """The pinned day plus `offset` days, in the `expires:` format."""
+        return (self.TODAY + timedelta(days=offset)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+
+    def test_finish_holds_a_hand_written_expires_to_the_day_its_run_started(self):
+        # The worker's own `declared[]` entry, dated: refused on the run's
+        # day when the date has lapsed, accepted when it still stands, and
+        # read format-only by a later reopening (`remediate`, a `finish`
+        # retried after midnight reads the run's day, not the clock's).
+        self.pin_today()
+        self.record()
+        entry = make_declared(check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway", repo="acme/fleet", path="knowledge/checkout.md")
+        entry["declaration"]["expires"] = self.day(-1)
+        findings = [f for f in posture_and_fault_findings() if f["check"] != "no-pdb"]
+        doc = declaring_doc(findings=findings)
+        doc["declared"] = [entry]
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT)
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("FINDINGS REJECTED", self.err)
+        self.assertIn(f"expired on {self.day(-1)}, before this run started on {self.day(0)}", self.err)
+        # Reopened with no day named: the document validates as written.
+        audit_report.validate_findings(copy.deepcopy(doc), DECLARING_AUDIT)
+        # A date that still stands on the run's day publishes the entry.
+        self.harness.calls.clear()
+        self.harness.payloads.clear()
+        entry["declaration"]["expires"] = self.day(0)
+        payload = self.finish(doc)
+        self.assertEqual(payload["declared"], 1)
+        self.assertIn(f"(until {self.day(0)})", self.ledger_body())
+
+    def test_the_runs_day_comes_from_starts_record(self):
+        self.record()
+        record = audit_report.read_run_record(DECLARING_AUDIT)
+        started = audit_report.parse_gh_timestamp(record[audit_report.RUN_RECORD_STARTED_KEY])
+        self.assertEqual(audit_report.run_start_day(DECLARING_AUDIT), started.date())
+        # With no record, the clock, pinned here.
+        Path(audit_report.run_record_path_for(DECLARING_AUDIT)).unlink()
+        with patch.object(audit_report, "_today_utc", return_value=self.TODAY):
+            self.assertEqual(audit_report.run_start_day(DECLARING_AUDIT), self.TODAY)
 
     def test_an_expired_declaration_no_longer_moves_the_posture_and_the_ledger_says_so(self):
+        self.pin_today()
         # An acceptance with a date on it lapses instead of being forgotten:
         # the posture comes back as a finding, and its block says which
         # declaration covered it until when, so the owner renews or fixes.
@@ -9607,6 +9663,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertNotIn("DECLARED:", self.err)
 
     def test_a_declaration_stands_through_the_day_it_names(self):
+        self.pin_today()
         # `expires: <today>` is still in force today and lapses tomorrow; an
         # owner who writes the last day of a review period means that day.
         self.record()
@@ -9616,6 +9673,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertNotIn("Declared intent expired", self.ledger_body())
 
     def test_a_future_expires_moves_the_posture_and_the_row_names_the_date(self):
+        self.pin_today()
         self.record()
         self.file({**self.entry(), audit_report.DECLARATION_EXPIRES_FIELD: self.day(30)})
         payload = self.finish(self.doc())
@@ -9629,6 +9687,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertNotIn("Declared intent expired", body)
 
     def test_a_standing_declaration_wins_over_an_expired_one_for_the_same_posture(self):
+        self.pin_today()
         # A renewed note beside a lapsed one: the posture is declared, and
         # the lapsed file is not reported against it.
         self.record()
@@ -9644,6 +9703,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertNotIn("DECLARATION EXPIRED", self.err)
 
     def test_the_split_the_manifest_route_and_the_shields_read_keeps_only_standing_entries(self):
+        self.pin_today()
         # The two routes that read `start`'s file beside the join — a
         # collector candidate the worker left out, and a 2.7 sibling's shield
         # — are handed the standing half; an expired entry is no declaration
@@ -9660,6 +9720,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertEqual([e["check"] for e in expired], ["no-pdb"])
 
     def test_an_expired_declaration_is_not_reported_against_a_fault_it_never_covered(self):
+        self.pin_today()
         # The expired path applies the standing path's shape rules: the
         # fixture's `hpa-cannot-scale` is the `minor` dangling-target fault,
         # which no declaration covers, so a lapsed note for the HPA earns it
@@ -9672,6 +9733,7 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.assertNotIn("Declared intent expired", self.ledger_body())
 
     def test_a_workers_copy_of_the_expired_field_is_dropped_by_the_validator(self):
+        self.pin_today()
         # Only `finish` writes the field, from `start`'s file; a worker's copy
         # would name a note nobody read, and the renderer would print it.
         findings = posture_and_fault_findings()
