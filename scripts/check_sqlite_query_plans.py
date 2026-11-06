@@ -9,7 +9,8 @@ such statements shipped that way (the `intercepted_events` fold lookup, #4331,
 and the `session_metadata` retention delete, #3567). This check asks SQLite's
 own planner instead, offline, and fails a pull request that adds another.
 
-`TARGETS` are read by AST. A statement is the first argument of any
+`TARGETS` (the server, the findings queue, the two state.db helpers, and the
+two scripts that open the database themselves) are read by AST. A statement is the first argument of any
 `.execute(...)` or `.executemany(...)` call that resolves without running the
 module: a string literal, a module-level constant, an f-string or `+`
 concatenation of those with `str(...)` of one or `", ".join(...)` over a tuple
@@ -31,7 +32,10 @@ no method or lambda inside it, which is Python's rule); and a `nonlocal` (or,
 for the module, `global`) declaration in any scope nested inside counts as a
 binding of the name it declares, since it lets that scope rebind it. A name
 bound any other way, or in two places, resolves to nothing, never to a module
-constant of the same name. Anything
+constant of the same name. A join over a repetition, `",".join("?" * n)` or
+over `["?"] * n` (an `IN` list's marks), resolves to one `?`, since the
+planner's choice of index does not depend on how many values the list
+carries. Anything
 else (`.format(...)`, `%`, a join over a comprehension, a name assigned in a
 branch) is listed as `dynamic` and not judged. A statement handed to a helper
 is read at the call site, one hop deep in the same module: a function (at
@@ -41,9 +45,13 @@ body executes one of its parameters, bare or through
 argument a call passes in that parameter's place, by position or by keyword,
 is a statement of the calling function, resolved where the call is written
 by the rules above (a name resolves to the helper visible where the call
-is written, innermost scope first, the same way a value does; a helper bound
-more than once, called through an attribute, or reached from another
-module is not read). The helper's own execute call stays `dynamic`, since
+is written, innermost scope first, the same way a value does, and a scope
+that binds the name to anything else, a local `def` that logs, shadows the
+module's helper; a helper bound more than once, called through an
+attribute, or reached from another module is not read). A call that passes
+nothing in the parameter's place executes the parameter's default, which is
+then that call's statement, resolved where the helper was written. The
+helper's own execute call stays `dynamic`, since
 its parameter has no value of its own. When the helper formats its
 parameter, each `{name}` field of the statement is filled with the static
 value of the keyword the helper passes under that name, or, for one with no
@@ -74,8 +82,12 @@ other table is a problem that fails the check, so a table `init_db()` does
 not build (a side table a function creates lazily, a misspelt owned name)
 earns its exemption in `FOREIGN_TABLES` with its owner beside it, or is
 built, rather than passing by being absent. An entry in `FOREIGN_TABLES`
-that the schema does build is a problem too. Any other prepare error (a
-missing column, a syntax error) is a problem that fails the check. A plan line
+that the schema does build is a problem too, and so is one a target creates:
+every `CREATE TABLE` in any string a target holds (`CREATE_TABLE_RE`) names
+a table of this repository's, a statement on one the schema does not build
+is a problem naming the DDL's site, and the table is built in the schema
+(`SCHEMA_SOURCE.extra_ddl_attrs`) rather than exempted. Any other prepare
+error (a missing column, a syntax error) is a problem that fails the check. A plan line
 that reads a whole table the schema defines is a finding, unless the table is
 in `BOUNDED_TABLES`: tables that hold one row, or a daily-pruned or capped
 handful, by design. Two plan lines read a whole table: every `SCAN <table>`,
@@ -102,6 +114,9 @@ a subquery or of a CTE the statement declares is not a table scan, whether the
 plan names it by its own name, by the alias the statement gives it, or as
 `(subquery-N)`: the plan's own `CO-ROUTINE <name>` and `MATERIALIZE <name>`
 lines declare the derived tables, and a `WITH` clause declares the CTEs. A
+CTE or derived table named like a table the schema defines is a problem
+that fails the check, since the plan prints `SCAN <name>` for both and the
+table's own scan would hide behind the derived one. A
 scan of any other name the statement does not declare is a problem that fails
 the check, so an alias shape the check does not read cannot pass as clean. The
 plan wording this reads (`SCAN <name>`, not `SCAN TABLE <name>`) arrived in
@@ -109,13 +124,19 @@ SQLite 3.36, so an older `sqlite3` library is a problem that fails the check
 before any statement is read.
 
 ``scripts/sqlite_query_plan_baseline.txt``: one line per (file, function,
-table) that carried a full scan when the check arrived,
+table) that carried a full scan when the check arrived, and one per (file,
+function) with statements the check cannot read, under `(dynamic)` in the
+table column (so a statement that leaves the gate by becoming dynamic, or a
+new one written so, is a rise, and each target's resolution has a floor),
 `<file> <function> <table> <count>`, with the owner of the fix in a comment
-above it. The list only shrinks: a count above the entry fails (a rise), a
-count below fails until the entry is lowered or removed (a drop), an entry
-whose function scans the table no more fails (stale), an entry naming a file
-the check does not read fails, and a line that is not an entry fails. A site
-with no entry is held at zero. A configured target that is missing is a
+above it. A count above the entry fails (a rise), a count below fails until
+the entry is lowered or removed (a drop), an entry whose function scans the
+table no more, or executes nothing unreadable, fails (stale), an entry
+naming a file the check does not read fails, a line that is not an entry
+fails, and a missing baseline file fails. A site with no entry is held at
+zero. An entry is lowered or removed as the tree improves; adding one is a
+hunk on the baseline that review reads, since nothing mechanical tells a
+new entry from an old one. A configured target that is missing is a
 failure too, so a moved file cannot turn the check green by leaving the scan.
 
 Exit 0 when every finding is pinned exactly; 1 otherwise. `--list` prints every
@@ -141,13 +162,16 @@ from typing import Iterable, TextIO
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The Python modules the check reads, repository-relative: the session KV
-# server, the findings queue it folds into its database, and the two state.db
-# helpers.
+# server, the findings queue it folds into its database, the two state.db
+# helpers, and the two scripts that open `session_kv.db` read-only themselves
+# (the chat notifier's route lookup, the end-of-day recap's ledger read).
 TARGETS: tuple[str, ...] = (
     "agents/platform/scripts/session_kv_server.py",
     "agents/platform/scripts/findings_queue.py",
     "agents/platform/scripts/session_retention.py",
     "agents/platform/scripts/session_manager.py",
+    "agents/platform/scripts/chat_notify.py",
+    "agents/platform/scripts/eod_report_generator.py",
 )
 
 
@@ -191,12 +215,13 @@ BOUNDED_INDEXES = frozenset({"idx_intercepted_events_backlog_pending"})
 # Tables the targets read that another process owns and `init_db()` never
 # builds, so a statement on one cannot be planned here and is listed
 # `skipped`: Hermes's `state.db` (`sessions`, `messages`, `state_meta`,
-# `executions`) and `kanban.db` (`tasks`, `task_events`, `task_comments`,
-# `task_links`, `kanban_notify_subs`, `kanban_worker_children`). A `no such
-# table` on any other name is a problem, so a side table a function creates
-# lazily, or a misspelt owned table, earns its entry here with its owner, or
-# is built, rather than passing by being absent; an entry the schema does
-# build is a problem too.
+# `executions`) and `kanban.db` (`tasks`, `task_runs`, `task_events`,
+# `task_comments`, `task_links`, `kanban_notify_subs`,
+# `kanban_worker_children`). A `no such table` on any other name is a
+# problem, so a side table a function creates lazily, or a misspelt owned
+# table, earns its entry here with its owner, or is built, rather than
+# passing by being absent; an entry the schema does build, or one a target
+# creates itself (`CREATE_TABLE_RE` below), is a problem too.
 FOREIGN_TABLES = frozenset(
     {
         "sessions",
@@ -204,6 +229,7 @@ FOREIGN_TABLES = frozenset(
         "state_meta",
         "executions",
         "tasks",
+        "task_runs",
         "task_events",
         "task_comments",
         "task_links",
@@ -211,6 +237,14 @@ FOREIGN_TABLES = frozenset(
         "kanban_worker_children",
     }
 )
+# A table a target creates itself: `CREATE TABLE [IF NOT EXISTS] <name>` in
+# any string a target holds, the schema builder's DDL included (a `CREATE
+# TEMP TABLE` is a connection's scratch, not a schema table, and does not
+# match). Such a table is this repository's whatever list names it: one
+# `FOREIGN_TABLES` also names is a problem, and one the schema does not
+# build is a problem naming the DDL's site, so a side table earns its place
+# in `SCHEMA_SOURCE.extra_ddl_attrs` rather than an exemption.
+CREATE_TABLE_RE = re.compile(r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"`\[]?(?P<table>\w+)", re.IGNORECASE)
 # SQLite's own schema table, under both of its names; a scan of it is a catalog
 # read, not a ledger read.
 SCHEMA_TABLES = frozenset({"sqlite_master", "sqlite_schema"})
@@ -220,6 +254,12 @@ SCHEMA_TABLES = frozenset({"sqlite_master", "sqlite_schema"})
 BASELINE = REPO_ROOT / "scripts" / "sqlite_query_plan_baseline.txt"
 BASELINE_FIELDS = 4
 COMMENT_PREFIX = "#"
+# The baseline pins the statements the check cannot read too, per function,
+# under this word in the table column (no table is named so): a statement
+# that leaves the gate by becoming dynamic, or a new one written so, is a
+# rise the check reports, which is also the floor under each target's
+# resolution.
+DYNAMIC_KEY = "(dynamic)"
 
 # The calls whose first argument is a statement.
 EXECUTE_METHODS = frozenset({"execute", "executemany"})
@@ -368,6 +408,23 @@ FOREIGN_TABLE_ERROR = (
     "does not list; build it in the schema, fix the name, or add it to FOREIGN_TABLES in {script} with its owner"
 )
 FOREIGN_TABLE_BUILT_ERROR = "{script}: FOREIGN_TABLES names {table!r}, which the schema builds; drop the entry"
+FOREIGN_TABLE_CREATED_ERROR = (
+    "{script}: FOREIGN_TABLES names {table!r}, which {site} creates, so it is this repository's; drop the entry and "
+    "build the table in the schema (SCHEMA_SOURCE.extra_ddl_attrs)"
+)
+CREATED_TABLE_UNBUILT_ERROR = (
+    "{file}:{line}: {function}: `{statement}` names {table!r}, which {site} creates and the schema does not build; "
+    "add its DDL to SCHEMA_SOURCE.extra_ddl_attrs in {script}"
+)
+DERIVED_NAME_ERROR = (
+    "{file}:{line}: {function}: `{statement}` names a CTE or subquery {name!r} after the table it reads, so a "
+    "`SCAN {name}` line cannot be placed; give it another name"
+)
+DYNAMIC_LINE = (
+    "{file}:{line}: {function} executes a statement the check cannot read: `{statement}`; write it as a literal or a "
+    "constant, or pin it in {baseline} as `{file} {function} {key} <count>`"
+)
+BASELINE_MISSING_ERROR = "{baseline}: the baseline file is missing; restore it (a file with no entries pins nothing)"
 BASELINE_MALFORMED_ERROR = "{baseline}:{line}: expected `<file> <function> <table> <count>` with a count above zero, got {text!r}"
 BASELINE_DUPLICATE_ERROR = "{baseline}:{line}: {file} {function} {table} already has an entry at line {first}"
 BASELINE_UNSCANNED_ERROR = "{baseline}:{line}: {file} is not a file this check reads; remove the entry"
@@ -379,10 +436,20 @@ BASELINE_DROP_ERROR = (
     "{file}: {function} scans {table} {found} time(s), the entry at {baseline}:{line} allows {allowed}; "
     "lower the entry to {found}"
 )
+DYNAMIC_STALE_ERROR = "{baseline}:{line}: {file} {function} executes no statement the check cannot read; remove the entry"
+DYNAMIC_RISE_ERROR = (
+    "{file}: {function} executes {found} statement(s) the check cannot read, the entry at {baseline}:{line} allows "
+    "{allowed}; write the new one as a literal or a constant"
+)
+DYNAMIC_DROP_ERROR = (
+    "{file}: {function} executes {found} statement(s) the check cannot read, the entry at {baseline}:{line} allows "
+    "{allowed}; lower the entry to {found}"
+)
 SUMMARY_FAIL = "check_sqlite_query_plans: {findings} finding(s) not pinned and {problems} problem(s)"
 SUMMARY_OK = (
     "check_sqlite_query_plans: {statements} statement(s) read across {files} file(s), {planned} planned, "
-    "{skipped} skipped on tables the repository does not define, no full scan beyond the {entries} baseline entr(y/ies)"
+    "{skipped} skipped on tables the repository does not define, {dynamic} not readable, no full scan or unreadable "
+    "statement beyond the {entries} baseline entr(y/ies)"
 )
 SCRIPT_NAME = "scripts/check_sqlite_query_plans.py"
 STATEMENT_PREVIEW_CHARS = 120
@@ -447,30 +514,26 @@ class _NullBindings(defaultdict):
 
 
 class _Constants:
-    """The statically resolvable names of one module, and of the other targets it names.
+    """The statically resolvable names of one module, its executing helpers, and the other targets it names.
 
-    A sibling's constant is resolved against the sibling's own names (its
-    f-string reads its own column tuple, not one of the same name here), so
-    each sibling is held as a `_Constants` of its own, one hop deep: a
-    sibling's constant that names a third module resolves to nothing.
+    `names` are the module-level names bound exactly once, by a plain
+    assignment, with the expression assigned (a binding anywhere in the
+    module's own body counts, inside a top-level `if`, `try`, `for` or `with`
+    too, and so does a `global` declaration in any function or class nested in
+    the module, which lets it rebind the name). `helpers` are the module-level
+    functions that execute a parameter. A sibling's constant is resolved
+    against the sibling's own names (its f-string reads its own column tuple,
+    not one of the same name here), so each sibling is held as a `_Constants`
+    of its own, one hop deep: a sibling's constant that names a third module
+    resolves to nothing, and a sibling's helpers are not read (one hop, same
+    module). `scan()` walks each module once and shares the maps, so a module
+    read as a sibling costs nothing more.
     """
 
-    def __init__(self, module: ast.Module, siblings: dict[str, ast.Module]) -> None:
-        self.names = _module_constants(module)
-        self.siblings: dict[str, _Constants] = {name: _Constants(tree, {}) for name, tree in siblings.items()}
-        # The module-level functions that execute a parameter; a sibling's are
-        # not read (one hop, same module).
-        self.helpers: dict[str, _Helper] = _helpers(module, ast.Global, [])
-
-
-def _module_constants(module: ast.Module) -> dict[str, ast.expr]:
-    """Module-level names bound exactly once, by a plain assignment, with the expression assigned.
-
-    A binding anywhere in the module's own body counts (inside a top-level
-    `if`, `try`, `for` or `with` too), and so does a `global` declaration in
-    any function or class nested in the module, which lets it rebind the name.
-    """
-    return {name: value for name, value in _bindings(module, ast.Global).items() if value is not None}
+    def __init__(self, names: dict[str, ast.expr], helpers: dict[str, _Helper], siblings: dict[str, _Constants]) -> None:
+        self.names = names
+        self.helpers = helpers
+        self.siblings = siblings
 
 
 def _own_nodes(scope: ast.AST) -> Iterable[ast.AST]:
@@ -483,8 +546,10 @@ def _own_nodes(scope: ast.AST) -> Iterable[ast.AST]:
             pending.extend(ast.iter_child_nodes(node))
 
 
-def _bindings(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]) -> dict[str, ast.expr | None]:
-    """Every name a scope binds: the expression, when bound exactly once by a plain assignment, else None.
+def _binding_counts(
+    scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]
+) -> tuple[dict[str, int], dict[str, ast.expr]]:
+    """How many times a scope binds each name, and the expression of each plain assignment.
 
     Every binding in the scope's own body counts against the name: a store to
     it (an assignment, an unpacking, a loop or `with` target, a walrus, an
@@ -493,18 +558,14 @@ def _bindings(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]
     `class`, whose body is a scope of its own and is not entered. A
     `declaration` (`nonlocal` for a function, `global` for the module) in any
     scope nested inside, however deep, counts as a binding here too, since it
-    lets that scope rebind the name. A name bound any other way, or twice, is
-    in the map with None, so it resolves to nothing rather than to the module
-    constant of the same name.
+    lets that scope rebind the name. A scope's map (`_scope_bindings`) holds
+    the expression for a name bound exactly once by a plain assignment and
+    None for one bound any other way, or twice, so that name resolves to
+    nothing rather than to the module constant of the same name. For a class
+    body a method's `nonlocal` over-counts (it names an enclosing function's
+    variable, never a class attribute), which can only make a class-body
+    name resolve to nothing, never to the wrong value.
     """
-    counts, values = _binding_counts(scope, declaration)
-    return {name: (values.get(name) if count == 1 else None) for name, count in counts.items()}
-
-
-def _binding_counts(
-    scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]
-) -> tuple[dict[str, int], dict[str, ast.expr]]:
-    """How many times a scope binds each name, as `_bindings` counts, and the expression of each plain assignment."""
     counts: dict[str, int] = defaultdict(int)
     values: dict[str, ast.expr] = {}
     for node in _own_nodes(scope):
@@ -539,17 +600,6 @@ def _assigned(node: ast.stmt) -> list[tuple[str, ast.expr]]:
     return []
 
 
-def _local_constants(scope: ast.AST) -> dict[str, ast.expr | None]:
-    """Every name a function, lambda or class body binds, as `_bindings` counts them.
-
-    A `nonlocal` in a scope nested inside is a binding here. For a class
-    body that over-counts (a method's `nonlocal` names an enclosing
-    function's variable, never a class attribute), which can only make a
-    class-body name resolve to nothing, never to the wrong value.
-    """
-    return _bindings(scope, ast.Nonlocal)
-
-
 def _bound_names(node: ast.AST) -> list[str]:
     """The names one node binds, if any."""
     if isinstance(node, ast.Name):
@@ -572,7 +622,7 @@ def _bound_names(node: ast.AST) -> list[str]:
 
 
 # The functions enclosing an expression, outermost first, each as the map
-# `_local_constants` builds; empty at module level.
+# `_scope_bindings` builds; empty at module level.
 Scopes = list[dict[str, ast.expr | None]]
 
 
@@ -603,8 +653,17 @@ class _Helper:
     # None when it executes the parameter bare.
     format_keywords: tuple[ast.keyword, ...] | None
     # The scopes the helper's body reads, outermost first, its own last: where
-    # the format keywords' values are resolved.
+    # the format keywords' values are resolved. The parameter's default, when
+    # it has one, was written in the enclosing scopes (`scopes[:-1]`).
     scopes: Scopes
+    # The parameter's default expression: the statement a call that passes
+    # nothing in its place executes. None when the parameter has no default.
+    default: ast.expr | None = None
+
+    @property
+    def defining_scopes(self) -> Scopes:
+        """The scopes the parameter's default was written in: the helper's enclosing scopes, not its own body."""
+        return self.scopes[:-1]
 
 
 @dataclass
@@ -616,26 +675,53 @@ class _Scope:
     helpers: dict[str, _Helper]
 
 
-def _own_defs(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal]) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
-    """The functions a scope's own body defines under a name the scope binds exactly once."""
-    counts, _ = _binding_counts(scope, declaration)
-    return {
-        node.name: node
-        for node in _own_nodes(scope)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and counts.get(node.name) == 1
-    }
+def _scope_bindings(
+    scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal], enclosing: Scopes | None
+) -> tuple[dict[str, ast.expr | None], dict[str, _Helper]]:
+    """A scope's names, as `_bindings` maps them, and the executing helpers its own body defines, from one walk.
+
+    `enclosing` are the maps visible around the scope, outermost first, or
+    None for the module, whose names are reached through `_Constants` rather
+    than the scope stack; a helper defined here reads those and this scope's
+    names, which is what its format keywords and its parameter's default are
+    resolved against. A helper is read only under a name the scope binds
+    exactly once, so a `def` rebound later is no helper.
+    """
+    counts, values = _binding_counts(scope, declaration)
+    names = {name: (values.get(name) if count == 1 else None) for name, count in counts.items()}
+    visible: Scopes = [] if enclosing is None else [*enclosing, names]
+    helpers: dict[str, _Helper] = {}
+    for node in _own_nodes(scope):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and counts.get(node.name) == 1:
+            helper = _executed_parameter(node, visible)
+            if helper is not None:
+                helpers[node.name] = helper
+    return names, helpers
 
 
-def _executed_parameter(function: ast.FunctionDef | ast.AsyncFunctionDef, scopes: Scopes) -> _Helper | None:
+def _parameter_default(function: ast.FunctionDef | ast.AsyncFunctionDef, name: str) -> ast.expr | None:
+    """The default expression of a parameter, positional (the trailing defaults align to the last parameters) or keyword-only."""
+    positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
+    if name in positional:
+        offset = positional.index(name) - (len(positional) - len(function.args.defaults))
+        return function.args.defaults[offset] if offset >= 0 else None
+    keyword_only = [arg.arg for arg in function.args.kwonlyargs]
+    return function.args.kw_defaults[keyword_only.index(name)] if name in keyword_only else None
+
+
+def _executed_parameter(function: ast.FunctionDef | ast.AsyncFunctionDef, enclosing: Scopes) -> _Helper | None:
     """The helper a function is when its own body executes one of its parameters, bare or through `.format(name=...)`.
 
     The parameter must be bound once (the parameter itself) so that what the
     helper executes is what the caller passed; a `.format` with positional
     arguments or `**kwargs` is not read, and the function is then no helper.
+    `enclosing` are the maps visible where the function is written; its own
+    locals go innermost, since its format keywords are its own.
     """
     positional = [arg.arg for arg in (*function.args.posonlyargs, *function.args.args)]
     keyword_only = [arg.arg for arg in function.args.kwonlyargs]
-    counts, _ = _binding_counts(function, ast.Nonlocal)
+    counts, values = _binding_counts(function, ast.Nonlocal)
+    scopes: Scopes = [*enclosing, {name: (values.get(name) if count == 1 else None) for name, count in counts.items()}]
     for node in _own_nodes(function):
         if not (
             isinstance(node, ast.Call)
@@ -657,37 +743,35 @@ def _executed_parameter(function: ast.FunctionDef | ast.AsyncFunctionDef, scopes
             executed = executed.func.value
         if not isinstance(executed, ast.Name) or counts.get(executed.id) != 1:
             continue
+        default = _parameter_default(function, executed.id)
         if executed.id in positional:
-            return _Helper(executed.id, positional.index(executed.id), keywords, scopes)
+            return _Helper(executed.id, positional.index(executed.id), keywords, scopes, default)
         if executed.id in keyword_only:
-            return _Helper(executed.id, None, keywords, scopes)
+            return _Helper(executed.id, None, keywords, scopes, default)
     return None
 
 
-def _helpers(scope: ast.AST, declaration: type[ast.Global] | type[ast.Nonlocal], scopes: Scopes) -> dict[str, _Helper]:
-    """name -> helper, for every function the scope's own body defines that executes a parameter.
-
-    `scopes` are the maps visible where the scope's body is written; each
-    helper's own locals go innermost, since its format keywords are its own.
-    """
-    found: dict[str, _Helper] = {}
-    for name, function in _own_defs(scope, declaration).items():
-        helper = _executed_parameter(function, [*scopes, _local_constants(function)])
-        if helper is not None:
-            found[name] = helper
-    return found
-
-
 def _passed(call: ast.Call, helper: _Helper) -> ast.expr | None:
-    """The argument a call passes in the helper's executed parameter's place, by keyword or by position, or None."""
+    """The expression the helper's executed parameter takes at a call, or None when the call does not say.
+
+    The keyword or positional argument in the parameter's place; otherwise the
+    parameter's default, which is the statement the helper then executes (the
+    caller resolves it where the helper was written: it is `helper.default`
+    by identity). None when a `*args` or `**kwargs` may fill the place, or
+    when nothing does and the parameter has no default.
+    """
     for keyword in call.keywords:
         if keyword.arg == helper.parameter:
             return keyword.value
-    if helper.position is None or helper.position >= len(call.args):
+    if any(keyword.arg is None for keyword in call.keywords):
         return None
-    if any(isinstance(arg, ast.Starred) for arg in call.args[: helper.position + 1]):
+    if helper.position is not None and helper.position < len(call.args):
+        if any(isinstance(arg, ast.Starred) for arg in call.args[: helper.position + 1]):
+            return None
+        return call.args[helper.position]
+    if any(isinstance(arg, ast.Starred) for arg in call.args):
         return None
-    return call.args[helper.position]
+    return helper.default
 
 
 def _formatted(sql: str, helper: _Helper, constants: _Constants) -> str | None:
@@ -783,6 +867,17 @@ def _sequence_items(expr: ast.expr, constants: _Constants, scopes: Scopes, depth
         return None
     if isinstance(expr, ast.Tuple):
         return list(expr.elts)
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Mult):
+        # A repetition, `"?" * n` or `["?"] * n` (an `IN` list's marks): one
+        # copy stands for the list, since the planner's choice of index does
+        # not depend on how many values the list carries. A string repeats
+        # its characters, which is what `join` iterates.
+        for side in (expr.left, expr.right):
+            if isinstance(side, ast.Constant) and isinstance(side.value, str):
+                return [ast.Constant(value=character) for character in side.value]
+            if isinstance(side, (ast.Tuple, ast.List)):
+                return list(side.elts)
+        return None
     if isinstance(expr, ast.Name):
         found = _lookup(expr.id, scopes)
         if found is not None:
@@ -824,19 +919,27 @@ class _Collector(ast.NodeVisitor):
         return [scope.names for scope in self._visible()]
 
     def _helper(self, name: str) -> _Helper | None:
-        """The executing helper a bare name means where the call is written: the innermost scope defining it, else the module's."""
+        """The executing helper a bare name means where the call is written, innermost scope first, as a value resolves.
+
+        A scope that binds the name to anything but its own executing helper
+        (a local `def` that logs instead, `run = other`) shadows the module's
+        helper of that name, so the call reads nothing, as the running code
+        calls the local.
+        """
         for scope in reversed(self._visible()):
             if name in scope.helpers:
                 return scope.helpers[name]
+            if name in scope.names:
+                return None
         return self.constants.helpers.get(name)
 
     def _scoped(self, node: ast.AST, name: str, is_class: bool = False) -> None:
         self.stack.append(name)
-        scope = _Scope(_local_constants(node), is_class, {})
-        self.scopes.append(scope)
         # A helper defined here reads this scope's names and the enclosing
-        # ones, so its map is built with this scope already on the stack.
-        scope.helpers = _helpers(node, ast.Nonlocal, self.locals)
+        # ones, so both maps come from one walk with the enclosing scopes
+        # visible.
+        names, helpers = _scope_bindings(node, ast.Nonlocal, self.locals)
+        self.scopes.append(_Scope(names, is_class, helpers))
         self.generic_visit(node)
         self.scopes.pop()
         self.stack.pop()
@@ -854,17 +957,21 @@ class _Collector(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Attribute) and node.func.attr in EXECUTE_METHODS and node.args:
-            self._record(node, node.args[0], None)
+            self._record(node, node.args[0], None, self.locals)
         elif isinstance(node.func, ast.Name):
             helper = self._helper(node.func.id)
             argument = None if helper is None else _passed(node, helper)
             if helper is not None and argument is not None:
-                self._record(node, argument, helper)
+                # The parameter's default was written where the helper was,
+                # so its names are the helper's enclosing scopes', not the
+                # caller's.
+                scopes = helper.defining_scopes if argument is helper.default else self.locals
+                self._record(node, argument, helper, scopes)
         self.generic_visit(node)
 
-    def _record(self, node: ast.Call, argument: ast.expr, helper: _Helper | None) -> None:
-        """One statement: an execute call's first argument, or the argument a call hands an executing helper."""
-        value = _resolve(argument, self.constants, self.locals)
+    def _record(self, node: ast.Call, argument: ast.expr, helper: _Helper | None, scopes: Scopes) -> None:
+        """One statement: an execute call's first argument, or the statement a call hands (or leaves to) an executing helper."""
+        value = _resolve(argument, self.constants, scopes)
         sql = value if isinstance(value, str) else None
         if sql is not None and helper is not None:
             sql = _formatted(sql, helper, self.constants)
@@ -872,23 +979,35 @@ class _Collector(ast.NodeVisitor):
         self.statements.append(Statement(self.shown, node.lineno, function, sql))
 
 
-def scan_statements(path: Path, root: Path, trees: dict[str, ast.Module]) -> list[Statement]:
-    """Every execute call in one module, with its statement where it resolves.
-
-    `trees` holds every target's parsed module under its stem, this one's
-    included, so nothing is read or parsed twice; the others are the siblings
-    whose constants a statement may name.
-    """
-    shown = path.relative_to(root).as_posix()
-    module = trees[path.stem]
-    others = {name: tree for name, tree in trees.items() if name != path.stem}
-    collector = _Collector(shown, _Constants(module, others))
+def scan_statements(shown: str, module: ast.Module, constants: _Constants) -> list[Statement]:
+    """Every execute call in one module, with its statement where it resolves."""
+    collector = _Collector(shown, constants)
     collector.visit(module)
     return collector.statements
 
 
-def scan(root: Path, targets: Iterable[str]) -> tuple[list[Statement], list[str], list[str]]:
-    """Every statement across the targets, the files read (repository-relative), and the targets that were not there."""
+def created_tables(trees: dict[str, ast.Module], shown: dict[str, str]) -> dict[str, str]:
+    """table -> `file:line` of the first `CREATE TABLE` naming it in any string a target holds.
+
+    Every string constant is read, an f-string's literal parts included, so
+    the schema builder's DDL, a side table's constant and a `CREATE TABLE` a
+    function runs itself all count; a table named here is this repository's.
+    """
+    found: dict[str, str] = {}
+    for stem, module in trees.items():
+        for node in ast.walk(module):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                for match in CREATE_TABLE_RE.finditer(node.value):
+                    found.setdefault(match.group("table"), f"{shown[stem]}:{node.lineno}")
+    return found
+
+
+def scan(root: Path, targets: Iterable[str]) -> tuple[list[Statement], list[str], list[str], dict[str, str]]:
+    """Every statement across the targets, the files read (repository-relative), the targets that were not there, and the tables the targets create.
+
+    Each module is parsed and walked for its names and helpers once; a target
+    reading another's constants gets the same maps as a sibling.
+    """
     paths: list[Path] = []
     problems: list[str] = []
     for rel in targets:
@@ -897,13 +1016,17 @@ def scan(root: Path, targets: Iterable[str]) -> tuple[list[Statement], list[str]
             problems.append(TARGET_MISSING_ERROR.format(target=rel, script=SCRIPT_NAME))
             continue
         paths.append(path)
-    trees = {path.stem: ast.parse(path.read_text(encoding="utf-8"), filename=path.relative_to(root).as_posix()) for path in paths}
+    shown = {path.stem: path.relative_to(root).as_posix() for path in paths}
+    trees = {stem: ast.parse((root / rel).read_text(encoding="utf-8"), filename=rel) for stem, rel in shown.items()}
+    bindings = {stem: _scope_bindings(tree, ast.Global, None) for stem, tree in trees.items()}
+    constants = {
+        stem: {name: value for name, value in names.items() if value is not None} for stem, (names, _) in bindings.items()
+    }
     statements: list[Statement] = []
-    files: list[str] = []
-    for path in paths:
-        files.append(path.relative_to(root).as_posix())
-        statements.extend(scan_statements(path, root, trees))
-    return statements, files, problems
+    for stem, module in trees.items():
+        siblings = {other: _Constants(constants[other], {}, {}) for other in trees if other != stem}
+        statements.extend(scan_statements(shown[stem], module, _Constants(constants[stem], bindings[stem][1], siblings)))
+    return statements, list(shown.values()), problems, created_tables(trees, shown)
 
 
 # ---------------------------------------------------------------------------
@@ -1083,8 +1206,16 @@ def planned_text(sql: str) -> str | None:
     return None if keyword in SCHEMA_KEYWORDS else sql
 
 
-def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[list[Verdict], list[str]]:
-    """Every statement classified, and the statements that do not prepare for a reason other than a foreign table."""
+def judge(
+    statements: Iterable[Statement], conn: sqlite3.Connection, created: dict[str, str] | None = None
+) -> tuple[list[Verdict], list[str]]:
+    """Every statement classified, and the problems: a prepare failure other than a foreign table, a list entry the schema contradicts.
+
+    `created` maps each table a target creates (`created_tables`) to the
+    DDL's site; such a table is this repository's, so a statement on one the
+    schema does not build is a problem naming that site, never `skipped`.
+    """
+    created = created or {}
     tables = schema_tables(conn)
     partial = partial_indexes(conn, tables)
     verdicts: list[Verdict] = []
@@ -1093,9 +1224,13 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
     problems: list[str] = [
         BOUNDED_INDEX_ERROR.format(script=SCRIPT_NAME, index=index) for index in sorted(BOUNDED_INDEXES - partial)
     ]
-    # A foreign table the schema builds is an owned table hidden from the
-    # check under the wrong list.
+    # A foreign table the schema builds, or one a target creates, is an owned
+    # table hidden from the check under the wrong list.
     problems.extend(FOREIGN_TABLE_BUILT_ERROR.format(script=SCRIPT_NAME, table=table) for table in sorted(FOREIGN_TABLES & tables))
+    problems.extend(
+        FOREIGN_TABLE_CREATED_ERROR.format(script=SCRIPT_NAME, table=table, site=created[table])
+        for table in sorted(FOREIGN_TABLES & created.keys())
+    )
     for statement in statements:
         if statement.sql is None:
             verdicts.append(Verdict(statement, KIND_DYNAMIC))
@@ -1110,23 +1245,26 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
             message = str(exc)
             if message.startswith(NO_SUCH_TABLE_PREFIX):
                 table = message[len(NO_SUCH_TABLE_PREFIX) :]
-                if table in FOREIGN_TABLES:
+                if table in FOREIGN_TABLES and table not in created:
                     verdicts.append(Verdict(statement, KIND_SKIPPED, table=table))
                     continue
-                # A table neither built nor listed as foreign: a lazily
-                # created side table or a misspelt owned name, not a Hermes
-                # table, so it is reported rather than skipped.
+                # A table neither built nor listed as foreign, or one a
+                # target creates itself: a lazily created side table or a
+                # misspelt owned name, not a Hermes table, so it is reported
+                # rather than skipped.
                 verdicts.append(Verdict(statement, KIND_ERROR, table=table, plan=message))
-                problems.append(
-                    FOREIGN_TABLE_ERROR.format(
-                        file=statement.file,
-                        line=statement.line,
-                        function=statement.function,
-                        statement=statement.preview,
-                        table=table,
-                        script=SCRIPT_NAME,
-                    )
+                fields = dict(
+                    file=statement.file,
+                    line=statement.line,
+                    function=statement.function,
+                    statement=statement.preview,
+                    table=table,
+                    script=SCRIPT_NAME,
                 )
+                if table in created:
+                    problems.append(CREATED_TABLE_UNBUILT_ERROR.format(site=created[table], **fields))
+                else:
+                    problems.append(FOREIGN_TABLE_ERROR.format(**fields))
             else:
                 verdicts.append(Verdict(statement, KIND_ERROR, plan=message))
                 problems.append(
@@ -1142,8 +1280,24 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
         judged = 0
         # The CTEs the statement declares and the derived tables the plan
         # declares are names a scan line may use, directly or through an
-        # alias, and none of them is a table.
+        # alias, and none of them is a table. One named like a table the
+        # schema defines would hide that table's own scan lines behind it
+        # (the plan prints `SCAN <name>` for both), so it is a problem, not
+        # a name.
         derived = cte_names(statement.sql) | derived_names(plans)
+        collisions = sorted(derived & tables)
+        if collisions:
+            verdicts.append(Verdict(statement, KIND_ERROR, table=collisions[0], plan=plans[0] if plans else None))
+            problems.append(
+                DERIVED_NAME_ERROR.format(
+                    file=statement.file,
+                    line=statement.line,
+                    function=statement.function,
+                    statement=statement.preview,
+                    name=collisions[0],
+                )
+            )
+            continue
         aliases = table_aliases(statement.sql, tables | derived)
         for plan in plans:
             name = scanned_table(plan)
@@ -1209,7 +1363,10 @@ def load_baseline(path: Path, shown: str) -> tuple[list[BaselineEntry], list[str
     errors: list[str] = []
     first_seen: dict[tuple[str, str, str], int] = {}
     if not path.is_file():
-        return entries, errors
+        # A missing file would pin nothing and pass a tree with no scans; it
+        # is reported, so a moved or deleted baseline cannot turn the check
+        # green on its own.
+        return entries, [BASELINE_MISSING_ERROR.format(baseline=shown)]
     for number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith(COMMENT_PREFIX):
@@ -1235,17 +1392,27 @@ def load_baseline(path: Path, shown: str) -> tuple[list[BaselineEntry], list[str
 def reconcile(
     verdicts: list[Verdict], files: list[str], entries: list[BaselineEntry], shown: str
 ) -> tuple[list[Verdict], list[str]]:
-    """Flagged scans no entry covers, and the entries the source no longer matches exactly."""
+    """Flagged scans and unreadable statements no entry covers, and the entries the source no longer matches exactly.
+
+    A scan is keyed by (file, function, table); a statement the check cannot
+    read by (file, function, `DYNAMIC_KEY`). Both follow the same rules: a
+    rise, a drop and a stale entry each fail.
+    """
     flagged: dict[tuple[str, str, str], list[Verdict]] = {}
     for verdict in verdicts:
         if verdict.flagged and verdict.table is not None:
             key = (verdict.statement.file, verdict.statement.function, verdict.table)
-            flagged.setdefault(key, []).append(verdict)
+        elif verdict.kind == KIND_DYNAMIC:
+            key = (verdict.statement.file, verdict.statement.function, DYNAMIC_KEY)
+        else:
+            continue
+        flagged.setdefault(key, []).append(verdict)
     problems: list[str] = []
     covered: set[tuple[str, str, str]] = set()
     scanned = set(files)
     for entry in entries:
         key = (entry.file, entry.function, entry.table)
+        dynamic = entry.table == DYNAMIC_KEY
         fields = dict(
             baseline=shown, line=entry.line, file=entry.file, function=entry.function, table=entry.table, allowed=entry.count
         )
@@ -1255,11 +1422,11 @@ def reconcile(
         found = len(flagged.get(key, ()))
         covered.add(key)
         if found == 0:
-            problems.append(BASELINE_STALE_ERROR.format(**fields))
+            problems.append((DYNAMIC_STALE_ERROR if dynamic else BASELINE_STALE_ERROR).format(**fields))
         elif found > entry.count:
-            problems.append(BASELINE_RISE_ERROR.format(found=found, **fields))
+            problems.append((DYNAMIC_RISE_ERROR if dynamic else BASELINE_RISE_ERROR).format(found=found, **fields))
         elif found < entry.count:
-            problems.append(BASELINE_DROP_ERROR.format(found=found, **fields))
+            problems.append((DYNAMIC_DROP_ERROR if dynamic else BASELINE_DROP_ERROR).format(found=found, **fields))
     findings = [v for key, group in sorted(flagged.items()) if key not in covered for v in group]
     return findings, problems
 
@@ -1288,7 +1455,7 @@ def check(
         print(SUMMARY_FAIL.format(findings=0, problems=1), file=err)
         return EXIT_FAIL
     shown = display_path(baseline, root)
-    statements, files, problems = scan(root, targets)
+    statements, files, problems, created = scan(root, targets)
     entries, malformed = load_baseline(baseline, shown)
     problems.extend(malformed)
     verdicts: list[Verdict] = []
@@ -1298,7 +1465,7 @@ def check(
         problems.extend(schema_problems)
         if conn is not None:
             try:
-                verdicts, prepare_problems = judge(statements, conn)
+                verdicts, prepare_problems = judge(statements, conn, created)
             finally:
                 conn.close()
             problems.extend(prepare_problems)
@@ -1319,18 +1486,17 @@ def check(
                 file=out,
             )
     for verdict in findings:
-        print(
-            FINDING_LINE.format(
-                file=verdict.statement.file,
-                line=verdict.statement.line,
-                function=verdict.statement.function,
-                table=verdict.table,
-                plan=verdict.plan,
-                statement=verdict.statement.preview,
-                baseline=shown,
-            ),
-            file=err,
+        fields = dict(
+            file=verdict.statement.file,
+            line=verdict.statement.line,
+            function=verdict.statement.function,
+            statement=verdict.statement.preview,
+            baseline=shown,
         )
+        if verdict.kind == KIND_DYNAMIC:
+            print(DYNAMIC_LINE.format(key=DYNAMIC_KEY, **fields), file=err)
+        else:
+            print(FINDING_LINE.format(table=verdict.table, plan=verdict.plan, **fields), file=err)
     for problem in problems:
         print(problem, file=err)
     if findings or problems:
@@ -1338,9 +1504,15 @@ def check(
         return EXIT_FAIL
     judged = {id(v.statement) for v in verdicts if v.kind in (KIND_OK, KIND_FINDING, KIND_BOUNDED)}
     skipped = sum(1 for v in verdicts if v.kind == KIND_SKIPPED)
+    dynamic = sum(1 for v in verdicts if v.kind == KIND_DYNAMIC)
     print(
         SUMMARY_OK.format(
-            statements=len(statements), files=len(files), planned=len(judged), skipped=skipped, entries=len(entries)
+            statements=len(statements),
+            files=len(files),
+            planned=len(judged),
+            skipped=skipped,
+            dynamic=dynamic,
+            entries=len(entries),
         ),
         file=out,
     )

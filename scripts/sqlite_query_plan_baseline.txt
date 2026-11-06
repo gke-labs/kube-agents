@@ -1,13 +1,16 @@
 # Statements that read a whole table the repository defines when
 # scripts/check_sqlite_query_plans.py arrived, pinned at the count they had
-# that day. One entry per line: `<file> <function> <table> <count>`, the file
-# relative to the repository root, the function as the check names it
-# (`Class.method` for a method), the table the plan scans, the count of
-# `SCAN <table>` plan lines above zero (one statement can scan a table twice).
-# The comment above an entry names the issue or pull request that owns the
-# index, or the bound the planner cannot see. The rules (the list only
-# shrinks: a rise, a drop, a stale entry, an entry for a file the check does
-# not read, and a line that is not an entry all fail) are in the script's
+# that day, and, in the last section, the statements the check cannot read
+# statically, pinned per function under `(dynamic)` in the table column. One
+# entry per line: `<file> <function> <table> <count>`, the file relative to
+# the repository root, the function as the check names it (`Class.method` for
+# a method), the table the plan scans, the count of `SCAN <table>` plan lines
+# above zero (one statement can scan a table twice). The comment above an
+# entry names the issue or pull request that owns the index, or the bound the
+# planner cannot see. The rules (a rise, a drop, a stale entry, an entry for a
+# file the check does not read, a line that is not an entry, and a missing
+# file all fail; an entry is lowered or removed as the tree improves, and
+# adding one is a hunk on this file for review to read) are in the script's
 # docstring; this file states only what is pinned and why.
 
 # #4331: the excluded-row fold, one correlated read per excluded event for the
@@ -59,3 +62,31 @@ agents/platform/scripts/session_kv_server.py list_intercepted_events intercepted
 # every proposal the agent has opened; one row per proposal, never pruned. A
 # covering index on (origin, origin_platform) is the fix.
 agents/platform/scripts/session_kv_server.py get_proposals_opened_counts proposals_opened 1
+
+# Statements the check cannot read, pinned per function so that a new one, or
+# one that stops resolving, is a rise the check reports. Each is built at run
+# time from something the AST does not hold: a migration loop's column or index
+# name (`init_db`, `init_findings_schema`), a column list chosen from
+# `PRAGMA table_info` while the process runs (the kanban feed and card readers,
+# the recap's ledger read), a WHERE or SET list assembled from the request's
+# filters (the findings queue), a PRAGMA name, or an executing helper's own
+# parameter (`_ids_where_in`, `get_task.read.newest`). `--list` names each one
+# with its line. Lower an entry when a statement becomes a literal or a
+# constant; the plan it then gets is the point.
+agents/platform/scripts/eod_report_generator.py load_intercepted_events (dynamic) 1
+agents/platform/scripts/findings_queue.py _register_one (dynamic) 3
+agents/platform/scripts/findings_queue.py init_findings_schema (dynamic) 2
+agents/platform/scripts/findings_queue.py list_findings (dynamic) 1
+agents/platform/scripts/findings_queue.py patch_finding (dynamic) 2
+agents/platform/scripts/findings_queue.py record_verification (dynamic) 1
+agents/platform/scripts/session_kv_server.py _card_stop_connect (dynamic) 2
+agents/platform/scripts/session_kv_server.py _collect_card_tree (dynamic) 1
+agents/platform/scripts/session_kv_server.py _extract_steps_from_conn (dynamic) 1
+agents/platform/scripts/session_kv_server.py _ids_where_in (dynamic) 1
+agents/platform/scripts/session_kv_server.py _read_pre_kanban_session_task (dynamic) 2
+agents/platform/scripts/session_kv_server.py _session_first_order_key (dynamic) 1
+agents/platform/scripts/session_kv_server.py _session_task_rows (dynamic) 1
+agents/platform/scripts/session_kv_server.py _task_rows (dynamic) 1
+agents/platform/scripts/session_kv_server.py get_task.read (dynamic) 2
+agents/platform/scripts/session_kv_server.py get_task.read.newest (dynamic) 1
+agents/platform/scripts/session_kv_server.py init_db (dynamic) 3

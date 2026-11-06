@@ -375,6 +375,34 @@ FIXTURE_SERVER = textwrap.dedent(
         return newest("SELECT id FROM events WHERE cluster = ? LIMIT ?", 5)
 
 
+    def in_marks(conn, ids):
+        marks = ",".join("?" * len(ids))
+        return conn.execute(f"SELECT id FROM events WHERE cluster IN ({marks})", ids).fetchall()
+
+
+    def in_marks_list(conn, ids):
+        return conn.execute(f"SELECT id FROM events WHERE id IN ({', '.join(['?'] * len(ids))})", ids).fetchall()
+
+
+    def count_events(conn, query="SELECT COUNT(*) FROM events"):
+        return conn.execute(query).fetchone()
+
+
+    def through_default(conn):
+        return count_events(conn)
+
+
+    def through_default_passed(conn):
+        return count_events(conn, RECENT_SQL)
+
+
+    def shadowed_helper(conn):
+        def run_sql(conn, query, params=()):
+            return (query, params)
+
+        return run_sql(conn, "SELECT id FROM events WHERE cluster = ?", ("x",))
+
+
     def bounded(conn):
         return conn.execute("SELECT body FROM data_volume_warning").fetchall()
 
@@ -449,8 +477,8 @@ FIXTURE_TARGETS = ("fixture_server.py", "fixture_helper.py")
 FIXTURE_BOUNDED_INDEXES = frozenset({"idx_events_backlog_pending"})
 # The one table the fixture reads that its schema never builds.
 FIXTURE_FOREIGN_TABLES = frozenset({"sessions"})
-# What the fixture's findings pin to, exactly.
-FIXTURE_BASELINE = textwrap.dedent(
+# What the fixture's findings pin to, exactly: the scans, then the statements the check cannot read.
+FIXTURE_SCAN_BASELINE = textwrap.dedent(
     """
     # the shapes the fixture leaves unindexed on purpose
     fixture_server.py unindexed events 1
@@ -476,8 +504,33 @@ FIXTURE_BASELINE = textwrap.dedent(
     fixture_server.py through_helper events 1
     fixture_server.py through_format_helper events 1
     fixture_server.py through_nested_helper events 1
+    fixture_server.py in_marks events 1
+    fixture_server.py through_default events 1
     """
 )
+FIXTURE_DYNAMIC_BASELINE = textwrap.dedent(
+    """
+    # the statements the fixture builds at run time on purpose
+    fixture_server.py init_db (dynamic) 1
+    fixture_server.py local_twice (dynamic) 1
+    fixture_server.py joined_comprehension (dynamic) 1
+    fixture_server.py joined_list (dynamic) 1
+    fixture_server.py except_shadow (dynamic) 1
+    fixture_server.py closure_nonlocal.inner (dynamic) 1
+    fixture_server.py module_rebound_in_block (dynamic) 1
+    fixture_server.py global_rebound (dynamic) 1
+    fixture_server.py lambda_param.<lambda> (dynamic) 1
+    fixture_server.py dynamic (dynamic) 1
+    fixture_server.py run_sql (dynamic) 1
+    fixture_server.py run_in (dynamic) 1
+    fixture_server.py through_helper_dynamic (dynamic) 1
+    fixture_server.py through_format_helper_unfilled (dynamic) 1
+    fixture_server.py run_rebound (dynamic) 1
+    fixture_server.py through_nested_helper.newest (dynamic) 1
+    fixture_server.py count_events (dynamic) 1
+    """
+)
+FIXTURE_BASELINE = FIXTURE_SCAN_BASELINE + FIXTURE_DYNAMIC_BASELINE
 
 
 def _write_fixture(root: Path, baseline: str | None = FIXTURE_BASELINE) -> Path:
@@ -531,6 +584,8 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("fixture_server.py:", err)
         self.assertIn("unindexed scans events: `SCAN events` for `SELECT id FROM events WHERE cluster = ?`", err)
         self.assertIn("index it or pin it in", err)
+        # No baseline file pins nothing, and says so rather than passing a tree with no scans.
+        self.assertIn("baseline.txt: the baseline file is missing; restore it", err)
 
     def test_classification_of_every_shape(self) -> None:
         baseline = _write_fixture(self.root)
@@ -634,6 +689,19 @@ class FixtureTests(unittest.TestCase):
         # A nested helper is read by the calls in the function that defines it.
         self.assertEqual(kinds[server + "through_nested_helper"], [KIND_FINDING])
         self.assertEqual(kinds[server + "through_nested_helper.newest"], [KIND_DYNAMIC])
+        # An `IN` list's marks, `",".join("?" * n)` or over `["?"] * n`, resolve to one `?`, so the statement plans.
+        self.assertEqual(kinds[server + "in_marks"], [KIND_FINDING])
+        self.assertIn("in_marks finding table=events plan=SCAN events statement=SELECT id FROM events WHERE cluster IN (?)", out)
+        self.assertEqual(kinds[server + "in_marks_list"], [KIND_OK])
+        # A call that passes nothing in the executed parameter's place executes the parameter's default, which is
+        # judged as that call's statement; the helper's own execute stays dynamic.
+        self.assertEqual(kinds[server + "through_default"], [KIND_FINDING])
+        self.assertIn("through_default finding table=events plan=SCAN events USING COVERING INDEX", out)
+        self.assertEqual(kinds[server + "through_default_passed"], [KIND_OK])
+        self.assertEqual(kinds[server + "count_events"], [KIND_DYNAMIC])
+        # A local `def` of the helper's name that executes nothing shadows the module helper: nothing is read.
+        self.assertNotIn(server + "shadowed_helper", kinds)
+        self.assertNotIn(server + "shadowed_helper.run_sql", kinds)
         self.assertEqual(kinds[server + "bounded"], [KIND_BOUNDED])
         self.assertEqual(kinds[server + "catalog"], [KIND_OK])
         self.assertEqual(kinds[server + "constant_row"], [KIND_OK])
@@ -652,9 +720,15 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("statement(s) read across 2 file(s)", out)
 
     def test_concatenated_statement_keeps_the_constant_value(self) -> None:
-        baseline = _write_fixture(self.root)
-        statements, _, _ = scan(self.root, FIXTURE_TARGETS)
+        _write_fixture(self.root)
+        statements, _, _, created = scan(self.root, FIXTURE_TARGETS)
+        # Every `CREATE TABLE` in a target's strings names a table of this repository's, with the DDL's site.
+        self.assertEqual(set(created), {"events", "data_volume_warning", "notes", "side"})
+        self.assertEqual(created["side"], "fixture_server.py:11")
         by_function = {s.function: s.sql for s in statements}
+        self.assertEqual(by_function["in_marks"], "SELECT id FROM events WHERE cluster IN (?)")
+        self.assertEqual(by_function["in_marks_list"], "SELECT id FROM events WHERE id IN (?)")
+        self.assertEqual(by_function["through_default"], "SELECT COUNT(*) FROM events")
         self.assertEqual(by_function["concatenated"], "SELECT id FROM events WHERE backlog = 1 AND created_at > ?")
         self.assertEqual(by_function["partial_literal"], "SELECT id FROM events WHERE reason = 'drift' AND object_uid = ?")
         self.assertEqual(by_function["local_once"], "SELECT id, cluster FROM events WHERE created_at > ?")
@@ -731,6 +805,109 @@ class FixtureTests(unittest.TestCase):
         self.assertNotIn("rebound_alias ok", out)
         self.assertNotIn("rebound_alias finding", out)
 
+    def test_cte_or_subquery_named_like_a_table_is_a_problem_not_a_pass(self) -> None:
+        baseline = _write_fixture(self.root)
+        # A FROM-subquery alias, or a CTE, named after the table it reads makes the plan print `SCAN events` for
+        # the table and for the derived rows alike; neither line is placed, and the statement is reported.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def shadow_alias(conn):
+                return conn.execute(
+                    "SELECT id FROM (SELECT id FROM events ORDER BY created_at LIMIT ?) AS events LIMIT ?", (5, 1)
+                ).fetchall()
+
+
+            def shadow_cte(conn):
+                return conn.execute(
+                    "WITH events AS (SELECT id FROM main.events WHERE created_at > ?) SELECT id FROM events", ("x",)
+                ).fetchall()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline, list_statements=True)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("shadow_alias: `SELECT id FROM (SELECT id FROM events ORDER BY created_at LIMIT ?) AS events LIMIT ?`", err)
+        self.assertIn("names a CTE or subquery 'events' after the table it reads, so a `SCAN events` line cannot be placed", err)
+        self.assertIn("shadow_cte: `WITH events AS (SELECT id FROM main.events WHERE created_at > ?) SELECT id FROM events`", err)
+        self.assertIn("shadow_alias error table=events", out)
+        self.assertIn("shadow_cte error table=events", out)
+        self.assertNotIn("shadow_alias ok", out)
+        self.assertNotIn("shadow_cte ok", out)
+        self.assertIn("0 finding(s) not pinned and 2 problem(s)", err)
+
+    def test_table_a_target_creates_is_never_skipped(self) -> None:
+        baseline = _write_fixture(self.root)
+        # A foreign entry for a table a target creates is a problem naming the DDL's site (and, since the fixture
+        # builds `side`, the built-table problem too).
+        code, _, err = _run(self.root, baseline, foreign_tables=frozenset({"sessions", "side"}))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("FOREIGN_TABLES names 'side', which fixture_server.py:11 creates, so it is this repository's; drop the entry", err)
+        self.assertIn("FOREIGN_TABLES names 'side', which the schema builds; drop the entry", err)
+        self.assertIn("0 finding(s) not pinned and 2 problem(s)", err)
+        # A table a function creates itself and the schema never builds is a problem naming the site, whether or
+        # not FOREIGN_TABLES names it: never `skipped`.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def scratch(conn, key):
+                conn.execute("CREATE TABLE IF NOT EXISTS scratch (id TEXT PRIMARY KEY, body TEXT)")
+                return conn.execute("SELECT body FROM scratch WHERE id = ?", (key,)).fetchone()
+            '''
+        )
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        create_line = source.count("\n", 0, source.index("CREATE TABLE IF NOT EXISTS scratch")) + 1
+        for foreign in (FIXTURE_FOREIGN_TABLES, FIXTURE_FOREIGN_TABLES | {"scratch"}):
+            code, out, err = _run(self.root, baseline, list_statements=True, foreign_tables=foreign)
+            self.assertEqual(code, EXIT_FAIL)
+            self.assertIn(
+                f"scratch: `SELECT body FROM scratch WHERE id = ?` names 'scratch', which fixture_server.py:{create_line} "
+                "creates and the schema does not build; add its DDL to SCHEMA_SOURCE.extra_ddl_attrs",
+                err,
+            )
+            self.assertIn("scratch error table=scratch plan=no such table: scratch", out)
+            self.assertNotIn("scratch skipped", out)
+        self.assertIn(f"FOREIGN_TABLES names 'scratch', which fixture_server.py:{create_line} creates", err)
+        self.assertIn("0 finding(s) not pinned and 2 problem(s)", err)
+
+    def test_dynamic_statements_are_pinned_per_function(self) -> None:
+        # The statements the check cannot read follow the scans' rules under `(dynamic)`: one with no entry is
+        # reported with where to pin it, and a rise, a drop and a stale entry each fail.
+        source = FIXTURE_SERVER + textwrap.dedent(
+            '''
+
+            def two_dynamic(conn, column):
+                conn.execute("SELECT {} FROM events WHERE id = ?".format(column), (1,))
+                return conn.execute("SELECT id FROM events WHERE {} = ?".format(column), ("x",)).fetchall()
+            '''
+        )
+        dynamic = (
+            FIXTURE_DYNAMIC_BASELINE.replace("fixture_server.py run_sql (dynamic) 1\n", "")
+            .replace("fixture_server.py local_twice (dynamic) 1", "fixture_server.py local_twice (dynamic) 2")
+            + "fixture_server.py indexed (dynamic) 1\nfixture_server.py two_dynamic (dynamic) 1\n"
+        )
+        baseline = _write_fixture(self.root, baseline=FIXTURE_SCAN_BASELINE + dynamic)
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, _, err = _run(self.root, baseline)
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn(
+            "run_sql executes a statement the check cannot read: `-`; write it as a literal or a constant, or pin it in "
+            "baseline.txt as `fixture_server.py run_sql (dynamic) <count>`",
+            err,
+        )
+        self.assertIn("two_dynamic executes 2 statement(s) the check cannot read, the entry at baseline.txt:", err)
+        self.assertIn("allows 1; write the new one as a literal or a constant", err)
+        self.assertIn("local_twice executes 1 statement(s) the check cannot read, the entry at baseline.txt:", err)
+        self.assertIn("allows 2; lower the entry to 1", err)
+        self.assertIn("fixture_server.py indexed executes no statement the check cannot read; remove the entry", err)
+        self.assertIn("1 finding(s) not pinned and 3 problem(s)", err)
+        # With the entries right, the same tree passes, and the summary counts the pinned statements.
+        baseline = _write_fixture(self.root, baseline=FIXTURE_BASELINE + "fixture_server.py two_dynamic (dynamic) 2\n")
+        (self.root / "fixture_server.py").write_text(source, encoding="utf-8")
+        code, out, err = _run(self.root, baseline)
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("19 not readable, no full scan or unreadable statement beyond the 43 baseline entr(y/ies)", out)
+
     def test_old_sqlite_is_a_problem_not_a_pass(self) -> None:
         baseline = _write_fixture(self.root)
         with mock.patch.object(sqlite3, "sqlite_version_info", (3, 34, 1)), mock.patch.object(sqlite3, "sqlite_version", "3.34.1"):
@@ -765,7 +942,8 @@ class FixtureTests(unittest.TestCase):
                 fixture_server.py unindexed events 0
                 fixture_server.py unindexed events 1
                 """
-            ),
+            )
+            + FIXTURE_DYNAMIC_BASELINE,
         )
         code, _, err = _run(self.root, baseline)
         self.assertEqual(code, EXIT_FAIL)
@@ -778,14 +956,14 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("baseline.txt:12: fixture_server.py unindexed events already has an entry at line 2", err)
         # `many`, `comma_list`, `quoted_alias`, `unpacked_shadow`, `closure.inner`, `nested_helper_name`,
         # `sibling_built_constant`, `index_walk`, `partial_index_walk`, `lambda_closure.<lambda>`, `Body`,
-        # `materialized_subquery`, `automatic_index` and `create_as_select` have no entry and are reported beside
-        # the problems.
+        # `materialized_subquery`, `automatic_index`, `create_as_select`, the three helper routes, `in_marks` and
+        # `through_default` have no entry and are reported beside the problems.
         self.assertIn("many scans notes: `SCAN notes`", err)
         self.assertIn("automatic_index scans notes: `SEARCH n USING AUTOMATIC COVERING INDEX (author=?)`", err)
         self.assertIn("index_walk scans events: `SCAN events USING COVERING INDEX idx_events_created_at`", err)
         self.assertIn("lambda_closure.<lambda> scans events: `SCAN events`", err)
         self.assertIn("through_format_helper scans events: `SCAN events` for `SELECT id FROM events WHERE cluster IN (?)`", err)
-        self.assertIn("17 finding(s) not pinned and 7 problem(s)", err)
+        self.assertIn("19 finding(s) not pinned and 7 problem(s)", err)
 
     def test_bounded_index_the_schema_does_not_build_is_a_problem(self) -> None:
         baseline = _write_fixture(self.root)
@@ -819,7 +997,9 @@ class FixtureTests(unittest.TestCase):
         code, _, err = _run(self.root, baseline, foreign_tables=frozenset({"sessions", "events"}))
         self.assertEqual(code, EXIT_FAIL)
         self.assertIn("FOREIGN_TABLES names 'events', which the schema builds; drop the entry", err)
-        self.assertIn("0 finding(s) not pinned and 1 problem(s)", err)
+        # The schema builder's own `CREATE TABLE` is a target's too, so the created-table rule names it as well.
+        self.assertIn("FOREIGN_TABLES names 'events', which fixture_server.py:29 creates, so it is this repository's", err)
+        self.assertIn("0 finding(s) not pinned and 2 problem(s)", err)
 
     def test_missing_target_fails(self) -> None:
         baseline = _write_fixture(self.root)
@@ -930,6 +1110,7 @@ class CheckoutTests(unittest.TestCase):
         self.assertLess(elapsed, 30.0)
         self.assertIn("check_sqlite_query_plans:", out.getvalue())
         self.assertIn("skipped on tables the repository does not define", out.getvalue())
+        self.assertIn("not readable, no full scan or unreadable statement beyond the", out.getvalue())
 
     def test_main_lists_the_checkout(self) -> None:
         out, err = io.StringIO(), io.StringIO()
@@ -937,6 +1118,10 @@ class CheckoutTests(unittest.TestCase):
         listing = out.getvalue()
         self.assertIn("agents/platform/scripts/session_kv_server.py:", listing)
         self.assertIn(" skipped table=sessions ", listing)
+        # The two scripts that open the database themselves are read too.
+        self.assertIn("agents/platform/scripts/chat_notify.py:", listing)
+        self.assertIn(" conversation_route ok table=- plan=- statement=SELECT metadata FROM session_metadata WHERE session_id = ?", listing)
+        self.assertIn("agents/platform/scripts/eod_report_generator.py:", listing)
         # The server's `_ids_where_in` executes its parameter: the literal a caller hands it is read at the call
         # site, its `{marks}` list as one parameter.
         self.assertIn(
