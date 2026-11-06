@@ -749,9 +749,8 @@ func (c *Client) subscribe(ctx context.Context, cfg SubscribeConfig, set func(*d
 // One error is not retried at all: a held bind refused on the durable's
 // stored config (ErrHeldBindRefused). That verdict was read from the
 // consumer the server already holds, so a retry reads the same one, and
-// retrying it for the window would hand the caller whichever error the last
-// attempt happened to end on (the context's, when a caller's deadline fires
-// mid-retry) in place of the refusal. A missing durable keeps the window.
+// spending the window on it would only delay the refusal; it is also never
+// recorded as the last answer below. A missing durable keeps the window.
 //
 // With cfg.WaitForStream, a missing stream does not count against the
 // window, and neither does a lost connection (connectionLost, or the
