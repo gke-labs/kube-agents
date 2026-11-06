@@ -1027,6 +1027,102 @@ router_settings:
 {{- end }}
 
 {{/*
+Every LiteLLM callback entry the chart can register, named once and sorted by
+whether the shadow replay proxy's key covers it
+(kube-agents.replayModelBehaviourChecksum). replayKeyed: the hooks that change
+what the model is sent or what comes back (thinking replay, cache-marker strip,
+redaction). replayUnkeyed: telemetry (otel, prometheus, the trace logger), the
+OAuth2 credential hook, and session affinity, which only picks a Vertex
+serving replica. templates/litellm.yaml registers callbacks only through these
+names, and tests/test_chart_replay_shadow.py fails on a rendered entry that is
+in neither set, so a new hook has to be put in one.
+
+Takes the root context; returns JSON.
+*/}}
+{{- define "kube-agents.litellmCallbacks" -}}
+{{- toJson (dict
+  "replayKeyed" (dict
+    "thinkingReplay" "litellm_thinking_replay_callback.proxy_handler_instance"
+    "cacheControlStrip" "litellm_cache_control_strip_callback.proxy_handler_instance"
+    "redaction" "litellm_redaction_callback.proxy_handler_instance")
+  "replayUnkeyed" (dict
+    "otel" "otel"
+    "prometheus" "prometheus"
+    "oauth2" "litellm_oauth2_callback.proxy_handler_instance"
+    "sessionAffinity" "litellm_session_affinity_callback.proxy_handler_instance"
+    "traceLog" "llm_trace_logger.proxy_handler_instance")) -}}
+{{- end }}
+
+{{/*
+The shadow replay proxy's checksum of what decides the model's answer
+(REPLAY_MODEL_BEHAVIOUR_CHECKSUM in litellm.yaml). The pods' checksum/config
+covers the whole config; this one treats the two LiteLLM routes to Google's
+Gemini models, gemini/ (the Gemini Developer API) and vertex_ai/ (Vertex AI),
+as one, so a nightly and a presubmit serving the same model with the same
+settings get the same replay key. Without that, the eval nightlies (Gemini
+Developer API) record answers no presubmit (Vertex AI) can ever look up.
+
+TODO(#4988): temporary. Once the nightlies and presubmits call the model
+through one API, key replay on the full checksum/config again and delete this.
+
+From the parsed rendered config it changes, and keeps everything else:
+  - a model's gemini/ or vertex_ai/ prefix becomes one shared token
+    ($sharedGoogleRoute); every other provider prefix stays as rendered, so
+    openai_compatible against gemini, or two servers behind two api_base
+    values, keep apart (the chart renders api_base for openai_compatible
+    only, so it stays in);
+  - the Vertex route keys ($vertexRouteParams) are dropped defensively: the
+    chart renders none of them into the config today (the project and
+    location reach the pod as env vars);
+  - the router's timeout and retry settings, which decide when a call is
+    retried, not what the answer says ($deliverySettings), are dropped;
+  - callbacks become .callbacks, the replayKeyed entries of
+    kube-agents.litellmCallbacks in registration order.
+Each keyed hook's source, and the redaction rule file when redaction is on,
+arrive in .sources and are hashed with the config, so an edit to one changes
+the key the way it rolls the pods.
+
+Takes a dict of config (the rendered gateway config), callbacks (the kept
+callback entries, in order) and sources (a list of strings).
+*/}}
+{{- define "kube-agents.replayModelBehaviourChecksum" -}}
+{{- $vertexRouteParams := list "vertex_project" "vertex_location" "vertex_credentials" -}}
+{{- $deliverySettings := list "timeout" "num_retries" "retry_after" -}}
+{{- $googleRoutePattern := "^(gemini|vertex_ai)/" -}}
+{{- $sharedGoogleRoute := "gemini-or-vertex_ai/" -}}
+{{- $parsed := .config | fromYaml -}}
+{{- if hasKey $parsed "Error" -}}
+{{- fail (printf "the rendered LiteLLM config does not parse as YAML, so the replay checksum cannot be computed: %s" (get $parsed "Error")) -}}
+{{- end -}}
+{{- $behaviour := deepCopy $parsed -}}
+{{- $models := list -}}
+{{- range $parsed.model_list -}}
+{{- $params := deepCopy .litellm_params -}}
+{{- range $vertexRouteParams -}}
+{{- $_ := unset $params . -}}
+{{- end -}}
+{{- $_ := set $params "model" (regexReplaceAll $googleRoutePattern $params.model $sharedGoogleRoute) -}}
+{{- $models = append $models (set (deepCopy .) "litellm_params" $params) -}}
+{{- end -}}
+{{- $_ := set $behaviour "model_list" $models -}}
+{{- $settings := deepCopy ($parsed.litellm_settings | default dict) -}}
+{{- $_ := set $settings "callbacks" .callbacks -}}
+{{- $_ := set $behaviour "litellm_settings" $settings -}}
+{{- if $parsed.router_settings -}}
+{{- $router := deepCopy $parsed.router_settings -}}
+{{- range $deliverySettings -}}
+{{- $_ := unset $router . -}}
+{{- end -}}
+{{- if $router -}}
+{{- $_ := set $behaviour "router_settings" $router -}}
+{{- else -}}
+{{- $_ := unset $behaviour "router_settings" -}}
+{{- end -}}
+{{- end -}}
+{{- printf "%s%s" (toJson $behaviour) (join "" .sources) | sha256sum -}}
+{{- end }}
+
+{{/*
 Selector labels for the operator Deployment. Kept minimal and stable:
 selectors are immutable once the Deployment exists.
 */}}
