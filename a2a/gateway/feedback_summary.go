@@ -141,12 +141,11 @@ var usageSummaryBrokerSubcommands = map[string][]string{
 	},
 	"git": {
 		"add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
-		"check-ref-format", "checkout", "cherry-pick", "clean", "clone", "commit",
-		"describe", "diff", "fetch", "grep", "init", "log", "ls-files", "ls-remote",
-		"ls-tree", "merge", "merge-base", "mv", "pull", "push", "rebase", "remote",
-		"reset", "restore", "rev-list", "rev-parse", "revert", "rm", "show",
-		"sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref",
-		"tag", "update-ref", "version", "worktree",
+		"checkout", "cherry-pick", "clean", "clone", "commit", "describe", "fetch",
+		"init", "log", "ls-files", "ls-remote", "ls-tree", "merge", "merge-base", "mv",
+		"pull", "push", "rebase", "remote", "reset", "restore", "rev-list", "rev-parse",
+		"revert", "rm", "show", "sparse-checkout", "stash", "status", "submodule",
+		"switch", "symbolic-ref", "tag", "update-ref", "version", "worktree",
 	},
 	"gh": {
 		"api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
