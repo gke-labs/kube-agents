@@ -4459,7 +4459,9 @@ def test_finding_scope_reads_past_the_new_finding_marker(token, github):
     assert res.status == "pass", res.reason
 
 
-_UPDATING_RUN_LEDGER = Path(__file__).parent / "fixtures" / "ledgers" / "updating_run_waste_audit.md"
+# A .txt, not a .md: a document the docs checks would expect a reader to reach
+# and prettier would reflow; this is a captured body a test compares byte for byte.
+_UPDATING_RUN_LEDGER = Path(__file__).parent / "fixtures" / "ledgers" / "updating_run_waste_audit.txt"
 _AUDIT_REPORT_SCRIPT = (
     Path(__file__).resolve().parents[2] / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
 )
