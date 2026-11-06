@@ -1,0 +1,112 @@
+# NIGHTLY -- an entry in hack/eval/nightly-cases.txt.
+#
+# Domain: fleet audits. Journey: a scheduled audit runs again over a fleet that
+# did not change since the last scheduled run, and the run is closed from that
+# run's stored findings document without the model drafting one by hand.
+# `audit_report.py precheck` digests the collector manifest and compares it with
+# the digest the last scheduled `finish` recorded; on `unchanged`, with the
+# scheduled flag, it runs `finish --scheduled` itself on the stored document
+# (docs/designs/fleet-audit-collector-manifest.md, section 3.7). Nine
+# governance SOPs run it after their collector.
+#
+# How the case makes the previous run and the scheduled run. The bench format
+# runs one prompt, and a chat-dispatched audit is an on-demand run, which never
+# passes the scheduled flag, so the stack prebuilt/unchanged-manifest-digest
+# does both halves on the install: it runs the previous scheduled run of the
+# fleet-consistency-drift stream the way a worker does, with no model (`start`,
+# the drift collector with the install's scope arguments, `draft` with the
+# `mark` variable below on each finding, `finish --scheduled --manifest-file`,
+# which stores the envelope and records the digest), then fires the stream's
+# real cron job and waits for it to end, as prebuilt/audit-chat-report does.
+# That run reads the roster prompt, which passes the flag to precheck and to
+# finish. The conversation itself is not graded: its prompt asks a question the
+# agent answers with no tool, and the safeguards hold it to that.
+#
+# Red on main: the SOP has no precheck step, the worker drafts the document by
+# hand and runs `finish`, and the envelope the run stores carries no `precheck`
+# key, so the objective fails on it. Green with the gate: the collector digests
+# the same as the planted run's, `precheck` closes the run from the stored
+# document, and the envelope carries `precheck: unchanged`. `silent_ok` on that
+# envelope is `finish`'s own verdict on this run's manifest against the ledger
+# and is not graded: a standing coverage gap keeps a no-forge install loud.
+#
+# The stream is fleet-consistency-drift because its checks read GKE metadata
+# only, which does not move between the plant and the run, and because the
+# sibling case fleet-audit-unchanged-finding-keeps-wording already plants on it.
+# The eval runner pauses the clock-started audits; arm.py records that the job
+# was paused, fires it anyway (Hermes' trigger re-enables it) and pauses it
+# again when the run ends. The objective's clock is the stack's `fired_at`, not
+# the conversation's start: the scheduled run ends before the turn begins.
+#
+# Planted defect required: drift-outlier (bench/tf/fleet/fixtures.json), so the
+# planted run has a finding to carry the mark. Isolation class: cluster-read-only,
+# GitOps-repo write, as for consistency-drift-outlier: both runs rewrite the
+# stream's ledger issue in the throwaway eval repository; audit_streams holds
+# the stream lock for the unit.
+id: fleet-audit-unchanged-manifest-skips-synthesis
+name: An unchanged collector manifest closes a scheduled audit from the stored document
+
+fixtures:
+  - drift-outlier
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/unchanged-manifest-digest"
+  teardown: true
+  variables:
+    # Letters, digits and hyphens only, so the ledger renders it as it is.
+    mark: "unchanged-digest-7e2b"
+
+validated: false
+
+domain: fleet-audits
+
+audit_streams: [fleet-consistency-drift]
+
+tool_calls_optional: true
+
+prompt: |
+  In one or two sentences, say what you do on this install. Answer from what you
+  already know: do not call any tool, and do not run, trigger or schedule
+  anything.
+expected_output: |
+  critical requirements:
+  - A one- or two-sentence description of the agent's role, with no tool call.
+  - No job is run, triggered or scheduled.
+
+verification_spec:
+  # The envelope the fired scheduled run stored: finished after the stack fired
+  # the job, and closed by precheck from the stored document. The key is written
+  # only by a `finish` that `precheck` ran, never by one a worker ran.
+  - name: the-scheduled-run-was-closed-by-the-precheck
+    role: objective
+    # assert: the stack waited for the run to end before the turn began.
+    mode: assert
+    check:
+      type: audit_report_stored
+      audit: fleet-consistency-drift
+      since_state_file: /opt/data/.bench-unchanged-manifest-digest.json
+      required_envelope:
+        precheck: unchanged
+  # The turn must not start an audit itself: the verifier cannot tell a run the
+  # session started from the one the stack fired.
+  - name: conversation-files-no-card
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]
+  # Nor run the stream in the session: a worker-run `finish` would store a
+  # second envelope of the stream, and the gate is not what it exercised.
+  - name: the-session-ran-no-finish
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    check:
+      type: worker_commands
+      forbidden_patterns:
+        - 'audit_report\.py (start|finish|precheck)\b'
