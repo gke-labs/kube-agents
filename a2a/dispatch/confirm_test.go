@@ -37,12 +37,25 @@ func TestALostAcceptIsAbandonedBeforeTheReoffer(t *testing.T) {
 	if good.confirmCount() != 1 || good.startedCount() != 1 {
 		t.Errorf("tse-1: %d confirms, %d starts; want one each", good.confirmCount(), good.startedCount())
 	}
-	// The abandon reached tse-0 before tse-1 was offered the task.
 	lost.mu.Lock()
 	abandon := lost.abandons[0]
 	lost.mu.Unlock()
 	if abandon.TaskID != "task-1" || abandon.Reason != abandonTimedOut {
 		t.Errorf("tse-0's abandon %+v", abandon)
+	}
+	// The abandon reached tse-0 before tse-1 was offered the task.
+	order := b.receivedOrder()
+	at := func(event string) int {
+		for i, e := range order {
+			if e == event {
+				return i
+			}
+		}
+		return -1
+	}
+	abandoned, reoffered := at("tse-0 "+string(lib.DispatchAbandon)+" task-1"), at("tse-1 "+string(lib.DispatchOffer)+" task-1")
+	if abandoned < 0 || reoffered < 0 || abandoned > reoffered {
+		t.Errorf("receive order %v: want tse-0's abandon before tse-1's offer", order)
 	}
 }
 

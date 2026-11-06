@@ -727,7 +727,9 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 		d.clearWaiting(hk)
 	}
 	if err != nil || key == "" {
-		d.release(h, false)
+		// The wait is noted before the holding goes: while it is held, Health
+		// keeps the waiting entry as one on offer, so a Health in between
+		// never sees the submission neither offered nor waiting.
 		if err != nil {
 			d.noteWaiting(hk, del.Received(), waitHandOffFailed)
 			log.Warn("hand-off failed; the submission stays queued", "err", err)
@@ -735,6 +737,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 			d.noteWaiting(hk, del.Received(), ReasonNoWorker)
 			log.Info("no worker took the task; the submission stays queued")
 		}
+		d.release(h, false)
 		if ctx.Err() == nil {
 			_ = del.Nak(d.cfg.RetryDelay)
 		}
