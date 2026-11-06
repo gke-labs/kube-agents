@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -123,7 +125,7 @@ func TestATaskCredentialMustBeThisConnections(t *testing.T) {
 		{"another pod UID", taskToken(t, kp, func(c *taskcred.Claims) { c.PodUID = "uid-p2" }), "pod UID"},
 		{"another profile", taskToken(t, kp, func(c *taskcred.Claims) { c.Profile = cluster }), "profile"},
 		{"another tier", taskToken(t, kp, func(c *taskcred.Claims) { c.Tier = "unattended" }), "tier"},
-		{"past the max lifetime", taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(defaultTaskCredentialMaxLifetime + time.Hour) }), "ceiling"},
+		{"past the max lifetime", taskToken(t, kp, func(c *taskcred.Claims) { c.Expires = time.Now().Add(DefaultTaskCredentialMaxLifetime + time.Hour) }), "ceiling"},
 		{"an untrusted key", taskToken(t, other, nil), "not a trusted task-signing key"},
 		{"the proxy audience", taskToken(t, kp, func(c *taskcred.Claims) { c.Audience = taskcred.AudienceCredentialProxy }), "credential-proxy"},
 		{"not a credential", "not-a-jwt", "not a JWT"},
@@ -591,7 +593,7 @@ func TestATaskCredentialMayOutliveGrantTTLButTheConnectionMayNot(t *testing.T) {
 	}
 
 	tooLong := taskToken(t, kp, func(c *taskcred.Claims) {
-		c.Expires = time.Now().Add(defaultTaskCredentialMaxLifetime + taskCredentialSkew + time.Minute)
+		c.Expires = time.Now().Add(DefaultTaskCredentialMaxLifetime + TaskCredentialSkew + time.Minute)
 	})
 	if _, err := authorizeWithTask(svc, tokenAuditorPod1, tooLong); err == nil || !strings.Contains(err.Error(), "ceiling") {
 		t.Errorf("a credential past the max lifetime plus skew: %v", err)
@@ -777,5 +779,43 @@ func TestTheLongestStemWorksOnARealServer(t *testing.T) {
 	case v := <-violations:
 		t.Errorf("the longest-stem connection hit a permissions error: %v", v)
 	default:
+	}
+}
+
+// A worker dialling its task connection through lib.TaskCredentialNATSOptions,
+// with the pod's token read from a file as the pod reads it, is the one the
+// callout grants: it reaches its own task's events and consumers.
+func TestTheLibTaskConnectionReachesItsTask(t *testing.T) {
+	kp, pub := taskSigningKey(t)
+	h := startHarness(t, profileMap, profileTokens(), withTaskSigningKeys(pub))
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenFile, []byte(tokenAuditorPod1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := lib.TaskCredentialNATSOptions(tokenFile, taskToken(t, kp, nil), auditorPod1, taskOne)
+	if err != nil {
+		t.Fatal(err)
+	}
+	violations := make(chan error, 16)
+	nc, err := nats.Connect(h.url, append(opts, h.dial,
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { violations <- e }))...)
+	if err != nil {
+		t.Fatalf("the lib task connection was refused: %v", err)
+	}
+	t.Cleanup(nc.Close)
+	in := lib.SessionConsumerName(stemOne, lib.SessionConsumerIn)
+	checkPublish(t, nc, violations, map[string]bool{
+		lib.TaskEventsSubject(auditor, taskOne):                                   false,
+		consumerSubject("CREATE", in) + "." + lib.TaskInSubject(auditor, taskOne): false,
+		lib.TaskEventsSubject(auditor, taskTwo):                                   true,
+	})
+}
+
+// lib names the task connection's stem without importing taskcred; the
+// callout grants by taskcred's.
+func TestLibAndTaskcredAgreeOnTheTaskStem(t *testing.T) {
+	if lib.TaskConsumerStem(auditorPod1, taskOne) != taskcred.ConsumerStem(auditorPod1, taskOne) {
+		t.Fatalf("lib.TaskConsumerStem %q != taskcred.ConsumerStem %q",
+			lib.TaskConsumerStem(auditorPod1, taskOne), taskcred.ConsumerStem(auditorPod1, taskOne))
 	}
 }

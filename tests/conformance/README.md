@@ -371,7 +371,7 @@ suite once at the end: a run that ends red says so and exits non-zero.
    invariant and the document that records the finding — and give its class a
    `..._precondition_...` test, which the self-check requires.
 
-## `chat/` holds data, not tests
+## `chat/` and `chat-ux/` hold data, not tests
 
 Each file in `chat/` pairs an input, lifted from a `today` presenter test or
 built to show a rule one pins, with the `kube-agents.chat/v1` messages the next-mode emitter owes for it. The payload
@@ -383,4 +383,7 @@ home, but they are wire-format rules rather than security invariants, so
 `make test-python`. The emitter runs every case: the kanban notifier's half in
 `deploy/docker/patches/test_chat_conformance.py`, and the hermes-bridge's half
 (the answer, and the ask's mark on its heartbeat and terminal) in
-`a2a/hermes-bridge/chat_test.go`.
+`a2a/hermes-bridge/chat_test.go`. Each of those also lints what it checks for
+the chat UX rules code can check (`chatmsg.Lint`, `chat_cases.lint`), and
+`chat-ux/lint.json` holds the lint's own cases, which the Go and Python lints
+both read, so a case they disagree on fails one side.

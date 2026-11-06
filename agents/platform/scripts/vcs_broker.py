@@ -68,6 +68,7 @@ import re
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -86,9 +87,11 @@ from providers import (
     short_branch,
     tls_refusal as tls_refusal_default,
     validate_branch,
+    validate_number,
     validate_revision,
 )
 from providers.credentials import CREDENTIAL_HELPER_KEY
+from providers.errors import UNAVAILABLE, UNRECOGNISED
 from workspace_paths import WorkspaceError, validate_path
 
 LOGGER = logging.getLogger("credential-proxy.vcs")
@@ -148,6 +151,27 @@ MERGED_PROPOSAL_STATE = "merged"
 # The neutral state for a proposal closed without a merge, the same adapters'
 # spelling.
 CLOSED_PROPOSAL_STATE = "closed"
+
+# The neutral state of a proposal still open, the same adapters' spelling.
+OPEN_PROPOSAL_STATE = "open"
+
+# `proposal-claim`'s forge check: the proposal the claim names must have been
+# created at most CLAIM_WINDOW_SECONDS ago, the life of the claim token the
+# HTTP layer minted with the `proposal-create` answer, and at most
+# CLAIM_CLOCK_SKEW_SECONDS in the future, the room the forge's clock gets. The
+# title it answers is cut at CLAIM_TITLE_MAX characters.
+CLAIM_WINDOW_SECONDS = 900
+CLAIM_CLOCK_SKEW_SECONDS = 60
+CLAIM_TITLE_MAX = 300
+# The forge failures `proposal-claim` asks again once: the two refusals the
+# provider layer reads as the forge's own trouble (`providers/errors.py`), the
+# set the agent side's `forge.TRANSIENT_CODES` retries reads on. The claim
+# token is spent before the check, so without this one 502 loses the claim.
+CLAIM_TRANSIENT_CODES = frozenset({UNAVAILABLE.code, UNRECOGNISED.code})
+# A forge's timestamp spells UTC as `Z`, which `fromisoformat` reads as an
+# offset only from Python 3.11.
+ISO_UTC_SUFFIX = "Z"
+ISO_UTC_OFFSET = "+00:00"
 
 # How many of a branch's proposals `branch-delete` reads. It needs all of them:
 # the one that carried the tip, and every other, since a branch any of them
@@ -351,6 +375,33 @@ def _git_refusal(forge: Forge, repo: str, stderr: Any, verb: str) -> WorkspaceEr
     forge.credential.headers(repo)
     LOGGER.warning("git refused the %s credential for a %s call", forge.name, verb)
     return WorkspaceError(text, status=401, code="FORGE_UNAUTHENTICATED")
+
+
+def _once_more_if_transient(what: str, call: Callable[[], Any]) -> Any:
+    """`call()`, asked once more when the forge's failure is in CLAIM_TRANSIENT_CODES.
+
+    A second failure, or any other refusal, is raised as the forge gave it.
+    """
+    try:
+        return call()
+    except WorkspaceError as error:
+        if error.fields.get("code") not in CLAIM_TRANSIENT_CODES:
+            raise
+        LOGGER.warning("proposal-claim: %s failed with %s; retrying once", what, error.fields.get("code"))
+    return call()
+
+
+def _age_seconds(created: Any, now: datetime) -> float | None:
+    """Seconds since a forge's `created` timestamp, or None when it cannot be read."""
+    try:
+        when = datetime.fromisoformat(str(created).replace(ISO_UTC_SUFFIX, ISO_UTC_OFFSET))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        return None
+    return (now - when).total_seconds()
+
+
 def _login_key(login: str) -> str:
     """One spelling for two sources that mark an automation differently.
 
@@ -2105,6 +2156,57 @@ class VcsBroker:
     def proposal_create(self, payload):
         return self._forge_verb("proposal-create", payload, pinned_target=True)
 
+    def proposal_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """`{url, number, title}` when the forge says this install just opened the proposal.
+
+        Reached through the HTTP layer only with a claim token it minted for
+        a `proposal-create` answer, and with that answer's url, number and
+        repository in `payload` in place of anything the caller sent: the
+        token is what proves the call, this is what proves the proposal. The
+        forge must answer `proposal-view` for the number with the same url, an
+        open state, a creation time inside CLAIM_WINDOW_SECONDS, and as author
+        the account this credential acts as. Anything else the forge answers
+        is a 409; the answer is the forge's, never the caller's. A forge that
+        must name its account and cannot raises IdentityUnknown, whose code
+        names the missing identity. The repository was held to
+        the managed list by the route before this ran. The route spent the
+        token before this ran, so a transient forge failure on either read
+        (CLAIM_TRANSIENT_CODES) is asked once more before it is answered.
+        """
+        url = payload.get("url")
+        number = validate_number(payload.get("number"))
+        bound = self._bind(payload)
+        # IdentityUnknown is not transient, so the wrapper raises it as it came:
+        # refused with its own code, which names the fix, as the other two
+        # `_viewer` callers are. The token is spent either way.
+        viewer = _once_more_if_transient("whoami", lambda: self._viewer(bound))
+        view = (
+            _once_more_if_transient(
+                "proposal-view",
+                lambda: bound.forge.proposal_view(bound.api, bound.repo, {"number": number}),
+            )
+            or {}
+        ).get("proposal") or {}
+        age = _age_seconds(view.get("created"), datetime.now(timezone.utc))
+        if not (
+            viewer
+            and isinstance(url, str)
+            and view.get("url") == url
+            and view.get("number") == number
+            and view.get("state") == OPEN_PROPOSAL_STATE
+            and age is not None
+            and -CLAIM_CLOCK_SKEW_SECONDS <= age <= CLAIM_WINDOW_SECONDS
+            and _login_key(str(view.get("author") or "")) == _login_key(viewer)
+        ):
+            raise WorkspaceError(
+                "The forge does not say this install opened that proposal in the "
+                "last few minutes: it is not open, not this credential's, not the "
+                "one the claim was minted for, or older than the claim window.",
+                status=409,
+                code="CLAIM_NOT_CONFIRMED",
+            )
+        return {"url": url, "number": number, "title": str(view.get("title") or "")[:CLAIM_TITLE_MAX]}
+
     def proposal_list(self, payload):
         return self._forge_verb("proposal-list", payload)
 
@@ -2258,6 +2360,7 @@ VCS_VERBS = frozenset(
         "proposal-close",
         "proposal-commits",
         "proposal-acknowledge",
+        "proposal-claim",
         "issue-update",
         "issue-close",
         "label-ensure",
@@ -2292,6 +2395,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "proposal-close": broker.proposal_close,
         "proposal-commits": broker.proposal_commits,
         "proposal-acknowledge": broker.proposal_acknowledge,
+        "proposal-claim": broker.proposal_claim,
         "issue-update": broker.issue_update,
         "issue-close": broker.issue_close,
         "label-ensure": broker.label_ensure,

@@ -3,7 +3,7 @@
 Reusable Terraform module for provisioning the GKE cluster that hosts Kube-Agents workloads. It manages one of three cluster shapes, selected by `cluster_mode` and `create_cluster`:
 
 - **`cluster_mode = "autopilot"`** (default) — a GKE Autopilot cluster. Autopilot clusters are regional: `location` must be a region (a zone is rejected at plan time).
-- **`cluster_mode = "standard"`** — a GKE Standard cluster: a default node pool of `e2-standard-4` machines (one per zone), Dataplane V2 with FQDN NetworkPolicy, the Filestore CSI and BackupRestore addons, Workload Identity, and CMEK database encryption. `enable_gvisor_node_pool` adds a dedicated GKE Sandbox pool (Standard only — Autopilot ships the `gvisor` RuntimeClass natively).
+- **`cluster_mode = "standard"`** — a GKE Standard cluster: a default node pool of `e2-standard-4` machines (one per zone), Dataplane V2 with FQDN NetworkPolicy, the Filestore CSI and BackupRestore addons, Workload Identity, and CMEK database encryption. `enable_gvisor_node_pool` adds a dedicated GKE Sandbox pool (Standard only — Autopilot ships the `gvisor` RuntimeClass natively). [Sizing the node pools](#sizing-the-node-pools) covers both pools' machine types, boot disks and the gVisor pool's autoscaling bounds.
 - **`create_cluster = false`** — install onto a cluster somebody else made. The module reads the named cluster through a data source and creates no cluster or KMS resources. Two postconditions gate the plan: the cluster must already have Workload Identity enabled, and it must enforce NetworkPolicy — either Dataplane V2 or the legacy Calico addon, which takes two `gcloud container clusters update` calls in order, `--update-addons=NetworkPolicy=ENABLED` and then `--enable-network-policy`. `install.sh` does both for you when authorized; a bare Terraform run refuses instead. `accept_no_network_policy = true` waives the second postcondition and installs onto a cluster that enforces none, without changing it; the `network_policy_enforced` output is then `false`, and every NetworkPolicy kube-agents installs is inert.
 
 The full-install composition passes `kube-agents-host=true` through `resource_labels` so the admin portal can discover the deployed host; standalone callers can use the same input when they install kube-agents on the cluster.
@@ -33,6 +33,32 @@ The `cluster_endpoint` output is whichever endpoint GKE publishes for the cluste
 > `kms_keyring_name`/`kms_key_name` values. The full-install composition's `lifecycle.sh`
 > does both for you; its README's [Teardown and re-apply](../../examples/full-install/README.md#teardown-and-re-apply) section says how, including how to restore
 > versions a raw destroy scheduled.
+
+## Sizing the node pools
+
+Standard mode only. `sizing_profile` picks the shape of both node pools in one setting, and each shape can be set on its own:
+
+| Input                                    | `small` (default) and `medium` | `fleet`         |
+| ---------------------------------------- | ------------------------------ | --------------- |
+| `standard_machine_type`                  | `e2-standard-4`                | `n2-standard-8` |
+| `standard_disk_size_gb`                  | 100                            | 200             |
+| `gvisor_machine_type`                    | `e2-standard-4`                | `n2-standard-4` |
+| `gvisor_disk_size_gb`                    | 100                            | 150             |
+| `standard_disk_type`, `gvisor_disk_type` | `pd-balanced`                  | `pd-balanced`   |
+
+`small` is the shape the module produced before profiles existed, so the default changes nothing on an existing cluster. `medium` resolves like `small` until a later change gives it a shape of its own. The four machine-type and disk-size inputs and the two disk-type inputs default to `null`, which means "the profile's value": an explicit value always wins, even one equal to the `small` shape, so a tfvars file that writes `standard_machine_type = "e2-standard-4"` beside `sizing_profile = "fleet"` gets `e2-standard-4`. The resolved values are the `standard_*` and `gvisor_*` outputs. Disk types accepted: `pd-standard`, `pd-balanced`, `pd-ssd` and `hyperdisk-balanced` (the last only on machine series that support it, which GKE checks at apply).
+
+The gVisor pool autoscales between `gvisor_min_node_count` (default 1) and `gvisor_max_node_count` (default 2) nodes per zone and is created at the minimum; equal bounds keep it at a fixed size. The default pool does not autoscale: `standard_node_count` (default 1) is the per-zone count the cluster is created with, and it is the cluster's `initial_node_count`, which the google provider treats as ForceNew on the cluster itself. Changing it on a live cluster plans the cluster's destruction and recreation, with every pool and workload on it; resize a live default pool with `gcloud container clusters resize` instead. The full-install composition's `lifecycle.sh` refuses such an apply (`guard_standard_node_count`), since its front doors apply without a prompt.
+
+A string input set to `""` counts as unset, which is what a blanked `TF_VAR_` line in `install.env` exports: the four machine-type and disk-type inputs take the profile's value, and `sizing_profile` itself takes `small`. A number input (a disk size, a node count or an autoscaling bound) set to `""` is refused by Terraform itself (`a number is required`), so delete such a line rather than blanking it.
+
+Changing a machine type or a boot disk on a live cluster updates the pool in place with a rolling node recreation, on either pool, with the google providers this module admits. None of the profile, machine-type, disk or autoscaling inputs replaces a pool or the cluster: the gVisor pool's creation count is read once and ignored afterwards, so raising `gvisor_min_node_count` later moves the autoscaling bound only. `standard_node_count` is the one exception above. At the defaults the module renders the disk values GKE has created pools with since 1.24 (100 GB, `pd-balanced`), so a cluster created on those defaults plans no change when it upgrades to this version of the module, and an existing gVisor pool gains the autoscaling bounds in place; a default pool created when GKE still defaulted to `pd-standard` plans an in-place disk-type change. Read the plan before applying.
+
+Through the full-install composition's front doors there is no plan to read: they apply under `-auto-approve`, and the sizing inputs reach them only as `TF_VAR_` lines in `install.env`, so a line lost between runs resolves the `small` profile and the apply would recreate every node of a larger pool onto it. The composition's `lifecycle.sh` refuses an apply whose resolved machine type or boot disk differs from the pool in state unless a sizing input asks for the change (`guard_node_pool_shape`): the pool's own `standard_*` or `gvisor_*` input, set to any value, or, for an attribute no explicit input decided at the last apply, `sizing_profile` set to a profile other than the one that apply recorded (the composition keeps the profile and the names of the explicit inputs that were set as two root outputs). A profile merely set is not that ask: kept beside an explicit line that has since been lost, it names no change, and a changed profile names nothing about an attribute an explicit line decided, so either apply is refused until the explicit input names the shape again. That covers the `pd-standard` pool above too: through the front doors its disk-type change waits until `standard_disk_type` names `pd-balanced`, or `pd-standard` to keep it.
+
+## Tests
+
+`tests/sizing_profile.tftest.hcl` plans the module against mocked `google` and `google-beta` providers and asserts what each sizing input renders: the default and `medium` give both pools the `small` shape with the gVisor pool autoscaling from 1 to 2 per zone, `fleet` gives the two fleet shapes, an explicit machine type, disk or bound wins over `fleet`, a string input set to `""` takes the profile's value and a blank profile the default, and the validations refuse an unknown profile, a boot disk under 10 GB, an unknown disk type, a bound below 1 and a floor above the ceiling. `make terraform-test` runs it; the suite needs Terraform 1.11 or newer, above the floor the module declares for an install.
 
 ## Usage
 

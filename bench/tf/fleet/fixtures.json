@@ -1,10 +1,10 @@
 {
   "schema_version": 2,
-  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below. kube_agents_bench.scope_exclude reads the same file, for a case that declares `scope_exclude:`, to name a slot's cluster in the install's spec.scope.exclude.clusters for that case's repetitions; it discovers nothing either.",
-  "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
-  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), `age_hours_ge` (an RFC 3339 timestamp at least `value` hours in the past; an unparseable one fails), `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default), `not_ahead_of_channel` (cluster subject only, no value: the version is in the cluster's own release channel's `validVersions` in get-server-config, or that list has a newer patch of the same minor, or a newer version when it carries none of that minor; an unrecognised version string fails), or `node_cpu_spare_ge` (a `node?<selector>` subject with no path: at least one node matches and every matched node keeps at least `value` millicores of allocatable CPU unrequested by the pods bound to it, counted the way the scheduler counts a pod, the larger of its containers' sum with restartable init containers and its biggest ordinary init container, plus pod overhead, Succeeded and Failed pods excluded; a matched node not yet reporting allocatable leaves the role not checked); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
+  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. A project-scoped role (`cluster_slot: null`: a Compute Engine object no cluster carries) is probed in the project with gcloud and published as `<role>.confirmed` alone, with no kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own set, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. One sanctioned exception, which discovers by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below. kube_agents_bench.scope_exclude reads the same file, for a case that declares `scope_exclude:`, to name a slot's cluster in the install's spec.scope.exclude.clusters for that case's repetitions; it discovers nothing either.",
+  "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A project-scoped role (`cluster_slot: null`, for a Compute Engine object no cluster carries) takes `<kind>/<name-prefix>*` instead, where the kind is `instance` or `firewall`: the runner lists the project's instances or firewall rules whose name starts with the prefix, with gcloud, and the probe passes when at least one is there. The prefix stops before the fleet's `cluster_prefix`, which is the Terraform's business. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
+  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, on a project-scoped role a probe-shaped `<kind>/<name-prefix>*` (every Compute Engine object of that kind whose name starts with the prefix, read with `gcloud compute ... list --format json`), `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]`, `[?(@.key=='value')]` or `[\"quoted.key\"]` steps, the last for a label or selector key the bare form cannot carry (`metadata.labels[\"pod-security.kubernetes.io/enforce-version\"]`); `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), `age_hours_ge` (an RFC 3339 timestamp at least `value` hours in the past; an unparseable one fails), `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default), `not_ahead_of_channel` (cluster subject only, no value: the version is in the cluster's own release channel's `validVersions` in get-server-config, or that list has a newer patch of the same minor, or a newer version when it carries none of that minor; an unrecognised version string fails), or `node_cpu_spare_ge` (a `node?<selector>` subject with no path: at least one node matches and every matched node keeps at least `value` millicores of allocatable CPU unrequested by the pods bound to it, counted the way the scheduler counts a pod, the larger of its containers' sum with restartable init containers and its biggest ordinary init container, plus pod overhead, Succeeded and Failed pods excluded; a matched node not yet reporting allocatable leaves the role not checked); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and the script writes `<role>.drift` beside the role's kubeconfig, one failed assertion per line with what was observed (#1544). The presubmit does not run this pass and never acts on a drift; a scheduled scan of every pool project from the CI health bot is the follow-up on #1550. A role with an empty list asserts nothing beyond presence. A `value` may be an object or an empty object; it is compared whole and structurally (key order does not matter), so an `emptyDir` with no fields is `{}`. One key of a label or selector map is asserted through the quoted step, not by comparing the whole map, so a key another owner adds is not drift.",
   "cluster_slots": {
-    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, and the default pool's own headroom. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
+    "a": "The seeded workload namespaces (each role's `namespace` names its own), plus the idle and pinned node pools, the default pool's own headroom, and the GKE Config Connector add-on in namespaced mode, the cluster the Config Connector eval cases plant on. Labelled `upgrade-family=seeded-regular`, the rollout family it shares with slots c and d.",
     "b": "Control plane held one minor behind the REGULAR channel default, plus the upgrade-readiness drain defects. Labelled `upgrade-family=seeded-held`: a rollout family of its own, so the regular family's rollout never waits on the lag.",
     "c": "The consistency outlier: no master authorized networks, and a default pool on a 50 GB boot disk with cpuCfsQuota off where every other pool runs 20 GB and no kubelet block. Labelled `upgrade-family=seeded-regular`.",
     "d": "Multi-zonal: nodes in two zones, carrying the zonal-skew fixtures. The only slot whose shape is the fixture. Labelled `upgrade-family=seeded-regular`."
@@ -785,7 +785,7 @@
       "cluster_slot": "a",
       "namespace": null,
       "probes": ["node?cloud.google.com/gke-nodepool=default-pool"],
-      "fixture": "seeded-a's default pool itself, two e2-standard-2 nodes with CPU to place the next planted fixture. Not a defect: the room every other slot-a fixture schedules into. At two e2-mediums the busier node was within 2-47m of full on every pool project and a 10m DaemonSet pod stranded, which the scan read as drift on that fixture's role (#3607)",
+      "fixture": "seeded-a's default pool itself, three e2-standard-2 nodes with CPU to place the next planted fixture. Not a defect: the room every other slot-a fixture schedules into. At two e2-mediums the busier node was within 2-47m of full on every pool project and a 10m DaemonSet pod stranded, which the scan read as drift on that fixture's role (#3607)",
       "state": [
         {
           "subject": "node?cloud.google.com/gke-nodepool=default-pool",
@@ -793,6 +793,28 @@
           "op": "node_cpu_spare_ge",
           "value": 100,
           "why": "a 10m fixture pod places only on a node with that much CPU unrequested, and 100m is ten fixtures' worth of warning: below it on the busier node the pool is a few fixtures from stranding one, which then reads as drift on its own role. A re-apply changes nothing for this role: the pool's machine_type or node_count in bench/tf/fleet/main.tf (seeded_a_default) is the fix"
+        }
+      ]
+    },
+    "config-connector-namespaced": {
+      "cluster_slot": "a",
+      "namespace": null,
+      "probes": ["configconnector/configconnector.core.cnrm.cloud.google.com"],
+      "fixture": "The GKE Config Connector add-on on seeded-a, and its ConfigConnector object in namespaced mode (config-connector.tf). Not a defect: the Config Connector eval cases plant their objects on this cluster, each in a namespace of its own with a ConfigConnectorContext that names the kcc-eval-context service account, which holds no project role. No controller runs until a namespace holds a context",
+      "state": [
+        {
+          "subject": "configconnector/configconnector.core.cnrm.cloud.google.com",
+          "path": "spec.mode",
+          "op": "eq",
+          "value": "namespaced",
+          "why": "in cluster mode one controller acts for every namespace with one service account, and the eval stack's ConfigConnectorContext is not read; namespaced mode is what keeps an eval object to the account its context names"
+        },
+        {
+          "subject": "configconnector/configconnector.core.cnrm.cloud.google.com",
+          "path": "status.healthy",
+          "op": "eq",
+          "value": true,
+          "why": "the operator reports healthy once it has installed the namespaced components; an object that is not healthy means the add-on's operator cannot run, and an eval stack's ConfigConnectorContext would then never get a controller"
         }
       ]
     },
@@ -1128,6 +1150,75 @@
           "path": null,
           "op": "absent",
           "why": "the proxy runs nothing; an envoy pod means the gateway was scaled up and its Programmed=False no longer matches the cluster"
+        }
+      ]
+    },
+    "startup-fail-vm": {
+      "cluster_slot": null,
+      "namespace": null,
+      "probes": ["instance/startup-fail-*"],
+      "fixture": "startup-fail-<prefix>, a standalone e2-micro in the fleet's zone whose startup script exits 1 on every boot, so the guest agent's failure line is on its serial console from the first boot onward. Project-scoped: a Compute Engine object no cluster carries, so the role has no cluster slot and no kubeconfig, and the runner publishes it as `<role>.confirmed` alone",
+      "state": [
+        {
+          "subject": "instance/startup-fail-*",
+          "path": "status",
+          "op": "any_eq",
+          "value": "RUNNING",
+          "why": "the GCE compute audit's startup-script check reads the serial console of RUNNING instances only; a stopped or terminated VM has no finding, and gce-startup-script-failure and gce-chat-request-runs-collector have nothing to name"
+        },
+        {
+          "subject": "instance/startup-fail-*",
+          "path": "metadata.items[?(@.key=='startup-script')].key",
+          "op": "any_eq",
+          "value": "startup-script",
+          "why": "the startup script is the defect; a VM whose startup-script metadata was removed boots clean, and the failure line stops at the next boot"
+        }
+      ]
+    },
+    "world-open-ingress": {
+      "cluster_slot": null,
+      "namespace": null,
+      "probes": [
+        "firewall/world-open-2379-*",
+        "instance/world-open-*",
+        "firewall/world-open-deny-remote-*"
+      ],
+      "fixture": "world-open-2379-<prefix>, an INGRESS firewall rule that opens tcp:2379 to 0.0.0.0/0 on the tag of world-open-<prefix>, the one VM that carries it, which holds an external IP; nothing listens on 2379. world-open-deny-remote-<prefix> blocks tcp:22 and tcp:3389 on that VM. Project-scoped, as startup-fail-vm is",
+      "state": [
+        {
+          "subject": "firewall/world-open-2379-*",
+          "path": "sourceRanges[*]",
+          "op": "any_eq",
+          "value": "0.0.0.0/0",
+          "why": "the networking audit's firewall-world-open-ingress check flags a management port open to the whole internet; a narrowed source range is no finding, and networking-world-open-ingress has nothing to grade"
+        },
+        {
+          "subject": "firewall/world-open-2379-*",
+          "path": "allowed[*].ports[*]",
+          "op": "any_eq",
+          "value": "2379",
+          "why": "tcp:2379 is the management port the check reads and the case grades by the rule's name; a rule moved to another port is a different finding"
+        },
+        {
+          "subject": "firewall/world-open-2379-*",
+          "path": "disabled",
+          "op": "none_eq",
+          "value": true,
+          "why": "the check reads enabled rules only; a disabled rule opens nothing"
+        },
+        {
+          "subject": "instance/world-open-*",
+          "path": "networkInterfaces[*].accessConfigs[*].type",
+          "op": "any_eq",
+          "value": "ONE_TO_ONE_NAT",
+          "why": "the check fires only on a rule that reaches an instance with an external IP; the VM without its access config makes the rule reach nothing"
+        },
+        {
+          "subject": "instance/world-open-*",
+          "path": "status",
+          "op": "any_eq",
+          "value": "RUNNING",
+          "why": "a stopped VM has no external IP in use, and the check counts instances that hold one"
         }
       ]
     }
