@@ -713,14 +713,15 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	}
 }
 
-// The console user is the web read surface plus one narrow publish: the
-// inbound chat subject the gateway's console adapter subscribes. Pinned
-// EXACTLY for the same reason web's list is - the reach lives in request
-// bodies and wildcards, and a blocklist cannot see either.
+// The console user is the web read surface plus two narrow publishes: the
+// inbound chat subjects the gateway's console adapter subscribes, .in for a
+// typed message and .confirm for a confirm. Pinned EXACTLY for the same
+// reason web's list is - the reach lives in request bodies and wildcards,
+// and a blocklist cannot see either.
 func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 
-	start := strings.Index(conf, "user: console")
+	start := strings.Index(conf, "user: console\n")
 	if start < 0 {
 		t.Fatal("nats.conf has no console user")
 	}
@@ -803,6 +804,107 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 	if !strings.Contains(gw, `"chat.console.*.confirm"`) {
 		t.Error("gateway cannot subscribe the console confirm subject")
+	}
+}
+
+// console-mcp, the console MCP server's user, is console less the confirm
+// door: the same read surface, the frame publish on chat.console.*.in, the
+// answers on chat.console.*.out, its own inbox, and nothing on
+// chat.console.*.confirm either way. A model drives that server, and a
+// confirm is the one way a task is granted the permit to make a change.
+// Pinned EXACTLY, for console's reason.
+func TestBuildA2ANATSConfigConsoleMCPUser(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+
+	start := strings.Index(conf, "user: "+a2aConsoleMCPUser+"\n")
+	if start < 0 {
+		t.Fatal("nats.conf has no console-mcp user")
+	}
+	rest := conf[start:]
+	if next := strings.Index(rest[1:], "user: "); next >= 0 {
+		rest = rest[:next+1]
+	}
+	if !strings.Contains(rest, `password: "pw-console-mcp"`) {
+		t.Error("console-mcp's password does not come from its own creds Secret key")
+	}
+	if strings.Contains(rest, "pw-console\"") {
+		t.Error("console-mcp renders the console's password")
+	}
+
+	want := []string{
+		"$JS.API.INFO",
+		"$JS.API.STREAM.INFO.TASKS",
+		"$JS.API.STREAM.INFO.DIRECTORY",
+		"$JS.API.STREAM.INFO.TOPICS-STATE",
+		"$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+		"$JS.API.CONSUMER.CREATE.TASKS.>",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
+		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
+		"$JS.API.CONSUMER.INFO.TASKS.*",
+		"$JS.API.CONSUMER.INFO.DIRECTORY.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
+		"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
+		"chat.console.*.in",
+		"_INBOX.console-mcp.>",
+	}
+	if got := a2aGrantSubjects(t, conf, a2aConsoleMCPUser, "publish"); !reflect.DeepEqual(got, want) {
+		t.Errorf("console-mcp publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+	wantSub := []string{"a2a.>", "chat.console.*.out", "_INBOX.console-mcp.>"}
+	if got := a2aGrantSubjects(t, conf, a2aConsoleMCPUser, "subscribe"); !reflect.DeepEqual(got, wantSub) {
+		t.Errorf("console-mcp subscribe allow-list changed.\n got: %q\nwant: %q", got, wantSub)
+	}
+	// Its deny lists are console's, so neither can be narrowed without the
+	// other.
+	for _, section := range []string{"publish", "subscribe"} {
+		want, _ := a2aGrantDenials(t, conf, "console", section)
+		if got, _ := a2aGrantDenials(t, conf, a2aConsoleMCPUser, section); !reflect.DeepEqual(got, want) {
+			t.Errorf("console-mcp %s deny-list = %q, want console's %q", section, got, want)
+		}
+	}
+
+	// Against console's own render, so the two cannot drift apart except by
+	// the confirm door and the inbox prefix.
+	strip := func(grants []string, drop ...string) []string {
+		var out []string
+		for _, g := range grants {
+			if !slices.Contains(drop, g) {
+				out = append(out, g)
+			}
+		}
+		return out
+	}
+	for _, section := range []string{"publish", "subscribe"} {
+		console := strip(a2aGrantSubjects(t, conf, "console", section), a2aConsoleConfirmSubject, "_INBOX.console.>")
+		mcp := strip(a2aGrantSubjects(t, conf, a2aConsoleMCPUser, section), "_INBOX.console-mcp.>")
+		if !reflect.DeepEqual(console, mcp) {
+			t.Errorf("console-mcp %s is not console's less the confirm door:\n console: %q\n     mcp: %q", section, console, mcp)
+		}
+	}
+	// No publish on the confirm door, the stop record or the dispatch
+	// subjects, by any pattern that reaches them, and no subscribe on the
+	// confirm door. (Its subscribe on a2a.> reads the stop and dispatch
+	// records, as console's and web's do.)
+	for _, c := range []struct {
+		section string
+		probes  []string
+	}{
+		{"publish", []string{"chat.console.*.confirm", "a2a.stop.>", "a2a.dispatch.>"}},
+		{"subscribe", []string{"chat.console.*.confirm"}},
+	} {
+		for _, g := range a2aGrantSubjects(t, conf, a2aConsoleMCPUser, c.section) {
+			for _, probe := range c.probes {
+				if subjectPatternsOverlap(g, probe) {
+					t.Errorf("console-mcp %s %q reaches %s", c.section, g, probe)
+				}
+			}
+		}
 	}
 }
 
@@ -3755,7 +3857,8 @@ func a2aGrantDenials(t *testing.T, conf, user, section string) ([]string, bool) 
 func a2aGrantList(t *testing.T, conf, user, section, list string) ([]string, bool) {
 	t.Helper()
 
-	start := strings.Index(conf, "user: "+user)
+	// Whole line: "user: console" is a prefix of "user: console-mcp".
+	start := strings.Index(conf, "user: "+user+"\n")
 	if start < 0 {
 		t.Fatalf("no %s user in the rendered config", user)
 	}
@@ -5274,6 +5377,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	want := []string{
 		"a2a.tasks.*.*.in",
 		"a2a.tasks.*.*.supervisor",
+		// A profile task's submission; the gateway is its one writer.
+		"a2a.submit.*.*.*.*",
+		// A profile task's stop record; the gateway is its one writer too.
+		"a2a.stop.*.*",
 		"$KV.session-state.>",
 		"$KV.feedback.>",
 		"$KV.people.>",
@@ -5287,6 +5394,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"chat.board",
 	}
 	want = append(want, a2aGatewayJetStreamGrants()...)
+	// The profile cards' start-up read: the directory's subject list and a
+	// direct get per card subject, and no consumer.
+	want = append(want, "$JS.API.STREAM.INFO.DIRECTORY", "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*")
 	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.gateway.>")
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("gateway publish allow-list changed.\n got: %q\nwant: %q", got, want)
@@ -5344,11 +5454,10 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
 	}
 	// Streams the gateway has no business on at all: not a read, not a
-	// consumer, not a direct get. The directory is the identity plane and
-	// the gateway reads it by subscribing to the cards; the topic streams
-	// are the blackboard, which nothing in a2a/gateway touches; the other
-	// two buckets are the bridge's and the capability envelope's.
-	for _, s := range []string{"DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
+	// consumer, not a direct get. The topic streams are the blackboard,
+	// which nothing in a2a/gateway touches; the other two buckets are the
+	// bridge's and the capability envelope's.
+	for _, s := range []string{"TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_cap"} {
 		forbidden = append(forbidden,
 			"$JS.API.STREAM.INFO."+s,
 			"$JS.API.CONSUMER.CREATE."+s+".x",
@@ -5360,6 +5469,21 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 			"$JS.API.DIRECT.GET."+s,
 		)
 	}
+	// The directory, the identity plane. The gateway follows the cards by
+	// subscribing, but subscribing alone misses cards published before it
+	// started, so it also reads them: the subject list, then DIRECT.GET on
+	// card subjects only. No consumer on it, and no direct get past the card
+	// subjects.
+	forbidden = append(forbidden,
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.CREATE.DIRECTORY.x.a2a.agents.platform",
+		"$JS.API.CONSUMER.DURABLE.CREATE.DIRECTORY.x",
+		"$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.x",
+		"$JS.API.CONSUMER.DELETE.DIRECTORY.x",
+		"$JS.API.DIRECT.GET.DIRECTORY",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.platform.x",
+		"$JS.API.DIRECT.GET.DIRECTORY.a2a.tasks.platform.task-0001.in",
+	)
 	forbidden = append(forbidden,
 		// A session pod's three consumers, and the bridge's durable: the
 		// gateway may create consumers on TASKS, and create-as-update
@@ -5469,6 +5593,9 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		// gateway answer feedback, over the feedback bucket.
 		{"startFeedback js.KeyValue", "$JS.API.STREAM.INFO." + a2aKVStreamPrefix + a2aFeedbackBucket},
 		{"feedbackDesk kv.Get", "$JS.API.DIRECT.GET." + a2aKVStreamPrefix + a2aFeedbackBucket + ".$KV." + a2aFeedbackBucket + ".t1.U1"},
+		// gateway.readDirectory, the profile cards' start-up read.
+		{"readDirectory js.Stream / stream.Info", "$JS.API.STREAM.INFO." + a2aDirectoryStream},
+		{"readDirectory GetLastMsgForSubject", "$JS.API.DIRECT.GET." + a2aDirectoryStream + ".a2a.agents.cluster"},
 		{"ExportFeedback ListKeys watcher", "$JS.API.CONSUMER.CREATE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		{"ExportFeedback watcher Stop", "$JS.API.CONSUMER.DELETE." + a2aKVStreamPrefix + a2aFeedbackBucket + "." + kvWatcherName},
 		// gateway people count, over the people bucket.
@@ -5994,6 +6121,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams: map[string][]string{
 				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
 				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
+				// The profile cards' start-up read: the subject list and a
+				// direct get per card, no consumer (readDirectory).
+				a2aDirectoryStream: {"STREAM.INFO", "DIRECT.GET"},
 				// The kept answer ratings: the registry's four verbs, for
 				// the same four calls (a2aGatewayJetStreamGrants).
 				a2aKVStreamPrefix + a2aFeedbackBucket: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
@@ -6302,7 +6432,7 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 	}
 }
 
-// The console chat door, in the one spelling every check here shares. Two
+// The console chat door, in the one spelling every check here shares. Three
 // exact subjects, not a namespace: the render's other chat.* grants are the
 // notify and board routes', held by their own checks, so admitting the "chat"
 // namespace wholesale in rule 2 would be wider than the thing being held.
@@ -6333,7 +6463,7 @@ var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound,
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
-// chat door subjects: the console's two, the notify route's three and the
+// chat door subjects: the console's three, the notify route's three and the
 // board route's two.
 //
 // The door is deliberately not a namespace here. Admitting "chat" would stop
@@ -6380,6 +6510,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		{"chat.discord.*.in", false},
 		{"chat.console.*.status", false},
 		{"chat.console.*.in.x", false},
+		{"chat.console.*.confirm.x", false},
 		{"chat.console.>", false},
 		// The notify route admits its subjects (one per routed backend, and
 		// the reply namespace) and nothing around them: a sibling backend not
@@ -6439,19 +6570,21 @@ func consoleDoorViolations(ids []a2aIdentity) []string {
 // TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader is the property the
 // console identity's security claim rests on (consoleIdentity's own comment):
 // the gateway takes a frame on chat.console.*.in as coming from nats:console
-// with no mapping table in between, because only console can publish there --
-// and console takes a notice on chat.console.*.out as coming from the
-// gateway for the same reason. Rule 2 above refuses everything in chat.*
-// that is not one of the two door subjects; what it cannot do is say which
-// principal may hold the door, since the door subjects are spelled the same
-// on whoever carries them. That is this test's job, and it holds them to one
-// intended writer and one intended reader: every principal's publish and
-// subscribe lists are checked for pattern overlap (subjectPatternsOverlap,
-// wildcards on either side) against chat.console.*.in and
-// chat.console.*.out. A literal chat.console.abc.in, a chat.*.*.in, or a
-// chat.> on any other principal -- bridge, seed, the callout-issued agent or
-// provision, even a widened web -- trips here; the mutation half below
-// proves the check would.
+// with no mapping table in between, because only console and console-mcp can
+// publish there; it takes a frame on chat.console.*.confirm as a confirm
+// because only console, never the model-driven console-mcp, can publish
+// there; and console and console-mcp take a notice on chat.console.*.out as
+// coming from the gateway for the same reason. Rule 2 above refuses
+// everything in chat.* that is not one of the three door subjects; what it
+// cannot do is say which principal may hold the door, since the door
+// subjects are spelled the same on whoever carries them. That is this test's
+// job, and it holds each side to its intended holders: every principal's
+// publish and subscribe lists are checked for pattern overlap
+// (subjectPatternsOverlap, wildcards on either side) against the three door
+// patterns. A literal chat.console.abc.in, a chat.*.*.in, or a chat.> on any
+// other principal -- bridge, seed, the callout-issued agent or provision,
+// even a widened web -- trips here; the mutation half below proves the check
+// would.
 func TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	ids := a2aIdentities(a2aTestAgent())
 	for _, v := range consoleDoorViolations(ids) {
@@ -6475,6 +6608,25 @@ func TestChatConsoleSubjectsHaveExactlyOneWriterAndOneReader(t *testing.T) {
 	v := consoleDoorViolations(mutated)
 	if len(v) != 1 || !strings.Contains(v[0], a2aBridgeUser+" publish \"chat.console.abc.in\"") {
 		t.Errorf("a literal chat.console.abc.in publish grant on %s was not reported exactly once; got %q", a2aBridgeUser, v)
+	}
+
+	// Mutation: console-mcp, which may publish on .in, gains the confirm
+	// door. It is the identity a model drives, so this is the widening that
+	// matters most.
+	mutated = slices.Clone(ids)
+	found = false
+	for i := range mutated {
+		if mutated[i].user == a2aConsoleMCPUser {
+			mutated[i].publish = append(slices.Clone(mutated[i].publish), consoleConfirm)
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no %s identity to mutate", a2aConsoleMCPUser)
+	}
+	v = consoleDoorViolations(mutated)
+	if len(v) != 1 || !strings.Contains(v[0], a2aConsoleMCPUser+" publish \"chat.console.*.confirm\"") {
+		t.Errorf("a chat.console.*.confirm publish grant on %s was not reported exactly once; got %q", a2aConsoleMCPUser, v)
 	}
 }
 
@@ -6622,8 +6774,8 @@ func TestA2AInjectBackendIsOffWithoutTheFlag(t *testing.T) {
 	dep := buildA2AGatewayDeployment(agent)
 	container := dep.Spec.Template.Spec.Containers[0]
 	for _, e := range container.Env {
-		if e.Name == a2aInjectListenEnvVar {
-			t.Errorf("%s is rendered without the flag", a2aInjectListenEnvVar)
+		if e.Name == a2aInjectListenEnvVar || e.Name == a2aInjectConfirmEnvVar {
+			t.Errorf("%s is rendered without the flag", e.Name)
 		}
 		// The chat map's path is rendered explicitly at the gateway's
 		// default; what the flag must not do is move it.
@@ -6678,6 +6830,11 @@ func TestA2AInjectBackendRendersUnderTheFlag(t *testing.T) {
 	if got := env[a2aInjectPrincipalMapEnv].Value; got != a2aInjectPrincipalMapPath {
 		t.Errorf("%s = %q, want the operator's own map at %q",
 			a2aInjectPrincipalMapEnv, got, a2aInjectPrincipalMapPath)
+	}
+	// A confirm over the door is the eval harness's, and rides on the same
+	// flag as the door itself.
+	if got := env[a2aInjectConfirmEnvVar].Value; got != "true" {
+		t.Errorf("%s = %q, want \"true\" under the flag", a2aInjectConfirmEnvVar, got)
 	}
 	// Beside the chat map rather than over it. The door may be armed next to
 	// a real backend now, and repointing the one variable would take that

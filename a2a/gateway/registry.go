@@ -281,6 +281,11 @@ type TaskRef struct {
 	// render. A redelivered event found here was rendered by a gateway that
 	// stopped or died before its ack landed, and is not rendered again.
 	RelayedSeqs []uint64 `json:"relayedSeqs,omitempty"`
+	// Tier is the tier a task addressed to an AgentProfile runs at; empty
+	// for a task addressed to platform or a session. A profile task's child
+	// runs at its tier, and the child's end reaches it as a childResult on
+	// its .in rather than as a wake (deliverChildResult).
+	Tier string `json:"tier,omitempty"`
 	// CorrelationID is the task's, kept past ActiveTask so a cancel for a
 	// task the record has released can still ride the task's own chain.
 	// Empty on entries written before it was recorded.
@@ -291,6 +296,12 @@ type TaskRef struct {
 	// written before the mint existed, which render `grants: null` — the
 	// same block a pre-mint gateway sent, and no executor checks a cancel.
 	Capability *capability.Ref `json:"capability,omitempty"`
+	// ChangeRequested is the value the task was submitted with
+	// (TaskParameters.ChangeRequested): true only for a turn that arrived
+	// with IntentConfirm, and for the children and wakes of its chain,
+	// which copy it from here rather than from anything the session wrote.
+	// False on entries written before it existed.
+	ChangeRequested bool `json:"changeRequested,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
 	// set only after the publish succeeded, so a true here means the cancel
 	// is on the stream. It is what lets a supervisor path reached long
@@ -414,9 +425,12 @@ type TaskRef struct {
 // that minted a child ends quietly as the chain's parent (observedAs).
 // relayTerminal, the heal and the read route all decide through it, after
 // settleHandOff has written what the stream shows.
+//
+// Not for a task submitted to an AgentProfile (Tier set): a refused
+// delegation doesn't end it, and its `completed` is a real result of its own.
 func (rec *SessionRecord) handOffEnd(taskID string, state lib.TaskState) (lib.TaskState, string, bool) {
 	ref, ok := rec.TaskRefFor(taskID)
-	if !ok || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
+	if !ok || ref.Tier != "" || ref.DelegationEnd == "" || len(ref.Children) > 0 || state != lib.StateCompleted {
 		return state, "", false
 	}
 	return lib.StateFailed, ref.DelegationEnd, true
@@ -544,14 +558,16 @@ func (rec *SessionRecord) TaskRefFor(taskID string) (TaskRef, bool) {
 // one task to them, its root (TaskRef.RootTaskID): a child is never named,
 // and neither is a turn that delegated, whose end is not the chain's. Every
 // other turn's end is its root's - a human turn is its own root, and a
-// wake that did not delegate ends the chain it continues. An id the record
-// does not hold is passed through as it is.
+// wake that did not delegate ends the chain it continues. A turn addressed
+// to an AgentProfile ends its chain even when it delegated: it waits open
+// for its children and ends after them. An id the record does not hold is
+// passed through as it is.
 func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 	ref, ok := rec.TaskRefFor(taskID)
 	if !ok {
 		return taskID, true
 	}
-	return ref.rootID(), ref.Role != taskRoleChild && len(ref.Children) == 0
+	return ref.rootID(), ref.Role != taskRoleChild && (len(ref.Children) == 0 || ref.Tier != "")
 }
 
 // delegationHandled reports whether the task's history entry shows a

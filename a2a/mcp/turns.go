@@ -990,8 +990,55 @@ func (b *NATSBus) publishFrame(token, text string) error {
 	if _, err := rand.Read(id); err != nil {
 		return err
 	}
-	frame, _ := json.Marshal(ConsoleInFrame{MessageID: conversationTokenPrefix + "-" + hex.EncodeToString(id), Text: text})
+	frame, err := consoleFrame(conversationTokenPrefix+"-"+hex.EncodeToString(id), text)
+	if err != nil {
+		return err
+	}
 	return b.client.Conn().Publish(fmt.Sprintf(consoleInSubject, token), frame)
+}
+
+// consoleFrameFields is every field a frame this server publishes may carry.
+// The console door reads more (gateway.ConsoleInFrame): a kind, and an
+// addressee with task parameters. Those are a human's clicks in the console
+// page, and this server speaks for a model, so it sends none of them: a stop
+// is the stop word as text, which the gateway reads as a typed message.
+//
+// This is defense in depth, not the boundary. A confirm (a turn submitted
+// with TaskParameters.ChangeRequested) is a frame on
+// chat.console.<token>.confirm, which the gateway takes from that subject
+// alone, and this server logs in as console-mcp, which holds no grant there:
+// the bus refuses the publish whatever this code sends.
+var consoleFrameFields = map[string]bool{"messageId": true, "text": true}
+
+// consoleFrame is the one way a console frame is built for publishing: from
+// a message id and the text, and checked against consoleFrameFields after
+// encoding, so a field added to ConsoleInFrame later cannot reach the bus
+// unreviewed.
+func consoleFrame(messageID, text string) ([]byte, error) {
+	frame, err := json.Marshal(ConsoleInFrame{MessageID: messageID, Text: text})
+	if err != nil {
+		return nil, err
+	}
+	if err := checkConsoleFrame(frame); err != nil {
+		return nil, err
+	}
+	return frame, nil
+}
+
+// checkConsoleFrame refuses an encoded frame carrying any field outside
+// consoleFrameFields: a kind of any value (above all "confirm"), an
+// addressee, parameters.
+func checkConsoleFrame(frame []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(frame, &fields); err != nil {
+		return fmt.Errorf("console frame: %w", err)
+	}
+	for k := range fields {
+		if !consoleFrameFields[k] {
+			return fmt.Errorf("console frame: field %q is not one this server sends", k)
+		}
+	}
+	return nil
 }
 
 // noticeText is a frame's text when it is a gateway notice about a turn, and

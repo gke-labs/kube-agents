@@ -35,6 +35,11 @@ const defaultMaxSessions = 10
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
 
+// defaultScopeFile is where the operator projects the install's rendered
+// spec.scope into the gateway pod: the same scope.json, at the same path, the
+// platform agent reads.
+const defaultScopeFile = "/etc/kube-agents/scope.json"
+
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
 const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
@@ -274,6 +279,16 @@ type Config struct {
 	// platform persona widens from the holders of the agent's own API key to
 	// anyone holding pods/portforward in the namespace.
 	InjectToken string
+
+	// InjectConfirm (A2A_INJECT_CONFIRM, "true" and nothing else) lets the
+	// inject door take intent "confirm", which submits the turn with a
+	// change requested (TaskParameters.ChangeRequested). Off, the door
+	// refuses that intent with a 400. The door's caller is the eval
+	// harness, a program, so a confirm over it is automation by design and
+	// belongs only on an install armed for evals: the operator renders this
+	// beside A2A_INJECT_LISTEN under the same flag (A2A_INJECT_BACKEND on
+	// the operator), and a door armed by hand without it cannot confirm.
+	InjectConfirm bool
 
 	// InjectPrincipalMapPath is the door's OWN principal map
 	// (A2A_INJECT_PRINCIPAL_MAP), separate from PrincipalMapPath and never a
@@ -609,6 +624,19 @@ type Config struct {
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
 
+	// ScopeFile is the rendered spec.scope a profile task's target is
+	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
+	// routed task, so an edit reaches the gateway without a restart. A
+	// missing or unreadable file refuses every target.
+	ScopeFile string
+
+	// ManagementProject is the install's own project
+	// (A2A_MANAGEMENT_PROJECT, spec.harness.projectId). checkTargetScope
+	// admits it whatever the scope lists, and ignores an exclude.projects
+	// entry that matches it, as the reconcile does. Empty admits nothing
+	// extra.
+	ManagementProject string
+
 	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
 	// turn before the gateway marks the turn's status line queued
 	// (A2A_BUSY_NOTICE_AT). The count is the fixed addressee's outstanding
@@ -700,6 +728,8 @@ func FromEnv() (*Config, error) {
 		AuthorityTier:         capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:        capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
 		CapabilityOptional:    capability.OptionalFromEnv(),
+		ScopeFile:             envOr("A2A_SCOPE_FILE", defaultScopeFile),
+		ManagementProject:     os.Getenv("A2A_MANAGEMENT_PROJECT"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -747,6 +777,10 @@ func FromEnv() (*Config, error) {
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)
+	cfg.InjectConfirm = os.Getenv("A2A_INJECT_CONFIRM") == "true"
+	if cfg.InjectConfirm && cfg.InjectListen == "" {
+		return nil, fmt.Errorf("A2A_INJECT_CONFIRM is set but the inject door is not armed (A2A_INJECT_LISTEN)")
+	}
 	cfg.A2ADoorListen = strings.TrimSpace(os.Getenv("A2A_DOOR_LISTEN"))
 	cfg.ConsoleDoor = os.Getenv("A2A_CONSOLE_DOOR") == "true"
 	cfg.A2ADoorToken = strings.TrimSpace(os.Getenv("A2A_DOOR_TOKEN"))

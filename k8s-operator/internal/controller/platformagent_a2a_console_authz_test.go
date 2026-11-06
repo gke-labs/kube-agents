@@ -240,3 +240,62 @@ func TestConsoleGrantOnARealServer(t *testing.T) {
 		t.Logf("%-48s refused (server: Subscription Violation)", "chat.console.tab-1.in (subscribe)")
 	}
 }
+
+// TestConsoleMCPOffTheConfirmDoorOnARealServer adds to
+// TestConsoleGrantOnARealServer what it does not prove about console-mcp, on
+// the rendered config: console-mcp reads the gateway's answer on
+// chat.console.*.out; its refused publish on chat.console.*.confirm never
+// reaches a gateway subscribed there (not only that the server logs the
+// violation); and its subscribes on .confirm and on the human console's
+// inbox are refused.
+func TestConsoleMCPOffTheConfirmDoorOnARealServer(t *testing.T) {
+	creds := a2aFullCreds("d", "1")
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
+	s, log := a2aStartRenderedServer(t, conf)
+	a2aProvisionLikeTheScript(t, s.ClientURL(), string(creds.Data["seed-password"]))
+	mcp, _ := a2aConnectAs(t, s.ClientURL(), a2aConsoleMCPUser, string(creds.Data[a2aConsoleMCPPasswordKey]))
+	gw, _ := a2aConnectAs(t, s.ClientURL(), "gateway", string(creds.Data["gateway-password"]))
+
+	confirmSub, err := gw.SubscribeSync("chat.console.*.confirm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outSub, err := mcp.SubscribeSync("chat.console.tab-c.out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, nc := range []interface{ Flush() error }{gw, mcp} {
+		if err := nc.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Allowed: console-mcp reads the gateway's answer.
+	if err := gw.Publish("chat.console.tab-c.out", []byte("answer")); err != nil {
+		t.Fatal(err)
+	}
+	_ = gw.Flush()
+	if _, err := outSub.NextMsg(2 * time.Second); err != nil {
+		t.Fatalf("console-mcp did not receive on .out: %v (violations: %q)", err, log.subscriptionViolations(a2aConsoleMCPUser))
+	}
+
+	// Refused: console-mcp on the confirm door, either way, and on the
+	// human console's inbox.
+	if err := mcp.Publish("chat.console.tab-c.confirm", []byte(`{"messageId":"c2","text":"open it"}`)); err != nil {
+		t.Fatal(err)
+	}
+	_ = mcp.Flush()
+	if !log.refusedPublish(a2aConsoleMCPUser, "chat.console.tab-c.confirm") {
+		t.Error("no Publish Violation logged for console-mcp on chat.console.tab-c.confirm")
+	}
+	if msg, err := confirmSub.NextMsg(300 * time.Millisecond); err == nil {
+		t.Errorf("console-mcp's confirm reached the gateway: %q", msg.Data)
+	}
+	for _, subject := range []string{"chat.console.*.confirm", "_INBOX.console.>"} {
+		_, _ = mcp.SubscribeSync(subject)
+		_ = mcp.Flush()
+		if !log.refusedSubscribe(a2aConsoleMCPUser, subject) {
+			t.Errorf("console-mcp could subscribe %s", subject)
+		}
+	}
+}

@@ -2388,6 +2388,86 @@ Mutation(
         "infrastructure",
     ),
     Mutation(
+        "A3-bridge-writes-stop-records",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.stop.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' stop records, so the "
+        "platform agent can stop a profile task it delegated. It can then stop "
+        "tasks other requesters started",
+    ),
+    Mutation(
+        "A3-bridge-submits-profile-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.submit.*.*.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' submit subject, so the "
+        "platform agent can hand a profile work without a gateway hop. It "
+        "then starts tasks under grants the gateway never minted for them",
+    ),
+    Mutation(
+        "A3-session-submits-profile-tasks",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskSubmitSubject("*", "*", "*", "*"),\n\t\t},'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "derive every executor a grant on profiles' submit subject, the "
+        "shortcut a worker delegating straight to a profile would take. A "
+        "worker can then start tasks of its own outside the gateway's checks",
+    ),
+    Mutation(
+        "A3-console-mcp-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t\t"chat.console.*.in",\n\t\t\t"_INBOX." + a2aConsoleMCPUser + ".>",',
+         '\t\t\t"chat.console.*.in",\n\t\t\ta2aConsoleConfirmSubject,\n\t\t\t"_INBOX." + a2aConsoleMCPUser + ".>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the console MCP server's user the console's confirm door, so "
+        "an IDE agent can confirm the change it just proposed. A model can "
+        "then grant its own task the permit to open a pull request",
+    ),
+    Mutation(
+        "A3-session-derives-all-chat",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\t"chat.>",\n\t\t},'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "derive every executor publish on `chat.>` so a worker can post its "
+        "own progress to a chat surface. It never spells `chat.console`, and "
+        "it reaches the console's confirm door all the same",
+    ),
+    Mutation(
+        "A3-dispatcher-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"chat.console.*.confirm",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the AgentProfile dispatcher the console's confirm door, so it "
+        "can confirm a queued change on the requester's behalf. Its identity "
+        "is built in its own file, outside the identities file the writer "
+        "sets used to read",
+    ),
+    Mutation(
+        "A3-dispatcher-stops-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ('\t\t\t"a2a.cap.verify."+a2aDispatcherUser,',
+         '\t\t\t"a2a.cap.verify."+a2aDispatcherUser,\n\t\t\t"a2a.stop.*.*",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the dispatcher publish on stop records, so it can drop a "
+        "queued task itself on a deadline. It can then stop any requester's task",
+    ),
+    Mutation(
+        "A3-bridge-confirms",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"chat.console.*.confirm",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_console_confirm_subject_has_exactly_one_writer",
+        "grant the static bridge publish on the console's confirm door, so the "
+        "platform agent can confirm a card's proposed change itself. A task "
+        "can then grant itself the change permit",
+    ),
+    Mutation(
         "A3-bridge-sends-a-notify",
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',

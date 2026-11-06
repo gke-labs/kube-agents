@@ -459,6 +459,14 @@ SOURCES: dict[str, Source] = {
     # file also holds one half of a contract neither module can import: the
     # operator renders an env var naming the agent's principal, and the `a2a`
     # CLI reads it back to pin its inbox prefix.
+    # The AgentProfile dispatcher's identity is built in its own file. It
+    # authenticates through the callout, so it is in no served config, and
+    # its publish list is appended to a per-profile slice that the identity
+    # reader above can't parse; the writer tests read its body directly.
+    "a2a_dispatcher": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ("func dispatcherIdentity(", "a2a.dispatch.*.*.*"),
+    ),
     "a2a_identities": Source(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         (
@@ -469,6 +477,18 @@ SOURCES: dict[str, Source] = {
             "a2aBusUserEnv",
             "a2aAgentBusUser",
             "a2aBridgeUser",
+        ),
+    ),
+    # The AgentProfile dispatcher's identity is built in its own file, from the
+    # profiles and durables the authmap lists, and joins the identity map
+    # beside the rows above. A writer set read from the identities file alone
+    # leaves it out of every one-writer assertion.
+    "a2a_dispatcher": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        (
+            "func dispatcherIdentity(",
+            "a2aDispatcherUser",
+            "var perProfile []string",
         ),
     ),
     # The JetStream halves of the publish lists live in the manifests file, and

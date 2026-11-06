@@ -33,8 +33,17 @@ import (
 // here as it happens; .out is core NATS, so a frame missed across a restart
 // is recovered from TASKS, which the console identity can read.
 //
+// A confirm (IntentConfirm) has a subject of its own,
+// chat.console.<token>.confirm, which only the human console user may
+// publish on: the console MCP server holds a separate identity
+// (console-mcp) with the same frame door on .in and no grant on .confirm,
+// so a model driving it cannot confirm a change. A frame on .in never
+// carries the intent, whatever its kind says.
+//
 // Identity is the grant. Only the `console` user may publish on
-// chat.console.*.in (the operator's consoleIdentity), so the sender IS
+// chat.console.*.confirm, and only `console` and `console-mcp` on
+// chat.console.*.in (the operator's consoleIdentity and
+// consoleMCPIdentity), so the sender IS
 // consoleAuthor and resolves to consolePrincipal with no mapping table in
 // between - the same subject-derived identity every other writer on this bus
 // has. One shared principal is the posture until the account split.
@@ -46,6 +55,22 @@ const (
 	consoleKeyPrefix  = "console:"
 
 	consoleInSubjectWildcard = "chat.console.*.in"
+	// consoleConfirmSubjectWildcard is the confirm door: a frame here is
+	// the same ask as one on .in, sent with IntentConfirm. It is the
+	// operator's a2aConsoleConfirmSubject (platformagent_a2a_identities.go),
+	// spelled again because the modules cannot import each other.
+	consoleConfirmSubjectWildcard = "chat.console.*.confirm"
+	// consoleInSuffix and consoleConfirmSuffix are the last subject token
+	// of each door, which is how inbound tells them apart.
+	consoleInSuffix      = "in"
+	consoleConfirmSuffix = "confirm"
+	// consoleSubjectRoot and consoleSubjectFamily are the first two subject
+	// tokens every console door carries; inbound checks them before it
+	// reads the door, so a frame on any other subject is not a console turn.
+	consoleSubjectRoot   = "chat"
+	consoleSubjectFamily = "console"
+	// consoleSubjectTokens is the token count of a console door subject.
+	consoleSubjectTokens = 4
 
 	// consoleConnName is the adapter's NATS connection name, and the
 	// "console" field on its connection-state log lines.
@@ -132,13 +157,22 @@ const (
 	consoleQueueFullNotice = "⚠️ %d messages are already waiting in this conversation, so new ones are dropped until it catches up"
 )
 
-// ConsoleInFrame is what the browser publishes. Kind is empty or "text";
-// it is the seam for gateway-side commands later, and a frame of any other
-// kind is dropped (logged, no notice) rather than forwarded as an ask.
+// ConsoleInFrame is what the browser publishes, on chat.console.<token>.in
+// for a typed message or chat.console.<token>.confirm for a click on a
+// confirm button: the same ask, sent with IntentConfirm, so its task may
+// make the change it confirms. The subject, never the frame, carries the
+// confirm. Kind is empty or "text" on either; a frame of any other kind
+// (including "confirm") is dropped (logged, no notice) rather than
+// forwarded as an ask.
 type ConsoleInFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
 	Kind      string `json:"kind,omitempty"`
+	// Addressee, when set, names the AgentProfile the turn is for, and
+	// Parameters are its task parameters (InboundMessage.Profile). Absent,
+	// the turn goes to the conversation's route, as every page turn does.
+	Addressee  string            `json:"addressee,omitempty"`
+	Parameters map[string]string `json:"parameters,omitempty"`
 }
 
 // ConsoleOutFrame is what the gateway publishes back. Edit true means
@@ -280,6 +314,11 @@ type ConsoleAdapter struct {
 // "Permissions Violation for Publish to \"<subject>\"" line.
 var consolePublishViolationRe = regexp.MustCompile(`for Publish to "(\S+)"`)
 
+// consoleSubscribeViolationRe pulls the subject out of nats-server's
+// "Permissions Violation for Subscription to \"<subject>\"" line, which is
+// how a refusal names which of the adapter's two subscriptions it hit.
+var consoleSubscribeViolationRe = regexp.MustCompile(`for Subscription to "(\S+)"`)
+
 // NewConsoleAdapter dials the bus with the gateway's own options. The async
 // error handler is the whole point of owning the connection: a subscribe
 // refused by the server (a NATS render that predates the console identity)
@@ -304,17 +343,20 @@ func NewConsoleAdapter(url string, natsOpts []nats.Option, log *slog.Logger) (*C
 			}
 			// nats.go's transient-error path hands a nil sub for every
 			// permissions violation, so the subject comes from the error
-			// text, or from the one subscription this adapter makes.
+			// text, or failing that from the .in subscription.
 			if m := consolePublishViolationRe.FindStringSubmatch(err.Error()); m != nil {
 				log.Error("console publish refused: the NATS config predates the console identity, or the NATS pod has not rolled onto the new config yet; notices and terminal frames are lost until the config carries chat.console.*.out for the gateway",
 					"subject", m[1], "err", err)
 				return
 			}
 			subject := consoleInSubjectWildcard
+			if m := consoleSubscribeViolationRe.FindStringSubmatch(err.Error()); m != nil {
+				subject = m[1]
+			}
 			if sub != nil {
 				subject = sub.Subject
 			}
-			log.Error("console subscription refused: the NATS config predates the console identity, or the NATS pod has not rolled onto the new config yet; the subscription is resent on reconnect and recovers once the config carries chat.console.*.in for the gateway",
+			log.Error("console subscription refused: the NATS config predates the console identity, or the NATS pod has not rolled onto the new config yet; the subscription is resent on reconnect and recovers once the config carries chat.console.*.in and chat.console.*.confirm for the gateway",
 				"subject", subject, "err", err)
 		}),
 		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
@@ -379,7 +421,7 @@ func (a *ConsoleAdapter) signalClosed() {
 	a.closedOnce.Do(func() { close(a.closedCh) })
 }
 
-// subscribed reports whether Run has bound its subscription (tests).
+// subscribed reports whether Run has bound its subscriptions (tests).
 func (a *ConsoleAdapter) subscribed() bool { return a.subscribedFlag.Load() }
 
 // closed reports whether the connection has been closed (tests).
@@ -391,7 +433,7 @@ func (a *ConsoleAdapter) closed() bool { return a.nc != nil && a.nc.IsClosed() }
 // the relay may still be rendering onto it, and the caller closes it (Close;
 // Gateway.Run does once its relay drain is done).
 //
-// The subscription is plain core NATS with no queue group, so every gateway
+// The subscriptions are plain core NATS with no queue group, so every gateway
 // process holding the console identity answers every frame rather than one
 // of them taking it. The deployment is single-replica with a Recreate
 // strategy (platformagent_a2a_manifests.go, a2aGatewayRecreateStrategyPatch),
@@ -400,7 +442,7 @@ func (a *ConsoleAdapter) closed() bool { return a.nc != nil && a.nc.IsClosed() }
 // replica, or a developer's gateway on a port-forward, becomes a second
 // subscriber on the same door.
 func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
-	sub, err := a.nc.Subscribe(consoleInSubjectWildcard, func(m *nats.Msg) {
+	deliver := func(m *nats.Msg) {
 		msg, notice, ok := a.inbound(m)
 		if notice != "" {
 			// Best effort; the frame was already refused.
@@ -409,9 +451,20 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 		if ok {
 			handler(msg)
 		}
-	})
-	if err != nil {
-		return fmt.Errorf("console adapter: subscribe: %w", err)
+	}
+	var subs []*nats.Subscription
+	unsubscribe := func() {
+		for _, sub := range subs {
+			_ = sub.Unsubscribe()
+		}
+	}
+	for _, subject := range []string{consoleInSubjectWildcard, consoleConfirmSubjectWildcard} {
+		sub, err := a.nc.Subscribe(subject, deliver)
+		if err != nil {
+			unsubscribe()
+			return fmt.Errorf("console adapter: subscribe %s: %w", subject, err)
+		}
+		subs = append(subs, sub)
 	}
 	if err := a.nc.Flush(); err != nil {
 		return fmt.Errorf("console adapter: flush: %w", err)
@@ -433,7 +486,7 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 			runErr = errors.New("console adapter: connection closed for good")
 		}
 	}
-	_ = sub.Unsubscribe()
+	unsubscribe()
 	// On a stop the connection stays open: ingress has ended, but the
 	// relay may still be rendering a batch onto it, and the gateway closes
 	// it once that drain is done (Gateway.Run).
@@ -448,9 +501,13 @@ func (a *ConsoleAdapter) Run(ctx context.Context, handler func(InboundMessage)) 
 // Every drop is logged: a silent drop of a real user is the failure the
 // gateway's own drop notice exists to avoid.
 func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
-	// Subject is chat.console.<token>.in; the token is the third field.
+	// Subject is chat.console.<token>.in or chat.console.<token>.confirm;
+	// the token is the third field and the door the fourth. The prefix is
+	// checked here too, not left to the subscription: the door decides the
+	// intent, so it is read only off a subject that is a console door.
 	parts := strings.Split(m.Subject, ".")
-	if len(parts) != 4 {
+	if len(parts) != consoleSubjectTokens || parts[0] != consoleSubjectRoot || parts[1] != consoleSubjectFamily ||
+		(parts[3] != consoleInSuffix && parts[3] != consoleConfirmSuffix) {
 		a.log.Warn("console frame dropped", "reason", "subject shape", "subject", m.Subject)
 		return InboundMessage{}, "", false
 	}
@@ -484,9 +541,20 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 	// one: the console runs beside whichever chat backend the process was
 	// configured for, so a frame that said nothing would be attributed to
 	// that backend and verified against its mapping table (Gateway.backendFor).
+	// The addressee is sender-chosen and becomes a subject token, so it is
+	// held to a profile name's shape here; the parameters are checked where
+	// the turn is routed (resolveProfile), which says why in the room.
+	if f.Addressee != "" && !lib.ValidSubjectToken(f.Addressee) {
+		a.log.Warn("console frame dropped", "reason", "addressee", "addressee", truncateRunes(f.Addressee, consoleMessageIDCap), "conversation", conversation, "messageId", f.MessageID)
+		return InboundMessage{}, "", false
+	}
 	msg := InboundMessage{
 		Conversation: conversation, Kind: "dm", Backend: consoleBackend,
 		AuthorID: consoleAuthor, MessageID: f.MessageID,
+		Profile: f.Addressee, Parameters: f.Parameters,
+	}
+	if parts[3] == consoleConfirmSuffix {
+		msg.Intent = IntentConfirm
 	}
 	if len(text) > consoleTextCap {
 		a.log.Warn("console frame dropped", "reason", "oversize", "conversation", conversation, "messageId", f.MessageID, "bytes", len(text))

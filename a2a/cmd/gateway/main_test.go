@@ -776,3 +776,19 @@ func TestTheStandbyAnswersOnEveryArmedDoor(t *testing.T) {
 		t.Fatalf("standby listens %v", got)
 	}
 }
+
+// The inject door takes intent "confirm" exactly when the config says so:
+// realMain builds it through newInjectDoor, which must arm AllowConfirm for
+// A2A_INJECT_CONFIRM=true and leave it off otherwise.
+func TestNewInjectDoorArmsConfirmOnlyUnderItsFlag(t *testing.T) {
+	for _, confirm := range []bool{false, true} {
+		cfg := &gateway.Config{InjectListen: "127.0.0.1:0", InjectToken: "tok", InjectConfirm: confirm}
+		door, err := newInjectDoor(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatalf("InjectConfirm=%v: %v", confirm, err)
+		}
+		if got := door.ConfirmAllowed(); got != confirm {
+			t.Errorf("InjectConfirm=%v: door ConfirmAllowed = %v, want %v", confirm, got, confirm)
+		}
+	}
+}

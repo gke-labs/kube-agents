@@ -196,7 +196,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// token only under its eval flag. See a2a/gateway/inject.go.
 	var doors []gateway.DoorSpec
 	if cfg.InjectArmed() {
-		door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+		door, err := newInjectDoor(cfg, log)
 		if err != nil {
 			log.Error("inject door", "err", err)
 			return err
@@ -478,4 +478,18 @@ func startMetricsListener(ctx context.Context, cfg *gateway.Config, metrics *gat
 			log.Error(metricsUnavailableAlert, "err", err)
 		}
 	}()
+}
+
+// newInjectDoor builds the inject door from the config, armed for intent
+// "confirm" only when A2A_INJECT_CONFIRM is set (Config.InjectConfirm). It is
+// realMain's one route to the door, split out so the wiring is testable.
+func newInjectDoor(cfg *gateway.Config, log *slog.Logger) (*gateway.InjectAdapter, error) {
+	door, err := gateway.NewInjectAdapter(cfg.InjectListen, cfg.InjectToken, cfg.FirstEventGrace, log)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.InjectConfirm {
+		door.AllowConfirm()
+	}
+	return door, nil
 }
