@@ -2211,7 +2211,11 @@ KCC_STALLED_MARK_PREFIX = "**Config Connector is not applying "
 KCC_STALLED_NOTE_MARK = KCC_STALLED_MARK_PREFIX + "this file.**"
 # Each paragraph is a core and a tail. The tail is the part a note can lose
 # when the core does not fit otherwise (`_fit_kcc_paragraph`).
-KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + " When the audit ran, Config Connector reported {objects}."
+# What follows the first sentence in every paragraph `finish` writes, in each
+# form and at each step of `KCC_PARAGRAPH_STEPS`. The strip pattern requires
+# it, so a worker sentence that only starts like the paragraph stays.
+KCC_STALLED_CONTINUATION = " When the audit ran, Config Connector reported "
+KCC_STALLED_NOTE_CORE = KCC_STALLED_NOTE_MARK + KCC_STALLED_CONTINUATION + "{objects}."
 KCC_STALLED_NOTE_TAIL = (
     "The cloud resource does not change after the merge until Config Connector applies the object again. "
     "If the reason rejects the change in this file, correct the declaration. Otherwise the change takes "
@@ -2226,7 +2230,7 @@ KCC_STALLED_NOTE = KCC_STALLED_NOTE_CORE + " " + KCC_STALLED_NOTE_TAIL
 # that file (`KCC_STALLED_DECLARED_MARK`); otherwise it is
 # `KCC_STALLED_OBJECT_MARK` and the paragraph names no file.
 KCC_STALLED_DECLARED_MARK = KCC_STALLED_MARK_PREFIX + "{path}.**"
-KCC_STALLED_DECLARED_CORE = KCC_STALLED_DECLARED_MARK + " When the audit ran, Config Connector reported {objects}."
+KCC_STALLED_DECLARED_CORE = KCC_STALLED_DECLARED_MARK + KCC_STALLED_CONTINUATION + "{objects}."
 KCC_STALLED_OBJECT_TAIL = (
     "Config Connector does not apply the object until that reason is gone, so a change to the declaration "
     "does not take effect before then, and this finding comes back on each run until then."
@@ -2235,7 +2239,7 @@ KCC_STALLED_DECLARED_NOTE = (
     KCC_STALLED_DECLARED_CORE + " " + KCC_STALLED_OBJECT_TAIL + " If the reason rejects the declaration, correct it there."
 )
 KCC_STALLED_OBJECT_MARK = KCC_STALLED_MARK_PREFIX + "the declaration of this object.**"
-KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + " When the audit ran, Config Connector reported {objects}. {search}"
+KCC_STALLED_UNDECLARED_CORE = KCC_STALLED_OBJECT_MARK + KCC_STALLED_CONTINUATION + "{objects}. {search}"
 # What the paragraph says when it names no file: that more than one file
 # declares the object, or only that it names none. It never says that no
 # file declares the object: a search can skip a file it cannot parse (a
@@ -2254,15 +2258,18 @@ KCC_STALLED_PARAGRAPH_FIELD = "kcc_stalled_paragraph"
 # An earlier copy of either paragraph, which a worker can copy from the
 # previous ledger. The pass removes it from every note and writes it again
 # when the stall is still there, as the route-note pass does with its notes.
-# Each first sentence is matched to its exact end, so a worker sentence that
-# only starts the same way is not a copied paragraph: "this file.**", "the
+# Each first sentence is matched to its exact end ("this file.**", "the
 # declaration of this object.**", or a file in a code span, also with
-# " in the repository `<repo>`" (`KCC_STALLED_DECLARED_MARK`,
-# `KCC_DECLARATION_IN_REPO`). The rest of the paragraph's line goes with it.
+# " in the repository `<repo>`": `KCC_STALLED_DECLARED_MARK`,
+# `KCC_DECLARATION_IN_REPO`), and then the text every paragraph `finish`
+# writes goes on with (`KCC_STALLED_CONTINUATION`). So a worker sentence that
+# only starts the same way is not a copied paragraph. The rest of the
+# paragraph's line goes with it.
 KCC_STALLED_NOTE_PATTERN = re.compile(
     r"[ \t]*"
     + re.escape(KCC_STALLED_MARK_PREFIX)
     + r"(?:this file\.\*\*|the declaration of this object\.\*\*|`[^`\n]+`(?: in the repository `[^`\n]+`)?\.\*\*)"
+    + re.escape(KCC_STALLED_CONTINUATION)
     + r"[^\n]*"
 )
 # What the merged-but-persisting line and comment say in place of the two

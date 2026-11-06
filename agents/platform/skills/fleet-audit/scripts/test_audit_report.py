@@ -23717,6 +23717,41 @@ metadata:
                 audit_report._strip_kcc_stalled_note(remediation)
                 self.assertEqual(remediation["note"], "Do it.")
 
+    def test_a_worker_sentence_with_a_code_span_is_not_stripped(self):
+        """Review finding: the first-sentence pattern took any code span, so a
+        worker sentence that names an object in one lost the sentence and the
+        rest of its line, and the log called it a copied paragraph. A copied
+        paragraph is one that goes on as `finish` writes it."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying `pinned-inference-pool`.** "
+                  "Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+            audit_report.disclose_manual_routes_and_log([finding], kcc_manifest(), set())
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("copied", err.getvalue())
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_paragraph_finish_writes_is_stripped(self):
+        """Every step of each paragraph form, the context-repository form
+        included, is stripped and written again."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        texts = [audit_report.KCC_STALLED_NOTE.format(objects=objects), audit_report.KCC_STALLED_NOTE_CORE.format(objects=objects)]
+        for path in ("`a/b.yaml`", "`a/b.yaml` in the repository `acme/infra`"):
+            texts += [audit_report.KCC_STALLED_DECLARED_NOTE.format(path=path, objects=objects),
+                      audit_report.KCC_STALLED_DECLARED_CORE.format(path=path, objects=objects)]
+        for search in (audit_report.KCC_DECLARATION_NOT_NAMED, audit_report.KCC_DECLARATION_SEARCH_MANY.format(count=2)):
+            texts += [audit_report.KCC_STALLED_UNDECLARED_NOTE.format(search=search, objects=objects),
+                      audit_report.KCC_STALLED_UNDECLARED_CORE.format(search=search, objects=objects)]
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + text}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, {})
