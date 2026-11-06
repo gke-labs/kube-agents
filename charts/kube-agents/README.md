@@ -565,8 +565,14 @@ itself. With `webConsole.environment.enabled` (the default) the chart also
 renders the console's ServiceAccount, a ClusterRole that lists nodes,
 namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
 gets/patches the `PlatformAgent` resource (for repository topology, preferred
-model annotations, and applied PR annotations). `values.yaml` describes
-each toggle. The
+model annotations, and applied PR annotations). `webConsole.resources` is
+sized to run under its requests, which is what GKE Autopilot without Pod
+bursting clamps the limits to; the console reads the memory limit the cluster
+admitted through the Downward API and sets its Go soft memory limit to nine
+tenths of it. For a busier console raise `webConsole.resources.requests.memory`
+under that clamp, where the request is the ceiling, and `limits.memory` where
+bursting is on and the limit is. `values.yaml`
+describes each toggle. The
 [Web console page](https://gke-labs.github.io/kube-agents/deploy/web-console/)
 is canonical for what it does and how it is reached.
 
@@ -1387,9 +1393,11 @@ old defaults. An explicit limit under 512Mi, in a values file or `extra_helm_val
 every path: raise it to 512Mi or more, or drop the key. The operator reads whatever limit is
 rendered through the Downward API and sets its Go soft memory limit to nine tenths of it, so a
 larger cluster raises this one value. On GKE Autopilot the floor still applies. A cluster without
-bursting raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, and sets the limits equal to
-the requests, so the manager runs under at least 512Mi there and the admitted pod differs from the
-rendered manifest. A cluster with bursting admits the manifest as rendered.
+bursting sets the limits equal to the requests, so the manager runs under its memory request, 256Mi
+by default, and `operator.resources.requests.memory` is the value to raise there; where Autopilot
+also raises the Pod to its per-Pod minimums, 250m CPU and 512 MiB, the manager runs under 512Mi
+and the admitted pod differs from the rendered manifest. Either way the manager reads the admitted
+limit. A cluster with bursting admits the manifest as rendered.
 
 ### Optional AgentProfiles (`profiles.tse`, `profiles.cluster`)
 
