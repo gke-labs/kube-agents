@@ -1204,6 +1204,15 @@
 # FIXTURE_NOT_READY entry.
 ./tasks/obtainability-major-pdb-auto-pr/task.yaml
 
+# A card that asks only for the install's usage summary is answered by the
+# kube-agents-feedback skill's summary subcommand (docs/designs/
+# chat-feedback-command.md §8, #4723): the result carries the script's
+# audited block, rating form cut, and nothing is filed. The worker's half of
+# the opt-in, measured as a plain ask. deployer: noop, no fixtures, one
+# resource read. Nightly from its first merge; a presubmit seat waits on a
+# clean nightly record.
+./tasks/platform-feedback-usage-summary-card/task.yaml
+
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its
 # tool results or from the card's run row, not under the 250 the fleet audits
