@@ -84,6 +84,15 @@ verification_spec:
       # either way — the case-format doc's HPA/HorizontalPodAutoscaler rule.
       required_phrases: ["checkout-gateway"]
       any_of_phrases: ["PodDisruptionBudget", "PDB"]
+      # The overstated single-drain claim this case once accepted: one drain
+      # evicts only the replicas on that node. Phrased narrowly, so a correct
+      # answer about back-to-back drains during an upgrade ("could evict both
+      # replicas") still passes. The last entry is the audit's old sentence.
+      forbidden_phrases:
+        - "one drain can evict both"
+        - "single drain can evict both"
+        - "one node drain can evict both"
+        - "single node drain during an upgrade can terminate every replica"
   # Cluster-state safeguard: "the fleet came out the way it went in."
   # tool_called cannot see worker mutations (it counts the delegating turn
   # by default, and even under scope: workers a call is intent, not
