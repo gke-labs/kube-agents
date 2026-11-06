@@ -1235,15 +1235,12 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if rec.Deadline.IsZero() {
 		// A record with no offer terms (an unreadable one decodes as written
 		// at its entry's write, decodeLease): the profile's current limit
-		// from the confirm, or from now when the record names no time at
-		// all, or the first tick would fail a live task before the restart
-		// grace could protect it.
+		// from the confirm, or from the renewal for a record that names no
+		// confirm. Every running record decodeLease returns has a renewal,
+		// so the limit always counts from a time the record gives.
 		started := rec.ConfirmedAt
 		if started.IsZero() {
 			started = rec.RenewedAt
-		}
-		if started.IsZero() {
-			started = d.now()
 		}
 		rec.Deadline = started.Add(seconds(prof.ActiveDeadlineSeconds))
 	}

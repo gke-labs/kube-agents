@@ -3,10 +3,14 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	natsserver "github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -208,5 +212,68 @@ func TestADroppedProfilesTerminalIsGivenUpOnAfterABound(t *testing.T) {
 	defer cancelShort()
 	if d2.publishTerminalRetry(short, quietLog(), del, h, lib.StateFailed, "lease expired", "") {
 		t.Errorf("a listed profile's refused terminal was given up on")
+	}
+}
+
+// d.sweep reads the bucket in one pass: a watch's initial values cost a
+// handful of messages on the dispatcher's connection whatever the bucket
+// holds, where a round trip per record costs one request each. Counted on
+// the connection, not timed, so a loaded CI runner can't flake it. The
+// tombstones are inside the retention, so the sweep deletes none and no
+// delete is counted.
+func TestTheSweepReadsTheBucketInOnePass(t *testing.T) {
+	const tombstones = 500
+	b := newBus(t, "tse-0")
+	finished := time.Now()
+	for i := range tombstones {
+		data, _ := json.Marshal(lib.LeaseRecord{TaskID: fmt.Sprintf("old-%d", i), Pod: "tse-old", Kind: lib.SubmitKindTop,
+			ConfirmedAt: finished, RenewedAt: finished, ExpiresAt: finished, FinishedAt: finished})
+		if _, err := b.js.PublishAsync("$KV."+lib.ProfileLeaseBucket+"."+lib.ProfileLeaseKey("tse", "read", "tse-old", fmt.Sprintf("old-%d", i)), data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-b.js.PublishAsyncComplete():
+	case <-time.After(30 * time.Second):
+		t.Fatal("seeding the tombstones")
+	}
+	ti := oneProfile("tse", 2, "tse-0")
+	conn := b.connect("dispatcher")
+	d, err := New(testConfig(), conn, ti.src, ti.pool, &fakeVerifier{}, quietLog())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := conn.Conn().Stats().OutMsgs
+	d.sweep(b.ctx)
+	sent := conn.Conn().Stats().OutMsgs - before
+	if sent >= tombstones/10 {
+		t.Errorf("a sweep over %d records sent %d messages; one pass sends a handful", tombstones, sent)
+	}
+	if n := len(b.tombstones()); n != tombstones {
+		t.Errorf("%d tombstones left, want all %d (each inside the retention)", n, tombstones)
+	}
+}
+
+// A sweep whose pass is cut short says so, rather than skip the rest
+// without a word. Here the watch itself is refused: the connection may
+// look the bucket up but not create the watch's consumer.
+func TestASweepCutShortSaysSo(t *testing.T) {
+	noWatch := []*natsserver.User{{Username: "disp-nowatch", Password: dispPass, Permissions: &natsserver.Permissions{
+		Publish: &natsserver.SubjectPermission{Allow: []string{">"},
+			Deny: []string{"$JS.API.CONSUMER.CREATE.KV_" + lib.ProfileLeaseBucket + ".>", "$JS.API.CONSUMER.CREATE.KV_" + lib.ProfileLeaseBucket}}}}}
+	b := newBusWith(t, noWatch, "tse-0")
+	b.putUnreadable("tse", "read", "tse-0", "task-1")
+	var g grantSwitch
+	g.set("disp-nowatch")
+	ti := oneProfile("tse", 2, "tse-0")
+	logs := &syncBuffer{}
+	d, err := New(testConfig(), b.connectAs(&g), ti.src, ti.pool, &fakeVerifier{},
+		slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.sweep(b.ctx)
+	if out := logs.String(); !strings.Contains(out, "lease sweep cut short") {
+		t.Errorf("a sweep whose watch was refused logged %q; want it said cut short", out)
 	}
 }
