@@ -212,7 +212,7 @@ func writeReports(sb *strings.Builder, out TurnOutcome, token string) {
 		fmt.Fprintf(sb, "\nThe turn's tasks were still running when the wait ended, so the card reports shown are only those that "+
 			"had arrived by then (%d); %s.\n", len(out.Reports), later)
 	case reportsNoCards:
-		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the gateway's result for task %s said no work was handed to cards, "+
+		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the gateway's result for task %s said no cards were left pending, "+
 			"so gathering stopped at once; %s.\n", cell(out.Root.TaskID), later)
 	case reportsNoCardSignal:
 		fmt.Fprintf(sb, "\nThe turn's tasks ended with no handoff or card subtask seen on them, and no result from the gateway "+

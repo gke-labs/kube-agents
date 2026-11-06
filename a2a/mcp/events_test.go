@@ -1034,7 +1034,7 @@ func TestAResultWithoutCardsEndsGatheringAtOnce(t *testing.T) {
 	if elapsed := time.Since(start); elapsed >= 4*time.Second {
 		t.Errorf("the turn took %s; a result without cards pending should end gathering at once", elapsed)
 	}
-	mustContain(t, text, answerText, "the gateway's result for task `task-root1` said no work was handed to cards, so gathering stopped at once")
+	mustContain(t, text, answerText, "the gateway's result for task `task-root1` said no cards were left pending, so gathering stopped at once")
 }
 
 // A streamed turn that ends with no card signal stops gathering at once,
@@ -1053,7 +1053,7 @@ func TestAStreamedTurnNamesTheGatewaysResultOnlyWhenHeard(t *testing.T) {
 	var sb strings.Builder
 	writeReports(&sb, out, "tok")
 	mustContain(t, sb.String(), "no handoff or card subtask seen on them, and no result from the gateway had been heard yet, so gathering stopped at once")
-	mustNotContain(t, sb.String(), "said no work was handed to cards")
+	mustNotContain(t, sb.String(), "said no cards were left pending")
 
 	w.results[root.TaskID] = false
 	out = TurnOutcome{Root: root, Task: out.Task}
@@ -1063,7 +1063,7 @@ func TestAStreamedTurnNamesTheGatewaysResultOnlyWhenHeard(t *testing.T) {
 	}
 	sb.Reset()
 	writeReports(&sb, out, "tok")
-	mustContain(t, sb.String(), "the gateway's result for task `task-root1` said no work was handed to cards, so gathering stopped at once")
+	mustContain(t, sb.String(), "the gateway's result for task `task-root1` said no cards were left pending, so gathering stopped at once")
 }
 
 // The root's result with cardsPending gathers the card's report that comes
@@ -1106,7 +1106,7 @@ func TestAnotherTasksResultDoesNotCount(t *testing.T) {
 	}})
 	text := send(t, s, map[string]any{"text": "restart checkout", "wait_seconds": turnWaitSecs})
 	mustContain(t, text, cardReport, noResultLine)
-	mustNotContain(t, text, "said no work was handed to cards")
+	mustNotContain(t, text, "said no cards were left pending")
 }
 
 // A result frame names its root by taskId or by its r-<task> message id; a
