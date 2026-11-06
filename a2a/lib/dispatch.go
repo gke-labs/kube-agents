@@ -399,7 +399,8 @@ type DispatchProfile struct {
 	// only where the chart installed the Job admission policy, which holds
 	// each Job to it exactly. The dispatcher uses it as it is. Absent, the
 	// profile's unattended tasks have no worker (the operator builds warm
-	// pools for the read tier only) and wait until their queue timeout.
+	// pools for the read tier only) and the dispatcher refuses them
+	// no-worker at admission.
 	JobTemplate json.RawMessage `json:"jobTemplate,omitempty"`
 }
 

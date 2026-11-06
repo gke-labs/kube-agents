@@ -408,8 +408,8 @@ leave open:
   the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
   under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
   supervisor beside the gateway. The codes are
-  `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
-  admission, and `lease-expired` and `deadline-exceeded` while it holds.
+  `tier-not-allowed`, `no-worker` (an unattended task with no runner, under Job mode below),
+  `verifier-refused`, `parameters-invalid` and `queue-timeout` at admission, and `lease-expired` and `deadline-exceeded` while it holds.
 - **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
   (profile, tier), default 3, opens its breaker. A Job that never starts counts too. While it
   is open, for
@@ -436,7 +436,9 @@ leave open:
   deleted when the task's outcome is settled, never when the dispatcher stops, so a restart
   re-adopts the task.
   Without a Job runner or a Job template, an unattended task has no worker (the operator builds
-  warm pools for the read tier only) and waits until its queue timeout.
+  warm pools for the read tier only), so admission refuses it at once, `no-worker` ("no runner
+  for unattended on this install: Job mode is off"), rather than leave it queued until its
+  queue timeout. A pool that serves the tier, were there one, would take the task instead.
 
 ### Execution
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -329,6 +330,35 @@ func (b *bus) runDispatcherOpt(cfg Config, ti *testInstall, v Verifier, opt func
 	}
 	b.t.Cleanup(stop)
 	return d, stop
+}
+
+// An unattended task with nothing to run it on (no Job mode for its profile,
+// and no pod in its tier's pool, which the operator builds for the read tier
+// only) is refused no-worker at admission, rather than left queued until its
+// queue timeout (an hour here): with no JobRunner, and with one but no Job
+// template.
+func TestAnUnattendedTaskWithNoRunnerIsRefusedAtOnce(t *testing.T) {
+	for name, withJobs := range map[string]bool{"no JobRunner": false, "no Job template": true} {
+		t.Run(name, func(t *testing.T) {
+			b := newBus(t)
+			b.ensure("inv", 1, 0, "unattended")
+			ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
+			jobs := newFakeJobs(0)
+			if withJobs {
+				b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
+			} else {
+				b.runDispatcher(testConfig(), ti, &fakeVerifier{})
+			}
+			b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+			ts := b.waitTerminal("task-1", 10*time.Second)
+			if ts.state != lib.StateRejected || !hasReason(ts, ReasonNoWorker) || !strings.Contains(ts.text, "Job mode is off") {
+				t.Errorf("terminal %+v, want the dispatcher's rejected %s naming Job mode", ts, ReasonNoWorker)
+			}
+			if jobs.launchCount() != 0 {
+				t.Errorf("%d Jobs launched for a profile with no Job template", jobs.launchCount())
+			}
+		})
+	}
 }
 
 // A dispatcher stopping while an unattended task runs leaves its Job: the
