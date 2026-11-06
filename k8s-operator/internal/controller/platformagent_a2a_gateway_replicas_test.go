@@ -41,6 +41,9 @@ func TestTheGatewayReplicaCountDefaultsToTwo(t *testing.T) {
 	if got := a2aGatewayReplicas(withGatewayReplicas(a2aTestAgent(), 3)); got != 3 {
 		t.Errorf("asked for 3 = %d", got)
 	}
+	if got := a2aGatewayReplicas(withGatewayReplicas(a2aTestAgent(), 2147483647)); got != 5 {
+		t.Errorf("asked for an absurd count = %d, want the maximum 5", got)
+	}
 }
 
 // TestTheElectedImageFollowsTheRunningGateway: the condition names what the

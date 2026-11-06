@@ -156,8 +156,10 @@ spec:
                                 Set 1 where the namespace's quota has no room for the extra pod a
                                 rolling update starts. The operator renders more than one replica only
                                 once a gateway on the image it renders has taken the Lease (the
-                                GatewayElected condition), and one replica until then.
+                                GatewayElected condition), and one replica until then. At most 5: only
+                                one replica works at a time, and the count feeds the namespace pod quota.
                               format: int32
+                              maximum: 5
                               minimum: 1
                               type: integer
                           type: object

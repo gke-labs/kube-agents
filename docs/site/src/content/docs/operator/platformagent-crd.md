@@ -778,7 +778,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   `kubectl scale rs <name> -n <namespace> --replicas=0`.
 
 - `availability.a2aGateway.replicas` — the A2A gateway's replica count under `mode: next`, default
-  2, minimum 1. One replica holds the gateway's Lease and does the work; the others stand by and
+  2, minimum 1, maximum 5. One replica holds the gateway's Lease and does the work; the others stand by and
   take over within the lease's 20s if it stops. The operator renders more than one only once a
   gateway pod on the image it renders holds the Lease (the `GatewayElected` condition), and one
   with `Recreate` until then. Two or more roll with a surge pod, so the namespace's ResourceQuota

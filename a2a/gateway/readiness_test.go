@@ -290,3 +290,32 @@ func TestATermStartWaitsOutAJetStreamOutage(t *testing.T) {
 		}
 	}
 }
+
+// TestATermStartGivesUpOnItsOwnBus: a term start that can't reach the bus
+// waits, naming the bus in Readiness, but only so long: a fault local to
+// this pod would otherwise hold the Lease while a standby with a working bus
+// stands idle.
+func TestATermStartGivesUpOnItsOwnBus(t *testing.T) {
+	old := termWaitBusMax
+	termWaitBusMax = 3 * time.Second
+	t.Cleanup(func() { termWaitBusMax = old })
+	r := startRig(t)
+	r.client.Close()
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.g.BeginTerm(context.Background())
+		done <- err
+	}()
+	waitFor(t, "the bus wait in Readiness", func() bool {
+		_, why := r.g.Readiness()
+		return strings.HasPrefix(why, "waiting for the bus: the gateway's term")
+	})
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("a term start with no bus succeeded")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the term start never gave up on the bus")
+	}
+}

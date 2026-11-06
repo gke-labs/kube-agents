@@ -2306,6 +2306,9 @@ class DocumentedFootprintTest(unittest.TestCase):
                 if k not in ("agentPod", "storage", "a2aProvision")
             )
         )
+        # The gateway's standby and a rollout's surge pod (a2aGatewayStandbyPods), which the
+        # footprint can't show: no golden renders the scale-out.
+        operator_standing += 2
         headroom = operator_standing + chart_default + margin
 
         page = " ".join(self._PREREQUISITES.read_text().split())

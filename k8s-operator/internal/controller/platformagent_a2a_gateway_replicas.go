@@ -34,6 +34,9 @@ const (
 	// a2aGatewayDefaultReplicas is the replica count under next when the CR
 	// names none: the active replica and one standby.
 	a2aGatewayDefaultReplicas = int32(2)
+	// a2aGatewayMaxReplicas is the CRD's maximum, held here too for a CR an
+	// older CRD admitted: the count feeds the namespace pod quota.
+	a2aGatewayMaxReplicas = int32(5)
 	// a2aGatewayPDBMaxUnavailable lets a drain take one replica at a time.
 	a2aGatewayPDBMaxUnavailable = 1
 	// a2aGatewaySpreadTopologyKey spreads the replicas over zones, so a zone
@@ -60,7 +63,7 @@ const (
 func a2aGatewayReplicas(agent *agentv1alpha1.PlatformAgent) int32 {
 	if d := agent.Spec.Deployment; d != nil && d.Availability != nil && d.Availability.A2AGateway != nil {
 		if r := d.Availability.A2AGateway.Replicas; r != nil && *r >= 1 {
-			return *r
+			return min(*r, a2aGatewayMaxReplicas)
 		}
 	}
 	return a2aGatewayDefaultReplicas

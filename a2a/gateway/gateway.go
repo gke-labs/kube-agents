@@ -90,11 +90,19 @@ const (
 const (
 	termWaitRetry    = 2 * time.Second
 	termWaitLogEvery = 30 * time.Second
+
 	// jetstreamTemporarilyUnavailable is the JetStream API's error code for
 	// "JetStream system temporarily unavailable", while its meta leader is
 	// being elected.
 	jetstreamTemporarilyUnavailable = jetstream.ErrorCode(10008)
 )
+
+// termWaitBusMax bounds a wait on the bus (not on the bucket): a fault local
+// to this pod's path to NATS would otherwise keep the Lease here while a
+// standby whose bus works stands idle. Past it the term start fails, the
+// lease is released, and the standby takes it. A missing bucket is the same
+// for every replica, so that wait has no bound. A var so tests can shorten it.
+var termWaitBusMax = 60 * time.Second
 
 // noticeBusUnreachable says a task's publish failed: on its rolling line, or
 // posted when the backend keeps none (StatusShower).
@@ -346,7 +354,10 @@ type Gateway struct {
 	// rather than the stream's.
 	relayBound    atomic.Bool
 	relayHeldBack atomic.Bool
-	// termWaiting is set while BeginTerm waits for the session-state bucket,
+	// termWaiting is set while BeginTerm waits out a term start that can
+	// clear on its own, and termWaitBus says the wait is for the bus rather
+	// than the session-state bucket, so Readiness names the right one.
+	termWaitBus atomic.Bool
 	// which the provision Job creates, so Readiness names that wait.
 	termWaiting atomic.Bool
 }
@@ -647,6 +658,9 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // and a later loss of TASKS is the rebuild path's to recover, as before.
 func (g *Gateway) Readiness() (bool, string) {
 	if g.termWaiting.Load() {
+		if g.termWaitBus.Load() {
+			return false, "waiting for the bus: the gateway's term can't start while JetStream isn't answering"
+		}
 		return false, fmt.Sprintf("waiting for bucket %s: the gateway's term can't start until the provision Job creates it", lib.SessionStateBucket)
 	}
 	if g.relayBound.Load() {
@@ -828,15 +842,28 @@ func (g *Gateway) bindRelay(ctx context.Context) (lib.Subscription, error) {
 // restarted pod meets the same wait. Readiness names it meanwhile.
 func (g *Gateway) BeginTerm(ctx context.Context) (uint64, error) {
 	defer g.termWaiting.Store(false)
-	var loggedAt time.Time
+	var loggedAt, busSince time.Time
 	for {
 		term, err := g.reg.BeginTerm(ctx)
 		if err == nil || !g.termCanWait(err) {
 			return term, err
 		}
+		bus := !errors.Is(err, jetstream.ErrBucketNotFound)
+		if !bus {
+			busSince = time.Time{}
+		} else if busSince.IsZero() {
+			busSince = time.Now()
+		} else if time.Since(busSince) >= termWaitBusMax {
+			return 0, fmt.Errorf("the bus didn't answer for %s, so the lease goes to a replica whose bus may: %w", termWaitBusMax, err)
+		}
+		g.termWaitBus.Store(bus)
 		g.termWaiting.Store(true)
 		if time.Since(loggedAt) >= termWaitLogEvery {
-			g.log.Warn("gateway term: waiting for the session-state bucket", "bucket", lib.SessionStateBucket, "err", err)
+			if bus {
+				g.log.Warn("gateway term: waiting for the bus", "err", err, "giveUpAfter", termWaitBusMax)
+			} else {
+				g.log.Warn("gateway term: waiting for the session-state bucket", "bucket", lib.SessionStateBucket, "err", err)
+			}
 			loggedAt = time.Now()
 		}
 		select {

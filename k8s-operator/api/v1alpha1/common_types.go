@@ -1556,9 +1556,11 @@ type A2AGatewayAvailabilitySpec struct {
 	// Set 1 where the namespace's quota has no room for the extra pod a
 	// rolling update starts. The operator renders more than one replica only
 	// once a gateway on the image it renders has taken the Lease (the
-	// GatewayElected condition), and one replica until then.
+	// GatewayElected condition), and one replica until then. At most 5: only
+	// one replica works at a time, and the count feeds the namespace pod quota.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=5
 	Replicas *int32 `json:"replicas,omitempty"`
 }
 
