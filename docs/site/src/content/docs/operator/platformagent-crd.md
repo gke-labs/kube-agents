@@ -352,14 +352,38 @@ to stall in a namespace with an open alert is added to that alert's card at once
 1440; unset or `0` alerts on the first sweep that sees the stall.
 
 `kinds` replaces the default list of resources the watch scans: Deployments, StatefulSets,
-DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, and cert-manager Certificates. Write each
-item as kubectl names the resource, in lower case: `deployments`,
-`gateways.gateway.networking.k8s.io`. The single item `all` scans every namespaced kind the cluster
-serves, with one read per kind in each namespace, which is slow on a large fleet. The API server
-refuses `all` next to another item, and refuses Secrets, ConfigMaps, Events, Endpoints,
-EndpointSlices, ControllerRevisions and Leases, which the scan reports nothing from. Up to 20
-items. A kind a cluster does not serve is left out on
-that cluster.
+DaemonSets, Jobs, Gateway API Gateways and HTTPRoutes, cert-manager Certificates, and
+`*.cnrm.cloud.google.com`, the Config Connector kinds. Write each item as kubectl names the
+resource, in lower case: `deployments`, `gateways.gateway.networking.k8s.io`. An item of the
+form `*.<suffix>` is a group wildcard for every namespaced kind whose API group ends in the
+suffix. A list you set replaces the wildcard too: name `*.cnrm.cloud.google.com` in it to keep
+the Config Connector kinds.
+
+The single item `all` scans every namespaced kind the cluster serves, with one read per kind in
+each namespace, which is slow on a large fleet. The API server refuses `all` next to another
+item, and refuses Secrets, ConfigMaps, Events, Endpoints, EndpointSlices, ControllerRevisions and
+Leases, which the scan reports nothing from. Up to 20 items. A kind a cluster does not serve is
+left out on that cluster.
+
+The Config Connector wildcard is in the default list because a managed resource that Config
+Connector cannot apply is silent in every other path. The controller does not crash and logs only
+on the object. The `ConfigConnector` object's status reports the controller's health, not the
+health of the resources it manages. The signal is the object's own `Ready` condition.
+`stall_report.py` reads it as a stale condition once it has been false for longer than the stall
+threshold, so a `SQLInstance` stuck on `UpdateFailed` is a stall like a Deployment past its
+progress deadline.
+
+The add-on serves about three hundred kinds, so the watch does not read each one in each
+namespace. On each cluster that serves them, it discovers once which kinds have objects and in
+which namespaces, with one `kubectl get` over every namespace for each batch of 50 kinds. It
+keeps the result in its ledger and reads in a namespace only the kinds it found there, at most 20
+by name. It discovers again after 6 hours, or after 1 hour when a batch failed, on at most 2
+clusters per sweep, so a fleet's refreshes spread out.
+
+A kind that gained its first object between two discoveries is read from the next one. A kind a
+discovery could not read, or one the cluster started to serve since the last discovery, holds its
+ledger rows as unread rather than clearing them. A cluster that serves no Config Connector kind
+runs no discovery.
 
 Separate from this block, the annotation `kubeagents.x-k8s.io/stall-watch: exempt` opts out
 without a CR change. On a namespace, the watch does not read the namespace, as if

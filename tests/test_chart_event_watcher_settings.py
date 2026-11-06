@@ -207,5 +207,40 @@ class EventWatcherSettingsRenderTest(unittest.TestCase):
                 self.assertIn("eventWatcher", res.stderr)
 
 
+# The Event.Reason values Config Connector records against a managed resource
+# whose reconcile did not succeed, from its monitoring guide. A managed
+# resource that cannot apply records nothing else, so the entrypoint's
+# --reason list carries every one of them.
+_CONFIG_CONNECTOR_REASONS = (
+    "UpdateFailed",
+    "DeleteFailed",
+    "DependencyNotReady",
+    "DependencyNotFound",
+    "DependencyInvalid",
+    "ManagementConflict",
+    "Unmanaged",
+    "PreActuationTransformFailed",
+    "PostActuationTransformFailed",
+)
+_REASON_LIST = re.compile(r"^readonly WATCHER_REASONS=(\S+)$", re.MULTILINE)
+_REASON_FLAG = '--reason="${WATCHER_REASONS}"'
+
+
+class EntrypointReasonListTest(unittest.TestCase):
+    """The --reason list the entrypoint passes, which replaces the binary's
+    default list in a deployed install."""
+
+    def test_the_entrypoint_passes_every_config_connector_failure_reason(self):
+        text = _ENTRYPOINT.read_text().replace("\\\n", "")
+        self.assertIn(_REASON_FLAG, text)
+        lists = _REASON_LIST.findall(text)
+        self.assertEqual(len(lists), 1, lists)
+        reasons = lists[0].split(",")
+        for reason in _CONFIG_CONNECTOR_REASONS:
+            self.assertIn(reason, reasons)
+        for normal_state in ("Updating", "UpToDate", "Deleting", "Deleted"):
+            self.assertNotIn(normal_state, reasons)
+
+
 if __name__ == "__main__":
     unittest.main()

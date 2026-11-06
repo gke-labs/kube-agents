@@ -86,6 +86,21 @@ DARK = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: i/o timeout"\nUnable to con
 PROXY_BUSY = "the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly"
 #: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
 SERVED_DEFAULT = ["deployments.apps", "statefulsets.apps", "daemonsets.apps", "jobs.batch", "gateways.gateway.networking.k8s.io", "httproutes.gateway.networking.k8s.io", "certificates.cert-manager.io", "pods", "configmaps"]
+#: The default list as it reaches stall_report.py on a cluster with no Config
+#: Connector: the plain kinds, the group wildcard expanded to nothing.
+PLAIN_DEFAULT = ",".join(k for k in stall_watch.DEFAULT_KINDS if not k.startswith("*."))
+#: Three Config Connector kinds, as api-resources names them, and objects of
+#: two of them, as the discovery listing prints them.
+KCC_SQL = "sqlinstances.sql.cnrm.cloud.google.com"
+KCC_TOPICS = "pubsubtopics.pubsub.cnrm.cloud.google.com"
+KCC_BUCKETS = "storagebuckets.storage.cnrm.cloud.google.com"
+KCC_SERVED = SERVED_DEFAULT + [KCC_SQL, KCC_TOPICS, KCC_BUCKETS]
+KCC_OBJECTS = [
+    ("payments", "SQLInstance", "sql.cnrm.cloud.google.com/v1beta1"),
+    ("payments", "SQLInstance", "sql.cnrm.cloud.google.com/v1beta1"),
+    ("config-control", "PubSubTopic", "pubsub.cnrm.cloud.google.com/v1beta1"),
+]
+KCC_ROW = finding("payments", "SQLInstance/orders-db", "stale-condition", "Ready=False UpdateFailed", stalled_for="97d", stalled_seconds=97 * 86400)
 NOT_SCANNED = "warning: deployments in checkout not scanned; its objects are missing from the count: kubectl exited 1\n"
 
 BOARD_SCHEMA = """
@@ -126,7 +141,12 @@ class FakeFleet:
     exempt annotation's value a `kubectl get` of that object prints; an object
     not in it prints nothing, as a deleted one does."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None, fetch_fails=(), annotations=None, namespaces_listing=None, object_annotations=None):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None, fetch_fails=(), annotations=None, namespaces_listing=None, object_annotations=None, objects=(), discovery=0):
+        # The (namespace, Kind, apiVersion) rows a wildcard discovery prints,
+        # on every cluster; `discovery` is its exit code (its output is kept on
+        # a non-zero one, as kubectl keeps what it listed), or an exception.
+        self.objects = list(objects)
+        self.discovery = discovery
         self.annotations = annotations or {}
         self.object_annotations = object_annotations or {}
         self.namespaces_listing = namespaces_listing or {}
@@ -197,6 +217,13 @@ class FakeFleet:
         if argv[:2] == list(stall_watch.EXEMPT_READ_ARGV) and argv[-len(stall_watch.EXEMPT_READ_FLAGS):] == list(stall_watch.EXEMPT_READ_FLAGS):
             namespace = argv[argv.index("-n") + 1]
             return completed(argv, self.object_annotations.get((namespace, argv[2]), ""))
+        if argv[:2] == list(stall_watch.DISCOVERY_ARGV) and argv[-len(stall_watch.DISCOVERY_FLAGS):] == list(stall_watch.DISCOVERY_FLAGS):
+            if isinstance(self.discovery, Exception):
+                raise self.discovery
+            batch = argv[len(stall_watch.DISCOVERY_ARGV)].split(",")
+            lines = [f"{ns}   {kind}   {api}\n" for ns, kind, api in self.objects if stall_watch.resource_for(kind, api, batch) in batch]
+            stderr = "Error from server (Forbidden): one kind is forbidden" if self.discovery else ""
+            return completed(argv, "".join(lines), returncode=self.discovery, stderr=stderr)
         if argv[:2] == ["kubectl", "api-resources"]:
             if isinstance(self.served, Exception):
                 raise self.served
@@ -222,6 +249,17 @@ class FakeFleet:
 
     def scanned(self):
         return [argv[argv.index("--namespace") + 1] for argv, _, _ in self.calls if argv[:1] == [stall_watch.PYTHON_EXECUTABLE]]
+
+    def kinds_asked(self, namespace):
+        """The --kind list the scan of `namespace` was given, or None."""
+        for argv, _, _ in self.calls:
+            if argv[:1] == [stall_watch.PYTHON_EXECUTABLE] and argv[argv.index("--namespace") + 1] == namespace:
+                return argv[argv.index("--kind") + 1].split(",") if "--kind" in argv else None
+        raise AssertionError(f"{namespace} was not scanned")
+
+    def discoveries(self):
+        """The kind batches the wildcard discovery listed, in call order."""
+        return [argv[len(stall_watch.DISCOVERY_ARGV)].split(",") for argv, _, _ in self.calls if argv[:2] == list(stall_watch.DISCOVERY_ARGV) and "--all-namespaces" in argv]
 
     def _cluster_from(self, kubeconfig):
         return next(key for key in self.fleet if Path(stall_watch.kubeconfig_path(*key)).name == Path(kubeconfig).name)
@@ -1201,7 +1239,7 @@ class Ledger(Base):
         self.assertEqual(left, ["repeating-warnings"], "the condition row cleared; the warning row waits for a scan that read events")
 
     def test_a_skipped_resource_matches_its_object_kind(self):
-        for resource, kind in (("gateways.gateway.networking.k8s.io", "Gateway"), ("networkpolicies.networking.k8s.io", "NetworkPolicy"), ("ingresses.networking.k8s.io", "Ingress"), ("statefulsets", "StatefulSet"), ("jobs.batch", "Job")):
+        for resource, kind in (("gateways.gateway.networking.k8s.io", "Gateway"), ("networkpolicies.networking.k8s.io", "NetworkPolicy"), ("ingresses.networking.k8s.io", "Ingress"), ("statefulsets", "StatefulSet"), ("jobs.batch", "Job"), (KCC_SQL, "SQLInstance"), ("computeaddresses.compute.cnrm.cloud.google.com", "ComputeAddress"), ("computeaddress.compute.cnrm.cloud.google.com", "ComputeAddress")):
             self.assertTrue(stall_watch.resource_names_kind(resource, kind), (resource, kind))
         self.assertFalse(stall_watch.resource_names_kind("deployments", "Gateway"))
 
@@ -1766,7 +1804,7 @@ class Scope(Base):
     def test_default_kinds_are_passed_and_all_lets_the_script_decide(self):
         _, fake = self.run_tick({"c": {"payments": []}})
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
-        self.assertEqual(scan[scan.index("--kind") + 1], ",".join(stall_watch.DEFAULT_KINDS))
+        self.assertEqual(scan[scan.index("--kind") + 1], PLAIN_DEFAULT)
         self.assertNotIn("pods", scan[scan.index("--kind") + 1].split(","))
         with patch.dict(os.environ, {stall_watch.KINDS_ENV: "all"}):
             _, fake = self.run_tick({"c": {"payments": []}})
@@ -1783,7 +1821,7 @@ class Scope(Base):
         self.assertEqual(self.ledger()["unreadable"], {}, "a CRD the cluster never installed does not make its namespaces unreadable")
         _, fake = self.run_tick({"c": {"payments": []}}, served=[])
         scan = next(argv for argv, _, _ in fake.calls if argv[0] == stall_watch.PYTHON_EXECUTABLE)
-        self.assertEqual(scan[scan.index("--kind") + 1], ",".join(stall_watch.DEFAULT_KINDS), "an empty api-resources leaves the list unfiltered")
+        self.assertEqual(scan[scan.index("--kind") + 1], PLAIN_DEFAULT, "an empty api-resources leaves the list unfiltered")
 
     def test_a_kind_the_discovery_listing_dropped_is_held_not_cleared(self):
         gateway = dict(GATEWAY_CONDITION_ROW, namespace="checkout")
@@ -1892,6 +1930,132 @@ class Scope(Base):
         self.state.write_text(json.dumps({"version": 2, "stalls": {"x": {}}}))
         self.assertEqual(stall_watch.load_state(self.state)["stalls"], {})
 
+
+
+class ConfigConnector(Base):
+    """The group wildcard in the default list: served Config Connector kinds
+    are discovered per cluster and read where their objects are."""
+
+    def test_served_kinds_with_objects_are_read_in_their_namespaces_only(self):
+        fleet = {"c": {"payments": [], "config-control": [], "web": []}}
+        _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_SQL, KCC_BUCKETS]], "one batch, every served Config Connector kind, by name")
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(",") + [KCC_SQL])
+        self.assertEqual(fake.kinds_asked("config-control"), PLAIN_DEFAULT.split(",") + [KCC_TOPICS])
+        self.assertEqual(fake.kinds_asked("web"), PLAIN_DEFAULT.split(","), "a namespace with no Config Connector object pays no read")
+        self.assertEqual(self.ledger()["unreadable"], {})
+        record = self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")]
+        self.assertEqual(record[stall_watch.DISCOVERY_KINDS_KEY], {KCC_SQL: ["payments"], KCC_TOPICS: ["config-control"], KCC_BUCKETS: []})
+        self.assertEqual(record[stall_watch.DISCOVERY_UNKNOWN_KEY], [])
+        _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(fake.discoveries(), [], "the record stands for the next tick")
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(",") + [KCC_SQL])
+
+    def test_a_cluster_with_no_config_connector_runs_no_discovery(self):
+        _, fake = self.run_tick({"c": {"payments": []}})
+        self.assertEqual(fake.discoveries(), [])
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(","))
+        self.assertNotIn(cid("c"), self.ledger()[stall_watch.DISCOVERED_KINDS_KEY])
+
+    def test_a_stalled_managed_resource_is_alerted_and_held_while_discovery_cannot_read_its_kind(self):
+        fleet = {"c": {"payments": [KCC_ROW]}}
+        t0 = "2026-11-06T00:00:00+00:00"
+        self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS, now=t0)
+        self.assertEqual(len(self.last_alerts), 1)
+        self.assertEqual([o["object"] for o in self.last_alerts[0]["objects"]], ["SQLInstance/orders-db"])
+        # Seven hours on: the refresh is due, every batch fails with nothing
+        # listed, and the scan of payments (asked without the kind) sees no row.
+        later = "2026-11-06T07:00:00+00:00"
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], discovery=1, now=later)
+        self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_SQL, KCC_BUCKETS]])
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(","))
+        self.assertEqual(lines, [], "the row is unread, not cleared")
+        self.assertEqual([e["object"] for e in self.ledger()["stalls"].values()], ["SQLInstance/orders-db"])
+        self.assertEqual(sorted(self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")][stall_watch.DISCOVERY_UNKNOWN_KEY]), sorted([KCC_SQL, KCC_TOPICS, KCC_BUCKETS]))
+        # The next tick retries nothing: a failed discovery waits its hour.
+        _, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], discovery=1, now="2026-11-06T07:30:00+00:00")
+        self.assertEqual(fake.discoveries(), [])
+        # An hour on it reads again, the object is gone, and the row clears.
+        lines, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=[], now="2026-11-06T08:00:00+00:00")
+        self.assertEqual(fake.discoveries(), [[KCC_TOPICS, KCC_SQL, KCC_BUCKETS]])
+        self.assertEqual(len(self.cleared(lines)), 1)
+
+    def test_a_batch_that_exits_non_zero_keeps_what_it_listed_and_holds_the_rest(self):
+        _, fake = self.run_tick({"c": {"payments": [], "config-control": []}}, served=KCC_SERVED, objects=KCC_OBJECTS, discovery=1)
+        self.assertEqual(fake.kinds_asked("payments"), PLAIN_DEFAULT.split(",") + [KCC_SQL], "a kind that printed an object is known where it printed one")
+        record = self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")]
+        self.assertEqual(record[stall_watch.DISCOVERY_UNKNOWN_KEY], [KCC_BUCKETS], "a kind that printed nothing from a failed batch may have been the failure")
+        self.assertEqual(self.ledger()["unreadable"], {}, "a held kind does not make the namespace unreadable")
+
+    def test_a_kind_served_since_the_record_is_held_until_the_refresh(self):
+        self.run_tick({"c": {"payments": [KCC_ROW]}}, served=KCC_SERVED, objects=KCC_OBJECTS, now="2026-11-06T00:00:00+00:00")
+        new_kind = "iampolicies.iam.cnrm.cloud.google.com"
+        iam_row = finding("payments", "IAMPolicy/orders-db-access", "stale-condition", "Ready=False DependencyNotReady")
+        self.run_tick({"c": {"payments": [KCC_ROW, iam_row]}}, served=KCC_SERVED + [new_kind], objects=KCC_OBJECTS, now="2026-11-06T00:30:00+00:00")
+        # The new kind is not asked for yet, and a row of it that a scan still
+        # reports (here, planted) is held rather than judged against the scan.
+        lines, fake = self.run_tick({"c": {"payments": [KCC_ROW]}}, served=KCC_SERVED + [new_kind], objects=KCC_OBJECTS, now="2026-11-06T01:00:00+00:00")
+        self.assertNotIn(new_kind, fake.kinds_asked("payments"))
+        self.assertEqual(lines, [])
+        self.assertEqual(sorted(e["object"] for e in self.ledger()["stalls"].values()), ["IAMPolicy/orders-db-access", "SQLInstance/orders-db"])
+
+    def test_more_kinds_in_a_namespace_than_the_cap_are_cut_by_name_and_held(self):
+        kinds = [f"kind{i:02d}s.k{i:02d}.cnrm.cloud.google.com" for i in range(stall_watch.WILDCARD_KINDS_CAP + 2)]
+        objects = [("config-control", f"Kind{i:02d}", f"k{i:02d}.cnrm.cloud.google.com/v1beta1") for i in range(len(kinds))]
+        with patch.object(sys, "stderr", io.StringIO()) as err:
+            _, fake = self.run_tick({"c": {"config-control": []}}, served=SERVED_DEFAULT + kinds, objects=objects)
+        self.assertEqual(fake.kinds_asked("config-control"), PLAIN_DEFAULT.split(",") + kinds[: stall_watch.WILDCARD_KINDS_CAP])
+        self.assertIn(f"has objects of {len(kinds)} kinds", err.getvalue())
+        self.assertEqual(self.ledger()["unreadable"], {})
+
+    def test_refreshes_are_spread_over_ticks_and_first_discoveries_are_not(self):
+        fleet = {"a": {"payments": []}, "b": {"payments": []}, "c": {"payments": []}}
+        _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS, now="2026-11-06T00:00:00+00:00")
+        self.assertEqual(len(fake.discoveries()), 3, "every cluster discovers on its first tick")
+        _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS, now="2026-11-06T07:00:00+00:00")
+        self.assertEqual(len(fake.discoveries()), stall_watch.DISCOVERY_REFRESHES_PER_TICK)
+        _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS, now="2026-11-06T07:30:00+00:00")
+        self.assertEqual(len(fake.discoveries()), 1, "the cluster the cap left stale refreshes next")
+
+    def test_an_explicit_list_may_name_the_wildcard_and_replaces_it_otherwise(self):
+        fleet = {"c": {"payments": [], "web": []}}
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: "deployments," + stall_watch.KCC_KINDS_WILDCARD}):
+            _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(fake.kinds_asked("payments"), ["deployments", KCC_SQL])
+        self.assertEqual(fake.kinds_asked("web"), ["deployments"])
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: "deployments,jobs"}):
+            _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(fake.discoveries(), [], "a list without the wildcard discovers nothing")
+        self.assertEqual(fake.kinds_asked("payments"), ["deployments", "jobs"])
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: stall_watch.KCC_KINDS_WILDCARD}):
+            _, fake = self.run_tick(fleet, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(fake.kinds_asked("payments"), [KCC_SQL])
+        self.assertEqual(fake.scanned(), ["payments"], "a namespace with nothing to ask about is not scanned, and is read")
+        self.assertEqual(self.ledger()["unreadable"], {})
+
+    def test_all_discovers_nothing_since_every_kind_is_read(self):
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: "all"}):
+            _, fake = self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(fake.discoveries(), [])
+        self.assertIsNone(fake.kinds_asked("payments"))
+
+    def test_discovery_splits_the_kinds_into_batches(self):
+        kinds = sorted(f"kind{i:03d}s.k{i:03d}.cnrm.cloud.google.com" for i in range(stall_watch.DISCOVERY_BATCH_KINDS + 1))
+        _, fake = self.run_tick({"c": {"payments": []}}, served=SERVED_DEFAULT + kinds, objects=[])
+        self.assertEqual(sorted(len(b) for b in fake.discoveries()), [1, stall_watch.DISCOVERY_BATCH_KINDS])
+        self.assertEqual(sorted(sum(fake.discoveries(), [])), kinds)
+
+    def test_a_discovery_timeout_holds_the_batch_and_the_cluster_is_still_read(self):
+        _, fake = self.run_tick({"c": {"checkout": [DEPLOYMENT_ROW]}}, served=KCC_SERVED, objects=KCC_OBJECTS, discovery=subprocess.TimeoutExpired("kubectl", stall_watch.DISCOVERY_TIMEOUT_SECONDS))
+        self.assertEqual(len(self.last_alerts), 1, "the Deployment stall is alerted as before")
+        self.assertEqual(fake.kinds_asked("checkout"), PLAIN_DEFAULT.split(","))
+        self.assertEqual(sorted(self.ledger()[stall_watch.DISCOVERED_KINDS_KEY][cid("c")][stall_watch.DISCOVERY_UNKNOWN_KEY]), sorted([KCC_SQL, KCC_TOPICS, KCC_BUCKETS]))
+
+    def test_the_record_follows_the_cluster_out_of_the_fleet(self):
+        self.run_tick({"c": {"payments": []}, "d": {"payments": []}}, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(sorted(self.ledger()[stall_watch.DISCOVERED_KINDS_KEY]), [cid("c"), cid("d")])
+        self.run_tick({"c": {"payments": []}}, served=KCC_SERVED, objects=KCC_OBJECTS)
+        self.assertEqual(sorted(self.ledger()[stall_watch.DISCOVERED_KINDS_KEY]), [cid("c")])
 
 
 class Projects(Base):

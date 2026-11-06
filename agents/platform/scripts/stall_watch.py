@@ -78,6 +78,26 @@ Pods are left out on purpose: a Pod that cannot start raises the Warning
 reasons the event watcher is gated on, and its owner shows here through its
 own condition or reference.
 
+Why a group wildcard. Config Connector serves some three hundred namespaced
+kinds under groups ending in ``.cnrm.cloud.google.com``, and a managed
+resource whose reconcile fails is silent in every other path: its controller
+does not crash, logs only on the object, and records at most a Warning event
+there. The object's own ``Ready`` condition is the signal, and
+``stall_report.py``'s stale-condition heuristic reads it; Config Connector's
+``ConfigConnector`` status reports the controller's health, not the managed
+resources'. So the default list carries ``*.cnrm.cloud.google.com``, which
+stands for every served kind in such a group. Listing all of them in every
+namespace would be three hundred reads a namespace, so per cluster the watch
+discovers once which of those kinds have objects and in which namespaces
+(``discover_kinds``: batches of kinds in one ``kubectl get`` over every
+namespace), keeps that in the ledger, redoes it after
+``DISCOVERY_REFRESH_SECONDS`` or when it left kinds unknown, and reads in a
+namespace only the kinds found there, at most ``WILDCARD_KINDS_CAP``. A kind
+discovery could not read, or that appeared since, is held as unread, so its
+rows are never judged absent; a kind that gained its first object between
+refreshes is read from the next refresh. An explicit ``STALL_WATCH_KINDS``
+replaces the wildcard with the rest of the default list, and may name it.
+
 What an install can tune. The CR's ``spec.harness.stallWatch`` reaches this
 script as three variables the operator pins in the managed .env on every
 install, empty when unset, so the agent cannot override them through its own
@@ -194,6 +214,15 @@ ALL_KINDS = "all"
 EXEMPT_ANNOTATION = "kubeagents.x-k8s.io/stall-watch"
 EXEMPT_VALUE = "exempt"
 EXEMPT_FIELD = "exempt"
+#: The suffix every Config Connector API group ends in
+#: (`sql.cnrm.cloud.google.com`, `pubsub.cnrm.cloud.google.com`, ...).
+KCC_GROUP_SUFFIX = ".cnrm.cloud.google.com"
+#: A kind-list item of the form `*.<group suffix>` stands for every namespaced
+#: kind the cluster serves whose group ends in the suffix. It is expanded per
+#: cluster from the `kubectl api-resources` listing the list is filtered on,
+#: and read only in the namespaces discovery found its objects in.
+GROUP_WILDCARD_PREFIX = "*."
+KCC_KINDS_WILDCARD = GROUP_WILDCARD_PREFIX + KCC_GROUP_SUFFIX[1:]
 #: Controllers whose silent stalls this watch exists for. Per cluster, the
 #: list is cut to what the cluster serves before it is handed to the script.
 DEFAULT_KINDS = (
@@ -204,6 +233,7 @@ DEFAULT_KINDS = (
     "gateways.gateway.networking.k8s.io",
     "httproutes.gateway.networking.k8s.io",
     "certificates.cert-manager.io",
+    KCC_KINDS_WILDCARD,
 )
 KINDS_SEPARATOR = ","
 # Kinds the watch never asks stall_report.py to read, whatever STALL_WATCH_KINDS
@@ -291,6 +321,30 @@ PROXY_TRUNCATED_TEXT = "credential proxy output truncated"
 #: has no cert-manager".
 API_RESOURCES_ARGV = ("kubectl", "api-resources", "--namespaced=true", "--verbs=list", "-o", "name")
 API_RESOURCES_TIMEOUT_SECONDS = 60
+#: Discovery of a wildcard's objects on one cluster: `kubectl get` over a
+#: batch of served kinds and every namespace, one line per object with its
+#: namespace, Kind and apiVersion, which `resource_for` maps back to the
+#: api-resources name. A batch is one proxied command, so a cluster with the
+#: Config Connector add-on (some 300 kinds) is six commands, DISCOVERY_WORKERS
+#: at a time; kubectl lists the kinds in a batch one after another, so the
+#: timeout is set for a slow API server at 50 kinds, not for one kind.
+DISCOVERY_ARGV = ("kubectl", "get")
+DISCOVERY_FLAGS = ("--all-namespaces", "--no-headers", "-o", "custom-columns=NAMESPACE:.metadata.namespace,KIND:.kind,API:.apiVersion")
+DISCOVERY_BATCH_KINDS = 50
+DISCOVERY_TIMEOUT_SECONDS = 120
+DISCOVERY_COLUMNS = 3
+#: How long a cluster's discovery stands before it is redone, how soon one
+#: that left kinds unknown (a batch that failed or was cut) is retried, and
+#: how many such redos one tick runs, so a fleet's refreshes spread over the
+#: ticks rather than all landing on one. A cluster with no record discovers
+#: at once: nothing of the wildcard's is read there until it does.
+DISCOVERY_REFRESH_SECONDS = 6 * 60 * 60
+DISCOVERY_RETRY_SECONDS = 60 * 60
+DISCOVERY_REFRESHES_PER_TICK = 2
+#: The most wildcard kinds read in one namespace, the cap the CR puts on an
+#: explicit kind list. Beyond it the first kinds by name are read and the rest
+#: held as unread, and stderr says so.
+WILDCARD_KINDS_CAP = 20
 #: stall_report.py exits 0 after skipping a kind or the events it could not
 #: read and says so on stderr, naming the resource; such a scan clears no
 #: row of that kind (or no repeating-warnings row, for the events) and every
@@ -325,6 +379,13 @@ CURSOR_KEY = "cursor"
 #: is this old, or until a read the kubeconfig could not serve, after which
 #: the tick fetches once more and retries that one call.
 CREDENTIALS_KEY = "credentials"
+#: Ledger key for each swept cluster's wildcard discovery: {cluster id:
+#: {DISCOVERY_AT_KEY: when, DISCOVERY_KINDS_KEY: {resource: [namespaces with
+#: objects]}, DISCOVERY_UNKNOWN_KEY: [resources it could not read]}}.
+DISCOVERED_KINDS_KEY = "discovered_kinds"
+DISCOVERY_AT_KEY = "at"
+DISCOVERY_KINDS_KEY = "kinds"
+DISCOVERY_UNKNOWN_KEY = "unknown"
 CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
 #: What a failed first read on a reused kubeconfig says when the kubeconfig
 #: itself is the problem, so one more fetch repairs it: the shim's refusal of
@@ -430,6 +491,8 @@ SHIM_RETRY_DEADLINE_SECONDS = max(0, CLUSTER_LIST_TIMEOUT_SECONDS - BROKER_GCLOU
 #: workers' commands have four slots, and none if cluster_agent_reconcile.py's
 #: four-wide pool is listing at the same time.
 LIST_WORKERS = 4
+#: Discovery batches run this many at a time, for the same slot arithmetic.
+DISCOVERY_WORKERS = LIST_WORKERS
 #: 12 s per listing at four wide: the per-listing share the 150 s budget gave
 #: at eight. The listing runs inside TICK_BUDGET_SECONDS, so it leaves the
 #: scans at least 1500 - 300 - LIST_GRACE_SECONDS.
@@ -671,6 +734,33 @@ def kinds_argument() -> str | None:
     return KINDS_SEPARATOR.join(kept or DEFAULT_KINDS)
 
 
+def is_wildcard(kind: str) -> bool:
+    return kind.startswith(GROUP_WILDCARD_PREFIX)
+
+
+def wildcard_kinds() -> list[str]:
+    """The group wildcards in the kind list; none when the list is `all`."""
+    configured = kinds_argument()
+    if configured is None:
+        return []
+    return [k for k in configured.split(KINDS_SEPARATOR) if is_wildcard(k)]
+
+
+def matches_wildcard(resource: str, wildcard: str) -> bool:
+    """Whether an api-resources name (`sqlinstances.sql.cnrm.cloud.google.com`)
+    is in a group the wildcard's suffix ends."""
+    return resource.endswith(wildcard[len(GROUP_WILDCARD_PREFIX) - 1 :])
+
+
+def join_kinds(base: str | None, extra: list[str] | None) -> str | None:
+    """The --kind value for one namespace: the cluster's list and the wildcard
+    kinds discovery found there. None keeps "every kind" (`all`); an empty
+    string is a namespace nothing is asked about."""
+    if base is None:
+        return None
+    return KINDS_SEPARATOR.join([k for k in base.split(KINDS_SEPARATOR) if k] + list(extra or []))
+
+
 def excluded_namespaces() -> frozenset[str]:
     """The namespaces STALL_WATCH_EXCLUDE_NAMESPACES names, matched exactly."""
     return frozenset(env_list(EXCLUDE_NAMESPACES_ENV, NAMESPACES_SEPARATOR))
@@ -804,15 +894,128 @@ def kinds_for(served: set[str] | None) -> tuple[str | None, set[str]]:
     kinds the filter removed. A removed kind is never asked for, so its rows
     are held as unread in every namespace of the cluster rather than judged
     absent: a discovery listing that dropped a served group must not close a
-    card under a live stall."""
+    card under a live stall. Group wildcards are not in the value: they are
+    expanded per namespace from what `discover_kinds` found (`wildcard_kinds_for`)."""
     configured = kinds_argument()
-    if configured is None or served is None:
-        return configured, set()
-    kept = [k for k in configured.split(KINDS_SEPARATOR) if k in served]
-    dropped = {k for k in configured.split(KINDS_SEPARATOR) if k not in served}
+    if configured is None:
+        return None, set()
+    plain = [k for k in configured.split(KINDS_SEPARATOR) if not is_wildcard(k)]
+    if served is None:
+        return KINDS_SEPARATOR.join(plain), set()
+    kept = [k for k in plain if k in served]
+    dropped = {k for k in plain if k not in served}
     if not kept:
-        return configured, set()
+        return KINDS_SEPARATOR.join(plain), set()
     return KINDS_SEPARATOR.join(kept), dropped
+
+
+def wildcard_candidates(served: set[str] | None, wildcards: list[str]) -> list[str]:
+    """The served resources the wildcards stand for, by name."""
+    if served is None:
+        return []
+    return sorted(r for r in served if any(matches_wildcard(r, w) for w in wildcards))
+
+
+def discovery_due(record: dict | None, now: str, refreshed: int) -> bool:
+    """Whether a cluster's wildcard discovery runs this tick: at once with no
+    record, after DISCOVERY_RETRY_SECONDS when the record left kinds unknown
+    and after DISCOVERY_REFRESH_SECONDS otherwise, the last two only while
+    fewer than DISCOVERY_REFRESHES_PER_TICK ran this tick."""
+    if not isinstance(record, dict) or not isinstance(record.get(DISCOVERY_KINDS_KEY), dict):
+        return True
+    try:
+        age = datetime.fromisoformat(now) - datetime.fromisoformat(str(record.get(DISCOVERY_AT_KEY)))
+    except (TypeError, ValueError):
+        return True
+    wait = DISCOVERY_RETRY_SECONDS if record.get(DISCOVERY_UNKNOWN_KEY) else DISCOVERY_REFRESH_SECONDS
+    return not (timedelta(0) <= age < timedelta(seconds=wait)) and refreshed < DISCOVERY_REFRESHES_PER_TICK
+
+
+def resource_for(kind: str, api_version: str, batch: list[str]) -> str:
+    """The api-resources name in `batch` for an object's Kind and apiVersion,
+    matched by group and plural; when the plural rule does not derive it, the
+    lower-case Kind in its group, which kubectl resolves as the singular."""
+    group = api_version.split("/", 1)[0]
+    for resource in batch:
+        if resource.endswith("." + group) and resource_names_kind(resource, kind):
+            return resource
+    return f"{kind.lower()}.{group}"
+
+
+def discover_kinds(kubeconfig: str, candidates: list[str], now: str) -> dict:
+    """Which of `candidates` have objects on the cluster, and in which
+    namespaces, from DISCOVERY_BATCH_KINDS kinds per `kubectl get`. A kind
+    that printed an object is known wherever it printed one; a kind that
+    printed none is known empty only when its batch exited 0 and was not cut,
+    and unknown otherwise, since kubectl lists the rest of a batch past a kind
+    it cannot read and the output does not say which one failed. A batch that
+    timed out or could not run leaves every kind in it unknown; the sandbox
+    being gone raises, as every other hop does."""
+    batches = [candidates[i : i + DISCOVERY_BATCH_KINDS] for i in range(0, len(candidates), DISCOVERY_BATCH_KINDS)]
+
+    def run(batch: list[str]):
+        argv = [*DISCOVERY_ARGV, KINDS_SEPARATOR.join(batch), *DISCOVERY_FLAGS]
+        try:
+            return batch, run_sandbox(argv, timeout=DISCOVERY_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
+        except sandbox_exec.SandboxUnavailable:
+            raise
+        except READ_FAILURES:
+            return batch, None
+
+    pool = ThreadPoolExecutor(max_workers=max(1, min(DISCOVERY_WORKERS, len(batches))))
+    try:
+        results = list(pool.map(run, batches))
+    finally:
+        pool.shutdown(wait=False)
+    kinds: dict[str, list[str]] = {}
+    unknown: list[str] = []
+    for batch, r in results:
+        seen: dict[str, set[str]] = {}
+        if r is not None:
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < DISCOVERY_COLUMNS:
+                    continue
+                namespace, kind, api_version = parts[:DISCOVERY_COLUMNS]
+                seen.setdefault(resource_for(kind, api_version, batch), set()).add(namespace)
+        complete = r is not None and r.returncode == 0 and PROXY_TRUNCATED_TEXT not in (r.stderr or "")
+        for resource, namespaces in seen.items():
+            kinds[resource] = sorted(namespaces)
+        for resource in batch:
+            if resource in seen:
+                continue
+            if complete:
+                kinds[resource] = []
+            else:
+                unknown.append(resource)
+    return {DISCOVERY_AT_KEY: now, DISCOVERY_KINDS_KEY: kinds, DISCOVERY_UNKNOWN_KEY: sorted(unknown)}
+
+
+def wildcard_kinds_for(record: dict | None, candidates: list[str], wildcards: list[str], label: str) -> tuple[dict[str, list[str]], set[str], dict[str, set[str]]]:
+    """From a cluster's discovery record: the wildcard kinds to read in each
+    namespace (at most WILDCARD_KINDS_CAP, by name), the kinds held as unread
+    in every namespace (unknown to the record, or served since it was made),
+    and the kinds held in one namespace because the cap cut them there."""
+    known = (record or {}).get(DISCOVERY_KINDS_KEY) if isinstance(record, dict) else None
+    if not isinstance(known, dict):
+        return {}, set(candidates), {}
+    held = set(candidates) - set(known) | set((record or {}).get(DISCOVERY_UNKNOWN_KEY) or [])
+    by_namespace: dict[str, list[str]] = {}
+    for resource, namespaces in sorted(known.items()):
+        if resource in held or not any(matches_wildcard(resource, w) for w in wildcards):
+            continue
+        for namespace in namespaces or []:
+            by_namespace.setdefault(str(namespace), []).append(resource)
+    cut: dict[str, set[str]] = {}
+    for namespace, resources in by_namespace.items():
+        if len(resources) > WILDCARD_KINDS_CAP:
+            cut[namespace] = set(resources[WILDCARD_KINDS_CAP:])
+            by_namespace[namespace] = resources[:WILDCARD_KINDS_CAP]
+            sys.stderr.write(
+                f"stall_watch: {label} namespace {namespace} has objects of {len(resources)} kinds under {', '.join(wildcards)}; "
+                f"the first {WILDCARD_KINDS_CAP} by name are read and the rest held as unread\n"
+            )
+    return by_namespace, held, cut
 
 
 def is_system_namespace(name: str) -> bool:
@@ -870,7 +1073,7 @@ def resource_names_kind(resource: str, kind: str) -> bool:
         singular = plural[: -len(PLURAL_ES)]
     else:
         singular = plural.rstrip("s")
-    return singular == kind.lower()
+    return kind.lower() in (singular, plural)
 
 
 def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | None) -> tuple[list[dict], set[str]]:
@@ -902,6 +1105,7 @@ def empty_state() -> dict:
         "updated_at": None,
         CURSOR_KEY: None,
         CREDENTIALS_KEY: {},
+        DISCOVERED_KINDS_KEY: {},
         BUDGET_EXHAUSTED_KEY: False,
         BUDGET_EXHAUSTED_VIEW_KEY: None,
         BUDGET_HELD_TICKS_KEY: 0,
@@ -971,6 +1175,7 @@ def with_project(data: dict, project: str) -> dict:
         EPISODES_KEY: {prefix + k: v for k, v in (data.get(EPISODES_KEY) or {}).items()},
         CURSOR_KEY: cursor,
         CREDENTIALS_KEY: {prefix + k: v for k, v in (data.get(CREDENTIALS_KEY) or {}).items()},
+        DISCOVERED_KINDS_KEY: {prefix + k: v for k, v in (data.get(DISCOVERED_KINDS_KEY) or {}).items()},
     }
 
 
@@ -1045,6 +1250,9 @@ class Sweep:
         #: ledger: the records this tick reused or renewed, less the clusters a
         #: fresh fetch did not make readable and the ones no longer listed.
         self.credentials: dict[str, str] = {}
+        #: Each listed cluster's wildcard discovery, for the ledger, kept on
+        #: the same terms as the credentials.
+        self.discovered: dict[str, dict] = {}
 
     @property
     def clusters(self) -> int:
@@ -1227,21 +1435,27 @@ def sweep_fleet(
     cursor: dict | None = None,
     credentials: dict[str, str] | None = None,
     now: str | None = None,
+    discovered: dict[str, dict] | None = None,
 ) -> Sweep:
     """Sweep the management project and every project on the roster. One
     project's listing failing holds that project's rows; every listing failing
     fails the sweep. `credentials` is the ledger's record of when each
-    cluster's kubeconfig was last fetched (see CREDENTIALS_KEY) and `now` the
-    tick's time, which a fetch this tick is recorded as."""
+    cluster's kubeconfig was last fetched (see CREDENTIALS_KEY), `discovered`
+    its record of each cluster's wildcard discovery (DISCOVERED_KINDS_KEY),
+    and `now` the tick's time, which a fetch or discovery this tick is
+    recorded as."""
     projects, unread_profiles = roster_projects()
     sweep = Sweep({management_project} | projects)
     sweep.unread_profiles = set(unread_profiles)
     sweep.unreadable.update(unread_profiles)
     records = dict(credentials or {})
+    discoveries = dict(discovered or {})
+    refreshed = 0
     now = now or now_iso()
     started = time.monotonic()
     source = report_source()
     excluded = excluded_namespaces()
+    wildcards = wildcard_kinds()
     failures: dict[str, Exception] = {}
     listings = list_projects(sorted(sweep.projects), management_project, started)
     # Every listed cluster is registered before any is read: a cluster the
@@ -1313,7 +1527,21 @@ def sweep_fleet(
             readable = True
             if fetched:
                 records[cid] = now
-            kinds, dropped = kinds_for(served_kinds(kubeconfig))
+            served = served_kinds(kubeconfig)
+            kinds, dropped = kinds_for(served)
+            # The wildcard's kinds, per namespace, from this cluster's
+            # discovery record, redone when due. A discovery that fails holds
+            # the kinds it could not read; it never makes the cluster unreadable.
+            extra_kinds, held, cut = {}, set(), {}
+            candidates = wildcard_candidates(served, wildcards)
+            if candidates:
+                record = discoveries.get(cid)
+                if discovery_due(record, now, refreshed):
+                    if record is not None:
+                        refreshed += 1
+                    record = discover_kinds(kubeconfig, candidates, now)
+                    discoveries[cid] = record
+                extra_kinds, held, cut = wildcard_kinds_for(record, candidates, wildcards, cluster_label(cid))
         except sandbox_exec.SandboxUnavailable:
             raise
         except READ_FAILURES as exc:
@@ -1345,8 +1573,14 @@ def sweep_fleet(
         for namespace in namespaces:
             if sweep.out_of_budget(started, cid, namespace):
                 break
+            namespace_kinds = join_kinds(kinds, extra_kinds.get(namespace))
             try:
-                findings, unread = scan_namespace(kubeconfig, namespace, source, kinds)
+                if namespace_kinds == "":
+                    # An explicit list of wildcards alone, none of whose kinds
+                    # have objects here: nothing to ask, and nothing held.
+                    findings, unread = [], set()
+                else:
+                    findings, unread = scan_namespace(kubeconfig, namespace, source, namespace_kinds)
             except sandbox_exec.SandboxUnavailable:
                 raise
             except subprocess.TimeoutExpired as exc:
@@ -1360,8 +1594,10 @@ def sweep_fleet(
             sweep.read_scopes.add(scope_key(cid, namespace))
             # A kind the cluster does not serve holds its rows without making
             # the namespace unreadable: most clusters lack some optional CRD.
-            if unread | dropped:
-                sweep.partial_scopes[scope_key(cid, namespace)] = unread | dropped
+            # So does a wildcard kind discovery could not read or the cap cut.
+            not_asked = unread | dropped | held | cut.get(namespace, set())
+            if not_asked:
+                sweep.partial_scopes[scope_key(cid, namespace)] = not_asked
             if unread:
                 sweep.unreadable[scope_key(cid, namespace)] = f"partial: {', '.join(sorted(unread))} not read"
             for f in findings:
@@ -1388,6 +1624,11 @@ def sweep_fleet(
     sweep.credentials = {
         cid: at
         for cid, at in records.items()
+        if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
+    }
+    sweep.discovered = {
+        cid: record
+        for cid, record in discoveries.items()
         if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
     }
     return sweep
@@ -2126,7 +2367,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     try:
         if lookup_error:
             raise lookup_error
-        sweep = sweep_fleet(project, state.get(CURSOR_KEY), state.get(CREDENTIALS_KEY), now)
+        sweep = sweep_fleet(project, state.get(CURSOR_KEY), state.get(CREDENTIALS_KEY), now, state.get(DISCOVERED_KINDS_KEY))
     except Exception as exc:  # noqa: BLE001 - a failed sweep is reported once, not raised every tick
         text = failure_text(exc)
         if state.get("sweep_error") != text:
@@ -2139,6 +2380,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         state["sweep_error"] = None
         state[CURSOR_KEY] = sweep.cursor
         state[CREDENTIALS_KEY] = sweep.credentials
+        state[DISCOVERED_KINDS_KEY] = sweep.discovered
         view = sweep.view()
         if sweep.budget_exhausted:
             if not state.get(BUDGET_EXHAUSTED_KEY):

@@ -60,6 +60,11 @@ func TestSettleAppliesToTheTransientFamiliesOnly(t *testing.T) {
 	for reason, want := range map[string]bool{
 		"CrashLoopBackOff": true, "FailedMount": true, "Unhealthy": true,
 		"NodeNotReady": false, "OOMKilled": false, "Evicted": false, "ImagePullBackOff": false, "FailedScheduling": false, "FailedToDrainNode": false,
+		// Config Connector re-records a reconcile failure on every reconcile
+		// while it lasts, and its normal states are on no list.
+		"UpdateFailed": true, "DeleteFailed": true, "DependencyNotReady": true, "DependencyNotFound": true, "DependencyInvalid": true,
+		"ManagementConflict": true, "Unmanaged": true, "PreActuationTransformFailed": true, "PostActuationTransformFailed": true,
+		"Updating": false, "UpToDate": false,
 	} {
 		if got := settleApplies(reason, ""); got != want {
 			t.Errorf("settleApplies(%q) = %t; want %t", reason, got, want)
