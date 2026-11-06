@@ -510,8 +510,9 @@ type a2aDispatchConfig struct {
 	RenewSeconds         int    `json:"renewSeconds"`
 	RestartGraceSeconds  int    `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int    `json:"acceptTimeoutSeconds"`
-	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS'
-	// max age, from the constant the provision script renders it from.
+	// SubmitRetentionSeconds is lib.DispatchConfig's: PROFILE_SUBMITS' max
+	// age, the longer of the constant the provision script creates it with
+	// and the live stream's as its Job reports it (dispatchSubmitRetentionSeconds).
 	SubmitRetentionSeconds int                  `json:"submitRetentionSeconds,omitempty"`
 	Profiles               []a2aDispatchProfile `json:"profiles"`
 }

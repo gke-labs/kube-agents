@@ -3921,7 +3921,7 @@ func (f *tasksSubjectCapFinding) eventMessage(jobName string) string {
 
 // a2aProvisionFindings is what parseA2AProvisionReport read out of one
 // report: each finding the reader knows, absent when the script did not
-// write it. Both nil/false is the clean report, {}.
+// write it. All nil/false is the clean report, {}.
 type a2aProvisionFindings struct {
 	tasksSubjectCap           *tasksSubjectCapFinding
 	topicsStateSubjectMissing bool
