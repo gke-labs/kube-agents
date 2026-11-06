@@ -189,6 +189,11 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(plugin, operator)
         self.assertEqual(len(plugin), 9)
 
+    def test_the_chat_plugins_proposals_read_age_family_is_the_one_the_poller_reads(self):
+        """The origins reading is present only beside a fresh ledger read age; a rename
+        of the family on either side would leave the reading absent for good."""
+        self.assertEqual(_py_const("PROPOSALS_READ_AGE_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "proposalsOpenedReadAgeSeries"))
+
     def test_the_usage_summarys_origin_fields_are_the_crds_json_tags(self):
         """The summary reads the nine fields by their json names; a renamed tag would leave
         that origin unprinted with every suite green. The gateway's copy is pinned to the

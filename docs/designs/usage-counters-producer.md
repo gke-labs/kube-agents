@@ -14,7 +14,8 @@ serves `kubeagents_tool_invocations_total`, `kubeagents_vcs_requests_total` and
 pod's `agent-api-auth` sidecar, and the `chat_metrics` plugin serves
 `kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total` and the `kubeagents_proposals_opened` gauge with its `kubeagents_proposals_opened_read_age_seconds` on the `platform-agent` container, all for the
 managed-Prometheus collector. The poller reads the `kubeagents_proposals_opened` gauge into the nine
-`proposalsFrom<Origin>` readings, which [`proposal-origin.md`](proposal-origin.md) owns (§2.3 there).
+`proposalsFrom<Origin>` readings and gates them on its read age, which
+[`proposal-origin.md`](proposal-origin.md) owns (§2.3 there).
 
 This document settles how the operator turns the other series into the status fields: a poller
 that runs on the leader off the reconcile path, scrapes the three endpoints over a NetworkPolicy
