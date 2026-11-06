@@ -320,13 +320,6 @@ FIXTURE_NOT_READY = {
     "terraform-new-cluster-pr": (
         "#3576: needs a Terraform provisioning/ path in the pool GitOps repositories"
     ),
-    # Needs a public repository whose tree is over the broker's 32 MiB
-    # snapshot ceiling, with a planted removed apiVersion outside the part
-    # that makes it large; the task.yaml's header specifies it.
-    "upgrades-api-deprecation-large-repo": (
-        "#4705: needs a public GitOps repository over the broker's snapshot "
-        "ceiling that holds a manifest on a removed apiVersion"
-    ),
     # Needs a cluster that runs Config Connector in the audited fleet of a
     # pool project; no pool project runs it (provisioning-kcc-cluster-without-
     # crds-stops relies on that). bench/tf/prebuilt/kcc-stalled-declaration

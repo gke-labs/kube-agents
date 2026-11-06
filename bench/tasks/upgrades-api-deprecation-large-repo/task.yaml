@@ -1,6 +1,5 @@
-# FIXTURE_NOT_READY in scripts/validate_bench_cases.py: the repository this
-# case names does not exist yet. Registered in hack/eval/nightly-cases.txt
-# once the fixture issue plants it.
+# NIGHTLY — registered in hack/eval/nightly-cases.txt. The fixture repository
+# was planted by #4705.
 #
 # The large-tree variant of upgrades-api-deprecation-clean-repo (#4279). The
 # broker refuses a snapshot of a tree over its ceiling (32 MiB of tar by
@@ -16,10 +15,15 @@
 # whatever versions the eval clusters run; the removal table ends at 1.32, and
 # a floor above it would leave nothing in range to find.
 #
-# Expected red on main, not yet observed (there is no fixture): the section is
-# `not scanned` with SNAPSHOT_TOO_LARGE, so the report names neither the
-# resource nor the apiVersion. Its red and three greens are owed once #4705
-# plants the repository.
+# Red on main, observed on the devops-bench-complex-evals dev install (today
+# mode, graded over the agent API) at main 5a4cdc5e: the scan's section is
+# `not scanned` (the broker refuses the 41963520-byte tree against its
+# 33554432-byte ceiling). The worker then snapshotted `clusters/` and
+# `README.md` itself and scanned the copy with `--manifests-dir`, so the report
+# names the PDB but fails the-scan-read-the-repository-itself and
+# the-section-names-its-source. Green three times on #4776's build: the scan
+# reads the tree in one snapshot of `clusters/` and every check passes. Not yet
+# run on a next-mode install through the inject door.
 #
 # Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
 # write). The repository is public, so the broker reads it as an unregistered
@@ -57,9 +61,9 @@ verification_spec:
     check:
       type: report_contains
       required_phrases: ["manifests as of"]
-  # The defect this case exists for: the planted manifest is found. Before the
-  # scan read large trees in parts, the section was `not scanned` and named
-  # neither.
+  # The planted manifest is found. On its own this check does not catch the
+  # defect: on main a worker found it by snapshotting the tree itself, which
+  # the-scan-read-the-repository-itself and the-section-names-its-source refuse.
   - name: the-removed-apiversion-is-found
     role: objective
     mode: assert

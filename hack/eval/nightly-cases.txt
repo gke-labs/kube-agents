@@ -1215,6 +1215,14 @@
 # hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS. Nightly from its first merge.
 ./tasks/tse-node-notready-pleg-probe/task.yaml
 
+# The API deprecation scan reads a repository over the broker's snapshot
+# ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops
+# (#4705), is a public tree over the ceiling with one manifest on a removed
+# apiVersion; the scan reads it with no credential, so it needs no pool change.
+# Red on main 5a4cdc5e and three greens on #4776's build, on the
+# devops-bench-complex-evals dev install (today mode, agent API).
+./tasks/upgrades-api-deprecation-large-repo/task.yaml
+
 # Catalogue entry 23 through the readiness report's control-plane-upgrade-history
 # rule: the capacity failures among each seeded cluster's upgrade and repair
 # operations, against its maintenance window (#3524). Read-only; no planted
