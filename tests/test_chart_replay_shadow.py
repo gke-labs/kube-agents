@@ -481,13 +481,13 @@ class ModesTest(unittest.TestCase):
         env = _proxy_env(_RECORD)
         self.assertEqual((env["REPLAY_MODE"], env["REPLAY_CACHE_DIR"]), ("record", "/data/replay-cache"))
         self.assertNotIn("REPLAY_ALLOW_SERVE", env)
-        self.assertEqual(env["REPLAY_DATA_MAX_BYTES"], "1073741824", "the cache shares the volume")
+        self.assertEqual(env["REPLAY_DATA_MAX_BYTES"], "1610612736", "the proxy counts the cache in the budget")
 
     def test_replay_with_both_switches_serves(self):
         env = _proxy_env(_REPLAY)
         self.assertEqual((env["REPLAY_MODE"], env["REPLAY_ALLOW_SERVE"], env["REPLAY_JOB_KIND"]),
                          ("replay", "yes", "replay-lane"))
-        self.assertEqual(env["REPLAY_DATA_MAX_BYTES"], "1073741824")
+        self.assertEqual(env["REPLAY_DATA_MAX_BYTES"], "1073741824", "the seeded cache sits outside the budget")
 
     def test_replay_without_allow_serve_or_allow_serve_without_replay_is_refused(self):
         without = [s for s in _REPLAY if "allowServe" not in s]
