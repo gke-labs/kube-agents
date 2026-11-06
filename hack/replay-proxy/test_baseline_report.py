@@ -690,6 +690,24 @@ class ThirdReview(unittest.TestCase):
         self.assertTrue(err.startswith("baseline_report: "), err)
 
 
+class NightlyUntrusted(unittest.TestCase):
+    def test_a_nightly_untrusted_line_has_its_own_scope_and_case_table(self):
+        runs = [eval_run("g1", [task("c", {"result": "pass"})], tier="gitlab")]
+        r = report([line("a", 1, kind="nightly-untrusted", build="g1", prompt=100), line("b", 2, build="n1")],
+                   runs=runs)
+        self.assertEqual(r["scopes"]["nightly-untrusted"]["prompt_tokens"], 100)
+        self.assertEqual(r["scopes"]["nightly"]["requests"], 1)
+        self.assertEqual(r["scopes"]["total"]["requests"], 2)
+        self.assertEqual(set(r["cases"]["nightly-untrusted"]), {"c"})
+        self.assertEqual(r["data_quality"]["eval_tier_mismatches"], 0)
+        self.assertIn("nightly-untrusted", br.render(r).splitlines()[3])
+        self.assertIn("nightly-untrusted", br.compare(r, r)["scopes"])
+
+    def test_the_kinds_do_not_depend_on_analyze_shadow_listing_it(self):
+        self.assertEqual(br.JOB_KINDS, ("nightly", "nightly-untrusted", "presubmit"))
+        self.assertEqual(br.SCOPES, ("total",) + br.JOB_KINDS)
+
+
 class MalformedInput(unittest.TestCase):
     def test_skips_and_bad_values_are_counted_not_fatal(self):
         r = report([

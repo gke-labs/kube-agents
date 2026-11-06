@@ -51,7 +51,14 @@ import schema as F
 REPORT_SCHEMA_VERSION = 1
 NIGHTLY = analyze_shadow.NIGHTLY
 PRESUBMIT = analyze_shadow.PRESUBMIT
-JOB_KINDS = analyze_shadow.JOB_KINDS
+# A scheduled run whose shadow logs are filed apart from the trusted nightly's
+# because it did not upload as the baseline recorder (the GitLab nightly, for
+# one). analyze_shadow names it once it knows the kind; until then, the same
+# value here.
+NIGHTLY_UNTRUSTED = getattr(analyze_shadow, "NIGHTLY_UNTRUSTED", "nightly-untrusted")
+# Every kind this report counts, whether or not analyze_shadow.JOB_KINDS lists
+# it yet.
+JOB_KINDS = (NIGHTLY, NIGHTLY_UNTRUSTED, PRESUBMIT)
 TOTAL_SCOPE = "total"
 SCOPES = (TOTAL_SCOPE,) + JOB_KINDS
 HTTP_OK = 200
