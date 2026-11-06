@@ -90,17 +90,21 @@ def proxy_section(records: Sequence[hl.Record]) -> str:
             "throughput; a broker whose slots are full shows a median admission wait above its lowest "
             "bucket.\n\n"
             + _table(
-                ("Workers", "Runs", "Commands per second", "Median s", "95th percentile s", "Failed",
+                ("Operation", "Workers", "Runs", "Commands per second", "Median s", "95th percentile s", "Failed",
                  "Proxy CPU peak (cores)", "Shell CPU peak (cores)", "Admission wait, median s"),
                 (
-                    (_count(level.workers), str(level.runs), _number(level.per_second),
+                    (level.operation, _count(level.workers), str(level.runs), _number(level.per_second),
                      _number(level.p50_seconds), _number(level.p95_seconds), _count(level.errors),
                      _number(level.cpu_cores), _number(level.shell_cpu_cores), _number(level.wait_p50_seconds))
                     for level in levels
                 ),
             )
         )
-    saturation = max((level.per_second for level in levels), default=None)
+    # Each load operation's best throughput; the slowest of those is what a mixed fleet gets.
+    peaks: dict[str, float] = {}
+    for level in levels:
+        peaks[level.operation] = max(peaks.get(level.operation, 0.0), level.per_second)
+    saturation = min(peaks.values(), default=None)
     if demand:
         rows = []
         for item in demand:
