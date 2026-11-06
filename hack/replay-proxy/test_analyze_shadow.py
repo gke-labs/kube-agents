@@ -329,11 +329,26 @@ class MissTest(unittest.TestCase):
         self.assertEqual(p2["matched_messages"], 1)
 
 
-def write_store(requests):
+def build_store(segment):
+    """The store collect_shadow.py copies out beside a build's logs/: <build>/store/."""
+    return os.path.join(os.path.dirname(os.path.dirname(segment)), "store")
+
+
+def write_with_stores(lines, texts):
+    """write(lines), plus each segment's build store holding the texts of the requests in it."""
+    paths = write(lines)
+    for path in paths:
+        with open(path) as handle:
+            ids = {json.loads(l).get("request_id") for l in handle if l.strip().startswith("{")}
+        write_store({rid: texts[rid] for rid in ids if rid in texts}, build_store(path))
+    return paths
+
+
+def write_store(requests, root=None):
     """A REPLAY_STORE_DIR holding `requests`: request_id -> list of message texts."""
-    root = tempfile.mkdtemp(dir=TEMP_DIR)
-    os.makedirs(os.path.join(root, "blobs"))
-    os.makedirs(os.path.join(root, "requests"))
+    root = root or tempfile.mkdtemp(dir=TEMP_DIR)
+    os.makedirs(os.path.join(root, "blobs"), exist_ok=True)
+    os.makedirs(os.path.join(root, "requests"), exist_ok=True)
     for request_id, messages in requests.items():
         blobs = []
         for text in messages:
@@ -378,6 +393,22 @@ class ClosestByTextTest(unittest.TestCase):
         lines[1] = dict(lines[1], job={"kind": "nightly-untrusted", "project": "p1", "build": "b0", "pr": "10"})
         miss = report(lines, texts=texts)[0]["top_misses"][0]
         self.assertEqual(miss["closest_request_id"], "n1")
+
+    def _untrusted_claiming_the_pull_request(self):
+        lines = [line("u1", 1, "nightly-untrusted", "b0", "A", ["s", "w", "ta"], pr="10"),
+                 presubmit("p1", 2, "10", "b1", "C", ["s", "w", "tc"])]
+        records, _ = analyze_shadow.load(write(lines))
+        return {r.request_id: r for r in records}, analyze_shadow.PrefixSources(records, {}, True, by_text=True)
+
+    def test_usable_refuses_an_untrusted_record_on_its_own(self):
+        records, sources = self._untrusted_claiming_the_pull_request()
+        self.assertFalse(sources.usable(records["u1"], records["p1"]))
+
+    def test_an_untrusted_record_is_never_a_text_candidate(self):
+        records, sources = self._untrusted_claiming_the_pull_request()
+        self.assertTrue(sources.members, "the presubmit's own prefixes are there")
+        for key, members in sources.members.items():
+            self.assertNotIn("u1", [r.request_id for r in members], key)
 
     def test_a_request_replay_could_not_have_used_is_never_closest(self):
         # n2 finished after p1 started, so it was not available to p1.
@@ -512,7 +543,7 @@ class ClosestByTextRulesTest(unittest.TestCase):
                  presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            analyze_shadow.main([*write(lines), "--store", root])
+            analyze_shadow.main([*write_with_stores(lines, self.TEXTS), "--by-text"])
         self.assertIn("closest request ranked by text for 1 of 1 misses", out.getvalue())
         self.assertRegex(out.getvalue(), r"\(nightly, by text 0\.\d+\)")
 
@@ -541,17 +572,49 @@ class ClosestByTextRulesTest(unittest.TestCase):
 
     def test_an_empty_store_path_is_refused(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", ""])
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store", ""])
 
     def test_a_store_without_blobs_is_refused(self):
         root = write_store(self.TEXTS)
         shutil.rmtree(os.path.join(root, "blobs"))
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", root])
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store", root])
 
     def test_a_store_without_requests_is_refused(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--store", TEMP_DIR + "/typo"])
+            analyze_shadow.main([*write([line("n1", 1, "nightly", "n", "A", ["a"])]), "--kind", "nightly", "--store",
+                                 TEMP_DIR + "/typo"])
+
+    def test_one_store_for_every_input_needs_kind_and_by_text_refuses_it(self):
+        root = write_store(self.TEXTS)
+        paths = write([line("n1", 1, "nightly", "n", "A", ["a"])])
+        for extra in (["--store", root], ["--by-text", "--kind", "nightly"], ["--by-text", "--kind", "nightly", "--store", root]):
+            with self.subTest(extra=extra):
+                err = io.StringIO()
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+                    analyze_shadow.main([*paths, *extra])
+                self.assertIn("--kind", err.getvalue())
+
+    def test_text_planted_in_another_build_never_stands_in_for_a_trusted_candidate(self):
+        # n1 and x are nightly; x's next message is the closer one. A presubmit that read the bucket
+        # plants store/requests/n1.json under its own build with p1's exact text, which a merged
+        # store would rank first.
+        lines = [line("n1", 1, "nightly", "n", "A", ["s", "w", "ta"]),
+                 line("x", 1.5, "nightly", "n", "X", ["s", "w", "tx"]),
+                 presubmit("p1", 10, "10", "b2", "C", ["s", "w", "tc"])]
+        paths = write_with_stores(lines, self.TEXTS)
+        presubmit_segment = next(p for p in paths if os.sep + "presubmit" + os.sep in p)
+        write_store({"n1": self.TEXTS["p1"]}, build_store(presubmit_segment))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(analyze_shadow.main([*paths, "--by-text", "--json"]), 0)
+        [miss] = json.loads(out.getvalue())["top_misses"]
+        self.assertEqual((miss["closest_request_id"], miss["closest_by"]), ("x", "text"))
+        # The same files with every store merged into one, as the old recipe did: the planted text wins.
+        merged = write_store({**self.TEXTS, "n1": self.TEXTS["p1"]})
+        records, _ = analyze_shadow.load(paths)
+        miss = analyze_shadow.summarize(records, texts=analyze_shadow.StoredText(merged))["top_misses"][0]
+        self.assertEqual(miss["closest_request_id"], "n1")
 
 
 class HealthTest(unittest.TestCase):

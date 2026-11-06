@@ -53,7 +53,7 @@ do not drift between requests of one conversation), ranked by tokens lost. The
 stored, scrubbed text of both is under their request_id for a diff.
 
 Many earlier requests can share that prefix (every worker conversation opens
-the same way). With `--store`, the copied-out REPLAY_STORE_DIR, the closest is
+the same way). With `--by-text` or `--store`, the closest is
 the one whose next message is most alike by the words they share, relative to
 both messages' length, among the 64 most recent distinct next messages that
 have stored text; one sharing no word with the miss's is no match. Each miss
@@ -61,16 +61,23 @@ then says how it was chosen (`closest_by`: `text` with its `closest_score`, or
 `earliest` and why: the miss's own text wasn't stored or has no words, no
 candidate's was, none shared a word, or every message matched), and the
 report counts the misses ranked by text, so a store missing some jobs shows
-as such. Without `--store`, the earliest
-available, as before. The health
+as such. Without either, the earliest
+available, as before.
+
+The text comes from the request's own build: `--by-text` reads each record's
+store from `<kind>/<YYYY-MM-DD>/<build>/store/`, beside the `logs/` it was
+loaded from, so text another run uploaded under its own prefix (a presubmit
+can read the bucket and learn a nightly's request ids) never stands in for a
+trusted candidate's. `--store DIR` names one store for every record, and so is
+only for logs from outside the bucket, read with `--kind`. The health
 counts show a broken setup; check them after the first day.
 
 A collision audit (did two requests that matched lead to different results?)
 is a later step: it joins each `Hit` from `iter_hits` with run verdicts and the
 stored text. Nothing here reads verdicts yet.
 
-Usage: python3 analyze_shadow.py PATH [PATH ...] [--kind KIND] [--merged MERGED.json] [--store DIR] [--top N]
-       [--json] [--ignore-storable]
+Usage: python3 analyze_shadow.py PATH [PATH ...] [--kind KIND [--store DIR] | --by-text] [--merged MERGED.json]
+       [--top N] [--json] [--ignore-storable]
 Each PATH is a `.jsonl` file or a directory searched for them. MERGED.json maps
 a pull request number to its merge time in epoch seconds.
 """
@@ -85,7 +92,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import request_store
 import schema as F
@@ -109,6 +116,8 @@ SEGMENT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$")
 MANIFEST_NAME = re.compile(r"^job-\d+\.json$")
 FILED_DEPTH = 5
 MANIFEST_DEPTH = 4
+# A build's copied-out REPLAY_STORE_DIR, beside its logs/ (collect_shadow.STORE_REQUESTS_DIR's top).
+BUILD_STORE_DIR = "store"
 # Requests sharing a prefix that a miss is compared against, newest first, one per distinct next message.
 MAX_PREFIX_CANDIDATES = 64
 STORE_MESSAGES_KEY = "messages"
@@ -186,13 +195,16 @@ class Record:
     completion_tokens: int
     latency_ms: int
     unstorable: List[str]
+    # The store of the build this line was filed under, when it came from the
+    # bucket's layout: the only place its stored text is read from (BuildStores).
+    store_dir: Optional[str] = None
 
     @property
     def storable(self) -> bool:
         return not self.unstorable
 
     @classmethod
-    def from_line(cls, entry: Dict[str, Any], kind: str) -> "Record":
+    def from_line(cls, entry: Dict[str, Any], kind: str, store_dir: Optional[str] = None) -> "Record":
         """`kind` is the folder's, which load() has checked the line's tag against."""
         job = entry.get(F.JOB) or {}
         hashes = entry.get(F.MESSAGE_HASHES)
@@ -217,6 +229,7 @@ class Record:
             completion_tokens=int(entry.get(F.COMPLETION_TOKENS) or 0),
             latency_ms=int(entry.get(F.LATENCY_MS) or 0),
             unstorable=[str(r) for r in entry.get(F.UNSTORABLE) or []],
+            store_dir=store_dir,
         )
 
     @property
@@ -392,6 +405,26 @@ class StoredText:
         except ValueError:
             return None
 
+    def text(self, record: "Record", index: int) -> Optional[str]:
+        """Message `index` of `record`, from this one store whatever build it came from."""
+        return self.message(record.request_id, index)
+
+
+class BuildStores:
+    """Each record's text from its own build's store (Record.store_dir), never another's."""
+
+    def __init__(self) -> None:
+        self.stores: Dict[str, StoredText] = {}
+
+    def text(self, record: "Record", index: int) -> Optional[str]:
+        if not record.store_dir:
+            return None
+        store = self.stores.setdefault(record.store_dir, StoredText(record.store_dir))
+        return store.message(record.request_id, index)
+
+
+TextSource = Union[StoredText, BuildStores]
+
 
 def message_text(message: Any) -> str:
     """A stored message's words: its content and its tool calls, without the JSON around them."""
@@ -449,7 +482,7 @@ class PrefixSources(Sources):
         return (bool(request.pr) and record.pr == request.pr and record.build != request.build
                 and self.build_end[record.build_key] <= request.ts)
 
-    def closest(self, request: Record, texts: Optional[StoredText] = None) -> Miss:
+    def closest(self, request: Record, texts: Optional[TextSource] = None) -> Miss:
         if request.search_hashes is None:
             return Miss(request, None, 0)
         root = request.search_settings_hash
@@ -466,7 +499,7 @@ class PrefixSources(Sources):
             return Miss(request, best, matched)
         if matched >= len(request.search_hashes):
             return Miss(request, best, matched, CLOSEST_BY_EARLIEST, UNRANKED_ALL_MATCHED)
-        current = texts.message(request.request_id, matched)
+        current = texts.text(request, matched)
         if current is None:
             return Miss(request, best, matched, CLOSEST_BY_EARLIEST, UNRANKED_OWN_TEXT_MISSING)
         if not current.split():  # an image- or thinking-only message: no words to rank by
@@ -478,7 +511,7 @@ class PrefixSources(Sources):
         return Miss(request, ranked, matched, CLOSEST_BY_TEXT, closest_score=round(score, SCORE_DECIMALS))
 
     def most_alike(
-        self, key: str, index: int, request: Record, current: str, texts: StoredText
+        self, key: str, index: int, request: Record, current: str, texts: TextSource
     ) -> Tuple[bool, Optional[Record], float]:
         """Of the usable requests sharing `key`, the one whose message `index` is most like `current`.
 
@@ -494,7 +527,7 @@ class PrefixSources(Sources):
             following = record.search_hashes[index] if index < len(record.search_hashes or []) else ""
             if following in seen or not self.usable(record, request):
                 continue
-            text = texts.message(record.request_id, index)
+            text = texts.text(record, index)
             if text is None:
                 continue
             seen.add(following)
@@ -582,6 +615,8 @@ def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record]
     skipped = {reason: 0 for reason in SKIP_REASONS}
     files, skipped[SKIP_OFF_LAYOUT] = log_files(paths, kind)
     for path, file_kind in files:
+        # At the layout (no `kind`), <build>/logs/<segment>: the build's store is beside logs/.
+        store_dir = None if kind else os.path.join(os.path.dirname(os.path.dirname(path)), BUILD_STORE_DIR)
         with open(path, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -611,7 +646,7 @@ def load(paths: Iterable[str], kind: Optional[str] = None) -> Tuple[List[Record]
                 if tag != file_kind:
                     skipped[SKIP_KIND_MISMATCH] += 1
                     continue
-                records.append(Record.from_line(entry, file_kind))
+                records.append(Record.from_line(entry, file_kind, store_dir))
     records.sort(key=lambda r: r.ts)
     return records, skipped
 
@@ -637,7 +672,7 @@ def iter_hits(
 
 def find_misses(
     records: List[Record], require_storable: bool = True, merged: Optional[Dict[str, float]] = None,
-    texts: Optional[StoredText] = None,
+    texts: Optional[TextSource] = None,
 ) -> List[Miss]:
     """High-estimate misses, each with its closest earlier request."""
     prefixes = PrefixSources(records, merged or {}, require_storable, by_text=texts is not None)
@@ -690,7 +725,7 @@ def health(records: List[Record], skipped: Optional[Dict[str, int]] = None) -> D
 def summarize(
     records: List[Record], require_storable: bool = True, top: int = DEFAULT_TOP_MISSES,
     merged: Optional[Dict[str, float]] = None, skipped: Optional[Dict[str, int]] = None,
-    texts: Optional[StoredText] = None,
+    texts: Optional[TextSource] = None,
 ) -> Dict[str, Any]:
     presubmit = [r for r in records if r.kind == PRESUBMIT]
     total_tokens = sum(r.prompt_tokens for r in presubmit)
@@ -801,11 +836,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--kind", choices=JOB_KINDS,
                         help="the job kind of every input, instead of the <kind>/<day>/<build>/logs/ folder each is under")
     parser.add_argument("--merged", help="JSON file mapping a pull request number to its merge time (epoch seconds)")
-    parser.add_argument("--store", help="the copied-out REPLAY_STORE_DIR, to rank requests sharing a prefix by text")
+    parser.add_argument("--by-text", action="store_true",
+                        help="rank requests sharing a prefix by text, from each build's own store/ beside its logs/")
+    parser.add_argument("--store", help="with --kind: one copied-out REPLAY_STORE_DIR for every input, to rank by text")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP_MISSES, help="misses to list")
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--ignore-storable", action="store_true", help="count sightings replay would not have saved")
     args = parser.parse_args(argv)
+    if args.store is not None and args.kind is None:
+        parser.error("--store names one store for every input, so only with --kind; logs at the bucket's layout use "
+                     "--by-text, which reads each build's own store/")
+    if args.by_text and (args.kind is not None or args.store is not None):
+        parser.error("--by-text reads each build's store/ beside its logs/, which inputs read with --kind do not "
+                     "have; use --store DIR")
     for needed in (request_store.REQUESTS_DIR, request_store.BLOBS_DIR) if args.store is not None else ():
         if not os.path.isdir(os.path.join(args.store, needed)):
             parser.error(f"--store {args.store} has no {needed}/ directory")
@@ -815,7 +858,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         parser.error(str(exc))
     report = summarize(
         records, require_storable=not args.ignore_storable, top=args.top, merged=load_merged(args.merged), skipped=skipped,
-        texts=StoredText(args.store) if args.store is not None else None,
+        texts=StoredText(args.store) if args.store is not None else BuildStores() if args.by_text else None,
     )
     if args.json:
         report["skipped_lines"] = skipped
