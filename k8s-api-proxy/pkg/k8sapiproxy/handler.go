@@ -35,16 +35,6 @@ const (
 	retryAfterSeconds = "1"
 )
 
-// longRunningSubresources are the subresources kube-apiserver also counts as long-running
-// and leaves out of its own max-in-flight limit.
-var longRunningSubresources = map[string]struct{}{
-	"attach":      {},
-	"exec":        {},
-	"log":         {},
-	"portforward": {},
-	"proxy":       {},
-}
-
 // Config configures NewHandler.
 type Config struct {
 	// Authenticator verifies the caller of each request. Required.
@@ -241,7 +231,8 @@ func (h *handler) recordObservability(r *http.Request, info *request.RequestInfo
 		}
 		spanReason = ev.Reason
 		h.metrics.recordRejection(ev.Reason, verbLabel, resLabel, subLabel, h.policy.Mode)
-	// Neither is the upstream failing: the TokenReview did (503), or the caller left, before or during the copy.
+	// Neither is the upstream failing: the TokenReview did (503), the caller left before or during the copy,
+	// or the in-flight cap turned the request away (429).
 	case ev.Outcome == OutcomeAuthUnavailable, ev.Outcome == OutcomeCanceled, ev.Outcome == OutcomeThrottled:
 		metricOutcome = string(ev.Outcome)
 	case ev.Outcome == OutcomeUpstreamError || ev.Outcome == OutcomeAborted || ev.StatusCode >= http.StatusInternalServerError:
@@ -344,11 +335,7 @@ func (h *handler) acquireSlot() (release func(), ok bool) {
 
 // isLongRunning reports a request that stays open for as long as the caller follows it.
 func isLongRunning(info *request.RequestInfo) bool {
-	if info.Verb == "watch" {
-		return true
-	}
-	_, ok := longRunningSubresources[info.Subresource]
-	return ok
+	return info.Verb == verbWatch || longRunningSubresources.Has(info.Subresource)
 }
 
 func refuse(w http.ResponseWriter, ev *AuditEvent, perr *PolicyError) {
