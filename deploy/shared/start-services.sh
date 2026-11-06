@@ -584,6 +584,10 @@ normalize_boolean WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD "${WATCHER_AUTOPILOT_SCAL
 # Not normalised here: the watcher parses the list, and a malformed one is
 # logged as an ALERT and ignored there, so it never stops the watcher.
 WATCHER_ALERT_EXCLUDE="${WATCHER_ALERT_EXCLUDE:-}"
+# The file the operator mounts with the same list. The watcher reads it again
+# every minute, so a change to the rules applies without a restart. When it is
+# set, the list above is not passed: the watcher refuses both.
+WATCHER_ALERT_EXCLUDE_FILE="${WATCHER_ALERT_EXCLUDE_FILE:-}"
 
 # The agent image's interpreter. The credential-proxy image is built on
 # agent-base by way of proxy-tools, so this is the same venv the agent runs
@@ -927,6 +931,11 @@ start_event_watcher() {
       ;;
   esac
 
+  alert_exclude_arg=(--alert-exclude="${WATCHER_ALERT_EXCLUDE}")
+  if [ -n "${WATCHER_ALERT_EXCLUDE_FILE}" ]; then
+    alert_exclude_arg=(--alert-exclude-file="${WATCHER_ALERT_EXCLUDE_FILE}")
+  fi
+
   (
     # Leave the loop on SIGTERM instead of going round it again. bash runs a trap
     # between commands, so this one is deferred until the foreground watcher below
@@ -960,7 +969,7 @@ start_event_watcher() {
         --settle="${WATCHER_SETTLE}" \
         --quiet-after="${WATCHER_QUIET_AFTER}" \
         --autopilot-scale-to-zero-hold="${WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD}" \
-        --alert-exclude="${WATCHER_ALERT_EXCLUDE}" || true
+        "${alert_exclude_arg[@]}" || true
       ran=$(( SECONDS - started ))
 
       # A run long enough to have synced and served is treated as a fresh

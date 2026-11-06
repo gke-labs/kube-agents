@@ -151,7 +151,10 @@ type flags struct {
 	namespaces        string
 	excludeNamespaces string
 	// alertExclude is the --alert-exclude JSON; see alertexclude.go.
-	alertExclude      string
+	alertExclude string
+	// alertExcludeFile names a file holding the same JSON, read again every
+	// --profiles-rescan so a change applies without a restart.
+	alertExcludeFile  string
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
@@ -220,6 +223,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.StringVar(&f.namespaces, "namespace", "", "Comma-separated allow-list of namespaces. Empty = all namespaces.")
 	fs.StringVar(&f.excludeNamespaces, "exclude-namespace", "", "Comma-separated deny-list of namespaces.")
 	fs.StringVar(&f.alertExclude, "alert-exclude", "", `JSON list of alert-exclude rules. An event any rule matches opens no incident; its cluster stays in scope for reads. Each rule sets one or more of cluster ({"projectId","location","clusterName"}, clusterName required), namespace, reason (the event's or its canonical reason), kind, and name (a trailing "*" is a prefix match); a rule matches when every part it sets matches. Empty = none.`)
+	fs.StringVar(&f.alertExcludeFile, "alert-exclude-file", "", "File holding the --alert-exclude JSON, read at startup and again every --profiles-rescan; a change applies to the events decided after it is read, and a malformed or unreadable change leaves the rules in force. Not set with --alert-exclude. Empty = no file.")
 
 	// Dedup.
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
@@ -238,7 +242,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
 	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, addressed by asking the GKE API about that profile's cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
-	fs.DurationVar(&f.profilesRescan, "profiles-rescan", defaultProfilesRescan, "How often --profiles-dir is read again after startup. A Cluster Agent profile written since the last read starts a watcher, one skipped on an earlier read (a GKE lookup refused with 429 or 5xx) is tried again, and one removed stops its watcher and snapshots its dedup cache. 0 = read the directory once, at startup.")
+	fs.DurationVar(&f.profilesRescan, "profiles-rescan", defaultProfilesRescan, "How often --profiles-dir is read again after startup. A Cluster Agent profile written since the last read starts a watcher, one skipped on an earlier read (a GKE lookup refused with 429 or 5xx) is tried again, and one removed stops its watcher and snapshots its dedup cache. --alert-exclude-file is read again on the same interval. 0 = read the directory once, at startup.")
 	fs.IntVar(&f.initialListConcurrency, "initial-list-concurrency", defaultInitialListConcurrency, "How many clusters may receive their initial Event state at once: the reflector's first list (every page of it, on a control plane without watch-list), or the initial events of its watch-list stream, and the relist after a 410 or a hold. Bounds the startup burst a fleet of large clusters makes on this container's memory; the rest wait their turn. 0 = no bound.")
 	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; with --profiles-dir the name comes from each profile's cluster_identity).")
 
@@ -356,6 +360,9 @@ func (f *flags) validate() error {
 	}
 	if f.profilesRescan < 0 {
 		return errors.New("--profiles-rescan must be >= 0 (0 = read the directory once)")
+	}
+	if f.alertExclude != "" && f.alertExcludeFile != "" {
+		return errors.New("set --alert-exclude or --alert-exclude-file, not both")
 	}
 	if f.initialListConcurrency < 0 {
 		return errors.New("--initial-list-concurrency must be >= 0 (0 = no bound)")
@@ -1356,6 +1363,13 @@ func realMain(argv []string) error {
 			log.Printf("metrics server: %v", err)
 		}
 	}()
+
+	// The rules file, read now, before any cluster starts, and again every
+	// --profiles-rescan: the operator's way to change the rules without a
+	// restart.
+	if f.alertExcludeFile != "" {
+		startAlertExcludeFile(ctx, f.alertExcludeFile, f.profilesRescan, filter, m)
+	}
 
 	clusters, err := buildWatchSet(ctx, f, m)
 	if err != nil {

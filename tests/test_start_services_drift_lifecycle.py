@@ -1200,12 +1200,19 @@ def _watcher_values_passed(watcher: str) -> set[str]:
     The command runs from the binary's path to the `|| true` that ends it, and
     every WATCHER_* token inside it counts, however it is quoted, prefixed or
     nested: `"${ROOT:-/opt}/${WATCHER_X}"` and `"${A:-${WATCHER_X}}"` are found
-    as surely as `"${WATCHER_X}"`. The lookbehind keeps EVENT_WATCHER_* out;
-    the supervisor's own WATCHER_* settings sit outside the command.
+    as surely as `"${WATCHER_X}"`. An array the command expands
+    (`"${args[@]}"`) counts with every value assigned to it in the function. The
+    lookbehind keeps EVENT_WATCHER_* out; the supervisor's own WATCHER_*
+    settings sit outside the command.
     """
     command = re.search(r"/usr/local/bin/k8s-event-watcher\b(.*?)\|\| true", watcher, re.S)
     assert command, "the watcher's command line was not found"
-    return set(re.findall(r"(?<![A-Z0-9_])WATCHER_[A-Z0-9_]+", command.group(1)))
+    text = command.group(1)
+    for array in re.findall(r'"\$\{(\w+)\[@\]\}"', text):
+        assignments = re.findall(rf"(?m)^\s*{array}=\((.*)\)$", watcher)
+        assert assignments, f"the array {array} the command expands is never assigned"
+        text += "\n".join(assignments)
+    return set(re.findall(r"(?<![A-Z0-9_])WATCHER_[A-Z0-9_]+", text))
 
 
 class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
@@ -1403,7 +1410,13 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
         covered = set(_WATCHER_DURATION_KNOBS) | set(_WATCHER_COUNT_KNOBS)
         self.assertEqual(
             set(),
-            passed - covered - {"WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD", "WATCHER_ALERT_EXCLUDE"},
+            passed
+            - covered
+            - {
+                "WATCHER_AUTOPILOT_SCALE_TO_ZERO_HOLD",
+                "WATCHER_ALERT_EXCLUDE",
+                "WATCHER_ALERT_EXCLUDE_FILE",
+            },
             "a WATCHER_* value reaches the watcher without a normaliser",
         )
 
@@ -1417,6 +1430,37 @@ class TheWatchersDurationAndCountFlagsCannotStopItStarting(_ScriptCase):
             '--alert-exclude="${WATCHER_ALERT_EXCLUDE}"',
             self.lift("start_event_watcher"),
         )
+
+    def test_the_rules_file_replaces_the_list_when_it_is_named(self) -> None:
+        """The operator's mounted file, read again by the watcher, wins.
+
+        Only one flag is passed: the watcher refuses both. An older operator
+        names no file, so the list is passed as before.
+        """
+        self.assertIn('WATCHER_ALERT_EXCLUDE_FILE="${WATCHER_ALERT_EXCLUDE_FILE:-}"', self.text)
+        watcher = self.lift("start_event_watcher")
+        block = re.search(r"(?ms)^  alert_exclude_arg=.*?^  fi$", watcher)
+        self.assertIsNotNone(block, "the alert-exclude argument block was not found")
+        self.assertIn('"${alert_exclude_arg[@]}" || true', watcher)
+        rules = '[{"namespace": "payments"}]'
+        for file, want in (
+            ("", f"--alert-exclude={rules}"),
+            (
+                "/etc/kube-agents/event-watcher/rules.json",
+                "--alert-exclude-file=/etc/kube-agents/event-watcher/rules.json",
+            ),
+        ):
+            with self.subTest(file=file):
+                result = _run_bash(
+                    f"""
+                    set -u
+                    WATCHER_ALERT_EXCLUDE={shlex.quote(rules)}
+                    WATCHER_ALERT_EXCLUDE_FILE={shlex.quote(file)}
+                    {block.group(0)}
+                    printf "%s\\n" "${{alert_exclude_arg[@]}}"
+                    """
+                )
+                self.assertEqual(want + "\n", result.stdout)
 
 
 if __name__ == "__main__":
