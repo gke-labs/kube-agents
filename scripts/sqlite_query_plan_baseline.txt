@@ -10,22 +10,19 @@
 # not read, and a line that is not an entry all fail) are in the script's
 # docstring; this file states only what is pinned and why.
 
-# #4331: the fold's ledger lookup, once for the outer read of the workload's
-# incidents and once for the `id IN (SELECT duplicate_of ...)` subquery that
-# folds a duplicate's anchor in. Pull request #4648 indexes the fold's ledger
-# lookups; whichever of it and this file lands second drops this entry, and
-# the stale rule names it.
-agents/platform/scripts/session_kv_server.py _open_fix_pull_request intercepted_events 2
-
 # #4331: the excluded-row fold, one correlated read per excluded event for the
 # newest row of the same object within EXCLUDED_ROW_FOLD_SECONDS. The index it
-# needs (cluster plus object_uid, over excluded rows) is a follow-up of #4648.
+# needs (cluster plus object_uid, over excluded rows) is a follow-up of pull
+# request #4648, which indexed the fold's other ledger lookups.
 agents/platform/scripts/session_kv_server.py post_excluded_event intercepted_events 1
 
-# Three one-shot writes per process start: stamping rows the previous process
-# admitted and never dispatched, releasing the fold anchors, and pruning the
-# reservations of triages that never started (the subquery over the ledger is
-# the scan). Each runs once per start, before the server serves a request.
+# Three one-shot writes per process start, each run once before the server
+# serves a request: stamping rows the previous process admitted and never
+# dispatched; pruning the reservations of triages that never started (the
+# subquery over the ledger is the scan); and releasing the fold anchors, which
+# walks the fold-anchor partial index (#4648), one row per anchor the previous
+# process left. That walk is the bound the planner cannot see: the rows it
+# reads are exactly the rows it rewrites, so there is nothing to index.
 agents/platform/scripts/session_kv_server.py init_db intercepted_events 3
 
 # One read of every session's metadata per process start, from init_db, to

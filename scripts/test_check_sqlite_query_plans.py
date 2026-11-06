@@ -17,6 +17,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import scripts.check_sqlite_query_plans as plan_check  # noqa: E402
 from scripts.check_sqlite_query_plans import (  # noqa: E402
     BASELINE,
     EXIT_FAIL,
@@ -89,6 +90,7 @@ FIXTURE_SERVER = textwrap.dedent(
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_created_at ON events (created_at)")
         conn.execute(f"CREATE INDEX IF NOT EXISTS idx_events_drift ON events (object_uid) WHERE reason = '{DRIFT_REASON}'")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_backlog_pending ON events (created_at) WHERE backlog = 1")
         conn.execute("CREATE TABLE IF NOT EXISTS data_volume_warning (id INTEGER PRIMARY KEY, body TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, author TEXT, body TEXT)")
         for column in ("extra",):
@@ -240,6 +242,22 @@ FIXTURE_SERVER = textwrap.dedent(
         return conn.execute("SELECT id FROM events WHERE reason = 'drift'").fetchall()
 
 
+    def bounded_index_walk(conn):
+        return conn.execute("SELECT id FROM events WHERE backlog = 1").fetchall()
+
+
+    def lambda_param(conn, flag):
+        sql = "SELECT id FROM events WHERE id = ?"
+        run = lambda sql: conn.execute(sql).fetchall()
+        return run("SELECT id FROM events WHERE cluster = ?" if flag else sql)
+
+
+    def lambda_closure(conn):
+        sql = "SELECT id FROM events WHERE cluster = ?"
+        run = lambda: conn.execute(sql).fetchall()
+        return run()
+
+
     def aliased_subquery(conn):
         return conn.execute(
             "SELECT g.cluster FROM (SELECT cluster, COUNT(*) AS c FROM events WHERE created_at > ? GROUP BY cluster) AS g "
@@ -350,6 +368,15 @@ FIXTURE_SERVER = textwrap.dedent(
                 return conn.execute("SELECT body FROM notes WHERE author = ?", ("x",)).fetchone()
 
             return inner()
+
+
+    class Body:
+        shadowed = "SELECT id FROM events WHERE cluster = ?"
+        if False:  # the shape alone, never run: a statement in the class body reads the class body's names
+            rows = CONN.execute(shadowed).fetchall()
+
+        def method(self, conn):
+            return conn.execute(shadowed, (1,)).fetchall()
     '''
 )
 
@@ -369,6 +396,8 @@ FIXTURE_SCHEMA = SchemaSource(
     module="fixture_server.py", db_path_attr="DB_PATH", init_function="init_db", extra_ddl_attrs=("SIDE_SCHEMA",)
 )
 FIXTURE_TARGETS = ("fixture_server.py", "fixture_helper.py")
+# The fixture's one partial index whose WHERE is a bound by design; `idx_events_drift` is partial too and is not here.
+FIXTURE_BOUNDED_INDEXES = frozenset({"idx_events_backlog_pending"})
 # What the fixture's findings pin to, exactly.
 FIXTURE_BASELINE = textwrap.dedent(
     """
@@ -382,6 +411,9 @@ FIXTURE_BASELINE = textwrap.dedent(
     fixture_server.py nested_helper_name events 1
     fixture_server.py sibling_built_constant events 1
     fixture_server.py index_walk events 1
+    fixture_server.py partial_index_walk events 1
+    fixture_server.py lambda_closure.<lambda> events 1
+    fixture_server.py Body events 1
     fixture_server.py materialized_subquery notes 1
     fixture_server.py automatic_index notes 1
     fixture_server.py create_as_select events 1
@@ -403,11 +435,18 @@ def _write_fixture(root: Path, baseline: str | None = FIXTURE_BASELINE) -> Path:
     return baseline_path
 
 
-def _run(root: Path, baseline: Path, list_statements: bool = False, **overrides) -> tuple[int, str, str]:
+def _run(
+    root: Path,
+    baseline: Path,
+    list_statements: bool = False,
+    bounded_indexes: frozenset[str] = FIXTURE_BOUNDED_INDEXES,
+    **overrides,
+) -> tuple[int, str, str]:
     out, err = io.StringIO(), io.StringIO()
     kwargs = dict(targets=FIXTURE_TARGETS, schema=FIXTURE_SCHEMA, baseline=baseline, list_statements=list_statements)
     kwargs.update(overrides)
-    code = check(root, out=out, err=err, **kwargs)
+    with mock.patch.object(plan_check, "BOUNDED_INDEXES", bounded_indexes):
+        code = check(root, out=out, err=err, **kwargs)
     return code, out.getvalue(), err.getvalue()
 
 
@@ -443,7 +482,7 @@ class FixtureTests(unittest.TestCase):
         server = "fixture_server.py:"
         # The schema builder's DDL and PRAGMA are listed, never prepared; the
         # ALTER TABLE in a loop does not resolve.
-        self.assertEqual(kinds[server + "init_db"], [KIND_SCHEMA] * 5 + [KIND_DYNAMIC, KIND_SCHEMA])
+        self.assertEqual(kinds[server + "init_db"], [KIND_SCHEMA] * 6 + [KIND_DYNAMIC, KIND_SCHEMA])
         self.assertEqual(kinds[server + "unindexed"], [KIND_FINDING])
         self.assertEqual(kinds[server + "indexed"], [KIND_OK])
         self.assertEqual(kinds[server + "covering"], [KIND_OK])
@@ -478,12 +517,24 @@ class FixtureTests(unittest.TestCase):
         # A sibling's constant resolves against the sibling's names: its table, not this module's HELPER_TABLE.
         self.assertEqual(kinds[server + "sibling_built_constant"], [KIND_FINDING])
         self.assertIn("sibling_built_constant finding table=events plan=SCAN events", out)
-        # A SCAN through an index still reads every row; through a partial index it reads what that index admits.
+        # A SCAN through an index still reads every row, and through a partial index it reads what that index
+        # admits, which is a bound only for an index BOUNDED_INDEXES vouches for: `idx_events_drift` is partial
+        # and not listed, so the walk through it is a finding like any other.
         self.assertEqual(kinds[server + "index_walk"], [KIND_FINDING])
         self.assertIn("index_walk finding table=events plan=SCAN events USING COVERING INDEX idx_events_created_at", out)
-        self.assertEqual(kinds[server + "partial_index_walk"], [KIND_BOUNDED])
-        self.assertIn("partial_index_walk bounded table=events plan=SCAN events USING ", out)
+        self.assertEqual(kinds[server + "partial_index_walk"], [KIND_FINDING])
+        self.assertIn("partial_index_walk finding table=events plan=SCAN events USING ", out)
         self.assertIn("INDEX idx_events_drift", out)
+        self.assertEqual(kinds[server + "bounded_index_walk"], [KIND_BOUNDED])
+        self.assertIn("bounded_index_walk bounded table=events plan=SCAN events USING ", out)
+        self.assertIn("INDEX idx_events_backlog_pending", out)
+        # A lambda is a scope of its own: its parameter, not the enclosing local of the same name, is what runs,
+        # and a closure variable it reads resolves as it does in a nested def.
+        self.assertEqual(kinds[server + "lambda_param.<lambda>"], [KIND_DYNAMIC])
+        self.assertEqual(kinds[server + "lambda_closure.<lambda>"], [KIND_FINDING])
+        # A statement in a class body reads the class body's names; a method does not see them.
+        self.assertEqual(kinds[server + "Body"], [KIND_FINDING])
+        self.assertEqual(kinds[server + "Body.method"], [KIND_OK])
         # A derived table the plan declares (CO-ROUTINE or MATERIALIZE) is no table under its alias either.
         self.assertEqual(kinds[server + "aliased_subquery"], [KIND_OK])
         self.assertEqual(kinds[server + "aliased_cte"], [KIND_OK])
@@ -541,6 +592,12 @@ class FixtureTests(unittest.TestCase):
         self.assertIsNone(by_function["module_rebound_in_block"])
         self.assertIsNone(by_function["global_rebound"])
         self.assertEqual(by_function["sibling_built_constant"], "SELECT id FROM events WHERE cluster = ?")
+        # The lambda's own parameter shadows the enclosing local; a lambda with no such parameter reads the local.
+        self.assertIsNone(by_function["lambda_param.<lambda>"])
+        self.assertEqual(by_function["lambda_closure.<lambda>"], "SELECT id FROM events WHERE cluster = ?")
+        # The class body's `shadowed` is read in the body and not in the method, which reads the module's.
+        self.assertEqual(by_function["Body"], "SELECT id FROM events WHERE cluster = ?")
+        self.assertEqual(by_function["Body.method"], "SELECT id FROM events WHERE id = ?")
         self.assertIsNone(by_function["except_shadow"])
         self.assertIsNone(by_function["joined_comprehension"])
         self.assertIsNone(by_function["local_twice"])
@@ -642,12 +699,24 @@ class FixtureTests(unittest.TestCase):
         self.assertIn("baseline.txt:11: expected `<file> <function> <table> <count>`", err)
         self.assertIn("baseline.txt:12: fixture_server.py unindexed events already has an entry at line 2", err)
         # `many`, `comma_list`, `quoted_alias`, `unpacked_shadow`, `closure.inner`, `nested_helper_name`,
-        # `sibling_built_constant`, `index_walk`, `materialized_subquery`, `automatic_index` and `create_as_select`
-        # have no entry and are reported beside the problems.
+        # `sibling_built_constant`, `index_walk`, `partial_index_walk`, `lambda_closure.<lambda>`, `Body`,
+        # `materialized_subquery`, `automatic_index` and `create_as_select` have no entry and are reported beside
+        # the problems.
         self.assertIn("many scans notes: `SCAN notes`", err)
         self.assertIn("automatic_index scans notes: `SEARCH n USING AUTOMATIC COVERING INDEX (author=?)`", err)
         self.assertIn("index_walk scans events: `SCAN events USING COVERING INDEX idx_events_created_at`", err)
-        self.assertIn("11 finding(s) not pinned and 7 problem(s)", err)
+        self.assertIn("lambda_closure.<lambda> scans events: `SCAN events`", err)
+        self.assertIn("14 finding(s) not pinned and 7 problem(s)", err)
+
+    def test_bounded_index_the_schema_does_not_build_is_a_problem(self) -> None:
+        baseline = _write_fixture(self.root)
+        # A list naming an index the schema never builds fails, and the fixture's bounded walk, no longer vouched
+        # for, is the finding it would otherwise be.
+        code, _, err = _run(self.root, baseline, bounded_indexes=frozenset({"idx_events_gone"}))
+        self.assertEqual(code, EXIT_FAIL)
+        self.assertIn("BOUNDED_INDEXES names 'idx_events_gone', which the schema does not build as a partial index", err)
+        self.assertIn("bounded_index_walk scans events: `SCAN events USING INDEX idx_events_backlog_pending`", err)
+        self.assertIn("1 finding(s) not pinned and 1 problem(s)", err)
 
     def test_missing_target_fails(self) -> None:
         baseline = _write_fixture(self.root)

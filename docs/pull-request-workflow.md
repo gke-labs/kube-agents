@@ -147,7 +147,8 @@ line, and the check skips the spans on that line. CI runs the same check through
 schema the server builds and fails a plan that reads a whole table this repository defines (a
 `SCAN <table>`, through an index or not, since a scan through an index walks the whole index; or a
 `SEARCH` through an automatic index, which is built by reading the table), because such a read
-grows with the fleet; a scan through a partial index is bounded by that index's `WHERE` and passes.
+grows with the fleet; a scan through a partial index passes as bounded only when the script's
+`BOUNDED_INDEXES` vouches for that index's `WHERE` as a bound (the pending drift backlog today).
 Statements on tables Hermes owns are listed as skipped, and the scans already in the tree are
 pinned with a reason in `scripts/sqlite_query_plan_baseline.txt`, which only shrinks. CI runs the
 same check through `scripts/test_check_sqlite_query_plans.py`.

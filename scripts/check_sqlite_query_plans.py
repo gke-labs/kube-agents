@@ -24,10 +24,14 @@ rule: a binding counts against the function or module whose own body holds
 it, wherever in that body (a module constant rebound inside a top-level `if`
 or `try` is bound twice); a nested function, lambda or class is a scope of
 its own, so its parameters and locals do not count against the function
-around it; and a `nonlocal` (or, for the module, `global`) declaration in any
-scope nested inside counts as a binding of the name it declares, since it
-lets that scope rebind it. A name bound any other way, or in two places,
-resolves to nothing, never to a module constant of the same name. Anything
+around it, and a statement written inside one reads that scope's names
+first (a lambda's parameter, not the enclosing function's local of the same
+name; a class body's names are read by the statements in that body and by
+no method or lambda inside it, which is Python's rule); and a `nonlocal` (or,
+for the module, `global`) declaration in any scope nested inside counts as a
+binding of the name it declares, since it lets that scope rebind it. A name
+bound any other way, or in two places, resolves to nothing, never to a module
+constant of the same name. Anything
 else (`.format(...)`, `%`, a join over a comprehension, a name assigned in a
 branch) is listed as `dynamic` and not judged. The check sees a statement
 only at the execute call: a literal handed to a helper that executes its
@@ -59,9 +63,15 @@ whole index, so a count, a projection of indexed columns or an `ORDER BY` an
 index serves still reads every row; a `LIMIT` is not in the plan line), and
 `SEARCH <table> USING AUTOMATIC ... INDEX`, the planner's transient index,
 which it builds by reading every row of the table each time the statement
-runs. A `SEARCH` on a real index is not a finding, and a `SCAN` through a
-partial index (one with a `WHERE`) reads only the rows that index admits,
-the bound the index declares, so it is listed `bounded` rather than flagged.
+runs. A `SEARCH` on a real index is not a finding. A `SCAN` through a
+partial index reads the rows its `WHERE` admits, which is a bound only when
+that set is small by design: the indexes in `BOUNDED_INDEXES` are, with the
+reason beside each, and a scan through one is listed `bounded`; any other
+partial index is a filter, not a bound (the workload-incident index admits
+every announced incident, the fold-anchor index every anchor since the last
+start), so a scan through it is a finding like any other. An entry in
+`BOUNDED_INDEXES` that the schema does not build as a partial index is a
+problem that fails the check, so the list cannot outlive the index it names.
 The planner names an aliased table by its alias, which the check maps back
 from the statement's FROM, JOIN, UPDATE, INTO and comma list words; an alias
 the statement binds to two different tables (an outer query and a subquery
@@ -147,6 +157,15 @@ SCHEMA_DB_FILENAME = "schema.db"
 # hold one row, `alert_quota` is pruned daily, `triage_pr_reservations` is
 # capped by the open-triage-pull-request limit.
 BOUNDED_TABLES = frozenset({"alert_quota", "data_volume_warning", "drift_backlog_lease", "triage_pr_reservations"})
+# Partial indexes whose WHERE admits a set that is bounded by design, so a
+# SCAN through one reads that set and no more: `idx_intercepted_events_backlog_pending`
+# (`backlog = 1`) holds the drift events waiting for the digest, which drains
+# it. The ledger's other partial indexes filter rather than bound (the
+# workload-incident index admits every announced incident; the fold-anchor
+# index every anchor since the previous start, released one by one only when
+# a triage fails), so they are not here, and a scan through one is a finding.
+# Each entry must exist as a partial index in the schema, or the check fails.
+BOUNDED_INDEXES = frozenset({"idx_intercepted_events_backlog_pending"})
 # SQLite's own schema table, under both of its names; a scan of it is a catalog
 # read, not a ledger read.
 SCHEMA_TABLES = frozenset({"sqlite_master", "sqlite_schema"})
@@ -203,7 +222,7 @@ SCAN_RE = re.compile(r"^(?P<verb>SCAN|SEARCH) (?P<name>\S+)(?: AS \S+)?(?P<rest>
 SEARCH_VERB = "SEARCH"
 AUTOMATIC_INDEX_MARKER = " USING AUTOMATIC "
 # The index a SCAN walks (`SCAN t USING INDEX i`, `SCAN t USING COVERING
-# INDEX i`); a partial one bounds the rows read to those its WHERE admits.
+# INDEX i`); one in BOUNDED_INDEXES bounds the rows read to those its WHERE admits.
 SCAN_INDEX_RE = re.compile(r" USING (?:COVERING )?INDEX (?P<index>\S+)")
 # `PRAGMA index_list(<table>)`: the index name and whether it is partial.
 INDEX_LIST_PRAGMA = "PRAGMA index_list({table})"
@@ -245,9 +264,11 @@ STR_CALL = "str"
 JOIN_METHOD = "join"
 # The detail column of an EXPLAIN QUERY PLAN row.
 PLAN_DETAIL_COLUMN = 3
-# How a function is named: `Class.method`, `outer.inner`, and this for a
-# statement outside any function.
+# How a function is named: `Class.method`, `outer.inner`, `outer.<lambda>`
+# (a lambda, as Python names it), and `(module)` for a statement outside any
+# function.
 QUALIFIED_SEPARATOR = "."
+LAMBDA_NAME = "<lambda>"
 MODULE_LEVEL = "(module)"
 # The nodes that open a scope of their own: a binding inside one belongs to
 # it, not to the function or module around it. A comprehension is left out on
@@ -286,6 +307,10 @@ SQLITE_VERSION_ERROR = (
 TARGET_MISSING_ERROR = "{target}: a configured target this check reads is missing; move the entry in {script} with the file"
 SCHEMA_IMPORT_ERROR = "{module}: the schema module does not import: {error}"
 SCHEMA_ATTR_ERROR = "{module}: the schema module has no attribute {attr}; update {script}"
+BOUNDED_INDEX_ERROR = (
+    "{script}: BOUNDED_INDEXES names {index!r}, which the schema does not build as a partial index; "
+    "drop the entry or build the index"
+)
 BASELINE_MALFORMED_ERROR = "{baseline}:{line}: expected `<file> <function> <table> <count>` with a count above zero, got {text!r}"
 BASELINE_DUPLICATE_ERROR = "{baseline}:{line}: {file} {function} {table} already has an entry at line {first}"
 BASELINE_UNSCANNED_ERROR = "{baseline}:{line}: {file} is not a file this check reads; remove the entry"
@@ -446,9 +471,15 @@ def _assigned(node: ast.stmt) -> list[tuple[str, ast.expr]]:
     return []
 
 
-def _local_constants(function: ast.AST) -> dict[str, ast.expr | None]:
-    """Every name the function binds, as `_bindings` counts them, with `nonlocal` in a nested scope a binding here."""
-    return _bindings(function, ast.Nonlocal)
+def _local_constants(scope: ast.AST) -> dict[str, ast.expr | None]:
+    """Every name a function, lambda or class body binds, as `_bindings` counts them.
+
+    A `nonlocal` in a scope nested inside is a binding here. For a class
+    body that over-counts (a method's `nonlocal` names an enclosing
+    function's variable, never a class attribute), which can only make a
+    class-body name resolve to nothing, never to the wrong value.
+    """
+    return _bindings(scope, ast.Nonlocal)
 
 
 def _bound_names(node: ast.AST) -> list[str]:
@@ -579,27 +610,39 @@ class _Collector(ast.NodeVisitor):
         self.shown = shown
         self.constants = constants
         self.stack: list[str] = []
-        # The enclosing functions' maps, outermost first; a class body pushes
-        # none, since a method does not see the names its class body binds.
-        self.locals: Scopes = []
+        # The enclosing scopes' maps, outermost first, each with whether it
+        # is a class body. A function or lambda reads every enclosing
+        # function's names; a class body's names are read by the statements
+        # written in that body and by nothing nested in it, since a method or
+        # a lambda inside a class does not see what its class body binds.
+        self.scopes: list[tuple[dict[str, ast.expr | None], bool]] = []
         self.statements: list[Statement] = []
 
-    def _scoped(self, node: ast.AST, name: str, local: dict[str, ast.expr | None] | None) -> None:
+    @property
+    def locals(self) -> Scopes:
+        """The maps a statement written here reads: the enclosing functions', and the class body's when it is innermost."""
+        visible = [local for local, is_class in self.scopes[:-1] if not is_class]
+        if self.scopes:
+            visible.append(self.scopes[-1][0])
+        return visible
+
+    def _scoped(self, node: ast.AST, name: str, is_class: bool = False) -> None:
         self.stack.append(name)
-        if local is not None:
-            self.locals.append(local)
+        self.scopes.append((_local_constants(node), is_class))
         self.generic_visit(node)
-        if local is not None:
-            self.locals.pop()
+        self.scopes.pop()
         self.stack.pop()
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._scoped(node, node.name, None)
+        self._scoped(node, node.name, is_class=True)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._scoped(node, node.name, _local_constants(node))
+        self._scoped(node, node.name)
 
     visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._scoped(node, LAMBDA_NAME)
 
     def visit_Call(self, node: ast.Call) -> None:
         if isinstance(node.func, ast.Attribute) and node.func.attr in EXECUTE_METHODS and node.args:
@@ -610,11 +653,16 @@ class _Collector(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def scan_statements(path: Path, root: Path, siblings: dict[str, ast.Module]) -> list[Statement]:
-    """Every execute call in one module, with its statement where it resolves."""
+def scan_statements(path: Path, root: Path, trees: dict[str, ast.Module]) -> list[Statement]:
+    """Every execute call in one module, with its statement where it resolves.
+
+    `trees` holds every target's parsed module under its stem, this one's
+    included, so nothing is read or parsed twice; the others are the siblings
+    whose constants a statement may name.
+    """
     shown = path.relative_to(root).as_posix()
-    module = ast.parse(path.read_text(encoding="utf-8"), filename=shown)
-    others = {name: tree for name, tree in siblings.items() if name != path.stem}
+    module = trees[path.stem]
+    others = {name: tree for name, tree in trees.items() if name != path.stem}
     collector = _Collector(shown, _Constants(module, others))
     collector.visit(module)
     return collector.statements
@@ -630,7 +678,7 @@ def scan(root: Path, targets: Iterable[str]) -> tuple[list[Statement], list[str]
             problems.append(TARGET_MISSING_ERROR.format(target=rel, script=SCRIPT_NAME))
             continue
         paths.append(path)
-    trees = {path.stem: ast.parse(path.read_text(encoding="utf-8"), filename=str(path)) for path in paths}
+    trees = {path.stem: ast.parse(path.read_text(encoding="utf-8"), filename=path.relative_to(root).as_posix()) for path in paths}
     statements: list[Statement] = []
     files: list[str] = []
     for path in paths:
@@ -752,7 +800,7 @@ def scan_index(plan: str) -> str | None:
 
 
 def partial_indexes(conn: sqlite3.Connection, tables: Iterable[str]) -> frozenset[str]:
-    """The names of the partial indexes (those with a WHERE) over the given tables; a scan through one is bounded by it."""
+    """The names of the partial indexes (those with a WHERE) over the given tables, which BOUNDED_INDEXES must be drawn from."""
     names: set[str] = set()
     for table in tables:
         for row in conn.execute(INDEX_LIST_PRAGMA.format(table=table)).fetchall():
@@ -821,7 +869,11 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
     tables = schema_tables(conn)
     partial = partial_indexes(conn, tables)
     verdicts: list[Verdict] = []
-    problems: list[str] = []
+    # A bounded index the schema no longer builds as a partial index would
+    # otherwise sit in the list forever, vouching for nothing.
+    problems: list[str] = [
+        BOUNDED_INDEX_ERROR.format(script=SCRIPT_NAME, index=index) for index in sorted(BOUNDED_INDEXES - partial)
+    ]
     for statement in statements:
         if statement.sql is None:
             verdicts.append(Verdict(statement, KIND_DYNAMIC))
@@ -893,8 +945,8 @@ def judge(statements: Iterable[Statement], conn: sqlite3.Connection) -> tuple[li
                 continue
             judged += 1
             # A scan through a partial index reads the rows its WHERE admits,
-            # the bound the index declares.
-            bounded = table in BOUNDED_TABLES or scan_index(plan) in partial
+            # a bound only for the indexes BOUNDED_INDEXES vouches for.
+            bounded = table in BOUNDED_TABLES or scan_index(plan) in BOUNDED_INDEXES
             verdicts.append(Verdict(statement, KIND_BOUNDED if bounded else KIND_FINDING, table=table, plan=plan))
         if judged == 0:
             verdicts.append(Verdict(statement, KIND_OK))
