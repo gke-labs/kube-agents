@@ -6696,6 +6696,26 @@ class TestDeclaredIntent(BaseTestCase):
         doc["declared"] = [make_declared(excerpt="   ")]
         self.rejects(doc, "declared[0].declaration.excerpt", "non-empty")
 
+    def test_an_expires_date_is_optional_one_format_and_not_in_the_past(self):
+        # A hand-written entry may carry the note's `expires:`; it is then
+        # held to the one format and to the calendar, because an expired
+        # declaration justifies nothing and the posture is a finding.
+        today = datetime.now(timezone.utc).date()
+        fmt = audit_report.DECLARATION_EXPIRES_FORMAT
+        doc = declaring_doc()
+        entry = make_declared()
+        entry["declaration"]["expires"] = (today + timedelta(days=1)).strftime(fmt)
+        doc["declared"] = [entry]
+        self.assertEqual(self.validate(doc)["declared"][0]["declaration"]["expires"], entry["declaration"]["expires"])
+        entry["declaration"]["expires"] = today.strftime(fmt)
+        self.validate(doc)
+        for bad in ("2027-1-5", "soon", 20270131, None, ""):
+            with self.subTest(expires=bad):
+                entry["declaration"]["expires"] = bad
+                self.rejects(doc, "declared[0].declaration.expires", audit_report.DECLARATION_EXPIRES_FORMAT_HINT)
+        entry["declaration"]["expires"] = (today - timedelta(days=1)).strftime(fmt)
+        self.rejects(doc, "declared[0].declaration.expires", "expired", "findings")
+
     def test_a_title_is_required(self):
         doc = declaring_doc()
         doc["declared"] = [make_declared(title="")]
@@ -8301,6 +8321,50 @@ class TestDeclarationParsing(unittest.TestCase):
         entries, _ = parse(note([declaration(namespace="", obj="Node/pool-a")]))
         self.assertEqual(entries[0]["namespace"], "")
 
+    def test_an_expires_date_is_read_quoted_or_bare(self):
+        # PyYAML resolves a bare `2027-01-31` as a `date` and a quoted one as
+        # a string; the owner should not have to know which, so both file the
+        # same entry, and an item without the field carries no key at all.
+        quoted, err = parse(note([declaration(), {**declaration(check="no-hpa", obj="Deployment/api"), "expires": "2027-01-31"}]))
+        self.assertEqual(err, "")
+        self.assertNotIn("expires", quoted[0])
+        self.assertEqual(quoted[1]["expires"], "2027-01-31")
+        bare, err = parse(
+            "---\ntype: decision\ntitle: api\ndeclares:\n"
+            "  - check: no-hpa\n    namespace: payments\n    object: Deployment/api\n    expires: 2027-01-31\n---\n"
+        )
+        self.assertEqual(err, "")
+        self.assertEqual(bare[0]["expires"], "2027-01-31")
+
+    def test_a_malformed_expires_skips_the_item_by_name(self):
+        # One date format, so a renewal is a one-field edit a reader can
+        # check at a glance; anything else is the owner's typo, and a typo
+        # silences one declaration rather than hiding the posture for ever.
+        bad_values = {
+            "a short month and day": "2027-1-5",
+            "a day-first date": "31-01-2027",
+            "a timestamp": "2027-01-31T00:00:00Z",
+            "prose": "next year",
+            "a number": 20270131,
+            "an empty string": "",
+        }
+        for label, value in bad_values.items():
+            with self.subTest(label):
+                entries, err = parse(note([{**declaration(), "expires": value}, declaration(check="no-hpa", obj="Deployment/api")]))
+                self.assertEqual([e["check"] for e in entries], ["no-hpa"])
+                self.assertIn("WARNING: acme/fleet:knowledge/checkout.md declares[0]", err)
+                self.assertIn("expires", err)
+                self.assertIn(audit_report.DECLARATION_EXPIRES_FORMAT_HINT, err)
+                self.assertIn("skipped", err)
+        # A bare timestamp PyYAML builds as a `datetime` is a date with a time
+        # on it, and the format is the date alone.
+        entries, err = parse(
+            "---\ntype: decision\ntitle: api\ndeclares:\n"
+            "  - check: no-pdb\n    namespace: payments\n    object: Deployment/checkout-gateway\n    expires: 2027-01-31T00:00:00Z\n---\n"
+        )
+        self.assertEqual(entries, [])
+        self.assertIn("expires", err)
+
     def test_whitespace_around_the_slash_is_a_hand_typed_kind_name(self):
         # The join is an exact lookup against the finding's `Kind/name`, so an
         # item that passed the shape check with the spaces kept would match
@@ -9462,6 +9526,87 @@ class TestHarnessDeclarationJoin(HarnessTestCase):
         self.file(self.entry(path="knowledge/fleet.md"), self.entry(cluster="prod-us-east", path="knowledge/prod.md"))
         self.finish(self.doc())
         self.assertIn("`acme/fleet:knowledge/prod.md`", self.ledger_body())
+
+    @staticmethod
+    def day(offset):
+        """Today in UTC plus `offset` days, in the `expires:` format."""
+        return (datetime.now(timezone.utc).date() + timedelta(days=offset)).strftime(
+            audit_report.DECLARATION_EXPIRES_FORMAT
+        )
+
+    def test_an_expired_declaration_no_longer_moves_the_posture_and_the_ledger_says_so(self):
+        # An acceptance with a date on it lapses instead of being forgotten:
+        # the posture comes back as a finding, and its block says which
+        # declaration covered it until when, so the owner renews or fixes.
+        self.record()
+        self.file({**self.entry(), audit_report.DECLARATION_EXPIRES_FIELD: self.day(-1)})
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 0)
+        self.assertEqual(payload["new"], 5)
+        body = self.ledger_body()
+        self.assertNotIn("## Declared intent", body)
+        self.assertIn(self.PDB_ID(), audit_report.parse_delta_block(body))
+        self.assertIn(
+            f"- **Declared intent expired:** `acme/fleet:knowledge/checkout.md` covered this "
+            f"posture until {self.day(-1)}. Renew its `expires:` date there, or remediate the posture.",
+            body,
+        )
+        self.assertIn(f"DECLARATION EXPIRED: {self.PDB_ID()}", self.err)
+        self.assertIn(self.day(-1), self.err)
+        self.assertNotIn("DECLARED:", self.err)
+
+    def test_a_declaration_stands_through_the_day_it_names(self):
+        # `expires: <today>` is still in force today and lapses tomorrow; an
+        # owner who writes the last day of a review period means that day.
+        self.record()
+        self.file({**self.entry(), audit_report.DECLARATION_EXPIRES_FIELD: self.day(0)})
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        self.assertNotIn("Declared intent expired", self.ledger_body())
+
+    def test_a_future_expires_moves_the_posture_and_the_row_names_the_date(self):
+        self.record()
+        self.file({**self.entry(), audit_report.DECLARATION_EXPIRES_FIELD: self.day(30)})
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        self.assertEqual(payload["new"], 4)
+        body = self.ledger_body()
+        self.assertIn("## Declared intent", body)
+        # The renewal date sits in the declaration cell, so a reader sees it
+        # before it lapses rather than after.
+        self.assertIn(f"`checkout runs unbudgeted` (until {self.day(30)}) |", body)
+        self.assertNotIn("Declared intent expired", body)
+
+    def test_a_standing_declaration_wins_over_an_expired_one_for_the_same_posture(self):
+        # A renewed note beside a lapsed one: the posture is declared, and
+        # the lapsed file is not reported against it.
+        self.record()
+        self.file(
+            {**self.entry(path="knowledge/old.md"), audit_report.DECLARATION_EXPIRES_FIELD: self.day(-10)},
+            self.entry(path="knowledge/renewed.md"),
+        )
+        payload = self.finish(self.doc())
+        self.assertEqual(payload["declared"], 1)
+        body = self.ledger_body()
+        self.assertIn("`acme/fleet:knowledge/renewed.md`", body)
+        self.assertNotIn("Declared intent expired", body)
+        self.assertNotIn("DECLARATION EXPIRED", self.err)
+
+    def test_the_split_the_manifest_route_and_the_shields_read_keeps_only_standing_entries(self):
+        # The two routes that read `start`'s file beside the join — a
+        # collector candidate the worker left out, and a 2.7 sibling's shield
+        # — are handed the standing half; an expired entry is no declaration
+        # on either, and a filed date in no format is applied on neither side.
+        live, expired = audit_report.split_expired_declarations(
+            [
+                {**self.entry(), audit_report.DECLARATION_EXPIRES_FIELD: self.day(-1)},
+                {**self.entry(check="no-hpa"), audit_report.DECLARATION_EXPIRES_FIELD: self.day(1)},
+                self.entry(check="single-replica"),
+                {**self.entry(check="no-hpa", obj="Deployment/web"), audit_report.DECLARATION_EXPIRES_FIELD: "soon"},
+            ]
+        )
+        self.assertEqual([e["check"] for e in live], ["no-hpa", "single-replica"])
+        self.assertEqual([e["check"] for e in expired], ["no-pdb"])
 
     def test_a_non_matching_entry_leaves_the_finding_alone(self):
         self.record()

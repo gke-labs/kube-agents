@@ -522,7 +522,14 @@ completely (every note under the searched paths arrived and was read) under `sea
 record, and `finish` unions that list into the document and moves each covered finding to
 `declared` before the withhold (#1576, #1577). The join moves `hpa-cannot-scale` only at the
 severity the SOP fixes for its `min == max` shape; the dangling-target fault shares the slug and
-stays a finding.
+stays a finding. An item may carry `expires`, an ISO 8601 date (`YYYY-MM-DD`, UTC) that is the
+last day it stands: `start` files the date and `finish` reads the calendar on the day it joins, so a
+lapsed item moves nothing, declares no collector candidate and shields no sibling, and the finding
+it covered publishes with a _Declared intent expired_ line naming the note and the date — the
+renewal is an edit to the note, never one the harness makes. A standing item for the same posture
+wins over a lapsed one. The Declared intent row of an item with a date says what day it stands
+until, and a hand-written `declared[].declaration.expires` is held to the format and rejected once
+past.
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
