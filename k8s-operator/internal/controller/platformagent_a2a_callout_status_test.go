@@ -308,3 +308,44 @@ func TestAnUnsettledMapAloneAsksForARequeue(t *testing.T) {
 		t.Errorf("a converged stack with no callout state asks for a requeue")
 	}
 }
+
+// The reader's errors are a closed vocabulary, never the peer's bytes: a pod
+// on the callout's labels that answers garbage must not put that garbage in
+// the condition (where past the CRD's message limit it would fail the whole
+// status write).
+func TestTheCalloutStatusReaderNeverQuotesThePeer(t *testing.T) {
+	const marker = "PEER-CONTROLLED-TEXT"
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = c.Write([]byte("NOT-HTTP " + marker + " " + strings.Repeat("x", 4096) + "\r\n\r\n"))
+			_ = c.Close()
+		}
+	}()
+	_, err = newHTTPCalloutStatus().Read(context.Background(), ln.Addr().String())
+	if err == nil || strings.Contains(err.Error(), marker) || len(err.Error()) > 64 {
+		t.Errorf("a non-HTTP answer gave error %q; want a short word with none of the peer's bytes", err)
+	}
+
+	notJSON := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("<html>" + marker + "</html>"))
+	}))
+	defer notJSON.Close()
+	if _, err := newHTTPCalloutStatus().Read(context.Background(), strings.TrimPrefix(notJSON.URL, "http://")); !errors.Is(err, errCalloutStatusNotAnswer) {
+		t.Errorf("a body that isn't a status gave %v, want %v", err, errCalloutStatusNotAnswer)
+	}
+
+	unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
+	defer unavailable.Close()
+	if _, err := newHTTPCalloutStatus().Read(context.Background(), strings.TrimPrefix(unavailable.URL, "http://")); err == nil || err.Error() != "HTTP 503" {
+		t.Errorf("a 503 gave %v, want HTTP 503", err)
+	}
+}

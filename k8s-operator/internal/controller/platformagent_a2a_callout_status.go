@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -28,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -89,11 +91,25 @@ func newHTTPCalloutStatus() *httpCalloutStatus {
 			Proxy:             nil,
 			DialContext:       (&net.Dialer{Timeout: a2aCalloutStatusTimeout}).DialContext,
 			DisableKeepAlives: true,
+			// What answers on a pod IP is untrusted, and Go's default holds
+			// 10 MiB of response headers.
+			MaxResponseHeaderBytes: usageScrapeMaxHeaderBytes,
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
 }
 
+// defaultCalloutStatus is the reader the reconciler uses when none is set:
+// one client for the life of the process, not one per pass.
+var defaultCalloutStatus = newHTTPCalloutStatus()
+
+// errCalloutStatusNotAnswer is a body that isn't a status answer.
+var errCalloutStatusNotAnswer = errors.New("not a status answer")
+
+// Read GETs addr's /status. Its errors are a closed vocabulary
+// (usageConnectKind, an HTTP status, errCalloutStatusNotAnswer), never text
+// net/http or the decoder built from the peer's bytes: the error lands in a
+// condition, and a pod that answers garbage must not put that garbage there.
 func (h *httpCalloutStatus) Read(ctx context.Context, addr string) (calloutStatusAnswer, error) {
 	var answer calloutStatusAnswer
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+a2aCalloutStatusPath, nil)
@@ -102,14 +118,16 @@ func (h *httpCalloutStatus) Read(ctx context.Context, addr string) (calloutStatu
 	}
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return answer, err
+		return answer, errors.New(usageConnectKind(err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return answer, fmt.Errorf("status %d", resp.StatusCode)
+		return answer, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	err = json.NewDecoder(io.LimitReader(resp.Body, a2aCalloutStatusMaxBytes)).Decode(&answer)
-	return answer, err
+	if json.NewDecoder(io.LimitReader(resp.Body, a2aCalloutStatusMaxBytes)).Decode(&answer) != nil {
+		return answer, errCalloutStatusNotAnswer
+	}
+	return answer, nil
 }
 
 // calloutMapState is what the callout pods said about the map this pass:
@@ -134,7 +152,7 @@ type calloutMapState struct {
 func (r *PlatformAgentReconciler) readCalloutMapState(ctx context.Context, agent *agentv1alpha1.PlatformAgent, rendered string) calloutMapState {
 	reader := r.calloutStatus
 	if reader == nil {
-		reader = newHTTPCalloutStatus()
+		reader = defaultCalloutStatus
 	}
 	unreadable := func(why string) calloutMapState {
 		return calloutMapState{status: metav1.ConditionUnknown, reason: a2aIdentityMapStatusUnreadable,
@@ -180,7 +198,7 @@ func (r *PlatformAgentReconciler) readCalloutMapState(ctx context.Context, agent
 		switch {
 		case res.err != nil:
 			if readErr == "" {
-				readErr = pod.Name + ": " + res.err.Error()
+				readErr = pod.Name + ": " + truncateForCondition(res.err.Error(), a2aCalloutRefusalMaxChars)
 			}
 		case res.answer.LastError != "":
 			return calloutMapState{status: metav1.ConditionFalse, reason: a2aIdentityMapRefused,
@@ -216,13 +234,11 @@ func truncateForCondition(s string, n int) string {
 		return s
 	}
 	cut := n
-	for cut > 0 && !utf8RuneStart(s[cut]) {
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
 	return s[:cut] + "…"
 }
-
-func utf8RuneStart(b byte) bool { return b&0xC0 != 0x80 }
 
 func podIsReady(pod *corev1.Pod) bool {
 	for _, c := range pod.Status.Conditions {
