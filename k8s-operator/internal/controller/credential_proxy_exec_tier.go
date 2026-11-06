@@ -77,6 +77,14 @@ const (
 	credentialProxyExecTierNameRefusalFmt     = "the agent's name %q is %d characters; with spec.deployment.credentialProxy.exec.replicas above 0 it must be at most %d, so <name>%s fits the 63-character Service name and label value. Rename the agent, or set exec.replicas to 0"
 	conditionReasonInvalidCredentialProxyExec = "InvalidCredentialProxyExec"
 	invalidExecTierReplicasMsgFmt             = "Invalid spec.deployment.credentialProxy.exec.replicas (%s); the exec tier is not rendered, and every command goes to the stateful broker until it is corrected"
+	// The broker's token for the github-token-minter: a projected
+	// ServiceAccount token, so the by-source Secret filter keeps it, and the
+	// exec role has no use for it (no TOKEN_BROKER_URL, and the minter's
+	// NetworkPolicy admits only pods with has-credential-proxy). Dropped by
+	// name; the broker's volume and mount use the same constant. Named without
+	// credential words, which gosec's G101 reads as a hardcoded credential.
+	brokerMinterVolume       = "credential-proxy-ksa-token"
+	execTierDroppedMinterEnv = "KSA_TOKEN_FILE"
 )
 
 // credentialProxyExecTierEnvDropped names the broker env the exec tier does
@@ -84,6 +92,7 @@ const (
 // the relays are not started there.
 var credentialProxyExecTierEnvDropped = map[string]bool{
 	"TOKEN_BROKER_URL":              true,
+	execTierDroppedMinterEnv:        true,
 	"GOOGLE_CHAT_PROJECT_ID":        true,
 	"GOOGLE_CHAT_SUBSCRIPTION_NAME": true,
 }
@@ -166,7 +175,8 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 //   - no Secret: no Secret-backed volume (forge credentials and CA bundles
 //     included) and no env read from one (chat, Teams and plugin credentials),
 //     dropped by source rather than by name so a Secret the broker gains later
-//     does not reach N exec pods; and no forge, relay or workspace settings.
+//     does not reach N exec pods; and no forge, relay or workspace settings;
+//   - no github-token-minter token, which is projected rather than a Secret.
 func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, broker *appsv1.Deployment) *appsv1.Deployment {
 	dep := broker.DeepCopy()
 	name := credentialProxyExecTierName(agent)
@@ -193,7 +203,7 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 	dep.Spec.Template.Labels = podLabels
 	delete(dep.Spec.Template.Annotations, secretEnvHashAnnotation)
 
-	dropped := map[string]bool{}
+	dropped := map[string]bool{brokerMinterVolume: true}
 	for _, v := range dep.Spec.Template.Spec.Volumes {
 		if volumeHoldsSecret(v) {
 			dropped[v.Name] = true

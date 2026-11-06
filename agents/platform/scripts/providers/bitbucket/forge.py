@@ -135,6 +135,9 @@ def _allowed_prefix(path: str) -> str:
 
 class BitbucketCloudForge(Forge):
     name = "bitbucket"
+    # `quota_from_headers` stays the default, unknown: no quota headers for
+    # this forge are documented here, and none are guessed, so the readings
+    # sweep paces it on its hourly budget alone (#4615).
     proposal_noun = "pull request"
     # No issue verbs (Atlassian removed the issue tracker on 2026-08-20), no
     # `label-ensure` (a pull request has no labels), and no

@@ -258,8 +258,9 @@ shim always takes the fallback and nothing reports it.
 - Own selector and labels. The exec pods do not reuse `credentialProxySelector`
   (`credential_proxy_manifests.go`), so today's Service does not send chat calls
   to them, where they would get a 404. They do not carry `kubeagents.x-k8s.io/has-credential-proxy`,
-  which opens the github-token-minter to a pod. The exec builder mounts no forge credentials and no
-  Slack tokens, so scaling out makes no copies of secrets that exec never uses.
+  which opens the github-token-minter to a pod. The exec builder mounts no forge credentials, no
+  Slack tokens and not the broker's ServiceAccount token for the minter, so scaling out makes no
+  copies of secrets that exec never uses.
 - Every chart or operator object that selects today's broker labels (`app: <agent>-credential-proxy`
   or `kubeagents.x-k8s.io/component: credential-proxy`) gets an exec-tier counterpart. The builder
   finds them by a search for both labels. On `main` they are:

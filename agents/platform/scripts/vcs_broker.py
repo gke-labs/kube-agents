@@ -748,6 +748,7 @@ class VcsBroker:
                 ca_file=forge.ca_file,
                 ca_source=forge.ca_source,
                 allow_http=(forge.scheme == "http"),
+                quota_from_headers=getattr(forge, "quota_from_headers", None),
             )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "

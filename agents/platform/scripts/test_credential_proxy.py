@@ -18273,6 +18273,36 @@ class SweepTransportTest(unittest.TestCase):
                     self.assertIn("static", request.get_header(header))
                     self.assertEqual([], executor.minted)
 
+    def test_the_sweep_transport_keeps_the_quota_the_forge_reports(self):
+        # #4615: the sweep paces step 2 on this reading, on either kind of forge.
+        from test_providers_http_transport import _Response
+
+        github = _forge_class("github")(refresh=mock.Mock(side_effect=AssertionError("no refresh")))
+        opener = self._opener(
+            _Response(
+                b"[]",
+                headers={
+                    "X-RateLimit-Limit": "5000",
+                    "X-RateLimit-Remaining": "250",
+                    "X-RateLimit-Reset": "1767225600",
+                    "X-RateLimit-Resource": "core",
+                },
+            )
+        )
+        transport = credential_proxy.sweep_transport_for(_SweepExecutor(), github, "acme/gitops", opener=opener)
+        self.assertIsNone(transport.quota())
+        transport.api("GET", "repos/acme/gitops/pulls/1/reviews")
+        self.assertEqual(providers.QuotaReading(5000, 250, 1767225600.0), transport.quota())
+
+        with tempfile.TemporaryDirectory() as temp:
+            token = Path(temp) / "token"
+            token.write_text("glpat-static\n")
+            gitlab = _forge_class("gitlab")("gitlab.example.test", str(token))
+            opener = self._opener(_Response(b"[]", headers={"RateLimit-Remaining": "40", "RateLimit-Limit": "600"}))
+            transport = credential_proxy.sweep_transport_for(_SweepExecutor(), gitlab, "acme/gitops", opener=opener)
+            transport.api("GET", "projects/1/merge_requests")
+            self.assertEqual(providers.QuotaReading(600, 40, None), transport.quota())
+
     def test_a_minted_or_brokered_github_credential_is_an_app_installation(self):
         with tempfile.TemporaryDirectory() as temp:
             token = Path(temp) / "token"

@@ -1160,6 +1160,7 @@ VCS_READINGS_FAILURE_REASONS = frozenset({
     vcs_readings.REASON_DETAIL_TRUNCATED,
     vcs_readings.REASON_RATE_LIMITED,
     vcs_readings.REASON_WARMING,
+    vcs_readings.REASON_QUOTA_FLOOR,
 })
 # The broker's own failures, by kind and, for a timeout, by the tool it ran:
 # work it took on and could not carry out
@@ -11575,6 +11576,9 @@ class _SweepTransport:
     def whoami(self) -> str:
         return self._retried(self._inner.whoami)
 
+    def quota(self) -> "providers.QuotaReading | None":
+        return self._inner.quota()
+
     def _retried(self, call: Callable[[], Any]) -> Any:
         try:
             return call()
@@ -11594,7 +11598,8 @@ def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: 
     GraphQL `viewer`. GitLab and Gitea: the forge's own HTTP transport with
     its static token, as every verb reads. Bounded by the numbers
     `build_vcs_broker` hands the broker. `opener` is the broker's
-    `http_opener`, for tests.
+    `http_opener`, for tests. Each keeps the quota the forge's headers report
+    (`quota_from_headers`), which the sweep paces step 2 on (#4615).
     """
     if forge.name == GITHUB_PROVIDER:
         api_url = forge.api_url or GITHUB_COM_API_URL
@@ -11614,6 +11619,7 @@ def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: 
             ca_file=forge.ca_file,
             ca_source=forge.ca_source,
             whoami_graphql=whoami_graphql,
+            quota_from_headers=getattr(forge, "quota_from_headers", None),
         )
         return _SweepTransport(transport, lambda: executor.drop_sweep_credential(forge.name, repo))
     if forge.transport == FORGE_HTTP_TRANSPORT and forge.api_url:
@@ -11630,6 +11636,7 @@ def sweep_transport_for(executor: CommandExecutor, forge, repo: str, *, opener: 
             ca_file=forge.ca_file,
             ca_source=forge.ca_source,
             allow_http=(forge.scheme == FORGE_HTTP_SCHEME),
+            quota_from_headers=getattr(forge, "quota_from_headers", None),
         )
     raise providers.ForgeUnsupported(f"{forge.name} has no HTTP transport for the readings sweep")
 

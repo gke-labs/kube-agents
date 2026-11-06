@@ -43,7 +43,7 @@ from pathlib import Path
 
 import pytest
 
-from kube_agents_bench import evidence_store, gate
+from kube_agents_bench import chat_shape, evidence_store, gate
 from kube_agents_bench.baselines import CaseOutOfScope
 from kube_agents_bench.gate import REPORT_EXCERPT_MAX_CHARS, _report_excerpt, main
 from kube_agents_bench.scoring import MISSING
@@ -486,6 +486,23 @@ def test_no_shape_line_without_a_shape(kanban_task, make_run, tmp_path, capsys):
     run_case(kanban_task, [make_run("kanban_red_1")], tmp_path / "case.json")
     printed = capsys.readouterr().out
     assert "  rep 1: " in printed and SHAPE_PREFIX not in printed
+
+
+def test_the_eval_dashboard_reads_back_the_shape_line_this_prints(kanban_task, make_run, tmp_path, capsys, monkeypatch):
+    """The contract with scripts/eval_dashboard: what chat_shape measures,
+    bench-gate prints and the collector parses must round-trip, so a renamed
+    key or a changed flag spelling fails here instead of emptying the
+    Nightly page's column and the digest's reply-shape line."""
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[2] / "scripts"))
+    from eval_dashboard import collect, nightly
+
+    shape = chat_shape.measure("Let me check.\n**Two pods are OOMKilled.** Want me to raise the limit?")
+    run = make_run("kanban_red_1")
+    (run / "shape.json").write_text(json.dumps(shape), encoding="utf-8")
+    run_case(kanban_task, [run], tmp_path / "case.json")
+    (task,) = collect.parse_build_log(capsys.readouterr().out)["tasks"]
+    assert task["reps"][0]["shape"] == shape
+    assert nightly.shape_rollup(task["reps"])["opens_on_verdict"] == 0
 
 
 @pytest.mark.parametrize(
