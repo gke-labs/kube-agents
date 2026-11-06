@@ -41,6 +41,8 @@ class DeployRequiresTheModelInAProwJob(unittest.TestCase):
         self.assertNotIn("REACHED", result.stdout)
         self.assertIn(variable, result.stderr)
         self.assertIn("eval-model", result.stderr, "the message says where a lane sets it")
+        # The dashboard's error-line regex (scripts/eval_dashboard/periodics.py) keys on this prefix.
+        self.assertTrue(result.stderr.startswith("FATAL: "), result.stderr)
 
     def test_a_prow_job_without_a_provider_stops_before_deploying(self) -> None:
         env = {k: v for k, v in ALL_SET.items() if k != "MODEL_PROVIDER"}
