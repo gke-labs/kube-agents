@@ -108,7 +108,7 @@ is `started_at`: `finish` reads it only to give the `collect_s` timer, and no de
 | `clusters[].candidates[]` route fields     | **read**         | `declaration`, `release_declaration`, `namespace_directory` and `reconciler`, each optional. `finish` reads them for the route notes on a `manual` remediation (the issue-ledger design, §6). An absent field is no claim.                                                                                                                                                                                                                                                                 |
 | `audit`                                    | **read**         | The stream the manifest was written for. When present it must equal `--audit`, the way `load_findings` holds the document to it; a mismatch is a validation error naming both. Absent, the manifest is accepted.                                                                                                                                                                                                                                                                           |
 | `finished_at`                              | **read**         | When the collector stopped. Compared against the run's `started_at`, which the harness records at `start`: a manifest that finished before this run opened is a previous run's collection, and is refused rather than cross-checked, because the fixed path the SOPs name is not scrubbed between runs. Absent or unparseable on either side is "cannot tell" and the manifest is accepted.                                                                                                |
-| `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. `finish` subtracts `started_at` from `finished_at` to give `collect_s`, a report timer that no decision uses. The other two are reserved for a run-over-run comparison; `finish` does not read them today.                                                                                                                                                                                                        |
+| `version`, `checks_revision`, `started_at` | carried          | Shape version, digest of the check logic, and the collector's own start. `finish` subtracts `started_at` from `finished_at` to give `collect_s`, a report timer that no decision uses. `version` is reserved; `checks_revision` is in the precheck's digest (§3.7), so a new collector build is a changed fleet, and `finish` itself does not read either.                                                                                                                                 |
 | `clusters[].autopilot`, `.project`, …      | carried          | Fleet facts the collector resolved during enumeration, for the SOP to copy rather than re-derive. `clusters[].limitations` is here too: the collector's own sentence saying what it read but did not compare on that target, which the SOP copies into the document where it becomes a coverage gap. `single_compute_class` on `candidates[]` is carried here too: fleet fact resolved during enumeration, for SOP §3.24 to copy rather than re-derive into targeted manifest remediation. |
 | `error` (top level)                        | carried          | Set only on a run that produced no cluster entry at all — enumeration itself failed, or every target in scope failed its read. The collector exits non-zero with it, and the SOPs answer it by not calling `finish`, so in practice `finish` never sees a manifest carrying it.                                                                                                                                                                                                            |
 
@@ -536,6 +536,48 @@ no sweep. Every id on the line, `unpublished_candidates[].id` included, is the l
 
 They are absent, not empty, on a run without the flag, so the line a stream without a collector
 prints is unchanged.
+
+### 3.7 The precheck — `manifest_delta`, `precheck`
+
+A scheduled run of a stream in `COLLECTOR_AUDITS` ran its collector and then had the model read the
+whole SOP, copy the manifest into a findings document and call `finish`, before anything told it the
+fleet had not changed since the previous scheduled run: a 250-turn session per stream per day whose
+answer was `[SILENT]`. `audit_report.py precheck --audit <id> --manifest-file <manifest>
+[--scheduled]` is the gate the nine governance SOPs run between the collector command and the
+drafting by hand.
+
+`manifest_delta.manifest_digest` is a SHA-256 over the manifest with its volatile keys removed:
+`started_at` and `finished_at` at the top, and each command's `command`, `duration_s` and
+`output_sha256` (the `check` and `rc` pairs stay, because §3.1 reads them). Everything else is in
+it — every cluster's `outcome`, candidates with their severity, excerpt and impact,
+`checks_not_applicable`, `checks_unevaluated`, `limitations`, `clusters_listed`, the Config
+Connector keys, and the top-level `checks_revision`, so a new collector build is a changed fleet — as a
+drop-list rather than a keep-list, so a key a collector adds later counts as a change until this
+module names it volatile. Cluster and command order do not count. `manifest_delta.should_run_llm_synthesis(audit_id,
+manifest, now, max_silent_age_seconds=7*86400)` reads
+`/opt/data/scratch/last_scheduled_digest_<audit-id>.json` and answers `(True, "first-run")` with no
+record, `(True, "findings-changed")` when the digest differs or the manifest can never close a run
+(a top-level `error`, a target whose outcome is neither `collected` nor `out-of-scope`, a non-empty
+`checks_unevaluated`), `(True, "periodic-refresh")` when `now - last_full_run_at` reaches the age,
+and `(False, "unchanged")` otherwise.
+
+`finish --scheduled` with a manifest writes that record after it published (`digest`,
+`checks_revision`, `recorded_at`, `last_full_run_at`); a scheduled `finish` that waived the manifest
+removes it. `precheck` prints one JSON line. Without `--scheduled`, or on any verdict but
+`unchanged`, the line is `{"verdict": …, "closed": false, "reason": …}` and the SOP continues. On
+`unchanged` with the flag, when the newest stored envelope of the ledger this run publishes to
+(`stored_scheduled_document`: not diverted, `scheduled: true`, this id scheme, a `document` with a
+findings list) is there, `precheck` writes that document to `findings_path` and runs `finish
+--scheduled` on it with this run's manifest. Nothing in §3.1–§3.6 or the ledger design changes:
+the cross-check holds the stored document to the fresh manifest, the delta and the scheduled
+baseline are `finish`'s, and `silent_ok` is its verdict. The line is then `finish`'s, plus
+`precheck: unchanged`, and the stored envelope carries the same key
+([`fleet-audit-report-store.md`](fleet-audit-report-store.md) §2); the record keeps its
+`last_full_run_at`, so a static fleet is still drafted in full once a week. A `finish` that
+rejects the stored document puts the findings file back as it was and reports `closed: false`
+with the rejection; a newer on-demand run, a store with nothing, or a document from another scheme
+are reasons to run in full, never errors. An on-demand run never passes the flag, so it is never
+closed from a stored document.
 
 ## 4. The waiver — `--no-collector-manifest <reason>`
 

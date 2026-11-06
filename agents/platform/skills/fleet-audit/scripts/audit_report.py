@@ -532,9 +532,15 @@ MAX_REPORTED_FINDINGS_ERRORS = 20
 # argparse's own line, and what a missing input names: the command that
 # produces it, not only the flag (#2856).
 DRAFT_COMMAND = "draft --audit <id> --manifest-file <collector manifest> --out <findings file>"
+PRECHECK_COMMAND = "precheck --audit <id> --manifest-file <collector manifest> [--scheduled]"
 LIFECYCLE_HINT = (
-    f"The order is `start`, the SOP's collector command, `{DRAFT_COMMAND}`, then "
+    f"The order is `start`, the SOP's collector command, `{PRECHECK_COMMAND}` (which closes an "
+    f"unchanged scheduled run itself), `{DRAFT_COMMAND}`, then "
     "`finish --audit <id> --findings-file <findings file> --manifest-file <collector manifest>`."
+)
+PRECHECK_USAGE_HINT = (
+    f"`{PRECHECK_COMMAND}` takes the manifest the SOP's collector command wrote; pass --scheduled "
+    "only when the cron prompt says the run is scheduled."
 )
 FINISH_USAGE_HINT = (
     f"`finish` takes --audit, --findings-file (write it with `{DRAFT_COMMAND}`) and "
@@ -1770,6 +1776,27 @@ SCHEDULED_REPORTED_UNDER_GAP_KEY = "scheduled_reported_under_gap"
 # the published ids did not move, or when `new` and `resolved` counted
 # against the record of the last scheduled run. See `since_last_scheduled`.
 SINCE_SCHEDULED_KEY = "since_last_scheduled"
+# On the JSON line and the stored envelope of a `finish` that `precheck` ran
+# from the stored document of the last scheduled run, because the
+# collector manifest digested the same as that run's: its value is the
+# gate's verdict, `unchanged`. Absent on every `finish` a worker ran.
+PRECHECK_KEY = "precheck"
+# On `precheck`'s own JSON line when it did not close the run: the gate's
+# verdict (`first-run`, `findings-changed`, `periodic-refresh` or
+# `unchanged`), whether the run was closed (always false on that line), and
+# why the SOP continues.
+PRECHECK_VERDICT_KEY = "verdict"
+PRECHECK_CLOSED_KEY = "closed"
+PRECHECK_REASON_KEY = "reason"
+PRECHECK_NOT_SCHEDULED_REASON = (
+    "not a scheduled run: only a scheduled run is closed from the stored document; the SOP continues"
+)
+PRECHECK_REASON_FIRST_RUN = "no scheduled run of this stream has recorded a manifest digest; the SOP continues"
+PRECHECK_REASON_FINDINGS_CHANGED = (
+    "the collector's findings are not the last scheduled run's, or the run is partial; the SOP continues"
+)
+PRECHECK_REASON_PERIODIC_REFRESH = "the last full synthesis is a week or more old; the SOP continues"
+PRECHECK_CONTINUES_SUFFIX = "; the SOP continues as a full run"
 # On the stored envelope only: the title and place of each previous finding
 # that the run kept under _Not re-checked this run_ (`unread_held_entries`).
 # The note and id-only tiers of the held span write no row for them, and the
@@ -2524,6 +2551,35 @@ SWEEP_OFF_ON_INSTALL_REASON = (
     f"the automatic sweep is off on this install (`{AUTO_PROMOTE_ENV}={AUTO_PROMOTE_OFF}`)"
 )
 _SWEEP_WAIVED = False
+# The gate verdict the running `finish` was started under by `precheck`, or
+# None for a `finish` a worker ran; set once per command.
+_PRECHECK_VERDICT: str | None = None
+
+
+def set_precheck_verdict(verdict: str | None) -> None:
+    """Record that `precheck` is running this `finish` from the stored document."""
+    global _PRECHECK_VERDICT
+    _PRECHECK_VERDICT = verdict
+
+
+def precheck_payload() -> dict:
+    """`{PRECHECK_KEY: verdict}` on a `finish` `precheck` ran, else nothing."""
+    return {PRECHECK_KEY: _PRECHECK_VERDICT} if _PRECHECK_VERDICT else {}
+
+
+def _manifest_delta():
+    """The gate module beside this file, imported on first use.
+
+    Lazy, and by this file's own directory, because `audit_report` is imported
+    from other directories (the status view, the bench plants) that put only
+    this file's path on `sys.path`.
+    """
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import manifest_delta
+
+    return manifest_delta
 
 
 def set_sweep_waived(waived: bool) -> None:
@@ -3924,6 +3980,7 @@ def report_envelope(
         ),
         SCHEDULED_REPORTED_UNDER_GAP_KEY: sorted(set(scheduled_reported_under_gap or [])),
         **({SILENT_FLOOR_KEY: True} if payload.get(SILENT_FLOOR_KEY) else {}),
+        **({PRECHECK_KEY: payload[PRECHECK_KEY]} if payload.get(PRECHECK_KEY) else {}),
         "ledger_held_open": ledger_held_open,
         **({OPEN_LEDGER_KEY: open_issue_number} if open_issue_number is not None else {}),
         "delta_known": delta_known,
@@ -22526,6 +22583,7 @@ def _finish_without_forge(
     )
     payload = {
         "status": NO_FORGE_STATUS,
+        **precheck_payload(),
         "issue_url": None,
         "new": len(new_ids),
         "resolved": len(resolved_ids),
@@ -23232,6 +23290,7 @@ def _finish_store_ledger(
     )
     payload = {
         "status": STORE_LEDGER_STATUS,
+        **precheck_payload(),
         "issue_url": None,
         "new": reported_new,
         "resolved": reported_resolved,
@@ -23351,6 +23410,163 @@ def handle_finish(args: argparse.Namespace) -> None:
         release_in_flight(audit_id)
         raise
     release_in_flight(audit_id)
+    _record_scheduled_digest(args, audit_id)
+
+
+def _record_scheduled_digest(args: argparse.Namespace, audit_id: str) -> None:
+    """Leave the gate's record after a scheduled `finish` published. Best-effort: never fails the run.
+
+    Only a scheduled run with a manifest records one: the digest is what the
+    next scheduled run's `precheck` compares its manifest with, and a run
+    that waived the manifest leaves nothing to compare, so its record is
+    removed and the next run is a first run. A `finish` that `precheck` ran
+    from the stored document keeps the previous `last_full_run_at`.
+    """
+    if not getattr(args, "scheduled", False):
+        return
+    delta = _manifest_delta()
+    manifest_file = str(getattr(args, "manifest_file", None) or "").strip()
+    try:
+        if not manifest_file:
+            delta.digest_path_for(audit_id, SCRATCH_DIR).unlink(missing_ok=True)
+            return
+        manifest = json.loads(Path(manifest_file).read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            return
+        path = delta.record_scheduled_digest(
+            audit_id, manifest, time.time(), full_run=_PRECHECK_VERDICT is None, scratch_dir=SCRATCH_DIR
+        )
+        log(f"precheck: recorded this scheduled run's manifest digest at {path}")
+    except Exception as exc:  # noqa: BLE001 -- the record is for the next run; this one has published
+        log(
+            f"WARNING: the manifest digest for {audit_id} was not recorded: {exc}; "
+            "the next scheduled run drafts its findings in full."
+        )
+
+
+def stored_scheduled_document(audit_id: str, repo: str | None) -> tuple[dict | None, str]:
+    """The findings document of the last scheduled run of the ledger this run publishes to, or why not.
+
+    The newest published envelope of that ledger's store (`first_stored_record`,
+    skipping a diverted one) has to be a scheduled run's (`RUN_SCHEDULED_KEY`),
+    under this id scheme, with a `document` that has a findings list. A newer
+    on-demand run, a store that holds nothing, or a document from another
+    scheme is a reason to run the audit in full, never an error: the gate
+    costs a full run when it cannot vouch for a close.
+    """
+    try:
+        store_repo = resolve_repo_or_no_forge(audit_id, repo)
+    except Exception as exc:  # noqa: BLE001 -- a resolver failure is a reason to run in full
+        return None, f"the repository could not be resolved ({exc})"
+    try:
+        directory = reports_dir_for(audit_id, store_repo)
+    except ValueError as exc:
+        return None, f"no report store for {store_repo} ({exc})"
+    key = _ledger_key(store_repo)
+    newest = first_stored_record(
+        directory, lambda envelope: _ledger_key(envelope.get("repo")) == key and not is_diverted(envelope)
+    )
+    if not newest:
+        return None, f"the report store holds no published run of {audit_id} for {store_repo}"
+    if newest.get(RUN_SCHEDULED_KEY) is not True:
+        return None, "the newest stored run of this ledger was not a scheduled run"
+    if newest.get("id_scheme") != ID_SCHEME:
+        return None, "the newest stored run was written under another id scheme"
+    document = newest.get("document")
+    if not isinstance(document, dict) or not isinstance(document.get("findings"), list):
+        return None, "the newest stored run carries no usable findings document"
+    return document, f"the document of the scheduled run that finished at {newest.get('finished_at')}"
+
+
+def _close_from_stored_document(
+    args: argparse.Namespace, audit_id: str, document: dict, verdict: str, manifest_file: str, source: str
+) -> str | None:
+    """Run `finish --scheduled` on the stored document and this run's manifest.
+
+    None when `finish` published (it printed its own JSON line, with
+    `PRECHECK_KEY`); otherwise the reason the SOP continues, with the
+    findings file put back as it was, so a `draft` the collector command
+    wrote is still the one the worker fills. A rejected document is that
+    reason: the manifest digested the same, but `finish` is the judge of
+    whether the document still fits it. A broker outage is raised as it is
+    from any command, and the same `precheck` is re-run once it answers.
+    """
+    path = Path(findings_path_for(audit_id))
+    previous = path.read_bytes() if path.is_file() else None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    close = argparse.Namespace(
+        audit=audit_id,
+        findings_file=str(path),
+        repo=getattr(args, "repo", None),
+        dry_run=False,
+        scheduled=True,
+        no_promote=False,
+        decline_fix=None,
+        manifest_file=manifest_file,
+        no_collector_manifest=None,
+    )
+    log(f"PRECHECK: {verdict}: closing the run from {source}")
+    set_precheck_verdict(verdict)
+    try:
+        handle_finish(close)
+    except BrokerUnavailable:
+        raise
+    except ValidationError as exc:
+        if previous is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_bytes(previous)
+        return f"finish did not take the stored document ({exc}){PRECHECK_CONTINUES_SUFFIX}"
+    finally:
+        set_precheck_verdict(None)
+    return None
+
+
+def handle_precheck(args: argparse.Namespace) -> None:
+    """The delta gate between the SOP's collector command and the drafting by hand.
+
+    Reads the manifest the collector just wrote, digests it
+    (`manifest_delta.manifest_digest`) and compares it with the digest the
+    last scheduled `finish` recorded. On a scheduled run whose fleet is
+    `unchanged`, it writes the last scheduled run's stored document to
+    `findings_path` and runs `finish --scheduled` on it with this run's
+    manifest, so the cross-check, the ledger comparison and the `silent_ok`
+    rule are `finish`'s own; the JSON line is then `finish`'s, plus
+    `precheck: unchanged`. In every other case it prints one JSON line with
+    the `verdict`, `closed: false` and the `reason`, and the SOP continues.
+    """
+    audit_id = validate_audit_id(args.audit)
+    scheduled = bool(getattr(args, "scheduled", False))
+    manifest_file = str(getattr(args, "manifest_file", None) or "").strip()
+    if not manifest_file:
+        raise ValidationError("--manifest-file: give the path of the manifest the collector wrote.")
+    manifest = load_manifest(manifest_file, audit_id, command="precheck")
+    delta = _manifest_delta()
+    run_llm, verdict = delta.should_run_llm_synthesis(
+        audit_id, manifest, datetime.now(timezone.utc).timestamp(), scratch_dir=SCRATCH_DIR
+    )
+    reasons = {
+        delta.VERDICT_FIRST_RUN: PRECHECK_REASON_FIRST_RUN,
+        delta.VERDICT_FINDINGS_CHANGED: PRECHECK_REASON_FINDINGS_CHANGED,
+        delta.VERDICT_PERIODIC_REFRESH: PRECHECK_REASON_PERIODIC_REFRESH,
+    }
+    line: dict[str, Any] = {PRECHECK_VERDICT_KEY: verdict, PRECHECK_CLOSED_KEY: False}
+    if not scheduled:
+        line[PRECHECK_REASON_KEY] = PRECHECK_NOT_SCHEDULED_REASON
+    elif run_llm:
+        line[PRECHECK_REASON_KEY] = reasons.get(verdict, verdict)
+    else:
+        document, source = stored_scheduled_document(audit_id, getattr(args, "repo", None))
+        if document is None:
+            line[PRECHECK_REASON_KEY] = f"{source}{PRECHECK_CONTINUES_SUFFIX}"
+        else:
+            reason = _close_from_stored_document(args, audit_id, document, verdict, manifest_file, source)
+            if reason is None:
+                return
+            line[PRECHECK_REASON_KEY] = reason
+    log(f"PRECHECK: {verdict}: {line[PRECHECK_REASON_KEY]}")
+    print(json.dumps(line))
 
 
 def findings_predate_run(path: str, audit_id: str) -> str | None:
@@ -24506,6 +24722,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
             # account for. A distinct word because the worker relays
             # this line, and "clean" is the one thing it is not.
             "status": "HELD" if unaccounted or held_unread else "CLEAN",
+            **precheck_payload(),
             "issue_url": existing_url,
             "new": 0,
             "resolved": clean_resolved,
@@ -25081,6 +25298,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> None:
     )
     payload = {
         "status": status,
+        **precheck_payload(),
         "issue_url": issue_url,
         "new": reported_new,
         "resolved": reported_resolved,
@@ -25373,6 +25591,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    precheck_parser = subparsers.add_parser(
+        "precheck",
+        help="After the SOP's collector command: compare its manifest with the last "
+        "scheduled run's digest and, on a scheduled run whose fleet did not change, "
+        "close the run from that run's stored document (its JSON line is then "
+        "finish's, plus precheck: unchanged). Otherwise print the verdict and continue the SOP.",
+    )
+    precheck_parser.usage_hint = PRECHECK_USAGE_HINT
+    precheck_parser.add_argument("--audit", required=True, help="Audit id.")
+    precheck_parser.add_argument(
+        "--manifest-file", required=True, metavar="PATH", help="The manifest the collector wrote this run."
+    )
+    precheck_parser.add_argument(
+        "--repo",
+        help="Optional target GitOps repository, as for finish (defaults to leased workspace repo or ConfigMap registered repo).",
+    )
+    precheck_parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help=(
+            "The run is a scheduled run: the cron prompt passes this flag, to precheck and to "
+            "finish. Only a scheduled run is closed from the stored document; without the flag "
+            "precheck only prints its verdict. Do not pass it on a run a person asked for."
+        ),
+    )
+
     fetch_parser = subparsers.add_parser(
         "fetch",
         help="Copy repository files into the workspace so a fix can edit them "
@@ -25507,6 +25751,8 @@ def main(argv: list[str] | None = None) -> int:
             handle_grep(args)
         elif args.subcommand == "draft":
             handle_draft(args)
+        elif args.subcommand == "precheck":
+            handle_precheck(args)
         elif args.subcommand == "remediate":
             handle_remediate(args)
         else:
