@@ -489,6 +489,11 @@ class SchemaTest(unittest.TestCase):
                 self.assertIn(f"at most {limit} ", kvc.PARAM_DESCRIPTION)
         self.assertIn(f"at least {kvc.MIN_EXCERPT_CHARS} ", kvc.PARAM_DESCRIPTION)
 
+    def test_the_description_keeps_claims_off_a_yes_or_no_answer(self):
+        # A worker reads this as it fills the field; the evidence would turn an answer into a report.
+        self.assertIn("On a yes-or-no question leave it out and call nothing verified", kvc.PARAM_DESCRIPTION)
+        self.assertIn("unless the card asks for verified claims", kvc.PARAM_DESCRIPTION)
+
     def test_an_upstream_parameter_of_the_same_name_fails(self):
         schema = kvc.apply_schema(copy.deepcopy(self.SCHEMA))
         with self.assertRaises(RuntimeError):
