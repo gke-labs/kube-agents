@@ -406,6 +406,46 @@ func TestAnUnstartedTasksJobIsDeletedWhenItEndsAtAdmission(t *testing.T) {
 	}
 }
 
+// The Job an earlier pass launched is deleted when its task ends at admission
+// though the operator has since dropped the profile's Job template (a Job-mode
+// revoke, a tier removed): the Job's name follows from the task, not from the
+// current template, and the refusal here is that very template's absence.
+func TestAnUnstartedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	b.ensure("inv", 1, 0, "unattended")
+	jobs := newFakeJobs(0)
+	if _, err := jobs.Launch(context.Background(), "inv", "unattended", "task-1"); err != nil { // an earlier pass, in Job mode
+		t.Fatal(err)
+	}
+	ti := unattendedInstall(1, func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateRejected || !hasReason(ts, ReasonNoWorker) {
+		t.Fatalf("terminal %+v, want rejected %s", ts, ReasonNoWorker)
+	}
+	waitFor(t, 5*time.Second, "the unstarted task's Job deleted", func() bool { return jobs.deleted("task-1") })
+}
+
+// A task re-adopted after its profile's Job template was dropped still ran on
+// a Job, which goes when the task ends.
+func TestAReadoptedTasksJobIsDeletedAfterItsTemplateIsDropped(t *testing.T) {
+	b := newBus(t, "job-task-1")
+	b.ensure("inv", 1, 0, "unattended")
+	w := b.worker("inv", "unattended", "job-task-1", answerAccept, 4*time.Second)
+	jobs := newFakeJobs(0)
+	ti := unattendedInstall(1, nil)
+	_, stop1 := b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
+	b.submit("inv", "unattended", lib.SubmitKindTop, "task-1")
+	waitFor(t, 10*time.Second, "task-1 started", func() bool { return w.startedTask("task-1") })
+	stop1()
+	ti.update(func(c *lib.DispatchConfig) { c.Profiles[0].JobTemplate = nil })
+	b.runDispatcherWith(testConfig(), ti, &fakeVerifier{}, jobs)
+	if ts := b.waitTerminal("task-1", 20*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v, want the worker's completed", ts)
+	}
+	waitFor(t, 5*time.Second, "the re-adopted task's Job deleted", func() bool { return jobs.deleted("task-1") })
+}
+
 // An offer to the Job's pod that never reaches the bus is not the worker's
 // failure: the task isn't failed, its Job isn't deleted, the breaker doesn't
 // count it, and the submission stays queued for the next pass.

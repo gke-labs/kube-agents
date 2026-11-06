@@ -665,7 +665,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	now := d.now()
 	cluster, ref, err := d.admit(ctx, del, snap, prof, hk, now)
 	if errors.Is(err, errStopped) {
-		d.dropUnstartedJob(ctx, log, prof, hk)
+		d.dropUnstartedJob(ctx, log, hk)
 		d.stopQueued(ctx, log, del, hk)
 		return
 	}
@@ -688,7 +688,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	if ref != nil {
 		log.Info("submission refused at admission", "reason", ref.reason, "detail", ref.detail)
 		d.clearWaiting(hk)
-		d.dropUnstartedJob(ctx, log, prof, hk)
+		d.dropUnstartedJob(ctx, log, hk)
 		d.reject(ctx, log, del, hk, ref)
 		return
 	}
@@ -1236,7 +1236,7 @@ func (d *Dispatcher) adopt(ctx context.Context, log *slog.Logger, del lib.Delive
 	if renew <= 0 {
 		renew = min(seconds(snap.RenewSeconds), lease/3)
 	}
-	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier), onJob: d.cfg.unattended(hk.tier) && d.jobs != nil && len(prof.JobTemplate) > 0,
+	h := &holding{profile: hk.profile, tier: hk.tier, kind: hk.kind, taskID: hk.taskID, unattended: d.cfg.unattended(hk.tier), onJob: d.cfg.unattended(hk.tier) && d.jobs != nil,
 		lease: lease, renew: renew, pod: pod, confirmed: true,
 		renewals: make(chan renewal, renewalBuffer), done: make(chan struct{})}
 	d.mu.Lock()

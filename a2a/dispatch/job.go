@@ -177,10 +177,12 @@ func (d *Dispatcher) endJob(ctx context.Context, log *slog.Logger, h *holding) {
 // dropUnstartedJob deletes the Job of a task that ends at admission (stopped,
 // or refused) without ever being confirmed: one launched before a dispatcher
 // restart, whose pod would otherwise wait for an offer until its deadline,
-// outside every cap. A task not in Job mode has none; a Job already gone is
-// no error.
-func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, prof lib.DispatchProfile, hk holdKey) {
-	if d.jobs == nil || len(prof.JobTemplate) == 0 || !d.cfg.unattended(hk.tier) {
+// outside every cap. Not held to the profile's current Job template: the
+// operator drops it (a revoke, a tier removed) while a Job an earlier pass
+// launched may still be there, and the Job's name follows from the task. A
+// Job never launched, or already gone, is no error.
+func (d *Dispatcher) dropUnstartedJob(ctx context.Context, log *slog.Logger, hk holdKey) {
+	if d.jobs == nil || !d.cfg.unattended(hk.tier) {
 		return
 	}
 	if err := d.jobs.Delete(ctx, hk.profile, hk.tier, hk.taskID); err != nil {
