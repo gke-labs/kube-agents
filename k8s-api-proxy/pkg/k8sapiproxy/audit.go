@@ -107,7 +107,8 @@ type slogAuditSink struct {
 }
 
 // NewSlogAuditSink returns an AuditSink that writes each event as one record to logger:
-// refusals at warn, upstream errors, aborted responses and panics at error, the rest at info.
+// refusals and requests over the in-flight cap at warn, upstream errors, aborted responses and
+// panics at error, the rest at info.
 func NewSlogAuditSink(logger *slog.Logger) AuditSink {
 	if logger == nil {
 		logger = slog.Default()
