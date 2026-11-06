@@ -12,6 +12,10 @@ module assembles that block from four sources and nothing else:
   inference gateway's Prometheus text for token, spend and latency figures;
 * the credential broker pod's Prometheus text on loopback port 8766 (through
   ``kubectl exec``; optional), rolled up to the top five ``tool/subcommand`` pairs;
+  when that cannot be read (``--no-exec`` included) the resource's
+  ``status.usage.topTools``, the operator's reading of the same five pairs,
+  stands in, rendered the same way the chat gateway's ``/feedback summary``
+  renders it;
 * ``kubectl version`` and cluster object counts for the Kubernetes version and the
   cluster scale line (optional); the model name is the resource's ``status.inference``,
   and the gateway's ConfigMap whenever the status has no ``inference`` key (optional):
@@ -166,9 +170,20 @@ USAGE_READINGS: Mapping[str, str] = {
     "peopleSeen7d": USAGE_GATEWAY_READING_SUFFIX,
     "peopleSeen30d": USAGE_GATEWAY_READING_SUFFIX,
 }
-#: Credential broker tool-invocation family and closed outcome order.
+#: Credential broker tool-invocation family and closed outcome order; the
+#: order is also the status row's field names, and the gateway's
+#: usageSummaryToolStatusOrder verbatim.
 TOOL_INVOCATIONS_FAMILY = "kubeagents_tool_invocations_total"
 TOOL_STATUS_ORDER: Tuple[str, ...] = ("success", "error", "blocked", "busy", "abandoned")
+#: ``status.usage.topTools``: the operator's reading of the top five pairs, the
+#: fallback for an unread broker, and its row fields; the gateway's
+#: usageTopTools* names verbatim.
+TOP_TOOLS_STATUS_KEY = "topTools"
+TOP_TOOLS_TOOL_FIELD = "tool"
+TOP_TOOLS_SUBCOMMAND_FIELD = "subcommand"
+TOP_TOOLS_TOTAL_FIELD = "total"
+TOOL_PAIR_SEPARATOR = "/"
+TOP_TOOLS_LABEL = f"tools (top {TOP_TOOLS_SHOWN}, since broker start)"
 #: Closed per-tool subcommand vocabularies, held equal to
 #: ``credential_proxy._subcommand_vocabulary(tool)`` by ``GatewayCopyTest``.
 BROKER_SUBCOMMANDS: Mapping[str, frozenset] = {
@@ -610,17 +625,27 @@ def _nearest_rank(ordered: Sequence[float], quantile: float) -> float:
     return ordered[min(len(ordered) - 1, int(round(quantile * (len(ordered) - 1))))]
 
 
+def _tool_pair(tool: str, sub: str) -> str:
+    """The pair as the block prints it: the tool alone for a bare tool, else ``tool/sub``."""
+    return tool if sub == NONE else f"{tool}{TOOL_PAIR_SEPARATOR}{sub}"
+
+
 def summarise_broker_tools(samples: Iterable[Sample]) -> List[Tuple[str, int, Mapping[str, int]]]:
-    """Top ``TOP_TOOLS_SHOWN`` tool/subcommand pairs by invocation count, with closed labels only."""
-    by_pair: Dict[str, Dict[str, int]] = {}
+    """Top ``TOP_TOOLS_SHOWN`` tool/subcommand pairs by invocation count, with closed labels only.
+
+    Sorted by total descending, then tool and subcommand ascending, the order
+    the operator writes ``status.usage.topTools`` in, so the block reads the
+    same from either source.
+    """
+    by_pair: Dict[Tuple[str, str], Dict[str, int]] = {}
     for sample in samples:
         if sample.name != TOOL_INVOCATIONS_FAMILY:
             continue
         count = int(round(sample.value))
         if count <= 0:
             continue
-        raw_tool = (sample.labels.get("tool") or OTHER_BUCKET).lower()
-        raw_sub = (sample.labels.get("subcommand") or NONE).lower()
+        raw_tool = (sample.labels.get(TOP_TOOLS_TOOL_FIELD) or OTHER_BUCKET).lower()
+        raw_sub = (sample.labels.get(TOP_TOOLS_SUBCOMMAND_FIELD) or NONE).lower()
         raw_status = (sample.labels.get("status") or OTHER_BUCKET).lower()
         tool = raw_tool if raw_tool in BROKER_TOOLS else OTHER_BUCKET
         allowed_subs = BROKER_SUBCOMMANDS.get(tool, frozenset())
@@ -631,12 +656,49 @@ def summarise_broker_tools(samples: Iterable[Sample]) -> List[Tuple[str, int, Ma
         else:
             sub = OTHER_BUCKET
         status = raw_status if raw_status in TOOL_STATUS_ORDER else OTHER_BUCKET
-        pair = tool if sub == NONE else f"{tool}/{sub}"
-        bucket = by_pair.setdefault(pair, {})
+        bucket = by_pair.setdefault((tool, sub), {})
         bucket[status] = bucket.get(status, 0) + count
-    rows = [(pair, sum(counts.values()), counts) for pair, counts in by_pair.items()]
-    rows.sort(key=lambda r: (-r[1], r[0]))
-    return rows[:TOP_TOOLS_SHOWN]
+    rows = [(tool, sub, sum(counts.values()), counts) for (tool, sub), counts in by_pair.items()]
+    rows.sort(key=lambda r: (-r[2], r[0], r[1]))
+    return [(_tool_pair(tool, sub), total, counts) for tool, sub, total, counts in rows[:TOP_TOOLS_SHOWN]]
+
+
+def summarise_status_tools(rows: Sequence[Any]) -> List[Tuple[str, int, Mapping[str, int]]]:
+    """``status.usage.topTools`` in the shape ``summarise_broker_tools`` returns.
+
+    The operator sorted and capped the list, so the rows are taken in their
+    order, at most ``TOP_TOOLS_SHOWN`` of them; a row that is not an object is
+    skipped. The gateway's ``renderTopTools`` reads the list the same way.
+    """
+    out: List[Tuple[str, int, Mapping[str, int]]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or len(out) >= TOP_TOOLS_SHOWN:
+            continue
+        tool = str(row.get(TOP_TOOLS_TOOL_FIELD) or "")
+        sub = str(row.get(TOP_TOOLS_SUBCOMMAND_FIELD) or "")
+        counts = {status: _count(row.get(status)) for status in TOOL_STATUS_ORDER if _count(row.get(status)) > 0}
+        out.append((_tool_pair(tool, sub), _count(row.get(TOP_TOOLS_TOTAL_FIELD)), counts))
+    return out
+
+
+def _count(value: Any) -> int:
+    """A status row's count as an integer; anything that is not one reads 0, as the gateway's asInt reads it."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tools_lines(top_tools: Sequence[Tuple[str, int, Mapping[str, int]]]) -> List[str]:
+    """The tools block: the label and ``none`` for no pairs, else the label and one row per pair."""
+    if not top_tools:
+        return [f"{TOP_TOOLS_LABEL}: {NONE}"]
+    lines = [f"{TOP_TOOLS_LABEL}:"]
+    status_order = TOOL_STATUS_ORDER + (OTHER_BUCKET,)
+    for pair, total, by_status in top_tools:
+        breakdown = ", ".join(f"{s} {by_status[s]}" for s in status_order if by_status.get(s))
+        lines.append(f"  {pair}: {total}" + (f" ({breakdown})" if breakdown else ""))
+    return lines
 
 
 @functools.lru_cache(maxsize=1)
@@ -761,18 +823,15 @@ def render(snapshot: Snapshot) -> str:
             lines.append(f"  {counter}: {int(value or 0)}")
     lines.append(f"  lastActive: {usage.get('lastActiveTime') or NEVER}")
     lines.append(f"  lastHumanActive: {usage.get('lastHumanActiveTime') or NEVER}")
-    if snapshot.broker_metrics is None:
-        lines.append(f"tools (top {TOP_TOOLS_SHOWN}, since broker start): {UNAVAILABLE}")
+    # The broker's own text first; the operator's reading of it in the status
+    # when the broker could not be read; unavailable when neither is there.
+    status_tools = usage.get(TOP_TOOLS_STATUS_KEY)
+    if snapshot.broker_metrics is not None:
+        lines.extend(_tools_lines(summarise_broker_tools(parse_prometheus(snapshot.broker_metrics))))
+    elif isinstance(status_tools, list):
+        lines.extend(_tools_lines(summarise_status_tools(status_tools)))
     else:
-        top_tools = summarise_broker_tools(parse_prometheus(snapshot.broker_metrics))
-        if not top_tools:
-            lines.append(f"tools (top {TOP_TOOLS_SHOWN}, since broker start): {NONE}")
-        else:
-            lines.append(f"tools (top {TOP_TOOLS_SHOWN}, since broker start):")
-            status_order = TOOL_STATUS_ORDER + (OTHER_BUCKET,)
-            for pair, total, by_status in top_tools:
-                breakdown = ", ".join(f"{s} {by_status[s]}" for s in status_order if by_status.get(s))
-                lines.append(f"  {pair}: {total}" + (f" ({breakdown})" if breakdown else ""))
+        lines.append(f"{TOP_TOOLS_LABEL}: {UNAVAILABLE}")
     lines.append("performance:")
     if snapshot.litellm_metrics is not None:
         samples = parse_prometheus(snapshot.litellm_metrics)

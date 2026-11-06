@@ -3985,8 +3985,9 @@ const defaultA2AMaxSessions = 10
 // a2aQuotaHeadroom is the sum of three parts:
 //
 //   - a2aStandingPods: what this operator keeps running for the agent;
-//   - the chart's pods (the operator, LiteLLM, Hindsight, the GitHub minter and
-//     the web console, plus one surge pod for each that rolls surge-first,
+//   - the chart's pods (its standing workloads in kube-agents.chartWorkloads:
+//     the operator, LiteLLM and its replay proxy, Hindsight, the GitHub minter
+//     and the web console, plus one surge pod for each that rolls surge-first,
 //     since a chart bump rolls several in one upgrade), which only the chart
 //     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation.
 //     The CR is in the namespace those pods run in, and the chart renders it
@@ -4043,36 +4044,39 @@ type a2aChartPodsWarning struct {
 	value      string
 }
 
-// a2aChartPodsDiscard says why the CR's chart-pods annotation is not used,
-// or "" when it is used or absent. An absent one is a CR written without the
-// chart, which the default is for; a present one the operator discards is a
-// figure the chart did not write (the chart refuses to render one past the
-// cap) or one it cannot read, and the default may then sit below what the
-// namespace runs, so the discard is reported rather than silent.
-func a2aChartPodsDiscard(agent *agentv1alpha1.PlatformAgent) string {
+// a2aChartPodsCount reads the CR's chart-pods annotation once (#4893): the
+// chart's pods in agent's namespace, surges included, that the session quota
+// counts, and why the annotation was discarded, "" when it was used or is
+// absent. An absent one is a CR written without the chart, which the default
+// is for. A present one the operator discards is a figure the chart did not
+// write (the chart refuses to render one past the cap) or one it cannot read,
+// and the default may then sit below what the namespace runs, so the reason
+// is reported rather than silent.
+func a2aChartPodsCount(agent *agentv1alpha1.PlatformAgent) (int64, string) {
 	raw, present := agent.GetAnnotations()[a2aChartPodsAnnotation]
 	if !present {
-		return ""
+		return a2aDefaultChartPods, ""
 	}
 	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	switch {
 	case err != nil:
-		return fmt.Sprintf("annotation %s=%q is not a number; the session quota counts the default of %d chart pods instead", a2aChartPodsAnnotation, raw, a2aDefaultChartPods)
+		return a2aDefaultChartPods, fmt.Sprintf("annotation %s=%q is not a number; the session quota counts the default of %d chart pods instead", a2aChartPodsAnnotation, raw, a2aDefaultChartPods)
 	case v < 0 || v > a2aMaxChartPods:
-		return fmt.Sprintf("annotation %s=%q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", a2aChartPodsAnnotation, raw, a2aMaxChartPods, a2aDefaultChartPods)
+		return a2aDefaultChartPods, fmt.Sprintf("annotation %s=%q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", a2aChartPodsAnnotation, raw, a2aMaxChartPods, a2aDefaultChartPods)
 	}
-	return ""
+	return v, ""
 }
 
-// a2aChartPods is the chart's pods in agent's namespace, surges included, as the chart
-// stamped them on the CR, or the default when it did not or stamped a figure
-// outside [0, a2aMaxChartPods].
+// a2aChartPods is the count a2aChartPodsCount reads.
 func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
-	raw := strings.TrimSpace(agent.GetAnnotations()[a2aChartPodsAnnotation])
-	if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v >= 0 && v <= a2aMaxChartPods {
-		return v
-	}
-	return a2aDefaultChartPods
+	n, _ := a2aChartPodsCount(agent)
+	return n
+}
+
+// a2aChartPodsDiscard is why a2aChartPodsCount discarded the annotation, or "".
+func a2aChartPodsDiscard(agent *agentv1alpha1.PlatformAgent) string {
+	_, why := a2aChartPodsCount(agent)
+	return why
 }
 
 // a2aStandingPods is every pod the operator keeps running for agent in next
@@ -7342,12 +7346,13 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	if profileQuotaErr != nil {
 		r.profileNamespaceFailure(ctx, agent, "delete the quota on the flip to today", profileQuotaErr)
 	}
-	// And the dispatcher's pod-read Role and binding there, likewise
-	// unowned, likewise not worth stopping the flip for, and likewise kept
-	// in sight: a failure leaves the fence below as the sentinel.
+	// And the dispatcher's warm pools, their CA bundle copy and its pod-read
+	// Role and binding there, likewise unowned, likewise not worth stopping
+	// the flip for, and likewise kept in sight: a failure leaves the fence
+	// below as the sentinel.
 	dispatcherRBACErr := r.deleteDispatcherPodsRBAC(ctx, agent)
 	if dispatcherRBACErr != nil {
-		r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's pod-read Role on the flip to today", dispatcherRBACErr)
+		r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on the flip to today", dispatcherRBACErr)
 	}
 
 	// 2. The callout's ClusterRoleBinding. Cluster-scoped, so it carries no

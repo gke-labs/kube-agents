@@ -464,6 +464,7 @@ On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/s
 - the image tag, the mode, the Kubernetes version, and the install's age and readiness;
 - the model as `provider/name` from the resource's `status.inference` (`unavailable` while the operator has not written it);
 - the `status.usage` counters;
+- the credential broker's top five `tool/subcommand` pairs since its pod started, from `status.usage.topTools` (`unavailable` while the status holds no list);
 - a roll-up of the chat turns the gateway's own records still hold (ended, cancelled, active);
 - a short feedback template.
 
@@ -471,7 +472,7 @@ The line is labelled `chat turns`, not `tasks`, because the script's `tasks` lin
 
 It names no cluster, project, namespace, task or person. The gateway audits the block outside its `model:` line, which carries only the provider and model name from the status. It refuses to post a block whose audited lines contain the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings), and says so instead. The block's own words, such as a bucket or interface name, are not refused.
 
-The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the cluster scale counts, the top five credential broker tools, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
+The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the cluster scale counts, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
 
 ### The Slack Home tab
 
@@ -650,25 +651,27 @@ The counter is fleet-wide, so the demand on it increases with the number of clus
 
 ### One incident per workload
 
-By default, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. Set `INCIDENT_WORKLOAD_DEDUP_SECONDS` to fold them into one. Within that many seconds of an alert, a later Warning event for the same workload, or a later Critical one after a Critical alert, posts nothing, starts no triage turn and spends no budget.
+Without folding, each pod and each reason of a broken workload is its own alert: a Deployment with three replicas that cannot pull its image posts three alerts, starts three triage turns, and spends three units of the `Warning` budget. `INCIDENT_WORKLOAD_DEDUP_SECONDS` folds them into one, and is on by default at `3600`, an hour. Within that many seconds of an alert, a later Warning event for the same workload, or a later Critical one after a Critical alert, posts nothing, starts no triage turn and spends no budget.
 
 The same workload means the same cluster, namespace and kind, and either the same Deployment (a pod named with its ReplicaSet hash, such as `checkout-6cfdb6b98b-zwv24`) or the same name for an object that is not a Pod. About 1 in 400 Deployments has a hash shorter than 8 characters, and its pods do not fold. Other pods do not fold: the pods of a StatefulSet, a DaemonSet, a Job or a CronJob each still alert, so a Job's failure is never folded into a same-named Deployment's alert.
 
-A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again, unless its fix is waiting for review (below). The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0`, the default, turns folding off, a larger value than `86400` counts as `86400`, and a value that is negative or not a number counts as `0`.
+A Critical event after a Warning alert is announced, so a workload that gets worse is announced again. A restart of the agent pod ends every open window, so the first event after one is announced again, unless its fix is waiting for review (below). The feed `GET /v1/intercepted-events` lists a folded event with the status `folded`. The value is a whole number of seconds; `0` turns folding off, a larger value than `86400` counts as `86400`, a negative value counts as `0`, and a value that is not a number counts as the default.
 
-Set it as an entry in the chart value `platformAgent.deployment.env`, or in the `PlatformAgent` CR's `spec.deployment.env` on an install that no chart manages:
+Change it with the chart value `platformAgent.deployment.incidentWorkloadDedupSeconds`, which renders the entry into the CR's `spec.deployment.env`, or set that entry yourself on an install that no chart manages. On an install made with `install.sh`, put the value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={deployment={incidentWorkloadDedupSeconds=0}}}'`. `0` turns folding off:
 
 ```yaml
 platformAgent:
   deployment:
-    env:
-      - name: INCIDENT_WORKLOAD_DEDUP_SECONDS
-        value: "900"
+    incidentWorkloadDedupSeconds: 0
 ```
 
-With the setting on, a workload that breaks again after the window, while the pull request the agent opened automatically to fix one of its recent incidents (`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`) is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand, or one opened for anything else asked in the incident's thread, does not count.
+An entry named `INCIDENT_WORKLOAD_DEDUP_SECONDS` in `platformAgent.deployment.env` wins over the key. A change to the window restarts the agent pod and the credential-proxy pod, and the first apply that renders the entry replaces entries added to the CR's `spec.deployment.env` by hand, as the ceilings paragraph above describes.
+
+With folding on, a workload that breaks again after the window, while the pull request the agent opened automatically to fix one of its recent incidents (`INCIDENT_TRIAGE_OPEN_PULL_REQUEST`) is still open for review, also starts no new triage turn. This covers any object that comes back under the same workload: a Deployment's new pods, and a StatefulSet pod, bare pod or other object that comes back under the same name. A pull request a person opened by hand, or one opened for anything else asked in the incident's thread, does not count.
 
 A fix opened by replying `apply` or clicking an option button in the incident's own thread holds a recurrence the same way. The hold counts the first card for the Platform Agent filed from that thread within 30 minutes of the reply. A later card in the thread does not count, and neither does an `apply` typed in the main space or the first reply in a Google Chat direct message, which is answered at top level. Under `spec.mode: next`, an `apply` on the platform the A2A gateway holds is not recorded and does not hold.
+
+With folding on by default, an install that opens fix pull requests runs this lookup for every new incident. The search is bounded, and a forge that does not answer in time announces the event as a new incident.
 
 The hold covers the same fault only: the event's reason must be one the incident showed, its own or one folded into it, so a workload waiting on a fix for `BackOff` that starts failing `Unhealthy` gets a new incident. For the same fault, the incident's chat thread gets one short reminder per window instead, naming the pull request: the fault is already diagnosed and its fix is waiting on a person. Once that pull request is merged or closed, the next new failure is a new incident again. The feed `GET /v1/intercepted-events` lists such an event as `folded`, with the pull request in its `pull_request` field.
 
@@ -680,7 +683,7 @@ By default, a triage report proposes GitOps fixes and stops. A human replies `ap
 
 Once the report is complete, the second card opens only the option the report marked Recommended, or the single proposed fix, through `submit-suggestion`, changing only the files that option calls for and leaving alternative options and unrelated definitions untouched. Any other value, or no value, keeps the default.
 
-Set it the same way as `INCIDENT_WORKLOAD_DEDUP_SECONDS`, as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
+Set it as an entry in `platformAgent.deployment.env` or in `spec.deployment.env`:
 
 ```yaml
 platformAgent:

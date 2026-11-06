@@ -678,7 +678,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   Those are `cluster-agent-reconcile`, which scaffolds a profile for a newly onboarded cluster and
   prunes one for a deleted cluster; `oobe`, which runs first-run onboarding (the
   `bootstrap-inventory-*` entries ship disabled); and `profile-cron-tick`, the only thing that ticks
-  a **named** profile's own store — so every `cluster-*` roster goes quiet with it. Nothing errors
+  a **named** profile's own store — so every `cluster-*` roster goes quiet with it, and so does the [idle-install hold](/kube-agents/concepts/autonomous-watchdogs/#idle-installs) on the Platform Agent's model-run jobs, which runs inside that job. Nothing errors
   and nothing is logged: a job that is never ticked stays `scheduled` with a `next_run_at` in the
   past.
 
@@ -1417,7 +1417,16 @@ clears both. With `spec.telemetry.peopleSeen: false` the gateway serves no sampl
 clear the same way. A 0 is a reading, and neither field moves `lastActiveTime` or
 `lastHumanActiveTime`.
 
-The operator also serves every counter, cluster gauge, reading and time of this block, and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
+`topTools` is the credential broker's five most-invoked tool and subcommand pairs since its pod
+last started, summed across the broker pods. Each row carries the pair's total and its outcomes
+(`success`, `error`, `blocked`, `busy`, `abandoned`); the rows sort by total, then by tool and
+subcommand. Every word is from the broker's own closed vocabularies, so the list carries no
+command line. A broker restart starts it over, a broker that has run nothing leaves it absent,
+and the second poll in a row that cannot read the broker clears it. It moves neither time. The
+summary script and the chat gateway's `/feedback summary` print it as the
+`tools (top 5, since broker start)` block.
+
+The operator also serves every counter, cluster gauge, scalar reading and time of this block (the two lists, `activeInterfaces` and `topTools`, aside), and `status.phase`, as Prometheus gauges on its own metrics port. A collector reads them without a query against the status; the series are on [Observability](/kube-agents/concepts/observability/#prometheus-metrics).
 
 `inference.provider` and `inference.model` are the install's default model, the one LiteLLM serves
 under `model-default`. The operator reads the LiteLLM config ConfigMap the `litellm` Deployment

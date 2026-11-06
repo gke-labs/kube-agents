@@ -21,6 +21,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"os"
 	"slices"
@@ -679,6 +680,12 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 			return fmt.Errorf("the dispatcher's pod-read %T: %w", obj, err), nil
 		}
 	}
+	// The warm pools the dispatcher hands interactive tasks to
+	// (agentprofile_pool.go). A failure there is the profile namespace's,
+	// like the quota's.
+	if err := r.reconcileProfilePools(ctx, agent, profiles, resolved); err != nil {
+		return err, nil
+	}
 	return nil, nil
 }
 
@@ -686,24 +693,38 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcher(ctx context.Context, ag
 // owned objects only if this agent controls them, and the profile namespace's
 // Role and binding only if they carry this agent's labels.
 func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (profileErr error, err error) {
+	// The pools and their bundle go first, whatever the deletes after them
+	// do: their pods hold bus and broker tokens, and nothing dispatches to
+	// them once the dispatcher is off.
+	profileErr = r.deleteDispatcherPodsRBAC(ctx, agent)
 	name := a2aDispatcherName(agent)
+	var errs []error
 	for _, obj := range []client.Object{
 		&appsv1.Deployment{}, &rbacv1.RoleBinding{}, &rbacv1.Role{}, &corev1.ServiceAccount{},
 	} {
 		if err := r.deleteIfControlled(ctx, agent, obj, types.NamespacedName{Namespace: agent.Namespace, Name: name}); err != nil {
-			return nil, err
+			errs = append(errs, err)
 		}
 	}
 	if err := r.deleteIfControlled(ctx, agent, &corev1.ConfigMap{}, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}); err != nil {
-		return nil, err
+		errs = append(errs, err)
 	}
-	return r.deleteDispatcherPodsRBAC(ctx, agent), nil
+	return profileErr, goerrors.Join(errs...)
 }
 
-// deleteDispatcherPodsRBAC removes the dispatcher's pod-read Role and binding
-// from the profile namespace, if they carry this agent's labels. Read
-// uncached: Role is a kind this controller doesn't watch.
+// deleteDispatcherPodsRBAC removes what the dispatcher left in the profile
+// namespace: its pod-read Role and binding, and this agent's warm pools.
 func (r *PlatformAgentReconciler) deleteDispatcherPodsRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	// The warm pools go whatever happens to the RBAC: they have no owner
+	// reference, so nothing else would reclaim pods holding bus and broker
+	// tokens.
+	return goerrors.Join(r.deleteDispatcherPodReadRBAC(ctx, agent), r.deleteProfilePools(ctx, agent))
+}
+
+// deleteDispatcherPodReadRBAC removes the dispatcher's pod-read Role and
+// binding from the profile namespace, if they carry this agent's labels.
+// Read uncached: Role is a kind this controller doesn't watch.
+func (r *PlatformAgentReconciler) deleteDispatcherPodReadRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	key := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherName(agent)}
 	for _, obj := range []client.Object{&rbacv1.RoleBinding{}, &rbacv1.Role{}} {
 		if err := r.a2aReader().Get(ctx, key, obj); err != nil {
@@ -743,7 +764,13 @@ func (r *PlatformAgentReconciler) deleteIfControlled(ctx context.Context, agent 
 // agentLabelsMark reports whether obj carries this agent's a2a labels, the
 // ownership test for objects in the profile namespace.
 func agentLabelsMark(obj client.Object, agent *agentv1alpha1.PlatformAgent) bool {
-	want := a2aLabels(agent, "dispatcher")
+	return agentLabelsMarkComponent(obj, agent, "dispatcher")
+}
+
+// agentLabelsMarkComponent is agentLabelsMark for an object of another
+// component: it carries this agent's labels with that component.
+func agentLabelsMarkComponent(obj client.Object, agent *agentv1alpha1.PlatformAgent, component string) bool {
+	want := a2aLabels(agent, component)
 	got := obj.GetLabels()
 	for k, v := range want {
 		if got[k] != v {

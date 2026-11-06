@@ -129,8 +129,11 @@ class GitopsWriteTokenTest(_Harness):
             echo "EXPORTED=${TF_VAR_bench_gitops_write_token_file}"
             echo "AT_LAUNCH=$(cat "${TOKEN_FILE}")"
             echo "MODE=$(stat -c %a "${TOKEN_FILE}" 2>/dev/null || stat -f %Lp "${TOKEN_FILE}")"
-            for _ in $(seq 1 50); do grep -q tok-write-2 "${TOKEN_FILE}" && break; command sleep 0.2; done
-            echo "RENEWED=$(cat "${TOKEN_FILE}")"
+            # One read per poll, reported as read: the renewer keeps renewing on
+            # the harness's short interval, so a second read could see a later token.
+            renewed=""
+            for _ in $(seq 1 50); do renewed="$(cat "${TOKEN_FILE}")"; [ "${renewed}" != "tok-write-1" ] && break; command sleep 0.2; done
+            echo "RENEWED=${renewed}"
             renewer="${GITOPS_WRITE_TOKEN_RENEWER}"
             stop_gitops_write_token "${TOKEN_FILE}"
             kill -0 "${renewer}" 2>/dev/null && echo "RENEWER=alive" || echo "RENEWER=gone"
@@ -144,7 +147,8 @@ class GitopsWriteTokenTest(_Harness):
         self.assertIn(f"EXPORTED={self.tmp / 'unit.gitops-token'}", out)
         self.assertIn("AT_LAUNCH=tok-write-1", out)
         self.assertIn("MODE=600", out)
-        self.assertIn("RENEWED=tok-write-2", out)
+        # A renewal happened, whatever count the renewer reached before the read.
+        self.assertRegex(out, r"RENEWED=tok-write-([2-9]|[1-9][0-9]+)\n")
         self.assertIn("RENEWER=gone", out)
         self.assertIn("FILE=removed", out)
         self.assertIn("UNSET=\n", out + "\n")
