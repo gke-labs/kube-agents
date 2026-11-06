@@ -218,7 +218,9 @@ An install that was stopped, by `spec.deployment.scaleToZero` or an outage, come
 
 A job is a catch-up when it is later than Hermes' grace: half its period, between two minutes and two hours. A job late but inside that window runs at once, as before. `no_agent` jobs are not touched, nor is a job marked due by hand with `hermes cron run`.
 
-A deferred job is held at its next slot until its turn, because Hermes re-anchors a due instant that is not one of the expression's own without firing it. `<profile-home>/cron/cron_catch_up_policy.json` records the slot the job missed and when it is given back. A record the store no longer matches, because someone ran the job or Hermes moved it, is dropped; a record that is lost leaves the job to run at the slot it is held at. The dispatcher's run output names each skip, deferral and release.
+A deferred job is held at its next slot until its turn, because Hermes re-anchors a due instant that is not one of the expression's own without firing it. `<profile-home>/cron/cron_catch_up_policy.json` records the slot the job missed and when it is given back.
+
+At its turn the job is decided afresh. If the ticker stopped again while it waited and its missed slot is now a whole period old, it is skipped like any other stale catch-up. Two turns that fall on one tick are spaced again. A record the store no longer matches, because someone ran the job or Hermes moved it, is dropped; a record that is lost leaves the job to run at the slot it is held at. The dispatcher's run output names each skip, deferral and release.
 
 `CRON_CATCH_UP_STAGGER_MINUTES` on the agent container, through `spec.deployment.env`, sets the step (default 30). `0` turns the policy off and releases whatever it holds; an unparsable or negative value means the default. The policy runs after the idle hold above, so a job that hold has moved is not a catch-up.
 

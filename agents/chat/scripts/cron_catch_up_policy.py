@@ -38,9 +38,12 @@ So a deferred job is held at its next natural slot, which is on the lattice
 and is where it would go if the record were lost, and the state file beside
 the store remembers the instant it was due and when to give it back. At that
 time, if ``next_run_at`` still reads the hold, the stored string is written
-back exactly as it was: Hermes then finds its own slot, past its grace, and
-takes its own catch-up path, missed-window row included. A job Hermes or a
-person moved in the meantime is left as they left it and the record dropped.
+back exactly as it was and the job is decided like any other due job on that
+tick: as the oldest catch-up it goes to Hermes, which finds its own slot, past
+its grace, and takes its own catch-up path, missed-window row included; behind
+an older one it waits a further step; a whole period late, because the ticker
+stopped again while it waited, it is skipped. A job Hermes or a person moved in
+the meantime is left as they left it and the record dropped.
 
 Only prompt-driven jobs are touched: a ``no_agent`` script costs no model
 run and Hermes' collapse is the right answer for it. A job marked due by hand
@@ -138,11 +141,12 @@ def stagger_step(environ: dict | None = None) -> timedelta | None:
     env = os.environ if environ is None else environ
     try:
         minutes = int(str(env.get(STAGGER_MINUTES_ENV, "")).strip())
-    except (TypeError, ValueError):
-        minutes = DEFAULT_STAGGER_MINUTES
+        step = timedelta(minutes=minutes)
+    except (TypeError, ValueError, OverflowError):  # unparsable, or wider than a timedelta
+        return timedelta(minutes=DEFAULT_STAGGER_MINUTES)
     if minutes < 0:
-        minutes = DEFAULT_STAGGER_MINUTES
-    return None if minutes == 0 else timedelta(minutes=minutes)
+        return timedelta(minutes=DEFAULT_STAGGER_MINUTES)
+    return None if minutes == 0 else step
 
 
 def grace_for(period: timedelta) -> timedelta:
@@ -289,10 +293,17 @@ def _due(job: dict, now: datetime) -> bool:
     return when is not None and when <= now
 
 
-def _release(deferred: dict, jobs_by_id: dict, now: datetime, step: timedelta | None, label: str) -> tuple[set[str], bool, list[str]]:
-    """Give back every deferred job whose time has come. Returns the ids
-    released, whether the store changed, and the lines."""
-    released: set[str] = set()
+def _release(deferred: dict, jobs_by_id: dict, now: datetime, step: timedelta | None, label: str) -> tuple[dict, bool, list[str]]:
+    """Give back every deferred job whose time has come. Returns the records
+    released (taken out of ``deferred``), whether the store changed, and the
+    lines.
+
+    A released job is then an ordinary due job for the scan that follows: if
+    the ticker stopped again while it waited, so that its missed slot is now a
+    whole period old, it is skipped like any other stale catch-up, and two
+    releases that fall on one tick are spaced again rather than fired together.
+    """
+    released: dict[str, dict] = {}
     changed = False
     lines: list[str] = []
     for job_id, record in list(deferred.items()):
@@ -311,11 +322,13 @@ def _release(deferred: dict, jobs_by_id: dict, now: datetime, step: timedelta | 
         if not isinstance(restore, str) or not restore:
             deferred.pop(job_id)
             continue
-        # The record stays until the store holds the restored slot: the
-        # caller pops it after its write, so a crash between the two leaves a
-        # record the next tick releases again, never a hold with no record.
+        # The record stays on disk until the store holds the restored slot:
+        # the caller writes it (or, when the job is deferred again on this
+        # tick, the new record naming the same hold) into the state it saves
+        # before the store, so a crash between the two leaves a record the
+        # store still matches, never a hold with no record.
         job["next_run_at"] = restore
-        released.add(job_id)
+        released[job_id] = deferred.pop(job_id)
         changed = True
         lines.append(f"{label}: released {job_id} for its catch-up of {restore}")
     return released, changed, lines
@@ -334,9 +347,10 @@ def _apply_locked(
 
     As in the idle policy, a new record reaches disk before the store takes
     its hold, and a released record leaves the state only after the store
-    has its slot back: a crash between the two writes leaves at worst a
-    record the store never took, which the next tick drops, and never a hold
-    no release can give back.
+    has its slot back (a job deferred again on the same tick keeps a record
+    naming the same hold throughout). A crash between the two writes leaves
+    at worst a record the store never took, which the next tick drops, or a
+    turn that slips one step, and never a hold no release can give back.
     """
     try:
         store = json.loads(store_path.read_text(encoding="utf-8"))
@@ -354,7 +368,7 @@ def _apply_locked(
     candidates: list[tuple[datetime, str, dict, timedelta, timedelta]] = []
     if step is not None:
         for job_id, job in jobs_by_id.items():
-            if not _prompt_driven(job) or job_id in deferred or job_id in released or marked_by_hand(job):
+            if not _prompt_driven(job) or job_id in deferred or marked_by_hand(job):
                 continue
             if isinstance(job.get("pending_slot"), dict):
                 # A dispatch that advanced the slot and died before claiming
@@ -387,7 +401,10 @@ def _apply_locked(
         if overdue >= period:
             why = f"{how}, {_fmt(overdue)} overdue on a {_fmt(period)} period"
         else:
-            release_at = now + step * fired
+            try:
+                release_at = now + step * fired
+            except OverflowError:  # a step past the calendar's end: no turn to wait for
+                release_at = target
             fired += 1
             if release_at == now:
                 continue  # the oldest miss fires on this tick, as Hermes has it
@@ -404,7 +421,7 @@ def _apply_locked(
                     f"held at {target_text} until then"
                 )
                 continue
-            why = f"{how}, a catch-up {_fmt(release_at - now)} later would run after its next slot"
+            why = f"{how}, a catch-up {_fmt(release_at - now)} later would run at or after its next slot"
         job["next_run_at"] = target_text
         changed = True
         lines.append(f"{label}: skipped the catch-up of {job_id}: {why}; next run {target_text}")
@@ -412,17 +429,25 @@ def _apply_locked(
 
     saved = None
     if changed:
-        if json.dumps(state, sort_keys=True) != state_before:
+        # Saved before the store, with the released records still in it
+        # (a re-deferred job's new record stands in for its old one); the
+        # caller's final save drops the released ones once the store has its
+        # slots back.
+        pending = dict(state)
+        pending["deferred"] = dict(released)
+        pending["deferred"].update(deferred)
+        if json.dumps(pending, sort_keys=True) != state_before:
             try:
-                _write_json(state_path, state)
+                _write_json(state_path, pending)
             except OSError as exc:
+                # Nothing reaches the store, and the released records go back
+                # so the caller's final save cannot drop them either.
+                deferred.update(released)
                 return json.dumps(state, sort_keys=True), [
                     f"{label}: cron catch-up policy could not save its state ({exc}); nothing changed"
                 ]
-            saved = json.dumps(state, sort_keys=True)
+            saved = json.dumps(pending, sort_keys=True)
         _write_json(store_path, store)
-        for job_id in released:
-            deferred.pop(job_id, None)
         for job_id, instant, detail in skips:
             note = record_skip(store_path.parent, job_id, now, instant, detail)
             if note is not None:

@@ -164,6 +164,10 @@ class SettingsTest(unittest.TestCase):
         for raw in ("soon", "-5", "1.5", ""):
             self.assertEqual(ccp.stagger_step({ccp.STAGGER_MINUTES_ENV: raw}), timedelta(minutes=30), raw)
 
+    def test_a_value_wider_than_a_timedelta_means_the_default(self):
+        for raw in (str(10**15), str(10**30)):
+            self.assertEqual(ccp.stagger_step({ccp.STAGGER_MINUTES_ENV: raw}), timedelta(minutes=30), raw)
+
 
 class GraceTest(unittest.TestCase):
     """The catch-up line is Hermes' own: half the period, clamped to [2 min, 2 h]."""
@@ -401,9 +405,10 @@ class ShortOutageTest(PolicyCase):
         self.assertEqual(self.next_run("security-patch-orchestrator"), "2026-08-05T07:20:00+00:00")
         self.assertEqual(self.state()["deferred"], {})
 
-    def test_a_released_job_is_not_deferred_again_on_the_same_tick(self):
+    def test_a_released_job_that_is_the_oldest_catch_up_fires_at_once(self):
         self.write(*self.roster())
         self.run_policy()
+        self.hermes_fired("compliance-audit", "2026-08-06T06:20:00+00:00")
         self.run_policy(now=NOW + timedelta(minutes=30))
         self.assertEqual(self.next_run("obtainability-audit"), "2026-08-05T06:20:00+00:00")
         self.assertNotIn("obtainability-audit", self.state()["deferred"])
@@ -435,6 +440,60 @@ class ShortOutageTest(PolicyCase):
         self.assertIn("deferred the catch-up of obtainability-audit to 2026-08-05T09:35:30+00:00", lines[0])
         self.assertIn("deferred the catch-up of security-patch-orchestrator to 2026-08-05T09:45:30+00:00", lines[1])
 
+    def test_a_step_past_the_calendars_end_folds_rather_than_raises(self):
+        # 10**10 minutes fits a timedelta and not the calendar from now: no
+        # turn to wait for, so the later catch-ups fold into their next slots.
+        self.write(*self.roster())
+        lines = self.run_policy(env={ccp.STAGGER_MINUTES_ENV: str(10**10)})
+        self.assertFalse(any("failed" in line for line in lines), lines)
+        self.assertEqual(self.next_run("compliance-audit"), "2026-08-05T06:20:00+00:00")
+        self.assertTrue(any(line.startswith("platform: skipped the catch-up of obtainability-audit") for line in lines), lines)
+        self.assertEqual(self.next_run("obtainability-audit"), "2026-08-06T06:20:00+00:00")
+        self.assertFalse(self.state_path.exists())
+
+    def test_a_second_pause_past_the_period_turns_a_turn_into_a_skip(self):
+        self.write(*self.roster())
+        self.run_policy()
+        self.hermes_fired("compliance-audit", "2026-08-06T06:20:00+00:00")
+        self.hermes_fired("gcp-networking-fabric-audit", "2026-08-06T08:00:00+00:00")
+        self.hermes_fired("ai-security-audit", "2026-08-06T08:50:00+00:00")
+        # The ticker stops for two days with both records live, past their
+        # turns and past the slots they are held at.
+        later = NOW + timedelta(days=2)
+        lines = self.run_policy(now=later)
+        self.assertIn("platform: released obtainability-audit for its catch-up of 2026-08-05T06:20:00+00:00", lines)
+        self.assertIn("platform: released security-patch-orchestrator for its catch-up of 2026-08-05T07:20:00+00:00", lines)
+        # The daily one is a whole period late and more: skipped to its next
+        # slot, with the row; the weekly one is inside its period and the
+        # oldest catch-up left, so it fires.
+        self.assertTrue(
+            any(line.startswith("platform: skipped the catch-up of obtainability-audit: 3 occurrence(s) missed since 2026-08-05T06:20:00+00:00, 2d 3h overdue on a 1d period") for line in lines),
+            lines,
+        )
+        self.assertEqual(self.next_run("obtainability-audit"), "2026-08-08T06:20:00+00:00")
+        self.assertEqual(self.next_run("security-patch-orchestrator"), "2026-08-05T07:20:00+00:00")
+        self.assertIn("obtainability-audit", [r["job_id"] for r in self.ledger_rows() if r["skip_reason"] == "stale_catch_up"])
+        self.assertEqual(self.state()["deferred"], {})
+
+    def test_two_turns_on_one_tick_are_spaced_again(self):
+        self.write(*self.roster())
+        self.run_policy()
+        self.hermes_fired("compliance-audit", "2026-08-06T06:20:00+00:00")
+        self.hermes_fired("gcp-networking-fabric-audit", "2026-08-06T08:00:00+00:00")
+        self.hermes_fired("ai-security-audit", "2026-08-06T08:50:00+00:00")
+        # The ticker misses both turns (09:55 and 10:25) and comes back at 10:40.
+        later = NOW + timedelta(minutes=75)
+        again = (later + timedelta(minutes=30)).isoformat()
+        lines = self.run_policy(now=later)
+        self.assertIn("platform: released obtainability-audit for its catch-up of 2026-08-05T06:20:00+00:00", lines)
+        self.assertIn("platform: released security-patch-orchestrator for its catch-up of 2026-08-05T07:20:00+00:00", lines)
+        # The oldest fires; the other waits one more step from this tick.
+        self.assertEqual(self.next_run("obtainability-audit"), "2026-08-05T06:20:00+00:00")
+        self.assertEqual(self.next_run("security-patch-orchestrator"), "2026-08-12T07:20:00+00:00")
+        self.assertTrue(any(f"deferred the catch-up of security-patch-orchestrator to {again}" in line for line in lines), lines)
+        self.assertEqual(self.state()["deferred"]["security-patch-orchestrator"]["release_at"], again)
+        self.assertEqual(self.state()["deferred"]["security-patch-orchestrator"]["restore"], "2026-08-05T07:20:00+00:00")
+
 
 class FoldedCatchUpTest(PolicyCase):
     def test_a_deferral_that_would_land_after_the_next_slot_is_a_skip(self):
@@ -451,7 +510,7 @@ class FoldedCatchUpTest(PolicyCase):
             lines,
             [
                 "platform: skipped the catch-up of b-resolver: 1 occurrence(s) missed since "
-                "2026-08-05T09:00:00+00:00, a catch-up 30m later would run after its next slot; next run 2026-08-05T09:30:00+00:00"
+                "2026-08-05T09:00:00+00:00, a catch-up 30m later would run at or after its next slot; next run 2026-08-05T09:30:00+00:00"
             ],
         )
         rows = self.ledger_rows()
@@ -673,10 +732,41 @@ class WriteOrderTest(PolicyCase):
         self.assertTrue(any("dropped the deferred catch-up of b" in line for line in lines), lines)
         self.assertTrue(any("deferred the catch-up of b" in line for line in lines), lines)
 
+    def test_a_state_write_that_fails_on_a_release_tick_loses_no_record(self):
+        # b was deferred; a ran; c comes due stale. The release of b and the
+        # new record for c go into one state write, and that write fails.
+        self.write(prompt_job("a", "20 6 * * *", slot("20 6 * * *")), prompt_job("b", "20 6 * * *", slot("20 6 * * *")))
+        self.run_policy()
+        jobs = self.jobs()
+        jobs["a"]["next_run_at"] = "2026-08-06T06:20:00+00:00"
+        self.write(*jobs.values(), prompt_job("c", "20 7 * * *", slot("20 7 * * *")))
+        real = ccp._write_json
+        failed = []
+
+        def write(path, payload):
+            if path == self.state_path and not failed:
+                failed.append(path)
+                raise OSError("transient")
+            real(path, payload)
+
+        ccp._write_json = write
+        self.addCleanup(setattr, ccp, "_write_json", real)
+        later = NOW + timedelta(minutes=30)
+        lines = self.run_policy(now=later)
+        self.assertTrue(any("could not save its state (transient); nothing changed" in line for line in lines), lines)
+        self.assertEqual(self.next_run("b"), "2026-08-06T06:20:00+00:00")  # still held
+        self.assertEqual(self.next_run("c"), iso(slot("20 7 * * *")))  # untouched
+        self.assertEqual(list(self.state()["deferred"]), ["b"])  # the record survived both saves
+        lines = self.run_policy(now=later + timedelta(minutes=1))
+        self.assertTrue(any("released b for its catch-up" in line for line in lines), lines)
+
     def test_a_release_the_store_never_took_keeps_its_record(self):
         self.write(prompt_job("a", "20 6 * * *", slot("20 6 * * *")), prompt_job("b", "20 6 * * *", slot("20 6 * * *")))
         self.run_policy()
         self.assertIn("b", self.state()["deferred"])
+        jobs = self.jobs()
+        jobs["a"]["next_run_at"] = "2026-08-06T06:20:00+00:00"  # Hermes ran the one it was handed
+        self.write(*jobs.values())
         self.failing_store_write()
         lines = ccp.apply(self.profile.parent.parent, NOW + timedelta(minutes=30), {})
         self.assertTrue(any("cron catch-up policy failed" in line for line in lines), lines)
