@@ -499,7 +499,10 @@ func (d *Dispatcher) regrant(ctx context.Context, want map[string]string, durabl
 				// The bus answered, so the grant is there: the durable
 				// just isn't yet, or its stored config is refused (the
 				// server's record, which no reconnect changes). The bind
-				// retries pick it up, with backoff, as bind's would.
+				// retries pick it up, with backoff, as bind's would. A
+				// bind BindAttemptTimeout cut short mid-look-up still
+				// lands here when an earlier attempt in the window was
+				// answered: the lib returns that answer with the deadline.
 				d.noteBindFailure(name, err)
 			default:
 				refused = append(refused, name)
