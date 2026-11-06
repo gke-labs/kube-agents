@@ -1278,7 +1278,7 @@ as on. An operator test holds that file to the operator's own list and sizes. Th
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
 a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
-pods with a surge pod for each that rolls with one (which the chart stamps on the
+pods with the surge pods each one's rollout can add, from its `maxSurge` (which the chart stamps on the
 `PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it)
 and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`,
 so a next-mode one written by hand in the release namespace must carry that annotation
