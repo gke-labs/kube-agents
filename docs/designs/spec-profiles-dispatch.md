@@ -286,7 +286,9 @@ paths:
   permits running the resolved profile at tier T for the target in scope, checks the tier
   against the profile's allowed tiers, and checks the message's age against
   `spec.queueTimeoutSeconds` (default 3600; the stream's own age limit is stream-wide). It
-  fails a task that fails any check with a visible notice.
+  fails a task that fails any check with a visible notice. A verifier nobody answers gives no
+  verdict: the submission stays queued and is asked about again, until a verdict or its queue
+  timeout ends it.
 - It then **holds the message unacknowledged for the task's whole life**, with periodic
   in-progress acks, and hands the task to an executor: a warm worker for interactive tiers, a
   Job for the unattended tier. Workers get tasks only from the dispatcher; they have no fetch
@@ -309,9 +311,121 @@ paths:
   one slot for top-level unattended work, so at a ceiling that can't fit both (1, 2 and 4
   with the default reserves) not every reserve is honoured in full, and the PlatformAgent
   carries a `ProfileReservesShort` warning saying which and the smallest ceiling that does.
+  At a ceiling of 2 there is a child reserve and no interactive one. At a ceiling of 1 there
+  is neither: every task runs alone, so a parent can never start a child.
 - ~~Each durable counts against the TASKS consumer budget (#2077), so that formula includes
   them.~~ Amended 10/28: the durables live on `PROFILE_SUBMITS`, whose `max_consumers` is
   their allowance (64, so 16 profiles with both tiers). They take no TASKS slot.
+
+**As built (amended 10/29, #3655).** The dispatcher is its own Deployment,
+`<agent>-a2a-dispatcher`: one replica, replaced with `Recreate`, since two at once would each
+enforce the ceiling against half the in-flight count. The mechanics the decisions above
+leave open:
+
+- **Settings.** The operator renders a dispatch ConfigMap, `<agent>-a2a-dispatch`, from
+  `spec.harness.tuning.profiles` and the bound profiles, every value resolved, and the
+  dispatcher watches it. It carries the ceiling and both reserves, each profile's tiers,
+  concurrency, queue timeout, deadline and durables, and four intervals: `leaseSeconds`
+  (default 90), `renewSeconds` (20; a lease is at least three renewals),
+  `restartGraceSeconds` (60) and `acceptTimeoutSeconds` (10). A change applies to new
+  offers. A task already handed out keeps the intervals its offer carried.
+- **Hand-off.** The dispatcher offers the task to a free warm pod on
+  `a2a.dispatch.<profile>.<tier>.<pod>` and waits `acceptTimeoutSeconds` for its `.accept`.
+  On an accept it writes the task's lease record, which starts the lease, and then sends
+  `confirm` on that pod's subject; the worker starts only on the confirm (contract addendum
+  5). An accept is a core publish, so it can be lost or late: an offer that times out is
+  abandoned on its pod before the task goes to the next one, and any accept no live offer
+  waits on, a late one included, is answered with `abandon`. A lost confirm costs the task,
+  which fails `lease-expired`, never a second run. Nothing is written while an offer is out:
+  the pod counts as busy in memory, and a dispatcher restarted mid-offer finds no record and
+  dispatches the task afresh. With no free pod the submission waits over its cap and is
+  redelivered. A record past its expiry doesn't keep its pod busy, and a sweep deletes records
+  long expired that no held submission has (its submission aged off the stream). A record
+  nobody can read counts as a running one: its task is treated as started, and the sweep
+  waits as long from the record's last write. Answers a pod
+  sends for tasks it doesn't hold are held to a small budget per pod.
+- **Task credentials.** With a task-signing key (a cluster seed, read from the file
+  `A2A_TASK_SIGNING_SEED_FILE` names), the confirm carries two credentials the dispatcher
+  mints for the pod that accepted, before the lease record is written (contract addendum 8, #3889).
+  `taskCredential` (audience `nats`) is the password of the worker's task connection.
+  `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
+  admission, and a task that names no cluster gets none. Both name the task, its profile and
+  tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
+  offer's deadline plus the callout's 30s clock skew, and never later than
+  `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
+  never carries either, and renewals mint nothing. A pod with no UID in the pool isn't
+  offered the task. The credentials are minted on the accept, before the lease is recorded.
+  If the pod's UID changed since the offer, or the mint fails, the offer is withdrawn as a
+  declined one is, and the task is offered again. With the variable unset, confirms carry neither, workers keep their
+  pod-level grants, and the dispatcher warns at startup. A file that is set but can't be read
+  or holds another key type stops the dispatcher at startup. The dispatcher logs a
+  credential's `jti`, never the token.
+- **Holding.** The submission stays unacknowledged for the task's whole life. This replaces
+  the subagent spec's ack after Job create. The worker renews on its `.lease` subject every
+  `renewSeconds`, and the dispatcher extends the record by `leaseSeconds`. When the worker
+  has published the task's terminal it sends a renewal with `final` set (`LeaseRenewal.Final`).
+  The dispatcher has no read on `.events`, so that renewal is how it learns the task ended:
+  it turns the record into a tombstone and frees the slot, then acks the submission and waits
+  for the server to confirm the ack (an ack that never lands, as on a durable the operator
+  deleted, leaves the tombstone to answer the redelivery). An expired lease or a passed
+  deadline also tells the worker to abandon the task.
+- **Tombstones.** `PROFILE_SUBMITS` keeps acked submissions for its 72h max age (limits
+  retention), so a durable re-created with DeliverAll replays every task it ever held. Every
+  outcome the dispatcher sees or writes is final: a `final` renewal, a `lease-expired` or
+  `deadline-exceeded` failure, a refusal at admission. On each it writes a tombstone before
+  it acks: the lease record under the same key with `finishedAt` set
+  (`LeaseRecord.FinishedAt`); a refusal, which no pod held, under the pod token `_refused`,
+  and before its `rejected` terminal, so a restart never re-admits a refusal already reported.
+  A submission that finds a tombstone is acked and nothing else: it is never offered,
+  adopted or given a second terminal, so a grant given since never runs a task once refused.
+  A tombstone keeps no pod busy and is never renewed or re-adopted; it is told from a
+  running lease by `finishedAt` alone, never by expiry, so an expired running lease is still
+  re-adopted under the restart grace and failed. The sweep deletes a tombstone, by revision,
+  once it is older than the stream's retention plus an hour. The retention is the dispatch
+  config's `submitRetentionSeconds`, which the operator renders from the constant it creates
+  the stream with, and never less than `lib.ProfileSubmitRetention` (72h). Both are compiled
+  values, not the live stream's max age, and the operator never edits an existing stream: a
+  release that raises the max age and a later one that lowers it leave the streams created
+  in between longer than the retention, so the constant isn't lowered below any max age a
+  release has shipped (#4948).
+- **Restart.** A re-adopted task's record gets `restartGraceSeconds` before an expired lease
+  fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
+  intervals its offer did, so a re-adopted task keeps them whatever the config says now.
+- **Grants.** The callout fixes a connection's grants when it connects, and the dispatcher's
+  name each durable and each profile's `.supervisor`. When the config adds a durable or a profile
+  the dispatcher reconnects, retrying with backoff while the callout's map catches up. Tasks
+  it holds keep running across the reconnect, which drains the old connection so answers it
+  had already received still arrive. The NATS spec's `PROFILE_SUBMITS` and callout
+  amendments of 10/28 ([`spec-nats-deployment.md`](spec-nats-deployment.md)) say the same
+  from the bus's side.
+- **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
+  is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
+  identity for one.
+- **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
+  subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
+  the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
+  once a worker had it. The message is `reason: <code> - <detail>`, the executors' form, and
+  the gateway's relay and the MCP server's task reader read `.supervisor` beside `.events`,
+  under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
+  supervisor beside the gateway. The codes are
+  `tier-not-allowed`, `verifier-refused`, `parameters-invalid` and `queue-timeout` at
+  admission, and `lease-expired` and `deadline-exceeded` while it holds.
+- **Breaker (#3655 PR 6a).** A run of `breakerThreshold` lease expiries in a row on one
+  (profile, tier), default 3, opens its breaker. While it is open, for
+  `breakerCooldownSeconds` (default 300), new submissions there are held queued, as over a
+  cap, never refused: a refusal would let one input that keeps killing workers fail every
+  other user's task on that tier. They still end with `queue-timeout`. Then it is half open:
+  the oldest held submission is admitted alone as the probe of that opening, and the rest
+  wait while it runs; a child of the probe (sharing its correlationId) is part of its attempt
+  and is admitted. The next expiry opens it again. Below the threshold any finished task
+  resets the run; once it has opened, only that opening's probe closes it, by finishing or
+  by running to its deadline still renewing. A stop never opens or closes the breaker by
+  itself, but its worker's silence counts as a loss: a worker that stops renewing, after a
+  stop or not, is counted, whether the lease runs out first or the stop's grace does (the
+  grace is never shorter than a renewal and two ticks, so one silent since before the stop is
+  always past the count's threshold when it ends). The
+  state is in memory, and the dispatcher's health lists open and half-open breakers. A held
+  task isn't told it is held yet (#4362).
 
 ### Execution
 

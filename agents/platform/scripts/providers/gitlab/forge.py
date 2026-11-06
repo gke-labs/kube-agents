@@ -35,7 +35,16 @@ from urllib.parse import quote
 
 import repo_ref
 
-from ..base import COLLABORATION_VERBS, TALLY_TOTAL, Forge, WorkspaceError, listing, tally_with_open
+from ..base import (
+    COLLABORATION_VERBS,
+    TALLY_TOTAL,
+    Forge,
+    QuotaReading,
+    WorkspaceError,
+    listing,
+    quota_reading,
+    tally_with_open,
+)
 from ..credentials import Credential, NoCredential, StaticFileCredential
 from ..validate import (
     MAX_CONVERSATION_SIZE,
@@ -87,6 +96,13 @@ ALREADY_AWARDED = "has already been taken"
 #: The header GitLab counts a listing's rows in. It leaves it off a listing
 #: past ten thousand rows, which is then no count.
 TOTAL_HEADER = "x-total"
+
+#: The headers GitLab reports the credential's request quota in, where the
+#: instance has rate limits on (`reset` in epoch seconds). An instance with
+#: none sends none, and the quota is unknown.
+RATE_LIMIT_HEADER = "ratelimit-limit"
+RATE_REMAINING_HEADER = "ratelimit-remaining"
+RATE_RESET_HEADER = "ratelimit-reset"
 
 #: How an author's merge requests are asked for: every state, newest activity
 #: first, as GitHub's search is asked.
@@ -147,6 +163,10 @@ class GitLabForge(Forge):
         "the PlatformAgent's spec.integration.forges, with a credentialsRef "
         "naming a Secret that holds the access token under the key `token`",
     )
+
+    @staticmethod
+    def quota_from_headers(headers: Mapping[str, Any]) -> QuotaReading | None:
+        return quota_reading(headers, RATE_LIMIT_HEADER, RATE_REMAINING_HEADER, RATE_RESET_HEADER)
 
     def __init__(
         self,

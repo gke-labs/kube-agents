@@ -50,10 +50,11 @@ declared column from the two files and fails when the page falls behind them.
 | Credential proxy (Envoy and the broker)                      | 1    | standard                                                               | 0.5 / 1 then 2 / 2                  | 4 / 8 then 8 / 8                               | 8 GiB, request and limit | none                                                     |
 | Gateway pod: agent, dashboard, log sidecar, `agent-api-auth` | 1    | gVisor under the installer default `runtimeClassName`                  | 1.506 / 3 then 5.5 / 12.25          | 1.9 / 8.6 then 5.5 / 18.25                     | 3 GiB (the two sidecars) | data claim 50 GiB default, 100 GiB fleet; 1 GiB metadata |
 | Shell sandbox `<name>-shell-0`                               | 1    | node default; its own `shellSandbox.runtimeClassName` opts into gVisor | 0.2 / 0.5 then 2 / 2                | unchanged; its own `resources` field raises it | none declared            | data claim follows the gateway's; 1 GiB for `sshd`       |
-| Operator                                                     | 1    | standard                                                               | 0.05 / 0.125 then 0.5 / 0.5         | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
+| Kubernetes API proxy                                         | 2    | standard                                                               | 0.1 / 0.25 then 1 / 0.5, each       | unchanged                                      | none declared            | none                                                     |
+| Operator                                                     | 1    | standard                                                               | 0.1 / 0.25 then 0.5 / 0.5           | 0.25 / 1 then 0.5 / 1                          | none declared            | none                                                     |
 | LiteLLM                                                      | 2    | standard                                                               | 0.1 / 2 then 0.5 / 3, each          | unchanged                                      | 1.25 GiB each            | none                                                     |
 | GitHub token minter                                          | 2    | standard                                                               | 0.05 / 0.0625 then 0.5 / 0.25, each | unchanged                                      | none declared            | none                                                     |
-| **Total**                                                    | 8    |                                                                        | **2.556 / 8.75 then 12 / 23.25**    | **6.6 / 22.25 then 18 / 35.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
+| **Total**                                                    | 10   |                                                                        | **2.806 / 9.375 then 14 / 24.25**   | **6.8 / 22.75 then 20 / 36.75**                | **13.5 GiB**             | **102 GiB default, 202 GiB fleet**                       |
 
 On GKE Autopilot the operator renders the credential proxy's requests at 2 vCPU and 2 GiB
 instead of 0.5 and 1, because Autopilot without bursting clamps a container's limits to its
@@ -81,9 +82,9 @@ the installer sets.
 Two optional stacks add to the total:
 
 - **Hindsight memory** (`platformAgent.harness.memory.provider: kube_agents_memory`): the API
-  at 0.25 vCPU and 1 GiB requests, 4 vCPU and 4 GiB limits; Postgres at 0.25 vCPU and 256 MiB
+  at 0.5 vCPU and 2 GiB requests, 4 vCPU and 4 GiB limits; Postgres at 0.25 vCPU and 256 MiB
   requests, 1 vCPU and 1 GiB limits, 1.1 GiB ephemeral and an 8 GiB claim. Declared.
-- **`spec.mode: next`**: about 0.7 vCPU and 1.1 GiB of standing requests across seven pods, and
+- **`spec.mode: next`**: about 0.9 vCPU and 1.4 GiB of standing requests across seven pods, and
   a 40 GiB NATS claim. Each delegation adds a session pod at 0.25 vCPU and 512 MiB requests with
   2 vCPU and 2 GiB limits, up to `maxSessions` (default 10) at once. The
   [prerequisites page](/kube-agents/install/prerequisites/#cluster-requirements) itemises them.
@@ -115,15 +116,34 @@ including the cluster fee; modeled, so check the pricing calculator against your
 ### Option B: GKE Standard
 
 The composition creates a default pool of `e2-standard-4` nodes, one per zone, and with gVisor
-on a `gvisor-pool` of `e2-standard-4`, one per zone, carrying GKE's sandbox taint. Neither
-machine type is an installer setting, and a machine type changed on a managed pool outside
-Terraform shows as drift on the next plan, so add pools beside them for a fleet.
+on a `gvisor-pool` of `e2-standard-4`, one per zone autoscaling to two, carrying GKE's sandbox
+taint. The module's
+[sizing inputs](https://github.com/gke-labs/kube-agents/blob/main/terraform/modules/gke-cluster/README.md#sizing-the-node-pools)
+resize both: `sizing_profile = "fleet"` renders the table's machine types and boot disks, and
+an explicit input such as `gvisor_machine_type = "n2-standard-8"` wins over the profile. The
+default pool keeps `standard_node_count` nodes per zone and does not autoscale.
 
-Add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
+The installer writes none of these inputs, so set them as `TF_VAR_` lines in `install.env` and
+keep the lines there for every later run. A lost profile line resolves the small profile, and a
+lost explicit line the profile's shape. The composition's `lifecycle.sh` refuses an apply that
+would resize a pool unless a sizing input asks for it: the pool's own input, or a changed profile
+for an attribute the profile decided at the last apply. A changed profile asks nothing about an
+attribute an explicit line set, so that line stays beside it. A machine type changed outside Terraform shows as drift on the next plan, so change it
+through the inputs, or add pools beside the managed ones.
+
+Resize or add them before applying the example. An `e2-standard-4` node has under 4 vCPU allocatable once
 the system DaemonSets take theirs, so the example's 4 vCPU proxy request fits on none of them.
 The proxy Deployment recreates its pod rather than rolling it: applied on the default pools, the
 example leaves the new proxy pod `Pending` with the old one gone. Every brokered `gcloud` and
 `kubectl` command, and the Google Chat relay, is then down until a node fits.
+
+The same holds under `spec.deployment.sizingProfile: auto`, which applies the `medium` row at 10
+clusters and the `fleet` row at 25 with no human in the loop. Before a step up the operator checks
+the namespace's `ResourceQuota` and the bounds of its `LimitRange` objects, not node
+allocatable capacity. A Standard pool therefore needs nodes that fit the `fleet` row's 4 vCPU proxy
+request (`e2-standard-8` or larger) before the count reaches 25. The `medium` row's 1 vCPU request
+fits an `e2-standard-4`. A `LimitRange` whose `max`, per container or per pod, is below a row's figure holds
+the tier at the row it admits, and the CR's `SizingCappedByQuota` condition names it.
 
 | Pool             | Shape (modeled)                                                                            | Carries                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
@@ -154,15 +174,16 @@ caveat beside it:
   admits nothing more in parallel.
 - `platformAgent.deployment.agentAPIAuth.resources`: 0.5 vCPU and 2 GiB requests, a 4 GiB
   memory limit, `limits.cpu` left at its default because the watcher's `GOMAXPROCS` follows it.
-- `platformAgent.deployment.env`: `INCIDENT_WORKLOAD_DEDUP_SECONDS=3600`, which folds an
-  admitted workload's later events into one incident for an hour, and
-  `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, which keeps the fleet audits from opening remediation
-  pull requests on their own.
+- `platformAgent.deployment.env`: `KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`, which keeps the fleet
+  audits from opening remediation pull requests on their own. The window that folds a workload's
+  later events into [one incident](/kube-agents/concepts/chatops/#one-incident-per-workload) is
+  an hour on every install and is not in the file: an `env` entry for it would override
+  `platformAgent.deployment.incidentWorkloadDedupSeconds`, the key that turns it off.
 
 The operator copies `platformAgent.deployment.env` onto the agent container only for names on
 its allowlist, forwards `KUBEAGENTS_AUDIT_AUTO_PROMOTE` to the shell sandbox, where the audits
 run, and passes every name it does not reserve to the credential proxy and `agent-api-auth`
-containers. Both names in the example reach the container that reads them. Process tunables such
+containers. The name in the example reaches the container that reads it. Process tunables such
 as `CLOUDSDK_CORE_DISABLE_FILE_LOGGING` and `MALLOC_ARENA_MAX` are not on the agent container's
 allowlist: a values file that sets them renders a proxy pod that carries them, where `gcloud` and
 `kubectl` run, and an agent container that does not. The example leaves them out. The
@@ -194,7 +215,7 @@ that already has one rather than pasting over it:
 
 ```bash
 PLATFORM_AGENT_STORAGE_SIZE=100Gi
-TF_VAR_extra_helm_values='{operator={resources={requests={cpu="250m",memory="1Gi"},limits={cpu="500m",memory="1Gi"}}},platformAgent={harness={tuning={maxInProgress=3}},deployment={env=[{name="INCIDENT_WORKLOAD_DEDUP_SECONDS",value="3600"},{name="KUBEAGENTS_AUDIT_AUTO_PROMOTE",value="false"}],credentialProxy={resources={requests={cpu="4",memory="8Gi"},limits={cpu="8",memory="8Gi"}}},agentAPIAuth={resources={requests={cpu="500m",memory="2Gi"},limits={memory="4Gi"}}}}}}'
+TF_VAR_extra_helm_values='{operator={resources={requests={cpu="250m",memory="1Gi"},limits={cpu="500m",memory="1Gi"}}},platformAgent={harness={tuning={maxInProgress=3}},deployment={env=[{name="KUBEAGENTS_AUDIT_AUTO_PROMOTE",value="false"}],credentialProxy={resources={requests={cpu="4",memory="8Gi"},limits={cpu="8",memory="8Gi"}}},agentAPIAuth={resources={requests={cpu="500m",memory="2Gi"},limits={memory="4Gi"}}}}}}'
 ```
 
 Read the result on the CR and the pods:

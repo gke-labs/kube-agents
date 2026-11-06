@@ -151,7 +151,7 @@ Every finding must conform to the full findings schema:
         "checks_run": [
           {
             "check": "cloud-nat-exhaustion",
-            "command": "gcloud compute routers list --project=proj-1 --format=json && gcloud compute routers get-status nat-router --region=us-central1 --project=proj-1 --format=json"
+            "command": "gcloud compute routers list --project=proj-1 '--format=json(name,region,nats)' && gcloud compute routers get-status nat-router --region=us-central1 --project=proj-1 --format=json"
           },
           {
             "check": "psc-routing-deadlock",
@@ -159,11 +159,11 @@ Every finding must conform to the full findings schema:
           },
           {
             "check": "mtu-packet-fragmentation",
-            "command": "gcloud compute networks list --project=proj-1 --format=json"
+            "command": "gcloud compute networks list --project=proj-1 '--format=json(name,selfLink,mtu,peerings)'"
           },
           {
             "check": "cloud-armor-false-positive",
-            "command": "gcloud compute security-policies list --project=proj-1 --format=json && gcloud compute backend-services list --project=proj-1 --format=json"
+            "command": "gcloud compute security-policies list --project=proj-1 '--format=json(name,rules)' && gcloud compute backend-services list --project=proj-1 '--format=json(name,securityPolicy)'"
           },
           {
             "check": "firewall-world-open-ingress",

@@ -313,7 +313,7 @@ HERMES_SSH=(ssh "${SSH_OPTS[@]}" hermes@127.0.0.1)
 check "the same key opens a hermes session" "hermes" "$("${HERMES_SSH[@]}" whoami 2>&1)"
 check "hermes gets the forwarded proxy URL too" "http://127.0.0.1:9999" \
   "$("${HERMES_SSH[@]}" 'echo "$CREDENTIAL_PROXY_URL"' 2>&1)"
-check "hermes gets the wrapper PATH too" "/opt/credential-proxy/bin/kubectl" \
+check "hermes gets stock kubectl on PATH" "/usr/local/bin/kubectl" \
   "$("${HERMES_SSH[@]}" 'command -v kubectl' 2>&1)"
 
 # The property the whole account exists for: nothing the model leaves behind
@@ -910,11 +910,11 @@ check_absent "and none fell back to a connection of its own" "disabling multiple
 ssh "${SSH_OPTS[@]}" -o "ControlPath=$CONTROL_PATH" -O exit agent@127.0.0.1 2>/dev/null
 
 echo
-echo "== 5. credential-proxy wrappers =="
-for cli in kubectl gcloud; do
-  check "$cli resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/$cli" \
-    "$("${SSH[@]}" "command -v $cli" 2>&1)"
-done
+echo "== 5. credential-proxy wrappers and stock kubectl =="
+check "gcloud resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/gcloud" \
+  "$("${SSH[@]}" "command -v gcloud" 2>&1)"
+check "kubectl resolves to stock kubectl in /usr/local/bin" "/usr/local/bin/kubectl" \
+  "$("${SSH[@]}" "command -v kubectl" 2>&1)"
 # Non-login is the shape of every command the agent sends, and the case that
 # reads no /etc/profile. This is the check that caught the original bug: PATH
 # arrived and CREDENTIAL_PROXY_URL did not, so the wrappers resolved and then
@@ -928,16 +928,50 @@ check "and into a login session" "http://127.0.0.1:9999" \
 # path gets a 401 from every wrapper rather than a connection error.
 check "CREDENTIAL_PROXY_TOKEN_FILE crosses too" "/var/run/secrets/kubeagents/credential-proxy/token" \
   "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_TOKEN_FILE"' 2>&1)"
-check "the wrapper dispatches rather than refusing to start" "credential proxy" \
-  "$("${SSH[@]}" 'kubectl version 2>&1' 2>&1)"
-check "leeway report dispatches cluster reads through the kubectl wrapper" "credential proxy" \
+check "the gcloud wrapper dispatches rather than refusing to start" "credential proxy" \
+  "$("${SSH[@]}" 'gcloud version 2>&1' 2>&1)"
+check "leeway report dispatches cluster reads through stock kubectl" "kubectl get nodes" \
   "$("${SSH[@]}" 'leeway report --clusters p/l/c' 2>&1)"
+# The kube-proxy kubeconfigs name the cluster in the server URL's path
+# (entrypoint.sh: `server: ${KUBE_PROXY_URL}/clusters/<ctx>`), and before
+# kubectl 1.34 `get --raw` replaced that path with the raw path, so every paged
+# collection read reached the proxy with no cluster in it (#4739): it landed on
+# the host and nothing failed, and the proxy now refuses such a request.
+# Proved against the installed binary rather than its version string: a server
+# inside the container records the path it receives from a `--raw` read sent
+# through a kubeconfig whose server carries `/clusters/seeded-a`.
+check "kubectl get --raw keeps the kubeconfig server's /clusters/<ctx> path" \
+  "request path /clusters/seeded-a/api/v1/pods?limit=1" \
+  "$("${SSH[@]}" "python3 - <<'PY'
+import http.server, json, os, subprocess, tempfile, threading
+seen = []
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        seen.append(self.path)
+        body = json.dumps({'kind': 'PodList', 'apiVersion': 'v1', 'metadata': {}, 'items': []}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+with tempfile.TemporaryDirectory() as d:
+    kc = os.path.join(d, 'kubeconfig')
+    with open(kc, 'w') as f:
+        f.write('apiVersion: v1\\nkind: Config\\nclusters:\\n- name: seeded-a\\n  cluster:\\n    server: http://127.0.0.1:%d/clusters/seeded-a\\nusers:\\n- name: u\\n  user:\\n    token: not-a-token\\ncontexts:\\n- name: seeded-a\\n  context: {cluster: seeded-a, user: u}\\ncurrent-context: seeded-a\\n' % srv.server_address[1])
+    r = subprocess.run(['kubectl', 'get', '--raw', '/api/v1/pods?limit=1', '--kubeconfig', kc], capture_output=True, text=True, timeout=60)
+srv.shutdown()
+print('request path', ' '.join(seen), '(exit %d)' % r.returncode, r.stderr.strip())
+PY" 2>&1)"
 check "the wrappers are on PATH" "/opt/credential-proxy/bin:" \
   "$("${SSH[@]}" 'echo "$PATH"' 2>&1)"
 # A login shell runs /etc/profile, which overwrites PATH wholesale; profile.d is
 # what puts the wrappers back. Both paths, because only one of them is sshd's.
-check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/kubectl" \
-  "$("${SSH[@]}" 'bash -l -c "command -v kubectl"' 2>&1)"
+check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/gcloud" \
+  "$("${SSH[@]}" 'bash -l -c "command -v gcloud"' 2>&1)"
 
 echo
 echo "== 5b. the version-control skill's local git =="

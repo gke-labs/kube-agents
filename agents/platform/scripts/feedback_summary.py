@@ -3,22 +3,33 @@
 
 Customers in restricted networks cannot send telemetry. What they can do is paste
 a short block of text into an email or a chat message after reading it. This
-module assembles that block from three sources and nothing else:
+module assembles that block from four sources and nothing else:
 
 * the ``PlatformAgent`` resource, read with ``kubectl get`` (required): mode,
   image tag, readiness, install age and ``status.usage``;
 * the gateway pod, through one ``kubectl exec`` for each (optional): the session-kv
   task feed on its loopback port, rolled up to counts and durations, and the
   inference gateway's Prometheus text for token, spend and latency figures;
-* ``kubectl version`` and the gateway's ConfigMap for the Kubernetes version and
-  the model name (optional).
+* the credential broker pod's Prometheus text on loopback port 8766 (through
+  ``kubectl exec``; optional), rolled up to the top five ``tool/subcommand`` pairs;
+  when that cannot be read (``--no-exec`` included) the resource's
+  ``status.usage.topTools``, the operator's reading of the same five pairs,
+  stands in, rendered the same way the chat gateway's ``/feedback summary``
+  renders it;
+* ``kubectl version`` and cluster object counts for the Kubernetes version and the
+  cluster scale line (optional); the model name is the resource's ``status.inference``,
+  and the gateway's ConfigMap whenever the status has no ``inference`` key (optional):
+  under an operator older than the field, before this operator's first Ready write
+  (so for a CR Degraded since it was created), and under a served CRD that prunes
+  the field.
 
 The block carries static enums, version strings, integer counters and durations.
 No cluster name, project id, namespace, task title, summary, result or error text
 reaches it: the task roll-up reads status and timestamps only, and ``main`` refuses
-to print a block in which any identifier read from the resource appears. Every
-optional source that fails prints as ``unavailable``; the block never exceeds
-SUMMARY_MAX_LINES so a reader can check all of it before pasting.
+to print a block in which any identifier read from the resource appears outside
+the ``model:`` line, which is printed by design. Every optional source that fails
+prints as ``unavailable`` (the cluster ``scale`` line is omitted when unread); the
+block never exceeds SUMMARY_MAX_LINES so a reader can check all of it before pasting.
 
 Run from a workstation::
 
@@ -40,14 +51,21 @@ import subprocess
 import sys
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextIO, Tuple
 
-SUMMARY_MAX_LINES = 40
+# Independent of the gateway's usageSummaryMaxLines: this block has lines the
+# gateway's lacks.
+SUMMARY_MAX_LINES = 57
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
+TOP_TOOLS_SHOWN = 5
 TASK_FEED_LIMIT = 200
 DEFAULT_NAMESPACE = "kubeagents-system"
 DEFAULT_AGENT_NAME = "platform-agent"
 GATEWAY_POD_INFIX = "-gateway-"
+BROKER_POD_INFIX = "-credential-proxy-"
+BROKER_CONTAINER = "envoy-credential-proxy"
+BROKER_METRICS_PORT = 8766
+BROKER_METRICS_URL = f"http://127.0.0.1:{BROKER_METRICS_PORT}/metrics"
 POD_PHASE_RUNNING = "Running"
 AGENT_CONTAINER = "platform-agent"
 SESSION_KV_URL = "http://127.0.0.1:8699/v1/tasks"
@@ -67,6 +85,7 @@ CURL_FLAGS = "-sSf"
 CURL_FLAGS_FOLLOW = "-sSfL"
 #: Why an optional source is missing, for the one stderr line.
 REASON_NO_POD = "no running gateway pod"
+REASON_NO_BROKER_POD = "no running credential-proxy pod"
 REASON_EXEC = "the exec or the request failed"
 REASON_SHAPE = "the answer had no tasks list"
 REASON_SKIPPED = "skipped by --no-exec"
@@ -82,6 +101,14 @@ READY_CONDITION = "Ready"
 OTHER_BUCKET = "other"
 SPEND_CURRENCY = "USD"
 TRUNCATED_SUFFIX = "+"
+KCC_CRD_SUFFIX = ".cnrm.cloud.google.com"
+SCALE_RESOURCES: Tuple[Tuple[str, str], ...] = (
+    ("namespaces", "namespaces"),
+    ("deployments", "deployments.apps"),
+    ("pods", "pods"),
+    ("nodes", "nodes"),
+    ("crds", "customresourcedefinitions.apiextensions.k8s.io"),
+)
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
@@ -108,8 +135,14 @@ USAGE_COUNTERS: Tuple[str, ...] = (
     "clustersMonitored",
     "chatMessagesInboundTotal",
     "sessionsTotal",
+    "chatSessionsTotal",
     "toolExecutionsTotal",
+    "toolExecutionsBlockedTotal",
+    "brokerFailuresTotal",
     "eventsIngestedTotal",
+    "chatTurnsErroredTotal",
+    "backgroundTasksGaveUpTotal",
+    "negativeFeedbackTotal",
     "remediationsProposedTotal",
     "remediationsMergedTotal",
     "proposalsAuthored",
@@ -117,19 +150,81 @@ USAGE_COUNTERS: Tuple[str, ...] = (
     "remediationsClosedUnmergedTotal",
     "proposalHumanTouches",
     "proposalsMergedUntouched",
+    "peopleSeen7d",
+    "peopleSeen30d",
 )
-#: The fields the broker reads off the forge rather than counts: absent means it
-#: has no reading yet, which is not 0.
-USAGE_READINGS = frozenset({
-    "remediationsMergedTotal",
-    "proposalsAuthored",
-    "remediationsOpen",
-    "remediationsClosedUnmergedTotal",
-    "proposalHumanTouches",
-    "proposalsMergedUntouched",
-})
 USAGE_NO_READING = "no reading"
-USAGE_READING_SUFFIX = " (as the forge reports)"
+USAGE_FORGE_READING_SUFFIX = " (as the forge reports)"
+USAGE_GATEWAY_READING_SUFFIX = " (as the gateway reports)"
+#: The fields read off a source rather than counted, each to the suffix naming
+#: that source: absent means no reading yet, which is not 0. The broker reads
+#: the six off the forge; the operator reads the two people readings off the
+#: A2A gateway.
+USAGE_READINGS: Mapping[str, str] = {
+    "remediationsMergedTotal": USAGE_FORGE_READING_SUFFIX,
+    "proposalsAuthored": USAGE_FORGE_READING_SUFFIX,
+    "remediationsOpen": USAGE_FORGE_READING_SUFFIX,
+    "remediationsClosedUnmergedTotal": USAGE_FORGE_READING_SUFFIX,
+    "proposalHumanTouches": USAGE_FORGE_READING_SUFFIX,
+    "proposalsMergedUntouched": USAGE_FORGE_READING_SUFFIX,
+    "peopleSeen7d": USAGE_GATEWAY_READING_SUFFIX,
+    "peopleSeen30d": USAGE_GATEWAY_READING_SUFFIX,
+}
+#: Credential broker tool-invocation family and closed outcome order; the
+#: order is also the status row's field names, and the gateway's
+#: usageSummaryToolStatusOrder verbatim.
+TOOL_INVOCATIONS_FAMILY = "kubeagents_tool_invocations_total"
+TOOL_STATUS_ORDER: Tuple[str, ...] = ("success", "error", "blocked", "busy", "abandoned")
+#: ``status.usage.topTools``: the operator's reading of the top five pairs, the
+#: fallback for an unread broker, and its row fields; the gateway's
+#: usageTopTools* names verbatim.
+TOP_TOOLS_STATUS_KEY = "topTools"
+TOP_TOOLS_TOOL_FIELD = "tool"
+TOP_TOOLS_SUBCOMMAND_FIELD = "subcommand"
+TOP_TOOLS_TOTAL_FIELD = "total"
+TOOL_PAIR_SEPARATOR = "/"
+TOP_TOOLS_LABEL = f"tools (top {TOP_TOOLS_SHOWN}, since broker start)"
+#: Closed per-tool subcommand vocabularies, held equal to
+#: ``credential_proxy._subcommand_vocabulary(tool)`` by ``GatewayCopyTest``.
+BROKER_SUBCOMMANDS: Mapping[str, frozenset] = {
+    "kubectl": frozenset({
+        "annotate", "api-resources", "api-versions", "apply", "attach", "auth",
+        "autoscale", "cluster-info", "config", "cordon", "cp", "create", "debug",
+        "delete", "describe", "diff", "drain", "edit", "events", "exec", "explain",
+        "expose", "get", "label", "logs", "patch", "port-forward", "proxy", "replace",
+        "rollout", "run", "scale", "set", "taint", "top", "uncordon", "version", "wait",
+    }),
+    "gcloud": frozenset({
+        "artifacts", "asset", "auth", "billing", "components", "compute", "config",
+        "container", "iam", "info", "init", "logging", "monitoring", "projects",
+        "resource-manager", "services", "version",
+    }),
+    "git": frozenset({
+        "add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
+        "check-ref-format", "checkout", "cherry-pick", "clean", "clone", "commit",
+        "describe", "diff", "fetch", "grep", "init", "log", "ls-files", "ls-remote",
+        "ls-tree", "merge", "merge-base", "mv", "pull", "push", "rebase", "remote",
+        "reset", "restore", "rev-list", "rev-parse", "revert", "rm", "show",
+        "sparse-checkout", "stash", "status", "submodule", "switch", "symbolic-ref",
+        "tag", "update-ref", "version", "worktree",
+    }),
+    "gh": frozenset({
+        "api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
+        "repo", "run", "search", "secret", "ssh-key", "status", "variable", "version",
+        "workflow",
+    }),
+    "feedback": frozenset({"submit"}),
+}
+BROKER_TOOLS = frozenset(BROKER_SUBCOMMANDS) | {OTHER_BUCKET}
+#: Every word the tools or scale lines may print from closed vocabularies, so an
+#: install whose spec happens to use a generic word is not refused for the
+#: template's own vocabulary.
+TEMPLATE_EXTRA_TOKENS = (
+    BROKER_TOOLS
+    | frozenset(sub for subs in BROKER_SUBCOMMANDS.values() for sub in subs)
+    | frozenset(TOOL_STATUS_ORDER)
+    | {"tools", "top", "since", "broker", "start", "scale", "namespaces", "deployments", "pods", "nodes", "crds", "kcc", NONE, OTHER_BUCKET}
+)
 #: Kanban statuses folded into the roll-up's buckets; anything else is "other".
 STATUS_BUCKETS: Mapping[str, str] = {
     "done": "done",
@@ -160,11 +255,74 @@ COMPLETION_QUANTILES: Tuple[float, float] = (0.5, 0.95)
 PROMETHEUS_LINE = re.compile(r'^(?P<name>[a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(?P<labels>(?:[^"}]|"(?:[^"\\]|\\.)*")*)\})?\s+(?P<value>\S+)')
 PROMETHEUS_LABEL = re.compile(r'(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
 LITELLM_MODEL_LINE = re.compile(r"^\s*model:\s*['\"]?(?P<model>[A-Za-z0-9_./:@+-]+)", re.MULTILINE)
-#: A model given as a resource path (``vertex_ai/projects/<id>/locations/<region>/endpoints/<n>``)
-#: names a project and a region between its first segment and its last; the block
-#: prints the provider and the last segment only, so neither reaches it and the
-#: audit does not refuse a block over a project the spec also names.
+#: The environment lines, in the order the block prints them; the gateway's
+#: usageSummaryEnvironmentKeys verbatim.
+ENVIRONMENT_KEYS: Tuple[str, ...] = ("version", "mode", "model", "kubernetes", "installed", "interfaces")
+#: ``status.inference``: the operator's reading of the install's default model.
+INFERENCE_STATUS_KEY = "inference"
+INFERENCE_PROVIDER_FIELD = "provider"
+INFERENCE_MODEL_FIELD = "model"
+#: The model line's start; the audit runs over the block without this one line.
+MODEL_LINE_PREFIX = "  model: "
+#: The model_list entry whose model is the install's default (the operator's agentModelName).
+LITELLM_DEFAULT_MODEL_ALIAS = "model-default"
+#: The ``model_name: model-default`` line, quoted or bare, at any indent.
+LITELLM_DEFAULT_NAME_LINE = re.compile(
+    rf"^[ \t]*(?:-[ \t]+)?model_name:[ \t]*(?P<q>['\"]?){re.escape(LITELLM_DEFAULT_MODEL_ALIAS)}(?P=q)[ \t]*(?:#[^\n]*)?$",
+    re.MULTILINE,
+)
+#: The same line followed, within its entry (indented lines that open no new
+#: list item), by ``litellm_params:`` and that block's ``model:``, quoted or
+#: bare, captured possibly empty.
+#:
+#: Two valid YAML shapes are not read: an entry with ``litellm_params:`` before
+#: ``model_name:``, and an entry with a nested ``- `` list line between the name
+#: line and ``litellm_params:``. Each prints ``unavailable`` with no fallback. No
+#: config the repository renders uses either: the chart's
+#: ``kube-agents.litellmConfig``, the kustomize ``litellm/base`` and
+#: ``overlays/anthropic`` configs, and the ``examples/litellm-*`` configs all put
+#: the name line first. This path runs whenever the status has no
+#: ``inference`` key: under an operator older than ``status.inference``, before
+#: this operator's first Ready write (so for a CR Degraded since it was
+#: created), and under a served CRD that prunes the field.
+#:
+#: A hand-edited config can hit further divergences from the operator's Go
+#: parser: a flow-style entry (``- {model_name: model-default, litellm_params:
+#: {model: gemini/x}}``) reads ``unavailable`` here and the pair in Go; a nested
+#: mapping under ``litellm_params`` whose own ``model:`` key precedes the real
+#: one reads the nested value here; a ``#`` inside an unquoted value
+#: (``hosted_vllm/acme#v2``) is truncated at the ``#`` here and kept in Go; an
+#: unquoted value with a space (``gemini/flash 2``) reads the text before the
+#: space here and is malformed in Go; and two entries both named
+#: ``model-default``, the first in params-first order, read the second here and
+#: the first in Go.
+LITELLM_DEFAULT_ENTRY_MODEL = re.compile(
+    LITELLM_DEFAULT_NAME_LINE.pattern + r"\n"
+    r"(?:(?:[ \t]+(?![ \t-])[^\n]*)?\n)*?"
+    r"[ \t]+litellm_params:[ \t]*(?:#[^\n]*)?\n"
+    r"(?:(?:[ \t]+(?![ \t-])(?!model:)[^\n]*)?\n)*?"
+    r"[ \t]+model:[ \t]*(?P<mq>['\"]?)(?P<model>[^'\"\s#]*)(?P=mq)",
+    re.MULTILINE,
+)
+#: A CRLF line end, normalised to LF before the LiteLLM regexes run: MULTILINE ``$``
+#: and the ``\n`` the entry pattern spells match only before LF.
+CRLF_LINE_END = "\r\n"
+LF_LINE_END = "\n"
+#: A LiteLLM model is ``<provider>/<name>``, split at the first separator.
 MODEL_SEGMENT_SEPARATOR = "/"
+#: A name that starts with this is a Vertex AI endpoint path
+#: (``projects/<id>/locations/<region>/endpoints/<n>``): only its last segment is kept.
+MODEL_RESOURCE_PATH_PREFIX = "projects/"
+#: The shortest full path, ``projects/<p>/locations/<l>/<kind>/<id>``, in segments.
+MODEL_RESOURCE_PATH_MIN_SEGMENTS = 6
+#: Where a full path carries its ``locations`` segment.
+MODEL_RESOURCE_PATH_LOCATIONS_INDEX = 2
+MODEL_RESOURCE_PATH_LOCATIONS = "locations"
+#: A name segment that starts with this is a Bedrock ARN: only its resource id is kept.
+MODEL_ARN_PREFIX = "arn:"
+MODEL_ARN_FIELD_SEPARATOR = ":"
+#: A full ARN's field count: ``arn:partition:service:region:account:resource``.
+MODEL_ARN_FIELDS = 6
 FEEDBACK_TEMPLATE: Tuple[str, ...] = (
     "feedback:",
     "  Rating: [ 👍 / 👎 / 😐 ]",
@@ -206,6 +364,8 @@ class Snapshot:
     tasks_truncated: bool = False
     #: Why a source in ``sources`` is False, by source name.
     source_reasons: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    broker_metrics: Optional[str] = None
+    scale: Optional[Mapping[str, int]] = None
 
     @property
     def identifiers(self) -> List[str]:
@@ -319,20 +479,106 @@ def histogram_quantiles(samples: Iterable[Sample], family: str, quantiles: Seque
     return tuple(results)
 
 
-def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
-    """The first provider-qualified model the gateway routes to, as ``provider/name``.
+def trim_model_name(name: str) -> str:
+    """The name after the provider, with a resource reference cut to its resource id.
 
-    A resource path keeps its provider and its last segment only: the segments
-    between them name a project and a region.
+    A reference must have its full shape, or the name is malformed and ``""``
+    comes back. A Vertex AI path needs ``projects/<p>/locations/<l>/<kind>/<id>``
+    at least and keeps the text after its last ``/``. A name with a segment that
+    starts with ``arn:`` needs six ``:`` fields from there
+    (``arn:partition:service:region:account:resource``) with a non-empty resource
+    part, and keeps the text after the resource part's last ``/``, or, without
+    one, the text after its last ``:``. So no project id, region or account id is
+    printed. Every other name is kept as typed.
+    """
+    segments = name.split(MODEL_SEGMENT_SEPARATOR)
+    if name.startswith(MODEL_RESOURCE_PATH_PREFIX):
+        if (
+            len(segments) < MODEL_RESOURCE_PATH_MIN_SEGMENTS
+            or segments[MODEL_RESOURCE_PATH_LOCATIONS_INDEX] != MODEL_RESOURCE_PATH_LOCATIONS
+        ):
+            return ""
+        return segments[-1]
+    for index, segment in enumerate(segments):
+        if not segment.startswith(MODEL_ARN_PREFIX):
+            continue
+        arn = MODEL_SEGMENT_SEPARATOR.join(segments[index:])
+        fields = arn.split(MODEL_ARN_FIELD_SEPARATOR, MODEL_ARN_FIELDS - 1)
+        if len(fields) < MODEL_ARN_FIELDS or not fields[-1]:
+            return ""
+        resource = fields[-1]
+        if MODEL_SEGMENT_SEPARATOR in resource:
+            return resource.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]
+        return resource.rsplit(MODEL_ARN_FIELD_SEPARATOR, 1)[-1]
+    return name
+
+
+def _valid_provider(provider: str) -> bool:
+    """A provider slug: not empty, no whitespace, and not itself a bare ARN or Vertex AI path."""
+    return (
+        bool(provider)
+        and not any(c.isspace() for c in provider)
+        and not provider.startswith(MODEL_ARN_PREFIX)
+        and MODEL_ARN_FIELD_SEPARATOR not in provider
+        and provider != MODEL_RESOURCE_PATH_PREFIX.rstrip(MODEL_SEGMENT_SEPARATOR)
+    )
+
+
+def split_model(litellm_model: str) -> Optional[str]:
+    """``provider/name`` with both sides non-empty after trimming, else None (malformed).
+
+    Whitespace on either side is malformed: the line must stay one line.
+    """
+    if litellm_model.endswith(MODEL_SEGMENT_SEPARATOR):
+        return None
+    provider, found, name = litellm_model.partition(MODEL_SEGMENT_SEPARATOR)
+    if not found or not _valid_provider(provider):
+        return None
+    name = trim_model_name(name)
+    if not name or any(c.isspace() for c in name):
+        return None
+    return f"{provider}{MODEL_SEGMENT_SEPARATOR}{name}"
+
+
+def model_from_litellm_config(config_yaml: Optional[str]) -> Optional[str]:
+    """The install's default model as the gateway's config states it, as ``provider/name``.
+
+    The operator's rule, ported: the entry named ``model-default`` answers when
+    it exists, and a malformed model there is None with no fallback; only when
+    no entry carries that name does the first well-formed provider-qualified
+    ``model:`` line answer.
     """
     if not config_yaml:
         return None
+    config_yaml = config_yaml.replace(CRLF_LINE_END, LF_LINE_END)
+    if LITELLM_DEFAULT_NAME_LINE.search(config_yaml):
+        entry = LITELLM_DEFAULT_ENTRY_MODEL.search(config_yaml)
+        return split_model(entry.group("model")) if entry else None
+    # The scan reads every ``model:`` line, while the operator's parser reads only
+    # ``model_list[].litellm_params.model``: a ``model:`` key elsewhere in the
+    # config can answer here and not in the operator. A CRLF config reads the
+    # same as LF: the line ends are normalised above.
     for match in LITELLM_MODEL_LINE.finditer(config_yaml):
-        model = match.group("model")
-        if MODEL_SEGMENT_SEPARATOR in model:
-            provider, _, path = model.partition(MODEL_SEGMENT_SEPARATOR)
-            return f"{provider}{MODEL_SEGMENT_SEPARATOR}{path.rsplit(MODEL_SEGMENT_SEPARATOR, 1)[-1]}"
+        model = split_model(match.group("model"))
+        if model:
+            return model
     return None
+
+
+def model_from_status(status: Mapping[str, Any]) -> Optional[str]:
+    """``provider/model`` from ``status.inference``; UNAVAILABLE when the key is
+    present without both fields (the operator's definite negative); None when the
+    key is absent (an operator older than the field, no Ready write yet, or a
+    served CRD that prunes it)."""
+    if INFERENCE_STATUS_KEY not in status:
+        return None
+    inference = status.get(INFERENCE_STATUS_KEY)
+    if not isinstance(inference, Mapping):
+        return UNAVAILABLE
+    provider, model = inference.get(INFERENCE_PROVIDER_FIELD), inference.get(INFERENCE_MODEL_FIELD)
+    if isinstance(provider, str) and isinstance(model, str) and provider and model:
+        return f"{provider}{MODEL_SEGMENT_SEPARATOR}{model}"
+    return UNAVAILABLE
 
 
 # --- the roll-up ----------------------------------------------------------------
@@ -380,12 +626,88 @@ def _nearest_rank(ordered: Sequence[float], quantile: float) -> float:
     return ordered[min(len(ordered) - 1, int(round(quantile * (len(ordered) - 1))))]
 
 
+def _tool_pair(tool: str, sub: str) -> str:
+    """The pair as the block prints it: the tool alone for a bare tool, else ``tool/sub``."""
+    return tool if sub == NONE else f"{tool}{TOOL_PAIR_SEPARATOR}{sub}"
+
+
+def summarise_broker_tools(samples: Iterable[Sample]) -> List[Tuple[str, int, Mapping[str, int]]]:
+    """Top ``TOP_TOOLS_SHOWN`` tool/subcommand pairs by invocation count, with closed labels only.
+
+    Sorted by total descending, then tool and subcommand ascending, the order
+    the operator writes ``status.usage.topTools`` in, so the block reads the
+    same from either source.
+    """
+    by_pair: Dict[Tuple[str, str], Dict[str, int]] = {}
+    for sample in samples:
+        if sample.name != TOOL_INVOCATIONS_FAMILY:
+            continue
+        count = int(round(sample.value))
+        if count <= 0:
+            continue
+        raw_tool = (sample.labels.get(TOP_TOOLS_TOOL_FIELD) or OTHER_BUCKET).lower()
+        raw_sub = (sample.labels.get(TOP_TOOLS_SUBCOMMAND_FIELD) or NONE).lower()
+        raw_status = (sample.labels.get("status") or OTHER_BUCKET).lower()
+        tool = raw_tool if raw_tool in BROKER_TOOLS else OTHER_BUCKET
+        allowed_subs = BROKER_SUBCOMMANDS.get(tool, frozenset())
+        if raw_sub == NONE:
+            sub = NONE
+        elif raw_sub in allowed_subs:
+            sub = raw_sub
+        else:
+            sub = OTHER_BUCKET
+        status = raw_status if raw_status in TOOL_STATUS_ORDER else OTHER_BUCKET
+        bucket = by_pair.setdefault((tool, sub), {})
+        bucket[status] = bucket.get(status, 0) + count
+    rows = [(tool, sub, sum(counts.values()), counts) for (tool, sub), counts in by_pair.items()]
+    rows.sort(key=lambda r: (-r[2], r[0], r[1]))
+    return [(_tool_pair(tool, sub), total, counts) for tool, sub, total, counts in rows[:TOP_TOOLS_SHOWN]]
+
+
+def summarise_status_tools(rows: Sequence[Any]) -> List[Tuple[str, int, Mapping[str, int]]]:
+    """``status.usage.topTools`` in the shape ``summarise_broker_tools`` returns.
+
+    The operator sorted and capped the list, so the rows are taken in their
+    order, at most ``TOP_TOOLS_SHOWN`` of them; a row that is not an object is
+    skipped. The gateway's ``renderTopTools`` reads the list the same way.
+    """
+    out: List[Tuple[str, int, Mapping[str, int]]] = []
+    for row in rows:
+        if not isinstance(row, Mapping) or len(out) >= TOP_TOOLS_SHOWN:
+            continue
+        tool = str(row.get(TOP_TOOLS_TOOL_FIELD) or "")
+        sub = str(row.get(TOP_TOOLS_SUBCOMMAND_FIELD) or "")
+        counts = {status: _count(row.get(status)) for status in TOOL_STATUS_ORDER if _count(row.get(status)) > 0}
+        out.append((_tool_pair(tool, sub), _count(row.get(TOP_TOOLS_TOTAL_FIELD)), counts))
+    return out
+
+
+def _count(value: Any) -> int:
+    """A status row's count as an integer; anything that is not one reads 0, as the gateway's asInt reads it."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tools_lines(top_tools: Sequence[Tuple[str, int, Mapping[str, int]]]) -> List[str]:
+    """The tools block: the label and ``none`` for no pairs, else the label and one row per pair."""
+    if not top_tools:
+        return [f"{TOP_TOOLS_LABEL}: {NONE}"]
+    lines = [f"{TOP_TOOLS_LABEL}:"]
+    status_order = TOOL_STATUS_ORDER + (OTHER_BUCKET,)
+    for pair, total, by_status in top_tools:
+        breakdown = ", ".join(f"{s} {by_status[s]}" for s in status_order if by_status.get(s))
+        lines.append(f"  {pair}: {total}" + (f" ({breakdown})" if breakdown else ""))
+    return lines
+
+
 @functools.lru_cache(maxsize=1)
 def template_tokens() -> frozenset:
     """Every token the block prints with no source at all: the template's own vocabulary."""
     empty = Snapshot(generated_at=TEMPLATE_EPOCH, cr={}, server_version=None, litellm_config=None,
                      tasks=None, litellm_metrics=None, sources={})
-    return frozenset(TOKEN_PATTERN.findall(render(empty)))
+    return frozenset(TOKEN_PATTERN.findall(render(empty))) | TEMPLATE_EXTRA_TOKENS
 
 
 def audit(text: str, identifiers: Iterable[str]) -> List[str]:
@@ -405,6 +727,21 @@ def audit(text: str, identifiers: Iterable[str]) -> List[str]:
         if re.search(pattern, text):
             leaked.append(identifier)
     return leaked
+
+
+def _without_model_line(text: str) -> str:
+    """The block less its first ``model:`` line, the one line printed by design.
+
+    A deployment name can carry a spec identifier as a segment
+    (``hosted_vllm/acme/llama-8b`` beside an ``org`` of ``acme``); the line is
+    never the reason a block is refused, and every other line stays audited.
+    """
+    lines = text.split("\n")
+    for index, line in enumerate(lines):
+        if line.startswith(MODEL_LINE_PREFIX):
+            del lines[index]
+            break
+    return "\n".join(lines)
 
 
 # --- rendering ------------------------------------------------------------------
@@ -454,22 +791,48 @@ def render(snapshot: Snapshot) -> str:
     spec, status = cr.get("spec") or {}, cr.get("status") or {}
     usage = status.get("usage") or {}
     lines: List[str] = ["```", f"{SUMMARY_TITLE} ({now.strftime('%Y-%m-%d')})", "environment:"]
-    lines.append(f"  version: {(spec.get('deployment') or {}).get('tag') or UNKNOWN}")
-    lines.append(f"  mode: {spec.get('mode') or DEFAULT_MODE}")
-    lines.append(f"  model: {model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE}")
-    lines.append(f"  kubernetes: {_server_version(snapshot.server_version)}")
-    lines.append(f"  installed: {_install_age(cr, now)}; ready: {_ready(cr)}")
+    model = model_from_status(status)
+    if model is None:
+        model = model_from_litellm_config(snapshot.litellm_config) or UNAVAILABLE
     interfaces = usage.get("activeInterfaces") or []
-    lines.append(f"  interfaces: {', '.join(sorted(str(i) for i in interfaces)) or NONE}")
+    environment = {
+        "version": (spec.get("deployment") or {}).get("tag") or UNKNOWN,
+        "mode": spec.get("mode") or DEFAULT_MODE,
+        "model": model,
+        "kubernetes": _server_version(snapshot.server_version),
+        "installed": f"{_install_age(cr, now)}; ready: {_ready(cr)}",
+        "interfaces": ", ".join(sorted(str(i) for i in interfaces)) or NONE,
+    }
+    lines.extend(f"  {key}: {environment[key]}" for key in ENVIRONMENT_KEYS)
+    if snapshot.scale:
+        scale = snapshot.scale
+        lines.append(
+            f"  scale: namespaces {scale.get('namespaces', 0)}, "
+            f"deployments {scale.get('deployments', 0)}, "
+            f"pods {scale.get('pods', 0)}, "
+            f"nodes {scale.get('nodes', 0)}, "
+            f"crds {scale.get('crds', 0)} (kcc {scale.get('kcc', 0)})"
+        )
     lines.append("usage:")
     for counter in USAGE_COUNTERS:
         value = usage.get(counter)
-        if counter in USAGE_READINGS:
+        suffix = USAGE_READINGS.get(counter)
+        if suffix is not None:
             shown = USAGE_NO_READING if value is None else int(value)
-            lines.append(f"  {counter}: {shown}{USAGE_READING_SUFFIX}")
+            lines.append(f"  {counter}: {shown}{suffix}")
         else:
             lines.append(f"  {counter}: {int(value or 0)}")
     lines.append(f"  lastActive: {usage.get('lastActiveTime') or NEVER}")
+    lines.append(f"  lastHumanActive: {usage.get('lastHumanActiveTime') or NEVER}")
+    # The broker's own text first; the operator's reading of it in the status
+    # when the broker could not be read; unavailable when neither is there.
+    status_tools = usage.get(TOP_TOOLS_STATUS_KEY)
+    if snapshot.broker_metrics is not None:
+        lines.extend(_tools_lines(summarise_broker_tools(parse_prometheus(snapshot.broker_metrics))))
+    elif isinstance(status_tools, list):
+        lines.extend(_tools_lines(summarise_status_tools(status_tools)))
+    else:
+        lines.append(f"{TOP_TOOLS_LABEL}: {UNAVAILABLE}")
     lines.append("performance:")
     if snapshot.litellm_metrics is not None:
         samples = parse_prometheus(snapshot.litellm_metrics)
@@ -521,21 +884,56 @@ def _optional(options: Options, *args: str, timeout: int = KUBECTL_TIMEOUT_SECON
         return None
 
 
-def _gateway_pod(options: Options) -> Optional[str]:
+def _running_pods(options: Options) -> Tuple[Optional[str], Optional[str]]:
+    """The running gateway and credential-proxy pod names from one pod list."""
     raw = _optional(options, "get", "pods", "-n", options.namespace, "-o", "json")
     if raw is None:
-        return None
+        return None, None
     try:
         items = json.loads(raw).get("items") or []
     except ValueError:
-        return None
+        return None, None
+    gateway: Optional[str] = None
+    broker: Optional[str] = None
     for item in items:
         metadata = item.get("metadata") or {}
         name = metadata.get("name") or ""
         running = (item.get("status") or {}).get("phase") == POD_PHASE_RUNNING
-        if name.startswith(options.name + GATEWAY_POD_INFIX) and running and not metadata.get("deletionTimestamp"):
-            return name
-    return None
+        if not running or metadata.get("deletionTimestamp"):
+            continue
+        if gateway is None and name.startswith(options.name + GATEWAY_POD_INFIX):
+            gateway = name
+        elif broker is None and name.startswith(options.name + BROKER_POD_INFIX):
+            broker = name
+    return gateway, broker
+
+
+def _broker_metrics(options: Options, broker_pod: Optional[str]) -> Optional[str]:
+    if not broker_pod:
+        return None
+    raw = _optional(
+        options, "exec", "-n", options.namespace, broker_pod, "-c", BROKER_CONTAINER, "--",
+        "sh", "-c", f"curl {CURL_FLAGS} -m {CURL_TIMEOUT_SECONDS} {BROKER_METRICS_URL}",
+        timeout=KUBECTL_TIMEOUT_SECONDS + CURL_TIMEOUT_SECONDS,
+    )
+    return raw if raw and raw.strip() else None
+
+
+def _cluster_scale(options: Options) -> Optional[Dict[str, int]]:
+    """Cluster-wide object counts from ``-o name`` lines (integer totals only, never names)."""
+    counts: Dict[str, int] = {}
+    for label, resource in SCALE_RESOURCES:
+        args = ["get", resource, "-o", "name"]
+        if label in ("deployments", "pods"):
+            args.insert(2, "--all-namespaces")
+        raw = _optional(options, *args)
+        if raw is None:
+            return None
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        counts[label] = len(lines)
+        if label == "crds":
+            counts["kcc"] = sum(1 for line in lines if line.endswith(KCC_CRD_SUFFIX))
+    return counts
 
 
 def _in_pod_curl(options: Options, pod: str, shell: str) -> Optional[str]:
@@ -619,17 +1017,36 @@ def collect(options: Options) -> Snapshot:
             server_version = json.loads(raw_version)
         except ValueError:
             server_version = None
-    litellm_config = _litellm_config(options)
+    # The ConfigMap is the fallback for a status with no ``inference`` key (an
+    # operator older than the field, no Ready write yet, or a served CRD that
+    # prunes it); with the key present the listing would be fetched and thrown
+    # away, so it is not made.
+    status = cr.get("status") if isinstance(cr.get("status"), Mapping) else {}
+    litellm_config = None if INFERENCE_STATUS_KEY in status else _litellm_config(options)
     tasks: Optional[Sequence[Mapping[str, Any]]] = None
     truncated = False
     metrics: Optional[str] = None
+    broker_metrics: Optional[str] = None
+    scale: Optional[Mapping[str, int]] = None
     reasons: Dict[str, str] = {}
     if not options.in_pod:
-        reasons = {"session-kv": REASON_SKIPPED, "litellm-metrics": REASON_SKIPPED}
+        reasons = {
+            "session-kv": REASON_SKIPPED,
+            "litellm-metrics": REASON_SKIPPED,
+            "broker-metrics": REASON_SKIPPED,
+            "scale": REASON_SKIPPED,
+        }
     else:
-        pod = _gateway_pod(options)
+        pod, broker_pod = _running_pods(options)
+        broker_metrics = _broker_metrics(options, broker_pod)
+        if broker_metrics is None:
+            reasons["broker-metrics"] = REASON_NO_BROKER_POD if not broker_pod else REASON_EXEC
+        scale = _cluster_scale(options)
+        if scale is None:
+            reasons["scale"] = REASON_EXEC
         if not pod:
-            reasons = {"session-kv": REASON_NO_POD, "litellm-metrics": REASON_NO_POD}
+            reasons["session-kv"] = REASON_NO_POD
+            reasons["litellm-metrics"] = REASON_NO_POD
         else:
             since = int(now.timestamp()) - TASK_WINDOW_DAYS * SECONDS_PER_DAY
             feed = _in_pod_curl(
@@ -650,8 +1067,13 @@ def collect(options: Options) -> Snapshot:
     return Snapshot(
         generated_at=now, cr=cr, server_version=server_version, litellm_config=litellm_config,
         tasks=tasks, litellm_metrics=metrics, tasks_truncated=truncated,
-        sources={"session-kv": tasks is not None, "litellm-metrics": metrics is not None},
-        source_reasons=reasons,
+        sources={
+            "session-kv": tasks is not None,
+            "litellm-metrics": metrics is not None,
+            "broker-metrics": broker_metrics is not None,
+            "scale": scale is not None,
+        },
+        source_reasons=reasons, broker_metrics=broker_metrics, scale=scale,
     )
 
 
@@ -661,7 +1083,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     parser.add_argument("--name", default=DEFAULT_AGENT_NAME, help="the PlatformAgent resource")
     parser.add_argument("--context")
     parser.add_argument("--kubeconfig")
-    parser.add_argument("--no-exec", action="store_true", help="read the resource only; skip the in-pod sources")
+    parser.add_argument("--no-exec", action="store_true", help="read the resource only; skip the pod and cluster-scale sources")
     args = parser.parse_args(argv)
     options = Options(namespace=args.namespace, name=args.name, context=args.context, kubeconfig=args.kubeconfig, in_pod=not args.no_exec)
     try:
@@ -674,7 +1096,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     if missing and options.in_pod:
         detail = "; ".join(f"{name}: {snapshot.source_reasons.get(name, REASON_EXEC)}" for name in missing)
         print(f"feedback-summary: could not be read: {detail}", file=stderr)
-    leaked = audit(text, snapshot.identifiers)
+    leaked = audit(_without_model_line(text), snapshot.identifiers)
     if leaked:
         print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)
         return EXIT_LEAK

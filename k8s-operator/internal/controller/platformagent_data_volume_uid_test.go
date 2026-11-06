@@ -91,10 +91,14 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 	// the same Deployment with no plugins. Both are pod-bearing builders,
 	// so both pods reach the assertion.
 	credentialProxyWithPlugins := buildCredentialProxyDeploymentForPlugins(agent, "p", nil, allBrokerCallersOwned, credentialProxyProfileConfig{}, false)
+	credentialProxyExecTier := buildCredentialProxyExecTierDeployment(agent, credentialProxy)
+	kubeProxy := buildKubeProxyDeployment(agent, "", true, "t")
 	a2aGateway := buildA2AGatewayDeployment(agent)
-	a2aCallout := buildA2ACalloutDeployment(agent, "")
+	a2aCallout := buildA2ACalloutDeployment(agent, "", 1)
 	a2aVerifier := buildA2AVerifierDeployment(agent)
 	a2aDispatcher := buildA2ADispatcherDeployment(agent)
+	poolProfile := testAgentProfile(agent.Namespace, "auditor")
+	profilePool := buildProfilePool(agent, &poolProfile, agentv1alpha1.AgentProfileTierRead, "agentprofile-auditor-read", false)
 	a2aConsole := buildA2AConsoleDeployment(agent)
 	a2aMCP := buildA2AMCPDeployment(agent)
 	gatewayStatefulSet := buildStatefulSet(agent, "c", "f", "s", "p", nil, opts)
@@ -107,10 +111,13 @@ func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTem
 		{"buildDeployment", gatewayDeployment.Name, gatewayDeployment.Spec.Template.Spec},
 		{"buildCredentialProxyDeployment", credentialProxy.Name, credentialProxy.Spec.Template.Spec},
 		{"buildCredentialProxyDeploymentForPlugins", credentialProxyWithPlugins.Name, credentialProxyWithPlugins.Spec.Template.Spec},
+		{"buildCredentialProxyExecTierDeployment", credentialProxyExecTier.Name, credentialProxyExecTier.Spec.Template.Spec},
+		{"buildKubeProxyDeployment", kubeProxy.Name, kubeProxy.Spec.Template.Spec},
 		{"buildA2AGatewayDeployment", a2aGateway.Name, a2aGateway.Spec.Template.Spec},
 		{"buildA2ACalloutDeployment", a2aCallout.Name, a2aCallout.Spec.Template.Spec},
 		{"buildA2AVerifierDeployment", a2aVerifier.Name, a2aVerifier.Spec.Template.Spec},
 		{"buildA2ADispatcherDeployment", a2aDispatcher.Name, a2aDispatcher.Spec.Template.Spec},
+		{"buildProfilePool", profilePool.Name, profilePool.Spec.Template.Spec},
 		{"buildA2AConsoleDeployment", a2aConsole.Name, a2aConsole.Spec.Template.Spec},
 		{"buildA2AMCPDeployment", a2aMCP.Name, a2aMCP.Spec.Template.Spec},
 		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},

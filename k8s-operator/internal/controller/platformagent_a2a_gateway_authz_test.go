@@ -250,6 +250,32 @@ func TestGatewayJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	allowed("$KV.feedback delete (feedbackDesk.Rate, a 👍)", fb.Delete(ctx, "t1.U1"))
 
+	// The people count (a2a/gateway/people.go): bound and its max age read
+	// at start, the desk's watch started and stopped, a person's put, the
+	// purge's key list and delete.
+	people, err := js.KeyValue(ctx, a2aPeopleBucket)
+	allowed("STREAM.INFO KV_people (tryPeople js.KeyValue)", err)
+	if status, err := people.Status(ctx); err != nil || status.TTL() <= 0 {
+		t.Errorf("the people bucket's max age read as %v (err %v); the gateway counts nobody without one", status, err)
+	}
+	peopleWatch, err := people.WatchAll(ctx)
+	allowed("CONSUMER.CREATE KV_people, watcher (peopleDesk.follow WatchAll)", err)
+	if err == nil {
+		allowed("CONSUMER.DELETE KV_people, watcher Stop (peopleDesk.follow)", peopleWatch.Stop())
+	}
+	const personKey = "people.0123456789abcdef"
+	_, err = people.Put(ctx, personKey, []byte("2026-11-02T00:00:00Z"))
+	allowed("$KV.people put (peopleDesk.put)", err)
+	_, err = people.Get(ctx, personKey)
+	allowed("DIRECT.GET KV_people", err)
+	peopleKeys, err := people.ListKeys(ctx)
+	allowed("CONSUMER.CREATE KV_people, watcher (purgePeople ListKeys)", err)
+	if err == nil {
+		for range peopleKeys.Keys() {
+		}
+	}
+	allowed("$KV.people delete (purgePeople)", people.Delete(ctx, personKey))
+
 	if v := log.publishViolations("gateway"); len(v) != 0 {
 		t.Errorf("the gateway's own operations tripped %d publish violations; each is a grant a2aGatewayJetStreamGrants is missing:\n%s",
 			len(v), strings.Join(v, "\n"))

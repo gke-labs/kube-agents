@@ -540,8 +540,8 @@ exactly as before, and the index only runs where the hook previously did nothing
 Google Chat opens a thread around every top-level message, so the thread name on
 an inbound payload cannot say whether the user posted at top level or replied
 inside a real thread. Chat's `message.threadReply` flag does say (it is true only
-for a reply in a thread; the `mode: next` gateway reads it, per
-`spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
+for a reply in a thread; the `mode: next` gateway reads it to mark a top-level ask and keys every DM
+message by its thread, per `spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
 the question by counting inbound messages per thread: a thread it has
 never seen one in is read as main flow, and the bot answers in the space rather
 than in the thread. Both writers of that counter live in the gateway process. A
@@ -645,13 +645,18 @@ profile's — then per-platform environment signals for an install neither file
 describes.
 
 An install with no chat route gets no send at all: when the managed scope turns
-every platform off and nothing routes one through the gateway — a `next` install
-whose only chat platform is held by the gateway with no home channel, or an
-install with neither Google Chat nor Slack — the relay answers 502 without posting. The detail names the gateway's
-platform from `A2A_NOTIFY_CONVERSATIONS` and the CR field that sets its home
-channel (`composed but not delivered to slack (no home channel: set
-spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), or says that no route
-exists when no platform can be named.
+every platform off and nothing routes one through the gateway — an install with
+neither Google Chat nor Slack, or one whose home channel is malformed, which routes
+nothing — the relay answers 502 without posting, and the detail says that no route
+exists. A `next` install whose only chat platform is held by the gateway with no home
+channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it, the relay
+sends, and the gateway refuses the post and keeps it for the digest it posts once a
+home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
+the relay's `composed but not delivered to <platform>`; the gateway's refusal, which
+says the post is kept, is in the gateway's and the session server's logs. A pod
+rendered before the operator routed it still answers the platform-naming detail
+(`composed but not delivered to slack (no home channel: set
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`).
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the

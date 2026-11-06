@@ -8,8 +8,10 @@ turned away, and what the model reads when a call is refused.
 fake and the token is fixed.
 """
 
+import dataclasses
 import http.client
 import json
+import socket
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -79,7 +81,7 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
 
         self.relay = FakeRelay(self.upstream.server_address[1])
 
-        for attribute in ("api_relay", "authenticator", "policy", "max_request_bytes"):
+        for attribute in ("api_relay", "authenticator", "policy", "max_request_bytes", "profile_gate"):
             self.addCleanup(
                 self._restore,
                 attribute,
@@ -107,6 +109,7 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
             "shell-token": credential_proxy.CALLER_ROLE_SHELL,
             "chat-token": credential_proxy.CALLER_ROLE_CHAT,
             "session-token": credential_proxy.CALLER_ROLE_SESSION,
+            "profile-token": credential_proxy.CALLER_ROLE_PROFILE,
         }
 
         def fake_review(token):
@@ -116,6 +119,18 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
 
         authenticator._review = fake_review
         CredentialProxyHandler.authenticator = authenticator
+
+        class FakeProfileGate:
+            # Binds any presented task credential; the real gate's checks have
+            # their own tests (test_credential_proxy_profile.py).
+            def admit(self, principal, token):
+                if token is None:
+                    return principal
+                if token == "a-refused-credential":
+                    raise credential_proxy.TaskCredentialRefused("signature does not verify")
+                return dataclasses.replace(principal, task=object(), caller=f"task:{token}")
+
+        CredentialProxyHandler.profile_gate = FakeProfileGate()
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -143,6 +158,80 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
             return response.status, dict(response.getheaders()), response.read()
         finally:
             connection.close()
+
+    # -- profile workers (#3658) --------------------------------------------
+
+    DK = "/v1/mcp/developer_knowledge"
+    TASK = {credential_proxy.TASK_CREDENTIAL_HEADER: "a-task-credential"}
+
+    def _profile(self, path, message, task=True):
+        return self._request(path=path, message=message, token="profile-token",
+                             headers=self.TASK if task else None)
+
+    def _refused_rule(self, body):
+        text = json.loads(body)["result"]["content"][0]["text"]
+        return text.rsplit("policy rule: ", 1)[1].strip()
+
+    def test_a_profile_worker_reads_documents_inside_a_task(self):
+        status, _, body = self._profile(self.DK, tools_call("search_documents"))
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.relay.hosts, ["developerknowledge.googleapis.com"])
+        self.assertEqual(len(self.upstream_requests), 1)
+
+    def test_a_profile_worker_with_no_task_reaches_nothing(self):
+        status, _, body = self._profile(self.DK, tools_call("search_documents"), task=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(self._refused_rule(body), credential_proxy.RULE_TASK_CREDENTIAL)
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_a_profile_worker_is_refused_the_gke_server(self):
+        # A gke tool names its cluster in its arguments, and the relay has no
+        # per-task target check, so a task could read any cluster through it.
+        status, _, body = self._profile(GKE, tools_call("get_cluster"))
+        self.assertEqual(status, 200)
+        self.assertEqual(self._refused_rule(body), mcp_policy.RULE_PROFILE_SERVER)
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_a_profile_worker_is_refused_answer_query(self):
+        status, _, body = self._profile(self.DK, tools_call("answer_query"))
+        self.assertEqual(status, 200)
+        self.assertEqual(self._refused_rule(body), mcp_policy.RULE_PROFILE_TOOL)
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_a_profile_workers_tool_list_is_its_two_reads(self):
+        self.reply = {"status": 200, "content_type": "application/json", "body": json.dumps({
+            "jsonrpc": "2.0", "id": 1, "result": {"tools": [
+                {"name": "answer_query"}, {"name": "get_documents"}, {"name": "search_documents"},
+            ]}}).encode()}
+        status, _, body = self._profile(self.DK, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.assertEqual(status, 200, body)
+        names = sorted(t["name"] for t in json.loads(body)["result"]["tools"])
+        self.assertEqual(names, ["get_documents", "search_documents"])
+        # The chat role still sees all three the table allows.
+        status, _, body = self._request(path=self.DK, message={"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        self.assertEqual(len(json.loads(body)["result"]["tools"]), 3)
+
+    def test_a_profile_worker_whose_credential_fails_is_refused_before_the_relay(self):
+        status, _, body = self._request(
+            path=self.DK, message=tools_call("search_documents"), token="profile-token",
+            headers={credential_proxy.TASK_CREDENTIAL_HEADER: "a-refused-credential"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(json.loads(body)["rule"], credential_proxy.RULE_TASK_CREDENTIAL)
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_every_method_on_gke_is_refused_to_a_profile_worker(self):
+        for method in ("initialize", "ping", "tools/list"):
+            with self.subTest(method=method):
+                status, _, body = self._profile(GKE, {"jsonrpc": "2.0", "id": 1, "method": method})
+                self.assertEqual(status, 200)
+                self.assertIn(mcp_policy.RULE_PROFILE_SERVER, json.loads(body)["error"]["message"])
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_a_session_pod_still_reaches_no_mcp_server(self):
+        status, _, _ = self._request(path=self.DK, message=tools_call("search_documents"), token="session-token")
+        self.assertEqual(status, 403)
+        self.assertEqual(self.upstream_requests, [])
 
     # -- what reaches Google ---------------------------------------------
 
@@ -253,6 +342,33 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         status, _, _ = self._request(body=b"{}", headers={"Content-Length": str(2 << 20)})
         self.assertEqual(status, 413)
         self.assertEqual(self.upstream_requests, [])
+
+    def test_a_relayed_message_whose_body_the_handler_cannot_frame_announces_its_close(self):
+        # The relay's direct write of the upstream's reply. The route reads
+        # Content-Length bytes before answering, so the one request on which
+        # the body counts as unread at that write is a POST carrying both
+        # Transfer-Encoding and a Content-Length: the handler frames no
+        # chunked body, so whatever it read, bytes may follow. The response
+        # must then say `Connection: close` itself, as the close is otherwise
+        # found by Envoy after it has pooled the connection as reusable.
+        body = json.dumps(tools_call("get_cluster")).encode()
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                b"POST " + GKE.encode("ascii") + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer chat-token\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            self.assertEqual(200, response.status)
+            self.assertEqual(self.reply["body"], response.read())
+            self.assertEqual("close", (response.getheader("Connection") or "").lower(), response.getheaders())
+            self.assertEqual(b"", sock.recv(1), "the connection stayed open")
+        # The message itself reached the upstream: this is the relayed path,
+        # not a refusal written through _json.
+        self.assertEqual(1, len(self.upstream_requests))
 
 
 if __name__ == "__main__":

@@ -242,6 +242,19 @@ profile's dispatch. Notes on the mechanics:
   with a stream lookup. This ordering is the fix: the pod exists _because_ the message
   is already durable, so the worker's task fetch cannot miss.
 
+**Amended 10/28 (#3655):** the dispatcher is its own Deployment (`<agent>-a2a-dispatcher`,
+one replica, replaced with `Recreate`), not a controller in the operator, and it reads one
+shared durable per (profile, tier, kind) on `PROFILE_SUBMITS` (`a2a.submit.>`) rather than
+one per profile on `…in`. Ack-after-create is replaced by holding: the dispatcher keeps each
+submission unacknowledged for the task's whole life, with in-progress acks, and acks it
+only when the task ends (the worker's final lease renewal, an expired lease, or a passed
+deadline). A restart therefore redelivers every held task, and the task's lease record
+decides whether it is re-adopted, failed or dispatched. A submission past
+`queueTimeoutSeconds` gets terminal `rejected` with `reason: queue-timeout`, since nothing
+ran, in place of the field table's `failed` and `queue-deadline-exceeded`. The design spec's
+"Admission and holding" ([`spec-profiles-dispatch.md`](spec-profiles-dispatch.md)) has the
+rest.
+
 **The Job.** `backoffLimit: 0` - Kubernetes does not get to re-run an LLM task that may
 have half-performed side effects. Retry is a decision for the requester, made against the
 terminal event (see lifecycle). `restartPolicy: Never`, `activeDeadlineSeconds` and
@@ -323,10 +336,12 @@ What the operator renders per profile, as built (amended 10/6):
   which presents the ServiceAccount token alone, gets the dispatch subjects, its inbox and
   its topics. After it accepts a task it opens a task connection with the token as the
   connection token and a task credential as the password. The dispatcher signs the
-  credential (`a2a/taskcred`), and the callout refuses it unless its pod name and UID are
-  the pod the token is bound to, and its profile and tier are the entry's. The task
-  connection gets that one task's `.events` publish and its three consumers, filtered
-  exactly on the task. They and its inbox are named for the task, not the pod
+  credential (`a2a/taskcred`) and sends it on the confirm as `taskCredential`, with a
+  `proxyToken` for the credential proxy when the task names a cluster (contract addendum 8;
+  [the dispatch design](spec-profiles-dispatch.md) has the details). The callout refuses it
+  unless its pod name and UID are the pod the token is bound to, and its profile and tier
+  are the entry's. The task connection gets that one task's `.events` publish and its
+  three consumers, filtered exactly on the task. They and its inbox are named for the task, not the pod
   (`<pod>_<task>-origin`, `-in`, `-events`, and `_INBOX.<pod>_<task>`), because a consumer's
   info, pull and delete subjects carry only its name, and a pod-named consumer would be
   reachable from the pod's next task. A credential may run to the callout's maximum task
@@ -346,15 +361,18 @@ What the operator renders per profile, as built (amended 10/6):
   shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
   ask the metadata server for the broker's Workload Identity token). The broker gives them a
   role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
-  route only, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist.
+  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist, and,
+  with a task credential, the MCP relay for Developer Knowledge's two document reads alone
+  (`mcp_policy.PROFILE_SERVER_TOOLS`).
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
-  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves four names against `spec.deployment.env`:
+  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves five names against `spec.deployment.env`:
   `CREDENTIAL_PROXY_PROFILE_AUDIENCE`, `CREDENTIAL_PROXY_PROFILE_IDENTITIES`,
-  `A2A_TASK_SIGNING_PUBLIC_KEYS` and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`;
-  `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already. The operator doesn't render the
-  max lifetime yet. The broker's fence admits the profile namespace and
+  `A2A_TASK_SIGNING_PUBLIC_KEYS`, `A2A_TASK_CREDENTIAL_MAX_LIFETIME` and
+  `A2A_TASK_SIGNING_SEED_FILE`; `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already.
+  **Amended 11/5 (#4471):** the operator renders the max lifetime, one value for the callout,
+  the broker and the dispatcher. The broker's fence admits the profile namespace and
   the profile namespace's fence lets it out to the broker's credentialed port.
   - The shim reads the dispatcher's `proxyToken` from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` on
     every call and sends it in `X-Kube-Agents-Task-Credential`, never in the body. The

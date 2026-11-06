@@ -1016,3 +1016,22 @@ class ReadingsCeilingTest(unittest.TestCase):
         self.assertEqual((34, False), (answer["count"], answer["truncated"]))
         self.assertEqual({"open": 0, "merged": 34, "closed": 0},
                          forge.proposal_tally(self.api(rows), "ACME/infra", {"author": self.AUTHOR}))
+
+
+class MergeCommitTest(unittest.TestCase):
+    def test_only_a_merged_pull_request_names_its_merge_commit(self):
+        sha = "839fa9a2d434eb697815b8fcafaecc51accfdbbc"
+        merged = {"mergeCommit": {"displayId": sha[:11], "id": sha}}
+        cases = (
+            ("MERGED", merged, sha),
+            # The recorded listings carry no `mergeCommit` property.
+            ("MERGED", {"commentCount": 0}, None),
+            ("MERGED", None, None),
+            ("OPEN", merged, None),
+            ("DECLINED", merged, None),
+        )
+        for state, properties, expected in cases:
+            node = pull(6, state, properties=properties)
+            with self.subTest(state=state, properties=properties):
+                answer = forge().proposal_view(lambda *args, **kwargs: node, "ACME/infra", {"number": 6})
+                self.assertEqual(expected, answer["proposal"]["mergeCommit"])

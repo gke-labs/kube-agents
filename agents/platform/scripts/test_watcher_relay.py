@@ -8,10 +8,12 @@ only the connections are pointed at the fakes and the token is fixed.
 
 import http.client
 import json
+import socket
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 import credential_proxy
 import watcher_policy
@@ -32,6 +34,14 @@ CLUSTER = {
     "legacyAbac": {"enabled": True},
 }
 EVENT_GAP_S = 0.3
+# For the peer that stops reading its stream: the window the broker gives
+# it, how long a test waits for the broker to act, the handler thread's
+# logging settle after the close, and the API server's chunk, written until
+# the broker closes its side.
+SHORT_IDLE_S = 0.5
+CLOSE_WAIT_S = 5
+SETTLE_S = 0.5
+UNREAD_STREAM_CHUNK = b"a" * (64 * 1024)
 # Captured before any test points the seam at a fake.
 REAL_K8S_CONNECTION = CredentialProxyHandler._watcher_k8s_connection
 
@@ -41,6 +51,7 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         owner = self
         self.google_requests = []
         self.k8s_requests = []
+        self.stream_unread = False
 
         class Google(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -72,6 +83,20 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
 
             def do_GET(self):  # noqa: N802
                 owner.k8s_requests.append((self.path, dict(self.headers)))
+                if owner.stream_unread:
+                    # A stream wider than any socket buffer, for the peer
+                    # that stops reading it: written until the broker
+                    # closes its side of the upstream connection.
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    try:
+                        while True:
+                            self.wfile.write(UNREAD_STREAM_CHUNK)
+                            self.wfile.flush()
+                    except OSError:
+                        return
                 if "watch=true" in self.path:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -159,8 +184,10 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         elif attribute in CredentialProxyHandler.__dict__:
             delattr(CredentialProxyHandler, attribute)
 
-    def _request(self, method, path, token="watcher-token", body=None):
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+    def _request(self, method, path, token="watcher-token", body=None, headers=None):
+        headers = dict(headers or {})
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         if body is not None:
             headers["Content-Type"] = "application/json"
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
@@ -258,6 +285,74 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - arrived, EVENT_GAP_S * 0.5)
         connection.close()
 
+    def test_a_watch_stream_says_it_will_close_and_ends_with_eof(self):
+        # The one response of unknown length the credentialed handler writes:
+        # no Content-Length, `Connection: close`, and the connection closed
+        # after the body, so a keep-alive client knows where the stream ends.
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
+        connection.request("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?watch=true",
+                           headers={"Authorization": "Bearer watcher-token"})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertEqual("close", (response.getheader("Connection") or "").lower())
+        self.assertIsNone(response.getheader("Content-Length"))
+        self.assertIsNone(response.getheader("Transfer-Encoding"))
+        # A close-delimited read returns only at EOF: the server closed, within
+        # the client's timeout, or this raises.
+        self.assertTrue(response.will_close)
+        body = response.read()
+        self.assertEqual(["e1", "e2"], [json.loads(line)["object"]["metadata"]["name"] for line in body.splitlines()])
+        connection.close()
+
+    def test_a_watcher_that_stops_reading_its_stream_is_logged_as_the_peers_stall_not_an_upstream_failure(self):
+        # The request read deadline leaves KEEPALIVE_IDLE_SECONDS on the
+        # socket for the whole request, so the relay's write to a watcher
+        # that stops reading for the window ends with a TimeoutError. That
+        # is the broker's own peer, not the API server: the line says so
+        # and names the request, the upstream-failure line that names the
+        # API server is not written, and the cached address stands.
+        self.stream_unread = True
+        path = "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/events?watch=true"
+        with mock.patch.object(credential_proxy, "KEEPALIVE_IDLE_SECONDS", SHORT_IDLE_S):
+            with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+                with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=CLOSE_WAIT_S) as unread:
+                    unread.sendall(f"GET {path} HTTP/1.1\r\nHost: broker\r\nAuthorization: Bearer watcher-token\r\n\r\n".encode("ascii"))
+                    deadline = time.monotonic() + CLOSE_WAIT_S
+                    while not any("not read by the peer" in line for line in logs.output):
+                        if time.monotonic() > deadline:
+                            self.fail(f"the cut stream was not logged: {logs.output}")
+                        time.sleep(0.1)
+                time.sleep(SETTLE_S)  # the handler thread finishes logging after the close
+        cut = [line for line in logs.output if "not read by the peer" in line]
+        self.assertEqual(1, len(cut), logs.output)
+        self.assertTrue(cut[0].startswith("WARNING:") and "type=TimeoutError" in cut[0], cut[0])
+        self.assertIn("request_id=", cut[0])
+        self.assertFalse(any("upstream failed" in line for line in logs.output), logs.output)
+        self.assertFalse(any("Traceback" in line for line in logs.output), logs.output)
+        self.assertTrue(any("watcher k8s forwarded" in line for line in logs.output), logs.output)
+        self.assertIn(("kagents-dev", "us-east4", "fleet-a"), CredentialProxyHandler.watcher_endpoints)
+
+    def test_a_get_carrying_a_body_on_the_cloud_passthrough_announces_its_close(self):
+        # The Cloud API passthrough writes its response without _json, and a
+        # GET reads no body, so a GET that announces one leaves it unread:
+        # the response must say `Connection: close` and the connection close
+        # after it, or the body is read as the next request line.
+        path = "/v1/watcher/gcp/container.googleapis.com/v1/projects/kagents-dev/locations/us-east4/clusters/fleet-a?alt=json&prettyPrint=false"
+        body = b'{"unread":true}'
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                f"GET {path} HTTP/1.1\r\nHost: broker\r\nAuthorization: Bearer watcher-token\r\n"
+                f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            relayed = response.read()
+            self.assertEqual(200, response.status, relayed)
+            self.assertEqual("close", (response.getheader("Connection") or "").lower(), response.getheaders())
+            self.assertEqual(b"", sock.recv(1), "the connection stayed open")
+        [(method, upstream_path, _, _)] = self.google_requests
+        self.assertEqual((method, upstream_path), ("GET", "/v1/projects/kagents-dev/locations/us-east4/clusters/fleet-a?alt=json&prettyPrint=false"))
+
     def test_secrets_writes_and_other_lists_never_reach_the_api_server(self):
         for method, path in (
             ("GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/api/v1/namespaces/default/secrets/db"),
@@ -268,6 +363,38 @@ class WatcherRelayOverTheSocketTest(unittest.TestCase):
                 status, _ = self._request(method, path, body=b"{}" if method == "POST" else None)
                 self.assertEqual(status, 403)
         self.assertEqual(self.k8s_requests, [])
+
+    def test_a_count_list_reaches_the_api_server_only_with_the_metadata_accept_it_forwards(self):
+        metadata = "application/json;as=PartialObjectMetadataList;g=meta.k8s.io;v=v1"
+        status, body = self._request(
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/apis/apps/v1/deployments?limit=1", headers={"Accept": metadata}
+        )
+        self.assertEqual(status, 200, body)
+        [(path, headers)] = self.k8s_requests
+        self.assertEqual(path, "/apis/apps/v1/deployments?limit=1")
+        self.assertEqual(headers["Accept"], metadata)
+        # The policy reads the Accept the broker forwards, so an Accept the
+        # forwarding shape drops (too long) is evaluated as absent: refused,
+        # not relayed as a list whose one item comes back whole. The over-long
+        # one is metadata-only on every range, so the policy on its own admits
+        # it; only the coupling to the forwarded value refuses it, which is
+        # what a policy reading the raw header would get wrong.
+        overlong = ",".join([metadata] * 5)
+        self.assertTrue(watcher_policy.accepts_metadata_only(overlong))
+        self.assertFalse(credential_proxy.WATCHER_K8S_ACCEPT_SHAPE.match(overlong))
+        for accept in (None, "application/json", metadata + ",application/json", overlong):
+            with self.subTest(accept=accept):
+                status, body = self._request(
+                    "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/apis/apps/v1/deployments?limit=1",
+                    headers={"Accept": accept} if accept else None,
+                )
+                self.assertEqual(status, 403, body)
+                self.assertIn(watcher_policy.RULE_K8S_ACCEPT, json.loads(body)["message"])
+        status, _ = self._request(
+            "GET", "/v1/k8s/kagents-dev/us-east4/fleet-a/apis/apps/v1/deployments?limit=2", headers={"Accept": metadata}
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(len(self.k8s_requests), 1)
 
     def test_a_refusal_is_a_kubernetes_status_naming_the_rule(self):
         # client-go turns this into a StatusError with the message verbatim, so

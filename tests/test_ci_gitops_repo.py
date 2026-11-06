@@ -939,7 +939,12 @@ class CiDeployGitlabPreflightTest(unittest.TestCase):
         text = _CI_DEPLOY.read_text(encoding="utf-8")
         self.assertIn(f'GITLAB_SECRETS_PROJECT="{_GITLAB_SECRETS_PROJECT}"', text)
         # Every Secret Manager read of the pair names that home, none the lease.
-        reads = [ln for ln in text.splitlines() if "secrets versions access latest" in ln]
+        # The agent's Gemini key is a separate secret, read from the lease on purpose.
+        reads = [
+            ln
+            for ln in text.splitlines()
+            if "secrets versions access latest" in ln and "EVAL_AGENT_GEMINI_KEY_SECRET" not in ln
+        ]
         self.assertEqual(len(reads), 2, reads)
         for ln in reads:
             self.assertIn('--project="${GITLAB_SECRETS_PROJECT}"', ln)

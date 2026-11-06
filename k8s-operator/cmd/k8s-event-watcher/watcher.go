@@ -113,6 +113,35 @@ const (
 	marksRecordedFormat = "watcher: [%s] %d autoscaler mark(s) in the %s recorded ahead of its delivery"
 	marksSourceList     = "list"
 	marksSourceStream   = "watch-list stream"
+	// pagedListPageSize is the page the list call asks for when the
+	// reflector falls back from a watch-list stream to a list: a control
+	// plane without the WatchList feature gate (off before 1.32 and at 1.33)
+	// refuses sendInitialEvents, and a stream that fails falls back too.
+	// client-go's reflector would collect every page of that list before the
+	// queue saw one Event, so the whole backlog of a thousand-node cluster
+	// sat in memory at once; listInPages dispatches each page and drops it,
+	// so the backlog costs one page whatever the cluster holds. 500 is the
+	// API server's own default page.
+	pagedListPageSize = 500
+	// pagedListResourceVersion is the resource version the paged list asks
+	// at: empty, a quorum read served from etcd in pages. "0" would be served
+	// from the watch cache, which ignores the limit and answers the whole
+	// backlog in one response, which is the size this exists to bound.
+	pagedListResourceVersion = ""
+	// reasonSelectorFormat is the field selector the mark pass lists with,
+	// one autoscaler reason at a time: a few objects a cluster, read before
+	// the backlog so every mark is on record ahead of the FailedScheduling
+	// events judged against it (see recordMark).
+	reasonSelectorFormat = "reason=%s"
+	// pagedListFormat and relistFormat are the one line each per paged list:
+	// the first is the initial sync without a watch-list stream, the second a
+	// list after the sync, which is the loop a slow batch can fall into and
+	// which nothing logged before (client-go reports the fallback at V(4)).
+	pagedListFormat = "watcher: [%s] listing Events in pages of %d: the API server served no watch-list stream (WatchList is off on control planes before 1.32 and at 1.33) or the stream failed"
+	relistFormat    = "watcher: [%s] relisting Events in pages of %d after the initial sync: the watch could not be resumed or the watch-list stream failed"
+	// restreamFormat is the watch-list path's relist: a second stream with
+	// sendInitialEvents after the first delivered its backlog.
+	restreamFormat = "watcher: [%s] re-streaming Events through a new watch-list stream after the initial sync: the watch could not be resumed"
 	// initialEventsEndValue is the value the API server sets on the bookmark
 	// annotation that ends a watch-list stream's initial events.
 	initialEventsEndValue = "true"
@@ -161,9 +190,12 @@ var errorHandlerOnce sync.Once
 // hold their own bounded entries), and a store would otherwise grow with the
 // event backlog of every watched cluster for no reader.
 type watcher struct {
-	client     kubernetes.Interface
-	dispatcher eventDispatcher
-	cluster    targetCluster
+	client kubernetes.Interface
+	// watchClient opens the Events watch: cluster.WatchClient, or client when
+	// that is nil (see targetCluster.WatchClient and watchConfig).
+	watchClient kubernetes.Interface
+	dispatcher  eventDispatcher
+	cluster     targetCluster
 	// forbiddenHold is the wait applied by handleWatchError after a 403 and by
 	// awaitPermitted after a denied preflight; it is forbiddenRetryInterval
 	// everywhere except tests, which shorten it.
@@ -177,6 +209,23 @@ type watcher struct {
 	// handleWatchError and the watch func of the ListWatch can report a
 	// transition from their own goroutines. Nil until Run is entered.
 	onWatching func(watching bool)
+	// onRelist is called, from the reflector's goroutine, each time the
+	// reflector lists the cluster's Events again after the initial sync: a
+	// watch it could not resume, or a watch-list stream that failed. Nil
+	// reports nothing.
+	onRelist func()
+	// deliveries and tracker are Run's delivery channel and sync tracker,
+	// kept on the watcher so listInPages, which runs on the reflector's
+	// goroutine, can hand each page's Events to the same delivery goroutine
+	// the queue feeds and count them toward the same sync. Set in Run before
+	// the reflector starts.
+	deliveries chan delivery
+	tracker    *synctrack.SingleFileTracker
+	// backlogDone, guarded by stateMu, is set once a paged list or a
+	// watch-list stream has delivered the cluster's whole backlog; a list or
+	// stream that starts after that is a relist, whether or not Run has seen
+	// the sync yet (synced is Run's goroutine's view and can lag).
+	backlogDone bool
 	// The watch state, guarded by stateMu: synced is set once Run's
 	// WaitForCacheSync has returned, held while a 403 has the reflector
 	// waiting and no watch has succeeded since, and watching is the last
@@ -204,8 +253,13 @@ type watcher struct {
 // newWatcher constructs a watcher. There is no resync period: a resync
 // re-fires every object a store holds, and this watcher holds none.
 func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster targetCluster) *watcher {
+	watchClient := cluster.WatchClient
+	if watchClient == nil {
+		watchClient = client
+	}
 	return &watcher{
 		client:        client,
+		watchClient:   watchClient,
 		dispatcher:    dispatcher,
 		cluster:       cluster,
 		forbiddenHold: forbiddenRetryInterval,
@@ -258,6 +312,7 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	deliveries := make(chan delivery, deliveryQueueDepth)
 	queue := cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{Transformer: stripManagedFields})
 	tracker := synctrack.NewSingleFileTracker(syncTrackerName)
+	w.deliveries, w.tracker = deliveries, tracker
 	controller := cache.New(&cache.Config{
 		Queue:                        queue,
 		ListerWatcher:                w.newListWatch(),
@@ -528,20 +583,8 @@ func (w *watcher) whoAmI(ctx context.Context) string {
 // the reflector sees from a cancelled request anyway.
 func (w *watcher) newListWatch() cache.ListerWatcher {
 	return cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
-		ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (k8sruntime.Object, error) {
-			release, err := w.gate.acquire(ctx)
-			if err != nil {
-				return nil, err
-			}
-			defer release()
-			list, err := w.client.CoreV1().Events(metav1.NamespaceAll).List(ctx, opts)
-			if err == nil {
-				w.listCompleted()
-				if list != nil {
-					w.recordMarksFromList(list)
-				}
-			}
-			return list, err
+		ListWithContextFunc: func(ctx context.Context, _ metav1.ListOptions) (k8sruntime.Object, error) {
+			return w.listInPages(ctx)
 		},
 		WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
 			initial := opts.SendInitialEvents != nil && *opts.SendInitialEvents
@@ -552,14 +595,28 @@ func (w *watcher) newListWatch() cache.ListerWatcher {
 					return nil, err
 				}
 			}
-			wi, err := w.client.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
+			wi, err := w.watchClient.CoreV1().Events(metav1.NamespaceAll).Watch(ctx, opts)
 			if err != nil {
 				release()
 				return wi, err
 			}
 			w.watchEstablished()
 			if initial {
-				wi = gatedWatch(wi, w.markObserver(), release)
+				// Counted once the server has accepted the stream: a reflector
+				// with watch-list on asks for one first on every relist, and a
+				// control plane without the gate refuses it before the paged
+				// list, which counts that relist itself.
+				if w.isRelist() {
+					log.Printf(restreamFormat, w.cluster.Name)
+					w.countRelist()
+				}
+				observe := w.markObserver()
+				wi = gatedWatch(wi, func(in watch.Event) {
+					observe(in)
+					if in.Type == watch.Bookmark && isInitialEventsEnd(in.Object) {
+						w.backlogDelivered()
+					}
+				}, release)
 			}
 			return wi, nil
 		},
@@ -595,6 +652,31 @@ func (w *watcher) listCompleted() {
 	defer w.stateMu.Unlock()
 	w.held = false
 	w.broken = false
+}
+
+// isRelist reports whether a paged list or watch-list stream about to start
+// is a second delivery of the cluster's backlog: Run has seen the sync, or
+// an earlier list or stream completed its backlog (backlogDelivered).
+func (w *watcher) isRelist() bool {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	return w.synced || w.backlogDone
+}
+
+// backlogDelivered records that the whole backlog has been handed to the
+// delivery goroutine: the paged list's last page, or the bookmark that ends a
+// watch-list stream's initial events.
+func (w *watcher) backlogDelivered() {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	w.backlogDone = true
+}
+
+// countRelist reports a relist to the metrics hook, when one is installed.
+func (w *watcher) countRelist() {
+	if w.onRelist != nil {
+		w.onRelist()
+	}
 }
 
 // markBroken records a list or watch failure that is not a 403. Reported as
@@ -763,18 +845,122 @@ func (w *watcher) recordMark(ev *corev1.Event) bool {
 	return w.dispatcher.RecordScaleUpMark(toTriageEvent(ev, w.cluster))
 }
 
-// recordMarksFromList records the marks one list page carries (see
-// recordMark); the reflector collects every page before it replaces the
-// store, so a mark on any page is on record before the first is delivered.
-func (w *watcher) recordMarksFromList(list *corev1.EventList) {
+// listInPages is the informer's list call. The reflector reaches it only
+// when it has no watch-list stream: the control plane refused
+// sendInitialEvents (WatchList off, before 1.32 and at 1.33) or the stream
+// failed, and on every relist after a watch it could not resume. client-go's
+// own list collects every page before the queue sees one Event, so the whole
+// backlog of a thousand-node cluster is in memory at once; this lists the
+// pages itself, hands each page's Events to the delivery goroutine and drops
+// it, and returns an empty list carrying the first page's resource version
+// for the reflector to watch from. The queue's initial batch is then empty,
+// and the sync tracker counts the pages' Events instead, so Run's sync still
+// means every Event of the backlog has been dispatched.
+//
+// The marks come first: a field-selected list per autoscaler reason puts
+// every TriggeredScaleUp and NotTriggerScaleUp on record before the first
+// page is delivered, which is what recordMark needs and what the single
+// collected list gave for free. The gate slot is held across both passes, as
+// the watch-list slot is held to the bookmark. The mark passes and the data
+// pass are separate snapshots, seconds apart: a mark written between them
+// is not on record when its pod's FailedScheduling is delivered, but a pod
+// the autoscaler ruled on seconds ago has been pending for seconds, and the
+// count backstop and the minimum span hold its event until the mark, which
+// the data pass or the watch delivers after it, has been recorded.
+//
+// A page that fails returns the error to the reflector. A 410 on a continue
+// token, a snapshot the API server has compacted under a slow batch, makes
+// the reflector list again at once, from the start, inside the same list
+// call; only a second failure reaches its backoff. The Events already
+// dispatched reach the dispatcher again then, as a relist's Events always
+// did, and the dedup window takes them.
+func (w *watcher) listInPages(ctx context.Context) (k8sruntime.Object, error) {
+	release, err := w.gate.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	relist := w.isRelist()
+	if relist {
+		log.Printf(relistFormat, w.cluster.Name, pagedListPageSize)
+		w.countRelist()
+	} else {
+		log.Printf(pagedListFormat, w.cluster.Name, pagedListPageSize)
+	}
+
 	recorded := 0
-	for i := range list.Items {
-		if w.recordMark(&list.Items[i]) {
-			recorded++
+	for _, reason := range scaleUpMarkReasons {
+		opts := metav1.ListOptions{FieldSelector: fmt.Sprintf(reasonSelectorFormat, reason)}
+		if _, err := w.eachEventPage(ctx, opts, func(ev *corev1.Event) error {
+			// The selector is the API server's to honour; a server that
+			// answers the whole backlog instead (client-go's fake does) must
+			// not have each mark recorded once per pass.
+			if ev.Reason != reason {
+				return nil
+			}
+			if w.recordMark(ev) {
+				recorded++
+			}
+			return nil
+		}); err != nil {
+			return nil, err
 		}
 	}
 	if recorded > 0 {
 		log.Printf(marksRecordedFormat, w.cluster.Name, recorded, marksSourceList)
+	}
+
+	resourceVersion, err := w.eachEventPage(ctx, metav1.ListOptions{}, func(ev *corev1.Event) error {
+		if !relist {
+			w.tracker.Start()
+		}
+		select {
+		case w.deliveries <- delivery{event: ev, initial: !relist}:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	w.backlogDelivered()
+	w.listCompleted()
+	return &corev1.EventList{ListMeta: metav1.ListMeta{ResourceVersion: resourceVersion}}, nil
+}
+
+// eachEventPage lists the cluster's Events in pages of pagedListPageSize at
+// pagedListResourceVersion, with opts' field selector, and calls fn on each
+// Event with its managedFields stripped (as the queue's transformer strips
+// them). It returns the first page's resource version, the snapshot every
+// later page continues from, which is where a watch resumes.
+func (w *watcher) eachEventPage(ctx context.Context, opts metav1.ListOptions, fn func(*corev1.Event) error) (string, error) {
+	opts.Limit = pagedListPageSize
+	opts.ResourceVersion = pagedListResourceVersion
+	var resourceVersion string
+	for {
+		list, err := w.client.CoreV1().Events(metav1.NamespaceAll).List(ctx, opts)
+		if err != nil {
+			return "", err
+		}
+		if resourceVersion == "" {
+			resourceVersion = list.ResourceVersion
+		}
+		// The whole page first, then the calls: a page is held until its
+		// last Event has been handed over, and a server that ignores the
+		// limit answers the whole backlog as one page.
+		for i := range list.Items {
+			list.Items[i].SetManagedFields(nil)
+		}
+		for i := range list.Items {
+			if err := fn(&list.Items[i]); err != nil {
+				return "", err
+			}
+		}
+		if list.Continue == "" {
+			return resourceVersion, nil
+		}
+		opts.Continue = list.Continue
 	}
 }
 

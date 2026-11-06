@@ -119,10 +119,11 @@ that failure is why this step has previously been skipped rather than run.
 **Shell scripts.** If you change a `.sh` file, run `make shellcheck`. The `validate` job runs the
 same target on every pull request, and it is a required check, so a warning-severity finding in
 any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
-shellcheck step in `.github/workflows/validate.yml`) from
-<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
-package on the GitHub-hosted runner image is whatever release that image's Ubuntu ships, not the
-one the job pins and asserts, and a different release reports a different set of findings than CI.
+shellcheck step in `.github/workflows/validate.yml`): a different release reports a different set
+of findings than CI. A distribution package is whatever release that distribution ships, so check
+`shellcheck --version` against the pin and install from
+<https://github.com/koalaman/shellcheck/releases> when it differs; the job does the same with the
+runner image's package.
 Fix a finding or suppress it with `# shellcheck disable=SCnnnn # reason` on the line above the
 command (shellcheck rejects a directive placed after one); the Makefile's exclude list is not the
 place, and the comment above the target says why. In a mirrored `gke-*` skill, make the edit in
@@ -172,7 +173,14 @@ file that downloads something is not covered until it is added there. A download
 consumer is exempt, because curl retries by restarting the transfer and the consumer has already
 been fed the bytes of the failed one.
 
-That module gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
+`docker-build.yml` also retries whole steps: the buildx setup and each image build that fetches
+from the network run once more, after a pause, when the first attempt fails. The in-image gate
+check runs once, because its failure is a test verdict. A new `docker/setup-buildx-action` or
+`docker/build-push-action` step there takes the same id, pause and retry steps, or joins
+`_EXEMPT_STEPS` with a reason. `python3 -m unittest tests.test_docker_build_retry` checks the
+shape.
+
+`tests/test_third_party_download_retry.py` gates more than the flags. It also runs the envtest retry loop in `k8s-operator/Makefile`,
 the `go install` retry behind setup-envtest, controller-gen and kustomize, and `a2a-test.yml`'s
 nats CLI install step against stubs, and reads the envtest cache steps in `k8s-operator-test.yml` and `a2a-test.yml` —
 one shared key, restored everywhere and saved only on main — so editing the macro or dropping a
@@ -182,7 +190,10 @@ clone that pip does not retry, and `tests/test_bench_deps_install_retry.py` runs
 stub pip. The artifact download in `python-tests.yml`'s join gets a second attempt a minute after a
 failed first one, because the action's own retries ran out twice with every shard uploaded;
 `test_the_join_downloads_the_shards_coverage_twice` in `scripts/test_integration_contracts.py` holds
-that shape.
+that shape. Every workflow that restores an Actions cache caps `@actions/cache`'s wait on one
+segment at a minute (`SEGMENT_DOWNLOAD_TIMEOUT_MINS`), so a restore the service refuses under the
+account's egress limit falls through to a cold install instead of holding the step for ten;
+`.agents/rules/github_actions.md` has the rule and `tests/test_cache_segment_timeout.py` holds it.
 
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
@@ -612,10 +623,9 @@ The two labels are the two people:
   the changed paths — [`OWNERS`](../OWNERS) at the root,
   [`k8s-api-proxy/OWNERS`](../k8s-api-proxy/OWNERS), which adds approvers for that module, and
   [`hack/OWNERS`](../hack/OWNERS) for the presubmit eval rosters (`hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`),
-  the inject lane's exclusions and safeguards under `hack/eval/`, and `hack/ci-eval-pr.sh` with the files that run inside it
-  ([`docs/eval-gate-roster.md`](eval-gate-roster.md) lists them; one is under `scripts/installer/OWNERS`), with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
+  and the inject lane's exclusions and safeguards under `hack/eval/`, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `eval-crew`. The last names only
   `eval-crew` and sets `no_parent_owners`, so a root approver's `/approve` does not clear a change
-  to what the presubmit runs, what blocks, or what grades it; the nightly file and the case directories under
+  to what the presubmit runs or what blocks; the nightly file and the case directories under
   `bench/tasks/` fall through to the root approvers (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one
   review from one person (#1070). An approver's own pull request counts as self-approved, so a
@@ -631,8 +641,7 @@ between them by what the author's own approval already covers (#1075): an approv
 only `lgtm`, so the draw is the whole pool at equal weight; any other change still needs an
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
-settles a self-approved change and nothing else. The `hack/eval/presubmit-cases.txt`,
-`hack/eval/blocking-roster.txt` and grader-pin entries send a change there to its own `eval-crew` group, so the
+settles a self-approved change and nothing else. The entries for the two presubmit roster files and the inject lane's two files under `hack/eval/` send a change there to its own `eval-crew` group, so the
 reviewer the workflow summons can clear both labels in one action. Not every `eval-crew`
 member is a root approver, so a change that also touches root-owned paths still waits on a root
 approver's `/approve` after that review. The bot never requests the author, so a member's own case
@@ -717,8 +726,6 @@ statuses on the head when an input changes — a push, a label, a new smoke stat
 green, so a gate missing from the head has not passed yet. Its `merge_group` jobs decide the same
 two again on the queue commit, and the enqueue sweep re-posts the head statuses of approved pull
 requests on its schedule. `scripts/merge_gate.py` is the reference for what each one reads.
-[`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) still re-pins a green's
-`BaseSHA:` suffix to the new head of `main`, which only Tide read.
 
 A push starts a fresh smoke run.
 [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0, makes some runs cheap: before

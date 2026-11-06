@@ -213,8 +213,9 @@ full-mode apply sets it again.
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s
 entrypoint's doing, and every published release's entrypoint does the same. Skills are not kept:
-on every start the entrypoint replaces the platform profile's `skills/`, and every cluster
-profile's, whole from the image. A skill `N` added is therefore gone at the first start after the
+on every start the entrypoint replaces the platform profile's `skills/` whole from the image, and
+a cluster profile's whenever its boot stamp does not match the image, which a start on a
+different image always is. A skill `N` added is therefore gone at the first start after the
 harness step rather than staying and failing on use
 ([Skills](/kube-agents/concepts/skills/#importing-external-skills) says the same of an injected
 skill).
