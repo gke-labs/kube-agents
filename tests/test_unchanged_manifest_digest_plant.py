@@ -138,6 +138,8 @@ class PlantTest(unittest.TestCase):
         self.assertEqual(titles, [f"{_MARK} authorized-networks Cluster/seeded-c"])
         self.assertTrue(self.plant.digest_record_path(self.audit_report).is_file())
         self.assertTrue(self.plant.planted_manifest_path(self.audit_report).is_file())
+        state = json.loads(self.plant.plant_state_path(self.audit_report).read_text(encoding="utf-8"))
+        self.assertEqual(state["finished_at"], latest["finished_at"])
         argv = self.collector_calls[0].args[0]
         self.assertEqual(argv[1:], [str(_SCRIPTS / "fleet_drift.py"), "--scope-projects", "p", "--config-connector"])
 
@@ -177,6 +179,22 @@ class PlantTest(unittest.TestCase):
         self.assertEqual(sorted(runs.glob("*.json")), [kept])
         self.assertFalse(self.plant.digest_record_path(self.audit_report).exists())
         self.assertFalse(self.plant.planted_manifest_path(self.audit_report).exists())
+
+    def test_the_teardown_removes_the_planted_envelope_without_the_mark(self):
+        """`finish` carries the previous run's wording, so the stored document can show no mark."""
+        self.assertEqual(self.run_plant(_MANIFEST), 0, self.err)
+        for path in [self.store() / "latest.json", *(self.store() / "runs").glob("*.json")]:
+            path.write_text(path.read_text(encoding="utf-8").replace(_MARK, "carried"), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.plant.teardown(self.audit_report, _MARK), 0)
+        self.assertFalse((self.store() / "latest.json").exists())
+        self.assertEqual(list((self.store() / "runs").glob("*.json")), [])
+        self.assertFalse(self.plant.plant_state_path(self.audit_report).exists())
+
+    def test_an_older_newest_envelope_fails_the_plant(self):
+        with mock.patch.object(self.plant, "stored_envelope", return_value=({"scheduled": True, "finished_at": "2020-01-01T00:00:00+00:00"}, "r")):
+            self.assertEqual(self.run_plant(_MANIFEST), 1)
+        self.assertIn("does not hold this scheduled run", self.err)
 
     def test_become_data_owner_does_nothing_when_not_root(self):
         with mock.patch.object(self.plant.os, "geteuid", return_value=1000):
