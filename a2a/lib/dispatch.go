@@ -33,9 +33,9 @@ const ProfileLeaseBucket = "PROFILE_LEASES"
 // DeliverAll replays everything inside it, so the dispatcher keeps a
 // finished task's tombstone (LeaseRecord.FinishedAt) at least this long
 // when the dispatch config carries no SubmitRetentionSeconds, and never
-// less than this when it does. It is a compiled value, not the live
-// stream's: the operator never edits an existing stream, so don't lower it
-// below any max age an operator has created PROFILE_SUBMITS with (#4948).
+// less than this when it does. The operator renders the live stream's max
+// age when it is longer than its own constant (#4948), so a stream an older
+// operator created longer is covered by the config, not by this floor.
 const ProfileSubmitRetention = 72 * time.Hour
 
 // MaxSubmitRetention is the longest SubmitRetentionSeconds a dispatch

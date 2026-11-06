@@ -1457,6 +1457,16 @@ install, at once when the Ready status update next writes for any other reason. 
 writers carry the field through as they read it, so a pass that ends `Degraded` lands nothing new.
 `inference` follows the same rule under a served CRD that predates it.
 
+`profileSubmitMaxAgeSeconds` is the live `PROFILE_SUBMITS` stream's max age, as the A2A
+provision Job last read it, when it is longer than this release creates the stream with (`0` is no
+age limit). Provisioning never edits an existing stream, so a stream an older release created
+keeps its own max age. The dispatch config's submit retention is the longer of the two, so a
+finished task's tombstone outlives its submission; no age limit renders a year.
+
+The field is absent when the stream is no longer than this release's, and before the first report.
+Only a report the operator can read changes it. Under a served CRD that predates the field the write is dropped and
+the retention stays this release's own until the CRD is applied.
+
 The counters and the two times land through the poller above, which consults the same five-minute
 record. Under a served CRD that predates `status.usage` they accumulate in the
 `<name>-usage-counters` ConfigMap and land with the first patch after this release's CRD is
