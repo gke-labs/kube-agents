@@ -24,7 +24,9 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"maps"
 	"net"
+	"os"
 	"path"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,6 +36,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	sigsyaml "sigs.k8s.io/yaml"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -48,6 +52,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"k8s.io/client-go/tools/record"
 )
 
 func a2aTestAgent() *agentv1alpha1.PlatformAgent {
@@ -61,13 +66,14 @@ func a2aTestCreds() *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"},
 		Data: map[string][]byte{
-			"gateway-password": []byte("pw-gateway"),
-			"bridge-password":  []byte("pw-bridge"),
-			"seed-password":    []byte("pw-seed"),
-			"web-password":     []byte("pw-web"),
-			"console-password": []byte("pw-console"),
-			"sys-password":     []byte("pw-sys"),
-			"callout-password": []byte("pw-callout"),
+			"gateway-password":     []byte("pw-gateway"),
+			"bridge-password":      []byte("pw-bridge"),
+			"seed-password":        []byte("pw-seed"),
+			"web-password":         []byte("pw-web"),
+			"console-password":     []byte("pw-console"),
+			"console-mcp-password": []byte("pw-console-mcp"),
+			"sys-password":         []byte("pw-sys"),
+			"callout-password":     []byte("pw-callout"),
 		},
 	}
 }
@@ -245,11 +251,12 @@ func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
 		// ack to hold — and a consumer on KV_cap is precisely the thing its
 		// grants are shaped to forbid, because one would be a live feed of
 		// every capability in flight.
-		"verifier": nil,
-		"seed":     nil,
-		"web":      nil,
-		"console":  nil,
-		"sys":      nil,
+		"verifier":        nil,
+		"seed":            nil,
+		"web":             nil,
+		"console":         nil,
+		a2aConsoleMCPUser: nil,
+		"sys":             nil,
 	}
 
 	for _, id := range a2aIdentities(agent) {
@@ -762,6 +769,7 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
 		"$JS.API.DIRECT.GET.PROFILE_SUBMITS.>",
 		"chat.console.*.in",
+		"chat.console.*.confirm",
 		"_INBOX.console.>",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -771,8 +779,8 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	if !reflect.DeepEqual(gotSub, wantSub) {
 		t.Errorf("console subscribe allow-list changed.\n got: %q\nwant: %q", gotSub, wantSub)
 	}
-	// web's subtraction: `a2a.>` covers the verifier's queue group.
-	if want := []string{"a2a.cap.>"}; !reflect.DeepEqual(gotSubDeny, want) {
+	// web's subtractions: `a2a.>` covers the verifier's queue group, dispatch offers and the stop records.
+	if want := []string{"a2a.cap.>", "a2a.dispatch.>", "a2a.stop.>"}; !reflect.DeepEqual(gotSubDeny, want) {
 		t.Errorf("console subscribe deny-list = %q, want %q", gotSubDeny, want)
 	}
 	// No verb on any KV_* stream, STREAM.INFO included: its subjects_filter
@@ -783,8 +791,8 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 		}
 	}
 
-	// The other half of the door: the gateway can hear the inbound subject
-	// and answer on the outbound one.
+	// The other half of the door: the gateway can hear the inbound and
+	// confirm subjects and answer on the outbound one.
 	gw := conf[strings.Index(conf, "user: gateway"):]
 	gw = gw[:strings.Index(gw[1:], "user: ")+1]
 	if !strings.Contains(gw, `"chat.console.*.out"`) {
@@ -792,6 +800,9 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 	if !strings.Contains(gw, `"chat.console.*.in"`) {
 		t.Error("gateway cannot subscribe the console inbound subject")
+	}
+	if !strings.Contains(gw, `"chat.console.*.confirm"`) {
+		t.Error("gateway cannot subscribe the console confirm subject")
 	}
 }
 
@@ -1552,18 +1563,127 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if !ok {
 		t.Fatalf("quota does not bound pods: %v", hard)
 	}
-	// Default gateway cap 10 + the fixed headroom for the rest of the
-	// namespace (base stack, rollout surge, race overshoot).
-	if pods.Value() != 26 {
-		t.Fatalf("default quota = %d, want 26 (cap 10 + headroom 16)", pods.Value())
+	// The gateway's cap plus the derived headroom (#3848): what the operator
+	// renders for the agent, the chart's pods (the default for a CR the chart
+	// did not stamp), and the transient margin.
+	standing := a2aStandingPods(agent)
+	want := 10 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin
+	if pods.Value() != want {
+		t.Fatalf("default quota = %d, want %d (cap 10 + standing %d + chart default %d + margin %d)",
+			pods.Value(), want, standing, a2aDefaultChartPods, a2aQuotaTransientMargin)
 	}
 
 	two := 2
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &two}}
 	pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
-	if pods.Value() != 18 {
-		t.Fatalf("tuned quota = %d, want 18 (cap 2 + headroom 16)", pods.Value())
+	if want := 2 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin; pods.Value() != want {
+		t.Fatalf("tuned quota = %d, want %d", pods.Value(), want)
 	}
+
+	// The MCP server is one more standing pod, only while its flag is on (#3869).
+	without := pods.Value()
+	t.Setenv(a2aMCPDoorEnvVar, "true")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+1 {
+		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
+	}
+
+	// And the profile dispatcher, one more while its image is set (#4808).
+	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+2 {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher = %d, want %d (two more than without them)", pods.Value(), without+2)
+	}
+}
+
+// The chart's standing pods come from the annotation the chart stamps on the
+// CR; a CR without one, or with an unreadable one, gets the chart's default.
+func TestA2AQuotaCountsTheChartsPods(t *testing.T) {
+	base := a2aTestAgent()
+	quotaBase := int64(resolveA2AMaxSessions(base)) + a2aStandingPods(base) + a2aQuotaTransientMargin
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		want       int64
+	}{
+		{"the chart's count", ptr.To("7"), quotaBase + 7},
+		{"zero, for a chart that renders none here", ptr.To("0"), quotaBase},
+		{"trimmed", ptr.To(" 4 "), quotaBase + 4},
+		{"the default without the annotation", nil, quotaBase + a2aDefaultChartPods},
+		{"the default for an unreadable count", ptr.To("seven"), quotaBase + a2aDefaultChartPods},
+		{"the default for a negative count", ptr.To("-3"), quotaBase + a2aDefaultChartPods},
+		{"the cap itself", ptr.To(strconv.Itoa(a2aMaxChartPods)), quotaBase + a2aMaxChartPods},
+		{"the default past the cap", ptr.To(strconv.Itoa(a2aMaxChartPods + 1)), quotaBase + a2aDefaultChartPods},
+		{"the default for a figure that would wrap the quota", ptr.To("9223372036854775807"), quotaBase + a2aDefaultChartPods},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			pods := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]
+			if pods.Value() != tc.want {
+				t.Fatalf("quota = %d, want %d", pods.Value(), tc.want)
+			}
+		})
+	}
+}
+
+// An agent scaled to zero runs no agent pod, so it holds no slot of the
+// headroom; the rest of the stack still stands.
+func TestA2AStandingPodsDropTheAgentPodAtScaleToZero(t *testing.T) {
+	agent := a2aTestAgent()
+	running := a2aStandingPods(agent)
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{ScaleToZero: ptr.To(true)}
+	if got := a2aStandingPods(agent); got != running-1 {
+		t.Fatalf("a2aStandingPods at scaleToZero = %d, want %d", got, running-1)
+	}
+}
+
+// a2aStandingPods has to name every standing workload the operator renders in
+// next mode. The next-mode golden is the operator's own steady-state render of
+// the example CR, so a Deployment or StatefulSet added there and not here fails
+// this rather than quietly eating the session headroom (#3848).
+func TestA2AStandingPodsMatchTheNextModeGolden(t *testing.T) {
+	dir := filepath.Join("..", "testing", "testdata", "platform")
+	input, err := os.ReadFile(filepath.Join(dir, "platformagent-next.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := &agentv1alpha1.PlatformAgent{}
+	if err := sigsyaml.Unmarshal(input, agent); err != nil {
+		t.Fatal(err)
+	}
+	golden, err := os.ReadFile(filepath.Join(dir, "expected", "platformagent-next.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rendered int64
+	var names []string
+	for _, doc := range strings.Split(string(golden), "\n---\n") {
+		var w struct {
+			Kind     string `json:"kind"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+			} `json:"spec"`
+		}
+		if err := sigsyaml.Unmarshal([]byte(doc), &w); err != nil {
+			t.Fatal(err)
+		}
+		if w.Kind != "Deployment" && w.Kind != "StatefulSet" {
+			continue
+		}
+		rendered += int64(ptr.Deref(w.Spec.Replicas, 1))
+		names = append(names, w.Kind+"/"+w.Metadata.Name)
+	}
+	if len(names) == 0 {
+		t.Fatal("no Deployment or StatefulSet found in the next-mode golden")
+	}
+	if got := a2aStandingPods(agent); got != rendered {
+		t.Fatalf("a2aStandingPods = %d, the next-mode golden runs %d pods across %v", got, rendered, names)
+	}
+
 }
 
 // The CR field reaches the gateway as an explicit env value even when unset:
@@ -2156,9 +2276,10 @@ func remedyRecreateWidth(t *testing.T, message string) int {
 // clean pass run, and require the tree to be empty at the end rather than
 // merely error-free.
 func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
-	// With the dispatcher on, so its objects are rendered and the cleanup
-	// is held to deleting them too.
+	// With the dispatcher and the gateway's election on, so their objects
+	// are rendered and the cleanup is held to deleting them too.
 	t.Setenv(a2aDispatcherImageEnvVar, "registry.example/a2a-dispatcher:test")
+	t.Setenv(a2aGatewayElectionEnvVar, "true")
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -4026,6 +4147,8 @@ func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
 	if before == "" {
 		t.Fatal("pod template carries no config hash")
 	}
+	// A changed config moves a running bus only behind a rolled-out callout.
+	theCalloutIsRolledOut(t, ctx, cl, agent)
 
 	// A reconcile that changes nothing must not roll the bus.
 	if _, err := r.Reconcile(ctx, req); err != nil {
@@ -5142,7 +5265,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
 		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
-		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
+		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
 		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {
 		t.Errorf("gateway subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
@@ -5920,6 +6043,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			streams:      consoleStreams,
 			accountLevel: []string{"$JS.API.INFO"},
 		},
+		a2aConsoleMCPUser: {
+			streams:      consoleStreams,
+			accountLevel: []string{"$JS.API.INFO"},
+		},
 		"provision": {
 			callout:      true,
 			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
@@ -6181,6 +6308,7 @@ func TestSubjectPatternsOverlap(t *testing.T) {
 // namespace wholesale in rule 2 would be wider than the thing being held.
 const (
 	consoleInbound  = "chat.console.*.in"
+	consoleConfirm  = "chat.console.*.confirm"
 	consoleOutbound = "chat.console.*.out"
 )
 
@@ -6201,7 +6329,7 @@ const (
 
 // chatDoorSubjects is every chat.* grant the render may produce, each
 // admitted as an exact subject.
-var chatDoorSubjects = []string{consoleInbound, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
+var chatDoorSubjects = []string{consoleInbound, consoleConfirm, consoleOutbound, notifyRequest, notifyRequestSlack, notifyRequestConsole, notifyReply, boardRequest, boardReply}
 
 // grantNamespaceAllowed is rule 2's spelling check. A grant's first token
 // must name one of the bus's own namespaces, or the grant must BE one of the
@@ -6234,6 +6362,7 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 		allowed bool
 	}{
 		{consoleInbound, true},
+		{consoleConfirm, true},
 		{consoleOutbound, true},
 		{notifyRequest, true},
 		{notifyRequestSlack, true},
@@ -6275,28 +6404,31 @@ func TestGrantNamespaceCheckRefusesChatBeyondTheDoor(t *testing.T) {
 
 // consoleDoorViolations returns one line per grant, across ids, that
 // overlaps a console door subject pattern on a principal other than that
-// side's one intended holder: publish on chat.console.*.in is console's
-// alone, subscribe there is gateway's alone, and the reverse for
-// chat.console.*.out.
+// side's intended holders: publish on chat.console.*.in is console and
+// console-mcp's alone, publish on chat.console.*.confirm is console's alone,
+// subscribe on both is gateway's alone, and the reverse for chat.console.*.out.
 func consoleDoorViolations(ids []a2aIdentity) []string {
 	rules := []struct {
-		verb, pattern, owner string
-		grants               func(a2aIdentity) []string
+		verb, pattern string
+		owners        []string
+		grants        func(a2aIdentity) []string
 	}{
-		{"publish", consoleInbound, "console", func(id a2aIdentity) []string { return id.publish }},
-		{"publish", consoleOutbound, "gateway", func(id a2aIdentity) []string { return id.publish }},
-		{"subscribe", consoleInbound, "gateway", func(id a2aIdentity) []string { return id.subscribe }},
-		{"subscribe", consoleOutbound, "console", func(id a2aIdentity) []string { return id.subscribe }},
+		{"publish", consoleInbound, []string{"console", a2aConsoleMCPUser}, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", consoleConfirm, []string{"console"}, func(id a2aIdentity) []string { return id.publish }},
+		{"publish", consoleOutbound, []string{"gateway"}, func(id a2aIdentity) []string { return id.publish }},
+		{"subscribe", consoleInbound, []string{"gateway"}, func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", consoleConfirm, []string{"gateway"}, func(id a2aIdentity) []string { return id.subscribe }},
+		{"subscribe", consoleOutbound, []string{"console", a2aConsoleMCPUser}, func(id a2aIdentity) []string { return id.subscribe }},
 	}
 	var out []string
 	for _, id := range ids {
 		for _, r := range rules {
-			if id.user == r.owner {
+			if slices.Contains(r.owners, id.user) {
 				continue
 			}
 			for _, g := range r.grants(id) {
 				if subjectPatternsOverlap(g, r.pattern) {
-					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %s may %s it", id.user, r.verb, g, r.pattern, r.owner, r.verb))
+					out = append(out, fmt.Sprintf("%s %s %q overlaps %s; only %v may %s it", id.user, r.verb, g, r.pattern, r.owners, r.verb))
 				}
 			}
 		}
@@ -8353,5 +8485,121 @@ func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 	noIntegration := a2aTestAgent()
 	if teamsEnabled(noIntegration) || !peopleReadingEnabled(noIntegration) {
 		t.Fatal("a CR with no spec.integration: want Teams off and the reading enabled")
+	}
+}
+
+// Each workload the operator renders only on a condition is counted when it
+// runs, in agent.Namespace: the credential proxy's exec tier (a CR field), the
+// MCP door and the dispatcher (operator flags). The golden tie cannot see
+// these, so each has a row here, and a new conditional workload needs one.
+func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
+	base := a2aStandingPods(a2aTestAgent())
+	t.Run("the exec tier, at its replicas", func(t *testing.T) {
+		agent := a2aTestAgent()
+		if agent.Spec.Deployment == nil {
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+		}
+		agent.Spec.Deployment.CredentialProxy = &agentv1alpha1.CredentialProxySpec{Exec: &agentv1alpha1.CredentialProxyExecSpec{Replicas: ptr.To(int32(3))}}
+		if got := a2aStandingPods(agent); got != base+3 {
+			t.Fatalf("standing pods with exec.replicas 3 = %d, want %d", got, base+3)
+		}
+	})
+	t.Run("the MCP door", func(t *testing.T) {
+		t.Setenv(a2aMCPDoorEnvVar, "true")
+		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
+		}
+	})
+	t.Run("the dispatcher", func(t *testing.T) {
+		t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:dev")
+		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
+			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
+		}
+	})
+}
+
+// A chart-pods annotation the operator discards is reported, once per spec
+// generation, as a Warning event; an absent one (a CR written without the
+// chart) and a usable one are not.
+func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
+	warnings := func(rec *record.FakeRecorder) int {
+		n := 0
+		for {
+			select {
+			case e := <-rec.Events:
+				if strings.Contains(e, a2aChartPodsDiscardedReason) {
+					n++
+				}
+			default:
+				return n
+			}
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		annotation *string
+		want       int
+	}{
+		{"past the cap", ptr.To("70"), 1},
+		{"unreadable", ptr.To("seven"), 1},
+		{"negative", ptr.To("-3"), 1},
+		{"usable", ptr.To("5"), 0},
+		{"absent", nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.annotation != nil {
+				agent.Annotations = map[string]string{a2aChartPodsAnnotation: *tc.annotation}
+			}
+			if why := a2aChartPodsDiscard(agent); (why != "") != (tc.want > 0) {
+				t.Fatalf("a2aChartPodsDiscard = %q", why)
+			}
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec}
+			ctx := context.Background()
+			for range 2 {
+				if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := warnings(rec); got != tc.want {
+				t.Fatalf("%d %s events over two passes of one generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+			agent.Generation++
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := warnings(rec); got != tc.want {
+				t.Fatalf("%d %s events after a new generation, want %d", got, a2aChartPodsDiscardedReason, tc.want)
+			}
+			// An annotation edit leaves the generation alone; a new bad value
+			// still warns, once.
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "99"}
+			for range 2 {
+				if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := warnings(rec); got != 1 {
+				t.Fatalf("%d %s events after a new bad value at the same generation, want 1", got, a2aChartPodsDiscardedReason)
+			}
+			// A usable value in between re-arms it: the same bad value again
+			// warns once more.
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "5"}
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			agent.Annotations = map[string]string{a2aChartPodsAnnotation: "99"}
+			if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			if got := warnings(rec); got != 1 {
+				t.Fatalf("%d %s events for a bad value back after a usable one, want 1", got, a2aChartPodsDiscardedReason)
+			}
+		})
 	}
 }

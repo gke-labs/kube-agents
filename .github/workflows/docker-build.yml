@@ -36,6 +36,38 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Every step that reaches a service this repository does not control -- the
+    # buildx setup and each image build but the in-image gate check -- runs
+    # once more if its first attempt fails. Five failed attempts between 2026-10-22
+    # and 2026-11-03 each died on a different service, and each passed on a
+    # manual re-run of the same commit:
+    #
+    #   - mirror.gcr.io, pulling the builder image: a per-minute project quota
+    #     (`toomanyrequests`), and a manifest whose config blob was `not found`
+    #     (#3825);
+    #   - packages.cloud.google.com, mid-publish: `File has unexpected size ...
+    #     Mirror sync in progress?` 13 seconds after its Release file (#4653);
+    #   - proxy.golang.org: `stream error: ... INTERNAL_ERROR` (#4404);
+    #   - the npm registry: an optional dependency that npm skipped without an
+    #     error, so tsup could not load `@rollup/rollup-linux-x64-gnu` (#4404).
+    #
+    # A retry inside the Dockerfile would have to cover apt, curl, go, npm and
+    # pip, one site at a time; the next new fetch would be unguarded again. Here
+    # the retry covers every fetch in the step, and it costs little: the builder
+    # keeps every layer the failed attempt finished, so the retry runs only the
+    # RUN that failed. A real build break fails both attempts and the job.
+    #
+    # The in-image gate check runs once: its RUN is a behavioural test whose
+    # intermittent failure flaky-check-notify.yml must still see. A mirror error
+    # can still red it; that red stays visible and a hand re-run records it.
+    #
+    # The pause step logs a warning annotation and a line in the job summary, so
+    # an attempt that needed the retry stays visible; flaky-check-notify.yml no
+    # longer sees it, because the job passes. RETRY_PAUSE_SECONDS outlasts the mirror's
+    # per-minute quota window and gives a repository mid-publish time to finish.
+    # tests/test_docker_build_retry.py holds the retry on every such step.
+    env:
+      RETRY_PAUSE_SECONDS: "60"
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,10 +98,26 @@ jobs:
       # daemon is covered by neither; none in this job pulls one, and
       # security-scan.yml names its job container on the mirror for the same reason.
       - name: Set up Docker Buildx
+        id: buildx
+        continue-on-error: true
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-        with:
+        with: &buildx-with
           buildkitd-config: .github/buildkitd.toml
           driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
+
+      - name: Wait before retrying Set up Docker Buildx
+        if: steps.buildx.outcome == 'failure'
+        env:
+          FAILED_STEP: Set up Docker Buildx
+        run: &retry-pause |
+          echo "::warning::${FAILED_STEP} failed on its first attempt; retrying once in ${RETRY_PAUSE_SECONDS}s"
+          echo "- ${FAILED_STEP}: first attempt failed, retried once" >> "$GITHUB_STEP_SUMMARY"
+          sleep "$RETRY_PAUSE_SECONDS"
+
+      - name: Set up Docker Buildx (retry)
+        if: steps.buildx.outcome == 'failure'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with: *buildx-with
 
       # platforms: linux/amd64 on every deploy/docker/Dockerfile build: the images
       # deploy to amd64 GKE nodes, and the multi-arch bases otherwise resolve to
@@ -131,8 +179,10 @@ jobs:
       # different image. Two images sharing a scope overwrite each other's index and
       # both stop hitting.
       - name: Build Platform Agent
+        id: build-platform
+        continue-on-error: true
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
+        with: &build-platform-with
           context: .
           file: deploy/docker/Dockerfile
           target: platform
@@ -144,6 +194,17 @@ jobs:
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=platform-agent' || '' }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+
+      - name: Wait before retrying Build Platform Agent
+        if: steps.build-platform.outcome == 'failure'
+        env:
+          FAILED_STEP: Build Platform Agent
+        run: *retry-pause
+
+      - name: Build Platform Agent (retry)
+        if: steps.build-platform.outcome == 'failure'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: *build-platform-with
 
       # Checked against `platform`, the deepest chain the Dockerfile ships; the
       # docstring in scripts/check_image_layers.py says why it is that one.
@@ -162,6 +223,13 @@ jobs:
       # away — as a worker exiting with "Unknown skill(s)" — so it is worth failing the PR
       # for. The host-side unit tests cannot reach it: see the stage comment in the
       # Dockerfile.
+      #
+      # The one build here with no retry. Its RUN is the gate check, a behavioural
+      # test, so a failure on the first attempt is a verdict on the code, and a
+      # retry would hide an intermittent one from flaky-check-notify.yml. Its solve
+      # still resolves the tag-referenced bases against the mirror, so a mirror
+      # error can still red this step; that red stays visible and a hand re-run
+      # records it as a flake, which is the accepted cost.
       - name: Verify entrypoint shared-state gate (in-image)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -206,8 +274,10 @@ jobs:
       # the shorter chain of the two and not the one the budget is measured
       # against; building it still proves the stage compiles.
       - name: Build Credential Sidecar
+        id: build-credential-proxy
+        continue-on-error: true
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
+        with: &build-credential-proxy-with
           context: .
           file: deploy/docker/Dockerfile
           target: credential-proxy
@@ -217,34 +287,84 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
-      - name: Build Kube Proxy
+      - name: Wait before retrying Build Credential Sidecar
+        if: steps.build-credential-proxy.outcome == 'failure'
+        env:
+          FAILED_STEP: Build Credential Sidecar
+        run: *retry-pause
+
+      - name: Build Credential Sidecar (retry)
+        if: steps.build-credential-proxy.outcome == 'failure'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
+        with: *build-credential-proxy-with
+
+      - name: Build Kube Proxy
+        id: build-kube-proxy
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: &build-kube-proxy-with
           context: .
           file: deploy/kube-proxy/Dockerfile
           platforms: linux/amd64
           push: false
           tags: kube-proxy:latest
 
-      - name: Build Replay Proxy
+      - name: Wait before retrying Build Kube Proxy
+        if: steps.build-kube-proxy.outcome == 'failure'
+        env:
+          FAILED_STEP: Build Kube Proxy
+        run: *retry-pause
+
+      - name: Build Kube Proxy (retry)
+        if: steps.build-kube-proxy.outcome == 'failure'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
+        with: *build-kube-proxy-with
+
+      - name: Build Replay Proxy
+        id: build-replay-proxy
+        continue-on-error: true
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: &build-replay-proxy-with
           context: examples/inference-replay/replay-proxy
           push: false
           tags: replay-proxy:latest
+
+      - name: Wait before retrying Build Replay Proxy
+        if: steps.build-replay-proxy.outcome == 'failure'
+        env:
+          FAILED_STEP: Build Replay Proxy
+        run: *retry-pause
+
+      - name: Build Replay Proxy (retry)
+        if: steps.build-replay-proxy.outcome == 'failure'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: *build-replay-proxy-with
 
       # Context is the repository root: the sandbox ships the same
       # credential-proxy client the agent image does, from its own location.
       # load: true because the next step runs the image, not just builds it.
       - name: Build Agent Sandbox
+        id: build-sandbox
+        continue-on-error: true
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
+        with: &build-sandbox-with
           context: .
           file: deploy/sandbox/Dockerfile
           platforms: linux/amd64
           push: false
           load: true
           tags: agent-sandbox:latest
+
+      - name: Wait before retrying Build Agent Sandbox
+        if: steps.build-sandbox.outcome == 'failure'
+        env:
+          FAILED_STEP: Build Agent Sandbox
+        run: *retry-pause
+
+      - name: Build Agent Sandbox (retry)
+        if: steps.build-sandbox.outcome == 'failure'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with: *build-sandbox-with
 
       # A build cannot tell you whether sshd starts, whether the agent's key is
       # accepted, or whether CREDENTIAL_PROXY_URL reaches the shell — the last

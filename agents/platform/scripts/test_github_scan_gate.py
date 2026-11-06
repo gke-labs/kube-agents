@@ -27,6 +27,7 @@ import inspect
 import dataclasses
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -559,6 +560,58 @@ class ParseTaskIdTest(unittest.TestCase):
 
     def test_unreadable_response_is_none(self):
         self.assertIsNone(gate._parse_task_id("board is down"))
+
+
+class FileCardOriginTest(unittest.TestCase):
+    """The board stamp is the card's `origin`, set by the in-pod override, never an argument."""
+
+    def _stub(self, sent, origin_module):
+        import types
+
+        kanban = types.ModuleType("hermes_cli.kanban")
+        current = getattr(origin_module, "current", lambda: None)
+        kanban.run_slash = lambda cmd: sent.append((cmd, current())) or '{"id": "t_1"}'
+        pkg = types.ModuleType("hermes_cli")
+        pkg.kanban = kanban
+        modules = {"hermes_cli": pkg, "hermes_cli.kanban": kanban}
+        if origin_module is not None:
+            pkg.kanban_origin = origin_module
+            modules["hermes_cli.kanban_origin"] = origin_module
+        return mock.patch.dict(sys.modules, modules)
+
+    def test_each_card_files_under_a_freshly_minted_ticket_for_its_origin(self):
+        import contextlib
+        import types
+
+        sent, minted = [], []
+        origin = types.ModuleType("hermes_cli.kanban_origin")
+
+        held = []
+
+        @contextlib.contextmanager
+        def writer_ticket(value):
+            minted.append(value)
+            held.append(f"ticket-{len(minted)}")
+            try:
+                yield held[-1]
+            finally:
+                held.pop()
+
+        origin.writer_ticket = writer_ticket
+        origin.current = lambda: held[-1] if held else None
+        card = gate._issue_card({"repository": "o/r", "issue_number": 1, "title_plain": "t"})
+        with self._stub(sent, origin):
+            self.assertEqual(gate.file_card(card), "t_1")
+            self.assertEqual(gate.file_card(card), "t_1")
+        self.assertEqual(minted, ["issue", "issue"])
+        self.assertEqual([ticket for _, ticket in sent], ["ticket-1", "ticket-2"])
+        self.assertNotIn("--origin", sent[0][0])
+
+    def test_without_the_origin_module_the_card_still_files(self):
+        sent = []
+        with self._stub(sent, None), redirect_stdout(io.StringIO()):
+            self.assertEqual(gate.file_card(gate.Card(title="t", body="b", idempotency_key="k", origin="issue")), "t_1")
+        self.assertEqual(sent[0][1], None)
 
 
 class PostBodyTest(unittest.TestCase):

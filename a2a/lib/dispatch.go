@@ -19,11 +19,31 @@ import (
 // dispatcher, the bucket's only writer, persists it under a key that starts
 // with that (profile, tier, pod). Workers hold no grant on the bucket at all:
 // a KV bucket allows rollup headers, so a put grant on any key would let a
-// worker purge every lease in it. After a restart the dispatcher lists a
-// (profile, tier)'s keys to rebuild which workers are busy.
+// worker purge every lease in it. Before each hand-off the dispatcher reads
+// a (profile, tier)'s records to know which workers are busy, held here or
+// not (a restart's redeliveries come up to an AckWait later).
 
 // ProfileLeaseBucket is the KV bucket the leases live in.
 const ProfileLeaseBucket = "PROFILE_LEASES"
+
+// ProfileSubmitRetention is how long ProfileSubmitStream keeps a
+// submission, acked or not: it mirrors the operator's `--max-age=72h` on
+// PROFILE_SUBMITS (a limits-retention stream). A durable re-created with
+// DeliverAll replays everything inside it, so the dispatcher keeps a
+// finished task's tombstone (LeaseRecord.FinishedAt) at least this long.
+const ProfileSubmitRetention = 72 * time.Hour
+
+// ProfileLeaseRefusedPod is the pod token of the tombstone the dispatcher
+// writes for a submission it refused at admission, which no pod ever held.
+// It is not a DNS label, so it can't be a pod's name.
+const ProfileLeaseRefusedPod = "_refused"
+
+// DispatcherSession is the `from.session` of the terminals the profile
+// dispatcher writes on a profile task's `…supervisor` subject (a refusal at
+// admission, a lease or deadline failure). A consumer that names its
+// supervisor (AgreementPolicy.Supervisor) lists it in OtherSupervisors to
+// read them.
+const DispatcherSession = "dispatcher"
 
 // DispatchSubject is where the dispatcher hands a task to one worker pod of
 // a (profile, tier) pool.
@@ -123,12 +143,27 @@ type DispatchMessage struct {
 	AcceptSeconds int `json:"acceptSeconds,omitempty"`
 	// Reason says why a task is abandoned. An abandon only.
 	Reason string `json:"reason,omitempty"`
+	// TaskCredential and ProxyToken are the task's own credentials (#3889,
+	// a2a/taskcred), minted for the confirmed pod. A confirm only, and only
+	// when the dispatcher has a task-signing key; without them the worker
+	// keeps its pod-level grants. TaskCredential (audience nats) is what the
+	// worker presents on its task connection to the bus. ProxyToken
+	// (audience credential-proxy) confines the task to the cluster the
+	// dispatcher checked at admission, and is absent when the task names no
+	// cluster. Both name the task, its profile and tier, the pod and its UID,
+	// and expire at the task's deadline plus a clock-skew allowance, never
+	// past the configured maximum lifetime.
+	TaskCredential string `json:"taskCredential,omitempty"`
+	ProxyToken     string `json:"proxyToken,omitempty"`
 }
 
 // Validate reports the first way m is malformed, or nil.
 func (m DispatchMessage) Validate() error {
 	if !ValidSubjectToken(m.TaskID) {
 		return fmt.Errorf("dispatch %s: task id %q is not one subject token", m.Type, m.TaskID)
+	}
+	if m.Type != DispatchConfirm && (m.TaskCredential != "" || m.ProxyToken != "") {
+		return fmt.Errorf("dispatch %s: task credentials ride on a confirm only", m.Type)
 	}
 	switch m.Type {
 	case DispatchOffer:
@@ -182,8 +217,8 @@ type LeaseRenewal struct {
 	TaskID string `json:"taskId"`
 	// Final says the worker has published the task's terminal on .events.
 	// The dispatcher has no read on .events, so this is how it learns the
-	// task ended: it releases the slot, acks the submission and deletes the
-	// lease at once, rather than holding the slot for a lease and then
+	// task ended: it releases the slot, acks the submission and turns the
+	// lease into a tombstone at once, rather than holding the slot for a lease and then
 	// failing a task that finished. (A worker that dies between the two
 	// still gets a lease-expired terminal, which the fold drops as a write
 	// after the final event.)
@@ -218,13 +253,47 @@ type LeaseRecord struct {
 	Deadline     time.Time `json:"deadline"`
 	LeaseSeconds int       `json:"leaseSeconds"`
 	RenewSeconds int       `json:"renewSeconds"`
+	// FinishedAt, set, makes the record a tombstone: the task ended (its
+	// final renewal came, or the dispatcher wrote its terminal: failed, or
+	// rejected at admission) at this time. A submission stream keeps acked
+	// submissions for ProfileSubmitRetention, so a durable re-created with
+	// DeliverAll replays finished tasks; the tombstone, kept under the same
+	// key at least that long, is how the dispatcher knows a replay is one
+	// and acks it without running or failing it again. A tombstone holds no
+	// worker and is never re-adopted or renewed.
+	FinishedAt time.Time `json:"finishedAt,omitzero"`
 }
+
+// Finished reports whether the record is a tombstone.
+func (l LeaseRecord) Finished() bool { return !l.FinishedAt.IsZero() }
 
 // Expired reports whether the lease has run out at now, given grace on
 // top of ExpiresAt (zero in steady state; the restart grace while a
-// restarted dispatcher re-adopts).
+// restarted dispatcher re-adopts). A tombstone is expired at every time,
+// whatever its ExpiresAt says: its task is over, so it keeps no pod busy
+// and is never re-adopted. Expired is never how a tombstone is told from a
+// running lease (an expired running lease is still a task to fail); that
+// is Finished.
 func (l LeaseRecord) Expired(now time.Time, grace time.Duration) bool {
+	if l.Finished() {
+		return true
+	}
 	return now.After(l.ExpiresAt.Add(grace))
+}
+
+// Validate reports the first way l can't be written, or nil: every record
+// names its task and its pod (a tombstone of a refusal, its
+// ProfileLeaseRefusedPod), and a running lease has an expiry.
+func (l LeaseRecord) Validate() error {
+	switch {
+	case !ValidSubjectToken(l.TaskID):
+		return fmt.Errorf("lease record: task id %q is not one subject token", l.TaskID)
+	case !ValidSubjectToken(l.Pod) && !(l.Finished() && l.Pod == ProfileLeaseRefusedPod):
+		return fmt.Errorf("lease record for %s: pod %q is not one subject token", l.TaskID, l.Pod)
+	case !l.Finished() && l.ExpiresAt.IsZero():
+		return fmt.Errorf("lease record for %s: a running lease needs an expiry", l.TaskID)
+	}
+	return nil
 }
 
 // DispatchConfigKey is the key in the operator-rendered dispatch ConfigMap
@@ -271,6 +340,14 @@ type DispatchConfig struct {
 	RenewSeconds         int `json:"renewSeconds"`
 	RestartGraceSeconds  int `json:"restartGraceSeconds"`
 	AcceptTimeoutSeconds int `json:"acceptTimeoutSeconds"`
+	// SubmitRetentionSeconds is how long ProfileSubmitStream keeps a
+	// submission (the operator renders it from the same value as the
+	// stream's max age). A durable re-created over the stream replays
+	// everything inside it, so the dispatcher is to keep a finished task's
+	// tombstone at least this long (it reads this from #4873 on; until then
+	// it keeps its own default). Zero is from an operator that predates the
+	// field; the dispatcher then uses its own default.
+	SubmitRetentionSeconds int `json:"submitRetentionSeconds,omitempty"`
 	// Profiles are the profiles bound to this install with a rendered
 	// identity. A profile absent here has no durables to read.
 	Profiles []DispatchProfile `json:"profiles"`
@@ -314,6 +391,8 @@ func (c DispatchConfig) Validate() error {
 		return fmt.Errorf("dispatch config: restart grace %ds must be at least two renewals of %ds", c.RestartGraceSeconds, c.RenewSeconds)
 	case c.AcceptTimeoutSeconds <= 0:
 		return fmt.Errorf("dispatch config: acceptTimeoutSeconds %d", c.AcceptTimeoutSeconds)
+	case c.SubmitRetentionSeconds < 0:
+		return fmt.Errorf("dispatch config: submitRetentionSeconds %d", c.SubmitRetentionSeconds)
 	}
 	seen := map[string]bool{}
 	for _, p := range c.Profiles {

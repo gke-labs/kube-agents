@@ -240,6 +240,9 @@ def load_intercepted_events(
                 # Absent on a ledger the session server has not migrated yet,
                 # where no row can have been folded.
                 duplicate_col = "duplicate_of" if "duplicate_of" in columns else "NULL"
+                # Absent on a ledger the session server has not migrated yet,
+                # where no row can have been held back by an alert-exclude rule.
+                alert_excluded_col = "excluded" if "excluded" in columns else "0"
                 # `intercepted_events` has had a second writer since the drift
                 # detector landed: session_kv_server.py records every
                 # out-of-band-change inject in it too, under
@@ -259,7 +262,8 @@ def load_intercepted_events(
                 # reads these rows next.
                 cursor.execute(
                     "SELECT cluster, namespace, workload, object_uid, object_kind, reason, message, "
-                    f"severity, occurrences, notified, created_at, {delivery_col}, {duplicate_col} "
+                    f"severity, occurrences, notified, created_at, {delivery_col}, {duplicate_col}, "
+                    f"{alert_excluded_col} "
                     "FROM intercepted_events "
                     "WHERE created_at >= datetime('now', ?) "
                     "AND reason NOT IN (?, ?) "
@@ -298,6 +302,7 @@ def load_intercepted_events(
                 "created_at": r[10],
                 "delivery_error": r[11] or "",
                 "duplicate_of": r[12],
+                "alert_excluded": bool(r[13]),
             }
             for r in rows
         ]
@@ -346,6 +351,15 @@ LISTED_SEVERITIES = frozenset({"Info"})
 # the digest exactly the false alarm the gate exists to prevent.
 _LISTED_EMOJI = "🔹"
 _SECTION_HEADING = "🔕 Informational Events Held Back from Chat"
+# The alert-exclude line's emoji: not 🔕, which heads the informational
+# section, since the two lines count different things.
+ALERT_EXCLUDED_EMOJI = "🔇"
+# How many workloads the alert-exclude line names, noisiest first; the rest
+# are counted as "and K more".
+ALERT_EXCLUDED_LISTED = 5
+# The name a row with neither a workload nor a UID is listed under, as a
+# forwarded row with no workload is.
+UNKNOWN_WORKLOAD = "unknown-workload"
 # The overflow past this is counted on a trailing line, never dropped silently.
 _ENTRY_LIMIT = 10
 # How many foreign cluster names the scope line prints before it counts the
@@ -400,11 +414,43 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
     cap_dropped_workloads: set = set()
     delivery_failed = 0
     dispatched_headless = 0
+    # Events an alert-exclude rule held back in the watcher, in sightings, and
+    # the workloads they came from, keyed as `cap_dropped_workloads` is. Counted
+    # over every row and kept out of every other figure: the rules silenced
+    # them on purpose, so they are neither forwarded events nor a reason to
+    # withhold the all-clear.
+    alert_excluded_events = 0
+    # Per workload, keyed as `cap_dropped_workloads` is: its label fields and
+    # the sightings it sent, for the named part of the line.
+    alert_excluded_by_workload: Dict[tuple, Dict[str, Any]] = {}
     workload_map: Dict[str, Dict[str, Any]] = {}
 
     for event in events:
         ns = event.get("namespace", "")
         reason = event.get("reason", "Unknown")
+        if event.get("alert_excluded"):
+            # Its cluster is in the scope the header names, excluded
+            # namespaces included, as for every other row.
+            if event.get("cluster"):
+                clusters_seen.add(event["cluster"])
+            sightings = int(event.get("occurrences", 1))
+            # Out of the 🔇 line in an excluded namespace, as in the
+            # breakdown, and counted in `excluded_occurrences` like any row
+            # the filter removed, so the scope line says those namespaces are
+            # outside the recap even when a rule muted all their traffic.
+            if ns and ns in exclude_ns:
+                excluded_occurrences += sightings
+                continue
+            alert_excluded_events += sightings
+            stored_workload = event.get("workload", "") or ""
+            uid = event.get("object_uid", "") or ""
+            key = (event.get("cluster", "") or "", ns, stored_workload, "" if stored_workload else uid)
+            entry = alert_excluded_by_workload.setdefault(
+                key,
+                {"cluster": key[0], "namespace": ns, "workload": stored_workload or uid or UNKNOWN_WORKLOAD, "count": 0},
+            )
+            entry["count"] += sightings
+            continue
 
         # A flag, not a `continue`. `EOD_EXCLUDE_NAMESPACES` is a noise filter on the
         # breakdown and the headline counts; the `cap_dropped` and `delivery_failed`
@@ -447,11 +493,11 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # and those are occurrences. `alerts_posted` stays a row count on
         # purpose — it is printed as "*N alerts* went to chat", and chat
         # received one post per row however many sightings that row stands
-        # for. Every row this version writes carries `occurrences = 1`, since
-        # the watcher's payload count comes from `Observe`'s new-incident
-        # branch and duplicates never reach the dispatch, so the two units
-        # agree today; they are written apart so they keep agreeing if a
-        # future writer batches sightings into one row.
+        # for. Every forwarded row carries `occurrences = 1`, since the
+        # watcher's payload count comes from `Observe`'s new-incident branch
+        # and duplicates never reach the dispatch, so the two units agree for
+        # these rows. The alert-exclude rows above batch sightings into one
+        # row, which is why the units are kept apart.
         cap_row = False
         event_delivery_failed = bool(event.get("delivery_error"))
         notified_val = event.get("notified")
@@ -482,7 +528,7 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         # kind-agnostic pass over the result strips the last segment off any
         # name ending in five alphanumerics, merging `api-store` and `api-cache`
         # into one `api` line the SRE cannot resolve back to a service.
-        workload = event.get("workload", "") or "unknown-workload"
+        workload = event.get("workload", "") or UNKNOWN_WORKLOAD
         cluster = event.get("cluster", "") or ""
         if cluster:
             clusters_seen.add(cluster)
@@ -602,6 +648,13 @@ def filter_and_aggregate_events(events: List[Dict[str, Any]]) -> Dict[str, Any]:
         "cap_dropped_alerts": len(cap_dropped_incidents),
         "cap_dropped_workloads": len(cap_dropped_workloads),
         "delivery_failed": delivery_failed,
+        "alert_excluded_events": alert_excluded_events,
+        "alert_excluded_workloads": len(alert_excluded_by_workload),
+        # Noisiest first, then by name, so the named part reads the same twice.
+        "alert_excluded_entries": sorted(
+            alert_excluded_by_workload.values(),
+            key=lambda e: (-e["count"], e["cluster"], e["namespace"], e["workload"]),
+        ),
         "entries": filtered_entries,
     }
 
@@ -778,6 +831,25 @@ def generate_markdown_report(
             lines.append(
                 f"⚠️ *{_plural(summary['delivery_failed'], 'alert')} failed to post to chat.*"
             )
+        # Unlike the withheld line, this one names its workloads: the
+        # operator's own rules muted them on purpose, so a name here repeats
+        # nothing chat said, and it is how a chronic failure that got worse
+        # while muted is noticed. Capped at ALERT_EXCLUDED_LISTED, noisiest
+        # first. "Silenced", not "held back": the ✅ line can say nothing was
+        # held back from chat, and these were never offered to it.
+        if summary.get("alert_excluded_events"):
+            excluded_entries = summary.get("alert_excluded_entries", [])
+            lines.append(
+                f"{ALERT_EXCLUDED_EMOJI} {_plural(summary['alert_excluded_events'], 'event')} from "
+                f"{_plural(summary['alert_excluded_workloads'], 'workload')} "
+                f"{'was' if summary['alert_excluded_events'] == 1 else 'were'} silenced by alert-exclude rules"
+                + (":" if excluded_entries else ".")
+            )
+            for entry in excluded_entries[:ALERT_EXCLUDED_LISTED]:
+                lines.append(f"    • `{_workload_label(entry, cluster_name)}` ({_plural(entry['count'], 'event')})")
+            more = len(excluded_entries) - ALERT_EXCLUDED_LISTED
+            if more > 0:
+                lines.append(f"    • and {_plural(more, 'more workload')}")
 
     if entry_count > 0:
         # The alert count is a count, not a listing: it says the watcher paged

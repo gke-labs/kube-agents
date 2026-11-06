@@ -117,7 +117,7 @@ func IsDelegate(text string) (string, bool) {
 	return rest, true
 }
 
-// slashSessionWord and slashOffWord spell the first of the two slash commands
+// slashSessionWord and slashOffWord spell the first of the slash commands
 // the gateway resolves itself. Spec-chatops-gateway "Sessions by default": a
 // slash command resolves first, names a route rather than a handle, and is a
 // debugging/opt-in door for the transition rather than the taught interface.
@@ -128,6 +128,11 @@ const (
 	slashSessionWord  = "session"
 	slashOffWord      = "off"
 	slashFeedbackWord = "feedback"
+	// slashSetHomeWord is Hermes's own "/sethome", and the typed "/hermes
+	// sethome" its legacy plugin used to unwrap, which the Slack adapter
+	// answers itself under mode next (IsSetHomeCommand).
+	slashSetHomeWord = "sethome"
+	slashHermesWord  = "hermes"
 	// slashFeedbackSummaryWord is the one argument the gateway answers itself:
 	// "/feedback summary" posts the install's identifier-free usage and
 	// feedback summary (docs/designs/chat-feedback-command.md, part 7).
@@ -174,6 +179,26 @@ func IsFeedbackCommand(text string) (string, bool) {
 func IsFeedbackSummaryCommand(text string) bool {
 	rest, ok := IsFeedbackCommand(text)
 	return ok && strings.EqualFold(rest, slashFeedbackSummaryWord)
+}
+
+// IsSetHomeCommand reports whether the turn asks to set the home channel the
+// Hermes way: "/sethome" (bare or with text after it, since Hermes's own took
+// none) or "/hermes sethome", case-insensitively. Not part of IsCommand: the
+// Slack adapter answers it itself before the text becomes a turn, and every
+// other reader of a turn's text treats it as the turn it was.
+func IsSetHomeCommand(text string) bool {
+	if _, ok := slashWord(text, slashSetHomeWord); ok {
+		return true
+	}
+	rest, ok := slashWord(text, slashHermesWord)
+	if !ok {
+		return false
+	}
+	word := rest
+	if end := strings.IndexFunc(rest, unicode.IsSpace); end >= 0 {
+		word = rest[:end]
+	}
+	return strings.EqualFold(word, slashSetHomeWord)
 }
 
 // slashWord resolves one slash command: a leading "/" (after trimming)

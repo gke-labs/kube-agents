@@ -76,10 +76,10 @@ _HELM_SET_VALUES = (
 # offenders", so the count is asserted, and a new chart Deployment fails here
 # until its author looks at its strategy and bumps the number.
 _EXPECTED_RENDERED_DEPLOYMENTS = 4
-# Nine golden cases, each emitting an agent gateway, a credential proxy and a
-# kube-proxy, and the next-mode case adding the A2A callout, verifier, console and
-# gateway.
-_EXPECTED_GOLDEN_DEPLOYMENTS = 31
+# Twelve golden cases, each emitting an agent gateway, a credential proxy and a
+# kube-proxy, the next-mode case adding the A2A callout, verifier, console and
+# gateway, and the two exec-tier cases the exec tier's Deployment.
+_EXPECTED_GOLDEN_DEPLOYMENTS = 42
 
 # Workloads that deliberately keep `maxUnavailable: 0` and so need a surge Pod
 # to roll, which a zero-headroom quota refuses. The two chart workloads are

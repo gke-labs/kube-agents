@@ -262,6 +262,9 @@ opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
 failure.
 
+`litellm.replayShadow` is an eval-only fixture, off by default: CI turns it on to put the
+inference-replay shadow proxy in front of LiteLLM ([`hack/replay-proxy/README.md`](../../hack/replay-proxy/README.md)).
+
 `litellm.rollingUpdate.maxUnavailable` defaults to `1` so that a rollout can
 replace a Pod in place. Set it to `0` for a zero-downtime rollout, but only
 where the namespace has quota headroom for one more LiteLLM Pod: at `0` the
@@ -933,6 +936,19 @@ lost. Move them to `platformAgent.deployment.env` first. A re-tag to a chart wit
 [chatops page](https://gke-labs.github.io/kube-agents/concepts/chatops/#daily-alert-ceiling) gives
 the buckets, the defaults and a sizing method.
 
+`platformAgent.deployment.eventWatcher` sets the event watcher's tuning settings: `dedupWindow`,
+`backoffMinCount`, `imagePullTransientMinCount`, `failedSchedulingMinCount`,
+`failedSchedulingMinSpan`, `scaleUpHold`, `settle`, `quietAfter` and `autopilotScaleToZeroHold`.
+Each key that is set becomes a `WATCHER_<NAME>` entry in the CR's `spec.deployment.env`, for example
+`failedSchedulingMinSpan` becomes `WATCHER_FAILEDSCHEDULING_MIN_SPAN`. The operator passes it to the
+`agent-api-auth` container, which runs the watcher. A key that is not set keeps the watcher's
+default. The schema checks the shape of each value: a Go duration, a count of at least 1 or a
+boolean. A duration that the watcher cannot read keeps its default, and the container log names it.
+An entry with the same name in `platformAgent.deployment.env` wins over the key, a `valueFrom`
+entry included. A change rolls the agent pod and the credential-proxy pod. The
+[watcher README](../../k8s-operator/cmd/k8s-event-watcher/README.md#4-configuration--operations)
+gives each setting's meaning and default.
+
 #### PlatformAgent annotations
 
 `platformAgent.annotations` is copied onto the CR's `metadata.annotations`, and
@@ -943,14 +959,16 @@ reads, such as `prevent-deletion`, `enable-litellm-network-policy`, and
 The Terraform composition uses the same route for one annotation the operator
 does not read, `network-policy-enforcement: absent-accepted`, the record of an
 install that chose to proceed onto a cluster enforcing no NetworkPolicy.
-Three of those the chart also stamps from values: `litellm.networkPolicy=false`
+Four of those the chart also stamps from values: `litellm.networkPolicy=false`
 stamps `enable-litellm-network-policy: "false"`, a non-empty
 `telemetry.collectorNamespace` stamps `otlp-collector-namespace`, and
 `litellm.modelProvider=openai_compatible` stamps `litellm-upstream-egress`
 with the egress rule derived from `litellm.openaiCompatible`, as compact JSON:
 `{"namespace":"<ns>","port":<targetPort>}` for an in-cluster Service, or
 `{"cidrs":["<cidr>",...],"port":<port>}` (not stamped for a public port-443
-endpoint, which needs no rule). When the
+endpoint, which needs no rule), and every render stamps
+`a2a-quota-chart-pods` with the chart's pods and their rollout surges (see Quota
+preflight). When the
 chart stamps a key, the value wins because it drives the rest of the release
 too, and an entry in `platformAgent.annotations` that disagrees with it fails
 the render instead of being overwritten. When the chart does not stamp the key
@@ -1102,7 +1120,7 @@ Exactly one owner creates the broker's KSA, depending on
 
 ### Admission policies
 
-`admissionPolicy.enabled` (default `true`) installs three cluster-scoped
+`admissionPolicy.enabled` (default `true`) installs four cluster-scoped
 `ValidatingAdmissionPolicy` objects and their bindings. Two are generated from
 `k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
 that grants a write or privilege-escalation verb, grants Secrets, or gives a
@@ -1119,6 +1137,13 @@ access, Pod Security "restricted", and exactly the session labels. Where it is
 rendered, the chart also sets `A2A_GATEWAY_POD_POLICY=true` on the operator, a
 signal for operator features that must run only where this policy is installed.
 Setting `admissionPolicy.enabled=false` removes this policy and that signal too.
+
+The fourth, `kube-agents-web-console-cr`, is generated from
+`k8s-operator/config/admission/web-console-cr-policy.yaml` and renders where the
+web console and its environment page are on. It holds the console's
+ServiceAccount to its own annotations and `spec.integration.forges`,
+`repositories` and `github` on the PlatformAgent, and refuses any other change it
+makes.
 
 The templates check `.Capabilities.KubeVersion` as well as this value, so on a
 cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
@@ -1179,10 +1204,21 @@ its TTL removes it, with the rest of the release standing), and the
 sets `A2A_BRIDGE_EXECUTOR` or `A2A_BRIDGE_RESOURCES` in any form, at no less than the agent
 container's size (the operator's fallback under `cli`), raised per key by any readable figure
 in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those values from above
-rather than re-implementing it, so it can over-count; it never fails the render on them. The mode is read from the values, so a mode set
+rather than re-implementing it, so it can over-count; it never fails the render on them.
+It also counts the standing pods the operator renders only behind an `operator.extraEnv` flag,
+listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
+is `true`, and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but
+blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+as on. An operator test holds that file to the operator's own list and sizes. The mode is read from the values, so a mode set
 on the `PlatformAgent` by hand while `platformAgent.mode` stays null is counted as `today`.
 The session pods a next install spawns on demand are not counted; the operator caps those with
-a `ResourceQuota` of its own.
+a `ResourceQuota` of its own, sized above the session cap by the pods it runs, the chart's own
+pods with a surge pod for each that rolls with one (which the chart stamps on the
+`PlatformAgent` as `kubeagents.x-k8s.io/a2a-quota-chart-pods`; 5 for a CR without it)
+and a margin of 7. With `platformAgent.enabled=false` the chart renders no `PlatformAgent`,
+so a next-mode one written by hand in the release namespace must carry that annotation
+itself, with the figure `helm template` stamps for the same values; without it the quota
+counts 5 for the chart's pods however many the release runs.
 The one value it will not guess is `hindsight.postgresql.storage`: the schema permits
 `null`, a claim sized from it would be counted as zero, so an empty one fails the check
 by name.
@@ -1444,6 +1480,10 @@ helm uninstall kube-agents -n kubeagents-system
   `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
   its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
   (`hack/check_chart_webhooks.py`); fix that one by editing the template.
+- `files/flagged-pods.yaml` is hand-kept: the pods the operator renders only behind an
+  `operator.extraEnv` flag, which no golden renders. `TestTheChartCountsEveryFlaggedPod`
+  (`k8s-operator/internal/controller`) fails when it and the operator's `a2aFlaggedPods`
+  differ, so edit both together.
 - `files/footprint.yaml` is generated too, but from a different source: it is summed from
   the operator's **golden manifests**
   (`k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml`, and

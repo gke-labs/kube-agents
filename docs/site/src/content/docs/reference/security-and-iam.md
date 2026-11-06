@@ -70,6 +70,11 @@ The install grants the agent GSA one of two permission sets. Both entry points c
 The default **read-only** set binds read roles, with one qualification under the Trace role:
 
 - `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
+
+  `roles/container.viewer` carries `container.thirdPartyObjects.list` and `.get`, which let the fleet-audit collectors list the Config Connector objects on a cluster. The collectors find the Config Connector kinds through the API server's discovery, which needs no grant. A `custom` set needs those two permissions or a Kubernetes RBAC grant of `list` on the Config Connector kinds. The collectors connect through `gcloud container clusters get-credentials`, so an RBAC grant names the agent's Google service account as a `User` subject (its email). Without that grant the read fails, no fix whose object is on that cluster gets the note about Config Connector, and the audit's log has a warning that names the clusters it could not read.
+
+  A `custom` set also needs `container.namespaces.list` or a Kubernetes RBAC grant of `list` on namespaces. Without it, an object that takes its project from its namespace has no known project, so it matches a fix only when one cluster runs Config Connector, and no warning appears.
+
 - `roles/compute.viewer` — read-only compute, reservations, machine types, and quota advice; the readiness report's `lb-connection-draining` and `orphan-node-objects` rules list a project's backend services and instances with it, and say `unknown` in a project that lacks it.
 - `roles/monitoring.viewer`, `roles/logging.viewer` — read-only metrics and logs.
 - `roles/gkehub.viewer` — read-only fleet membership and rollout sequencing (`gkehub.rolloutSequences.list`), for the readiness report's rollout-sequence precheck, which lists the fleet host project's RolloutSequences.
@@ -81,7 +86,7 @@ The default **read-only** set binds read roles, with one qualification under the
 
 `roles/container.viewer` is project-wide and unconditioned, so it reads Kubernetes objects in **every** cluster in the project, and the grants of the scope's read roles, per project or inherited from a declared folder or organisation, extend that to every cluster in the scope. The [scoped service account pool](#the-scoped-service-account-pool) is where that narrowing is designed to land — suspended, so today nothing narrows it; the pool section says why. A binding on a folder or organisation named in [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope) is inherited by every project beneath it, which is what makes a container worth declaring and also what a grant there reaches. A Shared VPC host or a Metrics Scope named there inherits nothing: each resolves to projects, and every one of them needs its own binding of the read roles, which the Terraform composition makes after resolving the selector at plan time (so a project attached or linked after the last apply is unreadable until the next one); the lookups themselves need `compute.projects.get` in the host project, the two Resource Manager reads `roles/monitoring.metricsScopesViewer` carries in the scoping project, and `resourcemanager.projects.get` in each monitored project it names; the read roles carry all of them between them.
 
-The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added.
+The **custom** set binds exactly the roles listed in `--custom-roles` (space- or comma-separated; the installer prompts for it and requires a non-empty value when this set is selected), carried as the composition's `project_roles` list — none of the built-in role bundles are added. A `custom` set that should keep the fleet audits' Config Connector note needs the grants named under [Roles per set](#roles-per-set) for `roles/container.viewer`. It also needs `container.clusters.get` (in `roles/container.clusterViewer`) for the credential fetch; without it, the audit cannot read the cluster's Config Connector objects, and the audit's log names the cluster.
 
 If that list names a role like `roles/container.admin`, the installer says so at the point of choice — it is the authority the removed bundle granted, reached the long way round — and continues. It is your call to make, not the installer's.
 
@@ -185,6 +190,12 @@ Under `spec.mode: next`, the A2A gateway creates session pods (one per delegated
 The source is [`k8s-operator/config/admission/a2a-gateway-pod-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/a2a-gateway-pod-policy.yaml). The chart installs it on the same terms as the two policies above: `admissionPolicy.enabled` and Kubernetes 1.30 or later. Method 2 applies it by hand. Where the chart installs it, the chart also sets `A2A_GATEWAY_POD_POLICY` on the operator. It is a signal for operator features that must run only where this policy is installed, and it says the policy was rendered, not that it still holds.
 
 It does not cover an install where it is not applied: there, the gateway's `create` on pods is as wide as its Role. It selects the gateway by its ServiceAccount name, `<name>-a2a-gateway`.
+
+### The admission policy on the web console's writes
+
+The [web console](/kube-agents/deploy/web-console/)'s ServiceAccount holds `get` and `patch` on the `PlatformAgent`, and RBAC cannot limit `patch` to fields. A fourth `ValidatingAdmissionPolicy`, `kube-agents-web-console-cr`, refuses any update by that ServiceAccount that changes something other than the console's own `kubeagents.x-k8s.io/` annotations and `spec.integration.forges`, `repositories` and `github`. The rest of the spec, the chat integrations' settings among it, and the labels, finalizers and owner references stay out of the console's reach.
+
+The source is [`k8s-operator/config/admission/web-console-cr-policy.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/admission/web-console-cr-policy.yaml). The chart installs it with `admissionPolicy.enabled` on Kubernetes 1.30 or later, where the console and its environment page are on. It selects the console by its ServiceAccount name, `<release>-web-console`. A forge the console writes still takes its own host and credential reference, so the policy does not limit where a forge token can be sent.
 
 ### The operator controller is a separate identity
 

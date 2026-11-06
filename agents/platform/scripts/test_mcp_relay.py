@@ -11,6 +11,7 @@ fake and the token is fixed.
 import dataclasses
 import http.client
 import json
+import socket
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -341,6 +342,33 @@ class McpRelayOverTheSocketTest(unittest.TestCase):
         status, _, _ = self._request(body=b"{}", headers={"Content-Length": str(2 << 20)})
         self.assertEqual(status, 413)
         self.assertEqual(self.upstream_requests, [])
+
+    def test_a_relayed_message_whose_body_the_handler_cannot_frame_announces_its_close(self):
+        # The relay's direct write of the upstream's reply. The route reads
+        # Content-Length bytes before answering, so the one request on which
+        # the body counts as unread at that write is a POST carrying both
+        # Transfer-Encoding and a Content-Length: the handler frames no
+        # chunked body, so whatever it read, bytes may follow. The response
+        # must then say `Connection: close` itself, as the close is otherwise
+        # found by Envoy after it has pooled the connection as reusable.
+        body = json.dumps(tools_call("get_cluster")).encode()
+        with socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=10) as sock:
+            sock.sendall(
+                b"POST " + GKE.encode("ascii") + b" HTTP/1.1\r\nHost: broker\r\n"
+                b"Authorization: Bearer chat-token\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+            )
+            response = http.client.HTTPResponse(sock)
+            response.begin()
+            self.assertEqual(200, response.status)
+            self.assertEqual(self.reply["body"], response.read())
+            self.assertEqual("close", (response.getheader("Connection") or "").lower(), response.getheaders())
+            self.assertEqual(b"", sock.recv(1), "the connection stayed open")
+        # The message itself reached the upstream: this is the relayed path,
+        # not a refusal written through _json.
+        self.assertEqual(1, len(self.upstream_requests))
 
 
 if __name__ == "__main__":

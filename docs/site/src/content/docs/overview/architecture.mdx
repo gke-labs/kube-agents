@@ -137,7 +137,7 @@ Everything except the LLM (and, for hosted providers, the LLM API endpoint) runs
 The hub footprint (operator, Platform Agent, LiteLLM, Minty) is small and roughly fixed — it doesn't grow with the number of clusters the agent manages, since those are read remotely through the GKE MCP server. Under `next` the A2A stack adds a few small pods to it. What actually drives node capacity:
 
 - **vLLM.** Local inference needs a GPU node pool; hosted LiteLLM does not.
-- **gVisor.** Sandboxed skill execution puts the agent pod under the `gvisor` RuntimeClass, which is the default (`--enable-gvisor=false` turns it off). On Autopilot, the default cluster shape, it costs no extra capacity. On Standard it means a `gvisor-pool` to run the pod on: one `e2-standard-4` per zone, so three nodes on a regional cluster, with no autoscaling.
+- **gVisor.** Sandboxed skill execution puts the agent pod under the `gvisor` RuntimeClass, which is the default (`--enable-gvisor=false` turns it off). On Autopilot, the default cluster shape, it costs no extra capacity. On Standard it means a `gvisor-pool` to run the pod on: one `e2-standard-4` per zone at the defaults, autoscaling to two. The module's [sizing inputs](https://github.com/gke-labs/kube-agents/blob/main/terraform/modules/gke-cluster/README.md#sizing-the-node-pools) change its machine type, disk and bounds.
 
 For production, prefer a **dedicated cluster** for the harness. The agent GSA can still be given broad GKE permissions through the `custom` permission set, so a hard cluster boundary limits blast radius if the execution sandbox is ever compromised. A shared cluster (with the `kubeagents-system` namespace for logical isolation) is fine for development.
 
