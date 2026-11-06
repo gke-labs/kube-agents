@@ -54,7 +54,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextI
 
 # Independent of the gateway's usageSummaryMaxLines: this block has lines the
 # gateway's lacks.
-SUMMARY_MAX_LINES = 57
+SUMMARY_MAX_LINES = 59
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
@@ -101,6 +101,15 @@ DEFAULT_MODE = "today"
 READY_CONDITION = "Ready"
 OTHER_BUCKET = "other"
 SPEND_CURRENCY = "USD"
+#: ``status.usage``'s three inference totals, the operator's running sums of
+#: LiteLLM's token and spend counters since the install (they survive a LiteLLM
+#: restart, where the live ``tokens:`` and ``spend:`` lines below start again at
+#: zero); the gateway's usageSummaryTotalFields verbatim. The spend is kept in
+#: micro-dollars so the field stays an integer.
+PERFORMANCE_TOTAL_FIELDS: Tuple[str, str, str] = ("inputTokensTotal", "outputTokensTotal", "spendMicrosUSDTotal")
+MICROS_PER_USD = 1_000_000
+TOKENS_SINCE_INSTALL_LABEL = "tokens (since install)"
+SPEND_SINCE_INSTALL_LABEL = "spend (since install)"
 TRUNCATED_SUFFIX = "+"
 KCC_CRD_SUFFIX = ".cnrm.cloud.google.com"
 SCALE_RESOURCES: Tuple[Tuple[str, str], ...] = (
@@ -875,6 +884,9 @@ def render(snapshot: Snapshot) -> str:
     else:
         lines.append(f"{TOP_TOOLS_LABEL}: {UNAVAILABLE}")
     lines.append("performance:")
+    tokens_in_total, tokens_out_total, spend_micros_total = (int(usage.get(field) or 0) for field in PERFORMANCE_TOTAL_FIELDS)
+    lines.append(f"  {TOKENS_SINCE_INSTALL_LABEL}: in {tokens_in_total} / out {tokens_out_total}")
+    lines.append(f"  {SPEND_SINCE_INSTALL_LABEL}: {spend_micros_total / MICROS_PER_USD:.2f} {SPEND_CURRENCY}")
     if snapshot.litellm_metrics is not None:
         samples = parse_prometheus(snapshot.litellm_metrics)
         tokens_in = family_total(samples, TOKEN_FAMILIES["in"])
