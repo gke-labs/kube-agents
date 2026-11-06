@@ -1,0 +1,64 @@
+# Statements that read a whole table the repository defines when
+# scripts/check_sqlite_query_plans.py arrived, pinned at the count they had
+# that day. One entry per line: `<file> <function> <table> <count>`, the file
+# relative to the repository root, the function as the check names it
+# (`Class.method` for a method), the table the plan scans, the count of
+# `SCAN <table>` plan lines above zero (one statement can scan a table twice).
+# The comment above an entry names the issue or pull request that owns the
+# index, or the bound the planner cannot see. The rules (the list only
+# shrinks: a rise, a drop, a stale entry, an entry for a file the check does
+# not read, and a line that is not an entry all fail) are in the script's
+# docstring; this file states only what is pinned and why.
+
+# #4331: the fold's ledger lookup, once for the outer read of the workload's
+# incidents and once for the `id IN (SELECT duplicate_of ...)` subquery that
+# folds a duplicate's anchor in. Pull request #4648 indexes the fold's ledger
+# lookups; whichever of it and this file lands second drops this entry, and
+# the stale rule names it.
+agents/platform/scripts/session_kv_server.py _open_fix_pull_request intercepted_events 2
+
+# #4331: the excluded-row fold, one correlated read per excluded event for the
+# newest row of the same object within EXCLUDED_ROW_FOLD_SECONDS. The index it
+# needs (cluster plus object_uid, over excluded rows) is a follow-up of #4648.
+agents/platform/scripts/session_kv_server.py post_excluded_event intercepted_events 1
+
+# Three one-shot writes per process start: stamping rows the previous process
+# admitted and never dispatched, releasing the fold anchors, and pruning the
+# reservations of triages that never started (the subquery over the ledger is
+# the scan). Each runs once per start, before the server serves a request.
+agents/platform/scripts/session_kv_server.py init_db intercepted_events 3
+
+# One read of every session's metadata per process start, from init_db, to
+# drop plaintext identities a pre-hash release stored. Once per start.
+agents/platform/scripts/session_kv_server.py _purge_plaintext_identities session_metadata 1
+
+# #3567: the retention deletes, run from the session, incident and cron-report
+# write paths, each a range delete on a timestamp column without an index
+# (`incidents.created_at`, `incident_applies.created_at`,
+# `session_metadata.updated_at`, `kanban_stamp_tickets.issued_at`). Each index
+# is a follow-up with its own justification; the issue owns the shape.
+agents/platform/scripts/session_kv_server.py cleanup_old_records incidents 1
+agents/platform/scripts/session_kv_server.py cleanup_old_records incident_applies 1
+agents/platform/scripts/session_kv_server.py cleanup_old_records session_metadata 1
+agents/platform/scripts/session_kv_server.py cleanup_old_records kanban_stamp_tickets 1
+
+# `GET /v1/sessions`: the newest sessions by `updated_at`, which has no index,
+# so the planner sorts the whole table for the LIMIT. The retention window
+# bounds the table, not the statement; an index on `updated_at` is the fix and
+# would also serve the retention delete above.
+agents/platform/scripts/session_kv_server.py list_sessions session_metadata 1
+
+# The recent-reports listing joins `thread_id` out of the metadata JSON in
+# Python, so it reads every session row; the same retention window bounds the
+# table. A `thread_id` column with an index is the fix.
+agents/platform/scripts/session_kv_server.py list_recent_reports session_metadata 1
+
+# The feed's first page, `ORDER BY id DESC LIMIT ?`: a reverse rowid walk that
+# stops at the limit, which the planner reports as a scan because rowid order
+# needs no index. Bounded by FEED_EVENTS_MAX_LIMIT; nothing to index.
+agents/platform/scripts/session_kv_server.py list_intercepted_events intercepted_events 1
+
+# The proposal-origin ledger's `GROUP BY origin, origin_platform` count over
+# every proposal the agent has opened; one row per proposal, never pruned. A
+# covering index on (origin, origin_platform) is the fix.
+agents/platform/scripts/session_kv_server.py get_proposals_opened_counts proposals_opened 1
