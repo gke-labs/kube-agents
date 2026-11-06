@@ -676,18 +676,24 @@ func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMes
 	if m.Stop != "" {
 		layout = gchatStopButtons(layout, conversation, m.Stop)
 	}
-	arguments := map[string]any{
-		"name":       messageID,
-		"updateMask": gchatLayoutUpdateMask,
-		"body":       gchatLayoutBody(layout),
+	patch := func(layout gchatChatLayout) error {
+		return a.apiCall([]string{"spaces", "messages"}, "patch", map[string]any{
+			"name":       messageID,
+			"updateMask": gchatLayoutUpdateMask,
+			"body":       gchatLayoutBody(layout),
+		}, nil)
 	}
-	if err := a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil); err != nil {
+	err := patch(layout)
+	if err != nil && m.Stop != "" && m.Chat == nil && errors.Is(gchatLayoutError(err, true), ErrLayoutRefused) {
+		// The text line once more without the button, under the same
+		// lock: a second entry here would wait on it for good.
+		a.log.Warn("gchat: the Stop button was refused; patching the text line without it", "conversation", conversation, "err", err)
+		m.Stop = ""
+		layout = a.answeredLayout(messageID, m, gchatChatLayout{Text: toGchatText(m.Text)})
+		err = patch(layout)
+	}
+	if err != nil {
 		err = gchatLayoutError(err, true)
-		if m.Stop != "" && m.Chat == nil && errors.Is(err, ErrLayoutRefused) {
-			a.log.Warn("gchat: the Stop button was refused; patching the text line without it", "conversation", conversation, "err", err)
-			m.Stop = ""
-			return a.editLaidOut(conversation, messageID, m)
-		}
 		if asks && errors.Is(err, ErrLayoutRefused) {
 			a.forgetAnswer(messageID)
 		}
