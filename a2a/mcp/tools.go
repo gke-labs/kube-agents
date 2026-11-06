@@ -214,6 +214,9 @@ func writeReports(sb *strings.Builder, out TurnOutcome, token string) {
 	case reportsNoCards:
 		fmt.Fprintf(sb, "\nThe turn's tasks ended, and the gateway's result for task %s said no work was handed to cards, "+
 			"so gathering stopped at once; %s.\n", cell(out.Root.TaskID), later)
+	case reportsNoCardSignal:
+		fmt.Fprintf(sb, "\nThe turn's tasks ended with no handoff or card subtask seen on them, and no result from the gateway "+
+			"had been heard yet, so gathering stopped at once; %s.\n", later)
 	case reportsQuiet:
 		if len(out.Reports) == 0 {
 			fmt.Fprintf(sb, "\n%s No card report came within %s of the end; a card's report can take minutes: %s.\n",

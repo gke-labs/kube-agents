@@ -1037,6 +1037,35 @@ func TestAResultWithoutCardsEndsGatheringAtOnce(t *testing.T) {
 	mustContain(t, text, answerText, "the gateway's result for task `task-root1` said no work was handed to cards, so gathering stopped at once")
 }
 
+// A streamed turn that ends with no card signal stops gathering at once,
+// but names the gateway's result only when that frame was heard: the step
+// poll often sees the root end before the frame arrives.
+func TestAStreamedTurnNamesTheGatewaysResultOnlyWhenHeard(t *testing.T) {
+	b := &NATSBus{events: NewEvents(&fakeSubscriber{})}
+	root := TaskRef{Addressee: fakeAddressee, TaskID: "task-root1"}
+	w := &turnWatch{token: "tok", results: map[string]bool{}}
+	out := TurnOutcome{Root: root, Task: &lib.Task{ID: root.TaskID, State: lib.StateCompleted, Final: true}}
+
+	b.gatherStepReports(t.Context(), w, &out, nil)
+	if out.ReportsEnd != reportsNoCardSignal || out.Cards != cardsUnknown {
+		t.Fatalf("no result heard: ReportsEnd %d, Cards %d; want reportsNoCardSignal, cardsUnknown", out.ReportsEnd, out.Cards)
+	}
+	var sb strings.Builder
+	writeReports(&sb, out, "tok")
+	mustContain(t, sb.String(), "no handoff or card subtask seen on them, and no result from the gateway had been heard yet, so gathering stopped at once")
+	mustNotContain(t, sb.String(), "said no work was handed to cards")
+
+	w.results[root.TaskID] = false
+	out = TurnOutcome{Root: root, Task: out.Task}
+	b.gatherStepReports(t.Context(), w, &out, nil)
+	if out.ReportsEnd != reportsNoCards || out.Cards != cardsNone {
+		t.Fatalf("result heard: ReportsEnd %d, Cards %d; want reportsNoCards, cardsNone", out.ReportsEnd, out.Cards)
+	}
+	sb.Reset()
+	writeReports(&sb, out, "tok")
+	mustContain(t, sb.String(), "the gateway's result for task `task-root1` said no work was handed to cards, so gathering stopped at once")
+}
+
 // The root's result with cardsPending gathers the card's report that comes
 // after it.
 func TestAResultWithCardsPendingGathersTheReport(t *testing.T) {

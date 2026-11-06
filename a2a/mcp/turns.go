@@ -1776,6 +1776,9 @@ const (
 	reportsWaitOver
 	// reportsNoCards: the root's result said no work went to cards.
 	reportsNoCards
+	// reportsNoCardSignal: a streamed turn ended with no handoff, card
+	// step or result frame heard, so gathering stopped at once.
+	reportsNoCardSignal
 )
 
 // reportQuiet is how long, once a turn's tasks have ended, gathering waits
@@ -2200,7 +2203,7 @@ func (b *NATSBus) gatherStepReports(ctx context.Context, w *turnWatch, out *Turn
 	if b.events == nil || w == nil {
 		return
 	}
-	_, pending := w.rootResult(out.Root.TaskID)
+	seen, pending := w.rootResult(out.Root.TaskID)
 	hasCards := pending || (out.Task != nil && out.Task.Artifact(lib.ArtifactHandoff) != nil) || len(extractKanbanCards(details)) > 0
 	if !hasCards {
 		for _, f := range out.Followed {
@@ -2219,7 +2222,13 @@ func (b *NATSBus) gatherStepReports(ctx context.Context, w *turnWatch, out *Turn
 				out.Reports = append(out.Reports, f)
 			}
 		}
-		out.Cards, out.ReportsEnd = cardsNone, reportsNoCards
+		// The step poll often sees the root end before the gateway's
+		// result frame arrives: name that frame only when it was heard.
+		if seen {
+			out.Cards, out.ReportsEnd = cardsNone, reportsNoCards
+		} else {
+			out.ReportsEnd = reportsNoCardSignal
+		}
 		return
 	}
 	b.gatherReports(ctx, w, out, true)
