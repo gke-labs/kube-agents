@@ -142,9 +142,9 @@ RUN ARCH=$(dpkg --print-architecture) && \
 # Pinned and checked against the release's SHA256SUMS, per architecture; a
 # version bump moves the hashes and the `leeway version` check in
 # deploy/sandbox/smoke-test.sh with it.
-ARG LEEWAY_VERSION=0.1.4
-ARG LEEWAY_SHA256_AMD64=ac75b0d62ad9bcc4cddb4c8c5297556b542a9cbb4c17d3fa66e456ecf2f1741a
-ARG LEEWAY_SHA256_ARM64=bac07bedb9bb4cbf4cbd12810fed16480caac5bf3ddbbaaf4ccf8b3303368bf3
+ARG LEEWAY_VERSION=0.1.5
+ARG LEEWAY_SHA256_AMD64=f241671cf5a6e6b642fda5238b31ea3283e8dcb7aa6b9782358f268515e71d8a
+ARG LEEWAY_SHA256_ARM64=6282ea89eeb9af23a50ac4f9f06bcf135206ff93f3beda9efa96cf94144ccc5c
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) LEEWAY_SHA256="${LEEWAY_SHA256_AMD64}" ;; \

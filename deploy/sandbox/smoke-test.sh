@@ -440,7 +440,7 @@ check "python3 exists (execute_code probes for it)" "python3" \
   "$("${SSH[@]}" 'command -v python3' 2>&1)"
 check "tar exists (file sync is tar over ssh, not sftp)" "tar" \
   "$("${SSH[@]}" 'command -v tar' 2>&1)"
-check "leeway exists (topology drift CLI)" "v0.1.4" \
+check "leeway exists (topology drift CLI)" "v0.1.5" \
   "$("${SSH[@]}" 'leeway version' 2>&1)"
 # tar run as root keeps the owner an archive records unless told
 # --no-same-owner, and the helm and leeway archives both record uid 1001, which
