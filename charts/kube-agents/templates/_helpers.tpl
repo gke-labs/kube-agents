@@ -1027,6 +1027,69 @@ router_settings:
 {{- end }}
 
 {{/*
+The shadow replay proxy's checksum of what decides the model's answer
+(REPLAY_MODEL_BEHAVIOUR_CHECKSUM in litellm.yaml). The pods' checksum/config
+covers the whole config; this one leaves out how a request reaches the model,
+so a Vertex AI install and a Gemini Developer API install serving the same
+model with the same settings get the same replay key. Without that, the eval
+nightlies (Gemini Developer API) record answers no presubmit (Vertex AI) can
+ever look up.
+
+TODO(#4988): temporary. Once the nightlies and presubmits call the model
+through one API, key replay on the full checksum/config again and delete this.
+
+What it drops, from the parsed rendered config, and keeps everything else:
+  - the provider prefix of each model (vertex_ai/gemini-4-argon and
+    gemini/gemini-4-argon are one model), and each model's endpoint and
+    credential keys ($routeParams);
+  - the router's timeout and retry settings, which decide when a call is
+    retried, not what the answer says ($deliverySettings);
+  - every callback the caller does not pass in .callbacks: the caller passes
+    only the hooks that change what the model is sent or what comes back.
+Each kept hook's source, and the redaction rule file when redaction is on,
+arrive in .sources and are hashed with the config, so an edit to one changes
+the key the way it rolls the pods.
+
+Takes a dict of config (the rendered gateway config), callbacks (the kept
+callback entries, in order) and sources (a list of strings).
+*/}}
+{{- define "kube-agents.replayModelBehaviourChecksum" -}}
+{{- $routeParams := list "api_base" "api_key" "api_version" "ssl_verify" "vertex_project" "vertex_location" "vertex_credentials" -}}
+{{- $deliverySettings := list "timeout" "num_retries" "retry_after" -}}
+{{- $providerPrefixPattern := "^[^/]+/" -}}
+{{- $parsed := .config | fromYaml -}}
+{{- if hasKey $parsed "Error" -}}
+{{- fail (printf "the rendered LiteLLM config does not parse as YAML, so the replay checksum cannot be computed: %s" (get $parsed "Error")) -}}
+{{- end -}}
+{{- $behaviour := deepCopy $parsed -}}
+{{- $models := list -}}
+{{- range $parsed.model_list -}}
+{{- $params := deepCopy .litellm_params -}}
+{{- range $routeParams -}}
+{{- $_ := unset $params . -}}
+{{- end -}}
+{{- $_ := set $params "model" (regexReplaceAll $providerPrefixPattern $params.model "") -}}
+{{- $models = append $models (set (deepCopy .) "litellm_params" $params) -}}
+{{- end -}}
+{{- $_ := set $behaviour "model_list" $models -}}
+{{- $settings := deepCopy ($parsed.litellm_settings | default dict) -}}
+{{- $_ := set $settings "callbacks" .callbacks -}}
+{{- $_ := set $behaviour "litellm_settings" $settings -}}
+{{- if $parsed.router_settings -}}
+{{- $router := deepCopy $parsed.router_settings -}}
+{{- range $deliverySettings -}}
+{{- $_ := unset $router . -}}
+{{- end -}}
+{{- if $router -}}
+{{- $_ := set $behaviour "router_settings" $router -}}
+{{- else -}}
+{{- $_ := unset $behaviour "router_settings" -}}
+{{- end -}}
+{{- end -}}
+{{- printf "%s%s" (toJson $behaviour) (join "" .sources) | sha256sum -}}
+{{- end }}
+
+{{/*
 Selector labels for the operator Deployment. Kept minimal and stable:
 selectors are immutable once the Deployment exists.
 */}}

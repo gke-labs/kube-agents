@@ -67,10 +67,13 @@ def _helm():
     return "helm"
 
 
-def _render(sets=(), chart=_CHART, show_only=None):
+def _render(sets=(), chart=_CHART, show_only=None, typed_sets=()):
+    """Render the chart; `sets` go in as strings bar true/false, `typed_sets` as Helm parses them."""
     args = [_helm(), "template", "test-release", str(chart)]
     for value in (*_REQUIRED, *sets):
         args += ["--set-string" if "=" in value and not value.endswith(("=true", "=false")) else "--set", value]
+    for value in typed_sets:
+        args += ["--set", value]
     if show_only:
         args += ["--show-only", show_only]
     return subprocess.run(args, capture_output=True, text=True, timeout=_HELM_TIMEOUT_SECONDS)
@@ -192,8 +195,7 @@ class EnabledTest(unittest.TestCase):
         self.assertEqual(self.container["image"], f"{_IMAGE_REPOSITORY}:{_IMAGE_TAG}")
 
     def test_fingerprint_inputs_are_what_litellm_runs(self):
-        annotation = self.litellm["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
-        self.assertEqual(self.env["REPLAY_LITELLM_CONFIG_CHECKSUM"], annotation)
+        self.assertRegex(self.env["REPLAY_MODEL_BEHAVIOUR_CHECKSUM"], r"^[0-9a-f]{64}$")
         litellm_container = next(c for c in self.litellm["spec"]["template"]["spec"]["containers"]
                                  if c["name"] == _LITELLM_CONTAINER)
         self.assertEqual(self.env["REPLAY_LITELLM_IMAGE"], litellm_container["image"])
@@ -236,6 +238,86 @@ class EnabledTest(unittest.TestCase):
         self.assertEqual(litellm["ports"], [{"port": 8080, "protocol": "TCP"}])
         [peer] = litellm["to"]
         self.assertEqual(peer, {"podSelector": {"matchLabels": {"app": "litellm", _ROLE: "litellm"}}})
+
+
+# The two model routes hack/ci-deploy.sh renders: presubmits on Vertex AI, the
+# nightlies on the Gemini Developer API, the rest of its LiteLLM flags alike.
+_EVAL_MODEL = "gemini-4-argon"
+_EVAL_LITELLM = (
+    f"litellm.modelDefaultName={_EVAL_MODEL}",
+    "litellm.vertex.serviceAccountAnnotations.iam\\.gke\\.io/gcp-service-account=litellm@pool.iam.gserviceaccount.com",
+    "litellm.vertex.sessionAffinity.enabled=true",
+)
+_EVAL_LITELLM_TYPED = (
+    "litellm.fallback.numRetries=2",
+    "litellm.fallback.retryAfterSeconds=20",
+    "litellm.vertex.sessionAffinity.slots=1",
+)
+_VERTEX = ("litellm.modelProvider=vertex_ai", *_EVAL_LITELLM)
+_GEMINI_API = ("litellm.modelProvider=gemini", *_EVAL_LITELLM)
+
+
+class ReplayKeyTest(unittest.TestCase):
+    """REPLAY_MODEL_BEHAVIOUR_CHECKSUM covers what decides the answer, not the route to the model."""
+
+    def render(self, sets, chart=_CHART, typed_sets=()):
+        res = _render((*_ON, *sets), chart=chart, show_only="templates/litellm.yaml",
+                      typed_sets=(*_EVAL_LITELLM_TYPED, *typed_sets))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        docs = _docs(res.stdout)
+        container = _find(docs, "Deployment", _PROXY)["spec"]["template"]["spec"]["containers"][0]
+        env = {e["name"]: e.get("value") for e in container["env"]}
+        rollout = _find(docs, "Deployment", "litellm")["spec"]["template"]["metadata"]["annotations"]["checksum/config"]
+        return env["REPLAY_MODEL_BEHAVIOUR_CHECKSUM"], rollout
+
+    def test_vertex_and_gemini_api_routes_to_one_model_share_the_key(self):
+        vertex_key, _ = self.render(_VERTEX)
+        gemini_key, _ = self.render(_GEMINI_API)
+        self.assertEqual(vertex_key, gemini_key)
+
+    def test_the_pods_still_roll_when_the_route_changes(self):
+        _, vertex_rollout = self.render(_VERTEX)
+        _, gemini_rollout = self.render(_GEMINI_API)
+        self.assertNotEqual(vertex_rollout, gemini_rollout)
+
+    def test_retry_settings_leave_the_key_alone(self):
+        base, _ = self.render(_VERTEX)
+        retried, _ = self.render(_VERTEX, typed_sets=("litellm.fallback.numRetries=1",
+                                                      "litellm.fallback.retryAfterSeconds=30"))
+        self.assertEqual(base, retried)
+
+    def test_what_changes_the_answer_changes_the_key(self):
+        base, _ = self.render(_VERTEX)
+        for name, extra, typed in (
+            ("model", ("litellm.modelDefaultName=gemini-3.5-flash",), ()),
+            ("max tokens", (), ("litellm.maxTokens=4096",)),
+            ("thinking", ("litellm.reasoningEffort=high",), ()),
+            ("fallback alias", ("litellm.fallback.reasoningEffort=low",), ()),
+            ("redaction", ("litellm.redaction.enabled=true",), ()),
+        ):
+            with self.subTest(name):
+                changed, _ = self.render((*_VERTEX, *extra), typed_sets=typed)
+                self.assertNotEqual(base, changed)
+
+    def test_an_edit_to_a_request_rewriting_hook_changes_the_key(self):
+        base, _ = self.render(_VERTEX)
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(_CHART, chart)
+            hook = chart / "files" / "litellm_thinking_replay_callback.py"
+            hook.write_text(hook.read_text() + "\n# edited\n")
+            changed, _ = self.render(_VERTEX, chart=chart)
+        self.assertNotEqual(base, changed)
+
+    def test_an_edit_to_the_replica_routing_hook_leaves_the_key_alone(self):
+        base, _ = self.render(_VERTEX)
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(_CHART, chart)
+            hook = chart / "files" / "litellm_session_affinity_callback.py"
+            hook.write_text(hook.read_text() + "\n# edited\n")
+            changed, _ = self.render(_VERTEX, chart=chart)
+        self.assertEqual(base, changed)
 
 
 class PdbTest(unittest.TestCase):
