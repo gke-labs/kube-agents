@@ -287,6 +287,7 @@ def test_the_per_repetition_detail_is_printed(kanban_task, tmp_path, capsys):
 REPORT_PREFIX = "  rep 1 report: "
 TIMING_PREFIX = "  rep 1 timing: "
 TOKENS_PREFIX = "  rep 1 tokens: "
+SHAPE_PREFIX = "  rep 1 shape: "
 
 
 def test_a_failing_repetition_quotes_the_agents_report_under_its_grading_line(
@@ -402,6 +403,7 @@ _API_TOKENS = {
     "front_door": {"input": 10, "cached": 100, "cache_write": 50, "reasoning": 0, "output": 7, "total": 167},
     "workers": {"input": 8, "total": 274986, "by_agent": {}, "unbilled": []},
 }
+_API_LINE = "input=18 output=1867 total=275153 cached=128562 cache_write=144706 reasoning=261"
 _INJECT_TOKENS = {
     "input": 60468, "cached": None, "cache_write": None, "reasoning": None, "output": 79,
     "total": 151969, "children": {"input": 91204, "output": 218, "total": 91422},
@@ -411,18 +413,28 @@ _INJECT_TOKENS = {
 @pytest.mark.parametrize(
     ("tokens", "expected"),
     [
-        (_API_TOKENS, TOKENS_PREFIX + "input=18 output=1867 total=275153"),
+        (_API_TOKENS, TOKENS_PREFIX + _API_LINE),
+        (
+            {key: value for key, value in _API_TOKENS.items() if key not in ("front_door", "workers")},
+            TOKENS_PREFIX + _API_LINE,
+        ),
+        # The front door's row was not read: `input` is the envelope's prompt
+        # total, and `cached` the workers' alone, so no split is printed.
+        (
+            {**_API_TOKENS, "front_door": {**_API_TOKENS["front_door"], "cached": None}},
+            TOKENS_PREFIX + "input=18 output=1867 total=275153",
+        ),
         (_INJECT_TOKENS, TOKENS_PREFIX + "input=60468 output=79 total=151969"),
         ({**_INJECT_TOKENS, "usage_partial": True}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
         (
             {**_API_TOKENS, "workers": {**_API_TOKENS["workers"], "unbilled": [{"session": "s1"}]}},
-            TOKENS_PREFIX + "input=18 output=1867 total=275153 partial=1",
+            TOKENS_PREFIX + _API_LINE + " partial=1",
         ),
         ({**_INJECT_TOKENS, "workers": None}, TOKENS_PREFIX + "input=60468 output=79 total=151969 partial=1"),
         ({"input": None, "output": 0, "total": 0}, TOKENS_PREFIX + "output=0 total=0"),
         ({"input": True, "output": 1.5, "total": 40}, TOKENS_PREFIX + "total=40"),
     ],
-    ids=["api", "inject", "inject-partial", "unbilled-worker", "workers-unbilled-whole", "zero-is-a-count", "non-counts-left-out"],
+    ids=["api", "api-no-workers", "api-front-door-unsplit", "inject", "inject-partial", "unbilled-worker", "workers-unbilled-whole", "zero-is-a-count", "non-counts-left-out"],
 )
 def test_the_tokens_line_follows_the_timing_line(kanban_task, make_run, tmp_path, capsys, tokens, expected):
     """The dashboard reads each repetition's token counts from `rep N
@@ -443,6 +455,37 @@ def test_no_tokens_line_when_the_record_has_no_count(kanban_task, make_run, tmp_
     run_case(kanban_task, [_tokened_run(make_run, tokens)], tmp_path / "case.json")
     printed = capsys.readouterr().out
     assert "  rep 1: " in printed and TOKENS_PREFIX not in printed
+
+
+@pytest.mark.parametrize(
+    ("shape", "expected"),
+    [
+        (
+            {"opens_on_verdict": False, "apology": True, "bot_messages": 3,
+             "words_before_answer": 7, "answer_words": 240},
+            SHAPE_PREFIX + "opens_on_verdict=0 apology=1 bot_messages=3 words_before_answer=7 answer_words=240",
+        ),
+        ({"answer_words": 24, "opens_on_verdict": True}, SHAPE_PREFIX + "opens_on_verdict=1 answer_words=24"),
+    ],
+    ids=["every-key", "keys-in-order-and-missing-left-out"],
+)
+def test_the_shape_line_follows_the_tokens_line(kanban_task, make_run, tmp_path, capsys, shape, expected):
+    """The dashboard reads each repetition's reply shape from `rep N shape:`,
+    a shape the collector's `rep N:` match skips. Reported, never graded."""
+    run = make_run("kanban_red_1")
+    (run / "shape.json").write_text(json.dumps(shape), encoding="utf-8")
+    run_case(kanban_task, [run], tmp_path / "case.json")
+    lines = capsys.readouterr().out.splitlines()
+    graded = next(i for i, line in enumerate(lines) if line.startswith("  rep 1: "))
+    assert lines[graded + 2].startswith(TOKENS_PREFIX)
+    assert lines[graded + 3] == expected
+    assert lines[graded + 4].startswith(REPORT_PREFIX)
+
+
+def test_no_shape_line_without_a_shape(kanban_task, make_run, tmp_path, capsys):
+    run_case(kanban_task, [make_run("kanban_red_1")], tmp_path / "case.json")
+    printed = capsys.readouterr().out
+    assert "  rep 1: " in printed and SHAPE_PREFIX not in printed
 
 
 @pytest.mark.parametrize(

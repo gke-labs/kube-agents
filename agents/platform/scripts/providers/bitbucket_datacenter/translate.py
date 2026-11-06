@@ -82,6 +82,12 @@ def _self_link(node: dict[str, Any]) -> str:
     return ""
 
 
+def _merge_commit(node: dict[str, Any]) -> str | None:
+    properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    merged = properties.get("mergeCommit")
+    return (str(merged.get("id") or "") or None) if isinstance(merged, dict) else None
+
+
 def proposal(node: dict[str, Any], repo: str = "") -> dict[str, Any]:
     """A pull request as a proposal.
 
@@ -89,6 +95,11 @@ def proposal(node: dict[str, Any], repo: str = "") -> dict[str, Any]:
     is in the same repository (project keys compare without case); the other
     repository's `KEY/slug` when it is a fork; "" when the instance does not
     say.
+
+    `mergeCommit` is `properties.mergeCommit.id`, `None` unless merged: the
+    merge or squash commit, or after a fast-forward merge the target's tip.
+    `None` for a merged pull request too when the instance leaves it out, as
+    the recorded pull-request listings do.
     """
     source = node.get("fromRef") if isinstance(node.get("fromRef"), dict) else {}
     target = node.get("toRef") if isinstance(node.get("toRef"), dict) else {}
@@ -109,6 +120,7 @@ def proposal(node: dict[str, Any], repo: str = "") -> dict[str, Any]:
         "created": instant(node.get("createdDate")),
         "updated": instant(node.get("updatedDate")),
         "closed": "" if state == "open" else instant(node.get("closedDate") or node.get("updatedDate")),
+        "mergeCommit": _merge_commit(node) if state == "merged" else None,
         "body": node.get("description") or "",
     }
 

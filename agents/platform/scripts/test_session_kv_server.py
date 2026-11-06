@@ -1188,11 +1188,11 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100")
         self.assertEqual([c.args for c in alert.call_args_list],
                          [("google_chat", "alert", "s1"), ("slack", "slack alert", "s1")])
-        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
 
     def test_the_title_is_recorded_before_the_turn_starts(self):
         def start(*_args):
-            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title")
+            session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", "")
             return STARTED
 
         session_kv_server._start_agent_turn.side_effect = start
@@ -1203,6 +1203,24 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         alert = self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         self.assertEqual([c.args for c in alert.call_args_list], [("google_chat", "alert", "s1")])
         session_kv_server._record_alert_title.assert_not_called()
+
+    def test_a_drift_kind_is_recorded_with_the_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title="the title", alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", "the title", session_kv_server.ALERT_KIND_DRIFT)
+
+    def test_a_drift_kind_is_recorded_without_a_title(self):
+        pool = park_triage_starts()
+        post = lambda platform, _msg, _session: None if platform == "google_chat" else "1712345678.000100"  # noqa: E731
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post):
+            session_kv_server.trigger_agent_troubleshooter(
+                "s1", "alert", {}, 7, alert_title=None, alert_kind=session_kv_server.ALERT_KIND_DRIFT)
+            pool.run()
+        session_kv_server._record_alert_title.assert_called_once_with("s1", None, session_kv_server.ALERT_KIND_DRIFT)
 
     def test_under_next_a_google_chat_thread_gets_the_title(self):
         # The title heads the plan the cards draw, which the gateway lays out on
@@ -1238,6 +1256,28 @@ class TestAlertTitleRecord(unittest.TestCase):
     def test_a_missing_row_is_not_an_error(self):
         session_kv_server._record_alert_title("k8s-evt-none", "x")
 
+    def test_a_kind_joins_the_routing_row_beside_the_title(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", "checkout HPA drift in seeded-b", "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {
+            "platform": "slack", "thread_id": "1.0", "title": "checkout HPA drift in seeded-b", "alert_kind": "drift",
+        })
+
+    def test_a_kind_without_a_title_is_still_recorded(self):
+        import sqlite3
+
+        session_kv_server._record_alert_title("k8s-evt-t1", None, "drift")
+        with sqlite3.connect(temp_db_path) as conn:
+            meta = json.loads(conn.execute(
+                "SELECT metadata FROM session_metadata WHERE session_id = ?", ("k8s-evt-t1",)
+            ).fetchone()[0])
+        self.assertEqual(meta, {"platform": "slack", "thread_id": "1.0", "alert_kind": "drift"})
+
     def test_the_gateway_reads_the_title_recorded(self):
         import importlib.util
         import sqlite3
@@ -1253,6 +1293,13 @@ class TestAlertTitleRecord(unittest.TestCase):
             )
         session_kv_server._record_alert_title("k8s-evt-t2", "payments-api crashloop in seeded-debug")
         self.assertEqual(reader.alert_title("C1", "2.0", temp_db_path), "payments-api crashloop in seeded-debug")
+        self.assertFalse(reader.is_drift_alert("C1", "2.0", temp_db_path))
+        session_kv_server._record_alert_title("k8s-evt-t2", "checkout HPA drift", session_kv_server.ALERT_KIND_DRIFT)
+        self.assertTrue(reader.is_drift_alert("C1", "2.0", temp_db_path))
+        self.assertEqual(
+            (reader.ALERT_KIND_KEY, reader.ALERT_KIND_DRIFT),
+            (session_kv_server.ALERT_KIND_KEY, session_kv_server.ALERT_KIND_DRIFT),
+        )
 
 
 class TestSessionKvServerAuth(unittest.TestCase):
@@ -2638,6 +2685,124 @@ class TestWorkloadIncidentFold(unittest.TestCase):
             forge.call.reset_mock()
             self.assertIsNone(session_kv_server._proposal_state("https://github.com/acme/fleet/issues/7", 5))
             forge.call.assert_not_called()
+
+    # What each forge the broker serves (providers/registry.py AVAILABLE)
+    # answers `proposal-create` with (providers/*/translate.py and the provider
+    # tests' fixtures): the forge, its configured host, the url, the repository
+    # the fold asks the forge about, and the number.
+    FORGE_PROPOSAL_URLS = (
+        ("github", "github.com", "https://github.com/acme/fleet/pull/7", "https://github.com/acme/fleet", 7, "acme/fleet"),
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/sub/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/sub/fleet",
+            7,
+            "group/sub/fleet",
+        ),
+        # A subgroup named like a marker before a numeric subgroup is still the
+        # repository: the last marker before the number is the merge request.
+        (
+            "gitlab",
+            "gitlab.example.com",
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/merge_requests/7",
+            "https://gitlab.example.com/group/pulls/2024/fleet",
+            7,
+            "group/pulls/2024/fleet",
+        ),
+        ("gitea", "gitea.example.com", "https://gitea.example.com/acme/fleet/pulls/7", "https://gitea.example.com/acme/fleet", 7, "acme/fleet"),
+        # An in-cluster Gitea serves http on a .svc host (docs/site install/gitea.md).
+        (
+            "gitea",
+            "gitea-http.gitea.svc.cluster.local",
+            "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet/pulls/7",
+            "http://gitea-http.gitea.svc.cluster.local:3000/demo/fleet",
+            7,
+            "demo/fleet",
+        ),
+        (
+            "bitbucket",
+            "bitbucket.org",
+            "https://bitbucket.org/acme/fleet/pull-requests/7/_/diff#comment-42",
+            "https://bitbucket.org/acme/fleet",
+            7,
+            "acme/fleet",
+        ),
+        (
+            "bitbucket-datacenter",
+            "bitbucket.example.com",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet/pull-requests/7/overview",
+            "https://bitbucket.example.com/projects/ACME/repos/fleet",
+            7,
+            "ACME/fleet",
+        ),
+    )
+    #: What a forge entry needs beyond provider and host; the in-cluster Gitea
+    #: declares its scheme and port.
+    FORGE_ENTRY_EXTRAS = {"gitea-http.gitea.svc.cluster.local": {"scheme": "http", "port": 3000}}
+
+    def test_the_forge_is_asked_about_a_pull_request_on_every_forge_the_broker_serves(self):
+        forge = MagicMock()
+        forge.call.return_value = {"proposal": {"state": "open"}}
+        with patch.dict(sys.modules, {"forge": forge}):
+            for _provider, _host, url, repository, number, _path in self.FORGE_PROPOSAL_URLS:
+                with self.subTest(url=url):
+                    forge.call.reset_mock()
+                    self.assertEqual(session_kv_server._proposal_state(url, 5), "open")
+                    forge.call.assert_called_once_with(
+                        "proposal-view", {"number": number}, repository, retry_transient=True
+                    )
+
+    def test_the_repository_read_from_each_forges_url_is_one_the_broker_resolves_to_that_forge(self):
+        import providers
+        from providers import registry as registry_module
+
+        forges = [{"provider": "github", "host": "github.com"}] + [
+            {"provider": provider, "host": host, "tokenPath": "/nonexistent/token", "allowedPaths": [], **self.FORGE_ENTRY_EXTRAS.get(host, {})}
+            for provider, host in sorted({(provider, host) for provider, host, *_rest in self.FORGE_PROPOSAL_URLS})
+            if provider != "github"
+        ]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "forges.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"forges": forges}, handle)
+        registry = providers.Registry({"forges": registry_module.load_forge_entries(path)})
+        self.assertEqual(
+            {cls.name for cls in providers.AVAILABLE},
+            {provider for provider, *_rest in self.FORGE_PROPOSAL_URLS},
+            "a forge the broker serves has no url shape here",
+        )
+        for provider, _host, url, repository, _number, repo_path in self.FORGE_PROPOSAL_URLS:
+            with self.subTest(url=url):
+                match = session_kv_server.PROPOSAL_URL_RE.match(url)
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(1), repository)
+                resolved, repo = registry.resolve(match.group(1))
+                self.assertEqual(resolved.name, provider)
+                self.assertEqual(repo, repo_path)
+
+    def test_an_incidents_fix_pull_request_is_found_on_every_forge_and_an_issue_is_not(self):
+        issue = "https://gitea.example.com/acme/fleet/issues/7"
+        cards = [(f"t-{i}", f"sess-{i}", row[2]) for i, row in enumerate(self.FORGE_PROPOSAL_URLS)]
+        self._board(cards=cards + [("t-issue", "sess-issue", issue)])
+        for i, row in enumerate(self.FORGE_PROPOSAL_URLS):
+            with self.subTest(url=row[2]):
+                self.assertEqual(session_kv_server._incident_pull_request_urls(f"sess-{i}"), [row[2]])
+        self.assertEqual(session_kv_server._incident_pull_request_urls("sess-issue"), [])
+        for not_a_proposal in (
+            issue,
+            "https://bitbucket.org/acme/fleet/issues/7",
+            "https://github.com/acme/fleet/commit/7",
+            # A listing, a marker with no number, and a number only in the query.
+            "https://gitea.example.com/acme/fleet/pulls",
+            "https://bitbucket.org/acme/fleet/pull-requests/",
+            "https://gitea.example.com/acme/fleet/pulls?state=open&id=7",
+            # An issue under a GitLab subgroup named like a marker, with a numeric child.
+            "https://gitlab.example.com/group/pulls/2024/fleet/-/issues/7",
+        ):
+            with self.subTest(url=not_a_proposal):
+                self.assertIsNone(session_kv_server.PROPOSAL_URL_RE.match(not_a_proposal))
 
     def test_an_abandoned_forge_call_cannot_hold_a_restart(self):
         release = threading.Event()
@@ -7012,6 +7177,30 @@ class TestDriftInject(unittest.TestCase):
         self.assertNotIn("Unknown", alert_msg)
 
     @patch.object(session_kv_server, "trigger_agent_troubleshooter")
+    def test_a_drift_alert_carries_its_title_and_kind(self, trigger):
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {
+            "alert_title": "checkout Deployment drift in prod-us-east1",
+            "alert_kind": session_kv_server.ALERT_KIND_DRIFT,
+        })
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self._inject()
+        self.assertEqual(trigger.call_args.kwargs, {"alert_title": None, "alert_kind": ""})
+
+    def test_the_drift_title_names_the_object_its_kind_and_cluster(self):
+        payload = {**self.DRIFT_PAYLOAD, "cluster": "seeded-b", "resource": {
+            "group": "autoscaling", "namespace": "shop", "resource": "horizontalpodautoscalers", "name": "checkout-gateway"}}
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": "1"}):
+            self.assertEqual(session_kv_server._drift_session_title(payload), "checkout-gateway HPA drift in seeded-b")
+            unlisted = {**payload, "cluster": "", "resource": {"resource": "leases", "name": "l1"}}
+            with patch.dict(os.environ, {"GKE_CLUSTER_NAME": "host-a"}):
+                self.assertEqual(session_kv_server._drift_session_title(unlisted), "l1 leases drift in host-a")
+            self.assertIsNone(session_kv_server._drift_session_title({**payload, "resource": {"resource": "pods"}}))
+        with patch.dict(os.environ, {"KAGE_SLACK_UX": ""}):
+            self.assertIsNone(session_kv_server._drift_session_title(payload))
+
+    @patch.object(session_kv_server, "trigger_agent_troubleshooter")
     def test_an_event_payload_still_takes_the_event_path(self, trigger):
         """The other half of the same dispatch: the watcher is unaffected."""
         event = {
@@ -11074,6 +11263,78 @@ class TestCardStop(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
 
+class AliveHelperTest(unittest.TestCase):
+    """The test helper `_alive` against a process reaped mid-check (#4828)."""
+
+    PID = 4242
+
+    def _with_proc(self, stat):
+        """Run `_alive(PID)` as on Linux, with `stat` standing in for opening
+        /proc/PID/stat: an exception to raise, or the file's text. The pid
+        answers os.kill, and ps must not be asked. os.path.exists says the
+        file is there, which only the pre-#4828 helper asked."""
+        import io
+
+        path = f"/proc/{self.PID}/stat"
+        real_open, real_kill = open, os.kill
+        real_isdir, real_exists = os.path.isdir, os.path.exists
+
+        def fake_open(p, *args, **kwargs):
+            if str(p) != path:
+                return real_open(p, *args, **kwargs)
+            if isinstance(stat, BaseException):
+                raise stat
+            if callable(stat):
+                return stat()
+            return io.StringIO(stat)
+
+        def no_ps(*args, **kwargs):
+            raise AssertionError("with a /proc, the stat file decides and ps is never asked")
+
+        with patch.object(os, "kill", lambda pid, sig: None if pid == self.PID else real_kill(pid, sig)), \
+                patch("builtins.open", fake_open), \
+                patch.object(os.path, "exists", lambda p: True if p == path else real_exists(p)), \
+                patch.object(os.path, "isdir", lambda p: True if p == "/proc/self" else real_isdir(p)), \
+                patch("subprocess.run", no_ps):
+            return _alive(self.PID)
+
+    def test_a_process_reaped_after_the_signal_check_is_not_alive(self):
+        # os.kill(pid, 0) still succeeds, then the process is reaped before its
+        # stat file is opened: the race CI hit.
+        self.assertFalse(self._with_proc(FileNotFoundError(2, "No such file or directory")))
+
+    def test_a_process_that_exits_while_its_stat_is_read_is_not_alive(self):
+        class Gone:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                raise ProcessLookupError(3, "No such process")
+
+        self.assertFalse(self._with_proc(Gone))
+
+    def test_the_stat_state_decides_on_linux(self):
+        self.assertTrue(self._with_proc("4242 (sleep) S 1 4242 4242 0 -1"))
+        self.assertFalse(self._with_proc("4242 (sleep) Z 1 4242 4242 0 -1"), "a zombie has exited")
+        # A ")" inside the command name: the state is after the last one.
+        self.assertTrue(self._with_proc("4242 (a) b) R 1 4242"))
+        self.assertFalse(self._with_proc("4242 (sleep"), "a stat with no state field")
+
+    def test_a_running_process_is_alive_and_an_exited_one_is_not(self):
+        import subprocess
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(_alive(child.pid))
+        finally:
+            child.kill()
+            child.wait(5)
+        self.assertFalse(_alive(child.pid))
+
+
 def _alive(pid):
     """True while `pid` runs; a zombie is not running."""
     import subprocess
@@ -11082,9 +11343,17 @@ def _alive(pid):
         os.kill(pid, 0)
     except OSError:
         return False
-    if os.path.exists(f"/proc/{pid}/stat"):
+    # One open, no exists() first: a process reaped between the two used to
+    # raise FileNotFoundError out of the test (#4828). With a /proc, a missing
+    # entry is a process that's gone; without one (macOS), ask ps.
+    try:
         with open(f"/proc/{pid}/stat") as fh:
             return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except IndexError:  # a stat with no state field: as production's _proc_alive reads it
+        return False
+    except (FileNotFoundError, ProcessLookupError):
+        if os.path.isdir("/proc/self"):
+            return False
     state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
     return bool(state) and not state.startswith("Z")
 
@@ -13040,6 +13309,34 @@ def closing_state(path):
     conn = sqlite3.connect(path, isolation_level=None)
     return closing(conn)
 
+
+class TestKeptRefusals(unittest.TestCase):
+    """`a2a notify` exit 5: the gateway kept a home post for its digest. The
+    re-senders treat it as handled, so the keep is not filled with retries."""
+
+    def test_drift_backlog_digest_kept_by_the_gateway_counts_as_sent(self):
+        exc = session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        with patch.object(session_kv_server.subprocess, "run", side_effect=exc), \
+                patch.object(session_kv_server.chat_notify, "routes", return_value=True):
+            self.assertTrue(session_kv_server._send_drift_backlog_digest("slack", "Drift backlog: 3 changes"))
+
+    def test_initial_alert_kept_by_the_gateway_returns_the_kept_marker(self):
+        exc = session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, ["a2a"], stderr="kept")
+        with patch.object(session_kv_server, "_run_alert_send", side_effect=exc):
+            self.assertEqual(session_kv_server._post_initial_alert("slack", "an alert"), session_kv_server.ALERT_KEPT_FOR_DIGEST)
+
+    def test_report_card_kept_by_the_gateway_posts_no_text(self):
+        res = MagicMock(returncode=chat_notify.NOTIFY_KEPT, stdout="", stderr="kept")
+        with patch.object(session_kv_server.subprocess, "run", return_value=res), \
+                patch.object(session_kv_server.chat_notify, "chat_command", return_value=["a2a"]):
+            posted = session_kv_server._post_audit_chat_via_gateway("slack", "platform", "audit", {"kind": "card"}, "text", "", 30)
+        self.assertIs(posted, session_kv_server.AUDIT_POST_KEPT)
+
+    def test_data_volume_warning_kept_by_the_gateway_stops_retrying(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["slack"]), \
+                patch.object(session_kv_server, "_chat_platforms_disabled", return_value=False), \
+                patch.object(session_kv_server, "_post_initial_alert", return_value=session_kv_server.ALERT_KEPT_FOR_DIGEST):
+            self.assertTrue(session_kv_server._post_data_volume_warning("data volume at 90%"))
 
 
 if __name__ == "__main__":

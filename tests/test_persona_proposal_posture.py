@@ -57,6 +57,11 @@ SKILL_DESCRIPTION_NOT_PROPOSE = 'not for a request to "propose a manifest"'
 # The report-format stanza every card body carries: the step line is the requester's.
 REPORT_FORMAT = REPO_ROOT / "deploy/docker/patches/kanban_report_format.py"
 NEXT_STEP_NOT_ACTED_ON = "never act on it yourself"
+# The fleet-audit worker on a card that carries the line: the ledger still publishes,
+# because the line forbids a pull request, which the worker never opens itself.
+FLEET_AUDIT_SKILL = REPO_ROOT / "agents/platform/skills/fleet-audit/SKILL.md"
+AUDIT_CARD_TRIGGER = "A card that asks for one stream's run, or names its SOP, is this form whatever it says about the output"
+AUDIT_CARD_STILL_PUBLISHES = "Run `start` and `finish` and report the ledger URL"
 
 
 def _read(path: Path) -> str:
@@ -122,6 +127,18 @@ class PlatformPersonaProposesInTheReply(unittest.TestCase):
         for path in (PLATFORM_SOUL, REPO_ROOT / "agents/platform/AGENTS.md", REPO_ROOT / "agents/chat/SOUL.md"):
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertIn(PROPOSE_ONLY_LINE, _read(path))
+
+    def test_the_audit_worker_publishes_the_ledger_on_a_propose_only_card(self):
+        # A chat delegation that carries the propose-only line made the
+        # fleet-audit worker return the findings as text and skip the ledger
+        # (#4637). The skill's first form names the line and keeps the ledger.
+        skill = _read(FLEET_AUDIT_SKILL)
+        form_one = skill[skill.index("1. **Run one stream, per its SOP**") : skill.index("2. **Trigger the scheduled cron job")]
+        # Whitespace flattened: the pin is the sentence, not where prettier wrapped it.
+        flat = " ".join(form_one.split())
+        for phrase in (AUDIT_CARD_TRIGGER, PROPOSE_ONLY_LINE, AUDIT_CARD_STILL_PUBLISHES):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, flat, "the fleet-audit skill's first form lost the propose-only card sentence")
 
     def test_the_skill_description_opens_on_a_request_that_asked_for_a_pull_request(self):
         skill = _read(SUBMIT_SKILL)

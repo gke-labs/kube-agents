@@ -637,6 +637,20 @@ class Digest(RunHarness):
         self.tick(health(), datetime(2026, 1, 17, 14, 5, tzinfo=timezone.utc))
         self.assertEqual(len(self.opener.requests), 3)
 
+    def test_the_digest_carries_one_line_on_the_forge_nightlies(self):
+        """Last night's result per forge-lane nightly; jobs with no night on
+        record at all, or in a lane with a reason, say so, and why."""
+        data = {"runs": [
+            {"build_id": "10", "tier": "gitlab", "job": "ci-kube-agents-eval-nightly-gitlab", "pr": None, "result": "SUCCESS", "started": "2026-09-14T06:30:00+00:00"},
+            {"build_id": "11", "tier": "gitlab", "job": "ci-kube-agents-eval-nightly-gitlab-next", "pr": None, "result": "FAILURE", "started": "2026-09-14T08:30:00+00:00"},
+        ]}
+        lines = [text for text in post_health.render_digest(health("GREEN"), T14, data).splitlines() if text.startswith("🦊")]
+        self.assertEqual(lines, [
+            "🦊 Forge lanes: GitLab today green · GitLab next red · GHES weekly, GitLab CE weekly off"
+            " (not in Prow yet; the weekly jobs wait on the Vertex quota)"
+        ])
+        self.assertFalse([t for t in post_health.render_digest(health("GREEN"), T14).splitlines() if t.startswith("🦊")], "no data.json, no line")
+
     def test_digest_carries_one_line_on_last_night_when_data_json_is_given(self):
         # Two nights of the nightly tier; the digest goes out Fri 9 AM ET
         # (13:00Z on 2026-09-04), so the night that started 00:00Z Friday
@@ -667,6 +681,8 @@ class Digest(RunHarness):
             # the nightly-red issues, so the one line stands and says why
             # (test_eval_dashboard_nightly_digest.py covers the section).
             "🌙 Nightly section skipped: no GitHub token to read the nightly-red issues.\n"
+            "🦊 Forge lanes: GitLab today, GitLab next no run on record · GHES weekly, GitLab CE weekly off"
+            " (not in Prow yet; the weekly jobs wait on the Vertex quota)\n"
             f"{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
         self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")

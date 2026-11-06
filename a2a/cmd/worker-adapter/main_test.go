@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -594,5 +595,61 @@ func TestASessionWithNoClusterViewIsToldNotToSearchThePod(t *testing.T) {
 	t.Setenv(lib.EnvProfileExecutor, "true")
 	if p := prompt(); strings.Contains(p, noClusterPrompt) {
 		t.Errorf("an AgentProfile's pod was told it has no cluster access: prompt = %q", p)
+	}
+}
+
+// A profile worker's base argv carries no tool, MCP or settings flags: the
+// persona's rendering supplies those for each task, and a second allowlist
+// here would leave the harness to choose between two.
+func TestAProfileWorkersBaseArgvLeavesToolsToThePersona(t *testing.T) {
+	t.Setenv("A2A_HARNESS_CMD", "")
+	argv := strings.Join(profileHarnessCommand(), " ")
+	for _, flag := range []string{"--allowedTools", "--disallowedTools", "--mcp-config", "--strict-mcp-config", "--setting-sources", "--append-system-prompt"} {
+		if strings.Contains(argv, flag) {
+			t.Errorf("the profile base argv carries %s: %s", flag, argv)
+		}
+	}
+	for _, want := range []string{"--print", "--output-format stream-json", "--input-format stream-json", "--model", "--max-turns"} {
+		if !strings.Contains(argv, want) {
+			t.Errorf("the profile base argv lacks %s: %s", want, argv)
+		}
+	}
+}
+
+// A profile worker binds no delegate socket: its harness argv is the
+// persona's, which carries no delegate MCP server, so a listener would serve
+// a tool the harness is never told of.
+func TestAProfileWorkerBindsNoDelegateSocket(t *testing.T) {
+	t.Setenv("TASK_ID", "task-profile")
+	t.Setenv("PROFILE", "chat")
+	t.Setenv("NATS_URL", "nats://127.0.0.1:1")
+	t.Setenv("A2A_CAPABILITY_REQUIRED", "false")
+	cfg, ok := configFromEnv(slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if !ok {
+		t.Fatal("configFromEnv rejected the environment")
+	}
+	if cfg.DelegateSocket == "" {
+		t.Fatal("the session config binds no delegate socket to begin with; the check below would pass on nothing")
+	}
+	got := profileModeConfig(cfg)
+	if got.DelegateSocket != "" {
+		t.Errorf("profile mode keeps the delegate socket %q", got.DelegateSocket)
+	}
+	if !reflect.DeepEqual(got.HarnessCommand, profileHarnessCommand()) || got.HarnessCommandNoDelegate != nil {
+		t.Errorf("profile mode argv = %q / %q, want the persona's base argv and no no-delegate variant", got.HarnessCommand, got.HarnessCommandNoDelegate)
+	}
+}
+
+// The reset paths come from the operator, and the worker empties only
+// absolute paths it was given: never a relative one (the worker's own
+// directory) or the root.
+func TestResetPathsTakeOnlyAbsoluteDirectories(t *testing.T) {
+	got := resetPaths("/scratch::relative:/:/home/node/:/tmp")
+	want := []string{"/scratch", "/home/node", "/tmp"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("resetPaths = %q, want %q", got, want)
+	}
+	if got := resetPaths(""); len(got) != 0 {
+		t.Errorf("resetPaths(\"\") = %q, want none", got)
 	}
 }
