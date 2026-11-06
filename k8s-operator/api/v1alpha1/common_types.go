@@ -1291,6 +1291,8 @@ type DeploymentSpec struct {
 	PodAnnotations map[string]string `json:"podAnnotations,omitempty"`
 
 	// ScaleToZero scales the deployment replicas to 0 when true (useful for saving costs during idle periods).
+	// While it holds and the gateway has no ready replica, status.phase reads Paused and the Ready
+	// condition False with reason ScaledToZero; clearing it restores the normal phases.
 	// +optional
 	ScaleToZero *bool `json:"scaleToZero,omitempty"`
 

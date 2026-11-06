@@ -159,3 +159,25 @@ func TestAGatewayAtZeroWithoutTheFieldIsProvisioning(t *testing.T) {
 		t.Errorf("Ready reason = %q, want Provisioning", cond.Reason)
 	}
 }
+
+// A workload that keeps running under the pause but has no ready replica, and
+// that the pod scan names no fault in (a failing readiness probe, a missing
+// StatefulSet), is named in the message: the phase stays Paused, since the
+// gateway is at zero on purpose, but "not failing" is not claimed over it.
+func TestAPausedInstallNamesAWorkloadThatIsNotReady(t *testing.T) {
+	agent := scaledToZeroAgent()
+	phase, msg := settleStatus(t, agent, drainedGateway(agent), shellSandbox(agent, 0), credentialBroker(agent, 1))
+
+	if phase != "Paused" {
+		t.Errorf("got phase %q, want Paused: the gateway is at zero because the spec asked for it", phase)
+	}
+	if cond := meta.FindStatusCondition(agent.Status.Conditions, "Ready"); cond.Reason != "ScaledToZero" {
+		t.Errorf("Ready reason = %q, want ScaledToZero", cond.Reason)
+	}
+	if !strings.Contains(msg, "StatefulSet test-agent-shell") {
+		t.Errorf("Ready message %q does not name the sandbox that is not ready", msg)
+	}
+	if strings.Contains(msg, "not failing") {
+		t.Errorf("Ready message %q claims the install is not failing while the sandbox has no ready replica", msg)
+	}
+}
